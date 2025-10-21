@@ -1,0 +1,23 @@
+# Python specific
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+.python-version
+.venv/
+env/
+
+# IDE specific
+.vscode/
+.idea/
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+build/
+
+# Docs
+docs/
