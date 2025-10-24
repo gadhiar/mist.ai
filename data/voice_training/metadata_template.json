@@ -1,0 +1,26 @@
+[
+  {
+    "audio_file": "clip_001.wav",
+    "text": "Hello, how can I help you today?",
+    "style": "friendly_greeting",
+    "emotional_tone": 0.7,
+    "quality_rating": 5,
+    "notes": "Example: Warm, welcoming tone"
+  },
+  {
+    "audio_file": "clip_002.wav",
+    "text": "Let me explain how this works.",
+    "style": "professional_explanation",
+    "emotional_tone": 0.5,
+    "quality_rating": 5,
+    "notes": "Clear and measured delivery"
+  },
+  {
+    "audio_file": "clip_003.wav",
+    "text": "That's a great question. Let me think about that for a moment.",
+    "style": "thoughtful_response",
+    "emotional_tone": 0.6,
+    "quality_rating": 5,
+    "notes": "Engaged and considering"
+  }
+]

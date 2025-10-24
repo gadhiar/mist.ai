@@ -5,6 +5,7 @@ __pycache__/
 *.pyo
 .python-version
 .venv/
+venv/
 env/
 
 # IDE specific
@@ -18,6 +19,7 @@ Thumbs.db
 # Build artifacts
 dist/
 build/
+dependencies/
 
 # Docs
 docs/

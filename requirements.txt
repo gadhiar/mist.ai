@@ -1,0 +1,32 @@
+# LLM & Inference
+ollama==0.4.4
+
+# Knowledge Graph
+networkx==3.2.1
+
+# Vector Store
+chromadb==0.4.24
+
+# Visualization
+plotly==5.18.0
+
+# Utilities
+pyyaml==6.0.1
+python-dotenv==1.0.1
+rich==13.7.0
+
+# Multimodal (Speech)
+# NOTE: Install torch/torchaudio separately with CUDA support:
+# pip install torch==2.4.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu124
+# Then run: pip install -r requirements.txt
+# See VOICE_SETUP.md for complete installation instructions
+torch==2.4.0  # Must match CSM requirement - install with CUDA support first
+torchaudio==2.4.0  # Must match CSM requirement - install with CUDA support first
+sounddevice>=0.4.6
+numpy>=1.24.0
+openai-whisper>=20231117
+
+# Development
+pytest==7.4.4
+black==24.1.1
+ipython==8.20.0

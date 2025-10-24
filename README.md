@@ -39,26 +39,29 @@ This isn't a ChatGPT wrapper or LLM fine-tuning project. It's a cognitive archit
 
 ### Key Features
 
-- **Hybrid Intelligence**: Local Llama 3.2 for transparent reasoning, cloud APIs (Claude/GPT) for complex tasks
+- **Hybrid Intelligence**: Local Qwen 2.5 32B for transparent reasoning, cloud APIs (Claude/GPT) for complex tasks
 - **Knowledge Graph**: Structured memory with full provenance tracking
 - **Multimodal Learning**: Teach through speech, vision, and text
 - **Model Agnostic**: Swap base models as they improve - knowledge persists
 - **Self-Aware**: Knows its limits and when to delegate
-- **Privacy-First**: All data local by default, user controls cloud sharing
+- **Privacy-First**: All data local by default, user controls cloud sharing, fully air-gapped capable
 
 ## Technology Stack
 
-- **Base Model**: Llama 3.2 8B (Ollama) - swappable
+- **Base Model**: Qwen 2.5 32B Instruct (Ollama) - swappable
 - **Knowledge**: NetworkX (graph) + ChromaDB (vectors)
-- **Speech**: Whisper (STT) + Piper (TTS)
-- **Vision**: Llama 3.2 Vision
+- **Speech**: Whisper base (STT) + Sesame CSM-1B (TTS)
+- **Vision**: Future - Qwen 2.5 Vision (planned)
 - **Cloud**: Claude Sonnet 4.5, GPT-4 (strategic use)
 - **Language**: Python 3.11+
-- **Platform**: Windows-native (WSL optional)
+- **Platform**: Windows-native
+- **Hardware**: RTX 4070 Super (12GB VRAM), 32GB RAM (64GB recommended)
 
 ## Quick Start
 
-See [docs/windows_dev_setup.md](docs/windows_dev_setup.md) for complete setup instructions.
+**Voice System:** See [VOICE_SETUP.md](VOICE_SETUP.md) for voice conversation setup (includes PyTorch with CUDA).
+
+**General Setup:** See [docs/windows_dev_setup.md](docs/windows_dev_setup.md) for complete development environment setup.
 
 ```bash
 # Clone the repository
@@ -66,7 +69,7 @@ git clone https://github.com/yourusername/mist.ai.git
 cd mist.ai
 
 # Install Ollama and pull the model
-ollama pull llama3.2:8b
+ollama pull qwen2.5:32b-instruct
 
 # Set up Python environment
 python -m venv venv
@@ -75,7 +78,27 @@ pip install -r requirements.txt
 
 # Run the system
 python -m src.main
+
+# Or run voice conversation (optimized, gap-free audio)
+python run_continuous_voice.py        # Turn-based conversation
+python run_interruptible_voice.py     # Natural flow - interrupt AI anytime
 ```
+
+### Voice Conversation Modes
+
+**Turn-Based Mode** (`run_continuous_voice.py`):
+- Simpler, lower resource usage
+- Wait for AI to finish before speaking
+- 8-9s response time, gap-free audio
+- Good for Q&A interactions
+
+**Interruptible Mode** (`run_interruptible_voice.py`):
+- Natural conversation flow
+- Interrupt AI anytime by speaking
+- AI stops within 50-100ms
+- Best for dialogue and discussion
+
+See [VOICE_IMPLEMENTATION_FINAL.md](VOICE_IMPLEMENTATION_FINAL.md) and [INTERRUPTION_FEATURE.md](INTERRUPTION_FEATURE.md) for details.
 
 ## Development Roadmap
 
@@ -98,19 +121,22 @@ This is actual AI architecture that grows more capable over time while remaining
 
 ## Documentation
 
-- [System Architecture](docs/system_architecture.md) - Complete technical design
-- [ADR 001](docs/adr_001.md) - Project vision and decisions
-- [ADR 006](docs/adr_006_multimodal.md) - Multimodal learning approach
-- [Setup Instructions](docs/setup_instructions.md) - Detailed environment setup
-- [Migration Guide](docs/migration_guide.md) - Moving to Claude Code
-- [Multimodal Quickstart](docs/multimodal_quickstart.md) - Speech/vision guide
+- [Project Handover](docs/PROJECT_HANDOVER.md) - Complete project context and status
+- [System Architecture](docs/design/system_architecture.md) - Complete technical design
+- [Scaling Architecture](docs/design/SCALING_ARCHITECTURE.md) - Performance and scaling strategy
+- [ADR 001: Vision](docs/decisions/adr_001_vision.md) - Project vision and decisions
+- [ADR 006: Multimodal](docs/decisions/adr_006_multimodal.md) - Multimodal learning approach
+- [ADR 007: Sesame CSM](docs/decisions/adr_007_sesame_csm.md) - TTS selection
+- [Windows Setup Guide](docs/guides/windows_dev_setup.md) - Complete environment setup
+- [Multimodal Quickstart](docs/guides/multimodal_quickstart.md) - Speech/vision guide
+- [Migration Guide](docs/guides/migration_guide.md) - Moving to Claude Code
 
 ## Cost Structure
 
 - **Development**: ~$40-60 over 10 weeks (Claude Pro for development support)
 - **Year 1**: ~$90-120 (higher during learning phase)
 - **Long-term**: Decreasing as local capability grows
-- **Hardware**: RTX 3070 or better (8GB+ VRAM)
+- **Hardware**: RTX 4070 Super or better (12GB+ VRAM), 32GB+ RAM
 
 ## Research Goals
 
