@@ -14,6 +14,9 @@ warnings.filterwarnings('ignore', category=UserWarning, module='torch._inductor'
 # This prevents inductor backend failures while still getting speedups where possible
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
+# Increase cache size to handle dynamic tensor shapes in streaming TTS
+# Default is 8, but streaming generates varying sequence lengths
+torch._dynamo.config.cache_size_limit = 128
 
 # Add CSM to path
 sys.path.insert(0, 'dependencies/csm')

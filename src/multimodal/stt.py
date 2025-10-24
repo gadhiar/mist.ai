@@ -53,6 +53,36 @@ class WhisperSTT:
 
         return text
 
+    def transcribe_audio(self, audio_data: np.ndarray, sample_rate: int = 16000) -> str:
+        """
+        Transcribe audio data directly (for VAD-based systems)
+
+        Args:
+            audio_data: Audio data as numpy array
+            sample_rate: Sample rate of the audio (default: 16000)
+
+        Returns:
+            Transcribed text
+        """
+        # Ensure audio is float32 and 1D
+        if audio_data.dtype != np.float32:
+            audio_data = audio_data.astype(np.float32)
+
+        if audio_data.ndim > 1:
+            audio_data = audio_data.flatten()
+
+        # Resample if needed (Whisper expects 16kHz)
+        if sample_rate != 16000:
+            # Simple resampling by decimation/interpolation
+            # For production, consider using librosa or torchaudio for better quality
+            from scipy import signal
+            num_samples = int(len(audio_data) * 16000 / sample_rate)
+            audio_data = signal.resample(audio_data, num_samples)
+
+        # Transcribe
+        result = self.model.transcribe(audio_data, fp16=False)
+        return result["text"].strip()
+
     def transcribe_file(self, audio_path: str) -> str:
         """
         Transcribe audio file

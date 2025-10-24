@@ -12,6 +12,7 @@ import sounddevice as sd
 import torch
 import time
 import numpy as np
+from datetime import datetime
 from src.multimodal.stt import WhisperSTT
 from src.multimodal.tts import SesameTTS
 from src.utils.cleanup import register_cleanup
@@ -20,6 +21,12 @@ from src.utils.cleanup import register_cleanup
 import sys
 sys.path.insert(0, 'dependencies/csm')
 from vad import AudioStreamProcessor
+
+
+def log(msg: str):
+    """Print message with timestamp"""
+    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[{timestamp}] {msg}")
 
 
 class InterruptibleVoiceInterface:
@@ -77,8 +84,8 @@ class InterruptibleVoiceInterface:
             }
         )
 
-        print("\n✓ Interruptible voice interface ready!")
-        print(f"✓ VAD threshold: {vad_threshold} (you can interrupt at any time)\n")
+        print("\nInterruptible voice interface ready!")
+        print(f"VAD threshold: {vad_threshold} (you can interrupt at any time)\n")
 
         # Audio playback management
         self.audio_queue = queue.Queue()
@@ -101,15 +108,18 @@ class InterruptibleVoiceInterface:
         """Called by VAD when user starts speaking"""
         with self.state_lock:
             if self.ai_speaking:
-                print("\n🎤 [INTERRUPT] User started speaking, stopping AI...")
+                log("[INTERRUPT] User started speaking, stopping AI...")
                 self.interrupt_playback.set()
 
     def _on_speech_end(self, audio_data, sample_rate):
         """Called by VAD when user stops speaking"""
-        print("🎤 Speech detected, transcribing...")
+        log(f"Speech detected, transcribing... (audio: {len(audio_data)} samples)")
 
         # Transcribe
+        t_start = time.time()
         user_text = self.stt.transcribe_audio(audio_data, sample_rate)
+        t_elapsed = time.time() - t_start
+        log(f"Transcription complete ({t_elapsed:.2f}s)")
         print(f"You: {user_text}")
 
         # Add to pending queue
@@ -120,7 +130,7 @@ class InterruptibleVoiceInterface:
         Background thread that continuously listens to microphone
         Uses VAD to detect speech and handle interruptions
         """
-        print("🎤 Microphone listening started (VAD-based)...")
+        print("Microphone listening started (VAD-based)...")
 
         def audio_callback(indata, frames, time_info, status):
             """Called by sounddevice for each audio chunk"""
@@ -132,16 +142,19 @@ class InterruptibleVoiceInterface:
             self.vad_processor.process_audio(audio_chunk)
 
         # Start continuous input stream
+        log("Starting continuous microphone stream (16kHz, 1024 blocksize)...")
         with sd.InputStream(
             samplerate=16000,
             channels=1,
-            blocksize=512,  # Match VAD frame size
+            blocksize=1024,  # Increased from 512 to reduce overflow
             callback=audio_callback,
             dtype=np.float32
         ):
+            log("Microphone stream active")
             # Keep running until stop signal
             while not self.stop_mic.is_set():
                 time.sleep(0.1)
+        log("Microphone stream stopped")
 
     def _audio_playback_worker(self):
         """
@@ -209,29 +222,50 @@ class InterruptibleVoiceInterface:
         try:
             # PRE-BUFFER: Wait for first 3 chunks before starting stream
             initial_chunks = []
-            for _ in range(3):
+            log("🔊 Playback: Waiting for initial 3 chunks to pre-buffer...")
+            prebuffer_start = time.time()
+            for i in range(3):
                 try:
                     chunk = self.audio_queue.get(timeout=5.0)
                     if chunk is None:
+                        log("🔊 Playback: Received stop signal during pre-buffer")
                         break
 
                     # Skip empty/invalid chunks
                     if isinstance(chunk, torch.Tensor):
                         chunk = chunk.cpu().numpy()
                     if len(chunk) < 100:
+                        log(f"🔊 Playback: Skipping tiny chunk ({len(chunk)} samples)")
                         continue
 
                     initial_chunks.append(chunk)
+                    log(f"🔊 Playback: Got chunk {i+1}/3 ({len(chunk)} samples)")
                 except queue.Empty:
                     break
 
             # Feed initial chunks to playback buffer
+            prebuffer_time = time.time() - prebuffer_start
+            log(f"🔊 Playback: Pre-buffer complete ({prebuffer_time:.2f}s, {len(initial_chunks)} chunks)")
             for chunk in initial_chunks:
                 self._playback_buffer.put(chunk)
 
+            if not initial_chunks:
+                log("⚠ No audio chunks received, skipping playback")
+                return
+
             # NOW start stream - buffer is ready
-            stream.start()
-            self._stream_active = True
+            log("🔊 Playback: Starting OutputStream (24kHz, blocksize 2048)...")
+            stream_start = time.time()
+            try:
+                stream.start()
+                self._stream_active = True
+                stream_open_time = time.time() - stream_start
+                log(f"Audio playback started (stream opened in {stream_open_time:.3f}s)")
+                if stream_open_time > 0.1:
+                    log(f"WARNING: Stream opening took >{stream_open_time:.3f}s - this may cause initial stutter")
+            except Exception as e:
+                log(f"ERROR: Failed to start OutputStream: {e}")
+                raise
 
             # Record timing
             if self.first_playback_time is None and initial_chunks:
@@ -242,6 +276,7 @@ class InterruptibleVoiceInterface:
             # Mark AI as speaking
             with self.state_lock:
                 self.ai_speaking = True
+            log("Playback: AI marked as speaking (interruption enabled)")
 
             # Process incoming chunks and feed to stream
             while not self.stop_playback.is_set() and not self.interrupt_playback.is_set():
@@ -278,25 +313,31 @@ class InterruptibleVoiceInterface:
 
             # Wait for stream to finish if not interrupted
             if not self.interrupt_playback.is_set():
+                log("Playback: Waiting for buffer to drain...")
                 while not self._playback_buffer.empty():
                     time.sleep(0.1)
                 time.sleep(0.2)
+                log("Playback complete (natural end)")
             else:
+                log("Playback: Interrupted, clearing buffer...")
                 # Clear playback buffer on interruption
                 while not self._playback_buffer.empty():
                     try:
                         self._playback_buffer.get_nowait()
                     except queue.Empty:
                         break
+                log("Playback stopped (interrupted)")
 
         finally:
             stream.stop()
             stream.close()
             self._stream_active = False
+            log("Playback: OutputStream closed")
 
             # Mark AI as not speaking
             with self.state_lock:
                 self.ai_speaking = False
+            log("🔊 Playback: AI no longer speaking (interruption disabled)")
 
     def start_listening(self):
         """Start continuous microphone listening"""
@@ -341,17 +382,49 @@ class InterruptibleVoiceInterface:
                 except queue.Empty:
                     continue
 
+                log(f"New user input received: '{user_text[:50]}...'")
+
+                # INTERRUPT if AI is currently speaking
+                if hasattr(self, 'playback_thread') and self.playback_thread and self.playback_thread.is_alive():
+                    log("INTERRUPT: Stopping current AI playback...")
+                    self.interrupt_playback.set()
+                    self.stop_playback.set()
+
+                    # Wait briefly for thread to stop
+                    self.playback_thread.join(timeout=0.5)
+                    if self.playback_thread.is_alive():
+                        log("WARNING: Playback thread still alive after interrupt signal")
+                    else:
+                        log("Playback stopped successfully")
+
+                # Clear audio queue from interrupted/previous generation
+                queue_cleared = 0
+                while not self.audio_queue.empty():
+                    try:
+                        self.audio_queue.get_nowait()
+                        queue_cleared += 1
+                    except queue.Empty:
+                        break
+                if queue_cleared > 0:
+                    log(f"Cleared {queue_cleared} stale audio chunks from queue")
+
                 # Check for exit
                 if any(word in user_text.lower() for word in ['goodbye', 'exit', 'quit', 'stop']):
-                    print("\n👋 Ending conversation. Goodbye!")
+                    print("\nEnding conversation. Goodbye!")
                     break
 
                 # Empty input check
                 if not user_text.strip():
+                    log("WARNING: Empty input, skipping")
                     print("(No speech detected)")
                     continue
 
+                log(f"Processing: '{user_text}'")
+                print(f"You: {user_text}")
+
                 # Generate AI response
+                log(f"LLM: Generating response for: '{user_text[:50]}...'")
+                llm_start = time.time()
                 print("Mist: ", end='', flush=True)
 
                 # Stream LLM response and collect full text
@@ -360,14 +433,18 @@ class InterruptibleVoiceInterface:
                     full_response += token
                     print(token, end='', flush=True)
                 print()
+                llm_time = time.time() - llm_start
+                log(f"LLM complete ({llm_time:.2f}s, {len(full_response)} chars)")
 
                 if not full_response.strip():
                     continue
 
                 # Preprocess text
                 preprocessed_text = self._preprocess_text_for_tts(full_response.lower())
+                log(f"TTS: Preprocessed text ({len(preprocessed_text)} chars)")
 
                 # Start audio playback thread
+                log("Starting playback worker thread...")
                 self.stop_playback.clear()
                 self.interrupt_playback.clear()
                 self.playback_thread = threading.Thread(target=self._audio_playback_worker)
@@ -375,6 +452,10 @@ class InterruptibleVoiceInterface:
                 self.playback_thread.start()
 
                 # Stream TTS audio
+                log("TTS: Starting audio generation...")
+                tts_start = time.time()
+                chunk_count = 0
+                first_chunk_time = None
                 for audio_chunk in self.tts.generator.generate_stream(
                     text=preprocessed_text,
                     speaker=self.tts.speaker_id,
@@ -385,19 +466,30 @@ class InterruptibleVoiceInterface:
                 ):
                     # Check for interruption
                     if self.interrupt_playback.is_set():
-                        print("\n[INTERRUPTED]")
+                        log("TTS: Generation interrupted by user speech")
                         break
+
+                    chunk_count += 1
+                    if first_chunk_time is None:
+                        first_chunk_time = time.time() - tts_start
+                        log(f"TTS: First chunk generated ({first_chunk_time:.2f}s)")
+
+                    if chunk_count <= 5 or chunk_count % 10 == 0:
+                        log(f"TTS: Chunk #{chunk_count} ({len(audio_chunk) if hasattr(audio_chunk, '__len__') else 'N/A'} samples)")
 
                     self.audio_queue.put(audio_chunk)
 
-                # Signal end and wait
+                tts_total = time.time() - tts_start
+                log(f"TTS generation complete ({tts_total:.2f}s, {chunk_count} chunks)")
+
+                # Signal end of audio generation
                 self.audio_queue.put(None)
+                log("Sent playback stop signal")
 
-                if self.playback_thread.is_alive():
-                    self.playback_thread.join(timeout=10.0)
-
-                # Clear interrupt flag for next turn
-                self.interrupt_playback.clear()
+                # DON'T wait for playback to finish - allow immediate interruption
+                # The next iteration will handle any interruption if user speaks
+                log("Audio generation complete, playback continues in background")
+                log("─" * 60)  # Separator for next turn
 
         except KeyboardInterrupt:
             print("\n\n👋 Conversation interrupted. Goodbye!")
