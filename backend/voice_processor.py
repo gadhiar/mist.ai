@@ -137,19 +137,14 @@ class VoiceProcessor:
                 self.loop,
             )
 
-            # Update latest input (CSM pattern: only keep latest!)
-            with self.input_lock:
-                self.latest_user_input = user_text
-                log_timestamp(f"Stored as latest input: '{user_text[:50]}...'")
-
-            # If AI is speaking, just queue it (interrupt already set)
+            # If AI is speaking, queue it for later (CSM pattern: only keep latest!)
             if self.is_speaking:
-                log_timestamp(
-                    "AI currently speaking, input queued for after interrupt"
-                )
+                with self.input_lock:
+                    self.latest_user_input = user_text
+                    log_timestamp(f"AI currently speaking, input queued: '{user_text[:50]}...'")
                 return
 
-            # Otherwise, process immediately
+            # Otherwise, process immediately (don't set latest_user_input)
             self._process_conversation_turn(user_text)
 
         except Exception as e:

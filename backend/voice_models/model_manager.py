@@ -39,6 +39,8 @@ class ModelManager:
         self.tts_result_queue = queue.Queue()
         self.tts_worker_thread = None
         self.tts_worker_running = threading.Event()
+        self.tts_generation_id = 0  # Track which generation is active
+        self.tts_lock = threading.Lock()
 
     def load_all_models(self):
         """Load all models (STT, TTS, LLM)"""
@@ -109,7 +111,8 @@ class ModelManager:
                 if request is None:
                     break
 
-                text, speaker_id, context, max_ms, temperature, topk = request
+                gen_id, text, speaker_id, context, max_ms, temperature, topk = request
+                logger.info(f"TTS worker: Processing generation ID {gen_id}")
 
                 for chunk in self.tts.generator.generate_stream(
                     text=text,
@@ -119,19 +122,22 @@ class ModelManager:
                     temperature=temperature,
                     topk=topk
                 ):
-                    self.tts_result_queue.put(("chunk", chunk))
+                    self.tts_result_queue.put(("chunk", gen_id, chunk))
 
                     if not self.tts_worker_running.is_set():
                         break
 
-                self.tts_result_queue.put(("complete", None))  # EOS marker
+                self.tts_result_queue.put(("complete", gen_id, None))  # EOS marker
+                logger.info(f"TTS worker: Completed generation ID {gen_id}")
 
             except queue.Empty:
                 continue
             except Exception as e:
                 import traceback
                 logger.error(f"Error in TTS worker: {e}\n{traceback.format_exc()}")
-                self.tts_result_queue.put(("error", e))
+                # Put error with generation ID if available
+                error_gen_id = gen_id if 'gen_id' in locals() else 0
+                self.tts_result_queue.put(("error", error_gen_id, e))
 
         logger.info("TTS worker thread exiting")
 
@@ -172,8 +178,28 @@ class ModelManager:
         context = self.tts.context if self.tts and self.tts.use_context else []
         speaker_id = self.tts.speaker_id if self.tts else 0
 
+        # Increment generation ID and clear stale results
+        with self.tts_lock:
+            self.tts_generation_id += 1
+            current_gen_id = self.tts_generation_id
+
+            # Clear any stale chunks from previous generations
+            cleared = 0
+            while not self.tts_result_queue.empty():
+                try:
+                    self.tts_result_queue.get_nowait()
+                    cleared += 1
+                except queue.Empty:
+                    break
+
+            if cleared > 0:
+                logger.info(f"Cleared {cleared} stale audio chunks from result queue")
+
+        logger.info(f"Starting TTS generation ID {current_gen_id}: '{preprocessed_text[:50]}...'")
+
         # Send request to worker thread (CSM pattern)
         self.tts_request_queue.put((
+            current_gen_id,
             preprocessed_text,
             speaker_id,
             context,
@@ -182,13 +208,19 @@ class ModelManager:
             self.config.tts_topk,
         ))
 
-        # Yield chunks from result queue
+        # Yield chunks from result queue (only for our generation ID)
         while True:
-            msg_type, data = self.tts_result_queue.get()
+            msg_type, gen_id, data = self.tts_result_queue.get()
+
+            # Skip chunks from old generations
+            if gen_id != current_gen_id:
+                logger.warning(f"Skipping chunk from old generation {gen_id} (current: {current_gen_id})")
+                continue
 
             if msg_type == "chunk":
                 yield data
             elif msg_type == "complete":
+                logger.info(f"TTS generation ID {current_gen_id} complete")
                 break
             elif msg_type == "error":
                 raise RuntimeError(f"TTS generation failed: {data}")
