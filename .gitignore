@@ -19,7 +19,6 @@ Thumbs.db
 # Build artifacts
 dist/
 build/
-dependencies/
 warmup_final.wav
 
 # Node.js / Frontend
