@@ -1,0 +1,117 @@
+M.I.S.T - Voice AI Assistant
+Copyright (c) 2025 Raj Gadhia
+
+This product includes software developed by Raj Gadhia.
+
+===============================================================================
+
+THIRD-PARTY COMPONENTS
+
+This software includes the following third-party components with their
+respective licenses:
+
+-------------------------------------------------------------------------------
+1. CSM Streaming (Modified)
+   Location: dependencies/csm/
+   Source: https://github.com/davidbrowne17/csm-streaming
+   License: Apache License 2.0
+   Copyright: Original authors of CSM Streaming
+
+   Modifications made by Raj Gadhia:
+   - generator.py: Added position overflow protection (sliding window)
+   - generator.py: Disabled torchaudio for PyTorch 2.7 nightly compatibility
+   - generator.py: Added try-catch for torch.compile to support Windows
+   - lora.py: Optimized training hyperparameters for Elise dataset
+   - lora.py: Changed view() calls to reshape() for compatibility
+
+   See dependencies/csm/LICENSE for full Apache 2.0 license text.
+   See dependencies/csm/MODIFICATIONS.md for detailed change documentation.
+
+-------------------------------------------------------------------------------
+2. Sesame CSM-1B Model
+   Location: Downloaded via HuggingFace Hub (sesame/csm-1b)
+   Source: https://huggingface.co/Sesame-CSM/csm-1b
+   License: Apache License 2.0
+   Copyright: Sesame AI / CSM Authors
+
+   This model is downloaded at runtime and not included in this repository.
+   Fine-tuned using LoRA (Low-Rank Adaptation) on custom voice dataset.
+
+-------------------------------------------------------------------------------
+3. OpenAI Whisper
+   Location: Downloaded via HuggingFace (openai/whisper-base)
+   Source: https://github.com/openai/whisper
+   License: MIT License
+   Copyright: OpenAI
+
+   Used for Speech-to-Text transcription.
+   Model downloaded at runtime via transformers library.
+
+-------------------------------------------------------------------------------
+4. Silero VAD
+   Location: Downloaded via torch.hub
+   Source: https://github.com/snakers4/silero-vad
+   License: MIT License
+   Copyright: Silero Team
+
+   Used for Voice Activity Detection.
+   Model downloaded at runtime.
+
+-------------------------------------------------------------------------------
+5. Elise Dataset
+   Location: Training data (not included in repository)
+   Source: https://huggingface.co/datasets/Jinsaryko/Elise
+   License: MIT License
+   Copyright: Ty Jones (Jinsaryko)
+   Creator: Ty Jones
+
+   Used for LoRA fine-tuning of Sesame CSM-1B model.
+   Dataset contains 1,195 voice samples used for voice cloning training.
+
+   MIT License requires inclusion of copyright notice and license text.
+   This dataset is not distributed with this software - used only for training.
+
+-------------------------------------------------------------------------------
+6. Ollama / Qwen 2.5
+   Location: External service (localhost:11434)
+   Source: https://ollama.com / https://qwenlm.github.io/
+   License: Apache License 2.0 (Qwen), MIT License (Ollama)
+
+   Used for Large Language Model responses.
+   Runs as separate service, not included in this repository.
+
+-------------------------------------------------------------------------------
+
+APACHE LICENSE 2.0 COMPONENTS
+
+The following components are licensed under Apache License 2.0:
+- dependencies/csm/ (CSM Streaming - Modified)
+- Sesame CSM-1B Model
+- Qwen 2.5 Model
+
+Apache License 2.0 Summary:
+You may use, reproduce, and distribute this work, with or without
+modification, provided you:
+1. Give appropriate credit to original authors
+2. Indicate if modifications were made
+3. Include a copy of the Apache License
+
+Full Apache 2.0 license text: dependencies/csm/LICENSE
+
+MIT LICENSE COMPONENTS
+
+The following components are licensed under MIT License:
+- M.I.S.T main codebase (this project)
+- OpenAI Whisper
+- Silero VAD
+- Ollama
+- Elise Dataset (training data only, not distributed)
+
+MIT License is permissive and allows commercial use, modification,
+distribution, and private use with minimal restrictions.
+
+===============================================================================
+
+For questions about licensing, contact: Raj Gadhia
+
+Last updated: 2025-01-28
