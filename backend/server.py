@@ -142,7 +142,7 @@ async def websocket_endpoint(websocket: WebSocket):
         {"type": "audio_complete"}
         {"type": "error", "message": "..."}
     """
-    await websocket.accept()
+    await websocket.accept(headers=None)
     active_connections.append(websocket)
 
     logger.info(f"Client connected (total: {len(active_connections)})")
@@ -185,7 +185,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif data["type"] == "interrupt":
                 # Manual interrupt request
-                logger.info("🛑 Manual interrupt requested")
+                logger.info("Manual interrupt requested")
                 voice_processor.interrupt_flag.set()
 
                 await websocket.send_json(
