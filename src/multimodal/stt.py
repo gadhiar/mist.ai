@@ -64,6 +64,8 @@ class WhisperSTT:
         Returns:
             Transcribed text
         """
+        import torch
+
         # Ensure audio is float32 and 1D
         if audio_data.dtype != np.float32:
             audio_data = audio_data.astype(np.float32)
@@ -79,8 +81,17 @@ class WhisperSTT:
             num_samples = int(len(audio_data) * 16000 / sample_rate)
             audio_data = signal.resample(audio_data, num_samples)
 
+        # Synchronize CUDA before transcription to prevent conflicts with TTS CUDA graphs
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
         # Transcribe
         result = self.model.transcribe(audio_data, fp16=False)
+
+        # Synchronize CUDA after transcription to ensure completion before TTS starts
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
         return result["text"].strip()
 
     def transcribe_file(self, audio_path: str) -> str:

@@ -185,9 +185,22 @@ class VoiceProcessor:
                 )
 
             llm_time = time.time() - llm_start
-            log_timestamp(
-                f"LLM complete ({llm_time:.2f}s, {len(full_response)} chars)"
-            )
+
+            # Trim to last complete sentence (CSM pattern)
+            # This ensures audio never cuts off mid-sentence
+            original_length = len(full_response)
+            full_response = self.models.trim_to_last_sentence(full_response)
+            trimmed_length = len(full_response)
+
+            if trimmed_length < original_length:
+                log_timestamp(
+                    f"LLM complete ({llm_time:.2f}s, {original_length} chars, " +
+                    f"trimmed to {trimmed_length} chars at sentence boundary)"
+                )
+            else:
+                log_timestamp(
+                    f"LLM complete ({llm_time:.2f}s, {len(full_response)} chars)"
+                )
 
             # Send full response
             asyncio.run_coroutine_threadsafe(
