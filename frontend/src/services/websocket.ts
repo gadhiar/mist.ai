@@ -52,10 +52,13 @@ export class WebSocketService {
     });
   }
 
-  private handleMessage(message: BackendMessage) {
+  private handleMessage(message: any) {
     const handlers = this.messageHandlers.get(message.type);
     if (handlers) {
-      handlers.forEach((handler) => handler(message.data));
+      // Backend sends flat messages: {type: "...", text: "...", etc}
+      // Not nested: {type: "...", data: {...}}
+      // So pass the entire message (it contains all the data)
+      handlers.forEach((handler) => handler(message));
     }
 
     // Also call wildcard handlers

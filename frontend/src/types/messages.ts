@@ -94,19 +94,23 @@ export interface UserAudioMessage {
 }
 
 // UI State enums
-export enum ConversationState {
-  IDLE = "idle",
-  LISTENING = "listening",
-  PROCESSING = "processing",
-  SPEAKING = "speaking",
-}
+export const ConversationState = {
+  IDLE: "idle",
+  LISTENING: "listening",
+  PROCESSING: "processing",
+  SPEAKING: "speaking",
+} as const;
 
-export enum AudioPlaybackState {
-  IDLE = "idle",
-  BUFFERING = "buffering",
-  PLAYING = "playing",
-  PAUSED = "paused",
-}
+export type ConversationState = typeof ConversationState[keyof typeof ConversationState];
+
+export const AudioPlaybackState = {
+  IDLE: "idle",
+  BUFFERING: "buffering",
+  PLAYING: "playing",
+  PAUSED: "paused",
+} as const;
+
+export type AudioPlaybackState = typeof AudioPlaybackState[keyof typeof AudioPlaybackState];
 
 // Conversation turn for display
 export interface ConversationTurn {

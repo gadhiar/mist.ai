@@ -1,72 +1,48 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 
-/* ---- CSS Variables ---- */
-:root {
-  --background: 0 0% 100%;
-  --foreground: 222.2 84% 4.9%;
-  --card: 0 0% 100%;
-  --card-foreground: 222.2 84% 4.9%;
-  --primary: 222.2 47.4% 11.2%;
-  --primary-foreground: 210 40% 98%;
-  --secondary: 210 40% 96.1%;
-  --secondary-foreground: 222.2 47.4% 11.2%;
-  --muted: 210 40% 96.1%;
-  --muted-foreground: 215.4 16.3% 46.9%;
-  --accent: 210 40% 96.1%;
-  --accent-foreground: 222.2 47.4% 11.2%;
-  --border: 214.3 31.8% 91.4%;
-  --input: 214.3 31.8% 91.4%;
-  --ring: 222.2 84% 4.9%;
+/* CSS Variables for theming */
+@theme {
+  --color-background: oklch(100% 0 0);
+  --color-foreground: oklch(9% 0.02 285);
+  --color-card: oklch(100% 0 0);
+  --color-card-foreground: oklch(9% 0.02 285);
+  --color-primary: oklch(11% 0.02 285);
+  --color-primary-foreground: oklch(98% 0.01 240);
+  --color-secondary: oklch(96% 0.01 240);
+  --color-secondary-foreground: oklch(11% 0.02 285);
+  --color-muted: oklch(96% 0.01 240);
+  --color-muted-foreground: oklch(46% 0.02 257);
+  --color-accent: oklch(96% 0.01 240);
+  --color-accent-foreground: oklch(11% 0.02 285);
+  --color-border: oklch(91% 0.01 257);
+  --color-input: oklch(91% 0.01 257);
+  --color-ring: oklch(9% 0.02 285);
+
   --radius: 0.5rem;
 }
 
-/* ---- Dark Mode Variables ---- */
-.dark {
-  --background: 222.2 84% 4.9%;
-  --foreground: 210 40% 98%;
-  --card: 222.2 84% 4.9%;
-  --card-foreground: 210 40% 98%;
-  --primary: 210 40% 98%;
-  --primary-foreground: 222.2 47.4% 11.2%;
-  --secondary: 217.2 32.6% 17.5%;
-  --secondary-foreground: 210 40% 98%;
-  --muted: 217.2 32.6% 17.5%;
-  --muted-foreground: 215 20.2% 65.1%;
-  --accent: 217.2 32.6% 17.5%;
-  --accent-foreground: 210 40% 98%;
-  --border: 217.2 32.6% 17.5%;
-  --input: 217.2 32.6% 17.5%;
-  --ring: 212.7 26.8% 83.9%;
+/* Dark mode */
+@media (prefers-color-scheme: dark) {
+  @theme {
+    --color-background: oklch(9% 0.02 285);
+    --color-foreground: oklch(98% 0.01 240);
+    --color-card: oklch(9% 0.02 285);
+    --color-card-foreground: oklch(98% 0.01 240);
+    --color-primary: oklch(98% 0.01 240);
+    --color-primary-foreground: oklch(11% 0.02 285);
+    --color-secondary: oklch(17% 0.02 257);
+    --color-secondary-foreground: oklch(98% 0.01 240);
+    --color-muted: oklch(17% 0.02 257);
+    --color-muted-foreground: oklch(65% 0.01 257);
+    --color-accent: oklch(17% 0.02 257);
+    --color-accent-foreground: oklch(98% 0.01 240);
+    --color-border: oklch(17% 0.02 257);
+    --color-input: oklch(17% 0.02 257);
+    --color-ring: oklch(83% 0.01 257);
+  }
 }
 
-/* ---- Base Styles ---- */
-@layer base {
-  /* Apply border to all elements */
-  * {
-    border-width: 1px;
-    border-color: hsl(var(--border));
-    border-radius: var(--radius);
-  }
-
-  body {
-    background-color: hsl(var(--background));
-    color: hsl(var(--foreground));
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-  }
-
-  /* Card example using your variables */
-  .card {
-    background-color: hsl(var(--card));
-    color: hsl(var(--card-foreground));
-    border-radius: var(--radius);
-  }
-
-  /* Primary button example */
-  .btn-primary {
-    background-color: hsl(var(--primary));
-    color: hsl(var(--primary-foreground));
-    border-radius: var(--radius);
-  }
+/* Base styles */
+body {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
 }

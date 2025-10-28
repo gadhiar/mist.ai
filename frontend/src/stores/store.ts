@@ -37,7 +37,7 @@ export const store = configureStore({
         ignoredActions: ['websocket/connect', 'websocket/disconnect'],
       },
     }).concat(createWebSocketMiddleware(wsService)),
-  devTools: process.env.NODE_ENV !== 'production',
+  devTools: import.meta.env.MODE !== 'production',
 });
 
 // Infer types from the store

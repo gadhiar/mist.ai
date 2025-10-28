@@ -149,11 +149,20 @@ const audioSlice = createSlice({
       state.currentAudioDuration = action.payload;
     },
 
-    // Audio complete (generation finished)
+    // Audio generation complete (all chunks received)
     audioComplete: (state) => {
+      // Don't change playback state yet - audio may still be playing
+      state.isBuffering = false;
+    },
+
+    // Audio playback finished (all audio played)
+    audioPlaybackFinished: (state) => {
       state.playbackState = AudioPlaybackState.IDLE;
       state.isPlaying = false;
-      state.isBuffering = false;
+      state.audioQueue = [];
+      state.currentChunkIndex = 0;
+      state.currentAudioPosition = 0;
+      state.currentAudioDuration = 0;
     },
 
     // Reset audio state
@@ -180,6 +189,7 @@ export const {
   updatePlaybackPosition,
   setAudioDuration,
   audioComplete,
+  audioPlaybackFinished,
   resetAudio,
 } = audioSlice.actions;
 

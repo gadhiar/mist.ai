@@ -5,20 +5,24 @@
 
 import { createSlice, type PayloadAction } from '@reduxjs/toolkit';
 
-export enum ConnectionStatus {
-  DISCONNECTED = 'disconnected',
-  CONNECTING = 'connecting',
-  CONNECTED = 'connected',
-  RECONNECTING = 'reconnecting',
-  ERROR = 'error',
-}
+export const ConnectionStatus = {
+  DISCONNECTED: 'disconnected',
+  CONNECTING: 'connecting',
+  CONNECTED: 'connected',
+  RECONNECTING: 'reconnecting',
+  ERROR: 'error',
+} as const;
 
-export enum VADStatus {
-  IDLE = 'idle',
-  SPEECH_STARTED = 'speech_started',
-  SPEECH_ENDED = 'speech_ended',
-  PROCESSING = 'processing',
-}
+export type ConnectionStatus = typeof ConnectionStatus[keyof typeof ConnectionStatus];
+
+export const VADStatus = {
+  IDLE: 'idle',
+  SPEECH_STARTED: 'speech_started',
+  SPEECH_ENDED: 'speech_ended',
+  PROCESSING: 'processing',
+} as const;
+
+export type VADStatus = typeof VADStatus[keyof typeof VADStatus];
 
 export interface ConnectionSliceState {
   // Connection status
