@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Companion - Chat</title>
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body, html {
+      background-color: #030712 !important;
+      color: white !important;
+      overflow-x: hidden;
+      margin: 0;
+      padding: 0;
+    }
+    
+    .pulse {
+      animation: pulse 1.5s infinite;
+    }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.7); }
+      70% { box-shadow: 0 0 0 10px rgba(99, 102, 241, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); }
+    }
+    
+    #voice-circle {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) scale(0.7);
+      width: 180px;
+      height: 180px;
+      border-radius: 50%;
+      background-color: rgba(99, 102, 241, 0.2);
+      z-index: 50;
+      pointer-events: none;
+      display: block !important;
+      transition: transform 0.5s ease, background-color 0.5s ease;
+    }
+    
+    #voice-circle.active {
+      animation: pulse-circle 2s infinite alternate;
+    }
+    
+    @keyframes pulse-circle {
+      0% { transform: translate(-50%, -50%) scale(1); background-color: rgba(99, 102, 241, 0.5); }
+      100% { transform: translate(-50%, -50%) scale(2); background-color: rgba(99, 102, 241, 0.1); }
+    }
+    
+    .header-container {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 64px;
+      z-index: 40;
+    }
+    
+    .status-container {
+      position: fixed;
+      left: 0;
+      top: 64px;
+      bottom: 0;
+      width: 25%;
+      overflow-y: auto;
+      padding: 10px;
+    }
+    
+    .conversation-container {
+      position: fixed;
+      right: 0;
+      top: 64px;
+      bottom: 0;
+      width: 25%;
+      overflow-y: auto;
+      padding: 10px;
+    }
+    
+    .center-area {
+      position: fixed;
+      left: 25%;
+      right: 25%;
+      top: 64px;
+      bottom: 0;
+    }
+    
+    /* Mobile layout */
+    @media (max-width: 768px) {
+      .status-container {
+        width: 50%;
+        left: 0;
+      }
+      
+      .conversation-container {
+        width: 50%;
+        right: 0;
+      }
+      
+      .center-area {
+        display: none;
+      }
+    }
+  </style>
+</head>
+<body class="bg-gray-950 text-white">
+
+  <div id="voice-circle"></div>
+
+  <header class="header-container bg-gray-900 p-4 flex justify-between items-center shadow-md">
+    <h1 class="text-2xl font-bold text-indigo-400">AI Companion</h1>
+    <button id="settingsBtn" class="bg-indigo-700 hover:bg-indigo-800 text-white px-4 py-2 rounded shadow">
+      Settings
+    </button>
+  </header>
+
+  <div class="flex flex-row">
+    
+    <aside class="status-container bg-gray-900 rounded-lg shadow p-4 flex flex-col">
+      <h2 class="text-xl font-semibold text-indigo-400 mb-4">Status</h2>
+
+      <div class="space-y-4">
+        <div>
+          <h3 class="text-lg font-medium mb-2">System</h3>
+          <div class="text-sm space-y-1">
+            <div class="flex justify-between"><span>Connection:</span><span id="connectionStatus" class="text-yellow-400">Connecting...</span></div>
+            <div class="flex justify-between"><span>Models:</span><span id="modelStatus" class="text-yellow-400">Not Loaded</span></div>
+            <div class="flex justify-between"><span>Audio:</span><span id="audioStatus" class="text-yellow-400">Idle</span></div>
+          </div>
+        </div>
+
+        <div>
+          <h3 class="text-lg font-medium mb-2">Session</h3>
+          <div class="text-sm space-y-1">
+            <div class="flex justify-between"><span>Duration:</span><span id="sessionDuration">00:00:00</span></div>
+            <div class="flex justify-between"><span>Messages:</span><span id="messageCount">0</span></div>
+          </div>
+        </div>
+        
+        <div class="mt-4 p-4 bg-gray-800 rounded-lg">
+          <div class="flex items-center justify-between">
+            <button id="micToggleBtn" class="w-16 h-16 bg-indigo-600 hover:bg-indigo-700 text-white rounded-full flex items-center justify-center focus:outline-none">
+              <svg xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              class="h-8 w-8">
+              <path stroke-linecap="round" stroke-linejoin="round"
+                    d="M12 3a4 4 0 0 1 4 4v6a4 4 0 0 1-8 0V7a4 4 0 0 1 4-4z"/>
+              <path stroke-linecap="round" stroke-linejoin="round"
+                    d="M19 11a7 7 0 0 1-14 0"/>
+              <path stroke-linecap="round" stroke-linejoin="round"
+                    d="M12 21v-4"/>
+            </svg>
+            </button>
+            <div class="text-center">
+              <span id="micStatus" class="text-sm text-gray-300 block">Click to speak</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <div class="center-area"></div>
+
+    <section class="conversation-container bg-gray-900 rounded-lg shadow p-4 flex flex-col">
+      <div id="conversationHistory" class="flex-grow overflow-y-auto space-y-4 mb-4" style="max-height: calc(100vh - 15rem);">
+      </div>
+
+      <div class="p-4 bg-gray-800 rounded-lg">
+        <div class="flex items-center">
+          <input 
+            type="text" 
+            id="textInput" 
+            class="flex-grow bg-gray-700 text-white p-3 rounded-l border border-gray-600 focus:outline-none focus:ring-2 focus:ring-indigo-500" 
+            placeholder="Type your message here..."
+          >
+          <button 
+            id="sendTextBtn" 
+            class="bg-indigo-600 hover:bg-indigo-700 text-white p-3 rounded-r border border-indigo-700"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
+            </svg>
+          </button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div id="settingsModal" class="fixed inset-0 bg-black bg-opacity-80 hidden z-50 flex items-center justify-center">
+    <div class="bg-gray-900 text-white p-6 rounded-lg shadow-lg w-full max-w-3xl max-h-screen overflow-y-auto">
+      <div class="flex justify-between items-center mb-6">
+        <h2 class="text-2xl font-bold text-indigo-400">Audio Settings</h2>
+        <button id="closeSettingsBtn" class="text-gray-400 hover:text-white">
+          ✕
+        </button>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <label for="micSelect" class="block text-sm font-medium">Microphone</label>
+          <select id="micSelect" class="w-full bg-gray-800 text-white p-2 rounded border border-gray-700 mt-1"></select>
+          <canvas id="micCanvas" class="w-full h-16 mt-2 rounded"></canvas>
+        </div>
+
+        <div>
+          <label for="outputSelect" class="block text-sm font-medium">Speaker</label>
+          <select id="outputSelect" class="w-full bg-gray-800 text-white p-2 rounded border border-gray-700 mt-1"></select>
+          <canvas id="outputCanvas" class="w-full h-16 mt-2 rounded"></canvas>
+        </div>
+
+        <div>
+          <label for="vadEnabled" class="flex items-center space-x-2 text-sm font-medium">
+            <input type="checkbox" id="vadEnabled" class="rounded text-indigo-600 focus:ring-indigo-500" checked />
+            <span>Voice Activity Detection</span>
+          </label>
+        </div>
+
+        <div>
+          <label for="vadThreshold" class="block text-sm font-medium">VAD Sensitivity: <span id="vadThresholdValue">0.5</span></label>
+          <input type="range" id="vadThreshold" min="0.1" max="0.9" step="0.05" value="0.5" class="w-full mt-1" />
+        </div>
+
+        <div>
+          <label for="volumeLevel" class="block text-sm font-medium">Microphone Volume: <span id="volumeLevelValue">1.0</span></label>
+          <input type="range" id="volumeLevel" min="0.1" max="2.0" step="0.1" value="1.0" class="w-full mt-1" />
+        </div>
+
+        <div>
+          <label for="speakerVolume" class="block text-sm font-medium">Speaker Volume: <span id="speakerVolumeValue">1.0</span></label>
+          <input type="range" id="speakerVolume" min="0.1" max="2.0" step="0.1" value="1.0" class="w-full mt-1" />
+        </div>
+      </div>
+
+      <div class="mt-6 flex justify-end space-x-4">
+        <button id="testMicBtn" class="bg-indigo-600 px-4 py-2 rounded hover:bg-indigo-700">Test Mic</button>
+        <button id="testAudioBtn" class="bg-indigo-600 px-4 py-2 rounded hover:bg-indigo-700">Test Audio</button>
+        <button id="saveAudioSettingsBtn" class="bg-green-600 px-4 py-2 rounded hover:bg-green-700">Save Settings</button>
+      </div>
+    </div>
+  </div>
+  
+  <script src="/static/chat.js"></script>
+</body>
+</html>

@@ -1,0 +1,48 @@
+@import "tailwindcss";
+
+/* CSS Variables for theming */
+@theme {
+  --color-background: oklch(100% 0 0);
+  --color-foreground: oklch(9% 0.02 285);
+  --color-card: oklch(100% 0 0);
+  --color-card-foreground: oklch(9% 0.02 285);
+  --color-primary: oklch(11% 0.02 285);
+  --color-primary-foreground: oklch(98% 0.01 240);
+  --color-secondary: oklch(96% 0.01 240);
+  --color-secondary-foreground: oklch(11% 0.02 285);
+  --color-muted: oklch(96% 0.01 240);
+  --color-muted-foreground: oklch(46% 0.02 257);
+  --color-accent: oklch(96% 0.01 240);
+  --color-accent-foreground: oklch(11% 0.02 285);
+  --color-border: oklch(91% 0.01 257);
+  --color-input: oklch(91% 0.01 257);
+  --color-ring: oklch(9% 0.02 285);
+
+  --radius: 0.5rem;
+}
+
+/* Dark mode */
+@media (prefers-color-scheme: dark) {
+  @theme {
+    --color-background: oklch(9% 0.02 285);
+    --color-foreground: oklch(98% 0.01 240);
+    --color-card: oklch(9% 0.02 285);
+    --color-card-foreground: oklch(98% 0.01 240);
+    --color-primary: oklch(98% 0.01 240);
+    --color-primary-foreground: oklch(11% 0.02 285);
+    --color-secondary: oklch(17% 0.02 257);
+    --color-secondary-foreground: oklch(98% 0.01 240);
+    --color-muted: oklch(17% 0.02 257);
+    --color-muted-foreground: oklch(65% 0.01 257);
+    --color-accent: oklch(17% 0.02 257);
+    --color-accent-foreground: oklch(98% 0.01 240);
+    --color-border: oklch(17% 0.02 257);
+    --color-input: oklch(17% 0.02 257);
+    --color-ring: oklch(83% 0.01 257);
+  }
+}
+
+/* Base styles */
+body {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+}
