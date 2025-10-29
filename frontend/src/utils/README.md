@@ -9,7 +9,7 @@ Utility functions and services for the Mist.AI frontend.
 ### Implemented Services
 
 #### `services/websocket.ts`
-**Status:** ✅ Complete
+**Status:** [COMPLETE]
 
 WebSocket service with automatic reconnection and message routing.
 
@@ -38,7 +38,7 @@ Web Audio API service for browser-based audio playback (prepared for future Web 
 ### Implemented Types
 
 #### `types/index.ts` & `types/messages.ts`
-**Status:** ✅ Complete
+**Status:** [COMPLETE]
 
 TypeScript type definitions for:
 - `BackendMessage` - Messages from backend (text chunks, audio chunks, VAD status)
@@ -53,13 +53,11 @@ When additional features are added:
 
 - `formatters.ts` - Timestamp formatting, duration display, text truncation
 - `constants.ts` - App-wide constants (WebSocket URL, audio settings, theme colors)
-- `audioUtils.ts` - Audio format conversion helpers (Float32Array ↔ base64)
+- `audioUtils.ts` - Audio format conversion helpers (Float32Array <-> base64)
 - `storageUtils.ts` - LocalStorage helpers for saving conversation history
 
 ## Guidelines
 
-- Use services for stateful functionality ✅
-- Use pure util functions for stateless transformations
-- Document complex logic ✅
-- Add unit tests for critical utilities
-- Use TypeScript for type safety ✅
+- Use services for stateful functionality- Use pure util functions for stateless transformations
+- Document complex logic- Add unit tests for critical utilities
+- Use TypeScript for type safety

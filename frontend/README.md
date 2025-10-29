@@ -19,12 +19,12 @@ Frontend will run on `http://localhost:5173`
 
 ## What's Implemented
 
-✓ React 18 + Vite + TypeScript
-✓ Tailwind CSS with custom theme
-✓ Redux Toolkit state management (3 slices)
-✓ WebSocket service
-✓ Type definitions matching backend protocol
-✓ Redux Provider wired up
+[DONE] React 18 + Vite + TypeScript
+[DONE] Tailwind CSS with custom theme
+[DONE] Redux Toolkit state management (3 slices)
+[DONE] WebSocket service
+[DONE] Type definitions matching backend protocol
+[DONE] Redux Provider wired up
 
 **Not Yet Implemented:**
 - UI components (ConversationDisplay, AudioStatus, etc.)
@@ -52,7 +52,7 @@ Backend (Port 8001)
 - `connectionSlice` - WebSocket connection, VAD status
 
 **Middleware:**
-- `websocketMiddleware` - Automatically syncs backend messages → Redux actions
+- `websocketMiddleware` - Automatically syncs backend messages -> Redux actions
 
 ## Technology Stack
 

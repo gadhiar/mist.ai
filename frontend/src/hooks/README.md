@@ -55,7 +55,5 @@ When browser-based features are added, these hooks may be implemented:
 
 ## Hook Guidelines
 
-- Follow React hooks rules ✅
-- Keep hooks focused on single responsibility
-- Use TypeScript for type safety ✅
-- Document parameters and return values
+- Follow React hooks rules- Keep hooks focused on single responsibility
+- Use TypeScript for type safety- Document parameters and return values

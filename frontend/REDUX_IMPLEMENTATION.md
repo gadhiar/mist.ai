@@ -15,7 +15,7 @@ frontend/src/stores/
 │   ├── audioSlice.ts                # 180+ lines - Audio playback
 │   └── connectionSlice.ts           # 120+ lines - Connection & VAD status
 ├── middleware/
-│   └── websocketMiddleware.ts       # 150+ lines - Redux ↔ WebSocket sync
+│   └── websocketMiddleware.ts       # 150+ lines - Redux <-> WebSocket sync
 └── README.md                         # 230+ lines - Complete documentation
 ```
 
@@ -56,8 +56,8 @@ frontend/src/stores/
 
 **Message Flow Example:**
 ```
-WebSocket: transcription → Middleware → Dispatch: addUserTranscription()
-                                      → Dispatch: setConversationState(PROCESSING)
+WebSocket: transcription -> Middleware -> Dispatch: addUserTranscription()
+                                      -> Dispatch: setConversationState(PROCESSING)
 ```
 
 ### Type Safety
@@ -88,7 +88,7 @@ WebSocket: transcription → Middleware → Dispatch: addUserTranscription()
 ### 2. Message Flow
 
 ```
-Backend → WebSocket → Middleware → Redux Actions → Store Update → Component Re-render
+Backend -> WebSocket -> Middleware -> Redux Actions -> Store Update -> Component Re-render
 ```
 
 Example for LLM streaming:

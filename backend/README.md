@@ -12,7 +12,7 @@ FastAPI Server (server.py)
 Voice Processor (voice_processor.py)
     ↓
 ┌─────────────────────────────────────┐
-│ VAD → STT → LLM → TTS → Audio Out  │
+│ VAD -> STT -> LLM -> TTS -> Audio Out  │
 └─────────────────────────────────────┘
     ↑
 Model Manager (voice_models/model_manager.py)
@@ -34,7 +34,7 @@ Orchestrates the voice conversation pipeline using Silero VAD callbacks.
 **Flow:**
 1. Audio chunks arrive via WebSocket
 2. VAD detects speech/silence
-3. On speech end: STT transcribes → LLM generates → TTS synthesizes
+3. On speech end: STT transcribes -> LLM generates -> TTS synthesizes
 4. Audio streams back via WebSocket
 
 **Features:**
@@ -60,7 +60,7 @@ Manages model lifecycle and TTS worker thread.
 
 ## Message Types
 
-### Client → Server
+### Client -> Server
 
 #### 1. Audio Chunk
 ```json
@@ -80,7 +80,7 @@ Raw audio from microphone (16kHz mono, float32)
 ```
 Interrupt current TTS generation
 
-### Server → Client
+### Server -> Client
 
 #### 1. Transcription
 ```json

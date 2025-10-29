@@ -78,9 +78,9 @@ try:
     print("Compiling model with torch.compile (PyTorch nightly)...")
     model.backbone = torch.compile(model.backbone, mode='reduce-overhead', fullgraph=True, backend='inductor')
     model.decoder = torch.compile(model.decoder, mode='reduce-overhead', fullgraph=True, backend='inductor')
-    print("✓ Model compilation successful")
+    print("[SUCCESS] Model compilation successful")
 except Exception as e:
-    print(f"⚠ torch.compile failed: {e}")
+    print(f"[WARNING] torch.compile failed: {e}")
     print("Continuing without compilation (streaming still works)")
 ```
 

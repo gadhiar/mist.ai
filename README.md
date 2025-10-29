@@ -22,7 +22,7 @@ This isn't a ChatGPT wrapper. It's a cognitive architecture being built from fir
 ### Working Features
 
 - **Real-time voice conversation** - Natural dialogue with near-instant interruption
-- **WebSocket architecture** - Backend (Python) ↔ Frontend (React, in progress)
+- **WebSocket architecture** - Backend (Python) <-> Frontend (React, in progress)
 - **Gap-free audio** - Smooth TTS playback with no stuttering
 - **Voice Activity Detection** - Automatic speech detection and interruption handling
 - **Local-first** - Runs entirely on your hardware (air-gapped capable)
@@ -139,10 +139,10 @@ Frontend will start on `http://localhost:5173`
 
 ## Project Status
 
-### Completed ✓
+### Completed
 
 - [x] WebSocket backend server
-- [x] Voice processing pipeline (VAD → STT → LLM → TTS)
+- [x] Voice processing pipeline (VAD -> STT -> LLM -> TTS)
 - [x] Real-time audio streaming
 - [x] Interruption support (<100ms latency)
 - [x] Gap-free audio playback
@@ -151,14 +151,14 @@ Frontend will start on `http://localhost:5173`
 - [x] Redux store architecture (conversation, audio, connection slices)
 - [x] WebSocket middleware for state sync
 
-### In Progress 🚧
+### In Progress
 
 - [ ] Frontend UI components
 - [ ] Web Audio API integration for browser playback
 - [ ] Connection status indicators
 - [ ] Conversation history display
 
-### Planned 📋
+### Planned
 
 - [ ] Knowledge graph foundation
 - [ ] Teaching interface

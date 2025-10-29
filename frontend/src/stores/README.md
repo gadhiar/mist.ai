@@ -115,14 +115,14 @@ stores/
 5. Coordinates audio playback with conversation state
 
 **Message Routing:**
-- `connection` → `connected()`
-- `transcription` → `addUserTranscription()`, `setConversationState(PROCESSING)`
-- `llm_response_chunk` → `startAssistantResponse()`, `appendResponseChunk()`
-- `llm_response_complete` → `completeAssistantResponse()`
-- `audio_chunk` → `addAudioChunk()`, `startBuffering()` (if first chunk)
-- `audio_complete` → `audioComplete()`, `setConversationState(IDLE)`
-- `vad_status` → `setVADStatus()`, state transitions, `clearAudioQueue()` (on speech_started)
-- `error` → `connectionError()`
+- `connection` -> `connected()`
+- `transcription` -> `addUserTranscription()`, `setConversationState(PROCESSING)`
+- `llm_response_chunk` -> `startAssistantResponse()`, `appendResponseChunk()`
+- `llm_response_complete` -> `completeAssistantResponse()`
+- `audio_chunk` -> `addAudioChunk()`, `startBuffering()` (if first chunk)
+- `audio_complete` -> `audioComplete()`, `setConversationState(IDLE)`
+- `vad_status` -> `setVADStatus()`, state transitions, `clearAudioQueue()` (on speech_started)
+- `error` -> `connectionError()`
 
 ## Usage
 

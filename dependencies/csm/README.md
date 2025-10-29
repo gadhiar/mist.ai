@@ -237,7 +237,7 @@ CSM is trained to be an audio generation model and not a general-purpose multimo
 
 The model has some capacity for non-English languages due to data contamination in the training data, but it likely won't do well.
 
-## Misuse and abuse ⚠️
+## Misuse and abuse [WARNING]
 
 This project provides a high-quality speech generation model for research and educational purposes. While we encourage responsible and ethical use, we **explicitly prohibit** the following:
 
