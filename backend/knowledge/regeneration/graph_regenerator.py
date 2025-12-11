@@ -1,0 +1,393 @@
+"""
+Graph Regeneration Module
+
+Rebuilds the knowledge graph from immutable utterances.
+
+This proves the architecture works:
+- Utterances are the source of truth
+- Knowledge graph is a materialized view
+- Can always rebuild from scratch
+"""
+
+from datetime import datetime
+from typing import List, Optional
+import logging
+
+from backend.knowledge.config import KnowledgeConfig
+from backend.knowledge.models import Utterance, RegenerationReport
+from backend.knowledge.storage import Neo4jConnection, GraphStore
+from backend.knowledge.extraction import EntityExtractor
+
+logger = logging.getLogger(__name__)
+
+
+class GraphRegenerator:
+    """
+    Regenerates knowledge graph from immutable utterances.
+
+    The knowledge graph is a materialized view built from utterances.
+    This class rebuilds the entire graph or specific conversations.
+
+    Example:
+        regenerator = GraphRegenerator(config)
+        report = await regenerator.regenerate_all()
+        print(f"Processed {report.processed} utterances")
+    """
+
+    def __init__(self, config: KnowledgeConfig):
+        """
+        Initialize graph regenerator
+
+        Args:
+            config: Knowledge system configuration
+        """
+        self.config = config
+        self.connection = Neo4jConnection(config.neo4j)
+        self.extractor = EntityExtractor(config, enable_property_enrichment=True)
+        self.graph_store = GraphStore(config)
+
+        logger.info("GraphRegenerator initialized")
+
+    async def regenerate_all(self) -> RegenerationReport:
+        """
+        Regenerate entire knowledge graph from all utterances
+
+        Process:
+        1. Fetch all utterances from Neo4j
+        2. Delete entity graph (preserve utterances)
+        3. Re-extract entities from each utterance
+        4. Store extracted entities
+        5. Return statistics
+
+        Returns:
+            RegenerationReport with statistics
+
+        Example:
+            >>> report = await regenerator.regenerate_all()
+            >>> print(f"Created {report.entities_created} entities")
+        """
+        start_time = datetime.now()
+
+        logger.info("=" * 60)
+        logger.info("Starting full graph regeneration")
+        logger.info("=" * 60)
+
+        try:
+            # Step 1: Fetch utterances
+            logger.info("Step 1: Fetching utterances...")
+            utterances = self._fetch_all_utterances()
+            logger.info(f"Found {len(utterances)} utterances to process")
+
+            if len(utterances) == 0:
+                logger.warning("No utterances found in database")
+                return RegenerationReport(
+                    total_utterances=0,
+                    processed=0,
+                    failed=0,
+                    entities_created=0,
+                    relationships_created=0,
+                    duration_seconds=0.0,
+                    errors=[]
+                )
+
+            # Step 2: Delete entity graph
+            logger.info("Step 2: Deleting entity graph...")
+            self._delete_graph_entities()
+            logger.info("Entity graph deleted (utterances preserved)")
+
+            # Step 3: Re-extract
+            logger.info("Step 3: Re-extracting entities...")
+            total_entities = 0
+            total_relationships = 0
+            processed = 0
+            failed = 0
+            errors = []
+
+            for i, utterance in enumerate(utterances, 1):
+                try:
+                    entities, relationships = await self._extract_and_store(utterance)
+                    total_entities += entities
+                    total_relationships += relationships
+                    processed += 1
+
+                    # Progress logging
+                    if i % 10 == 0 or i == len(utterances):
+                        logger.info(
+                            f"Progress: {i}/{len(utterances)} "
+                            f"({(i/len(utterances)*100):.1f}%) - "
+                            f"{total_entities} entities, {total_relationships} relationships"
+                        )
+
+                except Exception as e:
+                    failed += 1
+                    error_msg = f"Utterance {utterance.utterance_id[:8]}: {str(e)}"
+                    errors.append(error_msg)
+                    logger.error(f"Failed to process utterance: {error_msg}")
+                    # Continue with next utterance
+
+            # Step 4: Report
+            duration = (datetime.now() - start_time).total_seconds()
+
+            report = RegenerationReport(
+                total_utterances=len(utterances),
+                processed=processed,
+                failed=failed,
+                entities_created=total_entities,
+                relationships_created=total_relationships,
+                duration_seconds=duration,
+                errors=errors
+            )
+
+            logger.info("=" * 60)
+            logger.info("Regeneration complete!")
+            logger.info(f"  Processed: {processed}/{len(utterances)} utterances")
+            logger.info(f"  Entities: {total_entities}")
+            logger.info(f"  Relationships: {total_relationships}")
+            logger.info(f"  Failed: {failed}")
+            logger.info(f"  Duration: {duration:.2f}s")
+            logger.info("=" * 60)
+
+            return report
+
+        except Exception as e:
+            logger.error(f"Regeneration failed: {e}")
+            raise
+
+    async def regenerate_conversation(self, conversation_id: str) -> RegenerationReport:
+        """
+        Regenerate graph for a specific conversation
+
+        Useful for:
+        - Testing on subset of data
+        - Incremental regeneration
+        - Development and debugging
+
+        Args:
+            conversation_id: ID of conversation to regenerate
+
+        Returns:
+            RegenerationReport with statistics
+        """
+        start_time = datetime.now()
+
+        logger.info(f"Regenerating conversation: {conversation_id}")
+
+        try:
+            # Fetch utterances for this conversation
+            utterances = self._fetch_conversation_utterances(conversation_id)
+            logger.info(f"Found {len(utterances)} utterances in conversation")
+
+            if len(utterances) == 0:
+                logger.warning(f"No utterances found for conversation {conversation_id}")
+                return RegenerationReport(
+                    total_utterances=0,
+                    processed=0,
+                    failed=0,
+                    entities_created=0,
+                    relationships_created=0,
+                    duration_seconds=0.0,
+                    errors=[]
+                )
+
+            # Delete entities for this conversation only
+            self._delete_conversation_entities(conversation_id)
+
+            # Re-extract
+            total_entities = 0
+            total_relationships = 0
+            processed = 0
+            failed = 0
+            errors = []
+
+            for utterance in utterances:
+                try:
+                    entities, relationships = await self._extract_and_store(utterance)
+                    total_entities += entities
+                    total_relationships += relationships
+                    processed += 1
+                except Exception as e:
+                    failed += 1
+                    errors.append(f"{utterance.utterance_id[:8]}: {str(e)}")
+                    logger.error(f"Failed utterance: {e}")
+
+            duration = (datetime.now() - start_time).total_seconds()
+
+            report = RegenerationReport(
+                total_utterances=len(utterances),
+                processed=processed,
+                failed=failed,
+                entities_created=total_entities,
+                relationships_created=total_relationships,
+                duration_seconds=duration,
+                errors=errors
+            )
+
+            logger.info(f"Conversation regeneration complete: {processed}/{len(utterances)} processed")
+
+            return report
+
+        except Exception as e:
+            logger.error(f"Conversation regeneration failed: {e}")
+            raise
+
+    def _fetch_all_utterances(self) -> List[Utterance]:
+        """
+        Fetch all utterances from Neo4j
+
+        Returns utterances in chronological order to maintain conversation context.
+
+        Returns:
+            List of Utterance objects ordered by timestamp
+        """
+        query = """
+        MATCH (u:Utterance)
+        OPTIONAL MATCH (u)-[:PART_OF]->(c:ConversationEvent)
+        RETURN
+            u.utterance_id AS utterance_id,
+            u.text AS text,
+            u.timestamp AS timestamp,
+            u.metadata AS metadata,
+            c.conversation_id AS conversation_id
+        ORDER BY u.timestamp ASC
+        """
+
+        self.connection.connect()
+        results = self.connection.execute_query(query)
+        self.connection.disconnect()
+
+        utterances = []
+        for r in results:
+            utterances.append(Utterance(
+                utterance_id=r['utterance_id'],
+                conversation_id=r.get('conversation_id', 'unknown'),
+                text=r['text'],
+                timestamp=r['timestamp'].to_native() if hasattr(r['timestamp'], 'to_native') else r['timestamp'],
+                metadata=r.get('metadata')
+            ))
+
+        return utterances
+
+    def _fetch_conversation_utterances(self, conversation_id: str) -> List[Utterance]:
+        """
+        Fetch utterances for a specific conversation
+
+        Args:
+            conversation_id: Conversation ID
+
+        Returns:
+            List of Utterance objects for that conversation
+        """
+        query = """
+        MATCH (c:ConversationEvent {conversation_id: $conversation_id})
+              <-[:PART_OF]-(u:Utterance)
+        RETURN
+            u.utterance_id AS utterance_id,
+            u.text AS text,
+            u.timestamp AS timestamp,
+            u.metadata AS metadata,
+            c.conversation_id AS conversation_id
+        ORDER BY u.timestamp ASC
+        """
+
+        self.connection.connect()
+        results = self.connection.execute_query(query, {"conversation_id": conversation_id})
+        self.connection.disconnect()
+
+        utterances = []
+        for r in results:
+            utterances.append(Utterance(
+                utterance_id=r['utterance_id'],
+                conversation_id=r['conversation_id'],
+                text=r['text'],
+                timestamp=r['timestamp'].to_native() if hasattr(r['timestamp'], 'to_native') else r['timestamp'],
+                metadata=r.get('metadata')
+            ))
+
+        return utterances
+
+    def _delete_graph_entities(self):
+        """
+        Delete all __Entity__ nodes and their relationships
+
+        This removes the materialized graph view but preserves
+        the source of truth (ConversationEvent and Utterance nodes).
+
+        DETACH DELETE removes nodes AND all their relationships automatically.
+        """
+        logger.info("Deleting all entity nodes...")
+
+        query = """
+        MATCH (e:__Entity__)
+        DETACH DELETE e
+        """
+
+        self.connection.connect()
+        self.connection.execute_write(query)
+
+        # Verify deletion
+        count_query = "MATCH (e:__Entity__) RETURN count(e) AS count"
+        result = self.connection.execute_query(count_query)
+        entity_count = result[0]['count'] if result else 0
+
+        self.connection.disconnect()
+
+        if entity_count > 0:
+            raise RuntimeError(f"Failed to delete all entities: {entity_count} remain")
+
+        logger.info("All entity nodes deleted successfully")
+
+    def _delete_conversation_entities(self, conversation_id: str):
+        """
+        Delete entities for a specific conversation
+
+        Args:
+            conversation_id: Conversation ID
+        """
+        logger.info(f"Deleting entities for conversation {conversation_id}...")
+
+        query = """
+        MATCH (c:ConversationEvent {conversation_id: $conversation_id})
+              <-[:PART_OF]-(u:Utterance)
+              -[:HAS_ENTITY]->(e:__Entity__)
+        DETACH DELETE e
+        """
+
+        self.connection.connect()
+        self.connection.execute_write(query, {"conversation_id": conversation_id})
+        self.connection.disconnect()
+
+        logger.info("Conversation entities deleted")
+
+    async def _extract_and_store(self, utterance: Utterance) -> tuple[int, int]:
+        """
+        Re-extract entities from utterance and store
+
+        Args:
+            utterance: Utterance to process
+
+        Returns:
+            Tuple of (entities_count, relationships_count)
+        """
+        try:
+            # Extract
+            graph_docs = await self.extractor.extract_from_utterance(
+                utterance=utterance.text,
+                conversation_history=[],  # Could add context later
+                metadata=utterance.metadata
+            )
+
+            # Store
+            if graph_docs and graph_docs[0].nodes:
+                self.graph_store.store_extracted_entities(
+                    graph_document=graph_docs[0],
+                    utterance_id=utterance.utterance_id,
+                    ontology_version=self.config.ontology_version
+                )
+
+                return len(graph_docs[0].nodes), len(graph_docs[0].relationships)
+
+            return 0, 0
+
+        except Exception as e:
+            logger.error(f"Extraction failed for utterance {utterance.utterance_id}: {e}")
+            raise

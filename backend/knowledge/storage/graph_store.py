@@ -11,6 +11,7 @@ import logging
 
 from backend.knowledge.config import KnowledgeConfig
 from backend.knowledge.storage.neo4j_connection import Neo4jConnection
+from backend.knowledge.embeddings import EmbeddingGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ class GraphStore:
         """
         self.config = config
         self.connection = Neo4jConnection(config.neo4j)
+        self.embedding_generator = EmbeddingGenerator()
 
     def initialize_schema(self):
         """
@@ -75,6 +77,27 @@ class GraphStore:
                 logger.debug(f"Created index: {index[:50]}...")
             except Exception as e:
                 logger.warning(f"Index may already exist: {e}")
+
+        # Create vector index for semantic search
+        # Note: Requires Neo4j 5.11+ with vector index support
+        vector_index = """
+        CREATE VECTOR INDEX entity_embeddings IF NOT EXISTS
+        FOR (e:__Entity__)
+        ON e.embedding
+        OPTIONS {
+            indexConfig: {
+                `vector.dimensions`: 384,
+                `vector.similarity_function`: 'cosine'
+            }
+        }
+        """
+
+        try:
+            self.connection.execute_write(vector_index)
+            logger.info("Created vector index for embeddings")
+        except Exception as e:
+            logger.warning(f"Vector index creation failed (may not be supported): {e}")
+            logger.warning("Vector search will not be available without Neo4j 5.11+")
 
         logger.info("Schema initialization complete")
 
@@ -216,6 +239,10 @@ class GraphStore:
         entity_type = node.type if hasattr(node, 'type') else "Unknown"
         properties = getattr(node, 'properties', {})
 
+        # Generate embedding for semantic search
+        # Use entity_id as the text to embed (could be enhanced with properties)
+        embedding = self.embedding_generator.generate_embedding(node_id)
+
         # Build query with dynamic property setting
         # Neo4j doesn't allow nested dictionaries, so flatten properties
         property_sets = []
@@ -223,7 +250,8 @@ class GraphStore:
             "utterance_id": utterance_id,
             "node_id": node_id,
             "entity_type": entity_type,
-            "ontology_version": ontology_version
+            "ontology_version": ontology_version,
+            "embedding": embedding
         }
 
         # Add each property individually if they exist
@@ -239,6 +267,7 @@ class GraphStore:
         base_sets = """
             e.entity_type = $entity_type,
             e.ontology_version = $ontology_version,
+            e.embedding = $embedding,
             e.created_at = datetime(),
             e.created_from_utterance = $utterance_id"""
 
@@ -335,6 +364,62 @@ class GraphStore:
         results = self.connection.execute_query(query, params)
 
         return [dict(record) for record in results]
+
+    def search_similar_entities(
+        self,
+        query_text: str,
+        limit: int = 10,
+        similarity_threshold: float = 0.7
+    ) -> List[Dict]:
+        """
+        Search for entities semantically similar to query text
+
+        Uses vector similarity search on entity embeddings.
+        Requires Neo4j 5.11+ with vector index support.
+
+        Args:
+            query_text: Text to search for
+            limit: Maximum number of results to return
+            similarity_threshold: Minimum similarity score (0-1)
+
+        Returns:
+            List of SearchResult dictionaries with entity info and similarity scores
+
+        Example:
+            >>> results = graph_store.search_similar_entities("Python programming", limit=5)
+            >>> for r in results:
+            >>>     print(f"{r['entity_id']}: {r['similarity']:.3f}")
+        """
+        # Generate embedding for query text
+        query_embedding = self.embedding_generator.generate_embedding(query_text)
+
+        # Vector similarity search using Neo4j's vector index
+        # db.index.vector.queryNodes returns nodes sorted by similarity
+        query = """
+        CALL db.index.vector.queryNodes('entity_embeddings', $limit, $query_embedding)
+        YIELD node, score
+        WHERE score >= $similarity_threshold
+        RETURN
+            node.id AS entity_id,
+            node.entity_type AS entity_type,
+            score AS similarity,
+            properties(node) AS properties
+        ORDER BY score DESC
+        """
+
+        params = {
+            "query_embedding": query_embedding,
+            "limit": limit,
+            "similarity_threshold": similarity_threshold
+        }
+
+        try:
+            results = self.connection.execute_query(query, params)
+            return [dict(record) for record in results]
+        except Exception as e:
+            logger.error(f"Vector search failed: {e}")
+            logger.error("Ensure Neo4j 5.11+ is installed and vector index is created")
+            raise
 
     def close(self):
         """Close Neo4j connection"""
