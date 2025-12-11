@@ -11,6 +11,7 @@ from langchain_ollama import ChatOllama
 import logging
 
 from backend.knowledge.config import KnowledgeConfig
+from backend.knowledge.extraction.property_enricher import PropertyEnricher
 
 logger = logging.getLogger(__name__)
 
@@ -22,16 +23,19 @@ class EntityExtractor:
     Uses LangChain's LLMGraphTransformer with configurable LLM model.
     """
 
-    def __init__(self, config: KnowledgeConfig):
+    def __init__(self, config: KnowledgeConfig, enable_property_enrichment: bool = True):
         """
         Initialize entity extractor
 
         Args:
             config: Knowledge system configuration
+            enable_property_enrichment: Whether to enrich with property extraction
         """
         self.config = config
+        self.enable_property_enrichment = enable_property_enrichment
         self._llm = None
         self._transformer = None
+        self._property_enricher = None if not enable_property_enrichment else PropertyEnricher(config)
 
     def _get_llm(self) -> ChatOllama:
         """Get or create LLM instance"""
@@ -100,6 +104,15 @@ class EntityExtractor:
 
             if graph_docs:
                 logger.info(f"Extracted {len(graph_docs[0].nodes)} nodes and {len(graph_docs[0].relationships)} relationships")
+
+                # Enrich with properties if enabled
+                if self.enable_property_enrichment and self._property_enricher:
+                    for graph_doc in graph_docs:
+                        await self._property_enricher.enrich_graph_document(
+                            graph_doc,
+                            original_text=utterance
+                        )
+                    logger.info("Property enrichment complete")
             else:
                 logger.warning("No entities extracted")
 
