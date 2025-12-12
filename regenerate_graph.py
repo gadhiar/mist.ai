@@ -1,7 +1,11 @@
 """
-Graph Regeneration Script
+Graph Regeneration Script - Complete All-In-One Solution
 
-Rebuilds the entire knowledge graph from immutable utterances.
+Handles everything needed for graph regeneration:
+1. Checks Neo4j connection
+2. Initializes schema (indexes, constraints, vector index)
+3. Rebuilds knowledge graph from immutable utterances
+4. Generates embeddings for all entities
 
 This script demonstrates the event sourcing architecture:
 - Utterances are the immutable source of truth
@@ -16,7 +20,7 @@ Options:
     --dry-run              : Show what would be done without executing
 
 Example:
-    # Regenerate entire graph
+    # Regenerate entire graph (includes schema initialization)
     python regenerate_graph.py
 
     # Regenerate specific conversation
@@ -24,6 +28,9 @@ Example:
 
     # Dry run (preview)
     python regenerate_graph.py --dry-run
+
+Note: This script automatically handles schema initialization, so you don't
+need to run any other scripts first. Just make sure Neo4j is running!
 """
 
 import asyncio
@@ -34,7 +41,7 @@ from datetime import datetime
 
 from backend.knowledge.config import get_config
 from backend.knowledge.regeneration import GraphRegenerator
-from backend.knowledge.storage import Neo4jConnection
+from backend.knowledge.storage import Neo4jConnection, GraphStore
 
 # Configure logging
 logging.basicConfig(
@@ -83,6 +90,19 @@ async def regenerate_all(regenerator: GraphRegenerator, dry_run: bool = False):
 
     print("=" * 60)
 
+    # Helpful next steps
+    if report.processed > 0:
+        print("\nNext steps:")
+        print("  1. Test vector search:")
+        print("     python test_vector_search.py")
+        print()
+        print("  2. Test knowledge retrieval:")
+        print("     python test_knowledge_retrieval.py")
+        print()
+        print("  3. View graph in Neo4j Browser:")
+        print("     http://localhost:7474")
+        print()
+
     return report
 
 
@@ -127,6 +147,31 @@ async def regenerate_conversation(
     return report
 
 
+async def initialize_schema(config):
+    """
+    Initialize Neo4j schema (indexes and constraints)
+
+    Creates all necessary indexes including vector index for embeddings.
+
+    Args:
+        config: Knowledge configuration
+
+    Returns:
+        True if successful, False otherwise
+    """
+    logger.info("Initializing Neo4j schema...")
+
+    try:
+        graph_store = GraphStore(config)
+        graph_store.initialize_schema()
+        logger.info("[OK] Schema initialized successfully")
+        return True
+
+    except Exception as e:
+        logger.error(f"Schema initialization failed: {e}")
+        return False
+
+
 async def check_neo4j_connection(config):
     """
     Verify Neo4j connection before regeneration
@@ -146,16 +191,16 @@ async def check_neo4j_connection(config):
         # Test query
         result = connection.execute_query("RETURN 1 AS test")
         if result and result[0].get('test') == 1:
-            logger.info("✓ Neo4j connection successful")
+            logger.info("[OK] Neo4j connection successful")
             connection.disconnect()
             return True
         else:
-            logger.error("✗ Neo4j connection test failed")
+            logger.error("Neo4j connection test failed")
             connection.disconnect()
             return False
 
     except Exception as e:
-        logger.error(f"✗ Neo4j connection failed: {e}")
+        logger.error(f"Neo4j connection failed: {e}")
         return False
 
 
@@ -204,7 +249,14 @@ Examples:
         logger.error("Cannot proceed without Neo4j connection")
         sys.exit(1)
 
+    # Initialize schema (indexes, constraints, vector index)
+    logger.info("Step 1: Initializing schema...")
+    if not await initialize_schema(config):
+        logger.error("Failed to initialize schema")
+        sys.exit(1)
+
     # Initialize regenerator
+    logger.info("Step 2: Initializing regenerator...")
     try:
         regenerator = GraphRegenerator(config)
         logger.info("GraphRegenerator initialized")

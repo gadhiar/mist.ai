@@ -421,6 +421,148 @@ class GraphStore:
             logger.error("Ensure Neo4j 5.11+ is installed and vector index is created")
             raise
 
+    def get_entity_neighborhood(
+        self,
+        entity_id: str,
+        max_hops: int = 2,
+        relationship_types: Optional[List[str]] = None
+    ) -> List[Dict]:
+        """
+        Get N-hop neighborhood around an entity
+
+        Returns all entities and relationships within N hops.
+
+        Args:
+            entity_id: Starting entity
+            max_hops: Maximum traversal depth (1-3 recommended)
+            relationship_types: Optional filter for specific relationship types
+
+        Returns:
+            List of dicts with structure:
+            {
+                'path_length': int,
+                'source': str,
+                'source_type': str,
+                'relationship': str,
+                'target': str,
+                'target_type': str,
+                'properties': dict
+            }
+        """
+        if relationship_types:
+            rel_filter = f"WHERE ALL(r in relationships(path) WHERE type(r) IN {relationship_types})"
+        else:
+            rel_filter = ""
+
+        query = f"""
+        MATCH path = (start:__Entity__ {{id: $entity_id}})-[*1..{max_hops}]-(related:__Entity__)
+        {rel_filter}
+        WITH path, relationships(path) as rels, nodes(path) as nodes
+        UNWIND range(0, size(rels)-1) as idx
+        RETURN
+            size(rels) as path_length,
+            nodes[idx].id as source,
+            nodes[idx].entity_type as source_type,
+            type(rels[idx]) as relationship,
+            nodes[idx+1].id as target,
+            nodes[idx+1].entity_type as target_type,
+            properties(rels[idx]) as properties
+        """
+
+        params = {"entity_id": entity_id}
+        results = self.connection.execute_query(query, params)
+
+        return [dict(record) for record in results]
+
+    def get_user_relationships_to_entities(
+        self,
+        user_id: str,
+        entity_ids: List[str],
+        relationship_types: Optional[List[str]] = None
+    ) -> List[Dict]:
+        """
+        Get all relationships between User and specific entities
+
+        This finds direct connections: User -[r]-> Entity or User <-[r]- Entity
+
+        Args:
+            user_id: User entity ID (typically "User")
+            entity_ids: List of entity IDs to check connections to
+            relationship_types: Optional filter for specific relationships
+
+        Returns:
+            List of relationship dicts
+        """
+        if relationship_types:
+            rel_filter = f"AND type(r) IN {relationship_types}"
+        else:
+            rel_filter = ""
+
+        query = f"""
+        MATCH (user:__Entity__ {{id: $user_id}})-[r]-(entity:__Entity__)
+        WHERE entity.id IN $entity_ids {rel_filter}
+        RETURN
+            user.id as user_id,
+            entity.id as entity_id,
+            entity.entity_type as entity_type,
+            type(r) as relationship_type,
+            properties(r) as properties,
+            CASE
+                WHEN startNode(r) = user THEN 'outgoing'
+                ELSE 'incoming'
+            END as direction
+        """
+
+        params = {
+            "user_id": user_id,
+            "entity_ids": entity_ids
+        }
+
+        results = self.connection.execute_query(query, params)
+        return [dict(record) for record in results]
+
+    def get_all_user_relationships(
+        self,
+        user_id: str,
+        relationship_types: Optional[List[str]] = None,
+        entity_types: Optional[List[str]] = None
+    ) -> List[Dict]:
+        """
+        Get ALL relationships from User entity
+
+        Useful for "What do I know?" type queries.
+
+        Args:
+            user_id: User entity ID
+            relationship_types: Optional filter for specific relationships
+            entity_types: Optional filter for specific entity types
+
+        Returns:
+            List of relationship dicts
+        """
+        filters = []
+        if relationship_types:
+            filters.append(f"type(r) IN {relationship_types}")
+        if entity_types:
+            filters.append(f"entity.entity_type IN {entity_types}")
+
+        where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+
+        query = f"""
+        MATCH (user:__Entity__ {{id: $user_id}})-[r]->(entity:__Entity__)
+        {where_clause}
+        RETURN
+            entity.id as entity_id,
+            entity.entity_type as entity_type,
+            type(r) as relationship_type,
+            properties(r) as properties
+        ORDER BY entity.entity_type, entity.id
+        """
+
+        params = {"user_id": user_id}
+        results = self.connection.execute_query(query, params)
+        return [dict(record) for record in results]
+
     def close(self):
         """Close Neo4j connection"""
         self.connection.disconnect()

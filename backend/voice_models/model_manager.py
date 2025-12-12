@@ -18,6 +18,15 @@ from generator import Segment
 import ollama
 import torch
 
+# Knowledge graph integration
+try:
+    from backend.chat.knowledge_integration import KnowledgeIntegration
+    from backend.knowledge_config import DEFAULT_KNOWLEDGE_CONFIG
+    KNOWLEDGE_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Knowledge integration not available: {e}")
+    KNOWLEDGE_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -35,6 +44,27 @@ class ModelManager:
         self.stt = None
         self.tts = None
         self.llm_model = config.llm_model
+
+        # Knowledge graph integration
+        self.knowledge = None
+        if KNOWLEDGE_AVAILABLE and DEFAULT_KNOWLEDGE_CONFIG.enable_knowledge_integration:
+            try:
+                self.knowledge = KnowledgeIntegration(
+                    neo4j_uri=DEFAULT_KNOWLEDGE_CONFIG.neo4j_uri,
+                    neo4j_user=DEFAULT_KNOWLEDGE_CONFIG.neo4j_user,
+                    neo4j_password=DEFAULT_KNOWLEDGE_CONFIG.neo4j_password,
+                    model_name=DEFAULT_KNOWLEDGE_CONFIG.knowledge_model
+                )
+                if self.knowledge.is_enabled():
+                    logger.info("✅ Knowledge graph integration ENABLED")
+                else:
+                    logger.warning("⚠️  Knowledge integration disabled (Neo4j unavailable)")
+                    self.knowledge = None
+            except Exception as e:
+                logger.warning(f"⚠️  Knowledge integration disabled: {e}")
+                self.knowledge = None
+        else:
+            logger.info("Knowledge graph integration disabled in config")
 
         # TTS model worker thread (CSM pattern)
         self.tts_request_queue = queue.Queue()
@@ -314,13 +344,22 @@ class ModelManager:
 
     def generate_llm_response(self, user_text):
         """
-        Generate LLM response with context-aware system prompt.
+        Generate LLM response with optional knowledge graph integration.
 
-        Strategy: System prompt adapts to user intent - brief for simple queries,
-        thorough for explicit requests. LLM limit of 400 tokens provides room for
-        detailed responses. Downstream chunking handles overflow gracefully.
+        If knowledge integration is enabled and Neo4j is available, uses
+        knowledge-augmented conversation with autonomous tool use.
+        Otherwise falls back to standard LLM generation.
         """
-        system_prompt = """You are M.I.S.T, a helpful voice assistant and friend to your creator, Raj Gadhia.
+        # Use knowledge-augmented generation if available
+        if self.knowledge and self.knowledge.is_enabled():
+            logger.info("Using knowledge-augmented LLM response")
+            for token in self.knowledge.generate_response_streaming(user_text):
+                yield token
+        else:
+            # Fallback to standard LLM (original implementation)
+            logger.debug("Using standard LLM response (no knowledge integration)")
+
+            system_prompt = """You are M.I.S.T, a helpful voice assistant and friend to your creator, Raj Gadhia.
 
 Response Guidelines:
 - For simple questions or greetings: 1-3 sentences (brief and direct)
@@ -333,23 +372,23 @@ Response Guidelines:
 
 Match your response depth to what the user is asking for - be concise when appropriate, thorough when needed."""
 
-        response = ollama.chat(
-            model=self.llm_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text}
-            ],
-            stream=True,
-            options={
-                "num_predict": 400,  # Allow detailed responses when needed, chunking handles overflow
-                "temperature": 0.7,
-                "top_p": 0.9,
-            }
-        )
+            response = ollama.chat(
+                model=self.llm_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text}
+                ],
+                stream=True,
+                options={
+                    "num_predict": 400,  # Allow detailed responses when needed, chunking handles overflow
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                }
+            )
 
-        for chunk in response:
-            if "message" in chunk and "content" in chunk["message"]:
-                yield chunk["message"]["content"]
+            for chunk in response:
+                if "message" in chunk and "content" in chunk["message"]:
+                    yield chunk["message"]["content"]
 
     def _estimate_tokens(self, text, audio_tensor=None):
         """
