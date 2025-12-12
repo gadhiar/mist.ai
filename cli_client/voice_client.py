@@ -344,7 +344,7 @@ async def main():
     parser = argparse.ArgumentParser(description="Voice AI WebSocket Client")
     parser.add_argument(
         "--server",
-        default="ws://localhost:8000/ws",
+        default="ws://localhost:8001/ws",
         help="WebSocket server URL",
     )
     args = parser.parse_args()

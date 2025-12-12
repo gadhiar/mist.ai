@@ -46,7 +46,7 @@ class VoiceProcessor:
         """
         self.config = config
         self.message_queue = message_queue
-        self.models = ModelManager(config)
+        self.models = None  # Will be initialized in initialize()
 
         # State
         self.is_speaking = False
@@ -70,6 +70,9 @@ class VoiceProcessor:
 
         # Save event loop reference for VAD callbacks
         self.loop = asyncio.get_event_loop()
+
+        # Initialize model manager with event loop
+        self.models = ModelManager(self.config, event_loop=self.loop)
 
         # Load models in thread pool to not block event loop
         await self.loop.run_in_executor(None, self.models.load_all_models)

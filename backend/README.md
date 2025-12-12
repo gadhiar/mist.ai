@@ -24,7 +24,7 @@ Model Manager (voice_models/model_manager.py)
 FastAPI WebSocket server managing client connections and message routing.
 
 **Endpoints:**
-- `ws://localhost:8000/ws` - Main WebSocket endpoint
+- `ws://localhost:8001/ws` - Main WebSocket endpoint
 
 **Message Protocol:** See [Message Types](#message-types) below
 
@@ -187,7 +187,7 @@ class VoiceConfig(BaseModel):
 python backend/server.py
 ```
 
-Server starts on `ws://localhost:8000/ws`
+Server starts on `ws://localhost:8001/ws`
 
 ### With Custom Config
 ```python

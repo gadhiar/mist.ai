@@ -18,7 +18,7 @@ class KnowledgeConfig:
     neo4j_password: str = os.getenv("NEO4J_PASSWORD", "your_password")
 
     # LLM for knowledge operations
-    knowledge_model: str = "qwen2.5:7b"
+    knowledge_model: str = os.getenv("MODEL", "qwen2.5:7b-instruct").strip('"')
 
     # Feature flags
     enable_knowledge_integration: bool = True

@@ -10,7 +10,7 @@ from typing import Generator, Optional
 
 from backend.chat.conversation_handler import ConversationHandler
 from backend.knowledge.storage.graph_store import GraphStore
-from backend.knowledge.config import ExtractionConfig
+from backend.knowledge.config import KnowledgeConfig, Neo4jConfig, LLMConfig, EmbeddingConfig, ExtractionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -43,20 +43,32 @@ class KnowledgeIntegration:
         self.current_session_id = "default"
 
         try:
-            # Initialize graph store
-            graph_store = GraphStore(neo4j_uri, neo4j_user, neo4j_password)
-
-            # Initialize extraction config
-            config = ExtractionConfig(
-                model_name=model_name,
-                neo4j_uri=neo4j_uri,
-                neo4j_user=neo4j_user,
-                neo4j_password=neo4j_password
+            # Build complete knowledge config
+            neo4j_config = Neo4jConfig(
+                uri=neo4j_uri,
+                username=neo4j_user,
+                password=neo4j_password
             )
 
+            llm_config = LLMConfig(model=model_name)
+            embedding_config = EmbeddingConfig()
+            extraction_config = ExtractionConfig()
+
+            knowledge_config = KnowledgeConfig(
+                neo4j=neo4j_config,
+                llm=llm_config,
+                embedding=embedding_config,
+                extraction=extraction_config
+            )
+
+            # Initialize graph store with knowledge config
+            graph_store = GraphStore(knowledge_config)
+
             # Initialize conversation handler
+            # ConversationHandler expects ExtractionConfig (for compatibility)
+            # We'll pass the extraction part
             self.conversation_handler = ConversationHandler(
-                config=config,
+                config=extraction_config,
                 graph_store=graph_store,
                 model_name=model_name
             )
@@ -71,7 +83,8 @@ class KnowledgeIntegration:
     def generate_response_streaming(
         self,
         user_text: str,
-        session_id: Optional[str] = None
+        session_id: Optional[str] = None,
+        event_loop: Optional[asyncio.AbstractEventLoop] = None
     ) -> Generator[str, None, None]:
         """
         Generate LLM response with knowledge integration (streaming).
@@ -95,19 +108,31 @@ class KnowledgeIntegration:
             # Use session ID if provided
             sid = session_id or self.current_session_id
 
-            # Get response (async)
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            # Get response (async) - use provided event loop or existing one
+            if event_loop is not None:
+                # Use provided event loop (from voice_processor)
+                future = asyncio.run_coroutine_threadsafe(
+                    self.conversation_handler.handle_message(
+                        user_message=user_text,
+                        session_id=sid
+                    ),
+                    event_loop
+                )
+                response = future.result()
+            else:
+                # No event loop provided, create one (for testing)
+                import nest_asyncio
+                try:
+                    nest_asyncio.apply()
+                except:
+                    pass
 
-            try:
-                response = loop.run_until_complete(
+                response = asyncio.run(
                     self.conversation_handler.handle_message(
                         user_message=user_text,
                         session_id=sid
                     )
                 )
-            finally:
-                loop.close()
 
             # Yield complete response
             # TODO: Future enhancement - stream tokens as they're generated

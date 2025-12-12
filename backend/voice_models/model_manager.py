@@ -33,17 +33,19 @@ logger = logging.getLogger(__name__)
 class ModelManager:
     """Manages all ML models for the voice AI system"""
 
-    def __init__(self, config):
+    def __init__(self, config, event_loop=None):
         """
         Initialize model manager
 
         Args:
             config: VoiceConfig object
+            event_loop: Optional event loop for async operations
         """
         self.config = config
         self.stt = None
         self.tts = None
         self.llm_model = config.llm_model
+        self.event_loop = event_loop
 
         # Knowledge graph integration
         self.knowledge = None
@@ -353,7 +355,10 @@ class ModelManager:
         # Use knowledge-augmented generation if available
         if self.knowledge and self.knowledge.is_enabled():
             logger.info("Using knowledge-augmented LLM response")
-            for token in self.knowledge.generate_response_streaming(user_text):
+            for token in self.knowledge.generate_response_streaming(
+                user_text,
+                event_loop=self.event_loop
+            ):
                 yield token
         else:
             # Fallback to standard LLM (original implementation)
