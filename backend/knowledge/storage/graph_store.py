@@ -165,6 +165,10 @@ class GraphStore:
 
         # Build query conditionally based on metadata
         if metadata:
+            import json
+            # Convert metadata dict to JSON string (Neo4j doesn't support nested dicts)
+            metadata_json = json.dumps(metadata)
+
             query = """
             MATCH (c:ConversationEvent {conversation_id: $conversation_id})
             MERGE (u:Utterance {utterance_id: $utterance_id})
@@ -181,7 +185,7 @@ class GraphStore:
                 "conversation_id": conversation_id,
                 "text": text,
                 "timestamp": timestamp.isoformat(),
-                "metadata": metadata
+                "metadata": metadata_json
             }
         else:
             query = """

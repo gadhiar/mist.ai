@@ -145,21 +145,48 @@ class ConversationHandler:
                 Confirmation of what was learned and stored
             """
             try:
-                # Extract entities from text
-                result = await extractor.extract_from_text(
-                    text=text,
-                    user_id="User",
-                    conversation_id=context or "default"
+                import uuid
+                from datetime import datetime
+
+                # Ensure conversation event exists
+                conversation_id = context or "default"
+                graph_store.store_conversation_event(
+                    conversation_id=conversation_id,
+                    user_id="User"
                 )
 
-                if not result.entities:
+                # Generate unique utterance ID
+                utterance_id = str(uuid.uuid4())
+
+                # Store the utterance
+                graph_store.store_utterance(
+                    utterance_id=utterance_id,
+                    conversation_id=conversation_id,
+                    text=text,
+                    metadata={"source": "conversation", "timestamp": datetime.now().isoformat()}
+                )
+
+                # Extract entities from text
+                graph_docs = await extractor.extract_from_utterance(
+                    utterance=text,
+                    conversation_history=[],
+                    metadata={"utterance_id": utterance_id}
+                )
+
+                # Store extracted entities
+                if graph_docs and graph_docs[0].nodes:
+                    graph_store.store_extracted_entities(
+                        graph_document=graph_docs[0],
+                        utterance_id=utterance_id,
+                        ontology_version=None
+                    )
+
+                    entity_names = [n.id for n in graph_docs[0].nodes]
+                    rel_count = len(graph_docs[0].relationships)
+
+                    return f"Learned and stored: {len(entity_names)} entities ({', '.join(entity_names[:5])}{'...' if len(entity_names) > 5 else ''}) with {rel_count} relationships."
+                else:
                     return "No new knowledge extracted from the text."
-
-                # Format response
-                entity_names = [e.id for e in result.entities]
-                rel_count = len(result.relationships)
-
-                return f"Learned and stored: {len(entity_names)} entities ({', '.join(entity_names[:5])}{'...' if len(entity_names) > 5 else ''}) with {rel_count} relationships."
 
             except Exception as e:
                 logger.error(f"Error extracting knowledge: {e}")
@@ -231,20 +258,30 @@ class ConversationHandler:
             tool_results = []
 
             if hasattr(response, "tool_calls") and response.tool_calls:
-                logger.info(f"LLM made {len(response.tool_calls)} tool calls")
+                logger.info(f"[TOOLS] LLM made {len(response.tool_calls)} tool calls")
 
                 # Execute tool calls
                 for tool_call in response.tool_calls:
                     tool_name = tool_call.get("name")
                     tool_args = tool_call.get("args", {})
+                    tool_call_id = tool_call.get("id", f"call_{tool_name}")
 
-                    logger.info(f"Executing tool: {tool_name} with args: {tool_args}")
+                    logger.info(f"[TOOLS] Executing tool: {tool_name}")
+                    logger.info(f"[TOOLS]   Args: {tool_args}")
 
                     # Find and execute tool
                     tool_result = await self._execute_tool(tool_name, tool_args)
 
+                    # Log the result (truncated if too long)
+                    result_preview = tool_result[:200] + "..." if len(tool_result) > 200 else tool_result
+                    logger.info(f"[TOOLS]   Result: {result_preview}")
+
                     tool_calls.append({"name": tool_name, "args": tool_args})
-                    tool_results.append({"name": tool_name, "result": tool_result})
+                    tool_results.append({
+                        "name": tool_name,
+                        "result": tool_result,
+                        "tool_call_id": tool_call_id
+                    })
 
                 # If tools were called, get final response with tool results
                 messages.append({"role": "assistant", "content": response.content or ""})
@@ -253,12 +290,15 @@ class ConversationHandler:
                     messages.append({
                         "role": "tool",
                         "content": result["result"],
-                        "name": result["name"]
+                        "name": result["name"],
+                        "tool_call_id": result["tool_call_id"]
                     })
 
                 # Get final response
+                logger.info("[TOOLS] Generating final response with tool results...")
                 final_response = await self.llm.ainvoke(messages)
                 assistant_message = final_response.content
+                logger.info(f"[TOOLS] Final response: {assistant_message[:100]}...")
 
             else:
                 # No tool calls, use response directly
