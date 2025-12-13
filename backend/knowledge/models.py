@@ -245,3 +245,68 @@ class ConversationSession:
 
     def __str__(self):
         return f"Session {self.session_id}: {len(self.messages)} messages"
+
+
+@dataclass
+class SourceDocument:
+    """
+    Immutable source document for RAG corpus.
+
+    Represents external knowledge sources:
+    - Markdown files
+    - PDFs
+    - MCP-fetched web pages
+    - Uploaded documents
+
+    These are the provenance layer for DocumentChunks.
+    """
+    source_id: str  # Unique identifier (UUID)
+    file_path: str  # Path or URI to source
+    source_type: str  # "markdown", "pdf", "web", "upload"
+    content_hash: str  # SHA256 hash of content for deduplication
+    ingested_at: datetime = field(default_factory=datetime.now)
+
+    # Metadata
+    title: Optional[str] = None
+    author: Optional[str] = None
+    file_size: Optional[int] = None  # bytes
+    metadata: Optional[Dict[str, Any]] = None  # Flexible metadata storage
+
+    def __str__(self):
+        return f"SourceDocument({self.source_type}): {self.title or self.file_path}"
+
+
+@dataclass
+class DocumentChunk:
+    """
+    A chunk of a source document for RAG retrieval.
+
+    Serves dual purpose:
+    1. RAG Corpus: Vector search retrieves verbatim text
+    2. Entity Provenance: Entities link back to chunks
+
+    Immutable - chunks don't change unless source is re-ingested.
+    """
+    chunk_id: str  # Unique identifier (UUID)
+    source_id: str  # Links to SourceDocument
+    text: str  # The actual chunk text
+    position: int  # Position in document (0-indexed)
+
+    # Vector search
+    embedding: Optional[List[float]] = None  # 384-dim vector for semantic search
+
+    # Metadata
+    word_count: int = 0
+    char_count: int = 0
+    section_title: Optional[str] = None  # Section/header this chunk belongs to
+    metadata: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self):
+        """Calculate word and char counts if not provided"""
+        if self.word_count == 0:
+            self.word_count = len(self.text.split())
+        if self.char_count == 0:
+            self.char_count = len(self.text)
+
+    def __str__(self):
+        return f"Chunk {self.chunk_id[:8]}... ({self.word_count} words)"

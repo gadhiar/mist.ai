@@ -362,3 +362,46 @@ class KnowledgeRetriever:
         lines.append(f"Total facts: {len(facts)}")
 
         return "\n".join(lines)
+
+    async def search_documents(
+        self,
+        query: str,
+        limit: int = 5,
+        similarity_threshold: float = 0.7
+    ) -> List[Dict[str, Any]]:
+        """
+        Search DocumentChunks using vector similarity
+
+        This is RAG retrieval - finds relevant document chunks based on
+        semantic similarity to the query.
+
+        Args:
+            query: Search query
+            limit: Maximum chunks to return
+            similarity_threshold: Minimum similarity score (0.0-1.0)
+
+        Returns:
+            List of document chunks with metadata:
+            [
+                {
+                    "chunk_id": "...",
+                    "text": "...",
+                    "similarity": 0.85,
+                    "source_title": "...",
+                    "source_file": "...",
+                    "position": 0
+                }
+            ]
+        """
+        logger.info(f"Searching documents for: '{query}' (limit={limit}, threshold={similarity_threshold})")
+
+        # Use graph store's vector search on DocumentChunks
+        results = self.graph_store.search_document_chunks(
+            query_text=query,
+            limit=limit,
+            similarity_threshold=similarity_threshold
+        )
+
+        logger.info(f"Found {len(results)} document chunks")
+
+        return results

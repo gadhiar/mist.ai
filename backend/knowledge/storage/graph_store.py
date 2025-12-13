@@ -54,7 +54,9 @@ class GraphStore:
         constraints = [
             "CREATE CONSTRAINT entity_id_unique IF NOT EXISTS FOR (e:__Entity__) REQUIRE e.id IS UNIQUE",
             "CREATE CONSTRAINT conversation_id_unique IF NOT EXISTS FOR (c:ConversationEvent) REQUIRE c.conversation_id IS UNIQUE",
-            "CREATE CONSTRAINT utterance_id_unique IF NOT EXISTS FOR (u:Utterance) REQUIRE u.utterance_id IS UNIQUE"
+            "CREATE CONSTRAINT utterance_id_unique IF NOT EXISTS FOR (u:Utterance) REQUIRE u.utterance_id IS UNIQUE",
+            "CREATE CONSTRAINT source_id_unique IF NOT EXISTS FOR (s:SourceDocument) REQUIRE s.source_id IS UNIQUE",
+            "CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS FOR (c:DocumentChunk) REQUIRE c.chunk_id IS UNIQUE"
         ]
 
         for constraint in constraints:
@@ -68,7 +70,10 @@ class GraphStore:
         indexes = [
             "CREATE INDEX entity_type_idx IF NOT EXISTS FOR (e:__Entity__) ON (e.entity_type)",
             "CREATE INDEX conversation_timestamp_idx IF NOT EXISTS FOR (c:ConversationEvent) ON (c.timestamp)",
-            "CREATE INDEX utterance_timestamp_idx IF NOT EXISTS FOR (u:Utterance) ON (u.timestamp)"
+            "CREATE INDEX utterance_timestamp_idx IF NOT EXISTS FOR (u:Utterance) ON (u.timestamp)",
+            "CREATE INDEX source_type_idx IF NOT EXISTS FOR (s:SourceDocument) ON (s.source_type)",
+            "CREATE INDEX chunk_position_idx IF NOT EXISTS FOR (c:DocumentChunk) ON (c.position)",
+            "CREATE INDEX source_hash_idx IF NOT EXISTS FOR (s:SourceDocument) ON (s.content_hash)"
         ]
 
         for index in indexes:
@@ -78,26 +83,40 @@ class GraphStore:
             except Exception as e:
                 logger.warning(f"Index may already exist: {e}")
 
-        # Create vector index for semantic search
+        # Create vector indexes for semantic search
         # Note: Requires Neo4j 5.11+ with vector index support
-        vector_index = """
-        CREATE VECTOR INDEX entity_embeddings IF NOT EXISTS
-        FOR (e:__Entity__)
-        ON e.embedding
-        OPTIONS {
-            indexConfig: {
-                `vector.dimensions`: 384,
-                `vector.similarity_function`: 'cosine'
+        vector_indexes = [
+            """
+            CREATE VECTOR INDEX entity_embeddings IF NOT EXISTS
+            FOR (e:__Entity__)
+            ON e.embedding
+            OPTIONS {
+                indexConfig: {
+                    `vector.dimensions`: 384,
+                    `vector.similarity_function`: 'cosine'
+                }
             }
-        }
-        """
+            """,
+            """
+            CREATE VECTOR INDEX chunk_embeddings IF NOT EXISTS
+            FOR (c:DocumentChunk)
+            ON c.embedding
+            OPTIONS {
+                indexConfig: {
+                    `vector.dimensions`: 384,
+                    `vector.similarity_function`: 'cosine'
+                }
+            }
+            """
+        ]
 
-        try:
-            self.connection.execute_write(vector_index)
-            logger.info("Created vector index for embeddings")
-        except Exception as e:
-            logger.warning(f"Vector index creation failed (may not be supported): {e}")
-            logger.warning("Vector search will not be available without Neo4j 5.11+")
+        for vector_index in vector_indexes:
+            try:
+                self.connection.execute_write(vector_index)
+                logger.info("Created vector index")
+            except Exception as e:
+                logger.warning(f"Vector index creation failed (may not be supported): {e}")
+                logger.warning("Vector search will not be available without Neo4j 5.11+")
 
         logger.info("Schema initialization complete")
 
@@ -208,35 +227,183 @@ class GraphStore:
         result = self.connection.execute_query(query, params)
         return result[0]["id"] if result else utterance_id
 
+    def store_source_document(
+        self,
+        source_id: str,
+        file_path: str,
+        source_type: str,
+        content_hash: str,
+        title: Optional[str] = None,
+        author: Optional[str] = None,
+        file_size: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Store a source document
+
+        Args:
+            source_id: Unique source identifier
+            file_path: Path or URI to source
+            source_type: Type of source (markdown, pdf, web, upload)
+            content_hash: SHA256 hash of content
+            title: Document title
+            author: Document author
+            file_size: File size in bytes
+            metadata: Additional metadata (will be JSON serialized)
+
+        Returns:
+            Source ID
+        """
+        import json
+
+        query = """
+        MERGE (s:SourceDocument {source_id: $source_id})
+        ON CREATE SET
+            s.file_path = $file_path,
+            s.source_type = $source_type,
+            s.content_hash = $content_hash,
+            s.title = $title,
+            s.author = $author,
+            s.file_size = $file_size,
+            s.metadata = $metadata,
+            s.ingested_at = datetime(),
+            s.created_at = datetime()
+        RETURN s.source_id AS id
+        """
+
+        params = {
+            "source_id": source_id,
+            "file_path": file_path,
+            "source_type": source_type,
+            "content_hash": content_hash,
+            "title": title,
+            "author": author,
+            "file_size": file_size,
+            "metadata": json.dumps(metadata) if metadata else None
+        }
+
+        result = self.connection.execute_query(query, params)
+        return result[0]["id"] if result else source_id
+
+    def store_document_chunk(
+        self,
+        chunk_id: str,
+        source_id: str,
+        text: str,
+        position: int,
+        embedding: Optional[List[float]] = None,
+        section_title: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Store a document chunk with optional embedding
+
+        Args:
+            chunk_id: Unique chunk identifier
+            source_id: Source document ID
+            text: Chunk text
+            position: Position in document
+            embedding: Vector embedding for semantic search
+            section_title: Section/header title
+            metadata: Additional metadata (will be JSON serialized)
+
+        Returns:
+            Chunk ID
+        """
+        import json
+
+        # Calculate word and char counts
+        word_count = len(text.split())
+        char_count = len(text)
+
+        # Generate embedding if not provided
+        if embedding is None:
+            embedding = self.embedding_generator.generate_embedding(text)
+
+        query = """
+        MATCH (s:SourceDocument {source_id: $source_id})
+        MERGE (c:DocumentChunk {chunk_id: $chunk_id})
+        ON CREATE SET
+            c.text = $text,
+            c.position = $position,
+            c.word_count = $word_count,
+            c.char_count = $char_count,
+            c.section_title = $section_title,
+            c.embedding = $embedding,
+            c.metadata = $metadata,
+            c.created_at = datetime()
+        MERGE (c)-[:FROM_SOURCE]->(s)
+        RETURN c.chunk_id AS id
+        """
+
+        params = {
+            "chunk_id": chunk_id,
+            "source_id": source_id,
+            "text": text,
+            "position": position,
+            "word_count": word_count,
+            "char_count": char_count,
+            "section_title": section_title,
+            "embedding": embedding,
+            "metadata": json.dumps(metadata) if metadata else None
+        }
+
+        result = self.connection.execute_query(query, params)
+        return result[0]["id"] if result else chunk_id
+
     def store_extracted_entities(
         self,
         graph_document,
-        utterance_id: str,
+        utterance_id: Optional[str] = None,
+        chunk_id: Optional[str] = None,
         ontology_version: Optional[str] = None
     ):
         """
         Store extracted entities and relationships from LLMGraphTransformer
 
+        Entities can be extracted from either:
+        - Utterances (conversational knowledge)
+        - DocumentChunks (document knowledge)
+
         Args:
             graph_document: GraphDocument from LLMGraphTransformer
-            utterance_id: Source utterance ID
+            utterance_id: Source utterance ID (for conversational extraction)
+            chunk_id: Source document chunk ID (for document extraction)
             ontology_version: Ontology version used for extraction
+
+        Note: Must provide either utterance_id OR chunk_id, not both
         """
+        if not utterance_id and not chunk_id:
+            raise ValueError("Must provide either utterance_id or chunk_id")
+        if utterance_id and chunk_id:
+            raise ValueError("Cannot provide both utterance_id and chunk_id")
+
         if ontology_version is None:
             ontology_version = self.config.ontology_version
 
-        logger.info(f"Storing {len(graph_document.nodes)} nodes and {len(graph_document.relationships)} relationships")
+        source_id = utterance_id or chunk_id
+        source_type = "utterance" if utterance_id else "chunk"
+
+        logger.info(f"Storing {len(graph_document.nodes)} nodes and {len(graph_document.relationships)} relationships from {source_type}")
 
         # Store nodes
         for node in graph_document.nodes:
-            self._store_node(node, utterance_id, ontology_version)
+            self._store_node(node, source_id, source_type, ontology_version)
 
         # Store relationships
         for relationship in graph_document.relationships:
-            self._store_relationship(relationship, utterance_id, ontology_version)
+            self._store_relationship(relationship, source_id, source_type, ontology_version)
 
-    def _store_node(self, node, utterance_id: str, ontology_version: str):
-        """Store a single entity node"""
+    def _store_node(self, node, source_id: str, source_type: str, ontology_version: str):
+        """
+        Store a single entity node with provenance
+
+        Args:
+            node: Node from GraphDocument
+            source_id: Source ID (utterance_id or chunk_id)
+            source_type: Type of source ("utterance" or "chunk")
+            ontology_version: Ontology version
+        """
 
         # Extract node properties
         node_id = node.id
@@ -251,7 +418,7 @@ class GraphStore:
         # Neo4j doesn't allow nested dictionaries, so flatten properties
         property_sets = []
         params = {
-            "utterance_id": utterance_id,
+            "source_id": source_id,
             "node_id": node_id,
             "entity_type": entity_type,
             "ontology_version": ontology_version,
@@ -272,31 +439,48 @@ class GraphStore:
             e.entity_type = $entity_type,
             e.ontology_version = $ontology_version,
             e.embedding = $embedding,
-            e.created_at = datetime(),
-            e.created_from_utterance = $utterance_id"""
+            e.created_at = datetime()"""
 
         if property_sets:
             all_sets = base_sets + ",\n            " + ",\n            ".join(property_sets)
         else:
             all_sets = base_sets
 
-        query = f"""
-        MATCH (u:Utterance {{utterance_id: $utterance_id}})
-        MERGE (e:__Entity__ {{id: $node_id}})
-        ON CREATE SET
-            {all_sets}
-        MERGE (u)-[:HAS_ENTITY]->(e)
-        """
+        # Different query based on source type
+        if source_type == "utterance":
+            query = f"""
+            MATCH (u:Utterance {{utterance_id: $source_id}})
+            MERGE (e:__Entity__ {{id: $node_id}})
+            ON CREATE SET
+                {all_sets}
+            MERGE (u)-[:HAS_ENTITY]->(e)
+            """
+        else:  # chunk
+            query = f"""
+            MATCH (c:DocumentChunk {{chunk_id: $source_id}})
+            MERGE (e:__Entity__ {{id: $node_id}})
+            ON CREATE SET
+                {all_sets}
+            MERGE (e)-[:EXTRACTED_FROM]->(c)
+            """
 
         self.connection.execute_write(query, params)
-        logger.debug(f"Stored node: {node_id} ({entity_type})")
+        logger.debug(f"Stored node: {node_id} ({entity_type}) from {source_type}")
 
-    def _store_relationship(self, relationship, utterance_id: str, ontology_version: str):
-        """Store a single relationship between entities"""
+    def _store_relationship(self, relationship, source_id: str, source_type: str, ontology_version: str):
+        """
+        Store a single relationship between entities
+
+        Args:
+            relationship: Relationship from GraphDocument
+            source_id: Source ID (utterance_id or chunk_id)
+            source_type: Type of source ("utterance" or "chunk")
+            ontology_version: Ontology version
+        """
 
         # Extract relationship details
-        source_id = relationship.source.id
-        target_id = relationship.target.id
+        entity_source_id = relationship.source.id
+        entity_target_id = relationship.target.id
         rel_type = relationship.type
         properties = getattr(relationship, 'properties', {})
 
@@ -306,10 +490,9 @@ class GraphStore:
         # Build query with dynamic property setting
         property_sets = []
         params = {
-            "source_id": source_id,
-            "target_id": target_id,
-            "ontology_version": ontology_version,
-            "utterance_id": utterance_id
+            "source_id": entity_source_id,
+            "target_id": entity_target_id,
+            "ontology_version": ontology_version
         }
 
         # Add each property individually if they exist
@@ -324,8 +507,7 @@ class GraphStore:
         # Build the SET clause
         base_sets = """
             r.ontology_version = $ontology_version,
-            r.created_at = datetime(),
-            r.created_from_utterance = $utterance_id"""
+            r.created_at = datetime()"""
 
         if property_sets:
             all_sets = base_sets + ",\n            " + ",\n            ".join(property_sets)
@@ -341,7 +523,7 @@ class GraphStore:
         """
 
         self.connection.execute_write(query, params)
-        logger.debug(f"Stored relationship: {source_id} -[{rel_type}]-> {target_id}")
+        logger.debug(f"Stored relationship: {entity_source_id} -[{rel_type}]-> {entity_target_id}")
 
     def get_entities_for_conversation(self, conversation_id: str) -> List[Dict]:
         """
@@ -423,6 +605,70 @@ class GraphStore:
         except Exception as e:
             logger.error(f"Vector search failed: {e}")
             logger.error("Ensure Neo4j 5.11+ is installed and vector index is created")
+            raise
+
+    def search_document_chunks(
+        self,
+        query_text: str,
+        limit: int = 5,
+        similarity_threshold: float = 0.7
+    ) -> List[Dict]:
+        """
+        Search DocumentChunks using vector similarity (RAG retrieval)
+
+        Uses vector similarity search on chunk embeddings to find
+        relevant document passages.
+
+        Args:
+            query_text: Text to search for
+            limit: Maximum number of chunks to return
+            similarity_threshold: Minimum similarity score (0-1)
+
+        Returns:
+            List of dictionaries with chunk info and source metadata:
+            [
+                {
+                    "chunk_id": "...",
+                    "text": "...",
+                    "similarity": 0.85,
+                    "source_title": "...",
+                    "source_file": "...",
+                    "position": 0
+                }
+            ]
+        """
+        # Generate embedding for query text
+        query_embedding = self.embedding_generator.generate_embedding(query_text)
+
+        # Vector similarity search on DocumentChunk embeddings
+        query = """
+        CALL db.index.vector.queryNodes('chunk_embeddings', $limit, $query_embedding)
+        YIELD node, score
+        WHERE score >= $similarity_threshold
+        MATCH (s:SourceDocument)-[:FROM_SOURCE]->(node)
+        RETURN
+            node.chunk_id AS chunk_id,
+            node.text AS text,
+            node.position AS position,
+            score AS similarity,
+            s.title AS source_title,
+            s.file_path AS source_file,
+            s.source_type AS source_type
+        ORDER BY score DESC
+        """
+
+        params = {
+            "query_embedding": query_embedding,
+            "limit": limit,
+            "similarity_threshold": similarity_threshold
+        }
+
+        try:
+            results = self.connection.execute_query(query, params)
+            return [dict(record) for record in results]
+        except Exception as e:
+            logger.error(f"Document chunk search failed: {e}")
+            logger.error("Ensure Neo4j 5.11+ is installed and chunk_embeddings vector index is created")
             raise
 
     def get_entity_neighborhood(
