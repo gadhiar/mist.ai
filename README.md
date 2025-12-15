@@ -1,113 +1,164 @@
-# Mist.AI
+# MIST.AI
 
 A self-aware hybrid cognitive architecture combining transparent local reasoning with strategic cloud delegation.
 
-**Current Status:** Voice conversation system with real-time WebSocket architecture. Frontend UI in development.
+**Current Status:** Fully functional voice conversation system with integrated knowledge graph, autonomous tool usage, and auto-RAG. Frontend UI in development.
 
 ## What Is This?
 
-Mist.AI is a research platform for building true AI through a unique multi-layer architecture. The long-term vision includes knowledge graphs, transparent reasoning, and strategic delegation. **Currently implemented:** Real-time voice conversation system with natural interruption support.
+MIST.AI is a research platform building a transparent, continuously learning AI system. This is **not a ChatGPT wrapper** - it's a cognitive architecture built from first principles with persistent memory, autonomous reasoning, and strategic intelligence.
 
-### Long-Term Vision
+### Core Philosophy
 
-- **Transparent reasoning** via knowledge graph - see every decision
-- **Natural learning** through multimodal conversation (speech, vision, text)
-- **Strategic delegation** to cloud models when needed
-- **Continuous growth** that becomes more capable over time
+- **Transparency**: See every decision the AI makes - every entity extracted, every tool called
+- **Privacy-first**: Runs entirely local, air-gapped capable
+- **Continuous Growth**: Becomes more knowledgeable over time through accumulated personal knowledge
+- **Research-focused**: A learning platform for exploring AI architecture
 
-This isn't a ChatGPT wrapper. It's a cognitive architecture being built from first principles.
+### Key Capabilities
 
-## Current Implementation (v0.1)
+- ✅ **Real-time voice conversation** with natural interruption support
+- ✅ **Knowledge graph integration** - persistent memory that grows over time
+- ✅ **Autonomous tool usage** - LLM decides when to extract/query knowledge (MCP-like pattern)
+- ✅ **Auto-RAG** - automatic document injection for context-aware responses
+- ✅ **Personalized responses** - leverages accumulated user knowledge
+- ✅ **WebSocket architecture** - production-ready real-time communication
+- ✅ **Local-first** - complete air-gapped operation
 
-### Working Features
-
-- **Real-time voice conversation** - Natural dialogue with near-instant interruption
-- **WebSocket architecture** - Backend (Python) <-> Frontend (React, in progress)
-- **Gap-free audio** - Smooth TTS playback with no stuttering
-- **Voice Activity Detection** - Automatic speech detection and interruption handling
-- **Local-first** - Runs entirely on your hardware (air-gapped capable)
-
-### Architecture
+## Architecture
 
 ```
-┌──────────────────────────────────────────────────┐
-│  Frontend (React + Redux)                        │
-│  - Conversation display                          │
-│  - Audio visualization                           │
-│  - Connection status                             │
-└────────────────┬─────────────────────────────────┘
-                 │ WebSocket
-┌────────────────┴─────────────────────────────────┐
-│  Backend Server (Python, port 8001)              │
-│  ┌──────────────────────────────────────────────┐│
-│  │  Voice Processor                             ││
-│  │  - VAD (Silero)                              ││
-│  │  - STT (Whisper base)                        ││
-│  │  - LLM (Qwen 2.5 32B via Ollama)             ││
-│  │  - TTS (Sesame CSM-1B)                       ││
-│  └──────────────────────────────────────────────┘│
-└──────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  Frontend (React + TypeScript + WebSocket)                       │
+│  - Conversation display                                          │
+│  - Real-time transcription                                       │
+│  - Audio visualization                                           │
+└────────────────────────┬─────────────────────────────────────────┘
+                         │ WebSocket (Port 8001)
+┌────────────────────────┴─────────────────────────────────────────┐
+│  Backend Server (FastAPI)                                        │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  Voice Processor                                          │  │
+│  │  ├─ VAD (Silero) - Speech detection                       │  │
+│  │  ├─ STT (Whisper base) - Transcription                    │  │
+│  │  ├─ LLM (Qwen 2.5 7B) - Response generation               │  │
+│  │  └─ TTS (Sesame CSM-1B) - Audio synthesis                 │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  Knowledge System (Neo4j)                                 │  │
+│  │  ├─ Entity Extraction (LLMGraphTransformer)               │  │
+│  │  ├─ Vector Search (Sentence Transformers)                 │  │
+│  │  ├─ Graph Traversal (Multi-hop relationships)             │  │
+│  │  ├─ Auto-RAG (Document injection)                         │  │
+│  │  └─ Autonomous Tool Usage (extract/query)                 │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### Technology Stack
+## Technology Stack
 
-**Backend:**
-- **LLM**: Qwen 2.5 32B Instruct via Ollama
-- **STT**: OpenAI Whisper (base model)
-- **TTS**: Sesame CSM-1B (high-quality conversational voice)
-- **VAD**: Silero VAD
-- **Server**: FastAPI + WebSockets
+### Backend
+- **LLM**: Qwen 2.5 7B Instruct via Ollama (easily swappable)
+- **STT**: OpenAI Whisper (base model, 1.4GB)
+- **TTS**: Sesame CSM-1B (high-quality streaming synthesis)
+- **VAD**: Silero VAD (voice activity detection)
+- **Server**: FastAPI + Uvicorn + WebSockets
+- **Database**: Neo4j 5.x (graph database)
+- **Embeddings**: Sentence Transformers (all-MiniLM-L6-v2, 384-dim)
+- **Graph Processing**: LangChain's LLMGraphTransformer
 - **Audio**: sounddevice, numpy, scipy
 
-**Frontend (in development):**
+### Frontend (In Development)
 - **Framework**: React 18 + TypeScript
-- **Build**: Vite
-- **State**: Redux Toolkit
-- **Styling**: Tailwind CSS
+- **Build Tool**: Vite 5
+- **Styling**: Tailwind CSS 3
+- **Components**: shadcn/ui
+- **State Management**: Zustand (lightweight)
 - **WebSocket**: Native WebSocket API
 
-**Platform:**
-- **OS**: Windows 11
+### Platform Requirements
+- **OS**: Windows 11, macOS, or Linux
 - **Python**: 3.11+
-- **Hardware**: RTX 4070 Super (12GB VRAM), 32GB RAM
-- **CUDA**: 12.9 + cuDNN 9.5
+- **Node.js**: 18+
+- **Hardware**: NVIDIA GPU with 12GB+ VRAM (RTX 4070 Super tested), 32GB RAM
+- **CUDA**: 12.4+ with cuDNN 9.5
 
 ## Quick Start
 
-### Prerequisites
+### 1. Prerequisites
 
-1. **Hardware**: NVIDIA GPU with 12GB+ VRAM, 32GB+ RAM
-2. **CUDA**: 12.x installed
-3. **Ollama**: Installed and running
-4. **Python**: 3.11 or higher
-5. **Node.js**: 18+ (for frontend)
+Install the following:
+- **Ollama** - Local LLM infrastructure ([ollama.ai](https://ollama.ai))
+- **Neo4j** - Graph database ([neo4j.com](https://neo4j.com))
+- **Python 3.11+** with CUDA support
+- **Node.js 18+** (for frontend)
 
-### Backend Setup
+### 2. Backend Setup
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/mist.ai.git
+git clone https://github.com/gadhiar/mist.ai.git
 cd mist.ai
 
 # Install Ollama and pull model
-ollama pull qwen2.5:32b-instruct
+ollama pull qwen2.5:7b-instruct
 
 # Create Python virtual environment
 python -m venv venv
-venv\Scripts\activate
+venv\Scripts\activate  # Windows
+# source venv/bin/activate  # macOS/Linux
 
 # Install Python dependencies
 pip install -r requirements.txt
-pip install -r backend/requirements.txt
 
-# Start backend server
-cd backend
-python server.py
+# Configure .env file
+# Edit .env with your Neo4j credentials and settings
+```
+
+### 3. Configure Environment
+
+Create/edit `.env` file in the root directory:
+
+```bash
+# Neo4j Configuration
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=your_password
+NEO4J_DATABASE=neo4j
+
+# Knowledge Integration
+ENABLE_KNOWLEDGE_INTEGRATION=true
+
+# Voice Configuration
+TTS_ENABLED=true  # Set to false to disable TTS (text-only mode, saves memory)
+
+# Model Selection
+MODEL=qwen2.5:7b-instruct
+```
+
+### 4. Initialize Knowledge Graph
+
+```bash
+# Start Neo4j
+neo4j start
+
+# Verify connection
+python test_neo4j_connection.py
+
+# Initialize schema, indexes, and constraints
+python initialize_schema.py
+```
+
+### 5. Start Backend Server
+
+```bash
+# Start backend (from root directory)
+python backend/server.py
 ```
 
 Backend will start on `ws://localhost:8001`
 
-### CLI Client (Voice Conversation)
+### 6. Test with CLI Client
 
 ```bash
 # In a new terminal
@@ -119,15 +170,20 @@ python voice_client.py
 - Speak naturally - VAD detects when you start/stop
 - Interrupt anytime - AI stops within 50-100ms
 - Gap-free audio playback
+- Autonomous knowledge extraction and querying
 
-### Frontend Setup (In Development)
+**Try these conversation patterns:**
+1. **Learning**: "I use Python and FastAPI for backend development" → LLM extracts knowledge
+2. **Querying**: "What technologies do I use?" → LLM queries graph for personalized response
+3. **Natural chat**: "How are you today?" → Normal conversation without tools
+
+### 7. Frontend Setup (Optional - In Development)
 
 ```bash
 cd frontend
 
 # Install dependencies
 npm install
-npm install @reduxjs/toolkit react-redux framer-motion
 
 # Start dev server
 npm run dev
@@ -135,113 +191,299 @@ npm run dev
 
 Frontend will start on `http://localhost:5173`
 
-**Note:** Frontend UI is not yet functional - components are being built.
+## Key Features
 
-## Project Status
+### Voice Conversation System
+- **Real-time bidirectional dialogue** with WebSocket architecture
+- **Natural interruption support** - <100ms response time
+- **Gap-free audio playback** - optimized streaming for smooth experience
+- **Automatic speech detection** via Voice Activity Detection (VAD)
+- **Full pipeline**: Speech → Transcription → LLM → Audio
 
-### Completed
+### Knowledge Graph Integration
+- **Autonomous entity extraction** from conversational input
+- **Persistent memory** - Neo4j-backed knowledge storage
+- **Intelligent retrieval** - hybrid vector search + graph traversal
+- **Provenance tracking** - know which utterances created which entities
+- **Relationship types**: USES, WORKS_ON, EXPERT_IN, LEARNING, STRUGGLES_WITH, etc.
+- **Multi-hop graph expansion** for comprehensive context
 
-- [x] WebSocket backend server
-- [x] Voice processing pipeline (VAD -> STT -> LLM -> TTS)
-- [x] Real-time audio streaming
-- [x] Interruption support (<100ms latency)
-- [x] Gap-free audio playback
-- [x] CLI voice client
-- [x] Frontend scaffolding (React + Redux + TypeScript)
-- [x] Redux store architecture (conversation, audio, connection slices)
-- [x] WebSocket middleware for state sync
+### Autonomous Tool Usage (MCP-like Pattern)
+- **LLM decides autonomously** when to use tools - no explicit intent classification needed
+- **Two primary tools**:
+  - `query_knowledge_graph` - Retrieves relevant context from stored knowledge
+  - `extract_knowledge` - Stores new information from conversation
+- **Smart context awareness** - LLM knows when to extract, query, or just respond
+- **Streaming support** - token-by-token response generation visible in real-time
+- **Graceful degradation** - works without Neo4j (falls back to standard LLM)
 
-### In Progress
+### Auto-RAG (Retrieval-Augmented Generation)
+- **Automatic document injection** into LLM context
+- **Vector similarity search** on source documents
+- **Configurable retrieval** (threshold, limit via `.env`)
+- **Future extensibility** - support for user-uploaded documentation
 
-- [ ] Frontend UI components
-- [ ] Web Audio API integration for browser playback
-- [ ] Connection status indicators
-- [ ] Conversation history display
+## Project Structure
 
-### Planned
+```
+mist.ai/
+├── backend/                          # AI voice & knowledge systems
+│   ├── server.py                     # WebSocket server (port 8001)
+│   ├── voice_processor.py            # Voice pipeline orchestration
+│   ├── config.py                     # Voice system configuration
+│   ├── knowledge_config.py           # Knowledge graph configuration
+│   ├── voice_models/
+│   │   └── model_manager.py          # Model lifecycle + knowledge integration
+│   ├── chat/
+│   │   ├── conversation_handler.py   # MCP-like autonomous tool usage
+│   │   └── knowledge_integration.py  # Voice ↔ Knowledge bridge
+│   └── knowledge/                    # Knowledge graph system
+│       ├── extraction/               # Entity extraction (LLMGraphTransformer)
+│       ├── retrieval/                # Hybrid retrieval (vector + graph)
+│       ├── storage/                  # Neo4j persistence layer
+│       └── embeddings/               # Vector embeddings (Sentence Transformers)
+│
+├── frontend/                         # React UI (TypeScript)
+│   ├── src/
+│   │   ├── App.tsx
+│   │   ├── components/              # React components
+│   │   ├── hooks/                   # Custom hooks
+│   │   ├── services/                # Business logic
+│   │   └── types/                   # TypeScript types
+│   └── vite.config.ts
+│
+├── cli_client/                       # Python test client for voice
+│   └── voice_client.py
+│
+├── dependencies/csm/                 # Sesame CSM TTS (modified fork)
+├── docs/                             # Comprehensive documentation
+│   ├── guides/                       # Setup & operation guides
+│   ├── decisions/                    # Architecture Decision Records
+│   └── frontend/                     # Frontend architecture spec
+│
+├── requirements.txt                  # Python dependencies
+├── .env                              # Configuration (create from example)
+├── README.md                         # This file
+├── QUICKSTART_KNOWLEDGE_INTEGRATION.md # Quick KG setup guide
+├── INTEGRATION_STATUS.md             # Knowledge graph integration status
+├── E2E_TEST_GUIDE.md                # End-to-end testing guide
+├── NEO4J_QUERIES.md                 # Useful Neo4j query reference
+└── LICENSE                           # MIT License
+```
 
-- [ ] Knowledge graph foundation
-- [ ] Teaching interface
-- [ ] Vision integration (Qwen 2.5 Vision)
-- [ ] Meta-reasoning layer
-- [ ] Strategic cloud delegation (Claude, GPT-4)
-- [ ] Mobile app (React Native)
+### Key Scripts
+- `initialize_schema.py` - Set up Neo4j schema, indexes, constraints
+- `regenerate_graph.py` - Rebuild knowledge graph from stored utterances
+- `test_neo4j_connection.py` - Verify Neo4j connectivity
+- `test_conversation_handler.py` - Test conversation flow with tools
+- `wipe_neo4j.py` - Clean database (use with caution!)
+- `export_graph.py` - Export graph structure for analysis
+
+## Performance Characteristics
+
+### Voice Conversation Latencies
+- **VAD detection**: <50ms (speech start/stop)
+- **STT (Whisper base)**: ~500ms (transcription)
+- **LLM response**: 2-5s (token generation, first token ~1s)
+- **TTS (CSM-1B)**: 1-3s per sentence (streaming)
+- **Total first-token latency**: ~3-8s
+- **Interruption response**: <100ms
+
+### Knowledge System Performance
+- **Simple conversation** (no tools): ~1s
+- **Query scenario** (vector search + graph traversal): ~1.7-2s
+- **Learning scenario** (entity extraction): ~3.5-4.5s
+
+### Resource Usage
+- **GPU VRAM**: 8-10GB (Qwen 7B + TTS model)
+- **System RAM**: 4-6GB active
+- **CPU**: Moderate (audio processing threads)
+
+## Testing & Verification
+
+### End-to-End Testing
+
+1. **Start Neo4j**: `neo4j start`
+2. **Verify connection**: `python test_neo4j_connection.py`
+3. **Start backend**: `python backend/server.py`
+4. **Connect voice client**: `python cli_client/voice_client.py`
+5. **Test three scenarios**:
+   - **Learning**: "I use Python and FastAPI" → LLM extracts knowledge
+   - **Querying**: "What technologies do I use?" → LLM queries graph
+   - **Natural chat**: "How are you?" → No tools used
+
+### Verify in Neo4j Browser
+
+```cypher
+// View all entities
+MATCH (e:__Entity__) RETURN e LIMIT 25
+
+// View User's knowledge
+MATCH (u:__Entity__ {id: "User"})-[r]->(e) RETURN u, r, e
+
+// Check specific relationships
+MATCH (u)-[r:USES]->(t) RETURN u, r, t
+```
+
+See [E2E_TEST_GUIDE.md](E2E_TEST_GUIDE.md) for comprehensive testing instructions.
 
 ## Documentation
 
 ### Core Documentation
-- [Frontend Architecture](docs/frontend/FRONTEND_ARCHITECTURE.md) - Complete frontend technical spec
-- [Project Progress](PROJECT_PROGRESS.md) - Development timeline and status
+- [QUICKSTART_KNOWLEDGE_INTEGRATION.md](QUICKSTART_KNOWLEDGE_INTEGRATION.md) - Quick KG setup
+- [INTEGRATION_STATUS.md](INTEGRATION_STATUS.md) - Knowledge graph integration status
+- [E2E_TEST_GUIDE.md](E2E_TEST_GUIDE.md) - End-to-end testing workflow
+- [NEO4J_QUERIES.md](NEO4J_QUERIES.md) - Useful Neo4j query reference
+- [REPOSITORY_STRUCTURE.md](REPOSITORY_STRUCTURE.md) - Detailed project structure
 
 ### Technical Guides
-- [Windows Dev Setup](docs/guides/windows_dev_setup.md) - Complete environment setup
+- [Frontend Architecture](docs/frontend/FRONTEND_ARCHITECTURE.md) - Complete frontend spec
+- [Windows Dev Setup](docs/guides/windows_dev_setup.md) - Environment setup
 - [Torch Compile Fix](docs/guides/TORCH_COMPILE_FIX.md) - PyTorch optimization issues
-
-### Frontend Documentation
-- [Frontend Setup](frontend/SETUP.md) - Frontend installation guide
-- [Redux Implementation](frontend/REDUX_IMPLEMENTATION.md) - State management architecture
-- [Redux Store Guide](frontend/src/stores/README.md) - Using the Redux store
 
 ### Architecture Decision Records
 - [ADR 001: Vision](docs/decisions/adr_001_vision.md) - Project vision and philosophy
 - [ADR 007: Sesame CSM](docs/decisions/adr_007_sesame_csm.md) - TTS selection rationale
 
-## Development Notes
+## Project Status
 
-### Current Branch: `feat/web_socket`
+### Current Branch: `feat/entity_extraction`
 
-This branch implements the WebSocket architecture and frontend foundation.
+Latest developments focus on knowledge graph extraction, retrieval, and autonomous tool usage.
 
-### Performance Characteristics
+### Completed Features
 
-**Voice Conversation:**
-- VAD detection: <50ms
-- STT (Whisper base): ~500ms
-- LLM (Qwen 32B): 2-5s
-- TTS (CSM-1B): 1-3s per sentence (streaming)
-- Total first-token latency: ~3-8s
-- Interruption response: <100ms
+- [x] WebSocket backend server
+- [x] Voice processing pipeline (VAD → STT → LLM → TTS)
+- [x] Real-time audio streaming
+- [x] Interruption support (<100ms latency)
+- [x] Gap-free audio playback
+- [x] CLI voice client
+- [x] **Knowledge graph integration** (Neo4j)
+- [x] **Entity extraction** (LLMGraphTransformer)
+- [x] **Vector search** (Sentence Transformers)
+- [x] **Hybrid retrieval** (vector + graph traversal)
+- [x] **Autonomous tool usage** (MCP-like pattern)
+- [x] **Auto-RAG** (document injection)
+- [x] **Provenance tracking** (utterance → entity mapping)
+- [x] Frontend scaffolding (React + TypeScript)
 
-**Resource Usage:**
-- GPU VRAM: ~8-10GB (Qwen 32B + TTS)
-- System RAM: ~4-6GB
-- CPU: Moderate (audio processing)
+### In Progress
 
-### Known Issues
+- [ ] Frontend UI components (conversation display, audio visualization)
+- [ ] Web Audio API integration for browser playback
+- [ ] Knowledge graph visualization
+- [ ] Rich content support (markdown, images, links)
 
-- [ ] Frontend components not yet implemented
-- [ ] No conversation history persistence
-- [ ] No error recovery UI
-- [ ] Documentation needs updating for knowledge graph plans
+### Roadmap
+
+**Phase 1 (Complete):** Voice conversation system with WebSocket
+**Phase 2 (Complete):** Knowledge graph integration with autonomous tool use
+**Phase 3 (In Progress):** React frontend UI with real-time updates
+**Phase 4 (Planned):** Rich content (markdown, images, links in responses)
+**Phase 5 (Planned):** Vision integration (Qwen 2.5 Vision)
+**Phase 6 (Planned):** Meta-reasoning layer for explainability
+**Phase 7 (Planned):** Strategic cloud delegation (Claude, GPT-4)
+**Phase 8 (Planned):** Mobile app (React Native)
+
+### Long-Term Vision
+
+- **2025**: Working voice system with knowledge foundation ✅ (achieved)
+- **2027**: Competent specialist with deep domain knowledge
+- **2030**: Genuine intelligent system with 70B+ local model + years of accumulated knowledge
 
 ## Why This Matters
 
 This project explores building AI systems from first principles:
 
-1. **Transparency**: See and understand every decision
+1. **Transparency**: See and understand every decision - every tool call, extraction, retrieval
 2. **Privacy**: Runs entirely local, air-gapped capable
-3. **Control**: You own the data and logic
-4. **Learning**: System designed to grow over time
+3. **Control**: You own the data, the logic, the knowledge
+4. **Learning**: System designed to accumulate knowledge and grow over time
+5. **Research**: Platform for exploring cognitive architectures, not just using existing APIs
 
-**Long-term Vision:**
-- **2025**: Working voice system with knowledge foundation
-- **2027**: Competent specialist with deep domain knowledge
-- **2030**: Genuine intelligent system with 70B+ local model + years of accumulated knowledge
+**This is NOT a ChatGPT wrapper.** It's a cognitive architecture built from scratch with persistent memory, autonomous reasoning, and continuous learning capabilities.
+
+## Configuration Options
+
+### Voice System (`backend/config.py`)
+
+```python
+# TTS settings
+tts_enabled: bool = True  # Set to False to disable TTS (text-only mode, saves memory)
+tts_temperature: float = 0.8
+tts_topk: int = 50
+use_voice_context: bool = True
+
+# VAD settings
+vad_enabled: bool = True
+vad_threshold: float = 0.5
+```
+
+### Knowledge Graph (`backend/knowledge/config.py`)
+
+```python
+# Auto-RAG configuration
+auto_inject_docs: bool = True  # Enable/disable auto-injection
+auto_inject_limit: int = 3  # Number of chunks to auto-inject
+auto_inject_threshold: float = 0.4  # Similarity threshold (0.0-1.0)
+
+# Extraction settings
+extract_node_properties: bool = True
+extract_relationship_properties: bool = True
+min_extraction_confidence: float = 0.5
+```
+
+All settings can be configured via environment variables in `.env`.
+
+## Troubleshooting
+
+### Common Issues
+
+**Neo4j connection fails:**
+- Verify Neo4j is running: `neo4j status`
+- Check credentials in `.env` match Neo4j database
+- Test connection: `python test_neo4j_connection.py`
+
+**CUDA out of memory:**
+- Reduce model size: Switch to `qwen2.5:3b-instruct` in `.env`
+- Disable TTS: Set `TTS_ENABLED=false` in `.env` to save VRAM
+
+**Knowledge extraction not working:**
+- Verify `ENABLE_KNOWLEDGE_INTEGRATION=true` in `.env`
+- Check logs for tool call details: Look for `[TOOL_CALL]` prefix
+- Test conversation handler: `python test_conversation_handler.py`
+
+**Auto-RAG not finding documents:**
+- Verify chunks exist: Run query in Neo4j Browser: `MATCH (c:DocumentChunk) RETURN count(c)`
+- Check threshold: Lower `AUTO_INJECT_THRESHOLD` in `.env` (default 0.4)
+- Verify vector index: `SHOW INDEXES` in Neo4j Browser
 
 ## Contributing
 
-This is primarily a personal research project. Contributions, ideas, and discussions welcome via GitHub issues.
+This is primarily a personal research project. Contributions, ideas, and discussions are welcome via GitHub issues.
+
+**Areas of interest:**
+- Knowledge graph optimization
+- Frontend UI/UX improvements
+- Alternative model integrations
+- Performance optimizations
+- Documentation improvements
 
 ## License
 
-MIT License - See LICENSE for details
+MIT License - See [LICENSE](LICENSE) for details
 
 ## Acknowledgments
 
 - [Ollama](https://ollama.ai/) - Local LLM infrastructure
-- [Sesame CSM](https://huggingface.co/sesame-ai/csm-1b) - High-quality TTS
+- [Sesame CSM](https://huggingface.co/sesame-ai/csm-1b) - High-quality conversational TTS
+- [Neo4j](https://neo4j.com/) - Graph database platform
+- [LangChain](https://langchain.com/) - LLM framework and graph transformers
 - [Anthropic Claude](https://www.anthropic.com/) - Development assistance via Claude Code
 
 ---
 
-**Next Milestone:** Frontend UI components + conversation history persistence
+**Current Milestone:** Knowledge graph integration complete. Frontend UI components in development.
+
+**Next Milestone:** Rich content support (markdown, images, links) + knowledge graph visualization
