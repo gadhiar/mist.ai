@@ -147,6 +147,11 @@ class KnowledgeConfig:
     enable_versioning: bool = True  # Track ontology versions
     enable_provenance: bool = True  # Track extraction provenance
 
+    # Auto-RAG configuration
+    auto_inject_docs: bool = True  # Enable/disable auto-injection
+    auto_inject_limit: int = 3  # Number of chunks to auto-inject
+    auto_inject_threshold: float = 0.4  # Similarity threshold for auto-injection (lowered for permissive matching)
+
     @classmethod
     def from_env(cls) -> "KnowledgeConfig":
         """Load complete configuration from environment"""
@@ -157,7 +162,10 @@ class KnowledgeConfig:
             extraction=ExtractionConfig.from_env(),
             ontology_version=os.getenv("ONTOLOGY_VERSION", "1.0.0"),
             enable_versioning=os.getenv("ENABLE_VERSIONING", "true").lower() == "true",
-            enable_provenance=os.getenv("ENABLE_PROVENANCE", "true").lower() == "true"
+            enable_provenance=os.getenv("ENABLE_PROVENANCE", "true").lower() == "true",
+            auto_inject_docs=os.getenv("AUTO_INJECT_DOCS", "true").lower() == "true",
+            auto_inject_limit=int(os.getenv("AUTO_INJECT_LIMIT", "3")),
+            auto_inject_threshold=float(os.getenv("AUTO_INJECT_THRESHOLD", "0.4"))
         )
 
 

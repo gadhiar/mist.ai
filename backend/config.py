@@ -1,8 +1,12 @@
 """
 Configuration for Voice AI Backend
 """
+import os
 from pydantic import BaseModel
 from typing import Optional
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 class VoiceConfig(BaseModel):
@@ -19,6 +23,7 @@ class VoiceConfig(BaseModel):
     vad_sample_rate: int = 16000
 
     # TTS settings
+    tts_enabled: bool = True  # Set to False to disable TTS (text-only mode)
     tts_temperature: float = 0.8
     tts_topk: int = 50
     use_voice_context: bool = True
@@ -32,5 +37,13 @@ class VoiceConfig(BaseModel):
     debug: bool = False
 
 
+# Load configuration from environment
+def load_config() -> VoiceConfig:
+    """Load configuration from environment variables"""
+    return VoiceConfig(
+        tts_enabled=os.getenv("TTS_ENABLED", "true").lower() == "true"
+    )
+
+
 # Default configuration
-DEFAULT_CONFIG = VoiceConfig()
+DEFAULT_CONFIG = load_config()

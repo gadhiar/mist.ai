@@ -64,11 +64,9 @@ class KnowledgeIntegration:
             # Initialize graph store with knowledge config
             graph_store = GraphStore(knowledge_config)
 
-            # Initialize conversation handler
-            # ConversationHandler expects ExtractionConfig (for compatibility)
-            # We'll pass the extraction part
+            # Initialize conversation handler with full knowledge config
             self.conversation_handler = ConversationHandler(
-                config=extraction_config,
+                config=knowledge_config,
                 graph_store=graph_store,
                 model_name=model_name
             )

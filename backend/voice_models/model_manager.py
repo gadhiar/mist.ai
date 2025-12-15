@@ -85,13 +85,16 @@ class ModelManager:
         logger.info("1/3 Loading Whisper STT...")
         self.stt = WhisperSTT(model_size=self.config.whisper_model)
 
-        # Start TTS worker thread (CSM pattern)
-        logger.info("2/3 Starting TTS model worker thread...")
-        self._start_tts_worker()
+        # Start TTS worker thread (CSM pattern) - only if TTS is enabled
+        if self.config.tts_enabled:
+            logger.info("2/3 Starting TTS model worker thread...")
+            self._start_tts_worker()
 
-        # Wait for TTS warmup to complete
-        logger.info("   Waiting for TTS warmup...")
-        self.wait_for_tts_warmup()
+            # Wait for TTS warmup to complete
+            logger.info("   Waiting for TTS warmup...")
+            self.wait_for_tts_warmup()
+        else:
+            logger.info("2/3 TTS disabled - skipping TTS model loading")
 
         # Warmup LLM
         logger.info("3/3 Warming up LLM...")
@@ -456,6 +459,12 @@ Match your response depth to what the user is asking for - be concise when appro
         3. If text exceeds budget: chunk at sentence boundaries and generate sequentially
         4. Preserve context between chunks for voice consistency
         """
+        # If TTS is disabled, return empty generator
+        if not self.config.tts_enabled or self.tts is None:
+            logger.debug("TTS disabled - skipping audio generation")
+            return
+            yield  # Make this a generator
+
         import re
 
         # Preprocess text

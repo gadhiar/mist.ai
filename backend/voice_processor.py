@@ -213,46 +213,49 @@ class VoiceProcessor:
                 self.loop,
             )
 
-            # Generate TTS audio
-            log_timestamp("TTS: Starting audio generation...")
-            tts_start = time.time()
-            chunk_count = 0
-            first_chunk_time = None
+            # Generate TTS audio (if enabled)
+            if self.config.tts_enabled:
+                log_timestamp("TTS: Starting audio generation...")
+                tts_start = time.time()
+                chunk_count = 0
+                first_chunk_time = None
 
-            for audio_chunk in self.models.generate_tts_audio(full_response):
-                # Check for interruption
-                if self.interrupt_flag.is_set():
-                    log_timestamp("TTS generation interrupted by user")
-                    break
+                for audio_chunk in self.models.generate_tts_audio(full_response):
+                    # Check for interruption
+                    if self.interrupt_flag.is_set():
+                        log_timestamp("TTS generation interrupted by user")
+                        break
 
-                chunk_count += 1
+                    chunk_count += 1
 
-                if first_chunk_time is None:
-                    first_chunk_time = time.time() - tts_start
-                    log_timestamp(f"TTS: First chunk generated ({first_chunk_time:.2f}s)")
+                    if first_chunk_time is None:
+                        first_chunk_time = time.time() - tts_start
+                        log_timestamp(f"TTS: First chunk generated ({first_chunk_time:.2f}s)")
 
-                # Convert to numpy and send to clients
-                if isinstance(audio_chunk, torch.Tensor):
-                    audio_np = audio_chunk.cpu().numpy().astype(np.float32)
-                else:
-                    audio_np = audio_chunk.astype(np.float32)
+                    # Convert to numpy and send to clients
+                    if isinstance(audio_chunk, torch.Tensor):
+                        audio_np = audio_chunk.cpu().numpy().astype(np.float32)
+                    else:
+                        audio_np = audio_chunk.astype(np.float32)
 
-                asyncio.run_coroutine_threadsafe(
-                    self.message_queue.put(
-                        {
-                            "type": "audio_chunk",
-                            "audio": audio_np.tolist(),
-                            "sample_rate": 24000,
-                            "chunk_num": chunk_count,
-                        }
-                    ),
-                    self.loop,
+                    asyncio.run_coroutine_threadsafe(
+                        self.message_queue.put(
+                            {
+                                "type": "audio_chunk",
+                                "audio": audio_np.tolist(),
+                                "sample_rate": 24000,
+                                "chunk_num": chunk_count,
+                            }
+                        ),
+                        self.loop,
+                    )
+
+                tts_total = time.time() - tts_start
+                log_timestamp(
+                    f"TTS generation complete ({tts_total:.2f}s, {chunk_count} chunks)"
                 )
-
-            tts_total = time.time() - tts_start
-            log_timestamp(
-                f"TTS generation complete ({tts_total:.2f}s, {chunk_count} chunks)"
-            )
+            else:
+                log_timestamp("TTS: Disabled (text-only mode)")
 
             # Send completion signal
             asyncio.run_coroutine_threadsafe(

@@ -645,7 +645,7 @@ class GraphStore:
         CALL db.index.vector.queryNodes('chunk_embeddings', $limit, $query_embedding)
         YIELD node, score
         WHERE score >= $similarity_threshold
-        MATCH (s:SourceDocument)-[:FROM_SOURCE]->(node)
+        MATCH (s:SourceDocument)-[:FROM_SOURCE]-(node)
         RETURN
             node.chunk_id AS chunk_id,
             node.text AS text,

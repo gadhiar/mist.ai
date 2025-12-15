@@ -23,7 +23,7 @@ from backend.knowledge.models import (
     Message,
     RetrievalFilters
 )
-from backend.knowledge.config import ExtractionConfig
+from backend.knowledge.config import KnowledgeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ class ConversationHandler:
 
     def __init__(
         self,
-        config: ExtractionConfig,
+        config: KnowledgeConfig,
         graph_store: GraphStore,
         model_name: str = "qwen2.5:7b"
     ):
@@ -48,7 +48,7 @@ class ConversationHandler:
         Initialize conversation handler.
 
         Args:
-            config: Extraction configuration
+            config: Knowledge system configuration
             graph_store: Neo4j graph store
             model_name: Ollama model to use
         """
@@ -57,7 +57,7 @@ class ConversationHandler:
 
         # Initialize components
         self.retriever = KnowledgeRetriever(config, graph_store)
-        self.extractor = EntityExtractor(config)
+        self.extractor = EntityExtractor(config.extraction)
 
         # Initialize LLM
         self.llm = ChatOllama(
@@ -192,11 +192,74 @@ class ConversationHandler:
                 logger.error(f"Error extracting knowledge: {e}")
                 return f"Error storing knowledge: {str(e)}"
 
+        @tool
+        async def extract_knowledge_from_document(chunk_id: str, reason: Optional[str] = None) -> str:
+            """Extract entities from a specific document chunk into the knowledge graph.
+
+            Use this tool when:
+            - You found important information in documentation that should be remembered
+            - User asks you to "remember" or "learn" something from the docs
+            - You want to convert document facts into queryable knowledge graph entities
+            - Information will be queried frequently (extract once, query fast forever)
+
+            This is SELECTIVE extraction - only extract when truly useful.
+            Most doc info is already available via auto-injected context.
+
+            Args:
+                chunk_id: The chunk_id from auto-provided documentation
+                reason: Optional explanation of why you're extracting this
+
+            Returns:
+                Confirmation of entities extracted and stored
+            """
+            try:
+                # Get the chunk text
+                query = """
+                MATCH (c:DocumentChunk {chunk_id: $chunk_id})
+                RETURN c.text as text, c.chunk_id as chunk_id
+                """
+                results = graph_store.connection.execute_query(query, {"chunk_id": chunk_id})
+
+                if not results:
+                    return f"Chunk not found: {chunk_id}"
+
+                chunk_text = results[0]['text']
+
+                # Extract entities from chunk
+                graph_docs = await extractor.extract_from_utterance(
+                    utterance=chunk_text,
+                    conversation_history=[],
+                    metadata={
+                        "source": "document_extraction",
+                        "chunk_id": chunk_id,
+                        "reason": reason or "LLM-selected extraction"
+                    }
+                )
+
+                # Store extracted entities
+                if graph_docs and graph_docs[0].nodes:
+                    graph_store.store_extracted_entities(
+                        graph_document=graph_docs[0],
+                        chunk_id=chunk_id,
+                        ontology_version=None
+                    )
+
+                    entity_names = [n.id for n in graph_docs[0].nodes]
+                    rel_count = len(graph_docs[0].relationships)
+
+                    return f"Extracted from document: {len(entity_names)} entities ({', '.join(entity_names[:5])}{'...' if len(entity_names) > 5 else ''}) with {rel_count} relationships. These are now queryable via query_knowledge_graph."
+                else:
+                    return "No entities extracted from this chunk."
+
+            except Exception as e:
+                logger.error(f"Error extracting from document chunk: {e}")
+                return f"Error extracting knowledge from document: {str(e)}"
+
         # Bind tools to LLM
-        self.tools = [query_knowledge_graph, extract_knowledge]
+        self.tools = [query_knowledge_graph, extract_knowledge, extract_knowledge_from_document]
         self.llm_with_tools = self.llm.bind_tools(self.tools)
 
-        logger.info("Tools bound to LLM: query_knowledge_graph, extract_knowledge")
+        logger.info("Tools bound to LLM: query_knowledge_graph, extract_knowledge, extract_knowledge_from_document")
 
     def get_or_create_session(
         self,
@@ -244,8 +307,31 @@ class ConversationHandler:
         # Add user message to history
         session.add_message("user", user_message)
 
-        # Build conversation with system prompt
-        messages = self._build_messages(session, max_history)
+        # AUTO-INJECT: Search documentation (configurable)
+        doc_results = []
+        auto_inject_limit = self.config.auto_inject_limit
+        auto_inject_threshold = self.config.auto_inject_threshold
+        auto_inject_enabled = self.config.auto_inject_docs
+
+        if auto_inject_enabled:
+            # Skip auto-injection for very short messages
+            if len(user_message.split()) >= 3:
+                logger.info(f"[AUTO-RAG] Searching documentation for: '{user_message[:50]}...'")
+                try:
+                    doc_results = await self.retriever.search_documents(
+                        query=user_message,
+                        limit=auto_inject_limit,
+                        similarity_threshold=auto_inject_threshold
+                    )
+                    logger.info(f"[AUTO-RAG] Found {len(doc_results)} relevant document chunks")
+                except Exception as e:
+                    logger.error(f"[AUTO-RAG] Error searching documents: {e}")
+                    doc_results = []
+            else:
+                logger.debug(f"[AUTO-RAG] Skipping search for short message")
+
+        # Build conversation with system prompt and optional doc context
+        messages = self._build_messages(session, max_history, doc_context=doc_results)
 
         try:
             # LLM autonomously decides to use tools
@@ -328,43 +414,127 @@ class ConversationHandler:
 
         return f"Tool not found: {tool_name}"
 
+    def _format_document_context(self, doc_results: List[Dict[str, Any]]) -> str:
+        """
+        Format document search results for injection into context.
+
+        Args:
+            doc_results: List of document chunks from search_documents()
+
+        Returns:
+            Formatted string for system context
+        """
+        if not doc_results:
+            return ""
+
+        lines = ["=== MIST Documentation (Relevant Excerpts) ===\n"]
+
+        for i, result in enumerate(doc_results, 1):
+            source = result.get('source_title', 'Unknown Document')
+            text = result.get('text', '')
+            similarity = result.get('similarity', 0.0)
+
+            lines.append(f"[{i}] From: {source} (relevance: {similarity:.2f})")
+            lines.append(f"{text}\n")
+
+        lines.append("=" * 50)
+
+        return "\n".join(lines)
+
     def _build_messages(
         self,
         session: ConversationSession,
-        max_history: int
+        max_history: int,
+        doc_context: Optional[List[Dict[str, Any]]] = None
     ) -> List[Dict[str, str]]:
-        """Build message list for LLM with system prompt and history"""
+        """
+        Build message list for LLM with system prompt, doc context, and history.
 
-        system_prompt = """You are MIST, a conversational AI assistant with a personal knowledge graph about the user.
+        Args:
+            session: Conversation session
+            max_history: Maximum history messages to include
+            doc_context: Optional auto-injected document results
 
-You have access to two powerful tools:
+        Returns:
+            List of messages for LLM
+        """
 
-1. **query_knowledge_graph**: Search for information you've learned about the user
-   - Use when user asks about their past information, preferences, skills, projects, etc.
-   - Use to personalize responses based on accumulated knowledge
-   - Think: "Do I need context from what I've learned before?"
+        system_prompt = """You are MIST, a conversational AI assistant with a personal knowledge graph.
 
-2. **extract_knowledge**: Store new information the user shares
-   - Use when user tells you about themselves (technologies, projects, skills, preferences, etc.)
-   - Use to remember important information for future conversations
-   - Think: "Is this something I should remember?"
+=== CONTEXT PROVIDED ===
 
-**How to use tools autonomously:**
+You receive relevant MIST documentation automatically with each query (see below).
+This documentation is provided via semantic search and contains the most relevant information.
+
+=== AVAILABLE TOOLS ===
+
+You have three tools at your disposal:
+
+1. **query_knowledge_graph(query: str, limit: int = 20)**
+   - Search the personal knowledge graph for user-specific information
+   - Use when: User asks about THEIR preferences, skills, projects, past conversations
+   - Returns: Facts you've learned about the user (entities + relationships)
+   - Example: "What programming languages do I know?" → use this tool
+
+2. **extract_knowledge(text: str, context: str = None)**
+   - Store new information the user shares about themselves
+   - Use when: User tells you about their skills, preferences, projects, interests
+   - Effect: Adds entities to knowledge graph from conversation
+   - Example: "I'm learning React" → use this tool to remember
+
+3. **extract_knowledge_from_document(chunk_id: str, reason: str = None)**
+   - Extract entities from auto-provided documentation chunks into the knowledge graph
+   - Use when: User asks you to "remember" or "learn" something from the docs
+   - Use SPARINGLY: Only when user explicitly asks or info will be queried frequently
+   - Effect: Converts document facts into queryable graph entities
+   - Note: chunk_id can be found in the auto-provided documentation context
+
+=== TOOL USAGE STRATEGY ===
+
+**For user questions:**
+- Technical questions (how/what/why about MIST) → Use auto-provided docs (already in context)
+- Personal questions (about user's info) → Use query_knowledge_graph tool
+- Both types → Use docs + query_knowledge_graph
+
+**For user statements:**
+- Shares personal info → Use extract_knowledge tool
+- Asks to "remember" doc info → Use extract_knowledge_from_document tool (rarely needed)
+
+**Autonomous Decision Making:**
 - You decide when to use tools - no one tells you when
-- You can use both tools, one tool, or no tools per response
-- Think before responding: "Do I need to query? Do I need to learn?"
-- Use tools to provide personalized, context-aware responses
+- You can use multiple tools, one tool, or no tools per response
+- Think before responding: "What context do I need?"
+- Documentation is automatically provided - use it! Cite sources when helpful.
+- Only call query_knowledge_graph when you need personal user context
 
-**Guidelines:**
+=== GUIDELINES ===
+
 - Be conversational and natural
+- Cite documentation sources when answering technical questions
 - Use tools to enhance responses, not replace conversation
-- If you don't have information, query the knowledge graph
-- If user shares information, extract it
-- Combine retrieved knowledge with your conversational abilities
+- Combine auto-provided docs with your conversational abilities
+- Query the knowledge graph when personal context matters
 
-Remember: You're autonomous. Think about what you need to do, then do it."""
+Remember: Documentation is already provided below. Think about whether you need personal user context from the knowledge graph."""
 
         messages = [{"role": "system", "content": system_prompt}]
+
+        # Add documentation context if available
+        if doc_context:
+            doc_context_str = self._format_document_context(doc_context)
+            if doc_context_str:
+                # Log what's being injected for debugging
+                logger.info(f"[AUTO-RAG] Injecting {len(doc_context)} document chunks into context:")
+                for i, chunk in enumerate(doc_context, 1):
+                    title = chunk.get('source_title', 'Unknown')
+                    text_preview = chunk.get('text', '')[:100] + '...' if len(chunk.get('text', '')) > 100 else chunk.get('text', '')
+                    similarity = chunk.get('similarity', 0.0)
+                    logger.info(f"[AUTO-RAG]   [{i}] {title} (sim={similarity:.3f}): {text_preview}")
+
+                messages.append({
+                    "role": "system",
+                    "content": doc_context_str
+                })
 
         # Add conversation history
         history = session.get_history(max_history)
