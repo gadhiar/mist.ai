@@ -18,23 +18,55 @@ from generator import Segment
 import ollama
 import torch
 
+# Knowledge graph integration
+try:
+    from backend.chat.knowledge_integration import KnowledgeIntegration
+    from backend.knowledge_config import DEFAULT_KNOWLEDGE_CONFIG
+    KNOWLEDGE_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Knowledge integration not available: {e}")
+    KNOWLEDGE_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
 class ModelManager:
     """Manages all ML models for the voice AI system"""
 
-    def __init__(self, config):
+    def __init__(self, config, event_loop=None):
         """
         Initialize model manager
 
         Args:
             config: VoiceConfig object
+            event_loop: Optional event loop for async operations
         """
         self.config = config
         self.stt = None
         self.tts = None
         self.llm_model = config.llm_model
+        self.event_loop = event_loop
+
+        # Knowledge graph integration
+        self.knowledge = None
+        if KNOWLEDGE_AVAILABLE and DEFAULT_KNOWLEDGE_CONFIG.enable_knowledge_integration:
+            try:
+                self.knowledge = KnowledgeIntegration(
+                    neo4j_uri=DEFAULT_KNOWLEDGE_CONFIG.neo4j_uri,
+                    neo4j_user=DEFAULT_KNOWLEDGE_CONFIG.neo4j_user,
+                    neo4j_password=DEFAULT_KNOWLEDGE_CONFIG.neo4j_password,
+                    model_name=DEFAULT_KNOWLEDGE_CONFIG.knowledge_model
+                )
+                if self.knowledge.is_enabled():
+                    logger.info("✅ Knowledge graph integration ENABLED")
+                else:
+                    logger.warning("⚠️  Knowledge integration disabled (Neo4j unavailable)")
+                    self.knowledge = None
+            except Exception as e:
+                logger.warning(f"⚠️  Knowledge integration disabled: {e}")
+                self.knowledge = None
+        else:
+            logger.info("Knowledge graph integration disabled in config")
 
         # TTS model worker thread (CSM pattern)
         self.tts_request_queue = queue.Queue()
@@ -53,13 +85,16 @@ class ModelManager:
         logger.info("1/3 Loading Whisper STT...")
         self.stt = WhisperSTT(model_size=self.config.whisper_model)
 
-        # Start TTS worker thread (CSM pattern)
-        logger.info("2/3 Starting TTS model worker thread...")
-        self._start_tts_worker()
+        # Start TTS worker thread (CSM pattern) - only if TTS is enabled
+        if self.config.tts_enabled:
+            logger.info("2/3 Starting TTS model worker thread...")
+            self._start_tts_worker()
 
-        # Wait for TTS warmup to complete
-        logger.info("   Waiting for TTS warmup...")
-        self.wait_for_tts_warmup()
+            # Wait for TTS warmup to complete
+            logger.info("   Waiting for TTS warmup...")
+            self.wait_for_tts_warmup()
+        else:
+            logger.info("2/3 TTS disabled - skipping TTS model loading")
 
         # Warmup LLM
         logger.info("3/3 Warming up LLM...")
@@ -314,13 +349,25 @@ class ModelManager:
 
     def generate_llm_response(self, user_text):
         """
-        Generate LLM response with context-aware system prompt.
+        Generate LLM response with optional knowledge graph integration.
 
-        Strategy: System prompt adapts to user intent - brief for simple queries,
-        thorough for explicit requests. LLM limit of 400 tokens provides room for
-        detailed responses. Downstream chunking handles overflow gracefully.
+        If knowledge integration is enabled and Neo4j is available, uses
+        knowledge-augmented conversation with autonomous tool use.
+        Otherwise falls back to standard LLM generation.
         """
-        system_prompt = """You are M.I.S.T, a helpful voice assistant and friend to your creator, Raj Gadhia.
+        # Use knowledge-augmented generation if available
+        if self.knowledge and self.knowledge.is_enabled():
+            logger.info("Using knowledge-augmented LLM response")
+            for token in self.knowledge.generate_response_streaming(
+                user_text,
+                event_loop=self.event_loop
+            ):
+                yield token
+        else:
+            # Fallback to standard LLM (original implementation)
+            logger.debug("Using standard LLM response (no knowledge integration)")
+
+            system_prompt = """You are M.I.S.T, a helpful voice assistant and friend to your creator, Raj Gadhia.
 
 Response Guidelines:
 - For simple questions or greetings: 1-3 sentences (brief and direct)
@@ -333,23 +380,23 @@ Response Guidelines:
 
 Match your response depth to what the user is asking for - be concise when appropriate, thorough when needed."""
 
-        response = ollama.chat(
-            model=self.llm_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text}
-            ],
-            stream=True,
-            options={
-                "num_predict": 400,  # Allow detailed responses when needed, chunking handles overflow
-                "temperature": 0.7,
-                "top_p": 0.9,
-            }
-        )
+            response = ollama.chat(
+                model=self.llm_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text}
+                ],
+                stream=True,
+                options={
+                    "num_predict": 400,  # Allow detailed responses when needed, chunking handles overflow
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                }
+            )
 
-        for chunk in response:
-            if "message" in chunk and "content" in chunk["message"]:
-                yield chunk["message"]["content"]
+            for chunk in response:
+                if "message" in chunk and "content" in chunk["message"]:
+                    yield chunk["message"]["content"]
 
     def _estimate_tokens(self, text, audio_tensor=None):
         """
@@ -412,6 +459,12 @@ Match your response depth to what the user is asking for - be concise when appro
         3. If text exceeds budget: chunk at sentence boundaries and generate sequentially
         4. Preserve context between chunks for voice consistency
         """
+        # If TTS is disabled, return empty generator
+        if not self.config.tts_enabled or self.tts is None:
+            logger.debug("TTS disabled - skipping audio generation")
+            return
+            yield  # Make this a generator
+
         import re
 
         # Preprocess text

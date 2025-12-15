@@ -22,6 +22,13 @@ class WhisperSTT:
         print(f"Loading Whisper ({model_size})...")
         self.model = whisper.load_model(model_size)
         self.sample_rate = 16000  # Whisper expects 16kHz
+
+        # Initial prompt to bias Whisper towards "MIST" instead of "missed"
+        self.initial_prompt = (
+            "MIST is an AI assistant with knowledge graph capabilities. "
+            "The user is asking about MIST, the AI system, not missed or mist."
+        )
+
         print("Whisper loaded successfully!")
 
     def listen(self, duration: int = 5) -> str:
@@ -47,8 +54,12 @@ class WhisperSTT:
         sd.wait()
         print("Recording complete. Transcribing...")
 
-        # Transcribe
-        result = self.model.transcribe(audio.flatten(), fp16=False)
+        # Transcribe with initial prompt to bias towards "MIST"
+        result = self.model.transcribe(
+            audio.flatten(),
+            fp16=False,
+            initial_prompt=self.initial_prompt
+        )
         text = result["text"].strip()
 
         return text
@@ -85,8 +96,12 @@ class WhisperSTT:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
-        # Transcribe
-        result = self.model.transcribe(audio_data, fp16=False)
+        # Transcribe with initial prompt to bias towards "MIST"
+        result = self.model.transcribe(
+            audio_data,
+            fp16=False,
+            initial_prompt=self.initial_prompt
+        )
 
         # Synchronize CUDA after transcription to ensure completion before TTS starts
         if torch.cuda.is_available():
@@ -104,5 +119,9 @@ class WhisperSTT:
         Returns:
             Transcribed text
         """
-        result = self.model.transcribe(audio_path, fp16=False)
+        result = self.model.transcribe(
+            audio_path,
+            fp16=False,
+            initial_prompt=self.initial_prompt
+        )
         return result["text"].strip()
