@@ -1,0 +1,77 @@
+name: Flutter Code Quality
+
+on:
+  push:
+    branches: [main, feat/**, dev/**]
+    paths:
+      - 'mist_desktop/**'
+      - '!mist_desktop/build/**'
+      - '!mist_desktop/.dart_tool/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'mist_desktop/**'
+      - '!mist_desktop/build/**'
+      - '!mist_desktop/.dart_tool/**'
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: 'stable'
+
+      - name: Install dependencies
+        working-directory: mist_desktop
+        run: flutter pub get
+
+      - name: Check code formatting
+        working-directory: mist_desktop
+        run: |
+          flutter format --set-exit-if-changed lib/
+          if [ $? -ne 0 ]; then
+            echo "Code is not formatted. Run: flutter format lib/"
+            exit 1
+          fi
+
+      - name: Analyze code
+        working-directory: mist_desktop
+        run: |
+          flutter analyze --no-fatal-infos
+          if [ $? -ne 0 ]; then
+            echo "Analysis found issues. Review output above."
+            exit 1
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+    if: false  # Disabled until tests are added
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: 'stable'
+
+      - name: Install dependencies
+        working-directory: mist_desktop
+        run: flutter pub get
+
+      - name: Run tests
+        working-directory: mist_desktop
+        run: flutter test --coverage
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./mist_desktop/coverage/lcov.info
+          flags: flutter

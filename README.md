@@ -174,11 +174,29 @@ python voice_client.py
 - Autonomous knowledge extraction and querying
 
 **Try these conversation patterns:**
-1. **Learning**: "I use Python and FastAPI for backend development" → LLM extracts knowledge
-2. **Querying**: "What technologies do I use?" → LLM queries graph for personalized response
-3. **Natural chat**: "How are you today?" → Normal conversation without tools
+1. **Learning**: "I use Python and FastAPI for backend development" -> LLM extracts knowledge
+2. **Querying**: "What technologies do I use?" -> LLM queries graph for personalized response
+3. **Natural chat**: "How are you today?" -> Normal conversation without tools
 
-### 7. Flutter Frontend Setup (In Development)
+### 7. Set Up Git Hooks (Recommended)
+
+Install pre-commit hooks for automated code quality checks:
+
+```bash
+# Install pre-commit framework
+pip install pre-commit
+
+# Install hooks
+pre-commit install
+
+# Or use installation script
+bash scripts/install-git-hooks.sh     # Linux/macOS
+scripts\install-git-hooks.bat          # Windows
+```
+
+See [Quick Start Guide](QUICKSTART_GIT_HOOKS.md) or [Full Documentation](docs/GIT_WORKFLOWS.md).
+
+### 8. Flutter Frontend Setup (In Development)
 
 ```bash
 cd mist_desktop

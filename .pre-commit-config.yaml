@@ -1,0 +1,64 @@
+# Pre-commit hooks for MIST.AI
+# Install: pip install pre-commit && pre-commit install
+# Run manually: pre-commit run --all-files
+
+repos:
+  # Python code formatting
+  - repo: https://github.com/psf/black
+    rev: 24.1.1
+    hooks:
+      - id: black
+        language_version: python3.11
+        args: [--config=pyproject.toml]
+
+  # Python linting and auto-fixing
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.1.15
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+
+  # General file quality checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: \.md$
+      - id: end-of-file-fixer
+        exclude: \.md$
+      - id: check-yaml
+        exclude: ^mist_desktop/
+      - id: check-toml
+      - id: check-json
+      - id: check-added-large-files
+        args: [--maxkb=1000]
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+
+  # Dart/Flutter formatting
+  - repo: local
+    hooks:
+      - id: flutter-format
+        name: Flutter format
+        entry: bash -c 'cd mist_desktop && flutter format .'
+        language: system
+        types: [dart]
+        pass_filenames: false
+
+      - id: flutter-analyze
+        name: Flutter analyze
+        entry: bash -c 'cd mist_desktop && flutter analyze --no-fatal-infos'
+        language: system
+        types: [dart]
+        pass_filenames: false
+
+# Configuration
+default_language_version:
+  python: python3.11
+
+# Run hooks in parallel when possible
+default_stages: [commit]
+fail_fast: false

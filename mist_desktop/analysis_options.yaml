@@ -1,28 +1,93 @@
-# This file configures the analyzer, which statically analyzes Dart code to
-# check for errors, warnings, and lints.
+# Flutter/Dart Analyzer Configuration for MIST.AI Desktop
 #
-# The issues identified by the analyzer are surfaced in the UI of Dart-enabled
-# IDEs (https://dart.dev/tools#ides-and-editors). The analyzer can also be
-# invoked from the command line by running `flutter analyze`.
+# This configures static analysis for the Flutter desktop app.
+# Run: flutter analyze
 
-# The following line activates a set of recommended lints for Flutter apps,
-# packages, and plugins designed to encourage good coding practices.
+# Include Flutter's recommended lints as a baseline
 include: package:flutter_lints/flutter.yaml
 
+analyzer:
+  # Exclude generated files from analysis
+  exclude:
+    - "**/*.g.dart"
+    - "**/*.freezed.dart"
+    - "build/**"
+    - ".dart_tool/**"
+
+  # Treat certain issues as errors
+  errors:
+    # Make missing returns an error (catches bugs)
+    missing_return: error
+    # Make invalid overrides an error
+    invalid_override: error
+    # Ignore issues in generated files
+    invalid_annotation_target: ignore
+
+  # Strong mode settings
+  strong-mode:
+    implicit-casts: false
+    implicit-dynamic: false
+
 linter:
-  # The lint rules applied to this project can be customized in the
-  # section below to disable rules from the `package:flutter_lints/flutter.yaml`
-  # included above or to enable additional rules. A list of all available lints
-  # and their documentation is published at https://dart.dev/lints.
-  #
-  # Instead of disabling a lint rule for the entire project in the
-  # section below, it can also be suppressed for a single line of code
-  # or a specific dart file by using the `// ignore: name_of_lint` and
-  # `// ignore_for_file: name_of_lint` syntax on the line or in the file
-  # producing the lint.
   rules:
-    # avoid_print: false  # Uncomment to disable the `avoid_print` rule
-    # prefer_single_quotes: true  # Uncomment to enable the `prefer_single_quotes` rule
+    # Style rules
+    prefer_single_quotes: true
+    prefer_const_constructors: true
+    prefer_const_declarations: true
+    prefer_const_literals_to_create_immutables: true
+    prefer_final_fields: true
+    prefer_final_locals: true
+    sort_constructors_first: true
+    sort_unnamed_constructors_first: true
+
+    # Avoid bad patterns
+    avoid_print: true  # Use proper logging instead
+    avoid_unnecessary_containers: true
+    avoid_web_libraries_in_flutter: true
+    no_duplicate_case_values: true
+    prefer_void_to_null: true
+    unnecessary_brace_in_string_interps: true
+    unnecessary_getters_setters: true
+    unnecessary_null_aware_assignments: true
+    unnecessary_null_checks: true
+    unnecessary_null_in_if_null_operators: true
+    unnecessary_overrides: true
+    unnecessary_string_interpolations: true
+
+    # Documentation (relaxed for now, can be tightened)
+    # public_member_api_docs: false  # Too strict initially
+
+    # Line length (relaxed, black uses 100 for Python)
+    lines_longer_than_80_chars: false
+
+    # Require trailing commas for better diffs
+    require_trailing_commas: true
+
+    # Use proper types
+    always_specify_types: false  # Type inference is good
+    avoid_types_on_closure_parameters: true
+    omit_local_variable_types: false
+    prefer_typing_uninitialized_variables: true
+
+    # Error handling
+    only_throw_errors: true
+    use_rethrow_when_possible: true
+
+    # Async
+    unawaited_futures: true
+
+    # Collections
+    prefer_collection_literals: true
+    prefer_is_empty: true
+    prefer_is_not_empty: true
+    prefer_iterable_whereType: true
+
+    # Functions
+    prefer_function_declarations_over_variables: true
+    use_function_type_syntax_for_parameters: true
+
+    # Comments
+    slash_for_doc_comments: true
 
 # Additional information about this file can be found at
 # https://dart.dev/guides/language/analysis-options

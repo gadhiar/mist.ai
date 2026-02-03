@@ -1,0 +1,99 @@
+name: Python Code Quality
+
+on:
+  push:
+    branches: [main, feat/**, dev/**]
+    paths:
+      - 'backend/**'
+      - 'scripts/**'
+      - '**.py'
+      - 'requirements.txt'
+      - 'pyproject.toml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - 'scripts/**'
+      - '**.py'
+      - 'requirements.txt'
+      - 'pyproject.toml'
+
+jobs:
+  lint-and-format:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install black ruff mypy
+
+      - name: Check code formatting with Black
+        run: |
+          black --check backend/ scripts/
+          if [ $? -ne 0 ]; then
+            echo "Code is not formatted. Run: black backend/ scripts/"
+            exit 1
+          fi
+
+      - name: Lint with Ruff
+        run: |
+          ruff check backend/ scripts/
+          if [ $? -ne 0 ]; then
+            echo "Linting issues found. Run: ruff check backend/ scripts/ --fix"
+            exit 1
+          fi
+
+      - name: Type check with mypy (optional, continue on error)
+        run: |
+          mypy backend/ || echo "Type checking found issues (non-blocking)"
+        continue-on-error: true
+
+  check-ai-slop:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check for AI slop (critical issues only)
+        run: |
+          python scripts/check_ai_slop.py --critical-only --no-color
+          if [ $? -ne 0 ]; then
+            echo "Critical AI slop detected (emojis, unicode symbols)"
+            echo "Run: python scripts/check_ai_slop.py --fix"
+            exit 1
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+    if: false  # Disabled until tests are added
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: |
+          pytest tests/ -v --cov=backend --cov-report=term-missing
