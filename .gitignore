@@ -41,3 +41,17 @@ frontend/.vite/
 
 # Docs
 docs/
+
+# Claude Code
+.claude/
+
+# Flutter/Dart specific
+mist_desktop/.dart_tool/
+mist_desktop/.flutter-plugins
+mist_desktop/.flutter-plugins-dependencies
+mist_desktop/build/
+mist_desktop/windows/flutter/ephemeral/
+mist_desktop/macos/Flutter/ephemeral/
+mist_desktop/linux/flutter/ephemeral/
+mist_desktop/.packages
+mist_desktop/pubspec.lock

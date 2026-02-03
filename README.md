@@ -29,10 +29,11 @@ MIST.AI is a research platform building a transparent, continuously learning AI 
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  Frontend (React + TypeScript + WebSocket)                       │
-│  - Conversation display                                          │
-│  - Real-time transcription                                       │
-│  - Audio visualization                                           │
+│  Flutter Desktop (mist_desktop/)                                 │
+│  - Windows/macOS/Linux support                                   │
+│  - Voice recording & playback                                    │
+│  - Real-time conversation UI                                     │
+│  - WebSocket communication                                       │
 └────────────────────────┬─────────────────────────────────────────┘
                          │ WebSocket (Port 8001)
 ┌────────────────────────┴─────────────────────────────────────────┐
@@ -68,13 +69,13 @@ MIST.AI is a research platform building a transparent, continuously learning AI 
 - **Graph Processing**: LangChain's LLMGraphTransformer
 - **Audio**: sounddevice, numpy, scipy
 
-### Frontend (In Development)
-- **Framework**: React 18 + TypeScript
-- **Build Tool**: Vite 5
-- **Styling**: Tailwind CSS 3
-- **Components**: shadcn/ui
-- **State Management**: Zustand (lightweight)
-- **WebSocket**: Native WebSocket API
+### Frontend (Flutter Desktop - In Development)
+- **Framework**: Flutter 3.24+ (Dart 3.10+)
+- **Platform**: Windows Desktop (macOS/Linux ready)
+- **State Management**: Riverpod 3.x
+- **Audio**: record (recording) + audioplayers (playback)
+- **WebSocket**: web_socket_channel
+- **UI**: Material Design 3
 
 ### Platform Requirements
 - **OS**: Windows 11, macOS, or Linux
@@ -177,19 +178,23 @@ python voice_client.py
 2. **Querying**: "What technologies do I use?" → LLM queries graph for personalized response
 3. **Natural chat**: "How are you today?" → Normal conversation without tools
 
-### 7. Frontend Setup (Optional - In Development)
+### 7. Flutter Frontend Setup (In Development)
 
 ```bash
-cd frontend
+cd mist_desktop
 
-# Install dependencies
-npm install
+# Get Flutter dependencies
+flutter pub get
 
-# Start dev server
-npm run dev
+# Run on Windows
+flutter run -d windows
+
+# Or run on other platforms
+flutter devices  # List available devices
+flutter run -d <device-id>
 ```
 
-Frontend will start on `http://localhost:5173`
+See [FLUTTER_MIGRATION_PLAN.md](FLUTTER_MIGRATION_PLAN.md) for detailed setup instructions.
 
 ## Key Features
 
@@ -243,14 +248,17 @@ mist.ai/
 │       ├── storage/                  # Neo4j persistence layer
 │       └── embeddings/               # Vector embeddings (Sentence Transformers)
 │
-├── frontend/                         # React UI (TypeScript)
-│   ├── src/
-│   │   ├── App.tsx
-│   │   ├── components/              # React components
-│   │   ├── hooks/                   # Custom hooks
-│   │   ├── services/                # Business logic
-│   │   └── types/                   # TypeScript types
-│   └── vite.config.ts
+├── mist_desktop/                     # Flutter Desktop UI
+│   ├── lib/
+│   │   ├── main.dart                # App entry point
+│   │   ├── screens/                 # UI screens (chat, settings)
+│   │   ├── providers/               # Riverpod state providers
+│   │   ├── services/                # WebSocket, audio services
+│   │   ├── models/                  # Data models
+│   │   ├── widgets/                 # Reusable UI components
+│   │   └── config/                  # App configuration
+│   ├── pubspec.yaml                 # Flutter dependencies
+│   └── windows/                     # Windows platform code
 │
 ├── cli_client/                       # Python test client for voice
 │   └── voice_client.py
@@ -337,7 +345,7 @@ See [E2E_TEST_GUIDE.md](E2E_TEST_GUIDE.md) for comprehensive testing instruction
 - [REPOSITORY_STRUCTURE.md](REPOSITORY_STRUCTURE.md) - Detailed project structure
 
 ### Technical Guides
-- [Frontend Architecture](docs/frontend/FRONTEND_ARCHITECTURE.md) - Complete frontend spec
+- [Flutter Migration Plan](FLUTTER_MIGRATION_PLAN.md) - Comprehensive Flutter desktop implementation guide
 - [Windows Dev Setup](docs/guides/windows_dev_setup.md) - Environment setup
 - [Torch Compile Fix](docs/guides/TORCH_COMPILE_FIX.md) - PyTorch optimization issues
 
@@ -366,25 +374,27 @@ Latest developments focus on knowledge graph extraction, retrieval, and autonomo
 - [x] **Autonomous tool usage** (MCP-like pattern)
 - [x] **Auto-RAG** (document injection)
 - [x] **Provenance tracking** (utterance → entity mapping)
-- [x] Frontend scaffolding (React + TypeScript)
+- [x] Flutter desktop app scaffolding (Windows/macOS/Linux ready)
+- [x] Flutter WebSocket integration with backend
+- [x] Flutter voice recording and message display
 
 ### In Progress
 
-- [ ] Frontend UI components (conversation display, audio visualization)
-- [ ] Web Audio API integration for browser playback
-- [ ] Knowledge graph visualization
+- [ ] Flutter UI polish and testing
+- [ ] Audio playback integration (TTS from backend)
+- [ ] Knowledge graph visualization (Flutter)
 - [ ] Rich content support (markdown, images, links)
 
 ### Roadmap
 
 **Phase 1 (Complete):** Voice conversation system with WebSocket
 **Phase 2 (Complete):** Knowledge graph integration with autonomous tool use
-**Phase 3 (In Progress):** React frontend UI with real-time updates
+**Phase 3 (In Progress):** Flutter desktop UI with real-time updates
 **Phase 4 (Planned):** Rich content (markdown, images, links in responses)
 **Phase 5 (Planned):** Vision integration (Qwen 2.5 Vision)
 **Phase 6 (Planned):** Meta-reasoning layer for explainability
 **Phase 7 (Planned):** Strategic cloud delegation (Claude, GPT-4)
-**Phase 8 (Planned):** Mobile app (React Native)
+**Phase 8 (Planned):** Mobile app (Flutter iOS/Android)
 
 ### Long-Term Vision
 
@@ -484,6 +494,6 @@ MIT License - See [LICENSE](LICENSE) for details
 
 ---
 
-**Current Milestone:** Knowledge graph integration complete. Frontend UI components in development.
+**Current Milestone:** Knowledge graph integration complete. Flutter desktop app in development.
 
-**Next Milestone:** Rich content support (markdown, images, links) + knowledge graph visualization
+**Next Milestone:** Complete Flutter audio playback + knowledge graph visualization in Flutter
