@@ -173,8 +173,12 @@ class ChatNotifier extends Notifier<ChatState> {
 
   /// Finalize AI response
   void _finalizeAiResponse(String fullResponse) {
-    addMessage(ChatMessage.ai(fullResponse));
+    // Clear streaming state and add final message in one atomic update
+    // This prevents showing both the streaming preview and final message simultaneously
+    final updatedMessages = [...state.messages, ChatMessage.ai(fullResponse)];
+
     state = state.copyWith(
+      messages: updatedMessages,
       currentAiResponse: null,
       isProcessing: false,
     );
