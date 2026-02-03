@@ -290,8 +290,19 @@ class VoiceProcessor:
                         daemon=True,
                     ).start()
 
+    def process_complete_audio(self, audio_data, sample_rate):
+        """Process complete audio from client (no VAD needed - Flutter controls recording)"""
+        log_timestamp(f"Processing complete audio: {len(audio_data)} samples @ {sample_rate}Hz")
+
+        # Transcribe and process immediately in a new thread
+        threading.Thread(
+            target=self._process_user_speech,
+            args=(audio_data, sample_rate),
+            daemon=True,
+        ).start()
+
     def process_audio_chunk(self, audio_data, sample_rate):
-        """Process incoming audio chunk from client"""
+        """Process incoming audio chunk from client (VAD mode - deprecated)"""
         if self.vad_processor and self.config.vad_enabled:
             # Resample if needed
             if sample_rate != self.config.vad_sample_rate:

@@ -159,14 +159,16 @@ async def websocket_endpoint(websocket: WebSocket):
 
             # Handle different message types
             if data["type"] == "audio":
-                # Audio chunk from client
+                # Complete audio from client (no VAD, just transcribe and process)
                 audio_data = np.asarray(data["audio"], dtype=np.float32)
                 sample_rate = data.get("sample_rate", 16000)
 
-                # Process in thread to not block event loop
+                logger.info(f"📥 Received complete audio: {len(audio_data)} samples @ {sample_rate}Hz")
+
+                # Process complete audio directly (transcribe → LLM → TTS)
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(
-                    None, voice_processor.process_audio_chunk, audio_data, sample_rate
+                    None, voice_processor.process_complete_audio, audio_data, sample_rate
                 )
 
             elif data["type"] == "text":
