@@ -34,9 +34,9 @@ jobs:
       - name: Check code formatting
         working-directory: mist_desktop
         run: |
-          flutter format --set-exit-if-changed lib/
+          dart format --set-exit-if-changed lib/
           if [ $? -ne 0 ]; then
-            echo "Code is not formatted. Run: flutter format lib/"
+            echo "Code is not formatted. Run: dart format lib/"
             exit 1
           fi
 
