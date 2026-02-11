@@ -149,4 +149,4 @@ The app includes debug logging via the Logger package. Check console output for 
 
 ## Next Steps
 
-See [FLUTTER_MIGRATION_PLAN.md](../FLUTTER_MIGRATION_PLAN.md) for the complete migration roadmap.
+See [knowledge-vault/08-Reference/Flutter-Migration-Plan.md](../knowledge-vault/08-Reference/Flutter-Migration-Plan.md) for the complete migration roadmap.

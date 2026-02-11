@@ -212,7 +212,7 @@ flutter devices  # List available devices
 flutter run -d <device-id>
 ```
 
-See [FLUTTER_MIGRATION_PLAN.md](FLUTTER_MIGRATION_PLAN.md) for detailed setup instructions.
+For detailed Flutter migration documentation, see knowledge-vault/08-Reference/Flutter-Migration-Plan.md.
 
 ## Key Features
 
@@ -291,7 +291,6 @@ mist.ai/
 ├── .env                              # Configuration (create from example)
 ├── README.md                         # This file
 ├── QUICKSTART_KNOWLEDGE_INTEGRATION.md # Quick KG setup guide
-├── INTEGRATION_STATUS.md             # Knowledge graph integration status
 ├── E2E_TEST_GUIDE.md                # End-to-end testing guide
 ├── NEO4J_QUERIES.md                 # Useful Neo4j query reference
 └── LICENSE                           # MIT License
@@ -357,19 +356,15 @@ See [E2E_TEST_GUIDE.md](E2E_TEST_GUIDE.md) for comprehensive testing instruction
 
 ### Core Documentation
 - [QUICKSTART_KNOWLEDGE_INTEGRATION.md](QUICKSTART_KNOWLEDGE_INTEGRATION.md) - Quick KG setup
-- [INTEGRATION_STATUS.md](INTEGRATION_STATUS.md) - Knowledge graph integration status
 - [E2E_TEST_GUIDE.md](E2E_TEST_GUIDE.md) - End-to-end testing workflow
 - [NEO4J_QUERIES.md](NEO4J_QUERIES.md) - Useful Neo4j query reference
 - [REPOSITORY_STRUCTURE.md](REPOSITORY_STRUCTURE.md) - Detailed project structure
 
 ### Technical Guides
-- [Flutter Migration Plan](FLUTTER_MIGRATION_PLAN.md) - Comprehensive Flutter desktop implementation guide
 - [Windows Dev Setup](docs/guides/windows_dev_setup.md) - Environment setup
 - [Torch Compile Fix](docs/guides/TORCH_COMPILE_FIX.md) - PyTorch optimization issues
 
 ### Architecture Decision Records
-- [ADR 001: Vision](docs/decisions/adr_001_vision.md) - Project vision and philosophy
-- [ADR 007: Sesame CSM](docs/decisions/adr_007_sesame_csm.md) - TTS selection rationale
 
 ## Project Status
 

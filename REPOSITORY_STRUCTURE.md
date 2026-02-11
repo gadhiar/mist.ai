@@ -14,7 +14,7 @@ Production-ready repository with Flutter desktop frontend + Python backend.
 ### Documentation
 - `README.md` - Main project documentation
 - `E2E_TEST_GUIDE.md` - End-to-end testing instructions
-- `INTEGRATION_STATUS.md` - Knowledge integration status
+- `knowledge-vault/02-Sessions/Knowledge-Integration-Status.md` - Knowledge integration status
 - `QUICKSTART_KNOWLEDGE_INTEGRATION.md` - Quick start guide
 - `NEO4J_QUERIES.md` - Useful Neo4j queries reference
 - `LICENSE` - License file
@@ -125,8 +125,8 @@ docs/
 
 Root documentation:
 ├── README.md                        # Main project readme
-├── FLUTTER_MIGRATION_PLAN.md        # Comprehensive Flutter migration guide (1600 lines)
-├── INTEGRATION_STATUS.md            # Knowledge graph integration status
+├── knowledge-vault/08-Reference/Flutter-Migration-Plan.md        # Comprehensive Flutter migration guide (1600 lines)
+├── knowledge-vault/02-Sessions/Knowledge-Integration-Status.md            # Knowledge graph integration status
 ├── QUICKSTART_KNOWLEDGE_INTEGRATION.md # Quick KG setup
 ├── E2E_TEST_GUIDE.md               # End-to-end testing guide
 ├── NEO4J_QUERIES.md                # Useful Neo4j query reference

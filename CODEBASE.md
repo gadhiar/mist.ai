@@ -307,7 +307,7 @@ cd mist_desktop && flutter pub get
 - **CLAUDE.md** - AI integration guidelines (READ THIS FIRST)
 - **README.md** - Project overview and setup
 - **REPOSITORY_STRUCTURE.md** - File organization
-- **FLUTTER_MIGRATION_PLAN.md** - Detailed Flutter architecture
+- **knowledge-vault/08-Reference/Flutter-Migration-Plan.md** - Detailed Flutter architecture
 - **CONTRIBUTING.md** - Code quality standards
 
 ### Configuration
@@ -317,8 +317,8 @@ cd mist_desktop && flutter pub get
 - **.pre-commit-config.yaml** - Pre-commit hooks
 
 ### Key Decisions
-- **docs/decisions/adr_001_vision.md** - Project vision and philosophy
-- **docs/decisions/adr_007_sesame_csm.md** - TTS selection rationale
+- **knowledge-vault/03-Decisions/ADR-001-MIST-Vision-and-Architecture.md** - Project vision and philosophy
+- **knowledge-vault/03-Decisions/ADR-007-Sesame-CSM-TTS.md** - TTS selection rationale
 
 ---
 
