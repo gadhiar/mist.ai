@@ -2,13 +2,16 @@
 Streaming voice interface: Real-time STT -> LLM streaming -> TTS streaming
 Lowest latency voice interaction
 """
-import ollama
+
 import queue
-import threading
 import re
+import threading
+import time
+
+import ollama
 import sounddevice as sd
 import torch
-import time
+
 from src.multimodal.stt import WhisperSTT
 from src.multimodal.tts import SesameTTS
 from src.utils.cleanup import register_cleanup
@@ -45,9 +48,9 @@ class StreamingVoiceInterface:
 
         # Warmup LLM
         print("3/3 Warming up LLM...")
-        ollama.chat(model=self.llm_model, messages=[{'role': 'user', 'content': 'hi'}])
+        ollama.chat(model=self.llm_model, messages=[{"role": "user", "content": "hi"}])
 
-        print("\n✓ Streaming voice interface ready!\n")
+        print("\n Streaming voice interface ready!\n")
 
         # Audio playback management
         self.audio_queue = queue.Queue()
@@ -101,8 +104,11 @@ class StreamingVoiceInterface:
                 remaining_in_chunk = len(self._current_chunk) - self._chunk_position
                 samples_to_copy = min(remaining_in_chunk, samples_needed - samples_written)
 
-                outdata[samples_written:samples_written + samples_to_copy, 0] = \
-                    self._current_chunk[self._chunk_position:self._chunk_position + samples_to_copy]
+                outdata[samples_written : samples_written + samples_to_copy, 0] = (
+                    self._current_chunk[
+                        self._chunk_position : self._chunk_position + samples_to_copy
+                    ]
+                )
 
                 self._chunk_position += samples_to_copy
                 samples_written += samples_to_copy
@@ -113,7 +119,7 @@ class StreamingVoiceInterface:
             channels=1,
             blocksize=2048,  # ~85ms latency, good balance for conversational AI
             callback=audio_callback,
-            dtype=np.float32
+            dtype=np.float32,
         )
 
         try:
@@ -208,13 +214,13 @@ class StreamingVoiceInterface:
         """
         response = ollama.chat(
             model=self.llm_model,
-            messages=[{'role': 'user', 'content': prompt}],
-            stream=True  # Enable streaming mode
+            messages=[{"role": "user", "content": prompt}],
+            stream=True,  # Enable streaming mode
         )
 
         for chunk in response:
-            if 'message' in chunk and 'content' in chunk['message']:
-                yield chunk['message']['content']
+            if "message" in chunk and "content" in chunk["message"]:
+                yield chunk["message"]["content"]
 
     def _split_into_speech_chunks(self, text: str) -> list:
         """
@@ -229,7 +235,7 @@ class StreamingVoiceInterface:
             List of text chunks
         """
         # Split on sentence endings or long clauses
-        chunks = re.split(r'([.!?;:,]\s+)', text)
+        chunks = re.split(r"([.!?;:,]\s+)", text)
 
         # Recombine chunks with their punctuation
         result = []
@@ -253,7 +259,7 @@ class StreamingVoiceInterface:
             True if this is a good place to pause and generate audio
         """
         # Check for sentence endings or natural pauses
-        return any(punct in text for punct in ['.', '!', '?', ';\n', ':\n'])
+        return any(punct in text for punct in [".", "!", "?", ";\n", ":\n"])
 
     def _preprocess_text_for_tts(self, text: str) -> str:
         """
@@ -269,14 +275,14 @@ class StreamingVoiceInterface:
             Cleaned text with only allowed punctuation
         """
         # Remove all punctuation except . , ! ? '
-        pattern = r'[^\w\s.,!?\']'
-        cleaned_text = re.sub(pattern, '', text)
+        pattern = r"[^\w\s.,!?\']"
+        cleaned_text = re.sub(pattern, "", text)
 
         # Normalize multiple spaces to single space
-        cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
+        cleaned_text = re.sub(r"\s+", " ", cleaned_text)
 
         # Ensure there's a space after punctuation for better speech pacing
-        cleaned_text = re.sub(r'([.,!?])(\S)', r'\1 \2', cleaned_text)
+        cleaned_text = re.sub(r"([.,!?])(\S)", r"\1 \2", cleaned_text)
 
         return cleaned_text.strip()
 
@@ -309,7 +315,7 @@ class StreamingVoiceInterface:
         self.first_playback_time = None
 
         # 1. Listen (blocking, no way around this)
-        print("🎤 Listening...")
+        print(" Listening...")
         user_text = self.stt.listen(duration=duration)
         t_stt = time.time()
         if debug:
@@ -321,7 +327,7 @@ class StreamingVoiceInterface:
             return user_text, ""
 
         # 2. Stream LLM response and collect full text
-        print("Mist: ", end='', flush=True)
+        print("Mist: ", end="", flush=True)
 
         full_response = ""
         t_first_token = None
@@ -333,10 +339,10 @@ class StreamingVoiceInterface:
                     t_first_token = time.time()
                     if debug:
                         print(f"\n[DEBUG] First token: {t_first_token - t_stt:.2f}s", flush=True)
-                        print("Mist: ", end='', flush=True)
+                        print("Mist: ", end="", flush=True)
 
                 full_response += token
-                print(token, end='', flush=True)
+                print(token, end="", flush=True)
 
             print()  # Newline after response
             t_llm_done = time.time()
@@ -362,7 +368,7 @@ class StreamingVoiceInterface:
 
             # 5. Stream TTS at AUDIO level (not text level)
             # Pass ENTIRE text to generate_stream - it handles chunking internally
-            print("🔊 Generating speech...")
+            print(" Generating speech...")
             t_tts_start = time.time()
             audio_chunk_count = 0
             t_first_audio_chunk = None
@@ -375,12 +381,14 @@ class StreamingVoiceInterface:
                 context=self.tts.context if self.tts.use_context else [],
                 max_audio_length_ms=self.tts._estimate_audio_length(preprocessed_text),
                 temperature=0.8,  # Production setting (was 0.7)
-                topk=50  # Production setting (was 30)
+                topk=50,  # Production setting (was 30)
             ):
                 if t_first_audio_chunk is None:
                     t_first_audio_chunk = time.time()
                     if debug:
-                        print(f"[DEBUG] First audio chunk: {t_first_audio_chunk - t_stt:.2f}s from end of speech")
+                        print(
+                            f"[DEBUG] First audio chunk: {t_first_audio_chunk - t_stt:.2f}s from end of speech"
+                        )
 
                 audio_chunk_count += 1
 
@@ -390,13 +398,15 @@ class StreamingVoiceInterface:
             t_tts_done = time.time()
 
             if debug:
-                print(f"[DEBUG] TTS generation complete: {t_tts_done - t_tts_start:.2f}s ({audio_chunk_count} chunks)")
+                print(
+                    f"[DEBUG] TTS generation complete: {t_tts_done - t_tts_start:.2f}s ({audio_chunk_count} chunks)"
+                )
 
             # Update TTS context for voice consistency
             if self.tts.use_context and audio_chunk_count > 0:
                 # Concatenate all chunks for context
                 # (audio already sent to queue, we just need to track context)
-                from generator import Segment
+
                 # We'll update context after playback completes
                 pass
 
@@ -410,7 +420,7 @@ class StreamingVoiceInterface:
             t_end = time.time()
 
             if debug:
-                print(f"\n[DEBUG] === TIMING BREAKDOWN ===")
+                print("\n[DEBUG] === TIMING BREAKDOWN ===")
                 print(f"[DEBUG] Total time: {t_end - t_start:.2f}s")
                 print(f"[DEBUG] STT: {t_stt - t_start:.2f}s")
                 if t_first_token:
@@ -420,14 +430,19 @@ class StreamingVoiceInterface:
                 if t_first_audio_chunk:
                     print(f"[DEBUG] First audio chunk: {t_first_audio_chunk - t_stt:.2f}s")
                 if self.first_playback_time:
-                    print(f"[DEBUG] First audio PLAYING: {self.first_playback_time - t_start:.2f}s ← USER HEARS")
-                print(f"[DEBUG] TTS generation: {t_tts_done - t_tts_start:.2f}s ({audio_chunk_count} chunks)")
+                    print(
+                        f"[DEBUG] First audio PLAYING: {self.first_playback_time - t_start:.2f}s -> USER HEARS"
+                    )
+                print(
+                    f"[DEBUG] TTS generation: {t_tts_done - t_tts_start:.2f}s ({audio_chunk_count} chunks)"
+                )
                 print(f"[DEBUG] Total playback: {t_end - t_tts_done:.2f}s")
-                print(f"[DEBUG] ========================\n")
+                print("[DEBUG] ========================\n")
 
         except Exception as e:
             print(f"\nError during streaming: {e}")
             import traceback
+
             traceback.print_exc()
             self.stop_playback.set()
             if self.playback_thread and self.playback_thread.is_alive():
@@ -435,7 +450,6 @@ class StreamingVoiceInterface:
             return user_text, full_response
 
         return user_text, full_response
-
 
     def converse(self, duration: int = 5, debug: bool = False) -> tuple[str, str]:
         """
@@ -466,15 +480,15 @@ class StreamingVoiceInterface:
                 user_text, ai_text = self.converse_streaming(duration=5, debug=debug)
 
                 # Check for exit
-                if any(word in user_text.lower() for word in ['goodbye', 'exit', 'quit', 'stop']):
-                    print("\n👋 Ending conversation. Goodbye!")
+                if any(word in user_text.lower() for word in ["goodbye", "exit", "quit", "stop"]):
+                    print("\n Ending conversation. Goodbye!")
                     break
 
             except KeyboardInterrupt:
-                print("\n\n👋 Conversation interrupted. Goodbye!")
+                print("\n\n Conversation interrupted. Goodbye!")
                 break
             except Exception as e:
-                print(f"\n❌ Error: {e}")
+                print(f"\n Error: {e}")
                 break
 
 

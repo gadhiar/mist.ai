@@ -5,12 +5,19 @@ Provides a bridge between existing voice system and knowledge-augmented conversa
 """
 
 import asyncio
+import contextlib
 import logging
-from typing import Generator, Optional
+from collections.abc import Generator
 
 from backend.chat.conversation_handler import ConversationHandler
+from backend.knowledge.config import (
+    EmbeddingConfig,
+    ExtractionConfig,
+    KnowledgeConfig,
+    LLMConfig,
+    Neo4jConfig,
+)
 from backend.knowledge.storage.graph_store import GraphStore
-from backend.knowledge.config import KnowledgeConfig, Neo4jConfig, LLMConfig, EmbeddingConfig, ExtractionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +34,7 @@ class KnowledgeIntegration:
         neo4j_uri: str = "bolt://localhost:7687",
         neo4j_user: str = "neo4j",
         neo4j_password: str = "your_password",
-        model_name: str = "qwen2.5:7b"
+        model_name: str = "qwen2.5:7b",
     ):
         """
         Initialize knowledge integration.
@@ -39,16 +46,12 @@ class KnowledgeIntegration:
             model_name: Ollama model to use
         """
         self.enabled = False
-        self.conversation_handler: Optional[ConversationHandler] = None
+        self.conversation_handler: ConversationHandler | None = None
         self.current_session_id = "default"
 
         try:
             # Build complete knowledge config
-            neo4j_config = Neo4jConfig(
-                uri=neo4j_uri,
-                username=neo4j_user,
-                password=neo4j_password
-            )
+            neo4j_config = Neo4jConfig(uri=neo4j_uri, username=neo4j_user, password=neo4j_password)
 
             llm_config = LLMConfig(model=model_name)
             embedding_config = EmbeddingConfig()
@@ -58,7 +61,7 @@ class KnowledgeIntegration:
                 neo4j=neo4j_config,
                 llm=llm_config,
                 embedding=embedding_config,
-                extraction=extraction_config
+                extraction=extraction_config,
             )
 
             # Initialize graph store with knowledge config
@@ -66,23 +69,21 @@ class KnowledgeIntegration:
 
             # Initialize conversation handler with full knowledge config
             self.conversation_handler = ConversationHandler(
-                config=knowledge_config,
-                graph_store=graph_store,
-                model_name=model_name
+                config=knowledge_config, graph_store=graph_store, model_name=model_name
             )
 
             self.enabled = True
-            logger.info("✅ Knowledge integration enabled")
+            logger.info(" Knowledge integration enabled")
 
         except Exception as e:
-            logger.warning(f"⚠️  Knowledge integration disabled: {e}")
+            logger.warning(f"  Knowledge integration disabled: {e}")
             logger.warning("Falling back to standard LLM (no knowledge graph)")
 
     def generate_response_streaming(
         self,
         user_text: str,
-        session_id: Optional[str] = None,
-        event_loop: Optional[asyncio.AbstractEventLoop] = None
+        session_id: str | None = None,
+        event_loop: asyncio.AbstractEventLoop | None = None,
     ) -> Generator[str, None, None]:
         """
         Generate LLM response with knowledge integration (streaming).
@@ -111,25 +112,20 @@ class KnowledgeIntegration:
                 # Use provided event loop (from voice_processor)
                 future = asyncio.run_coroutine_threadsafe(
                     self.conversation_handler.handle_message(
-                        user_message=user_text,
-                        session_id=sid
+                        user_message=user_text, session_id=sid
                     ),
-                    event_loop
+                    event_loop,
                 )
                 response = future.result()
             else:
                 # No event loop provided, create one (for testing)
                 import nest_asyncio
-                try:
+
+                with contextlib.suppress(BaseException):
                     nest_asyncio.apply()
-                except:
-                    pass
 
                 response = asyncio.run(
-                    self.conversation_handler.handle_message(
-                        user_message=user_text,
-                        session_id=sid
-                    )
+                    self.conversation_handler.handle_message(user_message=user_text, session_id=sid)
                 )
 
             # Yield complete response
@@ -145,7 +141,7 @@ class KnowledgeIntegration:
         self.current_session_id = session_id
         logger.info(f"Session ID set to: {session_id}")
 
-    def clear_session(self, session_id: Optional[str] = None):
+    def clear_session(self, session_id: str | None = None):
         """Clear a conversation session"""
         if self.conversation_handler:
             sid = session_id or self.current_session_id

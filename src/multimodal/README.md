@@ -131,17 +131,17 @@ vi.start_conversation()
 **Flow:**
 ```
 Microphone Input
-    ↓
+    ->
 VAD Detection
-    ↓
+    ->
 [Speech Detected]
-    ↓
+    ->
 STT Transcription
-    ↓
+    ->
 LLM Generation
-    ↓
+    ->
 TTS Synthesis (streaming)
-    ↓
+    ->
 Audio Playback (chunks)
 ```
 
@@ -178,15 +178,15 @@ vi.start_conversation()
 **Interrupt Flow:**
 ```
 AI Speaking
-    ↓
+    ->
 [User Starts Speaking]
-    ↓
+    ->
 VAD Detects Speech (50ms)
-    ↓
+    ->
 Stop TTS Generation
-    ↓
+    ->
 Clear Audio Buffer
-    ↓
+    ->
 Listen to User
 ```
 

@@ -20,8 +20,7 @@ from backend.knowledge.config import KnowledgeConfig
 from backend.knowledge.storage.neo4j_connection import Neo4jConnection
 
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -29,14 +28,14 @@ logger = logging.getLogger(__name__)
 def wipe_database():
     """Completely wipe the Neo4j database"""
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("WARNING: DATABASE WIPE")
-    print("="*60)
+    print("=" * 60)
     print("This will DELETE EVERYTHING from Neo4j:")
     print("  - All nodes (ConversationEvents, Utterances, Entities)")
     print("  - All relationships")
     print("  - All indexes and constraints")
-    print("="*60)
+    print("=" * 60)
 
     response = input("\nType 'DELETE EVERYTHING' to confirm: ")
 
@@ -63,7 +62,7 @@ def wipe_database():
     try:
         constraints = connection.execute_query(constraints_query)
         for constraint in constraints:
-            constraint_name = constraint.get('name')
+            constraint_name = constraint.get("name")
             if constraint_name:
                 try:
                     drop_query = f"DROP CONSTRAINT {constraint_name} IF EXISTS"
@@ -80,9 +79,9 @@ def wipe_database():
     try:
         indexes = connection.execute_query(indexes_query)
         for index in indexes:
-            index_name = index.get('name')
+            index_name = index.get("name")
             # Skip constraint-backed indexes (they're dropped with constraints)
-            if index_name and index.get('type') != 'CONSTRAINT':
+            if index_name and index.get("type") != "CONSTRAINT":
                 try:
                     drop_query = f"DROP INDEX {index_name} IF EXISTS"
                     connection.execute_write(drop_query)
@@ -94,12 +93,12 @@ def wipe_database():
 
     connection.disconnect()
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("DATABASE WIPED SUCCESSFULLY")
-    print("="*60)
+    print("=" * 60)
     print("The Neo4j database is now completely empty.")
     print("Run seed_from_docs.py to populate with MIST documentation.")
-    print("="*60 + "\n")
+    print("=" * 60 + "\n")
 
 
 if __name__ == "__main__":

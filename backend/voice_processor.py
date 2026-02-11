@@ -1,16 +1,18 @@
 """
 Voice Processor - Handles voice conversation logic
 """
-import sys
+
 import asyncio
+import logging
+import queue
+import sys
 import threading
 import time
-import queue
-import logging
-import torch
-import numpy as np
 from datetime import datetime
 from pathlib import Path
+
+import numpy as np
+import torch
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
@@ -100,9 +102,7 @@ class VoiceProcessor:
         """Called by VAD when user starts speaking"""
         # Send message to clients (using saved event loop reference)
         asyncio.run_coroutine_threadsafe(
-            self.message_queue.put(
-                {"type": "vad_status", "status": "speech_started"}
-            ),
+            self.message_queue.put({"type": "vad_status", "status": "speech_started"}),
             self.loop,
         )
 
@@ -113,7 +113,7 @@ class VoiceProcessor:
 
     def _on_speech_end(self, audio_data, sample_rate):
         """Called by VAD when user stops speaking - SPAWN NEW THREAD"""
-        log_timestamp(f"Speech ended, spawning processing thread...")
+        log_timestamp("Speech ended, spawning processing thread...")
 
         # Process in separate thread (CSM pattern!)
         threading.Thread(
@@ -126,9 +126,7 @@ class VoiceProcessor:
         """Process user speech (runs in separate thread)"""
         try:
             # Transcribe
-            log_timestamp(
-                f"Transcribing audio ({len(audio_data)} samples @ {sample_rate}Hz)..."
-            )
+            log_timestamp(f"Transcribing audio ({len(audio_data)} samples @ {sample_rate}Hz)...")
             t_start = time.time()
             user_text = self.models.transcribe_audio(audio_data, sample_rate)
             t_elapsed = time.time() - t_start
@@ -174,7 +172,7 @@ class VoiceProcessor:
             self.is_speaking = True
 
             # Generate LLM response
-            log_timestamp(f"LLM: Generating response...")
+            log_timestamp("LLM: Generating response...")
             llm_start = time.time()
             full_response = ""
 
@@ -197,19 +195,15 @@ class VoiceProcessor:
 
             if trimmed_length < original_length:
                 log_timestamp(
-                    f"LLM complete ({llm_time:.2f}s, {original_length} chars, " +
-                    f"trimmed to {trimmed_length} chars at sentence boundary)"
+                    f"LLM complete ({llm_time:.2f}s, {original_length} chars, "
+                    + f"trimmed to {trimmed_length} chars at sentence boundary)"
                 )
             else:
-                log_timestamp(
-                    f"LLM complete ({llm_time:.2f}s, {len(full_response)} chars)"
-                )
+                log_timestamp(f"LLM complete ({llm_time:.2f}s, {len(full_response)} chars)")
 
             # Send full response
             asyncio.run_coroutine_threadsafe(
-                self.message_queue.put(
-                    {"type": "llm_response", "text": full_response}
-                ),
+                self.message_queue.put({"type": "llm_response", "text": full_response}),
                 self.loop,
             )
 
@@ -251,9 +245,7 @@ class VoiceProcessor:
                     )
 
                 tts_total = time.time() - tts_start
-                log_timestamp(
-                    f"TTS generation complete ({tts_total:.2f}s, {chunk_count} chunks)"
-                )
+                log_timestamp(f"TTS generation complete ({tts_total:.2f}s, {chunk_count} chunks)")
             else:
                 log_timestamp("TTS: Disabled (text-only mode)")
 
@@ -266,9 +258,7 @@ class VoiceProcessor:
         except Exception as e:
             logger.error(f"Error in conversation turn: {e}", exc_info=True)
             asyncio.run_coroutine_threadsafe(
-                self.message_queue.put(
-                    {"type": "error", "message": f"Generation error: {e}"}
-                ),
+                self.message_queue.put({"type": "error", "message": f"Generation error: {e}"}),
                 self.loop,
             )
 
@@ -308,11 +298,7 @@ class VoiceProcessor:
             if sample_rate != self.config.vad_sample_rate:
                 import scipy.signal
 
-                num_samples = int(
-                    len(audio_data)
-                    * self.config.vad_sample_rate
-                    / sample_rate
-                )
+                num_samples = int(len(audio_data) * self.config.vad_sample_rate / sample_rate)
                 audio_data = scipy.signal.resample(audio_data, num_samples)
 
             # Feed to VAD

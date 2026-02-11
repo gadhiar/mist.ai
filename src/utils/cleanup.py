@@ -1,9 +1,10 @@
 """
 Utility for cleaning up Ollama service on application exit.
 """
+
 import atexit
-import subprocess
 import logging
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -11,7 +12,7 @@ logger = logging.getLogger(__name__)
 def stop_ollama():
     """Stop Ollama service to free VRAM."""
     try:
-        subprocess.run(['ollama', 'stop'], check=False, capture_output=True)
+        subprocess.run(["ollama", "stop"], check=False, capture_output=True)
         logger.info("Ollama service stopped successfully")
     except Exception as e:
         logger.error(f"Failed to stop Ollama: {e}")

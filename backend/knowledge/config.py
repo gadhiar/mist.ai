@@ -6,7 +6,7 @@ Central configuration for Neo4j connection, embedding models, and extraction set
 
 import os
 from dataclasses import dataclass
-from typing import Optional
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,7 +18,7 @@ class Neo4jConfig:
 
     uri: str = "bolt://localhost:7687"  # Default Neo4j Desktop URI
     username: str = "neo4j"
-    password: str = os.getenv('NEO4J_PASSWORD')
+    password: str = os.getenv("NEO4J_PASSWORD")
     database: str = "neo4j"  # Default database name
 
     @classmethod
@@ -28,7 +28,7 @@ class Neo4jConfig:
             uri=os.getenv("NEO4J_URI", "bolt://localhost:7687"),
             username=os.getenv("NEO4J_USERNAME", "neo4j"),
             password=os.getenv("NEO4J_PASSWORD"),
-            database=os.getenv("NEO4J_DATABASE", "neo4j")
+            database=os.getenv("NEO4J_DATABASE", "neo4j"),
         )
 
 
@@ -46,7 +46,7 @@ class EmbeddingConfig:
         return cls(
             model_name=os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
             dimension=int(os.getenv("EMBEDDING_DIMENSION", "384")),
-            device=os.getenv("EMBEDDING_DEVICE", "cpu")
+            device=os.getenv("EMBEDDING_DEVICE", "cpu"),
         )
 
 
@@ -64,7 +64,7 @@ class LLMConfig:
         return cls(
             model=os.getenv("MODEL", "qwen2.5:7b-instruct"),
             base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-            temperature=float(os.getenv("LLM_TEMPERATURE", "0.0"))
+            temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
         )
 
 
@@ -77,8 +77,8 @@ class ExtractionConfig:
     extract_relationship_properties: bool = True  # Extract edge descriptions
 
     # Ontology constraints (None = dynamic extraction)
-    allowed_nodes: Optional[list[str]] = None
-    allowed_relationships: Optional[list[str]] = None
+    allowed_nodes: list[str] | None = None
+    allowed_relationships: list[str] | None = None
 
     # LLM instructions for extraction
     additional_instructions: str = """
@@ -88,9 +88,9 @@ class ExtractionConfig:
     1. ALWAYS create a "User" entity for first-person pronouns (I, me, my, mine)
     2. The User is the SUBJECT performing actions - relationships flow FROM User TO other entities
     3. Relationship direction MUST be correct: subject -[VERB]-> object
-       - "Sarah taught me React" → Sarah -[TAUGHT]-> User (subject is Sarah), User -[LEARNED]-> React
-       - "I use Python" → User -[USES]-> Python (NOT Python uses anything)
-       - "I work on Project" → User -[WORKS_ON]-> Project
+       - "Sarah taught me React" -> Sarah -[TAUGHT]-> User (subject is Sarah), User -[LEARNED]-> React
+       - "I use Python" -> User -[USES]-> Python (NOT Python uses anything)
+       - "I work on Project" -> User -[WORKS_ON]-> Project
 
     Entity Guidelines:
     - Extract: tools, technologies, projects, topics, skills, people, organizations
@@ -104,20 +104,20 @@ class ExtractionConfig:
     - Skill level: EXPERT_IN, PROFICIENT_IN, BEGINNER_IN, LEARNING
     - Temporal: USED_TO_USE, PLANS_TO_LEARN (capture time in properties)
     - Negation: DOES_NOT_USE, AVOIDS, HAS_NOT_WORKED_WITH
-    - Multi-entity: "I use X with Y" → User -[USES]-> X, User -[USES]-> Y, X -[WORKS_WITH]-> Y
+    - Multi-entity: "I use X with Y" -> User -[USES]-> X, User -[USES]-> Y, X -[WORKS_WITH]-> Y
 
     Property Capture:
-    - Temporal info: "for 3 months" → {{duration: "3 months"}}
-    - Time: "next month" → {{when: "next month"}}
-    - Proficiency: "expert", "beginner" → {{proficiency: "expert"}}
-    - Context: "in production", "daily" → {{context: "in production"}}
+    - Temporal info: "for 3 months" -> {{duration: "3 months"}}
+    - Time: "next month" -> {{when: "next month"}}
+    - Proficiency: "expert", "beginner" -> {{proficiency: "expert"}}
+    - Context: "in production", "daily" -> {{context: "in production"}}
 
     Common Patterns:
-    - "I have trouble with X" → User -[STRUGGLES_WITH]-> X
-    - "I'm good at X" → User -[PROFICIENT_IN]-> X
-    - "X for Y" when both are tools → User -[USES]-> X, X -[USED_FOR]-> Y
-    - "X with Y" → create relationships to BOTH, plus X -[WORKS_WITH]-> Y if applicable
-    - "prefer X over Y" → User -[PREFERS]-> X (do NOT create relationship with Y)
+    - "I have trouble with X" -> User -[STRUGGLES_WITH]-> X
+    - "I'm good at X" -> User -[PROFICIENT_IN]-> X
+    - "X for Y" when both are tools -> User -[USES]-> X, X -[USED_FOR]-> Y
+    - "X with Y" -> create relationships to BOTH, plus X -[WORKS_WITH]-> Y if applicable
+    - "prefer X over Y" -> User -[PREFERS]-> X (do NOT create relationship with Y)
     """
 
     # Confidence thresholds
@@ -128,8 +128,9 @@ class ExtractionConfig:
         """Load configuration from environment variables"""
         return cls(
             extract_node_properties=os.getenv("EXTRACT_NODE_PROPERTIES", "true").lower() == "true",
-            extract_relationship_properties=os.getenv("EXTRACT_REL_PROPERTIES", "true").lower() == "true",
-            min_extraction_confidence=float(os.getenv("MIN_EXTRACTION_CONFIDENCE", "0.5"))
+            extract_relationship_properties=os.getenv("EXTRACT_REL_PROPERTIES", "true").lower()
+            == "true",
+            min_extraction_confidence=float(os.getenv("MIN_EXTRACTION_CONFIDENCE", "0.5")),
         )
 
 
@@ -150,7 +151,9 @@ class KnowledgeConfig:
     # Auto-RAG configuration
     auto_inject_docs: bool = True  # Enable/disable auto-injection
     auto_inject_limit: int = 3  # Number of chunks to auto-inject
-    auto_inject_threshold: float = 0.4  # Similarity threshold for auto-injection (lowered for permissive matching)
+    auto_inject_threshold: float = (
+        0.4  # Similarity threshold for auto-injection (lowered for permissive matching)
+    )
 
     @classmethod
     def from_env(cls) -> "KnowledgeConfig":
@@ -165,12 +168,12 @@ class KnowledgeConfig:
             enable_provenance=os.getenv("ENABLE_PROVENANCE", "true").lower() == "true",
             auto_inject_docs=os.getenv("AUTO_INJECT_DOCS", "true").lower() == "true",
             auto_inject_limit=int(os.getenv("AUTO_INJECT_LIMIT", "3")),
-            auto_inject_threshold=float(os.getenv("AUTO_INJECT_THRESHOLD", "0.4"))
+            auto_inject_threshold=float(os.getenv("AUTO_INJECT_THRESHOLD", "0.4")),
         )
 
 
 # Global config instance
-_config: Optional[KnowledgeConfig] = None
+_config: KnowledgeConfig | None = None
 
 
 def get_config() -> KnowledgeConfig:

@@ -151,7 +151,7 @@ class AudioPlaybackService {
       final source = BytesSource(wavData);
 
       await _player.play(source);
-      _logger.d('Playing audio chunk (${bytes.length} bytes → ${wavData.length} bytes with WAV header, ${sampleRate}Hz)');
+      _logger.d('Playing audio chunk (${bytes.length} bytes -> ${wavData.length} bytes with WAV header, ${sampleRate}Hz)');
     } catch (e) {
       _logger.e('Error in _playBytes: $e');
       rethrow;

@@ -166,18 +166,18 @@ Root documentation:
 
 ## Integration Points
 
-### Flutter Frontend ↔ Backend
+### Flutter Frontend -> Backend
 ```
 Flutter App (mist_desktop/)
-  ↓ WebSocket (ws://localhost:8001)
+  -> WebSocket (ws://localhost:8001)
 Backend Server (server.py)
-  ↓ Receives audio/text messages
-Voice Processor → STT → LLM → TTS
-  ↓ Sends transcription/tokens/audio
+  -> Receives audio/text messages
+Voice Processor -> STT -> LLM -> TTS
+  -> Sends transcription/tokens/audio
 Flutter App (displays messages, plays audio)
 ```
 
-### Backend → Knowledge Graph
+### Backend -> Knowledge Graph
 ```python
 # In model_manager.py:
 if self.knowledge and self.knowledge.is_enabled():
@@ -189,12 +189,12 @@ else:
     ...
 ```
 
-### Knowledge Graph → Neo4j
+### Knowledge Graph -> Neo4j
 ```
 ConversationHandler
-  ↓ (autonomous tool use)
-query_knowledge_graph → KnowledgeRetriever → GraphStore → Neo4j
-extract_knowledge → EntityExtractor → GraphStore → Neo4j
+  -> (autonomous tool use)
+query_knowledge_graph -> KnowledgeRetriever -> GraphStore -> Neo4j
+extract_knowledge -> EntityExtractor -> GraphStore -> Neo4j
 ```
 
 ---
@@ -338,7 +338,7 @@ Before deploying:
 
 ## Migration History
 
-### React → Flutter Migration (Dec 2024)
+### React -> Flutter Migration (Dec 2024)
 **Removed:**
 - React/TypeScript frontend (~127MB)
 - Old frontend architecture docs
@@ -360,13 +360,13 @@ Before deploying:
 
 ## Current Status
 
-**Backend:** ✅ Production-ready
+**Backend:**  Production-ready
 - Voice pipeline complete
 - Knowledge graph integrated
 - Autonomous tool usage working
 - WebSocket server stable
 
-**Frontend:** 🚧 In Development
+**Frontend:**  In Development
 - Flutter UI scaffolding complete
 - WebSocket connection working
 - Voice recording implemented

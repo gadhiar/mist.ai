@@ -8,8 +8,8 @@ Usage:
     python initialize_schema.py
 """
 
-import sys
 import logging
+import sys
 
 from backend.knowledge.config import get_config
 from backend.knowledge.storage import GraphStore
@@ -17,8 +17,8 @@ from backend.knowledge.storage import GraphStore
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 
 logger = logging.getLogger(__name__)
@@ -61,6 +61,7 @@ def main():
     except Exception as e:
         logger.error(f"Schema initialization failed: {e}")
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
 

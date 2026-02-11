@@ -3,14 +3,16 @@ CLI WebSocket Client for Voice AI Server
 
 For testing the WebSocket server before building web frontend
 """
+
 import asyncio
 import json
-import sys
 import queue
+import sys
 import threading
+from pathlib import Path
+
 import numpy as np
 import sounddevice as sd
-from pathlib import Path
 
 # Add project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -110,7 +112,7 @@ class VoiceClient:
         elif msg_type == "audio_chunk":
             # Queue audio for playback
             audio_list = data.get("audio")
-            sample_rate = data.get("sample_rate", 24000)
+            data.get("sample_rate", 24000)
             chunk_num = data.get("chunk_num")
 
             if chunk_num == 1:
@@ -208,8 +210,11 @@ class VoiceClient:
                 remaining_in_chunk = len(self._current_chunk) - self._chunk_position
                 samples_to_copy = min(remaining_in_chunk, samples_needed - samples_written)
 
-                outdata[samples_written:samples_written + samples_to_copy, 0] = \
-                    self._current_chunk[self._chunk_position:self._chunk_position + samples_to_copy]
+                outdata[samples_written : samples_written + samples_to_copy, 0] = (
+                    self._current_chunk[
+                        self._chunk_position : self._chunk_position + samples_to_copy
+                    ]
+                )
 
                 self._chunk_position += samples_to_copy
                 samples_written += samples_to_copy
@@ -220,7 +225,7 @@ class VoiceClient:
             channels=1,
             blocksize=2048,
             callback=audio_callback,
-            dtype=np.float32
+            dtype=np.float32,
         )
 
         print("[Playback] OutputStream created, waiting for audio...")
@@ -233,9 +238,7 @@ class VoiceClient:
         while self.running:
             try:
                 # Get audio chunk from WebSocket messages
-                audio_chunk = await asyncio.wait_for(
-                    self.playback_queue.get(), timeout=0.1
-                )
+                audio_chunk = await asyncio.wait_for(self.playback_queue.get(), timeout=0.1)
 
                 # Check for new audio generation signal (string, not array)
                 if isinstance(audio_chunk, str) and audio_chunk == "START_NEW_AUDIO":
@@ -272,14 +275,16 @@ class VoiceClient:
                     self._playback_buffer.put(audio_chunk)
 
                     if prebuffer_count >= PREBUFFER_TARGET:
-                        print(f"[Playback] Pre-buffered {prebuffer_count} chunks, starting stream...")
+                        print(
+                            f"[Playback] Pre-buffered {prebuffer_count} chunks, starting stream..."
+                        )
                         self._stream.start()
                         stream_started = True
                 else:
                     # Stream already started, just feed chunks
                     self._playback_buffer.put(audio_chunk)
 
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
             except Exception as e:
                 print(f"Playback error: {e}")
@@ -297,7 +302,7 @@ class VoiceClient:
                     while not self.playback_queue.empty():
                         try:
                             await asyncio.wait_for(self.playback_queue.get(), timeout=0.01)
-                        except asyncio.TimeoutError:
+                        except TimeoutError:
                             break
                     # Stream will be restarted when new audio arrives
 

@@ -54,13 +54,13 @@ class AudioRecordingService {
 
       _isRecording = true;
       _recordingController.add(true);
-      _logger.i('✅ Audio recording started (16kHz, mono, PCM16)');
+      _logger.i(' Audio recording started (16kHz, mono, PCM16)');
 
       // Listen to audio stream and collect in buffer
       _audioStreamSubscription = stream.listen(
         (audioChunk) {
           _audioBuffer.addAll(audioChunk);
-          _logger.d('📦 Collected audio chunk: ${audioChunk.length} bytes (total: ${_audioBuffer.length})');
+          _logger.d(' Collected audio chunk: ${audioChunk.length} bytes (total: ${_audioBuffer.length})');
         },
         onError: (error) {
           _logger.e('Audio stream error: $error');
@@ -98,7 +98,7 @@ class AudioRecordingService {
       if (_audioBuffer.isNotEmpty) {
         final completeAudio = Uint8List.fromList(_audioBuffer);
         _audioCompleteController.add(completeAudio);
-        _logger.i('✅ Audio recording stopped - collected ${completeAudio.length} bytes total');
+        _logger.i(' Audio recording stopped - collected ${completeAudio.length} bytes total');
 
         // Clear buffer for next recording
         _audioBuffer.clear();

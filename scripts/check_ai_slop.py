@@ -59,7 +59,7 @@ PATTERNS = [
     # CRITICAL: Common emoji-like unicode symbols
     SlopPattern(
         name="emoji_symbols",
-        pattern=re.compile(r"[✓✗✅❌🎯🔧🚀💡⚠️📝📊🏗️🌟💪🤔👍👎🔥💯🎉🎊]"),
+        pattern=re.compile(r"[]"),
         severity="critical",
         fixable=True,
         replacement="",  # Just remove them
@@ -67,7 +67,7 @@ PATTERNS = [
     # CRITICAL: Arrow symbols (use -> instead)
     SlopPattern(
         name="arrow_symbols",
-        pattern=re.compile(r"[→←↔↑↓⇒⇐⇔⟹⟸⟺➜➝➞➟➠➡➢➣➤]"),
+        pattern=re.compile(r"[->->->->->->->->->->->]"),
         severity="critical",
         fixable=True,
         replacement="->",

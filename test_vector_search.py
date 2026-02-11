@@ -1,7 +1,10 @@
 """Test vector search directly"""
+
 import asyncio
+
 from backend.knowledge.config import KnowledgeConfig
 from backend.knowledge.storage.graph_store import GraphStore
+
 
 async def test():
     config = KnowledgeConfig.from_env()
@@ -11,7 +14,7 @@ async def test():
     query = "MIST capabilities"
 
     print(f"Testing vector search for: '{query}'")
-    print(f"Threshold: 0.4")
+    print("Threshold: 0.4")
     print("-" * 60)
 
     # Search with NO threshold to see what scores we're actually getting
@@ -32,7 +35,7 @@ async def test():
 
     results = graph_store.connection.execute_query(test_query, params)
 
-    print(f"\nTop 10 results (no threshold):")
+    print("\nTop 10 results (no threshold):")
     for i, r in enumerate(results, 1):
         print(f"{i}. Score: {r['similarity']:.4f}")
         print(f"   Text: {r['text'][:100]}...")
@@ -45,6 +48,7 @@ async def test():
         check_results = graph_store.connection.execute_query(check_query, {})
         print(f"Total chunks: {check_results[0]['count']}")
         print(f"Sample IDs: {check_results[0]['sample_ids']}")
+
 
 if __name__ == "__main__":
     asyncio.run(test())

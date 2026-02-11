@@ -190,7 +190,7 @@ ORDER BY u.timestamp
 
 ### Recommended Style Settings
 
-In Neo4j Browser, go to bottom-left gear icon → Configure
+In Neo4j Browser, go to bottom-left gear icon -> Configure
 
 **Node Captions:**
 ```
@@ -198,13 +198,13 @@ In Neo4j Browser, go to bottom-left gear icon → Configure
 ```
 
 **Node Color by Label:**
-- `__Entity__` with `entity_type='Person'` → Blue
-- `__Entity__` with `entity_type='Technology'` → Green
-- `__Entity__` with `entity_type='Tool'` → Orange
-- `__Entity__` with `entity_type='Project'` → Purple
-- `__Entity__` with `entity_type='Topic'` → Yellow
-- `Utterance` → Gray (if showing provenance)
-- `ConversationEvent` → Light Gray (if showing provenance)
+- `__Entity__` with `entity_type='Person'` -> Blue
+- `__Entity__` with `entity_type='Technology'` -> Green
+- `__Entity__` with `entity_type='Tool'` -> Orange
+- `__Entity__` with `entity_type='Project'` -> Purple
+- `__Entity__` with `entity_type='Topic'` -> Yellow
+- `Utterance` -> Gray (if showing provenance)
+- `ConversationEvent` -> Light Gray (if showing provenance)
 
 **Relationship Captions:**
 Show relationship type by default.

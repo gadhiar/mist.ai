@@ -5,10 +5,10 @@ Generates vector embeddings for text using sentence-transformers.
 Enables semantic search on the knowledge graph.
 """
 
-from sentence_transformers import SentenceTransformer
-from typing import List
 import logging
+
 import numpy as np
+from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ class EmbeddingGenerator:
             logger.info("Embedding model loaded successfully")
         return self._model
 
-    def generate_embedding(self, text: str) -> List[float]:
+    def generate_embedding(self, text: str) -> list[float]:
         """
         Generate embedding vector for text
 
@@ -80,16 +80,12 @@ class EmbeddingGenerator:
         model = self._get_model()
 
         # Generate embedding
-        embedding = model.encode(
-            text,
-            convert_to_numpy=True,
-            show_progress_bar=False
-        )
+        embedding = model.encode(text, convert_to_numpy=True, show_progress_bar=False)
 
         # Convert to list and return
         return embedding.tolist()
 
-    def generate_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
+    def generate_embeddings_batch(self, texts: list[str]) -> list[list[float]]:
         """
         Generate embeddings for multiple texts (more efficient than one-by-one)
 
@@ -120,7 +116,7 @@ class EmbeddingGenerator:
             valid_texts,
             convert_to_numpy=True,
             show_progress_bar=len(texts) > 100,  # Show progress for large batches
-            batch_size=32
+            batch_size=32,
         )
 
         # Convert to list of lists

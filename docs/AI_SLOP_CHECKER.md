@@ -17,15 +17,15 @@ The AI Slop Checker is a Python script that detects and removes "AI slop" patter
 These patterns will cause the script to exit with error code 1:
 
 1. **emoji** - Unicode emojis (U+1F300-U+1F9FF range)
-   - Example: 🎯, 🚀, 💡, 🔥
+   - Example: , , , 
    - Auto-fixable: Yes (removes them)
 
 2. **emoji_symbols** - Common emoji-like unicode symbols
-   - Example: ✓, ✅, ❌, ⚠️, 📝
+   - Example: , , , , 
    - Auto-fixable: Yes (removes them)
 
 3. **arrow_symbols** - Unicode arrow characters
-   - Example: →, ←, ⇒, ➜
+   - Example: ->, ->, ->, 
    - Auto-fixable: Yes (replaces with `->`)
 
 ### Warning Issues (Consider Fixing)
@@ -48,7 +48,7 @@ These are flagged but don't cause script failure:
    - Auto-fixable: No
 
 7. **exclamation_spam** - Excessive exclamation marks
-   - Example: `!!!`, `!!!!` (but `!!` is allowed)
+   - Example: `!`, `!` (but `!!` is allowed)
    - Auto-fixable: Yes (reduces to single `!`)
 
 ---
@@ -141,8 +141,8 @@ Checking 50 files for AI slop patterns...
 
 backend/server.py:
   [CRITICAL] emoji: 2 occurrence(s)
-    Line 45: ...🎯...
-    Line 120: ...✅...
+    Line 45: ......
+    Line 120: ......
 
 docs/README.md:
   [WARNING] superlatives: 1 occurrence(s)
@@ -533,10 +533,10 @@ A: This is a project rule documented in CLAUDE.md. Emojis are decorative and don
 A: No - it was removed from the hype words list. The script focuses on clearly problematic patterns.
 
 **Q: Can I use `!!` for emphasis?**
-A: Yes, only `!!!` or more triggers the warning. Double exclamation is acceptable.
+A: Yes, only `!` or more triggers the warning. Double exclamation is acceptable.
 
 **Q: What if I legitimately need to use an arrow symbol?**
-A: Use `->` instead of `→`. The script auto-fixes this.
+A: Use `->` instead of `->`. The script auto-fixes this.
 
 **Q: How do I disable warnings for a specific file?**
 A: Add the file pattern to `SKIP_PATTERNS` in the script, or use `--critical-only` to skip all warnings.

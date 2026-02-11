@@ -1,11 +1,11 @@
 """
 Speech-to-Text using Whisper
 """
-import whisper
-import sounddevice as sd
+
+
 import numpy as np
-import tempfile
-import wave
+import sounddevice as sd
+import whisper
 
 
 class WhisperSTT:
@@ -49,16 +49,14 @@ class WhisperSTT:
             int(duration * self.sample_rate),
             samplerate=self.sample_rate,
             channels=1,
-            dtype=np.float32
+            dtype=np.float32,
         )
         sd.wait()
         print("Recording complete. Transcribing...")
 
         # Transcribe with initial prompt to bias towards "MIST"
         result = self.model.transcribe(
-            audio.flatten(),
-            fp16=False,
-            initial_prompt=self.initial_prompt
+            audio.flatten(), fp16=False, initial_prompt=self.initial_prompt
         )
         text = result["text"].strip()
 
@@ -89,6 +87,7 @@ class WhisperSTT:
             # Simple resampling by decimation/interpolation
             # For production, consider using librosa or torchaudio for better quality
             from scipy import signal
+
             num_samples = int(len(audio_data) * 16000 / sample_rate)
             audio_data = signal.resample(audio_data, num_samples)
 
@@ -97,11 +96,7 @@ class WhisperSTT:
             torch.cuda.synchronize()
 
         # Transcribe with initial prompt to bias towards "MIST"
-        result = self.model.transcribe(
-            audio_data,
-            fp16=False,
-            initial_prompt=self.initial_prompt
-        )
+        result = self.model.transcribe(audio_data, fp16=False, initial_prompt=self.initial_prompt)
 
         # Synchronize CUDA after transcription to ensure completion before TTS starts
         if torch.cuda.is_available():
@@ -119,9 +114,5 @@ class WhisperSTT:
         Returns:
             Transcribed text
         """
-        result = self.model.transcribe(
-            audio_path,
-            fp16=False,
-            initial_prompt=self.initial_prompt
-        )
+        result = self.model.transcribe(audio_path, fp16=False, initial_prompt=self.initial_prompt)
         return result["text"].strip()

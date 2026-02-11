@@ -61,7 +61,7 @@ class ChatNotifier extends Notifier<ChatState> {
     _audioRecordingService.audioCompleteStream.listen((completeAudio) {
       // Send complete audio buffer to backend for Whisper transcription
       _wsService.sendAudioBytes(completeAudio);
-      _logger.i('📤 Sent complete audio to backend: ${completeAudio.length} bytes');
+      _logger.i(' Sent complete audio to backend: ${completeAudio.length} bytes');
     });
   }
 

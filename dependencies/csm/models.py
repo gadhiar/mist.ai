@@ -9,6 +9,7 @@ from torchtune.models import llama3_2
 
 logger = logging.getLogger(__name__)
 
+
 def llama3_2_1B() -> torchtune.modules.transformer.TransformerDecoder:
     return llama3_2.llama3_2(
         vocab_size=128_256,
@@ -23,6 +24,7 @@ def llama3_2_1B() -> torchtune.modules.transformer.TransformerDecoder:
         rope_base=500_000,
         scale_factor=32,
     )
+
 
 def llama3_2_100M() -> torchtune.modules.transformer.TransformerDecoder:
     return llama3_2.llama3_2(
@@ -39,10 +41,12 @@ def llama3_2_100M() -> torchtune.modules.transformer.TransformerDecoder:
         scale_factor=32,
     )
 
+
 FLAVORS = {
     "llama-1B": llama3_2_1B,
     "llama-100M": llama3_2_100M,
 }
+
 
 def _prepare_transformer(model):
     embed_dim = model.tok_embeddings.embedding_dim
@@ -50,8 +54,10 @@ def _prepare_transformer(model):
     model.output = nn.Identity()
     return model, embed_dim
 
+
 def _create_causal_mask(seq_len: int, device: torch.device):
     return torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+
 
 def _index_causal_mask(mask: torch.Tensor, input_pos: torch.Tensor):
     """
@@ -65,9 +71,13 @@ def _index_causal_mask(mask: torch.Tensor, input_pos: torch.Tensor):
     r = mask[input_pos, :]
     return r
 
-def _multinomial_sample_one_no_sync(probs):  # Does multinomial sampling without a cuda synchronization
+
+def _multinomial_sample_one_no_sync(
+    probs,
+):  # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs).exponential_(1)
     return torch.argmax(probs / q, dim=-1, keepdim=True).to(dtype=torch.int)
+
 
 def sample_topk(logits: torch.Tensor, topk: int, temperature: float):
     logits = logits / temperature
@@ -80,6 +90,7 @@ def sample_topk(logits: torch.Tensor, topk: int, temperature: float):
 
     sample_token = _multinomial_sample_one_no_sync(probs)
     return sample_token
+
 
 @dataclass
 class ModelArgs:
@@ -105,11 +116,15 @@ class Model(
         self.decoder, decoder_dim = _prepare_transformer(FLAVORS[config.decoder_flavor]())
 
         self.text_embeddings = nn.Embedding(config.text_vocab_size, backbone_dim)
-        self.audio_embeddings = nn.Embedding(config.audio_vocab_size * config.audio_num_codebooks, backbone_dim)
+        self.audio_embeddings = nn.Embedding(
+            config.audio_vocab_size * config.audio_num_codebooks, backbone_dim
+        )
 
         self.projection = nn.Linear(backbone_dim, decoder_dim, bias=False)
         self.codebook0_head = nn.Linear(backbone_dim, config.audio_vocab_size, bias=False)
-        self.audio_head = nn.Parameter(torch.empty(config.audio_num_codebooks - 1, decoder_dim, config.audio_vocab_size))
+        self.audio_head = nn.Parameter(
+            torch.empty(config.audio_num_codebooks - 1, decoder_dim, config.audio_vocab_size)
+        )
 
     def setup_caches(self, max_batch_size: int) -> torch.Tensor:
         """Setup KV caches and return a causal mask."""
@@ -118,10 +133,16 @@ class Model(
 
         with device:
             self.backbone.setup_caches(max_batch_size, dtype)
-            self.decoder.setup_caches(max_batch_size, dtype, decoder_max_seq_len=self.config.audio_num_codebooks)
+            self.decoder.setup_caches(
+                max_batch_size, dtype, decoder_max_seq_len=self.config.audio_num_codebooks
+            )
 
-        self.register_buffer("backbone_causal_mask", _create_causal_mask(self.backbone.max_seq_len, device))
-        self.register_buffer("decoder_causal_mask", _create_causal_mask(self.config.audio_num_codebooks, device))
+        self.register_buffer(
+            "backbone_causal_mask", _create_causal_mask(self.backbone.max_seq_len, device)
+        )
+        self.register_buffer(
+            "decoder_causal_mask", _create_causal_mask(self.config.audio_num_codebooks, device)
+        )
 
     def generate_frame(
         self,
@@ -158,15 +179,19 @@ class Model(
 
         curr_h = torch.cat([last_h.unsqueeze(1), c0_embed], dim=1)
         curr_sample = c0_sample.clone()
-        curr_pos = torch.arange(0, curr_h.size(1), device=curr_h.device).unsqueeze(0).repeat(curr_h.size(0), 1)
+        curr_pos = (
+            torch.arange(0, curr_h.size(1), device=curr_h.device)
+            .unsqueeze(0)
+            .repeat(curr_h.size(0), 1)
+        )
 
         # Decoder caches must be reset every frame.
         self.decoder.reset_caches()
         for i in range(1, self.config.audio_num_codebooks):
             curr_decoder_mask = _index_causal_mask(self.decoder_causal_mask, curr_pos)
-            decoder_h = self.decoder(self.projection(curr_h), input_pos=curr_pos, mask=curr_decoder_mask).to(
-                dtype=dtype
-            )
+            decoder_h = self.decoder(
+                self.projection(curr_h), input_pos=curr_pos, mask=curr_decoder_mask
+            ).to(dtype=dtype)
             ci_logits = torch.mm(decoder_h[:, -1, :], self.audio_head[i - 1])
             ci_sample = sample_topk(ci_logits, topk, temperature)
             ci_embed = self._embed_audio(i, ci_sample)
@@ -188,11 +213,11 @@ class Model(
         text_embeds = self.text_embeddings(tokens[:, :, -1]).unsqueeze(-2)
 
         audio_tokens = tokens[:, :, :-1] + (
-            self.config.audio_vocab_size * torch.arange(self.config.audio_num_codebooks, device=tokens.device)
+            self.config.audio_vocab_size
+            * torch.arange(self.config.audio_num_codebooks, device=tokens.device)
         )
         audio_embeds = self.audio_embeddings(audio_tokens.view(-1)).reshape(
             tokens.size(0), tokens.size(1), self.config.audio_num_codebooks, -1
         )
 
         return torch.cat([audio_embeds, text_embeds], dim=-2)
-    

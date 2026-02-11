@@ -3,21 +3,22 @@ Voice AI WebSocket Server
 
 Based on CSM demo architecture - production-ready for web frontend
 """
+
 import asyncio
 import logging
-import sys
 import os
-from pathlib import Path
+import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 # Fix Windows console encoding for Unicode characters
 if sys.platform == "win32":
     os.environ["PYTHONIOENCODING"] = "utf-8"
     # Reconfigure stdout/stderr to use UTF-8
-    if hasattr(sys.stdout, 'reconfigure'):
-        sys.stdout.reconfigure(encoding='utf-8')
-    if hasattr(sys.stderr, 'reconfigure'):
-        sys.stderr.reconfigure(encoding='utf-8')
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
 
 import numpy as np
 import uvicorn
@@ -29,8 +30,9 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(project_root / "backend"))
 
-from config import DEFAULT_CONFIG, VoiceConfig
 from voice_processor import VoiceProcessor
+
+from config import DEFAULT_CONFIG
 
 # Setup logging
 logging.basicConfig(
@@ -148,9 +150,7 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info(f"Client connected (total: {len(active_connections)})")
 
     # Send welcome message
-    await websocket.send_json(
-        {"type": "status", "message": "Connected to Mist.AI Voice Server"}
-    )
+    await websocket.send_json({"type": "status", "message": "Connected to Mist.AI Voice Server"})
 
     try:
         while True:
@@ -163,9 +163,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 audio_data = np.asarray(data["audio"], dtype=np.float32)
                 sample_rate = data.get("sample_rate", 16000)
 
-                logger.info(f"📥 Received complete audio: {len(audio_data)} samples @ {sample_rate}Hz")
+                logger.info(
+                    f" Received complete audio: {len(audio_data)} samples @ {sample_rate}Hz"
+                )
 
-                # Process complete audio directly (transcribe → LLM → TTS)
+                # Process complete audio directly (transcribe -> LLM -> TTS)
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(
                     None, voice_processor.process_complete_audio, audio_data, sample_rate
@@ -174,7 +176,7 @@ async def websocket_endpoint(websocket: WebSocket):
             elif data["type"] == "text":
                 # Text message (manual input)
                 user_text = data["text"]
-                logger.info(f"📝 Text message from client: '{user_text}'")
+                logger.info(f" Text message from client: '{user_text}'")
 
                 # Send to message queue
                 await message_queue.put({"type": "transcription", "text": user_text})
@@ -190,16 +192,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.info("Manual interrupt requested")
                 voice_processor.interrupt_flag.set()
 
-                await websocket.send_json(
-                    {"type": "status", "message": "Interrupt acknowledged"}
-                )
+                await websocket.send_json({"type": "status", "message": "Interrupt acknowledged"})
 
             elif data["type"] == "reset_vad":
                 # Reset VAD state
                 voice_processor.reset_vad()
-                await websocket.send_json(
-                    {"type": "status", "message": "VAD reset"}
-                )
+                await websocket.send_json({"type": "status", "message": "VAD reset"})
 
             elif data["type"] == "config":
                 # Update configuration (future feature)

@@ -2,16 +2,16 @@
 
 ## Quick E2E Test
 
-Test the full system from Neo4j → Backend → Frontend → Voice
+Test the full system from Neo4j -> Backend -> Frontend -> Voice
 
 ---
 
 ## Prerequisites
 
-- ✅ Neo4j installed and running
-- ✅ Python environment activated
-- ✅ Frontend setup complete
-- ✅ `.env` file configured
+-  Neo4j installed and running
+-  Python environment activated
+-  Frontend setup complete
+-  `.env` file configured
 
 ---
 
@@ -43,7 +43,7 @@ venv/Scripts/python.exe test_neo4j_connection.py
 Expected output:
 ```
 Testing Neo4j connection...
-✅ Connection successful!
+ Connection successful!
 ```
 
 If this fails, check:
@@ -63,15 +63,15 @@ venv/Scripts/python.exe backend/server.py
 
 ```
 Loading all models...
-✅ Knowledge graph integration ENABLED
+ Knowledge graph integration ENABLED
 Server ready on ws://0.0.0.0:8765/ws
 ```
 
 **If you see:**
 ```
-⚠️  Knowledge integration disabled (Neo4j unavailable)
+  Knowledge integration disabled (Neo4j unavailable)
 ```
-→ Go back to Step 1, Neo4j isn't accessible
+-> Go back to Step 1, Neo4j isn't accessible
 
 ---
 
@@ -231,11 +231,11 @@ This simulates the conversation flow without voice/frontend.
 
 ## Success Criteria
 
-✅ Backend starts with "Knowledge integration ENABLED"
-✅ Voice input → LLM response works
-✅ Backend logs show tool calls (extract_knowledge, query_knowledge_graph)
-✅ Neo4j Browser shows extracted entities and relationships
-✅ LLM gives personalized responses based on stored knowledge
+ Backend starts with "Knowledge integration ENABLED"
+ Voice input -> LLM response works
+ Backend logs show tool calls (extract_knowledge, query_knowledge_graph)
+ Neo4j Browser shows extracted entities and relationships
+ LLM gives personalized responses based on stored knowledge
 
 ---
 
@@ -264,25 +264,25 @@ This simulates the conversation flow without voice/frontend.
 **Full E2E flow:**
 ```
 You speak
-  ↓
+  ->
 Frontend (microphone)
-  ↓
-WebSocket → Backend
-  ↓
-VoiceProcessor → ModelManager
-  ↓
-KnowledgeIntegration → ConversationHandler
-  ↓
+  ->
+WebSocket -> Backend
+  ->
+VoiceProcessor -> ModelManager
+  ->
+KnowledgeIntegration -> ConversationHandler
+  ->
 LLM with Tools (autonomous decision)
-  ↓
+  ->
 query_knowledge_graph OR extract_knowledge
-  ↓
+  ->
 Neo4j (read/write)
-  ↓
+  ->
 Response with context
-  ↓
-TTS → Audio
-  ↓
+  ->
+TTS -> Audio
+  ->
 You hear response
 ```
 

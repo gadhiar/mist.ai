@@ -10,6 +10,7 @@ Usage:
 
 from rich.console import Console
 from rich.panel import Panel
+
 from backend.knowledge.config import get_config
 from backend.knowledge.storage import Neo4jConnection
 
@@ -50,22 +51,26 @@ def wipe_database():
         node_count = result[0]["count"] if result else 0
 
         if node_count == 0:
-            console.print(Panel.fit(
-                "[bold green]Database wiped successfully![/bold green]\n\n"
-                "All nodes and relationships have been deleted.\n"
-                "Ready for fresh extraction test.",
-                title="Success",
-                border_style="green"
-            ))
+            console.print(
+                Panel.fit(
+                    "[bold green]Database wiped successfully![/bold green]\n\n"
+                    "All nodes and relationships have been deleted.\n"
+                    "Ready for fresh extraction test.",
+                    title="Success",
+                    border_style="green",
+                )
+            )
         else:
             console.print(f"[yellow]Warning: {node_count} nodes still remain[/yellow]")
 
     except Exception as e:
-        console.print(Panel.fit(
-            f"[bold red]Error wiping database[/bold red]\n\n{str(e)}",
-            title="Error",
-            border_style="red"
-        ))
+        console.print(
+            Panel.fit(
+                f"[bold red]Error wiping database[/bold red]\n\n{str(e)}",
+                title="Error",
+                border_style="red",
+            )
+        )
 
     finally:
         connection.disconnect()
