@@ -1,5 +1,4 @@
-"""
-Wipe Neo4j Database Completely
+"""Wipe Neo4j Database Completely.
 
 DANGER: This script deletes EVERYTHING from Neo4j.
 - All nodes (ConversationEvents, Utterances, Entities)
@@ -26,8 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 def wipe_database():
-    """Completely wipe the Neo4j database"""
-
+    """Completely wipe the Neo4j database."""
     print("\n" + "=" * 60)
     print("WARNING: DATABASE WIPE")
     print("=" * 60)

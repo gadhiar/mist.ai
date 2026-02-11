@@ -1,5 +1,4 @@
-"""
-CLI WebSocket Client for Voice AI Server
+"""CLI WebSocket Client for Voice AI Server.
 
 For testing the WebSocket server before building web frontend
 """
@@ -26,7 +25,7 @@ except ImportError:
 
 
 class VoiceClient:
-    """CLI client that connects to Voice AI WebSocket server"""
+    """CLI client that connects to Voice AI WebSocket server."""
 
     def __init__(self, server_url="ws://localhost:8001/ws"):
         self.server_url = server_url
@@ -49,13 +48,13 @@ class VoiceClient:
         self._interrupt_playback = threading.Event()  # Signal to stop playback
 
     async def connect(self):
-        """Connect to WebSocket server"""
+        """Connect to WebSocket server."""
         print(f"Connecting to {self.server_url}...")
         self.websocket = await websockets.connect(self.server_url)
         print("Connected to server")
 
     async def send_audio_chunk(self, audio_data, sample_rate):
-        """Send audio chunk to server"""
+        """Send audio chunk to server."""
         await self.websocket.send(
             json.dumps(
                 {
@@ -67,15 +66,15 @@ class VoiceClient:
         )
 
     async def send_text(self, text):
-        """Send text message to server"""
+        """Send text message to server."""
         await self.websocket.send(json.dumps({"type": "text", "text": text}))
 
     async def send_interrupt(self):
-        """Send interrupt signal"""
+        """Send interrupt signal."""
         await self.websocket.send(json.dumps({"type": "interrupt"}))
 
     async def receive_messages(self):
-        """Receive and handle messages from server"""
+        """Receive and handle messages from server."""
         try:
             async for message in self.websocket:
                 data = json.loads(message)
@@ -85,7 +84,7 @@ class VoiceClient:
             self.running = False
 
     async def handle_message(self, data):
-        """Handle different message types from server"""
+        """Handle different message types from server."""
         msg_type = data.get("type")
 
         if msg_type == "status":
@@ -135,7 +134,7 @@ class VoiceClient:
             print(f"Unknown message type: {msg_type}")
 
     async def microphone_worker(self):
-        """Capture audio from microphone and send to server"""
+        """Capture audio from microphone and send to server."""
         print("[Mic] Starting...")
 
         # Save event loop reference for callback thread
@@ -169,14 +168,13 @@ class VoiceClient:
         print("[Mic] Stopped")
 
     async def playback_worker(self):
-        """
-        Play audio chunks using OutputStream for gap-free playback
-        Mimics the working voice_interface_interrupt.py pattern
+        """Play audio chunks using OutputStream for gap-free playback
+        Mimics the working voice_interface_interrupt.py pattern.
         """
         print("[Playback] Starting OutputStream...")
 
         def audio_callback(outdata, frames, time_info, status):
-            """Called by sounddevice when it needs more audio data"""
+            """Called by sounddevice when it needs more audio data."""
             if status:
                 print(f"Stream status: {status}")
 
@@ -313,7 +311,7 @@ class VoiceClient:
         print("[Playback] Stopped")
 
     async def run(self):
-        """Run the voice client"""
+        """Run the voice client."""
         try:
             await self.connect()
             self.running = True
@@ -343,7 +341,7 @@ class VoiceClient:
 
 
 async def main():
-    """Main entry point"""
+    """Main entry point."""
     import argparse
 
     parser = argparse.ArgumentParser(description="Voice AI WebSocket Client")

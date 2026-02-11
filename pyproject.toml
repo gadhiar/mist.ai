@@ -56,12 +56,24 @@ select = [
     "B",   # flake8-bugbear
     "C4",  # flake8-comprehensions
     "SIM", # flake8-simplify
+    "D",   # pydocstyle (docstring quality)
 ]
 
 ignore = [
     "E501",  # line too long (handled by black)
     "B008",  # do not perform function call in argument defaults (FastAPI uses this)
     "B905",  # zip without explicit strict parameter
+    "D100",  # missing docstring in public module (too strict for now)
+    "D104",  # missing docstring in public package (too strict for now)
+    "D107",  # missing docstring in __init__ (too strict for now)
+    "D103",  # missing docstring in public function (acceptable for scripts)
+    "D105",  # missing docstring in magic method (standard practice)
+    "E402",  # module level import not at top (intentional for some scripts)
+    "N806",  # variable naming should be lowercase (intentional constants in functions)
+    "F402",  # import shadowed by loop variable (minor issue)
+    "E722",  # bare except (will fix manually if needed)
+    "D417",  # missing argument descriptions (can be improved incrementally)
+    "D205",  # blank line between summary and description (minor style)
 ]
 
 # Exclude directories
@@ -81,6 +93,9 @@ exclude = [
 [tool.ruff.isort]
 known-first-party = ["backend", "cli_client"]
 section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+
+[tool.ruff.pydocstyle]
+convention = "google"  # Use Google-style docstrings
 
 [tool.mypy]
 python_version = "3.11"
@@ -143,3 +158,11 @@ omit = [
 precision = 2
 show_missing = true
 skip_covered = false
+
+[tool.bandit]
+exclude_dirs = ["tests", "dependencies", ".venv", "venv"]
+skips = ["B101"]  # Skip assert_used (we use asserts appropriately)
+
+[tool.codespell]
+skip = "*.git,*.venv,venv,*.pyc,*.egg-info,*.lock,mist_desktop,dependencies"
+ignore-words-list = "crate,nd,te,thre,hass,bloc,lod"

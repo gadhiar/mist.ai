@@ -1,5 +1,4 @@
-"""
-Graph Regeneration Script - Complete All-In-One Solution
+"""Graph Regeneration Script - Complete All-In-One Solution.
 
 Handles everything needed for graph regeneration:
 1. Checks Neo4j connection
@@ -53,8 +52,7 @@ logger = logging.getLogger(__name__)
 
 
 async def regenerate_all(regenerator: GraphRegenerator, dry_run: bool = False):
-    """
-    Regenerate entire knowledge graph
+    """Regenerate entire knowledge graph.
 
     Args:
         regenerator: GraphRegenerator instance
@@ -106,8 +104,7 @@ async def regenerate_all(regenerator: GraphRegenerator, dry_run: bool = False):
 async def regenerate_conversation(
     regenerator: GraphRegenerator, conversation_id: str, dry_run: bool = False
 ):
-    """
-    Regenerate specific conversation
+    """Regenerate specific conversation.
 
     Args:
         regenerator: GraphRegenerator instance
@@ -143,8 +140,7 @@ async def regenerate_conversation(
 
 
 async def initialize_schema(config):
-    """
-    Initialize Neo4j schema (indexes and constraints)
+    """Initialize Neo4j schema (indexes and constraints).
 
     Creates all necessary indexes including vector index for embeddings.
 
@@ -168,8 +164,7 @@ async def initialize_schema(config):
 
 
 async def check_neo4j_connection(config):
-    """
-    Verify Neo4j connection before regeneration
+    """Verify Neo4j connection before regeneration.
 
     Args:
         config: Knowledge configuration
@@ -200,7 +195,7 @@ async def check_neo4j_connection(config):
 
 
 async def main():
-    """Main entry point"""
+    """Main entry point."""
     parser = argparse.ArgumentParser(
         description="Regenerate knowledge graph from utterances",
         formatter_class=argparse.RawDescriptionHelpFormatter,

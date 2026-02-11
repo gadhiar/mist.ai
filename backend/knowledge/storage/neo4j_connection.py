@@ -1,5 +1,4 @@
-"""
-Neo4j Database Connection
+"""Neo4j Database Connection.
 
 Handles connection to Neo4j database with automatic retries and health checks.
 """
@@ -14,15 +13,13 @@ logger = logging.getLogger(__name__)
 
 
 class Neo4jConnection:
-    """
-    Neo4j database connection manager
+    """Neo4j database connection manager.
 
     Handles connection lifecycle, health checks, and query execution.
     """
 
     def __init__(self, config: Neo4jConfig):
-        """
-        Initialize Neo4j connection
+        """Initialize Neo4j connection.
 
         Args:
             config: Neo4j configuration
@@ -31,8 +28,7 @@ class Neo4jConnection:
         self._driver: Driver | None = None
 
     def connect(self) -> Driver:
-        """
-        Establish connection to Neo4j database
+        """Establish connection to Neo4j database.
 
         Returns:
             Neo4j driver instance
@@ -53,20 +49,20 @@ class Neo4jConnection:
                 logger.info(" Successfully connected to Neo4j")
 
             except Exception as e:
-                logger.error(f" Failed to connect to Neo4j: {e}")
+                logger.error(f"Failed to connect to Neo4j: {e}")
                 raise
 
         return self._driver
 
     def disconnect(self):
-        """Close connection to Neo4j database"""
+        """Close connection to Neo4j database."""
         if self._driver is not None:
             self._driver.close()
             self._driver = None
             logger.info("Disconnected from Neo4j")
 
     def is_connected(self) -> bool:
-        """Check if connected to Neo4j"""
+        """Check if connected to Neo4j."""
         if self._driver is None:
             return False
 
@@ -77,8 +73,7 @@ class Neo4jConnection:
             return False
 
     def execute_query(self, query: str, parameters: dict | None = None) -> list:
-        """
-        Execute a Cypher query
+        """Execute a Cypher query.
 
         Args:
             query: Cypher query string
@@ -95,8 +90,7 @@ class Neo4jConnection:
             return list(result)
 
     def execute_write(self, query: str, parameters: dict | None = None):
-        """
-        Execute a write transaction
+        """Execute a write transaction.
 
         Args:
             query: Cypher query string
@@ -109,8 +103,7 @@ class Neo4jConnection:
             session.execute_write(lambda tx: tx.run(query, parameters or {}))
 
     def health_check(self) -> dict:
-        """
-        Perform health check on Neo4j connection
+        """Perform health check on Neo4j connection.
 
         Returns:
             Health check results
@@ -146,10 +139,10 @@ class Neo4jConnection:
             }
 
     def __enter__(self):
-        """Context manager entry"""
+        """Context manager entry."""
         self.connect()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit"""
+        """Context manager exit."""
         self.disconnect()

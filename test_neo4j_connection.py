@@ -1,5 +1,4 @@
-"""
-Test Neo4j Connection
+"""Test Neo4j Connection.
 
 Simple script to verify Neo4j Desktop is running and accessible.
 
@@ -20,8 +19,7 @@ console = Console()
 
 
 def test_connection():
-    """Test Neo4j connection and display results"""
-
+    """Test Neo4j connection and display results."""
     console.print("\n[bold cyan]Testing Neo4j Connection...[/bold cyan]\n")
 
     # Load config

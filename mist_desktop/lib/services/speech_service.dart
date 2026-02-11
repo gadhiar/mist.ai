@@ -65,11 +65,16 @@ class SpeechService {
     try {
       await _speech.listen(
         onResult: _handleResult,
-        listenFor: const Duration(seconds: 60), // Max listen duration (increased)
-        pauseFor: const Duration(seconds: 5),   // Pause detection (increased to avoid early stop)
+        listenFor: const Duration(
+          seconds: 60,
+        ), // Max listen duration (increased)
+        pauseFor: const Duration(
+          seconds: 5,
+        ), // Pause detection (increased to avoid early stop)
         listenOptions: stt.SpeechListenOptions(
           partialResults: true,
-          cancelOnError: false, // Don't auto-cancel on errors (Windows plugin has issues)
+          cancelOnError:
+              false, // Don't auto-cancel on errors (Windows plugin has issues)
           listenMode: stt.ListenMode.confirmation,
         ),
       );

@@ -1,5 +1,4 @@
-"""
-Initialize Neo4j Schema
+"""Initialize Neo4j Schema.
 
 Creates indexes and constraints for the knowledge graph,
 including the vector index for semantic search.
@@ -25,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 def main():
-    """Initialize Neo4j schema"""
+    """Initialize Neo4j schema."""
     print("=" * 60)
     print("Neo4j Schema Initialization")
     print("=" * 60)

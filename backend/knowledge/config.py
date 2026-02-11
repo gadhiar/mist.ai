@@ -1,5 +1,4 @@
-"""
-Knowledge System Configuration
+"""Knowledge System Configuration.
 
 Central configuration for Neo4j connection, embedding models, and extraction settings.
 """
@@ -14,7 +13,7 @@ load_dotenv()
 
 @dataclass
 class Neo4jConfig:
-    """Neo4j database configuration"""
+    """Neo4j database configuration."""
 
     uri: str = "bolt://localhost:7687"  # Default Neo4j Desktop URI
     username: str = "neo4j"
@@ -23,7 +22,7 @@ class Neo4jConfig:
 
     @classmethod
     def from_env(cls) -> "Neo4jConfig":
-        """Load configuration from environment variables"""
+        """Load configuration from environment variables."""
         return cls(
             uri=os.getenv("NEO4J_URI", "bolt://localhost:7687"),
             username=os.getenv("NEO4J_USERNAME", "neo4j"),
@@ -34,7 +33,7 @@ class Neo4jConfig:
 
 @dataclass
 class EmbeddingConfig:
-    """Embedding model configuration"""
+    """Embedding model configuration."""
 
     model_name: str = "all-MiniLM-L6-v2"  # Fast, local model
     dimension: int = 384  # MiniLM embedding dimension
@@ -42,7 +41,7 @@ class EmbeddingConfig:
 
     @classmethod
     def from_env(cls) -> "EmbeddingConfig":
-        """Load configuration from environment variables"""
+        """Load configuration from environment variables."""
         return cls(
             model_name=os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
             dimension=int(os.getenv("EMBEDDING_DIMENSION", "384")),
@@ -52,7 +51,7 @@ class EmbeddingConfig:
 
 @dataclass
 class LLMConfig:
-    """LLM model configuration"""
+    """LLM model configuration."""
 
     model: str = "qwen2.5:7b-instruct"  # Default Ollama model
     base_url: str = "http://localhost:11434"  # Ollama default
@@ -60,7 +59,7 @@ class LLMConfig:
 
     @classmethod
     def from_env(cls) -> "LLMConfig":
-        """Load configuration from environment variables"""
+        """Load configuration from environment variables."""
         return cls(
             model=os.getenv("MODEL", "qwen2.5:7b-instruct"),
             base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
@@ -70,7 +69,7 @@ class LLMConfig:
 
 @dataclass
 class ExtractionConfig:
-    """Entity extraction configuration"""
+    """Entity extraction configuration."""
 
     # Extraction settings
     extract_node_properties: bool = True  # Extract node descriptions
@@ -125,7 +124,7 @@ class ExtractionConfig:
 
     @classmethod
     def from_env(cls) -> "ExtractionConfig":
-        """Load configuration from environment variables"""
+        """Load configuration from environment variables."""
         return cls(
             extract_node_properties=os.getenv("EXTRACT_NODE_PROPERTIES", "true").lower() == "true",
             extract_relationship_properties=os.getenv("EXTRACT_REL_PROPERTIES", "true").lower()
@@ -136,7 +135,7 @@ class ExtractionConfig:
 
 @dataclass
 class KnowledgeConfig:
-    """Complete knowledge system configuration"""
+    """Complete knowledge system configuration."""
 
     neo4j: Neo4jConfig
     llm: LLMConfig
@@ -157,7 +156,7 @@ class KnowledgeConfig:
 
     @classmethod
     def from_env(cls) -> "KnowledgeConfig":
-        """Load complete configuration from environment"""
+        """Load complete configuration from environment."""
         return cls(
             neo4j=Neo4jConfig.from_env(),
             llm=LLMConfig.from_env(),
@@ -177,7 +176,7 @@ _config: KnowledgeConfig | None = None
 
 
 def get_config() -> KnowledgeConfig:
-    """Get global knowledge system configuration"""
+    """Get global knowledge system configuration."""
     global _config
     if _config is None:
         _config = KnowledgeConfig.from_env()
@@ -185,6 +184,6 @@ def get_config() -> KnowledgeConfig:
 
 
 def set_config(config: KnowledgeConfig):
-    """Set global knowledge system configuration"""
+    """Set global knowledge system configuration."""
     global _config
     _config = config

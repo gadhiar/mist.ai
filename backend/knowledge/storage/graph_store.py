@@ -1,5 +1,4 @@
-"""
-Graph Storage Module
+"""Graph Storage Module.
 
 Stores extracted entities and relationships in Neo4j with provenance tracking.
 """
@@ -16,8 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class GraphStore:
-    """
-    Manages storage of knowledge graph in Neo4j
+    """Manages storage of knowledge graph in Neo4j.
 
     Handles:
     - Storing extracted entities and relationships
@@ -26,8 +24,7 @@ class GraphStore:
     """
 
     def __init__(self, config: KnowledgeConfig):
-        """
-        Initialize graph store
+        """Initialize graph store.
 
         Args:
             config: Knowledge system configuration
@@ -37,8 +34,7 @@ class GraphStore:
         self.embedding_generator = EmbeddingGenerator()
 
     def initialize_schema(self):
-        """
-        Create indexes and constraints in Neo4j
+        """Create indexes and constraints in Neo4j.
 
         Sets up:
         - Uniqueness constraints on entity IDs
@@ -122,8 +118,7 @@ class GraphStore:
     def store_conversation_event(
         self, conversation_id: str, user_id: str, timestamp: datetime | None = None
     ) -> str:
-        """
-        Store a conversation event
+        """Store a conversation event.
 
         Args:
             conversation_id: Unique conversation identifier
@@ -162,8 +157,7 @@ class GraphStore:
         timestamp: datetime | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> str:
-        """
-        Store a single utterance
+        """Store a single utterance.
 
         Args:
             utterance_id: Unique utterance identifier
@@ -235,8 +229,7 @@ class GraphStore:
         file_size: int | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> str:
-        """
-        Store a source document
+        """Store a source document.
 
         Args:
             source_id: Unique source identifier
@@ -292,8 +285,7 @@ class GraphStore:
         section_title: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> str:
-        """
-        Store a document chunk with optional embedding
+        """Store a document chunk with optional embedding.
 
         Args:
             chunk_id: Unique chunk identifier
@@ -355,8 +347,7 @@ class GraphStore:
         chunk_id: str | None = None,
         ontology_version: str | None = None,
     ):
-        """
-        Store extracted entities and relationships from LLMGraphTransformer
+        """Store extracted entities and relationships from LLMGraphTransformer.
 
         Entities can be extracted from either:
         - Utterances (conversational knowledge)
@@ -394,8 +385,7 @@ class GraphStore:
             self._store_relationship(relationship, source_id, source_type, ontology_version)
 
     def _store_node(self, node, source_id: str, source_type: str, ontology_version: str):
-        """
-        Store a single entity node with provenance
+        """Store a single entity node with provenance.
 
         Args:
             node: Node from GraphDocument
@@ -403,7 +393,6 @@ class GraphStore:
             source_type: Type of source ("utterance" or "chunk")
             ontology_version: Ontology version
         """
-
         # Extract node properties
         node_id = node.id
         entity_type = node.type if hasattr(node, "type") else "Unknown"
@@ -428,7 +417,7 @@ class GraphStore:
         if properties:
             for key, value in properties.items():
                 # Only add primitive types (string, number, boolean)
-                if isinstance(value, (str, int, float, bool)):
+                if isinstance(value, str | int | float | bool):
                     param_key = f"prop_{key}"
                     property_sets.append(f"e.{key} = ${param_key}")
                     params[param_key] = value
@@ -469,8 +458,7 @@ class GraphStore:
     def _store_relationship(
         self, relationship, source_id: str, source_type: str, ontology_version: str
     ):
-        """
-        Store a single relationship between entities
+        """Store a single relationship between entities.
 
         Args:
             relationship: Relationship from GraphDocument
@@ -478,7 +466,6 @@ class GraphStore:
             source_type: Type of source ("utterance" or "chunk")
             ontology_version: Ontology version
         """
-
         # Extract relationship details
         entity_source_id = relationship.source.id
         entity_target_id = relationship.target.id
@@ -500,7 +487,7 @@ class GraphStore:
         if properties:
             for key, value in properties.items():
                 # Only add primitive types (string, number, boolean)
-                if isinstance(value, (str, int, float, bool)):
+                if isinstance(value, str | int | float | bool):
                     param_key = f"prop_{key}"
                     property_sets.append(f"r.{key} = ${param_key}")
                     params[param_key] = value
@@ -527,8 +514,7 @@ class GraphStore:
         logger.debug(f"Stored relationship: {entity_source_id} -[{rel_type}]-> {entity_target_id}")
 
     def get_entities_for_conversation(self, conversation_id: str) -> list[dict]:
-        """
-        Retrieve all entities extracted from a conversation
+        """Retrieve all entities extracted from a conversation.
 
         Args:
             conversation_id: Conversation identifier
@@ -555,8 +541,7 @@ class GraphStore:
     def search_similar_entities(
         self, query_text: str, limit: int = 10, similarity_threshold: float = 0.7
     ) -> list[dict]:
-        """
-        Search for entities semantically similar to query text
+        """Search for entities semantically similar to query text.
 
         Uses vector similarity search on entity embeddings.
         Requires Neo4j 5.11+ with vector index support.
@@ -608,8 +593,7 @@ class GraphStore:
     def search_document_chunks(
         self, query_text: str, limit: int = 5, similarity_threshold: float = 0.7
     ) -> list[dict]:
-        """
-        Search DocumentChunks using vector similarity (RAG retrieval)
+        """Search DocumentChunks using vector similarity (RAG retrieval).
 
         Uses vector similarity search on chunk embeddings to find
         relevant document passages.
@@ -671,8 +655,7 @@ class GraphStore:
     def get_entity_neighborhood(
         self, entity_id: str, max_hops: int = 2, relationship_types: list[str] | None = None
     ) -> list[dict]:
-        """
-        Get N-hop neighborhood around an entity
+        """Get N-hop neighborhood around an entity.
 
         Returns all entities and relationships within N hops.
 
@@ -723,8 +706,7 @@ class GraphStore:
     def get_user_relationships_to_entities(
         self, user_id: str, entity_ids: list[str], relationship_types: list[str] | None = None
     ) -> list[dict]:
-        """
-        Get all relationships between User and specific entities
+        """Get all relationships between User and specific entities.
 
         This finds direct connections: User -[r]-> Entity or User <-[r]- Entity
 
@@ -764,8 +746,7 @@ class GraphStore:
         relationship_types: list[str] | None = None,
         entity_types: list[str] | None = None,
     ) -> list[dict]:
-        """
-        Get ALL relationships from User entity
+        """Get ALL relationships from User entity.
 
         Useful for "What do I know?" type queries.
 
@@ -801,5 +782,5 @@ class GraphStore:
         return [dict(record) for record in results]
 
     def close(self):
-        """Close Neo4j connection"""
+        """Close Neo4j connection."""
         self.connection.disconnect()

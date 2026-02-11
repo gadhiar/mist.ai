@@ -1,12 +1,7 @@
 import 'package:uuid/uuid.dart';
 
 /// Message Types
-enum MessageType {
-  user,
-  ai,
-  system,
-  error,
-}
+enum MessageType { user, ai, system, error }
 
 /// Chat Message Model
 class ChatMessage {
@@ -26,8 +21,8 @@ class ChatMessage {
     this.audioData,
     this.audioSampleRate,
     this.metadata,
-  })  : id = id ?? const Uuid().v4(),
-        timestamp = timestamp ?? DateTime.now();
+  }) : id = id ?? const Uuid().v4(),
+       timestamp = timestamp ?? DateTime.now();
 
   /// Create a user message
   factory ChatMessage.user(String text, {List<double>? audioData}) {
@@ -40,27 +35,17 @@ class ChatMessage {
 
   /// Create an AI message
   factory ChatMessage.ai(String text, {List<double>? audioData}) {
-    return ChatMessage(
-      text: text,
-      type: MessageType.ai,
-      audioData: audioData,
-    );
+    return ChatMessage(text: text, type: MessageType.ai, audioData: audioData);
   }
 
   /// Create a system message
   factory ChatMessage.system(String text) {
-    return ChatMessage(
-      text: text,
-      type: MessageType.system,
-    );
+    return ChatMessage(text: text, type: MessageType.system);
   }
 
   /// Create an error message
   factory ChatMessage.error(String text) {
-    return ChatMessage(
-      text: text,
-      type: MessageType.error,
-    );
+    return ChatMessage(text: text, type: MessageType.error);
   }
 
   /// Copy with modifications

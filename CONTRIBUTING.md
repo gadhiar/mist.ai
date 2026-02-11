@@ -64,19 +64,40 @@ Use plain text alternatives: `[SUCCESS]`, `[WARNING]`, `[ERROR]`, `->`, etc.
 - Use Black formatter (no manual formatting decisions)
 - Import order: stdlib, third-party, local (handled by isort/ruff)
 
-**Before Committing:**
+**Automated Pre-Commit Checks:**
+All checks run automatically when you commit (via pre-commit hooks):
+- **Black** - Python code formatting
+- **Ruff** - Python linting with auto-fix
+- **Mypy** - Static type checking (non-blocking)
+- **Bandit** - Security vulnerability scanning
+- **Codespell** - Spell checking in code and docs
+- **AI Slop Checker** - Detects emojis, unicode symbols (auto-fix)
+- **Flutter format** - Dart code formatting
+- **Flutter analyze** - Dart linting
+- **File quality** - YAML/JSON validation, trailing whitespace, etc.
+
+**Manual Commands (if needed):**
 ```bash
-# Format code
+# Format code manually
 black backend/
 
-# Lint and auto-fix
+# Lint and auto-fix manually
 ruff check backend/ --fix
 
-# Type check (optional but recommended)
+# Type check
 mypy backend/
 
+# Security scan
+bandit -r backend/ scripts/
+
+# Spell check
+codespell
+
 # Check for AI slop
-python scripts/check_ai_slop.py
+python scripts/check_ai_slop.py --incremental
+
+# Run all pre-commit hooks manually
+pre-commit run --all-files
 ```
 
 **Type Hints:**
@@ -187,19 +208,39 @@ Co-Authored-By: Claude <noreply@anthropic.com>
 
 ### Pre-commit Hooks
 
-Pre-commit hooks run automatically before each commit:
-- Black formatting (Python)
-- Ruff linting (Python)
-- AI slop detection (all files)
-- Trailing whitespace removal
-- YAML/JSON validation
-- Flutter formatting/analysis (Dart)
+Pre-commit hooks run automatically before each commit. **All 16 hooks must pass before commit succeeds.**
+
+**Python Checks:**
+- **Black** - Code formatting (auto-fix)
+- **Ruff** - Linting with auto-fix
+- **Mypy** - Type checking (namespace packages enabled)
+- **Bandit** - Security scanning (with nosec comments)
+- **Codespell** - Spell checking
+
+**Dart/Flutter Checks:**
+- **Dart format** - Code formatting (auto-fix)
+- **Flutter analyze** - Linting (info-level warnings non-fatal)
+
+**General Quality Checks:**
+- **AI Slop Checker** - Emoji and unicode symbol detection (auto-fix, runs on changed files only)
+- **Trailing whitespace** - Auto-removed
+- **End-of-file fixer** - Ensures files end with newline
+- **YAML/JSON/TOML validation** - Syntax checking
+- **Large file detection** - Prevents commits >1MB
+- **Merge conflict markers** - Detects unresolved conflicts
+- **Private key detection** - Prevents accidental secret commits
+- **Line ending normalization** - Converts to LF (Windows: CRLF)
 
 If hooks fail, fix the issues and commit again.
 
 **Run manually:**
 ```bash
+# Run all hooks
 pre-commit run --all-files
+
+# Run specific hook
+pre-commit run black --all-files
+pre-commit run check-ai-slop --all-files
 ```
 
 ---

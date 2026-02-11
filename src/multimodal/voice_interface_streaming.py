@@ -1,6 +1,5 @@
-"""
-Streaming voice interface: Real-time STT -> LLM streaming -> TTS streaming
-Lowest latency voice interaction
+"""Streaming voice interface: Real-time STT -> LLM streaming -> TTS streaming
+Lowest latency voice interaction.
 """
 
 import queue
@@ -18,11 +17,10 @@ from src.utils.cleanup import register_cleanup
 
 
 class StreamingVoiceInterface:
-    """Voice interface with aggressive streaming for minimum latency"""
+    """Voice interface with aggressive streaming for minimum latency."""
 
     def __init__(self, llm_model: str = "qwen2.5:7b-instruct"):
-        """
-        Initialize streaming voice interface
+        """Initialize streaming voice interface.
 
         Args:
             llm_model: Ollama model name (must support streaming)
@@ -60,8 +58,7 @@ class StreamingVoiceInterface:
         self.playback_lock = threading.Lock()
 
     def _audio_playback_worker(self):
-        """
-        Background thread using OutputStream for gap-free continuous playback
+        """Background thread using OutputStream for gap-free continuous playback.
 
         Uses sounddevice.OutputStream which keeps audio device open continuously,
         eliminating gaps caused by sd.play() reopening the device each time.
@@ -75,7 +72,7 @@ class StreamingVoiceInterface:
         self._stream_active = False
 
         def audio_callback(outdata, frames, time_info, status):
-            """Called by sounddevice when it needs more audio data"""
+            """Called by sounddevice when it needs more audio data."""
             if status:
                 print(f"\nStream status: {status}")
 
@@ -203,8 +200,7 @@ class StreamingVoiceInterface:
             self._stream_active = False
 
     def _stream_llm(self, prompt: str):
-        """
-        Stream tokens from LLM
+        """Stream tokens from LLM.
 
         Args:
             prompt: User input
@@ -223,8 +219,7 @@ class StreamingVoiceInterface:
                 yield chunk["message"]["content"]
 
     def _split_into_speech_chunks(self, text: str) -> list:
-        """
-        Split text into natural speech chunks
+        """Split text into natural speech chunks.
 
         Splits on sentence boundaries and punctuation for natural pauses
 
@@ -249,8 +244,7 @@ class StreamingVoiceInterface:
         return [chunk.strip() for chunk in result if chunk.strip()]
 
     def _is_chunk_boundary(self, text: str) -> bool:
-        """
-        Check if text contains a good boundary for speech synthesis
+        """Check if text contains a good boundary for speech synthesis.
 
         Args:
             text: Text chunk to check
@@ -262,8 +256,7 @@ class StreamingVoiceInterface:
         return any(punct in text for punct in [".", "!", "?", ";\n", ":\n"])
 
     def _preprocess_text_for_tts(self, text: str) -> str:
-        """
-        Preprocess text for TTS following csm-streaming best practices
+        """Preprocess text for TTS following csm-streaming best practices.
 
         Removes all punctuation except periods, commas, exclamation points,
         and question marks to create cleaner speech output while preserving intonation.
@@ -287,8 +280,7 @@ class StreamingVoiceInterface:
         return cleaned_text.strip()
 
     def converse_streaming(self, duration: int = 5, debug: bool = False) -> tuple[str, str]:
-        """
-        Streaming conversation: Start speaking as soon as possible
+        """Streaming conversation: Start speaking as soon as possible.
 
         Following csm-streaming best practices:
         1. Buffer complete LLM response
@@ -452,8 +444,7 @@ class StreamingVoiceInterface:
         return user_text, full_response
 
     def converse(self, duration: int = 5, debug: bool = False) -> tuple[str, str]:
-        """
-        Single conversation turn - alias for converse_streaming
+        """Single conversation turn - alias for converse_streaming.
 
         Args:
             duration: Recording duration in seconds
@@ -465,9 +456,8 @@ class StreamingVoiceInterface:
         return self.converse_streaming(duration, debug=debug)
 
     def continuous_conversation(self, debug: bool = False):
-        """
-        Continuous conversation loop with low-latency streaming
-        Say 'goodbye' or 'exit' to end
+        """Continuous conversation loop with low-latency streaming
+        Say 'goodbye' or 'exit' to end.
 
         Args:
             debug: Enable timing debug output
@@ -494,7 +484,7 @@ class StreamingVoiceInterface:
 
 # Convenience function for quick testing
 def test_streaming_voice():
-    """Quick test of streaming voice interface"""
+    """Quick test of streaming voice interface."""
     print("=== Testing Streaming Voice Interface ===\n")
 
     vi = StreamingVoiceInterface()

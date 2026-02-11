@@ -1,6 +1,4 @@
-"""
-Text-to-Speech using Sesame CSM
-"""
+"""Text-to-Speech using Sesame CSM."""
 
 import sys
 import warnings
@@ -27,11 +25,10 @@ from generator import Segment, load_csm_1b_local
 
 
 class SesameTTS:
-    """Optimized wrapper for Sesame CSM text-to-speech with context persistence"""
+    """Optimized wrapper for Sesame CSM text-to-speech with context persistence."""
 
     def __init__(self, device: str = None, use_context: bool = True):
-        """
-        Initialize Sesame CSM TTS
+        """Initialize Sesame CSM TTS.
 
         Args:
             device: 'cuda' or 'cpu'. Auto-detects if None.
@@ -68,8 +65,7 @@ class SesameTTS:
         self._load_reference_audio(project_root)
 
     def _load_reference_audio(self, project_root):
-        """
-        Load reference audio clips from Elise dataset to initialize context.
+        """Load reference audio clips from Elise dataset to initialize context.
         This provides the voice signature for consistent generation.
         """
         import json
@@ -127,9 +123,8 @@ class SesameTTS:
             print("Warning: No reference audio loaded. Voice consistency may be reduced.")
 
     def _estimate_audio_length(self, text: str) -> int:
-        """
-        Estimate audio length in ms based on text
-        Assumes ~150 words/minute speaking rate
+        """Estimate audio length in ms based on text
+        Assumes ~150 words/minute speaking rate.
         """
         words = len(text.split())
         # 150 words/min = 2.5 words/sec = 400ms/word
@@ -147,8 +142,7 @@ class SesameTTS:
         topk: int = 20,
         streaming: bool = True,
     ) -> torch.Tensor:
-        """
-        Generate speech from text with optimized settings
+        """Generate speech from text with optimized settings.
 
         Args:
             text: Text to speak
@@ -215,11 +209,11 @@ class SesameTTS:
         return audio
 
     def reset_context(self):
-        """Reset voice context (useful for starting a new conversation)"""
+        """Reset voice context (useful for starting a new conversation)."""
         self.context = []
 
     def _play_audio(self, audio: torch.Tensor):
-        """Play audio using sounddevice"""
+        """Play audio using sounddevice."""
         try:
             import sounddevice as sd
 

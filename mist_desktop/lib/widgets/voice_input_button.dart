@@ -21,10 +21,7 @@ class VoiceInputButton extends ConsumerWidget {
 
   Widget _buildButton(BuildContext context, WidgetRef ref, bool isRecording) {
     return IconButton.filled(
-      icon: Icon(
-        isRecording ? Icons.mic : Icons.mic_none,
-        size: 28,
-      ),
+      icon: Icon(isRecording ? Icons.mic : Icons.mic_none, size: 28),
       style: IconButton.styleFrom(
         backgroundColor: isRecording
             ? ThemeConfig.processingColor
@@ -102,10 +99,7 @@ class VoiceInputIndicator extends ConsumerWidget {
           const SizedBox(width: 8),
           const Text(
             'Recording...',
-            style: TextStyle(
-              fontSize: 14,
-              fontWeight: FontWeight.w500,
-            ),
+            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
           ),
         ],
       ),
@@ -122,18 +116,11 @@ class VoiceInputIndicator extends ConsumerWidget {
       child: const Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(
-            Icons.volume_up,
-            size: 16,
-            color: ThemeConfig.primaryColor,
-          ),
+          Icon(Icons.volume_up, size: 16, color: ThemeConfig.primaryColor),
           SizedBox(width: 8),
           Text(
             'Playing...',
-            style: TextStyle(
-              fontSize: 14,
-              fontWeight: FontWeight.w500,
-            ),
+            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
           ),
         ],
       ),

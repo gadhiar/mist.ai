@@ -1,5 +1,4 @@
-"""
-Knowledge Graph - Core data structure for transparent reasoning
+"""Knowledge Graph - Core data structure for transparent reasoning.
 
 This implements a learning, reasoning knowledge graph with:
 - Provenance tracking (where knowledge came from)
@@ -17,7 +16,7 @@ import networkx as nx
 
 
 class NodeType(Enum):
-    """Types of nodes in the knowledge graph"""
+    """Types of nodes in the knowledge graph."""
 
     CONCEPT = "concept"  # Abstract concept (e.g., "Programming Language")
     ENTITY = "entity"  # Concrete entity (e.g., "Python")
@@ -27,7 +26,7 @@ class NodeType(Enum):
 
 
 class EdgeType(Enum):
-    """Types of relationships between nodes"""
+    """Types of relationships between nodes."""
 
     IS_A = "is_a"  # Taxonomy (Python is_a Programming Language)
     HAS_PROPERTY = "has_property"  # Attribute (Python has_property "interpreted")
@@ -39,7 +38,7 @@ class EdgeType(Enum):
 
 
 class Source(Enum):
-    """Where knowledge came from (provenance)"""
+    """Where knowledge came from (provenance)."""
 
     USER = "user"  # Taught by user
     CLOUD = "cloud"  # From cloud AI (Claude/GPT)
@@ -50,8 +49,7 @@ class Source(Enum):
 
 @dataclass
 class Node:
-    """
-    A node in the knowledge graph
+    """A node in the knowledge graph.
 
     Nodes represent concepts, entities, facts, or rules.
     They track their own confidence, usage, and learning history.
@@ -68,23 +66,23 @@ class Node:
     last_used: datetime | None = None
 
     def __post_init__(self):
-        """Convert string enums to enum objects if needed"""
+        """Convert string enums to enum objects if needed."""
         if isinstance(self.node_type, str):
             self.node_type = NodeType(self.node_type)
         if isinstance(self.learned_from, str):
             self.learned_from = Source(self.learned_from)
 
     def use(self):
-        """Mark this node as used (reinforcement)"""
+        """Mark this node as used (reinforcement)."""
         self.usage_count += 1
         self.last_used = datetime.now()
 
     def update_confidence(self, delta: float):
-        """Adjust confidence based on feedback"""
+        """Adjust confidence based on feedback."""
         self.confidence = max(0.0, min(1.0, self.confidence + delta))
 
     def to_dict(self) -> dict:
-        """Serialize to dictionary"""
+        """Serialize to dictionary."""
         data = asdict(self)
         data["node_type"] = self.node_type.value
         data["learned_from"] = self.learned_from.value
@@ -95,7 +93,7 @@ class Node:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Node":
-        """Deserialize from dictionary"""
+        """Deserialize from dictionary."""
         data = data.copy()
         data["timestamp"] = datetime.fromisoformat(data["timestamp"])
         if data.get("last_used"):
@@ -105,8 +103,7 @@ class Node:
 
 @dataclass
 class Edge:
-    """
-    An edge (relationship) in the knowledge graph
+    """An edge (relationship) in the knowledge graph.
 
     Edges connect nodes and represent typed relationships.
     They also track confidence and learning provenance.
@@ -124,27 +121,27 @@ class Edge:
     success_count: int = 0  # How often this edge led to correct reasoning
 
     def __post_init__(self):
-        """Convert string enums to enum objects if needed"""
+        """Convert string enums to enum objects if needed."""
         if isinstance(self.edge_type, str):
             self.edge_type = EdgeType(self.edge_type)
         if isinstance(self.learned_from, str):
             self.learned_from = Source(self.learned_from)
 
     def use(self, successful: bool = True):
-        """Mark edge as used in reasoning"""
+        """Mark edge as used in reasoning."""
         self.usage_count += 1
         if successful:
             self.success_count += 1
 
     def update_confidence(self):
-        """Update confidence based on success rate"""
+        """Update confidence based on success rate."""
         if self.usage_count > 0:
             success_rate = self.success_count / self.usage_count
             # Weighted average with prior confidence
             self.confidence = 0.7 * self.confidence + 0.3 * success_rate
 
     def to_dict(self) -> dict:
-        """Serialize to dictionary"""
+        """Serialize to dictionary."""
         data = asdict(self)
         data["edge_type"] = self.edge_type.value
         data["learned_from"] = self.learned_from.value
@@ -153,15 +150,14 @@ class Edge:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Edge":
-        """Deserialize from dictionary"""
+        """Deserialize from dictionary."""
         data = data.copy()
         data["timestamp"] = datetime.fromisoformat(data["timestamp"])
         return cls(**data)
 
 
 class KnowledgeGraph:
-    """
-    The core knowledge graph with reasoning capabilities
+    """The core knowledge graph with reasoning capabilities.
 
     This is NOT a simple database - it's a learning, reasoning system:
     - Tracks provenance and confidence
@@ -180,7 +176,7 @@ class KnowledgeGraph:
         self._type_index: dict[NodeType, set[str]] = {}  # type -> node_ids
 
     def add_node(self, node: Node) -> None:
-        """Add a node to the graph"""
+        """Add a node to the graph."""
         # Store node
         self.nodes[node.id] = node
         self.graph.add_node(node.id, **node.to_dict())
@@ -195,7 +191,7 @@ class KnowledgeGraph:
         self._type_index[node.node_type].add(node.id)
 
     def add_edge(self, edge: Edge) -> None:
-        """Add an edge to the graph"""
+        """Add an edge to the graph."""
         # Validate nodes exist
         if edge.from_id not in self.nodes:
             raise ValueError(f"Node {edge.from_id} not found")
@@ -207,22 +203,21 @@ class KnowledgeGraph:
         self.graph.add_edge(edge.from_id, edge.to_id, **edge.to_dict())
 
     def get_node(self, node_id: str) -> Node | None:
-        """Get node by ID"""
+        """Get node by ID."""
         return self.nodes.get(node_id)
 
     def find_nodes_by_label(self, label: str) -> list[Node]:
-        """Find all nodes with matching label"""
+        """Find all nodes with matching label."""
         node_ids = self._label_index.get(label, set())
         return [self.nodes[nid] for nid in node_ids]
 
     def find_nodes_by_type(self, node_type: NodeType) -> list[Node]:
-        """Find all nodes of a given type"""
+        """Find all nodes of a given type."""
         node_ids = self._type_index.get(node_type, set())
         return [self.nodes[nid] for nid in node_ids]
 
     def find_paths(self, start_id: str, end_id: str, max_depth: int = 5) -> list[list[Edge]]:
-        """
-        Find all paths between two nodes
+        """Find all paths between two nodes.
 
         Returns list of paths, where each path is a list of edges
         """
@@ -251,15 +246,14 @@ class KnowledgeGraph:
             return []
 
     def _find_edge(self, from_id: str, to_id: str) -> Edge | None:
-        """Find edge between two nodes"""
+        """Find edge between two nodes."""
         for edge in self.edges:
             if edge.from_id == from_id and edge.to_id == to_id:
                 return edge
         return None
 
     def get_neighborhood(self, node_id: str, radius: int = 2) -> dict:
-        """
-        Get all nodes within radius hops
+        """Get all nodes within radius hops.
 
         Returns: {node_id: Node} dictionary
         """
@@ -296,7 +290,7 @@ class KnowledgeGraph:
         return neighbors
 
     def prune_low_confidence(self, threshold: float = 0.3):
-        """Remove nodes and edges below confidence threshold"""
+        """Remove nodes and edges below confidence threshold."""
         # Remove low confidence nodes
         to_remove = [nid for nid, node in self.nodes.items() if node.confidence < threshold]
 
@@ -310,7 +304,7 @@ class KnowledgeGraph:
         self._rebuild_graph()
 
     def remove_node(self, node_id: str):
-        """Remove a node and all connected edges"""
+        """Remove a node and all connected edges."""
         if node_id not in self.nodes:
             return
 
@@ -331,7 +325,7 @@ class KnowledgeGraph:
             self.graph.remove_node(node_id)
 
     def _rebuild_graph(self):
-        """Rebuild NetworkX graph from nodes and edges"""
+        """Rebuild NetworkX graph from nodes and edges."""
         self.graph = nx.DiGraph()
         for node_id, node in self.nodes.items():
             self.graph.add_node(node_id, **node.to_dict())
@@ -339,7 +333,7 @@ class KnowledgeGraph:
             self.graph.add_edge(edge.from_id, edge.to_id, **edge.to_dict())
 
     def get_stats(self) -> dict:
-        """Get graph statistics"""
+        """Get graph statistics."""
         return {
             "node_count": len(self.nodes),
             "edge_count": len(self.edges),
@@ -355,7 +349,7 @@ class KnowledgeGraph:
         }
 
     def save(self, filepath: str):
-        """Save graph to JSON file"""
+        """Save graph to JSON file."""
         data = {
             "nodes": [n.to_dict() for n in self.nodes.values()],
             "edges": [e.to_dict() for e in self.edges],
@@ -366,7 +360,7 @@ class KnowledgeGraph:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
     def load(self, filepath: str):
-        """Load graph from JSON file"""
+        """Load graph from JSON file."""
         with open(filepath, encoding="utf-8") as f:
             data = json.load(f)
 

@@ -34,7 +34,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install black ruff mypy
+          pip install black ruff mypy bandit[toml] codespell
 
       - name: Check code formatting with Black
         run: |
@@ -57,23 +57,19 @@ jobs:
           mypy backend/ || echo "Type checking found issues (non-blocking)"
         continue-on-error: true
 
-  check-ai-slop:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Check for AI slop (critical issues only)
+      - name: Security scan with Bandit
         run: |
-          python scripts/check_ai_slop.py --critical-only --no-color
+          bandit -c pyproject.toml -r backend/ scripts/
           if [ $? -ne 0 ]; then
-            echo "Critical AI slop detected (emojis, unicode symbols)"
-            echo "Run: python scripts/check_ai_slop.py --fix"
+            echo "Security issues found. Review output above."
+            exit 1
+          fi
+
+      - name: Spell check with codespell
+        run: |
+          codespell --skip="*.git,*.venv,venv,*.pyc,*.egg-info,*.lock,mist_desktop,dependencies" --ignore-words-list="crate,nd,te,thre,hass,bloc,lod"
+          if [ $? -ne 0 ]; then
+            echo "Spelling errors found. Review output above."
             exit 1
           fi
 

@@ -1,5 +1,4 @@
-"""
-Export Graph Structure
+"""Export Graph Structure.
 
 Exports the current graph structure from Neo4j for analysis.
 
@@ -17,8 +16,7 @@ console = Console()
 
 
 def export_graph():
-    """Export graph structure from Neo4j"""
-
+    """Export graph structure from Neo4j."""
     config = get_config()
     connection = Neo4jConnection(config.neo4j)
 

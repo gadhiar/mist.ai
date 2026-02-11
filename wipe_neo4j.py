@@ -1,5 +1,4 @@
-"""
-Wipe Neo4j Database
+"""Wipe Neo4j Database.
 
 Deletes all nodes and relationships from Neo4j database.
 Use this to start fresh for testing.
@@ -18,8 +17,7 @@ console = Console()
 
 
 def wipe_database():
-    """Wipe all data from Neo4j database"""
-
+    """Wipe all data from Neo4j database."""
     console.print("\n[bold red]WARNING: This will DELETE ALL DATA from Neo4j![/bold red]\n")
 
     # Ask for confirmation

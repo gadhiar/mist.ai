@@ -1,7 +1,4 @@
-"""
-Speech-to-Text using Whisper
-"""
-
+"""Speech-to-Text using Whisper."""
 
 import numpy as np
 import sounddevice as sd
@@ -9,11 +6,10 @@ import whisper
 
 
 class WhisperSTT:
-    """Simple wrapper for Whisper speech-to-text"""
+    """Simple wrapper for Whisper speech-to-text."""
 
     def __init__(self, model_size: str = "base"):
-        """
-        Initialize Whisper STT
+        """Initialize Whisper STT.
 
         Args:
             model_size: 'tiny', 'base', 'small', 'medium', 'large'
@@ -32,8 +28,7 @@ class WhisperSTT:
         print("Whisper loaded successfully!")
 
     def listen(self, duration: int = 5) -> str:
-        """
-        Record audio from microphone and transcribe
+        """Record audio from microphone and transcribe.
 
         Args:
             duration: Recording duration in seconds
@@ -63,8 +58,7 @@ class WhisperSTT:
         return text
 
     def transcribe_audio(self, audio_data: np.ndarray, sample_rate: int = 16000) -> str:
-        """
-        Transcribe audio data directly (for VAD-based systems)
+        """Transcribe audio data directly (for VAD-based systems).
 
         Args:
             audio_data: Audio data as numpy array
@@ -105,8 +99,7 @@ class WhisperSTT:
         return result["text"].strip()
 
     def transcribe_file(self, audio_path: str) -> str:
-        """
-        Transcribe audio file
+        """Transcribe audio file.
 
         Args:
             audio_path: Path to audio file

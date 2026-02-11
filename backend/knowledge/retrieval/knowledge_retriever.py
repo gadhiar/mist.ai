@@ -1,5 +1,4 @@
-"""
-Knowledge Retriever
+"""Knowledge Retriever.
 
 Hybrid retrieval system combining vector search with graph traversal.
 """
@@ -16,8 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class KnowledgeRetriever:
-    """
-    Retrieves relevant knowledge from graph for answering questions
+    """Retrieves relevant knowledge from graph for answering questions.
 
     Combines:
     - Vector similarity search (find relevant entities)
@@ -35,8 +33,7 @@ class KnowledgeRetriever:
     """
 
     def __init__(self, config: KnowledgeConfig, graph_store: GraphStore):
-        """
-        Initialize retriever
+        """Initialize retriever.
 
         Args:
             config: Knowledge system configuration
@@ -61,8 +58,7 @@ class KnowledgeRetriever:
         max_hops: int | None = None,
         filters: RetrievalFilters | None = None,
     ) -> RetrievalResult:
-        """
-        Retrieve relevant knowledge for a query
+        """Retrieve relevant knowledge for a query.
 
         Process:
         1. Vector search for relevant entities
@@ -163,8 +159,7 @@ class KnowledgeRetriever:
     async def _vector_search(
         self, query: str, similarity_threshold: float, limit: int
     ) -> list[dict]:
-        """
-        Perform vector similarity search
+        """Perform vector similarity search.
 
         Returns list of entities sorted by similarity
         """
@@ -181,8 +176,7 @@ class KnowledgeRetriever:
         max_hops: int,
         filters: RetrievalFilters | None,
     ) -> list[RetrievedFact]:
-        """
-        Gather facts from graph
+        """Gather facts from graph.
 
         Process:
         1. Get User's direct relationships to found entities
@@ -266,7 +260,7 @@ class KnowledgeRetriever:
     def _apply_filters(
         self, facts: list[RetrievedFact], filters: RetrievalFilters
     ) -> list[RetrievedFact]:
-        """Apply optional filters to facts"""
+        """Apply optional filters to facts."""
         filtered = facts
 
         if filters.entity_types:
@@ -298,8 +292,7 @@ class KnowledgeRetriever:
         return filtered
 
     def _rank_facts(self, facts: list[RetrievedFact], limit: int) -> list[RetrievedFact]:
-        """
-        Rank facts by relevance
+        """Rank facts by relevance.
 
         Sorting:
         1. Primary: Similarity score (higher = better)
@@ -310,8 +303,7 @@ class KnowledgeRetriever:
         return sorted_facts[:limit]
 
     def _format_context(self, facts: list[RetrievedFact], query: str) -> str:
-        """
-        Format facts as natural language context for LLM
+        """Format facts as natural language context for LLM.
 
         Returns formatted string ready for LLM consumption
         """
@@ -366,8 +358,7 @@ class KnowledgeRetriever:
     async def search_documents(
         self, query: str, limit: int = 5, similarity_threshold: float = 0.7
     ) -> list[dict[str, Any]]:
-        """
-        Search DocumentChunks using vector similarity
+        """Search DocumentChunks using vector similarity.
 
         This is RAG retrieval - finds relevant document chunks based on
         semantic similarity to the query.

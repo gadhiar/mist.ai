@@ -1,5 +1,4 @@
-"""
-Knowledge Graph Integration for Voice Processor
+"""Knowledge Graph Integration for Voice Processor.
 
 Provides a bridge between existing voice system and knowledge-augmented conversation.
 """
@@ -23,8 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 class KnowledgeIntegration:
-    """
-    Integrates knowledge graph with existing voice system.
+    """Integrates knowledge graph with existing voice system.
 
     Wraps ConversationHandler to work with existing streaming architecture.
     """
@@ -33,11 +31,10 @@ class KnowledgeIntegration:
         self,
         neo4j_uri: str = "bolt://localhost:7687",
         neo4j_user: str = "neo4j",
-        neo4j_password: str = "your_password",
+        neo4j_password: str = "your_password",  # nosec B107 - default placeholder, overridden by env
         model_name: str = "qwen2.5:7b",
     ):
-        """
-        Initialize knowledge integration.
+        """Initialize knowledge integration.
 
         Args:
             neo4j_uri: Neo4j connection URI
@@ -76,7 +73,7 @@ class KnowledgeIntegration:
             logger.info(" Knowledge integration enabled")
 
         except Exception as e:
-            logger.warning(f"  Knowledge integration disabled: {e}")
+            logger.warning(f"Knowledge integration disabled: {e}")
             logger.warning("Falling back to standard LLM (no knowledge graph)")
 
     def generate_response_streaming(
@@ -85,8 +82,7 @@ class KnowledgeIntegration:
         session_id: str | None = None,
         event_loop: asyncio.AbstractEventLoop | None = None,
     ) -> Generator[str, None, None]:
-        """
-        Generate LLM response with knowledge integration (streaming).
+        """Generate LLM response with knowledge integration (streaming).
 
         Note: Current implementation returns complete response, not streaming.
         Future: Can implement true streaming with tool results.
@@ -137,16 +133,16 @@ class KnowledgeIntegration:
             yield f"I encountered an error: {str(e)}"
 
     def set_session_id(self, session_id: str):
-        """Set the current session ID"""
+        """Set the current session ID."""
         self.current_session_id = session_id
         logger.info(f"Session ID set to: {session_id}")
 
     def clear_session(self, session_id: str | None = None):
-        """Clear a conversation session"""
+        """Clear a conversation session."""
         if self.conversation_handler:
             sid = session_id or self.current_session_id
             self.conversation_handler.clear_session(sid)
 
     def is_enabled(self) -> bool:
-        """Check if knowledge integration is enabled"""
+        """Check if knowledge integration is enabled."""
         return self.enabled

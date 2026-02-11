@@ -5,12 +5,7 @@ import '../config/app_config.dart';
 import '../models/websocket_message.dart';
 
 /// WebSocket Connection Status
-enum ConnectionStatus {
-  disconnected,
-  connecting,
-  connected,
-  error,
-}
+enum ConnectionStatus { disconnected, connecting, connected, error }
 
 /// WebSocket Service for communicating with the backend
 class WebSocketService {
@@ -39,9 +34,7 @@ class WebSocketService {
       _updateStatus(ConnectionStatus.connecting);
       _logger.i('Connecting to WebSocket: ${AppConfig.wsUrl}');
 
-      _channel = WebSocketChannel.connect(
-        Uri.parse(AppConfig.wsUrl),
-      );
+      _channel = WebSocketChannel.connect(Uri.parse(AppConfig.wsUrl));
 
       // Wait for connection to be established
       await _channel!.ready;
@@ -96,10 +89,9 @@ class WebSocketService {
   void sendAudioBytes(List<int> audioBytes, {int sampleRate = 16000}) {
     // Convert PCM16 bytes to float32 array for backend
     final audioData = _convertPCM16ToFloat32(audioBytes);
-    sendMessage(WebSocketMessage.audio(
-      audio: audioData,
-      sampleRate: sampleRate,
-    ));
+    sendMessage(
+      WebSocketMessage.audio(audio: audioData, sampleRate: sampleRate),
+    );
   }
 
   /// Convert PCM16 bytes to float32 array

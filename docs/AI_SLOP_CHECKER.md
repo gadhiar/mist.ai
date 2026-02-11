@@ -215,22 +215,29 @@ Structured data for scripts and automation:
 
 ## Common Workflows
 
-### Pre-Commit Check (Fast)
+### Pre-Commit Check (Automatic)
 
-Check only changed files for critical issues:
+**The AI slop checker runs automatically on every commit via pre-commit hooks.**
+
+It checks only changed files (`--incremental`) for critical issues (emojis, unicode symbols).
+
+If issues are found, the commit is blocked and you'll see an error message. Fix with:
 
 ```bash
-python scripts/check_ai_slop.py --incremental --critical-only
+# Auto-fix the issues
+python scripts/check_ai_slop.py --incremental --fix
+
+# Or fix all files
+python scripts/check_ai_slop.py --fix --critical-only
+
+# Then commit again
+git add .
+git commit -m "your message"
 ```
 
-Add to `.git/hooks/pre-commit`:
+**Manual run (check changed files only):**
 ```bash
-#!/bin/bash
 python scripts/check_ai_slop.py --incremental --critical-only
-if [ $? -ne 0 ]; then
-    echo "Critical AI slop detected. Run: python scripts/check_ai_slop.py --fix"
-    exit 1
-fi
 ```
 
 ### Auto-Fix Workflow
@@ -264,7 +271,11 @@ cat ai-slop.md
 
 ### CI/CD Integration
 
-In GitHub Actions or similar:
+**The AI slop checker is NOT run in CI** - it runs automatically via pre-commit hooks instead.
+
+This keeps CI fast and prevents false positives from third-party dependencies.
+
+If you need to run it in CI for your fork:
 
 ```yaml
 - name: Check for AI slop
@@ -353,21 +364,19 @@ The script automatically skips:
 
 ## Integration with Pre-Commit Framework
 
-Add to `.pre-commit-config.yaml`:
+**Already integrated!** The AI slop checker is configured in `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: local
   hooks:
     - id: check-ai-slop
       name: Check for AI slop patterns
-      entry: python scripts/check_ai_slop.py
+      entry: python scripts/check_ai_slop.py --incremental --critical-only --no-color
       language: system
       pass_filenames: false
-      args: [--critical-only]
-      stages: [commit]
 ```
 
-This runs automatically on every commit.
+This runs automatically on every commit, checking only changed files for critical issues (emojis, unicode symbols).
 
 ---
 

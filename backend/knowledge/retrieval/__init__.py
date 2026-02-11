@@ -1,5 +1,4 @@
-"""
-Knowledge Retrieval Module
+"""Knowledge Retrieval Module.
 
 Retrieves relevant context from knowledge graph for answering questions.
 """

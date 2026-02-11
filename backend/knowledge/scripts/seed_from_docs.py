@@ -1,5 +1,4 @@
-"""
-Seed RAG Corpus from MIST Documentation
+"""Seed RAG Corpus from MIST Documentation.
 
 This script:
 1. Reads all MIST documentation markdown files
@@ -34,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 class DocumentationSeeder:
-    """Seeds RAG corpus from MIST documentation"""
+    """Seeds RAG corpus from MIST documentation."""
 
     def __init__(self):
         self.config = KnowledgeConfig.from_env()
@@ -44,7 +43,7 @@ class DocumentationSeeder:
         self.docs_root = Path(__file__).parent.parent.parent.parent / "docs"
 
     def find_documentation_files(self) -> list[Path]:
-        """Find all markdown documentation files"""
+        """Find all markdown documentation files."""
         doc_files = []
 
         # Recursively find all .md files in docs directory
@@ -66,8 +65,7 @@ class DocumentationSeeder:
         return doc_files
 
     def read_document(self, file_path: Path) -> tuple[str, str]:
-        """
-        Read a documentation file and extract title and content
+        """Read a documentation file and extract title and content.
 
         Returns:
             Tuple of (title, content)
@@ -90,8 +88,7 @@ class DocumentationSeeder:
             return "", ""
 
     def chunk_document(self, title: str, content: str, file_path: Path) -> list[str]:
-        """
-        Break document into entity-rich chunks
+        """Break document into entity-rich chunks.
 
         Strategy:
         - Split by headers (##, ###) to preserve logical sections
@@ -159,8 +156,7 @@ class DocumentationSeeder:
         return chunks
 
     async def seed_from_documentation(self):
-        """Main seeding process"""
-
+        """Main seeding process."""
         print("\n" + "=" * 60)
         print("SEEDING KNOWLEDGE GRAPH FROM MIST DOCUMENTATION")
         print("=" * 60)
@@ -245,7 +241,7 @@ class DocumentationSeeder:
 
 
 async def main():
-    """Run the seeding process"""
+    """Run the seeding process."""
     seeder = DocumentationSeeder()
     await seeder.seed_from_documentation()
 

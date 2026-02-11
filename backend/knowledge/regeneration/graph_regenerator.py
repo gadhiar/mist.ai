@@ -1,5 +1,4 @@
-"""
-Graph Regeneration Module
+"""Graph Regeneration Module.
 
 Rebuilds the knowledge graph from immutable utterances.
 
@@ -21,8 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 class GraphRegenerator:
-    """
-    Regenerates knowledge graph from immutable utterances.
+    """Regenerates knowledge graph from immutable utterances.
 
     The knowledge graph is a materialized view built from utterances.
     This class rebuilds the entire graph or specific conversations.
@@ -34,8 +32,7 @@ class GraphRegenerator:
     """
 
     def __init__(self, config: KnowledgeConfig):
-        """
-        Initialize graph regenerator
+        """Initialize graph regenerator.
 
         Args:
             config: Knowledge system configuration
@@ -48,8 +45,7 @@ class GraphRegenerator:
         logger.info("GraphRegenerator initialized")
 
     async def regenerate_all(self) -> RegenerationReport:
-        """
-        Regenerate entire knowledge graph from all utterances
+        """Regenerate entire knowledge graph from all utterances.
 
         Process:
         1. Fetch all utterances from Neo4j
@@ -139,11 +135,11 @@ class GraphRegenerator:
 
             logger.info("=" * 60)
             logger.info("Regeneration complete!")
-            logger.info(f"  Processed: {processed}/{len(utterances)} utterances")
-            logger.info(f"  Entities: {total_entities}")
-            logger.info(f"  Relationships: {total_relationships}")
-            logger.info(f"  Failed: {failed}")
-            logger.info(f"  Duration: {duration:.2f}s")
+            logger.info(f"Processed: {processed}/{len(utterances)} utterances")
+            logger.info(f"Entities: {total_entities}")
+            logger.info(f"Relationships: {total_relationships}")
+            logger.info(f"Failed: {failed}")
+            logger.info(f"Duration: {duration:.2f}s")
             logger.info("=" * 60)
 
             return report
@@ -153,8 +149,7 @@ class GraphRegenerator:
             raise
 
     async def regenerate_conversation(self, conversation_id: str) -> RegenerationReport:
-        """
-        Regenerate graph for a specific conversation
+        """Regenerate graph for a specific conversation.
 
         Useful for:
         - Testing on subset of data
@@ -232,8 +227,7 @@ class GraphRegenerator:
             raise
 
     def _fetch_all_utterances(self) -> list[Utterance]:
-        """
-        Fetch all utterances from Neo4j
+        """Fetch all utterances from Neo4j.
 
         Returns utterances in chronological order to maintain conversation context.
 
@@ -275,8 +269,7 @@ class GraphRegenerator:
         return utterances
 
     def _fetch_conversation_utterances(self, conversation_id: str) -> list[Utterance]:
-        """
-        Fetch utterances for a specific conversation
+        """Fetch utterances for a specific conversation.
 
         Args:
             conversation_id: Conversation ID
@@ -319,8 +312,7 @@ class GraphRegenerator:
         return utterances
 
     def _delete_graph_entities(self):
-        """
-        Delete all __Entity__ nodes and their relationships
+        """Delete all __Entity__ nodes and their relationships.
 
         This removes the materialized graph view but preserves
         the source of truth (ConversationEvent and Utterance nodes).
@@ -350,8 +342,7 @@ class GraphRegenerator:
         logger.info("All entity nodes deleted successfully")
 
     def _delete_conversation_entities(self, conversation_id: str):
-        """
-        Delete entities for a specific conversation
+        """Delete entities for a specific conversation.
 
         Args:
             conversation_id: Conversation ID
@@ -372,8 +363,7 @@ class GraphRegenerator:
         logger.info("Conversation entities deleted")
 
     async def _extract_and_store(self, utterance: Utterance) -> tuple[int, int]:
-        """
-        Re-extract entities from utterance and store
+        """Re-extract entities from utterance and store.
 
         Args:
             utterance: Utterance to process

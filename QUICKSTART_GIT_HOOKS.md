@@ -28,33 +28,54 @@ Hooks will now run automatically on every commit.
 
 ## What gets checked?
 
-- [CRITICAL] Emojis and unicode symbols (auto-fixed)
-- [CHECK] Python formatting (Black)
-- [CHECK] Python linting (Ruff)
-- [CHECK] Flutter formatting
-- [CHECK] Flutter analysis
-- [CHECK] YAML/JSON validation
-- [CHECK] Trailing whitespace
-- [CHECK] Secret detection
+All **16 hooks** run automatically on every commit:
+
+**Python Quality (5 hooks):**
+- Black - Code formatting (auto-fix)
+- Ruff - Linting + auto-fix
+- Mypy - Type checking (non-blocking)
+- Bandit - Security scanning
+- Codespell - Spell checking
+
+**Dart/Flutter (2 hooks):**
+- Dart format - Code formatting (auto-fix)
+- Flutter analyze - Linting
+
+**General Quality (9 hooks):**
+- **AI Slop Checker** - Emoji/unicode detection (auto-fix, runs on changed files only)
+- Trailing whitespace removal
+- End-of-file fixer
+- YAML/TOML/JSON validation
+- Large file detection (>1MB)
+- Merge conflict detection
+- Private key detection
+- Line ending normalization
 
 ---
 
 ## Common commands
 
 ```bash
-# Manual run
+# Run all hooks manually
 pre-commit run --all-files
 
-# Fix AI slop (emojis)
-python scripts/check_ai_slop.py --fix
+# Run specific hook
+pre-commit run black --all-files
+pre-commit run check-ai-slop --all-files
+
+# Fix AI slop manually (all files)
+python scripts/check_ai_slop.py --fix --critical-only
+
+# Fix AI slop (changed files only - faster)
+python scripts/check_ai_slop.py --incremental --fix
 
 # Fix Python formatting
 black backend/
 
 # Fix Flutter formatting
-cd mist_desktop && flutter format lib/
+cd mist_desktop && dart format .
 
-# Skip hooks (emergency only)
+# Skip hooks (emergency only - use sparingly!)
 git commit --no-verify
 ```
 

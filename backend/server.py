@@ -1,5 +1,4 @@
-"""
-Voice AI WebSocket Server
+"""Voice AI WebSocket Server.
 
 Based on CSM demo architecture - production-ready for web frontend
 """
@@ -49,7 +48,7 @@ config = DEFAULT_CONFIG
 
 
 async def broadcast_messages():
-    """Background task to broadcast messages to all connected clients"""
+    """Background task to broadcast messages to all connected clients."""
     while True:
         message = await message_queue.get()
 
@@ -67,7 +66,7 @@ async def broadcast_messages():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan event handler for startup and shutdown"""
+    """Lifespan event handler for startup and shutdown."""
     global voice_processor
 
     # Startup
@@ -109,13 +108,13 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    """Health check"""
+    """Health check."""
     return {"status": "online", "service": "Mist.AI Voice Server"}
 
 
 @app.get("/health")
 async def health():
-    """Detailed health check"""
+    """Detailed health check."""
     return {
         "status": "healthy",
         "models_loaded": voice_processor is not None,
@@ -125,8 +124,7 @@ async def health():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """
-    WebSocket endpoint for voice conversation
+    """WebSocket endpoint for voice conversation.
 
     Message types:
     - From client:
@@ -163,9 +161,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 audio_data = np.asarray(data["audio"], dtype=np.float32)
                 sample_rate = data.get("sample_rate", 16000)
 
-                logger.info(
-                    f" Received complete audio: {len(audio_data)} samples @ {sample_rate}Hz"
-                )
+                logger.info(f"Received complete audio: {len(audio_data)} samples @ {sample_rate}Hz")
 
                 # Process complete audio directly (transcribe -> LLM -> TTS)
                 loop = asyncio.get_event_loop()
@@ -176,7 +172,7 @@ async def websocket_endpoint(websocket: WebSocket):
             elif data["type"] == "text":
                 # Text message (manual input)
                 user_text = data["text"]
-                logger.info(f" Text message from client: '{user_text}'")
+                logger.info(f"Text message from client: '{user_text}'")
 
                 # Send to message queue
                 await message_queue.put({"type": "transcription", "text": user_text})

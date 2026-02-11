@@ -1,5 +1,4 @@
-"""
-Knowledge System Data Models
+"""Knowledge System Data Models.
 
 Core data structures for working with the knowledge graph.
 """
@@ -11,8 +10,7 @@ from typing import Any
 
 @dataclass
 class Utterance:
-    """
-    Represents an immutable utterance from conversation.
+    """Represents an immutable utterance from conversation.
 
     This is the source of truth - the knowledge graph can always
     be regenerated from utterances.
@@ -30,8 +28,7 @@ class Utterance:
 
 @dataclass
 class RegenerationReport:
-    """
-    Statistics and results from graph regeneration.
+    """Statistics and results from graph regeneration.
 
     Tracks what happened during regeneration process.
     """
@@ -46,7 +43,7 @@ class RegenerationReport:
 
     @property
     def success_rate(self) -> float:
-        """Calculate success rate percentage"""
+        """Calculate success rate percentage."""
         if self.total_utterances == 0:
             return 0.0
         return (self.processed / self.total_utterances) * 100
@@ -65,8 +62,7 @@ class RegenerationReport:
 
 @dataclass
 class SearchResult:
-    """
-    Result from vector similarity search.
+    """Result from vector similarity search.
 
     Contains entity information and similarity score.
     """
@@ -82,8 +78,7 @@ class SearchResult:
 
 @dataclass
 class RetrievalFilters:
-    """
-    Optional filters for knowledge retrieval.
+    """Optional filters for knowledge retrieval.
 
     Designed for LLM to specify what it wants to retrieve.
     Default behavior: Return all relevant context (no filtering).
@@ -99,8 +94,7 @@ class RetrievalFilters:
 
 @dataclass
 class RetrievedFact:
-    """
-    A single fact (relationship) retrieved from knowledge graph.
+    """A single fact (relationship) retrieved from knowledge graph.
 
     Represents a subject-predicate-object triple with metadata.
     """
@@ -122,12 +116,11 @@ class RetrievedFact:
     created_at: datetime | None = None
 
     def to_triple_string(self) -> str:
-        """Format as subject-predicate-object triple"""
+        """Format as subject-predicate-object triple."""
         return f"{self.subject} -[{self.predicate}]-> {self.object}"
 
     def to_natural_language(self) -> str:
-        """
-        Format as natural language sentence
+        """Format as natural language sentence.
 
         Example: "You use Python (expert proficiency, 5 years)"
         """
@@ -153,8 +146,7 @@ class RetrievedFact:
 
 @dataclass
 class RetrievalResult:
-    """
-    Complete result from knowledge retrieval.
+    """Complete result from knowledge retrieval.
 
     Contains all retrieved facts and formatted context for LLM.
     """
@@ -179,15 +171,15 @@ class RetrievalResult:
     config_used: dict[str, Any]  # What parameters were used
 
     def get_top_facts(self, n: int = 10) -> list[RetrievedFact]:
-        """Get top N facts by score"""
+        """Get top N facts by score."""
         return self.facts[:n]
 
     def get_facts_by_entity(self, entity_id: str) -> list[RetrievedFact]:
-        """Get all facts involving a specific entity"""
+        """Get all facts involving a specific entity."""
         return [f for f in self.facts if f.subject == entity_id or f.object == entity_id]
 
     def summary(self) -> str:
-        """Brief summary of retrieval"""
+        """Brief summary of retrieval."""
         return f"Retrieved {self.total_facts} facts from {self.entities_found} entities in {self.retrieval_time_ms:.1f}ms"
 
     def __str__(self):
@@ -196,8 +188,7 @@ class RetrievalResult:
 
 @dataclass
 class Message:
-    """
-    A single message in a conversation.
+    """A single message in a conversation.
 
     Represents either user input or assistant response.
     """
@@ -216,8 +207,7 @@ class Message:
 
 @dataclass
 class ConversationSession:
-    """
-    Tracks a conversation session with context.
+    """Tracks a conversation session with context.
 
     Models human memory: One event per session with timestamps.
     Links to ConversationEvent in Neo4j.
@@ -234,14 +224,13 @@ class ConversationSession:
     conversation_event_id: str | None = None  # Links to ConversationEvent node
 
     def add_message(self, role: str, content: str, tool_calls=None, tool_results=None):
-        """Add a message to the conversation"""
+        """Add a message to the conversation."""
         msg = Message(role=role, content=content, tool_calls=tool_calls, tool_results=tool_results)
         self.messages.append(msg)
         return msg
 
     def get_history(self, max_messages: int | None = None) -> list[dict[str, str]]:
-        """
-        Get conversation history formatted for LLM.
+        """Get conversation history formatted for LLM.
 
         Returns list of {"role": "user/assistant", "content": "..."}
         """
@@ -257,8 +246,7 @@ class ConversationSession:
 
 @dataclass
 class SourceDocument:
-    """
-    Immutable source document for RAG corpus.
+    """Immutable source document for RAG corpus.
 
     Represents external knowledge sources:
     - Markdown files
@@ -287,8 +275,7 @@ class SourceDocument:
 
 @dataclass
 class DocumentChunk:
-    """
-    A chunk of a source document for RAG retrieval.
+    """A chunk of a source document for RAG retrieval.
 
     Serves dual purpose:
     1. RAG Corpus: Vector search retrieves verbatim text
@@ -312,7 +299,7 @@ class DocumentChunk:
     metadata: dict[str, Any] | None = None
 
     def __post_init__(self):
-        """Calculate word and char counts if not provided"""
+        """Calculate word and char counts if not provided."""
         if self.word_count == 0:
             self.word_count = len(self.text.split())
         if self.char_count == 0:

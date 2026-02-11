@@ -1,5 +1,4 @@
-"""
-Conversation Handler with MCP-like Tool Access
+"""Conversation Handler with MCP-like Tool Access.
 
 Enables LLM to autonomously:
 - Query knowledge graph for context
@@ -23,8 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 class ConversationHandler:
-    """
-    Handles conversations with knowledge graph integration.
+    """Handles conversations with knowledge graph integration.
 
     Uses MCP-like tool access pattern:
     - LLM decides autonomously when to query or extract
@@ -35,8 +33,7 @@ class ConversationHandler:
     def __init__(
         self, config: KnowledgeConfig, graph_store: GraphStore, model_name: str = "qwen2.5:7b"
     ):
-        """
-        Initialize conversation handler.
+        """Initialize conversation handler.
 
         Args:
             config: Knowledge system configuration
@@ -65,8 +62,7 @@ class ConversationHandler:
         logger.info(f"ConversationHandler initialized with model: {model_name}")
 
     def _setup_tools(self):
-        """Setup LLM tools for MCP-like access"""
-
+        """Setup LLM tools for MCP-like access."""
         # Store references for tool implementations
         retriever = self.retriever
         extractor = self.extractor
@@ -177,9 +173,7 @@ class ConversationHandler:
                 return f"Error storing knowledge: {str(e)}"
 
         @tool
-        async def extract_knowledge_from_document(
-            chunk_id: str, reason: str | None = None
-        ) -> str:
+        async def extract_knowledge_from_document(chunk_id: str, reason: str | None = None) -> str:
             """Extract entities from a specific document chunk into the knowledge graph.
 
             Use this tool when:
@@ -248,7 +242,7 @@ class ConversationHandler:
         )
 
     def get_or_create_session(self, session_id: str, user_id: str = "User") -> ConversationSession:
-        """Get existing session or create new one"""
+        """Get existing session or create new one."""
         if session_id not in self.sessions:
             self.sessions[session_id] = ConversationSession(session_id=session_id, user_id=user_id)
             logger.info(f"Created new session: {session_id}")
@@ -258,8 +252,7 @@ class ConversationHandler:
     async def handle_message(
         self, user_message: str, session_id: str, user_id: str = "User", max_history: int = 10
     ) -> str:
-        """
-        Handle a user message with autonomous tool use.
+        """Handle a user message with autonomous tool use.
 
         LLM decides autonomously whether to:
         1. Query knowledge graph for context
@@ -384,7 +377,7 @@ class ConversationHandler:
             return error_msg
 
     async def _execute_tool(self, tool_name: str, tool_args: dict[str, Any]) -> str:
-        """Execute a tool by name"""
+        """Execute a tool by name."""
         for tool in self.tools:
             if tool.name == tool_name:
                 return await tool.ainvoke(tool_args)
@@ -392,8 +385,7 @@ class ConversationHandler:
         return f"Tool not found: {tool_name}"
 
     def _format_document_context(self, doc_results: list[dict[str, Any]]) -> str:
-        """
-        Format document search results for injection into context.
+        """Format document search results for injection into context.
 
         Args:
             doc_results: List of document chunks from search_documents()
@@ -424,8 +416,7 @@ class ConversationHandler:
         max_history: int,
         doc_context: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, str]]:
-        """
-        Build message list for LLM with system prompt, doc context, and history.
+        """Build message list for LLM with system prompt, doc context, and history.
 
         Args:
             session: Conversation session
@@ -435,7 +426,6 @@ class ConversationHandler:
         Returns:
             List of messages for LLM
         """
-
         system_prompt = """You are MIST, a conversational AI assistant with a personal knowledge graph.
 
 === CONTEXT PROVIDED ===
@@ -525,13 +515,13 @@ Remember: Documentation is already provided below. Think about whether you need 
         return messages
 
     def clear_session(self, session_id: str):
-        """Clear a conversation session"""
+        """Clear a conversation session."""
         if session_id in self.sessions:
             del self.sessions[session_id]
             logger.info(f"Cleared session: {session_id}")
 
     def get_session_info(self, session_id: str) -> dict[str, Any] | None:
-        """Get information about a session"""
+        """Get information about a session."""
         if session_id not in self.sessions:
             return None
 

@@ -1,5 +1,4 @@
-"""
-Test Conversation Handler with Knowledge Graph Integration
+"""Test Conversation Handler with Knowledge Graph Integration.
 
 Tests the MCP-like autonomous tool use for query and extraction.
 """
@@ -19,8 +18,7 @@ from backend.knowledge.storage.graph_store import GraphStore
 
 
 async def test_conversation_handler():
-    """Test the conversation handler with sample interactions"""
-
+    """Test the conversation handler with sample interactions."""
     print("=" * 70)
     print("CONVERSATION HANDLER TEST")
     print("=" * 70)
@@ -129,8 +127,7 @@ async def test_conversation_handler():
 
 
 async def test_simple_interaction():
-    """Simple single interaction test"""
-
+    """Simple single interaction test."""
     print("=" * 70)
     print("SIMPLE INTERACTION TEST")
     print("=" * 70)

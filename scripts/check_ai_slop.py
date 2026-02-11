@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-AI Slop Detection and Removal Tool
+"""AI Slop Detection and Removal Tool.
 
 Detects and removes "AI slop" patterns that violate project style guidelines.
 See docs/AI_SLOP_CHECKER.md for complete documentation.
@@ -28,7 +27,7 @@ For full documentation, see: docs/AI_SLOP_CHECKER.md
 import argparse
 import json
 import re
-import subprocess
+import subprocess  # nosec B404 - used only for safe git commands
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -59,7 +58,7 @@ PATTERNS = [
     # CRITICAL: Common emoji-like unicode symbols
     SlopPattern(
         name="emoji_symbols",
-        pattern=re.compile(r"[]"),
+        pattern=re.compile(r"[✓✗✅❌🎯🔧🚀💡⚠️📝📊🏗️🌟💪🤔👍👎🔥💯🎉🎊]"),
         severity="critical",
         fixable=True,
         replacement="",  # Just remove them
@@ -67,7 +66,7 @@ PATTERNS = [
     # CRITICAL: Arrow symbols (use -> instead)
     SlopPattern(
         name="arrow_symbols",
-        pattern=re.compile(r"[->->->->->->->->->->->]"),
+        pattern=re.compile(r"[→←↔↑↓⇒⇐⇔⟹⟸⟺➜➝➞➟➠➡➢➣➤]"),
         severity="critical",
         fixable=True,
         replacement="->",
@@ -121,19 +120,21 @@ PATTERNS = [
 
 # Files to always skip
 SKIP_PATTERNS = [
-    r"\.git/",
-    r"venv/",
-    r"node_modules/",
-    r"__pycache__/",
+    r"\.git[/\\]",
+    r"[/\\]?venv[/\\]",
+    r"[/\\]?\.venv[/\\]",
+    r"node_modules[/\\]",
+    r"__pycache__[/\\]",
     r"\.pyc$",
     r"\.jpg$",
     r"\.png$",
     r"\.ico$",
     r"\.wav$",
     r"\.mp3$",
-    r"dependencies/",
+    r"dependencies[/\\]",
     r"\.lock$",
     r"package-lock\.json$",
+    r"check_ai_slop\.py$",  # Skip self - contains patterns by design
 ]
 
 
@@ -146,7 +147,7 @@ def should_skip_file(file_path: Path) -> bool:
 def get_git_diff_files() -> set[Path]:
     """Get list of files changed in git (unstaged + staged)."""
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603, B607 - safe git command with fixed arguments
             ["git", "diff", "--name-only", "HEAD"], capture_output=True, text=True, check=True
         )
         files = result.stdout.strip().split("\n")
@@ -163,8 +164,7 @@ def filter_by_severity(patterns: list[SlopPattern], severity_threshold: str) -> 
 
 
 def check_file(file_path: Path) -> dict[str, list[tuple[int, str, str]]]:
-    """
-    Check a single file for AI slop patterns.
+    """Check a single file for AI slop patterns.
 
     Returns:
         Dict mapping pattern names to list of (line_num, line_content, match)
@@ -194,8 +194,7 @@ def check_file(file_path: Path) -> dict[str, list[tuple[int, str, str]]]:
 
 
 def fix_file(file_path: Path, dry_run: bool = False) -> int:
-    """
-    Fix AI slop in a file.
+    """Fix AI slop in a file.
 
     Returns:
         Number of fixes applied

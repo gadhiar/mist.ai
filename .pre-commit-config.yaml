@@ -18,6 +18,40 @@ repos:
       - id: ruff
         args: [--fix, --exit-non-zero-on-fix]
 
+  # Type checking with mypy
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.8.0
+    hooks:
+      - id: mypy
+        args: [--config-file=pyproject.toml, --namespace-packages, --explicit-package-bases]
+        exclude: ^(dependencies/|tests/)
+
+  # Security scanning with bandit
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.7.6
+    hooks:
+      - id: bandit
+        args: [-c, pyproject.toml]
+        additional_dependencies: ["bandit[toml]"]
+        exclude: ^(dependencies/|tests/)
+
+  # Spell checking
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.2.6
+    hooks:
+      - id: codespell
+        args: [--ignore-words-list=crate,nd,te,thre,hass,bloc,lod]
+        exclude: ^(dependencies/|\.git/|\.venv/|mist_desktop/)
+
+  # AI slop detection (runs only on changed files)
+  - repo: local
+    hooks:
+      - id: check-ai-slop
+        name: Check for AI slop patterns
+        entry: python scripts/check_ai_slop.py --incremental --critical-only --no-color
+        language: system
+        pass_filenames: false
+
   # General file quality checks
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
@@ -36,6 +70,7 @@ repos:
       - id: detect-private-key
       - id: mixed-line-ending
         args: [--fix=lf]
+        exclude: ^mist_desktop/(build|ios|android|macos|windows|linux|web)/
 
 
   # Dart/Flutter formatting
@@ -43,7 +78,7 @@ repos:
     hooks:
       - id: flutter-format
         name: Flutter format
-        entry: bash -c 'cd mist_desktop && flutter format .'
+        entry: bash -c 'cd mist_desktop && dart format .'
         language: system
         types: [dart]
         pass_filenames: false

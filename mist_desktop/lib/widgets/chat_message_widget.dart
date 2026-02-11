@@ -7,10 +7,7 @@ import '../config/theme_config.dart';
 class ChatMessageWidget extends StatelessWidget {
   final ChatMessage message;
 
-  const ChatMessageWidget({
-    super.key,
-    required this.message,
-  });
+  const ChatMessageWidget({super.key, required this.message});
 
   @override
   Widget build(BuildContext context) {
@@ -63,11 +60,7 @@ class ChatMessageWidget extends StatelessWidget {
                 Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(
-                      icon,
-                      size: 16,
-                      color: textColor.withOpacity(0.7),
-                    ),
+                    Icon(icon, size: 16, color: textColor.withOpacity(0.7)),
                     const SizedBox(width: 4),
                     Text(
                       _getLabel(),
@@ -91,11 +84,7 @@ class ChatMessageWidget extends StatelessWidget {
                 // Message text
                 SelectableText(
                   message.text,
-                  style: TextStyle(
-                    fontSize: 14,
-                    color: textColor,
-                    height: 1.4,
-                  ),
+                  style: TextStyle(fontSize: 14, color: textColor, height: 1.4),
                 ),
               ],
             ),

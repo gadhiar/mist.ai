@@ -1,6 +1,4 @@
-"""
-Voice Processor - Handles voice conversation logic
-"""
+"""Voice Processor - Handles voice conversation logic."""
 
 import asyncio
 import logging
@@ -30,17 +28,16 @@ logger = logging.getLogger(__name__)
 
 
 def log_timestamp(msg: str):
-    """Log with timestamp"""
+    """Log with timestamp."""
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     logger.info(f"[{timestamp}] {msg}")
 
 
 class VoiceProcessor:
-    """Handles voice conversation processing"""
+    """Handles voice conversation processing."""
 
     def __init__(self, config, message_queue):
-        """
-        Initialize voice processor
+        """Initialize voice processor.
 
         Args:
             config: VoiceConfig object
@@ -67,7 +64,7 @@ class VoiceProcessor:
         self.loop = None
 
     async def initialize(self):
-        """Initialize models and VAD"""
+        """Initialize models and VAD."""
         log_timestamp("Initializing voice processor...")
 
         # Save event loop reference for VAD callbacks
@@ -99,7 +96,7 @@ class VoiceProcessor:
         log_timestamp("Voice processor initialized")
 
     def _on_speech_start(self):
-        """Called by VAD when user starts speaking"""
+        """Called by VAD when user starts speaking."""
         # Send message to clients (using saved event loop reference)
         asyncio.run_coroutine_threadsafe(
             self.message_queue.put({"type": "vad_status", "status": "speech_started"}),
@@ -112,7 +109,7 @@ class VoiceProcessor:
             self.interrupt_flag.set()
 
     def _on_speech_end(self, audio_data, sample_rate):
-        """Called by VAD when user stops speaking - SPAWN NEW THREAD"""
+        """Called by VAD when user stops speaking - SPAWN NEW THREAD."""
         log_timestamp("Speech ended, spawning processing thread...")
 
         # Process in separate thread (CSM pattern!)
@@ -123,7 +120,7 @@ class VoiceProcessor:
         ).start()
 
     def _process_user_speech(self, audio_data, sample_rate):
-        """Process user speech (runs in separate thread)"""
+        """Process user speech (runs in separate thread)."""
         try:
             # Transcribe
             log_timestamp(f"Transcribing audio ({len(audio_data)} samples @ {sample_rate}Hz)...")
@@ -158,7 +155,7 @@ class VoiceProcessor:
             )
 
     def _process_conversation_turn(self, user_text):
-        """Process one conversation turn (LLM + TTS)"""
+        """Process one conversation turn (LLM + TTS)."""
         # Try to acquire generation lock (non-blocking like CSM!)
         if not self.generation_lock.acquire(blocking=False):
             log_timestamp("Generation already in progress, skipping")
@@ -281,7 +278,7 @@ class VoiceProcessor:
                     ).start()
 
     def process_complete_audio(self, audio_data, sample_rate):
-        """Process complete audio from client (no VAD needed - Flutter controls recording)"""
+        """Process complete audio from client (no VAD needed - Flutter controls recording)."""
         log_timestamp(f"Processing complete audio: {len(audio_data)} samples @ {sample_rate}Hz")
 
         # Transcribe and process immediately in a new thread
@@ -292,7 +289,7 @@ class VoiceProcessor:
         ).start()
 
     def process_audio_chunk(self, audio_data, sample_rate):
-        """Process incoming audio chunk from client (VAD mode - deprecated)"""
+        """Process incoming audio chunk from client (VAD mode - deprecated)."""
         if self.vad_processor and self.config.vad_enabled:
             # Resample if needed
             if sample_rate != self.config.vad_sample_rate:
@@ -305,7 +302,7 @@ class VoiceProcessor:
             self.vad_processor.process_audio(audio_data)
 
     def reset_vad(self):
-        """Reset VAD state"""
+        """Reset VAD state."""
         if self.vad_processor:
             self.vad_processor.reset()
             log_timestamp("VAD reset")

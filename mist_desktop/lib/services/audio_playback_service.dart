@@ -37,8 +37,8 @@ class AudioPlaybackService {
     header.setUint32(4, fileSize, Endian.little);
 
     // WAVE header
-    header.setUint8(8, 0x57);  // 'W'
-    header.setUint8(9, 0x41);  // 'A'
+    header.setUint8(8, 0x57); // 'W'
+    header.setUint8(9, 0x41); // 'A'
     header.setUint8(10, 0x56); // 'V'
     header.setUint8(11, 0x45); // 'E'
 
@@ -48,7 +48,7 @@ class AudioPlaybackService {
     header.setUint8(14, 0x74); // 't'
     header.setUint8(15, 0x20); // ' '
     header.setUint32(16, 16, Endian.little); // Subchunk1Size (16 for PCM)
-    header.setUint16(20, 1, Endian.little);  // AudioFormat (1 = PCM)
+    header.setUint16(20, 1, Endian.little); // AudioFormat (1 = PCM)
     header.setUint16(22, numChannels, Endian.little);
     header.setUint32(24, sampleRate, Endian.little);
     header.setUint32(28, byteRate, Endian.little);
@@ -108,12 +108,17 @@ class AudioPlaybackService {
       pcm16.add((pcm16Value >> 8) & 0xFF);
     }
 
-    _logger.d('Converted ${audioFloats.length} float32 samples to ${pcm16.length} PCM16 bytes');
+    _logger.d(
+      'Converted ${audioFloats.length} float32 samples to ${pcm16.length} PCM16 bytes',
+    );
     return Uint8List.fromList(pcm16);
   }
 
   /// Play audio chunk from float32 samples
-  Future<void> playAudioChunkFloat32(List<double> audioData, int sampleRate) async {
+  Future<void> playAudioChunkFloat32(
+    List<double> audioData,
+    int sampleRate,
+  ) async {
     try {
       // Convert float32 to PCM16
       final pcm16Bytes = _float32ToPCM16(audioData);
@@ -121,7 +126,9 @@ class AudioPlaybackService {
       // Add to queue if currently playing
       if (_isPlaying) {
         _audioQueue.add(pcm16Bytes);
-        _logger.d('Added audio chunk to queue (queue size: ${_audioQueue.length})');
+        _logger.d(
+          'Added audio chunk to queue (queue size: ${_audioQueue.length})',
+        );
         return;
       }
 
@@ -151,7 +158,9 @@ class AudioPlaybackService {
       final source = BytesSource(wavData);
 
       await _player.play(source);
-      _logger.d('Playing audio chunk (${bytes.length} bytes -> ${wavData.length} bytes with WAV header, ${sampleRate}Hz)');
+      _logger.d(
+        'Playing audio chunk (${bytes.length} bytes -> ${wavData.length} bytes with WAV header, ${sampleRate}Hz)',
+      );
     } catch (e) {
       _logger.e('Error in _playBytes: $e');
       rethrow;
@@ -165,7 +174,9 @@ class AudioPlaybackService {
     }
 
     final nextChunk = _audioQueue.removeAt(0);
-    _logger.d('Playing next chunk from queue (remaining: ${_audioQueue.length})');
+    _logger.d(
+      'Playing next chunk from queue (remaining: ${_audioQueue.length})',
+    );
 
     // Assume same sample rate (24000Hz from backend)
     _playBytes(nextChunk, 24000);

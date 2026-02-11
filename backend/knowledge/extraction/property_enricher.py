@@ -1,5 +1,4 @@
-"""
-Property Enrichment Module
+"""Property Enrichment Module.
 
 Extracts temporal, contextual, and relational properties from text that
 LLMGraphTransformer doesn't capture in its structured output.
@@ -60,14 +59,12 @@ Return ONLY valid JSON. No explanations.""",
 
 
 class PropertyEnricher:
-    """
-    Enriches graph relationships with temporal and contextual properties
+    """Enriches graph relationships with temporal and contextual properties
     by doing a second, focused extraction pass.
     """
 
     def __init__(self, config: KnowledgeConfig):
-        """
-        Initialize property enricher
+        """Initialize property enricher.
 
         Args:
             config: Knowledge system configuration
@@ -76,7 +73,7 @@ class PropertyEnricher:
         self._llm = None
 
     def _get_llm(self) -> ChatOllama:
-        """Get or create LLM instance"""
+        """Get or create LLM instance."""
         if self._llm is None:
             # Use same LLM as extraction, but could use smaller/faster model
             self._llm = ChatOllama(
@@ -87,8 +84,7 @@ class PropertyEnricher:
         return self._llm
 
     async def enrich_graph_document(self, graph_document, original_text: str):
-        """
-        Enrich a GraphDocument with additional properties
+        """Enrich a GraphDocument with additional properties.
 
         This modifies the graph_document in place, adding properties to
         relationships based on the original text.
@@ -138,8 +134,7 @@ class PropertyEnricher:
         return graph_document
 
     async def _extract_properties(self, text: str, relationship_type: str) -> dict[str, str]:
-        """
-        Extract properties from text using LLM
+        """Extract properties from text using LLM.
 
         Args:
             text: Original utterance text
@@ -183,8 +178,7 @@ class PropertyEnricher:
 
 
 class ContextAwarePropertyEnricher(PropertyEnricher):
-    """
-    Enhanced enricher that uses conversation context to better
+    """Enhanced enricher that uses conversation context to better
     extract properties.
 
     This is for future enhancement - can use conversation history
@@ -194,8 +188,7 @@ class ContextAwarePropertyEnricher(PropertyEnricher):
     async def enrich_with_context(
         self, graph_document, original_text: str, conversation_history: list[str] | None = None
     ):
-        """
-        Enrich with conversation context
+        """Enrich with conversation context.
 
         Future enhancement: Use conversation history to better
         understand temporal references ("still working on it",

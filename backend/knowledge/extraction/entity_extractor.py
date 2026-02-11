@@ -1,5 +1,4 @@
-"""
-Entity Extraction Module
+"""Entity Extraction Module.
 
 Extracts entities and relationships from conversational text using LLMGraphTransformer.
 """
@@ -17,15 +16,13 @@ logger = logging.getLogger(__name__)
 
 
 class EntityExtractor:
-    """
-    Extracts entities and relationships from conversational text
+    """Extracts entities and relationships from conversational text.
 
     Uses LangChain's LLMGraphTransformer with configurable LLM model.
     """
 
     def __init__(self, config: KnowledgeConfig, enable_property_enrichment: bool = True):
-        """
-        Initialize entity extractor
+        """Initialize entity extractor.
 
         Args:
             config: Knowledge system configuration
@@ -40,7 +37,7 @@ class EntityExtractor:
         )
 
     def _get_llm(self) -> ChatOllama:
-        """Get or create LLM instance"""
+        """Get or create LLM instance."""
         if self._llm is None:
             logger.info(f"Initializing LLM: {self.config.llm.model}")
             self._llm = ChatOllama(
@@ -51,7 +48,7 @@ class EntityExtractor:
         return self._llm
 
     def _get_transformer(self) -> LLMGraphTransformer:
-        """Get or create graph transformer"""
+        """Get or create graph transformer."""
         if self._transformer is None:
             llm = self._get_llm()
 
@@ -79,8 +76,7 @@ class EntityExtractor:
         conversation_history: list[str] | None = None,
         metadata: dict | None = None,
     ) -> list:
-        """
-        Extract entities and relationships from a single utterance
+        """Extract entities and relationships from a single utterance.
 
         Args:
             utterance: User's statement
@@ -131,8 +127,7 @@ class EntityExtractor:
     async def extract_batch(
         self, utterances: list[str], metadata_list: list[dict] | None = None
     ) -> list:
-        """
-        Extract entities from multiple utterances in batch
+        """Extract entities from multiple utterances in batch.
 
         Args:
             utterances: List of user statements

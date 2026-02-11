@@ -1,6 +1,4 @@
-"""
-Utility for cleaning up Ollama service on application exit.
-"""
+"""Utility for cleaning up Ollama service on application exit."""
 
 import atexit
 import logging

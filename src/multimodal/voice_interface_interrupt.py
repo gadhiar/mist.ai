@@ -1,5 +1,4 @@
-"""
-Interruptible Voice Interface
+"""Interruptible Voice Interface.
 
 Allows user to interrupt AI mid-response by speaking.
 Uses continuous VAD-based microphone listening + OutputStream interruption.
@@ -28,17 +27,16 @@ from vad import AudioStreamProcessor
 
 
 def log(msg: str):
-    """Print message with timestamp"""
+    """Print message with timestamp."""
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     print(f"[{timestamp}] {msg}")
 
 
 class InterruptibleVoiceInterface:
-    """Voice interface with interrupt capability - user can speak at any time"""
+    """Voice interface with interrupt capability - user can speak at any time."""
 
     def __init__(self, llm_model: str = "qwen2.5:7b-instruct", vad_threshold: float = 0.5):
-        """
-        Initialize interruptible voice interface
+        """Initialize interruptible voice interface.
 
         Args:
             llm_model: Ollama model name (must support streaming)
@@ -106,14 +104,14 @@ class InterruptibleVoiceInterface:
         self.state_lock = threading.Lock()
 
     def _on_speech_start(self):
-        """Called by VAD when user starts speaking"""
+        """Called by VAD when user starts speaking."""
         with self.state_lock:
             if self.ai_speaking:
                 log("[INTERRUPT] User started speaking, stopping AI...")
                 self.interrupt_playback.set()
 
     def _on_speech_end(self, audio_data, sample_rate):
-        """Called by VAD when user stops speaking"""
+        """Called by VAD when user stops speaking."""
         log(f"Speech detected, transcribing... (audio: {len(audio_data)} samples)")
 
         # Transcribe
@@ -127,14 +125,13 @@ class InterruptibleVoiceInterface:
         self.pending_transcription.put(user_text)
 
     def _continuous_microphone_worker(self):
-        """
-        Background thread that continuously listens to microphone
-        Uses VAD to detect speech and handle interruptions
+        """Background thread that continuously listens to microphone
+        Uses VAD to detect speech and handle interruptions.
         """
         print("Microphone listening started (VAD-based)...")
 
         def audio_callback(indata, frames, time_info, status):
-            """Called by sounddevice for each audio chunk"""
+            """Called by sounddevice for each audio chunk."""
             if status:
                 print(f"Mic status: {status}")
 
@@ -158,9 +155,8 @@ class InterruptibleVoiceInterface:
         log("Microphone stream stopped")
 
     def _audio_playback_worker(self):
-        """
-        Background thread using OutputStream for gap-free continuous playback
-        Now supports interruption when user speaks
+        """Background thread using OutputStream for gap-free continuous playback
+        Now supports interruption when user speaks.
         """
         import numpy as np
 
@@ -171,7 +167,7 @@ class InterruptibleVoiceInterface:
         self._stream_active = False
 
         def audio_callback(outdata, frames, time_info, status):
-            """Called by sounddevice when it needs more audio data"""
+            """Called by sounddevice when it needs more audio data."""
             if status:
                 print(f"\nStream status: {status}")
 
@@ -344,7 +340,7 @@ class InterruptibleVoiceInterface:
             log(" Playback: AI no longer speaking (interruption disabled)")
 
     def start_listening(self):
-        """Start continuous microphone listening"""
+        """Start continuous microphone listening."""
         if self.mic_thread is None or not self.mic_thread.is_alive():
             self.stop_mic.clear()
             self.mic_thread = threading.Thread(target=self._continuous_microphone_worker)
@@ -352,13 +348,13 @@ class InterruptibleVoiceInterface:
             self.mic_thread.start()
 
     def stop_listening(self):
-        """Stop continuous microphone listening"""
+        """Stop continuous microphone listening."""
         self.stop_mic.set()
         if self.mic_thread and self.mic_thread.is_alive():
             self.mic_thread.join(timeout=2.0)
 
     def _preprocess_text_for_tts(self, text: str) -> str:
-        """Preprocess text for TTS"""
+        """Preprocess text for TTS."""
         pattern = r"[^\w\s.,!?\']"
         cleaned_text = re.sub(pattern, "", text)
         cleaned_text = re.sub(r"\s+", " ", cleaned_text)
@@ -366,8 +362,7 @@ class InterruptibleVoiceInterface:
         return cleaned_text.strip()
 
     def continuous_conversation(self, debug: bool = False):
-        """
-        Continuous conversation with interruption support
+        """Continuous conversation with interruption support.
 
         User can speak at any time to interrupt AI response
         """
@@ -509,7 +504,7 @@ class InterruptibleVoiceInterface:
             self.stop_listening()
 
     def _stream_llm(self, prompt: str):
-        """Stream tokens from LLM"""
+        """Stream tokens from LLM."""
         response = ollama.chat(
             model=self.llm_model, messages=[{"role": "user", "content": prompt}], stream=True
         )
