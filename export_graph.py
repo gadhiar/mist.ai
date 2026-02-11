@@ -1,5 +1,4 @@
-"""
-Export Graph Structure
+"""Export Graph Structure.
 
 Exports the current graph structure from Neo4j for analysis.
 
@@ -9,6 +8,7 @@ Usage:
 
 from rich.console import Console
 from rich.table import Table
+
 from backend.knowledge.config import get_config
 from backend.knowledge.storage import Neo4jConnection
 
@@ -16,8 +16,7 @@ console = Console()
 
 
 def export_graph():
-    """Export graph structure from Neo4j"""
-
+    """Export graph structure from Neo4j."""
     config = get_config()
     connection = Neo4jConnection(config.neo4j)
 
@@ -47,8 +46,18 @@ def export_graph():
         for entity in entities:
             entity_id = entity["id"]
             entity_type = entity["type"]
-            props = {k: v for k, v in entity["props"].items()
-                    if k not in ["id", "entity_type", "ontology_version", "created_at", "created_from_utterance"]}
+            props = {
+                k: v
+                for k, v in entity["props"].items()
+                if k
+                not in [
+                    "id",
+                    "entity_type",
+                    "ontology_version",
+                    "created_at",
+                    "created_from_utterance",
+                ]
+            }
             props_str = str(props) if props else "-"
             entity_table.add_row(entity_id, entity_type, props_str)
 
@@ -79,8 +88,11 @@ def export_graph():
             source = rel["source"]
             rel_type = rel["relationship"]
             target = rel["target"]
-            props = {k: v for k, v in rel["props"].items()
-                    if k not in ["ontology_version", "created_at", "created_from_utterance"]}
+            props = {
+                k: v
+                for k, v in rel["props"].items()
+                if k not in ["ontology_version", "created_at", "created_from_utterance"]
+            }
             props_str = str(props) if props else "-"
             rel_table.add_row(source, rel_type, target, props_str)
 

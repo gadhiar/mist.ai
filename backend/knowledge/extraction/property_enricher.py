@@ -1,5 +1,4 @@
-"""
-Property Enrichment Module
+"""Property Enrichment Module.
 
 Extracts temporal, contextual, and relational properties from text that
 LLMGraphTransformer doesn't capture in its structured output.
@@ -8,11 +7,11 @@ This is a post-processing step that uses a small, focused LLM call to
 extract properties without needing specific prompt patterns.
 """
 
-from typing import Dict, List, Optional
-from langchain_ollama import ChatOllama
-from langchain_core.prompts import ChatPromptTemplate
-import logging
 import json
+import logging
+
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_ollama import ChatOllama
 
 from backend.knowledge.config import KnowledgeConfig
 
@@ -20,8 +19,11 @@ logger = logging.getLogger(__name__)
 
 
 # Simple schema for property extraction
-PROPERTY_EXTRACTION_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are a property extractor. Extract temporal, contextual, and descriptive properties from text.
+PROPERTY_EXTRACTION_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are a property extractor. Extract temporal, contextual, and descriptive properties from text.
 
 Return ONLY a JSON object with properties. If a property doesn't exist, omit it.
 
@@ -46,20 +48,23 @@ Available property types:
 - status: how it's going (e.g., "going well", "struggling", "completed")
 - intent: future/past (e.g., "future", "past", "current")
 
-Return ONLY valid JSON. No explanations."""),
-    ("user", "Text: {text}\n\nRelationship type: {relationship_type}\n\nExtract properties as JSON:")
-])
+Return ONLY valid JSON. No explanations.""",
+        ),
+        (
+            "user",
+            "Text: {text}\n\nRelationship type: {relationship_type}\n\nExtract properties as JSON:",
+        ),
+    ]
+)
 
 
 class PropertyEnricher:
-    """
-    Enriches graph relationships with temporal and contextual properties
+    """Enriches graph relationships with temporal and contextual properties
     by doing a second, focused extraction pass.
     """
 
     def __init__(self, config: KnowledgeConfig):
-        """
-        Initialize property enricher
+        """Initialize property enricher.
 
         Args:
             config: Knowledge system configuration
@@ -68,23 +73,18 @@ class PropertyEnricher:
         self._llm = None
 
     def _get_llm(self) -> ChatOllama:
-        """Get or create LLM instance"""
+        """Get or create LLM instance."""
         if self._llm is None:
             # Use same LLM as extraction, but could use smaller/faster model
             self._llm = ChatOllama(
                 model=self.config.llm.model,
                 base_url=self.config.llm.base_url,
-                temperature=0.0  # Deterministic for property extraction
+                temperature=0.0,  # Deterministic for property extraction
             )
         return self._llm
 
-    async def enrich_graph_document(
-        self,
-        graph_document,
-        original_text: str
-    ):
-        """
-        Enrich a GraphDocument with additional properties
+    async def enrich_graph_document(self, graph_document, original_text: str):
+        """Enrich a GraphDocument with additional properties.
 
         This modifies the graph_document in place, adding properties to
         relationships based on the original text.
@@ -105,18 +105,21 @@ class PropertyEnricher:
         for rel in graph_document.relationships:
             try:
                 properties = await self._extract_properties(
-                    text=original_text,
-                    relationship_type=rel.type
+                    text=original_text, relationship_type=rel.type
                 )
 
                 if properties:
                     # Merge with existing properties
-                    if not hasattr(rel, 'properties') or rel.properties is None:
+                    if not hasattr(rel, "properties") or rel.properties is None:
                         rel.properties = {}
 
                     # Convert list of {key: value} to dict if needed
                     if isinstance(rel.properties, list):
-                        props_dict = {p.get('key'): p.get('value') for p in rel.properties if isinstance(p, dict)}
+                        props_dict = {
+                            p.get("key"): p.get("value")
+                            for p in rel.properties
+                            if isinstance(p, dict)
+                        }
                         rel.properties = props_dict
 
                     # Add enriched properties
@@ -130,13 +133,8 @@ class PropertyEnricher:
 
         return graph_document
 
-    async def _extract_properties(
-        self,
-        text: str,
-        relationship_type: str
-    ) -> Dict[str, str]:
-        """
-        Extract properties from text using LLM
+    async def _extract_properties(self, text: str, relationship_type: str) -> dict[str, str]:
+        """Extract properties from text using LLM.
 
         Args:
             text: Original utterance text
@@ -149,10 +147,7 @@ class PropertyEnricher:
         chain = PROPERTY_EXTRACTION_PROMPT | llm
 
         try:
-            response = await chain.ainvoke({
-                "text": text,
-                "relationship_type": relationship_type
-            })
+            response = await chain.ainvoke({"text": text, "relationship_type": relationship_type})
 
             # Parse JSON response
             content = response.content.strip()
@@ -160,8 +155,8 @@ class PropertyEnricher:
             # Handle markdown code blocks
             if content.startswith("```"):
                 # Extract JSON from code block
-                lines = content.split('\n')
-                content = '\n'.join(lines[1:-1])  # Remove ``` markers
+                lines = content.split("\n")
+                content = "\n".join(lines[1:-1])  # Remove ``` markers
 
             properties = json.loads(content)
 
@@ -183,8 +178,7 @@ class PropertyEnricher:
 
 
 class ContextAwarePropertyEnricher(PropertyEnricher):
-    """
-    Enhanced enricher that uses conversation context to better
+    """Enhanced enricher that uses conversation context to better
     extract properties.
 
     This is for future enhancement - can use conversation history
@@ -192,13 +186,9 @@ class ContextAwarePropertyEnricher(PropertyEnricher):
     """
 
     async def enrich_with_context(
-        self,
-        graph_document,
-        original_text: str,
-        conversation_history: Optional[List[str]] = None
+        self, graph_document, original_text: str, conversation_history: list[str] | None = None
     ):
-        """
-        Enrich with conversation context
+        """Enrich with conversation context.
 
         Future enhancement: Use conversation history to better
         understand temporal references ("still working on it",

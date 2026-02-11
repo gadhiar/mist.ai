@@ -1,5 +1,4 @@
-"""
-Conversation Handler with MCP-like Tool Access
+"""Conversation Handler with MCP-like Tool Access.
 
 Enables LLM to autonomously:
 - Query knowledge graph for context
@@ -7,30 +6,23 @@ Enables LLM to autonomously:
 - Think and search database freely
 """
 
-import asyncio
 import logging
-from typing import Optional, List, Dict, Any
-from datetime import datetime
+from typing import Any
 
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 
-from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
-from backend.knowledge.extraction.entity_extractor import EntityExtractor
-from backend.knowledge.storage.graph_store import GraphStore
-from backend.knowledge.models import (
-    ConversationSession,
-    Message,
-    RetrievalFilters
-)
 from backend.knowledge.config import KnowledgeConfig
+from backend.knowledge.extraction.entity_extractor import EntityExtractor
+from backend.knowledge.models import ConversationSession, RetrievalFilters
+from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
+from backend.knowledge.storage.graph_store import GraphStore
 
 logger = logging.getLogger(__name__)
 
 
 class ConversationHandler:
-    """
-    Handles conversations with knowledge graph integration.
+    """Handles conversations with knowledge graph integration.
 
     Uses MCP-like tool access pattern:
     - LLM decides autonomously when to query or extract
@@ -39,13 +31,9 @@ class ConversationHandler:
     """
 
     def __init__(
-        self,
-        config: KnowledgeConfig,
-        graph_store: GraphStore,
-        model_name: str = "qwen2.5:7b"
+        self, config: KnowledgeConfig, graph_store: GraphStore, model_name: str = "qwen2.5:7b"
     ):
-        """
-        Initialize conversation handler.
+        """Initialize conversation handler.
 
         Args:
             config: Knowledge system configuration
@@ -69,13 +57,12 @@ class ConversationHandler:
         self._setup_tools()
 
         # Active sessions
-        self.sessions: Dict[str, ConversationSession] = {}
+        self.sessions: dict[str, ConversationSession] = {}
 
         logger.info(f"ConversationHandler initialized with model: {model_name}")
 
     def _setup_tools(self):
-        """Setup LLM tools for MCP-like access"""
-
+        """Setup LLM tools for MCP-like access."""
         # Store references for tool implementations
         retriever = self.retriever
         extractor = self.extractor
@@ -84,9 +71,9 @@ class ConversationHandler:
         @tool
         async def query_knowledge_graph(
             query: str,
-            entity_types: Optional[List[str]] = None,
-            relationship_types: Optional[List[str]] = None,
-            limit: int = 20
+            entity_types: list[str] | None = None,
+            relationship_types: list[str] | None = None,
+            limit: int = 20,
         ) -> str:
             """Search the knowledge graph for relevant information about the user.
 
@@ -108,15 +95,11 @@ class ConversationHandler:
                 filters = None
                 if entity_types or relationship_types:
                     filters = RetrievalFilters(
-                        entity_types=entity_types,
-                        relationship_types=relationship_types
+                        entity_types=entity_types, relationship_types=relationship_types
                     )
 
                 result = await retriever.retrieve(
-                    query=query,
-                    user_id="User",
-                    limit=limit,
-                    filters=filters
+                    query=query, user_id="User", limit=limit, filters=filters
                 )
 
                 if result.total_facts == 0:
@@ -129,7 +112,7 @@ class ConversationHandler:
                 return f"Error searching knowledge graph: {str(e)}"
 
         @tool
-        async def extract_knowledge(text: str, context: Optional[str] = None) -> str:
+        async def extract_knowledge(text: str, context: str | None = None) -> str:
             """Extract and store new knowledge from text into the knowledge graph.
 
             Use this tool when:
@@ -151,8 +134,7 @@ class ConversationHandler:
                 # Ensure conversation event exists
                 conversation_id = context or "default"
                 graph_store.store_conversation_event(
-                    conversation_id=conversation_id,
-                    user_id="User"
+                    conversation_id=conversation_id, user_id="User"
                 )
 
                 # Generate unique utterance ID
@@ -163,14 +145,12 @@ class ConversationHandler:
                     utterance_id=utterance_id,
                     conversation_id=conversation_id,
                     text=text,
-                    metadata={"source": "conversation", "timestamp": datetime.now().isoformat()}
+                    metadata={"source": "conversation", "timestamp": datetime.now().isoformat()},
                 )
 
                 # Extract entities from text
                 graph_docs = await extractor.extract_from_utterance(
-                    utterance=text,
-                    conversation_history=[],
-                    metadata={"utterance_id": utterance_id}
+                    utterance=text, conversation_history=[], metadata={"utterance_id": utterance_id}
                 )
 
                 # Store extracted entities
@@ -178,7 +158,7 @@ class ConversationHandler:
                     graph_store.store_extracted_entities(
                         graph_document=graph_docs[0],
                         utterance_id=utterance_id,
-                        ontology_version=None
+                        ontology_version=None,
                     )
 
                     entity_names = [n.id for n in graph_docs[0].nodes]
@@ -193,7 +173,7 @@ class ConversationHandler:
                 return f"Error storing knowledge: {str(e)}"
 
         @tool
-        async def extract_knowledge_from_document(chunk_id: str, reason: Optional[str] = None) -> str:
+        async def extract_knowledge_from_document(chunk_id: str, reason: str | None = None) -> str:
             """Extract entities from a specific document chunk into the knowledge graph.
 
             Use this tool when:
@@ -223,7 +203,7 @@ class ConversationHandler:
                 if not results:
                     return f"Chunk not found: {chunk_id}"
 
-                chunk_text = results[0]['text']
+                chunk_text = results[0]["text"]
 
                 # Extract entities from chunk
                 graph_docs = await extractor.extract_from_utterance(
@@ -232,16 +212,14 @@ class ConversationHandler:
                     metadata={
                         "source": "document_extraction",
                         "chunk_id": chunk_id,
-                        "reason": reason or "LLM-selected extraction"
-                    }
+                        "reason": reason or "LLM-selected extraction",
+                    },
                 )
 
                 # Store extracted entities
                 if graph_docs and graph_docs[0].nodes:
                     graph_store.store_extracted_entities(
-                        graph_document=graph_docs[0],
-                        chunk_id=chunk_id,
-                        ontology_version=None
+                        graph_document=graph_docs[0], chunk_id=chunk_id, ontology_version=None
                     )
 
                     entity_names = [n.id for n in graph_docs[0].nodes]
@@ -259,32 +237,22 @@ class ConversationHandler:
         self.tools = [query_knowledge_graph, extract_knowledge, extract_knowledge_from_document]
         self.llm_with_tools = self.llm.bind_tools(self.tools)
 
-        logger.info("Tools bound to LLM: query_knowledge_graph, extract_knowledge, extract_knowledge_from_document")
+        logger.info(
+            "Tools bound to LLM: query_knowledge_graph, extract_knowledge, extract_knowledge_from_document"
+        )
 
-    def get_or_create_session(
-        self,
-        session_id: str,
-        user_id: str = "User"
-    ) -> ConversationSession:
-        """Get existing session or create new one"""
+    def get_or_create_session(self, session_id: str, user_id: str = "User") -> ConversationSession:
+        """Get existing session or create new one."""
         if session_id not in self.sessions:
-            self.sessions[session_id] = ConversationSession(
-                session_id=session_id,
-                user_id=user_id
-            )
+            self.sessions[session_id] = ConversationSession(session_id=session_id, user_id=user_id)
             logger.info(f"Created new session: {session_id}")
 
         return self.sessions[session_id]
 
     async def handle_message(
-        self,
-        user_message: str,
-        session_id: str,
-        user_id: str = "User",
-        max_history: int = 10
+        self, user_message: str, session_id: str, user_id: str = "User", max_history: int = 10
     ) -> str:
-        """
-        Handle a user message with autonomous tool use.
+        """Handle a user message with autonomous tool use.
 
         LLM decides autonomously whether to:
         1. Query knowledge graph for context
@@ -321,14 +289,14 @@ class ConversationHandler:
                     doc_results = await self.retriever.search_documents(
                         query=user_message,
                         limit=auto_inject_limit,
-                        similarity_threshold=auto_inject_threshold
+                        similarity_threshold=auto_inject_threshold,
                     )
                     logger.info(f"[AUTO-RAG] Found {len(doc_results)} relevant document chunks")
                 except Exception as e:
                     logger.error(f"[AUTO-RAG] Error searching documents: {e}")
                     doc_results = []
             else:
-                logger.debug(f"[AUTO-RAG] Skipping search for short message")
+                logger.debug("[AUTO-RAG] Skipping search for short message")
 
         # Build conversation with system prompt and optional doc context
         messages = self._build_messages(session, max_history, doc_context=doc_results)
@@ -359,26 +327,28 @@ class ConversationHandler:
                     tool_result = await self._execute_tool(tool_name, tool_args)
 
                     # Log the result (truncated if too long)
-                    result_preview = tool_result[:200] + "..." if len(tool_result) > 200 else tool_result
+                    result_preview = (
+                        tool_result[:200] + "..." if len(tool_result) > 200 else tool_result
+                    )
                     logger.info(f"[TOOLS]   Result: {result_preview}")
 
                     tool_calls.append({"name": tool_name, "args": tool_args})
-                    tool_results.append({
-                        "name": tool_name,
-                        "result": tool_result,
-                        "tool_call_id": tool_call_id
-                    })
+                    tool_results.append(
+                        {"name": tool_name, "result": tool_result, "tool_call_id": tool_call_id}
+                    )
 
                 # If tools were called, get final response with tool results
                 messages.append({"role": "assistant", "content": response.content or ""})
 
                 for result in tool_results:
-                    messages.append({
-                        "role": "tool",
-                        "content": result["result"],
-                        "name": result["name"],
-                        "tool_call_id": result["tool_call_id"]
-                    })
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "content": result["result"],
+                            "name": result["name"],
+                            "tool_call_id": result["tool_call_id"],
+                        }
+                    )
 
                 # Get final response
                 logger.info("[TOOLS] Generating final response with tool results...")
@@ -395,7 +365,7 @@ class ConversationHandler:
                 "assistant",
                 assistant_message,
                 tool_calls=tool_calls if tool_calls else None,
-                tool_results=tool_results if tool_results else None
+                tool_results=tool_results if tool_results else None,
             )
 
             return assistant_message
@@ -406,17 +376,16 @@ class ConversationHandler:
             session.add_message("assistant", error_msg)
             return error_msg
 
-    async def _execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
-        """Execute a tool by name"""
+    async def _execute_tool(self, tool_name: str, tool_args: dict[str, Any]) -> str:
+        """Execute a tool by name."""
         for tool in self.tools:
             if tool.name == tool_name:
                 return await tool.ainvoke(tool_args)
 
         return f"Tool not found: {tool_name}"
 
-    def _format_document_context(self, doc_results: List[Dict[str, Any]]) -> str:
-        """
-        Format document search results for injection into context.
+    def _format_document_context(self, doc_results: list[dict[str, Any]]) -> str:
+        """Format document search results for injection into context.
 
         Args:
             doc_results: List of document chunks from search_documents()
@@ -430,9 +399,9 @@ class ConversationHandler:
         lines = ["=== MIST Documentation (Relevant Excerpts) ===\n"]
 
         for i, result in enumerate(doc_results, 1):
-            source = result.get('source_title', 'Unknown Document')
-            text = result.get('text', '')
-            similarity = result.get('similarity', 0.0)
+            source = result.get("source_title", "Unknown Document")
+            text = result.get("text", "")
+            similarity = result.get("similarity", 0.0)
 
             lines.append(f"[{i}] From: {source} (relevance: {similarity:.2f})")
             lines.append(f"{text}\n")
@@ -445,10 +414,9 @@ class ConversationHandler:
         self,
         session: ConversationSession,
         max_history: int,
-        doc_context: Optional[List[Dict[str, Any]]] = None
-    ) -> List[Dict[str, str]]:
-        """
-        Build message list for LLM with system prompt, doc context, and history.
+        doc_context: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, str]]:
+        """Build message list for LLM with system prompt, doc context, and history.
 
         Args:
             session: Conversation session
@@ -458,7 +426,6 @@ class ConversationHandler:
         Returns:
             List of messages for LLM
         """
-
         system_prompt = """You are MIST, a conversational AI assistant with a personal knowledge graph.
 
 === CONTEXT PROVIDED ===
@@ -474,13 +441,13 @@ You have three tools at your disposal:
    - Search the personal knowledge graph for user-specific information
    - Use when: User asks about THEIR preferences, skills, projects, past conversations
    - Returns: Facts you've learned about the user (entities + relationships)
-   - Example: "What programming languages do I know?" → use this tool
+   - Example: "What programming languages do I know?" -> use this tool
 
 2. **extract_knowledge(text: str, context: str = None)**
    - Store new information the user shares about themselves
    - Use when: User tells you about their skills, preferences, projects, interests
    - Effect: Adds entities to knowledge graph from conversation
-   - Example: "I'm learning React" → use this tool to remember
+   - Example: "I'm learning React" -> use this tool to remember
 
 3. **extract_knowledge_from_document(chunk_id: str, reason: str = None)**
    - Extract entities from auto-provided documentation chunks into the knowledge graph
@@ -492,13 +459,13 @@ You have three tools at your disposal:
 === TOOL USAGE STRATEGY ===
 
 **For user questions:**
-- Technical questions (how/what/why about MIST) → Use auto-provided docs (already in context)
-- Personal questions (about user's info) → Use query_knowledge_graph tool
-- Both types → Use docs + query_knowledge_graph
+- Technical questions (how/what/why about MIST) -> Use auto-provided docs (already in context)
+- Personal questions (about user's info) -> Use query_knowledge_graph tool
+- Both types -> Use docs + query_knowledge_graph
 
 **For user statements:**
-- Shares personal info → Use extract_knowledge tool
-- Asks to "remember" doc info → Use extract_knowledge_from_document tool (rarely needed)
+- Shares personal info -> Use extract_knowledge tool
+- Asks to "remember" doc info -> Use extract_knowledge_from_document tool (rarely needed)
 
 **Autonomous Decision Making:**
 - You decide when to use tools - no one tells you when
@@ -524,17 +491,22 @@ Remember: Documentation is already provided below. Think about whether you need 
             doc_context_str = self._format_document_context(doc_context)
             if doc_context_str:
                 # Log what's being injected for debugging
-                logger.info(f"[AUTO-RAG] Injecting {len(doc_context)} document chunks into context:")
+                logger.info(
+                    f"[AUTO-RAG] Injecting {len(doc_context)} document chunks into context:"
+                )
                 for i, chunk in enumerate(doc_context, 1):
-                    title = chunk.get('source_title', 'Unknown')
-                    text_preview = chunk.get('text', '')[:100] + '...' if len(chunk.get('text', '')) > 100 else chunk.get('text', '')
-                    similarity = chunk.get('similarity', 0.0)
-                    logger.info(f"[AUTO-RAG]   [{i}] {title} (sim={similarity:.3f}): {text_preview}")
+                    title = chunk.get("source_title", "Unknown")
+                    text_preview = (
+                        chunk.get("text", "")[:100] + "..."
+                        if len(chunk.get("text", "")) > 100
+                        else chunk.get("text", "")
+                    )
+                    similarity = chunk.get("similarity", 0.0)
+                    logger.info(
+                        f"[AUTO-RAG]   [{i}] {title} (sim={similarity:.3f}): {text_preview}"
+                    )
 
-                messages.append({
-                    "role": "system",
-                    "content": doc_context_str
-                })
+                messages.append({"role": "system", "content": doc_context_str})
 
         # Add conversation history
         history = session.get_history(max_history)
@@ -543,13 +515,13 @@ Remember: Documentation is already provided below. Think about whether you need 
         return messages
 
     def clear_session(self, session_id: str):
-        """Clear a conversation session"""
+        """Clear a conversation session."""
         if session_id in self.sessions:
             del self.sessions[session_id]
             logger.info(f"Cleared session: {session_id}")
 
-    def get_session_info(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Get information about a session"""
+    def get_session_info(self, session_id: str) -> dict[str, Any] | None:
+        """Get information about a session."""
         if session_id not in self.sessions:
             return None
 
@@ -559,5 +531,5 @@ Remember: Documentation is already provided below. Think about whether you need 
             "user_id": session.user_id,
             "started_at": session.started_at.isoformat(),
             "message_count": len(session.messages),
-            "last_message": session.messages[-1].content if session.messages else None
+            "last_message": session.messages[-1].content if session.messages else None,
         }

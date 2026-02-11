@@ -6,15 +6,15 @@ WebSocket-based voice conversation backend for M.I.S.T AI.
 
 ```
 WebSocket Client
-    ↓
+    ->
 FastAPI Server (server.py)
-    ↓
+    ->
 Voice Processor (voice_processor.py)
-    ↓
+    ->
 ┌─────────────────────────────────────┐
 │ VAD -> STT -> LLM -> TTS -> Audio Out  │
 └─────────────────────────────────────┘
-    ↑
+    ->
 Model Manager (voice_models/model_manager.py)
 ```
 
@@ -207,9 +207,9 @@ processor = VoiceProcessor(config, message_queue)
 
 ```
 Main Thread (FastAPI)
-    ↓
+    ->
 Voice Processor Thread
-    ↓
+    ->
 ┌──────────────────────────┐
 │ TTS Worker Thread        │
 │ - Dedicated thread       │
@@ -229,15 +229,15 @@ Voice Processor Thread
 ### Latency Breakdown
 ```
 User stops speaking
-  ↓ 100ms (VAD detection)
+  -> 100ms (VAD detection)
 STT transcription
-  ↓ 300ms (Whisper)
+  -> 300ms (Whisper)
 LLM generation
-  ↓ 1-3s (Qwen streaming)
+  -> 1-3s (Qwen streaming)
 TTS generation
-  ↓ 2-5s (CSM first chunk)
+  -> 2-5s (CSM first chunk)
 Audio playback starts
-  ↓ Streaming continues...
+  -> Streaming continues...
 Complete audio
 ```
 

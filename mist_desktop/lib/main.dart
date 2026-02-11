@@ -5,11 +5,7 @@ import 'config/app_config.dart';
 import 'screens/chat_screen.dart';
 
 void main() {
-  runApp(
-    const ProviderScope(
-      child: MistAIApp(),
-    ),
-  );
+  runApp(const ProviderScope(child: MistAIApp()));
 }
 
 class MistAIApp extends StatelessWidget {

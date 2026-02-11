@@ -34,9 +34,9 @@ python backend/knowledge/scripts/seed_from_docs.py
 **Architecture:**
 ```
 SourceDocument (file metadata, hash)
-    ↓ FROM_SOURCE
+    -> FROM_SOURCE
 DocumentChunk (text + embedding for RAG)
-    ↓ EXTRACTED_FROM (created on-demand by LLM)
+    -> EXTRACTED_FROM (created on-demand by LLM)
 Entity (knowledge graph nodes)
 ```
 

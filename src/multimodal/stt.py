@@ -1,19 +1,15 @@
-"""
-Speech-to-Text using Whisper
-"""
-import whisper
-import sounddevice as sd
+"""Speech-to-Text using Whisper."""
+
 import numpy as np
-import tempfile
-import wave
+import sounddevice as sd
+import whisper
 
 
 class WhisperSTT:
-    """Simple wrapper for Whisper speech-to-text"""
+    """Simple wrapper for Whisper speech-to-text."""
 
     def __init__(self, model_size: str = "base"):
-        """
-        Initialize Whisper STT
+        """Initialize Whisper STT.
 
         Args:
             model_size: 'tiny', 'base', 'small', 'medium', 'large'
@@ -32,8 +28,7 @@ class WhisperSTT:
         print("Whisper loaded successfully!")
 
     def listen(self, duration: int = 5) -> str:
-        """
-        Record audio from microphone and transcribe
+        """Record audio from microphone and transcribe.
 
         Args:
             duration: Recording duration in seconds
@@ -49,24 +44,21 @@ class WhisperSTT:
             int(duration * self.sample_rate),
             samplerate=self.sample_rate,
             channels=1,
-            dtype=np.float32
+            dtype=np.float32,
         )
         sd.wait()
         print("Recording complete. Transcribing...")
 
         # Transcribe with initial prompt to bias towards "MIST"
         result = self.model.transcribe(
-            audio.flatten(),
-            fp16=False,
-            initial_prompt=self.initial_prompt
+            audio.flatten(), fp16=False, initial_prompt=self.initial_prompt
         )
         text = result["text"].strip()
 
         return text
 
     def transcribe_audio(self, audio_data: np.ndarray, sample_rate: int = 16000) -> str:
-        """
-        Transcribe audio data directly (for VAD-based systems)
+        """Transcribe audio data directly (for VAD-based systems).
 
         Args:
             audio_data: Audio data as numpy array
@@ -89,6 +81,7 @@ class WhisperSTT:
             # Simple resampling by decimation/interpolation
             # For production, consider using librosa or torchaudio for better quality
             from scipy import signal
+
             num_samples = int(len(audio_data) * 16000 / sample_rate)
             audio_data = signal.resample(audio_data, num_samples)
 
@@ -97,11 +90,7 @@ class WhisperSTT:
             torch.cuda.synchronize()
 
         # Transcribe with initial prompt to bias towards "MIST"
-        result = self.model.transcribe(
-            audio_data,
-            fp16=False,
-            initial_prompt=self.initial_prompt
-        )
+        result = self.model.transcribe(audio_data, fp16=False, initial_prompt=self.initial_prompt)
 
         # Synchronize CUDA after transcription to ensure completion before TTS starts
         if torch.cuda.is_available():
@@ -110,8 +99,7 @@ class WhisperSTT:
         return result["text"].strip()
 
     def transcribe_file(self, audio_path: str) -> str:
-        """
-        Transcribe audio file
+        """Transcribe audio file.
 
         Args:
             audio_path: Path to audio file
@@ -119,9 +107,5 @@ class WhisperSTT:
         Returns:
             Transcribed text
         """
-        result = self.model.transcribe(
-            audio_path,
-            fp16=False,
-            initial_prompt=self.initial_prompt
-        )
+        result = self.model.transcribe(audio_path, fp16=False, initial_prompt=self.initial_prompt)
         return result["text"].strip()

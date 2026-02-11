@@ -1,5 +1,4 @@
-"""
-Graph Regeneration Module
+"""Graph Regeneration Module.
 
 Rebuilds the knowledge graph from immutable utterances.
 
@@ -9,21 +8,19 @@ This proves the architecture works:
 - Can always rebuild from scratch
 """
 
-from datetime import datetime
-from typing import List, Optional
 import logging
+from datetime import datetime
 
 from backend.knowledge.config import KnowledgeConfig
-from backend.knowledge.models import Utterance, RegenerationReport
-from backend.knowledge.storage import Neo4jConnection, GraphStore
 from backend.knowledge.extraction import EntityExtractor
+from backend.knowledge.models import RegenerationReport, Utterance
+from backend.knowledge.storage import GraphStore, Neo4jConnection
 
 logger = logging.getLogger(__name__)
 
 
 class GraphRegenerator:
-    """
-    Regenerates knowledge graph from immutable utterances.
+    """Regenerates knowledge graph from immutable utterances.
 
     The knowledge graph is a materialized view built from utterances.
     This class rebuilds the entire graph or specific conversations.
@@ -35,8 +32,7 @@ class GraphRegenerator:
     """
 
     def __init__(self, config: KnowledgeConfig):
-        """
-        Initialize graph regenerator
+        """Initialize graph regenerator.
 
         Args:
             config: Knowledge system configuration
@@ -49,8 +45,7 @@ class GraphRegenerator:
         logger.info("GraphRegenerator initialized")
 
     async def regenerate_all(self) -> RegenerationReport:
-        """
-        Regenerate entire knowledge graph from all utterances
+        """Regenerate entire knowledge graph from all utterances.
 
         Process:
         1. Fetch all utterances from Neo4j
@@ -87,7 +82,7 @@ class GraphRegenerator:
                     entities_created=0,
                     relationships_created=0,
                     duration_seconds=0.0,
-                    errors=[]
+                    errors=[],
                 )
 
             # Step 2: Delete entity graph
@@ -135,16 +130,16 @@ class GraphRegenerator:
                 entities_created=total_entities,
                 relationships_created=total_relationships,
                 duration_seconds=duration,
-                errors=errors
+                errors=errors,
             )
 
             logger.info("=" * 60)
             logger.info("Regeneration complete!")
-            logger.info(f"  Processed: {processed}/{len(utterances)} utterances")
-            logger.info(f"  Entities: {total_entities}")
-            logger.info(f"  Relationships: {total_relationships}")
-            logger.info(f"  Failed: {failed}")
-            logger.info(f"  Duration: {duration:.2f}s")
+            logger.info(f"Processed: {processed}/{len(utterances)} utterances")
+            logger.info(f"Entities: {total_entities}")
+            logger.info(f"Relationships: {total_relationships}")
+            logger.info(f"Failed: {failed}")
+            logger.info(f"Duration: {duration:.2f}s")
             logger.info("=" * 60)
 
             return report
@@ -154,8 +149,7 @@ class GraphRegenerator:
             raise
 
     async def regenerate_conversation(self, conversation_id: str) -> RegenerationReport:
-        """
-        Regenerate graph for a specific conversation
+        """Regenerate graph for a specific conversation.
 
         Useful for:
         - Testing on subset of data
@@ -186,7 +180,7 @@ class GraphRegenerator:
                     entities_created=0,
                     relationships_created=0,
                     duration_seconds=0.0,
-                    errors=[]
+                    errors=[],
                 )
 
             # Delete entities for this conversation only
@@ -219,10 +213,12 @@ class GraphRegenerator:
                 entities_created=total_entities,
                 relationships_created=total_relationships,
                 duration_seconds=duration,
-                errors=errors
+                errors=errors,
             )
 
-            logger.info(f"Conversation regeneration complete: {processed}/{len(utterances)} processed")
+            logger.info(
+                f"Conversation regeneration complete: {processed}/{len(utterances)} processed"
+            )
 
             return report
 
@@ -230,9 +226,8 @@ class GraphRegenerator:
             logger.error(f"Conversation regeneration failed: {e}")
             raise
 
-    def _fetch_all_utterances(self) -> List[Utterance]:
-        """
-        Fetch all utterances from Neo4j
+    def _fetch_all_utterances(self) -> list[Utterance]:
+        """Fetch all utterances from Neo4j.
 
         Returns utterances in chronological order to maintain conversation context.
 
@@ -257,19 +252,24 @@ class GraphRegenerator:
 
         utterances = []
         for r in results:
-            utterances.append(Utterance(
-                utterance_id=r['utterance_id'],
-                conversation_id=r.get('conversation_id', 'unknown'),
-                text=r['text'],
-                timestamp=r['timestamp'].to_native() if hasattr(r['timestamp'], 'to_native') else r['timestamp'],
-                metadata=r.get('metadata')
-            ))
+            utterances.append(
+                Utterance(
+                    utterance_id=r["utterance_id"],
+                    conversation_id=r.get("conversation_id", "unknown"),
+                    text=r["text"],
+                    timestamp=(
+                        r["timestamp"].to_native()
+                        if hasattr(r["timestamp"], "to_native")
+                        else r["timestamp"]
+                    ),
+                    metadata=r.get("metadata"),
+                )
+            )
 
         return utterances
 
-    def _fetch_conversation_utterances(self, conversation_id: str) -> List[Utterance]:
-        """
-        Fetch utterances for a specific conversation
+    def _fetch_conversation_utterances(self, conversation_id: str) -> list[Utterance]:
+        """Fetch utterances for a specific conversation.
 
         Args:
             conversation_id: Conversation ID
@@ -295,19 +295,24 @@ class GraphRegenerator:
 
         utterances = []
         for r in results:
-            utterances.append(Utterance(
-                utterance_id=r['utterance_id'],
-                conversation_id=r['conversation_id'],
-                text=r['text'],
-                timestamp=r['timestamp'].to_native() if hasattr(r['timestamp'], 'to_native') else r['timestamp'],
-                metadata=r.get('metadata')
-            ))
+            utterances.append(
+                Utterance(
+                    utterance_id=r["utterance_id"],
+                    conversation_id=r["conversation_id"],
+                    text=r["text"],
+                    timestamp=(
+                        r["timestamp"].to_native()
+                        if hasattr(r["timestamp"], "to_native")
+                        else r["timestamp"]
+                    ),
+                    metadata=r.get("metadata"),
+                )
+            )
 
         return utterances
 
     def _delete_graph_entities(self):
-        """
-        Delete all __Entity__ nodes and their relationships
+        """Delete all __Entity__ nodes and their relationships.
 
         This removes the materialized graph view but preserves
         the source of truth (ConversationEvent and Utterance nodes).
@@ -327,7 +332,7 @@ class GraphRegenerator:
         # Verify deletion
         count_query = "MATCH (e:__Entity__) RETURN count(e) AS count"
         result = self.connection.execute_query(count_query)
-        entity_count = result[0]['count'] if result else 0
+        entity_count = result[0]["count"] if result else 0
 
         self.connection.disconnect()
 
@@ -337,8 +342,7 @@ class GraphRegenerator:
         logger.info("All entity nodes deleted successfully")
 
     def _delete_conversation_entities(self, conversation_id: str):
-        """
-        Delete entities for a specific conversation
+        """Delete entities for a specific conversation.
 
         Args:
             conversation_id: Conversation ID
@@ -359,8 +363,7 @@ class GraphRegenerator:
         logger.info("Conversation entities deleted")
 
     async def _extract_and_store(self, utterance: Utterance) -> tuple[int, int]:
-        """
-        Re-extract entities from utterance and store
+        """Re-extract entities from utterance and store.
 
         Args:
             utterance: Utterance to process
@@ -373,7 +376,7 @@ class GraphRegenerator:
             graph_docs = await self.extractor.extract_from_utterance(
                 utterance=utterance.text,
                 conversation_history=[],  # Could add context later
-                metadata=utterance.metadata
+                metadata=utterance.metadata,
             )
 
             # Store
@@ -381,7 +384,7 @@ class GraphRegenerator:
                 self.graph_store.store_extracted_entities(
                     graph_document=graph_docs[0],
                     utterance_id=utterance.utterance_id,
-                    ontology_version=self.config.ontology_version
+                    ontology_version=self.config.ontology_version,
                 )
 
                 return len(graph_docs[0].nodes), len(graph_docs[0].relationships)

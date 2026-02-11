@@ -24,26 +24,17 @@ class WebSocketMessage {
   final String type;
   final Map<String, dynamic> data;
 
-  WebSocketMessage({
-    required this.type,
-    required this.data,
-  });
+  WebSocketMessage({required this.type, required this.data});
 
   /// Create from JSON string
   factory WebSocketMessage.fromJson(String jsonStr) {
     final json = jsonDecode(jsonStr) as Map<String, dynamic>;
-    return WebSocketMessage(
-      type: json['type'] as String,
-      data: json,
-    );
+    return WebSocketMessage(type: json['type'] as String, data: json);
   }
 
   /// Create from Map
   factory WebSocketMessage.fromMap(Map<String, dynamic> map) {
-    return WebSocketMessage(
-      type: map['type'] as String,
-      data: map,
-    );
+    return WebSocketMessage(type: map['type'] as String, data: map);
   }
 
   /// Convert to JSON string
@@ -78,10 +69,7 @@ class WebSocketMessage {
   factory WebSocketMessage.text(String text) {
     return WebSocketMessage(
       type: WsMessageType.text,
-      data: {
-        'type': WsMessageType.text,
-        'text': text,
-      },
+      data: {'type': WsMessageType.text, 'text': text},
     );
   }
 
@@ -89,9 +77,7 @@ class WebSocketMessage {
   factory WebSocketMessage.interrupt() {
     return WebSocketMessage(
       type: WsMessageType.interrupt,
-      data: {
-        'type': WsMessageType.interrupt,
-      },
+      data: {'type': WsMessageType.interrupt},
     );
   }
 
@@ -99,9 +85,7 @@ class WebSocketMessage {
   factory WebSocketMessage.resetVad() {
     return WebSocketMessage(
       type: WsMessageType.resetVad,
-      data: {
-        'type': WsMessageType.resetVad,
-      },
+      data: {'type': WsMessageType.resetVad},
     );
   }
 

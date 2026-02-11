@@ -1,14 +1,13 @@
-"""
-Entity Extraction Module
+"""Entity Extraction Module.
 
 Extracts entities and relationships from conversational text using LLMGraphTransformer.
 """
 
-from typing import List, Optional
+import logging
+
 from langchain_core.documents import Document
 from langchain_experimental.graph_transformers import LLMGraphTransformer
 from langchain_ollama import ChatOllama
-import logging
 
 from backend.knowledge.config import KnowledgeConfig
 from backend.knowledge.extraction.property_enricher import PropertyEnricher
@@ -17,15 +16,13 @@ logger = logging.getLogger(__name__)
 
 
 class EntityExtractor:
-    """
-    Extracts entities and relationships from conversational text
+    """Extracts entities and relationships from conversational text.
 
     Uses LangChain's LLMGraphTransformer with configurable LLM model.
     """
 
     def __init__(self, config: KnowledgeConfig, enable_property_enrichment: bool = True):
-        """
-        Initialize entity extractor
+        """Initialize entity extractor.
 
         Args:
             config: Knowledge system configuration
@@ -35,32 +32,40 @@ class EntityExtractor:
         self.enable_property_enrichment = enable_property_enrichment
         self._llm = None
         self._transformer = None
-        self._property_enricher = None if not enable_property_enrichment else PropertyEnricher(config)
+        self._property_enricher = (
+            None if not enable_property_enrichment else PropertyEnricher(config)
+        )
 
     def _get_llm(self) -> ChatOllama:
-        """Get or create LLM instance"""
+        """Get or create LLM instance."""
         if self._llm is None:
             logger.info(f"Initializing LLM: {self.config.llm.model}")
             self._llm = ChatOllama(
                 model=self.config.llm.model,
                 base_url=self.config.llm.base_url,
-                temperature=self.config.llm.temperature
+                temperature=self.config.llm.temperature,
             )
         return self._llm
 
     def _get_transformer(self) -> LLMGraphTransformer:
-        """Get or create graph transformer"""
+        """Get or create graph transformer."""
         if self._transformer is None:
             llm = self._get_llm()
 
             logger.info("Initializing LLMGraphTransformer")
             self._transformer = LLMGraphTransformer(
                 llm=llm,
-                node_properties=["description"] if self.config.extraction.extract_node_properties else False,
-                relationship_properties=["description"] if self.config.extraction.extract_relationship_properties else False,
+                node_properties=(
+                    ["description"] if self.config.extraction.extract_node_properties else False
+                ),
+                relationship_properties=(
+                    ["description"]
+                    if self.config.extraction.extract_relationship_properties
+                    else False
+                ),
                 allowed_nodes=self.config.extraction.allowed_nodes,
                 allowed_relationships=self.config.extraction.allowed_relationships,
-                additional_instructions=self.config.extraction.additional_instructions
+                additional_instructions=self.config.extraction.additional_instructions,
             )
 
         return self._transformer
@@ -68,11 +73,10 @@ class EntityExtractor:
     async def extract_from_utterance(
         self,
         utterance: str,
-        conversation_history: Optional[List[str]] = None,
-        metadata: Optional[dict] = None
-    ) -> List:
-        """
-        Extract entities and relationships from a single utterance
+        conversation_history: list[str] | None = None,
+        metadata: dict | None = None,
+    ) -> list:
+        """Extract entities and relationships from a single utterance.
 
         Args:
             utterance: User's statement
@@ -90,10 +94,7 @@ class EntityExtractor:
             context = utterance
 
         # Create document
-        doc = Document(
-            page_content=context,
-            metadata=metadata or {"utterance": utterance}
-        )
+        doc = Document(page_content=context, metadata=metadata or {"utterance": utterance})
 
         # Extract
         logger.debug(f"Extracting from: {utterance}")
@@ -103,14 +104,15 @@ class EntityExtractor:
             graph_docs = await transformer.aconvert_to_graph_documents([doc])
 
             if graph_docs:
-                logger.info(f"Extracted {len(graph_docs[0].nodes)} nodes and {len(graph_docs[0].relationships)} relationships")
+                logger.info(
+                    f"Extracted {len(graph_docs[0].nodes)} nodes and {len(graph_docs[0].relationships)} relationships"
+                )
 
                 # Enrich with properties if enabled
                 if self.enable_property_enrichment and self._property_enricher:
                     for graph_doc in graph_docs:
                         await self._property_enricher.enrich_graph_document(
-                            graph_doc,
-                            original_text=utterance
+                            graph_doc, original_text=utterance
                         )
                     logger.info("Property enrichment complete")
             else:
@@ -123,12 +125,9 @@ class EntityExtractor:
             raise
 
     async def extract_batch(
-        self,
-        utterances: List[str],
-        metadata_list: Optional[List[dict]] = None
-    ) -> List:
-        """
-        Extract entities from multiple utterances in batch
+        self, utterances: list[str], metadata_list: list[dict] | None = None
+    ) -> list:
+        """Extract entities from multiple utterances in batch.
 
         Args:
             utterances: List of user statements

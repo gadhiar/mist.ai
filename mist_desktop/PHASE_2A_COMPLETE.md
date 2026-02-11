@@ -1,4 +1,4 @@
-# Phase 2A: Voice Input & Audio Playback - COMPLETE ✅
+# Phase 2A: Voice Input & Audio Playback - COMPLETE 
 
 ## Summary
 
@@ -56,28 +56,28 @@ permission_handler: ^11.3.1       # Microphone permissions
 ┌─────────────────────────────────┐
 │      Flutter Desktop App        │
 │                                 │
-│  [Mic Button] → STT Service     │
-│       ↓                         │
-│  Transcription → WebSocket      │
-│       ↓                         │
+│  [Mic Button] -> STT Service     │
+│       ->                         │
+│  Transcription -> WebSocket      │
+│       ->                         │
 │  Backend (LLM + TTS)            │
-│       ↓                         │
-│  Audio Chunks ← WebSocket       │
-│       ↓                         │
+│       ->                         │
+│  Audio Chunks -> WebSocket       │
+│       ->                         │
 │  Audio Playback Service         │
-│       ↓                         │
-│  Speakers 🔊                    │
+│       ->                         │
+│  Speakers                     │
 └─────────────────────────────────┘
 ```
 
 ## Protocol
 
-### Client → Server (Text Only)
+### Client -> Server (Text Only)
 ```json
 {"type": "text", "text": "transcribed speech"}
 ```
 
-### Server → Client
+### Server -> Client
 ```json
 {"type": "llm_response", "text": "AI response"}
 {"type": "audio_chunk", "audio": [...], "sample_rate": 24000}
@@ -86,22 +86,22 @@ permission_handler: ^11.3.1       # Microphone permissions
 
 ## User Flow
 
-1. **User clicks mic button** → App starts listening
-2. **User speaks** → Real-time transcription (STT)
-3. **Speech ends** → Transcription sent to backend as text
-4. **Backend processes** → LLM generates response + TTS audio
-5. **App receives** → Displays text + plays audio
-6. **User hears response** → Audio playback with queue management
+1. **User clicks mic button** -> App starts listening
+2. **User speaks** -> Real-time transcription (STT)
+3. **Speech ends** -> Transcription sent to backend as text
+4. **Backend processes** -> LLM generates response + TTS audio
+5. **App receives** -> Displays text + plays audio
+6. **User hears response** -> Audio playback with queue management
 
-## What Works Now ✅
+## What Works Now 
 
-- ✅ Voice input with platform STT
-- ✅ Real-time listening indicator
-- ✅ Automatic transcription → message sending
-- ✅ Audio playback from backend
-- ✅ Queue management for audio chunks
-- ✅ Combined text + voice input
-- ✅ Stop/interrupt functionality
+-  Voice input with platform STT
+-  Real-time listening indicator
+-  Automatic transcription -> message sending
+-  Audio playback from backend
+-  Queue management for audio chunks
+-  Combined text + voice input
+-  Stop/interrupt functionality
 
 ## Next Steps - Phase 2B
 
@@ -167,7 +167,7 @@ permission_handler: ^11.3.1       # Microphone permissions
 - No visual waveform yet
 - No voice settings UI yet
 
-## Success Criteria ✅
+## Success Criteria 
 
 - [x] Voice input working
 - [x] Audio playback working

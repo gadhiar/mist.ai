@@ -6,9 +6,9 @@ Get your knowledge-augmented conversation system running in 5 minutes.
 
 ## Prerequisites
 
-✅ Neo4j running on `bolt://localhost:7687`
-✅ Python environment with dependencies installed
-✅ Existing MIST voice system working
+ Neo4j running on `bolt://localhost:7687`
+ Python environment with dependencies installed
+ Existing MIST voice system working
 
 ---
 
@@ -16,7 +16,7 @@ Get your knowledge-augmented conversation system running in 5 minutes.
 
 ```bash
 # Test imports
-venv/Scripts/python.exe -c "from backend.chat import ConversationHandler; print('✅ Ready')"
+venv/Scripts/python.exe -c "from backend.chat import ConversationHandler; print(' Ready')"
 
 # Test simple conversation (requires Neo4j)
 venv/Scripts/python.exe test_conversation_handler.py --mode simple
@@ -26,7 +26,7 @@ venv/Scripts/python.exe test_conversation_handler.py --mode simple
 ```
 USER: I use Python and FastAPI for backend development.
 MIST: [Autonomous response with tool use]
-✅ Test passed!
+ Test passed!
 ```
 
 ---
@@ -66,9 +66,9 @@ if DEFAULT_KNOWLEDGE_CONFIG.enable_knowledge_integration:
             neo4j_password=DEFAULT_KNOWLEDGE_CONFIG.neo4j_password,
             model_name=DEFAULT_KNOWLEDGE_CONFIG.knowledge_model
         )
-        logger.info("✅ Knowledge integration enabled")
+        logger.info(" Knowledge integration enabled")
     except Exception as e:
-        logger.warning(f"⚠️  Knowledge integration disabled: {e}")
+        logger.warning(f"  Knowledge integration disabled: {e}")
 ```
 
 **In `generate_llm_response()`, replace the ollama.chat call:**
@@ -106,12 +106,12 @@ venv/Scripts/python.exe backend/server.py
 
 ---
 
-## Done! 🎉
+## Done! 
 
 Your voice assistant now has:
-- ✅ Autonomous knowledge extraction
-- ✅ Contextual knowledge retrieval
-- ✅ Personalized responses based on accumulated knowledge
+-  Autonomous knowledge extraction
+-  Contextual knowledge retrieval
+-  Personalized responses based on accumulated knowledge
 
 ---
 
@@ -119,7 +119,7 @@ Your voice assistant now has:
 
 **Check logs for:**
 ```
-✅ Knowledge integration enabled
+ Knowledge integration enabled
 LLM made 1 tool calls
 Executing tool: extract_knowledge with args: {...}
 ```
@@ -135,13 +135,13 @@ MATCH (e:__Entity__) RETURN e LIMIT 25
 ## Troubleshooting
 
 **"Knowledge integration disabled"**
-→ Check Neo4j is running: `neo4j status`
+-> Check Neo4j is running: `neo4j status`
 
 **"No information found for query"**
-→ Graph is empty, say something to learn first
+-> Graph is empty, say something to learn first
 
 **Slow responses**
-→ Reduce `max_retrieval_facts=10` in `knowledge_config.py`
+-> Reduce `max_retrieval_facts=10` in `knowledge_config.py`
 
 ---
 
@@ -160,4 +160,4 @@ MATCH (e:__Entity__) RETURN e LIMIT 25
 3. **Tune configuration** - Adjust limits and thresholds as needed
 4. **Build frontend features** - Visualize knowledge graph, show sources
 
-Enjoy your knowledge-augmented voice assistant! 🚀
+Enjoy your knowledge-augmented voice assistant! 

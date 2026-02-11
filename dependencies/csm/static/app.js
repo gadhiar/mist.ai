@@ -37,15 +37,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (data.type === "status") {
       if (data.message.includes("Models initialized")) {
         console.log("Model initialization confirmed. Redirecting...");
-      
+
         // Save config again just to be safe
         localStorage.setItem('ai_config', JSON.stringify(lastConfig));
-      
+
         // Close WebSocket before navigating
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.close();
         }
-      
+
         // Wait briefly to let server clean up, then redirect
         setTimeout(() => {
           window.location.href = "/chat";
@@ -130,9 +130,9 @@ function showLoading(show, message) {
   const loadingContainer = document.getElementById('loadingContainer');
   const loadingSpinner = document.getElementById('loadingSpinner');
   const loadingText = document.getElementById('loadingText');
-  
+
   isLoading = show;
-  
+
   if (show) {
     saveButton.disabled = true;
     saveButton.classList.add('opacity-50', 'cursor-not-allowed');

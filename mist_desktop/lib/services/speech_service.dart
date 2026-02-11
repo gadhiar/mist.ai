@@ -65,18 +65,23 @@ class SpeechService {
     try {
       await _speech.listen(
         onResult: _handleResult,
-        listenFor: const Duration(seconds: 60), // Max listen duration (increased)
-        pauseFor: const Duration(seconds: 5),   // Pause detection (increased to avoid early stop)
+        listenFor: const Duration(
+          seconds: 60,
+        ), // Max listen duration (increased)
+        pauseFor: const Duration(
+          seconds: 5,
+        ), // Pause detection (increased to avoid early stop)
         listenOptions: stt.SpeechListenOptions(
           partialResults: true,
-          cancelOnError: false, // Don't auto-cancel on errors (Windows plugin has issues)
+          cancelOnError:
+              false, // Don't auto-cancel on errors (Windows plugin has issues)
           listenMode: stt.ListenMode.confirmation,
         ),
       );
 
       _isListening = true;
       _listeningController.add(true);
-      _logger.i('✅ Started listening - speak now!');
+      _logger.i(' Started listening - speak now!');
     } catch (e) {
       _logger.e('Error starting listening: $e');
       _isListening = false;
@@ -124,18 +129,18 @@ class SpeechService {
       final text = result.recognizedWords as String;
       final isFinal = result.finalResult as bool;
 
-      _logger.i('📝 STT Result: "$text" (final: $isFinal)');
+      _logger.i(' STT Result: "$text" (final: $isFinal)');
 
       // Only send final results to avoid too many partial updates
       if (isFinal && text.isNotEmpty) {
-        _logger.i('🚀 Sending transcription: "$text"');
+        _logger.i(' Sending transcription: "$text"');
         _transcriptionController.add(text);
-        _logger.i('✅ Transcription sent successfully!');
+        _logger.i(' Transcription sent successfully!');
       } else if (!isFinal) {
-        _logger.d('⏭️  Skipping partial result: "$text"');
+        _logger.d('⏭  Skipping partial result: "$text"');
       }
     } catch (e) {
-      _logger.e('❌ Error handling STT result: $e');
+      _logger.e(' Error handling STT result: $e');
       _logger.e('Result object: $result');
     }
   }

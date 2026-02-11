@@ -61,7 +61,9 @@ class ChatNotifier extends Notifier<ChatState> {
     _audioRecordingService.audioCompleteStream.listen((completeAudio) {
       // Send complete audio buffer to backend for Whisper transcription
       _wsService.sendAudioBytes(completeAudio);
-      _logger.i('📤 Sent complete audio to backend: ${completeAudio.length} bytes');
+      _logger.i(
+        ' Sent complete audio to backend: ${completeAudio.length} bytes',
+      );
     });
   }
 
@@ -101,9 +103,13 @@ class ChatNotifier extends Notifier<ChatState> {
         if (message.audio != null && message.sampleRate != null) {
           // Backend sends float32 values [-1.0, 1.0] as a list
           // Keep them as doubles for proper conversion to PCM16
-          final audioData = message.audio!.map((e) => (e as num).toDouble()).toList();
+          final audioData = message.audio!
+              .map((e) => (e as num).toDouble())
+              .toList();
           _audioService.playAudioChunkFloat32(audioData, message.sampleRate!);
-          _logger.d('Playing audio chunk: ${message.chunkNum} (${audioData.length} samples)');
+          _logger.d(
+            'Playing audio chunk: ${message.chunkNum} (${audioData.length} samples)',
+          );
         }
         break;
 
@@ -143,9 +149,7 @@ class ChatNotifier extends Notifier<ChatState> {
 
   /// Add a message to the chat
   void addMessage(ChatMessage message) {
-    state = state.copyWith(
-      messages: [...state.messages, message],
-    );
+    state = state.copyWith(messages: [...state.messages, message]);
   }
 
   /// Send a text message
@@ -194,10 +198,7 @@ class ChatNotifier extends Notifier<ChatState> {
     _wsService.sendInterrupt();
     _audioService.stop(); // Stop any playing audio
     _audioRecordingService.stopRecording(); // Stop recording
-    state = state.copyWith(
-      isProcessing: false,
-      currentAiResponse: null,
-    );
+    state = state.copyWith(isProcessing: false, currentAiResponse: null);
   }
 
   /// Start voice input (start recording and streaming audio to backend)

@@ -1,4 +1,4 @@
-"""Embedding generation for semantic search"""
+"""Embedding generation for semantic search."""
 
 from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
 

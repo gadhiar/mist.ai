@@ -113,14 +113,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                 : ListView.builder(
                     controller: _scrollController,
                     padding: const EdgeInsets.all(8),
-                    itemCount: chatState.messages.length +
+                    itemCount:
+                        chatState.messages.length +
                         (chatState.currentAiResponse != null ? 1 : 0),
                     itemBuilder: (context, index) {
                       // Show streaming AI response
                       if (index == chatState.messages.length &&
                           chatState.currentAiResponse != null) {
                         return _buildStreamingMessage(
-                            chatState.currentAiResponse!);
+                          chatState.currentAiResponse!,
+                        );
                       }
 
                       final message = chatState.messages[index];
@@ -142,10 +144,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                     child: CircularProgressIndicator(strokeWidth: 2),
                   ),
                   SizedBox(width: 8),
-                  Text(
-                    'Processing...',
-                    style: TextStyle(fontSize: 12),
-                  ),
+                  Text('Processing...', style: TextStyle(fontSize: 12)),
                 ],
               ),
             ),
@@ -176,10 +175,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           const SizedBox(height: 16),
           Text(
             'Start a conversation with MIST.AI',
-            style: TextStyle(
-              fontSize: 16,
-              color: Colors.grey.shade600,
-            ),
+            style: TextStyle(fontSize: 16, color: Colors.grey.shade600),
           ),
         ],
       ),

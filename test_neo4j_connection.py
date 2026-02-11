@@ -1,5 +1,4 @@
-"""
-Test Neo4j Connection
+"""Test Neo4j Connection.
 
 Simple script to verify Neo4j Desktop is running and accessible.
 
@@ -8,19 +7,19 @@ Usage:
 """
 
 import sys
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from backend.knowledge.config import Neo4jConfig, get_config
+from backend.knowledge.config import get_config
 from backend.knowledge.storage import Neo4jConnection
 
 console = Console()
 
 
 def test_connection():
-    """Test Neo4j connection and display results"""
-
+    """Test Neo4j connection and display results."""
     console.print("\n[bold cyan]Testing Neo4j Connection...[/bold cyan]\n")
 
     # Load config
@@ -42,11 +41,13 @@ def test_connection():
 
         # Display results
         if health["status"] == "healthy":
-            console.print(Panel.fit(
-                f"[bold green]✅ SUCCESS![/bold green]\n\n{health['message']}",
-                title="Neo4j Connection",
-                border_style="green"
-            ))
+            console.print(
+                Panel.fit(
+                    f"[bold green] SUCCESS![/bold green]\n\n{health['message']}",
+                    title="Neo4j Connection",
+                    border_style="green",
+                )
+            )
 
             # Test a simple query
             console.print("\n[bold cyan]Running test query...[/bold cyan]")
@@ -61,23 +62,27 @@ def test_connection():
 
             console.print(table)
 
-            console.print("\n[bold green]✅ Neo4j is ready to use![/bold green]\n")
+            console.print("\n[bold green] Neo4j is ready to use![/bold green]\n")
             return True
 
         else:
-            console.print(Panel.fit(
-                f"[bold red]❌ FAILED[/bold red]\n\n{health['message']}\n\n{health.get('error', '')}",
-                title="Neo4j Connection",
-                border_style="red"
-            ))
+            console.print(
+                Panel.fit(
+                    f"[bold red] FAILED[/bold red]\n\n{health['message']}\n\n{health.get('error', '')}",
+                    title="Neo4j Connection",
+                    border_style="red",
+                )
+            )
             return False
 
     except Exception as e:
-        console.print(Panel.fit(
-            f"[bold red]❌ CONNECTION FAILED[/bold red]\n\n{str(e)}",
-            title="Neo4j Connection Error",
-            border_style="red"
-        ))
+        console.print(
+            Panel.fit(
+                f"[bold red] CONNECTION FAILED[/bold red]\n\n{str(e)}",
+                title="Neo4j Connection Error",
+                border_style="red",
+            )
+        )
 
         console.print("\n[yellow]Troubleshooting:[/yellow]")
         console.print("1. Make sure Neo4j Desktop is running")

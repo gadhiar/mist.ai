@@ -1,0 +1,168 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mist-ai"
+version = "0.1.0"
+description = "MIST.AI - Transparent cognitive architecture with persistent memory"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+keywords = ["ai", "voice", "knowledge-graph", "neo4j", "local-llm"]
+authors = [
+    {name = "MIST.AI Contributors"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+    \.git
+  | \.venv
+  | venv
+  | \.mypy_cache
+  | \.pytest_cache
+  | \.ruff_cache
+  | __pycache__
+  | dependencies
+  | dist
+  | build
+)/
+'''
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+# Enable specific rule sets
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+    "D",   # pydocstyle (docstring quality)
+]
+
+ignore = [
+    "E501",  # line too long (handled by black)
+    "B008",  # do not perform function call in argument defaults (FastAPI uses this)
+    "B905",  # zip without explicit strict parameter
+    "D100",  # missing docstring in public module (too strict for now)
+    "D104",  # missing docstring in public package (too strict for now)
+    "D107",  # missing docstring in __init__ (too strict for now)
+    "D103",  # missing docstring in public function (acceptable for scripts)
+    "D105",  # missing docstring in magic method (standard practice)
+    "E402",  # module level import not at top (intentional for some scripts)
+    "N806",  # variable naming should be lowercase (intentional constants in functions)
+    "F402",  # import shadowed by loop variable (minor issue)
+    "E722",  # bare except (will fix manually if needed)
+    "D417",  # missing argument descriptions (can be improved incrementally)
+    "D205",  # blank line between summary and description (minor style)
+]
+
+# Exclude directories
+exclude = [
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "dependencies",
+    "dist",
+    "build",
+]
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["F401"]  # Allow unused imports in __init__.py
+
+[tool.ruff.isort]
+known-first-party = ["backend", "cli_client"]
+section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+
+[tool.ruff.pydocstyle]
+convention = "google"  # Use Google-style docstrings
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false  # Start lenient, tighten later
+disallow_incomplete_defs = false
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+# Per-module options
+[[tool.mypy.overrides]]
+module = [
+    "ollama.*",
+    "neo4j.*",
+    "langchain.*",
+    "chromadb.*",
+    "sentence_transformers.*",
+    "plotly.*",
+    "rich.*",
+    "sounddevice.*",
+    "whisper.*",
+    "torch.*",
+    "torchaudio.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--showlocals",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+]
+
+[tool.coverage.run]
+source = ["backend"]
+omit = [
+    "*/tests/*",
+    "*/test_*.py",
+    "*/__pycache__/*",
+    "*/dependencies/*",
+]
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+skip_covered = false
+
+[tool.bandit]
+exclude_dirs = ["tests", "dependencies", ".venv", "venv"]
+skips = ["B101"]  # Skip assert_used (we use asserts appropriately)
+
+[tool.codespell]
+skip = "*.git,*.venv,venv,*.pyc,*.egg-info,*.lock,mist_desktop,dependencies"
+ignore-words-list = "crate,nd,te,thre,hass,bloc,lod"

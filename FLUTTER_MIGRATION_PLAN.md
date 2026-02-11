@@ -44,12 +44,12 @@
 
 ### Success Criteria
 
-- ✅ Connect to Python backend via WebSocket (port 8001)
-- ✅ Display conversation with streaming LLM tokens
-- ✅ Visualize knowledge graph with interactive nodes/edges
-- ✅ Play audio from backend with gap-free experience
-- ✅ Show real-time entity extraction and retrieval
-- ✅ Run in system tray, <100MB RAM usage
+-  Connect to Python backend via WebSocket (port 8001)
+-  Display conversation with streaming LLM tokens
+-  Visualize knowledge graph with interactive nodes/edges
+-  Play audio from backend with gap-free experience
+-  Show real-time entity extraction and retrieval
+-  Run in system tray, <100MB RAM usage
 
 ---
 
@@ -74,10 +74,10 @@ flutter --version
 flutter doctor -v
 
 # Expected output:
-# [✓] Flutter (Channel stable, 3.24.x)
-# [✓] Windows Version (Windows 10+)
-# [✓] Visual Studio (2022+ with Desktop development with C++)
-# [✓] VS Code or Android Studio
+# [] Flutter (Channel stable, 3.24.x)
+# [] Windows Version (Windows 10+)
+# [] Visual Studio (2022+ with Desktop development with C++)
+# [] VS Code or Android Studio
 ```
 
 **Required Visual Studio Components:**
@@ -120,7 +120,7 @@ flutter devices
 
 ```bash
 flutter doctor
-# All checks should pass (✓)
+# All checks should pass ()
 ```
 
 ---
@@ -161,7 +161,7 @@ flutter doctor
 │  │  └─ WebSocketMessage                                  │  │
 │  └───────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
-                         ↓ WebSocket
+                         -> WebSocket
 ┌─────────────────────────────────────────────────────────────┐
 │  Python Backend (Existing, No Changes)                      │
 │  - FastAPI WebSocket Server (port 8001)                     │
@@ -457,7 +457,7 @@ mist_desktop/                        # Flutter app root
    - ScrollView with message bubbles
    - User messages (right-aligned, blue)
    - Assistant messages (left-aligned, gray)
-   - Streaming animation (typing indicator → token-by-token reveal)
+   - Streaming animation (typing indicator -> token-by-token reveal)
 
 4. **Handle WebSocket Messages**
    ```dart
@@ -617,8 +617,8 @@ mist_desktop/                        # Flutter app root
 
 6. **Add Interactivity**
    - Pan/zoom (via InteractiveViewer)
-   - Click node → show details
-   - Hover → highlight connections
+   - Click node -> show details
+   - Hover -> highlight connections
    - Animate new nodes appearing
 
 **Deliverable**: Interactive knowledge graph showing real-time entity extraction and retrieval
@@ -953,7 +953,7 @@ class GraphNotifier extends StateNotifier<GraphData> {
 
 ### Message Protocol
 
-**Backend → Frontend Messages:**
+**Backend -> Frontend Messages:**
 
 ```dart
 // Message types from Python backend
@@ -985,7 +985,7 @@ enum WSMessageType {
 }
 ```
 
-**Frontend → Backend Messages:**
+**Frontend -> Backend Messages:**
 
 ```dart
 // Send text message
@@ -1122,7 +1122,7 @@ class ReconnectingWebSocketService extends WebSocketService {
 │  │  └─────────────────────┘│  │  [Pan/Zoom controls]   │  │
 │  │                         │  │                        │  │
 │  │  ┌─────────────────────┐│  │  Stats: 15 nodes,     │  │
-│  │  │ Type message...   [→]││  │         23 edges      │  │
+│  │  │ Type message...   [->]││  │         23 edges      │  │
 │  │  └─────────────────────┘│  │                        │  │
 │  └─────────────────────────┘  └────────────────────────┘  │
 │                                                            │

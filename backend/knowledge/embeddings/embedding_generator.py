@@ -1,21 +1,19 @@
-"""
-Embedding Generation Module
+"""Embedding Generation Module.
 
 Generates vector embeddings for text using sentence-transformers.
 Enables semantic search on the knowledge graph.
 """
 
-from sentence_transformers import SentenceTransformer
-from typing import List
 import logging
+
 import numpy as np
+from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
 
 class EmbeddingGenerator:
-    """
-    Generates vector embeddings for text using sentence-transformers.
+    """Generates vector embeddings for text using sentence-transformers.
 
     Uses all-MiniLM-L6-v2 model by default:
     - 384 dimensions
@@ -30,8 +28,7 @@ class EmbeddingGenerator:
     """
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        """
-        Initialize embedding generator
+        """Initialize embedding generator.
 
         Args:
             model_name: Sentence-transformers model name
@@ -44,8 +41,7 @@ class EmbeddingGenerator:
         logger.info(f"EmbeddingGenerator initialized with model: {model_name}")
 
     def _get_model(self) -> SentenceTransformer:
-        """
-        Lazy load the embedding model
+        """Lazy load the embedding model.
 
         Only loads model when first needed to save memory and startup time.
         """
@@ -55,9 +51,8 @@ class EmbeddingGenerator:
             logger.info("Embedding model loaded successfully")
         return self._model
 
-    def generate_embedding(self, text: str) -> List[float]:
-        """
-        Generate embedding vector for text
+    def generate_embedding(self, text: str) -> list[float]:
+        """Generate embedding vector for text.
 
         Args:
             text: Input text to embed
@@ -80,18 +75,13 @@ class EmbeddingGenerator:
         model = self._get_model()
 
         # Generate embedding
-        embedding = model.encode(
-            text,
-            convert_to_numpy=True,
-            show_progress_bar=False
-        )
+        embedding = model.encode(text, convert_to_numpy=True, show_progress_bar=False)
 
         # Convert to list and return
         return embedding.tolist()
 
-    def generate_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
-        """
-        Generate embeddings for multiple texts (more efficient than one-by-one)
+    def generate_embeddings_batch(self, texts: list[str]) -> list[list[float]]:
+        """Generate embeddings for multiple texts (more efficient than one-by-one).
 
         Args:
             texts: List of input texts
@@ -120,15 +110,14 @@ class EmbeddingGenerator:
             valid_texts,
             convert_to_numpy=True,
             show_progress_bar=len(texts) > 100,  # Show progress for large batches
-            batch_size=32
+            batch_size=32,
         )
 
         # Convert to list of lists
         return embeddings.tolist()
 
     def compute_similarity(self, text1: str, text2: str) -> float:
-        """
-        Compute cosine similarity between two texts
+        """Compute cosine similarity between two texts.
 
         Args:
             text1: First text

@@ -1,5 +1,4 @@
-"""
-Conversation handling with knowledge graph integration.
+"""Conversation handling with knowledge graph integration.
 
 MCP-like tool access for autonomous knowledge retrieval and extraction.
 """

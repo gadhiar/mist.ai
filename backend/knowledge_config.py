@@ -1,5 +1,4 @@
-"""
-Knowledge Graph Configuration
+"""Knowledge Graph Configuration.
 
 Configuration for knowledge graph integration with voice system.
 """
@@ -10,7 +9,7 @@ from dataclasses import dataclass
 
 @dataclass
 class KnowledgeConfig:
-    """Configuration for knowledge graph integration"""
+    """Configuration for knowledge graph integration."""
 
     # Neo4j connection
     neo4j_uri: str = os.getenv("NEO4J_URI", "bolt://localhost:7687")

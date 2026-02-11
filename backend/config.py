@@ -1,16 +1,15 @@
-"""
-Configuration for Voice AI Backend
-"""
+"""Configuration for Voice AI Backend."""
+
 import os
-from pydantic import BaseModel
-from typing import Optional
+
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 load_dotenv()
 
 
 class VoiceConfig(BaseModel):
-    """Configuration for voice AI system"""
+    """Configuration for voice AI system."""
 
     # Model paths
     whisper_model: str = "base"
@@ -29,7 +28,7 @@ class VoiceConfig(BaseModel):
     use_voice_context: bool = True
 
     # Server settings
-    host: str = "0.0.0.0"
+    host: str = "0.0.0.0"  # nosec B104 - intentional bind to all interfaces for dev server
     port: int = 8001  # Changed from 8000 to avoid conflict with HYTE Nexus
     max_connections: int = 10
 
@@ -39,10 +38,8 @@ class VoiceConfig(BaseModel):
 
 # Load configuration from environment
 def load_config() -> VoiceConfig:
-    """Load configuration from environment variables"""
-    return VoiceConfig(
-        tts_enabled=os.getenv("TTS_ENABLED", "true").lower() == "true"
-    )
+    """Load configuration from environment variables."""
+    return VoiceConfig(tts_enabled=os.getenv("TTS_ENABLED", "true").lower() == "true")
 
 
 # Default configuration

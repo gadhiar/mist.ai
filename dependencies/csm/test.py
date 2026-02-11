@@ -28,6 +28,7 @@ audio_paths = [
     "utterance_3.wav",
 ]
 
+
 def load_audio(audio_path):
     print(f"Loading reference audio: {audio_path}")
     audio_load_start = time.time()
@@ -37,6 +38,7 @@ def load_audio(audio_path):
     )
     print(f"Audio loaded and resampled in {time.time() - audio_load_start:.2f} seconds")
     return audio_tensor
+
 
 print("Creating segments with reference audio...")
 segments_start = time.time()
@@ -54,7 +56,7 @@ audio = generator.generate(
     speaker=0,
     context=segments,
     max_audio_length_ms=10_000,
-    stream=True  # Enable internal streaming
+    stream=True,  # Enable internal streaming
 )
 print(f"Audio generation completed in {time.time() - gen_start:.2f} seconds")
 
@@ -72,7 +74,7 @@ generate_streaming_audio(
     context=segments,
     output_file="audio_streamed.wav",
     max_audio_length_ms=10_000,
-    play_audio=True  # Set to True to play audio in real-time (requires sounddevice package)
+    play_audio=True,  # Set to True to play audio in real-time (requires sounddevice package)
 )
 
 total_time = time.time() - start_time

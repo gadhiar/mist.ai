@@ -1,5 +1,4 @@
-"""
-Graph Regeneration Script - Complete All-In-One Solution
+"""Graph Regeneration Script - Complete All-In-One Solution.
 
 Handles everything needed for graph regeneration:
 1. Checks Neo4j connection
@@ -33,31 +32,27 @@ Note: This script automatically handles schema initialization, so you don't
 need to run any other scripts first. Just make sure Neo4j is running!
 """
 
-import asyncio
 import argparse
+import asyncio
 import logging
 import sys
-from datetime import datetime
 
 from backend.knowledge.config import get_config
 from backend.knowledge.regeneration import GraphRegenerator
-from backend.knowledge.storage import Neo4jConnection, GraphStore
+from backend.knowledge.storage import GraphStore, Neo4jConnection
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 
 logger = logging.getLogger(__name__)
 
 
 async def regenerate_all(regenerator: GraphRegenerator, dry_run: bool = False):
-    """
-    Regenerate entire knowledge graph
+    """Regenerate entire knowledge graph.
 
     Args:
         regenerator: GraphRegenerator instance
@@ -107,12 +102,9 @@ async def regenerate_all(regenerator: GraphRegenerator, dry_run: bool = False):
 
 
 async def regenerate_conversation(
-    regenerator: GraphRegenerator,
-    conversation_id: str,
-    dry_run: bool = False
+    regenerator: GraphRegenerator, conversation_id: str, dry_run: bool = False
 ):
-    """
-    Regenerate specific conversation
+    """Regenerate specific conversation.
 
     Args:
         regenerator: GraphRegenerator instance
@@ -148,8 +140,7 @@ async def regenerate_conversation(
 
 
 async def initialize_schema(config):
-    """
-    Initialize Neo4j schema (indexes and constraints)
+    """Initialize Neo4j schema (indexes and constraints).
 
     Creates all necessary indexes including vector index for embeddings.
 
@@ -173,8 +164,7 @@ async def initialize_schema(config):
 
 
 async def check_neo4j_connection(config):
-    """
-    Verify Neo4j connection before regeneration
+    """Verify Neo4j connection before regeneration.
 
     Args:
         config: Knowledge configuration
@@ -190,7 +180,7 @@ async def check_neo4j_connection(config):
 
         # Test query
         result = connection.execute_query("RETURN 1 AS test")
-        if result and result[0].get('test') == 1:
+        if result and result[0].get("test") == 1:
             logger.info("[OK] Neo4j connection successful")
             connection.disconnect()
             return True
@@ -205,7 +195,7 @@ async def check_neo4j_connection(config):
 
 
 async def main():
-    """Main entry point"""
+    """Main entry point."""
     parser = argparse.ArgumentParser(
         description="Regenerate knowledge graph from utterances",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -219,19 +209,13 @@ Examples:
 
   # Dry run (preview)
   python regenerate_graph.py --dry-run
-        """
+        """,
     )
 
-    parser.add_argument(
-        '--conversation-id',
-        type=str,
-        help='Regenerate specific conversation only'
-    )
+    parser.add_argument("--conversation-id", type=str, help="Regenerate specific conversation only")
 
     parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='Show what would be done without executing'
+        "--dry-run", action="store_true", help="Show what would be done without executing"
     )
 
     args = parser.parse_args()
@@ -268,11 +252,7 @@ Examples:
     try:
         if args.conversation_id:
             # Regenerate specific conversation
-            await regenerate_conversation(
-                regenerator,
-                args.conversation_id,
-                dry_run=args.dry_run
-            )
+            await regenerate_conversation(regenerator, args.conversation_id, dry_run=args.dry_run)
         else:
             # Regenerate entire graph
             await regenerate_all(regenerator, dry_run=args.dry_run)
@@ -285,6 +265,7 @@ Examples:
     except Exception as e:
         logger.error(f"Regeneration failed: {e}")
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
 

@@ -1,41 +1,41 @@
-"""
-Model Manager - Handles loading and lifecycle of all ML models
-"""
-import sys
-import time
+"""Model Manager - Handles loading and lifecycle of all ML models."""
+
 import logging
 import queue
+import sys
 import threading
+import time
 from pathlib import Path
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-sys.path.insert(0, 'dependencies/csm')
+sys.path.insert(0, "dependencies/csm")
+
+import ollama
+import torch
+from generator import Segment
 
 from src.multimodal.stt import WhisperSTT
 from src.multimodal.tts import SesameTTS
-from generator import Segment
-import ollama
-import torch
+
+logger = logging.getLogger(__name__)
 
 # Knowledge graph integration
 try:
     from backend.chat.knowledge_integration import KnowledgeIntegration
     from backend.knowledge_config import DEFAULT_KNOWLEDGE_CONFIG
+
     KNOWLEDGE_AVAILABLE = True
 except ImportError as e:
     logger.warning(f"Knowledge integration not available: {e}")
     KNOWLEDGE_AVAILABLE = False
 
-logger = logging.getLogger(__name__)
-
 
 class ModelManager:
-    """Manages all ML models for the voice AI system"""
+    """Manages all ML models for the voice AI system."""
 
     def __init__(self, config, event_loop=None):
-        """
-        Initialize model manager
+        """Initialize model manager.
 
         Args:
             config: VoiceConfig object
@@ -55,15 +55,15 @@ class ModelManager:
                     neo4j_uri=DEFAULT_KNOWLEDGE_CONFIG.neo4j_uri,
                     neo4j_user=DEFAULT_KNOWLEDGE_CONFIG.neo4j_user,
                     neo4j_password=DEFAULT_KNOWLEDGE_CONFIG.neo4j_password,
-                    model_name=DEFAULT_KNOWLEDGE_CONFIG.knowledge_model
+                    model_name=DEFAULT_KNOWLEDGE_CONFIG.knowledge_model,
                 )
                 if self.knowledge.is_enabled():
-                    logger.info("✅ Knowledge graph integration ENABLED")
+                    logger.info(" Knowledge graph integration ENABLED")
                 else:
-                    logger.warning("⚠️  Knowledge integration disabled (Neo4j unavailable)")
+                    logger.warning("  Knowledge integration disabled (Neo4j unavailable)")
                     self.knowledge = None
             except Exception as e:
-                logger.warning(f"⚠️  Knowledge integration disabled: {e}")
+                logger.warning(f"Knowledge integration disabled: {e}")
                 self.knowledge = None
         else:
             logger.info("Knowledge graph integration disabled in config")
@@ -77,7 +77,7 @@ class ModelManager:
         self.tts_lock = threading.Lock()
 
     def load_all_models(self):
-        """Load all models (STT, TTS, LLM)"""
+        """Load all models (STT, TTS, LLM)."""
         logger.info("Loading all models...")
         start = time.time()
 
@@ -98,29 +98,25 @@ class ModelManager:
 
         # Warmup LLM
         logger.info("3/3 Warming up LLM...")
-        ollama.chat(
-            model=self.llm_model, messages=[{"role": "user", "content": "hi"}]
-        )
+        ollama.chat(model=self.llm_model, messages=[{"role": "user", "content": "hi"}])
 
         elapsed = time.time() - start
         logger.info(f"All models loaded in {elapsed:.1f}s")
 
     def _start_tts_worker(self):
-        """Start dedicated TTS model worker thread (CSM pattern)"""
+        """Start dedicated TTS model worker thread (CSM pattern)."""
         if self.tts_worker_thread is not None and self.tts_worker_thread.is_alive():
             return
 
         self.tts_worker_running.set()
         self.tts_worker_thread = threading.Thread(
-            target=self._tts_worker,
-            daemon=True,
-            name="tts_worker"
+            target=self._tts_worker, daemon=True, name="tts_worker"
         )
         self.tts_worker_thread.start()
         logger.info("Started dedicated TTS model worker thread")
 
     def _tts_worker(self):
-        """TTS model worker thread - loads and runs model (CSM pattern)"""
+        """TTS model worker thread - loads and runs model (CSM pattern)."""
         logger.info("TTS worker thread started")
 
         # Disable CUDA graphs to avoid threading issues (CSM pattern)
@@ -129,8 +125,7 @@ class ModelManager:
 
         logger.info("Loading Sesame TTS in worker thread...")
         self.tts = SesameTTS(
-            device=self.config.tts_device,
-            use_context=self.config.use_voice_context
+            device=self.config.tts_device, use_context=self.config.use_voice_context
         )
 
         # Warmup TTS
@@ -150,7 +145,9 @@ class ModelManager:
 
                 gen_id, text, speaker_id, context, max_ms, temperature, topk = request
                 logger.info(f"TTS worker: Processing generation ID {gen_id}")
-                logger.info(f"TTS worker: Context has {len(context)} segments, max_audio={max_ms}ms")
+                logger.info(
+                    f"TTS worker: Context has {len(context)} segments, max_audio={max_ms}ms"
+                )
 
                 # Synchronize CUDA before TTS to prevent conflicts with Whisper
                 if torch.cuda.is_available():
@@ -167,7 +164,7 @@ class ModelManager:
                         context=context,
                         max_audio_length_ms=max_ms,
                         temperature=temperature,
-                        topk=topk
+                        topk=topk,
                     ):
                         audio_chunks.append(chunk)
                         chunk_count += 1
@@ -181,6 +178,7 @@ class ModelManager:
                 except Exception as gen_error:
                     logger.error(f"TTS generation error: {gen_error}")
                     import traceback
+
                     logger.error(traceback.format_exc())
                     raise
 
@@ -198,11 +196,7 @@ class ModelManager:
                     complete_audio = complete_audio.cpu()
 
                     # Create segment and update context
-                    segment = Segment(
-                        speaker=speaker_id,
-                        text=text,
-                        audio=complete_audio
-                    )
+                    segment = Segment(speaker=speaker_id, text=text, audio=complete_audio)
                     self.tts.context.append(segment)
 
                     # More aggressive trimming to prevent CUDA out of bounds
@@ -220,6 +214,7 @@ class ModelManager:
                 continue
             except Exception as e:
                 import traceback
+
                 logger.error(f"Error in TTS worker: {e}\n{traceback.format_exc()}")
 
                 # Clean up CUDA memory on error to prevent cascading failures
@@ -228,24 +223,23 @@ class ModelManager:
                     logger.info("Cleared CUDA cache after error")
 
                 # Put error with generation ID if available
-                error_gen_id = gen_id if 'gen_id' in locals() else 0
+                error_gen_id = gen_id if "gen_id" in locals() else 0
                 self.tts_result_queue.put(("error", error_gen_id, str(e)))
 
         logger.info("TTS worker thread exiting")
 
     def wait_for_tts_warmup(self):
-        """Wait for TTS worker to finish warming up"""
+        """Wait for TTS worker to finish warming up."""
         msg_type, _ = self.tts_result_queue.get()
         if msg_type != "warmup_complete":
             raise RuntimeError("TTS warmup failed")
 
     def transcribe_audio(self, audio_data, sample_rate=16000):
-        """Transcribe audio using Whisper"""
+        """Transcribe audio using Whisper."""
         return self.stt.transcribe_audio(audio_data, sample_rate)
 
     def trim_to_last_sentence(self, text: str) -> str:
-        """
-        Trim text to last complete sentence boundary (CSM pattern).
+        """Trim text to last complete sentence boundary (CSM pattern).
 
         Returns text truncated at the final full sentence boundary.
         A boundary is considered to be any '.', '!' or '?' followed by
@@ -271,8 +265,7 @@ class ModelManager:
         return text.strip()
 
     def _split_into_sentences(self, text: str) -> list:
-        """
-        Split text into sentences at natural boundaries.
+        """Split text into sentences at natural boundaries.
 
         Returns list of sentences, preserving sentence terminators.
         """
@@ -284,9 +277,9 @@ class ModelManager:
 
         # Recombine sentences with their punctuation
         result = []
-        for i in range(0, len(sentences)-1, 2):
-            if i+1 < len(sentences):
-                result.append((sentences[i] + sentences[i+1]).strip())
+        for i in range(0, len(sentences) - 1, 2):
+            if i + 1 < len(sentences):
+                result.append((sentences[i] + sentences[i + 1]).strip())
             else:
                 result.append(sentences[i].strip())
 
@@ -297,8 +290,7 @@ class ModelManager:
         return [s for s in result if s]  # Filter empty strings
 
     def _chunk_text_by_tokens(self, text: str, max_text_tokens: int) -> list:
-        """
-        Split text into chunks that fit within token limits.
+        """Split text into chunks that fit within token limits.
 
         Groups sentences together until approaching token limit, then starts new chunk.
         Ensures each chunk ends at a sentence boundary.
@@ -348,8 +340,7 @@ class ModelManager:
         return chunks
 
     def generate_llm_response(self, user_text):
-        """
-        Generate LLM response with optional knowledge graph integration.
+        """Generate LLM response with optional knowledge graph integration.
 
         If knowledge integration is enabled and Neo4j is available, uses
         knowledge-augmented conversation with autonomous tool use.
@@ -358,11 +349,9 @@ class ModelManager:
         # Use knowledge-augmented generation if available
         if self.knowledge and self.knowledge.is_enabled():
             logger.info("Using knowledge-augmented LLM response")
-            for token in self.knowledge.generate_response_streaming(
-                user_text,
-                event_loop=self.event_loop
-            ):
-                yield token
+            yield from self.knowledge.generate_response_streaming(
+                user_text, event_loop=self.event_loop
+            )
         else:
             # Fallback to standard LLM (original implementation)
             logger.debug("Using standard LLM response (no knowledge integration)")
@@ -384,14 +373,14 @@ Match your response depth to what the user is asking for - be concise when appro
                 model=self.llm_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_text}
+                    {"role": "user", "content": user_text},
                 ],
                 stream=True,
                 options={
                     "num_predict": 400,  # Allow detailed responses when needed, chunking handles overflow
                     "temperature": 0.7,
                     "top_p": 0.9,
-                }
+                },
             )
 
             for chunk in response:
@@ -399,8 +388,7 @@ Match your response depth to what the user is asking for - be concise when appro
                     yield chunk["message"]["content"]
 
     def _estimate_tokens(self, text, audio_tensor=None):
-        """
-        Estimate token count for text and audio following CSM's approach.
+        """Estimate token count for text and audio following CSM's approach.
 
         Returns: estimated token count
         """
@@ -419,8 +407,7 @@ Match your response depth to what the user is asking for - be concise when appro
         return text_tokens + audio_tokens
 
     def _calculate_context_tokens(self, context):
-        """
-        Calculate total tokens in context following CSM's approach.
+        """Calculate total tokens in context following CSM's approach.
 
         Returns: total token count for all segments in context
         """
@@ -428,9 +415,11 @@ Match your response depth to what the user is asking for - be concise when appro
 
         for segment in context:
             # Use tokenizer if available, otherwise estimate
-            if hasattr(self.tts, 'generator') and hasattr(self.tts.generator, '_text_tokenizer'):
+            if hasattr(self.tts, "generator") and hasattr(self.tts.generator, "_text_tokenizer"):
                 try:
-                    tokens = self.tts.generator._text_tokenizer.encode(f"[{segment.speaker}]{segment.text}")
+                    tokens = self.tts.generator._text_tokenizer.encode(
+                        f"[{segment.speaker}]{segment.text}"
+                    )
                     segment_text_tokens = len(tokens)
                 except:
                     # Fallback to estimation
@@ -450,8 +439,7 @@ Match your response depth to what the user is asking for - be concise when appro
         return total_tokens
 
     def generate_tts_audio(self, text):
-        """
-        Generate TTS audio (streaming) with intelligent chunking for long responses.
+        """Generate TTS audio (streaming) with intelligent chunking for long responses.
 
         Strategy:
         1. Preprocess and analyze text token requirements
@@ -487,7 +475,9 @@ Match your response depth to what the user is asking for - be concise when appro
         # Safety check: If context is too large, trim it before proceeding
         # This prevents crashes from previous long responses
         if context_tokens > MAX_CONTEXT_TOKENS:
-            logger.warning(f"Context too large ({context_tokens} tokens) - trimming to references only")
+            logger.warning(
+                f"Context too large ({context_tokens} tokens) - trimming to references only"
+            )
             context = context[:3] if len(context) >= 3 else context
             context_tokens = self._calculate_context_tokens(context)
             logger.info(f"Trimmed context to {context_tokens} tokens")
@@ -510,23 +500,31 @@ Match your response depth to what the user is asking for - be concise when appro
         MAX_SAFE_INPUT = 900  # Conservative but allows reasonable responses
 
         if total_input_tokens > MAX_SAFE_INPUT:
-            logger.warning(f"Total input ({total_input_tokens} tokens) exceeds safe limit ({MAX_SAFE_INPUT})")
+            logger.warning(
+                f"Total input ({total_input_tokens} tokens) exceeds safe limit ({MAX_SAFE_INPUT})"
+            )
             logger.warning("Aggressively trimming context to prevent CUDA index errors")
 
             # Keep only references, drop all conversation history
             context = context[:3] if len(context) >= 3 else context
             context_tokens = self._calculate_context_tokens(context)
             total_input_tokens = context_tokens + text_tokens
-            logger.info(f"After trimming: context={context_tokens}, total_input={total_input_tokens}")
+            logger.info(
+                f"After trimming: context={context_tokens}, total_input={total_input_tokens}"
+            )
 
             # If STILL too large after trimming, we must chunk the text
             if total_input_tokens > MAX_SAFE_INPUT:
-                logger.error(f"Even with minimal context, input is too large ({total_input_tokens} tokens)")
+                logger.error(
+                    f"Even with minimal context, input is too large ({total_input_tokens} tokens)"
+                )
                 logger.error("Text is too long for single generation - forcing chunking")
                 # Set text_tokens high to force chunking path below
                 text_tokens = 999  # Will trigger EXTREME_LENGTH_THRESHOLD
 
-        logger.info(f"Token analysis: context={context_tokens}, text={text_tokens}, total_input={total_input_tokens}")
+        logger.info(
+            f"Token analysis: context={context_tokens}, text={text_tokens}, total_input={total_input_tokens}"
+        )
 
         # Decision: Chunk or single generation?
         # Real-world testing shows CSM quality degrades on generations >150 tokens
@@ -548,7 +546,9 @@ Match your response depth to what the user is asking for - be concise when appro
             rich_context = reference_context + recent_context
 
             rich_context_tokens = self._calculate_context_tokens(rich_context)
-            logger.info(f"Using rich context: {len(reference_context)} references + {len(recent_context)} recent = {rich_context_tokens} tokens")
+            logger.info(
+                f"Using rich context: {len(reference_context)} references + {len(recent_context)} recent = {rich_context_tokens} tokens"
+            )
 
             # Target: ~100-120 tokens per chunk for stable generation
             TARGET_CHUNK_SIZE = 120
@@ -564,8 +564,7 @@ Match your response depth to what the user is asking for - be concise when appro
                 logger.info(f"[CHUNK {i+1}/{len(text_chunks)}] Generating: '{chunk_text[:50]}...'")
 
                 # Generate this chunk with the SAME rich context
-                for audio_chunk in self._generate_single_chunk(chunk_text, rich_context, speaker_id):
-                    yield audio_chunk
+                yield from self._generate_single_chunk(chunk_text, rich_context, speaker_id)
 
                 # Critical: Clean up between chunks
                 if torch.cuda.is_available():
@@ -573,7 +572,7 @@ Match your response depth to what the user is asking for - be concise when appro
                     torch.cuda.empty_cache()
 
                 # Reset KV cache for clean state
-                if self.tts and hasattr(self.tts.generator, '_model'):
+                if self.tts and hasattr(self.tts.generator, "_model"):
                     try:
                         self.tts.generator._model.reset_caches()
                         logger.info(f"[CHUNK {i+1}] Reset KV cache")
@@ -586,7 +585,9 @@ Match your response depth to what the user is asking for - be concise when appro
             # The TTS worker has been adding each chunk to self.tts.context
             # For multi-chunk responses, we need to ensure context doesn't exceed token budget
             if self.tts and self.tts.use_context:
-                logger.info(f"Chunking complete. Context before cleanup: {len(self.tts.context)} segments")
+                logger.info(
+                    f"Chunking complete. Context before cleanup: {len(self.tts.context)} segments"
+                )
 
                 # First, standard trimming: 3 references + 2 most recent
                 if len(self.tts.context) > 5:
@@ -601,14 +602,17 @@ Match your response depth to what the user is asking for - be concise when appro
                 while context_tokens > MAX_CONTEXT_TOKENS and len(self.tts.context) > 3:
                     # Remove the oldest non-reference segment (index 3)
                     self.tts.context.pop(3)
-                    logger.info(f"Removed segment to fit token budget (was {context_tokens} tokens)")
+                    logger.info(
+                        f"Removed segment to fit token budget (was {context_tokens} tokens)"
+                    )
                     context_tokens = self._calculate_context_tokens(self.tts.context)
 
-                logger.info(f"Final context: {len(self.tts.context)} segments, {context_tokens} tokens")
+                logger.info(
+                    f"Final context: {len(self.tts.context)} segments, {context_tokens} tokens"
+                )
 
     def _generate_single_chunk(self, preprocessed_text, context, speaker_id):
-        """
-        Generate TTS audio for a single chunk of text.
+        """Generate TTS audio for a single chunk of text.
 
         This is the core generation logic extracted for reuse by chunking system.
         """
@@ -640,8 +644,10 @@ Match your response depth to what the user is asking for - be concise when appro
         SAFETY_MARGIN = 50
         available_output_tokens = MAX_SEQ_LEN - input_tokens - SAFETY_MARGIN
 
-        logger.info(f"Chunk tokens: context={context_tokens}, text={text_tokens}, " +
-                   f"available_output={available_output_tokens}")
+        logger.info(
+            f"Chunk tokens: context={context_tokens}, text={text_tokens}, "
+            + f"available_output={available_output_tokens}"
+        )
 
         # Convert available tokens to audio frames
         # Each frame = 80ms of audio (CSM spec)
@@ -663,19 +669,23 @@ Match your response depth to what the user is asking for - be concise when appro
         max_audio_length = min(max_audio_length, 600000)  # Cap at 10 minutes (very generous)
         max_audio_length = max(max_audio_length, 5000)  # Min 5s
 
-        logger.info(f"Max audio: {max_audio_length}ms (token_limit={max_audio_length_from_tokens}ms, " +
-                   f"text_estimate={estimated_ms}ms, words={words})")
+        logger.info(
+            f"Max audio: {max_audio_length}ms (token_limit={max_audio_length_from_tokens}ms, "
+            + f"text_estimate={estimated_ms}ms, words={words})"
+        )
 
         # Submit generation request to worker thread
-        self.tts_request_queue.put((
-            current_gen_id,
-            preprocessed_text,
-            speaker_id,
-            context,
-            max_audio_length,
-            self.config.tts_temperature,
-            self.config.tts_topk,
-        ))
+        self.tts_request_queue.put(
+            (
+                current_gen_id,
+                preprocessed_text,
+                speaker_id,
+                context,
+                max_audio_length,
+                self.config.tts_temperature,
+                self.config.tts_topk,
+            )
+        )
 
         # Yield audio chunks from result queue
         while True:
@@ -683,7 +693,9 @@ Match your response depth to what the user is asking for - be concise when appro
 
             # Skip chunks from old generations
             if gen_id != current_gen_id:
-                logger.warning(f"Skipping chunk from old generation {gen_id} (current: {current_gen_id})")
+                logger.warning(
+                    f"Skipping chunk from old generation {gen_id} (current: {current_gen_id})"
+                )
                 continue
 
             if msg_type == "chunk":
@@ -695,7 +707,7 @@ Match your response depth to what the user is asking for - be concise when appro
                 raise RuntimeError(f"TTS generation failed: {data}")
 
     def shutdown(self):
-        """Shutdown model workers"""
+        """Shutdown model workers."""
         if self.tts_worker_running.is_set():
             logger.info("Shutting down TTS worker...")
             self.tts_worker_running.clear()

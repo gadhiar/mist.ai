@@ -17,13 +17,13 @@ MIST.AI is a research platform building a transparent, continuously learning AI 
 
 ### Key Capabilities
 
-- ✅ **Real-time voice conversation** with natural interruption support
-- ✅ **Knowledge graph integration** - persistent memory that grows over time
-- ✅ **Autonomous tool usage** - LLM decides when to extract/query knowledge (MCP-like pattern)
-- ✅ **Auto-RAG** - automatic document injection for context-aware responses
-- ✅ **Personalized responses** - leverages accumulated user knowledge
-- ✅ **WebSocket architecture** - production-ready real-time communication
-- ✅ **Local-first** - complete air-gapped operation
+-  **Real-time voice conversation** with natural interruption support
+-  **Knowledge graph integration** - persistent memory that grows over time
+-  **Autonomous tool usage** - LLM decides when to extract/query knowledge (MCP-like pattern)
+-  **Auto-RAG** - automatic document injection for context-aware responses
+-  **Personalized responses** - leverages accumulated user knowledge
+-  **WebSocket architecture** - production-ready real-time communication
+-  **Local-first** - complete air-gapped operation
 
 ## Architecture
 
@@ -174,11 +174,29 @@ python voice_client.py
 - Autonomous knowledge extraction and querying
 
 **Try these conversation patterns:**
-1. **Learning**: "I use Python and FastAPI for backend development" → LLM extracts knowledge
-2. **Querying**: "What technologies do I use?" → LLM queries graph for personalized response
-3. **Natural chat**: "How are you today?" → Normal conversation without tools
+1. **Learning**: "I use Python and FastAPI for backend development" -> LLM extracts knowledge
+2. **Querying**: "What technologies do I use?" -> LLM queries graph for personalized response
+3. **Natural chat**: "How are you today?" -> Normal conversation without tools
 
-### 7. Flutter Frontend Setup (In Development)
+### 7. Set Up Git Hooks (Recommended)
+
+Install pre-commit hooks for automated code quality checks:
+
+```bash
+# Install pre-commit framework
+pip install pre-commit
+
+# Install hooks
+pre-commit install
+
+# Or use installation script
+bash scripts/install-git-hooks.sh     # Linux/macOS
+scripts\install-git-hooks.bat          # Windows
+```
+
+See [Quick Start Guide](QUICKSTART_GIT_HOOKS.md) or [Full Documentation](docs/GIT_WORKFLOWS.md).
+
+### 8. Flutter Frontend Setup (In Development)
 
 ```bash
 cd mist_desktop
@@ -203,7 +221,7 @@ See [FLUTTER_MIGRATION_PLAN.md](FLUTTER_MIGRATION_PLAN.md) for detailed setup in
 - **Natural interruption support** - <100ms response time
 - **Gap-free audio playback** - optimized streaming for smooth experience
 - **Automatic speech detection** via Voice Activity Detection (VAD)
-- **Full pipeline**: Speech → Transcription → LLM → Audio
+- **Full pipeline**: Speech -> Transcription -> LLM -> Audio
 
 ### Knowledge Graph Integration
 - **Autonomous entity extraction** from conversational input
@@ -241,7 +259,7 @@ mist.ai/
 │   │   └── model_manager.py          # Model lifecycle + knowledge integration
 │   ├── chat/
 │   │   ├── conversation_handler.py   # MCP-like autonomous tool usage
-│   │   └── knowledge_integration.py  # Voice ↔ Knowledge bridge
+│   │   └── knowledge_integration.py  # Voice -> Knowledge bridge
 │   └── knowledge/                    # Knowledge graph system
 │       ├── extraction/               # Entity extraction (LLMGraphTransformer)
 │       ├── retrieval/                # Hybrid retrieval (vector + graph)
@@ -316,9 +334,9 @@ mist.ai/
 3. **Start backend**: `python backend/server.py`
 4. **Connect voice client**: `python cli_client/voice_client.py`
 5. **Test three scenarios**:
-   - **Learning**: "I use Python and FastAPI" → LLM extracts knowledge
-   - **Querying**: "What technologies do I use?" → LLM queries graph
-   - **Natural chat**: "How are you?" → No tools used
+   - **Learning**: "I use Python and FastAPI" -> LLM extracts knowledge
+   - **Querying**: "What technologies do I use?" -> LLM queries graph
+   - **Natural chat**: "How are you?" -> No tools used
 
 ### Verify in Neo4j Browser
 
@@ -362,7 +380,7 @@ Latest developments focus on knowledge graph extraction, retrieval, and autonomo
 ### Completed Features
 
 - [x] WebSocket backend server
-- [x] Voice processing pipeline (VAD → STT → LLM → TTS)
+- [x] Voice processing pipeline (VAD -> STT -> LLM -> TTS)
 - [x] Real-time audio streaming
 - [x] Interruption support (<100ms latency)
 - [x] Gap-free audio playback
@@ -373,7 +391,7 @@ Latest developments focus on knowledge graph extraction, retrieval, and autonomo
 - [x] **Hybrid retrieval** (vector + graph traversal)
 - [x] **Autonomous tool usage** (MCP-like pattern)
 - [x] **Auto-RAG** (document injection)
-- [x] **Provenance tracking** (utterance → entity mapping)
+- [x] **Provenance tracking** (utterance -> entity mapping)
 - [x] Flutter desktop app scaffolding (Windows/macOS/Linux ready)
 - [x] Flutter WebSocket integration with backend
 - [x] Flutter voice recording and message display
@@ -398,7 +416,7 @@ Latest developments focus on knowledge graph extraction, retrieval, and autonomo
 
 ### Long-Term Vision
 
-- **2025**: Working voice system with knowledge foundation ✅ (achieved)
+- **2025**: Working voice system with knowledge foundation  (achieved)
 - **2027**: Competent specialist with deep domain knowledge
 - **2030**: Genuine intelligent system with 70B+ local model + years of accumulated knowledge
 
