@@ -42,6 +42,7 @@ dependencies:
   audioplayers: ^6.1.0              # Audio playback for TTS
   permission_handler: ^11.3.1       # Microphone permissions
   path_provider: ^2.1.4             # Temporary file paths
+  speech_to_text: ^7.0.0            # Speech recognition (for future local STT)
 
   # UI & Icons
   cupertino_icons: ^1.0.8
