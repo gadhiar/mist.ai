@@ -9,6 +9,7 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 # Fix Windows console encoding for Unicode characters
 if sys.platform == "win32":
@@ -29,9 +30,9 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(project_root / "backend"))
 
-from voice_processor import VoiceProcessor
-
-from config import DEFAULT_CONFIG
+# Import config BEFORE voice_processor to avoid CSM config conflict
+from config import DEFAULT_CONFIG  # isort:skip
+from voice_processor import VoiceProcessor  # isort:skip
 
 # Setup logging
 logging.basicConfig(
@@ -41,9 +42,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Global state
-active_connections = []
-message_queue = asyncio.Queue()
-voice_processor = None
+active_connections: list[WebSocket] = []
+message_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+voice_processor: VoiceProcessor | None = None
 config = DEFAULT_CONFIG
 
 
@@ -146,6 +147,9 @@ async def websocket_endpoint(websocket: WebSocket):
     active_connections.append(websocket)
 
     logger.info(f"Client connected (total: {len(active_connections)})")
+
+    # Ensure voice processor is initialized
+    assert voice_processor is not None, "Voice processor not initialized"
 
     # Send welcome message
     await websocket.send_json({"type": "status", "message": "Connected to Mist.AI Voice Server"})

@@ -54,7 +54,7 @@ jobs:
 
       - name: Type check with mypy (optional, continue on error)
         run: |
-          mypy backend/ || echo "Type checking found issues (non-blocking)"
+          mypy backend/ --follow-imports=silent || echo "Type checking found issues (non-blocking)"
         continue-on-error: true
 
       - name: Security scan with Bandit

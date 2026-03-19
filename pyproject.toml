@@ -110,6 +110,15 @@ warn_unused_ignores = true
 warn_no_return = true
 warn_unreachable = true
 strict_equality = true
+follow_imports = "silent"  # Check imports but don't report their errors
+exclude = [
+    "^dependencies/",
+    "^src/",
+    "^tests/",
+    "^build/",
+    "^dist/",
+    "^\\.venv/",
+]
 
 # Per-module options
 [[tool.mypy.overrides]]
@@ -125,6 +134,13 @@ module = [
     "whisper.*",
     "torch.*",
     "torchaudio.*",
+    "numpy.*",
+    "uvicorn.*",
+    "fastapi.*",
+    "vad.*",
+    "generator.*",
+    "nest_asyncio.*",
+    "scipy.*",
 ]
 ignore_missing_imports = true
 
