@@ -46,6 +46,8 @@ docs/
 
 # Claude Code
 .claude/
+CLAUDE.md
+CODEBASE.md
 
 # Flutter/Dart specific
 mist_desktop/.dart_tool/
