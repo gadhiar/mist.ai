@@ -7,11 +7,14 @@ Enables LLM to autonomously:
 """
 
 import logging
+from datetime import datetime
 from typing import Any
 
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 
+from backend.event_store.models import ConversationTurnEvent
+from backend.event_store.store import EventStore
 from backend.knowledge.config import KnowledgeConfig
 from backend.knowledge.extraction.entity_extractor import EntityExtractor
 from backend.knowledge.models import ConversationSession, RetrievalFilters
@@ -58,6 +61,21 @@ class ConversationHandler:
 
         # Active sessions
         self.sessions: dict[str, ConversationSession] = {}
+
+        # Event store (Layer 1) -- append-only conversation log
+        self.event_store: EventStore | None = None
+        es_config = config.event_store
+        if es_config.enabled:
+            try:
+                self.event_store = EventStore(db_path=es_config.db_path)
+                self.event_store.initialize()
+                logger.info("Event store enabled at %s", self.event_store.db_path)
+            except Exception as e:
+                logger.error("Failed to initialize event store: %s", e, exc_info=True)
+                self.event_store = None
+
+        # Maps external session_id -> event store session_id
+        self._es_session_ids: dict[str, str] = {}
 
         logger.info(f"ConversationHandler initialized with model: {model_name}")
 
@@ -368,6 +386,17 @@ class ConversationHandler:
                 tool_results=tool_results if tool_results else None,
             )
 
+            # --- Event Store Write (Layer 1) ---
+            # Synchronous, <5ms target. Happens BEFORE any async extraction.
+            self._record_turn_event(
+                session_id=session_id,
+                user_message=user_message,
+                assistant_message=assistant_message,
+                context_window=messages,
+                doc_results=doc_results,
+                tool_calls=tool_calls if tool_calls else None,
+            )
+
             return assistant_message
 
         except Exception as e:
@@ -383,6 +412,84 @@ class ConversationHandler:
                 return await tool.ainvoke(tool_args)
 
         return f"Tool not found: {tool_name}"
+
+    def _record_turn_event(
+        self,
+        session_id: str,
+        user_message: str,
+        assistant_message: str,
+        context_window: list[dict[str, str]] | None = None,
+        doc_results: list[dict[str, Any]] | None = None,
+        tool_calls: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Record a conversation turn to the event store.
+
+        Synchronous write, targets <5ms. Failures are logged but never
+        propagated -- the event store must not break the conversation flow.
+
+        Args:
+            session_id: External session identifier.
+            user_message: Raw user utterance.
+            assistant_message: Raw system response.
+            context_window: The full message list sent to the LLM.
+            doc_results: Auto-injected RAG document chunks, if any.
+            tool_calls: Tool calls made during this turn, if any.
+        """
+        if self.event_store is None:
+            return
+
+        try:
+            # Ensure an event store session exists for this session_id
+            if session_id not in self._es_session_ids:
+                es_session_id = self.event_store.start_session(input_modality="text")
+                self._es_session_ids[session_id] = es_session_id
+
+            es_session_id = self._es_session_ids[session_id]
+
+            # Determine turn_index from session turn_count
+            es_session = self.event_store.get_session(es_session_id)
+            turn_index = es_session.turn_count if es_session else 0
+
+            # Build retrieval_context from doc_results if present
+            retrieval_context = None
+            if doc_results:
+                retrieval_context = {
+                    "doc_chunks": [
+                        {
+                            "source_title": r.get("source_title", ""),
+                            "text": r.get("text", "")[:500],
+                            "similarity": r.get("similarity", 0.0),
+                        }
+                        for r in doc_results
+                    ]
+                }
+
+            event = ConversationTurnEvent(
+                session_id=es_session_id,
+                turn_index=turn_index,
+                timestamp=datetime.now(),
+                user_utterance=user_message,
+                system_response=assistant_message,
+                context_window=context_window,
+                retrieval_context=retrieval_context,
+                tool_calls=tool_calls,
+                llm_model=self.llm.model,
+                llm_parameters={"temperature": self.llm.temperature},
+                ontology_version=self.config.ontology_version,
+            )
+
+            event_id = self.event_store.append_turn(event)
+            logger.debug("Recorded turn event %s for session %s", event_id, session_id)
+
+        except Exception as e:
+            # Log but never propagate -- event store failure must not
+            # break the conversation.
+            logger.error(
+                "Failed to record turn event for session %s: %s",
+                session_id,
+                e,
+                exc_info=True,
+            )
 
     def _format_document_context(self, doc_results: list[dict[str, Any]]) -> str:
         """Format document search results for injection into context.
