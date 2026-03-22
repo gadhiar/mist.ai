@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Knowledge graph integration
 try:
     from backend.chat.knowledge_integration import KnowledgeIntegration
-    from backend.knowledge_config import DEFAULT_KNOWLEDGE_CONFIG
+    from backend.knowledge.config import KnowledgeConfig as _KnowledgeConfig
 
     KNOWLEDGE_AVAILABLE = True
 except ImportError as e:
@@ -49,24 +49,21 @@ class ModelManager:
 
         # Knowledge graph integration
         self.knowledge = None
-        if KNOWLEDGE_AVAILABLE and DEFAULT_KNOWLEDGE_CONFIG.enable_knowledge_integration:
+        if KNOWLEDGE_AVAILABLE:
             try:
-                self.knowledge = KnowledgeIntegration(
-                    neo4j_uri=DEFAULT_KNOWLEDGE_CONFIG.neo4j_uri,
-                    neo4j_user=DEFAULT_KNOWLEDGE_CONFIG.neo4j_user,
-                    neo4j_password=DEFAULT_KNOWLEDGE_CONFIG.neo4j_password,
-                    model_name=DEFAULT_KNOWLEDGE_CONFIG.knowledge_model,
-                )
-                if self.knowledge.is_enabled():
-                    logger.info(" Knowledge graph integration ENABLED")
+                knowledge_config = _KnowledgeConfig.from_env()
+                if knowledge_config.enable_knowledge_integration:
+                    self.knowledge = KnowledgeIntegration(config=knowledge_config)
+                    if self.knowledge.is_enabled():
+                        logger.info("Knowledge graph integration ENABLED")
+                    else:
+                        logger.warning("Knowledge integration disabled (Neo4j unavailable)")
+                        self.knowledge = None
                 else:
-                    logger.warning("  Knowledge integration disabled (Neo4j unavailable)")
-                    self.knowledge = None
+                    logger.info("Knowledge graph integration disabled in config")
             except Exception as e:
                 logger.warning(f"Knowledge integration disabled: {e}")
                 self.knowledge = None
-        else:
-            logger.info("Knowledge graph integration disabled in config")
 
         # TTS model worker thread (CSM pattern)
         self.tts_request_queue = queue.Queue()

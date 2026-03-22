@@ -4,6 +4,7 @@ Stores extracted entities and relationships in Neo4j with provenance tracking.
 """
 
 import logging
+import re
 from datetime import datetime
 from typing import Any
 
@@ -472,8 +473,13 @@ class GraphStore:
         rel_type = relationship.type
         properties = getattr(relationship, "properties", {})
 
-        # Sanitize relationship type for Cypher (no spaces, special chars)
+        # Sanitize relationship type for Cypher
         rel_type_safe = rel_type.replace(" ", "_").replace("-", "_").upper()
+
+        # Validate against Cypher injection -- only alphanumeric + underscore allowed
+        if not re.match(r"^[A-Z][A-Z0-9_]*$", rel_type_safe):
+            logger.warning(f"Invalid relationship type rejected: {rel_type!r}")
+            return
 
         # Build query with dynamic property setting
         property_sets = []
@@ -677,9 +683,7 @@ class GraphStore:
             }
         """
         if relationship_types:
-            rel_filter = (
-                f"WHERE ALL(r in relationships(path) WHERE type(r) IN {relationship_types})"
-            )
+            rel_filter = "WHERE ALL(r in relationships(path) WHERE type(r) IN $relationship_types)"
         else:
             rel_filter = ""
 
@@ -698,7 +702,9 @@ class GraphStore:
             properties(rels[idx]) as properties
         """
 
-        params = {"entity_id": entity_id}
+        params: dict[str, Any] = {"entity_id": entity_id}
+        if relationship_types:
+            params["relationship_types"] = relationship_types
         results = self.connection.execute_query(query, params)
 
         return [dict(record) for record in results]
@@ -718,7 +724,7 @@ class GraphStore:
         Returns:
             List of relationship dicts
         """
-        rel_filter = f"AND type(r) IN {relationship_types}" if relationship_types else ""
+        rel_filter = "AND type(r) IN $relationship_types" if relationship_types else ""
 
         query = f"""
         MATCH (user:__Entity__ {{id: $user_id}})-[r]-(entity:__Entity__)
@@ -735,7 +741,9 @@ class GraphStore:
             END as direction
         """
 
-        params = {"user_id": user_id, "entity_ids": entity_ids}
+        params: dict[str, Any] = {"user_id": user_id, "entity_ids": entity_ids}
+        if relationship_types:
+            params["relationship_types"] = relationship_types
 
         results = self.connection.execute_query(query, params)
         return [dict(record) for record in results]
@@ -760,9 +768,9 @@ class GraphStore:
         """
         filters = []
         if relationship_types:
-            filters.append(f"type(r) IN {relationship_types}")
+            filters.append("type(r) IN $relationship_types")
         if entity_types:
-            filters.append(f"entity.entity_type IN {entity_types}")
+            filters.append("entity.entity_type IN $entity_types")
 
         where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
 
@@ -777,7 +785,11 @@ class GraphStore:
         ORDER BY entity.entity_type, entity.id
         """
 
-        params = {"user_id": user_id}
+        params: dict[str, Any] = {"user_id": user_id}
+        if relationship_types:
+            params["relationship_types"] = relationship_types
+        if entity_types:
+            params["entity_types"] = entity_types
         results = self.connection.execute_query(query, params)
         return [dict(record) for record in results]
 

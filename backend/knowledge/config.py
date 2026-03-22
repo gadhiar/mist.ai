@@ -142,6 +142,9 @@ class KnowledgeConfig:
     embedding: EmbeddingConfig
     extraction: ExtractionConfig
 
+    # Feature flags
+    enable_knowledge_integration: bool = True  # Master switch for knowledge system
+
     # System settings
     ontology_version: str = "1.0.0"  # Current ontology version
     enable_versioning: bool = True  # Track ontology versions
@@ -162,6 +165,8 @@ class KnowledgeConfig:
             llm=LLMConfig.from_env(),
             embedding=EmbeddingConfig.from_env(),
             extraction=ExtractionConfig.from_env(),
+            enable_knowledge_integration=os.getenv("ENABLE_KNOWLEDGE_INTEGRATION", "true").lower()
+            == "true",
             ontology_version=os.getenv("ONTOLOGY_VERSION", "1.0.0"),
             enable_versioning=os.getenv("ENABLE_VERSIONING", "true").lower() == "true",
             enable_provenance=os.getenv("ENABLE_PROVENANCE", "true").lower() == "true",
