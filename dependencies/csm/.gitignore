@@ -47,7 +47,7 @@ context_audio.wav
 *.safetensors
 *.bin
 
-# Training data - Elise dataset (390MB) - not distributed with code
+# Training data - not distributed with code
 audio_data/
 
 # Fine-tuned model directory - extremely large (161GB with checkpoints)

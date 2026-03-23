@@ -175,9 +175,9 @@ class VoiceConfig(BaseModel):
 - **Token Limit:** 400 tokens max (150 tokens preferred for quality)
 
 ### TTS: Sesame CSM-1B
-- **Model:** Fine-tuned on Elise dataset (epoch 20)
+- **Model:** Fine-tuned via LoRA on voice training dataset
 - **Sample Rate:** 24kHz
-- **Voice:** Consistent female voice (Elise)
+- **Voice:** Consistent voice from fine-tuned model
 - **Latency:** ~2-3s RTF (Real-Time Factor)
 
 ## Running the Server

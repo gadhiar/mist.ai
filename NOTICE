@@ -21,7 +21,7 @@ respective licenses:
    - generator.py: Added position overflow protection (sliding window)
    - generator.py: Disabled torchaudio for PyTorch 2.7 nightly compatibility
    - generator.py: Added try-catch for torch.compile to support Windows
-   - lora.py: Optimized training hyperparameters for Elise dataset
+   - lora.py: Optimized training hyperparameters for voice fine-tuning
    - lora.py: Changed view() calls to reshape() for compatibility
 
    See dependencies/csm/LICENSE for full Apache 2.0 license text.
@@ -58,21 +58,7 @@ respective licenses:
    Model downloaded at runtime.
 
 -------------------------------------------------------------------------------
-5. Elise Dataset
-   Location: Training data (not included in repository)
-   Source: https://huggingface.co/datasets/Jinsaryko/Elise
-   License: MIT License
-   Copyright: Ty Jones (Jinsaryko)
-   Creator: Ty Jones
-
-   Used for LoRA fine-tuning of Sesame CSM-1B model.
-   Dataset contains 1,195 voice samples used for voice cloning training.
-
-   MIT License requires inclusion of copyright notice and license text.
-   This dataset is not distributed with this software - used only for training.
-
--------------------------------------------------------------------------------
-6. Ollama / Qwen 2.5
+5. Ollama / Qwen 2.5
    Location: External service (localhost:11434)
    Source: https://ollama.com / https://qwenlm.github.io/
    License: Apache License 2.0 (Qwen), MIT License (Ollama)
@@ -105,7 +91,6 @@ The following components are licensed under MIT License:
 - OpenAI Whisper
 - Silero VAD
 - Ollama
-- Elise Dataset (training data only, not distributed)
 
 MIT License is permissive and allows commercial use, modification,
 distribution, and private use with minimal restrictions.

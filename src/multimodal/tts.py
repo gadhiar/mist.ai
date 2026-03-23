@@ -61,11 +61,11 @@ class SesameTTS:
 
         print("Sesame CSM loaded successfully!")
 
-        # Load reference audio from Elise dataset for maximum voice consistency
+        # Load reference audio from voice training dataset for maximum voice consistency
         self._load_reference_audio(project_root)
 
     def _load_reference_audio(self, project_root):
-        """Load reference audio clips from Elise dataset to initialize context.
+        """Load reference audio clips from voice training dataset to initialize context.
         This provides the voice signature for consistent generation.
         """
         import json
@@ -76,7 +76,7 @@ class SesameTTS:
         metadata_path = audio_dir / "dataset_metadata.json"
 
         if not metadata_path.exists():
-            print("Warning: Elise dataset metadata not found. Voice consistency may be reduced.")
+            print("Warning: Voice dataset metadata not found. Voice consistency may be reduced.")
             return
 
         # Load metadata to get transcriptions
@@ -87,7 +87,7 @@ class SesameTTS:
         # Use clips 0, 5, and 10 for variety in phonetic content
         reference_indices = [0, 5, 10]
 
-        print(f"Loading {len(reference_indices)} reference audio clips from Elise dataset...")
+        print(f"Loading {len(reference_indices)} reference audio clips from voice dataset...")
 
         for idx in reference_indices:
             if idx >= len(metadata["samples"]):

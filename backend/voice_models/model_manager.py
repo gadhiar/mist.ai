@@ -653,7 +653,7 @@ Match your response depth to what the user is asking for - be concise when appro
 
         # Estimate audio duration based on text length
         words = len(preprocessed_text.split())
-        # Elise speaks at ~600ms/word (100 words/min = very slow)
+        # Voice model speaks at ~600ms/word (100 words/min = very slow)
         # Add 50% buffer for pauses and natural speech variation
         estimated_ms = int(words * 600 * 1.5)
 

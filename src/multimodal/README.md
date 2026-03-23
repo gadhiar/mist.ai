@@ -58,7 +58,7 @@ text = stt.transcribe_audio(audio_data, sample_rate=16000)
 ### tts.py - Text-to-Speech
 
 **Model:** Sesame CSM-1B (Fine-tuned)
-**Voice:** Elise dataset (consistent female voice)
+**Voice:** Fine-tuned voice dataset
 **Sample Rate:** 24kHz
 
 #### SesameTTS Class
@@ -83,7 +83,7 @@ audio = tts.speak("Hello, this is M.I.S.T!", play=False)
 
 **Features:**
 - **Context preservation** - Maintains voice consistency across utterances
-- **Reference audio loading** - Initializes with 3 Elise dataset clips
+- **Reference audio loading** - Initializes with 3 voice training dataset clips
 - **Streaming generation** - Chunk-by-chunk audio delivery
 - **Fine-tuned model** - Epoch 20 checkpoint (best validation loss: 6.110)
 
@@ -313,7 +313,7 @@ tts.speak(text, temperature=0.3, topk=10)
 # More natural/varied
 tts.speak(text, temperature=0.8, topk=40)
 
-# Elise default (recommended)
+# Default (recommended)
 tts.speak(text, temperature=0.55, topk=20)
 ```
 

@@ -34,23 +34,23 @@ logger = logging.getLogger(__name__)
 
 AUDIO_DIR = "audio_data"
 OUTPUT_DIR = "finetuned_model"
-NUM_EPOCHS = 25  # Optimized for ~9.5 hour training window
-BATCH_SIZE = 2  # Full GPU utilization (12GB VRAM available)
-GRADIENT_ACCUMULATION_STEPS = 4  # Effective batch size = 8
-LEARNING_RATE = 3e-7  # Lower LR for stable 25-epoch training
-MAX_GRAD_NORM = 0.5  # Increased for better gradient flow
+NUM_EPOCHS = 15  # More passes to learn voice character from 277 clips
+BATCH_SIZE = 1  # Conservative for 12GB VRAM
+GRADIENT_ACCUMULATION_STEPS = 8  # Effective batch size = 8 for stable gradients
+LEARNING_RATE = 5e-7  # Smooth convergence over more epochs
+MAX_GRAD_NORM = 0.1  # Conservative clipping
 NUM_CYCLES = 1.0
 USE_WANDB = False
 SEED = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MIXED_PRECISION = True
-WARMUP_STEPS = 150  # More warmup for longer training
+WARMUP_STEPS = 75  # Proportional warmup for 15 epochs
 SPEAKER_ID = 0
 MODEL_NAME = "sesame/csm-1b"
 TRANSCRIPTION_MODEL = "openai/whisper-large-v3-turbo"
-MAX_AUDIO_FILES = 0  # Use all 1,195 samples from Elise dataset
-R = 128  # Doubled LoRA rank for maximum voice quality
-APLHA = 128  # Keep scaling ratio at 1.0
+MAX_AUDIO_FILES = 0  # Use all 277 Cortana clips
+R = 96  # High rank for best voice quality without overfitting
+APLHA = 96  # Keep scaling ratio at 1.0
 
 
 class TrainingVisualizer:
