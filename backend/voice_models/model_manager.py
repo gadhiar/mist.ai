@@ -17,6 +17,7 @@ from generator import Segment
 
 from src.multimodal.stt import WhisperSTT
 from src.multimodal.tts import SesameTTS
+from src.multimodal.voice_profile import VoiceProfileRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -121,8 +122,14 @@ class ModelManager:
         torch._inductor.config.fx_graph_cache = False
 
         logger.info("Loading Sesame TTS in worker thread...")
+        project_root = Path(__file__).parent.parent.parent
+        registry = VoiceProfileRegistry(project_root / "data" / "voice_profiles")
+        profile = registry.get_active()
+        logger.info(f"Active voice profile: {profile.name} ({profile.description})")
         self.tts = SesameTTS(
-            device=self.config.tts_device, use_context=self.config.use_voice_context
+            profile=profile,
+            device=self.config.tts_device,
+            use_context=self.config.use_voice_context,
         )
 
         # Warmup TTS
@@ -679,8 +686,8 @@ Match your response depth to what the user is asking for - be concise when appro
                 speaker_id,
                 context,
                 max_audio_length,
-                self.config.tts_temperature,
-                self.config.tts_topk,
+                self.tts.profile.temperature,
+                self.tts.profile.topk,
             )
         )
 
