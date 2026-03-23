@@ -157,9 +157,8 @@ class VoiceConfig(BaseModel):
 
     # TTS
     tts_device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    voice_profile: str = "cortana"  # Selected via VOICE_PROFILE env var
     use_voice_context: bool = True
-    tts_temperature: float = 0.55
-    tts_topk: int = 20
 ```
 
 ## Model Details
