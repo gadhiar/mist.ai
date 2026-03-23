@@ -33,6 +33,8 @@ sys.path.insert(0, str(project_root / "backend"))
 # Import config BEFORE voice_processor to avoid CSM config conflict
 from config import DEFAULT_CONFIG  # isort:skip
 from voice_processor import VoiceProcessor  # isort:skip
+from factories import build_curation_scheduler  # isort:skip
+from knowledge.config import KnowledgeConfig  # isort:skip
 
 # Setup logging
 logging.basicConfig(
@@ -46,6 +48,7 @@ active_connections: set[WebSocket] = set()
 active_connections_lock = asyncio.Lock()
 message_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 voice_processor: VoiceProcessor | None = None
+curation_scheduler = None
 config = DEFAULT_CONFIG
 
 
@@ -72,7 +75,7 @@ async def broadcast_messages():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
-    global voice_processor
+    global voice_processor, curation_scheduler
 
     # Startup
     logger.info("=" * 60)
@@ -86,6 +89,16 @@ async def lifespan(app: FastAPI):
     # Start message broadcaster
     broadcaster_task = asyncio.create_task(broadcast_messages())
 
+    # Start curation scheduler for periodic graph maintenance
+    try:
+        knowledge_config = KnowledgeConfig.from_env()
+        curation_scheduler = build_curation_scheduler(knowledge_config)
+        await curation_scheduler.start()
+        logger.info("Curation scheduler started")
+    except Exception as e:
+        logger.warning("Curation scheduler failed to start: %s", e)
+        curation_scheduler = None
+
     logger.info(f"Server ready on ws://{config.host}:{config.port}/ws")
     logger.info("=" * 60)
 
@@ -93,6 +106,8 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Server shutting down...")
+    if curation_scheduler is not None:
+        await curation_scheduler.stop()
     broadcaster_task.cancel()
     if voice_processor and voice_processor.models:
         voice_processor.models.shutdown()
