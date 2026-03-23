@@ -21,7 +21,43 @@ torch._dynamo.config.cache_size_limit = 128
 # Add CSM to path
 sys.path.insert(0, "dependencies/csm")
 
-from generator import Segment, load_csm_1b_local
+from generator import Generator, Segment
+
+from models import Model, ModelArgs
+
+
+def _load_finetuned_csm(weights_path: str, device: str = "cuda") -> Generator:
+    """Load CSM-1B base model and overlay fine-tuned weights.
+
+    Fine-tuned model.safetensors files are raw weight dumps (not HF-formatted
+    checkpoints), so we load the base model first then overlay fine-tuned weights
+    with strict=False to allow partial weight updates (LoRA-merged weights).
+    """
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+
+    # Load base model architecture and weights from HuggingFace
+    base_path = hf_hub_download(repo_id="sesame/csm-1b", filename="model.safetensors")
+    config = ModelArgs(
+        backbone_flavor="llama-1B",
+        decoder_flavor="llama-100M",
+        text_vocab_size=128256,
+        audio_vocab_size=2051,
+        audio_num_codebooks=32,
+    )
+    model = Model(config)
+    base_dict = load_file(base_path)
+    model.load_state_dict(base_dict, strict=True)
+
+    # Overlay fine-tuned weights (strict=False for LoRA-merged partial updates)
+    finetuned_dict = load_file(weights_path)
+    model.load_state_dict(finetuned_dict, strict=False)
+
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    model.to(device=device, dtype=dtype)
+    model.eval()
+
+    return Generator(model)
 
 
 class SesameTTS:
@@ -45,7 +81,7 @@ class SesameTTS:
 
         inductor_config.fx_graph_cache = False
 
-        self.generator = load_csm_1b_local(str(profile.weights_path), device=device)
+        self.generator = _load_finetuned_csm(str(profile.weights_path), device=device)
         self.device = device
         self.use_context = use_context
         self.context = []
