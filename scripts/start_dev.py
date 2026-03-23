@@ -1,12 +1,15 @@
 """Start the MIST.AI development stack.
 
 Usage:
-    python scripts/start_dev.py          # Start Ollama, verify Neo4j
-    python scripts/start_dev.py --stop   # Stop Ollama
+    python scripts/start_dev.py              # Start full stack (Neo4j, Ollama, backend, frontend)
+    python scripts/start_dev.py --deps-only  # Start dependencies only (Neo4j, Ollama)
+    python scripts/start_dev.py --stop       # Stop services
 
 Prerequisites:
-    - Neo4j Desktop running with a local database started
+    - Docker Desktop (for Neo4j)
     - Ollama installed
+    - Python venv with dependencies
+    - Flutter SDK on PATH
 """
 
 import argparse
@@ -120,6 +123,51 @@ def start_neo4j() -> bool:
     return False
 
 
+def start_backend() -> subprocess.Popen | None:
+    """Start the backend server."""
+    if check_port("localhost", 8001):
+        print("  [OK] Backend already running on :8001")
+        return None
+
+    print("  Starting backend server...")
+    venv_python = "venv\\Scripts\\python" if sys.platform == "win32" else "venv/bin/python"
+    try:
+        proc = subprocess.Popen(
+            [venv_python, "backend/server.py"],
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
+        )
+    except FileNotFoundError:
+        print(f"  [FAIL] {venv_python} not found. Create venv first.")
+        return None
+
+    for i in range(15):
+        time.sleep(1)
+        if check_port("localhost", 8001):
+            print("  [OK] Backend started on ws://localhost:8001")
+            return proc
+        if i % 5 == 4:
+            print(f"  Waiting... ({i + 1}s)")
+
+    print("  [FAIL] Backend did not start in 15s")
+    return None
+
+
+def start_frontend() -> subprocess.Popen | None:
+    """Start the Flutter frontend."""
+    print("  Launching Flutter frontend...")
+    try:
+        proc = subprocess.Popen(
+            ["flutter", "run", "-d", "windows"],
+            cwd="mist_desktop",
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
+        )
+        print("  [OK] Flutter frontend launching (mist_desktop)")
+        return proc
+    except FileNotFoundError:
+        print("  [FAIL] flutter not found. Is Flutter SDK on PATH?")
+        return None
+
+
 def stop() -> None:
     """Stop Neo4j (Docker) and Ollama."""
     print("Stopping stack...")
@@ -143,6 +191,11 @@ def stop() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="MIST.AI dev stack manager")
     parser.add_argument("--stop", action="store_true", help="Stop services")
+    parser.add_argument(
+        "--deps-only",
+        action="store_true",
+        help="Only start dependencies (Neo4j, Ollama), not backend/frontend",
+    )
     args = parser.parse_args()
 
     if args.stop:
@@ -155,35 +208,77 @@ def main() -> None:
     print()
 
     # 1. Neo4j
-    print("[1/3] Starting Neo4j...")
+    print("[1/5] Starting Neo4j...")
     neo4j_ok = start_neo4j()
 
     # 2. Ollama
-    print("[2/3] Starting Ollama...")
+    print("[2/5] Starting Ollama...")
     ollama_ok = start_ollama()
 
     # 3. Model
     if ollama_ok:
-        print("[3/3] Checking model...")
+        print("[3/5] Checking model...")
         model_ok = check_model()
     else:
         model_ok = False
 
-    print()
-    print("=" * 50)
-    if neo4j_ok and ollama_ok and model_ok:
-        print("  Stack ready.")
+    if not (neo4j_ok and ollama_ok and model_ok):
+        print()
+        print("=" * 50)
+        print("  Stack NOT ready. Fix the issues above.")
+        print("=" * 50)
+        sys.exit(1)
+
+    if args.deps_only:
+        print()
+        print("=" * 50)
+        print("  Dependencies ready.")
         print()
         print("  Neo4j:   bolt://localhost:7687")
         print("  Ollama:  http://localhost:11434")
         print()
         print("  Start backend:  venv\\Scripts\\python backend\\server.py")
         print("  Start frontend: cd mist_desktop && flutter run -d windows")
-        print("  Run tests:      venv\\Scripts\\python -m pytest tests/ -v")
-    else:
-        print("  Stack NOT ready. Fix the issues above.")
-        sys.exit(1)
+        print("=" * 50)
+        return
+
+    # 4. Backend
+    print("[4/5] Starting backend...")
+    backend_proc = start_backend()
+    backend_ok = backend_proc is not None or check_port("localhost", 8001)
+
+    # 5. Frontend
+    print("[5/5] Starting frontend...")
+    frontend_proc = start_frontend()
+    frontend_ok = frontend_proc is not None
+
+    print()
     print("=" * 50)
+    print("  Stack running." if backend_ok and frontend_ok else "  Stack partially running.")
+    print()
+    print("  Neo4j:    bolt://localhost:7687")
+    print("  Ollama:   http://localhost:11434")
+    print("  Backend:  ws://localhost:8001" if backend_ok else "  Backend:  [NOT RUNNING]")
+    print("  Frontend: Flutter desktop" if frontend_ok else "  Frontend: [NOT RUNNING]")
+    print()
+    print("  Stop all: python scripts/start_dev.py --stop")
+    print("  Run tests: venv\\Scripts\\python -m pytest tests/ -v")
+    print("=" * 50)
+
+    # Keep script alive while subprocesses run
+    procs = [p for p in (backend_proc, frontend_proc) if p is not None]
+    if procs:
+        try:
+            # Wait for any child to exit
+            while all(p.poll() is None for p in procs):
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print()
+            print("Shutting down...")
+            for p in procs:
+                p.terminate()
+            for p in procs:
+                p.wait(timeout=5)
 
 
 if __name__ == "__main__":
