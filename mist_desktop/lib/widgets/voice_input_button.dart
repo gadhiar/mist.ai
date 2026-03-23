@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/audio_provider.dart';
-import '../providers/chat_provider.dart';
+import '../providers/voice_provider.dart';
 import '../config/theme_config.dart';
 
 /// Voice Input Button - Push to talk or toggle
@@ -36,13 +36,13 @@ class VoiceInputButton extends ConsumerWidget {
 
   void _handleButtonPress(WidgetRef ref) {
     final audioService = ref.read(audioRecordingServiceProvider);
-    final chatNotifier = ref.read(chatProvider.notifier);
+    final voiceNotifier = ref.read(voiceProvider.notifier);
 
     // Use the service's actual state, not the stream state
     if (audioService.isRecording) {
-      chatNotifier.stopVoiceInput();
+      voiceNotifier.stopVoiceInput();
     } else {
-      chatNotifier.startVoiceInput();
+      voiceNotifier.startVoiceInput();
     }
   }
 }

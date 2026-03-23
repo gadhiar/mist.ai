@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../models/message_model.dart';
 import '../providers/chat_provider.dart';
 import '../providers/websocket_provider.dart';
 import '../services/websocket_service.dart';
@@ -19,6 +20,7 @@ class ChatScreen extends ConsumerStatefulWidget {
 class _ChatScreenState extends ConsumerState<ChatScreen> {
   final TextEditingController _textController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
+  int _lastMessageCount = 0;
 
   @override
   void initState() {
@@ -74,10 +76,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final chatState = ref.watch(chatProvider);
     final connectionStatus = ref.watch(connectionStatusProvider);
 
-    // Auto-scroll when new messages arrive
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _scrollToBottom();
-    });
+    // Auto-scroll only when the message count increases
+    final totalItems =
+        chatState.messages.length +
+        (chatState.currentAiResponse != null ? 1 : 0);
+    if (totalItems > _lastMessageCount) {
+      _lastMessageCount = totalItems;
+      WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+    }
 
     return Scaffold(
       appBar: AppBar(
@@ -120,8 +126,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                       // Show streaming AI response
                       if (index == chatState.messages.length &&
                           chatState.currentAiResponse != null) {
-                        return _buildStreamingMessage(
-                          chatState.currentAiResponse!,
+                        return ChatMessageWidget(
+                          message: ChatMessage.ai(chatState.currentAiResponse!),
+                          isStreaming: true,
                         );
                       }
 
@@ -178,58 +185,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
             style: TextStyle(fontSize: 16, color: Colors.grey.shade600),
           ),
         ],
-      ),
-    );
-  }
-
-  Widget _buildStreamingMessage(String text) {
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: Container(
-        constraints: BoxConstraints(
-          maxWidth: MediaQuery.of(context).size.width * 0.7,
-        ),
-        margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
-        child: Card(
-          elevation: 1,
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Icon(Icons.smart_toy, size: 16),
-                    const SizedBox(width: 4),
-                    const Text(
-                      'MIST.AI',
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    SizedBox(
-                      width: 12,
-                      height: 12,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 1.5,
-                        color: Colors.grey.shade600,
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                SelectableText(
-                  text,
-                  style: const TextStyle(fontSize: 14, height: 1.4),
-                ),
-              ],
-            ),
-          ),
-        ),
       ),
     );
   }

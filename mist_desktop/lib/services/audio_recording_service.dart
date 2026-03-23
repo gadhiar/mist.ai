@@ -9,6 +9,7 @@ class AudioRecordingService {
   final AudioRecorder _recorder = AudioRecorder();
 
   bool _isRecording = false;
+  bool _pendingStop = false;
   StreamSubscription<Uint8List>? _audioStreamSubscription;
   final List<int> _audioBuffer = []; // Collect all audio chunks
 
@@ -33,6 +34,8 @@ class AudioRecordingService {
       return;
     }
 
+    _pendingStop = false;
+
     try {
       // Check permission
       if (!await hasPermission()) {
@@ -54,6 +57,12 @@ class AudioRecordingService {
 
       _isRecording = true;
       _recordingController.add(true);
+
+      if (_pendingStop) {
+        _pendingStop = false;
+        await stopRecording();
+        return;
+      }
       _logger.i(' Audio recording started (16kHz, mono, PCM16)');
 
       // Listen to audio stream and collect in buffer
@@ -84,6 +93,7 @@ class AudioRecordingService {
   /// Stop recording and emit complete audio
   Future<void> stopRecording() async {
     if (!_isRecording) {
+      _pendingStop = true;
       return;
     }
 

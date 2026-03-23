@@ -57,36 +57,23 @@ class WebSocketMessage {
   }) {
     return WebSocketMessage(
       type: WsMessageType.audio,
-      data: {
-        'type': WsMessageType.audio,
-        'audio': audio,
-        'sample_rate': sampleRate,
-      },
+      data: {'audio': audio, 'sample_rate': sampleRate},
     );
   }
 
   /// Text message
   factory WebSocketMessage.text(String text) {
-    return WebSocketMessage(
-      type: WsMessageType.text,
-      data: {'type': WsMessageType.text, 'text': text},
-    );
+    return WebSocketMessage(type: WsMessageType.text, data: {'text': text});
   }
 
   /// Interrupt message
   factory WebSocketMessage.interrupt() {
-    return WebSocketMessage(
-      type: WsMessageType.interrupt,
-      data: {'type': WsMessageType.interrupt},
-    );
+    return WebSocketMessage(type: WsMessageType.interrupt, data: {});
   }
 
   /// Reset VAD message
   factory WebSocketMessage.resetVad() {
-    return WebSocketMessage(
-      type: WsMessageType.resetVad,
-      data: {'type': WsMessageType.resetVad},
-    );
+    return WebSocketMessage(type: WsMessageType.resetVad, data: {});
   }
 
   // Getters for common fields

@@ -18,6 +18,14 @@ class WebSocketService {
   final _statusController = StreamController<ConnectionStatus>.broadcast();
   final _messageController = StreamController<WebSocketMessage>.broadcast();
 
+  // Reconnection state
+  Timer? _reconnectTimer;
+  int _reconnectAttempts = 0;
+  bool _shouldReconnect = true;
+
+  static const _initialReconnectDelay = Duration(seconds: 1);
+  static const _maxReconnectDelay = Duration(seconds: 30);
+
   // Getters
   ConnectionStatus get status => _status;
   Stream<ConnectionStatus> get statusStream => _statusController.stream;
@@ -39,16 +47,17 @@ class WebSocketService {
       // Wait for connection to be established
       await _channel!.ready;
 
-      _updateStatus(ConnectionStatus.connected);
-      _logger.i('WebSocket connected successfully');
-
-      // Listen to messages
+      // Register listener before updating status so any immediate messages are not missed
       _channel!.stream.listen(
         _handleMessage,
         onError: _handleError,
         onDone: _handleClose,
         cancelOnError: false,
       );
+
+      _reconnectAttempts = 0;
+      _updateStatus(ConnectionStatus.connected);
+      _logger.i('WebSocket connected successfully');
     } catch (e) {
       _logger.e('Failed to connect to WebSocket: $e');
       _updateStatus(ConnectionStatus.error);
@@ -56,8 +65,12 @@ class WebSocketService {
     }
   }
 
-  /// Disconnect from WebSocket server
+  /// Disconnect from WebSocket server (explicit user-initiated disconnect; disables auto-reconnect)
   Future<void> disconnect() async {
+    _shouldReconnect = false;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+
     if (_status == ConnectionStatus.disconnected) {
       return;
     }
@@ -66,6 +79,13 @@ class WebSocketService {
     await _channel?.sink.close();
     _channel = null;
     _updateStatus(ConnectionStatus.disconnected);
+  }
+
+  /// Cancel any pending reconnect attempt without fully disconnecting
+  void cancelReconnect() {
+    _shouldReconnect = false;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
   }
 
   /// Send a message to the server
@@ -123,6 +143,7 @@ class WebSocketService {
 
   /// Handle incoming message
   void _handleMessage(dynamic data) {
+    if (_messageController.isClosed) return;
     try {
       final jsonStr = data as String;
       final message = WebSocketMessage.fromJson(jsonStr);
@@ -142,17 +163,53 @@ class WebSocketService {
   /// Handle WebSocket close
   void _handleClose() {
     _logger.i('WebSocket connection closed');
+    _channel = null;
     _updateStatus(ConnectionStatus.disconnected);
+
+    if (_shouldReconnect) {
+      _scheduleReconnect();
+    }
+  }
+
+  /// Schedule a reconnect attempt with exponential backoff
+  void _scheduleReconnect() {
+    final delay = _reconnectAttempts == 0
+        ? _initialReconnectDelay
+        : Duration(
+            seconds:
+                (_initialReconnectDelay.inSeconds * (1 << _reconnectAttempts))
+                    .clamp(0, _maxReconnectDelay.inSeconds),
+          );
+    _reconnectAttempts++;
+    _logger.i(
+      'Scheduling reconnect attempt $_reconnectAttempts in ${delay.inSeconds}s',
+    );
+
+    _reconnectTimer = Timer(delay, () async {
+      if (!_shouldReconnect) return;
+      try {
+        _shouldReconnect = true;
+        await connect();
+      } catch (e) {
+        _logger.w('Reconnect attempt $_reconnectAttempts failed: $e');
+        if (_shouldReconnect) {
+          _scheduleReconnect();
+        }
+      }
+    });
   }
 
   /// Update connection status
   void _updateStatus(ConnectionStatus newStatus) {
     _status = newStatus;
+    if (_statusController.isClosed) return;
     _statusController.add(newStatus);
   }
 
   /// Dispose resources
   void dispose() {
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
     disconnect();
     _statusController.close();
     _messageController.close();

@@ -9,8 +9,6 @@ class ChatMessage {
   final String text;
   final MessageType type;
   final DateTime timestamp;
-  final List<double>? audioData;
-  final int? audioSampleRate;
   final Map<String, dynamic>? metadata;
 
   ChatMessage({
@@ -18,24 +16,18 @@ class ChatMessage {
     required this.text,
     required this.type,
     DateTime? timestamp,
-    this.audioData,
-    this.audioSampleRate,
     this.metadata,
   }) : id = id ?? const Uuid().v4(),
        timestamp = timestamp ?? DateTime.now();
 
   /// Create a user message
-  factory ChatMessage.user(String text, {List<double>? audioData}) {
-    return ChatMessage(
-      text: text,
-      type: MessageType.user,
-      audioData: audioData,
-    );
+  factory ChatMessage.user(String text) {
+    return ChatMessage(text: text, type: MessageType.user);
   }
 
   /// Create an AI message
-  factory ChatMessage.ai(String text, {List<double>? audioData}) {
-    return ChatMessage(text: text, type: MessageType.ai, audioData: audioData);
+  factory ChatMessage.ai(String text) {
+    return ChatMessage(text: text, type: MessageType.ai);
   }
 
   /// Create a system message
@@ -54,8 +46,6 @@ class ChatMessage {
     String? text,
     MessageType? type,
     DateTime? timestamp,
-    List<double>? audioData,
-    int? audioSampleRate,
     Map<String, dynamic>? metadata,
   }) {
     return ChatMessage(
@@ -63,8 +53,6 @@ class ChatMessage {
       text: text ?? this.text,
       type: type ?? this.type,
       timestamp: timestamp ?? this.timestamp,
-      audioData: audioData ?? this.audioData,
-      audioSampleRate: audioSampleRate ?? this.audioSampleRate,
       metadata: metadata ?? this.metadata,
     );
   }

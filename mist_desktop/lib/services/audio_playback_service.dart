@@ -9,7 +9,7 @@ class AudioPlaybackService {
   final AudioPlayer _player = AudioPlayer();
 
   bool _isPlaying = false;
-  final List<Uint8List> _audioQueue = [];
+  final List<(Uint8List, int)> _audioQueue = [];
 
   // Stream controller for playback status
   final _playbackController = StreamController<bool>.broadcast();
@@ -125,7 +125,7 @@ class AudioPlaybackService {
 
       // Add to queue if currently playing
       if (_isPlaying) {
-        _audioQueue.add(pcm16Bytes);
+        _audioQueue.add((pcm16Bytes, sampleRate));
         _logger.d(
           'Added audio chunk to queue (queue size: ${_audioQueue.length})',
         );
@@ -139,13 +139,6 @@ class AudioPlaybackService {
       _logger.e('Stack trace: ${StackTrace.current}');
       rethrow;
     }
-  }
-
-  /// Play audio chunk from bytes (deprecated - use playAudioChunkFloat32)
-  Future<void> playAudioChunk(List<int> audioData, int sampleRate) async {
-    // Convert ints to doubles and use the float32 method
-    final audioFloats = audioData.map((e) => e.toDouble()).toList();
-    await playAudioChunkFloat32(audioFloats, sampleRate);
   }
 
   /// Play audio from bytes
@@ -173,13 +166,12 @@ class AudioPlaybackService {
       return;
     }
 
-    final nextChunk = _audioQueue.removeAt(0);
+    final (nextChunk, rate) = _audioQueue.removeAt(0);
     _logger.d(
       'Playing next chunk from queue (remaining: ${_audioQueue.length})',
     );
 
-    // Assume same sample rate (24000Hz from backend)
-    _playBytes(nextChunk, 24000);
+    _playBytes(nextChunk, rate);
   }
 
   /// Stop playback

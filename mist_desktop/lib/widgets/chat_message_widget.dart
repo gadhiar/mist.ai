@@ -6,8 +6,13 @@ import '../config/theme_config.dart';
 /// Chat Message Widget
 class ChatMessageWidget extends StatelessWidget {
   final ChatMessage message;
+  final bool isStreaming;
 
-  const ChatMessageWidget({super.key, required this.message});
+  const ChatMessageWidget({
+    super.key,
+    required this.message,
+    this.isStreaming = false,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -70,6 +75,17 @@ class ChatMessageWidget extends StatelessWidget {
                         fontWeight: FontWeight.w500,
                       ),
                     ),
+                    if (isStreaming && message.type == MessageType.ai) ...[
+                      const SizedBox(width: 8),
+                      SizedBox(
+                        width: 12,
+                        height: 12,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 1.5,
+                          color: textColor.withOpacity(0.6),
+                        ),
+                      ),
+                    ],
                     const Spacer(),
                     Text(
                       _formatTime(message.timestamp),
