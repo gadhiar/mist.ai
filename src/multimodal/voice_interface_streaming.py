@@ -12,6 +12,7 @@ import sounddevice as sd
 import torch
 
 from src.multimodal.stt import WhisperSTT
+from src.multimodal.text_preprocessing import preprocess_text_for_tts
 from src.multimodal.tts import SesameTTS
 from src.utils.cleanup import register_cleanup
 
@@ -262,29 +263,14 @@ class StreamingVoiceInterface:
         # Check for sentence endings or natural pauses
         return any(punct in text for punct in [".", "!", "?", ";\n", ":\n"])
 
-    def _preprocess_text_for_tts(self, text: str) -> str:
-        """Preprocess text for TTS following csm-streaming best practices.
+    @staticmethod
+    def _preprocess_text_for_tts(text: str) -> str:
+        """Preprocess text for TTS with prosody-preserving substitutions.
 
-        Removes all punctuation except periods, commas, exclamation points,
-        and question marks to create cleaner speech output while preserving intonation.
-
-        Args:
-            text: Input text with potential punctuation
-
-        Returns:
-            Cleaned text with only allowed punctuation
+        Delegates to shared `preprocess_text_for_tts` to keep all TTS
+        preprocessing in one place.
         """
-        # Remove all punctuation except . , ! ? '
-        pattern = r"[^\w\s.,!?\']"
-        cleaned_text = re.sub(pattern, "", text)
-
-        # Normalize multiple spaces to single space
-        cleaned_text = re.sub(r"\s+", " ", cleaned_text)
-
-        # Ensure there's a space after punctuation for better speech pacing
-        cleaned_text = re.sub(r"([.,!?])(\S)", r"\1 \2", cleaned_text)
-
-        return cleaned_text.strip()
+        return preprocess_text_for_tts(text)
 
     def converse_streaming(self, duration: int = 5, debug: bool = False) -> tuple[str, str]:
         """Streaming conversation: Start speaking as soon as possible.
@@ -354,7 +340,7 @@ class StreamingVoiceInterface:
                 return user_text, ""
 
             # 3. Preprocess text for TTS (csm-streaming pattern)
-            preprocessed_text = self._preprocess_text_for_tts(full_response.lower())
+            preprocessed_text = self._preprocess_text_for_tts(full_response)
 
             if debug:
                 print(f"[DEBUG] Preprocessed text: '{preprocessed_text[:100]}...'")

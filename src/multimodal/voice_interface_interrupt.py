@@ -5,7 +5,6 @@ Uses continuous VAD-based microphone listening + OutputStream interruption.
 """
 
 import queue
-import re
 
 # Import VAD from csm-streaming
 import sys
@@ -19,6 +18,7 @@ import sounddevice as sd
 import torch
 
 from src.multimodal.stt import WhisperSTT
+from src.multimodal.text_preprocessing import preprocess_text_for_tts
 from src.multimodal.tts import SesameTTS
 from src.utils.cleanup import register_cleanup
 
@@ -360,13 +360,14 @@ class InterruptibleVoiceInterface:
         if self.mic_thread and self.mic_thread.is_alive():
             self.mic_thread.join(timeout=2.0)
 
-    def _preprocess_text_for_tts(self, text: str) -> str:
-        """Preprocess text for TTS."""
-        pattern = r"[^\w\s.,!?\']"
-        cleaned_text = re.sub(pattern, "", text)
-        cleaned_text = re.sub(r"\s+", " ", cleaned_text)
-        cleaned_text = re.sub(r"([.,!?])(\S)", r"\1 \2", cleaned_text)
-        return cleaned_text.strip()
+    @staticmethod
+    def _preprocess_text_for_tts(text: str) -> str:
+        """Preprocess text for TTS with prosody-preserving substitutions.
+
+        Delegates to shared `preprocess_text_for_tts` to keep all TTS
+        preprocessing in one place.
+        """
+        return preprocess_text_for_tts(text)
 
     def continuous_conversation(self, debug: bool = False):
         """Continuous conversation with interruption support.
@@ -450,7 +451,7 @@ class InterruptibleVoiceInterface:
                     continue
 
                 # Preprocess text
-                preprocessed_text = self._preprocess_text_for_tts(full_response.lower())
+                preprocessed_text = self._preprocess_text_for_tts(full_response)
                 log(f"TTS: Preprocessed text ({len(preprocessed_text)} chars)")
 
                 # Start audio playback thread
