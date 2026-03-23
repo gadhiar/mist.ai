@@ -785,7 +785,7 @@ Match your response depth to what the user is asking for - be concise when appro
         )
 
         # Yield audio chunks from result queue
-        RESULT_QUEUE_TIMEOUT = 30.0
+        RESULT_QUEUE_TIMEOUT = 120.0  # First generation includes torch.compile (~30-60s)
         while True:
             try:
                 msg_type, gen_id, data = self.tts_result_queue.get(timeout=RESULT_QUEUE_TIMEOUT)
