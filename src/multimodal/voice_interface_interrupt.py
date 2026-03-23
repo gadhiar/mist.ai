@@ -51,7 +51,14 @@ class InterruptibleVoiceInterface:
         self.stt = WhisperSTT(model_size="base")
 
         print("2/4 Loading Sesame CSM TTS...")
-        self.tts = SesameTTS(use_context=True)
+        from pathlib import Path
+
+        from src.multimodal.voice_profile import VoiceProfileRegistry
+
+        project_root = Path(__file__).parent.parent.parent
+        registry = VoiceProfileRegistry(project_root / "data" / "voice_profiles")
+        profile = registry.get_active()
+        self.tts = SesameTTS(profile=profile, use_context=True)
 
         # Warmup TTS
         print("   Warming up TTS...")
@@ -464,8 +471,8 @@ class InterruptibleVoiceInterface:
                     speaker=self.tts.speaker_id,
                     context=self.tts.context if self.tts.use_context else [],
                     max_audio_length_ms=self.tts._estimate_audio_length(preprocessed_text),
-                    temperature=0.8,
-                    topk=50,
+                    temperature=self.tts.profile.temperature,
+                    topk=self.tts.profile.topk,
                 ):
                     # Check for interruption
                     if self.interrupt_playback.is_set():
