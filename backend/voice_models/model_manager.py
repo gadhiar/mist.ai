@@ -133,10 +133,22 @@ class ModelManager:
             use_context=self.config.use_voice_context,
         )
 
-        # Warmup TTS
-        logger.info("Warming up TTS with dummy text...")
+        # Warmup TTS -- exercise BOTH code paths to trigger torch.compile
+        # speak() uses generate(), but real requests use generate_stream()
+        logger.info("Warming up TTS (non-streaming path)...")
         dummy_audio = self.tts.speak("Initialization complete.", play=False)
-        logger.info(f"TTS warmed up (audio shape: {dummy_audio.shape})")
+        logger.info(f"TTS non-streaming warmed up (audio shape: {dummy_audio.shape})")
+
+        logger.info("Warming up TTS (streaming path)...")
+        stream_chunks = []
+        for chunk in self.tts.generator.generate_stream(
+            text="System ready.",
+            speaker=self.tts.speaker_id,
+            context=self.tts.context,
+            max_audio_length_ms=5000,
+        ):
+            stream_chunks.append(chunk)
+        logger.info(f"TTS streaming warmed up ({len(stream_chunks)} chunks)")
 
         # Signal warmup complete
         self.tts_result_queue.put(("warmup_complete", None))
