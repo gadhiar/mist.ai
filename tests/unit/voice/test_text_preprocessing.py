@@ -85,10 +85,20 @@ class TestQuotationMarks:
         assert '"' not in result
         assert "hello" in result
 
-    def test_smart_quotes_removed(self):
+    def test_smart_double_quotes_removed(self):
         result = preprocess_text_for_tts("He said \u201chello\u201d")
         assert "\u201c" not in result
         assert "\u201d" not in result
+
+    def test_curly_apostrophe_preserved_as_straight(self):
+        """LLMs frequently emit curly apostrophes in contractions."""
+        assert preprocess_text_for_tts("don\u2019t") == "don't"
+        assert preprocess_text_for_tts("it\u2019s") == "it's"
+        assert preprocess_text_for_tts("I\u2019m") == "i'm"
+
+    def test_curly_single_quotes_become_apostrophe(self):
+        result = preprocess_text_for_tts("\u2018hello\u2019")
+        assert result == "'hello'"
 
 
 class TestWhitespace:

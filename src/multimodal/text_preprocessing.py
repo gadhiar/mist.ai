@@ -49,13 +49,16 @@ def preprocess_text_for_tts(text: str) -> str:
     # Remove parentheses but keep content
     text = re.sub(r"[()]", "", text)
 
+    # Convert smart quotes BEFORE the character stripping regex
+    # Smart single quotes -> straight apostrophe (preserves contractions like don't, it's)
+    text = re.sub(r"[\u2018\u2019]", "'", text)
+    # Smart double quotes -> nothing (remove)
+    text = re.sub(r"[\u201c\u201d]", "", text)
+
     # Remove remaining non-speech characters (brackets, special symbols)
     # Keep: word chars, whitespace, periods, commas, exclamation, question, apostrophe,
     # and the ellipsis placeholder (contains \x00 which is not \w)
-    text = re.sub(r"[^\w\s.,!?'\"\x00]", "", text)
-
-    # Remove quotation marks (double quotes and smart quotes)
-    text = re.sub(r'["\u201c\u201d\u2018\u2019]', "", text)
+    text = re.sub(r"[^\w\s.,!?'\x00]", "", text)
 
     # Normalize whitespace
     text = re.sub(r"\s+", " ", text)

@@ -90,9 +90,9 @@ class SesameTTS:
         Assumes ~150 words/minute speaking rate.
         """
         words = len(text.split())
-        # 150 words/min = 2.5 words/sec = 400ms/word
-        # Add 20% buffer
-        estimated_ms = int(words * 400 * 1.2)
+        # ~450ms/word (133 words/min, moderate pace)
+        # Add 50% buffer for pauses and natural speech variation
+        estimated_ms = int(words * 450 * 1.5)
         # Clamp between 2s and 15s
         return max(2000, min(estimated_ms, 15000))
 
