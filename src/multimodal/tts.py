@@ -27,100 +27,63 @@ from generator import Segment, load_csm_1b_local
 class SesameTTS:
     """Optimized wrapper for Sesame CSM text-to-speech with context persistence."""
 
-    def __init__(self, device: str = None, use_context: bool = True):
+    def __init__(self, profile, device: str = None, use_context: bool = True):
         """Initialize Sesame CSM TTS.
 
         Args:
+            profile: VoiceProfile containing weights path, reference clips, and config.
             device: 'cuda' or 'cpu'. Auto-detects if None.
-            use_context: If True, maintain voice context for consistency and speed
+            use_context: If True, maintain voice context for consistency and speed.
         """
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        print(f"Loading FINE-TUNED Sesame CSM (Epoch 20) on {device}...")
+        self.profile = profile
+        print(f"Loading Sesame CSM ({profile.name}) on {device}...")
 
-        # Disable FX graph cache to avoid triton_key error on Windows
-        # Only affects first-load compile time (~30s), NOT runtime performance
         import torch._inductor.config as inductor_config
 
         inductor_config.fx_graph_cache = False
 
-        # Load fine-tuned model from epoch 20 (best validation loss: 6.110)
-        # Need absolute path for model loading
-        from pathlib import Path
-
-        project_root = Path(__file__).parent.parent.parent
-        model_path = str(
-            project_root / "dependencies" / "csm" / "finetuned_model" / "checkpoint-epoch-20"
-        )
-        self.generator = load_csm_1b_local(model_path, device=device)
+        self.generator = load_csm_1b_local(str(profile.weights_path), device=device)
         self.device = device
         self.use_context = use_context
-        self.context = []  # Voice context for consistency
-        self.speaker_id = 0
+        self.context = []
+        self.speaker_id = profile.speaker_id
 
-        print("Sesame CSM loaded successfully!")
+        print(f"Sesame CSM ({profile.name}) loaded successfully!")
 
-        # Load reference audio from voice training dataset for maximum voice consistency
-        self._load_reference_audio(project_root)
+        self._load_reference_audio()
 
-    def _load_reference_audio(self, project_root):
-        """Load reference audio clips from voice training dataset to initialize context.
-        This provides the voice signature for consistent generation.
-        """
-        import json
-
+    def _load_reference_audio(self):
+        """Load reference audio clips from voice profile for voice anchoring."""
         import torchaudio
 
-        audio_dir = project_root / "dependencies" / "csm" / "audio_data"
-        metadata_path = audio_dir / "dataset_metadata.json"
-
-        if not metadata_path.exists():
-            print("Warning: Voice dataset metadata not found. Voice consistency may be reduced.")
+        if not self.profile.reference_clips:
+            print("Warning: No reference clips in voice profile. Voice consistency may be reduced.")
             return
 
-        # Load metadata to get transcriptions
-        with open(metadata_path) as f:
-            metadata = json.load(f)
+        print(
+            f"Loading {len(self.profile.reference_clips)} reference clips"
+            f" from {self.profile.name} profile..."
+        )
 
-        # Select 3 diverse reference clips from the dataset
-        # Use clips 0, 5, and 10 for variety in phonetic content
-        reference_indices = [0, 5, 10]
+        for clip in self.profile.reference_clips:
+            audio, sr = torchaudio.load(str(clip.audio_path))
+            audio = audio.squeeze(0)
 
-        print(f"Loading {len(reference_indices)} reference audio clips from voice dataset...")
+            if sr != self.profile.sample_rate:
+                audio = torchaudio.functional.resample(audio, sr, self.profile.sample_rate)
 
-        for idx in reference_indices:
-            if idx >= len(metadata["samples"]):
-                continue
+            segment = Segment(
+                speaker=self.profile.speaker_id,
+                text=clip.transcription.lower(),
+                audio=audio,
+            )
+            self.context.append(segment)
+            print(f'  Loaded: {clip.audio_path.name} - "{clip.transcription[:50]}..."')
 
-            sample = metadata["samples"][idx]
-            audio_path = audio_dir / sample["audio_file"]
-
-            if not audio_path.exists():
-                print(f"Warning: Reference audio {audio_path} not found, skipping.")
-                continue
-
-            try:
-                # Load and resample to 24kHz (CSM's native sample rate)
-                audio, sr = torchaudio.load(str(audio_path))
-                audio = audio.squeeze(0)  # Remove channel dimension
-
-                if sr != 24000:
-                    audio = torchaudio.functional.resample(audio, sr, 24000)
-
-                # Create segment with transcription (lowercase to match generation preprocessing)
-                segment = Segment(speaker=self.speaker_id, text=sample["text"].lower(), audio=audio)
-
-                self.context.append(segment)
-                print(f"  Loaded: {sample['audio_file']} - \"{sample['text'][:50]}...\"")
-
-            except Exception as e:
-                print(f"Warning: Failed to load {audio_path}: {e}")
-
-        if len(self.context) > 0:
-            print(f"Successfully loaded {len(self.context)} reference clips for voice consistency.")
-        else:
-            print("Warning: No reference audio loaded. Voice consistency may be reduced.")
+        print(f"Loaded {len(self.context)} reference clips for voice consistency.")
 
     def _estimate_audio_length(self, text: str) -> int:
         """Estimate audio length in ms based on text
@@ -138,8 +101,8 @@ class SesameTTS:
         text: str,
         output_path: str = None,
         play: bool = False,
-        temperature: float = 0.55,
-        topk: int = 20,
+        temperature: float = None,
+        topk: int = None,
         streaming: bool = True,
     ) -> torch.Tensor:
         """Generate speech from text with optimized settings.
@@ -148,13 +111,16 @@ class SesameTTS:
             text: Text to speak
             output_path: Optional path to save audio file
             play: Whether to play audio immediately (requires sounddevice)
-            temperature: Sampling temperature (lower = faster, more deterministic)
-            topk: Top-k sampling (lower = faster, more focused)
+            temperature: Sampling temperature. Defaults to profile value.
+            topk: Top-k sampling. Defaults to profile value.
             streaming: Use streaming generation for lower latency
 
         Returns:
             Audio tensor (concatenated from all chunks if streaming)
         """
+        temperature = temperature if temperature is not None else self.profile.temperature
+        topk = topk if topk is not None else self.profile.topk
+
         # Estimate appropriate max length based on text
         max_length = self._estimate_audio_length(text)
 
