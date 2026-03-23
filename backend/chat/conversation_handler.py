@@ -6,17 +6,25 @@ Enables LLM to autonomously:
 - Think and search database freely
 """
 
+from __future__ import annotations
+
+import asyncio
 import logging
-from typing import Any
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 
+from backend.event_store.models import ConversationTurnEvent
+from backend.event_store.store import EventStore
 from backend.knowledge.config import KnowledgeConfig
-from backend.knowledge.extraction.entity_extractor import EntityExtractor
 from backend.knowledge.models import ConversationSession, RetrievalFilters
 from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from backend.knowledge.storage.graph_store import GraphStore
+
+if TYPE_CHECKING:
+    from backend.knowledge.extraction.pipeline import ExtractionPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -31,21 +39,26 @@ class ConversationHandler:
     """
 
     def __init__(
-        self, config: KnowledgeConfig, graph_store: GraphStore, model_name: str = "qwen2.5:7b"
-    ):
+        self,
+        config: KnowledgeConfig,
+        graph_store: GraphStore,
+        extraction_pipeline: ExtractionPipeline,
+        model_name: str = "qwen2.5:7b",
+    ) -> None:
         """Initialize conversation handler.
 
         Args:
             config: Knowledge system configuration
             graph_store: Neo4j graph store
+            extraction_pipeline: Pipeline for automatic knowledge extraction.
             model_name: Ollama model to use
         """
         self.config = config
         self.graph_store = graph_store
+        self._extraction_pipeline = extraction_pipeline
 
         # Initialize components
         self.retriever = KnowledgeRetriever(config, graph_store)
-        self.extractor = EntityExtractor(config.extraction)
 
         # Initialize LLM
         self.llm = ChatOllama(
@@ -59,14 +72,27 @@ class ConversationHandler:
         # Active sessions
         self.sessions: dict[str, ConversationSession] = {}
 
+        # Event store (Layer 1) -- append-only conversation log
+        self.event_store: EventStore | None = None
+        es_config = config.event_store
+        if es_config.enabled:
+            try:
+                self.event_store = EventStore(db_path=es_config.db_path)
+                self.event_store.initialize()
+                logger.info("Event store enabled at %s", self.event_store.db_path)
+            except Exception as e:
+                logger.error("Failed to initialize event store: %s", e, exc_info=True)
+                self.event_store = None
+
+        # Maps external session_id -> event store session_id
+        self._es_session_ids: dict[str, str] = {}
+
         logger.info(f"ConversationHandler initialized with model: {model_name}")
 
     def _setup_tools(self):
         """Setup LLM tools for MCP-like access."""
         # Store references for tool implementations
         retriever = self.retriever
-        extractor = self.extractor
-        graph_store = self.graph_store
 
         @tool
         async def query_knowledge_graph(
@@ -111,135 +137,11 @@ class ConversationHandler:
                 logger.error(f"Error querying knowledge graph: {e}")
                 return f"Error searching knowledge graph: {str(e)}"
 
-        @tool
-        async def extract_knowledge(text: str, context: str | None = None) -> str:
-            """Extract and store new knowledge from text into the knowledge graph.
-
-            Use this tool when:
-            - User shares information about themselves (skills, preferences, projects, etc.)
-            - You learn something new that should be remembered
-            - User mentions technologies, tools, people, or relationships
-
-            Args:
-                text: The text to extract knowledge from (typically user's message)
-                context: Optional context about the conversation
-
-            Returns:
-                Confirmation of what was learned and stored
-            """
-            try:
-                import uuid
-                from datetime import datetime
-
-                # Ensure conversation event exists
-                conversation_id = context or "default"
-                graph_store.store_conversation_event(
-                    conversation_id=conversation_id, user_id="User"
-                )
-
-                # Generate unique utterance ID
-                utterance_id = str(uuid.uuid4())
-
-                # Store the utterance
-                graph_store.store_utterance(
-                    utterance_id=utterance_id,
-                    conversation_id=conversation_id,
-                    text=text,
-                    metadata={"source": "conversation", "timestamp": datetime.now().isoformat()},
-                )
-
-                # Extract entities from text
-                graph_docs = await extractor.extract_from_utterance(
-                    utterance=text, conversation_history=[], metadata={"utterance_id": utterance_id}
-                )
-
-                # Store extracted entities
-                if graph_docs and graph_docs[0].nodes:
-                    graph_store.store_extracted_entities(
-                        graph_document=graph_docs[0],
-                        utterance_id=utterance_id,
-                        ontology_version=None,
-                    )
-
-                    entity_names = [n.id for n in graph_docs[0].nodes]
-                    rel_count = len(graph_docs[0].relationships)
-
-                    return f"Learned and stored: {len(entity_names)} entities ({', '.join(entity_names[:5])}{'...' if len(entity_names) > 5 else ''}) with {rel_count} relationships."
-                else:
-                    return "No new knowledge extracted from the text."
-
-            except Exception as e:
-                logger.error(f"Error extracting knowledge: {e}")
-                return f"Error storing knowledge: {str(e)}"
-
-        @tool
-        async def extract_knowledge_from_document(chunk_id: str, reason: str | None = None) -> str:
-            """Extract entities from a specific document chunk into the knowledge graph.
-
-            Use this tool when:
-            - You found important information in documentation that should be remembered
-            - User asks you to "remember" or "learn" something from the docs
-            - You want to convert document facts into queryable knowledge graph entities
-            - Information will be queried frequently (extract once, query fast forever)
-
-            This is SELECTIVE extraction - only extract when truly useful.
-            Most doc info is already available via auto-injected context.
-
-            Args:
-                chunk_id: The chunk_id from auto-provided documentation
-                reason: Optional explanation of why you're extracting this
-
-            Returns:
-                Confirmation of entities extracted and stored
-            """
-            try:
-                # Get the chunk text
-                query = """
-                MATCH (c:DocumentChunk {chunk_id: $chunk_id})
-                RETURN c.text as text, c.chunk_id as chunk_id
-                """
-                results = graph_store.connection.execute_query(query, {"chunk_id": chunk_id})
-
-                if not results:
-                    return f"Chunk not found: {chunk_id}"
-
-                chunk_text = results[0]["text"]
-
-                # Extract entities from chunk
-                graph_docs = await extractor.extract_from_utterance(
-                    utterance=chunk_text,
-                    conversation_history=[],
-                    metadata={
-                        "source": "document_extraction",
-                        "chunk_id": chunk_id,
-                        "reason": reason or "LLM-selected extraction",
-                    },
-                )
-
-                # Store extracted entities
-                if graph_docs and graph_docs[0].nodes:
-                    graph_store.store_extracted_entities(
-                        graph_document=graph_docs[0], chunk_id=chunk_id, ontology_version=None
-                    )
-
-                    entity_names = [n.id for n in graph_docs[0].nodes]
-                    rel_count = len(graph_docs[0].relationships)
-
-                    return f"Extracted from document: {len(entity_names)} entities ({', '.join(entity_names[:5])}{'...' if len(entity_names) > 5 else ''}) with {rel_count} relationships. These are now queryable via query_knowledge_graph."
-                else:
-                    return "No entities extracted from this chunk."
-
-            except Exception as e:
-                logger.error(f"Error extracting from document chunk: {e}")
-                return f"Error extracting knowledge from document: {str(e)}"
-
         # Bind tools to LLM
-        self.tools = [query_knowledge_graph, extract_knowledge, extract_knowledge_from_document]
+        self.tools = [query_knowledge_graph]
         self.llm_with_tools = self.llm.bind_tools(self.tools)
 
-        logger.info(
-            "Tools bound to LLM: query_knowledge_graph, extract_knowledge, extract_knowledge_from_document"
-        )
+        logger.info("Tools bound to LLM: query_knowledge_graph")
 
     def get_or_create_session(self, session_id: str, user_id: str = "User") -> ConversationSession:
         """Get existing session or create new one."""
@@ -338,7 +240,11 @@ class ConversationHandler:
                     )
 
                 # If tools were called, get final response with tool results
-                messages.append({"role": "assistant", "content": response.content or ""})
+                # Preserve the full AIMessage including tool_calls for proper correlation
+                assistant_msg = {"role": "assistant", "content": response.content or ""}
+                if hasattr(response, "tool_calls") and response.tool_calls:
+                    assistant_msg["tool_calls"] = response.tool_calls
+                messages.append(assistant_msg)
 
                 for result in tool_results:
                     messages.append(
@@ -368,12 +274,40 @@ class ConversationHandler:
                 tool_results=tool_results if tool_results else None,
             )
 
+            # --- Event Store Write (Layer 1) ---
+            # Synchronous, <5ms target. Happens BEFORE any async extraction.
+            event_id = self._record_turn_event(
+                session_id=session_id,
+                user_message=user_message,
+                assistant_message=assistant_message,
+                context_window=messages,
+                doc_results=doc_results,
+                tool_calls=tool_calls if tool_calls else None,
+            )
+
+            # Fire-and-forget background extraction
+            if event_id and len(user_message.split()) >= 3:
+                asyncio.create_task(
+                    self._extract_knowledge_async(
+                        utterance=user_message,
+                        conversation_history=session.get_history(max_history),
+                        event_id=event_id,
+                        session_id=session_id,
+                    )
+                )
+
             return assistant_message
 
         except Exception as e:
             logger.error(f"Error handling message: {e}", exc_info=True)
             error_msg = f"I encountered an error: {str(e)}"
             session.add_message("assistant", error_msg)
+            # Record the error turn to event store
+            self._record_turn_event(
+                session_id=session_id,
+                user_message=user_message,
+                assistant_message=error_msg,
+            )
             return error_msg
 
     async def _execute_tool(self, tool_name: str, tool_args: dict[str, Any]) -> str:
@@ -383,6 +317,134 @@ class ConversationHandler:
                 return await tool.ainvoke(tool_args)
 
         return f"Tool not found: {tool_name}"
+
+    async def _extract_knowledge_async(
+        self,
+        utterance: str,
+        conversation_history: list[dict[str, str]],
+        event_id: str,
+        session_id: str,
+    ) -> None:
+        """Fire-and-forget background extraction.
+
+        Called via asyncio.create_task after every user turn.
+        Failures are logged but never propagated.
+        """
+        try:
+            result = await self._extraction_pipeline.extract_from_utterance(
+                utterance=utterance,
+                conversation_history=conversation_history,
+                event_id=event_id,
+                session_id=session_id,
+            )
+            # Log results at debug level. Result may be ValidationResult
+            # (has .entities/.relationships) or CurationResult (has .write_result
+            # with counts). Handle both without importing concrete types.
+            if hasattr(result, "entities"):
+                # ValidationResult path (curation disabled)
+                entity_count = len(result.entities)
+                rel_count = len(result.relationships)
+            elif hasattr(result, "write_result"):
+                # CurationResult path (curation enabled)
+                wr = result.write_result
+                entity_count = wr.entities_created + wr.entities_updated
+                rel_count = wr.relationships_created
+            else:
+                entity_count = 0
+                rel_count = 0
+
+            if entity_count or rel_count:
+                logger.debug(
+                    "Background extraction: %d entities, %d relationships from '%s'",
+                    entity_count,
+                    rel_count,
+                    utterance[:60],
+                )
+        except Exception as e:
+            logger.error("Background extraction failed (non-fatal): %s", e)
+
+    def _record_turn_event(
+        self,
+        session_id: str,
+        user_message: str,
+        assistant_message: str,
+        context_window: list[dict[str, str]] | None = None,
+        doc_results: list[dict[str, Any]] | None = None,
+        tool_calls: list[dict[str, Any]] | None = None,
+    ) -> str | None:
+        """Record a conversation turn to the event store.
+
+        Synchronous write, targets <5ms. Failures are logged but never
+        propagated -- the event store must not break the conversation flow.
+
+        Args:
+            session_id: External session identifier.
+            user_message: Raw user utterance.
+            assistant_message: Raw system response.
+            context_window: The full message list sent to the LLM.
+            doc_results: Auto-injected RAG document chunks, if any.
+            tool_calls: Tool calls made during this turn, if any.
+
+        Returns:
+            The event_id on success, None if event store is disabled or on failure.
+        """
+        if self.event_store is None:
+            return None
+
+        try:
+            # Ensure an event store session exists for this session_id
+            if session_id not in self._es_session_ids:
+                es_session_id = self.event_store.start_session(input_modality="text")
+                self._es_session_ids[session_id] = es_session_id
+
+            es_session_id = self._es_session_ids[session_id]
+
+            # Determine turn_index from session turn_count
+            es_session = self.event_store.get_session(es_session_id)
+            turn_index = es_session.turn_count if es_session else 0
+
+            # Build retrieval_context from doc_results if present
+            retrieval_context = None
+            if doc_results:
+                retrieval_context = {
+                    "doc_chunks": [
+                        {
+                            "source_title": r.get("source_title", ""),
+                            "text": r.get("text", "")[:500],
+                            "similarity": r.get("similarity", 0.0),
+                        }
+                        for r in doc_results
+                    ]
+                }
+
+            event = ConversationTurnEvent(
+                session_id=es_session_id,
+                turn_index=turn_index,
+                timestamp=datetime.now(),
+                user_utterance=user_message,
+                system_response=assistant_message,
+                context_window=context_window,
+                retrieval_context=retrieval_context,
+                tool_calls=tool_calls,
+                llm_model=self.llm.model,
+                llm_parameters={"temperature": self.llm.temperature},
+                ontology_version=self.config.ontology_version,
+            )
+
+            event_id = self.event_store.append_turn(event)
+            logger.debug("Recorded turn event %s for session %s", event_id, session_id)
+            return event_id
+
+        except Exception as e:
+            # Log but never propagate -- event store failure must not
+            # break the conversation.
+            logger.error(
+                "Failed to record turn event for session %s: %s",
+                session_id,
+                e,
+                exc_info=True,
+            )
+            return None
 
     def _format_document_context(self, doc_results: list[dict[str, Any]]) -> str:
         """Format document search results for injection into context.
@@ -431,30 +493,17 @@ class ConversationHandler:
 === CONTEXT PROVIDED ===
 
 You receive relevant MIST documentation automatically with each query (see below).
-This documentation is provided via semantic search and contains the most relevant information.
+Knowledge from conversations is captured automatically -- you do not need to extract it manually.
 
 === AVAILABLE TOOLS ===
 
-You have three tools at your disposal:
+You have one tool at your disposal:
 
 1. **query_knowledge_graph(query: str, limit: int = 20)**
    - Search the personal knowledge graph for user-specific information
    - Use when: User asks about THEIR preferences, skills, projects, past conversations
    - Returns: Facts you've learned about the user (entities + relationships)
    - Example: "What programming languages do I know?" -> use this tool
-
-2. **extract_knowledge(text: str, context: str = None)**
-   - Store new information the user shares about themselves
-   - Use when: User tells you about their skills, preferences, projects, interests
-   - Effect: Adds entities to knowledge graph from conversation
-   - Example: "I'm learning React" -> use this tool to remember
-
-3. **extract_knowledge_from_document(chunk_id: str, reason: str = None)**
-   - Extract entities from auto-provided documentation chunks into the knowledge graph
-   - Use when: User asks you to "remember" or "learn" something from the docs
-   - Use SPARINGLY: Only when user explicitly asks or info will be queried frequently
-   - Effect: Converts document facts into queryable graph entities
-   - Note: chunk_id can be found in the auto-provided documentation context
 
 === TOOL USAGE STRATEGY ===
 
@@ -463,14 +512,8 @@ You have three tools at your disposal:
 - Personal questions (about user's info) -> Use query_knowledge_graph tool
 - Both types -> Use docs + query_knowledge_graph
 
-**For user statements:**
-- Shares personal info -> Use extract_knowledge tool
-- Asks to "remember" doc info -> Use extract_knowledge_from_document tool (rarely needed)
-
 **Autonomous Decision Making:**
-- You decide when to use tools - no one tells you when
-- You can use multiple tools, one tool, or no tools per response
-- Think before responding: "What context do I need?"
+- You decide when to use the tool - no one tells you when
 - Documentation is automatically provided - use it! Cite sources when helpful.
 - Only call query_knowledge_graph when you need personal user context
 
@@ -518,6 +561,13 @@ Remember: Documentation is already provided below. Think about whether you need 
         """Clear a conversation session."""
         if session_id in self.sessions:
             del self.sessions[session_id]
+            # End event store session
+            if self.event_store and session_id in self._es_session_ids:
+                try:
+                    self.event_store.end_session(self._es_session_ids[session_id])
+                except Exception as e:
+                    logger.error("Failed to end event store session: %s", e)
+                del self._es_session_ids[session_id]
             logger.info(f"Cleared session: {session_id}")
 
     def get_session_info(self, session_id: str) -> dict[str, Any] | None:

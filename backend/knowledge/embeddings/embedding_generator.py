@@ -116,6 +116,9 @@ class EmbeddingGenerator:
         # Convert to list of lists
         return embeddings.tolist()
 
+    # Alias to satisfy EmbeddingProvider protocol
+    generate_embeddings = generate_embeddings_batch
+
     def compute_similarity(self, text1: str, text2: str) -> float:
         """Compute cosine similarity between two texts.
 

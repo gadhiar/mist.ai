@@ -53,9 +53,21 @@ backend/
     ├── config.py               # Extraction configuration
     ├── models.py               # Data models (Entity, Utterance, etc.)
     │
-    ├── extraction/             # Entity extraction
-    │   ├── entity_extractor.py
-    │   └── property_enricher.py
+    ├── extraction/             # Ontology-constrained extraction pipeline (stages 1-6)
+    │   ├── pipeline.py          # ExtractionPipeline orchestrator
+    │   ├── ontology_extractor.py # Single LLM call with ontology constraints
+    │   ├── preprocessor.py      # Context assembly (no LLM)
+    │   ├── confidence.py        # Hedge detection, third-party cap
+    │   ├── temporal.py          # Relative to absolute date resolution
+    │   ├── normalizer.py        # Canonical IDs, alias + embedding dedup
+    │   └── validator.py         # Schema + constraint validation
+    │
+    ├── curation/               # Per-conversation curation (stages 7-8)
+    │   ├── pipeline.py          # CurationPipeline orchestrator
+    │   ├── confidence.py        # Confidence arithmetic
+    │   ├── deduplication.py     # 3-tier entity dedup against graph
+    │   ├── conflict_resolver.py # Supersession, contradiction, progression
+    │   └── graph_writer.py      # MERGE upserts + provenance
     │
     ├── retrieval/              # Knowledge retrieval
     │   └── knowledge_retriever.py
@@ -144,8 +156,8 @@ Root documentation:
 - **Regeneration**: Rebuild from immutable utterances
 
 ### 2. MCP-Like Conversation
-- **Autonomous tool use**: LLM decides when to query/extract
-- **Two tools**: `query_knowledge_graph`, `extract_knowledge`
+- **Autonomous tool use**: LLM queries knowledge graph on demand
+- **One tool**: `query_knowledge_graph` (extraction is automatic)
 - **Session management**: Track conversation history
 - **Graceful fallback**: Works without Neo4j
 
@@ -194,7 +206,7 @@ else:
 ConversationHandler
   -> (autonomous tool use)
 query_knowledge_graph -> KnowledgeRetriever -> GraphStore -> Neo4j
-extract_knowledge -> EntityExtractor -> GraphStore -> Neo4j
+[automatic] asyncio.create_task -> ExtractionPipeline -> CurationPipeline -> Neo4j
 ```
 
 ---

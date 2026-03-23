@@ -4,12 +4,12 @@ Stores extracted entities and relationships in Neo4j with provenance tracking.
 """
 
 import logging
+import re
 from datetime import datetime
 from typing import Any
 
-from backend.knowledge.config import KnowledgeConfig
-from backend.knowledge.embeddings import EmbeddingGenerator
-from backend.knowledge.storage.neo4j_connection import Neo4jConnection
+from backend.errors import Neo4jQueryError
+from backend.interfaces import EmbeddingProvider, GraphConnection
 
 logger = logging.getLogger(__name__)
 
@@ -23,15 +23,15 @@ class GraphStore:
     - Versioning support (ontology versions)
     """
 
-    def __init__(self, config: KnowledgeConfig):
-        """Initialize graph store.
+    def __init__(self, connection: GraphConnection, embedding_generator: EmbeddingProvider):
+        """Initialize graph store with injected dependencies.
 
         Args:
-            config: Knowledge system configuration
+            connection: Graph database connection (satisfies GraphConnection protocol).
+            embedding_generator: Embedding provider (satisfies EmbeddingProvider protocol).
         """
-        self.config = config
-        self.connection = Neo4jConnection(config.neo4j)
-        self.embedding_generator = EmbeddingGenerator()
+        self.connection = connection
+        self.embedding_generator = embedding_generator
 
     def initialize_schema(self):
         """Create indexes and constraints in Neo4j.
@@ -58,7 +58,7 @@ class GraphStore:
             try:
                 self.connection.execute_write(constraint)
                 logger.debug(f"Created constraint: {constraint[:50]}...")
-            except Exception as e:
+            except Neo4jQueryError as e:
                 logger.warning(f"Constraint may already exist: {e}")
 
         # Create indexes for performance
@@ -75,7 +75,7 @@ class GraphStore:
             try:
                 self.connection.execute_write(index)
                 logger.debug(f"Created index: {index[:50]}...")
-            except Exception as e:
+            except Neo4jQueryError as e:
                 logger.warning(f"Index may already exist: {e}")
 
         # Create vector indexes for semantic search
@@ -109,7 +109,7 @@ class GraphStore:
             try:
                 self.connection.execute_write(vector_index)
                 logger.info("Created vector index")
-            except Exception as e:
+            except Neo4jQueryError as e:
                 logger.warning(f"Vector index creation failed (may not be supported): {e}")
                 logger.warning("Vector search will not be available without Neo4j 5.11+")
 
@@ -146,8 +146,8 @@ class GraphStore:
             "timestamp": timestamp.isoformat(),
         }
 
-        result = self.connection.execute_query(query, params)
-        return result[0]["id"] if result else conversation_id
+        self.connection.execute_write(query, params)
+        return conversation_id
 
     def store_utterance(
         self,
@@ -215,8 +215,8 @@ class GraphStore:
                 "timestamp": timestamp.isoformat(),
             }
 
-        result = self.connection.execute_query(query, params)
-        return result[0]["id"] if result else utterance_id
+        self.connection.execute_write(query, params)
+        return utterance_id
 
     def store_source_document(
         self,
@@ -272,8 +272,8 @@ class GraphStore:
             "metadata": json.dumps(metadata) if metadata else None,
         }
 
-        result = self.connection.execute_query(query, params)
-        return result[0]["id"] if result else source_id
+        self.connection.execute_write(query, params)
+        return source_id
 
     def store_document_chunk(
         self,
@@ -337,15 +337,15 @@ class GraphStore:
             "metadata": json.dumps(metadata) if metadata else None,
         }
 
-        result = self.connection.execute_query(query, params)
-        return result[0]["id"] if result else chunk_id
+        self.connection.execute_write(query, params)
+        return chunk_id
 
     def store_extracted_entities(
         self,
         graph_document,
         utterance_id: str | None = None,
         chunk_id: str | None = None,
-        ontology_version: str | None = None,
+        ontology_version: str = "1.0.0",  # Default to current ontology version
     ):
         """Store extracted entities and relationships from LLMGraphTransformer.
 
@@ -366,9 +366,6 @@ class GraphStore:
         if utterance_id and chunk_id:
             raise ValueError("Cannot provide both utterance_id and chunk_id")
 
-        if ontology_version is None:
-            ontology_version = self.config.ontology_version
-
         source_id = utterance_id or chunk_id
         source_type = "utterance" if utterance_id else "chunk"
 
@@ -383,6 +380,124 @@ class GraphStore:
         # Store relationships
         for relationship in graph_document.relationships:
             self._store_relationship(relationship, source_id, source_type, ontology_version)
+
+    def store_validated_entities(
+        self,
+        entities: list[dict],
+        relationships: list[dict],
+        utterance_id: str,
+        ontology_version: str = "1.0.0",
+    ) -> None:
+        """Store entities and relationships from ValidationResult format.
+
+        Accepts the dict-based format from ExtractionPipeline's ValidationResult
+        instead of GraphDocument with Node objects. Uses the same MERGE queries
+        as store_extracted_entities.
+
+        Args:
+            entities: List of entity dicts with keys: id, type, name, confidence,
+                source_type, aliases, description.
+            relationships: List of relationship dicts with keys: source, target,
+                type, confidence, source_type, temporal_status, context.
+            utterance_id: Source utterance ID for provenance.
+            ontology_version: Ontology version used for extraction.
+        """
+        logger.info(
+            "Storing %d entities and %d relationships from validated extraction",
+            len(entities),
+            len(relationships),
+        )
+
+        for entity in entities:
+            self._store_validated_node(entity, utterance_id, ontology_version)
+
+        for rel in relationships:
+            self._store_validated_relationship(rel, utterance_id, ontology_version)
+
+    def _store_validated_node(self, entity: dict, utterance_id: str, ontology_version: str) -> None:
+        """Store a single entity from dict format."""
+        node_id = entity.get("id", "")
+        entity_type = entity.get("type", "Unknown")
+        display_name = entity.get("name", node_id)
+        confidence = entity.get("confidence", 0.8)
+        description = entity.get("description", "")
+
+        embed_parts = [node_id]
+        if entity_type and entity_type != "Unknown":
+            embed_parts.append(entity_type)
+        if description:
+            embed_parts.append(description)
+        embedding = self.embedding_generator.generate_embedding(" ".join(embed_parts))
+
+        query = """
+        MATCH (u:Utterance {utterance_id: $utterance_id})
+        MERGE (e:__Entity__ {id: $node_id})
+        ON CREATE SET
+            e.entity_type = $entity_type,
+            e.display_name = $display_name,
+            e.confidence = $confidence,
+            e.ontology_version = $ontology_version,
+            e.embedding = $embedding,
+            e.description = $description,
+            e.created_at = datetime()
+        ON MATCH SET
+            e.updated_at = datetime(),
+            e.entity_type = CASE WHEN e.entity_type = 'Unknown'
+                THEN $entity_type ELSE e.entity_type END,
+            e.embedding = $embedding
+        MERGE (u)-[:HAS_ENTITY]->(e)
+        """
+
+        self.connection.execute_write(
+            query,
+            {
+                "utterance_id": utterance_id,
+                "node_id": node_id,
+                "entity_type": entity_type,
+                "display_name": display_name,
+                "confidence": confidence,
+                "ontology_version": ontology_version,
+                "embedding": embedding,
+                "description": description,
+            },
+        )
+
+    def _store_validated_relationship(
+        self, rel: dict, utterance_id: str, ontology_version: str
+    ) -> None:
+        """Store a single relationship from dict format."""
+        source = rel.get("source", "")
+        target = rel.get("target", "")
+        rel_type = rel.get("type", "")
+        confidence = rel.get("confidence", 0.8)
+
+        sanitized_type = re.sub(r"[^A-Z_]", "", rel_type.upper())
+        if not sanitized_type:
+            logger.warning("Invalid relationship type '%s', skipping", rel_type)
+            return
+
+        query = f"""
+        MATCH (s:__Entity__ {{id: $source}})
+        MATCH (t:__Entity__ {{id: $target}})
+        MERGE (s)-[r:{sanitized_type}]->(t)
+        ON CREATE SET
+            r.confidence = $confidence,
+            r.ontology_version = $ontology_version,
+            r.created_at = datetime()
+        ON MATCH SET
+            r.updated_at = datetime(),
+            r.confidence = $confidence
+        """
+
+        self.connection.execute_write(
+            query,
+            {
+                "source": source,
+                "target": target,
+                "confidence": confidence,
+                "ontology_version": ontology_version,
+            },
+        )
 
     def _store_node(self, node, source_id: str, source_type: str, ontology_version: str):
         """Store a single entity node with provenance.
@@ -399,8 +514,15 @@ class GraphStore:
         properties = getattr(node, "properties", {})
 
         # Generate embedding for semantic search
-        # Use entity_id as the text to embed (could be enhanced with properties)
-        embedding = self.embedding_generator.generate_embedding(node_id)
+        # Build semantic text from available properties for richer embeddings
+        embed_parts = [node_id]
+        if entity_type and entity_type != "Unknown":
+            embed_parts.append(entity_type)
+        description = properties.get("description", "")
+        if description:
+            embed_parts.append(description)
+        embedding_text = " ".join(embed_parts)
+        embedding = self.embedding_generator.generate_embedding(embedding_text)
 
         # Build query with dynamic property setting
         # Neo4j doesn't allow nested dictionaries, so flatten properties
@@ -413,16 +535,22 @@ class GraphStore:
             "embedding": embedding,
         }
 
+        # Only allow safe property keys (alphanumeric + underscore, no Cypher special chars)
+        SAFE_PROPERTY_KEY = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
         # Add each property individually if they exist
         if properties:
             for key, value in properties.items():
+                if not SAFE_PROPERTY_KEY.match(key):
+                    logger.warning("Unsafe property key rejected: %r", key)
+                    continue
                 # Only add primitive types (string, number, boolean)
                 if isinstance(value, str | int | float | bool):
                     param_key = f"prop_{key}"
                     property_sets.append(f"e.{key} = ${param_key}")
                     params[param_key] = value
 
-        # Build the SET clause
+        # Build the ON CREATE SET clause
         base_sets = """
             e.entity_type = $entity_type,
             e.ontology_version = $ontology_version,
@@ -434,6 +562,15 @@ class GraphStore:
         else:
             all_sets = base_sets
 
+        # Build the ON MATCH SET clause (update mutable properties on re-encounter)
+        match_sets = """
+            e.updated_at = datetime(),
+            e.entity_type = CASE WHEN e.entity_type = 'Unknown' THEN $entity_type ELSE e.entity_type END,
+            e.embedding = $embedding"""
+
+        if property_sets:
+            match_sets = match_sets + ",\n            " + ",\n            ".join(property_sets)
+
         # Different query based on source type
         if source_type == "utterance":
             query = f"""
@@ -441,6 +578,8 @@ class GraphStore:
             MERGE (e:__Entity__ {{id: $node_id}})
             ON CREATE SET
                 {all_sets}
+            ON MATCH SET
+                {match_sets}
             MERGE (u)-[:HAS_ENTITY]->(e)
             """
         else:  # chunk
@@ -449,6 +588,8 @@ class GraphStore:
             MERGE (e:__Entity__ {{id: $node_id}})
             ON CREATE SET
                 {all_sets}
+            ON MATCH SET
+                {match_sets}
             MERGE (e)-[:EXTRACTED_FROM]->(c)
             """
 
@@ -472,8 +613,13 @@ class GraphStore:
         rel_type = relationship.type
         properties = getattr(relationship, "properties", {})
 
-        # Sanitize relationship type for Cypher (no spaces, special chars)
+        # Sanitize relationship type for Cypher
         rel_type_safe = rel_type.replace(" ", "_").replace("-", "_").upper()
+
+        # Validate against Cypher injection -- only alphanumeric + underscore allowed
+        if not re.match(r"^[A-Z][A-Z0-9_]*$", rel_type_safe):
+            logger.warning(f"Invalid relationship type rejected: {rel_type!r}")
+            return
 
         # Build query with dynamic property setting
         property_sets = []
@@ -483,16 +629,22 @@ class GraphStore:
             "ontology_version": ontology_version,
         }
 
+        # Only allow safe property keys (alphanumeric + underscore, no Cypher special chars)
+        SAFE_PROPERTY_KEY = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
         # Add each property individually if they exist
         if properties:
             for key, value in properties.items():
+                if not SAFE_PROPERTY_KEY.match(key):
+                    logger.warning("Unsafe property key rejected: %r", key)
+                    continue
                 # Only add primitive types (string, number, boolean)
                 if isinstance(value, str | int | float | bool):
                     param_key = f"prop_{key}"
                     property_sets.append(f"r.{key} = ${param_key}")
                     params[param_key] = value
 
-        # Build the SET clause
+        # Build the ON CREATE SET clause
         base_sets = """
             r.ontology_version = $ontology_version,
             r.created_at = datetime()"""
@@ -502,12 +654,21 @@ class GraphStore:
         else:
             all_sets = base_sets
 
+        # Build the ON MATCH SET clause (update mutable properties on re-encounter)
+        match_sets = """
+            r.updated_at = datetime()"""
+
+        if property_sets:
+            match_sets = match_sets + ",\n            " + ",\n            ".join(property_sets)
+
         query = f"""
         MATCH (source:__Entity__ {{id: $source_id}})
         MATCH (target:__Entity__ {{id: $target_id}})
         MERGE (source)-[r:{rel_type_safe}]->(target)
         ON CREATE SET
             {all_sets}
+        ON MATCH SET
+            {match_sets}
         """
 
         self.connection.execute_write(query, params)
@@ -585,7 +746,7 @@ class GraphStore:
         try:
             results = self.connection.execute_query(query, params)
             return [dict(record) for record in results]
-        except Exception as e:
+        except (Neo4jQueryError, Exception) as e:  # May also get embedding errors
             logger.error(f"Vector search failed: {e}")
             logger.error("Ensure Neo4j 5.11+ is installed and vector index is created")
             raise
@@ -645,7 +806,7 @@ class GraphStore:
         try:
             results = self.connection.execute_query(query, params)
             return [dict(record) for record in results]
-        except Exception as e:
+        except (Neo4jQueryError, Exception) as e:  # May also get embedding errors
             logger.error(f"Document chunk search failed: {e}")
             logger.error(
                 "Ensure Neo4j 5.11+ is installed and chunk_embeddings vector index is created"
@@ -676,10 +837,11 @@ class GraphStore:
                 'properties': dict
             }
         """
+        if not isinstance(max_hops, int) or max_hops < 1 or max_hops > 5:
+            raise ValueError(f"max_hops must be an integer between 1 and 5, got {max_hops}")
+
         if relationship_types:
-            rel_filter = (
-                f"WHERE ALL(r in relationships(path) WHERE type(r) IN {relationship_types})"
-            )
+            rel_filter = "WHERE ALL(r in relationships(path) WHERE type(r) IN $relationship_types)"
         else:
             rel_filter = ""
 
@@ -698,7 +860,9 @@ class GraphStore:
             properties(rels[idx]) as properties
         """
 
-        params = {"entity_id": entity_id}
+        params: dict[str, Any] = {"entity_id": entity_id}
+        if relationship_types:
+            params["relationship_types"] = relationship_types
         results = self.connection.execute_query(query, params)
 
         return [dict(record) for record in results]
@@ -718,7 +882,7 @@ class GraphStore:
         Returns:
             List of relationship dicts
         """
-        rel_filter = f"AND type(r) IN {relationship_types}" if relationship_types else ""
+        rel_filter = "AND type(r) IN $relationship_types" if relationship_types else ""
 
         query = f"""
         MATCH (user:__Entity__ {{id: $user_id}})-[r]-(entity:__Entity__)
@@ -735,7 +899,9 @@ class GraphStore:
             END as direction
         """
 
-        params = {"user_id": user_id, "entity_ids": entity_ids}
+        params: dict[str, Any] = {"user_id": user_id, "entity_ids": entity_ids}
+        if relationship_types:
+            params["relationship_types"] = relationship_types
 
         results = self.connection.execute_query(query, params)
         return [dict(record) for record in results]
@@ -760,9 +926,9 @@ class GraphStore:
         """
         filters = []
         if relationship_types:
-            filters.append(f"type(r) IN {relationship_types}")
+            filters.append("type(r) IN $relationship_types")
         if entity_types:
-            filters.append(f"entity.entity_type IN {entity_types}")
+            filters.append("entity.entity_type IN $entity_types")
 
         where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
 
@@ -777,9 +943,35 @@ class GraphStore:
         ORDER BY entity.entity_type, entity.id
         """
 
-        params = {"user_id": user_id}
+        params: dict[str, Any] = {"user_id": user_id}
+        if relationship_types:
+            params["relationship_types"] = relationship_types
+        if entity_types:
+            params["entity_types"] = entity_types
         results = self.connection.execute_query(query, params)
         return [dict(record) for record in results]
+
+    def ensure_mist_identity(self) -> None:
+        """Create the MistIdentity singleton node if it does not exist.
+
+        MistIdentity is the hub of MIST's self-model. All internal entities
+        (MistTrait, MistCapability, MistPreference, MistUncertainty) link
+        to it via HAS_TRAIT, HAS_CAPABILITY, HAS_PREFERENCE, IS_UNCERTAIN_ABOUT.
+        """
+        query = """
+        MERGE (m:__Entity__:MistIdentity {id: 'mist-identity'})
+        ON CREATE SET
+            m.entity_type = 'MistIdentity',
+            m.display_name = 'MIST',
+            m.knowledge_domain = 'internal',
+            m.personality_summary = 'A cognitive architecture with persistent memory.',
+            m.confidence = 1.0,
+            m.status = 'active',
+            m.created_at = datetime(),
+            m.ontology_version = '1.0.0'
+        """
+        self.connection.execute_write(query)
+        logger.debug("MistIdentity singleton ensured")
 
     def close(self):
         """Close Neo4j connection."""

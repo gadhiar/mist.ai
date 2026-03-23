@@ -12,9 +12,9 @@ import logging
 from datetime import datetime
 
 from backend.knowledge.config import KnowledgeConfig
-from backend.knowledge.extraction import EntityExtractor
+from backend.knowledge.extraction.pipeline import ExtractionPipeline
 from backend.knowledge.models import RegenerationReport, Utterance
-from backend.knowledge.storage import GraphStore, Neo4jConnection
+from backend.knowledge.storage.graph_store import GraphStore
 
 logger = logging.getLogger(__name__)
 
@@ -31,17 +31,23 @@ class GraphRegenerator:
         print(f"Processed {report.processed} utterances")
     """
 
-    def __init__(self, config: KnowledgeConfig):
+    def __init__(
+        self,
+        config: KnowledgeConfig,
+        extraction_pipeline: ExtractionPipeline,
+        graph_store: GraphStore,
+    ) -> None:
         """Initialize graph regenerator.
 
         Args:
-            config: Knowledge system configuration
+            config: Knowledge system configuration.
+            extraction_pipeline: ExtractionPipeline (with include_curation=False).
+            graph_store: Graph store for entity storage and graph operations.
         """
         self.config = config
-        self.connection = Neo4jConnection(config.neo4j)
-        self.extractor = EntityExtractor(config, enable_property_enrichment=True)
-        self.graph_store = GraphStore(config)
-
+        self._pipeline = extraction_pipeline
+        self.graph_store = graph_store
+        self.connection = graph_store.connection
         logger.info("GraphRegenerator initialized")
 
     async def regenerate_all(self) -> RegenerationReport:
@@ -363,34 +369,33 @@ class GraphRegenerator:
         logger.info("Conversation entities deleted")
 
     async def _extract_and_store(self, utterance: Utterance) -> tuple[int, int]:
-        """Re-extract entities from utterance and store.
+        """Re-extract entities from utterance via ExtractionPipeline.
 
         Args:
-            utterance: Utterance to process
+            utterance: Utterance to process.
 
         Returns:
-            Tuple of (entities_count, relationships_count)
+            Tuple of (entities_count, relationships_count).
         """
         try:
-            # Extract
-            graph_docs = await self.extractor.extract_from_utterance(
+            result = await self._pipeline.extract_from_utterance(
                 utterance=utterance.text,
-                conversation_history=[],  # Could add context later
-                metadata=utterance.metadata,
+                conversation_history=[],
+                event_id=f"regen_{utterance.utterance_id}",
+                session_id=utterance.conversation_id or "regeneration",
             )
 
-            # Store
-            if graph_docs and graph_docs[0].nodes:
-                self.graph_store.store_extracted_entities(
-                    graph_document=graph_docs[0],
+            if result.entities:
+                self.graph_store.store_validated_entities(
+                    entities=result.entities,
+                    relationships=result.relationships,
                     utterance_id=utterance.utterance_id,
                     ontology_version=self.config.ontology_version,
                 )
-
-                return len(graph_docs[0].nodes), len(graph_docs[0].relationships)
+                return len(result.entities), len(result.relationships)
 
             return 0, 0
 
         except Exception as e:
-            logger.error(f"Extraction failed for utterance {utterance.utterance_id}: {e}")
+            logger.error("Extraction failed for utterance %s: %s", utterance.utterance_id, e)
             raise

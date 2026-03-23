@@ -6,7 +6,9 @@ Handles connection to Neo4j database with automatic retries and health checks.
 import logging
 
 from neo4j import Driver, GraphDatabase
+from neo4j.exceptions import Neo4jError, ServiceUnavailable
 
+from backend.errors import MistError, Neo4jConnectionError, Neo4jQueryError
 from backend.knowledge.config import Neo4jConfig
 
 logger = logging.getLogger(__name__)
@@ -27,14 +29,11 @@ class Neo4jConnection:
         self.config = config
         self._driver: Driver | None = None
 
-    def connect(self) -> Driver:
+    def connect(self) -> None:
         """Establish connection to Neo4j database.
 
-        Returns:
-            Neo4j driver instance
-
         Raises:
-            Exception: If connection fails
+            Neo4jConnectionError: If connection fails.
         """
         if self._driver is None:
             logger.info(f"Connecting to Neo4j at {self.config.uri}")
@@ -46,15 +45,13 @@ class Neo4jConnection:
 
                 # Verify connectivity
                 self._driver.verify_connectivity()
-                logger.info(" Successfully connected to Neo4j")
+                logger.info("Successfully connected to Neo4j")
 
-            except Exception as e:
+            except (ServiceUnavailable, Neo4jError) as e:
                 logger.error(f"Failed to connect to Neo4j: {e}")
-                raise
+                raise Neo4jConnectionError(f"Failed to connect to Neo4j: {e}") from e
 
-        return self._driver
-
-    def disconnect(self):
+    def disconnect(self) -> None:
         """Close connection to Neo4j database."""
         if self._driver is not None:
             self._driver.close()
@@ -69,38 +66,54 @@ class Neo4jConnection:
         try:
             self._driver.verify_connectivity()
             return True
-        except Exception:
+        except (Neo4jError, ServiceUnavailable):
             return False
 
-    def execute_query(self, query: str, parameters: dict | None = None) -> list:
+    def execute_query(self, query: str, params: dict | None = None) -> list[dict]:
         """Execute a Cypher query.
 
         Args:
-            query: Cypher query string
-            parameters: Query parameters
+            query: Cypher query string.
+            params: Query parameters.
 
         Returns:
-            List of query results
+            List of result records as dicts.
+
+        Raises:
+            Neo4jQueryError: If the query fails.
         """
         if self._driver is None:
             self.connect()
 
-        with self._driver.session(database=self.config.database) as session:
-            result = session.run(query, parameters or {})
-            return list(result)
+        try:
+            with self._driver.session(database=self.config.database) as session:
+                result = session.run(query, params or {})
+                return [record.data() for record in result]
+        except Neo4jError as e:
+            raise Neo4jQueryError(f"Query execution failed: {e}") from e
 
-    def execute_write(self, query: str, parameters: dict | None = None):
+    def execute_write(self, query: str, params: dict | None = None) -> list[dict]:
         """Execute a write transaction.
 
         Args:
-            query: Cypher query string
-            parameters: Query parameters
+            query: Cypher query string.
+            params: Query parameters.
+
+        Returns:
+            List of result records as dicts.
+
+        Raises:
+            Neo4jQueryError: If the write transaction fails.
         """
         if self._driver is None:
             self.connect()
 
-        with self._driver.session(database=self.config.database) as session:
-            session.execute_write(lambda tx: tx.run(query, parameters or {}))
+        try:
+            with self._driver.session(database=self.config.database) as session:
+                result = session.execute_write(lambda tx: list(tx.run(query, params or {})))
+                return [record.data() for record in result]
+        except Neo4jError as e:
+            raise Neo4jQueryError(f"Write transaction failed: {e}") from e
 
     def health_check(self) -> dict:
         """Perform health check on Neo4j connection.
@@ -130,7 +143,7 @@ class Neo4jConnection:
                 "message": "Neo4j connection is healthy",
             }
 
-        except Exception as e:
+        except (Neo4jError, MistError) as e:
             return {
                 "status": "unhealthy",
                 "connected": False,

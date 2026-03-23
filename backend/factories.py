@@ -1,0 +1,225 @@
+"""Composition root for MIST.AI backend.
+
+All dependency wiring lives here. Classes accept required constructor
+params -- this module provides the factory functions that know how to
+assemble them with real implementations.
+
+Usage:
+    from backend.factories import build_graph_store
+    graph_store = build_graph_store(config)
+
+For tests, bypass factories and pass fakes directly to constructors.
+"""
+
+import logging
+
+from langchain_ollama import ChatOllama
+
+from backend.interfaces import EmbeddingProvider, EventStoreProvider, GraphConnection
+from backend.knowledge.config import KnowledgeConfig
+from backend.knowledge.curation.confidence import ConfidenceManager
+from backend.knowledge.curation.conflict_resolver import ConflictResolver
+from backend.knowledge.curation.deduplication import EntityDeduplicator
+from backend.knowledge.curation.graph_writer import CurationGraphWriter
+from backend.knowledge.curation.pipeline import CurationPipeline
+from backend.knowledge.embeddings import EmbeddingGenerator
+from backend.knowledge.extraction.confidence import ConfidenceScorer
+from backend.knowledge.extraction.normalizer import EntityNormalizer
+from backend.knowledge.extraction.ontology_extractor import OntologyConstrainedExtractor
+from backend.knowledge.extraction.pipeline import ExtractionPipeline
+from backend.knowledge.extraction.preprocessor import PreProcessor
+from backend.knowledge.extraction.temporal import TemporalResolver
+from backend.knowledge.extraction.validator import ExtractionValidator
+from backend.knowledge.storage.graph_executor import GraphExecutor
+from backend.knowledge.storage.graph_store import GraphStore
+from backend.knowledge.storage.neo4j_connection import Neo4jConnection
+
+logger = logging.getLogger(__name__)
+
+
+def build_neo4j_connection(config: KnowledgeConfig) -> Neo4jConnection:
+    """Create and connect a Neo4jConnection."""
+    conn = Neo4jConnection(config.neo4j)
+    conn.connect()
+    return conn
+
+
+def build_graph_executor(
+    config: KnowledgeConfig, connection: GraphConnection | None = None
+) -> GraphExecutor:
+    """Create a GraphExecutor with async boundary."""
+    conn = connection or build_neo4j_connection(config)
+    return GraphExecutor(conn)
+
+
+def build_graph_store(
+    config: KnowledgeConfig,
+    connection: GraphConnection | None = None,
+    embedding_generator: EmbeddingProvider | None = None,
+) -> GraphStore:
+    """Create a GraphStore with injected dependencies."""
+    conn = connection or build_neo4j_connection(config)
+    embeddings = embedding_generator or EmbeddingGenerator(config.embedding.model_name)
+    return GraphStore(conn, embeddings)
+
+
+def build_curation_pipeline(config: KnowledgeConfig, executor: GraphExecutor) -> CurationPipeline:
+    """Create a fully wired CurationPipeline."""
+    embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+    confidence_mgr = ConfidenceManager()
+    return CurationPipeline(
+        deduplicator=EntityDeduplicator(executor, embedding_provider, confidence_mgr),
+        conflict_resolver=ConflictResolver(executor),
+        graph_writer=CurationGraphWriter(executor, embedding_provider, confidence_mgr),
+    )
+
+
+def build_extraction_pipeline(
+    config: KnowledgeConfig,
+    graph_store: GraphStore | None = None,
+    include_curation: bool = True,
+    include_internal_derivation: bool = True,
+) -> ExtractionPipeline:
+    """Create a fully wired ExtractionPipeline."""
+    gs = graph_store or build_graph_store(config)
+    executor = build_graph_executor(config, gs.connection)
+
+    curation = build_curation_pipeline(config, executor) if include_curation else None
+
+    llm = ChatOllama(
+        model=config.llm.model,
+        base_url=config.llm.base_url,
+        temperature=0.0,
+        format="json",
+    )
+
+    internal_deriver = None
+    if include_internal_derivation:
+        from backend.knowledge.extraction.internal_derivation import InternalKnowledgeDeriver
+
+        internal_deriver = InternalKnowledgeDeriver(llm=llm, executor=executor)
+        # Ensure MistIdentity singleton exists (sync call, OK in factory context)
+        gs.ensure_mist_identity()
+
+    return ExtractionPipeline(
+        preprocessor=PreProcessor(),
+        extractor=OntologyConstrainedExtractor(config, llm=llm),
+        confidence_scorer=ConfidenceScorer(),
+        temporal_resolver=TemporalResolver(),
+        normalizer=EntityNormalizer(
+            embedding_generator=gs.embedding_generator,
+            executor=executor,
+        ),
+        validator=ExtractionValidator(
+            min_confidence=config.extraction.min_extraction_confidence,
+        ),
+        graph_store=gs,
+        curation_pipeline=curation,
+        internal_deriver=internal_deriver,
+    )
+
+
+def build_conversation_handler(
+    config: KnowledgeConfig,
+    model_name: str = "qwen2.5:7b",
+):
+    """Create a fully wired ConversationHandler."""
+    from backend.chat.conversation_handler import ConversationHandler
+
+    gs = build_graph_store(config)
+    pipeline = build_extraction_pipeline(config, graph_store=gs, include_curation=True)
+    return ConversationHandler(
+        config=config,
+        graph_store=gs,
+        extraction_pipeline=pipeline,
+        model_name=model_name,
+    )
+
+
+def build_graph_regenerator(config: KnowledgeConfig):
+    """Create a fully wired GraphRegenerator (no curation)."""
+    from backend.knowledge.regeneration.graph_regenerator import GraphRegenerator
+
+    gs = build_graph_store(config)
+    pipeline = build_extraction_pipeline(
+        config, graph_store=gs, include_curation=False, include_internal_derivation=False
+    )
+    return GraphRegenerator(
+        config=config,
+        extraction_pipeline=pipeline,
+        graph_store=gs,
+    )
+
+
+def build_curation_scheduler(
+    config: KnowledgeConfig,
+    event_store: EventStoreProvider | None = None,
+):
+    """Create a fully wired CurationScheduler with all maintenance jobs.
+
+    Args:
+        config: Knowledge subsystem configuration.
+        event_store: Optional event store for SelfReflectionJob. When None,
+            the reflection job returns immediately with zero counts.
+    """
+    from langchain_ollama import ChatOllama
+
+    from backend.knowledge.curation.centrality import CentralityAnalyzer
+    from backend.knowledge.curation.community import CommunityDetector
+    from backend.knowledge.curation.confidence_decay import ConfidenceDecayJob
+    from backend.knowledge.curation.embedding_maintenance import EmbeddingMaintenance
+    from backend.knowledge.curation.health import GraphHealthScorer
+    from backend.knowledge.curation.orphan_detector import OrphanDetector
+    from backend.knowledge.curation.scheduler import CurationScheduler, JobConfig
+    from backend.knowledge.curation.self_reflection import SelfReflectionJob
+    from backend.knowledge.curation.staleness import StalenessDetector
+    from backend.knowledge.extraction.internal_derivation import InternalKnowledgeDeriver
+    from backend.knowledge.extraction.signal_detector import SignalDetector
+
+    gs = build_graph_store(config)
+    executor = build_graph_executor(config, gs.connection)
+    embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+
+    llm = ChatOllama(
+        model=config.llm.model,
+        base_url=config.llm.base_url,
+        temperature=0.0,
+        format="json",
+    )
+    internal_deriver = InternalKnowledgeDeriver(llm=llm, executor=executor)
+
+    return CurationScheduler(
+        jobs=[
+            (
+                JobConfig(name="confidence_decay", interval_seconds=86400),
+                ConfidenceDecayJob(executor),
+            ),
+            (
+                JobConfig(name="staleness_detection", interval_seconds=604800),
+                StalenessDetector(executor),
+            ),
+            (JobConfig(name="orphan_detection", interval_seconds=604800), OrphanDetector(executor)),
+            (JobConfig(name="health_scoring", interval_seconds=86400), GraphHealthScorer(executor)),
+            (
+                JobConfig(name="self_reflection", interval_seconds=86400),
+                SelfReflectionJob(
+                    executor=executor,
+                    internal_deriver=internal_deriver,
+                    signal_detector=SignalDetector(),
+                    event_store=event_store,
+                ),
+            ),
+            (
+                JobConfig(name="community_detection", interval_seconds=604800, enabled=False),
+                CommunityDetector(executor),
+            ),
+            (
+                JobConfig(name="centrality_analysis", interval_seconds=604800, enabled=False),
+                CentralityAnalyzer(executor),
+            ),
+            (
+                JobConfig(name="embedding_maintenance", interval_seconds=2592000, enabled=False),
+                EmbeddingMaintenance(executor, embedding_provider),
+            ),
+        ]
+    )

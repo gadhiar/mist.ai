@@ -134,6 +134,24 @@ class ExtractionConfig:
 
 
 @dataclass
+class EventStoreConfig:
+    """Event store (Layer 1) configuration."""
+
+    enabled: bool = True  # Master switch for event store recording
+    db_path: str | None = None  # Defaults to ~/.mist/event_store.db
+    audio_dir: str | None = None  # Defaults to ~/.mist/audio/
+
+    @classmethod
+    def from_env(cls) -> "EventStoreConfig":
+        """Load configuration from environment variables."""
+        return cls(
+            enabled=os.getenv("EVENT_STORE_ENABLED", "true").lower() == "true",
+            db_path=os.getenv("EVENT_STORE_DB_PATH"),
+            audio_dir=os.getenv("EVENT_STORE_AUDIO_DIR"),
+        )
+
+
+@dataclass
 class KnowledgeConfig:
     """Complete knowledge system configuration."""
 
@@ -141,6 +159,12 @@ class KnowledgeConfig:
     llm: LLMConfig
     embedding: EmbeddingConfig
     extraction: ExtractionConfig
+
+    # Event store (Layer 1)
+    event_store: EventStoreConfig = None  # type: ignore[assignment]
+
+    # Feature flags
+    enable_knowledge_integration: bool = True  # Master switch for knowledge system
 
     # System settings
     ontology_version: str = "1.0.0"  # Current ontology version
@@ -154,6 +178,11 @@ class KnowledgeConfig:
         0.4  # Similarity threshold for auto-injection (lowered for permissive matching)
     )
 
+    def __post_init__(self):
+        """Ensure event_store config is never None."""
+        if self.event_store is None:
+            self.event_store = EventStoreConfig()
+
     @classmethod
     def from_env(cls) -> "KnowledgeConfig":
         """Load complete configuration from environment."""
@@ -162,6 +191,9 @@ class KnowledgeConfig:
             llm=LLMConfig.from_env(),
             embedding=EmbeddingConfig.from_env(),
             extraction=ExtractionConfig.from_env(),
+            event_store=EventStoreConfig.from_env(),
+            enable_knowledge_integration=os.getenv("ENABLE_KNOWLEDGE_INTEGRATION", "true").lower()
+            == "true",
             ontology_version=os.getenv("ONTOLOGY_VERSION", "1.0.0"),
             enable_versioning=os.getenv("ENABLE_VERSIONING", "true").lower() == "true",
             enable_provenance=os.getenv("ENABLE_PROVENANCE", "true").lower() == "true",

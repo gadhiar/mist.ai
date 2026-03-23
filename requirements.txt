@@ -35,6 +35,7 @@ openai-whisper>=20231117
 
 # Development & Code Quality
 pytest==7.4.4
+pytest-asyncio>=0.23.0
 pytest-cov==4.1.0
 black==24.1.1
 ruff==0.1.15

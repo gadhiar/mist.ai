@@ -42,7 +42,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Global state
-active_connections: list[WebSocket] = []
+active_connections: set[WebSocket] = set()
+active_connections_lock = asyncio.Lock()
 message_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 voice_processor: VoiceProcessor | None = None
 config = DEFAULT_CONFIG
@@ -54,13 +55,16 @@ async def broadcast_messages():
         message = await message_queue.get()
 
         # Send to all connected clients
-        for websocket in active_connections[:]:
-            try:
-                await websocket.send_json(message)
-            except Exception as e:
-                logger.error(f"Error sending to client: {e}")
-                if websocket in active_connections:
-                    active_connections.remove(websocket)
+        async with active_connections_lock:
+            stale = []
+            for websocket in active_connections:
+                try:
+                    await websocket.send_json(message)
+                except Exception as e:
+                    logger.error(f"Error sending to client: {e}")
+                    stale.append(websocket)
+            for ws in stale:
+                active_connections.discard(ws)
 
         message_queue.task_done()
 
@@ -144,12 +148,18 @@ async def websocket_endpoint(websocket: WebSocket):
         {"type": "error", "message": "..."}
     """
     await websocket.accept(headers=None)
-    active_connections.append(websocket)
+    async with active_connections_lock:
+        active_connections.add(websocket)
 
     logger.info(f"Client connected (total: {len(active_connections)})")
 
     # Ensure voice processor is initialized
-    assert voice_processor is not None, "Voice processor not initialized"
+    if voice_processor is None:
+        await websocket.send_json({"type": "error", "message": "Server not ready"})
+        await websocket.close(code=1013)
+        async with active_connections_lock:
+            active_connections.discard(websocket)
+        return
 
     # Send welcome message
     await websocket.send_json({"type": "status", "message": "Connected to Mist.AI Voice Server"})
@@ -159,47 +169,58 @@ async def websocket_endpoint(websocket: WebSocket):
             # Receive message from client
             data = await websocket.receive_json()
 
+            msg_type = data.get("type")
+            if msg_type is None:
+                await websocket.send_json({"type": "error", "message": "Missing 'type' field"})
+                continue
+
             # Handle different message types
-            if data["type"] == "audio":
+            if msg_type == "audio":
                 # Complete audio from client (no VAD, just transcribe and process)
-                audio_data = np.asarray(data["audio"], dtype=np.float32)
+                audio_payload = data.get("audio")
+                if audio_payload is None:
+                    await websocket.send_json({"type": "error", "message": "Missing 'audio' field"})
+                    continue
+                audio_data = np.asarray(audio_payload, dtype=np.float32)
                 sample_rate = data.get("sample_rate", 16000)
 
                 logger.info(f"Received complete audio: {len(audio_data)} samples @ {sample_rate}Hz")
 
                 # Process complete audio directly (transcribe -> LLM -> TTS)
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     None, voice_processor.process_complete_audio, audio_data, sample_rate
                 )
 
-            elif data["type"] == "text":
+            elif msg_type == "text":
                 # Text message (manual input)
-                user_text = data["text"]
+                user_text = data.get("text", "")
+                if not user_text:
+                    continue
                 logger.info(f"Text message from client: '{user_text}'")
 
                 # Send to message queue
                 await message_queue.put({"type": "transcription", "text": user_text})
 
                 # Process (will spawn thread internally)
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     None, voice_processor._process_conversation_turn, user_text
                 )
 
-            elif data["type"] == "interrupt":
+            elif msg_type == "interrupt":
                 # Manual interrupt request
                 logger.info("Manual interrupt requested")
                 voice_processor.interrupt_flag.set()
 
                 await websocket.send_json({"type": "status", "message": "Interrupt acknowledged"})
 
-            elif data["type"] == "reset_vad":
+            elif msg_type == "reset_vad":
                 # Reset VAD state
                 voice_processor.reset_vad()
                 await websocket.send_json({"type": "status", "message": "VAD reset"})
 
-            elif data["type"] == "config":
+            elif msg_type == "config":
                 # Update configuration (future feature)
                 logger.info("Config update requested (not implemented)")
                 await websocket.send_json(
@@ -207,15 +228,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 )
 
             else:
-                logger.warning(f"Unknown message type: {data.get('type')}")
+                logger.warning(f"Unknown message type: {msg_type}")
 
     except WebSocketDisconnect:
         logger.info(f"Client disconnected (remaining: {len(active_connections) - 1})")
     except Exception as e:
         logger.error(f"WebSocket error: {e}", exc_info=True)
     finally:
-        if websocket in active_connections:
-            active_connections.remove(websocket)
+        async with active_connections_lock:
+            active_connections.discard(websocket)
 
 
 if __name__ == "__main__":

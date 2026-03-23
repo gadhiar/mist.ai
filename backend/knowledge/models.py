@@ -1,11 +1,20 @@
 """Knowledge System Data Models.
 
 Core data structures for working with the knowledge graph.
+
+Includes both the original retrieval/session models and Phase 1B
+extraction pipeline models (re-exported from their source modules).
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+
+# Re-export Phase 1B extraction models for convenience.
+# Canonical definitions live in their respective modules.
+from backend.knowledge.extraction.ontology_extractor import ExtractionResult  # noqa: F401
+from backend.knowledge.extraction.preprocessor import PreProcessedInput  # noqa: F401
+from backend.knowledge.extraction.validator import ValidationResult  # noqa: F401
 
 
 @dataclass

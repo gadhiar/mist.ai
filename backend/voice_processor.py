@@ -68,7 +68,7 @@ class VoiceProcessor:
         log_timestamp("Initializing voice processor...")
 
         # Save event loop reference for VAD callbacks
-        self.loop = asyncio.get_event_loop()
+        self.loop = asyncio.get_running_loop()
 
         # Initialize model manager with event loop
         self.models = ModelManager(self.config, event_loop=self.loop)

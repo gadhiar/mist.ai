@@ -23,8 +23,8 @@ from pathlib import Path
 # Add backend to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
+from backend.factories import build_graph_store
 from backend.knowledge.config import KnowledgeConfig
-from backend.knowledge.storage.graph_store import GraphStore
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -37,7 +37,7 @@ class DocumentationSeeder:
 
     def __init__(self):
         self.config = KnowledgeConfig.from_env()
-        self.graph_store = GraphStore(self.config)
+        self.graph_store = build_graph_store(self.config)
 
         # Documentation paths
         self.docs_root = Path(__file__).parent.parent.parent.parent / "docs"
@@ -236,7 +236,7 @@ class DocumentationSeeder:
         print("  LLM can optionally extract entities from chunks into KG")
         print("\nThe RAG corpus is now seeded with MIST documentation!")
         print("Use search_documents tool for retrieval")
-        print("Use extract_knowledge_from_document for selective extraction")
+        print("Knowledge extraction happens automatically during conversations")
         print("=" * 60 + "\n")
 
 

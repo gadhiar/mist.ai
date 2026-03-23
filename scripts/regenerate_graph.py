@@ -32,14 +32,20 @@ Note: This script automatically handles schema initialization, so you don't
 need to run any other scripts first. Just make sure Neo4j is running!
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import logging
 import sys
+from typing import TYPE_CHECKING
 
+from backend.factories import build_graph_regenerator
 from backend.knowledge.config import get_config
-from backend.knowledge.regeneration import GraphRegenerator
 from backend.knowledge.storage import GraphStore, Neo4jConnection
+
+if TYPE_CHECKING:
+    from backend.knowledge.regeneration.graph_regenerator import GraphRegenerator
 
 # Configure logging
 logging.basicConfig(
@@ -242,7 +248,7 @@ Examples:
     # Initialize regenerator
     logger.info("Step 2: Initializing regenerator...")
     try:
-        regenerator = GraphRegenerator(config)
+        regenerator = build_graph_regenerator(config)
         logger.info("GraphRegenerator initialized")
     except Exception as e:
         logger.error(f"Failed to initialize GraphRegenerator: {e}")

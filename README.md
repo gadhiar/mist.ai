@@ -93,12 +93,7 @@ python initialize_schema.py
 # Start backend
 python backend/server.py     # Listens on ws://localhost:8001
 
-# Test with CLI client (new terminal)
-python cli_client/voice_client.py
-```
-
-**Flutter frontend** (in development):
-```bash
+# Flutter frontend
 cd mist_desktop && flutter pub get && flutter run -d windows
 ```
 
@@ -148,7 +143,6 @@ See [REPOSITORY_STRUCTURE.md](REPOSITORY_STRUCTURE.md) for the full tree. Key di
 mist.ai/
   backend/              # Python -- FastAPI server, voice pipeline, knowledge system
   mist_desktop/         # Flutter -- cross-platform desktop UI
-  cli_client/           # Python -- CLI voice test client
   dependencies/csm/     # Modified Sesame CSM TTS fork (Apache 2.0)
   docs/                 # Guides, setup, architecture decisions
 ```

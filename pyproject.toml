@@ -89,9 +89,12 @@ exclude = [
 
 [tool.ruff.per-file-ignores]
 "__init__.py" = ["F401"]  # Allow unused imports in __init__.py
+"backend/interfaces.py" = ["D102"]  # Protocol stubs have no method bodies to document
+"tests/mocks/*.py" = ["D102"]  # Test fake methods are self-documenting via class docstrings
+"tests/**/*.py" = ["D101", "D102"]  # Test classes/methods use descriptive names, not docstrings
 
 [tool.ruff.isort]
-known-first-party = ["backend", "cli_client"]
+known-first-party = ["backend"]
 section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
 
 [tool.ruff.pydocstyle]
@@ -155,6 +158,7 @@ addopts = [
     "--strict-config",
     "--showlocals",
 ]
+asyncio_mode = "strict"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
@@ -176,9 +180,9 @@ show_missing = true
 skip_covered = false
 
 [tool.bandit]
-exclude_dirs = ["tests", "dependencies", ".venv", "venv"]
+exclude_dirs = ["tests", "dependencies", ".venv", "venv", "scripts"]
 skips = ["B101"]  # Skip assert_used (we use asserts appropriately)
 
 [tool.codespell]
 skip = "*.git,*.venv,venv,*.pyc,*.egg-info,*.lock,mist_desktop,dependencies"
-ignore-words-list = "crate,nd,te,thre,hass,bloc,lod"
+ignore-words-list = "crate,nd,te,thre,hass,bloc,lod,deriver"
