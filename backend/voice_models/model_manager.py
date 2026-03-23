@@ -233,9 +233,21 @@ class ModelManager:
 
         logger.info("TTS worker thread exiting")
 
-    def wait_for_tts_warmup(self):
-        """Wait for TTS worker to finish warming up."""
-        msg_type, _ = self.tts_result_queue.get()
+    def wait_for_tts_warmup(self, timeout: float = 120.0):
+        """Wait for TTS worker to finish warming up.
+
+        Args:
+            timeout: Maximum seconds to wait for warmup (default 120s).
+
+        Raises:
+            RuntimeError: If warmup times out or reports failure.
+        """
+        try:
+            msg_type, _ = self.tts_result_queue.get(timeout=timeout)
+        except queue.Empty:
+            raise RuntimeError(
+                f"TTS warmup timed out after {timeout}s - model may have failed to load"
+            ) from None
         if msg_type != "warmup_complete":
             raise RuntimeError("TTS warmup failed")
 
@@ -456,7 +468,6 @@ Match your response depth to what the user is asking for - be concise when appro
         if not self.config.tts_enabled or self.tts is None:
             logger.debug("TTS disabled - skipping audio generation")
             return
-            yield  # Make this a generator
 
         # Preprocess text (prosody-preserving substitutions)
         preprocessed_text = preprocess_text_for_tts(text)
@@ -756,6 +767,10 @@ Match your response depth to what the user is asking for - be concise when appro
             + f"text_estimate={estimated_ms}ms, words={words})"
         )
 
+        # Guard against uninitialized TTS before accessing profile
+        if self.tts is None:
+            raise RuntimeError("TTS not initialized - worker thread may have failed to start")
+
         # Submit generation request to worker thread
         self.tts_request_queue.put(
             (
@@ -770,8 +785,18 @@ Match your response depth to what the user is asking for - be concise when appro
         )
 
         # Yield audio chunks from result queue
+        RESULT_QUEUE_TIMEOUT = 30.0
         while True:
-            msg_type, gen_id, data = self.tts_result_queue.get()
+            try:
+                msg_type, gen_id, data = self.tts_result_queue.get(timeout=RESULT_QUEUE_TIMEOUT)
+            except queue.Empty:
+                logger.error(
+                    f"TTS generation timed out after {RESULT_QUEUE_TIMEOUT}s "
+                    "- worker may be stuck"
+                )
+                raise RuntimeError(
+                    f"TTS generation timeout after {RESULT_QUEUE_TIMEOUT}s"
+                ) from None
 
             # Skip chunks from old generations
             if gen_id != current_gen_id:
