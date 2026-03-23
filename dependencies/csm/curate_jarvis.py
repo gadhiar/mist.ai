@@ -526,9 +526,10 @@ def main() -> None:
     print(f"\n[STAGE 5] Selecting reference clips...")
     reference_clips = select_reference_clips(ranked)
 
-    # Remove reference clips from training set
+    # Remove reference clips from training set and cap at 495
     ref_filenames = {clip["filename"] for clip in reference_clips}
     training_clips = [r for r in ranked if r["filename"] not in ref_filenames]
+    training_clips = training_clips[:495]
     print(f"[STAGE 5] Training: {len(training_clips)}, Reference: {len(reference_clips)}")
 
     # ------------------------------------------------------------------
@@ -550,10 +551,10 @@ def main() -> None:
             training_transcriptions[clip["filename"]] = clip["transcription"]
     print(f"  Copied {len(training_clips)} training clips to {OUTPUT_DIR}")
 
-    # Copy reference clips
-    for clip in reference_clips:
+    # Copy reference clips with sequential naming
+    for i, clip in enumerate(reference_clips):
         src = resampled_dir / clip["filename"]
-        dst = REFERENCE_DIR / clip["filename"]
+        dst = REFERENCE_DIR / f"ref_{i + 1:03d}.wav"
         if src.exists():
             shutil.copy2(str(src), str(dst))
     print(f"  Copied {len(reference_clips)} reference clips to {REFERENCE_DIR}")
@@ -562,6 +563,7 @@ def main() -> None:
     generate_lora_cache(OUTPUT_DIR, training_transcriptions)
 
     # Write curation report
+    total_training_duration_min = sum(c["duration"] for c in training_clips) / 60
     report = {
         "source_dir": str(SOURCE_DIR),
         "total_source_files": len(source_files),
@@ -570,6 +572,7 @@ def main() -> None:
         "total_rejected": rejected_count,
         "training_clips": len(training_clips),
         "reference_clips": len(reference_clips),
+        "total_training_duration_min": round(total_training_duration_min, 2),
         "thresholds": {
             "spectral_flatness_90pctl": sf_threshold,
             "rms_std_90pctl": rms_threshold,
@@ -586,11 +589,12 @@ def main() -> None:
         "reference_clip_details": [
             {
                 "filename": c["filename"],
+                "ref_name": f"ref_{i + 1:03d}.wav",
                 "duration": c["duration"],
                 "combined_score": c["combined_score"],
                 "transcription": c["transcription"],
             }
-            for c in reference_clips
+            for i, c in enumerate(reference_clips)
         ],
         "all_clips": [
             {
