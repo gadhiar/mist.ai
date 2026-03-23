@@ -214,8 +214,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
                 logger.info(f"Text message from client: '{user_text}'")
 
-                # Send to message queue
-                await message_queue.put({"type": "transcription", "text": user_text})
+                # No transcription broadcast here -- frontend already added
+                # the user message optimistically in sendTextMessage().
+                # Voice path sends its own transcription from _process_user_speech().
 
                 # Process (will spawn thread internally)
                 loop = asyncio.get_running_loop()
