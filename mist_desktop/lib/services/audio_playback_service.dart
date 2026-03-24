@@ -14,8 +14,9 @@ class AudioPlaybackService {
   // PCM accumulation buffer for continuous playback
   final List<int> _pcmBuffer = [];
   int? _bufferSampleRate;
-  // Flush threshold: ~2 seconds at 24kHz 16-bit mono (24000 * 2 * 2)
-  static const int _flushThresholdBytes = 192000;
+  int _chunksSinceFlush = 0;
+  // Flush every 2 chunks (~3.2s of audio at 20-frame CSM buffer)
+  static const int _flushChunkThreshold = 2;
 
   // Stream controller for playback status
   final _playbackController = StreamController<bool>.broadcast();
@@ -136,13 +137,15 @@ class AudioPlaybackService {
       // Convert float32 to PCM16 bytes and accumulate
       final pcm16Bytes = _float32ToPCM16(audioData);
       _pcmBuffer.addAll(pcm16Bytes);
+      _chunksSinceFlush++;
 
       _logger.d(
-        'Buffered ${pcm16Bytes.length} PCM bytes (total: ${_pcmBuffer.length})',
+        'Buffered chunk $_chunksSinceFlush '
+        '(${pcm16Bytes.length} bytes, total: ${_pcmBuffer.length})',
       );
 
-      // Flush if buffer exceeds threshold (keeps latency reasonable)
-      if (_pcmBuffer.length >= _flushThresholdBytes) {
+      // Flush every N chunks to balance latency vs continuity
+      if (_chunksSinceFlush >= _flushChunkThreshold) {
         _flushBuffer();
       }
     } catch (e) {
@@ -158,6 +161,7 @@ class AudioPlaybackService {
 
     final pcmData = Uint8List.fromList(_pcmBuffer);
     _pcmBuffer.clear();
+    _chunksSinceFlush = 0;
 
     final sampleRate = _bufferSampleRate ?? 24000;
     final wavData = _addWavHeader(pcmData, sampleRate);
@@ -219,6 +223,7 @@ class AudioPlaybackService {
       await _player.stop();
       _audioQueue.clear();
       _pcmBuffer.clear();
+      _chunksSinceFlush = 0;
       _isPlaying = false;
       _playbackController.add(false);
       _logger.i('Stopped audio playback');
@@ -251,6 +256,7 @@ class AudioPlaybackService {
   void clearQueue() {
     _audioQueue.clear();
     _pcmBuffer.clear();
+    _chunksSinceFlush = 0;
     _logger.d('Cleared audio queue and buffer');
   }
 
