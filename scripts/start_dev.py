@@ -130,35 +130,49 @@ def start_backend() -> subprocess.Popen | None:
         return None
 
     print("  Starting backend server...")
-    venv_python = "venv\\Scripts\\python" if sys.platform == "win32" else "venv/bin/python"
+    # Resolve venv python relative to project root (parent of scripts/)
+    from pathlib import Path
+
+    project_root = Path(__file__).resolve().parent.parent
+    if sys.platform == "win32":
+        venv_python = str(project_root / "venv" / "Scripts" / "python.exe")
+    else:
+        venv_python = str(project_root / "venv" / "bin" / "python")
+    print(f"  Using venv: {venv_python}")
     try:
         proc = subprocess.Popen(
             [venv_python, "backend/server.py"],
+            cwd=str(project_root),
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
         )
     except FileNotFoundError:
         print(f"  [FAIL] {venv_python} not found. Create venv first.")
         return None
 
-    for i in range(15):
+    for i in range(90):
         time.sleep(1)
         if check_port("localhost", 8001):
             print("  [OK] Backend started on ws://localhost:8001")
             return proc
-        if i % 5 == 4:
-            print(f"  Waiting... ({i + 1}s)")
+        if i % 10 == 9:
+            print(f"  Waiting for backend (loading TTS models)... ({i + 1}s)")
 
-    print("  [FAIL] Backend did not start in 15s")
+    print("  [FAIL] Backend did not start in 90s")
     return None
 
 
 def start_frontend() -> subprocess.Popen | None:
     """Start the Flutter frontend."""
+    import shutil
+    from pathlib import Path
+
     print("  Launching Flutter frontend...")
+    flutter_cmd = shutil.which("flutter") or r"C:\Users\rajga\flutter\bin\flutter"
+    project_root = Path(__file__).resolve().parent.parent
     try:
         proc = subprocess.Popen(
-            ["flutter", "run", "-d", "windows"],
-            cwd="mist_desktop",
+            [flutter_cmd, "run", "-d", "windows"],
+            cwd=str(project_root / "mist_desktop"),
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
         )
         print("  [OK] Flutter frontend launching (mist_desktop)")
@@ -265,20 +279,46 @@ def main() -> None:
     print("  Run tests: venv\\Scripts\\python -m pytest tests/ -v")
     print("=" * 50)
 
-    # Keep script alive while subprocesses run
+    # Keep script alive while subprocesses run, clean up everything on exit
     procs = [p for p in (backend_proc, frontend_proc) if p is not None]
     if procs:
+        import atexit
+        import contextlib
+
+        def cleanup():
+            print()
+            print("Shutting down stack...")
+            for p in procs:
+                with contextlib.suppress(OSError):
+                    p.terminate()
+            for p in procs:
+                with contextlib.suppress(Exception):
+                    p.wait(timeout=5)
+            stop()
+            print("Stack stopped.")
+
+        # Ensure cleanup runs on normal exit, Ctrl+C, and terminal close
+        atexit.register(cleanup)
+        if sys.platform == "win32":
+            # CTRL_CLOSE_EVENT fires when terminal window is closed
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+
+            def console_handler(event):
+                if event in (0, 2):  # CTRL_C_EVENT, CTRL_CLOSE_EVENT
+                    cleanup()
+                    return True
+                return False
+
+            handler_func = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_ulong)(console_handler)
+            kernel32.SetConsoleCtrlHandler(handler_func, True)
+
         try:
-            # Wait for any child to exit
             while all(p.poll() is None for p in procs):
                 time.sleep(1)
         except KeyboardInterrupt:
-            print()
-            print("Shutting down...")
-            for p in procs:
-                p.terminate()
-            for p in procs:
-                p.wait(timeout=5)
+            pass  # cleanup runs via atexit
 
 
 if __name__ == "__main__":
