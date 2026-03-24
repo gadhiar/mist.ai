@@ -79,7 +79,8 @@ class VoiceNotifier extends Notifier<VoiceState> {
         break;
 
       case WsMessageType.audioComplete:
-        _logger.d('Audio generation complete');
+        _logger.d('Audio generation complete - flushing buffer');
+        _audioService.flushAndFinalize();
         state = state.copyWith(isPlaying: false);
         break;
 
