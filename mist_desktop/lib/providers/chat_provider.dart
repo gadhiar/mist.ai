@@ -21,11 +21,14 @@ class ChatState {
     List<ChatMessage>? messages,
     bool? isProcessing,
     String? currentAiResponse,
+    bool clearCurrentAiResponse = false,
   }) {
     return ChatState(
       messages: messages ?? this.messages,
       isProcessing: isProcessing ?? this.isProcessing,
-      currentAiResponse: currentAiResponse ?? this.currentAiResponse,
+      currentAiResponse: clearCurrentAiResponse
+          ? null
+          : (currentAiResponse ?? this.currentAiResponse),
     );
   }
 }
@@ -126,7 +129,7 @@ class ChatNotifier extends Notifier<ChatState> {
 
     state = state.copyWith(
       messages: updatedMessages,
-      currentAiResponse: null,
+      clearCurrentAiResponse: true,
       isProcessing: false,
     );
   }
@@ -139,7 +142,7 @@ class ChatNotifier extends Notifier<ChatState> {
   /// Interrupt current processing (chat state only; caller should also stop voice)
   void interrupt() {
     _wsService.sendInterrupt();
-    state = state.copyWith(isProcessing: false, currentAiResponse: null);
+    state = state.copyWith(isProcessing: false, clearCurrentAiResponse: true);
   }
 }
 
