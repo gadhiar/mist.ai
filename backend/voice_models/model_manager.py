@@ -150,6 +150,14 @@ class ModelManager:
             stream_chunks.append(chunk)
         logger.info(f"TTS streaming warmed up ({len(stream_chunks)} chunks)")
 
+        # Reset context to reference clips only -- discard warmup dummy audio
+        # Warmup generates low-quality audio that degrades voice anchoring
+        ref_count = len(self.tts.profile.reference_clips)
+        self.tts.context = self.tts.context[:ref_count]
+        logger.info(
+            f"Context reset to {len(self.tts.context)} reference clips (warmup audio discarded)"
+        )
+
         # Signal warmup complete
         self.tts_result_queue.put(("warmup_complete", None))
 
@@ -175,6 +183,11 @@ class ModelManager:
                 chunk_count = 0
 
                 try:
+                    logger.info(
+                        f"TTS worker: Starting generate_stream "
+                        f"(text={len(text)} chars, max_audio={max_ms}ms, "
+                        f"temp={temperature}, topk={topk})"
+                    )
                     for chunk in self.tts.generator.generate_stream(
                         text=text,
                         speaker=speaker_id,
@@ -765,13 +778,11 @@ Match your response depth to what the user is asking for - be concise when appro
         # Add 50% buffer for pauses and natural speech variation
         estimated_ms = int(words * 450 * 1.5)
 
-        # Use larger of token-based or text-based estimate for complete audio
-        # This ensures we don't cut off audio mid-sentence
-        max_audio_length = max(max_audio_length_from_tokens, estimated_ms)
-
-        # Don't cap too aggressively - allow long responses
-        # 400 words = 240s base * 1.5 = 360s = 6 minutes
-        max_audio_length = min(max_audio_length, 600000)  # Cap at 10 minutes (very generous)
+        # Use text-based estimate as primary, token-based as upper bound
+        # Text estimate is grounded in actual content; token budget is just a ceiling
+        max_audio_length = estimated_ms
+        max_audio_length = min(max_audio_length, max_audio_length_from_tokens)
+        max_audio_length = min(max_audio_length, 90_000)  # Hard cap at 90s per chunk
         max_audio_length = max(max_audio_length, 5000)  # Min 5s
 
         logger.info(
