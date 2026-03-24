@@ -229,11 +229,12 @@ class ModelManager:
                     segment = Segment(speaker=speaker_id, text=text, audio=complete_audio)
                     self.tts.context.append(segment)
 
-                    # More aggressive trimming to prevent CUDA out of bounds
-                    # Keep 3 reference clips + 2 most recent utterances (5 total)
-                    # This ensures we stay well under 2048 token limit even with long responses
-                    if len(self.tts.context) > 5:
-                        self.tts.context = self.tts.context[:3] + self.tts.context[-2:]
+                    # Keep reference clips + only 1 recent utterance
+                    # 4 refs (~26s) + 1 recent (~10-15s) = ~40s context max
+                    ref_count = len(self.tts.profile.reference_clips)
+                    max_segments = ref_count + 1
+                    if len(self.tts.context) > max_segments:
+                        self.tts.context = self.tts.context[:ref_count] + self.tts.context[-1:]
 
                     logger.info(f"Updated context: now {len(self.tts.context)} segments")
 
@@ -500,6 +501,7 @@ Match your response depth to what the user is asking for - be concise when appro
         # Get context if enabled
         context = self.tts.context if self.tts and self.tts.use_context else []
         speaker_id = self.tts.speaker_id if self.tts else 0
+        ref_count = len(self.tts.profile.reference_clips) if self.tts else 3
 
         # CSM model limits
         MAX_CONTEXT_TOKENS = 800  # Safe context limit before trimming
@@ -513,7 +515,7 @@ Match your response depth to what the user is asking for - be concise when appro
             logger.warning(
                 f"Context too large ({context_tokens} tokens) - trimming to references only"
             )
-            context = context[:3] if len(context) >= 3 else context
+            context = context[:ref_count] if len(context) >= ref_count else context
             context_tokens = self._calculate_context_tokens(context)
             logger.info(f"Trimmed context to {context_tokens} tokens")
 
@@ -541,7 +543,7 @@ Match your response depth to what the user is asking for - be concise when appro
             logger.warning("Aggressively trimming context to prevent CUDA index errors")
 
             # Keep only references, drop all conversation history
-            context = context[:3] if len(context) >= 3 else context
+            context = context[:ref_count] if len(context) >= ref_count else context
             context_tokens = self._calculate_context_tokens(context)
             total_input_tokens = context_tokens + text_tokens
             logger.info(
@@ -576,8 +578,9 @@ Match your response depth to what the user is asking for - be concise when appro
 
             # Use richer context: 3 references + most recent conversation turn (if available)
             # This maintains voice quality better than references-only
-            reference_context = list(context[:3] if len(context) >= 3 else [])
-            recent_context = context[-1:] if len(context) > 3 else []
+            ref_count = len(self.tts.profile.reference_clips)
+            reference_context = list(context[:ref_count] if len(context) >= ref_count else [])
+            recent_context = context[-1:] if len(context) > ref_count else []
             rich_context = list(reference_context + recent_context)
 
             rich_context_tokens = self._calculate_context_tokens(rich_context)
@@ -659,9 +662,11 @@ Match your response depth to what the user is asking for - be concise when appro
                     f"Chunking complete. Context before cleanup: {len(self.tts.context)} segments"
                 )
 
-                # First, standard trimming: 3 references + 2 most recent
-                if len(self.tts.context) > 5:
-                    self.tts.context = self.tts.context[:3] + self.tts.context[-2:]
+                # Trim: keep reference clips + 1 most recent
+                rc = len(self.tts.profile.reference_clips)
+                max_seg = rc + 1
+                if len(self.tts.context) > max_seg:
+                    self.tts.context = self.tts.context[:rc] + self.tts.context[-1:]
                     logger.info(f"Trimmed to {len(self.tts.context)} segments")
 
                 # Then, token-aware trimming: ensure we're under safe limit
