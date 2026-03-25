@@ -1,10 +1,18 @@
 name: jarvis
-description: "JARVIS voice from Marvel's Avengers, LoRA fine-tuned on CSM-1B (epoch 10/12, R=96, 486 clips)"
+description: "JARVIS voice via Chatterbox Turbo zero-shot cloning from 25s reference"
 speaker_id: 0
-weights_path: dependencies/csm/finetuned_model_jarvis/checkpoint-epoch-10/model.safetensors
+tts_engine: chatterbox
 sample_rate: 24000
 temperature: 0.8
-topk: 40
+exaggeration: 0.5
+cfg_weight: 0.5
+
+# Chatterbox uses a single reference WAV for zero-shot cloning
+reference_audio_path: reference/combined_25s.wav
+
+# Legacy CSM fields (kept for rollback if needed)
+# weights_path: dependencies/csm/finetuned_model_jarvis/checkpoint-epoch-10/model.safetensors
+# topk: 40
 
 reference_clips:
   - audio: reference/ref_001.wav
