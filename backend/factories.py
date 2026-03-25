@@ -37,6 +37,22 @@ from backend.knowledge.storage.neo4j_connection import Neo4jConnection
 logger = logging.getLogger(__name__)
 
 
+def build_vector_store(config: KnowledgeConfig) -> "LanceDBVectorStore":  # noqa: F821
+    """Create and connect a LanceDBVectorStore.
+
+    Args:
+        config: Knowledge subsystem configuration.
+
+    Returns:
+        Connected LanceDBVectorStore ready for use.
+    """
+    from backend.knowledge.storage.vector_store import LanceDBVectorStore
+
+    store = LanceDBVectorStore(config.vector_store)
+    store.connect()
+    return store
+
+
 def build_neo4j_connection(config: KnowledgeConfig) -> Neo4jConnection:
     """Create and connect a Neo4jConnection."""
     conn = Neo4jConnection(config.neo4j)
@@ -116,6 +132,8 @@ def build_extraction_pipeline(
         graph_store=gs,
         curation_pipeline=curation,
         internal_deriver=internal_deriver,
+        embedding_provider=gs.embedding_generator,
+        extraction_config=config.extraction,
     )
 
 
@@ -123,16 +141,42 @@ def build_conversation_handler(
     config: KnowledgeConfig,
     model_name: str = "qwen2.5:7b",
 ):
-    """Create a fully wired ConversationHandler."""
+    """Create a fully wired ConversationHandler.
+
+    Builds a hybrid retriever with optional vector store support.
+    If vector store creation fails (e.g. LanceDB not available),
+    the retriever falls back to graph-only behaviour.
+    """
     from backend.chat.conversation_handler import ConversationHandler
+    from backend.errors import VectorStoreError
+    from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
 
     gs = build_graph_store(config)
     pipeline = build_extraction_pipeline(config, graph_store=gs, include_curation=True)
+
+    # Build vector store with graceful fallback
+    vector_store = None
+    try:
+        vector_store = build_vector_store(config)
+    except (VectorStoreError, Exception) as exc:
+        logger.warning("Vector store unavailable, falling back to graph-only retrieval: %s", exc)
+
+    retriever = build_knowledge_retriever(
+        config=config,
+        graph_store=gs,
+        vector_store=vector_store,
+        embedding_provider=gs.embedding_generator,
+    )
+
+    tracker = ToolUsageTracker(config.skill_derivation)
+
     return ConversationHandler(
         config=config,
         graph_store=gs,
         extraction_pipeline=pipeline,
+        retriever=retriever,
         model_name=model_name,
+        tool_usage_tracker=tracker,
     )
 
 
@@ -154,6 +198,7 @@ def build_graph_regenerator(config: KnowledgeConfig):
 def build_curation_scheduler(
     config: KnowledgeConfig,
     event_store: EventStoreProvider | None = None,
+    tracker: "ToolUsageTracker | None" = None,  # noqa: F821
 ):
     """Create a fully wired CurationScheduler with all maintenance jobs.
 
@@ -161,6 +206,8 @@ def build_curation_scheduler(
         config: Knowledge subsystem configuration.
         event_store: Optional event store for SelfReflectionJob. When None,
             the reflection job returns immediately with zero counts.
+        tracker: Optional ToolUsageTracker for SkillDerivationJob. When None,
+            a default tracker is created from config.
     """
     from langchain_ollama import ChatOllama
 
@@ -172,9 +219,11 @@ def build_curation_scheduler(
     from backend.knowledge.curation.orphan_detector import OrphanDetector
     from backend.knowledge.curation.scheduler import CurationScheduler, JobConfig
     from backend.knowledge.curation.self_reflection import SelfReflectionJob
+    from backend.knowledge.curation.skill_derivation import SkillDerivationJob
     from backend.knowledge.curation.staleness import StalenessDetector
     from backend.knowledge.extraction.internal_derivation import InternalKnowledgeDeriver
     from backend.knowledge.extraction.signal_detector import SignalDetector
+    from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
 
     gs = build_graph_store(config)
     executor = build_graph_executor(config, gs.connection)
@@ -187,6 +236,14 @@ def build_curation_scheduler(
         format="json",
     )
     internal_deriver = InternalKnowledgeDeriver(llm=llm, executor=executor)
+
+    skill_config = config.skill_derivation
+    usage_tracker = tracker or ToolUsageTracker(skill_config)
+    skill_job = SkillDerivationJob(
+        tracker=usage_tracker,
+        executor=executor,
+        config=skill_config,
+    )
 
     return CurationScheduler(
         jobs=[
@@ -221,5 +278,84 @@ def build_curation_scheduler(
                 JobConfig(name="embedding_maintenance", interval_seconds=2592000, enabled=False),
                 EmbeddingMaintenance(executor, embedding_provider),
             ),
+            (
+                JobConfig(
+                    name="skill_derivation",
+                    interval_seconds=86400,
+                    enabled=skill_config.enabled,
+                ),
+                skill_job,
+            ),
         ]
+    )
+
+
+def build_knowledge_retriever(
+    config: KnowledgeConfig,
+    graph_store: GraphStore | None = None,
+    vector_store: "VectorStoreProvider | None" = None,  # noqa: F821
+    embedding_provider: EmbeddingProvider | None = None,
+) -> "KnowledgeRetriever":  # noqa: F821
+    """Create a fully wired KnowledgeRetriever with hybrid retrieval.
+
+    Builds missing dependencies from config. When no explicit
+    embedding_provider is given, reuses graph_store.embedding_generator
+    so a single model instance serves both backends.
+
+    Args:
+        config: Knowledge subsystem configuration.
+        graph_store: Optional pre-built graph store.
+        vector_store: Optional pre-built vector store.
+        embedding_provider: Optional pre-built embedding provider.
+
+    Returns:
+        Ready-to-use KnowledgeRetriever instance.
+    """
+    from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
+    from backend.knowledge.retrieval.query_classifier import QueryClassifier
+
+    gs = graph_store or build_graph_store(config)
+    vs = vector_store  # None is acceptable -- retriever degrades gracefully
+    ep = embedding_provider or gs.embedding_generator
+    classifier = QueryClassifier(config.query_intent)
+
+    return KnowledgeRetriever(
+        config=config,
+        graph_store=gs,
+        vector_store=vs,
+        query_classifier=classifier,
+        embedding_provider=ep,
+    )
+
+
+def build_ingestion_pipeline(
+    config: KnowledgeConfig,
+    vector_store: "VectorStoreProvider | None" = None,  # noqa: F821
+    embedding_provider: EmbeddingProvider | None = None,
+    graph_store: "GraphStore | None" = None,
+) -> "IngestionPipeline":  # noqa: F821
+    """Create a fully wired IngestionPipeline.
+
+    Args:
+        config: Knowledge subsystem configuration.
+        vector_store: Optional pre-built vector store. Built from config
+            if not provided.
+        embedding_provider: Optional pre-built embedding provider. Built
+            from config if not provided.
+        graph_store: Optional pre-built graph store for provenance tracking.
+            When provided, ExternalSource and VectorChunk nodes are created
+            in Neo4j after each successful ingestion.
+
+    Returns:
+        Ready-to-use IngestionPipeline instance.
+    """
+    from backend.knowledge.ingestion.pipeline import IngestionPipeline
+
+    vs = vector_store or build_vector_store(config)
+    ep = embedding_provider or EmbeddingGenerator(config.embedding.model_name)
+    return IngestionPipeline(
+        vector_store=vs,
+        embedding_provider=ep,
+        config=config.ingestion,
+        graph_store=graph_store,
     )

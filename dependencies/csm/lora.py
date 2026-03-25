@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 AUDIO_DIR = "audio_data"
 OUTPUT_DIR = "finetuned_model"
-NUM_EPOCHS = 15  # More passes to learn voice character from 277 clips
+NUM_EPOCHS = 15  # 277 Cortana clips, 15 epochs
 BATCH_SIZE = 1  # Conservative for 12GB VRAM
 GRADIENT_ACCUMULATION_STEPS = 8  # Effective batch size = 8 for stable gradients
 LEARNING_RATE = 5e-7  # Smooth convergence over more epochs

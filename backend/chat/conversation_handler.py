@@ -19,12 +19,13 @@ from langchain_ollama import ChatOllama
 from backend.event_store.models import ConversationTurnEvent
 from backend.event_store.store import EventStore
 from backend.knowledge.config import KnowledgeConfig
-from backend.knowledge.models import ConversationSession, RetrievalFilters
+from backend.knowledge.models import ConversationSession, RetrievalFilters, RetrievalResult
 from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from backend.knowledge.storage.graph_store import GraphStore
 
 if TYPE_CHECKING:
     from backend.knowledge.extraction.pipeline import ExtractionPipeline
+    from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,9 @@ class ConversationHandler:
         config: KnowledgeConfig,
         graph_store: GraphStore,
         extraction_pipeline: ExtractionPipeline,
+        retriever: KnowledgeRetriever,
         model_name: str = "qwen2.5:7b",
+        tool_usage_tracker: ToolUsageTracker | None = None,
     ) -> None:
         """Initialize conversation handler.
 
@@ -51,14 +54,16 @@ class ConversationHandler:
             config: Knowledge system configuration
             graph_store: Neo4j graph store
             extraction_pipeline: Pipeline for automatic knowledge extraction.
+            retriever: Pre-built knowledge retriever (supports hybrid retrieval).
             model_name: Ollama model to use
+            tool_usage_tracker: Optional tracker for recording tool calls for
+                skill derivation. When None, tool usage is not recorded.
         """
         self.config = config
         self.graph_store = graph_store
         self._extraction_pipeline = extraction_pipeline
-
-        # Initialize components
-        self.retriever = KnowledgeRetriever(config, graph_store)
+        self.retriever = retriever
+        self._tool_usage_tracker = tool_usage_tracker
 
         # Initialize LLM
         self.llm = ChatOllama(
@@ -177,8 +182,8 @@ class ConversationHandler:
         # Add user message to history
         session.add_message("user", user_message)
 
-        # AUTO-INJECT: Search documentation (configurable)
-        doc_results = []
+        # AUTO-INJECT: Hybrid retrieval (configurable)
+        retrieval_result: RetrievalResult | None = None
         auto_inject_limit = self.config.auto_inject_limit
         auto_inject_threshold = self.config.auto_inject_threshold
         auto_inject_enabled = self.config.auto_inject_docs
@@ -186,22 +191,29 @@ class ConversationHandler:
         if auto_inject_enabled:
             # Skip auto-injection for very short messages
             if len(user_message.split()) >= 3:
-                logger.info(f"[AUTO-RAG] Searching documentation for: '{user_message[:50]}...'")
+                logger.info("[AUTO-RAG] Retrieving context for: '%s...'", user_message[:50])
                 try:
-                    doc_results = await self.retriever.search_documents(
+                    retrieval_result = await self.retriever.retrieve(
                         query=user_message,
+                        user_id=user_id,
                         limit=auto_inject_limit,
                         similarity_threshold=auto_inject_threshold,
                     )
-                    logger.info(f"[AUTO-RAG] Found {len(doc_results)} relevant document chunks")
+                    logger.info(
+                        "[HYBRID-RAG] Intent: %s, confidence: %.2f, facts: %d, chunks: %d",
+                        retrieval_result.intent,
+                        retrieval_result.config_used.get("similarity_threshold", 0.0),
+                        retrieval_result.total_facts,
+                        retrieval_result.document_chunks_used,
+                    )
                 except Exception as e:
-                    logger.error(f"[AUTO-RAG] Error searching documents: {e}")
-                    doc_results = []
+                    logger.error("[AUTO-RAG] Error during hybrid retrieval: %s", e)
+                    retrieval_result = None
             else:
-                logger.debug("[AUTO-RAG] Skipping search for short message")
+                logger.debug("[AUTO-RAG] Skipping retrieval for short message")
 
-        # Build conversation with system prompt and optional doc context
-        messages = self._build_messages(session, max_history, doc_context=doc_results)
+        # Build conversation with system prompt and optional retrieval context
+        messages = self._build_messages(session, max_history, retrieval_result=retrieval_result)
 
         try:
             # LLM autonomously decides to use tools
@@ -238,6 +250,27 @@ class ConversationHandler:
                     tool_results.append(
                         {"name": tool_name, "result": tool_result, "tool_call_id": tool_call_id}
                     )
+
+                    # Record tool usage for skill derivation
+                    if self._tool_usage_tracker is not None:
+                        from datetime import UTC
+
+                        from backend.knowledge.extraction.tool_usage_tracker import (
+                            ToolCallRecord,
+                            classify_tool_type,
+                        )
+
+                        self._tool_usage_tracker.record(
+                            ToolCallRecord(
+                                tool_name=tool_name,
+                                tool_type=classify_tool_type(tool_name),
+                                context=str(tool_args)[:500],
+                                success=not tool_result.startswith("Tool not found:"),
+                                timestamp=datetime.now(UTC),
+                                session_id=session_id,
+                                event_id="",  # Not yet available at tool dispatch time
+                            )
+                        )
 
                 # If tools were called, get final response with tool results
                 # Preserve the full AIMessage including tool_calls for proper correlation
@@ -281,7 +314,7 @@ class ConversationHandler:
                 user_message=user_message,
                 assistant_message=assistant_message,
                 context_window=messages,
-                doc_results=doc_results,
+                retrieval_result=retrieval_result,
                 tool_calls=tool_calls if tool_calls else None,
             )
 
@@ -369,7 +402,7 @@ class ConversationHandler:
         user_message: str,
         assistant_message: str,
         context_window: list[dict[str, str]] | None = None,
-        doc_results: list[dict[str, Any]] | None = None,
+        retrieval_result: RetrievalResult | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
     ) -> str | None:
         """Record a conversation turn to the event store.
@@ -382,7 +415,7 @@ class ConversationHandler:
             user_message: Raw user utterance.
             assistant_message: Raw system response.
             context_window: The full message list sent to the LLM.
-            doc_results: Auto-injected RAG document chunks, if any.
+            retrieval_result: Hybrid retrieval result from auto-RAG, if any.
             tool_calls: Tool calls made during this turn, if any.
 
         Returns:
@@ -403,18 +436,14 @@ class ConversationHandler:
             es_session = self.event_store.get_session(es_session_id)
             turn_index = es_session.turn_count if es_session else 0
 
-            # Build retrieval_context from doc_results if present
+            # Build retrieval_context from RetrievalResult if present
             retrieval_context = None
-            if doc_results:
+            if retrieval_result and retrieval_result.total_facts > 0:
                 retrieval_context = {
-                    "doc_chunks": [
-                        {
-                            "source_title": r.get("source_title", ""),
-                            "text": r.get("text", "")[:500],
-                            "similarity": r.get("similarity", 0.0),
-                        }
-                        for r in doc_results
-                    ]
+                    "intent": retrieval_result.intent,
+                    "requires_mcp": retrieval_result.requires_mcp,
+                    "fact_count": retrieval_result.total_facts,
+                    "document_chunks_used": retrieval_result.document_chunks_used,
                 }
 
             event = ConversationTurnEvent(
@@ -476,14 +505,14 @@ class ConversationHandler:
         self,
         session: ConversationSession,
         max_history: int,
-        doc_context: list[dict[str, Any]] | None = None,
+        retrieval_result: RetrievalResult | None = None,
     ) -> list[dict[str, str]]:
-        """Build message list for LLM with system prompt, doc context, and history.
+        """Build message list for LLM with system prompt, retrieval context, and history.
 
         Args:
             session: Conversation session
             max_history: Maximum history messages to include
-            doc_context: Optional auto-injected document results
+            retrieval_result: Optional hybrid retrieval result from auto-RAG
 
         Returns:
             List of messages for LLM
@@ -492,7 +521,8 @@ class ConversationHandler:
 
 === CONTEXT PROVIDED ===
 
-You receive relevant MIST documentation automatically with each query (see below).
+You receive relevant context automatically with each query (see below).
+This may include graph facts, document excerpts, or both depending on query type.
 Knowledge from conversations is captured automatically -- you do not need to extract it manually.
 
 === AVAILABLE TOOLS ===
@@ -508,13 +538,13 @@ You have one tool at your disposal:
 === TOOL USAGE STRATEGY ===
 
 **For user questions:**
-- Technical questions (how/what/why about MIST) -> Use auto-provided docs (already in context)
+- Technical questions (how/what/why about MIST) -> Use auto-provided context (already below)
 - Personal questions (about user's info) -> Use query_knowledge_graph tool
-- Both types -> Use docs + query_knowledge_graph
+- Both types -> Use context + query_knowledge_graph
 
 **Autonomous Decision Making:**
 - You decide when to use the tool - no one tells you when
-- Documentation is automatically provided - use it! Cite sources when helpful.
+- Context is automatically provided - use it! Cite sources when helpful.
 - Only call query_knowledge_graph when you need personal user context
 
 === GUIDELINES ===
@@ -522,34 +552,33 @@ You have one tool at your disposal:
 - Be conversational and natural
 - Cite documentation sources when answering technical questions
 - Use tools to enhance responses, not replace conversation
-- Combine auto-provided docs with your conversational abilities
+- Combine auto-provided context with your conversational abilities
 - Query the knowledge graph when personal context matters
 
-Remember: Documentation is already provided below. Think about whether you need personal user context from the knowledge graph."""
+Remember: Context is already provided below. Think about whether you need personal user context from the knowledge graph."""
 
         messages = [{"role": "system", "content": system_prompt}]
 
-        # Add documentation context if available
-        if doc_context:
-            doc_context_str = self._format_document_context(doc_context)
-            if doc_context_str:
-                # Log what's being injected for debugging
-                logger.info(
-                    f"[AUTO-RAG] Injecting {len(doc_context)} document chunks into context:"
-                )
-                for i, chunk in enumerate(doc_context, 1):
-                    title = chunk.get("source_title", "Unknown")
-                    text_preview = (
-                        chunk.get("text", "")[:100] + "..."
-                        if len(chunk.get("text", "")) > 100
-                        else chunk.get("text", "")
-                    )
-                    similarity = chunk.get("similarity", 0.0)
-                    logger.info(
-                        f"[AUTO-RAG]   [{i}] {title} (sim={similarity:.3f}): {text_preview}"
-                    )
+        # Add retrieval context if available
+        if retrieval_result and retrieval_result.total_facts > 0:
+            context_str = retrieval_result.formatted_context
+            logger.info(
+                "[AUTO-RAG] Injecting retrieval context: intent=%s, facts=%d, chunks=%d",
+                retrieval_result.intent,
+                retrieval_result.total_facts,
+                retrieval_result.document_chunks_used,
+            )
+            messages.append({"role": "system", "content": context_str})
 
-                messages.append({"role": "system", "content": doc_context_str})
+            # Append live data advisory when query requires MCP tools
+            if retrieval_result.requires_mcp and retrieval_result.suggested_tools:
+                advisory = (
+                    "=== LIVE DATA ADVISORY ===\n"
+                    "This query appears to request real-time information. Consider using\n"
+                    "available tools for current data rather than relying on stored knowledge.\n"
+                    "Suggested tools: %s" % ", ".join(retrieval_result.suggested_tools)
+                )
+                messages.append({"role": "system", "content": advisory})
 
         # Add conversation history
         history = session.get_history(max_history)

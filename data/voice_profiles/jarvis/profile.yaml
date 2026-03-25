@@ -1,0 +1,19 @@
+name: jarvis
+description: "JARVIS voice from Marvel's Avengers, LoRA fine-tuned on CSM-1B (epoch 10/12, R=96, 486 clips)"
+speaker_id: 0
+weights_path: dependencies/csm/finetuned_model_jarvis/checkpoint-epoch-10/model.safetensors
+sample_rate: 24000
+temperature: 0.8
+topk: 40
+
+reference_clips:
+  - audio: reference/ref_001.wav
+    transcription: "I will scan the area for aim signatures and update your HUD. Be on your guard."
+  - audio: reference/ref_002.wav
+    transcription: "There is something you should all see at the war table. It is about Dr. Rappaccini."
+  - audio: reference/ref_003.wav
+    transcription: "There are several scouting parties in the area. Best be on alert."
+  - audio: reference/ref_004.wav
+    transcription: "I am not sure what the human equivalent would be. I suppose it is like being locked out of the library."
+  - audio: reference/ref_005.wav
+    transcription: "The elevator has been unlocked. You may proceed down into the facility."

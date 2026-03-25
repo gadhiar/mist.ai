@@ -20,6 +20,7 @@ from backend.knowledge.extraction.ontology_extractor import (
 from backend.knowledge.extraction.pipeline import ExtractionPipeline
 from backend.knowledge.extraction.preprocessor import PreProcessedInput, PreProcessor
 from backend.knowledge.extraction.temporal import TemporalResolver
+from backend.knowledge.extraction.tool_classifier import ToolOutputClassifier
 from backend.knowledge.extraction.validator import ExtractionValidator, ValidationResult
 
 __all__ = [
@@ -33,4 +34,5 @@ __all__ = [
     "EntityNormalizer",
     "ExtractionValidator",
     "ValidationResult",
+    "ToolOutputClassifier",
 ]

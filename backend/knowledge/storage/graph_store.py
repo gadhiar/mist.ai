@@ -32,6 +32,16 @@ class GraphStore:
         """
         self.connection = connection
         self.embedding_generator = embedding_generator
+        self._vector_indexes_available: bool = False
+
+    @property
+    def vector_indexes_available(self) -> bool:
+        """Return True if all vector indexes were successfully created.
+
+        External callers can check this before attempting vector search
+        operations to avoid unnecessary query failures.
+        """
+        return self._vector_indexes_available
 
     def initialize_schema(self):
         """Create indexes and constraints in Neo4j.
@@ -52,6 +62,8 @@ class GraphStore:
             "CREATE CONSTRAINT utterance_id_unique IF NOT EXISTS FOR (u:Utterance) REQUIRE u.utterance_id IS UNIQUE",
             "CREATE CONSTRAINT source_id_unique IF NOT EXISTS FOR (s:SourceDocument) REQUIRE s.source_id IS UNIQUE",
             "CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS FOR (c:DocumentChunk) REQUIRE c.chunk_id IS UNIQUE",
+            "CREATE CONSTRAINT external_source_uri_unique IF NOT EXISTS FOR (es:ExternalSource) REQUIRE es.source_uri IS UNIQUE",
+            "CREATE CONSTRAINT vector_chunk_store_id_unique IF NOT EXISTS FOR (vc:VectorChunk) REQUIRE vc.vector_store_id IS UNIQUE",
         ]
 
         for constraint in constraints:
@@ -69,6 +81,8 @@ class GraphStore:
             "CREATE INDEX source_type_idx IF NOT EXISTS FOR (s:SourceDocument) ON (s.source_type)",
             "CREATE INDEX chunk_position_idx IF NOT EXISTS FOR (c:DocumentChunk) ON (c.position)",
             "CREATE INDEX source_hash_idx IF NOT EXISTS FOR (s:SourceDocument) ON (s.content_hash)",
+            "CREATE INDEX external_source_type_idx IF NOT EXISTS FOR (es:ExternalSource) ON (es.source_type)",
+            "CREATE INDEX vector_chunk_source_id_idx IF NOT EXISTS FOR (vc:VectorChunk) ON (vc.source_id)",
         ]
 
         for index in indexes:
@@ -105,13 +119,24 @@ class GraphStore:
             """,
         ]
 
+        successful_vector_indexes = 0
         for vector_index in vector_indexes:
             try:
                 self.connection.execute_write(vector_index)
                 logger.info("Created vector index")
+                successful_vector_indexes += 1
             except Neo4jQueryError as e:
                 logger.warning(f"Vector index creation failed (may not be supported): {e}")
                 logger.warning("Vector search will not be available without Neo4j 5.11+")
+
+        self._vector_indexes_available = successful_vector_indexes == len(vector_indexes)
+        if not self._vector_indexes_available:
+            logger.warning(
+                "Not all vector indexes were created (%d/%d). "
+                "Vector search methods will return empty results.",
+                successful_vector_indexes,
+                len(vector_indexes),
+            )
 
         logger.info("Schema initialization complete")
 
@@ -231,6 +256,9 @@ class GraphStore:
     ) -> str:
         """Store a source document.
 
+        .. deprecated::
+            Use IngestionPipeline instead.
+
         Args:
             source_id: Unique source identifier
             file_path: Path or URI to source
@@ -245,6 +273,13 @@ class GraphStore:
             Source ID
         """
         import json
+        import warnings
+
+        warnings.warn(
+            "GraphStore.store_source_document is deprecated. Use IngestionPipeline.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
         query = """
         MERGE (s:SourceDocument {source_id: $source_id})
@@ -287,6 +322,9 @@ class GraphStore:
     ) -> str:
         """Store a document chunk with optional embedding.
 
+        .. deprecated::
+            Use IngestionPipeline instead.
+
         Args:
             chunk_id: Unique chunk identifier
             source_id: Source document ID
@@ -300,6 +338,13 @@ class GraphStore:
             Chunk ID
         """
         import json
+        import warnings
+
+        warnings.warn(
+            "GraphStore.store_document_chunk is deprecated. Use IngestionPipeline.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
         # Calculate word and char counts
         word_count = len(text.split())
@@ -339,6 +384,150 @@ class GraphStore:
 
         self.connection.execute_write(query, params)
         return chunk_id
+
+    def store_external_source(self, source_uri: str, source_type: str, **kwargs) -> str:
+        """Store an external source provenance record.
+
+        Creates or updates an ExternalSource node representing a document,
+        MCP output, web resource, or other external data origin for the
+        hybrid vector store architecture.
+
+        Args:
+            source_uri: Unique URI identifying the source.
+            source_type: Type of source (document, mcp, web, etc.).
+            **kwargs: Additional properties to store on the node.
+                Only primitive types (str, int, float, bool) are accepted.
+
+        Returns:
+            The source_uri of the stored node.
+        """
+        # Filter kwargs to primitive types only
+        safe_props = {k: v for k, v in kwargs.items() if isinstance(v, str | int | float | bool)}
+
+        # Build dynamic property SET fragments
+        prop_sets = "".join(f",\n            es.{k} = ${k}" for k in safe_props)
+
+        query = f"""
+        MERGE (es:ExternalSource {{source_uri: $source_uri}})
+        ON CREATE SET
+            es.source_type = $source_type,
+            es.created_at = datetime(){prop_sets}
+        ON MATCH SET
+            es.source_type = $source_type,
+            es.updated_at = datetime(){prop_sets}
+        RETURN es.source_uri AS id
+        """
+
+        params = {"source_uri": source_uri, "source_type": source_type, **safe_props}
+
+        self.connection.execute_write(query, params)
+        return source_uri
+
+    def store_vector_chunk_ref(self, vector_store_id: str, source_id: str, **kwargs) -> str:
+        """Store a lightweight vector chunk reference node.
+
+        Creates or updates a VectorChunk node that acts as a Neo4j-side
+        pointer to a chunk stored in LanceDB. Unlike DocumentChunk, this
+        node does NOT store text or embedding data.
+
+        The `source_id` links to an ExternalSource node via its `source_uri`
+        property.
+
+        Args:
+            vector_store_id: Unique ID matching the chunk in LanceDB.
+            source_id: The `source_uri` of the parent ExternalSource.
+            **kwargs: Additional properties to store on the node.
+                Only primitive types (str, int, float, bool) are accepted.
+
+        Returns:
+            The vector_store_id of the stored node.
+        """
+        # Filter kwargs to primitive types only
+        safe_props = {k: v for k, v in kwargs.items() if isinstance(v, str | int | float | bool)}
+
+        # Build dynamic property SET fragments
+        prop_sets = "".join(f",\n            vc.{k} = ${k}" for k in safe_props)
+
+        query = f"""
+        MERGE (vc:VectorChunk {{vector_store_id: $vector_store_id}})
+        ON CREATE SET
+            vc.source_id = $source_id,
+            vc.created_at = datetime(){prop_sets}
+        ON MATCH SET
+            vc.source_id = $source_id,
+            vc.updated_at = datetime(){prop_sets}
+        RETURN vc.vector_store_id AS id
+        """
+
+        params = {"vector_store_id": vector_store_id, "source_id": source_id, **safe_props}
+
+        self.connection.execute_write(query, params)
+        return vector_store_id
+
+    def create_provenance_links(
+        self,
+        entity_ids: list[str],
+        source_uri: str,
+        source_type: str,
+        chunk_ids: list[str] | None = None,
+    ) -> None:
+        """Link entities to their external source and optional vector chunks.
+
+        Creates SOURCED_FROM edges from each entity to the ExternalSource node,
+        and optionally REFERENCES edges from each entity to each VectorChunk.
+
+        The entity-to-chunk linking uses a Cartesian product: every entity is
+        linked to every chunk. This is intentional for document-level provenance.
+        Per-entity chunk mapping is deferred to the curation pipeline (K-05).
+
+        Args:
+            entity_ids: List of `__Entity__` node IDs to link.
+            source_uri: URI of the ExternalSource node.
+            source_type: Type passed to `store_external_source` (document, mcp, web, etc.).
+            chunk_ids: Optional list of VectorChunk `vector_store_id` values.
+                An empty list is treated the same as None (no REFERENCES edges).
+        """
+        if not entity_ids:
+            logger.debug("create_provenance_links called with empty entity_ids, skipping")
+            return
+
+        # Ensure ExternalSource node exists (MERGE, idempotent)
+        self.store_external_source(source_uri, source_type)
+
+        # Ensure VectorChunk nodes exist and are linked to the source
+        if chunk_ids:
+            for chunk_id in chunk_ids:
+                self.store_vector_chunk_ref(chunk_id, source_uri)
+
+        # Create SOURCED_FROM edges (batch via UNWIND)
+        sourced_query = """
+        UNWIND $entity_ids AS eid
+        MATCH (e:__Entity__ {id: eid})
+        MATCH (es:ExternalSource {source_uri: $source_uri})
+        MERGE (e)-[r:SOURCED_FROM]->(es)
+        ON CREATE SET r.created_at = datetime()
+        ON MATCH SET r.updated_at = datetime()
+        """
+        self.connection.execute_write(
+            sourced_query,
+            {"entity_ids": entity_ids, "source_uri": source_uri},
+        )
+
+        # Create REFERENCES edges (Cartesian product -- intentional, document-level provenance)
+        if chunk_ids:
+            references_query = """
+            UNWIND $entity_ids AS eid
+            UNWIND $chunk_ids AS cid
+            MATCH (e:__Entity__ {id: eid})
+            MATCH (vc:VectorChunk {vector_store_id: cid})
+            MERGE (e)-[r:REFERENCES]->(vc)
+            ON CREATE SET r.created_at = datetime()
+            ON MATCH SET r.updated_at = datetime()
+            """
+            self.connection.execute_write(
+                references_query,
+                {"entity_ids": entity_ids, "chunk_ids": chunk_ids},
+            )
 
     def store_extracted_entities(
         self,
@@ -720,6 +909,13 @@ class GraphStore:
             >>> for r in results:
             >>>     print(f"{r['entity_id']}: {r['similarity']:.3f}")
         """
+        if not self._vector_indexes_available:
+            logger.warning(
+                "search_similar_entities called but vector indexes are not available; "
+                "returning empty results"
+            )
+            return []
+
         # Generate embedding for query text
         query_embedding = self.embedding_generator.generate_embedding(query_text)
 
@@ -746,10 +942,14 @@ class GraphStore:
         try:
             results = self.connection.execute_query(query, params)
             return [dict(record) for record in results]
-        except (Neo4jQueryError, Exception) as e:  # May also get embedding errors
-            logger.error(f"Vector search failed: {e}")
-            logger.error("Ensure Neo4j 5.11+ is installed and vector index is created")
-            raise
+        except (Neo4jQueryError, Exception) as e:
+            logger.warning(f"Vector search failed: {e}")
+            logger.warning(
+                "Disabling vector search. Ensure Neo4j 5.11+ is installed and "
+                "vector indexes are created."
+            )
+            self._vector_indexes_available = False
+            return []
 
     def search_document_chunks(
         self, query_text: str, limit: int = 5, similarity_threshold: float = 0.7
@@ -777,6 +977,13 @@ class GraphStore:
                 }
             ]
         """
+        if not self._vector_indexes_available:
+            logger.warning(
+                "search_document_chunks called but vector indexes are not available; "
+                "returning empty results"
+            )
+            return []
+
         # Generate embedding for query text
         query_embedding = self.embedding_generator.generate_embedding(query_text)
 
@@ -806,12 +1013,14 @@ class GraphStore:
         try:
             results = self.connection.execute_query(query, params)
             return [dict(record) for record in results]
-        except (Neo4jQueryError, Exception) as e:  # May also get embedding errors
-            logger.error(f"Document chunk search failed: {e}")
-            logger.error(
-                "Ensure Neo4j 5.11+ is installed and chunk_embeddings vector index is created"
+        except (Neo4jQueryError, Exception) as e:
+            logger.warning(f"Document chunk search failed: {e}")
+            logger.warning(
+                "Disabling vector search. Ensure Neo4j 5.11+ is installed and "
+                "chunk_embeddings vector index is created."
             )
-            raise
+            self._vector_indexes_available = False
+            return []
 
     def get_entity_neighborhood(
         self, entity_id: str, max_hops: int = 2, relationship_types: list[str] | None = None

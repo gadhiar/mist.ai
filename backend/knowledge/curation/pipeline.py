@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 from backend.knowledge.curation.conflict_resolver import ConflictResolutionResult, ConflictResolver
 from backend.knowledge.curation.deduplication import DeduplicationResult, EntityDeduplicator
-from backend.knowledge.curation.graph_writer import CurationGraphWriter, WriteResult
+from backend.knowledge.curation.graph_writer import CurationGraphWriter, SourceMetadata, WriteResult
 from backend.knowledge.extraction.validator import ValidationResult
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,7 @@ class CurationPipeline:
         validation_result: ValidationResult,
         event_id: str,
         session_id: str,
+        source_metadata: SourceMetadata | None = None,
     ) -> CurationResult:
         """Run curation stages and write to graph.
 
@@ -63,6 +64,8 @@ class CurationPipeline:
             validation_result: Output of Stage 6 validation.
             event_id: Source event ID for provenance.
             session_id: Conversation session ID.
+            source_metadata: Optional external source metadata. Forwarded
+                to `CurationGraphWriter.write` for document provenance.
 
         Returns:
             CurationResult with combined stage results (may be partial
@@ -123,12 +126,19 @@ class CurationPipeline:
                 supersession_actions=conflict_result.supersession_actions,
                 event_id=event_id,
                 session_id=session_id,
+                source_metadata=source_metadata,
             )
+            doc_prov_msg = ""
+            if write_result.document_provenance_edges > 0:
+                doc_prov_msg = (
+                    ", %d document provenance edges" % write_result.document_provenance_edges
+                )
             logger.debug(
-                "Stage 8 (write): %d entities, %d relationships, %d provenance edges",
+                "Stage 8 (write): %d entities, %d relationships, %d provenance edges%s",
                 write_result.entities_created + write_result.entities_updated,
                 write_result.relationships_created,
                 write_result.provenance_edges_created,
+                doc_prov_msg,
             )
         except Exception as e:
             logger.error("Stage 8 (write) failed: %s", e)

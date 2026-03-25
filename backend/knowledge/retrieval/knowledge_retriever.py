@@ -1,25 +1,57 @@
 """Knowledge Retriever.
 
 Hybrid retrieval system combining vector search with graph traversal.
+Routes queries by classified intent (factual, relational, hybrid, live)
+and merges results using Reciprocal Rank Fusion when both backends
+are consulted.
 """
 
 import logging
 import time
 from typing import Any
 
-from backend.knowledge.config import KnowledgeConfig
-from backend.knowledge.models import RetrievalFilters, RetrievalResult, RetrievedFact
+from backend.errors import VectorStoreError
+from backend.interfaces import EmbeddingProvider, VectorStoreProvider
+from backend.knowledge.config import KnowledgeConfig, QueryIntentConfig
+from backend.knowledge.models import (
+    RetrievalFilters,
+    RetrievalResult,
+    RetrievedFact,
+    VectorSearchResult,
+)
+from backend.knowledge.retrieval.query_classifier import QueryClassifier
 from backend.knowledge.storage import GraphStore
 
 logger = logging.getLogger(__name__)
 
+# Sentinel value for graph_distance on vector-only results.
+# Must be large enough to sort after real graph matches in _rank_facts
+# but NOT -1 (which would break the ascending sort).
+_VECTOR_DISTANCE_SENTINEL = 999
+
+# Static keyword -> MCP tool mapping for live intent routing.
+_LIVE_TOOL_MAP: dict[str, str] = {
+    "linear": "mcp__linear__list_issues",
+    "ticket": "mcp__linear__get_issue",
+    "issue": "mcp__linear__list_issues",
+    "sprint": "mcp__linear__list_cycles",
+    "github": "mcp__github__search_code",
+    "pr": "mcp__github__list_pull_requests",
+    "pull request": "mcp__github__list_pull_requests",
+    "commit": "mcp__github__list_commits",
+    "branch": "mcp__github__create_branch",
+    "repo": "mcp__github__get_file_contents",
+}
+
 
 class KnowledgeRetriever:
-    """Retrieves relevant knowledge from graph for answering questions.
+    """Retrieves relevant knowledge from graph and vector stores.
 
     Combines:
-    - Vector similarity search (find relevant entities)
-    - Graph traversal (expand context)
+    - Query intent classification (route to correct backend)
+    - Vector similarity search (find relevant document chunks)
+    - Graph traversal (expand entity context)
+    - RRF merge (combine ranked lists from both backends)
     - User-centric relationships (personalization)
 
     Example:
@@ -32,15 +64,33 @@ class KnowledgeRetriever:
         print(result.formatted_context)
     """
 
-    def __init__(self, config: KnowledgeConfig, graph_store: GraphStore):
+    def __init__(
+        self,
+        config: KnowledgeConfig,
+        graph_store: GraphStore,
+        vector_store: VectorStoreProvider | None = None,
+        query_classifier: QueryClassifier | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
+    ):
         """Initialize retriever.
 
         Args:
-            config: Knowledge system configuration
-            graph_store: Graph storage instance
+            config: Knowledge system configuration.
+            graph_store: Graph storage instance.
+            vector_store: Optional vector store for document chunk retrieval.
+            query_classifier: Optional query classifier. When None, all
+                queries default to relational intent (preserving legacy behaviour).
+            embedding_provider: Optional embedding provider for query vectorisation.
+                When None and vector_store is provided, falls back to
+                graph_store.embedding_generator.
         """
         self.config = config
         self.graph_store = graph_store
+        self._vector_store = vector_store
+        self._query_classifier = query_classifier
+        self._embedding_provider = embedding_provider or getattr(
+            graph_store, "embedding_generator", None
+        )
 
         # Default retrieval parameters (can be overridden)
         self.default_limit = 20
@@ -61,23 +111,21 @@ class KnowledgeRetriever:
         """Retrieve relevant knowledge for a query.
 
         Process:
-        1. Vector search for relevant entities
-        2. Get User's relationships to found entities
-        3. Expand graph context (N hops from found entities)
-        4. Apply filters (if specified)
-        5. Rank and score results
-        6. Format context for LLM
+        1. Classify intent (if classifier available)
+        2. Route by intent to appropriate backend(s)
+        3. Merge results with RRF for hybrid queries
+        4. Rank and format context for LLM
 
         Args:
-            query: User's question or search query
-            user_id: User entity ID (default "User")
-            limit: Max facts to return (default from config)
-            similarity_threshold: Min similarity for vector search (default 0.6)
-            max_hops: Graph traversal depth (default 2)
-            filters: Optional filters for retrieval
+            query: User's question or search query.
+            user_id: User entity ID (default "User").
+            limit: Max facts to return (default from config).
+            similarity_threshold: Min similarity for vector search (default 0.6).
+            max_hops: Graph traversal depth (default 2).
+            filters: Optional filters for retrieval.
 
         Returns:
-            RetrievalResult with facts and formatted context
+            RetrievalResult with facts, formatted context, and intent metadata.
         """
         start_time = time.time()
 
@@ -85,51 +133,103 @@ class KnowledgeRetriever:
         limit = limit or self.default_limit
         similarity_threshold = similarity_threshold or self.default_similarity_threshold
         max_hops = max_hops or self.default_max_hops
+        intent_config = self.config.query_intent or QueryIntentConfig()
 
         logger.info(f"Retrieving knowledge for query: '{query}'")
         logger.info(
             f"Parameters: limit={limit}, threshold={similarity_threshold}, max_hops={max_hops}"
         )
 
-        # Step 1: Vector search
-        vector_start = time.time()
-        similar_entities = await self._vector_search(query, similarity_threshold, limit * 2)
-        vector_time = (time.time() - vector_start) * 1000
+        # Step 1: Classify intent
+        if self._query_classifier is not None:
+            intent_result = self._query_classifier.classify(query)
+            intent = intent_result.intent
+        else:
+            intent = "relational"
 
-        logger.info(f"Vector search found {len(similar_entities)} entities")
+        logger.info(f"Query intent: {intent}")
 
-        if not similar_entities:
-            # No entities found
+        # Step 2: Route by intent
+        if intent == "live":
+            # Early return for live queries
+            suggested = self._map_live_tools(query)
+            total_time = (time.time() - start_time) * 1000
             return RetrievalResult(
                 query=query,
                 user_id=user_id,
                 facts=[],
                 entities_found=0,
                 total_facts=0,
-                formatted_context="No relevant knowledge found in the graph.",
-                retrieval_time_ms=(time.time() - start_time) * 1000,
-                vector_search_time_ms=vector_time,
+                formatted_context="This query requires live data from external tools.",
+                retrieval_time_ms=total_time,
+                vector_search_time_ms=0,
                 graph_traversal_time_ms=0,
                 config_used={
                     "limit": limit,
                     "similarity_threshold": similarity_threshold,
                     "max_hops": max_hops,
                 },
+                intent=intent,
+                requires_mcp=True,
+                suggested_tools=suggested,
             )
 
-        # Step 2 & 3: Graph traversal
-        graph_start = time.time()
-        facts = await self._gather_facts(
-            user_id=user_id, similar_entities=similar_entities, max_hops=max_hops, filters=filters
-        )
-        graph_time = (time.time() - graph_start) * 1000
+        # Generate embedding once for reuse across backends
+        query_embedding: list[float] | None = None
+        if intent in ("factual", "hybrid") and self._embedding_provider is not None:
+            query_embedding = self._embedding_provider.generate_embedding(query)
 
-        logger.info(f"Graph traversal gathered {len(facts)} facts")
+        graph_facts: list[RetrievedFact] = []
+        vector_facts: list[RetrievedFact] = []
+        vector_time = 0.0
+        graph_time = 0.0
+        entities_found = 0
+        document_chunks_used = 0
 
-        # Step 4: Rank and limit
-        ranked_facts = self._rank_facts(facts, limit)
+        # Relational path (graph)
+        if intent in ("relational", "hybrid"):
+            graph_start = time.time()
+            graph_limit = intent_config.max_graph_results if intent == "hybrid" else limit
+            graph_facts = await self._relational_retrieve(
+                query=query,
+                user_id=user_id,
+                limit=graph_limit,
+                similarity_threshold=similarity_threshold,
+                max_hops=max_hops,
+                filters=filters,
+            )
+            graph_time = (time.time() - graph_start) * 1000
+            # Count unique entities from graph facts
+            entity_ids = set()
+            for f in graph_facts:
+                entity_ids.add(f.subject)
+                entity_ids.add(f.object)
+            entities_found = len(entity_ids)
 
-        # Step 5: Format context
+        # Factual path (vector store)
+        if intent in ("factual", "hybrid") and self._vector_store is not None:
+            vector_start = time.time()
+            vector_limit = intent_config.max_vector_results if intent == "hybrid" else limit
+            vector_facts = await self._factual_retrieve(
+                query=query,
+                embedding=query_embedding,
+                limit=vector_limit,
+            )
+            vector_time = (time.time() - vector_start) * 1000
+            document_chunks_used = len(vector_facts)
+
+        # Step 3: Merge results
+        if intent == "hybrid" and graph_facts and vector_facts:
+            merged = self._merge_rrf(graph_facts, vector_facts, intent_config)
+            ranked_facts = merged[:limit]
+        elif intent == "factual":
+            ranked_facts = self._rank_facts(vector_facts, limit)
+        else:
+            # relational or hybrid where one list is empty
+            combined = graph_facts + vector_facts
+            ranked_facts = self._rank_facts(combined, limit)
+
+        # Step 4: Format context
         formatted_context = self._format_context(ranked_facts, query)
 
         total_time = (time.time() - start_time) * 1000
@@ -138,7 +238,7 @@ class KnowledgeRetriever:
             query=query,
             user_id=user_id,
             facts=ranked_facts,
-            entities_found=len(similar_entities),
+            entities_found=entities_found,
             total_facts=len(ranked_facts),
             formatted_context=formatted_context,
             retrieval_time_ms=total_time,
@@ -150,18 +250,197 @@ class KnowledgeRetriever:
                 "max_hops": max_hops,
                 "filters": filters,
             },
+            intent=intent,
+            document_chunks_used=document_chunks_used,
         )
 
         logger.info(f"Retrieval complete: {result.summary()}")
 
         return result
 
+    # -- Retrieval backends ---------------------------------------------------
+
+    async def _relational_retrieve(
+        self,
+        query: str,
+        user_id: str,
+        limit: int,
+        similarity_threshold: float,
+        max_hops: int,
+        filters: RetrievalFilters | None,
+    ) -> list[RetrievedFact]:
+        """Retrieve facts via graph traversal (entity similarity + neighbourhood).
+
+        This is the original retrieve() logic extracted into its own method.
+
+        Args:
+            query: User's natural language query.
+            user_id: User entity ID.
+            limit: Max results for vector entity search.
+            similarity_threshold: Min similarity for entity matching.
+            max_hops: Graph traversal depth.
+            filters: Optional retrieval filters.
+
+        Returns:
+            Deduplicated, filtered list of RetrievedFact from the graph.
+        """
+        similar_entities = await self._vector_search(query, similarity_threshold, limit * 2)
+
+        if not similar_entities:
+            return []
+
+        facts = await self._gather_facts(
+            user_id=user_id,
+            similar_entities=similar_entities,
+            max_hops=max_hops,
+            filters=filters,
+        )
+
+        return facts
+
+    async def _factual_retrieve(
+        self,
+        query: str,
+        embedding: list[float] | None,
+        limit: int,
+    ) -> list[RetrievedFact]:
+        """Retrieve facts from vector store (document chunks).
+
+        Converts VectorSearchResult objects into RetrievedFact with
+        graph_distance=999 so they sort after direct graph matches.
+
+        Args:
+            query: User's natural language query.
+            embedding: Pre-computed query embedding (may be None).
+            limit: Max results to return.
+
+        Returns:
+            List of RetrievedFact mapped from vector search results.
+        """
+        if self._vector_store is None:
+            return []
+
+        if embedding is None and self._embedding_provider is not None:
+            embedding = self._embedding_provider.generate_embedding(query)
+
+        if embedding is None:
+            logger.warning("No embedding available for factual retrieval")
+            return []
+
+        results = self._vector_store_search(embedding, limit)
+
+        facts: list[RetrievedFact] = []
+        for vsr in results:
+            # Derive a display title from metadata or source_id
+            title = vsr.metadata.get("title", vsr.source_id) if vsr.metadata else vsr.source_id
+            fact = RetrievedFact(
+                subject="Document",
+                subject_type="DocumentChunk",
+                predicate="CONTAINS",
+                object=title,
+                object_type=vsr.source_type,
+                properties={
+                    "chunk_id": vsr.chunk_id,
+                    "text": vsr.text,
+                    "source_id": vsr.source_id,
+                },
+                similarity_score=vsr.similarity,
+                graph_distance=_VECTOR_DISTANCE_SENTINEL,
+            )
+            facts.append(fact)
+
+        return facts
+
+    def _vector_store_search(self, embedding: list[float], limit: int) -> list[VectorSearchResult]:
+        """Execute raw vector store search with error handling.
+
+        Args:
+            embedding: Query vector.
+            limit: Max results.
+
+        Returns:
+            List of VectorSearchResult, empty on failure.
+        """
+        if self._vector_store is None:
+            return []
+
+        try:
+            return self._vector_store.search(query_embedding=embedding, limit=limit)
+        except VectorStoreError as exc:
+            logger.warning("Vector store search failed, degrading to graph-only: %s", exc)
+            return []
+
+    # -- RRF merge ------------------------------------------------------------
+
+    @staticmethod
+    def _merge_rrf(
+        graph_facts: list[RetrievedFact],
+        vector_facts: list[RetrievedFact],
+        config: QueryIntentConfig,
+    ) -> list[RetrievedFact]:
+        """Merge two ranked lists using Reciprocal Rank Fusion.
+
+        For each fact at rank r (1-based) in a list, its RRF score
+        contribution is weight * (1 / (k + r)).  Facts appearing in
+        both lists accumulate scores from both.  Deduplication uses
+        the (subject, predicate, object) triple as key.
+
+        Args:
+            graph_facts: Ranked facts from graph retrieval.
+            vector_facts: Ranked facts from vector retrieval.
+            config: RRF parameters (k, weights).
+
+        Returns:
+            Merged list sorted by descending RRF score.
+        """
+        k = config.rrf_k
+        scores: dict[tuple[str, str, str], float] = {}
+        fact_map: dict[tuple[str, str, str], RetrievedFact] = {}
+
+        for rank, fact in enumerate(graph_facts, start=1):
+            key = (fact.subject, fact.predicate, fact.object)
+            scores[key] = scores.get(key, 0.0) + config.rrf_graph_weight * (1.0 / (k + rank))
+            if key not in fact_map:
+                fact_map[key] = fact
+
+        for rank, fact in enumerate(vector_facts, start=1):
+            key = (fact.subject, fact.predicate, fact.object)
+            scores[key] = scores.get(key, 0.0) + config.rrf_vector_weight * (1.0 / (k + rank))
+            if key not in fact_map:
+                fact_map[key] = fact
+
+        sorted_keys = sorted(scores, key=lambda k_: scores[k_], reverse=True)
+        return [fact_map[k_] for k_ in sorted_keys]
+
+    # -- Live intent ----------------------------------------------------------
+
+    @staticmethod
+    def _map_live_tools(query: str) -> tuple[str, ...]:
+        """Map query keywords to suggested MCP tool names.
+
+        Args:
+            query: User's natural language query.
+
+        Returns:
+            Tuple of MCP tool name strings matching keywords in the query.
+        """
+        query_lower = query.lower()
+        tools: list[str] = []
+        seen: set[str] = set()
+        for keyword, tool in _LIVE_TOOL_MAP.items():
+            if keyword in query_lower and tool not in seen:
+                tools.append(tool)
+                seen.add(tool)
+        return tuple(tools)
+
+    # -- Existing graph helpers (unchanged) -----------------------------------
+
     async def _vector_search(
         self, query: str, similarity_threshold: float, limit: int
     ) -> list[dict]:
-        """Perform vector similarity search.
+        """Perform vector similarity search on graph entities.
 
-        Returns list of entities sorted by similarity
+        Returns list of entities sorted by similarity.
         """
         results = self.graph_store.search_similar_entities(
             query_text=query, limit=limit, similarity_threshold=similarity_threshold
@@ -305,49 +584,70 @@ class KnowledgeRetriever:
     def _format_context(self, facts: list[RetrievedFact], query: str) -> str:
         """Format facts as natural language context for LLM.
 
-        Returns formatted string ready for LLM consumption
+        Partitions facts into graph facts (graph_distance < 999) and
+        document facts (graph_distance == 999) and formats each group
+        with appropriate presentation.
+
+        Returns formatted string ready for LLM consumption.
         """
         if not facts:
             return "No relevant knowledge found in the graph."
 
+        # Partition into graph vs document facts
+        graph_facts = [f for f in facts if f.graph_distance < _VECTOR_DISTANCE_SENTINEL]
+        doc_facts = [f for f in facts if f.graph_distance >= _VECTOR_DISTANCE_SENTINEL]
+
         lines = [f"Relevant knowledge from your graph (query: '{query}'):", ""]
 
-        # Group facts by subject for better readability
-        facts_by_subject = {}
-        for fact in facts:
-            if fact.subject not in facts_by_subject:
-                facts_by_subject[fact.subject] = []
-            facts_by_subject[fact.subject].append(fact)
+        # Format graph facts grouped by subject
+        if graph_facts:
+            facts_by_subject: dict[str, list[RetrievedFact]] = {}
+            for fact in graph_facts:
+                if fact.subject not in facts_by_subject:
+                    facts_by_subject[fact.subject] = []
+                facts_by_subject[fact.subject].append(fact)
 
-        for subject, subject_facts in facts_by_subject.items():
-            lines.append(f"### {subject}")
+            for subject, subject_facts in facts_by_subject.items():
+                lines.append(f"### {subject}")
 
-            for fact in subject_facts:
-                # Format relationship
-                rel_str = fact.predicate.replace("_", " ").lower()
+                for fact in subject_facts:
+                    # Format relationship
+                    rel_str = fact.predicate.replace("_", " ").lower()
 
-                # Format properties
-                prop_str = ""
-                if fact.properties:
-                    relevant_props = {
-                        k: v
-                        for k, v in fact.properties.items()
-                        if k
-                        not in [
-                            "created_at",
-                            "ontology_version",
-                            "created_from_utterance",
-                            "embedding",
-                        ]
-                    }
-                    if relevant_props:
-                        prop_parts = [f"{k}={v}" for k, v in relevant_props.items()]
-                        prop_str = f" [{', '.join(prop_parts)}]"
+                    # Format properties
+                    prop_str = ""
+                    if fact.properties:
+                        relevant_props = {
+                            k: v
+                            for k, v in fact.properties.items()
+                            if k
+                            not in [
+                                "created_at",
+                                "ontology_version",
+                                "created_from_utterance",
+                                "embedding",
+                            ]
+                        }
+                        if relevant_props:
+                            prop_parts = [f"{k}={v}" for k, v in relevant_props.items()]
+                            prop_str = f" [{', '.join(prop_parts)}]"
 
-                # Format line
-                lines.append(f"  - {rel_str} {fact.object} ({fact.object_type}){prop_str}")
+                    # Format line
+                    lines.append(f"  - {rel_str} {fact.object} ({fact.object_type}){prop_str}")
 
-            lines.append("")  # Blank line between subjects
+                lines.append("")  # Blank line between subjects
+
+        # Format document facts
+        if doc_facts:
+            lines.append("### Relevant Documents")
+            for idx, fact in enumerate(doc_facts, start=1):
+                title = fact.object
+                score = fact.similarity_score
+                chunk_text = fact.properties.get("text", "")
+                truncated = chunk_text[:500] if len(chunk_text) > 500 else chunk_text
+                lines.append(f"[doc-{idx}] Source: {title} (similarity: {score:.2f})")
+                lines.append(f"    {truncated}")
+            lines.append("")
 
         # Add metadata
         lines.append("---")

@@ -5,13 +5,20 @@ previous LLMGraphTransformer + PropertyEnricher two-pass approach.
 Uses Qwen 2.5 7B via Ollama with format="json" for structured output.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import re
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from backend.interfaces import LLMProvider
+
+if TYPE_CHECKING:
+    from backend.knowledge.curation.graph_writer import SourceMetadata
+
 from backend.knowledge.config import KnowledgeConfig
 from backend.knowledge.extraction.preprocessor import PreProcessedInput
 from backend.knowledge.extraction.prompts import (
@@ -35,6 +42,7 @@ class ExtractionResult:
     raw_llm_output: str = ""
     extraction_time_ms: float = 0.0
     source_utterance: str = ""
+    source_metadata: SourceMetadata | None = None
 
 
 class OntologyConstrainedExtractor:

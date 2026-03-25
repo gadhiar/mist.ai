@@ -6,9 +6,79 @@ Includes both the original retrieval/session models and Phase 1B
 extraction pipeline models (re-exported from their source modules).
 """
 
+import enum
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+
+
+class RoutingDestination(str, enum.Enum):
+    """Where a piece of content should be routed for storage."""
+
+    VECTOR_ONLY = "vector_only"
+    GRAPH_AND_VECTOR = "graph_and_vector"
+    MCP_ONLY = "mcp_only"
+    DISCARD = "discard"
+
+
+class ContentSourceType(str, enum.Enum):
+    """Origin type of incoming content."""
+
+    CONVERSATION = "conversation"
+    DOCUMENT_CHUNK = "document_chunk"
+    MCP_TOOL_OUTPUT = "mcp_tool_output"
+    REFERENCE_LOOKUP = "reference_lookup"
+    SYSTEM = "system"
+
+
+@dataclass(frozen=True, slots=True)
+class RoutingDecision:
+    """Result of knowledge routing classification.
+
+    Determines whether content belongs in the graph, vector store,
+    both, or should be discarded entirely.
+    """
+
+    destination: str  # RoutingDestination value
+    reason: str
+    confidence: float
+
+
+@dataclass(frozen=True, slots=True)
+class ToolClassification:
+    """Result of tool output classification for MCP tool results.
+
+    Provides granular per-provider routing decisions that supplement
+    the generic MCP fast-path in KnowledgeRouter. The classifier
+    parses tool names, applies provider-specific rules, and enforces
+    anti-bloat gates (dedup, rate limiting, content length).
+
+    Collapse of suppressed/suppression_reason into destination/reason:
+    suppression is expressed as destination=DISCARD with reason describing
+    the suppression cause (e.g. "rate_limit_exceeded", "duplicate_within_1h").
+    """
+
+    destination: str  # RoutingDestination value
+    reason: str
+    confidence: float
+    tool_provider: str  # "linear", "github", "filesystem", "web", "unknown"
+    tool_action: str  # parsed action from tool name
+    source_level: str  # "orchestrator" or "agent"
+    content_hash: str  # SHA-256 of tool output
+
+
+@dataclass(frozen=True, slots=True)
+class QueryIntent:
+    """Result of query intent classification for hybrid retrieval.
+
+    Determines which retrieval backends should handle a query based
+    on pattern-matched intent signals.
+    """
+
+    intent: str  # "factual" | "relational" | "hybrid" | "live"
+    confidence: float  # 0.0-1.0
+    suggested_stores: tuple[str, ...]  # ("vector",), ("graph",), ("vector", "graph"), ("mcp",)
+
 
 # Re-export Phase 1B extraction models for convenience.
 # Canonical definitions live in their respective modules.
@@ -179,6 +249,12 @@ class RetrievalResult:
     # Configuration used
     config_used: dict[str, Any]  # What parameters were used
 
+    # Hybrid retrieval metadata (all defaulted for backwards compat)
+    intent: str | None = None  # Classified query intent
+    requires_mcp: bool = False  # True when live data needed
+    suggested_tools: tuple[str, ...] = ()  # MCP tools for live intent
+    document_chunks_used: int = 0  # Number of vector store chunks in results
+
     def get_top_facts(self, n: int = 10) -> list[RetrievedFact]:
         """Get top N facts by score."""
         return self.facts[:n]
@@ -316,3 +392,18 @@ class DocumentChunk:
 
     def __str__(self):
         return f"Chunk {self.chunk_id[:8]}... ({self.word_count} words)"
+
+
+@dataclass(frozen=True, slots=True)
+class VectorSearchResult:
+    """Result from vector similarity search in the document store.
+
+    Returned by VectorStoreProvider.search(). Immutable value object.
+    """
+
+    chunk_id: str
+    text: str
+    similarity: float
+    source_id: str
+    source_type: str
+    metadata: dict

@@ -16,6 +16,14 @@ class ReferenceClip:
 
 
 @dataclass(frozen=True)
+class ProfileLineage:
+    """Records which parent profile contributed to a derived/blended profile."""
+
+    profile: str
+    weight: float
+
+
+@dataclass(frozen=True)
 class VoiceProfile:
     """Immutable voice identity: weights, reference clips, and sampling config.
 
@@ -31,6 +39,7 @@ class VoiceProfile:
     sample_rate: int = 24_000
     temperature: float = 0.8
     topk: int = 40
+    derived_from: tuple[ProfileLineage, ...] | None = None
 
 
 class VoiceProfileRegistry:
@@ -106,6 +115,14 @@ class VoiceProfileRegistry:
                 )
             )
 
+        lineage = None
+        raw_lineage = data.get("derived_from")
+        if raw_lineage:
+            lineage = tuple(
+                ProfileLineage(profile=entry["profile"], weight=entry["weight"])
+                for entry in raw_lineage
+            )
+
         return VoiceProfile(
             name=data["name"],
             description=data.get("description", ""),
@@ -115,6 +132,7 @@ class VoiceProfileRegistry:
             sample_rate=data.get("sample_rate", 24_000),
             temperature=data.get("temperature", 0.8),
             topk=data.get("topk", 40),
+            derived_from=lineage,
         )
 
     def get(self, name: str) -> VoiceProfile:
