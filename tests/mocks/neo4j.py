@@ -24,10 +24,22 @@ class FakeNeo4jRecord:
 class FakeNeo4jConnection:
     """Test double for Neo4jConnection. Satisfies GraphConnection protocol."""
 
-    def __init__(self, *, query_results=None, write_results=None, query_responses=None):
+    def __init__(
+        self,
+        *,
+        query_results=None,
+        write_results=None,
+        query_responses=None,
+        write_errors=None,
+        query_errors=None,
+    ):
         self._query_results = query_results or []
         self._write_results = write_results or []
         self._query_responses = query_responses or {}
+        # Pattern -> exception: raise Neo4jQueryError when pattern appears in write query.
+        self._write_errors: dict[str, Exception] = write_errors or {}
+        # Pattern -> exception: raise Neo4jQueryError when pattern appears in read query.
+        self._query_errors: dict[str, Exception] = query_errors or {}
         self.queries: list[tuple[str, dict | None]] = []
         self.writes: list[tuple[str, dict | None]] = []
         self._connected = True
@@ -43,6 +55,9 @@ class FakeNeo4jConnection:
 
     def execute_query(self, query, params=None):
         self.queries.append((query, params))
+        for pattern, exc in self._query_errors.items():
+            if pattern in query:
+                raise exc
         for pattern, results in self._query_responses.items():
             if pattern in query:
                 return results
@@ -50,6 +65,9 @@ class FakeNeo4jConnection:
 
     def execute_write(self, query, params=None):
         self.writes.append((query, params))
+        for pattern, exc in self._write_errors.items():
+            if pattern in query:
+                raise exc
         return self._write_results
 
     def assert_query_executed(self, pattern: str):

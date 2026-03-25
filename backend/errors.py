@@ -17,6 +17,8 @@ Hierarchy:
     +-- CurationError
     +-- InternalDerivationError
     +-- EmbeddingError
+    +-- VectorStoreError
+    +-- IngestionError
 
 Usage:
     from backend.errors import Neo4jConnectionError
@@ -82,3 +84,17 @@ class InternalDerivationError(MistError):
 
 class EmbeddingError(MistError):
     """Raised when generating or storing a vector embedding fails."""
+
+
+# -- Vector store --------------------------------------------------------------
+
+
+class VectorStoreError(MistError):
+    """Vector store operation failed."""
+
+
+# -- Ingestion ----------------------------------------------------------------
+
+
+class IngestionError(MistError):
+    """Document ingestion pipeline failure."""

@@ -32,5 +32,7 @@ class TestCurationIntegration:
             validator=ExtractionValidator(min_confidence=0.5),
             graph_store=gs,
             curation_pipeline=None,
+            embedding_provider=None,
         )
         assert pipeline._curation_pipeline is None
+        assert pipeline._embedding_provider is None

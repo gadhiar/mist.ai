@@ -727,7 +727,7 @@ LOCATION = NodeTypeDefinition(
 )
 
 # ===================================================================
-# BRIDGING Entity Types (2)
+# BRIDGING Entity Types (4)
 # ===================================================================
 
 LEARNING_EVENT = NodeTypeDefinition(
@@ -812,6 +812,81 @@ CONVERSATION_CONTEXT = NodeTypeDefinition(
     ),
 )
 
+EXTERNAL_SOURCE = NodeTypeDefinition(
+    type_name="ExternalSource",
+    description="Provenance record for a document, MCP tool output, web resource, or upload that produced knowledge.",
+    knowledge_domain=KnowledgeDomain.BRIDGING,
+    required_properties=(
+        PropertyDefinition(
+            name="source_type",
+            type="string",
+            required=True,
+            description="Type of external source.",
+            allowed_values=("document", "mcp_tool", "web", "upload"),
+        ),
+        PropertyDefinition(
+            name="source_uri",
+            type="string",
+            required=True,
+            description="URI identifying the external source.",
+        ),
+    ),
+    optional_properties=(
+        PropertyDefinition(
+            name="title",
+            type="string",
+            required=False,
+            description="Human-readable title of the external source.",
+        ),
+        PropertyDefinition(
+            name="last_accessed",
+            type="datetime",
+            required=False,
+            description="When this source was last accessed.",
+        ),
+        PropertyDefinition(
+            name="content_hash",
+            type="string",
+            required=False,
+            description="Hash of the source content for change detection.",
+        ),
+    ),
+)
+
+VECTOR_CHUNK = NodeTypeDefinition(
+    type_name="VectorChunk",
+    description="Lightweight reference node pointing to a chunk in the vector store.",
+    knowledge_domain=KnowledgeDomain.BRIDGING,
+    required_properties=(
+        PropertyDefinition(
+            name="vector_store_id",
+            type="string",
+            required=True,
+            description="Identifier of this chunk in the vector store.",
+        ),
+        PropertyDefinition(
+            name="source_id",
+            type="string",
+            required=True,
+            description="Identifier of the parent source that produced this chunk.",
+        ),
+    ),
+    optional_properties=(
+        PropertyDefinition(
+            name="position",
+            type="int",
+            required=False,
+            description="Ordinal position of this chunk within the source.",
+        ),
+        PropertyDefinition(
+            name="section_title",
+            type="string",
+            required=False,
+            description="Title of the section this chunk belongs to.",
+        ),
+    ),
+)
+
 # ===================================================================
 # Collected node type lists
 # ===================================================================
@@ -842,6 +917,8 @@ _EXTERNAL_NODE_TYPES: tuple[NodeTypeDefinition, ...] = (
 _BRIDGING_NODE_TYPES: tuple[NodeTypeDefinition, ...] = (
     LEARNING_EVENT,
     CONVERSATION_CONTEXT,
+    EXTERNAL_SOURCE,
+    VECTOR_CHUNK,
 )
 
 ALL_NODE_TYPES: list[NodeTypeDefinition] = list(
@@ -992,7 +1069,7 @@ EXPERIENCED = EdgeTypeDefinition(
 )
 
 # ===================================================================
-# Structural / Social / Provenance Relationships (11)
+# Structural / Social / Provenance Relationships (14)
 # ===================================================================
 
 IS_A = EdgeTypeDefinition(
@@ -1088,6 +1165,27 @@ SUPERSEDES = EdgeTypeDefinition(
     allowed_target_types=("LearningEvent",),
 )
 
+SOURCED_FROM = EdgeTypeDefinition(
+    type_name="SOURCED_FROM",
+    description="Links an extractable entity to the external source it was derived from.",
+    allowed_source_types=tuple(nt.type_name for nt in _EXTERNAL_NODE_TYPES),
+    allowed_target_types=("ExternalSource",),
+)
+
+REFERENCES = EdgeTypeDefinition(
+    type_name="REFERENCES",
+    description="Links an extractable entity to a vector chunk that supports it.",
+    allowed_source_types=tuple(nt.type_name for nt in _EXTERNAL_NODE_TYPES),
+    allowed_target_types=("VectorChunk",),
+)
+
+DERIVED_FROM = EdgeTypeDefinition(
+    type_name="DERIVED_FROM",
+    description="Links an extractable entity or learning event to the vector chunk or external source it was derived from.",
+    allowed_source_types=tuple(nt.type_name for nt in _EXTERNAL_NODE_TYPES) + ("LearningEvent",),
+    allowed_target_types=("VectorChunk", "ExternalSource"),
+)
+
 # ===================================================================
 # Collected edge type lists
 # ===================================================================
@@ -1129,6 +1227,9 @@ _STRUCTURAL_EDGE_TYPES: tuple[EdgeTypeDefinition, ...] = (
     LEARNED_FROM,
     ABOUT,
     SUPERSEDES,
+    SOURCED_FROM,
+    REFERENCES,
+    DERIVED_FROM,
 )
 
 ALL_EDGE_TYPES: list[EdgeTypeDefinition] = list(

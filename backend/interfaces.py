@@ -8,7 +8,10 @@ implementations can be swapped for test doubles via dependency injection.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from backend.knowledge.models import DocumentChunk, VectorSearchResult
 
 
 class GraphConnection(Protocol):
@@ -43,3 +46,19 @@ class EventStoreProvider(Protocol):
     def append_turn(self, event: Any) -> str: ...
     def get_turns(self, session_id: str) -> list: ...
     def get_turns_since(self, since: datetime) -> list[dict]: ...
+
+
+class VectorStoreProvider(Protocol):
+    """Contract for vector similarity search and chunk storage."""
+
+    def store_chunks(self, chunks: list[DocumentChunk]) -> list[str]: ...
+    def search(
+        self,
+        query_embedding: list[float],
+        limit: int,
+        filters: dict | None = None,
+    ) -> list[VectorSearchResult]: ...
+    def delete_by_source(self, source_id: str) -> int: ...
+    def get_chunk(self, chunk_id: str) -> DocumentChunk | None: ...
+    def count(self) -> int: ...
+    def health_check(self) -> bool: ...

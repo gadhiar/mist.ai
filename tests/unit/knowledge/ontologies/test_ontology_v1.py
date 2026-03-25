@@ -29,8 +29,8 @@ from backend.knowledge.ontologies.v1_0_0 import (
 class TestEntityTypes:
     """Verify the complete set of entity types in the ontology."""
 
-    def test_has_19_entity_types(self):
-        assert len(ALL_NODE_TYPES) == 19
+    def test_has_21_entity_types(self):
+        assert len(ALL_NODE_TYPES) == 21
 
     @pytest.mark.parametrize(
         "type_name",
@@ -84,16 +84,18 @@ class TestEntityTypes:
         [
             pytest.param("LearningEvent", id="LearningEvent"),
             pytest.param("ConversationContext", id="ConversationContext"),
+            pytest.param("ExternalSource", id="ExternalSource"),
+            pytest.param("VectorChunk", id="VectorChunk"),
         ],
     )
-    def test_bridging_domain_has_2_types(self, type_name: str):
+    def test_bridging_domain_has_4_types(self, type_name: str):
         bridging_types = [
             nt for nt in ALL_NODE_TYPES if nt.knowledge_domain == KnowledgeDomain.BRIDGING
         ]
 
         bridging_names = [nt.type_name for nt in bridging_types]
 
-        assert len(bridging_types) == 2
+        assert len(bridging_types) == 4
         assert type_name in bridging_names
 
     def test_extractable_types_are_external_only(self):
@@ -115,8 +117,8 @@ class TestEntityTypes:
 class TestRelationshipTypes:
     """Verify the complete set of relationship types in the ontology."""
 
-    def test_has_30_relationship_types(self):
-        assert len(ALL_EDGE_TYPES) == 30
+    def test_has_33_relationship_types(self):
+        assert len(ALL_EDGE_TYPES) == 33
 
     def test_extractable_relationships_count(self):
         # 13 user-centric + 8 structural (excludes LEARNED_FROM, ABOUT, SUPERSEDES)

@@ -3,10 +3,17 @@
 import pytest
 
 from backend.chat.conversation_handler import ConversationHandler
+from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
+from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from backend.knowledge.storage.graph_store import GraphStore
 from tests.mocks.config import build_test_config
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeNeo4jConnection
+
+
+def _make_retriever(config, gs):
+    """Build a graph-only KnowledgeRetriever for tests."""
+    return KnowledgeRetriever(config=config, graph_store=gs)
 
 
 class FakeExtractionPipeline:
@@ -41,6 +48,7 @@ class TestConstructorDI:
             config=config,
             graph_store=gs,
             extraction_pipeline=pipeline,
+            retriever=_make_retriever(config, gs),
         )
         assert handler._extraction_pipeline is pipeline
 
@@ -54,6 +62,7 @@ class TestConstructorDI:
             config=config,
             graph_store=gs,
             extraction_pipeline=pipeline,
+            retriever=_make_retriever(config, gs),
         )
         tool_names = [t.name for t in handler.tools]
         assert "extract_knowledge" not in tool_names
@@ -74,6 +83,7 @@ class TestExtractKnowledgeAsync:
             config=config,
             graph_store=gs,
             extraction_pipeline=pipeline,
+            retriever=_make_retriever(config, gs),
         )
 
         await handler._extract_knowledge_async(
@@ -100,6 +110,7 @@ class TestExtractKnowledgeAsync:
             config=config,
             graph_store=gs,
             extraction_pipeline=pipeline,
+            retriever=_make_retriever(config, gs),
         )
 
         # Should not raise
@@ -109,6 +120,46 @@ class TestExtractKnowledgeAsync:
             event_id="evt-001",
             session_id="sess-001",
         )
+
+
+class TestToolUsageTrackerDI:
+    def test_accepts_tool_usage_tracker_parameter(self):
+        # Arrange
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        pipeline = FakeExtractionPipeline()
+        config = build_test_config()
+        tracker = ToolUsageTracker(config.skill_derivation)
+
+        # Act
+        handler = ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=pipeline,
+            retriever=_make_retriever(config, gs),
+            tool_usage_tracker=tracker,
+        )
+
+        # Assert
+        assert handler._tool_usage_tracker is tracker
+
+    def test_tool_usage_tracker_defaults_to_none(self):
+        # Arrange
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        pipeline = FakeExtractionPipeline()
+        config = build_test_config()
+
+        # Act
+        handler = ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=pipeline,
+            retriever=_make_retriever(config, gs),
+        )
+
+        # Assert
+        assert handler._tool_usage_tracker is None
 
 
 class TestShortMessageSkip:
@@ -124,6 +175,7 @@ class TestShortMessageSkip:
             config=config,
             graph_store=gs,
             extraction_pipeline=pipeline,
+            retriever=_make_retriever(config, gs),
         )
         assert handler is not None
 

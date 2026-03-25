@@ -23,6 +23,12 @@ dist/
 build/
 warmup_final.wav
 
+# Voice training data and development audio (local only)
+data/vector_store/
+dependencies/csm/audio_data_*/
+*.wav
+!data/voice_profiles/**/*.yaml
+
 # Node.js / Frontend
 node_modules/
 .npm/
