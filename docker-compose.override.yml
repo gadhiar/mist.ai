@@ -1,0 +1,15 @@
+# Dev mode -- volume mounts for code editing without rebuild.
+# Active by default when running `docker compose up`.
+# Named volumes (hf-cache, torch-cache, data) are inherited from base compose.
+services:
+  mist-backend:
+    volumes:
+      - ./backend:/app/backend:ro
+      - ./src:/app/src:ro
+      - ./dependencies:/app/dependencies:ro
+      - ./scripts:/app/scripts:ro
+      - ./tests:/app/tests:ro
+    environment:
+      # Filesystem polling required on Windows Docker Desktop
+      # (inotify does not propagate across mount boundaries)
+      - WATCHFILES_FORCE_POLLING=1
