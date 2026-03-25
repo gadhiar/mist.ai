@@ -5,7 +5,6 @@ Uses continuous VAD-based microphone listening + OutputStream interruption.
 """
 
 import queue
-import re
 
 # Import VAD from csm-streaming
 import sys
@@ -19,6 +18,7 @@ import sounddevice as sd
 import torch
 
 from src.multimodal.stt import WhisperSTT
+from src.multimodal.text_preprocessing import preprocess_text_for_tts
 from src.multimodal.tts import SesameTTS
 from src.utils.cleanup import register_cleanup
 
@@ -51,7 +51,14 @@ class InterruptibleVoiceInterface:
         self.stt = WhisperSTT(model_size="base")
 
         print("2/4 Loading Sesame CSM TTS...")
-        self.tts = SesameTTS(use_context=True)
+        from pathlib import Path
+
+        from src.multimodal.voice_profile import VoiceProfileRegistry
+
+        project_root = Path(__file__).parent.parent.parent
+        registry = VoiceProfileRegistry(project_root / "data" / "voice_profiles")
+        profile = registry.get_active()
+        self.tts = SesameTTS(profile=profile, use_context=True)
 
         # Warmup TTS
         print("   Warming up TTS...")
@@ -353,13 +360,14 @@ class InterruptibleVoiceInterface:
         if self.mic_thread and self.mic_thread.is_alive():
             self.mic_thread.join(timeout=2.0)
 
-    def _preprocess_text_for_tts(self, text: str) -> str:
-        """Preprocess text for TTS."""
-        pattern = r"[^\w\s.,!?\']"
-        cleaned_text = re.sub(pattern, "", text)
-        cleaned_text = re.sub(r"\s+", " ", cleaned_text)
-        cleaned_text = re.sub(r"([.,!?])(\S)", r"\1 \2", cleaned_text)
-        return cleaned_text.strip()
+    @staticmethod
+    def _preprocess_text_for_tts(text: str) -> str:
+        """Preprocess text for TTS with prosody-preserving substitutions.
+
+        Delegates to shared `preprocess_text_for_tts` to keep all TTS
+        preprocessing in one place.
+        """
+        return preprocess_text_for_tts(text)
 
     def continuous_conversation(self, debug: bool = False):
         """Continuous conversation with interruption support.
@@ -443,7 +451,7 @@ class InterruptibleVoiceInterface:
                     continue
 
                 # Preprocess text
-                preprocessed_text = self._preprocess_text_for_tts(full_response.lower())
+                preprocessed_text = self._preprocess_text_for_tts(full_response)
                 log(f"TTS: Preprocessed text ({len(preprocessed_text)} chars)")
 
                 # Start audio playback thread
@@ -464,8 +472,8 @@ class InterruptibleVoiceInterface:
                     speaker=self.tts.speaker_id,
                     context=self.tts.context if self.tts.use_context else [],
                     max_audio_length_ms=self.tts._estimate_audio_length(preprocessed_text),
-                    temperature=0.8,
-                    topk=50,
+                    temperature=self.tts.profile.temperature,
+                    topk=self.tts.profile.topk,
                 ):
                     # Check for interruption
                     if self.interrupt_playback.is_set():

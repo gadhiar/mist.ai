@@ -90,8 +90,8 @@ except Exception as e:
 
 #### Modification 1: Optimized training hyperparameters
 **Lines:** 36-51
-**Reason:** Tuned for 9.5-hour training window with Elise dataset (1,195 samples)
-**Impact:** Higher quality voice cloning with rank-128 LoRA
+**Reason:** Tuned for voice fine-tuning with Cortana dataset (277 clips)
+**Impact:** Higher quality voice cloning with rank-96 LoRA
 
 ```python
 # ORIGINAL:
@@ -105,19 +105,19 @@ R=32          # LoRA rank
 APLHA=32      # LoRA alpha
 
 # MODIFIED:
-NUM_EPOCHS = 25              # Optimized for ~9.5 hour training window
+NUM_EPOCHS = 15              # Optimized for Cortana dataset
 BATCH_SIZE = 2               # Full GPU utilization (12GB VRAM available)
 GRADIENT_ACCUMULATION_STEPS = 4  # Effective batch size = 8
-LEARNING_RATE = 3e-7         # Lower LR for stable 25-epoch training
+LEARNING_RATE = 5e-7         # Lower LR for stable training
 MAX_GRAD_NORM = 0.5          # Increased for better gradient flow
 WARMUP_STEPS = 150           # More warmup for longer training
-R=128                        # Doubled LoRA rank for maximum voice quality
-APLHA=128                    # Keep scaling ratio at 1.0
-MAX_AUDIO_FILES = 0          # Use all 1,195 samples from Elise dataset
+R=96                         # LoRA rank for voice quality
+APLHA=96                     # Keep scaling ratio at 1.0
+MAX_AUDIO_FILES = 0          # Use all 277 clips from Cortana dataset
 ```
 
 **Results:**
-- Validation loss: 6.110 (epoch 20)
+- Voice fine-tuning with Cortana dataset
 - High-quality voice consistency
 - Natural prosody and intonation
 
@@ -153,7 +153,6 @@ The following files remain unchanged from the original repository:
 - `run_csm.py`
 - `vad.py`
 - `test.py`
-- `prepare_elise_dataset.py`
 - `LICENSE` (Original Apache 2.0 license preserved)
 
 ---

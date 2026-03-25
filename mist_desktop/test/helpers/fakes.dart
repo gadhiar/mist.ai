@@ -174,6 +174,7 @@ class PlayAudioChunkCall {
 class FakeAudioPlaybackService implements AudioPlaybackService {
   final List<PlayAudioChunkCall> playAudioChunkCalls = [];
   int stopCallCount = 0;
+  int flushAndFinalizeCallCount = 0;
 
   bool _isPlaying = false;
   final _playbackController = StreamController<bool>.broadcast();
@@ -213,6 +214,11 @@ class FakeAudioPlaybackService implements AudioPlaybackService {
 
   @override
   void clearQueue() {}
+
+  @override
+  void flushAndFinalize() {
+    flushAndFinalizeCallCount++;
+  }
 
   @override
   void dispose() {

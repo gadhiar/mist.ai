@@ -147,6 +147,8 @@ def _days_since_update(updated_at: str | float) -> float:
         then = _dt.datetime.fromtimestamp(updated_at, tz=_dt.UTC)
     else:
         raw = str(updated_at)
+        if not raw or raw == "None":
+            return 0.0  # No valid timestamp, skip decay
         if raw.endswith("Z"):
             raw = raw[:-1] + "+00:00"
         then = _dt.datetime.fromisoformat(raw)

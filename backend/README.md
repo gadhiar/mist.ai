@@ -157,9 +157,8 @@ class VoiceConfig(BaseModel):
 
     # TTS
     tts_device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    voice_profile: str = "cortana"  # Selected via VOICE_PROFILE env var
     use_voice_context: bool = True
-    tts_temperature: float = 0.55
-    tts_topk: int = 20
 ```
 
 ## Model Details
@@ -175,9 +174,9 @@ class VoiceConfig(BaseModel):
 - **Token Limit:** 400 tokens max (150 tokens preferred for quality)
 
 ### TTS: Sesame CSM-1B
-- **Model:** Fine-tuned on Elise dataset (epoch 20)
+- **Model:** Fine-tuned via LoRA on voice training dataset
 - **Sample Rate:** 24kHz
-- **Voice:** Consistent female voice (Elise)
+- **Voice:** Consistent voice from fine-tuned model
 - **Latency:** ~2-3s RTF (Real-Time Factor)
 
 ## Running the Server

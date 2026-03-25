@@ -16,7 +16,9 @@ import torch
 from generator import Segment
 
 from src.multimodal.stt import WhisperSTT
+from src.multimodal.text_preprocessing import preprocess_text_for_tts
 from src.multimodal.tts import SesameTTS
+from src.multimodal.voice_profile import VoiceProfileRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -121,14 +123,40 @@ class ModelManager:
         torch._inductor.config.fx_graph_cache = False
 
         logger.info("Loading Sesame TTS in worker thread...")
+        project_root = Path(__file__).parent.parent.parent
+        registry = VoiceProfileRegistry(project_root / "data" / "voice_profiles")
+        profile = registry.get_active()
+        logger.info(f"Active voice profile: {profile.name} ({profile.description})")
         self.tts = SesameTTS(
-            device=self.config.tts_device, use_context=self.config.use_voice_context
+            profile=profile,
+            device=self.config.tts_device,
+            use_context=self.config.use_voice_context,
         )
 
-        # Warmup TTS
-        logger.info("Warming up TTS with dummy text...")
+        # Warmup TTS -- exercise BOTH code paths to trigger torch.compile
+        # speak() uses generate(), but real requests use generate_stream()
+        logger.info("Warming up TTS (non-streaming path)...")
         dummy_audio = self.tts.speak("Initialization complete.", play=False)
-        logger.info(f"TTS warmed up (audio shape: {dummy_audio.shape})")
+        logger.info(f"TTS non-streaming warmed up (audio shape: {dummy_audio.shape})")
+
+        logger.info("Warming up TTS (streaming path)...")
+        stream_chunks = []
+        for chunk in self.tts.generator.generate_stream(
+            text="System ready.",
+            speaker=self.tts.speaker_id,
+            context=self.tts.context,
+            max_audio_length_ms=5000,
+        ):
+            stream_chunks.append(chunk)
+        logger.info(f"TTS streaming warmed up ({len(stream_chunks)} chunks)")
+
+        # Reset context to reference clips only -- discard warmup dummy audio
+        # Warmup generates low-quality audio that degrades voice anchoring
+        ref_count = len(self.tts.profile.reference_clips)
+        self.tts.context = self.tts.context[:ref_count]
+        logger.info(
+            f"Context reset to {len(self.tts.context)} reference clips (warmup audio discarded)"
+        )
 
         # Signal warmup complete
         self.tts_result_queue.put(("warmup_complete", None))
@@ -155,6 +183,11 @@ class ModelManager:
                 chunk_count = 0
 
                 try:
+                    logger.info(
+                        f"TTS worker: Starting generate_stream "
+                        f"(text={len(text)} chars, max_audio={max_ms}ms, "
+                        f"temp={temperature}, topk={topk})"
+                    )
                     for chunk in self.tts.generator.generate_stream(
                         text=text,
                         speaker=speaker_id,
@@ -185,8 +218,8 @@ class ModelManager:
 
                 # Update context with generated audio (CRITICAL for consistency)
                 if len(audio_chunks) > 0 and self.tts and self.tts.use_context:
-                    # Concatenate all chunks
-                    complete_audio = torch.cat(audio_chunks, dim=0)
+                    # Concatenate all chunks with crossfade for smooth boundaries
+                    complete_audio = self._crossfade_chunks(audio_chunks)
 
                     # Move to CPU to prevent CUDA memory fragmentation
                     # Context audio should be on CPU for stable long-term storage
@@ -196,11 +229,12 @@ class ModelManager:
                     segment = Segment(speaker=speaker_id, text=text, audio=complete_audio)
                     self.tts.context.append(segment)
 
-                    # More aggressive trimming to prevent CUDA out of bounds
-                    # Keep 3 reference clips + 2 most recent utterances (5 total)
-                    # This ensures we stay well under 2048 token limit even with long responses
-                    if len(self.tts.context) > 5:
-                        self.tts.context = self.tts.context[:3] + self.tts.context[-2:]
+                    # Keep reference clips + only 1 recent utterance
+                    # 4 refs (~26s) + 1 recent (~10-15s) = ~40s context max
+                    ref_count = len(self.tts.profile.reference_clips)
+                    max_segments = ref_count + 1
+                    if len(self.tts.context) > max_segments:
+                        self.tts.context = self.tts.context[:ref_count] + self.tts.context[-1:]
 
                     logger.info(f"Updated context: now {len(self.tts.context)} segments")
 
@@ -225,9 +259,21 @@ class ModelManager:
 
         logger.info("TTS worker thread exiting")
 
-    def wait_for_tts_warmup(self):
-        """Wait for TTS worker to finish warming up."""
-        msg_type, _ = self.tts_result_queue.get()
+    def wait_for_tts_warmup(self, timeout: float = 120.0):
+        """Wait for TTS worker to finish warming up.
+
+        Args:
+            timeout: Maximum seconds to wait for warmup (default 120s).
+
+        Raises:
+            RuntimeError: If warmup times out or reports failure.
+        """
+        try:
+            msg_type, _ = self.tts_result_queue.get(timeout=timeout)
+        except queue.Empty:
+            raise RuntimeError(
+                f"TTS warmup timed out after {timeout}s - model may have failed to load"
+            ) from None
         if msg_type != "warmup_complete":
             raise RuntimeError("TTS warmup failed")
 
@@ -448,20 +494,14 @@ Match your response depth to what the user is asking for - be concise when appro
         if not self.config.tts_enabled or self.tts is None:
             logger.debug("TTS disabled - skipping audio generation")
             return
-            yield  # Make this a generator
 
-        import re
-
-        # Preprocess text
-        pattern = r"[^\w\s.,!?\']"
-        cleaned_text = re.sub(pattern, "", text)
-        cleaned_text = re.sub(r"\s+", " ", cleaned_text)
-        cleaned_text = re.sub(r"([.,!?])(\S)", r"\1 \2", cleaned_text)
-        preprocessed_text = cleaned_text.strip().lower()
+        # Preprocess text (prosody-preserving substitutions)
+        preprocessed_text = preprocess_text_for_tts(text)
 
         # Get context if enabled
         context = self.tts.context if self.tts and self.tts.use_context else []
         speaker_id = self.tts.speaker_id if self.tts else 0
+        ref_count = len(self.tts.profile.reference_clips) if self.tts else 3
 
         # CSM model limits
         MAX_CONTEXT_TOKENS = 800  # Safe context limit before trimming
@@ -475,7 +515,7 @@ Match your response depth to what the user is asking for - be concise when appro
             logger.warning(
                 f"Context too large ({context_tokens} tokens) - trimming to references only"
             )
-            context = context[:3] if len(context) >= 3 else context
+            context = context[:ref_count] if len(context) >= ref_count else context
             context_tokens = self._calculate_context_tokens(context)
             logger.info(f"Trimmed context to {context_tokens} tokens")
 
@@ -503,7 +543,7 @@ Match your response depth to what the user is asking for - be concise when appro
             logger.warning("Aggressively trimming context to prevent CUDA index errors")
 
             # Keep only references, drop all conversation history
-            context = context[:3] if len(context) >= 3 else context
+            context = context[:ref_count] if len(context) >= ref_count else context
             context_tokens = self._calculate_context_tokens(context)
             total_input_tokens = context_tokens + text_tokens
             logger.info(
@@ -538,13 +578,15 @@ Match your response depth to what the user is asking for - be concise when appro
 
             # Use richer context: 3 references + most recent conversation turn (if available)
             # This maintains voice quality better than references-only
-            reference_context = context[:3] if len(context) >= 3 else []
-            recent_context = context[-1:] if len(context) > 3 else []
-            rich_context = reference_context + recent_context
+            ref_count = len(self.tts.profile.reference_clips)
+            reference_context = list(context[:ref_count] if len(context) >= ref_count else [])
+            recent_context = context[-1:] if len(context) > ref_count else []
+            rich_context = list(reference_context + recent_context)
 
             rich_context_tokens = self._calculate_context_tokens(rich_context)
             logger.info(
-                f"Using rich context: {len(reference_context)} references + {len(recent_context)} recent = {rich_context_tokens} tokens"
+                f"Using rich context: {len(reference_context)} references + "
+                f"{len(recent_context)} recent = {rich_context_tokens} tokens"
             )
 
             # Target: ~100-120 tokens per chunk for stable generation
@@ -554,14 +596,18 @@ Match your response depth to what the user is asking for - be concise when appro
             text_chunks = self._chunk_text_by_tokens(preprocessed_text, TARGET_CHUNK_SIZE)
             logger.info(f"Split into {len(text_chunks)} chunks (~{TARGET_CHUNK_SIZE} tokens each)")
 
-            # CRITICAL: Use the SAME context for ALL chunks
-            # Do NOT update context between chunks - prevents state mismatch
-            # The TTS worker will add the complete response to global context once at the end
+            # Generate chunks with context carryover: after generating chunk N,
+            # add its audio as context for chunk N+1 so prosody stays continuous.
+            # Reference clips are always kept; only one carryover segment at a time
+            # to stay within the ~800 token context budget.
             for i, chunk_text in enumerate(text_chunks):
                 logger.info(f"[CHUNK {i+1}/{len(text_chunks)}] Generating: '{chunk_text[:50]}...'")
 
-                # Generate this chunk with the SAME rich context
-                yield from self._generate_single_chunk(chunk_text, rich_context, speaker_id)
+                # Generate this chunk, collecting audio parts for context carryover
+                chunk_audio_parts = []
+                for audio_part in self._generate_single_chunk(chunk_text, rich_context, speaker_id):
+                    chunk_audio_parts.append(audio_part)
+                    yield audio_part
 
                 # Critical: Clean up between chunks
                 if torch.cuda.is_available():
@@ -576,6 +622,36 @@ Match your response depth to what the user is asking for - be concise when appro
                     except Exception as e:
                         logger.warning(f"[CHUNK {i+1}] KV reset failed: {e}")
 
+                # Add this chunk as context for the next chunk so it "hears"
+                # the previous output and maintains prosody continuity.
+                # Keep reference clips, replace any previous carryover segment.
+                if i < len(text_chunks) - 1 and chunk_audio_parts:
+                    chunk_audio = self._crossfade_chunks(chunk_audio_parts)
+                    chunk_audio_cpu = chunk_audio.cpu()
+
+                    chunk_segment = Segment(
+                        speaker=speaker_id,
+                        text=chunk_text,
+                        audio=chunk_audio_cpu,
+                    )
+
+                    # Budget check: references + carryover must stay under limit
+                    candidate_context = list(reference_context) + [chunk_segment]
+                    candidate_tokens = self._calculate_context_tokens(candidate_context)
+
+                    if candidate_tokens <= MAX_CONTEXT_TOKENS:
+                        rich_context = candidate_context
+                        logger.info(
+                            f"[CHUNK {i+1}] Added carryover context " f"({candidate_tokens} tokens)"
+                        )
+                    else:
+                        # Carryover would exceed budget; keep references only
+                        rich_context = list(reference_context)
+                        logger.warning(
+                            f"[CHUNK {i+1}] Carryover too large "
+                            f"({candidate_tokens} tokens), using references only"
+                        )
+
                 logger.info(f"[CHUNK {i+1}/{len(text_chunks)}] Complete")
 
             # After all chunks complete, aggressively trim the main TTS context
@@ -586,9 +662,11 @@ Match your response depth to what the user is asking for - be concise when appro
                     f"Chunking complete. Context before cleanup: {len(self.tts.context)} segments"
                 )
 
-                # First, standard trimming: 3 references + 2 most recent
-                if len(self.tts.context) > 5:
-                    self.tts.context = self.tts.context[:3] + self.tts.context[-2:]
+                # Trim: keep reference clips + 1 most recent
+                rc = len(self.tts.profile.reference_clips)
+                max_seg = rc + 1
+                if len(self.tts.context) > max_seg:
+                    self.tts.context = self.tts.context[:rc] + self.tts.context[-1:]
                     logger.info(f"Trimmed to {len(self.tts.context)} segments")
 
                 # Then, token-aware trimming: ensure we're under safe limit
@@ -607,6 +685,54 @@ Match your response depth to what the user is asking for - be concise when appro
                 logger.info(
                     f"Final context: {len(self.tts.context)} segments, {context_tokens} tokens"
                 )
+
+    def _crossfade_chunks(self, chunks: list, crossfade_ms: int = 50) -> torch.Tensor:
+        """Concatenate audio chunks with raised-cosine crossfade.
+
+        Applies a smooth fade-out/fade-in at chunk boundaries to prevent
+        amplitude discontinuities (clicks/pops) from hard concatenation.
+
+        Args:
+            chunks: List of 1-D audio tensors (24kHz sample rate assumed)
+            crossfade_ms: Crossfade duration in milliseconds
+
+        Returns:
+            Single concatenated tensor with crossfaded boundaries
+        """
+        if not chunks:
+            return torch.tensor([])
+        if len(chunks) == 1:
+            return chunks[0]
+
+        sample_rate = 24000
+        crossfade_samples = int(crossfade_ms / 1000 * sample_rate)
+
+        result = chunks[0]
+        for chunk in chunks[1:]:
+            if len(result) < crossfade_samples or len(chunk) < crossfade_samples:
+                # Too short to crossfade, just concatenate
+                result = torch.cat([result, chunk], dim=0)
+                continue
+
+            # Raised cosine fade
+            fade = torch.linspace(0, 1, crossfade_samples, device=result.device)
+
+            # Fade out end of result, fade in start of chunk
+            result_end = result[-crossfade_samples:]
+            chunk_start = chunk[:crossfade_samples]
+
+            crossfaded = result_end * (1 - fade) + chunk_start * fade
+
+            result = torch.cat(
+                [
+                    result[:-crossfade_samples],
+                    crossfaded,
+                    chunk[crossfade_samples:],
+                ],
+                dim=0,
+            )
+
+        return result
 
     def _generate_single_chunk(self, preprocessed_text, context, speaker_id):
         """Generate TTS audio for a single chunk of text.
@@ -653,23 +779,25 @@ Match your response depth to what the user is asking for - be concise when appro
 
         # Estimate audio duration based on text length
         words = len(preprocessed_text.split())
-        # Elise speaks at ~600ms/word (100 words/min = very slow)
+        # ~450ms/word estimate (133 words/min, moderate pace)
         # Add 50% buffer for pauses and natural speech variation
-        estimated_ms = int(words * 600 * 1.5)
+        estimated_ms = int(words * 450 * 1.5)
 
-        # Use larger of token-based or text-based estimate for complete audio
-        # This ensures we don't cut off audio mid-sentence
-        max_audio_length = max(max_audio_length_from_tokens, estimated_ms)
-
-        # Don't cap too aggressively - allow long responses
-        # 400 words = 240s base * 1.5 = 360s = 6 minutes
-        max_audio_length = min(max_audio_length, 600000)  # Cap at 10 minutes (very generous)
+        # Use text-based estimate as primary, token-based as upper bound
+        # Text estimate is grounded in actual content; token budget is just a ceiling
+        max_audio_length = estimated_ms
+        max_audio_length = min(max_audio_length, max_audio_length_from_tokens)
+        max_audio_length = min(max_audio_length, 90_000)  # Hard cap at 90s per chunk
         max_audio_length = max(max_audio_length, 5000)  # Min 5s
 
         logger.info(
             f"Max audio: {max_audio_length}ms (token_limit={max_audio_length_from_tokens}ms, "
             + f"text_estimate={estimated_ms}ms, words={words})"
         )
+
+        # Guard against uninitialized TTS before accessing profile
+        if self.tts is None:
+            raise RuntimeError("TTS not initialized - worker thread may have failed to start")
 
         # Submit generation request to worker thread
         self.tts_request_queue.put(
@@ -679,14 +807,24 @@ Match your response depth to what the user is asking for - be concise when appro
                 speaker_id,
                 context,
                 max_audio_length,
-                self.config.tts_temperature,
-                self.config.tts_topk,
+                self.tts.profile.temperature,
+                self.tts.profile.topk,
             )
         )
 
         # Yield audio chunks from result queue
+        RESULT_QUEUE_TIMEOUT = 120.0  # First generation includes torch.compile (~30-60s)
         while True:
-            msg_type, gen_id, data = self.tts_result_queue.get()
+            try:
+                msg_type, gen_id, data = self.tts_result_queue.get(timeout=RESULT_QUEUE_TIMEOUT)
+            except queue.Empty:
+                logger.error(
+                    f"TTS generation timed out after {RESULT_QUEUE_TIMEOUT}s "
+                    "- worker may be stuck"
+                )
+                raise RuntimeError(
+                    f"TTS generation timeout after {RESULT_QUEUE_TIMEOUT}s"
+                ) from None
 
             # Skip chunks from old generations
             if gen_id != current_gen_id:

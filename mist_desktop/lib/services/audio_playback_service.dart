@@ -11,6 +11,13 @@ class AudioPlaybackService {
   bool _isPlaying = false;
   final List<(Uint8List, int)> _audioQueue = [];
 
+  // PCM accumulation buffer for continuous playback
+  final List<int> _pcmBuffer = [];
+  int? _bufferSampleRate;
+  int _chunksSinceFlush = 0;
+  // Flush every 2 chunks (~3.2s of audio at 20-frame CSM buffer)
+  static const int _flushChunkThreshold = 2;
+
   // Stream controller for playback status
   final _playbackController = StreamController<bool>.broadcast();
 
@@ -114,71 +121,109 @@ class AudioPlaybackService {
     return Uint8List.fromList(pcm16);
   }
 
-  /// Play audio chunk from float32 samples
+  /// Buffer audio chunk from float32 samples for continuous playback.
+  ///
+  /// Accumulates PCM data instead of playing each chunk individually.
+  /// Flushes to the playback queue when the buffer exceeds the threshold,
+  /// keeping first-audio latency at ~2 seconds while eliminating
+  /// inter-chunk gaps.
   Future<void> playAudioChunkFloat32(
     List<double> audioData,
     int sampleRate,
   ) async {
     try {
-      // Convert float32 to PCM16
+      _bufferSampleRate = sampleRate;
+
+      // Convert float32 to PCM16 bytes and accumulate
       final pcm16Bytes = _float32ToPCM16(audioData);
+      _pcmBuffer.addAll(pcm16Bytes);
+      _chunksSinceFlush++;
 
-      // Add to queue if currently playing
-      if (_isPlaying) {
-        _audioQueue.add((pcm16Bytes, sampleRate));
-        _logger.d(
-          'Added audio chunk to queue (queue size: ${_audioQueue.length})',
-        );
-        return;
+      _logger.d(
+        'Buffered chunk $_chunksSinceFlush '
+        '(${pcm16Bytes.length} bytes, total: ${_pcmBuffer.length})',
+      );
+
+      // Flush every N chunks to balance latency vs continuity
+      if (_chunksSinceFlush >= _flushChunkThreshold) {
+        _flushBuffer();
       }
-
-      // Play immediately if not playing
-      await _playBytes(pcm16Bytes, sampleRate);
     } catch (e) {
-      _logger.e('Error playing audio chunk: $e');
+      _logger.e('Error buffering audio chunk: $e');
       _logger.e('Stack trace: ${StackTrace.current}');
       rethrow;
     }
   }
 
-  /// Play audio from bytes
-  Future<void> _playBytes(Uint8List bytes, int sampleRate) async {
+  /// Flush accumulated PCM buffer as a single WAV segment.
+  void _flushBuffer() {
+    if (_pcmBuffer.isEmpty) return;
+
+    final pcmData = Uint8List.fromList(_pcmBuffer);
+    _pcmBuffer.clear();
+    _chunksSinceFlush = 0;
+
+    final sampleRate = _bufferSampleRate ?? 24000;
+    final wavData = _addWavHeader(pcmData, sampleRate);
+
+    _logger.d(
+      'Flushing buffer: ${pcmData.length} PCM bytes -> ${wavData.length} WAV bytes',
+    );
+
+    _queueWavForPlayback(wavData, sampleRate);
+  }
+
+  /// Called when the backend signals audio generation is complete.
+  /// Flushes any remaining buffered PCM data as a final WAV segment.
+  void flushAndFinalize() {
+    _flushBuffer();
+    _logger.d('Audio buffer finalized');
+  }
+
+  /// Queue a WAV segment for playback, or play immediately if idle.
+  void _queueWavForPlayback(Uint8List wavData, int sampleRate) {
+    if (_isPlaying) {
+      _audioQueue.add((wavData, sampleRate));
+      _logger.d('Queued WAV segment (queue size: ${_audioQueue.length})');
+      return;
+    }
+
+    _playWav(wavData);
+  }
+
+  /// Play a complete WAV segment (already has header).
+  Future<void> _playWav(Uint8List wavData) async {
     try {
-      // Add WAV header to raw PCM data
-      final wavData = _addWavHeader(bytes, sampleRate);
-
-      // Create a BytesSource for the audio player
       final source = BytesSource(wavData);
-
       await _player.play(source);
-      _logger.d(
-        'Playing audio chunk (${bytes.length} bytes -> ${wavData.length} bytes with WAV header, ${sampleRate}Hz)',
-      );
+      _logger.d('Playing WAV segment (${wavData.length} bytes)');
     } catch (e) {
-      _logger.e('Error in _playBytes: $e');
+      _logger.e('Error in _playWav: $e');
       rethrow;
     }
   }
 
-  /// Play next audio chunk in queue
+  /// Play next WAV segment from the queue.
   void _playNextInQueue() {
     if (_audioQueue.isEmpty) {
       return;
     }
 
-    final (nextChunk, rate) = _audioQueue.removeAt(0);
+    final (nextWav, _) = _audioQueue.removeAt(0);
     _logger.d(
-      'Playing next chunk from queue (remaining: ${_audioQueue.length})',
+      'Playing next WAV segment from queue (remaining: ${_audioQueue.length})',
     );
 
-    _playBytes(nextChunk, rate);
+    _playWav(nextWav);
   }
 
-  /// Stop playback
+  /// Stop playback and discard all buffered audio.
   Future<void> stop() async {
     try {
       await _player.stop();
       _audioQueue.clear();
+      _pcmBuffer.clear();
+      _chunksSinceFlush = 0;
       _isPlaying = false;
       _playbackController.add(false);
       _logger.i('Stopped audio playback');
@@ -207,16 +252,19 @@ class AudioPlaybackService {
     }
   }
 
-  /// Clear audio queue
+  /// Clear audio queue and PCM buffer.
   void clearQueue() {
     _audioQueue.clear();
-    _logger.d('Cleared audio queue');
+    _pcmBuffer.clear();
+    _chunksSinceFlush = 0;
+    _logger.d('Cleared audio queue and buffer');
   }
 
-  /// Dispose resources
+  /// Dispose resources.
   void dispose() {
     _player.dispose();
     _playbackController.close();
     _audioQueue.clear();
+    _pcmBuffer.clear();
   }
 }

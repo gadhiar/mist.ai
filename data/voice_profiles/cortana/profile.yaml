@@ -1,0 +1,17 @@
+name: cortana
+description: "Cortana voice from Halo 3, LoRA fine-tuned on CSM-1B (15 epochs, R=96)"
+speaker_id: 0
+weights_path: dependencies/csm/finetuned_model/model.safetensors
+sample_rate: 24000
+temperature: 0.8
+topk: 40
+
+reference_clips:
+  - audio: 050lb_030_cor.wav
+    transcription: "High Charity, the Prophet's Holy City is on-"
+  - audio: 050lb_230_cor.wav
+    transcription: "High Charity, the Prophet's Holy City is on its way to Earth, with an army of flood."
+  - audio: 050lb_240_cor.wav
+    transcription: "I can't tell you everything. It's not safe. The Gravemind, it knows I'm in the system."
+  - audio: golden_sample.wav
+    transcription: "I want to be upfront about something. The confidence score on that last extraction was only point four two, which is, well, below our threshold. I ran it anyway because the context seemed strong, but I would not recommend acting on it without verification."

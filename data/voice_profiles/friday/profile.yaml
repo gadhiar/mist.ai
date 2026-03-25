@@ -1,0 +1,9 @@
+name: friday
+description: "FRIDAY voice (pending training data acquisition)"
+speaker_id: 0
+weights_path: null
+sample_rate: 24000
+temperature: 0.8
+topk: 40
+
+reference_clips: []

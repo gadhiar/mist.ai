@@ -23,8 +23,7 @@ class VoiceConfig(BaseModel):
 
     # TTS settings
     tts_enabled: bool = True  # Set to False to disable TTS (text-only mode)
-    tts_temperature: float = 0.8
-    tts_topk: int = 50
+    voice_profile: str = "cortana"  # Selected via VOICE_PROFILE env var
     use_voice_context: bool = True
 
     # Server settings
@@ -39,7 +38,10 @@ class VoiceConfig(BaseModel):
 # Load configuration from environment
 def load_config() -> VoiceConfig:
     """Load configuration from environment variables."""
-    return VoiceConfig(tts_enabled=os.getenv("TTS_ENABLED", "true").lower() == "true")
+    return VoiceConfig(
+        tts_enabled=os.getenv("TTS_ENABLED", "true").lower() == "true",
+        voice_profile=os.getenv("VOICE_PROFILE", "cortana"),
+    )
 
 
 # Default configuration

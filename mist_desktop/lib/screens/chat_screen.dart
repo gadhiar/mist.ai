@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/message_model.dart';
 import '../providers/chat_provider.dart';
+import '../providers/voice_provider.dart';
 import '../providers/websocket_provider.dart';
 import '../services/websocket_service.dart';
 import '../widgets/chat_message_widget.dart';
@@ -75,6 +76,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   Widget build(BuildContext context) {
     final chatState = ref.watch(chatProvider);
     final connectionStatus = ref.watch(connectionStatusProvider);
+    // Initialize VoiceNotifier so audio message listener is registered
+    ref.watch(voiceProvider);
 
     // Auto-scroll only when the message count increases
     final totalItems =
