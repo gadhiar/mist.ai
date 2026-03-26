@@ -165,6 +165,11 @@ class VoiceProcessor:
         first_chunk_time = None
         first_sentence_time = None
 
+        # Minimum chars for quality TTS output. Short inputs (<40 chars)
+        # cause Chatterbox to glitch on the first utterance because the
+        # model lacks enough text context to match the reference voice.
+        min_tts_chars = 40
+
         while True:
             try:
                 sentence = sentence_queue.get(timeout=1.0)
@@ -176,6 +181,19 @@ class VoiceProcessor:
                 break
             if self.interrupt_flag.is_set():
                 break
+
+            # Coalesce short sentences with the next to avoid TTS glitches.
+            # Peek at queue and merge until we have enough text or the queue
+            # is empty / signals end.
+            while len(sentence) < min_tts_chars:
+                try:
+                    next_item = sentence_queue.get(timeout=2.0)
+                except queue.Empty:
+                    break
+                if next_item is None:
+                    # End-of-stream -- generate what we have
+                    break
+                sentence = sentence + " " + next_item
 
             if first_sentence_time is None:
                 first_sentence_time = time.time()
