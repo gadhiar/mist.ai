@@ -163,6 +163,7 @@ class VoiceProcessor:
         """
         chunk_count = 0
         first_chunk_time = None
+        first_sentence_time = None
 
         while True:
             try:
@@ -176,6 +177,9 @@ class VoiceProcessor:
             if self.interrupt_flag.is_set():
                 break
 
+            if first_sentence_time is None:
+                first_sentence_time = time.time()
+
             log_timestamp(f"TTS: Generating sentence ({len(sentence)} chars)")
 
             for audio_chunk in self.models.generate_tts_audio(sentence):
@@ -184,10 +188,14 @@ class VoiceProcessor:
 
                 chunk_count += 1
                 if first_chunk_time is None:
-                    first_chunk_time = time.time() - tts_start_time
+                    elapsed_from_sentence = time.time() - first_sentence_time
+                    elapsed_from_turn = time.time() - tts_start_time
                     log_timestamp(
-                        f"TTS: First audio chunk ({first_chunk_time:.2f}s " f"from TTS start)"
+                        f"TTS: First audio chunk "
+                        f"({elapsed_from_sentence:.2f}s from first sentence, "
+                        f"{elapsed_from_turn:.2f}s from turn start)"
                     )
+                    first_chunk_time = elapsed_from_turn
 
                 if isinstance(audio_chunk, torch.Tensor):
                     audio_np = audio_chunk.cpu().numpy().astype(np.float32)

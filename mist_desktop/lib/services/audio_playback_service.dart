@@ -15,8 +15,17 @@ class AudioPlaybackService {
   final List<int> _pcmBuffer = [];
   int? _bufferSampleRate;
   int _chunksSinceFlush = 0;
-  // Flush every 2 chunks (~3.2s of audio at 20-frame CSM buffer)
-  static const int _flushChunkThreshold = 2;
+  bool _preBuffering = true;
+
+  // Pre-buffer threshold: accumulate this many seconds of audio before
+  // starting playback. Eliminates gaps between sentences caused by TTS
+  // generation time exceeding the previous sentence's audio duration.
+  // On single-GPU, TTS runs ~1.3x slower due to LLM contention, so
+  // buffering 2 sentences (~6-8s) covers the worst-case gap.
+  static const double _preBufferSeconds = 6.0;
+
+  // After pre-buffer fills, flush every chunk immediately for low latency.
+  static const int _flushChunkThreshold = 1;
 
   // Stream controller for playback status
   final _playbackController = StreamController<bool>.broadcast();
@@ -123,10 +132,13 @@ class AudioPlaybackService {
 
   /// Buffer audio chunk from float32 samples for continuous playback.
   ///
-  /// Accumulates PCM data instead of playing each chunk individually.
-  /// Flushes to the playback queue when the buffer exceeds the threshold,
-  /// keeping first-audio latency at ~2 seconds while eliminating
-  /// inter-chunk gaps.
+  /// During pre-buffering, accumulates audio until [_preBufferSeconds]
+  /// worth of PCM data is collected, then flushes everything and starts
+  /// playback. After the pre-buffer is satisfied, each subsequent chunk
+  /// is flushed immediately for lowest latency.
+  ///
+  /// This eliminates gaps between sentences where TTS generation time
+  /// exceeds the previous sentence's audio duration.
   Future<void> playAudioChunkFloat32(
     List<double> audioData,
     int sampleRate,
@@ -139,14 +151,31 @@ class AudioPlaybackService {
       _pcmBuffer.addAll(pcm16Bytes);
       _chunksSinceFlush++;
 
+      // Calculate buffered audio duration
+      // PCM16 = 2 bytes per sample, mono
+      final bufferedSeconds = _pcmBuffer.length / (sampleRate * 2);
+
       _logger.d(
         'Buffered chunk $_chunksSinceFlush '
-        '(${pcm16Bytes.length} bytes, total: ${_pcmBuffer.length})',
+        '(${pcm16Bytes.length} bytes, total: ${_pcmBuffer.length}, '
+        '${bufferedSeconds.toStringAsFixed(1)}s)',
       );
 
-      // Flush every N chunks to balance latency vs continuity
-      if (_chunksSinceFlush >= _flushChunkThreshold) {
-        _flushBuffer();
+      if (_preBuffering) {
+        // During pre-buffer phase, wait until we have enough audio
+        if (bufferedSeconds >= _preBufferSeconds) {
+          _logger.i(
+            'Pre-buffer filled (${bufferedSeconds.toStringAsFixed(1)}s, '
+            '$_chunksSinceFlush chunks). Starting playback.',
+          );
+          _preBuffering = false;
+          _flushBuffer();
+        }
+      } else {
+        // After pre-buffer, flush every chunk immediately
+        if (_chunksSinceFlush >= _flushChunkThreshold) {
+          _flushBuffer();
+        }
       }
     } catch (e) {
       _logger.e('Error buffering audio chunk: $e');
@@ -175,7 +204,15 @@ class AudioPlaybackService {
 
   /// Called when the backend signals audio generation is complete.
   /// Flushes any remaining buffered PCM data as a final WAV segment.
+  /// If still pre-buffering (short response), plays whatever we have.
   void flushAndFinalize() {
+    if (_preBuffering && _pcmBuffer.isNotEmpty) {
+      _logger.i(
+        'Audio complete during pre-buffer. Flushing '
+        '${_pcmBuffer.length} bytes immediately.',
+      );
+      _preBuffering = false;
+    }
     _flushBuffer();
     _logger.d('Audio buffer finalized');
   }
@@ -224,6 +261,7 @@ class AudioPlaybackService {
       _audioQueue.clear();
       _pcmBuffer.clear();
       _chunksSinceFlush = 0;
+      _preBuffering = true;
       _isPlaying = false;
       _playbackController.add(false);
       _logger.i('Stopped audio playback');
@@ -252,11 +290,12 @@ class AudioPlaybackService {
     }
   }
 
-  /// Clear audio queue and PCM buffer.
+  /// Clear audio queue and PCM buffer. Resets pre-buffer state.
   void clearQueue() {
     _audioQueue.clear();
     _pcmBuffer.clear();
     _chunksSinceFlush = 0;
+    _preBuffering = true;
     _logger.d('Cleared audio queue and buffer');
   }
 
