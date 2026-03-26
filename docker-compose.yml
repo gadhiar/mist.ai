@@ -81,7 +81,7 @@ services:
     volumes:
       - mist-ollama-models:/root/.ollama
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:11434/ || exit 1"]
+      test: ["CMD", "ollama", "list"]
       interval: 10s
       timeout: 5s
       retries: 5
