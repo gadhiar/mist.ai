@@ -22,6 +22,7 @@ from vad import AudioStreamProcessor
 
 # Import from backend.voice_models explicitly
 sys.path.insert(0, str(project_root / "backend"))
+from request_context import new_request_id, spawn_with_context
 from voice_models.model_manager import ModelManager
 
 logger = logging.getLogger(__name__)
@@ -113,11 +114,7 @@ class VoiceProcessor:
         log_timestamp("Speech ended, spawning processing thread...")
 
         # Process in separate thread (CSM pattern!)
-        threading.Thread(
-            target=self._process_user_speech,
-            args=(audio_data, sample_rate),
-            daemon=True,
-        ).start()
+        spawn_with_context(self._process_user_speech, audio_data, sample_rate)
 
     def _process_user_speech(self, audio_data, sample_rate):
         """Process user speech (runs in separate thread)."""
@@ -156,6 +153,8 @@ class VoiceProcessor:
 
     def _process_conversation_turn(self, user_text):
         """Process one conversation turn (LLM + TTS)."""
+        new_request_id()
+
         # Try to acquire generation lock (non-blocking like CSM!)
         if not self.generation_lock.acquire(blocking=False):
             log_timestamp("Generation already in progress, skipping")
@@ -271,22 +270,14 @@ class VoiceProcessor:
                     self.latest_user_input = None
                     log_timestamp(f"Processing pending input: '{pending_input}'")
                     # Process in new thread to avoid blocking
-                    threading.Thread(
-                        target=self._process_conversation_turn,
-                        args=(pending_input,),
-                        daemon=True,
-                    ).start()
+                    spawn_with_context(self._process_conversation_turn, pending_input)
 
     def process_complete_audio(self, audio_data, sample_rate):
         """Process complete audio from client (no VAD needed - Flutter controls recording)."""
         log_timestamp(f"Processing complete audio: {len(audio_data)} samples @ {sample_rate}Hz")
 
         # Transcribe and process immediately in a new thread
-        threading.Thread(
-            target=self._process_user_speech,
-            args=(audio_data, sample_rate),
-            daemon=True,
-        ).start()
+        spawn_with_context(self._process_user_speech, audio_data, sample_rate)
 
     def process_audio_chunk(self, audio_data, sample_rate):
         """Process incoming audio chunk from client (VAD mode - deprecated)."""
