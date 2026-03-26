@@ -1,20 +1,103 @@
+# MIST.AI Backend Stack (production)
+# Usage: docker compose up -d
+# Dev mode: docker-compose.override.yml adds volume mounts automatically
 services:
-  neo4j:
+  mist-backend:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    container_name: mist-backend
+    ports:
+      - "8001:8001"
+    environment:
+      - NEO4J_URI=bolt://mist-neo4j:7687
+      - NEO4J_USERNAME=${NEO4J_USERNAME:-neo4j}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-password}
+      - NEO4J_DATABASE=${NEO4J_DATABASE:-neo4j}
+      - OLLAMA_HOST=http://mist-ollama:11434
+      - OLLAMA_BASE_URL=http://mist-ollama:11434
+      - MODEL=${MODEL:-qwen2.5:7b-instruct}
+      - EVENT_STORE_DB_PATH=/app/data/event_store.db
+      - EVENT_STORE_AUDIO_DIR=/app/data/audio
+      - VECTOR_STORE_DATA_DIR=/app/data/vector_store
+      - TTS_ENABLED=${TTS_ENABLED:-true}
+      - TTS_ENGINE=${TTS_ENGINE:-chatterbox}
+      - TTS_EXAGGERATION=${TTS_EXAGGERATION:-0.5}
+      - TTS_TEMPERATURE=${TTS_TEMPERATURE:-0.8}
+      - TTS_CFG_WEIGHT=${TTS_CFG_WEIGHT:-0.5}
+      - VOICE_PROFILE=${VOICE_PROFILE:-friday}
+      - ENABLE_KNOWLEDGE_INTEGRATION=${ENABLE_KNOWLEDGE_INTEGRATION:-true}
+    volumes:
+      - ./data:/app/data
+      - mist-hf-cache:/root/.cache/huggingface
+      - mist-torch-cache:/root/.cache/torch
+    depends_on:
+      mist-neo4j:
+        condition: service_healthy
+      mist-ollama:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  mist-neo4j:
     image: neo4j:5
     container_name: mist-neo4j
     ports:
-      - "7474:7474"  # Browser
-      - "7687:7687"  # Bolt
+      - "7474:7474"
+      - "7687:7687"
     environment:
-      NEO4J_AUTH: neo4j/password
-      NEO4J_PLUGINS: '["apoc"]'
+      - NEO4J_AUTH=${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-password}
+      - NEO4J_PLUGINS=["apoc"]
     volumes:
-      - neo4j_data:/data
+      - mist-neo4j-data:/data
+      - mist-neo4j-logs:/logs
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget --spider http://localhost:7474 || exit 1"]
-      interval: 5s
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 5
+      start_period: 30s
+
+  mist-ollama:
+    image: ollama/ollama:latest
+    container_name: mist-ollama
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_KEEP_ALIVE=0
+    volumes:
+      - mist-ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
 
 volumes:
-  neo4j_data:
+  mist-neo4j-data:
+  mist-neo4j-logs:
+  mist-ollama-models:
+  mist-hf-cache:
+  mist-torch-cache:

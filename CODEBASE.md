@@ -1,27 +1,27 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-03-22
-**Branch:** fix/pre-rebuild-audit-cleanup (13 commits ahead of origin)
-**Status:** Knowledge system Phase 2 complete, Phase 3 next
+**Last Updated:** 2026-03-25
+**Branch:** test/chatterbox-eval
+**Status:** Knowledge pipeline merged, backend containerized, Chatterbox TTS integrated
 
 ---
 
 ## Current Status
 
 ### Backend
-- **Status:** PRODUCTION READY
+- **Status:** CONTAINERIZED (Docker + CUDA 12.4)
 - **Server:** FastAPI WebSocket on port 8001
-- **Voice Pipeline:** VAD -> Whisper -> Qwen 2.5 -> Sesame CSM-1B
-- **Knowledge Graph:** Full extraction + curation pipeline with automatic knowledge capture
-- **Configuration:** TTS currently DISABLED (.env: TTS_ENABLED=false)
-- **Code Quality:** [COMPLETE] Full suite - Black, Ruff, Mypy, Bandit, Codespell, AI slop detection
-- **Tests:** 146 unit tests passing
+- **Voice Pipeline:** VAD -> Whisper -> Qwen 2.5 7B -> Chatterbox Turbo TTS
+- **Knowledge Graph:** Full extraction + curation pipeline merged to main (655 tests, 369 new)
+- **Configuration:** TTS now ENABLED by default (TTS_ENABLED=true, TTS_ENGINE=chatterbox)
+- **Code Quality:** [COMPLETE] Full suite -- Black, Ruff, Mypy, Bandit, Codespell, AI slop detection
+- **Tests:** 655 unit tests (run inside container)
 
 ### Frontend
 - **Status:** IN DEVELOPMENT
 - **Platform:** Flutter desktop (Windows/macOS/Linux)
 - **Implementation:** WebSocket client, voice recording complete
-- **Pending:** Audio playback integration (needs TTS enabled)
+- **Pending:** Audio playback integration testing with Chatterbox TTS
 - **Planned:** Knowledge graph visualization
 - **Code Quality:** [COMPLETE] Flutter analyzer configured with custom rules
 
@@ -30,23 +30,27 @@
 ## Active Work
 
 ### Current Focus
-1. Phase 4 Tier 3: community detection, centrality, embedding maintenance (in progress)
-2. 48 P3 items in KNOWN_ISSUES.md from backend audit (opportunistic)
-3. Integration testing with Ollama + Neo4j
+1. Seed knowledge DB, run full end-to-end test
+2. Setup FRIDAY voice profile (Chatterbox reference audio)
+3. Clean up ~176GB CSM training data (legacy, no longer needed)
+4. Merge test/chatterbox-eval to main
+5. Knowledge graph visualization in Flutter
 
-### Recently Completed (2026-03-22)
-- Phase 1A: Ontology definitions (19 entity types, 30 relationship types)
-- Phase 1B: 6-stage extraction pipeline (OntologyConstrainedExtractor)
-- Phase 2A: Curation pipeline (dedup, conflict resolution, provenance tracking)
-- Phase 2B: ConversationHandler migration (automatic extraction, legacy removal)
-- Phase 3: Internal knowledge derivation (MIST self-model, Stage 9)
-- Phase 4 Tier 1+2: Periodic curation (decay, staleness, orphans, reflection, health, scheduler)
-- Testing foundation: 204 unit tests, DI refactoring, mock factories
-- Backend audit: P0/P1/P2 fixes, KNOWN_ISSUES.md tracking P3 items
+### Recently Completed (2026-03-25)
+- Knowledge extraction + curation pipeline merged to main (23 modified + 12 new files)
+- Chatterbox Turbo selected after 18-model TTS evaluation (replaces Sesame CSM-1B)
+- Docker Compose stack created (backend + Neo4j 5 + Ollama -- 3 services)
+- Chatterbox adapter implemented in model_manager.py
+- CSM imports made lazy (no torchtune dependency when using Chatterbox)
+- Voice profile system extended for Chatterbox (tts_engine, reference_audio_path)
+- Flash attention confirmed working inside Linux container (PyTorch 2.6+cu124)
+- 655 backend tests passing (369 new from knowledge pipeline)
 
 ### Known Issues
-- TTS disabled in .env (intentional for development, saves VRAM)
-- Flutter audio playback not tested yet (pending TTS enable)
+- Native Windows venv is corrupted -- use Docker container going forward
+- Flutter audio playback not tested yet (pending e2e test with Chatterbox)
+- ~176GB of legacy CSM training data needs cleanup
+- 48 P3 items in KNOWN_ISSUES.md from 2026-03-22 audit (opportunistic)
 
 ### Blockers
 None
@@ -55,39 +59,48 @@ None
 
 ## Recent Changes
 
-### Post-merge cleanup (2026-03-20)
-- Added `.gitattributes` to fix WSL2 line-ending phantom diffs (160 files showing as modified due to CRLF/LF mismatch on /mnt/d/)
-- Updated CODEBASE.md to reflect current state on main
+### Chatterbox TTS + Docker Stack (2026-03-25)
+- Chatterbox Turbo replaces Sesame CSM-1B as primary TTS engine
+  - Performance: 0.74x RTF vs 2.3x RTF (CSM)
+  - VRAM: 3.9GB vs 10GB (CSM)
+  - Zero-shot voice cloning, MIT license
+- Docker Compose stack: mist-backend + Neo4j 5 + Ollama
+- Dev mode: docker-compose.override.yml mounts code as read-only volumes
+- Backend container: nvidia/cuda:12.4.0-devel-ubuntu22.04 + Python 3.11
+- PyTorch 2.6.0+cu124 with flash attention inside container
 
-### Commits since code/quality merge (6bafae8):
-- `6ed1e73` docs: streamline README for public presentation
-- `96cc70a` chore: remove internal AI workflow files from tracking
-- `4d3c675` chore: fix mypy config, update dependencies, register speech_to_text plugin
-- `2b4cd94` docs: reorganize documentation - move historical docs to knowledge-vault
-- `0321673` chore: Clean up root directory structure
-- `6bafae8` Merge pull request #4 from gadhiar/code/quality
-
-### Code Quality Merge (PR #4, 2025-02-10)
-[COMPLETE] Merged code/quality branch into main:
-
-**Quality Tools:**
-- Black, Ruff, Mypy, Bandit, Codespell, AI slop checker
-- 16 pre-commit hooks configured
-- 7 CI checks passing (GitHub Actions)
-
-**Code Fixes:**
-- Fixed 228 docstring issues
-- Removed 722 emojis/symbols from 16 documentation files
-- Fixed undefined logger bug in backend/voice_models/model_manager.py
+### Knowledge Pipeline Merge (2026-03-25)
+- 23 modified files + 12 new files merged to main
+- 655 tests total (369 new)
+- Full extraction + curation pipeline with automatic knowledge capture
 
 ### Previous Milestones
+- Phase 1A: Ontology definitions (19 entity types, 30 relationship types)
+- Phase 1B: 6-stage extraction pipeline (OntologyConstrainedExtractor)
+- Phase 2A: Curation pipeline (dedup, conflict resolution, provenance tracking)
+- Phase 2B: ConversationHandler migration (automatic extraction, legacy removal)
+- Phase 3: Internal knowledge derivation (MIST self-model, Stage 9)
+- Phase 4 Tier 1+2: Periodic curation (decay, staleness, orphans, reflection, health, scheduler)
+- Backend audit: P0/P1/P2 fixes, KNOWN_ISSUES.md tracking P3 items
+- Code quality merge (PR #4): 16 pre-commit hooks, 7 CI checks
 - Removed obsolete React frontend (saved 127MB)
-- Completed Flutter migration with Riverpod state management
-- Implemented Flutter WebSocket client and voice recording
+- Flutter migration with Riverpod state management
 
 ---
 
 ## Architecture Overview
+
+### Docker Stack
+```
+docker/
+├── backend/
+│   ├── Dockerfile              # CUDA 12.4 + Python 3.11 + Chatterbox
+│   └── .dockerignore           # Excludes CSM training data
+└── ollama/
+    └── init-models.sh          # First-run model pull
+docker-compose.yml              # 3-service stack (backend, neo4j, ollama)
+docker-compose.override.yml     # Dev mode volume mounts
+```
 
 ### Backend Structure
 ```
@@ -96,7 +109,7 @@ backend/
 ├── voice_processor.py     # Voice pipeline orchestration
 ├── config.py              # Voice system configuration
 ├── knowledge_config.py    # Knowledge graph configuration
-├── voice_models/          # ML model management
+├── voice_models/          # ML model management (Chatterbox adapter)
 ├── chat/                  # Conversation handling + tool usage
 └── knowledge/             # Neo4j knowledge graph system
 ```
@@ -117,6 +130,7 @@ mist_desktop/
 - Flutter connects to backend via WebSocket (ws://localhost:8001)
 - Backend sends: transcriptions, LLM tokens, audio chunks
 - Frontend sends: audio data, text messages, interrupts
+- Services communicate via Docker container hostnames (mist-neo4j, mist-ollama)
 
 ---
 
@@ -124,22 +138,32 @@ mist_desktop/
 
 ### Environment Variables (.env)
 ```bash
-# Neo4j
-NEO4J_URI=bolt://localhost:7687
+# Neo4j (containerized)
+NEO4J_URI=bolt://mist-neo4j:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=password
 
 # Features
 ENABLE_KNOWLEDGE_INTEGRATION=true
-TTS_ENABLED=false  # Set true to enable audio playback
+TTS_ENABLED=true
+TTS_ENGINE=chatterbox
+
+# TTS Parameters
+VOICE_PROFILE=jarvis
+TTS_EXAGGERATION=0.5
+TTS_TEMPERATURE=0.8
+TTS_CFG_WEIGHT=0.5
 
 # Model
 MODEL=qwen2.5:7b-instruct
 ```
 
 ### Critical Settings
-- TTS_ENABLED: Currently false (saves 2-3GB VRAM during development)
-- ENABLE_KNOWLEDGE_INTEGRATION: true (knowledge graph active)
+- TTS_ENABLED=true (Chatterbox enabled by default)
+- TTS_ENGINE=chatterbox (legacy CSM still available but not recommended)
+- ENABLE_KNOWLEDGE_INTEGRATION=true (knowledge graph active)
+- Docker data root: D:\Users\rajga\DockerData (not default C:)
+- .env.example has all config with defaults
 
 ---
 
@@ -148,11 +172,16 @@ MODEL=qwen2.5:7b-instruct
 ### Backend
 - Python 3.11+
 - FastAPI + Uvicorn (WebSocket server)
-- Ollama (LLM inference - Qwen 2.5 7B)
-- Whisper (STT - base model)
-- Sesame CSM-1B (TTS - modified fork)
+- Docker (nvidia/cuda:12.4.0-devel-ubuntu22.04)
+- PyTorch 2.6.0+cu124 (flash attention enabled)
+- Ollama (LLM inference -- Qwen 2.5 7B)
+- Whisper (STT -- base model)
+- Chatterbox Turbo (TTS -- zero-shot voice cloning, MIT license)
 - Neo4j 5.x (knowledge graph)
-- PyTorch 2.4.0 + CUDA 12.4
+- Sentence Transformers (all-MiniLM-L6-v2, 384-dim embeddings)
+
+### Legacy (retained but not active)
+- Sesame CSM-1B (replaced by Chatterbox -- imports made lazy, no torchtune dependency)
 
 ### Frontend
 - Flutter 3.24+ / Dart 3.10+
@@ -165,17 +194,37 @@ MODEL=qwen2.5:7b-instruct
 
 ## Development Workflow
 
-### Starting Work
-1. Check this file (CODEBASE.md) for current status
-2. Run `git status` and check recent commits
-3. Read relevant docs if touching new areas
+### Starting the Stack
+```bash
+# Start full stack (backend + Neo4j + Ollama)
+docker compose up -d
 
-### Making Changes
-1. Update code with proper formatting (black, flutter format)
-2. Run checks before committing (pre-commit)
-3. Test changes manually or with tests
+# Or use dev script
+python scripts/start_dev.py
 
-### Run Code Quality Checks
+# View logs
+docker compose logs -f mist-backend
+```
+
+### Running Tests
+```bash
+# Run tests inside container (native venv is corrupted)
+docker compose run --rm --no-deps mist-backend pytest tests/unit/
+
+# Run specific test file
+docker compose run --rm --no-deps mist-backend pytest tests/unit/test_specific.py
+```
+
+### Building and Rebuilding
+```bash
+# Rebuild after Dockerfile changes
+docker compose build mist-backend
+
+# Full rebuild (no cache)
+docker compose build --no-cache mist-backend
+```
+
+### Code Quality Checks
 ```bash
 python scripts/check_ai_slop.py --critical-only
 pre-commit run --all-files
@@ -184,16 +233,23 @@ ruff check backend/ --fix
 cd mist_desktop && dart format . && flutter analyze
 ```
 
+### Flutter Development
+```bash
+cd mist_desktop
+flutter test
+flutter analyze
+flutter run -d windows
+```
+
 ---
 
 ## Testing
 
 ### Backend Tests
-```bash
-python test_neo4j_connection.py
-python test_conversation_handler.py --mode simple
-python test_vector_search.py
-```
+- **Count:** 655 unit tests (369 new from knowledge pipeline)
+- **Runner:** pytest inside Docker container
+- **Command:** `docker compose run --rm --no-deps mist-backend pytest tests/unit/`
+- **Note:** Tests must run inside container -- native Windows venv is missing dependencies
 
 ### Flutter Tests
 ```bash
@@ -202,48 +258,55 @@ flutter test
 flutter analyze
 ```
 
-### Manual Testing
-1. Start Neo4j: `neo4j start`
-2. Start backend: `python backend/server.py`
-3. Run Flutter: `cd mist_desktop && flutter run -d windows`
-4. Test voice input and conversation flow
+### Manual End-to-End Testing
+1. Start stack: `docker compose up -d`
+2. Run Flutter: `cd mist_desktop && flutter run -d windows`
+3. Test voice input and conversation flow
+4. Verify TTS audio playback
 
 ---
 
 ## Next Steps
 
 ### Immediate Priorities
-1. Knowledge/DB failsafe -- persistent memory reliability
-2. Command Center architecture design
-3. Model routing strategy (local Qwen vs cloud API)
+1. Seed knowledge DB, run full e2e test
+2. Setup FRIDAY voice profile (Chatterbox reference audio)
+3. Clean up ~176GB legacy CSM training data
+4. Merge test/chatterbox-eval to main
 
 ### Short-term Goals
 1. Knowledge graph visualization in Flutter
-2. Flutter UI polish and error handling
-3. Test Flutter audio playback with TTS enabled
+2. Flutter audio playback testing with Chatterbox
+3. Address P3 items from KNOWN_ISSUES.md (opportunistic)
 
 ### Long-term Goals
-1. Agent spawning and task delegation
-2. Vision integration (Qwen 2.5 Vision)
-3. Meta-reasoning layer for explainability
-4. Mobile app (Flutter iOS/Android)
+1. Command Center architecture (orchestrating agentic teams)
+2. Agent spawning and task delegation
+3. Model routing strategy (local Qwen vs cloud API)
+4. Vision integration (Qwen 2.5 Vision)
+5. Meta-reasoning layer for explainability
+6. Mobile app (Flutter iOS/Android)
 
 ---
 
 ## Important Files
 
 ### Documentation
-- **CLAUDE.md** - AI integration guidelines
-- **README.md** - Project overview and setup
-- **REPOSITORY_STRUCTURE.md** - File organization
-- **CONTRIBUTING.md** - Code quality standards
+- **CLAUDE.md** -- AI integration guidelines
+- **README.md** -- Project overview and setup
+- **REPOSITORY_STRUCTURE.md** -- File organization
+- **CONTRIBUTING.md** -- Code quality standards
+- **KNOWN_ISSUES.md** -- 48 P3 items from backend audit
 
 ### Configuration
-- **.env** - Environment variables (never commit)
-- **.gitattributes** - Line ending normalization (WSL2/Windows)
-- **pyproject.toml** - Python tool configuration
-- **analysis_options.yaml** - Flutter/Dart linting
-- **.pre-commit-config.yaml** - Pre-commit hooks
+- **.env** -- Environment variables (never commit)
+- **.env.example** -- All config with defaults
+- **.gitattributes** -- Line ending normalization (WSL2/Windows)
+- **pyproject.toml** -- Python tool configuration
+- **analysis_options.yaml** -- Flutter/Dart linting
+- **.pre-commit-config.yaml** -- Pre-commit hooks
+- **docker-compose.yml** -- 3-service stack definition
+- **docker-compose.override.yml** -- Dev mode volume mounts
 
 ---
 
@@ -251,9 +314,11 @@ flutter analyze
 
 | Area | Status | Notes |
 |------|--------|-------|
-| Backend | PROD READY | TTS disabled for dev |
+| Backend | CONTAINERIZED | Docker + CUDA 12.4 |
+| TTS | Chatterbox Turbo | 0.74x RTF, 3.9GB VRAM |
+| Knowledge | COMPLETE | 655 tests, Neo4j integrated |
 | Frontend | IN DEV | Audio playback pending |
-| Knowledge Graph | COMPLETE | Neo4j integrated |
 | Code Quality | COMPLETE | 16 pre-commit hooks, 7 CI checks |
+| Docker | COMPLETE | 3-service Compose stack |
 | CI/CD | COMPLETE | GitHub Actions configured |
 | Line Endings | FIXED | .gitattributes normalizes to LF |

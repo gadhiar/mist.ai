@@ -29,6 +29,10 @@ dependencies/csm/audio_data_*/
 *.wav
 !data/voice_profiles/**/*.yaml
 
+# Chatterbox evaluation venv and outputs
+venv-chatterbox/
+data/chatterbox_eval/
+
 # Node.js / Frontend
 node_modules/
 .npm/

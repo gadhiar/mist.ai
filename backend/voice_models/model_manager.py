@@ -13,12 +13,14 @@ sys.path.insert(0, "dependencies/csm")
 
 import ollama
 import torch
-from generator import Segment
 
 from src.multimodal.stt import WhisperSTT
 from src.multimodal.text_preprocessing import preprocess_text_for_tts
-from src.multimodal.tts import SesameTTS
 from src.multimodal.voice_profile import VoiceProfileRegistry
+
+# Lazy imports for TTS engines -- only loaded when needed
+# CSM: from generator import Segment; from src.multimodal.tts import SesameTTS
+# Chatterbox: from src.multimodal.tts import ChatterboxTTS
 
 logger = logging.getLogger(__name__)
 
@@ -115,18 +117,80 @@ class ModelManager:
         logger.info("Started dedicated TTS model worker thread")
 
     def _tts_worker(self):
-        """TTS model worker thread - loads and runs model (CSM pattern)."""
+        """TTS model worker thread - loads and runs model."""
         logger.info("TTS worker thread started")
+
+        project_root = Path(__file__).parent.parent.parent
+        registry = VoiceProfileRegistry(project_root / "data" / "voice_profiles")
+        profile = registry.get_active()
+        logger.info(f"Active voice profile: {profile.name} ({profile.description})")
+
+        if profile.tts_engine == "chatterbox":
+            self._tts_worker_chatterbox(profile)
+        else:
+            self._tts_worker_csm(profile)
+
+    def _tts_worker_chatterbox(self, profile):
+        """Chatterbox TTS worker -- zero-shot voice cloning, no context management."""
+        from src.multimodal.tts import ChatterboxTTS as _ChatterboxTTS
+
+        logger.info("Loading Chatterbox TTS in worker thread...")
+        self.tts = _ChatterboxTTS(profile=profile, device=self.config.tts_device)
+        self.tts.warmup()
+
+        # Signal warmup complete
+        self.tts_result_queue.put(("warmup_complete", None))
+
+        # Process requests
+        while self.tts_worker_running.is_set():
+            try:
+                request = self.tts_request_queue.get(timeout=0.1)
+                if request is None:
+                    break
+
+                gen_id, text = request[0], request[1]
+                logger.info(f"TTS worker: Processing generation ID {gen_id} ({len(text)} chars)")
+
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
+                try:
+                    audio = self.tts.generate(text)
+                    self.tts_result_queue.put(("chunk", gen_id, audio))
+                    logger.info(f"TTS worker: Generated {audio.shape[0] / 24000:.2f}s audio")
+                except Exception as gen_error:
+                    logger.error(f"TTS generation error: {gen_error}", exc_info=True)
+                    self.tts_result_queue.put(("error", gen_id, str(gen_error)))
+                    continue
+
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
+                self.tts_result_queue.put(("complete", gen_id, None))
+                logger.info(f"TTS worker: Completed generation ID {gen_id}")
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Error in TTS worker: {e}", exc_info=True)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                error_gen_id = gen_id if "gen_id" in locals() else 0
+                self.tts_result_queue.put(("error", error_gen_id, str(e)))
+
+        logger.info("TTS worker thread exiting")
+
+    def _tts_worker_csm(self, profile):
+        """Legacy CSM TTS worker -- streaming with context management."""
+        from generator import Segment
+
+        from src.multimodal.tts import SesameTTS
 
         # Disable CUDA graphs to avoid threading issues (CSM pattern)
         torch._inductor.config.triton.cudagraphs = False
         torch._inductor.config.fx_graph_cache = False
 
         logger.info("Loading Sesame TTS in worker thread...")
-        project_root = Path(__file__).parent.parent.parent
-        registry = VoiceProfileRegistry(project_root / "data" / "voice_profiles")
-        profile = registry.get_active()
-        logger.info(f"Active voice profile: {profile.name} ({profile.description})")
         self.tts = SesameTTS(
             profile=profile,
             device=self.config.tts_device,
@@ -134,7 +198,6 @@ class ModelManager:
         )
 
         # Warmup TTS -- exercise BOTH code paths to trigger torch.compile
-        # speak() uses generate(), but real requests use generate_stream()
         logger.info("Warming up TTS (non-streaming path)...")
         dummy_audio = self.tts.speak("Initialization complete.", play=False)
         logger.info(f"TTS non-streaming warmed up (audio shape: {dummy_audio.shape})")
@@ -150,8 +213,7 @@ class ModelManager:
             stream_chunks.append(chunk)
         logger.info(f"TTS streaming warmed up ({len(stream_chunks)} chunks)")
 
-        # Reset context to reference clips only -- discard warmup dummy audio
-        # Warmup generates low-quality audio that degrades voice anchoring
+        # Reset context to reference clips only
         ref_count = len(self.tts.profile.reference_clips)
         self.tts.context = self.tts.context[:ref_count]
         logger.info(
@@ -174,11 +236,9 @@ class ModelManager:
                     f"TTS worker: Context has {len(context)} segments, max_audio={max_ms}ms"
                 )
 
-                # Synchronize CUDA before TTS to prevent conflicts with Whisper
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
 
-                # Collect all chunks for context update
                 audio_chunks = []
                 chunk_count = 0
 
@@ -206,31 +266,19 @@ class ModelManager:
                     logger.info(f"TTS worker: Generated {chunk_count} audio chunks")
 
                 except Exception as gen_error:
-                    logger.error(f"TTS generation error: {gen_error}")
-                    import traceback
-
-                    logger.error(traceback.format_exc())
+                    logger.error(f"TTS generation error: {gen_error}", exc_info=True)
                     raise
 
-                # Synchronize CUDA after TTS to ensure completion
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
 
-                # Update context with generated audio (CRITICAL for consistency)
+                # Update context with generated audio
                 if len(audio_chunks) > 0 and self.tts and self.tts.use_context:
-                    # Concatenate all chunks with crossfade for smooth boundaries
                     complete_audio = self._crossfade_chunks(audio_chunks)
-
-                    # Move to CPU to prevent CUDA memory fragmentation
-                    # Context audio should be on CPU for stable long-term storage
                     complete_audio = complete_audio.cpu()
-
-                    # Create segment and update context
                     segment = Segment(speaker=speaker_id, text=text, audio=complete_audio)
                     self.tts.context.append(segment)
 
-                    # Keep reference clips + only 1 recent utterance
-                    # 4 refs (~26s) + 1 recent (~10-15s) = ~40s context max
                     ref_count = len(self.tts.profile.reference_clips)
                     max_segments = ref_count + 1
                     if len(self.tts.context) > max_segments:
@@ -238,7 +286,7 @@ class ModelManager:
 
                     logger.info(f"Updated context: now {len(self.tts.context)} segments")
 
-                self.tts_result_queue.put(("complete", gen_id, None))  # EOS marker
+                self.tts_result_queue.put(("complete", gen_id, None))
                 logger.info(f"TTS worker: Completed generation ID {gen_id}")
 
             except queue.Empty:
@@ -248,12 +296,10 @@ class ModelManager:
 
                 logger.error(f"Error in TTS worker: {e}\n{traceback.format_exc()}")
 
-                # Clean up CUDA memory on error to prevent cascading failures
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                     logger.info("Cleared CUDA cache after error")
 
-                # Put error with generation ID if available
                 error_gen_id = gen_id if "gen_id" in locals() else 0
                 self.tts_result_queue.put(("error", error_gen_id, str(e)))
 
@@ -481,19 +527,27 @@ Match your response depth to what the user is asking for - be concise when appro
 
         return total_tokens
 
-    def generate_tts_audio(self, text):
-        """Generate TTS audio (streaming) with intelligent chunking for long responses.
+    def _is_chatterbox(self) -> bool:
+        """Check if current TTS engine is Chatterbox."""
+        return self.tts is not None and hasattr(self.tts, "model")
 
-        Strategy:
-        1. Preprocess and analyze text token requirements
-        2. If text fits in token budget: generate directly
-        3. If text exceeds budget: chunk at sentence boundaries and generate sequentially
-        4. Preserve context between chunks for voice consistency
+    def generate_tts_audio(self, text):
+        """Generate TTS audio with engine-appropriate strategy.
+
+        Chatterbox: preprocess text, chunk long responses at sentence boundaries,
+        generate each chunk via worker thread.
+
+        CSM (legacy): streaming generation with context/token budget management.
         """
-        # If TTS is disabled, return empty generator
         if not self.config.tts_enabled or self.tts is None:
             logger.debug("TTS disabled - skipping audio generation")
             return
+
+        if self._is_chatterbox():
+            yield from self._generate_tts_chatterbox(text)
+            return
+
+        # --- Legacy CSM path below ---
 
         # Preprocess text (prosody-preserving substitutions)
         preprocessed_text = preprocess_text_for_tts(text)
@@ -626,6 +680,8 @@ Match your response depth to what the user is asking for - be concise when appro
                 # the previous output and maintains prosody continuity.
                 # Keep reference clips, replace any previous carryover segment.
                 if i < len(text_chunks) - 1 and chunk_audio_parts:
+                    from generator import Segment
+
                     chunk_audio = self._crossfade_chunks(chunk_audio_parts)
                     chunk_audio_cpu = chunk_audio.cpu()
 
@@ -685,6 +741,82 @@ Match your response depth to what the user is asking for - be concise when appro
                 logger.info(
                     f"Final context: {len(self.tts.context)} segments, {context_tokens} tokens"
                 )
+
+    def _generate_tts_chatterbox(self, text):
+        """Generate TTS audio using Chatterbox engine.
+
+        For short text (<3 sentences), generates in a single call.
+        For longer text, chunks at sentence boundaries and generates each
+        chunk independently (Chatterbox uses a fixed reference WAV, so
+        no context carryover is needed between chunks).
+        """
+        preprocessed_text = preprocess_text_for_tts(text)
+        sentences = self._split_into_sentences(preprocessed_text)
+
+        # Group sentences into chunks of ~2-3 sentences for natural pacing
+        # Chatterbox handles up to ~50 words well in a single generation
+        MAX_WORDS_PER_CHUNK = 50
+        chunks = []
+        current_chunk = []
+        current_words = 0
+
+        for sentence in sentences:
+            word_count = len(sentence.split())
+            if current_words + word_count > MAX_WORDS_PER_CHUNK and current_chunk:
+                chunks.append(" ".join(current_chunk))
+                current_chunk = [sentence]
+                current_words = word_count
+            else:
+                current_chunk.append(sentence)
+                current_words += word_count
+
+        if current_chunk:
+            chunks.append(" ".join(current_chunk))
+
+        if not chunks:
+            chunks = [preprocessed_text]
+
+        logger.info(f"Chatterbox: {len(sentences)} sentences -> {len(chunks)} chunks")
+
+        for i, chunk_text in enumerate(chunks):
+            with self.tts_lock:
+                self.tts_generation_id += 1
+                current_gen_id = self.tts_generation_id
+
+                # Clear stale results
+                while not self.tts_result_queue.empty():
+                    try:
+                        self.tts_result_queue.get_nowait()
+                    except queue.Empty:
+                        break
+
+            logger.info(f"[CHUNK {i+1}/{len(chunks)}] Submitting: '{chunk_text[:60]}...'")
+
+            # Submit to worker -- Chatterbox requests only need gen_id and text
+            self.tts_request_queue.put((current_gen_id, chunk_text))
+
+            # Collect result
+            TIMEOUT = 120.0
+            while True:
+                try:
+                    msg_type, gen_id, data = self.tts_result_queue.get(timeout=TIMEOUT)
+                except queue.Empty:
+                    raise RuntimeError(f"TTS generation timeout after {TIMEOUT}s") from None
+
+                if gen_id != current_gen_id:
+                    continue
+
+                if msg_type == "chunk":
+                    yield data
+                elif msg_type == "complete":
+                    logger.info(f"[CHUNK {i+1}/{len(chunks)}] Complete")
+                    break
+                elif msg_type == "error":
+                    raise RuntimeError(f"TTS generation failed: {data}")
+
+            # Clean up between chunks
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _crossfade_chunks(self, chunks: list, crossfade_ms: int = 50) -> torch.Tensor:
         """Concatenate audio chunks with raised-cosine crossfade.

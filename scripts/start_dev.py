@@ -1,18 +1,19 @@
-"""Start the MIST.AI development stack.
+"""Start the MIST.AI development stack via Docker Compose.
 
 Usage:
-    python scripts/start_dev.py              # Start full stack (Neo4j, Ollama, backend, frontend)
-    python scripts/start_dev.py --deps-only  # Start dependencies only (Neo4j, Ollama)
-    python scripts/start_dev.py --stop       # Stop services
+    python scripts/start_dev.py              # Start full stack + Flutter frontend
+    python scripts/start_dev.py --deps-only  # Start backend stack only (no Flutter)
+    python scripts/start_dev.py --stop       # Stop all services
+    python scripts/start_dev.py --logs       # Tail backend logs
+    python scripts/start_dev.py --restart    # Restart backend container (pick up code changes)
 
 Prerequisites:
-    - Docker Desktop (for Neo4j)
-    - Ollama installed
-    - Python venv with dependencies
-    - Flutter SDK on PATH
+    - Docker Desktop with NVIDIA Container Toolkit
+    - Flutter SDK on PATH (for frontend)
 """
 
 import argparse
+import contextlib
 import socket
 import subprocess
 import sys
@@ -29,42 +30,104 @@ def check_port(host: str, port: int, timeout: float = 2.0) -> bool:
         return False
 
 
-def start_ollama() -> bool:
-    """Start Ollama serve in the background."""
-    if check_port("localhost", 11434):
-        print("  [OK] Ollama already running on :11434")
-        return True
-
-    print("  Starting Ollama...")
+def check_docker() -> bool:
+    """Verify Docker daemon is running."""
     try:
-        subprocess.Popen(
-            ["ollama", "serve"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        result = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
+        if result.returncode != 0:
+            print("  [FAIL] Docker daemon not running. Start Docker Desktop.")
+            return False
+        print("  [OK] Docker daemon running")
+        return True
     except FileNotFoundError:
-        print("  [FAIL] Ollama not found. Install from https://ollama.com")
+        print("  [FAIL] Docker not found. Install Docker Desktop.")
+        return False
+    except subprocess.TimeoutExpired:
+        print("  [FAIL] Docker info timed out.")
         return False
 
-    # Wait for it to become ready
-    for i in range(15):
-        time.sleep(1)
-        if check_port("localhost", 11434):
-            print("  [OK] Ollama started on :11434")
-            return True
-        if i % 5 == 4:
-            print(f"  Waiting... ({i + 1}s)")
 
-    print("  [FAIL] Ollama did not start in 15s")
+def start_stack(build: bool = False) -> bool:
+    """Start the Docker Compose stack (backend + Neo4j + Ollama)."""
+    print("  Starting Docker Compose stack...")
+    cmd = ["docker", "compose", "up", "-d"]
+    if build:
+        cmd.append("--build")
+    try:
+        result = subprocess.run(
+            cmd,
+            timeout=600,
+        )
+        if result.returncode != 0:
+            print("  [FAIL] docker compose up failed")
+            return False
+        print("  [OK] Compose stack started")
+        return True
+    except subprocess.TimeoutExpired:
+        print("  [FAIL] docker compose up timed out (10min)")
+        return False
+
+
+def wait_for_service(name: str, host: str, port: int, max_wait: int = 120) -> bool:
+    """Wait for a service to become reachable on a port."""
+    for i in range(max_wait):
+        if check_port(host, port):
+            print(f"  [OK] {name} ready on :{port}")
+            return True
+        if i % 15 == 14:
+            print(f"  Waiting for {name}... ({i + 1}s)")
+        time.sleep(1)
+
+    print(f"  [FAIL] {name} did not start in {max_wait}s")
     return False
 
 
-def check_model(model: str = "qwen2.5:7b-instruct") -> bool:
-    """Check if the required model is available, pull if not."""
+def wait_for_container_healthy(
+    container: str,
+    max_wait: int = 180,
+    quiet_interval: int = 15,
+) -> bool:
+    """Wait for a Docker container to report healthy status.
+
+    Unlike port checks, this waits for the container's own healthcheck
+    to pass, ensuring models are fully loaded before returning.
+    """
+    for i in range(max_wait):
+        try:
+            result = subprocess.run(
+                ["docker", "inspect", container, "--format", "{{.State.Health.Status}}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            status = result.stdout.strip()
+            if status == "healthy":
+                print(f"  [OK] {container} healthy")
+                return True
+            if status not in ("starting", "healthy"):
+                print(f"  [FAIL] {container} status: {status}")
+                return False
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        if i % quiet_interval == quiet_interval - 1:
+            print(f"  Waiting for {container}... ({i + 1}s)")
+        time.sleep(1)
+
+    print(f"  [FAIL] {container} not healthy after {max_wait}s")
+    return False
+
+
+def pull_model(model: str = "qwen2.5:7b-instruct") -> bool:
+    """Ensure the LLM model is available in Ollama."""
+    print(f"  Checking model {model}...")
     try:
         result = subprocess.run(
-            ["ollama", "list"],
+            ["docker", "compose", "exec", "mist-ollama", "ollama", "list"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -72,97 +135,27 @@ def check_model(model: str = "qwen2.5:7b-instruct") -> bool:
         if model in result.stdout:
             print(f"  [OK] Model {model} available")
             return True
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
 
-    print(f"  Pulling {model} (first time only, may take a few minutes)...")
-    try:
-        subprocess.run(["ollama", "pull", model], timeout=600)
-        print(f"  [OK] Model {model} pulled")
-        return True
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        print(f"  [FAIL] Could not pull {model}")
-        return False
-
-
-def start_neo4j() -> bool:
-    """Start Neo4j via Docker if not already running."""
-    if check_port("localhost", 7687):
-        print("  [OK] Neo4j already running on bolt://localhost:7687")
-        return True
-
-    print("  Starting Neo4j via Docker...")
+    print(f"  Pulling {model} (first time only, may take several minutes)...")
     try:
         result = subprocess.run(
-            ["docker", "compose", "up", "-d", "neo4j"],
-            capture_output=True,
-            text=True,
-            timeout=30,
+            ["docker", "compose", "exec", "mist-ollama", "ollama", "pull", model],
+            timeout=600,
         )
-        if result.returncode != 0:
-            print(f"  [FAIL] docker compose failed: {result.stderr.strip()}")
-            print("         Is Docker Desktop running?")
-            return False
-    except FileNotFoundError:
-        print("  [FAIL] Docker not found. Install Docker Desktop.")
+        if result.returncode == 0:
+            print(f"  [OK] Model {model} pulled")
+            return True
+        print(f"  [FAIL] Could not pull {model}")
         return False
     except subprocess.TimeoutExpired:
-        print("  [FAIL] Docker compose timed out.")
+        print("  [FAIL] Model pull timed out")
         return False
-
-    # Wait for Neo4j to become ready
-    for i in range(30):
-        time.sleep(1)
-        if check_port("localhost", 7687):
-            print("  [OK] Neo4j started on bolt://localhost:7687")
-            return True
-        if i % 10 == 9:
-            print(f"  Waiting for Neo4j... ({i + 1}s)")
-
-    print("  [FAIL] Neo4j did not start in 30s")
-    return False
-
-
-def start_backend() -> subprocess.Popen | None:
-    """Start the backend server."""
-    if check_port("localhost", 8001):
-        print("  [OK] Backend already running on :8001")
-        return None
-
-    print("  Starting backend server...")
-    # Resolve venv python relative to project root (parent of scripts/)
-    from pathlib import Path
-
-    project_root = Path(__file__).resolve().parent.parent
-    if sys.platform == "win32":
-        venv_python = str(project_root / "venv" / "Scripts" / "python.exe")
-    else:
-        venv_python = str(project_root / "venv" / "bin" / "python")
-    print(f"  Using venv: {venv_python}")
-    try:
-        proc = subprocess.Popen(
-            [venv_python, "backend/server.py"],
-            cwd=str(project_root),
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
-        )
-    except FileNotFoundError:
-        print(f"  [FAIL] {venv_python} not found. Create venv first.")
-        return None
-
-    for i in range(90):
-        time.sleep(1)
-        if check_port("localhost", 8001):
-            print("  [OK] Backend started on ws://localhost:8001")
-            return proc
-        if i % 10 == 9:
-            print(f"  Waiting for backend (loading TTS models)... ({i + 1}s)")
-
-    print("  [FAIL] Backend did not start in 90s")
-    return None
 
 
 def start_frontend() -> subprocess.Popen | None:
-    """Start the Flutter frontend."""
+    """Start the Flutter frontend (native Windows)."""
     import shutil
     from pathlib import Path
 
@@ -182,33 +175,36 @@ def start_frontend() -> subprocess.Popen | None:
         return None
 
 
+def tail_logs() -> None:
+    """Tail backend container logs."""
+    with contextlib.suppress(KeyboardInterrupt):
+        subprocess.run(["docker", "compose", "logs", "-f", "mist-backend"])
+
+
 def stop() -> None:
-    """Stop Neo4j (Docker) and Ollama."""
+    """Stop the Docker Compose stack."""
     print("Stopping stack...")
     subprocess.run(["docker", "compose", "down"], capture_output=True)
-    print("  Neo4j stopped.")
-    if sys.platform == "win32":
-        subprocess.run(
-            ["taskkill", "/f", "/im", "ollama.exe"],
-            capture_output=True,
-        )
-        subprocess.run(
-            ["taskkill", "/f", "/im", "ollama_llama_server.exe"],
-            capture_output=True,
-        )
-    else:
-        subprocess.run(["pkill", "-f", "ollama serve"], capture_output=True)
-    print("  Ollama stopped.")
-    print("Stack stopped.")
+    print("  Stack stopped.")
+
+
+def restart_backend() -> None:
+    """Restart just the backend container (pick up code changes)."""
+    print("Restarting backend...")
+    subprocess.run(["docker", "compose", "restart", "mist-backend"])
+    print("  Backend restarted.")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="MIST.AI dev stack manager")
-    parser.add_argument("--stop", action="store_true", help="Stop services")
+    parser = argparse.ArgumentParser(description="MIST.AI dev stack manager (Docker)")
+    parser.add_argument("--stop", action="store_true", help="Stop all services")
+    parser.add_argument("--logs", action="store_true", help="Tail backend logs")
+    parser.add_argument("--restart", action="store_true", help="Restart backend container")
+    parser.add_argument("--build", action="store_true", help="Rebuild images before starting")
     parser.add_argument(
         "--deps-only",
         action="store_true",
-        help="Only start dependencies (Neo4j, Ollama), not backend/frontend",
+        help="Start backend stack only, no Flutter frontend",
     )
     args = parser.parse_args()
 
@@ -216,50 +212,65 @@ def main() -> None:
         stop()
         return
 
+    if args.logs:
+        tail_logs()
+        return
+
+    if args.restart:
+        restart_backend()
+        return
+
     print("=" * 50)
-    print("  MIST.AI Development Stack")
+    print("  MIST.AI Development Stack (Docker)")
     print("=" * 50)
     print()
 
-    # 1. Neo4j
-    print("[1/5] Starting Neo4j...")
-    neo4j_ok = start_neo4j()
+    # 1. Docker
+    print("[1/5] Checking Docker...")
+    if not check_docker():
+        sys.exit(1)
 
-    # 2. Ollama
-    print("[2/5] Starting Ollama...")
-    ollama_ok = start_ollama()
+    # 2. Start stack
+    print("[2/5] Starting services...")
+    if not start_stack(build=args.build):
+        sys.exit(1)
 
-    # 3. Model
+    # 3. Wait for services
+    #    Neo4j and Ollama: port checks (fast, no model loading).
+    #    Backend: wait for Docker healthcheck (models take ~90s to load).
+    print("[3/5] Waiting for services...")
+    neo4j_ok = wait_for_service("Neo4j", "localhost", 7687, max_wait=60)
+    ollama_ok = wait_for_service("Ollama", "localhost", 11434, max_wait=30)
+    print("  Backend loading models (Whisper + Chatterbox + LLM)...")
+    backend_ok = wait_for_container_healthy("mist-backend", max_wait=180)
+
+    # 4. Model
     if ollama_ok:
-        print("[3/5] Checking model...")
-        model_ok = check_model()
-    else:
-        model_ok = False
+        print("[4/5] Checking LLM model...")
+        pull_model()
 
-    if not (neo4j_ok and ollama_ok and model_ok):
+    if not (neo4j_ok and ollama_ok and backend_ok):
         print()
         print("=" * 50)
-        print("  Stack NOT ready. Fix the issues above.")
+        print("  Stack NOT fully ready. Check logs:")
+        print("  docker compose logs mist-backend")
         print("=" * 50)
         sys.exit(1)
 
     if args.deps_only:
         print()
         print("=" * 50)
-        print("  Dependencies ready.")
+        print("  Backend stack ready.")
         print()
-        print("  Neo4j:   bolt://localhost:7687")
-        print("  Ollama:  http://localhost:11434")
+        print("  Neo4j:    bolt://localhost:7687 (browser: http://localhost:7474)")
+        print("  Ollama:   http://localhost:11434")
+        print("  Backend:  ws://localhost:8001/ws")
         print()
-        print("  Start backend:  venv\\Scripts\\python backend\\server.py")
-        print("  Start frontend: cd mist_desktop && flutter run -d windows")
+        print("  Logs:     python scripts/start_dev.py --logs")
+        print("  Restart:  python scripts/start_dev.py --restart")
+        print("  Stop:     python scripts/start_dev.py --stop")
         print("=" * 50)
         return
-
-    # 4. Backend
-    print("[4/5] Starting backend...")
-    backend_proc = start_backend()
-    backend_ok = backend_proc is not None or check_port("localhost", 8001)
 
     # 5. Frontend
     print("[5/5] Starting frontend...")
@@ -268,45 +279,41 @@ def main() -> None:
 
     print()
     print("=" * 50)
-    print("  Stack running." if backend_ok and frontend_ok else "  Stack partially running.")
+    print("  Stack running." if frontend_ok else "  Backend running (frontend failed).")
     print()
     print("  Neo4j:    bolt://localhost:7687")
     print("  Ollama:   http://localhost:11434")
-    print("  Backend:  ws://localhost:8001" if backend_ok else "  Backend:  [NOT RUNNING]")
+    print("  Backend:  ws://localhost:8001/ws")
     print("  Frontend: Flutter desktop" if frontend_ok else "  Frontend: [NOT RUNNING]")
     print()
-    print("  Stop all: python scripts/start_dev.py --stop")
-    print("  Run tests: venv\\Scripts\\python -m pytest tests/ -v")
+    print("  Restart backend: python scripts/start_dev.py --restart")
+    print("  View logs:       python scripts/start_dev.py --logs")
+    print("  Stop all:        python scripts/start_dev.py --stop")
+    print("  Run tests:       docker compose exec mist-backend pytest tests/unit/ -v")
     print("=" * 50)
 
-    # Keep script alive while subprocesses run, clean up everything on exit
-    procs = [p for p in (backend_proc, frontend_proc) if p is not None]
-    if procs:
+    # Keep alive while Flutter runs
+    if frontend_proc:
         import atexit
         import contextlib
 
         def cleanup():
             print()
-            print("Shutting down stack...")
-            for p in procs:
-                with contextlib.suppress(OSError):
-                    p.terminate()
-            for p in procs:
-                with contextlib.suppress(Exception):
-                    p.wait(timeout=5)
+            print("Shutting down...")
+            with contextlib.suppress(OSError):
+                frontend_proc.terminate()
+            with contextlib.suppress(Exception):
+                frontend_proc.wait(timeout=5)
             stop()
-            print("Stack stopped.")
 
-        # Ensure cleanup runs on normal exit, Ctrl+C, and terminal close
         atexit.register(cleanup)
         if sys.platform == "win32":
-            # CTRL_CLOSE_EVENT fires when terminal window is closed
             import ctypes
 
             kernel32 = ctypes.windll.kernel32
 
             def console_handler(event):
-                if event in (0, 2):  # CTRL_C_EVENT, CTRL_CLOSE_EVENT
+                if event in (0, 2):
                     cleanup()
                     return True
                 return False
@@ -315,10 +322,10 @@ def main() -> None:
             kernel32.SetConsoleCtrlHandler(handler_func, True)
 
         try:
-            while all(p.poll() is None for p in procs):
+            while frontend_proc.poll() is None:
                 time.sleep(1)
         except KeyboardInterrupt:
-            pass  # cleanup runs via atexit
+            pass
 
 
 if __name__ == "__main__":

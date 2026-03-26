@@ -1,5 +1,6 @@
-"""Text-to-Speech using Sesame CSM."""
+"""Text-to-Speech engines: Sesame CSM and Chatterbox Turbo."""
 
+import logging
 import sys
 import warnings
 
@@ -18,22 +19,25 @@ torch._dynamo.config.suppress_errors = True
 # Default is 8, but streaming generates varying sequence lengths
 torch._dynamo.config.cache_size_limit = 128
 
-# Add CSM to path
-sys.path.insert(0, "dependencies/csm")
 
-from generator import Generator, Segment
+def _ensure_csm_path():
+    """Add CSM to sys.path if not already present."""
+    csm_path = "dependencies/csm"
+    if csm_path not in sys.path:
+        sys.path.insert(0, csm_path)
 
-from models import Model, ModelArgs
 
-
-def _load_finetuned_csm(weights_path: str, device: str = "cuda") -> Generator:
+def _load_finetuned_csm(weights_path: str, device: str = "cuda"):
     """Load CSM-1B base model and overlay fine-tuned weights.
 
     Fine-tuned model.safetensors files are raw weight dumps (not HF-formatted
     checkpoints), so we load the base model first then overlay fine-tuned weights
     with strict=False to allow partial weight updates (LoRA-merged weights).
     """
+    _ensure_csm_path()
+    from generator import Generator
     from huggingface_hub import hf_hub_download
+    from models import Model, ModelArgs
     from safetensors.torch import load_file
 
     # Load base model architecture and weights from HuggingFace
@@ -94,6 +98,9 @@ class SesameTTS:
     def _load_reference_audio(self):
         """Load reference audio clips from voice profile for voice anchoring."""
         import torchaudio
+
+        _ensure_csm_path()
+        from generator import Segment
 
         if not self.profile.reference_clips:
             print("Warning: No reference clips in voice profile. Voice consistency may be reduced.")
@@ -188,6 +195,9 @@ class SesameTTS:
 
         # Update context with this generation (keep reference + last 2 for voice consistency)
         if self.use_context and len(audio) > 0:
+            _ensure_csm_path()
+            from generator import Segment
+
             segment = Segment(speaker=self.speaker_id, text=text, audio=audio)
             self.context.append(segment)
             # Keep 3 reference clips + 2 most recent utterances (5 total)
@@ -223,3 +233,63 @@ class SesameTTS:
             sd.wait()
         except ImportError:
             print("Install sounddevice to play audio: pip install sounddevice")
+
+
+logger = logging.getLogger(__name__)
+
+
+class ChatterboxTTS:
+    """Wrapper for Chatterbox Turbo TTS with zero-shot voice cloning.
+
+    Unlike CSM, Chatterbox does not use context segments or fine-tuned weights.
+    It clones voice from a single reference WAV file at inference time.
+    """
+
+    SAMPLE_RATE = 24_000
+
+    def __init__(self, profile, device: str | None = None):
+        """Initialize Chatterbox TTS.
+
+        Args:
+            profile: VoiceProfile with reference_audio_path set.
+            device: 'cuda' or 'cpu'. Auto-detects if None.
+        """
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        self.profile = profile
+        self.device = device
+        self.reference_audio_path = str(profile.reference_audio_path)
+
+        logger.info("Loading Chatterbox Turbo (%s) on %s...", profile.name, device)
+
+        from chatterbox.tts import ChatterboxTTS as _ChatterboxTTS
+
+        self.model = _ChatterboxTTS.from_pretrained(device=device)
+
+        logger.info("Chatterbox Turbo (%s) loaded", profile.name)
+
+    def generate(self, text: str) -> torch.Tensor:
+        """Generate speech from text using zero-shot voice cloning.
+
+        Args:
+            text: Text to synthesize.
+
+        Returns:
+            1-D audio tensor at 24kHz sample rate.
+        """
+        wav = self.model.generate(
+            text,
+            audio_prompt_path=self.reference_audio_path,
+            exaggeration=self.profile.exaggeration,
+            temperature=self.profile.temperature,
+            cfg_weight=self.profile.cfg_weight,
+        )
+        # Chatterbox returns shape (1, samples) -- squeeze to 1-D
+        return wav.squeeze(0)
+
+    def warmup(self) -> None:
+        """Run a warmup generation to trigger model compilation."""
+        logger.info("Warming up Chatterbox TTS...")
+        _ = self.generate("Initialization complete.")
+        logger.info("Chatterbox TTS warmup complete")

@@ -1,9 +1,13 @@
 name: friday
-description: "FRIDAY voice (pending training data acquisition)"
+description: "FRIDAY voice via Chatterbox Turbo zero-shot cloning from 46s reference"
 speaker_id: 0
-weights_path: null
+tts_engine: chatterbox
 sample_rate: 24000
 temperature: 0.8
-topk: 40
+exaggeration: 0.5
+cfg_weight: 0.5
+
+# Chatterbox uses a single reference WAV for zero-shot cloning
+reference_audio_path: reference/ref_001.wav
 
 reference_clips: []

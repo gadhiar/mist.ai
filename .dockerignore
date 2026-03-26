@@ -1,0 +1,59 @@
+# Docker build context exclusions
+# The build context is the project root (.), so this file must be here.
+
+# Python virtual environments (~10-20GB each)
+venv/
+venv-chatterbox/
+.venv/
+
+# Git
+.git/
+
+# CSM training data, models, caches, and test outputs (~180GB)
+dependencies/csm/audio_data*/
+dependencies/csm/finetuned_model*/
+dependencies/csm/hf_cache/
+dependencies/csm/jarvis_test_outputs/
+dependencies/csm/test_output/
+*.wav
+*.safetensors
+*.bin
+*.pt
+!data/voice_profiles/**/*.yaml
+
+# Data directories (mounted at runtime, not baked into image)
+data/vector_store/
+data/chatterbox_eval/
+
+# Flutter frontend (not needed in backend container)
+mist_desktop/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE and tools
+.claude/
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment files (injected via compose)
+.env
+.env.local
+
+# Documentation and specs (not needed at runtime)
+docs/
+knowledge-vault/
+
+# Docker files themselves
+docker/
+
+# Node artifacts
+node_modules/
