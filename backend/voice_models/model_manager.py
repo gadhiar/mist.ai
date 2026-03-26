@@ -101,6 +101,15 @@ class ModelManager:
         logger.info("3/3 Warming up LLM...")
         ollama.chat(model=self.llm_model, messages=[{"role": "user", "content": "hi"}])
 
+        # Eager-load embedding model so first RAG query has no cold start
+        if self.knowledge and self.knowledge.is_enabled():
+            handler = self.knowledge.conversation_handler
+            if handler and hasattr(handler, "graph_store"):
+                embedding_gen = getattr(handler.graph_store, "embedding_generator", None)
+                if embedding_gen and hasattr(embedding_gen, "warmup"):
+                    logger.info("Warming up embedding model...")
+                    embedding_gen.warmup()
+
         elapsed = time.time() - start
         logger.info(f"All models loaded in {elapsed:.1f}s")
 
@@ -131,7 +140,12 @@ class ModelManager:
             self._tts_worker_csm(profile)
 
     def _tts_worker_chatterbox(self, profile):
-        """Chatterbox TTS worker -- zero-shot voice cloning, no context management."""
+        """Chatterbox TTS worker -- zero-shot voice cloning, no context management.
+
+        With pipeline parallelism, sentences arrive one at a time from the
+        sentence queue.  No CUDA synchronize between generations -- the worker
+        processes requests back-to-back for minimum latency.
+        """
         from src.multimodal.tts import ChatterboxTTS as _ChatterboxTTS
 
         logger.info("Loading Chatterbox TTS in worker thread...")
@@ -149,32 +163,35 @@ class ModelManager:
                     break
 
                 gen_id, text = request[0], request[1]
-                logger.info(f"TTS worker: Processing generation ID {gen_id} ({len(text)} chars)")
-
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
+                logger.info(
+                    "TTS worker: Processing generation ID %d (%d chars)",
+                    gen_id,
+                    len(text),
+                )
 
                 try:
                     audio = self.tts.generate(text)
                     self.tts_result_queue.put(("chunk", gen_id, audio))
-                    logger.info(f"TTS worker: Generated {audio.shape[0] / 24000:.2f}s audio")
+                    logger.info(
+                        "TTS worker: Generated %.2fs audio",
+                        audio.shape[0] / 24000,
+                    )
                 except Exception as gen_error:
-                    logger.error(f"TTS generation error: {gen_error}", exc_info=True)
+                    logger.error("TTS generation error: %s", gen_error, exc_info=True)
                     self.tts_result_queue.put(("error", gen_id, str(gen_error)))
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
                     continue
 
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-
                 self.tts_result_queue.put(("complete", gen_id, None))
-                logger.info(f"TTS worker: Completed generation ID {gen_id}")
+                logger.info("TTS worker: Completed generation ID %d", gen_id)
 
             except queue.Empty:
                 continue
             except Exception as e:
-                logger.error(f"Error in TTS worker: {e}", exc_info=True)
+                logger.error("Error in TTS worker: %s", e, exc_info=True)
                 if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
                 error_gen_id = gen_id if "gen_id" in locals() else 0
                 self.tts_result_queue.put(("error", error_gen_id, str(e)))
 
@@ -437,8 +454,8 @@ class ModelManager:
         """
         # Use knowledge-augmented generation if available
         if self.knowledge and self.knowledge.is_enabled():
-            logger.info("Using knowledge-augmented LLM response")
-            yield from self.knowledge.generate_response_streaming(
+            logger.info("Using knowledge-augmented LLM response (streaming tokens)")
+            yield from self.knowledge.generate_tokens_streaming(
                 user_text, event_loop=self.event_loop
             )
         else:
@@ -743,80 +760,49 @@ Match your response depth to what the user is asking for - be concise when appro
                 )
 
     def _generate_tts_chatterbox(self, text):
-        """Generate TTS audio using Chatterbox engine.
+        """Generate TTS audio using Chatterbox engine for a single sentence.
 
-        For short text (<3 sentences), generates in a single call.
-        For longer text, chunks at sentence boundaries and generates each
-        chunk independently (Chatterbox uses a fixed reference WAV, so
-        no context carryover is needed between chunks).
+        With pipeline parallelism, text arrives as individual sentences from
+        the sentence boundary detector. No re-chunking needed -- each call
+        generates audio for one sentence.
         """
         preprocessed_text = preprocess_text_for_tts(text)
-        sentences = self._split_into_sentences(preprocessed_text)
 
-        # Group sentences into chunks of ~2-3 sentences for natural pacing
-        # Chatterbox handles up to ~50 words well in a single generation
-        MAX_WORDS_PER_CHUNK = 50
-        chunks = []
-        current_chunk = []
-        current_words = 0
+        with self.tts_lock:
+            self.tts_generation_id += 1
+            current_gen_id = self.tts_generation_id
 
-        for sentence in sentences:
-            word_count = len(sentence.split())
-            if current_words + word_count > MAX_WORDS_PER_CHUNK and current_chunk:
-                chunks.append(" ".join(current_chunk))
-                current_chunk = [sentence]
-                current_words = word_count
-            else:
-                current_chunk.append(sentence)
-                current_words += word_count
-
-        if current_chunk:
-            chunks.append(" ".join(current_chunk))
-
-        if not chunks:
-            chunks = [preprocessed_text]
-
-        logger.info(f"Chatterbox: {len(sentences)} sentences -> {len(chunks)} chunks")
-
-        for i, chunk_text in enumerate(chunks):
-            with self.tts_lock:
-                self.tts_generation_id += 1
-                current_gen_id = self.tts_generation_id
-
-                # Clear stale results
-                while not self.tts_result_queue.empty():
-                    try:
-                        self.tts_result_queue.get_nowait()
-                    except queue.Empty:
-                        break
-
-            logger.info(f"[CHUNK {i+1}/{len(chunks)}] Submitting: '{chunk_text[:60]}...'")
-
-            # Submit to worker -- Chatterbox requests only need gen_id and text
-            self.tts_request_queue.put((current_gen_id, chunk_text))
-
-            # Collect result
-            TIMEOUT = 120.0
-            while True:
+            while not self.tts_result_queue.empty():
                 try:
-                    msg_type, gen_id, data = self.tts_result_queue.get(timeout=TIMEOUT)
+                    self.tts_result_queue.get_nowait()
                 except queue.Empty:
-                    raise RuntimeError(f"TTS generation timeout after {TIMEOUT}s") from None
-
-                if gen_id != current_gen_id:
-                    continue
-
-                if msg_type == "chunk":
-                    yield data
-                elif msg_type == "complete":
-                    logger.info(f"[CHUNK {i+1}/{len(chunks)}] Complete")
                     break
-                elif msg_type == "error":
-                    raise RuntimeError(f"TTS generation failed: {data}")
 
-            # Clean up between chunks
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        logger.info(
+            "Chatterbox: generating '%s...' (%d chars)",
+            preprocessed_text[:50],
+            len(preprocessed_text),
+        )
+
+        self.tts_request_queue.put((current_gen_id, preprocessed_text))
+
+        TIMEOUT = 120.0
+        while True:
+            try:
+                msg_type, gen_id, data = self.tts_result_queue.get(timeout=TIMEOUT)
+            except queue.Empty:
+                raise RuntimeError(f"TTS generation timeout after {TIMEOUT}s") from None
+
+            if gen_id != current_gen_id:
+                continue
+
+            if msg_type == "chunk":
+                yield data
+            elif msg_type == "complete":
+                logger.info("Chatterbox: generation complete")
+                break
+            elif msg_type == "error":
+                raise RuntimeError(f"TTS generation failed: {data}")
 
     def _crossfade_chunks(self, chunks: list, crossfade_ms: int = 50) -> torch.Tensor:
         """Concatenate audio chunks with raised-cosine crossfade.

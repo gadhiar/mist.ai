@@ -51,6 +51,18 @@ class EmbeddingGenerator:
             logger.info("Embedding model loaded successfully")
         return self._model
 
+    def warmup(self) -> None:
+        """Eagerly load the embedding model and run a dummy encode.
+
+        Call during startup to avoid cold-start latency on the first
+        real embedding request. Safe to call multiple times -- subsequent
+        calls are no-ops.
+        """
+        model = self._get_model()
+        # Run a dummy encode so any one-time initialization is completed
+        model.encode("warmup", convert_to_numpy=True, show_progress_bar=False)
+        logger.info("Embedding model warmup complete")
+
     def generate_embedding(self, text: str) -> list[float]:
         """Generate embedding vector for text.
 
