@@ -87,6 +87,41 @@ def wait_for_service(name: str, host: str, port: int, max_wait: int = 120) -> bo
     return False
 
 
+def wait_for_container_healthy(
+    container: str,
+    max_wait: int = 180,
+    quiet_interval: int = 15,
+) -> bool:
+    """Wait for a Docker container to report healthy status.
+
+    Unlike port checks, this waits for the container's own healthcheck
+    to pass, ensuring models are fully loaded before returning.
+    """
+    for i in range(max_wait):
+        try:
+            result = subprocess.run(
+                ["docker", "inspect", container, "--format", "{{.State.Health.Status}}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            status = result.stdout.strip()
+            if status == "healthy":
+                print(f"  [OK] {container} healthy")
+                return True
+            if status not in ("starting", "healthy"):
+                print(f"  [FAIL] {container} status: {status}")
+                return False
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        if i % quiet_interval == quiet_interval - 1:
+            print(f"  Waiting for {container}... ({i + 1}s)")
+        time.sleep(1)
+
+    print(f"  [FAIL] {container} not healthy after {max_wait}s")
+    return False
+
+
 def pull_model(model: str = "qwen2.5:7b-instruct") -> bool:
     """Ensure the LLM model is available in Ollama."""
     print(f"  Checking model {model}...")
@@ -201,10 +236,13 @@ def main() -> None:
         sys.exit(1)
 
     # 3. Wait for services
+    #    Neo4j and Ollama: port checks (fast, no model loading).
+    #    Backend: wait for Docker healthcheck (models take ~90s to load).
     print("[3/5] Waiting for services...")
     neo4j_ok = wait_for_service("Neo4j", "localhost", 7687, max_wait=60)
     ollama_ok = wait_for_service("Ollama", "localhost", 11434, max_wait=30)
-    backend_ok = wait_for_service("Backend", "localhost", 8001, max_wait=120)
+    print("  Backend loading models (Whisper + Chatterbox + LLM)...")
+    backend_ok = wait_for_container_healthy("mist-backend", max_wait=180)
 
     # 4. Model
     if ollama_ok:
