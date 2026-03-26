@@ -13,7 +13,7 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
-from .request_context import current_request_id
+from request_context import current_request_id
 
 _thread_local = threading.local()
 

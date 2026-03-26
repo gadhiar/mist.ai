@@ -37,11 +37,18 @@ from factories import build_curation_scheduler  # isort:skip
 from knowledge.config import KnowledgeConfig  # isort:skip
 from log_handler import WebSocketLogHandler  # isort:skip
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+# Setup logging -- console + persistent file
+_log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+logging.basicConfig(level=logging.INFO, format=_log_format)
+
+# Persistent file log (survives container removal via bind mount)
+_log_dir = Path("/app/logs")
+_log_dir.mkdir(parents=True, exist_ok=True)
+_file_handler = logging.FileHandler(_log_dir / "mist-backend.log")
+_file_handler.setFormatter(logging.Formatter(_log_format))
+_file_handler.setLevel(logging.DEBUG)  # Capture everything to disk
+logging.getLogger().addHandler(_file_handler)
+
 logger = logging.getLogger(__name__)
 
 # Global state
