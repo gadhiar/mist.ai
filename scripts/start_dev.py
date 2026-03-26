@@ -52,12 +52,15 @@ def check_docker() -> bool:
         return False
 
 
-def start_stack() -> bool:
+def start_stack(build: bool = False) -> bool:
     """Start the Docker Compose stack (backend + Neo4j + Ollama)."""
     print("  Starting Docker Compose stack...")
+    cmd = ["docker", "compose", "up", "-d"]
+    if build:
+        cmd.append("--build")
     try:
         result = subprocess.run(
-            ["docker", "compose", "up", "-d", "--build"],
+            cmd,
             timeout=600,
         )
         if result.returncode != 0:
@@ -162,6 +165,7 @@ def main() -> None:
     parser.add_argument("--stop", action="store_true", help="Stop all services")
     parser.add_argument("--logs", action="store_true", help="Tail backend logs")
     parser.add_argument("--restart", action="store_true", help="Restart backend container")
+    parser.add_argument("--build", action="store_true", help="Rebuild images before starting")
     parser.add_argument(
         "--deps-only",
         action="store_true",
@@ -193,7 +197,7 @@ def main() -> None:
 
     # 2. Start stack
     print("[2/5] Starting services...")
-    if not start_stack():
+    if not start_stack(build=args.build):
         sys.exit(1)
 
     # 3. Wait for services
