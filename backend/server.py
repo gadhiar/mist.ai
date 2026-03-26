@@ -35,12 +35,20 @@ from config import DEFAULT_CONFIG  # isort:skip
 from voice_processor import VoiceProcessor  # isort:skip
 from factories import build_curation_scheduler  # isort:skip
 from knowledge.config import KnowledgeConfig  # isort:skip
+from log_handler import WebSocketLogHandler  # isort:skip
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+# Setup logging -- console + persistent file
+_log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+logging.basicConfig(level=logging.INFO, format=_log_format)
+
+# Persistent file log (survives container removal via bind mount)
+_log_dir = Path("/app/logs")
+_log_dir.mkdir(parents=True, exist_ok=True)
+_file_handler = logging.FileHandler(_log_dir / "mist-backend.log")
+_file_handler.setFormatter(logging.Formatter(_log_format))
+_file_handler.setLevel(logging.DEBUG)  # Capture everything to disk
+logging.getLogger().addHandler(_file_handler)
+
 logger = logging.getLogger(__name__)
 
 # Global state
@@ -49,6 +57,7 @@ active_connections_lock = asyncio.Lock()
 message_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 voice_processor: VoiceProcessor | None = None
 curation_scheduler = None
+log_handler: WebSocketLogHandler | None = None
 config = DEFAULT_CONFIG
 
 
@@ -75,7 +84,7 @@ async def broadcast_messages():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
-    global voice_processor, curation_scheduler
+    global voice_processor, curation_scheduler, log_handler
 
     # Startup
     logger.info("=" * 60)
@@ -88,6 +97,12 @@ async def lifespan(app: FastAPI):
 
     # Start message broadcaster
     broadcaster_task = asyncio.create_task(broadcast_messages())
+
+    # Attach WebSocket log handler to root logger
+    loop = asyncio.get_running_loop()
+    log_handler = WebSocketLogHandler(event_loop=loop, message_queue=message_queue)
+    logging.getLogger().addHandler(log_handler)
+    logger.info("WebSocket log handler attached")
 
     # Start curation scheduler for periodic graph maintenance
     try:
@@ -108,6 +123,7 @@ async def lifespan(app: FastAPI):
     logger.info("Server shutting down...")
     if curation_scheduler is not None:
         await curation_scheduler.stop()
+    logging.getLogger().removeHandler(log_handler)
     broadcaster_task.cancel()
     if voice_processor and voice_processor.models:
         voice_processor.models.shutdown()
@@ -235,6 +251,52 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Reset VAD state
                 voice_processor.reset_vad()
                 await websocket.send_json({"type": "status", "message": "VAD reset"})
+
+            elif msg_type == "log_config":
+                # Runtime log level control
+                action = data.get("action")
+                if action != "set_level":
+                    await websocket.send_json(
+                        {
+                            "type": "log_config_error",
+                            "message": (f"Invalid action: '{action}'. " "Must be 'set_level'."),
+                        }
+                    )
+                    continue
+
+                level = data.get("level", "")
+                if level not in ("DEBUG", "INFO", "WARNING", "ERROR"):
+                    await websocket.send_json(
+                        {
+                            "type": "log_config_error",
+                            "message": (
+                                f"Invalid level: '{level}'. "
+                                "Must be one of DEBUG, INFO, WARNING, ERROR."
+                            ),
+                        }
+                    )
+                    continue
+
+                target_logger = data.get("logger")
+                if not target_logger:
+                    await websocket.send_json(
+                        {
+                            "type": "log_config_error",
+                            "message": "Missing 'logger' field.",
+                        }
+                    )
+                    continue
+
+                if log_handler is not None:
+                    log_handler.set_logger_level(target_logger, level)
+
+                await websocket.send_json(
+                    {
+                        "type": "log_config_ack",
+                        "logger": target_logger,
+                        "level": level,
+                    }
+                )
 
             elif msg_type == "config":
                 # Update configuration (future feature)

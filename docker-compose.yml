@@ -29,6 +29,7 @@ services:
       - ENABLE_KNOWLEDGE_INTEGRATION=${ENABLE_KNOWLEDGE_INTEGRATION:-true}
     volumes:
       - ./data:/app/data
+      - ./logs:/app/logs
       - mist-hf-cache:/root/.cache/huggingface
       - mist-torch-cache:/root/.cache/torch
     depends_on:

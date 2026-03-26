@@ -8,6 +8,8 @@ import contextlib
 import logging
 from collections.abc import Generator
 
+import ollama
+
 from backend.chat.conversation_handler import ConversationHandler
 from backend.factories import build_conversation_handler
 from backend.knowledge.config import KnowledgeConfig
@@ -98,6 +100,135 @@ class KnowledgeIntegration:
         except Exception as e:
             logger.error(f"Error in knowledge integration: {e}", exc_info=True)
             yield f"I encountered an error: {str(e)}"
+
+    def generate_tokens_streaming(
+        self,
+        user_text: str,
+        session_id: str | None = None,
+        event_loop: asyncio.AbstractEventLoop | None = None,
+    ) -> Generator[str, None, None]:
+        """Generate LLM response with true token-level streaming.
+
+        Runs RAG retrieval, builds a voice-optimized prompt, then streams
+        tokens directly from Ollama. Bypasses ConversationHandler's
+        tool-calling chain for lower latency.
+
+        Known limitations vs handle_message():
+        - No tool calling (voice mode does not need mid-stream tools)
+        - EventStore recording added after stream completes
+        - Background extraction skipped (TODO: add in future)
+
+        Args:
+            user_text: User's message.
+            session_id: Optional session ID.
+            event_loop: Event loop for async RAG retrieval.
+
+        Yields:
+            Individual tokens from the LLM stream.
+        """
+        if not self.enabled or not self.conversation_handler:
+            yield "I'm sorry, the knowledge system is not available right now."
+            return
+
+        try:
+            sid = session_id or self.current_session_id
+            handler = self.conversation_handler
+
+            # Step 1: RAG retrieval
+            retrieval_result = None
+            if (
+                handler.retriever
+                and handler.config.auto_inject_docs
+                and len(user_text.split()) >= 3
+                and event_loop is not None
+            ):
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        handler.retriever.retrieve(
+                            query=user_text,
+                            user_id="User",
+                            limit=handler.config.auto_inject_limit,
+                            similarity_threshold=handler.config.auto_inject_threshold,
+                        ),
+                        event_loop,
+                    )
+                    retrieval_result = future.result(timeout=30)
+                    if retrieval_result and retrieval_result.total_facts > 0:
+                        logger.info(
+                            "RAG retrieved %d facts for voice streaming",
+                            retrieval_result.total_facts,
+                        )
+                except Exception as e:
+                    logger.warning("RAG retrieval failed in voice streaming: %s", e)
+
+            # Step 2: Build voice-optimized messages
+            session = handler.get_or_create_session(sid, "User")
+            session.add_message("user", user_text)
+
+            system_prompt = (
+                "You are M.I.S.T, a helpful voice assistant and friend to your "
+                "creator, Raj Gadhia.\n\n"
+                "Response Guidelines:\n"
+                "- For simple questions or greetings: 1-3 sentences\n"
+                "- For detailed requests: provide complete, thorough responses\n"
+                "- Use a warm, friendly tone suitable for spoken conversation\n"
+                "- Prioritize correctness, accuracy, and thoroughness\n"
+                "- Don't artificially truncate content the user explicitly "
+                "requested"
+            )
+
+            messages: list[dict[str, str]] = [
+                {"role": "system", "content": system_prompt},
+            ]
+
+            # Add RAG context if available
+            if retrieval_result and retrieval_result.total_facts > 0:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": retrieval_result.formatted_context,
+                    }
+                )
+
+            # Add conversation history (last 10 turns = 20 messages)
+            for msg in session.messages[-20:]:
+                messages.append({"role": msg.role, "content": msg.content})
+
+            # Step 3: Stream tokens directly from Ollama
+            model_name = handler.config.llm.model
+            response = ollama.chat(
+                model=model_name,
+                messages=messages,
+                stream=True,
+                options={"num_predict": 400, "temperature": 0.7, "top_p": 0.9},
+            )
+
+            full_response = ""
+            for chunk in response:
+                if "message" in chunk and "content" in chunk["message"]:
+                    token = chunk["message"]["content"]
+                    full_response += token
+                    yield token
+
+            # Step 4: Record to session history
+            session.add_message("assistant", full_response)
+
+            # Step 5: Record to EventStore (Layer 1 audit trail)
+            if handler.event_store:
+                try:
+                    handler._record_turn_event(
+                        session_id=sid,
+                        user_message=user_text,
+                        assistant_message=full_response,
+                        context_window=messages,
+                        retrieval_result=retrieval_result,
+                    )
+                except Exception as e:
+                    logger.warning("EventStore recording failed: %s", e)
+
+        except Exception as e:
+            logger.error("Error in streaming knowledge integration: %s", e, exc_info=True)
+            yield f"I encountered an error: {e!s}"
 
     def set_session_id(self, session_id: str):
         """Set the current session ID."""

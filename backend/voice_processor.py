@@ -22,6 +22,7 @@ from vad import AudioStreamProcessor
 
 # Import from backend.voice_models explicitly
 sys.path.insert(0, str(project_root / "backend"))
+from request_context import new_request_id, spawn_with_context
 from voice_models.model_manager import ModelManager
 
 logger = logging.getLogger(__name__)
@@ -113,11 +114,7 @@ class VoiceProcessor:
         log_timestamp("Speech ended, spawning processing thread...")
 
         # Process in separate thread (CSM pattern!)
-        threading.Thread(
-            target=self._process_user_speech,
-            args=(audio_data, sample_rate),
-            daemon=True,
-        ).start()
+        spawn_with_context(self._process_user_speech, audio_data, sample_rate)
 
     def _process_user_speech(self, audio_data, sample_rate):
         """Process user speech (runs in separate thread)."""
@@ -154,95 +151,167 @@ class VoiceProcessor:
                 self.loop,
             )
 
+    def _tts_consumer(self, sentence_queue: queue.Queue, tts_start_time: float) -> None:
+        """Consume sentences from queue, generate TTS, send audio to client.
+
+        Runs in a dedicated thread. Processes sentences as they arrive
+        from the LLM producer, generating and sending audio for each.
+
+        Args:
+            sentence_queue: Queue of sentences to synthesize. None = stop signal.
+            tts_start_time: Timestamp when TTS phase started (for logging).
+        """
+        chunk_count = 0
+        first_chunk_time = None
+        first_sentence_time = None
+
+        # Minimum chars for quality TTS output. Short inputs (<40 chars)
+        # cause Chatterbox to glitch on the first utterance because the
+        # model lacks enough text context to match the reference voice.
+        min_tts_chars = 40
+
+        while True:
+            try:
+                sentence = sentence_queue.get(timeout=1.0)
+            except queue.Empty:
+                if self.interrupt_flag.is_set():
+                    break
+                continue
+            if sentence is None:
+                break
+            if self.interrupt_flag.is_set():
+                break
+
+            # Coalesce short sentences with the next to avoid TTS glitches.
+            # Peek at queue and merge until we have enough text or the queue
+            # is empty / signals end.
+            while len(sentence) < min_tts_chars:
+                try:
+                    next_item = sentence_queue.get(timeout=2.0)
+                except queue.Empty:
+                    break
+                if next_item is None:
+                    # End-of-stream -- generate what we have
+                    break
+                sentence = sentence + " " + next_item
+
+            if first_sentence_time is None:
+                first_sentence_time = time.time()
+
+            log_timestamp(f"TTS: Generating sentence ({len(sentence)} chars)")
+
+            for audio_chunk in self.models.generate_tts_audio(sentence):
+                if self.interrupt_flag.is_set():
+                    break
+
+                chunk_count += 1
+                if first_chunk_time is None:
+                    elapsed_from_sentence = time.time() - first_sentence_time
+                    elapsed_from_turn = time.time() - tts_start_time
+                    log_timestamp(
+                        f"TTS: First audio chunk "
+                        f"({elapsed_from_sentence:.2f}s from first sentence, "
+                        f"{elapsed_from_turn:.2f}s from turn start)"
+                    )
+                    first_chunk_time = elapsed_from_turn
+
+                if isinstance(audio_chunk, torch.Tensor):
+                    audio_np = audio_chunk.cpu().numpy().astype(np.float32)
+                else:
+                    audio_np = audio_chunk.astype(np.float32)
+
+                asyncio.run_coroutine_threadsafe(
+                    self.message_queue.put(
+                        {
+                            "type": "audio_chunk",
+                            "audio": audio_np.tolist(),
+                            "sample_rate": 24000,
+                            "chunk_num": chunk_count,
+                        }
+                    ),
+                    self.loop,
+                )
+
+        tts_total = time.time() - tts_start_time
+        log_timestamp(f"TTS consumer done ({tts_total:.2f}s, {chunk_count} chunks)")
+
     def _process_conversation_turn(self, user_text):
-        """Process one conversation turn (LLM + TTS)."""
-        # Try to acquire generation lock (non-blocking like CSM!)
+        """Process one conversation turn with LLM-TTS pipeline parallelism."""
         if not self.generation_lock.acquire(blocking=False):
             log_timestamp("Generation already in progress, skipping")
             return
 
         try:
+            from backend.sentence_detector import SentenceBoundaryDetector
+
+            new_request_id()
             log_timestamp(f"Starting conversation turn for: '{user_text}'")
 
-            # Clear interrupt flag
             self.interrupt_flag.clear()
             self.is_speaking = True
 
-            # Generate LLM response
-            log_timestamp("LLM: Generating response...")
+            # === LLM + TTS Pipeline ===
+            sentence_detector = SentenceBoundaryDetector()
+            sentence_queue = queue.Queue()
+            tts_start_time = time.time()
+
+            # Start TTS consumer thread (reads sentences, generates audio)
+            if self.config.tts_enabled:
+                tts_thread = spawn_with_context(self._tts_consumer, sentence_queue, tts_start_time)
+
+            # LLM producer: stream tokens, detect sentences, feed TTS
+            log_timestamp("LLM: Generating response (streaming)...")
             llm_start = time.time()
             full_response = ""
 
             for token in self.models.generate_llm_response(user_text):
+                if self.interrupt_flag.is_set():
+                    log_timestamp("LLM generation interrupted")
+                    break
                 full_response += token
 
-                # Send token to clients
+                # Send token to client for real-time text display
                 asyncio.run_coroutine_threadsafe(
-                    self.message_queue.put({"type": "llm_token", "token": token}),
+                    self.message_queue.put(
+                        {
+                            "type": "llm_token",
+                            "token": token,
+                        }
+                    ),
                     self.loop,
                 )
 
+                # Detect sentence boundaries and feed TTS
+                if self.config.tts_enabled:
+                    sentences = sentence_detector.feed(token)
+                    for sentence in sentences:
+                        sentence_queue.put(sentence)
+
             llm_time = time.time() - llm_start
 
-            # Trim to last complete sentence (CSM pattern)
-            # This ensures audio never cuts off mid-sentence
-            original_length = len(full_response)
+            # Trim to last complete sentence
             full_response = self.models.trim_to_last_sentence(full_response)
-            trimmed_length = len(full_response)
-
-            if trimmed_length < original_length:
-                log_timestamp(
-                    f"LLM complete ({llm_time:.2f}s, {original_length} chars, "
-                    + f"trimmed to {trimmed_length} chars at sentence boundary)"
-                )
-            else:
-                log_timestamp(f"LLM complete ({llm_time:.2f}s, {len(full_response)} chars)")
+            log_timestamp(f"LLM complete ({llm_time:.2f}s, {len(full_response)} chars)")
 
             # Send full response
             asyncio.run_coroutine_threadsafe(
-                self.message_queue.put({"type": "llm_response", "text": full_response}),
+                self.message_queue.put(
+                    {
+                        "type": "llm_response",
+                        "text": full_response,
+                    }
+                ),
                 self.loop,
             )
 
-            # Generate TTS audio (if enabled)
+            # Flush remaining text to TTS
             if self.config.tts_enabled:
-                log_timestamp("TTS: Starting audio generation...")
-                tts_start = time.time()
-                chunk_count = 0
-                first_chunk_time = None
-
-                for audio_chunk in self.models.generate_tts_audio(full_response):
-                    # Check for interruption
-                    if self.interrupt_flag.is_set():
-                        log_timestamp("TTS generation interrupted by user")
-                        break
-
-                    chunk_count += 1
-
-                    if first_chunk_time is None:
-                        first_chunk_time = time.time() - tts_start
-                        log_timestamp(f"TTS: First chunk generated ({first_chunk_time:.2f}s)")
-
-                    # Convert to numpy and send to clients
-                    if isinstance(audio_chunk, torch.Tensor):
-                        audio_np = audio_chunk.cpu().numpy().astype(np.float32)
-                    else:
-                        audio_np = audio_chunk.astype(np.float32)
-
-                    asyncio.run_coroutine_threadsafe(
-                        self.message_queue.put(
-                            {
-                                "type": "audio_chunk",
-                                "audio": audio_np.tolist(),
-                                "sample_rate": 24000,
-                                "chunk_num": chunk_count,
-                            }
-                        ),
-                        self.loop,
-                    )
-
-                tts_total = time.time() - tts_start
-                log_timestamp(f"TTS generation complete ({tts_total:.2f}s, {chunk_count} chunks)")
+                for sentence in sentence_detector.flush():
+                    sentence_queue.put(sentence)
+                sentence_queue.put(None)  # Signal end
+                tts_thread.join(timeout=120)
+                if tts_thread.is_alive():
+                    logger.warning("TTS consumer thread did not finish within 120s")
             else:
                 log_timestamp("TTS: Disabled (text-only mode)")
 
@@ -253,9 +322,14 @@ class VoiceProcessor:
             )
 
         except Exception as e:
-            logger.error(f"Error in conversation turn: {e}", exc_info=True)
+            logger.error("Error in conversation turn: %s", e, exc_info=True)
             asyncio.run_coroutine_threadsafe(
-                self.message_queue.put({"type": "error", "message": f"Generation error: {e}"}),
+                self.message_queue.put(
+                    {
+                        "type": "error",
+                        "message": f"Generation error: {e}",
+                    }
+                ),
                 self.loop,
             )
 
@@ -263,30 +337,20 @@ class VoiceProcessor:
             self.is_speaking = False
             self.generation_lock.release()
 
-            # Check if there's a pending input (CSM pattern!)
+            # Check for pending input
             with self.input_lock:
                 if self.latest_user_input and not self.interrupt_flag.is_set():
-                    # Process the latest input
                     pending_input = self.latest_user_input
                     self.latest_user_input = None
                     log_timestamp(f"Processing pending input: '{pending_input}'")
-                    # Process in new thread to avoid blocking
-                    threading.Thread(
-                        target=self._process_conversation_turn,
-                        args=(pending_input,),
-                        daemon=True,
-                    ).start()
+                    spawn_with_context(self._process_conversation_turn, pending_input)
 
     def process_complete_audio(self, audio_data, sample_rate):
         """Process complete audio from client (no VAD needed - Flutter controls recording)."""
         log_timestamp(f"Processing complete audio: {len(audio_data)} samples @ {sample_rate}Hz")
 
         # Transcribe and process immediately in a new thread
-        threading.Thread(
-            target=self._process_user_speech,
-            args=(audio_data, sample_rate),
-            daemon=True,
-        ).start()
+        spawn_with_context(self._process_user_speech, audio_data, sample_rate)
 
     def process_audio_chunk(self, audio_data, sample_rate):
         """Process incoming audio chunk from client (VAD mode - deprecated)."""
