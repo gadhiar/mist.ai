@@ -8,6 +8,7 @@ langchain>=0.3.12
 langchain-community>=0.3.12
 langchain-experimental>=0.3.3
 langchain-core>=0.3.25
+langchain-ollama>=0.3.2
 
 # Vector Store & Embeddings
 chromadb==0.4.24
