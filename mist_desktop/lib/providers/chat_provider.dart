@@ -94,6 +94,12 @@ class ChatNotifier extends Notifier<ChatState> {
         }
         break;
 
+      case WsMessageType.log:
+      case WsMessageType.logConfigAck:
+      case WsMessageType.logConfigError:
+        // Handled by LogNotifier
+        break;
+
       default:
         // audioChunk and audioComplete are handled by VoiceNotifier
         break;

@@ -17,6 +17,12 @@ class WsMessageType {
   static const String audioChunk = 'audio_chunk';
   static const String audioComplete = 'audio_complete';
   static const String error = 'error';
+  static const String log = 'log';
+  static const String logConfigAck = 'log_config_ack';
+  static const String logConfigError = 'log_config_error';
+
+  // From client (log control)
+  static const String logConfig = 'log_config';
 }
 
 /// WebSocket Message Model
