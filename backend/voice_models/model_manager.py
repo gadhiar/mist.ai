@@ -59,6 +59,7 @@ class ModelManager:
                 if knowledge_config.enable_knowledge_integration:
                     self.knowledge = KnowledgeIntegration(config=knowledge_config)
                     if self.knowledge.is_enabled():
+                        self.knowledge.set_voice_profile(config.voice_profile)
                         logger.info("Knowledge graph integration ENABLED")
                     else:
                         logger.warning("Knowledge integration disabled (Neo4j unavailable)")

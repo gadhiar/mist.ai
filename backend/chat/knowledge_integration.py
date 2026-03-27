@@ -7,8 +7,10 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Generator
+from pathlib import Path
 
 import ollama
+import yaml
 
 from backend.chat.conversation_handler import ConversationHandler
 from backend.factories import build_conversation_handler
@@ -44,6 +46,75 @@ class KnowledgeIntegration:
         except Exception as e:
             logger.warning(f"Knowledge integration disabled: {e}")
             logger.warning("Falling back to standard LLM (no knowledge graph)")
+
+    def set_voice_profile(self, profile_name: str) -> None:
+        """Set the active voice profile for personality templating."""
+        self._voice_profile = profile_name
+        logger.info("Voice profile set to: %s", profile_name)
+
+    def _load_personality(self, profile_name: str) -> dict:
+        """Load personality config for a voice profile."""
+        config_path = (
+            Path(__file__).parent.parent.parent
+            / "voice_profiles"
+            / profile_name
+            / "personality.yaml"
+        )
+        if not config_path.exists():
+            logger.debug("No personality config at %s", config_path)
+            return {}
+        with open(config_path) as f:
+            return yaml.safe_load(f) or {}
+
+    def _build_voice_system_prompt(self, personality: dict) -> str:
+        """Build voice system prompt from personality config."""
+        if not personality:
+            return (
+                "You are M.I.S.T, a helpful voice assistant and friend to your "
+                "creator, Raj Gadhia.\n\n"
+                "Response Guidelines:\n"
+                "- For simple questions or greetings: 1-3 sentences\n"
+                "- For detailed requests: provide complete, thorough responses\n"
+                "- Use a warm, friendly tone suitable for spoken conversation\n"
+                "- Prioritize correctness, accuracy, and thoroughness\n"
+                "- Don't artificially truncate content the user explicitly "
+                "requested"
+            )
+
+        name = personality.get("name", "M.I.S.T")
+        style = personality.get("speaking_style", "").strip()
+        openers = personality.get("characteristic_openers", [])
+        mannerisms = personality.get("mannerisms", [])
+
+        parts = [
+            f"You are {name}, a personal AI assistant and friend to " "your creator, Raj Gadhia."
+        ]
+
+        if style:
+            parts.append(f"\nSpeaking style: {style}")
+
+        if openers:
+            opener_list = "\n".join(f"- {o}" for o in openers)
+            parts.append(
+                "\nWhen responding, begin with a brief acknowledgment or "
+                "opening phrase before your main answer. Examples of "
+                f"characteristic openers you use:\n{opener_list}"
+            )
+
+        if mannerisms:
+            mannerism_list = "\n".join(f"- {m}" for m in mannerisms)
+            parts.append(f"\nAdditional guidelines:\n{mannerism_list}")
+
+        parts.append(
+            "\nResponse Guidelines:\n"
+            "- For simple questions or greetings: 1-3 sentences\n"
+            "- For detailed requests: provide complete, thorough responses\n"
+            "- Prioritize correctness, accuracy, and thoroughness\n"
+            "- Don't artificially truncate content the user explicitly "
+            "requested"
+        )
+
+        return "\n".join(parts)
 
     def generate_response_streaming(
         self,
@@ -165,17 +236,9 @@ class KnowledgeIntegration:
             session = handler.get_or_create_session(sid, "User")
             session.add_message("user", user_text)
 
-            system_prompt = (
-                "You are M.I.S.T, a helpful voice assistant and friend to your "
-                "creator, Raj Gadhia.\n\n"
-                "Response Guidelines:\n"
-                "- For simple questions or greetings: 1-3 sentences\n"
-                "- For detailed requests: provide complete, thorough responses\n"
-                "- Use a warm, friendly tone suitable for spoken conversation\n"
-                "- Prioritize correctness, accuracy, and thoroughness\n"
-                "- Don't artificially truncate content the user explicitly "
-                "requested"
-            )
+            voice_profile = getattr(self, "_voice_profile", "friday")
+            personality = self._load_personality(voice_profile)
+            system_prompt = self._build_voice_system_prompt(personality)
 
             messages: list[dict[str, str]] = [
                 {"role": "system", "content": system_prompt},
