@@ -1,8 +1,8 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-03-26
+**Last Updated:** 2026-03-27
 **Branch:** main
-**Status:** Voice pipeline optimized (4-5s TTFA), log streaming active, Flutter nav rail + log viewer operational
+**Status:** Voice pipeline fully optimized (~2.5-3.5s TTFA target), binary audio transport, personality profiles, log streaming
 
 ---
 
@@ -11,21 +11,24 @@
 ### Backend
 - **Status:** CONTAINERIZED (Docker + CUDA 12.4)
 - **Server:** FastAPI WebSocket on port 8001
-- **Voice Pipeline:** VAD -> Whisper -> Qwen 2.5 7B -> Chatterbox Turbo TTS (pipeline parallelism, ~4-5s TTFA)
+- **Voice Pipeline:** VAD -> Whisper -> Qwen 2.5 7B -> Chatterbox Turbo TTS (pipeline parallelism, binary PCM16 transport, ~2.5-3.5s TTFA target)
+- **Audio Transport:** Binary WebSocket frames (MIST protocol: 16-byte header + PCM16), RMS normalization (-20 dBFS), interrupt fade-out
+- **Personality System:** YAML-based personality configs per voice profile (openers, speaking style, mannerisms)
 - **Log Streaming:** WebSocketLogHandler with per-logger gating, token bucket rate limiter, request ID propagation
 - **Persistent Logging:** `./logs/mist-backend.log` at DEBUG level (survives container removal)
 - **Knowledge Graph:** Full extraction + curation pipeline (655 tests, 369 new)
 - **Configuration:** TTS_ENABLED=true, TTS_ENGINE=chatterbox, VOICE_PROFILE=friday
 - **Code Quality:** [COMPLETE] Full suite -- Black, Ruff, Mypy, Bandit, Codespell, AI slop detection
-- **Tests:** 655+ unit tests (run inside container), 14 sentence detector tests, token streaming tests
+- **Tests:** 670+ unit tests (run inside container), 20 audio protocol tests, 14 sentence detector tests, 7 personality config tests
 
 ### Frontend
 - **Status:** IN DEVELOPMENT
 - **Platform:** Flutter desktop (Windows/macOS/Linux)
-- **Implementation:** WebSocket client, voice recording, nav rail, log viewer [TESTED]
+- **Implementation:** WebSocket client, voice recording, nav rail, log viewer, binary audio playback [E2E PENDING]
 - **Nav Rail:** Expandable sidebar (72px/200px), 4 destinations (Chat, Logs, Voice Profiles stub, Settings stub)
 - **Log Viewer:** Level filter chips, text search (300ms debounce), group by request/component, ring buffer (5,000 entries)
-- **Pending:** Knowledge graph visualization, binary WebSocket audio transport
+- **Audio Playback:** flutter_soloud PCM16 streaming, first-chunk immediate playback, jitter buffer, underrun tracking
+- **Pending:** Knowledge graph visualization, E2E validation of binary audio transport
 - **Code Quality:** [COMPLETE] Flutter analyzer configured with custom rules
 
 ---
@@ -33,12 +36,27 @@
 ## Active Work
 
 ### Current Focus
-1. Binary WebSocket audio transport (Phase 2 -- 7x bandwidth reduction)
+1. E2E validation of binary audio transport + personality profiles [PENDING USER TEST]
 2. Knowledge graph visualization in Flutter
 3. Seed knowledge DB, run full e2e knowledge integration test
 4. Merge to origin/main when ready to push remotely
 
-### Recently Completed (2026-03-26)
+### Recently Completed (2026-03-27)
+- Binary WebSocket audio transport: MIST protocol (16-byte header + PCM16), replaces JSON float32 arrays (~7x bandwidth reduction)
+- Backend: audio_protocol.py (frame builder, RMS normalization, fade-out, PCM16 conversion), 20 tests
+- Server broadcast_messages() dispatches binary frames via send_bytes(), text via send_text()
+- Flutter: AudioPlaybackService rewritten for flutter_soloud PCM streaming (replaces audioplayers WAV-queue)
+- First-chunk immediate playback (no 6s pre-buffer), jitter buffer for subsequent chunks, underrun tracking
+- BinaryAudioFrame parser, WebSocket binary/text frame discrimination, VoiceNotifier binary routing
+- Personality profile system: YAML configs per voice profile (openers, speaking style, mannerisms)
+- FRIDAY personality config written (8 characteristic openers, all under 40 chars)
+- System prompt templated from personality config in generate_tokens_streaming()
+- First-sentence coalescing bypass for first-utterance priming
+- Jarvis and Cortana personality stubs
+- Linear tickets created: MIS-98 (pre-buffering), MIS-99 (personality), MIS-100 (Profiles screen), MIS-101 (FRIDAY review), MIS-102 (streaming TTS research)
+- MIS-45 marked Done, MIS-76 updated with merge conflict details
+
+### Previously Completed (2026-03-26)
 - Merged test/chatterbox-eval to main (Docker, Chatterbox, 10 commits)
 - Backend log streaming: WebSocketLogHandler, request ID propagation via contextvars, runtime log level control
 - Persistent file logging to ./logs/mist-backend.log (DEBUG level, survives container removal)
@@ -46,14 +64,10 @@
 - Voice pipeline parallelism: LLM producer + TTS consumer via sentence queue
 - SentenceBoundaryDetector with abbreviation/decimal/ellipsis/list marker handling (14 tests)
 - True Ollama token streaming in KnowledgeIntegration (bypasses ConversationHandler tool chain)
-- Duration-based pre-buffering (6s) and sentence coalescing (40 char min)
 - Time-to-first-audio improved from 12-19s to ~4-5s
 - Eager embedding model loading, CUDA sync removal
 - FRIDAY voice profile created (46.2s reference WAV), all 3 profiles migrated to Chatterbox
 - Default voice profile switched to friday
-- CSM training data deleted (~176GB), Marvel's Avengers deleted
-- Start script fixed: health-based waiting, no forced rebuild, Ollama healthcheck
-- Missing langchain-ollama dependency fixed
 
 ### Previously Completed (2026-03-25)
 - Knowledge extraction + curation pipeline merged to main (23 modified + 12 new files)
@@ -65,10 +79,12 @@
 ### Known Issues
 - Native Windows venv is corrupted -- use Docker container going forward
 - GPU contention between Ollama and Chatterbox adds ~1.1x TTS overhead on single GPU
+- Binary audio transport implemented but not E2E validated yet (pending manual test)
 - Log handler uses bare import (`from log_handler import ...`) not relative
 - Knowledge DB has not been seeded -- RAG retrieval returns 0 facts
-- 43 commits ahead of origin/main (not pushed per policy)
+- 50+ commits ahead of origin/main (not pushed per policy)
 - 48 P3 items in KNOWN_ISSUES.md from 2026-03-22 audit (opportunistic)
+- 1 pre-existing test failure: test_get_active_default expects "cortana" but config defaults to "jarvis"
 
 ### Blockers
 None
@@ -136,8 +152,9 @@ docker-compose.override.yml     # Dev mode volume mounts
 ### Backend Structure
 ```
 backend/
-├── server.py              # WebSocket server (port 8001), log handler attachment
-├── voice_processor.py     # Voice pipeline orchestration (pipeline parallelism)
+├── server.py              # WebSocket server (port 8001), mixed text/binary broadcast
+├── voice_processor.py     # Voice pipeline orchestration (pipeline parallelism, binary frames)
+├── audio_protocol.py      # MIST binary frame builder, RMS normalization, PCM16 conversion
 ├── log_handler.py         # WebSocketLogHandler (rate limiting, re-entrancy guard)
 ├── request_context.py     # ContextVar propagation + spawn_with_context
 ├── sentence_detector.py   # Sentence boundary detection for streaming TTS
