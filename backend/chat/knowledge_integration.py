@@ -93,8 +93,8 @@ class KnowledgeIntegration:
                     self.conversation_handler.handle_message(user_message=user_text, session_id=sid)
                 )
 
-            # Yield complete response
-            # TODO: Future enhancement - stream tokens as they're generated
+            # Yield complete response (non-streaming fallback).
+            # For token-level streaming, use generate_tokens_streaming().
             yield response
 
         except Exception as e:

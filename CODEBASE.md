@@ -1,8 +1,8 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-03-25
-**Branch:** test/chatterbox-eval
-**Status:** Knowledge pipeline merged, backend containerized, Chatterbox TTS integrated
+**Last Updated:** 2026-03-26
+**Branch:** main
+**Status:** Voice pipeline optimized (4-5s TTFA), log streaming active, Flutter nav rail + log viewer operational
 
 ---
 
@@ -11,18 +11,21 @@
 ### Backend
 - **Status:** CONTAINERIZED (Docker + CUDA 12.4)
 - **Server:** FastAPI WebSocket on port 8001
-- **Voice Pipeline:** VAD -> Whisper -> Qwen 2.5 7B -> Chatterbox Turbo TTS
-- **Knowledge Graph:** Full extraction + curation pipeline merged to main (655 tests, 369 new)
-- **Configuration:** TTS now ENABLED by default (TTS_ENABLED=true, TTS_ENGINE=chatterbox)
+- **Voice Pipeline:** VAD -> Whisper -> Qwen 2.5 7B -> Chatterbox Turbo TTS (pipeline parallelism, ~4-5s TTFA)
+- **Log Streaming:** WebSocketLogHandler with per-logger gating, token bucket rate limiter, request ID propagation
+- **Persistent Logging:** `./logs/mist-backend.log` at DEBUG level (survives container removal)
+- **Knowledge Graph:** Full extraction + curation pipeline (655 tests, 369 new)
+- **Configuration:** TTS_ENABLED=true, TTS_ENGINE=chatterbox, VOICE_PROFILE=friday
 - **Code Quality:** [COMPLETE] Full suite -- Black, Ruff, Mypy, Bandit, Codespell, AI slop detection
-- **Tests:** 655 unit tests (run inside container)
+- **Tests:** 655+ unit tests (run inside container), 14 sentence detector tests, token streaming tests
 
 ### Frontend
 - **Status:** IN DEVELOPMENT
 - **Platform:** Flutter desktop (Windows/macOS/Linux)
-- **Implementation:** WebSocket client, voice recording complete
-- **Pending:** Audio playback integration testing with Chatterbox TTS
-- **Planned:** Knowledge graph visualization
+- **Implementation:** WebSocket client, voice recording, nav rail, log viewer [TESTED]
+- **Nav Rail:** Expandable sidebar (72px/200px), 4 destinations (Chat, Logs, Voice Profiles stub, Settings stub)
+- **Log Viewer:** Level filter chips, text search (300ms debounce), group by request/component, ring buffer (5,000 entries)
+- **Pending:** Knowledge graph visualization, binary WebSocket audio transport
 - **Code Quality:** [COMPLETE] Flutter analyzer configured with custom rules
 
 ---
@@ -30,26 +33,41 @@
 ## Active Work
 
 ### Current Focus
-1. Seed knowledge DB, run full end-to-end test
-2. Setup FRIDAY voice profile (Chatterbox reference audio)
-3. Clean up ~176GB CSM training data (legacy, no longer needed)
-4. Merge test/chatterbox-eval to main
-5. Knowledge graph visualization in Flutter
+1. Binary WebSocket audio transport (Phase 2 -- 7x bandwidth reduction)
+2. Knowledge graph visualization in Flutter
+3. Seed knowledge DB, run full e2e knowledge integration test
+4. Merge to origin/main when ready to push remotely
 
-### Recently Completed (2026-03-25)
+### Recently Completed (2026-03-26)
+- Merged test/chatterbox-eval to main (Docker, Chatterbox, 10 commits)
+- Backend log streaming: WebSocketLogHandler, request ID propagation via contextvars, runtime log level control
+- Persistent file logging to ./logs/mist-backend.log (DEBUG level, survives container removal)
+- Flutter nav rail + log viewer (expandable sidebar, 4 destinations, filter/search/group, ring buffer)
+- Voice pipeline parallelism: LLM producer + TTS consumer via sentence queue
+- SentenceBoundaryDetector with abbreviation/decimal/ellipsis/list marker handling (14 tests)
+- True Ollama token streaming in KnowledgeIntegration (bypasses ConversationHandler tool chain)
+- Duration-based pre-buffering (6s) and sentence coalescing (40 char min)
+- Time-to-first-audio improved from 12-19s to ~4-5s
+- Eager embedding model loading, CUDA sync removal
+- FRIDAY voice profile created (46.2s reference WAV), all 3 profiles migrated to Chatterbox
+- Default voice profile switched to friday
+- CSM training data deleted (~176GB), Marvel's Avengers deleted
+- Start script fixed: health-based waiting, no forced rebuild, Ollama healthcheck
+- Missing langchain-ollama dependency fixed
+
+### Previously Completed (2026-03-25)
 - Knowledge extraction + curation pipeline merged to main (23 modified + 12 new files)
 - Chatterbox Turbo selected after 18-model TTS evaluation (replaces Sesame CSM-1B)
 - Docker Compose stack created (backend + Neo4j 5 + Ollama -- 3 services)
-- Chatterbox adapter implemented in model_manager.py
-- CSM imports made lazy (no torchtune dependency when using Chatterbox)
-- Voice profile system extended for Chatterbox (tts_engine, reference_audio_path)
 - Flash attention confirmed working inside Linux container (PyTorch 2.6+cu124)
 - 655 backend tests passing (369 new from knowledge pipeline)
 
 ### Known Issues
 - Native Windows venv is corrupted -- use Docker container going forward
-- Flutter audio playback not tested yet (pending e2e test with Chatterbox)
-- ~176GB of legacy CSM training data needs cleanup
+- GPU contention between Ollama and Chatterbox adds ~1.1x TTS overhead on single GPU
+- Log handler uses bare import (`from log_handler import ...`) not relative
+- Knowledge DB has not been seeded -- RAG retrieval returns 0 facts
+- 43 commits ahead of origin/main (not pushed per policy)
 - 48 P3 items in KNOWN_ISSUES.md from 2026-03-22 audit (opportunistic)
 
 ### Blockers
@@ -58,6 +76,19 @@ None
 ---
 
 ## Recent Changes
+
+### Log Streaming + Nav Rail + Voice Optimization (2026-03-26)
+- Backend log streaming via WebSocketLogHandler (structured records, rate limiting, re-entrancy guard)
+- Request ID propagation via contextvars with spawn_with_context utility
+- Runtime log level control via log_config WebSocket messages
+- Flutter nav rail (72px collapsed / 200px expanded, 200ms animation, 4 destinations)
+- Log viewer: level filter chips, text search (300ms debounce), group by request/component
+- LogEntryTile: monospace, color-coded levels, tap-to-expand, right-click context menu
+- Ring buffer (5,000 entries, Queue for O(1)), 100ms batched updates, auto-scroll with 50px threshold
+- Voice pipeline parallelism: LLM token streaming -> sentence boundary detection -> TTS consumer
+- Pre-buffering (6s) and sentence coalescing (40 char min) for gapless audio
+- Time-to-first-audio: 12-19s -> ~4-5s (70-81% reduction)
+- 26 files changed, +4,616 lines
 
 ### Chatterbox TTS + Docker Stack (2026-03-25)
 - Chatterbox Turbo replaces Sesame CSM-1B as primary TTS engine
@@ -105,8 +136,11 @@ docker-compose.override.yml     # Dev mode volume mounts
 ### Backend Structure
 ```
 backend/
-├── server.py              # WebSocket server (port 8001)
-├── voice_processor.py     # Voice pipeline orchestration
+├── server.py              # WebSocket server (port 8001), log handler attachment
+├── voice_processor.py     # Voice pipeline orchestration (pipeline parallelism)
+├── log_handler.py         # WebSocketLogHandler (rate limiting, re-entrancy guard)
+├── request_context.py     # ContextVar propagation + spawn_with_context
+├── sentence_detector.py   # Sentence boundary detection for streaming TTS
 ├── config.py              # Voice system configuration
 ├── knowledge_config.py    # Knowledge graph configuration
 ├── voice_models/          # ML model management (Chatterbox adapter)
@@ -120,16 +154,27 @@ mist_desktop/
 ├── lib/
 │   ├── main.dart
 │   ├── providers/         # Riverpod state management
+│   │   ├── chat_provider.dart
+│   │   ├── log_provider.dart        # LogNotifier + LogState (ring buffer)
+│   │   └── navigation_provider.dart # Sidebar state
 │   ├── services/          # WebSocket, audio services
 │   ├── screens/           # UI screens
+│   │   ├── chat_screen.dart
+│   │   ├── log_screen.dart          # Log viewer with grouping
+│   │   └── stub_screen.dart         # Placeholder destinations
 │   ├── widgets/           # Reusable components
+│   │   ├── app_shell.dart           # Navigation rail + content area
+│   │   ├── log_entry_tile.dart      # Monospace log entry display
+│   │   └── log_toolbar.dart         # Filter chips, search, controls
 │   └── models/            # Data models
+│       ├── websocket_message.dart   # Includes log message types
+│       └── log_entry.dart           # LogEntry data class
 ```
 
 ### Key Integration Points
 - Flutter connects to backend via WebSocket (ws://localhost:8001)
-- Backend sends: transcriptions, LLM tokens, audio chunks
-- Frontend sends: audio data, text messages, interrupts
+- Backend sends: transcriptions, LLM tokens, audio chunks, structured log entries
+- Frontend sends: audio data, text messages, interrupts, log_config (level control)
 - Services communicate via Docker container hostnames (mist-neo4j, mist-ollama)
 
 ---
@@ -149,7 +194,7 @@ TTS_ENABLED=true
 TTS_ENGINE=chatterbox
 
 # TTS Parameters
-VOICE_PROFILE=jarvis
+VOICE_PROFILE=friday
 TTS_EXAGGERATION=0.5
 TTS_TEMPERATURE=0.8
 TTS_CFG_WEIGHT=0.5
@@ -246,7 +291,7 @@ flutter run -d windows
 ## Testing
 
 ### Backend Tests
-- **Count:** 655 unit tests (369 new from knowledge pipeline)
+- **Count:** 655+ unit tests (369 from knowledge pipeline, 14 sentence detector, token streaming tests)
 - **Runner:** pytest inside Docker container
 - **Command:** `docker compose run --rm --no-deps mist-backend pytest tests/unit/`
 - **Note:** Tests must run inside container -- native Windows venv is missing dependencies
@@ -269,14 +314,14 @@ flutter analyze
 ## Next Steps
 
 ### Immediate Priorities
-1. Seed knowledge DB, run full e2e test
-2. Setup FRIDAY voice profile (Chatterbox reference audio)
-3. Clean up ~176GB legacy CSM training data
-4. Merge test/chatterbox-eval to main
+1. Binary WebSocket audio transport (Phase 2 -- 7x bandwidth reduction, gapless playback)
+2. Knowledge graph visualization in Flutter
+3. Seed knowledge DB, run full e2e knowledge integration test
+4. Merge to origin/main when ready
 
 ### Short-term Goals
-1. Knowledge graph visualization in Flutter
-2. Flutter audio playback testing with Chatterbox
+1. Voice Profiles screen (currently stub) -- manage/preview voice profiles from Flutter
+2. Settings screen (currently stub) -- runtime config from Flutter
 3. Address P3 items from KNOWN_ISSUES.md (opportunistic)
 
 ### Long-term Goals
@@ -317,7 +362,7 @@ flutter analyze
 | Backend | CONTAINERIZED | Docker + CUDA 12.4 |
 | TTS | Chatterbox Turbo | 0.74x RTF, 3.9GB VRAM |
 | Knowledge | COMPLETE | 655 tests, Neo4j integrated |
-| Frontend | IN DEV | Audio playback pending |
+| Frontend | IN DEV | Nav rail + log viewer operational |
 | Code Quality | COMPLETE | 16 pre-commit hooks, 7 CI checks |
 | Docker | COMPLETE | 3-service Compose stack |
 | CI/CD | COMPLETE | GitHub Actions configured |
