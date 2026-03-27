@@ -4,6 +4,7 @@ import 'package:logger/logger.dart';
 import '../services/audio_recording_service.dart';
 import '../services/audio_playback_service.dart';
 import '../services/websocket_service.dart';
+import '../models/binary_audio_frame.dart';
 import '../models/websocket_message.dart';
 import 'websocket_provider.dart';
 import 'audio_provider.dart';
@@ -55,9 +56,23 @@ class VoiceNotifier extends Notifier<VoiceState> {
       _handleAudioMessage(message);
     });
 
+    // Route binary audio frames to playback service
+    final audioFrameSub = _wsService.audioFrameStream.listen(_handleAudioFrame);
+
+    // Stop audio cleanly on WebSocket disconnect or error
+    final connectionSub = _wsService.statusStream.listen((status) {
+      if (status == ConnectionStatus.disconnected ||
+          status == ConnectionStatus.error) {
+        _audioService.stopImmediately();
+        state = state.copyWith(isPlaying: false);
+      }
+    });
+
     ref.onDispose(() {
       audioSub.cancel();
       wsSub.cancel();
+      audioFrameSub.cancel();
+      connectionSub.cancel();
     });
 
     return const VoiceState();
@@ -65,15 +80,40 @@ class VoiceNotifier extends Notifier<VoiceState> {
 
   /// Handle audio-related incoming WebSocket messages.
   ///
-  /// TODO(Task 6): Audio routing is being migrated to binary frame stream
-  /// via _handleAudioFrame. JSON audio_chunk and audio_complete messages
-  /// are no longer processed here. This method will be removed or
-  /// simplified when the binary audio pipeline is fully wired.
+  /// Audio is now routed via the binary frame stream (_handleAudioFrame).
+  /// This method handles any remaining JSON control messages that are
+  /// not audio-specific. Non-audio messages are forwarded to ChatNotifier.
   void _handleAudioMessage(WebSocketMessage message) {
     switch (message.type) {
       default:
         // Non-audio messages are handled by ChatNotifier
         break;
+    }
+  }
+
+  /// Handle binary audio frames from the WebSocket binary stream.
+  ///
+  /// Routes each frame type to the appropriate AudioPlaybackService method:
+  ///   0x01 (audio_chunk)    -> writeChunk()
+  ///   0x02 (audio_complete) -> drain()
+  ///   0x03 (interrupt_fade) -> fadeAndClose()
+  void _handleAudioFrame(BinaryAudioFrame frame) {
+    _audioService.validateSequence(frame.chunkSeq);
+
+    if (frame.isAudioChunk) {
+      // writeChunk() internally handles the case where a new chunk arrives
+      // while the previous response is still draining or fading -- it calls
+      // _forceCleanup() and starts a fresh stream automatically.
+      _audioService.writeChunk(frame.payload, frame.sampleRate);
+      state = state.copyWith(isPlaying: true);
+    } else if (frame.isAudioComplete) {
+      _audioService.drain();
+      state = state.copyWith(isPlaying: false);
+    } else if (frame.isInterruptFade) {
+      _audioService.fadeAndClose(frame.payload);
+      state = state.copyWith(isPlaying: false);
+    } else {
+      _logger.w('Unknown audio frame type: ${frame.messageType}');
     }
   }
 
