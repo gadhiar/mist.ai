@@ -1,6 +1,7 @@
 """Voice Processor - Handles voice conversation logic."""
 
 import asyncio
+import json
 import logging
 import queue
 import sys
@@ -22,6 +23,15 @@ from vad import AudioStreamProcessor
 
 # Import from backend.voice_models explicitly
 sys.path.insert(0, str(project_root / "backend"))
+from audio_protocol import (
+    MSG_AUDIO_CHUNK,
+    MSG_AUDIO_COMPLETE,
+    MSG_INTERRUPT_FADE,
+    build_audio_frame,
+    float32_to_pcm16,
+    generate_fade_out,
+    rms_normalize,
+)
 from request_context import new_request_id, spawn_with_context
 from voice_models.model_manager import ModelManager
 
@@ -162,8 +172,10 @@ class VoiceProcessor:
             tts_start_time: Timestamp when TTS phase started (for logging).
         """
         chunk_count = 0
+        chunk_seq = 0
         first_chunk_time = None
         first_sentence_time = None
+        first_sentence = True
 
         # Minimum chars for quality TTS output. Short inputs (<40 chars)
         # cause Chatterbox to glitch on the first utterance because the
@@ -184,16 +196,19 @@ class VoiceProcessor:
 
             # Coalesce short sentences with the next to avoid TTS glitches.
             # Peek at queue and merge until we have enough text or the queue
-            # is empty / signals end.
-            while len(sentence) < min_tts_chars:
-                try:
-                    next_item = sentence_queue.get(timeout=2.0)
-                except queue.Empty:
-                    break
-                if next_item is None:
-                    # End-of-stream -- generate what we have
-                    break
-                sentence = sentence + " " + next_item
+            # is empty / signals end. Skip coalescing for the first sentence
+            # to minimize time-to-first-audio.
+            if not first_sentence:
+                while len(sentence) < min_tts_chars:
+                    try:
+                        next_item = sentence_queue.get(timeout=2.0)
+                    except queue.Empty:
+                        break
+                    if next_item is None:
+                        # End-of-stream -- generate what we have
+                        break
+                    sentence = sentence + " " + next_item
+            first_sentence = False
 
             if first_sentence_time is None:
                 first_sentence_time = time.time()
@@ -202,6 +217,23 @@ class VoiceProcessor:
 
             for audio_chunk in self.models.generate_tts_audio(sentence):
                 if self.interrupt_flag.is_set():
+                    if isinstance(audio_chunk, torch.Tensor):
+                        audio_np = audio_chunk.cpu().numpy().astype(np.float32)
+                    else:
+                        audio_np = audio_chunk.astype(np.float32)
+                    fade_audio = generate_fade_out(audio_np, sample_rate=24000)
+                    chunk_seq += 1
+                    fade_frame = build_audio_frame(
+                        MSG_INTERRUPT_FADE,
+                        0,
+                        chunk_seq,
+                        24000,
+                        float32_to_pcm16(rms_normalize(fade_audio)),
+                    )
+                    asyncio.run_coroutine_threadsafe(
+                        self.message_queue.put(fade_frame),
+                        self.loop,
+                    )
                     break
 
                 chunk_count += 1
@@ -220,17 +252,33 @@ class VoiceProcessor:
                 else:
                     audio_np = audio_chunk.astype(np.float32)
 
+                pcm16_bytes = float32_to_pcm16(rms_normalize(audio_np))
+                chunk_seq += 1
+                frame = build_audio_frame(
+                    MSG_AUDIO_CHUNK,
+                    0,
+                    chunk_seq,
+                    24000,
+                    pcm16_bytes,
+                )
                 asyncio.run_coroutine_threadsafe(
-                    self.message_queue.put(
-                        {
-                            "type": "audio_chunk",
-                            "audio": audio_np.tolist(),
-                            "sample_rate": 24000,
-                            "chunk_num": chunk_count,
-                        }
-                    ),
+                    self.message_queue.put(frame),
                     self.loop,
                 )
+
+        # Send completion frame
+        chunk_seq += 1
+        complete_frame = build_audio_frame(
+            MSG_AUDIO_COMPLETE,
+            0,
+            chunk_seq,
+            24000,
+            b"",
+        )
+        asyncio.run_coroutine_threadsafe(
+            self.message_queue.put(complete_frame),
+            self.loop,
+        )
 
         tts_total = time.time() - tts_start_time
         log_timestamp(f"TTS consumer done ({tts_total:.2f}s, {chunk_count} chunks)")
@@ -272,12 +320,7 @@ class VoiceProcessor:
 
                 # Send token to client for real-time text display
                 asyncio.run_coroutine_threadsafe(
-                    self.message_queue.put(
-                        {
-                            "type": "llm_token",
-                            "token": token,
-                        }
-                    ),
+                    self.message_queue.put(json.dumps({"type": "llm_token", "token": token})),
                     self.loop,
                 )
 
@@ -295,12 +338,7 @@ class VoiceProcessor:
 
             # Send full response
             asyncio.run_coroutine_threadsafe(
-                self.message_queue.put(
-                    {
-                        "type": "llm_response",
-                        "text": full_response,
-                    }
-                ),
+                self.message_queue.put(json.dumps({"type": "llm_response", "text": full_response})),
                 self.loop,
             )
 
@@ -315,20 +353,19 @@ class VoiceProcessor:
             else:
                 log_timestamp("TTS: Disabled (text-only mode)")
 
-            # Send completion signal
-            asyncio.run_coroutine_threadsafe(
-                self.message_queue.put({"type": "audio_complete"}),
-                self.loop,
-            )
+            # Send completion signal (text-only mode only; TTS consumer
+            # sends the binary MSG_AUDIO_COMPLETE frame when TTS is enabled)
+            if not self.config.tts_enabled:
+                asyncio.run_coroutine_threadsafe(
+                    self.message_queue.put(json.dumps({"type": "audio_complete"})),
+                    self.loop,
+                )
 
         except Exception as e:
             logger.error("Error in conversation turn: %s", e, exc_info=True)
             asyncio.run_coroutine_threadsafe(
                 self.message_queue.put(
-                    {
-                        "type": "error",
-                        "message": f"Generation error: {e}",
-                    }
+                    json.dumps({"type": "error", "message": f"Generation error: {e}"})
                 ),
                 self.loop,
             )

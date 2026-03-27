@@ -9,7 +9,6 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
 
 # Fix Windows console encoding for Unicode characters
 if sys.platform == "win32":
@@ -54,7 +53,7 @@ logger = logging.getLogger(__name__)
 # Global state
 active_connections: set[WebSocket] = set()
 active_connections_lock = asyncio.Lock()
-message_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+message_queue: asyncio.Queue[str | bytes] = asyncio.Queue()
 voice_processor: VoiceProcessor | None = None
 curation_scheduler = None
 log_handler: WebSocketLogHandler | None = None
@@ -71,7 +70,10 @@ async def broadcast_messages():
             stale = []
             for websocket in active_connections:
                 try:
-                    await websocket.send_json(message)
+                    if isinstance(message, bytes):
+                        await websocket.send_bytes(message)
+                    elif isinstance(message, str):
+                        await websocket.send_text(message)
                 except Exception as e:
                     logger.error(f"Error sending to client: {e}")
                     stale.append(websocket)
