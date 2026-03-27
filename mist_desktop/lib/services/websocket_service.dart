@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:typed_data';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:logger/logger.dart';
 import '../config/app_config.dart';
+import '../models/binary_audio_frame.dart';
 import '../models/websocket_message.dart';
 
 /// WebSocket Connection Status
@@ -17,6 +19,7 @@ class WebSocketService {
   // Stream controllers
   final _statusController = StreamController<ConnectionStatus>.broadcast();
   final _messageController = StreamController<WebSocketMessage>.broadcast();
+  final _audioFrameController = StreamController<BinaryAudioFrame>.broadcast();
 
   // Reconnection state
   Timer? _reconnectTimer;
@@ -30,6 +33,7 @@ class WebSocketService {
   ConnectionStatus get status => _status;
   Stream<ConnectionStatus> get statusStream => _statusController.stream;
   Stream<WebSocketMessage> get messageStream => _messageController.stream;
+  Stream<BinaryAudioFrame> get audioFrameStream => _audioFrameController.stream;
 
   /// Connect to WebSocket server
   Future<void> connect() async {
@@ -143,14 +147,29 @@ class WebSocketService {
 
   /// Handle incoming message
   void _handleMessage(dynamic data) {
-    if (_messageController.isClosed) return;
-    try {
-      final jsonStr = data as String;
-      final message = WebSocketMessage.fromJson(jsonStr);
-      _logger.d('Received message: ${message.type}');
-      _messageController.add(message);
-    } catch (e) {
-      _logger.e('Failed to parse message: $e');
+    if (data is List<int>) {
+      // Binary frame -- parse as audio
+      if (_audioFrameController.isClosed) return;
+      final frame = BinaryAudioFrame.parse(Uint8List.fromList(data));
+      if (frame != null) {
+        _audioFrameController.add(frame);
+      } else {
+        _logger.w('Malformed binary frame received');
+      }
+    } else if (data is String) {
+      // Text frame -- parse as JSON message
+      if (_messageController.isClosed) return;
+      try {
+        final message = WebSocketMessage.fromJson(data);
+        _logger.d('Received message: ${message.type}');
+        _messageController.add(message);
+      } catch (e) {
+        _logger.e('Failed to parse message: $e');
+      }
+    } else {
+      _logger.w(
+        'Received unexpected WebSocket frame type: ${data.runtimeType}',
+      );
     }
   }
 
@@ -213,5 +232,6 @@ class WebSocketService {
     disconnect();
     _statusController.close();
     _messageController.close();
+    _audioFrameController.close();
   }
 }

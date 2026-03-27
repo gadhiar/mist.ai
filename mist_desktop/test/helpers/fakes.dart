@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:mist_desktop/models/binary_audio_frame.dart';
 import 'package:mist_desktop/models/websocket_message.dart';
 import 'package:mist_desktop/services/audio_playback_service.dart';
 import 'package:mist_desktop/services/audio_recording_service.dart';
@@ -15,6 +16,7 @@ class FakeWebSocketService implements WebSocketService {
 
   final _statusController = StreamController<ConnectionStatus>.broadcast();
   final _messageController = StreamController<WebSocketMessage>.broadcast();
+  final _audioFrameController = StreamController<BinaryAudioFrame>.broadcast();
 
   ConnectionStatus _status = ConnectionStatus.disconnected;
 
@@ -23,6 +25,8 @@ class FakeWebSocketService implements WebSocketService {
       _statusController;
   StreamController<WebSocketMessage> get messageTestController =>
       _messageController;
+  StreamController<BinaryAudioFrame> get audioFrameTestController =>
+      _audioFrameController;
 
   @override
   ConnectionStatus get status => _status;
@@ -32,6 +36,9 @@ class FakeWebSocketService implements WebSocketService {
 
   @override
   Stream<WebSocketMessage> get messageStream => _messageController.stream;
+
+  @override
+  Stream<BinaryAudioFrame> get audioFrameStream => _audioFrameController.stream;
 
   // Convenience: last text message payload
   String? get lastSentText {
@@ -91,6 +98,7 @@ class FakeWebSocketService implements WebSocketService {
   void dispose() {
     _statusController.close();
     _messageController.close();
+    _audioFrameController.close();
   }
 
   // Test helper: simulate incoming server message
