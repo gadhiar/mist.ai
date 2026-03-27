@@ -9,6 +9,7 @@ services:
       - ./dependencies:/app/dependencies:ro
       - ./scripts:/app/scripts:ro
       - ./tests:/app/tests:ro
+      - ./voice_profiles:/app/voice_profiles:ro
     environment:
       # Filesystem polling required on Windows Docker Desktop
       # (inotify does not propagate across mount boundaries)
