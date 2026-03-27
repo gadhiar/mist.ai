@@ -1,309 +1,379 @@
 import 'dart:async';
 import 'dart:typed_data';
-import 'package:audioplayers/audioplayers.dart';
+import 'package:flutter_soloud/flutter_soloud.dart';
 import 'package:logger/logger.dart';
 
-/// Audio Playback Service for TTS audio from backend
+/// Playback state machine states.
+enum PlaybackState { idle, buffering, playing, draining, fading }
+
+/// Audio Playback Service -- continuous PCM streaming via flutter_soloud.
+///
+/// Each backend response creates a new buffer stream source. The SoLoud
+/// engine stays initialized for the lifetime of this service. PCM16 data
+/// arrives as raw Uint8List bytes from binary WebSocket frames.
+///
+/// First-chunk immediate playback: the first chunk from pipeline
+/// parallelism is a full sentence (~2-4s of audio), so playback starts
+/// immediately on the first writeChunk() call with no buffering threshold.
+/// Subsequent chunks feed directly into the playing stream.
+///
+/// If a new response arrives while draining or fading a previous one,
+/// the old stream is stopped with a fade and the new one starts
+/// immediately.
 class AudioPlaybackService {
   final _logger = Logger();
-  final AudioPlayer _player = AudioPlayer();
 
-  bool _isPlaying = false;
-  final List<(Uint8List, int)> _audioQueue = [];
-
-  // PCM accumulation buffer for continuous playback
-  final List<int> _pcmBuffer = [];
-  int? _bufferSampleRate;
-  int _chunksSinceFlush = 0;
-  bool _preBuffering = true;
-
-  // Pre-buffer threshold: accumulate this many seconds of audio before
-  // starting playback. Eliminates gaps between sentences caused by TTS
-  // generation time exceeding the previous sentence's audio duration.
-  // On single-GPU, TTS runs ~1.3x slower due to LLM contention, so
-  // buffering 2 sentences (~6-8s) covers the worst-case gap.
-  static const double _preBufferSeconds = 6.0;
-
-  // After pre-buffer fills, flush every chunk immediately for low latency.
-  static const int _flushChunkThreshold = 1;
-
-  // Stream controller for playback status
+  // Stream controller for playback status (true = playing/buffering)
   final _playbackController = StreamController<bool>.broadcast();
 
+  PlaybackState _state = PlaybackState.idle;
+  AudioSource? _activeSource;
+  SoundHandle? _activeHandle;
+
+  // Diagnostics
+  int _underrunCount = 0;
+  int _sequenceGapCount = 0;
+  int _lastChunkSeq = -1;
+  int _chunksReceived = 0;
+  Timer? _drainTimer;
+
+  // Underrun warning threshold per response
+  static const int _underrunWarningThreshold = 3;
+
   // Getters
-  bool get isPlaying => _isPlaying;
+  PlaybackState get state => _state;
+  bool get isPlaying =>
+      _state == PlaybackState.playing ||
+      _state == PlaybackState.buffering ||
+      _state == PlaybackState.draining;
   Stream<bool> get playbackStream => _playbackController.stream;
+  int get underrunCount => _underrunCount;
+  int get sequenceGapCount => _sequenceGapCount;
 
-  /// Convert raw PCM int16 data to WAV format with headers
-  Uint8List _addWavHeader(List<int> pcmData, int sampleRate) {
-    final numChannels = 1; // Mono
-    final bitsPerSample = 16; // 16-bit PCM
-    final byteRate = sampleRate * numChannels * (bitsPerSample ~/ 8);
-    final blockAlign = numChannels * (bitsPerSample ~/ 8);
-    final dataSize = pcmData.length;
-    final fileSize = 36 + dataSize;
-
-    final header = ByteData(44);
-
-    // RIFF header
-    header.setUint8(0, 0x52); // 'R'
-    header.setUint8(1, 0x49); // 'I'
-    header.setUint8(2, 0x46); // 'F'
-    header.setUint8(3, 0x46); // 'F'
-    header.setUint32(4, fileSize, Endian.little);
-
-    // WAVE header
-    header.setUint8(8, 0x57); // 'W'
-    header.setUint8(9, 0x41); // 'A'
-    header.setUint8(10, 0x56); // 'V'
-    header.setUint8(11, 0x45); // 'E'
-
-    // fmt subchunk
-    header.setUint8(12, 0x66); // 'f'
-    header.setUint8(13, 0x6D); // 'm'
-    header.setUint8(14, 0x74); // 't'
-    header.setUint8(15, 0x20); // ' '
-    header.setUint32(16, 16, Endian.little); // Subchunk1Size (16 for PCM)
-    header.setUint16(20, 1, Endian.little); // AudioFormat (1 = PCM)
-    header.setUint16(22, numChannels, Endian.little);
-    header.setUint32(24, sampleRate, Endian.little);
-    header.setUint32(28, byteRate, Endian.little);
-    header.setUint16(32, blockAlign, Endian.little);
-    header.setUint16(34, bitsPerSample, Endian.little);
-
-    // data subchunk
-    header.setUint8(36, 0x64); // 'd'
-    header.setUint8(37, 0x61); // 'a'
-    header.setUint8(38, 0x74); // 't'
-    header.setUint8(39, 0x61); // 'a'
-    header.setUint32(40, dataSize, Endian.little);
-
-    // Combine header + PCM data
-    final wavFile = Uint8List(44 + pcmData.length);
-    wavFile.setRange(0, 44, header.buffer.asUint8List());
-    wavFile.setRange(44, 44 + pcmData.length, pcmData);
-
-    return wavFile;
-  }
-
-  AudioPlaybackService() {
-    _initializePlayer();
-  }
-
-  /// Initialize audio player
-  void _initializePlayer() {
-    // Listen to player state changes
-    _player.onPlayerStateChanged.listen((state) {
-      final wasPlaying = _isPlaying;
-      _isPlaying = state == PlayerState.playing;
-
-      if (wasPlaying != _isPlaying) {
-        _playbackController.add(_isPlaying);
+  /// Initialize the SoLoud engine. Call once at app startup.
+  Future<void> initialize() async {
+    try {
+      if (!SoLoud.instance.isInitialized) {
+        await SoLoud.instance.init();
+        _logger.i('SoLoud engine initialized');
       }
-
-      // When audio completes, play next in queue
-      if (state == PlayerState.completed) {
-        _playNextInQueue();
-      }
-    });
-
-    _logger.i('Audio playback service initialized');
+    } catch (e) {
+      _logger.e('Failed to initialize SoLoud engine: $e');
+      rethrow;
+    }
   }
 
-  /// Convert float32 audio samples to PCM16 bytes
-  Uint8List _float32ToPCM16(List<double> audioFloats) {
-    // Backend sends float32 values [-1.0, 1.0] via JSON
-    final pcm16 = <int>[];
-
-    for (final floatValue in audioFloats) {
-      // Convert float32 [-1.0, 1.0] to PCM16 [-32768, 32767]
-      final pcm16Value = (floatValue * 32767).round().clamp(-32768, 32767);
-
-      // Write as little-endian 16-bit int
-      pcm16.add(pcm16Value & 0xFF);
-      pcm16.add((pcm16Value >> 8) & 0xFF);
+  /// Feed a PCM16 chunk into the active stream.
+  ///
+  /// On first call (idle state): creates a buffer stream source and starts
+  /// playback immediately -- no buffering threshold. The first chunk from
+  /// pipeline parallelism is a full sentence (~2-4s of audio), so there
+  /// is no risk of underrun on the first chunk.
+  ///
+  /// If called while draining or fading a previous response, the old
+  /// stream is stopped with a fade and a new stream starts for the
+  /// incoming response.
+  void writeChunk(Uint8List pcm16Data, int sampleRate) {
+    if (_state == PlaybackState.draining || _state == PlaybackState.fading) {
+      _logger.i(
+        'New chunk arrived in $_state state -- '
+        'stopping old stream and starting new one',
+      );
+      _forceCleanup();
     }
 
-    _logger.d(
-      'Converted ${audioFloats.length} float32 samples to ${pcm16.length} PCM16 bytes',
-    );
-    return Uint8List.fromList(pcm16);
-  }
-
-  /// Buffer audio chunk from float32 samples for continuous playback.
-  ///
-  /// During pre-buffering, accumulates audio until [_preBufferSeconds]
-  /// worth of PCM data is collected, then flushes everything and starts
-  /// playback. After the pre-buffer is satisfied, each subsequent chunk
-  /// is flushed immediately for lowest latency.
-  ///
-  /// This eliminates gaps between sentences where TTS generation time
-  /// exceeds the previous sentence's audio duration.
-  Future<void> playAudioChunkFloat32(
-    List<double> audioData,
-    int sampleRate,
-  ) async {
     try {
-      _bufferSampleRate = sampleRate;
+      if (_state == PlaybackState.idle) {
+        _startNewStream(sampleRate);
+      }
 
-      // Convert float32 to PCM16 bytes and accumulate
-      final pcm16Bytes = _float32ToPCM16(audioData);
-      _pcmBuffer.addAll(pcm16Bytes);
-      _chunksSinceFlush++;
-
-      // Calculate buffered audio duration
-      // PCM16 = 2 bytes per sample, mono
-      final bufferedSeconds = _pcmBuffer.length / (sampleRate * 2);
+      SoLoud.instance.addAudioDataStream(_activeSource!, pcm16Data);
+      _chunksReceived++;
 
       _logger.d(
-        'Buffered chunk $_chunksSinceFlush '
-        '(${pcm16Bytes.length} bytes, total: ${_pcmBuffer.length}, '
-        '${bufferedSeconds.toStringAsFixed(1)}s)',
+        'Fed chunk #$_chunksReceived (${pcm16Data.length} bytes) '
+        'in $_state state',
       );
-
-      if (_preBuffering) {
-        // During pre-buffer phase, wait until we have enough audio
-        if (bufferedSeconds >= _preBufferSeconds) {
-          _logger.i(
-            'Pre-buffer filled (${bufferedSeconds.toStringAsFixed(1)}s, '
-            '$_chunksSinceFlush chunks). Starting playback.',
-          );
-          _preBuffering = false;
-          _flushBuffer();
-        }
-      } else {
-        // After pre-buffer, flush every chunk immediately
-        if (_chunksSinceFlush >= _flushChunkThreshold) {
-          _flushBuffer();
-        }
+    } on SoLoudPcmBufferFullCppException {
+      _underrunCount++;
+      _logger.w(
+        'PCM buffer full (overfeed) -- chunk dropped '
+        '(underrun count: $_underrunCount)',
+      );
+      if (_underrunCount > _underrunWarningThreshold) {
+        _logger.w(
+          'Underrun count ($_underrunCount) exceeds threshold '
+          '($_underrunWarningThreshold) for this response',
+        );
       }
     } catch (e) {
-      _logger.e('Error buffering audio chunk: $e');
-      _logger.e('Stack trace: ${StackTrace.current}');
-      rethrow;
+      _logger.e('Error writing chunk: $e');
     }
   }
 
-  /// Flush accumulated PCM buffer as a single WAV segment.
-  void _flushBuffer() {
-    if (_pcmBuffer.isEmpty) return;
+  /// Create a new buffer stream source and start playback immediately.
+  ///
+  /// The source is created synchronously so data can be fed right away.
+  /// The play() call is async but we fire-and-forget it -- data fed
+  /// before play starts will be buffered by flutter_soloud.
+  ///
+  /// State transitions directly to playing (no buffering phase) because
+  /// the first chunk is a full sentence with enough audio data to
+  /// prevent underruns.
+  void _startNewStream(int sampleRate) {
+    _resetDiagnostics();
 
-    final pcmData = Uint8List.fromList(_pcmBuffer);
-    _pcmBuffer.clear();
-    _chunksSinceFlush = 0;
-
-    final sampleRate = _bufferSampleRate ?? 24000;
-    final wavData = _addWavHeader(pcmData, sampleRate);
-
-    _logger.d(
-      'Flushing buffer: ${pcmData.length} PCM bytes -> ${wavData.length} WAV bytes',
+    _activeSource = SoLoud.instance.setBufferStream(
+      sampleRate: sampleRate,
+      channels: Channels.mono,
+      format: BufferType.s16le,
+      bufferingType: BufferingType.preserved,
+      bufferingTimeNeeds: 0.15,
     );
 
-    _queueWavForPlayback(wavData, sampleRate);
+    // Transition directly to playing -- first chunk is a full sentence
+    // (~2-4s of audio), so no buffering threshold needed.
+    _setState(PlaybackState.playing);
+
+    // play() is async -- fire and store the handle when ready.
+    // Data fed via addAudioDataStream before play resolves is buffered.
+    SoLoud.instance
+        .play(_activeSource!)
+        .then((handle) {
+          _activeHandle = handle;
+          _logger.d('SoLoud play handle acquired');
+        })
+        .catchError((Object e) {
+          _logger.e('Failed to start SoLoud playback: $e');
+          _cleanup();
+        });
+
+    _logger.i(
+      'Started new buffer stream (rate: $sampleRate, '
+      'jitter buffer: 150ms) -- immediate playback',
+    );
   }
 
-  /// Called when the backend signals audio generation is complete.
-  /// Flushes any remaining buffered PCM data as a final WAV segment.
-  /// If still pre-buffering (short response), plays whatever we have.
-  void flushAndFinalize() {
-    if (_preBuffering && _pcmBuffer.isNotEmpty) {
-      _logger.i(
-        'Audio complete during pre-buffer. Flushing '
-        '${_pcmBuffer.length} bytes immediately.',
+  /// Signal that all audio data has been sent for this response.
+  ///
+  /// Calls setDataIsEnded on the source and transitions to draining.
+  /// The stream will finish playing remaining buffered audio, then
+  /// we clean up.
+  void drain() {
+    if (_activeSource == null || _state == PlaybackState.idle) {
+      _logger.d('drain() called with no active source -- ignoring');
+      return;
+    }
+
+    if (_state == PlaybackState.draining || _state == PlaybackState.fading) {
+      _logger.d('drain() called in $_state state -- ignoring');
+      return;
+    }
+
+    try {
+      SoLoud.instance.setDataIsEnded(_activeSource!);
+      _setState(PlaybackState.draining);
+      _logger.i('Draining -- setDataIsEnded called');
+
+      _logStreamDiagnostics();
+      _startDrainMonitor();
+    } catch (e) {
+      _logger.e('Error during drain: $e');
+      _cleanup();
+    }
+  }
+
+  /// Feed a fade-out payload and close the stream.
+  ///
+  /// Used when an interrupt_fade frame arrives: we feed the short
+  /// fade audio, signal end-of-data, and transition to fading.
+  void fadeAndClose(Uint8List fadePayload) {
+    if (_activeSource == null || _state == PlaybackState.idle) {
+      _logger.d('fadeAndClose() called with no active source -- ignoring');
+      return;
+    }
+
+    try {
+      SoLoud.instance.addAudioDataStream(_activeSource!, fadePayload);
+      SoLoud.instance.setDataIsEnded(_activeSource!);
+      _setState(PlaybackState.fading);
+      _logger.i('Fading -- fed ${fadePayload.length} bytes fade payload');
+
+      _logStreamDiagnostics();
+      _startDrainMonitor();
+    } on SoLoudPcmBufferFullCppException {
+      _logger.w('Buffer full during fadeAndClose -- forcing stop');
+      _cleanup();
+    } catch (e) {
+      _logger.e('Error during fadeAndClose: $e');
+      _cleanup();
+    }
+  }
+
+  /// Hard stop -- dispose source and reset to idle immediately.
+  void stopImmediately() {
+    _logger.i('stopImmediately() called');
+    _cleanup();
+  }
+
+  /// Stop with a brief silence ramp.
+  ///
+  /// Used when a new response starts while still draining the previous
+  /// one. Feeds a short block of silence then disposes.
+  void stopWithFade() {
+    if (_activeSource == null || _state == PlaybackState.idle) {
+      _logger.d('stopWithFade() called with no active source');
+      return;
+    }
+
+    try {
+      // 20ms of silence at 24kHz mono 16-bit = 960 bytes
+      final silence = Uint8List(960);
+      SoLoud.instance.addAudioDataStream(_activeSource!, silence);
+      SoLoud.instance.setDataIsEnded(_activeSource!);
+      _setState(PlaybackState.fading);
+      _logger.i('stopWithFade -- fed 20ms silence ramp');
+
+      // Clean up after the silence plays out
+      Future.delayed(const Duration(milliseconds: 50), () {
+        _cleanup();
+      });
+    } catch (e) {
+      _logger.w('Error during stopWithFade: $e -- forcing cleanup');
+      _cleanup();
+    }
+  }
+
+  /// Track chunk sequence numbers and log gaps.
+  void validateSequence(int chunkSeq) {
+    if (_lastChunkSeq >= 0 && chunkSeq != _lastChunkSeq + 1) {
+      final gap = chunkSeq - _lastChunkSeq - 1;
+      _sequenceGapCount++;
+      _logger.w(
+        'Sequence gap detected: expected ${_lastChunkSeq + 1}, '
+        'got $chunkSeq (gap: $gap, total gaps: $_sequenceGapCount)',
       );
-      _preBuffering = false;
     }
-    _flushBuffer();
-    _logger.d('Audio buffer finalized');
+    _lastChunkSeq = chunkSeq;
   }
 
-  /// Queue a WAV segment for playback, or play immediately if idle.
-  void _queueWavForPlayback(Uint8List wavData, int sampleRate) {
-    if (_isPlaying) {
-      _audioQueue.add((wavData, sampleRate));
-      _logger.d('Queued WAV segment (queue size: ${_audioQueue.length})');
-      return;
-    }
+  /// Monitor draining/fading state and clean up when playback finishes.
+  void _startDrainMonitor() {
+    _drainTimer?.cancel();
+    // Poll every 100ms to check if playback has finished.
+    // SoLoud auto-disposes the source when buffer is drained after
+    // setDataIsEnded, so we check if the source is still valid.
+    _drainTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
+      if (_activeSource == null) {
+        timer.cancel();
+        return;
+      }
 
-    _playWav(wavData);
+      try {
+        // Check if the sound handle is still valid by querying it.
+        // If SoLoud has finished playing, the handle becomes invalid
+        // and operations on it may throw.
+        final valid = SoLoud.instance.getIsValidVoiceHandle(_activeHandle!);
+        if (!valid) {
+          _logger.d('Drain/fade complete -- source finished playing');
+          timer.cancel();
+          _cleanup();
+        }
+      } catch (e) {
+        // Source no longer valid -- playback finished
+        _logger.d('Drain monitor: source invalid -- cleaning up');
+        timer.cancel();
+        _cleanup();
+      }
+    });
   }
 
-  /// Play a complete WAV segment (already has header).
-  Future<void> _playWav(Uint8List wavData) async {
-    try {
-      final source = BytesSource(wavData);
-      await _player.play(source);
-      _logger.d('Playing WAV segment (${wavData.length} bytes)');
-    } catch (e) {
-      _logger.e('Error in _playWav: $e');
-      rethrow;
+  void _setState(PlaybackState newState) {
+    final oldState = _state;
+    _state = newState;
+
+    final wasPlaying =
+        oldState == PlaybackState.playing ||
+        oldState == PlaybackState.buffering ||
+        oldState == PlaybackState.draining;
+    final nowPlaying =
+        newState == PlaybackState.playing ||
+        newState == PlaybackState.buffering ||
+        newState == PlaybackState.draining;
+
+    if (wasPlaying != nowPlaying) {
+      _playbackController.add(nowPlaying);
     }
+
+    _logger.d('State: $oldState -> $newState');
   }
 
-  /// Play next WAV segment from the queue.
-  void _playNextInQueue() {
-    if (_audioQueue.isEmpty) {
-      return;
-    }
+  void _cleanup() {
+    _drainTimer?.cancel();
+    _drainTimer = null;
 
-    final (nextWav, _) = _audioQueue.removeAt(0);
-    _logger.d(
-      'Playing next WAV segment from queue (remaining: ${_audioQueue.length})',
+    if (_activeHandle != null) {
+      try {
+        // Stop any active playback on this handle
+        SoLoud.instance.stop(_activeHandle!);
+      } catch (e) {
+        // Handle may already be invalid -- that's fine
+        _logger.d('Cleanup: handle already disposed');
+      }
+      _activeHandle = null;
+    }
+    _activeSource = null;
+
+    _setState(PlaybackState.idle);
+  }
+
+  /// Force cleanup without SoLoud interaction for state transitions
+  /// where we need to reset before starting a new stream.
+  void _forceCleanup() {
+    _drainTimer?.cancel();
+    _drainTimer = null;
+
+    if (_activeHandle != null) {
+      try {
+        SoLoud.instance.stop(_activeHandle!);
+      } catch (e) {
+        _logger.d('Force cleanup: handle already disposed');
+      }
+      _activeHandle = null;
+    }
+    _activeSource = null;
+
+    // Reset to idle without emitting a playback stream event --
+    // the new stream will immediately follow.
+    _state = PlaybackState.idle;
+  }
+
+  void _resetDiagnostics() {
+    _underrunCount = 0;
+    _sequenceGapCount = 0;
+    _lastChunkSeq = -1;
+    _chunksReceived = 0;
+  }
+
+  void _logStreamDiagnostics() {
+    _logger.i(
+      'Stream diagnostics: '
+      'chunks=$_chunksReceived, '
+      'underruns=$_underrunCount, '
+      'sequence_gaps=$_sequenceGapCount',
     );
 
-    _playWav(nextWav);
-  }
-
-  /// Stop playback and discard all buffered audio.
-  Future<void> stop() async {
-    try {
-      await _player.stop();
-      _audioQueue.clear();
-      _pcmBuffer.clear();
-      _chunksSinceFlush = 0;
-      _preBuffering = true;
-      _isPlaying = false;
-      _playbackController.add(false);
-      _logger.i('Stopped audio playback');
-    } catch (e) {
-      _logger.e('Error stopping playback: $e');
+    if (_underrunCount > _underrunWarningThreshold) {
+      _logger.w(
+        'High underrun count for this response: $_underrunCount '
+        '(threshold: $_underrunWarningThreshold)',
+      );
     }
   }
 
-  /// Pause playback
-  Future<void> pause() async {
-    try {
-      await _player.pause();
-      _logger.i('Paused audio playback');
-    } catch (e) {
-      _logger.e('Error pausing playback: $e');
-    }
-  }
-
-  /// Resume playback
-  Future<void> resume() async {
-    try {
-      await _player.resume();
-      _logger.i('Resumed audio playback');
-    } catch (e) {
-      _logger.e('Error resuming playback: $e');
-    }
-  }
-
-  /// Clear audio queue and PCM buffer. Resets pre-buffer state.
-  void clearQueue() {
-    _audioQueue.clear();
-    _pcmBuffer.clear();
-    _chunksSinceFlush = 0;
-    _preBuffering = true;
-    _logger.d('Cleared audio queue and buffer');
-  }
-
-  /// Dispose resources.
+  /// Dispose resources. Called when the service is torn down.
   void dispose() {
-    _player.dispose();
+    _cleanup();
     _playbackController.close();
-    _audioQueue.clear();
-    _pcmBuffer.clear();
   }
 }

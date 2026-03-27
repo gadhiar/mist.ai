@@ -39,7 +39,7 @@ dependencies:
 
   # Audio - Phase 2B (Stream to Backend Whisper)
   record: ^6.1.2                    # Audio recording (latest version)
-  audioplayers: ^6.1.0              # Audio playback for TTS
+  flutter_soloud: ^3.1.5             # PCM streaming audio playback
   permission_handler: ^11.3.1       # Microphone permissions
   path_provider: ^2.1.4             # Temporary file paths
   speech_to_text: ^7.0.0            # Speech recognition (for future local STT)

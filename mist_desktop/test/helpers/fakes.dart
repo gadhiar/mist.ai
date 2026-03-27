@@ -172,60 +172,87 @@ class FakeAudioRecordingService implements AudioRecordingService {
 // FakeAudioPlaybackService
 // ---------------------------------------------------------------------------
 
-class PlayAudioChunkCall {
-  const PlayAudioChunkCall({required this.audioData, required this.sampleRate});
+class WriteChunkCall {
+  const WriteChunkCall({required this.pcm16Data, required this.sampleRate});
 
-  final List<double> audioData;
+  final Uint8List pcm16Data;
   final int sampleRate;
 }
 
 class FakeAudioPlaybackService implements AudioPlaybackService {
-  final List<PlayAudioChunkCall> playAudioChunkCalls = [];
-  int stopCallCount = 0;
-  int flushAndFinalizeCallCount = 0;
+  final List<WriteChunkCall> writeChunkCalls = [];
+  int drainCallCount = 0;
+  int stopImmediatelyCallCount = 0;
+  int stopWithFadeCallCount = 0;
+  int fadeAndCloseCallCount = 0;
+  final List<int> validatedSequences = [];
+  Uint8List? lastFadePayload;
 
-  bool _isPlaying = false;
+  PlaybackState _state = PlaybackState.idle;
   final _playbackController = StreamController<bool>.broadcast();
 
   StreamController<bool> get playbackTestController => _playbackController;
 
   @override
-  bool get isPlaying => _isPlaying;
+  PlaybackState get state => _state;
+
+  @override
+  bool get isPlaying =>
+      _state == PlaybackState.playing ||
+      _state == PlaybackState.buffering ||
+      _state == PlaybackState.draining;
 
   @override
   Stream<bool> get playbackStream => _playbackController.stream;
 
   @override
-  Future<void> playAudioChunkFloat32(
-    List<double> audioData,
-    int sampleRate,
-  ) async {
-    playAudioChunkCalls.add(
-      PlayAudioChunkCall(audioData: audioData, sampleRate: sampleRate),
+  int get underrunCount => 0;
+
+  @override
+  int get sequenceGapCount => 0;
+
+  @override
+  Future<void> initialize() async {}
+
+  @override
+  void writeChunk(Uint8List pcm16Data, int sampleRate) {
+    writeChunkCalls.add(
+      WriteChunkCall(pcm16Data: pcm16Data, sampleRate: sampleRate),
     );
-    _isPlaying = true;
+    _state = PlaybackState.playing;
     _playbackController.add(true);
   }
 
   @override
-  Future<void> stop() async {
-    stopCallCount++;
-    _isPlaying = false;
+  void drain() {
+    drainCallCount++;
+    _state = PlaybackState.draining;
+  }
+
+  @override
+  void fadeAndClose(Uint8List fadePayload) {
+    fadeAndCloseCallCount++;
+    lastFadePayload = fadePayload;
+    _state = PlaybackState.fading;
+  }
+
+  @override
+  void stopImmediately() {
+    stopImmediatelyCallCount++;
+    _state = PlaybackState.idle;
     _playbackController.add(false);
   }
 
   @override
-  Future<void> pause() async {}
+  void stopWithFade() {
+    stopWithFadeCallCount++;
+    _state = PlaybackState.idle;
+    _playbackController.add(false);
+  }
 
   @override
-  Future<void> resume() async {}
-
-  @override
-  void clearQueue() {}
-
-  @override
-  void flushAndFinalize() {
-    flushAndFinalizeCallCount++;
+  void validateSequence(int chunkSeq) {
+    validatedSequences.add(chunkSeq);
   }
 
   @override

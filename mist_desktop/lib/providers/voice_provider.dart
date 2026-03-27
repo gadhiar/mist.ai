@@ -63,27 +63,14 @@ class VoiceNotifier extends Notifier<VoiceState> {
     return const VoiceState();
   }
 
-  /// Handle audio-related incoming WebSocket messages
+  /// Handle audio-related incoming WebSocket messages.
+  ///
+  /// TODO(Task 6): Audio routing is being migrated to binary frame stream
+  /// via _handleAudioFrame. JSON audio_chunk and audio_complete messages
+  /// are no longer processed here. This method will be removed or
+  /// simplified when the binary audio pipeline is fully wired.
   void _handleAudioMessage(WebSocketMessage message) {
     switch (message.type) {
-      case WsMessageType.audioChunk:
-        if (message.audio != null && message.sampleRate != null) {
-          final audioData = message.audio!
-              .map((e) => (e as num).toDouble())
-              .toList();
-          _audioService.playAudioChunkFloat32(audioData, message.sampleRate!);
-          _logger.d(
-            'Playing audio chunk: ${message.chunkNum} (${audioData.length} samples)',
-          );
-        }
-        break;
-
-      case WsMessageType.audioComplete:
-        _logger.d('Audio generation complete - flushing buffer');
-        _audioService.flushAndFinalize();
-        state = state.copyWith(isPlaying: false);
-        break;
-
       default:
         // Non-audio messages are handled by ChatNotifier
         break;
@@ -112,7 +99,7 @@ class VoiceNotifier extends Notifier<VoiceState> {
 
   /// Stop all audio (called during interrupt)
   Future<void> stopAll() async {
-    await _audioService.stop();
+    _audioService.stopImmediately();
     await _audioRecordingService.stopRecording();
     state = const VoiceState();
   }
