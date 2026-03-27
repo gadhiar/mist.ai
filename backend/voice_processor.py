@@ -110,7 +110,7 @@ class VoiceProcessor:
         """Called by VAD when user starts speaking."""
         # Send message to clients (using saved event loop reference)
         asyncio.run_coroutine_threadsafe(
-            self.message_queue.put({"type": "vad_status", "status": "speech_started"}),
+            self.message_queue.put(json.dumps({"type": "vad_status", "status": "speech_started"})),
             self.loop,
         )
 
@@ -138,7 +138,7 @@ class VoiceProcessor:
 
             # Send transcription to clients
             asyncio.run_coroutine_threadsafe(
-                self.message_queue.put({"type": "transcription", "text": user_text}),
+                self.message_queue.put(json.dumps({"type": "transcription", "text": user_text})),
                 self.loop,
             )
 
@@ -156,7 +156,7 @@ class VoiceProcessor:
             logger.error(f"Error processing user speech: {e}", exc_info=True)
             asyncio.run_coroutine_threadsafe(
                 self.message_queue.put(
-                    {"type": "error", "message": f"Speech processing error: {e}"}
+                    json.dumps({"type": "error", "message": f"Speech processing error: {e}"})
                 ),
                 self.loop,
             )
