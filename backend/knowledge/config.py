@@ -53,17 +53,21 @@ class EmbeddingConfig:
 class LLMConfig:
     """LLM model configuration."""
 
-    model: str = "qwen2.5:7b-instruct"  # Default Ollama model
-    base_url: str = "http://localhost:11434"  # Ollama default
+    model: str = "qwen2.5:7b-instruct"
+    base_url: str = "http://localhost:8080"  # llama-server default
     temperature: float = 0.0  # Deterministic for extraction
+    backend: str = "llamacpp"  # "llamacpp" or "ollama"
 
     @classmethod
     def from_env(cls) -> "LLMConfig":
         """Load configuration from environment variables."""
+        backend = os.getenv("LLM_BACKEND", "llamacpp")
+        default_url = "http://localhost:11434" if backend == "ollama" else "http://localhost:8080"
         return cls(
             model=os.getenv("MODEL", "qwen2.5:7b-instruct"),
-            base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+            base_url=os.getenv("LLM_SERVER_URL", default_url),
             temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
+            backend=backend,
         )
 
 
