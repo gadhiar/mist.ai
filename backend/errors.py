@@ -9,8 +9,8 @@ Hierarchy:
     MistError
     +-- Neo4jConnectionError
     +-- Neo4jQueryError
-    +-- OllamaConnectionError
-    +-- OllamaResponseError
+    +-- LLMConnectionError
+    +-- LLMResponseError
     +-- ExtractionError
     +-- ExtractionValidationError
     +-- NormalizationError
@@ -45,15 +45,15 @@ class Neo4jQueryError(MistError):
     """Raised when a Cypher query fails or returns unexpected results."""
 
 
-# -- Ollama / LLM ----------------------------------------------------------
+# -- LLM backend -------------------------------------------------------------
 
 
-class OllamaConnectionError(MistError):
-    """Raised when the Ollama service is unreachable or refuses a connection."""
+class LLMConnectionError(MistError):
+    """Raised when the LLM service is unreachable or refuses a connection."""
 
 
-class OllamaResponseError(MistError):
-    """Raised when Ollama returns an invalid or unparsable response."""
+class LLMResponseError(MistError):
+    """Raised when the LLM service returns an invalid or unparsable response."""
 
 
 # -- Knowledge pipeline ----------------------------------------------------
