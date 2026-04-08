@@ -180,7 +180,7 @@ class VoiceProfileRegistry:
     def get_active(self) -> VoiceProfile:
         """Get the currently active voice profile.
 
-        Reads VOICE_PROFILE env var, defaults to 'cortana'.
+        Reads VOICE_PROFILE env var, defaults to 'jarvis'.
 
         Returns:
             The active VoiceProfile.
