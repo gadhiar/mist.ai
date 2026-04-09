@@ -23,6 +23,9 @@ dist/
 build/
 warmup_final.wav
 
+# GGUF model files (large binaries)
+models/*.gguf
+
 # Voice training data and development audio (local only)
 data/vector_store/
 dependencies/csm/audio_data_*/
