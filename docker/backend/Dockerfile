@@ -34,6 +34,9 @@ RUN pip install chatterbox-tts soundfile
 COPY requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt
 
+# Ensure openai and httpx are installed (safety net if requirements.txt cache is stale)
+RUN pip install "openai>=1.30" "httpx>=0.27"
+
 # 4. Re-pin PyTorch ONLY if chatterbox or requirements overwrote it
 RUN TORCH_VER=$(python -c "import torch; print(torch.__version__)") && \
     if [ "$TORCH_VER" != "2.6.0+cu124" ]; then \
