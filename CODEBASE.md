@@ -1,8 +1,8 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-03-27
-**Branch:** main
-**Status:** Voice pipeline fully optimized (~2.5-3.5s TTFA target), binary audio transport, personality profiles, log streaming
+**Last Updated:** 2026-04-08
+**Branch:** main (feat/model-backend-migration pending merge)
+**Status:** Voice pipeline fully optimized (~2.5-3.5s TTFA target), binary audio transport, personality profiles, log streaming, llama-server backend
 
 ---
 
@@ -11,15 +11,16 @@
 ### Backend
 - **Status:** CONTAINERIZED (Docker + CUDA 12.4)
 - **Server:** FastAPI WebSocket on port 8001
+- **LLM Backend:** llama-server (llama.cpp) via StreamingLLMProvider abstraction; Ollama retained as fallback
 - **Voice Pipeline:** VAD -> Whisper -> Qwen 2.5 7B -> Chatterbox Turbo TTS (pipeline parallelism, binary PCM16 transport, ~2.5-3.5s TTFA target)
 - **Audio Transport:** Binary WebSocket frames (MIST protocol: 16-byte header + PCM16), RMS normalization (-20 dBFS), interrupt fade-out
 - **Personality System:** YAML-based personality configs per voice profile (openers, speaking style, mannerisms)
 - **Log Streaming:** WebSocketLogHandler with per-logger gating, token bucket rate limiter, request ID propagation
 - **Persistent Logging:** `./logs/mist-backend.log` at DEBUG level (survives container removal)
 - **Knowledge Graph:** Full extraction + curation pipeline (655 tests, 369 new)
-- **Configuration:** TTS_ENABLED=true, TTS_ENGINE=chatterbox, VOICE_PROFILE=friday
+- **Configuration:** TTS_ENABLED=true, TTS_ENGINE=chatterbox, VOICE_PROFILE=friday, LLM_BACKEND=llama-server
 - **Code Quality:** [COMPLETE] Full suite -- Black, Ruff, Mypy, Bandit, Codespell, AI slop detection
-- **Tests:** 670+ unit tests (run inside container), 20 audio protocol tests, 14 sentence detector tests, 7 personality config tests
+- **Tests:** 696 unit tests (run inside container), 20 audio protocol tests, 14 sentence detector tests, 7 personality config tests
 
 ### Frontend
 - **Status:** IN DEVELOPMENT
@@ -36,12 +37,25 @@
 ## Active Work
 
 ### Current Focus
-1. E2E validation of binary audio transport + personality profiles [PENDING USER TEST]
-2. Knowledge graph visualization in Flutter
-3. Seed knowledge DB, run full e2e knowledge integration test
-4. Merge to origin/main when ready to push remotely
+1. Merge feat/model-backend-migration to main
+2. E2E validation of binary audio transport + personality profiles [PENDING USER TEST]
+3. Knowledge graph visualization in Flutter
+4. Seed knowledge DB, run full e2e knowledge integration test
+5. Merge to origin/main when ready to push remotely
 
-### Recently Completed (2026-03-27)
+### Recently Completed (2026-04-08)
+- Model backend migration: Ollama replaced with llama-server (llama.cpp) behind StreamingLLMProvider abstraction
+- New backend/llm/ package: LlamaServerProvider (primary), OllamaProvider (fallback), build_llm_provider() factory
+- Docker: mist-ollama service replaced with mist-llm (ghcr.io/ggml-org/llama.cpp:server-cuda)
+- Dependencies: langchain-ollama, langchain-core removed; openai, httpx added; ollama kept for fallback
+- Error hierarchy: OllamaConnectionError -> LLMConnectionError, OllamaResponseError -> LLMResponseError
+- Conversation handler: langchain tool binding replaced with OpenAI-format JSON tool schemas
+- Voice pipeline: ollama.chat(stream=True) replaced with provider.generate_sync(request, stream=True)
+- New env vars: LLM_BACKEND, LLM_SERVER_URL, MODELS_DIR, LLM_MODEL_FILE, LLM_CTX_SIZE
+- All consumers receive LLM provider via DI (build_llm_provider() factory)
+- 696 tests passing (up from 670+)
+
+### Previously Completed (2026-03-27)
 - Binary WebSocket audio transport: MIST protocol (16-byte header + PCM16), replaces JSON float32 arrays (~7x bandwidth reduction)
 - Backend: audio_protocol.py (frame builder, RMS normalization, fade-out, PCM16 conversion), 20 tests
 - Server broadcast_messages() dispatches binary frames via send_bytes(), text via send_text()
@@ -78,7 +92,7 @@
 
 ### Known Issues
 - Native Windows venv is corrupted -- use Docker container going forward
-- GPU contention between Ollama and Chatterbox adds ~1.1x TTS overhead on single GPU
+- GPU contention between llama-server and Chatterbox adds ~1.1x TTS overhead on single GPU
 - Binary audio transport implemented but not E2E validated yet (pending manual test)
 - Log handler uses bare import (`from log_handler import ...`) not relative
 - Knowledge DB has not been seeded -- RAG retrieval returns 0 facts
@@ -111,7 +125,7 @@ None
   - Performance: 0.74x RTF vs 2.3x RTF (CSM)
   - VRAM: 3.9GB vs 10GB (CSM)
   - Zero-shot voice cloning, MIT license
-- Docker Compose stack: mist-backend + Neo4j 5 + Ollama
+- Docker Compose stack: mist-backend + Neo4j 5 + mist-llm (llama-server)
 - Dev mode: docker-compose.override.yml mounts code as read-only volumes
 - Backend container: nvidia/cuda:12.4.0-devel-ubuntu22.04 + Python 3.11
 - PyTorch 2.6.0+cu124 with flash attention inside container
@@ -143,9 +157,7 @@ docker/
 ├── backend/
 │   ├── Dockerfile              # CUDA 12.4 + Python 3.11 + Chatterbox
 │   └── .dockerignore           # Excludes CSM training data
-└── ollama/
-    └── init-models.sh          # First-run model pull
-docker-compose.yml              # 3-service stack (backend, neo4j, ollama)
+docker-compose.yml              # 3-service stack (backend, neo4j, mist-llm)
 docker-compose.override.yml     # Dev mode volume mounts
 ```
 
@@ -162,6 +174,7 @@ backend/
 ├── knowledge_config.py    # Knowledge graph configuration
 ├── voice_models/          # ML model management (Chatterbox adapter)
 ├── chat/                  # Conversation handling + tool usage
+├── llm/                   # LLM provider abstraction (StreamingLLMProvider, LlamaServerProvider, OllamaProvider)
 └── knowledge/             # Neo4j knowledge graph system
 ```
 
@@ -192,7 +205,7 @@ mist_desktop/
 - Flutter connects to backend via WebSocket (ws://localhost:8001)
 - Backend sends: transcriptions, LLM tokens, audio chunks, structured log entries
 - Frontend sends: audio data, text messages, interrupts, log_config (level control)
-- Services communicate via Docker container hostnames (mist-neo4j, mist-ollama)
+- Services communicate via Docker container hostnames (mist-neo4j, mist-llm)
 
 ---
 
@@ -216,11 +229,16 @@ TTS_EXAGGERATION=0.5
 TTS_TEMPERATURE=0.8
 TTS_CFG_WEIGHT=0.5
 
-# Model
-MODEL=qwen2.5:7b-instruct
+# LLM Backend
+LLM_BACKEND=llama-server          # "llama-server" (default) or "ollama" (fallback)
+LLM_SERVER_URL=http://mist-llm:8080  # llama-server endpoint
+MODELS_DIR=/models                # GGUF model directory (container path)
+LLM_MODEL_FILE=qwen2.5-7b-instruct-q4_k_m.gguf
+LLM_CTX_SIZE=8192                 # Context window size
 ```
 
 ### Critical Settings
+- LLM_BACKEND=llama-server (default; set to "ollama" for fallback)
 - TTS_ENABLED=true (Chatterbox enabled by default)
 - TTS_ENGINE=chatterbox (legacy CSM still available but not recommended)
 - ENABLE_KNOWLEDGE_INTEGRATION=true (knowledge graph active)
@@ -236,7 +254,9 @@ MODEL=qwen2.5:7b-instruct
 - FastAPI + Uvicorn (WebSocket server)
 - Docker (nvidia/cuda:12.4.0-devel-ubuntu22.04)
 - PyTorch 2.6.0+cu124 (flash attention enabled)
-- Ollama (LLM inference -- Qwen 2.5 7B)
+- llama-server / llama.cpp (LLM inference -- Qwen 2.5 7B via GGUF, OpenAI-compatible API)
+- StreamingLLMProvider abstraction (LlamaServerProvider primary, OllamaProvider fallback)
+- openai + httpx (LLM client libraries)
 - Whisper (STT -- base model)
 - Chatterbox Turbo (TTS -- zero-shot voice cloning, MIT license)
 - Neo4j 5.x (knowledge graph)
@@ -258,7 +278,7 @@ MODEL=qwen2.5:7b-instruct
 
 ### Starting the Stack
 ```bash
-# Start full stack (backend + Neo4j + Ollama)
+# Start full stack (backend + Neo4j + llama-server)
 docker compose up -d
 
 # Or use dev script
@@ -308,7 +328,7 @@ flutter run -d windows
 ## Testing
 
 ### Backend Tests
-- **Count:** 655+ unit tests (369 from knowledge pipeline, 14 sentence detector, token streaming tests)
+- **Count:** 696 unit tests (369 from knowledge pipeline, 14 sentence detector, token streaming tests, LLM provider tests)
 - **Runner:** pytest inside Docker container
 - **Command:** `docker compose run --rm --no-deps mist-backend pytest tests/unit/`
 - **Note:** Tests must run inside container -- native Windows venv is missing dependencies
@@ -331,7 +351,7 @@ flutter analyze
 ## Next Steps
 
 ### Immediate Priorities
-1. Binary WebSocket audio transport (Phase 2 -- 7x bandwidth reduction, gapless playback)
+1. Merge feat/model-backend-migration branch to main
 2. Knowledge graph visualization in Flutter
 3. Seed knowledge DB, run full e2e knowledge integration test
 4. Merge to origin/main when ready
@@ -367,7 +387,7 @@ flutter analyze
 - **pyproject.toml** -- Python tool configuration
 - **analysis_options.yaml** -- Flutter/Dart linting
 - **.pre-commit-config.yaml** -- Pre-commit hooks
-- **docker-compose.yml** -- 3-service stack definition
+- **docker-compose.yml** -- 3-service stack definition (backend, neo4j, mist-llm)
 - **docker-compose.override.yml** -- Dev mode volume mounts
 
 ---
@@ -376,11 +396,11 @@ flutter analyze
 
 | Area | Status | Notes |
 |------|--------|-------|
-| Backend | CONTAINERIZED | Docker + CUDA 12.4 |
+| Backend | CONTAINERIZED | Docker + CUDA 12.4, llama-server (llama.cpp) |
 | TTS | Chatterbox Turbo | 0.74x RTF, 3.9GB VRAM |
 | Knowledge | COMPLETE | 655 tests, Neo4j integrated |
 | Frontend | IN DEV | Nav rail + log viewer operational |
 | Code Quality | COMPLETE | 16 pre-commit hooks, 7 CI checks |
-| Docker | COMPLETE | 3-service Compose stack |
+| Docker | COMPLETE | 3-service Compose stack (backend, neo4j, mist-llm) |
 | CI/CD | COMPLETE | GitHub Actions configured |
 | Line Endings | FIXED | .gitattributes normalizes to LF |
