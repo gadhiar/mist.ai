@@ -13,8 +13,6 @@ For tests, bypass factories and pass fakes directly to constructors.
 
 import logging
 
-from langchain_ollama import ChatOllama
-
 from backend.interfaces import EmbeddingProvider, EventStoreProvider, GraphConnection
 from backend.knowledge.config import KnowledgeConfig
 from backend.knowledge.curation.confidence import ConfidenceManager
@@ -33,6 +31,7 @@ from backend.knowledge.extraction.validator import ExtractionValidator
 from backend.knowledge.storage.graph_executor import GraphExecutor
 from backend.knowledge.storage.graph_store import GraphStore
 from backend.knowledge.storage.neo4j_connection import Neo4jConnection
+from backend.llm import StreamingLLMProvider
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +78,34 @@ def build_graph_store(
     return GraphStore(conn, embeddings)
 
 
+def build_llm_provider(config: KnowledgeConfig) -> StreamingLLMProvider:
+    """Create the LLM provider based on config.
+
+    Args:
+        config: Knowledge subsystem configuration.
+
+    Returns:
+        StreamingLLMProvider instance (LlamaServerProvider or OllamaProvider).
+    """
+    llm_config = config.llm
+    if llm_config.backend == "llamacpp":
+        from backend.llm.llama_server_provider import LlamaServerProvider
+
+        return LlamaServerProvider(
+            base_url=llm_config.base_url,
+            model=llm_config.model,
+        )
+    elif llm_config.backend == "ollama":
+        from backend.llm.ollama_provider import OllamaProvider
+
+        return OllamaProvider(
+            base_url=llm_config.base_url,
+            model=llm_config.model,
+        )
+    else:
+        raise ValueError(f"Unknown LLM backend: {llm_config.backend}")
+
+
 def build_curation_pipeline(config: KnowledgeConfig, executor: GraphExecutor) -> CurationPipeline:
     """Create a fully wired CurationPipeline."""
     embedding_provider = EmbeddingGenerator(config.embedding.model_name)
@@ -93,6 +120,7 @@ def build_curation_pipeline(config: KnowledgeConfig, executor: GraphExecutor) ->
 def build_extraction_pipeline(
     config: KnowledgeConfig,
     graph_store: GraphStore | None = None,
+    llm_provider: StreamingLLMProvider | None = None,
     include_curation: bool = True,
     include_internal_derivation: bool = True,
 ) -> ExtractionPipeline:
@@ -102,24 +130,19 @@ def build_extraction_pipeline(
 
     curation = build_curation_pipeline(config, executor) if include_curation else None
 
-    llm = ChatOllama(
-        model=config.llm.model,
-        base_url=config.llm.base_url,
-        temperature=0.0,
-        format="json",
-    )
+    provider = llm_provider or build_llm_provider(config)
 
     internal_deriver = None
     if include_internal_derivation:
         from backend.knowledge.extraction.internal_derivation import InternalKnowledgeDeriver
 
-        internal_deriver = InternalKnowledgeDeriver(llm=llm, executor=executor)
+        internal_deriver = InternalKnowledgeDeriver(llm=provider, executor=executor)
         # Ensure MistIdentity singleton exists (sync call, OK in factory context)
         gs.ensure_mist_identity()
 
     return ExtractionPipeline(
         preprocessor=PreProcessor(),
-        extractor=OntologyConstrainedExtractor(config, llm=llm),
+        extractor=OntologyConstrainedExtractor(config, llm=provider),
         confidence_scorer=ConfidenceScorer(),
         temporal_resolver=TemporalResolver(),
         normalizer=EntityNormalizer(
@@ -140,6 +163,7 @@ def build_extraction_pipeline(
 def build_conversation_handler(
     config: KnowledgeConfig,
     model_name: str = "qwen2.5:7b",
+    llm_provider: StreamingLLMProvider | None = None,
 ):
     """Create a fully wired ConversationHandler.
 
@@ -152,7 +176,10 @@ def build_conversation_handler(
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
 
     gs = build_graph_store(config)
-    pipeline = build_extraction_pipeline(config, graph_store=gs, include_curation=True)
+    provider = llm_provider or build_llm_provider(config)
+    pipeline = build_extraction_pipeline(
+        config, graph_store=gs, llm_provider=provider, include_curation=True
+    )
 
     # Build vector store with graceful fallback
     vector_store = None
@@ -199,6 +226,7 @@ def build_curation_scheduler(
     config: KnowledgeConfig,
     event_store: EventStoreProvider | None = None,
     tracker: "ToolUsageTracker | None" = None,  # noqa: F821
+    llm_provider: StreamingLLMProvider | None = None,
 ):
     """Create a fully wired CurationScheduler with all maintenance jobs.
 
@@ -209,8 +237,6 @@ def build_curation_scheduler(
         tracker: Optional ToolUsageTracker for SkillDerivationJob. When None,
             a default tracker is created from config.
     """
-    from langchain_ollama import ChatOllama
-
     from backend.knowledge.curation.centrality import CentralityAnalyzer
     from backend.knowledge.curation.community import CommunityDetector
     from backend.knowledge.curation.confidence_decay import ConfidenceDecayJob
@@ -229,13 +255,8 @@ def build_curation_scheduler(
     executor = build_graph_executor(config, gs.connection)
     embedding_provider = EmbeddingGenerator(config.embedding.model_name)
 
-    llm = ChatOllama(
-        model=config.llm.model,
-        base_url=config.llm.base_url,
-        temperature=0.0,
-        format="json",
-    )
-    internal_deriver = InternalKnowledgeDeriver(llm=llm, executor=executor)
+    provider = llm_provider or build_llm_provider(config)
+    internal_deriver = InternalKnowledgeDeriver(llm=provider, executor=executor)
 
     skill_config = config.skill_derivation
     usage_tracker = tracker or ToolUsageTracker(skill_config)
