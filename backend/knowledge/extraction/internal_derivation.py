@@ -63,7 +63,7 @@ class InternalKnowledgeDeriver:
         """Initialize the deriver.
 
         Args:
-            llm: LLM provider (LLMProvider protocol or ChatOllama).
+            llm: LLM provider (satisfies LLMProvider protocol).
             executor: Async graph executor for writing internal entities.
         """
         self._llm = llm
