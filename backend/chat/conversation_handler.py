@@ -13,21 +13,60 @@ import logging
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from langchain_core.tools import tool
-from langchain_ollama import ChatOllama
-
 from backend.event_store.models import ConversationTurnEvent
 from backend.event_store.store import EventStore
 from backend.knowledge.config import KnowledgeConfig
 from backend.knowledge.models import ConversationSession, RetrievalFilters, RetrievalResult
 from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from backend.knowledge.storage.graph_store import GraphStore
+from backend.llm import LLMRequest, StreamingLLMProvider
+from backend.llm.models import ToolCall as LLMToolCall
 
 if TYPE_CHECKING:
     from backend.knowledge.extraction.pipeline import ExtractionPipeline
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
 
 logger = logging.getLogger(__name__)
+
+KNOWLEDGE_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "query_knowledge_graph",
+            "description": (
+                "Search the knowledge graph for relevant information about the user. "
+                "Use when: user asks about past info, preferences, or knowledge; "
+                "you need context about entities, technologies, projects; "
+                "you want to personalize based on what you know."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": ("What to search for (e.g. 'Python', 'my projects')"),
+                    },
+                    "entity_types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": ("Optional filter by entity types (e.g. ['Technology'])"),
+                    },
+                    "relationship_types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": ("Optional filter by relationships (e.g. ['USES'])"),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum facts to retrieve (default 20)",
+                        "default": 20,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
 
 
 class ConversationHandler:
@@ -45,7 +84,7 @@ class ConversationHandler:
         graph_store: GraphStore,
         extraction_pipeline: ExtractionPipeline,
         retriever: KnowledgeRetriever,
-        model_name: str = "qwen2.5:7b",
+        llm_provider: StreamingLLMProvider,
         tool_usage_tracker: ToolUsageTracker | None = None,
     ) -> None:
         """Initialize conversation handler.
@@ -55,7 +94,7 @@ class ConversationHandler:
             graph_store: Neo4j graph store
             extraction_pipeline: Pipeline for automatic knowledge extraction.
             retriever: Pre-built knowledge retriever (supports hybrid retrieval).
-            model_name: Ollama model to use
+            llm_provider: LLM inference provider (StreamingLLMProvider).
             tool_usage_tracker: Optional tracker for recording tool calls for
                 skill derivation. When None, tool usage is not recorded.
         """
@@ -65,14 +104,11 @@ class ConversationHandler:
         self.retriever = retriever
         self._tool_usage_tracker = tool_usage_tracker
 
-        # Initialize LLM
-        self.llm = ChatOllama(
-            model=model_name,
-            temperature=0.7,
-        )
+        # LLM provider (replaces ChatOllama)
+        self._provider = llm_provider
 
-        # Bind tools to LLM
-        self._setup_tools()
+        # Tool configuration
+        self._tool_schemas = KNOWLEDGE_TOOL_SCHEMAS
 
         # Active sessions
         self.sessions: dict[str, ConversationSession] = {}
@@ -92,61 +128,49 @@ class ConversationHandler:
         # Maps external session_id -> event store session_id
         self._es_session_ids: dict[str, str] = {}
 
-        logger.info(f"ConversationHandler initialized with model: {model_name}")
+        logger.info("ConversationHandler initialized with model: %s", llm_provider.model)
 
-    def _setup_tools(self):
-        """Setup LLM tools for MCP-like access."""
-        # Store references for tool implementations
-        retriever = self.retriever
-
-        @tool
-        async def query_knowledge_graph(
-            query: str,
-            entity_types: list[str] | None = None,
-            relationship_types: list[str] | None = None,
-            limit: int = 20,
-        ) -> str:
-            """Search the knowledge graph for relevant information about the user.
-
-            Use this tool when:
-            - User asks about their past information, preferences, or knowledge
-            - You need context about entities, technologies, projects, or relationships
-            - You want to personalize your response based on what you know
-
-            Args:
-                query: What to search for (e.g., "Python programming", "my projects", "backend technologies")
-                entity_types: Optional filter by entity types (e.g., ["Technology", "Project"])
-                relationship_types: Optional filter by relationships (e.g., ["USES", "WORKS_ON"])
-                limit: Maximum facts to retrieve (default 20)
-
-            Returns:
-                Natural language context with relevant facts from the knowledge graph
-            """
-            try:
-                filters = None
-                if entity_types or relationship_types:
-                    filters = RetrievalFilters(
-                        entity_types=entity_types, relationship_types=relationship_types
-                    )
-
-                result = await retriever.retrieve(
-                    query=query, user_id="User", limit=limit, filters=filters
+    async def _handle_query_knowledge_graph(
+        self,
+        query: str,
+        entity_types: list[str] | None = None,
+        relationship_types: list[str] | None = None,
+        limit: int = 20,
+    ) -> str:
+        """Execute the query_knowledge_graph tool."""
+        try:
+            filters = None
+            if entity_types or relationship_types:
+                filters = RetrievalFilters(
+                    entity_types=entity_types,
+                    relationship_types=relationship_types,
                 )
 
-                if result.total_facts == 0:
-                    return f"No information found for query: '{query}'. You may want to ask the user about this topic."
+            result = await self.retriever.retrieve(
+                query=query, user_id="User", limit=limit, filters=filters
+            )
 
-                return result.formatted_context
+            if result.total_facts == 0:
+                return (
+                    f"No information found for query: '{query}'. "
+                    "You may want to ask the user about this topic."
+                )
 
-            except Exception as e:
-                logger.error(f"Error querying knowledge graph: {e}")
-                return f"Error searching knowledge graph: {str(e)}"
+            return result.formatted_context
 
-        # Bind tools to LLM
-        self.tools = [query_knowledge_graph]
-        self.llm_with_tools = self.llm.bind_tools(self.tools)
+        except Exception as e:
+            logger.error("Error querying knowledge graph: %s", e)
+            return f"Error searching knowledge graph: {e!s}"
 
-        logger.info("Tools bound to LLM: query_knowledge_graph")
+    async def _dispatch_tool(self, tool_call: LLMToolCall) -> str:
+        """Dispatch a tool call to its handler."""
+        handlers = {
+            "query_knowledge_graph": self._handle_query_knowledge_graph,
+        }
+        handler = handlers.get(tool_call.name)
+        if handler is None:
+            return f"Tool not found: {tool_call.name}"
+        return await handler(**tool_call.arguments)
 
     def get_or_create_session(self, session_id: str, user_id: str = "User") -> ConversationSession:
         """Get existing session or create new one."""
@@ -219,36 +243,42 @@ class ConversationHandler:
             # LLM autonomously decides to use tools
             logger.info(f"Processing message in session {session_id}")
 
-            response = await self.llm_with_tools.ainvoke(messages)
+            request = LLMRequest(
+                messages=messages,
+                tools=self._tool_schemas,
+                temperature=0.7,
+                max_tokens=400,
+            )
+            response = await self._provider.invoke(request)
 
             # Check if LLM made tool calls
             tool_calls = []
             tool_results = []
 
-            if hasattr(response, "tool_calls") and response.tool_calls:
-                logger.info(f"[TOOLS] LLM made {len(response.tool_calls)} tool calls")
+            if response.tool_calls:
+                logger.info("[TOOLS] LLM made %d tool calls", len(response.tool_calls))
 
                 # Execute tool calls
-                for tool_call in response.tool_calls:
-                    tool_name = tool_call.get("name")
-                    tool_args = tool_call.get("args", {})
-                    tool_call_id = tool_call.get("id", f"call_{tool_name}")
+                for tc in response.tool_calls:
+                    logger.info("[TOOLS] Executing tool: %s", tc.name)
+                    logger.info("[TOOLS]   Args: %s", tc.arguments)
 
-                    logger.info(f"[TOOLS] Executing tool: {tool_name}")
-                    logger.info(f"[TOOLS]   Args: {tool_args}")
-
-                    # Find and execute tool
-                    tool_result = await self._execute_tool(tool_name, tool_args)
+                    # Dispatch to handler
+                    tool_result = await self._dispatch_tool(tc)
 
                     # Log the result (truncated if too long)
                     result_preview = (
                         tool_result[:200] + "..." if len(tool_result) > 200 else tool_result
                     )
-                    logger.info(f"[TOOLS]   Result: {result_preview}")
+                    logger.info("[TOOLS]   Result: %s", result_preview)
 
-                    tool_calls.append({"name": tool_name, "args": tool_args})
+                    tool_calls.append({"name": tc.name, "args": tc.arguments})
                     tool_results.append(
-                        {"name": tool_name, "result": tool_result, "tool_call_id": tool_call_id}
+                        {
+                            "name": tc.name,
+                            "result": tool_result,
+                            "tool_call_id": tc.id,
+                        }
                     )
 
                     # Record tool usage for skill derivation
@@ -262,21 +292,22 @@ class ConversationHandler:
 
                         self._tool_usage_tracker.record(
                             ToolCallRecord(
-                                tool_name=tool_name,
-                                tool_type=classify_tool_type(tool_name),
-                                context=str(tool_args)[:500],
+                                tool_name=tc.name,
+                                tool_type=classify_tool_type(tc.name),
+                                context=str(tc.arguments)[:500],
                                 success=not tool_result.startswith("Tool not found:"),
                                 timestamp=datetime.now(UTC),
                                 session_id=session_id,
-                                event_id="",  # Not yet available at tool dispatch time
+                                event_id="",
                             )
                         )
 
-                # If tools were called, get final response with tool results
-                # Preserve the full AIMessage including tool_calls for proper correlation
-                assistant_msg = {"role": "assistant", "content": response.content or ""}
-                if hasattr(response, "tool_calls") and response.tool_calls:
-                    assistant_msg["tool_calls"] = response.tool_calls
+                # Build assistant message with tool_calls for correlation
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": response.content or "",
+                    "tool_calls": [tc.to_openai_dict() for tc in response.tool_calls],
+                }
                 messages.append(assistant_msg)
 
                 for result in tool_results:
@@ -284,16 +315,19 @@ class ConversationHandler:
                         {
                             "role": "tool",
                             "content": result["result"],
-                            "name": result["name"],
                             "tool_call_id": result["tool_call_id"],
                         }
                     )
 
-                # Get final response
+                # Get final response with tool results
                 logger.info("[TOOLS] Generating final response with tool results...")
-                final_response = await self.llm.ainvoke(messages)
+                final_request = LLMRequest(messages=messages, temperature=0.7, max_tokens=400)
+                final_response = await self._provider.invoke(final_request)
                 assistant_message = final_response.content
-                logger.info(f"[TOOLS] Final response: {assistant_message[:100]}...")
+                logger.info(
+                    "[TOOLS] Final response: %s...",
+                    assistant_message[:100],
+                )
 
             else:
                 # No tool calls, use response directly
@@ -342,14 +376,6 @@ class ConversationHandler:
                 assistant_message=error_msg,
             )
             return error_msg
-
-    async def _execute_tool(self, tool_name: str, tool_args: dict[str, Any]) -> str:
-        """Execute a tool by name."""
-        for tool in self.tools:
-            if tool.name == tool_name:
-                return await tool.ainvoke(tool_args)
-
-        return f"Tool not found: {tool_name}"
 
     async def _extract_knowledge_async(
         self,
@@ -455,8 +481,8 @@ class ConversationHandler:
                 context_window=context_window,
                 retrieval_context=retrieval_context,
                 tool_calls=tool_calls,
-                llm_model=self.llm.model,
-                llm_parameters={"temperature": self.llm.temperature},
+                llm_model=self._provider.model,
+                llm_parameters={"temperature": 0.7},
                 ontology_version=self.config.ontology_version,
             )
 

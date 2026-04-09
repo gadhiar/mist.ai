@@ -9,12 +9,12 @@ import logging
 from collections.abc import Generator
 from pathlib import Path
 
-import ollama
 import yaml
 
 from backend.chat.conversation_handler import ConversationHandler
 from backend.factories import build_conversation_handler
 from backend.knowledge.config import KnowledgeConfig
+from backend.llm import LLMRequest, StreamingLLMProvider
 
 logger = logging.getLogger(__name__)
 
@@ -25,26 +25,34 @@ class KnowledgeIntegration:
     Wraps ConversationHandler to work with existing streaming architecture.
     """
 
-    def __init__(self, config: KnowledgeConfig):
+    def __init__(self, config: KnowledgeConfig, llm_provider: StreamingLLMProvider | None = None):
         """Initialize knowledge integration.
 
         Args:
             config: Complete knowledge system configuration
+            llm_provider: Optional pre-built provider. When None, built from config.
         """
         self.enabled = False
         self.conversation_handler: ConversationHandler | None = None
         self.current_session_id = "default"
+        self._llm_provider = llm_provider
 
         try:
+            if llm_provider is None:
+                from backend.factories import build_llm_provider
+
+                llm_provider = build_llm_provider(config)
+                self._llm_provider = llm_provider
+
             self.conversation_handler = build_conversation_handler(
-                config=config, model_name=config.llm.model
+                config=config, llm_provider=llm_provider
             )
 
             self.enabled = True
             logger.info("Knowledge integration enabled")
 
         except Exception as e:
-            logger.warning(f"Knowledge integration disabled: {e}")
+            logger.warning("Knowledge integration disabled: %s", e)
             logger.warning("Falling back to standard LLM (no knowledge graph)")
 
     def set_voice_profile(self, profile_name: str) -> None:
@@ -181,7 +189,7 @@ class KnowledgeIntegration:
         """Generate LLM response with true token-level streaming.
 
         Runs RAG retrieval, builds a voice-optimized prompt, then streams
-        tokens directly from Ollama. Bypasses ConversationHandler's
+        tokens via the injected LLM provider. Bypasses ConversationHandler's
         tool-calling chain for lower latency.
 
         Known limitations vs handle_message():
@@ -257,21 +265,19 @@ class KnowledgeIntegration:
             for msg in session.messages[-20:]:
                 messages.append({"role": msg.role, "content": msg.content})
 
-            # Step 3: Stream tokens directly from Ollama
-            model_name = handler.config.llm.model
-            response = ollama.chat(
-                model=model_name,
+            # Step 3: Stream tokens from LLM provider
+            request = LLMRequest(
                 messages=messages,
-                stream=True,
-                options={"num_predict": 400, "temperature": 0.7, "top_p": 0.9},
+                temperature=0.7,
+                max_tokens=400,
+                top_p=0.9,
             )
 
             full_response = ""
-            for chunk in response:
-                if "message" in chunk and "content" in chunk["message"]:
-                    token = chunk["message"]["content"]
-                    full_response += token
-                    yield token
+            for chunk in self._llm_provider.generate_sync(request, stream=True):
+                if chunk.content:
+                    full_response += chunk.content
+                    yield chunk.content
 
             # Step 4: Record to session history
             session.add_message("assistant", full_response)

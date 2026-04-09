@@ -162,7 +162,6 @@ def build_extraction_pipeline(
 
 def build_conversation_handler(
     config: KnowledgeConfig,
-    model_name: str = "qwen2.5:7b",
     llm_provider: StreamingLLMProvider | None = None,
 ):
     """Create a fully wired ConversationHandler.
@@ -202,7 +201,7 @@ def build_conversation_handler(
         graph_store=gs,
         extraction_pipeline=pipeline,
         retriever=retriever,
-        model_name=model_name,
+        llm_provider=provider,
         tool_usage_tracker=tracker,
     )
 
