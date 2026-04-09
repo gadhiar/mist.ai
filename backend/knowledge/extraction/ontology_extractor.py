@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from backend.interfaces import LLMProvider
+from backend.llm.models import LLMRequest
 
 if TYPE_CHECKING:
     from backend.knowledge.curation.graph_writer import SourceMetadata
@@ -136,12 +137,15 @@ class OntologyConstrainedExtractor:
 
         start_time = time.perf_counter()
         try:
-            response = await self._llm.ainvoke(
-                [
+            request = LLMRequest(
+                messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message},
-                ]
+                ],
+                json_mode=True,
+                temperature=0.0,
             )
+            response = await self._llm.invoke(request)
             raw_output = response.content
         except Exception as e:
             elapsed_ms = (time.perf_counter() - start_time) * 1000
