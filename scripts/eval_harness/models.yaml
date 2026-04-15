@@ -12,7 +12,8 @@
 # Spec corrections baked in (per cross-validation research Section 6):
 #   1. No --system-prompt-file (removed upstream Oct 2024, PR #9857).
 #   2. Base image pinned to CUDA 12.8.1 (applies to containerized runs).
-#   3. --kv-unified 0 added for correctness under KV quantization.
+#   3. --no-kv-unified added for correctness under KV quantization
+#      (flag became boolean in llama.cpp >= b8700; was --kv-unified 0 pre-b8700).
 #   4. GBNF grammar passed via extra_body.grammar, not --grammar-file.
 #   5. Speculative decoding dropped from baseline (Nemotron only has 0.5B draft).
 #   6. --cache-ram 4096 (the real flag), not --cram 256.
@@ -40,10 +41,7 @@ defaults:
     - "999"
     - "--cache-ram"
     - "4096"
-    - "--kv-unified"
-    - "0"
-    - "--log-format"
-    - "json"
+    - "--no-kv-unified"
     - "--no-webui"
 
   # Default context window for the harness.
