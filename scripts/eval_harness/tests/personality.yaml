@@ -7,7 +7,7 @@ description: >-
   runaway responses.
 
 temperature_mode: conversation
-max_tokens: 384
+max_tokens: 1024
 use_grammar: false
 response_format: null
 

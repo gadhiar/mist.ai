@@ -353,6 +353,7 @@ class ServerSpec:
     binary_path: str
     gguf_path: str
     chat_template: str | None
+    chat_template_file: str | None
     ctx_size: int
     shared_args: tuple[str, ...]
     extra_args: tuple[str, ...]
@@ -418,7 +419,9 @@ class ServerLauncher:
         cmd: list[str] = [self._spec.binary_path]
         cmd.extend(["-m", self._spec.gguf_path])
         cmd.extend(["--ctx-size", str(self._spec.ctx_size)])
-        if self._spec.chat_template:
+        if self._spec.chat_template_file:
+            cmd.extend(["--chat-template-file", self._spec.chat_template_file])
+        elif self._spec.chat_template:
             cmd.extend(["--chat-template", self._spec.chat_template])
         cmd.extend(self._spec.shared_args)
         cmd.extend(self._spec.extra_args)

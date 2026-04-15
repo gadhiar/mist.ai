@@ -107,10 +107,12 @@ class Candidate:
     temperature: dict[str, float]
     top_p: dict[str, float]
     chat_template: str | None
+    chat_template_file: str | None
     tool_parser: str | None
     gbnf_supported: bool
     stop_sequences: tuple[str, ...]
     extra_server_args: tuple[str, ...]
+    shared_server_args_override: tuple[str, ...] | None
     notes: str
 
 
@@ -204,10 +206,17 @@ def _parse_candidate(entry: dict[str, Any]) -> Candidate:
         temperature=dict(entry.get("temperature", {"extraction": 0.0, "conversation": 0.7})),
         top_p=dict(entry.get("top_p", {"extraction": 0.95, "conversation": 0.95})),
         chat_template=entry.get("chat_template"),
+        chat_template_file=entry.get("chat_template_file"),
         tool_parser=entry.get("tool_parser"),
         gbnf_supported=bool(entry.get("gbnf_supported", True)),
         stop_sequences=tuple(entry.get("stop_sequences", [])),
         extra_server_args=tuple(entry.get("extra_server_args", [])),
+        shared_server_args_override=(
+            tuple(entry["shared_server_args_override"])
+            if "shared_server_args_override" in entry
+            and entry["shared_server_args_override"] is not None
+            else None
+        ),
         notes=entry.get("notes", ""),
     )
 
@@ -297,14 +306,19 @@ def build_messages(test_file: TestFile, case: TestCase) -> list[dict[str, Any]]:
     """Assemble OpenAI-format messages for one test case.
 
     System prompt priority: case.system_prompt > test_file.system_prompt.
-    Context (if present) goes in as a separate system message before the user
-    turn so the harness matches MIST's real extraction prompt layout.
+    Context (if present) is folded into the single system message to avoid
+    two consecutive system messages, which some bundled jinja templates
+    reject: Qwen 3.5 requires system to be first-only, Gemma 3 requires
+    strict user/assistant alternation.
     """
     messages: list[dict[str, Any]] = []
     system_prompt = case.system_prompt or test_file.system_prompt
-    if system_prompt:
+    if system_prompt and case.context:
+        combined = f"{system_prompt}\n\nContext:\n{case.context}"
+        messages.append({"role": "system", "content": combined})
+    elif system_prompt:
         messages.append({"role": "system", "content": system_prompt})
-    if case.context:
+    elif case.context:
         messages.append({"role": "system", "content": f"Context:\n{case.context}"})
     messages.append({"role": "user", "content": case.prompt})
     return messages
@@ -407,13 +421,19 @@ def run_candidate(
     launcher: ServerLauncher | None = None
     if not external:
         gguf_path = str(models_dir / candidate.gguf)
+        shared_args = (
+            candidate.shared_server_args_override
+            if candidate.shared_server_args_override is not None
+            else defaults.shared_server_args
+        )
         spec = ServerSpec(
             candidate_id=candidate.id,
             binary_path=llama_server_bin,
             gguf_path=gguf_path,
             chat_template=candidate.chat_template,
+            chat_template_file=candidate.chat_template_file,
             ctx_size=candidate.context_size,
-            shared_args=defaults.shared_server_args,
+            shared_args=shared_args,
             extra_args=candidate.extra_server_args,
         )
         launcher = ServerLauncher(spec, log_dir=log_dir)
