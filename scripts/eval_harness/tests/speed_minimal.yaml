@@ -1,0 +1,41 @@
+test_type: speed
+description: >-
+  Carteakey-aligned minimal-prompt speed characterization. Each case has
+  no system prompt and a ~10-token user prompt with a short generation
+  budget. Matches the shape of carteakey.dev's llama-bench tg128 /
+  server-realistic text@128k throughput measurements. Isolates raw
+  generation throughput from prompt-processing overhead. Target floor:
+  same as speed.yaml (30 t/s) but the expected ceiling is much higher
+  because prompt-processing time is not amortized into tokens/sec.
+  Run FIRST (before other tests) to guarantee a cold KV cache state.
+
+temperature_mode: extraction
+max_tokens: 128
+use_grammar: false
+response_format: null
+
+cases:
+  - id: count_1_to_20
+    prompt: "Count from 1 to 20, one number per line."
+    expected:
+      target_tokens_per_second: 30
+
+  - id: alphabet
+    prompt: "Write the lowercase English alphabet, one letter per line."
+    expected:
+      target_tokens_per_second: 30
+
+  - id: colors_list
+    prompt: "List ten colors, one per line."
+    expected:
+      target_tokens_per_second: 30
+
+  - id: hello_langs
+    prompt: "Say hello in five different languages. One per line."
+    expected:
+      target_tokens_per_second: 30
+
+  - id: days_of_week
+    prompt: "Write the seven days of the week, one per line."
+    expected:
+      target_tokens_per_second: 30

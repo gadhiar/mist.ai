@@ -59,6 +59,7 @@ DEFAULT_RESULTS_DIR = HARNESS_ROOT / "results"
 DEFAULT_LOG_DIR = DEFAULT_RESULTS_DIR / "server-logs"
 
 DEFAULT_TEST_ORDER: tuple[str, ...] = (
+    "speed_minimal",
     "schema_conformance",
     "tool_selection",
     "personality",

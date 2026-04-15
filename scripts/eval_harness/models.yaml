@@ -1116,3 +1116,222 @@ candidates:
     notes: >-
       Probe 7: fully stripped Q5_K_XL. Bundled template, no FA, f16 KV,
       no --fit. Pure Q5_K_XL quality ceiling with minimal interference.
+
+  # ---------------------------------------------------------------------
+  # EXPANSIVE GEMMA 4 MATRIX -- Carteakey post full coverage, added
+  # 2026-04-15 for Phase 3 expansive variant sweep. Tests levers not
+  # covered by the initial 3-variant optimization set: full 128k context,
+  # larger fit-target headroom, --parallel 2 concurrency.
+  # ---------------------------------------------------------------------
+
+  - id: gemma-4-26b-a4b-q5xl-fit-128k
+    display_name: "Gemma 4 26B-A4B MoE (UD-Q5_K_XL, --fit on, 128k ctx)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q5_K_XL.gguf"
+    quant: Q5_K_XL
+    size_gb: 21.2
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 131072
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/gemma4_26b_chat_template.jinja"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--fit"
+      - "on"
+      - "--fit-ctx"
+      - "131072"
+      - "--fit-target"
+      - "512"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "10"
+      - "--threads-batch"
+      - "12"
+      - "--no-mmap"
+      - "--mlock"
+      - "--prio"
+      - "2"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--no-warmup"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Carteakey's exact text-server profile including the full 128k
+      context window. Tests whether larger ctx hurts our tokens/sec
+      at Q5_K_XL when prompt size stays constant (speed_minimal) vs
+      when prompts are realistic (5k-token MIST extraction).
+
+  - id: gemma-4-26b-a4b-q3xl-fit-target-1024
+    display_name: "Gemma 4 26B-A4B MoE (UD-Q3_K_XL, --fit on, --fit-target 1024)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf"
+    quant: Q3_K_XL
+    size_gb: 12.88
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/gemma4_26b_chat_template.jinja"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--fit"
+      - "on"
+      - "--fit-ctx"
+      - "32768"
+      - "--fit-target"
+      - "1024"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--no-mmap"
+      - "--mlock"
+      - "--prio"
+      - "2"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--no-warmup"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Larger --fit-target (1024 vs 512). Gives the scheduler more GPU
+      headroom, fewer layers offloaded to DDR5. May trade some speed
+      for stability / fewer OOM near context limits. Carteakey notes
+      fit-target=2048 is needed for vision stability; 1024 is a
+      midpoint for text-only.
+
+  - id: gemma-4-26b-a4b-q3xl-fit-parallel2
+    display_name: "Gemma 4 26B-A4B MoE (UD-Q3_K_XL, --fit on, --parallel 2)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf"
+    quant: Q3_K_XL
+    size_gb: 12.88
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/gemma4_26b_chat_template.jinja"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--fit"
+      - "on"
+      - "--fit-ctx"
+      - "32768"
+      - "--fit-target"
+      - "512"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "2048"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--no-mmap"
+      - "--mlock"
+      - "--prio"
+      - "2"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "2"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--no-warmup"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Two concurrent decode slots (--parallel 2) + larger batch-size
+      2048. MIST voice pipeline is single-user but concurrency reduces
+      latency variance under bursty extraction load. Tests whether
+      we can serve background knowledge extraction concurrently with
+      the conversational path without sacrificing TTFA.
