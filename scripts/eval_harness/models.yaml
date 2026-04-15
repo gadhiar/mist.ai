@@ -80,7 +80,7 @@ candidates:
     top_p:
       extraction: 0.95
       conversation: 0.95
-    chat_template: "gemma"
+    chat_template: null
     tool_parser: null
     gbnf_supported: true
     stop_sequences:
@@ -111,7 +111,7 @@ candidates:
     top_p:
       extraction: 0.95
       conversation: 0.95
-    chat_template: "chatml"
+    chat_template: null
     tool_parser: "hermes"
     gbnf_supported: true
     stop_sequences:
@@ -141,7 +141,7 @@ candidates:
     top_p:
       extraction: 0.95
       conversation: 0.95
-    chat_template: "gemma"
+    chat_template: null
     tool_parser: null
     gbnf_supported: true
     stop_sequences:
@@ -171,7 +171,7 @@ candidates:
     top_p:
       extraction: 0.95
       conversation: 0.95
-    chat_template: "chatml"
+    chat_template: null
     tool_parser: "hermes"
     gbnf_supported: true
     stop_sequences:
@@ -206,7 +206,7 @@ candidates:
     top_p:
       extraction: 0.95
       conversation: 0.95
-    chat_template: "chatml"
+    chat_template: null
     tool_parser: "hermes"
     gbnf_supported: true
     stop_sequences:
@@ -236,7 +236,7 @@ candidates:
     top_p:
       extraction: 0.95
       conversation: 0.95
-    chat_template: "chatml"
+    chat_template: null
     tool_parser: "hermes"
     gbnf_supported: true
     stop_sequences:
@@ -266,7 +266,7 @@ candidates:
     top_p:
       extraction: 0.95
       conversation: 0.95
-    chat_template: "chatml"
+    chat_template: null
     tool_parser: null
     gbnf_supported: true
     stop_sequences:
@@ -296,7 +296,7 @@ candidates:
     top_p:
       extraction: 0.95
       conversation: 0.95
-    chat_template: "chatml"
+    chat_template: null
     tool_parser: null
     gbnf_supported: true
     stop_sequences:
