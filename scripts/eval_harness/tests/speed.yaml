@@ -1,0 +1,42 @@
+test_type: speed
+description: >-
+  Speed characterization test. Each case is a short, deterministic
+  prompt that exercises inference throughput with minimal scoring
+  overhead. The scorer measures tokens_per_second and compares
+  against a target floor. MIST's goal from ADR-008: a sustained
+  inference rate that keeps voice pipeline TTFA under the 6-second
+  budget. Target floor: 30 t/s.
+
+temperature_mode: extraction
+max_tokens: 256
+use_grammar: false
+response_format: null
+
+system_prompt: |
+  You are MIST, a personal cognitive assistant. Answer briefly in one or two sentences.
+
+cases:
+  - id: quick_ack
+    prompt: "Confirm you are online and ready."
+    expected:
+      target_tokens_per_second: 30
+
+  - id: short_factual
+    prompt: "What time zone is Seattle in during March?"
+    expected:
+      target_tokens_per_second: 30
+
+  - id: one_line_summary
+    prompt: "Summarize Docker in one sentence."
+    expected:
+      target_tokens_per_second: 30
+
+  - id: mid_length_answer
+    prompt: "In three sentences, explain what speculative decoding is and when it helps."
+    expected:
+      target_tokens_per_second: 30
+
+  - id: extraction_style_speed
+    prompt: "Extract nothing and output exactly: {\"entities\": [], \"relationships\": []}"
+    expected:
+      target_tokens_per_second: 30

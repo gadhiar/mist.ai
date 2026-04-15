@@ -1,0 +1,310 @@
+# MIST model backend A/B evaluation candidates.
+#
+# Each candidate describes how the harness should talk to a single
+# llama-server instance serving that model. The harness may either
+# connect to an externally-started server (--external) or spawn one
+# per-candidate as a subprocess (default).
+#
+# Source of truth for the candidate list:
+#   Decisions/ADR-008-revised-model-backend-selection.md (Phase 1.5 amended)
+#   Projects/mist-ai/research/2026-04-11-model-backend-cross-validation.md
+#
+# Spec corrections baked in (per cross-validation research Section 6):
+#   1. No --system-prompt-file (removed upstream Oct 2024, PR #9857).
+#   2. Base image pinned to CUDA 12.8.1 (applies to containerized runs).
+#   3. --kv-unified 0 added for correctness under KV quantization.
+#   4. GBNF grammar passed via extra_body.grammar, not --grammar-file.
+#   5. Speculative decoding dropped from baseline (Nemotron only has 0.5B draft).
+#   6. --cache-ram 4096 (the real flag), not --cram 256.
+#
+# llama.cpp build pin: >= b8670 (required for Gemma 4 MoE support).
+
+defaults:
+  # Server endpoint the harness connects to.
+  base_url: "http://127.0.0.1:8080"
+
+  # Where GGUFs live locally. Override via LLAMA_MODELS_DIR env var.
+  models_dir: "D:/Users/rajga/models"
+
+  # llama-server binary lookup. Override via LLAMA_SERVER_BIN env var
+  # or --llama-server-bin CLI flag.
+  llama_server_binary: "llama-server"
+
+  # Shared server flags applied to every candidate unless overridden.
+  shared_server_args:
+    - "--host"
+    - "127.0.0.1"
+    - "--port"
+    - "8080"
+    - "--n-gpu-layers"
+    - "999"
+    - "--cache-ram"
+    - "4096"
+    - "--kv-unified"
+    - "0"
+    - "--log-format"
+    - "json"
+    - "--no-webui"
+
+  # Default context window for the harness.
+  ctx_size: 8192
+
+  # How long to wait for /health to become ready after spawn (seconds).
+  spawn_health_timeout_seconds: 120
+
+  # Per-request timeout (seconds).
+  request_timeout_seconds: 180
+
+  # API key placeholder (llama-server does not require one).
+  api_key: "not-needed"
+
+# ---------------------------------------------------------------------
+# PRIMARY CANDIDATES (4) -- the A/B matrix winner comes from here.
+# ---------------------------------------------------------------------
+
+candidates:
+  - id: gemma-4-26b-a4b-iq4xs
+    display_name: "Gemma 4 26B-A4B MoE (UD-IQ4_XS)"
+    tier: primary
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-IQ4_XS.gguf"
+    quant: IQ4_XS
+    size_gb: 13.4
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 8192
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: "gemma"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    notes: >-
+      MoE with 3.8B active parameters. Requires llama.cpp build b8670+.
+      Windows CUDA path must be smoke-tested at desktop before A/B begins.
+      User-directed primary focus per Phase 1.5 (newer model, MoE tradeoff
+      accepted for quality ceiling).
+
+  - id: qwen-3.5-9b-q8
+    display_name: "Qwen 3.5 9B Instruct (Q8_0)"
+    tier: primary
+    family: qwen-3.5
+    vendor: alibaba
+    gguf: "bartowski/Qwen3.5-9B-Instruct-Q8_0.gguf"
+    quant: Q8_0
+    size_gb: 9.53
+    total_params_b: 9.0
+    active_params_b: 9.0
+    architecture: dense
+    context_size: 8192
+    served_model_name: "qwen3.5-9b-instruct"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: "chatml"
+    tool_parser: "hermes"
+    gbnf_supported: true
+    stop_sequences:
+      - "<|im_end|>"
+    extra_server_args: []
+    notes: >-
+      IFEval 91.5 at Q8_0 (near-lossless). Highest-confidence primary
+      addition per Phase 1.5 LARGE agent. Native tool calling via
+      hermes-style parser. Q8_0 fits 12 GB VRAM with room for KV cache.
+
+  - id: gemma-3-12b-q5km
+    display_name: "Gemma 3 12B Instruct (Q5_K_M)"
+    tier: primary
+    family: gemma-3
+    vendor: google
+    gguf: "bartowski/gemma-3-12b-it-Q5_K_M.gguf"
+    quant: Q5_K_M
+    size_gb: 8.4
+    total_params_b: 12.0
+    active_params_b: 12.0
+    architecture: dense
+    context_size: 8192
+    served_model_name: "gemma-3-12b-it"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: "gemma"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    notes: >-
+      LLMStructBench #1 at 12-14B tier (0.72). Mature llama.cpp support,
+      no chat template bugs. Dense architecture, strong extraction
+      baseline.
+
+  - id: qwen-2.5-14b-q5km
+    display_name: "Qwen 2.5 14B Instruct (Q5_K_M)"
+    tier: primary
+    family: qwen-2.5
+    vendor: alibaba
+    gguf: "bartowski/Qwen2.5-14B-Instruct-Q5_K_M.gguf"
+    quant: Q5_K_M
+    size_gb: 10.5
+    total_params_b: 14.0
+    active_params_b: 14.0
+    architecture: dense
+    context_size: 8192
+    served_model_name: "qwen2.5-14b-instruct"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: "chatml"
+    tool_parser: "hermes"
+    gbnf_supported: true
+    stop_sequences:
+      - "<|im_end|>"
+    extra_server_args: []
+    notes: >-
+      Silent on temperature=0 (no warnings). Native tool calling, mature
+      llama.cpp support. Independent REP agent primary pick in Phase 1.5.
+
+  # ---------------------------------------------------------------------
+  # DIAGNOSTIC BASELINES (4) -- run to characterize primary winners, not
+  # to become the deployed model. Useful for extraction-only or stretch
+  # scenarios.
+  # ---------------------------------------------------------------------
+
+  - id: qwen-3.5-27b-iq2m
+    display_name: "Qwen 3.5 27B Dense (IQ2_M)"
+    tier: diagnostic
+    family: qwen-3.5
+    vendor: alibaba
+    gguf: "bartowski/Qwen3.5-27B-IQ2_M.gguf"
+    quant: IQ2_M
+    size_gb: 10.6
+    total_params_b: 27.0
+    active_params_b: 27.0
+    architecture: dense
+    context_size: 8192
+    served_model_name: "qwen3.5-27b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: "chatml"
+    tool_parser: "hermes"
+    gbnf_supported: true
+    stop_sequences:
+      - "<|im_end|>"
+    extra_server_args: []
+    notes: >-
+      Stretch goal. IFEval 95.0 baseline but IQ2 degrades to unknown
+      territory. Run only after primary A/B to decide whether the
+      2-bit quality cliff is acceptable.
+
+  - id: hermes-4-14b-q5km
+    display_name: "Hermes-4-14B (Q5_K_M)"
+    tier: diagnostic
+    family: hermes-4
+    vendor: nous-research
+    gguf: "NousResearch/Hermes-4-14B-Q5_K_M.gguf"
+    quant: Q5_K_M
+    size_gb: 10.5
+    total_params_b: 14.0
+    active_params_b: 14.0
+    architecture: dense
+    context_size: 8192
+    served_model_name: "hermes-4-14b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: "chatml"
+    tool_parser: "hermes"
+    gbnf_supported: true
+    stop_sequences:
+      - "<|im_end|>"
+    extra_server_args: []
+    notes: >-
+      Schema adherence specialist. Diagnostic baseline for extraction-only
+      ceiling. Not a candidate for production due to weaker conversational
+      quality vs Qwen 2.5 / Gemma 3.
+
+  - id: nuextract-2-8b-q8
+    display_name: "NuExtract 2.0 8B (Q8_0)"
+    tier: diagnostic
+    family: nuextract-2
+    vendor: numind
+    gguf: "numind/NuExtract-2.0-8B-Q8_0.gguf"
+    quant: Q8_0
+    size_gb: 8.5
+    total_params_b: 8.0
+    active_params_b: 8.0
+    architecture: dense
+    context_size: 8192
+    served_model_name: "nuextract-2-8b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: "chatml"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<|im_end|>"
+    extra_server_args: []
+    notes: >-
+      Extraction specialist. Fine-tuned specifically for structured
+      information extraction. Useful as an upper bound for the
+      schema_conformance test; not viable as a general-purpose MIST model.
+
+  - id: nemotron-nano-12b-v2-q4km
+    display_name: "NVIDIA Nemotron Nano 12B v2 (Q4_K_M)"
+    tier: diagnostic
+    family: nemotron-nano
+    vendor: nvidia
+    gguf: "bartowski/Nemotron-Nano-12B-v2-Q4_K_M.gguf"
+    quant: Q4_K_M
+    size_gb: 7.2
+    total_params_b: 12.0
+    active_params_b: 12.0
+    architecture: dense
+    context_size: 8192
+    served_model_name: "nemotron-nano-12b-v2"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: "chatml"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<|im_end|>"
+    extra_server_args: []
+    notes: >-
+      Demoted from primary per Phase 1.5 ADV agent. "Explicit temp=0"
+      marketing claim was overstated. Retained as diagnostic baseline
+      because the architecture is independent of Gemma/Qwen.
