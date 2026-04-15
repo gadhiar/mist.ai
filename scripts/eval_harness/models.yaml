@@ -97,14 +97,14 @@ candidates:
     tier: primary
     family: qwen-3.5
     vendor: alibaba
-    gguf: "bartowski/Qwen3.5-9B-Instruct-Q8_0.gguf"
+    gguf: "unsloth/Qwen3.5-9B-Q8_0.gguf"
     quant: Q8_0
     size_gb: 9.53
     total_params_b: 9.0
     active_params_b: 9.0
     architecture: dense
     context_size: 8192
-    served_model_name: "qwen3.5-9b-instruct"
+    served_model_name: "qwen3.5-9b"
     temperature:
       extraction: 0.0
       conversation: 0.7
@@ -127,7 +127,7 @@ candidates:
     tier: primary
     family: gemma-3
     vendor: google
-    gguf: "bartowski/gemma-3-12b-it-Q5_K_M.gguf"
+    gguf: "bartowski/google_gemma-3-12b-it-Q5_K_M.gguf"
     quant: Q5_K_M
     size_gb: 8.4
     total_params_b: 12.0
@@ -192,9 +192,9 @@ candidates:
     tier: diagnostic
     family: qwen-3.5
     vendor: alibaba
-    gguf: "bartowski/Qwen3.5-27B-IQ2_M.gguf"
+    gguf: "unsloth/Qwen3.5-27B-UD-IQ2_M.gguf"
     quant: IQ2_M
-    size_gb: 10.6
+    size_gb: 10.2
     total_params_b: 27.0
     active_params_b: 27.0
     architecture: dense
@@ -222,7 +222,7 @@ candidates:
     tier: diagnostic
     family: hermes-4
     vendor: nous-research
-    gguf: "NousResearch/Hermes-4-14B-Q5_K_M.gguf"
+    gguf: "bartowski/NousResearch_Hermes-4-14B-Q5_K_M.gguf"
     quant: Q5_K_M
     size_gb: 10.5
     total_params_b: 14.0
@@ -254,7 +254,7 @@ candidates:
     vendor: numind
     gguf: "numind/NuExtract-2.0-8B-Q8_0.gguf"
     quant: Q8_0
-    size_gb: 8.5
+    size_gb: 8.1
     total_params_b: 8.0
     active_params_b: 8.0
     architecture: dense
@@ -282,9 +282,9 @@ candidates:
     tier: diagnostic
     family: nemotron-nano
     vendor: nvidia
-    gguf: "bartowski/Nemotron-Nano-12B-v2-Q4_K_M.gguf"
+    gguf: "bartowski/nvidia_NVIDIA-Nemotron-Nano-12B-v2-Q4_K_M.gguf"
     quant: Q4_K_M
-    size_gb: 7.2
+    size_gb: 7.5
     total_params_b: 12.0
     active_params_b: 12.0
     architecture: dense
