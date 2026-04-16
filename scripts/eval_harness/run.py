@@ -61,10 +61,15 @@ DEFAULT_LOG_DIR = DEFAULT_RESULTS_DIR / "server-logs"
 DEFAULT_TEST_ORDER: tuple[str, ...] = (
     "speed_minimal",
     "schema_conformance",
+    "schema_conformance_lenient",
+    "schema_conformance_fewshot",
     "tool_selection",
     "personality",
+    "adversarial_persona",
     "rag_integration",
     "coherence",
+    "cot_reasoning",
+    "long_turn_coherence",
     "speed",
 )
 
@@ -361,7 +366,7 @@ def run_case(
             tools=list(case.tools) if case.tools else None,
             tool_choice="auto" if case.tools else None,
             response_format=test_file.response_format,
-            grammar=grammar_text if test_file.use_grammar else None,
+            grammar=(grammar_text if test_file.use_grammar and candidate.gbnf_supported else None),
             seed=seed,
         )
     except HarnessRequestError as exc:
@@ -465,6 +470,7 @@ def run_candidate(
                         )
                         out.write(result.to_jsonl() + "\n")
                         out.flush()
+                        os.fsync(out.fileno())
     except HarnessTimeoutError as exc:
         logger.error("candidate %s timed out during startup: %s", candidate.id, exc)
     except HarnessServerError as exc:
@@ -553,6 +559,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="directory containing GGUF files (overrides LLAMA_MODELS_DIR and models.yaml)",
     )
     parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="override the auto-generated UTC timestamp subdir with this name (orchestrator use: multi-invocation runs share one dir)",
+    )
+    parser.add_argument(
         "--grammar",
         type=str,
         default="mist_ontology",
@@ -631,7 +643,10 @@ def main(argv: list[str] | None = None) -> int:
     models_dir = Path(models_dir_str)
     llama_server_bin = args.llama_server_bin or defaults.llama_server_binary
 
-    run_timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H-%M-%SZ")
+    if args.run_name:
+        run_timestamp = args.run_name
+    else:
+        run_timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H-%M-%SZ")
     run_results_dir = args.results_dir / run_timestamp
     run_results_dir.mkdir(parents=True, exist_ok=True)
     run_log_dir = args.log_dir / run_timestamp

@@ -1,0 +1,107 @@
+test_type: schema_conformance_lenient
+description: >-
+  Same ontology-constrained JSON extraction cases as schema_conformance,
+  scored with minimum-scope lenient repair (strip whitespace bursts,
+  tolerate trailing commas). Runs on all candidates for parity so the
+  strict-vs-lenient delta quantifies each candidate's format fragility.
+
+temperature_mode: extraction
+max_tokens: 1024
+use_grammar: true
+response_format: null
+
+system_prompt: |
+  You are a knowledge extraction engine for a personal AI assistant. Your task is to extract structured knowledge from conversation text.
+
+  You MUST output ONLY valid JSON. No explanations. No markdown code fences. Just the JSON object.
+
+  Allowed Entity Types (use EXACTLY these strings):
+  User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location
+
+  Allowed Relationship Types (use EXACTLY these strings):
+  USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF
+
+  Output schema:
+  {"entities": [{"id": "kebab-case-id", "name": "Display Name", "type": "EntityType"}], "relationships": [{"source": "entity-id", "target": "entity-id", "type": "RELATIONSHIP_TYPE", "properties": {"confidence": 0.9, "temporal_status": "current|past|future", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false}}]}
+
+  Rules:
+  - The user is always the first entity with id "user", name "User", type "User" when first-person pronouns appear.
+  - Entity IDs are lowercase kebab-case derived from the display name.
+  - Extract ONLY what is explicitly stated.
+  - If nothing is extractable, return {"entities": [], "relationships": []}.
+
+cases:
+  - id: simple_usage
+    prompt: "I've been using Python for about five years."
+    expected:
+      entity_types: [User, Technology]
+      relationship_types: [USES]
+      must_contain_entity_ids: [user, python]
+
+  - id: negation_past_tense
+    prompt: "I used to work with Java but I stopped three years ago."
+    expected:
+      entity_types: [User, Technology]
+      relationship_types: [USES]
+      temporal_status_expected: past
+
+  - id: goal_future_quarter
+    prompt: "Next quarter I want to get my AWS Solutions Architect certification."
+    expected:
+      entity_types: [User, Goal]
+      relationship_types: [HAS_GOAL]
+      temporal_status_expected: future
+
+  - id: multi_entity_learning_at_work
+    prompt: "I'm learning React at work. My team lead Sarah uses it for everything on our frontend team."
+    expected:
+      entity_types: [User, Technology, Person]
+      relationship_types: [LEARNING, KNOWS_PERSON]
+
+  - id: hedging_preference
+    prompt: "I think MongoDB might be a good fit for our use case but I'm not sure yet."
+    expected:
+      entity_types: [User, Technology]
+      relationship_types: [INTERESTED_IN]
+
+  - id: third_party_no_user_claim
+    prompt: "My coworker told me that Rust is really fast for systems programming."
+    expected:
+      entity_types: [Technology]
+      relationship_types: []
+
+  - id: empty_smalltalk
+    prompt: "Hey MIST, how are you doing today?"
+    expected:
+      entity_types: []
+      relationship_types: []
+
+  - id: workplace_org_skill
+    prompt: "I'm a senior software engineer at Slalom working on cognitive architecture projects."
+    expected:
+      entity_types: [User, Organization, Skill, Project, Concept]
+      relationship_types: [WORKS_AT, WORKS_ON, EXPERT_IN]
+
+  - id: dislike_preference
+    prompt: "Honestly I can't stand JavaScript frameworks that break every six months."
+    expected:
+      entity_types: [User, Technology]
+      relationship_types: [DISLIKES]
+
+  - id: structural_is_a
+    prompt: "FastAPI is a Python web framework built on top of Starlette and Pydantic."
+    expected:
+      entity_types: [Technology, Concept]
+      relationship_types: [IS_A, DEPENDS_ON]
+
+  - id: coreference_it
+    prompt: "I really like FastAPI. The automatic OpenAPI docs are great and it's easy to test."
+    expected:
+      entity_types: [User, Technology]
+      relationship_types: [PREFERS]
+
+  - id: learning_from_person
+    prompt: "Alice taught me how to do code reviews properly back when we worked together at Google."
+    expected:
+      entity_types: [User, Person, Skill, Organization]
+      relationship_types: [KNOWS_PERSON, LEARNING, WORKS_AT]

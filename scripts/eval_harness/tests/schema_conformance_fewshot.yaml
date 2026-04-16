@@ -1,0 +1,246 @@
+test_type: schema_conformance
+description: >-
+  Same ontology-constrained JSON extraction cases as schema_conformance,
+  but every case prepends 2 gold examples (input + correct JSON output)
+  to the per-case system_prompt. Tests whether Gemma's schema failures
+  are cured by in-context learning of the target shape. Uses the strict
+  scorer (same as schema_conformance) so a score jump here is evidence
+  that prompting, not scoring, is what moved the needle.
+
+temperature_mode: extraction
+max_tokens: 1024
+use_grammar: true
+response_format: null
+
+system_prompt: null
+
+cases:
+  - id: simple_usage
+    system_prompt: |
+      You are a knowledge extraction engine for a personal AI assistant. Your task is to extract structured knowledge from conversation text.
+
+      You MUST output ONLY valid JSON. No explanations. No markdown code fences. Just the JSON object.
+
+      Allowed Entity Types (use EXACTLY these strings):
+      User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location
+
+      Allowed Relationship Types (use EXACTLY these strings):
+      USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF
+
+      Output schema:
+      {"entities": [{"id": "kebab-case-id", "name": "Display Name", "type": "EntityType"}], "relationships": [{"source": "entity-id", "target": "entity-id", "type": "RELATIONSHIP_TYPE", "properties": {"confidence": 0.9, "temporal_status": "current|past|future", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false}}]}
+
+      Rules:
+      - The user is always the first entity with id "user", name "User", type "User" when first-person pronouns appear.
+      - Entity IDs are lowercase kebab-case derived from the display name.
+      - Extract ONLY what is explicitly stated.
+      - If nothing is extractable, return {"entities": [], "relationships": []}.
+
+      Example 1:
+      Input: "I've been programming in Go for a couple of years."
+      Output: {"entities":[{"id":"user","name":"User","type":"User"},{"id":"go","name":"Go","type":"Technology"}],"relationships":[{"source":"user","target":"go","type":"USES","properties":{"confidence":0.9,"temporal_status":"current","start_date":null,"end_date":null,"temporal_expression":"a couple of years","context":null,"negated":false}}]}
+
+      Example 2:
+      Input: "I want to learn Kubernetes this year."
+      Output: {"entities":[{"id":"user","name":"User","type":"User"},{"id":"kubernetes","name":"Kubernetes","type":"Goal"}],"relationships":[{"source":"user","target":"kubernetes","type":"HAS_GOAL","properties":{"confidence":0.9,"temporal_status":"future","start_date":null,"end_date":null,"temporal_expression":"this year","context":null,"negated":false}}]}
+    prompt: "I've been using Python for about five years."
+    expected:
+      entity_types: [User, Technology]
+      relationship_types: [USES]
+      must_contain_entity_ids: [user, python]
+
+  - id: negation_past_tense
+    system_prompt: |
+      You are a knowledge extraction engine for a personal AI assistant. Output ONLY valid JSON, no markdown.
+
+      Allowed Entity Types: User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location
+      Allowed Relationship Types: USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF
+      Schema: {"entities":[{"id":"kebab-id","name":"Display","type":"EntityType"}],"relationships":[{"source":"id","target":"id","type":"REL","properties":{"confidence":0.9,"temporal_status":"current|past|future","start_date":null,"end_date":null,"temporal_expression":null,"context":null,"negated":false}}]}
+
+      Example (past usage):
+      Input: "I used to write Perl in my first job but haven't touched it since."
+      Output: {"entities":[{"id":"user","name":"User","type":"User"},{"id":"perl","name":"Perl","type":"Technology"}],"relationships":[{"source":"user","target":"perl","type":"USES","properties":{"confidence":0.9,"temporal_status":"past","start_date":null,"end_date":null,"temporal_expression":"first job","context":null,"negated":true}}]}
+
+      Example (current usage):
+      Input: "I use Docker every day for development."
+      Output: {"entities":[{"id":"user","name":"User","type":"User"},{"id":"docker","name":"Docker","type":"Technology"}],"relationships":[{"source":"user","target":"docker","type":"USES","properties":{"confidence":0.9,"temporal_status":"current","start_date":null,"end_date":null,"temporal_expression":"every day","context":"development","negated":false}}]}
+    prompt: "I used to work with Java but I stopped three years ago."
+    expected:
+      entity_types: [User, Technology]
+      relationship_types: [USES]
+      temporal_status_expected: past
+
+  - id: goal_future_quarter
+    system_prompt: |
+      You are a knowledge extraction engine. Output ONLY valid JSON.
+
+      Entity Types: User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location
+      Relationship Types: USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF
+
+      Example (future goal):
+      Input: "By year-end I want to finish my CKAD certification."
+      Output: {"entities":[{"id":"user","name":"User","type":"User"},{"id":"ckad-certification","name":"CKAD Certification","type":"Goal"}],"relationships":[{"source":"user","target":"ckad-certification","type":"HAS_GOAL","properties":{"confidence":0.9,"temporal_status":"future","start_date":null,"end_date":null,"temporal_expression":"by year-end","context":null,"negated":false}}]}
+
+      Example (current ongoing goal):
+      Input: "I'm working toward a senior staff promotion this cycle."
+      Output: {"entities":[{"id":"user","name":"User","type":"User"},{"id":"senior-staff-promotion","name":"Senior Staff Promotion","type":"Goal"}],"relationships":[{"source":"user","target":"senior-staff-promotion","type":"HAS_GOAL","properties":{"confidence":0.9,"temporal_status":"current","start_date":null,"end_date":null,"temporal_expression":"this cycle","context":null,"negated":false}}]}
+    prompt: "Next quarter I want to get my AWS Solutions Architect certification."
+    expected:
+      entity_types: [User, Goal]
+      relationship_types: [HAS_GOAL]
+      temporal_status_expected: future
+
+  - id: multi_entity_learning_at_work
+    system_prompt: |
+      Knowledge extraction. Output JSON only. Use only these entity types: User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location. Use only these relationship types: USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF.
+
+      Example (multi-entity with people):
+      Input: "I'm picking up Rust at the office. My colleague Ben is the go-to expert on it."
+      Output: {"entities":[{"id":"user","name":"User","type":"User"},{"id":"rust","name":"Rust","type":"Technology"},{"id":"ben","name":"Ben","type":"Person"}],"relationships":[{"source":"user","target":"rust","type":"LEARNING","properties":{"confidence":0.9,"temporal_status":"current","start_date":null,"end_date":null,"temporal_expression":null,"context":"office","negated":false}},{"source":"user","target":"ben","type":"KNOWS_PERSON","properties":{"confidence":0.9,"temporal_status":"current","start_date":null,"end_date":null,"temporal_expression":null,"context":null,"negated":false}},{"source":"ben","target":"rust","type":"EXPERT_IN","properties":{"confidence":0.9,"temporal_status":"current","start_date":null,"end_date":null,"temporal_expression":null,"context":null,"negated":false}}]}
+
+      Example (empty):
+      Input: "Good morning."
+      Output: {"entities":[],"relationships":[]}
+    prompt: "I'm learning React at work. My team lead Sarah uses it for everything on our frontend team."
+    expected:
+      entity_types: [User, Technology, Person]
+      relationship_types: [LEARNING, KNOWS_PERSON]
+
+  - id: hedging_preference
+    system_prompt: |
+      Knowledge extraction. Output JSON only.
+
+      Entity Types: User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location
+      Relationship Types: USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF
+
+      Example (hedged interest):
+      Input: "I've been thinking about switching to Neovim but I'm not convinced it's worth the migration."
+      Output: {"entities":[{"id":"user","name":"User","type":"User"},{"id":"neovim","name":"Neovim","type":"Technology"}],"relationships":[{"source":"user","target":"neovim","type":"INTERESTED_IN","properties":{"confidence":0.6,"temporal_status":"current","start_date":null,"end_date":null,"temporal_expression":null,"context":"considering migration","negated":false}}]}
+
+      Example (confirmed use):
+      Input: "I use Vim daily."
+      Output: {"entities":[{"id":"user","name":"User","type":"User"},{"id":"vim","name":"Vim","type":"Technology"}],"relationships":[{"source":"user","target":"vim","type":"USES","properties":{"confidence":0.95,"temporal_status":"current","start_date":null,"end_date":null,"temporal_expression":"daily","context":null,"negated":false}}]}
+    prompt: "I think MongoDB might be a good fit for our use case but I'm not sure yet."
+    expected:
+      entity_types: [User, Technology]
+      relationship_types: [INTERESTED_IN]
+
+  - id: third_party_no_user_claim
+    system_prompt: |
+      Knowledge extraction. Output JSON only.
+
+      Entity Types: User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location
+      Relationship Types: USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF
+
+      Extract ONLY what the user explicitly claims about themselves. If the user is reporting what someone else said, do NOT attribute that claim to the user.
+
+      Example (third-party report, no user claim):
+      Input: "My friend swears by Obsidian for note-taking."
+      Output: {"entities":[{"id":"obsidian","name":"Obsidian","type":"Technology"}],"relationships":[]}
+
+      Example (user claim):
+      Input: "I use Obsidian every day."
+      Output: {"entities":[{"id":"user","name":"User","type":"User"},{"id":"obsidian","name":"Obsidian","type":"Technology"}],"relationships":[{"source":"user","target":"obsidian","type":"USES","properties":{"confidence":0.95,"temporal_status":"current","start_date":null,"end_date":null,"temporal_expression":"every day","context":null,"negated":false}}]}
+    prompt: "My coworker told me that Rust is really fast for systems programming."
+    expected:
+      entity_types: [Technology]
+      relationship_types: []
+
+  - id: empty_smalltalk
+    system_prompt: |
+      Knowledge extraction. Output JSON only.
+
+      If the user's message contains no extractable knowledge (e.g., greetings, small talk), return empty lists.
+
+      Example:
+      Input: "Hey, what's up?"
+      Output: {"entities":[],"relationships":[]}
+
+      Example:
+      Input: "Good evening MIST."
+      Output: {"entities":[],"relationships":[]}
+    prompt: "Hey MIST, how are you doing today?"
+    expected:
+      entity_types: []
+      relationship_types: []
+
+  - id: workplace_org_skill
+    system_prompt: |
+      Knowledge extraction. Output JSON only.
+
+      Entity Types: User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location
+      Relationship Types: USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF
+
+      Example:
+      Input: "I'm a data engineer at Acme working on the analytics platform."
+      Output: {"entities":[{"id":"user","name":"User","type":"User"},{"id":"acme","name":"Acme","type":"Organization"},{"id":"data-engineering","name":"Data Engineering","type":"Skill"},{"id":"analytics-platform","name":"Analytics Platform","type":"Project"}],"relationships":[{"source":"user","target":"acme","type":"WORKS_AT","properties":{"confidence":0.95,"temporal_status":"current","start_date":null,"end_date":null,"temporal_expression":null,"context":null,"negated":false}},{"source":"user","target":"analytics-platform","type":"WORKS_ON","properties":{"confidence":0.9,"temporal_status":"current","start_date":null,"end_date":null,"temporal_expression":null,"context":null,"negated":false}},{"source":"user","target":"data-engineering","type":"EXPERT_IN","properties":{"confidence":0.9,"temporal_status":"current","start_date":null,"end_date":null,"temporal_expression":null,"context":null,"negated":false}}]}
+    prompt: "I'm a senior software engineer at Slalom working on cognitive architecture projects."
+    expected:
+      entity_types: [User, Organization, Skill, Project, Concept]
+      relationship_types: [WORKS_AT, WORKS_ON, EXPERT_IN]
+
+  - id: dislike_preference
+    system_prompt: |
+      Knowledge extraction. Output JSON only.
+
+      Entity Types: User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location
+      Relationship Types: USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF
+
+      Example (dislike):
+      Input: "I really don't enjoy working with PHP."
+      Output: {"entities":[{"id":"user","name":"User","type":"User"},{"id":"php","name":"PHP","type":"Technology"}],"relationships":[{"source":"user","target":"php","type":"DISLIKES","properties":{"confidence":0.9,"temporal_status":"current","start_date":null,"end_date":null,"temporal_expression":null,"context":null,"negated":false}}]}
+
+      Example (prefer):
+      Input: "I much prefer Postgres over MySQL."
+      Output: {"entities":[{"id":"user","name":"User","type":"User"},{"id":"postgres","name":"Postgres","type":"Technology"},{"id":"mysql","name":"MySQL","type":"Technology"}],"relationships":[{"source":"user","target":"postgres","type":"PREFERS","properties":{"confidence":0.9,"temporal_status":"current","start_date":null,"end_date":null,"temporal_expression":null,"context":"over MySQL","negated":false}}]}
+    prompt: "Honestly I can't stand JavaScript frameworks that break every six months."
+    expected:
+      entity_types: [User, Technology]
+      relationship_types: [DISLIKES]
+
+  - id: structural_is_a
+    system_prompt: |
+      Knowledge extraction. Output JSON only. Use only the listed entity/relationship types.
+
+      Entity Types: User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location
+      Relationship Types: USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF
+
+      Example (structural facts, no user involvement):
+      Input: "Django is a Python web framework built on top of WSGI."
+      Output: {"entities":[{"id":"django","name":"Django","type":"Technology"},{"id":"python-web-framework","name":"Python Web Framework","type":"Concept"},{"id":"wsgi","name":"WSGI","type":"Technology"}],"relationships":[{"source":"django","target":"python-web-framework","type":"IS_A","properties":{"confidence":0.95,"temporal_status":"current","start_date":null,"end_date":null,"temporal_expression":null,"context":null,"negated":false}},{"source":"django","target":"wsgi","type":"DEPENDS_ON","properties":{"confidence":0.95,"temporal_status":"current","start_date":null,"end_date":null,"temporal_expression":null,"context":null,"negated":false}}]}
+    prompt: "FastAPI is a Python web framework built on top of Starlette and Pydantic."
+    expected:
+      entity_types: [Technology, Concept]
+      relationship_types: [IS_A, DEPENDS_ON]
+
+  - id: coreference_it
+    system_prompt: |
+      Knowledge extraction. Output JSON only.
+
+      Entity Types: User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location
+      Relationship Types: USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF
+
+      Resolve pronouns like "it" back to the subject of the previous sentence.
+
+      Example:
+      Input: "I really appreciate Svelte. The compiler output is tiny and it's fast to iterate on."
+      Output: {"entities":[{"id":"user","name":"User","type":"User"},{"id":"svelte","name":"Svelte","type":"Technology"}],"relationships":[{"source":"user","target":"svelte","type":"PREFERS","properties":{"confidence":0.9,"temporal_status":"current","start_date":null,"end_date":null,"temporal_expression":null,"context":"small compiler output, fast iteration","negated":false}}]}
+    prompt: "I really like FastAPI. The automatic OpenAPI docs are great and it's easy to test."
+    expected:
+      entity_types: [User, Technology]
+      relationship_types: [PREFERS]
+
+  - id: learning_from_person
+    system_prompt: |
+      Knowledge extraction. Output JSON only.
+
+      Entity Types: User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location
+      Relationship Types: USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF
+
+      Example (learning from a person at an org):
+      Input: "My mentor Greg showed me how to profile Python back at Dropbox."
+      Output: {"entities":[{"id":"user","name":"User","type":"User"},{"id":"greg","name":"Greg","type":"Person"},{"id":"python-profiling","name":"Python Profiling","type":"Skill"},{"id":"dropbox","name":"Dropbox","type":"Organization"}],"relationships":[{"source":"user","target":"greg","type":"KNOWS_PERSON","properties":{"confidence":0.9,"temporal_status":"past","start_date":null,"end_date":null,"temporal_expression":"back at Dropbox","context":null,"negated":false}},{"source":"user","target":"python-profiling","type":"LEARNING","properties":{"confidence":0.9,"temporal_status":"past","start_date":null,"end_date":null,"temporal_expression":"back at Dropbox","context":null,"negated":false}},{"source":"user","target":"dropbox","type":"WORKS_AT","properties":{"confidence":0.9,"temporal_status":"past","start_date":null,"end_date":null,"temporal_expression":null,"context":null,"negated":false}}]}
+    prompt: "Alice taught me how to do code reviews properly back when we worked together at Google."
+    expected:
+      entity_types: [User, Person, Skill, Organization]
+      relationship_types: [KNOWS_PERSON, LEARNING, WORKS_AT]

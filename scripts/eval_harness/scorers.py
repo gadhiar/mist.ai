@@ -518,8 +518,31 @@ def score_speed(
     return passed, score, breakdown
 
 
+def score_schema_conformance_lenient(
+    result: dict[str, Any], expected: dict[str, Any]
+) -> tuple[bool, float, dict[str, Any]]:
+    """Score schema_conformance with minimum-scope output repair.
+
+    Applies two repairs to raw response before scoring:
+      (a) Strip trailing whitespace and control-character bursts.
+      (b) Tolerate trailing commas before closing braces/brackets.
+    Otherwise identical to strict score_schema_conformance: same five
+    structural checks, same recall blending. Runs on all candidates for
+    parity so delta vs strict quantifies each candidate's fragility under
+    format-sensitive downstream consumers.
+    """
+    raw = result.get("response_content", "")
+    cleaned = _apply_minimum_lenient_repair(raw)
+    proxied = dict(result)
+    proxied["response_content"] = cleaned
+    passed, score, breakdown = score_schema_conformance(proxied, expected)
+    breakdown["lenient_repairs_applied"] = cleaned != raw
+    return passed, score, breakdown
+
+
 SCORER_REGISTRY: dict[str, Scorer] = {
     "schema_conformance": score_schema_conformance,
+    "schema_conformance_lenient": score_schema_conformance_lenient,
     "tool_selection": score_tool_selection,
     "personality": score_personality,
     "rag_integration": score_rag_integration,
@@ -548,6 +571,26 @@ def _parse_json_lenient(raw: str) -> dict[str, Any] | None:
         return json.loads(match.group(0))
     except json.JSONDecodeError:
         return None
+
+
+def _apply_minimum_lenient_repair(raw: str) -> str:
+    """Minimum-scope repairs for schema_conformance_lenient.
+
+    Repairs applied, in order:
+      (a) Strip leading and trailing whitespace, collapse runs of 3+
+          consecutive whitespace characters inside JSON to a single space.
+      (b) Remove trailing commas before closing braces and brackets
+          (`,}` -> `}`, `,]` -> `]`).
+
+    No brace repair, no entity deduplication, no ID normalization. These
+    two repairs mirror what any tolerant downstream JSON parser does.
+    """
+    if not raw:
+        return raw
+    cleaned = raw.strip()
+    cleaned = re.sub(r"\s{3,}", " ", cleaned)
+    cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)
+    return cleaned
 
 
 def _set_recall(expected: list[str], produced: set[Any]) -> float:
