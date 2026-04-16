@@ -14,8 +14,8 @@ services:
       - NEO4J_USERNAME=${NEO4J_USERNAME:-neo4j}
       - NEO4J_PASSWORD=${NEO4J_PASSWORD:-password}
       - NEO4J_DATABASE=${NEO4J_DATABASE:-neo4j}
-      - OLLAMA_HOST=http://mist-ollama:11434
-      - OLLAMA_BASE_URL=http://mist-ollama:11434
+      - LLM_SERVER_URL=http://mist-llm:8080
+      - LLM_BACKEND=llamacpp
       - MODEL=${MODEL:-qwen2.5:7b-instruct}
       - EVENT_STORE_DB_PATH=/app/data/event_store.db
       - EVENT_STORE_AUDIO_DIR=/app/data/audio
@@ -35,7 +35,7 @@ services:
     depends_on:
       mist-neo4j:
         condition: service_healthy
-      mist-ollama:
+      mist-llm:
         condition: service_healthy
     deploy:
       resources:
@@ -72,21 +72,54 @@ services:
       retries: 5
       start_period: 30s
 
-  mist-ollama:
-    image: ollama/ollama:latest
-    container_name: mist-ollama
+  mist-llm:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: mist-llm
     ports:
-      - "11434:11434"
-    environment:
-      - OLLAMA_KEEP_ALIVE=0
+      - "8080:8080"
     volumes:
-      - mist-ollama-models:/root/.ollama
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
+      - ${MODELS_DIR:-./models}:/models:ro
+      - ./config/system_prompt.txt:/config/system_prompt.txt:ro
+    # Model + server config selected via the 2026-04-16 Gemma 4 exoneration
+    # gauntlet. Winner: gemma-4-E4B-it Q5_K_M dense + carteakey-full joint
+    # recipe. Hermes-4 technically edged V2 on the pre-registered rule but
+    # Gemma passed V1 production gate, matched V2 within noise, dominated
+    # V4 speed (83.5 vs 35.7 t/s) and won adversarial robustness at p<0.0001.
+    # See knowledge-vault/Decisions/ADR-008-revised-model-backend-selection.md
+    environment:
+      - LLAMA_ARG_MODEL=/models/${LLM_MODEL_FILE:-unsloth/gemma-4-E4B-it-Q5_K_M.gguf}
+      - LLAMA_ARG_N_GPU_LAYERS=999
+      - LLAMA_ARG_CTX_SIZE=${LLM_CTX_SIZE:-32768}
+      - LLAMA_ARG_FLASH_ATTN=on
+      - LLAMA_ARG_HOST=0.0.0.0
+      - LLAMA_ARG_PORT=8080
+      - LLAMA_ARG_THREADS=10
+      - LLAMA_ARG_THREADS_BATCH=12
+      - LLAMA_ARG_BATCH_SIZE=1024
+      - LLAMA_ARG_UBATCH_SIZE=512
+      - LLAMA_ARG_N_PARALLEL=1
+      - LLAMA_ARG_METRICS=1
+      - LLAMA_ARG_CACHE_TYPE_K=q8_0
+      - LLAMA_ARG_CACHE_TYPE_V=q8_0
+      - LLAMA_ARG_JINJA=1
+    # Sampling defaults that don't map to LLAMA_ARG_ envvars. Applied at
+    # server level when the request doesn't override. Per-request
+    # overrides from backend/llm/LlamaServerProvider take precedence.
+    command:
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--temp"
+      - "1.0"
+      - "--top-p"
+      - "0.95"
+      - "--top-k"
+      - "64"
+      - "--min-p"
+      - "0.0"
+      - "--repeat-penalty"
+      - "1.0"
+      - "--seed"
+      - "3407"
     deploy:
       resources:
         reservations:
@@ -94,11 +127,16 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     restart: unless-stopped
 
 volumes:
   mist-neo4j-data:
   mist-neo4j-logs:
-  mist-ollama-models:
   mist-hf-cache:
   mist-torch-cache:

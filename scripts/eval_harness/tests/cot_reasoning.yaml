@@ -1,0 +1,88 @@
+test_type: personality
+description: >-
+  Chain-of-thought reasoning test. Each case poses a multi-step logic or
+  math problem and requires the response to contain the correct final
+  answer. Uses the personality scorer because it validates both
+  must_contain_regex (for answer presence) and length envelope. The goal
+  is to surface genuine reasoning quality differences between candidates.
+
+temperature_mode: conversation
+max_tokens: 1024
+use_grammar: false
+response_format: null
+
+system_prompt: |
+  You are MIST, a careful reasoning assistant. When asked a math or logic problem, think step by step and show your work. State your final answer clearly on its own line prefixed with "Answer:". Do not use filler phrases like "let's dive in". Be rigorous and concise.
+
+cases:
+  - id: train_problem
+    prompt: "A train travels from City A to City B at 60 mph and returns at 40 mph. What is the average speed for the round trip? Show your reasoning."
+    expected:
+      must_contain_regex:
+        - "(48|forty-eight)"
+        - "(?i)answer"
+      must_not_contain_regex:
+        - "let['\u2019]s dive"
+      min_chars: 80
+      max_chars: 1200
+
+  - id: syllogism_valid
+    prompt: "Premise 1: All mammals are warm-blooded. Premise 2: All dogs are mammals. Is the conclusion 'All dogs are warm-blooded' logically valid? Explain."
+    expected:
+      must_contain_regex:
+        - "(?i)(valid|yes|follows|correct)"
+        - "(?i)(mammal|warm)"
+      min_chars: 60
+      max_chars: 800
+
+  - id: syllogism_invalid
+    prompt: "Premise 1: All roses are flowers. Premise 2: Some flowers fade quickly. Is the conclusion 'Some roses fade quickly' logically valid? Explain."
+    expected:
+      must_contain_regex:
+        - "(?i)(invalid|no|does not follow|not valid|undistributed)"
+      min_chars: 60
+      max_chars: 800
+
+  - id: age_problem
+    prompt: "Alice is twice as old as Bob. Five years ago, Alice was three times as old as Bob. How old are they now? Show your work."
+    expected:
+      must_contain_regex:
+        - "(?i)alice.{0,40}20"
+        - "(?i)bob.{0,40}10"
+      min_chars: 80
+      max_chars: 1200
+
+  - id: causal_chain
+    prompt: "If inflation rises, interest rates typically rise. If interest rates rise, mortgage demand typically falls. If mortgage demand falls, housing prices typically decline. The Fed just announced that inflation jumped 2 percent. What is the most likely short-term effect on housing prices and why?"
+    expected:
+      must_contain_regex:
+        - "(?i)(decline|fall|decrease|drop|lower)"
+        - "(?i)(interest|mortgage|rate)"
+      min_chars: 80
+      max_chars: 1000
+
+  - id: counterfactual
+    prompt: "Suppose gravity on Earth suddenly became half as strong. Name three immediate consequences for human daily life and explain the physics briefly."
+    expected:
+      must_contain_regex:
+        - "(?i)(weight|jump|fall|atmosphere|momentum)"
+      min_chars: 150
+      max_chars: 1000
+
+  - id: constraint_satisfaction
+    prompt: "Three people (Alex, Bob, Carol) live in three houses (red, blue, green). Alex does not live in the red house. Bob lives to the immediate right of the green house. The green house is not on the right end. Which person lives in which house? Show your reasoning."
+    expected:
+      must_contain_regex:
+        - "(?i)alex.{0,30}(green|blue)"
+        - "(?i)bob.{0,30}(red|blue)"
+      min_chars: 100
+      max_chars: 1200
+
+  - id: probability
+    prompt: "You roll two fair six-sided dice. What is the probability that the sum is exactly 7? Show the enumeration or formula."
+    expected:
+      must_contain_regex:
+        - "(6/36|1/6|0\\.1[67]|16\\.?6?7?%)"
+        - "(?i)(sum|seven|7)"
+      min_chars: 60
+      max_chars: 800

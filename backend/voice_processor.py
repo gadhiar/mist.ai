@@ -81,8 +81,21 @@ class VoiceProcessor:
         # Save event loop reference for VAD callbacks
         self.loop = asyncio.get_running_loop()
 
+        # Build LLM provider
+        try:
+            from backend.factories import build_llm_provider
+            from backend.knowledge.config import KnowledgeConfig
+
+            knowledge_config = KnowledgeConfig.from_env()
+            self._llm_provider = build_llm_provider(knowledge_config)
+        except Exception as e:
+            logger.warning("LLM provider build failed, ModelManager will use None: %s", e)
+            self._llm_provider = None
+
         # Initialize model manager with event loop
-        self.models = ModelManager(self.config, event_loop=self.loop)
+        self.models = ModelManager(
+            self.config, event_loop=self.loop, llm_provider=self._llm_provider
+        )
 
         # Load models in thread pool to not block event loop
         await self.loop.run_in_executor(None, self.models.load_all_models)

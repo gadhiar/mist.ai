@@ -1,14 +1,11 @@
 # LLM & Inference
-ollama>=0.6.1  # Required for langchain-ollama 1.0.0 compatibility
+ollama>=0.4
+openai>=1.30  # OpenAI-compatible client for llama-server
+httpx>=0.27  # Async HTTP client for health checks
 
 # Knowledge Graph
 networkx==3.2.1
 neo4j==5.24.0
-langchain>=0.3.12
-langchain-community>=0.3.12
-langchain-experimental>=0.3.3
-langchain-core>=0.3.25
-langchain-ollama>=0.3.2
 
 # Vector Store & Embeddings
 chromadb==0.4.24

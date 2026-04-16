@@ -1,0 +1,1998 @@
+# MIST model backend A/B evaluation candidates.
+#
+# Each candidate describes how the harness should talk to a single
+# llama-server instance serving that model. The harness may either
+# connect to an externally-started server (--external) or spawn one
+# per-candidate as a subprocess (default).
+#
+# Source of truth for the candidate list:
+#   Decisions/ADR-008-revised-model-backend-selection.md (Phase 1.5 amended)
+#   Projects/mist-ai/research/2026-04-11-model-backend-cross-validation.md
+#
+# Spec corrections baked in (per cross-validation research Section 6):
+#   1. No --system-prompt-file (removed upstream Oct 2024, PR #9857).
+#   2. Base image pinned to CUDA 12.8.1 (applies to containerized runs).
+#   3. --no-kv-unified added for correctness under KV quantization
+#      (flag became boolean in llama.cpp >= b8700; was --kv-unified 0 pre-b8700).
+#   4. GBNF grammar passed via extra_body.grammar, not --grammar-file.
+#   5. Speculative decoding dropped from baseline (Nemotron only has 0.5B draft).
+#   6. --cache-ram 4096 (the real flag), not --cram 256.
+#
+# llama.cpp build pin: >= b8670 (required for Gemma 4 MoE support).
+
+defaults:
+  # Server endpoint the harness connects to.
+  base_url: "http://127.0.0.1:8080"
+
+  # Where GGUFs live locally. Override via LLAMA_MODELS_DIR env var.
+  models_dir: "D:/Users/rajga/models"
+
+  # llama-server binary lookup. Override via LLAMA_SERVER_BIN env var
+  # or --llama-server-bin CLI flag.
+  llama_server_binary: "llama-server"
+
+  # Shared server flags applied to every candidate unless overridden.
+  shared_server_args:
+    - "--host"
+    - "127.0.0.1"
+    - "--port"
+    - "8080"
+    - "--n-gpu-layers"
+    - "999"
+    - "--cache-ram"
+    - "4096"
+    - "--no-kv-unified"
+    - "--no-webui"
+
+  # Default context window for the harness.
+  ctx_size: 8192
+
+  # How long to wait for /health to become ready after spawn (seconds).
+  spawn_health_timeout_seconds: 120
+
+  # Per-request timeout (seconds).
+  request_timeout_seconds: 180
+
+  # API key placeholder (llama-server does not require one).
+  api_key: "not-needed"
+
+# ---------------------------------------------------------------------
+# PRIMARY CANDIDATES (4) -- the A/B matrix winner comes from here.
+# ---------------------------------------------------------------------
+
+candidates:
+  - id: gemma-4-26b-a4b-iq4xs
+    display_name: "Gemma 4 26B-A4B MoE (UD-IQ4_XS)"
+    tier: primary
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-IQ4_XS.gguf"
+    quant: IQ4_XS
+    size_gb: 13.4
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 8192
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    notes: >-
+      MoE with 3.8B active parameters. Requires llama.cpp build b8670+.
+      Windows CUDA path must be smoke-tested at desktop before A/B begins.
+      User-directed primary focus per Phase 1.5 (newer model, MoE tradeoff
+      accepted for quality ceiling).
+
+  - id: qwen-3.5-9b-q8
+    display_name: "Qwen 3.5 9B Instruct (Q8_0)"
+    tier: primary
+    family: qwen-3.5
+    vendor: alibaba
+    gguf: "unsloth/Qwen3.5-9B-Q8_0.gguf"
+    quant: Q8_0
+    size_gb: 9.53
+    total_params_b: 9.0
+    active_params_b: 9.0
+    architecture: dense
+    context_size: 8192
+    served_model_name: "qwen3.5-9b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    tool_parser: "hermes"
+    gbnf_supported: true
+    stop_sequences:
+      - "<|im_end|>"
+    extra_server_args: []
+    notes: >-
+      IFEval 91.5 at Q8_0 (near-lossless). Highest-confidence primary
+      addition per Phase 1.5 LARGE agent. Native tool calling via
+      hermes-style parser. Q8_0 fits 12 GB VRAM with room for KV cache.
+
+  - id: gemma-3-12b-q5km
+    display_name: "Gemma 3 12B Instruct (Q5_K_M)"
+    tier: primary
+    family: gemma-3
+    vendor: google
+    gguf: "bartowski/google_gemma-3-12b-it-Q5_K_M.gguf"
+    quant: Q5_K_M
+    size_gb: 8.4
+    total_params_b: 12.0
+    active_params_b: 12.0
+    architecture: dense
+    context_size: 8192
+    served_model_name: "gemma-3-12b-it"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    notes: >-
+      LLMStructBench #1 at 12-14B tier (0.72). Mature llama.cpp support,
+      no chat template bugs. Dense architecture, strong extraction
+      baseline.
+
+  - id: qwen-2.5-14b-q5km
+    display_name: "Qwen 2.5 14B Instruct (Q5_K_M)"
+    tier: primary
+    family: qwen-2.5
+    vendor: alibaba
+    gguf: "bartowski/Qwen2.5-14B-Instruct-Q5_K_M.gguf"
+    quant: Q5_K_M
+    size_gb: 10.5
+    total_params_b: 14.0
+    active_params_b: 14.0
+    architecture: dense
+    context_size: 8192
+    served_model_name: "qwen2.5-14b-instruct"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    tool_parser: "hermes"
+    gbnf_supported: true
+    stop_sequences:
+      - "<|im_end|>"
+    extra_server_args: []
+    notes: >-
+      Silent on temperature=0 (no warnings). Native tool calling, mature
+      llama.cpp support. Independent REP agent primary pick in Phase 1.5.
+
+  # ---------------------------------------------------------------------
+  # DIAGNOSTIC BASELINES (4) -- run to characterize primary winners, not
+  # to become the deployed model. Useful for extraction-only or stretch
+  # scenarios.
+  # ---------------------------------------------------------------------
+
+  - id: qwen-3.5-27b-iq2m
+    display_name: "Qwen 3.5 27B Dense (IQ2_M)"
+    tier: diagnostic
+    family: qwen-3.5
+    vendor: alibaba
+    gguf: "unsloth/Qwen3.5-27B-UD-IQ2_M.gguf"
+    quant: IQ2_M
+    size_gb: 10.2
+    total_params_b: 27.0
+    active_params_b: 27.0
+    architecture: dense
+    context_size: 8192
+    served_model_name: "qwen3.5-27b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    tool_parser: "hermes"
+    gbnf_supported: true
+    stop_sequences:
+      - "<|im_end|>"
+    extra_server_args: []
+    notes: >-
+      Stretch goal. IFEval 95.0 baseline but IQ2 degrades to unknown
+      territory. Run only after primary A/B to decide whether the
+      2-bit quality cliff is acceptable.
+
+  - id: hermes-4-14b-q5km
+    display_name: "Hermes-4-14B (Q5_K_M)"
+    tier: diagnostic
+    family: hermes-4
+    vendor: nous-research
+    gguf: "bartowski/NousResearch_Hermes-4-14B-Q5_K_M.gguf"
+    quant: Q5_K_M
+    size_gb: 10.5
+    total_params_b: 14.0
+    active_params_b: 14.0
+    architecture: dense
+    context_size: 8192
+    served_model_name: "hermes-4-14b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    tool_parser: "hermes"
+    gbnf_supported: true
+    stop_sequences:
+      - "<|im_end|>"
+    extra_server_args: []
+    notes: >-
+      Schema adherence specialist. Diagnostic baseline for extraction-only
+      ceiling. Not a candidate for production due to weaker conversational
+      quality vs Qwen 2.5 / Gemma 3.
+
+  - id: nuextract-2-8b-q8
+    display_name: "NuExtract 2.0 8B (Q8_0)"
+    tier: diagnostic
+    family: nuextract-2
+    vendor: numind
+    gguf: "numind/NuExtract-2.0-8B-Q8_0.gguf"
+    quant: Q8_0
+    size_gb: 8.1
+    total_params_b: 8.0
+    active_params_b: 8.0
+    architecture: dense
+    context_size: 8192
+    served_model_name: "nuextract-2-8b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<|im_end|>"
+    extra_server_args: []
+    notes: >-
+      Extraction specialist. Fine-tuned specifically for structured
+      information extraction. Useful as an upper bound for the
+      schema_conformance test; not viable as a general-purpose MIST model.
+
+  - id: nemotron-nano-12b-v2-q4km
+    display_name: "NVIDIA Nemotron Nano 12B v2 (Q4_K_M)"
+    tier: diagnostic
+    family: nemotron-nano
+    vendor: nvidia
+    gguf: "bartowski/nvidia_NVIDIA-Nemotron-Nano-12B-v2-Q4_K_M.gguf"
+    quant: Q4_K_M
+    size_gb: 7.5
+    total_params_b: 12.0
+    active_params_b: 12.0
+    architecture: dense
+    context_size: 8192
+    served_model_name: "nemotron-nano-12b-v2"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<|im_end|>"
+    extra_server_args: []
+    notes: >-
+      Demoted from primary per Phase 1.5 ADV agent. "Explicit temp=0"
+      marketing claim was overstated. Retained as diagnostic baseline
+      because the architecture is independent of Gemma/Qwen.
+
+  # ---------------------------------------------------------------------
+  # OPTIMIZATION VARIANTS -- Phase 3 tuning test matrix for the two
+  # finalists (Hermes-4-14B and Gemma 4 26B-A4B). Each variant uses
+  # shared_server_args_override to bypass the defaults block and specify
+  # a full flag set tuned to the specific quant/offload strategy.
+  # Source: Phase 3 research synthesis + carteakey.dev empirical
+  # measurements on matching hardware (RTX 4070 SUPER 12GB).
+  # ---------------------------------------------------------------------
+
+  - id: gemma-4-26b-a4b-q5xl-fit
+    display_name: "Gemma 4 26B-A4B MoE (UD-Q5_K_XL, --fit on)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q5_K_XL.gguf"
+    quant: Q5_K_XL
+    size_gb: 21.2
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/gemma4_26b_chat_template.jinja"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--fit"
+      - "on"
+      - "--fit-ctx"
+      - "32768"
+      - "--fit-target"
+      - "512"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--no-mmap"
+      - "--mlock"
+      - "--prio"
+      - "2"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--no-warmup"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Carteakey-validated config for 12 GB VRAM. --fit distributes
+      layers between GPU and system RAM; shared path and KV stay on
+      GPU, routed experts spill to 32 GB DDR5. Target: 40-50 t/s.
+
+  - id: gemma-4-26b-a4b-iq4xs-moeoff
+    display_name: "Gemma 4 26B-A4B MoE (IQ4_XS, --n-cpu-moe 22)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-IQ4_XS.gguf"
+    quant: IQ4_XS
+    size_gb: 13.4
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/gemma4_26b_chat_template.jinja"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--n-gpu-layers"
+      - "99"
+      - "--n-cpu-moe"
+      - "22"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "2048"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Explicit MoE expert offload. --n-cpu-moe 22 offloads the bottom
+      22 MoE layers to CPU while keeping 8 on GPU (per carteakey's
+      comment suggestion to keep some experts on GPU). Target: 25-40 t/s.
+
+  - id: gemma-4-26b-a4b-q3xl-fit
+    display_name: "Gemma 4 26B-A4B MoE (UD-Q3_K_XL, --fit on)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf"
+    quant: Q3_K_XL
+    size_gb: 12.88
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/gemma4_26b_chat_template.jinja"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--fit"
+      - "on"
+      - "--fit-ctx"
+      - "32768"
+      - "--fit-target"
+      - "512"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--no-mmap"
+      - "--mlock"
+      - "--prio"
+      - "2"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--no-warmup"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Unsloth Dynamic Q3_K_XL "dark horse" per Phase 3 research agent
+      A: 3-bit only on tolerant expert tensors, rest higher precision.
+      Smaller than IQ4_XS (12.88 GB vs 13.4 GB). Target: 35-50 t/s.
+
+  - id: hermes-4-14b-q5km-optimized
+    display_name: "Hermes-4-14B Q5_K_M (no-think template + KV q8)"
+    tier: optimization
+    family: hermes-4
+    vendor: nous-research
+    gguf: "bartowski/NousResearch_Hermes-4-14B-Q5_K_M.gguf"
+    quant: Q5_K_M
+    size_gb: 10.5
+    total_params_b: 14.0
+    active_params_b: 14.0
+    architecture: dense
+    context_size: 8192
+    served_model_name: "hermes-4-14b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/hermes4_no_think.jinja"
+    tool_parser: "hermes"
+    gbnf_supported: true
+    stop_sequences:
+      - "<|im_end|>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--n-gpu-layers"
+      - "999"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "2048"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--cache-ram"
+      - "8192"
+      - "--parallel"
+      - "1"
+      - "--cont-batching"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--jinja"
+      - "--reasoning"
+      - "off"
+      - "--reasoning-format"
+      - "none"
+      - "--reasoning-budget"
+      - "0"
+      - "--metrics"
+    notes: >-
+      Pinned no-think template hard-codes thinking=false/keep_cots=false
+      (bypass broken --chat-template-kwargs). Baseline 6.3 t/s was an
+      accounting artifact; real throughput ~25-30 t/s. KV q8 + fa for
+      ~50% KV VRAM cut. --cache-ram 8192 for fat 8k prompts with tool
+      schemas.
+
+  - id: hermes-4-14b-q5km-ngram
+    display_name: "Hermes-4-14B Q5_K_M (no-think + ngram speculative)"
+    tier: optimization
+    family: hermes-4
+    vendor: nous-research
+    gguf: "bartowski/NousResearch_Hermes-4-14B-Q5_K_M.gguf"
+    quant: Q5_K_M
+    size_gb: 10.5
+    total_params_b: 14.0
+    active_params_b: 14.0
+    architecture: dense
+    context_size: 8192
+    served_model_name: "hermes-4-14b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/hermes4_no_think.jinja"
+    tool_parser: "hermes"
+    gbnf_supported: true
+    stop_sequences:
+      - "<|im_end|>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--n-gpu-layers"
+      - "999"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "2048"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--cache-ram"
+      - "8192"
+      - "--parallel"
+      - "1"
+      - "--cont-batching"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--jinja"
+      - "--reasoning"
+      - "off"
+      - "--reasoning-format"
+      - "none"
+      - "--reasoning-budget"
+      - "0"
+      - "--spec-type"
+      - "ngram-cache"
+      - "--draft-max"
+      - "8"
+      - "--draft-min"
+      - "2"
+      - "--metrics"
+    notes: >-
+      h4-optimized + --spec-type ngram-cache for prompt-lookup decoding
+      (no draft model needed; avoids Qwen3 BOS/vocab mismatch risk).
+      Expected 1.3-1.8x speedup on low-entropy extraction tasks.
+
+  # ---------------------------------------------------------------------
+  # GEMMA 4 ISOLATION PROBES -- diagnostic variants to root-cause the
+  # schema_conformance regression observed in the 5-variant smoke test
+  # (baseline 0.43 -> q5xl-fit 0.39). One variable changed per probe.
+  # ---------------------------------------------------------------------
+
+  - id: gemma-4-q5xl-fit-bundled-template
+    display_name: "Gemma 4 Q5_K_XL --fit (bundled template, no pin)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q5_K_XL.gguf"
+    quant: Q5_K_XL
+    size_gb: 21.2
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--fit"
+      - "on"
+      - "--fit-ctx"
+      - "32768"
+      - "--fit-target"
+      - "512"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--no-mmap"
+      - "--mlock"
+      - "--prio"
+      - "2"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--no-warmup"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Isolation probe 1: identical to q5xl-fit BUT drops the pinned
+      chat_template_file. Uses the GGUF-bundled jinja template instead.
+      If schema score recovers vs q5xl-fit, the Google chat template is
+      the culprit. If score stays low, template is not the issue.
+
+  - id: gemma-4-q5xl-fit-f16kv
+    display_name: "Gemma 4 Q5_K_XL --fit (f16 KV, no quant)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q5_K_XL.gguf"
+    quant: Q5_K_XL
+    size_gb: 21.2
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/gemma4_26b_chat_template.jinja"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--fit"
+      - "on"
+      - "--fit-ctx"
+      - "32768"
+      - "--fit-target"
+      - "512"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "f16"
+      - "--cache-type-v"
+      - "f16"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--no-mmap"
+      - "--mlock"
+      - "--prio"
+      - "2"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--no-warmup"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Isolation probe 2: identical to q5xl-fit BUT uses f16 KV cache
+      instead of q8_0. Isolates the arithmetic-risk concern (issue
+      #10697). If schema score recovers, KV quant is degrading Gemma 4's
+      hybrid sliding-window+global attention. If score stays low, KV
+      quant is not the issue.
+
+  - id: gemma-4-q5xl-fit-no-fa
+    display_name: "Gemma 4 Q5_K_XL --fit (no FA, f16 KV)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q5_K_XL.gguf"
+    quant: Q5_K_XL
+    size_gb: 21.2
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/gemma4_26b_chat_template.jinja"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--fit"
+      - "on"
+      - "--fit-ctx"
+      - "32768"
+      - "--fit-target"
+      - "512"
+      - "--flash-attn"
+      - "off"
+      - "--cache-type-k"
+      - "f16"
+      - "--cache-type-v"
+      - "f16"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--no-mmap"
+      - "--mlock"
+      - "--prio"
+      - "2"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--no-warmup"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Probe 3: FA off + f16 KV (FA is only required for quantized KV).
+      Isolates flash-attn precision effect on Gemma 4 hybrid attention.
+
+  - id: gemma-4-q5xl-no-fit
+    display_name: "Gemma 4 Q5_K_XL (no --fit, -ngl 999 auto)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q5_K_XL.gguf"
+    quant: Q5_K_XL
+    size_gb: 21.2
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/gemma4_26b_chat_template.jinja"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--n-gpu-layers"
+      - "999"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Probe 4: drops --fit, uses -ngl 999 for llama.cpp's automatic
+      offload. Isolates --fit layer-placement effect vs default.
+
+  - id: gemma-4-q5xl-minimal
+    display_name: "Gemma 4 Q5_K_XL (minimal opts, no FA/fit, f16 KV)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q5_K_XL.gguf"
+    quant: Q5_K_XL
+    size_gb: 21.2
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/gemma4_26b_chat_template.jinja"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--n-gpu-layers"
+      - "999"
+      - "--flash-attn"
+      - "off"
+      - "--cache-type-k"
+      - "f16"
+      - "--cache-type-v"
+      - "f16"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Probe 5: minimal opt stack. No --fit, no FA, no KV quant.
+      Lower bound for Q5_K_XL quality with optimizations stripped.
+      Closest to baseline IQ4_XS config but with Q5_K_XL quant.
+
+  - id: gemma-4-iq4xs-full-opts
+    display_name: "Gemma 4 IQ4_XS (full opts matched to q5xl-fit)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-IQ4_XS.gguf"
+    quant: IQ4_XS
+    size_gb: 13.4
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/gemma4_26b_chat_template.jinja"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--fit"
+      - "on"
+      - "--fit-ctx"
+      - "32768"
+      - "--fit-target"
+      - "512"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--no-mmap"
+      - "--mlock"
+      - "--prio"
+      - "2"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--no-warmup"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Probe 6: IQ4_XS with IDENTICAL flag set to q5xl-fit. Isolates the
+      quant variable (Q5_K_XL vs IQ4_XS) holding all other flags equal.
+
+  - id: gemma-4-q5xl-stripped
+    display_name: "Gemma 4 Q5_K_XL (bundled template, no FA, f16 KV, no fit)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q5_K_XL.gguf"
+    quant: Q5_K_XL
+    size_gb: 21.2
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--n-gpu-layers"
+      - "999"
+      - "--flash-attn"
+      - "off"
+      - "--cache-type-k"
+      - "f16"
+      - "--cache-type-v"
+      - "f16"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Probe 7: fully stripped Q5_K_XL. Bundled template, no FA, f16 KV,
+      no --fit. Pure Q5_K_XL quality ceiling with minimal interference.
+
+  # ---------------------------------------------------------------------
+  # EXPANSIVE GEMMA 4 MATRIX -- Carteakey post full coverage, added
+  # 2026-04-15 for Phase 3 expansive variant sweep. Tests levers not
+  # covered by the initial 3-variant optimization set: full 128k context,
+  # larger fit-target headroom, --parallel 2 concurrency.
+  # ---------------------------------------------------------------------
+
+  - id: gemma-4-26b-a4b-q5xl-fit-128k
+    display_name: "Gemma 4 26B-A4B MoE (UD-Q5_K_XL, --fit on, 128k ctx)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q5_K_XL.gguf"
+    quant: Q5_K_XL
+    size_gb: 21.2
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 131072
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/gemma4_26b_chat_template.jinja"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--fit"
+      - "on"
+      - "--fit-ctx"
+      - "131072"
+      - "--fit-target"
+      - "512"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "10"
+      - "--threads-batch"
+      - "12"
+      - "--no-mmap"
+      - "--mlock"
+      - "--prio"
+      - "2"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--no-warmup"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Carteakey's exact text-server profile including the full 128k
+      context window. Tests whether larger ctx hurts our tokens/sec
+      at Q5_K_XL when prompt size stays constant (speed_minimal) vs
+      when prompts are realistic (5k-token MIST extraction).
+
+  - id: gemma-4-26b-a4b-q3xl-fit-target-1024
+    display_name: "Gemma 4 26B-A4B MoE (UD-Q3_K_XL, --fit on, --fit-target 1024)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf"
+    quant: Q3_K_XL
+    size_gb: 12.88
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/gemma4_26b_chat_template.jinja"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--fit"
+      - "on"
+      - "--fit-ctx"
+      - "32768"
+      - "--fit-target"
+      - "1024"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--no-mmap"
+      - "--mlock"
+      - "--prio"
+      - "2"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--no-warmup"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Larger --fit-target (1024 vs 512). Gives the scheduler more GPU
+      headroom, fewer layers offloaded to DDR5. May trade some speed
+      for stability / fewer OOM near context limits. Carteakey notes
+      fit-target=2048 is needed for vision stability; 1024 is a
+      midpoint for text-only.
+
+  - id: gemma-4-26b-a4b-q3xl-fit-parallel2
+    display_name: "Gemma 4 26B-A4B MoE (UD-Q3_K_XL, --fit on, --parallel 2)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf"
+    quant: Q3_K_XL
+    size_gb: 12.88
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/gemma4_26b_chat_template.jinja"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--fit"
+      - "on"
+      - "--fit-ctx"
+      - "32768"
+      - "--fit-target"
+      - "512"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "2048"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--no-mmap"
+      - "--mlock"
+      - "--prio"
+      - "2"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "2"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--no-warmup"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Two concurrent decode slots (--parallel 2) + larger batch-size
+      2048. MIST voice pipeline is single-user but concurrency reduces
+      latency variance under bursty extraction load. Tests whether
+      we can serve background knowledge extraction concurrently with
+      the conversational path without sacrificing TTFA.
+
+  # ---------------------------------------------------------------------
+  # EXONERATION PROTOCOL VARIANTS -- added 2026-04-16 for the Gemma 4
+  # prove-guilty investigation. See plan file at
+  # ~/.claude/plans/cozy-herding-pebble.md.
+  #
+  # Dense 12B is the primary torchbearer per product-owner decision;
+  # MoE 26B-A4B variants are kept as secondary fallback if D1 picks MoE
+  # as torchbearer. The orchestrator selects the correct variant set
+  # from the D1 result.
+  # ---------------------------------------------------------------------
+
+  - id: gemma-4-e4b-dense-q5km
+    display_name: "Gemma 4 E4B Instruct (Q5_K_M, dense)"
+    tier: optimization
+    family: gemma-4-dense
+    vendor: google
+    gguf: "unsloth/gemma-4-E4B-it-Q5_K_M.gguf"
+    quant: Q5_K_M
+    size_gb: 5.48
+    total_params_b: 7.85
+    active_params_b: 4.0
+    architecture: dense
+    context_size: 32768
+    served_model_name: "gemma-4-e4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--n-gpu-layers"
+      - "999"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--cache-ram"
+      - "2048"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Gemma 4 E4B dense baseline. Full GPU residency on 12GB VRAM; no
+      --fit needed. Tests the MoE-versus-Dense architectural hypothesis
+      for structured JSON extraction.
+
+  - id: gemma-4-e2b-draft-q8
+    display_name: "Gemma 4 E2B Instruct (Q8_0, dense, draft model)"
+    tier: optimization
+    family: gemma-4-dense
+    vendor: google
+    gguf: "unsloth/gemma-4-E2B-it-Q8_0.gguf"
+    quant: Q8_0
+    size_gb: 5.05
+    total_params_b: 3.98
+    active_params_b: 2.0
+    architecture: dense
+    context_size: 32768
+    served_model_name: "gemma-4-e2b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--n-gpu-layers"
+      - "999"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--cache-ram"
+      - "1024"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Gemma 4 4B dense. Reference floor for the Gemma 4 family and
+      candidate speculative-decoding draft for 12B or 26B-A4B targets.
+
+  - id: gemma-4-e4b-dense-carteakey-full
+    display_name: "Gemma 4 E4B dense (carteakey-full joint recipe)"
+    tier: optimization
+    family: gemma-4-dense
+    vendor: google
+    gguf: "unsloth/gemma-4-E4B-it-Q5_K_M.gguf"
+    quant: Q5_K_M
+    size_gb: 5.48
+    total_params_b: 7.85
+    active_params_b: 4.0
+    architecture: dense
+    context_size: 32768
+    served_model_name: "gemma-4-e4b"
+    temperature:
+      extraction: 1.0
+      conversation: 1.0
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--n-gpu-layers"
+      - "999"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "10"
+      - "--threads-batch"
+      - "12"
+      - "--cache-ram"
+      - "2048"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--jinja"
+      - "--metrics"
+      - "--top-k"
+      - "64"
+      - "--min-p"
+      - "0.0"
+      - "--repeat-penalty"
+      - "1.0"
+      - "--seed"
+      - "3407"
+    notes: >-
+      Carteakey full joint sampling and threading recipe applied to
+      Dense 12B. temp=1.0, top-k=64, min-p=0.0, asymmetric threads
+      10/12, fixed seed 3407.
+
+  - id: gemma-4-e4b-dense-no-grammar
+    display_name: "Gemma 4 E4B dense (gbnf_supported=false)"
+    tier: optimization
+    family: gemma-4-dense
+    vendor: google
+    gguf: "unsloth/gemma-4-E4B-it-Q5_K_M.gguf"
+    quant: Q5_K_M
+    size_gb: 5.48
+    total_params_b: 7.85
+    active_params_b: 4.0
+    architecture: dense
+    context_size: 32768
+    served_model_name: "gemma-4-e4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: null
+    tool_parser: null
+    gbnf_supported: false
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--n-gpu-layers"
+      - "999"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--cache-ram"
+      - "2048"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Dense 12B with grammar enforcement disabled via gbnf_supported
+      flag. Pairs with tests/schema_conformance_lenient.yaml to test
+      whether GBNF is what sabotages Gemma schema output.
+
+  - id: gemma-4-e4b-dense-bundled-template
+    display_name: "Gemma 4 E4B dense (bundled jinja, no custom template)"
+    tier: optimization
+    family: gemma-4-dense
+    vendor: google
+    gguf: "unsloth/gemma-4-E4B-it-Q5_K_M.gguf"
+    quant: Q5_K_M
+    size_gb: 5.48
+    total_params_b: 7.85
+    active_params_b: 4.0
+    architecture: dense
+    context_size: 32768
+    served_model_name: "gemma-4-e4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--n-gpu-layers"
+      - "999"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--cache-ram"
+      - "2048"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Identical to baseline 12B dense; kept distinct for audit trail.
+      Both chat_template and chat_template_file null so GGUF bundled
+      jinja is used (default for Gemma 4 family).
+
+  - id: gemma-4-e4b-dense-temp-1
+    display_name: "Gemma 4 E4B dense (temp=1.0 on extraction)"
+    tier: optimization
+    family: gemma-4-dense
+    vendor: google
+    gguf: "unsloth/gemma-4-E4B-it-Q5_K_M.gguf"
+    quant: Q5_K_M
+    size_gb: 5.48
+    total_params_b: 7.85
+    active_params_b: 4.0
+    architecture: dense
+    context_size: 32768
+    served_model_name: "gemma-4-e4b"
+    temperature:
+      extraction: 1.0
+      conversation: 1.0
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--n-gpu-layers"
+      - "999"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--cache-ram"
+      - "2048"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      Dense 12B with Gemma-trained sampling defaults (temp=1.0). Isolates
+      the sampling-distribution effect without carteakey-full threading
+      and env-var changes. Contrasts with baseline q5km.
+
+  - id: gemma-4-26b-a4b-q3xl-fit-carteakey-full
+    display_name: "Gemma 4 26B-A4B MoE Q3_K_XL (carteakey-full joint)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf"
+    quant: Q3_K_XL
+    size_gb: 12.88
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 1.0
+      conversation: 1.0
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/gemma4_26b_chat_template.jinja"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--fit"
+      - "on"
+      - "--fit-ctx"
+      - "32768"
+      - "--fit-target"
+      - "512"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "10"
+      - "--threads-batch"
+      - "12"
+      - "--no-mmap"
+      - "--mlock"
+      - "--prio"
+      - "2"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--no-warmup"
+      - "--jinja"
+      - "--metrics"
+      - "--top-k"
+      - "64"
+      - "--min-p"
+      - "0.0"
+      - "--repeat-penalty"
+      - "1.0"
+      - "--seed"
+      - "3407"
+    notes: >-
+      Carteakey full joint recipe on MoE Q3_K_XL. Sampling + threading
+      changes plus existing --fit and q8 KV and flash-attn settings.
+      MoE x temp=1.0 should avoid router degeneracy per clean-room
+      review.
+
+  - id: gemma-4-26b-a4b-q3xl-fit-no-grammar
+    display_name: "Gemma 4 26B-A4B MoE Q3_K_XL (gbnf_supported=false)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf"
+    quant: Q3_K_XL
+    size_gb: 12.88
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/gemma4_26b_chat_template.jinja"
+    tool_parser: null
+    gbnf_supported: false
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--fit"
+      - "on"
+      - "--fit-ctx"
+      - "32768"
+      - "--fit-target"
+      - "512"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--no-mmap"
+      - "--mlock"
+      - "--prio"
+      - "2"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--no-warmup"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      MoE Q3_K_XL with grammar disabled. Pair with
+      tests/schema_conformance_lenient.yaml.
+
+  - id: gemma-4-26b-a4b-q3xl-fit-bundled-template
+    display_name: "Gemma 4 26B-A4B MoE Q3_K_XL (bundled jinja)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf"
+    quant: Q3_K_XL
+    size_gb: 12.88
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--fit"
+      - "on"
+      - "--fit-ctx"
+      - "32768"
+      - "--fit-target"
+      - "512"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--no-mmap"
+      - "--mlock"
+      - "--prio"
+      - "2"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--no-warmup"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      MoE Q3_K_XL with GGUF-bundled jinja instead of pinned
+      gemma4_26b_chat_template.jinja. Tests whether the custom template
+      is subtly wrong for MoE routing.
+
+  - id: gemma-4-26b-a4b-q3xl-fit-temp-1
+    display_name: "Gemma 4 26B-A4B MoE Q3_K_XL (temp=1.0 extraction)"
+    tier: optimization
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf"
+    quant: Q3_K_XL
+    size_gb: 12.88
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 1.0
+      conversation: 1.0
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: "D:/Users/rajga/mist.ai/scripts/eval_harness/config/gemma4_26b_chat_template.jinja"
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    shared_server_args_override:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "--fit"
+      - "on"
+      - "--fit-ctx"
+      - "32768"
+      - "--fit-target"
+      - "512"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--batch-size"
+      - "1024"
+      - "--ubatch-size"
+      - "512"
+      - "--threads"
+      - "8"
+      - "--threads-batch"
+      - "8"
+      - "--no-mmap"
+      - "--mlock"
+      - "--prio"
+      - "2"
+      - "--cache-ram"
+      - "6144"
+      - "--parallel"
+      - "1"
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--no-warmup"
+      - "--jinja"
+      - "--metrics"
+    notes: >-
+      MoE Q3_K_XL with temp=1.0 on extraction. Isolates MoE x temp=0
+      router-degeneracy effect without other carteakey-full changes.

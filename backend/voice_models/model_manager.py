@@ -11,9 +11,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 sys.path.insert(0, "dependencies/csm")
 
-import ollama
 import torch
 
+from backend.llm import LLMRequest, StreamingLLMProvider
 from src.multimodal.stt import WhisperSTT
 from src.multimodal.text_preprocessing import preprocess_text_for_tts
 from src.multimodal.voice_profile import VoiceProfileRegistry
@@ -38,14 +38,21 @@ except ImportError as e:
 class ModelManager:
     """Manages all ML models for the voice AI system."""
 
-    def __init__(self, config, event_loop=None):
+    def __init__(
+        self,
+        config,
+        event_loop=None,
+        llm_provider: StreamingLLMProvider | None = None,
+    ):
         """Initialize model manager.
 
         Args:
             config: VoiceConfig object
             event_loop: Optional event loop for async operations
+            llm_provider: Optional LLM provider for inference calls
         """
         self.config = config
+        self._llm_provider = llm_provider
         self.stt = None
         self.tts = None
         self.llm_model = config.llm_model
@@ -57,7 +64,9 @@ class ModelManager:
             try:
                 knowledge_config = _KnowledgeConfig.from_env()
                 if knowledge_config.enable_knowledge_integration:
-                    self.knowledge = KnowledgeIntegration(config=knowledge_config)
+                    self.knowledge = KnowledgeIntegration(
+                        config=knowledge_config, llm_provider=llm_provider
+                    )
                     if self.knowledge.is_enabled():
                         self.knowledge.set_voice_profile(config.voice_profile)
                         logger.info("Knowledge graph integration ENABLED")
@@ -100,7 +109,12 @@ class ModelManager:
 
         # Warmup LLM
         logger.info("3/3 Warming up LLM...")
-        ollama.chat(model=self.llm_model, messages=[{"role": "user", "content": "hi"}])
+        if self._llm_provider is not None:
+            warmup_request = LLMRequest(
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=1,
+            )
+            self._llm_provider.invoke_sync(warmup_request)
 
         # Eager-load embedding model so first RAG query has no cold start
         if self.knowledge and self.knowledge.is_enabled():
@@ -476,23 +490,19 @@ Response Guidelines:
 
 Match your response depth to what the user is asking for - be concise when appropriate, thorough when needed."""
 
-            response = ollama.chat(
-                model=self.llm_model,
+            request = LLMRequest(
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_text},
                 ],
-                stream=True,
-                options={
-                    "num_predict": 400,  # Allow detailed responses when needed, chunking handles overflow
-                    "temperature": 0.7,
-                    "top_p": 0.9,
-                },
+                max_tokens=400,
+                temperature=0.7,
+                top_p=0.9,
             )
 
-            for chunk in response:
-                if "message" in chunk and "content" in chunk["message"]:
-                    yield chunk["message"]["content"]
+            for chunk in self._llm_provider.generate_sync(request, stream=True):
+                if chunk.content:
+                    yield chunk.content
 
     def _estimate_tokens(self, text, audio_tensor=None):
         """Estimate token count for text and audio following CSM's approach.

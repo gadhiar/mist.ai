@@ -17,6 +17,7 @@ from backend.knowledge.extraction.internal_prompts import (
 )
 from backend.knowledge.extraction.signal_detector import SignalDetectionResult, SignalDetector
 from backend.knowledge.storage.graph_executor import GraphExecutor
+from backend.llm.models import LLMRequest
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,7 @@ class InternalKnowledgeDeriver:
         """Initialize the deriver.
 
         Args:
-            llm: LLM provider (LLMProvider protocol or ChatOllama).
+            llm: LLM provider (satisfies LLMProvider protocol).
             executor: Async graph executor for writing internal entities.
         """
         self._llm = llm
@@ -113,7 +114,12 @@ class InternalKnowledgeDeriver:
 
         # LLM call
         try:
-            response = await self._llm.ainvoke(messages)
+            request = LLMRequest(
+                messages=messages,
+                json_mode=True,
+                temperature=0.0,
+            )
+            response = await self._llm.invoke(request)
             raw = response.content
         except Exception as e:
             logger.error("Internal derivation LLM call failed: %s", e)

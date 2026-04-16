@@ -1,0 +1,210 @@
+test_type: tool_selection
+description: >-
+  Function-calling accuracy for MIST's agentic tool set. Tests whether
+  the candidate selects the right tool with approximately correct
+  arguments, and whether it correctly refuses to call any tool when
+  the user request does not need one.
+
+temperature_mode: conversation
+max_tokens: 512
+use_grammar: false
+response_format: null
+
+system_prompt: |
+  You are MIST, a personal cognitive assistant. You have access to a set of tools for interacting with the user's knowledge graph, calendar, files, and voice profiles. Only call a tool when it is clearly needed to fulfill the user's request. If the request is small talk or can be answered from general knowledge, respond directly without a tool call.
+
+cases:
+  - id: recall_python_knowledge
+    prompt: "What do you remember about my experience with Python?"
+    tools:
+      - type: function
+        function:
+          name: recall_from_knowledge_graph
+          description: Search the user's knowledge graph for entities, relationships, or facts matching a natural-language query.
+          parameters:
+            type: object
+            properties:
+              query:
+                type: string
+                description: Natural-language search query.
+              entity_type:
+                type: string
+                description: Optional entity type filter.
+              limit:
+                type: integer
+                description: Max results to return.
+            required: [query]
+      - type: function
+        function:
+          name: schedule_reminder
+          description: Schedule a reminder for the user.
+          parameters:
+            type: object
+            properties:
+              text:
+                type: string
+              when:
+                type: string
+    expected:
+      tool_name: recall_from_knowledge_graph
+      arguments:
+        query: "Python"
+
+  - id: schedule_reminder_tomorrow
+    prompt: "Remind me to call my mom tomorrow at 5 PM."
+    tools:
+      - type: function
+        function:
+          name: recall_from_knowledge_graph
+          description: Search the user's knowledge graph.
+          parameters:
+            type: object
+            properties:
+              query:
+                type: string
+            required: [query]
+      - type: function
+        function:
+          name: schedule_reminder
+          description: Schedule a reminder for the user at a specific time.
+          parameters:
+            type: object
+            properties:
+              text:
+                type: string
+              when:
+                type: string
+                description: ISO 8601 timestamp or natural-language time expression.
+            required: [text, when]
+    expected:
+      tool_name: schedule_reminder
+      arguments:
+        text: "call my mom"
+
+  - id: web_search_breaking_news
+    prompt: "What happened with the latest FOMC rate decision?"
+    tools:
+      - type: function
+        function:
+          name: recall_from_knowledge_graph
+          description: Search the user's knowledge graph.
+          parameters:
+            type: object
+            properties:
+              query:
+                type: string
+            required: [query]
+      - type: function
+        function:
+          name: search_web
+          description: Search the public web for recent information.
+          parameters:
+            type: object
+            properties:
+              query:
+                type: string
+            required: [query]
+    expected:
+      tool_name: search_web
+
+  - id: voice_profile_switch_friday
+    prompt: "Switch to the FRIDAY voice."
+    tools:
+      - type: function
+        function:
+          name: set_voice_profile
+          description: Switch the active voice profile.
+          parameters:
+            type: object
+            properties:
+              profile:
+                type: string
+                enum: [jarvis, friday, cortana]
+            required: [profile]
+    expected:
+      tool_name: set_voice_profile
+      arguments:
+        profile: friday
+
+  - id: no_tool_small_talk
+    prompt: "Good morning! How are you today?"
+    tools:
+      - type: function
+        function:
+          name: recall_from_knowledge_graph
+          description: Search the user's knowledge graph.
+          parameters:
+            type: object
+            properties:
+              query:
+                type: string
+            required: [query]
+      - type: function
+        function:
+          name: schedule_reminder
+          description: Schedule a reminder for the user.
+          parameters:
+            type: object
+            properties:
+              text:
+                type: string
+              when:
+                type: string
+            required: [text, when]
+    expected:
+      no_tool_call: true
+
+  - id: no_tool_general_knowledge
+    prompt: "What's the capital of France?"
+    tools:
+      - type: function
+        function:
+          name: search_web
+          description: Search the public web for recent information.
+          parameters:
+            type: object
+            properties:
+              query:
+                type: string
+            required: [query]
+    expected:
+      no_tool_call: true
+
+  - id: open_file_by_path
+    prompt: "Open my resume at D:/docs/resume.pdf."
+    tools:
+      - type: function
+        function:
+          name: open_file
+          description: Open a file at a given path.
+          parameters:
+            type: object
+            properties:
+              path:
+                type: string
+            required: [path]
+    expected:
+      tool_name: open_file
+      arguments:
+        path: "D:/docs/resume.pdf"
+
+  - id: recall_with_entity_type_filter
+    prompt: "Which people do you know I work with?"
+    tools:
+      - type: function
+        function:
+          name: recall_from_knowledge_graph
+          description: Search the user's knowledge graph for entities.
+          parameters:
+            type: object
+            properties:
+              query:
+                type: string
+              entity_type:
+                type: string
+                enum: [User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location]
+            required: [query]
+    expected:
+      tool_name: recall_from_knowledge_graph
+      arguments:
+        entity_type: Person

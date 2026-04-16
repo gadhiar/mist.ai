@@ -9,6 +9,7 @@ from backend.knowledge.storage.graph_store import GraphStore
 from tests.mocks.config import build_test_config
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeNeo4jConnection
+from tests.mocks.ollama import FakeLLM
 
 
 def _make_retriever(config, gs):
@@ -49,10 +50,11 @@ class TestConstructorDI:
             graph_store=gs,
             extraction_pipeline=pipeline,
             retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
         )
         assert handler._extraction_pipeline is pipeline
 
-    def test_no_extract_knowledge_tool(self):
+    def test_tool_schemas_contain_query_knowledge_graph(self):
         conn = FakeNeo4jConnection()
         gs = GraphStore(conn, FakeEmbeddingGenerator())
         pipeline = FakeExtractionPipeline()
@@ -63,8 +65,9 @@ class TestConstructorDI:
             graph_store=gs,
             extraction_pipeline=pipeline,
             retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
         )
-        tool_names = [t.name for t in handler.tools]
+        tool_names = [s["function"]["name"] for s in handler._tool_schemas]
         assert "extract_knowledge" not in tool_names
         assert "extract_knowledge_from_document" not in tool_names
         assert "query_knowledge_graph" in tool_names
@@ -84,6 +87,7 @@ class TestExtractKnowledgeAsync:
             graph_store=gs,
             extraction_pipeline=pipeline,
             retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
         )
 
         await handler._extract_knowledge_async(
@@ -111,6 +115,7 @@ class TestExtractKnowledgeAsync:
             graph_store=gs,
             extraction_pipeline=pipeline,
             retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
         )
 
         # Should not raise
@@ -137,6 +142,7 @@ class TestToolUsageTrackerDI:
             graph_store=gs,
             extraction_pipeline=pipeline,
             retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
             tool_usage_tracker=tracker,
         )
 
@@ -156,6 +162,7 @@ class TestToolUsageTrackerDI:
             graph_store=gs,
             extraction_pipeline=pipeline,
             retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
         )
 
         # Assert
@@ -176,6 +183,7 @@ class TestShortMessageSkip:
             graph_store=gs,
             extraction_pipeline=pipeline,
             retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
         )
         assert handler is not None
 

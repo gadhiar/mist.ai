@@ -1,0 +1,93 @@
+test_type: rag_integration
+description: >-
+  RAG integration test: does the candidate correctly incorporate
+  facts retrieved from the knowledge graph into its response? Each
+  case supplies a context block that simulates a graph lookup result,
+  followed by a user question whose answer must come from that context.
+  Recall is measured as the fraction of gold facts that appear in the
+  response. Forbidden facts catch hallucination.
+
+temperature_mode: conversation
+max_tokens: 512
+use_grammar: false
+response_format: null
+
+system_prompt: |
+  You are MIST, a personal cognitive assistant with access to the user's knowledge graph. When you are given a Context block, treat it as retrieved facts from the graph. Ground your answer in those facts. Do not invent details that are not in the context. If the context is empty or does not answer the question, say so.
+
+cases:
+  - id: stack_recall_with_context
+    context: |
+      Knowledge graph results:
+      - User USES Python (since 2019, confidence 0.95)
+      - User USES FastAPI (current, confidence 0.90)
+      - User USES Neo4j (learning since 2024-03, confidence 0.85)
+      - User WORKS_AT Slalom (current, confidence 1.00)
+      - User WORKS_ON MIST.AI (current, confidence 0.95)
+    prompt: "What's my current tech stack?"
+    expected:
+      must_contain_facts:
+        - Python
+        - FastAPI
+        - Neo4j
+      must_not_contain_facts:
+        - Rust
+        - Elixir
+
+  - id: people_recall_with_context
+    context: |
+      Knowledge graph results:
+      - User KNOWS_PERSON Alice (context: former coworker at Google)
+      - User KNOWS_PERSON Bob (context: current team lead at Slalom)
+      - User KNOWS_PERSON Carol (context: mentor from university)
+    prompt: "Who do you remember I've worked with closely?"
+    expected:
+      must_contain_facts:
+        - Alice
+        - Bob
+        - Carol
+      must_not_contain_facts:
+        - Eve
+        - Frank
+
+  - id: goal_recall_with_context
+    context: |
+      Knowledge graph results:
+      - User HAS_GOAL AWS Solutions Architect certification (future, target next quarter)
+      - User HAS_GOAL Ship MIST.AI voice pipeline v1 (current)
+      - User HAS_GOAL Write 3 technical blog posts in 2026 (current)
+    prompt: "What are my open goals right now?"
+    expected:
+      must_contain_facts:
+        - AWS Solutions Architect
+        - MIST.AI voice pipeline
+        - blog posts
+      must_not_contain_facts:
+        - Kubernetes certification
+
+  - id: no_context_honest_answer
+    context: |
+      Knowledge graph results:
+      (no matches)
+    prompt: "What do you know about my experience with Haskell?"
+    expected:
+      must_contain_facts:
+        - "no"
+      must_not_contain_facts:
+        - years
+        - expert
+
+  - id: mixed_context_selectivity
+    context: |
+      Knowledge graph results:
+      - User WORKS_ON MIST.AI (current, confidence 0.95)
+      - User WORKS_ON Wedding AR app (parked, confidence 0.90)
+      - User USES Flutter (current, confidence 0.85)
+      - User PREFERS dark mode UIs (confidence 0.80)
+    prompt: "What projects am I actively working on right now?"
+    expected:
+      must_contain_facts:
+        - MIST.AI
+      must_not_contain_facts:
+        - dark mode
+        - Wedding AR

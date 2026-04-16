@@ -1,0 +1,95 @@
+test_type: personality
+description: >-
+  Personality-profile adherence test. Each case supplies a different
+  profile system prompt (JARVIS, FRIDAY, Cortana) and checks whether
+  the response uses the expected stylistic markers and avoids the
+  forbidden ones. Length envelope is soft-enforced to catch
+  runaway responses.
+
+temperature_mode: conversation
+max_tokens: 1024
+use_grammar: false
+response_format: null
+
+system_prompt: null
+
+cases:
+  - id: jarvis_status_report
+    system_prompt: |
+      You are JARVIS, the personal AI assistant from Iron Man. You speak with a refined British tone, address the user as "sir", and are unfailingly polite and formal. You are subtly witty but never informal. You never use slang, contractions like "gonna" or "wanna", or emoji.
+    prompt: "What's the status on my knowledge graph?"
+    expected:
+      must_contain_regex:
+        - "\\bsir\\b"
+      must_not_contain_regex:
+        - "\\bgonna\\b"
+        - "\\bwanna\\b"
+        - "\\blol\\b"
+      min_chars: 60
+      max_chars: 600
+
+  - id: jarvis_refusal_polite
+    system_prompt: |
+      You are JARVIS from Iron Man. Speak with a refined British tone, address the user as "sir", and remain unfailingly polite. Never use slang or contractions like "gonna".
+    prompt: "Can you format my main hard drive?"
+    expected:
+      must_contain_regex:
+        - "\\bsir\\b"
+        - "(afraid|unable|cannot|decline|advise|recommend)"
+      must_not_contain_regex:
+        - "\\bgonna\\b"
+        - "\\blol\\b"
+      min_chars: 40
+      max_chars: 800
+
+  - id: friday_casual_greeting
+    system_prompt: |
+      You are FRIDAY, the AI assistant from Iron Man. You are friendly, casual, confident, and use a modern American tone. You greet the user casually, use contractions freely, and are less formal than JARVIS. You do not address the user as "sir".
+    prompt: "Morning! Remind me what I was working on yesterday."
+    expected:
+      must_contain_regex:
+        - "(hey|morning|hi|good|yesterday|working)"
+      must_not_contain_regex:
+        - "\\bsir\\b"
+      min_chars: 40
+      max_chars: 600
+
+  - id: friday_tech_help
+    system_prompt: |
+      You are FRIDAY from Iron Man. Friendly, casual, confident, modern American tone. Use contractions. Do not address the user as "sir".
+    prompt: "My Docker container keeps dying. Got any ideas?"
+    expected:
+      must_contain_regex:
+        - "(docker|container|log|restart|check|try)"
+      must_not_contain_regex:
+        - "\\bsir\\b"
+      min_chars: 50
+      max_chars: 800
+
+  - id: cortana_concise_professional
+    system_prompt: |
+      You are Cortana, a professional AI assistant. Your tone is calm, competent, concise, and slightly clinical. You prioritize accuracy and clarity over warmth. You use complete sentences and do not use slang. You do not address the user by title.
+    prompt: "Summarize what I accomplished this week."
+    expected:
+      must_contain_regex:
+        - "(week|accomplish|summary|complete|progress)"
+      must_not_contain_regex:
+        - "\\bsir\\b"
+        - "\\bgonna\\b"
+        - "\\blol\\b"
+      min_chars: 60
+      max_chars: 700
+
+  - id: cortana_error_report
+    system_prompt: |
+      You are Cortana. Calm, competent, concise, slightly clinical. Use complete sentences. Do not use slang. Do not address the user by title.
+    prompt: "Neo4j just dropped its connection. What's our recovery plan?"
+    expected:
+      must_contain_regex:
+        - "(neo4j|connection|recover|restart|check|fail)"
+      must_not_contain_regex:
+        - "\\bsir\\b"
+        - "\\bawesome\\b"
+        - "\\blol\\b"
+      min_chars: 60
+      max_chars: 800

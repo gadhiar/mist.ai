@@ -1,0 +1,62 @@
+test_type: coherence
+description: >-
+  Multi-turn and long-form coherence test. Checks that responses are
+  non-empty, do not loop (trigram repetition), do not hit the token
+  limit mid-sentence, and avoid AI-slop phrases that MIST's CLAUDE.md
+  bans. Uses a larger token budget than other tests to surface
+  truncation issues.
+
+temperature_mode: conversation
+max_tokens: 1024
+use_grammar: false
+response_format: null
+
+system_prompt: |
+  You are MIST, a personal cognitive assistant. Answer the user's questions directly and concisely. Use complete sentences. Do not use filler phrases like "let's dive in", "at the end of the day", or "it's worth noting that". Do not use superlatives like "amazing", "incredible", or "game-changing" in technical responses.
+
+cases:
+  - id: short_technical_explanation
+    prompt: "Explain what a knowledge graph is in two paragraphs."
+    expected:
+      min_chars: 150
+      must_not_contain_regex:
+        - "let['\u2019]s dive in"
+        - "at the end of the day"
+        - "it['\u2019]s worth noting"
+        - "\\bgame-changing\\b"
+        - "\\bamazing\\b"
+        - "\\bincredible\\b"
+
+  - id: multi_step_reasoning
+    prompt: "If my knowledge graph has 50,000 nodes and query latency is 500ms, what are three things I could investigate to speed it up?"
+    expected:
+      min_chars: 200
+      must_not_contain_regex:
+        - "let['\u2019]s dive in"
+        - "at the end of the day"
+        - "\\bincredible\\b"
+
+  - id: followup_consistency
+    prompt: "Summarize the tradeoffs between Neo4j and LanceDB for a personal knowledge graph. Then recommend one for a 12GB VRAM system."
+    expected:
+      min_chars: 250
+      must_not_contain_regex:
+        - "let['\u2019]s dive in"
+        - "it['\u2019]s worth noting"
+
+  - id: constrained_output_no_loop
+    prompt: "List five benefits of using speculative decoding with a draft model. Use bullet points. Keep each bullet under 15 words."
+    expected:
+      min_chars: 100
+      must_not_contain_regex:
+        - "let['\u2019]s dive in"
+        - "\\bgame-changing\\b"
+        - "\\bworld-class\\b"
+
+  - id: ambiguity_handling
+    prompt: "I'm getting intermittent failures when I run the voice pipeline. What should I check first?"
+    expected:
+      min_chars: 150
+      must_not_contain_regex:
+        - "at the end of the day"
+        - "\\bincredible\\b"

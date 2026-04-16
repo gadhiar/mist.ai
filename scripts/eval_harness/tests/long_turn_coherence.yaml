@@ -1,0 +1,72 @@
+test_type: coherence
+description: >-
+  Long-turn coherence test. Each case is a single long prompt that
+  simulates multi-turn context, requiring the assistant to resolve
+  references back to earlier turns, resist topic drift, and preserve
+  established facts. Scored with the coherence scorer (no-loop,
+  non-empty, min-length, no AI slop).
+
+temperature_mode: conversation
+max_tokens: 2048
+use_grammar: false
+response_format: null
+
+system_prompt: |
+  You are MIST, a careful cognitive assistant with perfect recall over the current conversation. Answer the final question based on everything stated earlier in the prompt. Do not use filler phrases like "let's dive in", "at the end of the day", "it's worth noting". Be concise and reference earlier content accurately.
+
+cases:
+  - id: reference_resolution_over_distance
+    prompt: |
+      Turn 1 (user): I'm setting up a new homelab. The hardware budget is $2000. I have a 4U rack already.
+      Turn 2 (assistant): Got it. What's the intended primary workload?
+      Turn 3 (user): Mostly self-hosted media (Jellyfin, Sonarr) plus a small Kubernetes cluster for dev work.
+      Turn 4 (assistant): Understood. Are you prioritizing low power draw or raw compute?
+      Turn 5 (user): Power draw is important. I'm in California and electricity is expensive.
+      Turn 6 (assistant): Makes sense. Any preference for AMD vs Intel?
+      Turn 7 (user): I've had good luck with AMD in the past. Probably Ryzen on the compute nodes.
+      Turn 8 (assistant): Noted. How many nodes are you thinking for the cluster?
+      Turn 9 (user): Three. One control plane and two workers.
+      Turn 10 (user, final): Given everything above, recommend a specific CPU and motherboard combination for the worker nodes. Mention the key constraints I've given you and how your recommendation addresses them.
+    expected:
+      min_chars: 400
+      must_not_contain_regex:
+        - "let['\u2019]s dive"
+        - "at the end of the day"
+        - "\\bamazing\\b"
+        - "\\bincredible\\b"
+
+  - id: topic_drift_resistance
+    prompt: |
+      Turn 1 (user): My team is evaluating message brokers for a new event-driven system.
+      Turn 2 (assistant): What scale and latency requirements do you have?
+      Turn 3 (user): Roughly 50k events per second peak, sub-100ms end-to-end latency, persistent durable storage.
+      Turn 4 (assistant): Kafka, RabbitMQ, and NATS are all worth considering. Any existing infrastructure constraints?
+      Turn 5 (user): We're on Kubernetes already and our ops team prefers Helm charts with official community support.
+      Turn 6 (assistant): That narrows it. Do you need exactly-once delivery or is at-least-once acceptable?
+      Turn 7 (user): At-least-once is fine; we handle idempotency downstream.
+      Turn 8 (user, tangent): By the way, I just got a new mechanical keyboard and I love the sound.
+      Turn 9 (user, final): Given the requirements from earlier, which message broker would you pick and why? Do not discuss my keyboard.
+    expected:
+      min_chars: 300
+      must_not_contain_regex:
+        - "(?i)keyboard"
+        - "let['\u2019]s dive"
+        - "\\bincredible\\b"
+
+  - id: callback_to_first_turn
+    prompt: |
+      Turn 1 (user): At my previous job at a fintech startup, we used a monorepo with Bazel.
+      Turn 2 (assistant): What language was the monorepo primarily?
+      Turn 3 (user): Mostly Go for backend services and TypeScript for frontend.
+      Turn 4 (assistant): Bazel works well for that mix. What was your experience with build times?
+      Turn 5 (user): Incremental builds were fast but cold CI builds took 20 minutes.
+      Turn 6 (assistant): Did you try remote caching?
+      Turn 7 (user): Yes, with BuildBarn. It helped a lot.
+      Turn 8 (assistant): How did onboarding new engineers go with Bazel?
+      Turn 9 (user): That was painful. Bazel's learning curve is steep.
+      Turn 10 (user, final): Based on my experience at the job I mentioned at the very start of this conversation, would I recommend Bazel to a new team of five engineers starting from scratch? Reference what I said about that job and why.
+    expected:
+      min_chars: 300
+      must_not_contain_regex:
+        - "let['\u2019]s dive"
+        - "at the end of the day"

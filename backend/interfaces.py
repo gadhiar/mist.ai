@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from backend.knowledge.models import DocumentChunk, VectorSearchResult
+    from backend.llm.models import LLMRequest, LLMResponse
 
 
 class GraphConnection(Protocol):
@@ -32,9 +33,12 @@ class EmbeddingProvider(Protocol):
 
 
 class LLMProvider(Protocol):
-    """Contract for large language model inference."""
+    """Contract for large language model inference.
 
-    async def ainvoke(self, messages: list) -> Any: ...
+    Implemented by StreamingLLMProvider (production) and FakeLLM (tests).
+    """
+
+    async def invoke(self, request: LLMRequest) -> LLMResponse: ...
 
 
 class EventStoreProvider(Protocol):

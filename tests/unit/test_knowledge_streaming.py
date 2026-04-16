@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock, patch
 
+from tests.mocks.ollama import FakeLLM
+
 
 class TestKnowledgeStreamingTokens:
     """Test that generate_tokens_streaming yields individual tokens."""
@@ -10,9 +12,12 @@ class TestKnowledgeStreamingTokens:
         """Should yield individual tokens, not a single blob."""
         from backend.chat.knowledge_integration import KnowledgeIntegration
 
+        fake_llm = FakeLLM(streaming_chunks=["Hello", " there", "."])
+
         ki = KnowledgeIntegration.__new__(KnowledgeIntegration)
         ki.enabled = True
         ki.current_session_id = "test"
+        ki._llm_provider = fake_llm
 
         # Mock conversation handler with realistic attributes
         handler = MagicMock()
@@ -24,20 +29,9 @@ class TestKnowledgeStreamingTokens:
         handler.event_store = None
         ki.conversation_handler = handler
 
-        mock_chunks = [
-            {"message": {"content": "Hello"}},
-            {"message": {"content": " there"}},
-            {"message": {"content": "."}},
-        ]
-
-        with patch("backend.chat.knowledge_integration.ollama") as mock_ollama:
-            mock_ollama.chat.return_value = iter(mock_chunks)
-
-            tokens = list(
-                ki.generate_tokens_streaming(
-                    "hello how are you doing today", event_loop=MagicMock()
-                )
-            )
+        tokens = list(
+            ki.generate_tokens_streaming("hello how are you doing today", event_loop=MagicMock())
+        )
 
         assert len(tokens) == 3
         assert tokens[0] == "Hello"
@@ -47,12 +41,15 @@ class TestKnowledgeStreamingTokens:
         session.add_message.assert_any_call("assistant", "Hello there.")
 
     def test_rag_context_included_when_available(self):
-        """RAG results should be included in messages sent to Ollama."""
+        """RAG results should be included in messages sent to the LLM provider."""
         from backend.chat.knowledge_integration import KnowledgeIntegration
+
+        fake_llm = FakeLLM(streaming_chunks=["Sure!"])
 
         ki = KnowledgeIntegration.__new__(KnowledgeIntegration)
         ki.enabled = True
         ki.current_session_id = "test"
+        ki._llm_provider = fake_llm
 
         handler = MagicMock()
         handler.config.auto_inject_docs = True
@@ -72,18 +69,11 @@ class TestKnowledgeStreamingTokens:
 
         mock_loop = MagicMock()
 
-        mock_chunks = [{"message": {"content": "Sure!"}}]
-
-        with (
-            patch("backend.chat.knowledge_integration.ollama") as mock_ollama,
-            patch("asyncio.run_coroutine_threadsafe") as mock_rcts,
-        ):
+        with patch("asyncio.run_coroutine_threadsafe") as mock_rcts:
             # Make the future return the retrieval result
             mock_future = MagicMock()
             mock_future.result.return_value = retrieval_result
             mock_rcts.return_value = mock_future
-
-            mock_ollama.chat.return_value = iter(mock_chunks)
 
             tokens = list(
                 ki.generate_tokens_streaming(
@@ -93,8 +83,8 @@ class TestKnowledgeStreamingTokens:
             )
 
         assert tokens == ["Sure!"]
-        # Verify RAG context was included in Ollama call
-        call_args = mock_ollama.chat.call_args
-        messages = call_args.kwargs["messages"]
-        context_messages = [m for m in messages if "Known facts" in m.get("content", "")]
+        # Verify RAG context was included in messages sent to the provider
+        assert len(fake_llm.calls) == 1
+        request = fake_llm.calls[0]
+        context_messages = [m for m in request.messages if "Known facts" in m.get("content", "")]
         assert len(context_messages) == 1

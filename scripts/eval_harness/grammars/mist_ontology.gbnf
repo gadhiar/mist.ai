@@ -1,0 +1,58 @@
+# MIST ontology extraction grammar (v1.0.1).
+#
+# Constrains llama.cpp sampling to produce only valid JSON matching
+# MIST's knowledge extraction schema: 12 entity types and 21 extractable
+# relationship types. Temporal status is restricted to the three legal
+# values. Numbers and strings follow standard JSON escape rules.
+#
+# Source of truth: backend/knowledge/ontologies/v1_0_0.py
+#                  backend/knowledge/extraction/prompts.py
+#
+# Passed to llama-server via extra_body={"grammar": <contents of this file>}.
+#
+# v1.0.1 (2026-04-15): Collapsed multi-line rule bodies to single lines.
+# llama.cpp's GBNF parser terminates a rule definition at end-of-line
+# unless the parser is mid-expression (open paren, trailing operator).
+# v1.0.0 had bare line breaks after the first sequence element of
+# extraction/entity/relationship/relationship-properties; the parser
+# saw end-of-rule on those breaks and rejected the next line as an
+# invalid rule definition starting with a string literal. Reference:
+# https://github.com/ggml-org/llama.cpp/blob/master/grammars/json.gbnf
+
+root ::= extraction
+
+extraction ::= "{" ws "\"entities\"" ws ":" ws "[" ws entity-list? ws "]" ws "," ws "\"relationships\"" ws ":" ws "[" ws relationship-list? ws "]" ws "}"
+
+entity-list ::= entity (ws "," ws entity)*
+
+entity ::= "{" ws "\"id\"" ws ":" ws string ws "," ws "\"name\"" ws ":" ws string ws "," ws "\"type\"" ws ":" ws entity-type ws "}"
+
+entity-type ::= "\"User\"" | "\"Person\"" | "\"Organization\"" | "\"Technology\"" | "\"Skill\"" | "\"Project\"" | "\"Concept\"" | "\"Topic\"" | "\"Event\"" | "\"Goal\"" | "\"Preference\"" | "\"Location\""
+
+relationship-list ::= relationship (ws "," ws relationship)*
+
+relationship ::= "{" ws "\"source\"" ws ":" ws string ws "," ws "\"target\"" ws ":" ws string ws "," ws "\"type\"" ws ":" ws relationship-type ws "," ws "\"properties\"" ws ":" ws relationship-properties ws "}"
+
+relationship-type ::= "\"USES\"" | "\"KNOWS\"" | "\"WORKS_ON\"" | "\"WORKS_AT\"" | "\"INTERESTED_IN\"" | "\"HAS_GOAL\"" | "\"PREFERS\"" | "\"DISLIKES\"" | "\"EXPERT_IN\"" | "\"LEARNING\"" | "\"STRUGGLES_WITH\"" | "\"DECIDED\"" | "\"EXPERIENCED\"" | "\"IS_A\"" | "\"PART_OF\"" | "\"RELATED_TO\"" | "\"DEPENDS_ON\"" | "\"USED_FOR\"" | "\"WORKS_WITH\"" | "\"KNOWS_PERSON\"" | "\"MEMBER_OF\""
+
+relationship-properties ::= "{" ws "\"confidence\"" ws ":" ws confidence-number ws "," ws "\"temporal_status\"" ws ":" ws temporal-status ws "," ws "\"start_date\"" ws ":" ws date-or-null ws "," ws "\"end_date\"" ws ":" ws date-or-null ws "," ws "\"temporal_expression\"" ws ":" ws string-or-null ws "," ws "\"context\"" ws ":" ws string-or-null ws "," ws "\"negated\"" ws ":" ws boolean ws "}"
+
+temporal-status ::= "\"current\"" | "\"past\"" | "\"future\""
+
+date-or-null ::= date-string | "null"
+
+# ISO date "YYYY-MM-DD" in double quotes.
+date-string ::= "\"" [0-9] [0-9] [0-9] [0-9] "-" [0-9] [0-9] "-" [0-9] [0-9] "\""
+
+string-or-null ::= string | "null"
+
+boolean ::= "true" | "false"
+
+# Confidence clamped to [0.0, 1.0] as a decimal.
+confidence-number ::= ("0" "." [0-9]+) | "1" | ("1" "." "0" "0"?) | "0"
+
+# Standard JSON string with escapes.
+string ::= "\"" char* "\""
+char ::= [^"\\] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F])
+
+ws ::= [ \t\n\r]*
