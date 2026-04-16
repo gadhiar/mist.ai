@@ -80,20 +80,46 @@ services:
     volumes:
       - ${MODELS_DIR:-./models}:/models:ro
       - ./config/system_prompt.txt:/config/system_prompt.txt:ro
+    # Model + server config selected via the 2026-04-16 Gemma 4 exoneration
+    # gauntlet. Winner: gemma-4-E4B-it Q5_K_M dense + carteakey-full joint
+    # recipe. Hermes-4 technically edged V2 on the pre-registered rule but
+    # Gemma passed V1 production gate, matched V2 within noise, dominated
+    # V4 speed (83.5 vs 35.7 t/s) and won adversarial robustness at p<0.0001.
+    # See knowledge-vault/Decisions/ADR-008-revised-model-backend-selection.md
     environment:
-      - LLAMA_ARG_MODEL=/models/${LLM_MODEL_FILE:-Qwen2.5-14B-Instruct-Q4_K_M.gguf}
-      - LLAMA_ARG_N_GPU_LAYERS=99
-      - LLAMA_ARG_CTX_SIZE=${LLM_CTX_SIZE:-16384}
-      - LLAMA_ARG_FLASH_ATTN=1
+      - LLAMA_ARG_MODEL=/models/${LLM_MODEL_FILE:-unsloth/gemma-4-E4B-it-Q5_K_M.gguf}
+      - LLAMA_ARG_N_GPU_LAYERS=999
+      - LLAMA_ARG_CTX_SIZE=${LLM_CTX_SIZE:-32768}
+      - LLAMA_ARG_FLASH_ATTN=on
       - LLAMA_ARG_HOST=0.0.0.0
       - LLAMA_ARG_PORT=8080
-      - LLAMA_ARG_THREADS=8
-      - LLAMA_ARG_BATCH_SIZE=2048
+      - LLAMA_ARG_THREADS=10
+      - LLAMA_ARG_THREADS_BATCH=12
+      - LLAMA_ARG_BATCH_SIZE=1024
       - LLAMA_ARG_UBATCH_SIZE=512
       - LLAMA_ARG_N_PARALLEL=1
       - LLAMA_ARG_METRICS=1
       - LLAMA_ARG_CACHE_TYPE_K=q8_0
-      - LLAMA_ARG_CACHE_TYPE_V=q4_0
+      - LLAMA_ARG_CACHE_TYPE_V=q8_0
+      - LLAMA_ARG_JINJA=1
+    # Sampling defaults that don't map to LLAMA_ARG_ envvars. Applied at
+    # server level when the request doesn't override. Per-request
+    # overrides from backend/llm/LlamaServerProvider take precedence.
+    command:
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--temp"
+      - "1.0"
+      - "--top-p"
+      - "0.95"
+      - "--top-k"
+      - "64"
+      - "--min-p"
+      - "0.0"
+      - "--repeat-penalty"
+      - "1.0"
+      - "--seed"
+      - "3407"
     deploy:
       resources:
         reservations:
