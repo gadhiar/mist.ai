@@ -136,7 +136,9 @@ def build_extraction_pipeline(
     if include_internal_derivation:
         from backend.knowledge.extraction.internal_derivation import InternalKnowledgeDeriver
 
-        internal_deriver = InternalKnowledgeDeriver(llm=provider, executor=executor)
+        internal_deriver = InternalKnowledgeDeriver(
+            llm=provider, executor=executor, temperature=config.llm.temperature
+        )
         # Ensure MistIdentity singleton exists (sync call, OK in factory context)
         gs.ensure_mist_identity()
 

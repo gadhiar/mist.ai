@@ -36,6 +36,7 @@ class KnowledgeIntegration:
         self.conversation_handler: ConversationHandler | None = None
         self.current_session_id = "default"
         self._llm_provider = llm_provider
+        self._config = config
 
         try:
             if llm_provider is None:
@@ -268,7 +269,7 @@ class KnowledgeIntegration:
             # Step 3: Stream tokens from LLM provider
             request = LLMRequest(
                 messages=messages,
-                temperature=0.7,
+                temperature=self._config.llm.temperature,
                 max_tokens=400,
                 top_p=0.9,
             )

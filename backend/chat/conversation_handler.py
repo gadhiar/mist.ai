@@ -246,7 +246,7 @@ class ConversationHandler:
             request = LLMRequest(
                 messages=messages,
                 tools=self._tool_schemas,
-                temperature=0.7,
+                temperature=self.config.llm.temperature,
                 max_tokens=400,
             )
             response = await self._provider.invoke(request)
@@ -321,7 +321,11 @@ class ConversationHandler:
 
                 # Get final response with tool results
                 logger.info("[TOOLS] Generating final response with tool results...")
-                final_request = LLMRequest(messages=messages, temperature=0.7, max_tokens=400)
+                final_request = LLMRequest(
+                    messages=messages,
+                    temperature=self.config.llm.temperature,
+                    max_tokens=400,
+                )
                 final_response = await self._provider.invoke(final_request)
                 assistant_message = final_response.content
                 logger.info(

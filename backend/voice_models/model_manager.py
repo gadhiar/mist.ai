@@ -1,6 +1,7 @@
 """Model Manager - Handles loading and lifecycle of all ML models."""
 
 import logging
+import os
 import queue
 import sys
 import threading
@@ -496,7 +497,7 @@ Match your response depth to what the user is asking for - be concise when appro
                     {"role": "user", "content": user_text},
                 ],
                 max_tokens=400,
-                temperature=0.7,
+                temperature=float(os.getenv("LLM_TEMPERATURE", "0.7")),
                 top_p=0.9,
             )
 

@@ -59,15 +59,19 @@ class InternalKnowledgeDeriver:
     for the majority of turns that have no internal signals.
     """
 
-    def __init__(self, llm, executor: GraphExecutor) -> None:
+    def __init__(self, llm, executor: GraphExecutor, temperature: float = 0.0) -> None:
         """Initialize the deriver.
 
         Args:
             llm: LLM provider (satisfies LLMProvider protocol).
             executor: Async graph executor for writing internal entities.
+            temperature: Sampling temperature for extraction calls. Defaults
+                to 0.0 for backward compatibility; production deployments
+                should pass LLMConfig.temperature from the KnowledgeConfig.
         """
         self._llm = llm
         self._executor = executor
+        self._temperature = temperature
         self._signal_detector = SignalDetector()
 
     async def derive(
@@ -117,7 +121,7 @@ class InternalKnowledgeDeriver:
             request = LLMRequest(
                 messages=messages,
                 json_mode=True,
-                temperature=0.0,
+                temperature=self._temperature,
             )
             response = await self._llm.invoke(request)
             raw = response.content

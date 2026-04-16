@@ -143,7 +143,7 @@ class OntologyConstrainedExtractor:
                     {"role": "user", "content": user_message},
                 ],
                 json_mode=True,
-                temperature=0.0,
+                temperature=self.config.llm.temperature,
             )
             response = await self._llm.invoke(request)
             raw_output = response.content
