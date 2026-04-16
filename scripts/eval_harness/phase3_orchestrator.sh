@@ -73,25 +73,39 @@ log "master dir: ${MASTER_DIR}"
 log "=============================================================="
 
 # ---------------------------------------------------------------
-# Phase A - Ablation confirmation
+# Phase model/test lists -- override via env var to resume or narrow.
+# Set PHASE_X_MODELS="" (empty) to skip that phase entirely.
 # ---------------------------------------------------------------
-PHASE_A_MODELS="gemma-4-26b-a4b-q5xl-fit,gemma-4-q5xl-fit-no-fa,gemma-4-q5xl-minimal,gemma-4-q5xl-no-fit,gemma-4-q5xl-fit-f16kv,gemma-4-q5xl-stripped"
-PHASE_A_TESTS="speed_minimal,schema_conformance,speed"
-PHASE_A_DIR="$(run_phase "PHASE A (ablation)" "${PHASE_A_MODELS}" "${PHASE_A_TESTS}")"
+PHASE_A_MODELS="${PHASE_A_MODELS-gemma-4-26b-a4b-q5xl-fit,gemma-4-q5xl-fit-no-fa,gemma-4-q5xl-minimal,gemma-4-q5xl-no-fit,gemma-4-q5xl-fit-f16kv,gemma-4-q5xl-stripped}"
+PHASE_A_TESTS="${PHASE_A_TESTS-speed_minimal,schema_conformance,speed}"
 
-# ---------------------------------------------------------------
-# Phase B - Expansive Gemma 4 matrix
-# ---------------------------------------------------------------
-PHASE_B_MODELS="gemma-4-26b-a4b-q5xl-fit,gemma-4-26b-a4b-q3xl-fit,gemma-4-26b-a4b-iq4xs-moeoff,gemma-4-26b-a4b-q5xl-fit-128k,gemma-4-26b-a4b-q3xl-fit-target-1024,gemma-4-26b-a4b-q3xl-fit-parallel2"
-PHASE_B_TESTS="speed_minimal,schema_conformance,tool_selection,personality,rag_integration,coherence,speed"
-PHASE_B_DIR="$(run_phase "PHASE B (Gemma 4 expansive matrix)" "${PHASE_B_MODELS}" "${PHASE_B_TESTS}")"
+PHASE_B_MODELS="${PHASE_B_MODELS-gemma-4-26b-a4b-q5xl-fit,gemma-4-26b-a4b-q3xl-fit,gemma-4-26b-a4b-iq4xs-moeoff,gemma-4-26b-a4b-q5xl-fit-128k,gemma-4-26b-a4b-q3xl-fit-target-1024,gemma-4-26b-a4b-q3xl-fit-parallel2}"
+PHASE_B_TESTS="${PHASE_B_TESTS-speed_minimal,schema_conformance,tool_selection,personality,rag_integration,coherence,speed}"
 
-# ---------------------------------------------------------------
-# Phase C - Non-Gemma finalists
-# ---------------------------------------------------------------
-PHASE_C_MODELS="qwen-2.5-14b-q5km,hermes-4-14b-q5km-ngram,hermes-4-14b-q5km-optimized"
-PHASE_C_TESTS="speed_minimal,schema_conformance,tool_selection,personality,rag_integration,coherence,speed"
-PHASE_C_DIR="$(run_phase "PHASE C (non-Gemma finalists)" "${PHASE_C_MODELS}" "${PHASE_C_TESTS}")"
+PHASE_C_MODELS="${PHASE_C_MODELS-qwen-2.5-14b-q5km,hermes-4-14b-q5km-ngram,hermes-4-14b-q5km-optimized}"
+PHASE_C_TESTS="${PHASE_C_TESTS-speed_minimal,schema_conformance,tool_selection,personality,rag_integration,coherence,speed}"
+
+PHASE_A_DIR="SKIPPED"
+PHASE_B_DIR="SKIPPED"
+PHASE_C_DIR="SKIPPED"
+
+if [ -n "${PHASE_A_MODELS}" ]; then
+    PHASE_A_DIR="$(run_phase "PHASE A (ablation)" "${PHASE_A_MODELS}" "${PHASE_A_TESTS}")"
+else
+    log "PHASE A skipped (PHASE_A_MODELS empty)"
+fi
+
+if [ -n "${PHASE_B_MODELS}" ]; then
+    PHASE_B_DIR="$(run_phase "PHASE B (Gemma 4 expansive matrix)" "${PHASE_B_MODELS}" "${PHASE_B_TESTS}")"
+else
+    log "PHASE B skipped (PHASE_B_MODELS empty)"
+fi
+
+if [ -n "${PHASE_C_MODELS}" ]; then
+    PHASE_C_DIR="$(run_phase "PHASE C (non-Gemma finalists)" "${PHASE_C_MODELS}" "${PHASE_C_TESTS}")"
+else
+    log "PHASE C skipped (PHASE_C_MODELS empty)"
+fi
 
 # ---------------------------------------------------------------
 # Master summary
