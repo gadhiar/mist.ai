@@ -18,6 +18,8 @@ class TestKnowledgeStreamingTokens:
         ki.enabled = True
         ki.current_session_id = "test"
         ki._llm_provider = fake_llm
+        ki._config = MagicMock()
+        ki._config.llm.temperature = 0.7
 
         # Mock conversation handler with realistic attributes
         handler = MagicMock()
@@ -50,6 +52,8 @@ class TestKnowledgeStreamingTokens:
         ki.enabled = True
         ki.current_session_id = "test"
         ki._llm_provider = fake_llm
+        ki._config = MagicMock()
+        ki._config.llm.temperature = 0.7
 
         handler = MagicMock()
         handler.config.auto_inject_docs = True
