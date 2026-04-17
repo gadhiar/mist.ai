@@ -72,3 +72,6 @@ mist_desktop/macos/Flutter/ephemeral/
 mist_desktop/linux/flutter/ephemeral/
 mist_desktop/.packages
 mist_desktop/pubspec.lock
+
+# Local scratch workspace (mirrored plans, exploratory artifacts)
+.local/
