@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from backend.knowledge.curation.confidence import ConfidenceManager
+from backend.knowledge.curation.conflict_resolver import SupersessionAction
 from backend.knowledge.curation.graph_writer import CurationGraphWriter
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
@@ -33,3 +34,46 @@ async def test_ensure_conversation_context_uses_provenance_label() -> None:
     assert (
         "__Entity__:ConversationContext" not in merge_query
     ), f"ADR-009: ConversationContext must not carry :__Entity__, got: {merge_query}"
+
+
+@pytest.mark.asyncio
+async def test_create_learning_event_uses_provenance_label() -> None:
+    # Arrange
+    conn = FakeNeo4jConnection()
+    executor = FakeGraphExecutor(connection=conn)
+    writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
+
+    action = SupersessionAction(
+        old_rel_type="KNOWS",
+        old_target_id="entity-old-001",
+        new_target_id="entity-new-002",
+        reason="contradiction",
+    )
+
+    # Act
+    await writer._create_learning_event(
+        action=action,
+        session_id="test-session-456",
+        event_id="evt-001",
+        now="2026-04-17T00:00:00Z",
+        source_metadata=None,
+    )
+
+    # Assert: LearningEvent MERGE uses :__Provenance__, not :__Entity__
+    le_merges = [q for q, _ in conn.writes if "LearningEvent" in q and "MERGE" in q]
+    assert le_merges, f"Expected a LearningEvent MERGE, got writes: {conn.writes}"
+    merge_query = le_merges[0]
+    assert (
+        "__Provenance__:LearningEvent" in merge_query
+    ), f"ADR-009: LearningEvent must carry :__Provenance__, got: {merge_query}"
+    assert (
+        "__Entity__:LearningEvent" not in merge_query
+    ), f"ADR-009: LearningEvent must not carry :__Entity__, got: {merge_query}"
+
+    # Assert: ABOUT-edge target query keeps :__Entity__ (cross-layer edge semantics)
+    about_matches = [q for q, _ in conn.writes if "ABOUT" in q and "MATCH" in q]
+    assert about_matches, f"Expected an ABOUT MATCH query, got writes: {conn.writes}"
+    about_query = about_matches[0]
+    assert (
+        ":__Entity__ {id:" in about_query or "target:__Entity__" in about_query
+    ), f"ADR-009: ABOUT-edge target must retain :__Entity__ filter, got: {about_query}"

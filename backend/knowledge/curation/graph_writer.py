@@ -422,7 +422,7 @@ class CurationGraphWriter:
         learning_id = f"learning-{event_id}-{action.old_rel_type}-{action.old_target_id}"
         learned_clause, learned_params = self._learned_from_clause(source_metadata, session_id)
         await self._executor.execute_write(
-            "MERGE (le:__Entity__:LearningEvent {id: $learning_id}) "
+            "MERGE (le:__Provenance__:LearningEvent {id: $learning_id}) "
             "ON CREATE SET le.entity_type = 'LearningEvent', "
             "le.display_name = $display_name, le.knowledge_domain = 'bridging', "
             "le.learning_type = $reason, le.old_relationship = $old_rel, "
