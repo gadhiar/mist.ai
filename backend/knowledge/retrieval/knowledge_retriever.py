@@ -448,6 +448,17 @@ class KnowledgeRetriever:
 
         return results
 
+    @staticmethod
+    def _is_provenance_id(node_id: str) -> bool:
+        """Return True if *node_id* identifies a :__Provenance__ node.
+
+        ADR-009 v1.1: provenance nodes must never appear in retrieval output.
+        GraphStore.get_entity_neighborhood and get_user_relationships_to_entities
+        enforce this at the Cypher level via :__Entity__-only path anchors.
+        This guard provides a second line of defence at the retriever boundary.
+        """
+        return "__prov__" in node_id or "__Provenance__" in node_id
+
     async def _gather_facts(
         self,
         user_id: str,
@@ -475,6 +486,14 @@ class KnowledgeRetriever:
         )
 
         for rel in user_rels:
+            # ADR-009 v1.1: second-line defence — skip provenance IDs that
+            # should never reach this point (GraphStore enforces at Cypher level).
+            if self._is_provenance_id(rel["entity_id"]):
+                logger.warning(
+                    "Skipping provenance-shaped entity_id in user_rels: %s",
+                    rel["entity_id"],
+                )
+                continue
             fact = RetrievedFact(
                 subject=user_id,
                 subject_type="Person",  # Assume User is Person
@@ -501,6 +520,16 @@ class KnowledgeRetriever:
                 )
 
                 for rel in neighborhood:
+                    # ADR-009 v1.1: second-line defence on both path endpoints.
+                    if self._is_provenance_id(rel["source"]) or self._is_provenance_id(
+                        rel["target"]
+                    ):
+                        logger.warning(
+                            "Skipping provenance-shaped node in neighborhood: source=%s target=%s",
+                            rel["source"],
+                            rel["target"],
+                        )
+                        continue
                     fact = RetrievedFact(
                         subject=rel["source"],
                         subject_type=rel["source_type"],
