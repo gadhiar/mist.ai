@@ -466,7 +466,7 @@ class GraphStore:
         prop_sets = "".join(f",\n            vc.{k} = ${k}" for k in safe_props)
 
         query = f"""
-        MERGE (vc:VectorChunk {{vector_store_id: $vector_store_id}})
+        MERGE (vc:__Provenance__:VectorChunk {{vector_store_id: $vector_store_id}})
         ON CREATE SET
             vc.source_id = $source_id,
             vc.created_at = datetime(){prop_sets}
