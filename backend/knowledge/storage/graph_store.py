@@ -13,6 +13,26 @@ from backend.interfaces import EmbeddingProvider, GraphConnection
 
 logger = logging.getLogger(__name__)
 
+# ADR-009 v1.1: user-facing relationship types allowed during graph-hop expansion.
+# Provenance edge types (DERIVED_FROM, EXTRACTED_FROM, LEARNED_FROM, ABOUT,
+# SOURCED_FROM, REFERENCES) are intentionally excluded to preserve the
+# :__Entity__ vs :__Provenance__ separation at hop 2+.
+_USER_FACING_REL_TYPES: list[str] = [
+    "USES",
+    "LEARNING",
+    "WORKS_ON",
+    "WORKS_AT",
+    "KNOWS",
+    "INTERESTED_IN",
+    "IS_A",
+    "PART_OF",
+    "DEPENDS_ON",
+    "RELATED_TO",
+    "HAS_TRAIT",
+    "HAS_CAPABILITY",
+    "HAS_PREFERENCE",
+]
+
 
 class GraphStore:
     """Manages storage of knowledge graph in Neo4j.
@@ -1066,14 +1086,14 @@ class GraphStore:
         if not isinstance(max_hops, int) or max_hops < 1 or max_hops > 5:
             raise ValueError(f"max_hops must be an integer between 1 and 5, got {max_hops}")
 
-        if relationship_types:
-            rel_filter = "WHERE ALL(r in relationships(path) WHERE type(r) IN $relationship_types)"
-        else:
-            rel_filter = ""
+        # ADR-009 v1.1: always enforce user-facing rel-type allowlist.
+        # Caller may pass a tighter subset; fall back to the module-level allowlist.
+        allowed_types = relationship_types if relationship_types else _USER_FACING_REL_TYPES
 
         query = f"""
         MATCH path = (start:__Entity__ {{id: $entity_id}})-[*1..{max_hops}]-(related:__Entity__)
-        {rel_filter}
+        WHERE ALL(node IN nodes(path) WHERE node:__Entity__)
+          AND ALL(rel IN relationships(path) WHERE type(rel) IN $allowed_rel_types)
         WITH path, relationships(path) as rels, nodes(path) as nodes
         UNWIND range(0, size(rels)-1) as idx
         RETURN
@@ -1086,9 +1106,7 @@ class GraphStore:
             properties(rels[idx]) as properties
         """
 
-        params: dict[str, Any] = {"entity_id": entity_id}
-        if relationship_types:
-            params["relationship_types"] = relationship_types
+        params: dict[str, Any] = {"entity_id": entity_id, "allowed_rel_types": allowed_types}
         results = self.connection.execute_query(query, params)
 
         return [dict(record) for record in results]
@@ -1108,11 +1126,12 @@ class GraphStore:
         Returns:
             List of relationship dicts
         """
-        rel_filter = "AND type(r) IN $relationship_types" if relationship_types else ""
+        # ADR-009 v1.1: always enforce user-facing rel-type allowlist.
+        allowed_types = relationship_types if relationship_types else _USER_FACING_REL_TYPES
 
-        query = f"""
-        MATCH (user:__Entity__ {{id: $user_id}})-[r]-(entity:__Entity__)
-        WHERE entity.id IN $entity_ids {rel_filter}
+        query = """
+        MATCH (user:__Entity__ {id: $user_id})-[r]-(entity:__Entity__)
+        WHERE entity.id IN $entity_ids AND type(r) IN $allowed_rel_types
         RETURN
             user.id as user_id,
             entity.id as entity_id,
@@ -1125,9 +1144,11 @@ class GraphStore:
             END as direction
         """
 
-        params: dict[str, Any] = {"user_id": user_id, "entity_ids": entity_ids}
-        if relationship_types:
-            params["relationship_types"] = relationship_types
+        params: dict[str, Any] = {
+            "user_id": user_id,
+            "entity_ids": entity_ids,
+            "allowed_rel_types": allowed_types,
+        }
 
         results = self.connection.execute_query(query, params)
         return [dict(record) for record in results]
@@ -1150,13 +1171,14 @@ class GraphStore:
         Returns:
             List of relationship dicts
         """
-        filters = []
-        if relationship_types:
-            filters.append("type(r) IN $relationship_types")
+        # ADR-009 v1.1: always enforce user-facing rel-type allowlist.
+        allowed_types = relationship_types if relationship_types else _USER_FACING_REL_TYPES
+
+        filters: list[str] = ["type(r) IN $allowed_rel_types"]
         if entity_types:
             filters.append("entity.entity_type IN $entity_types")
 
-        where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+        where_clause = f"WHERE {' AND '.join(filters)}"
 
         query = f"""
         MATCH (user:__Entity__ {{id: $user_id}})-[r]->(entity:__Entity__)
@@ -1169,9 +1191,7 @@ class GraphStore:
         ORDER BY entity.entity_type, entity.id
         """
 
-        params: dict[str, Any] = {"user_id": user_id}
-        if relationship_types:
-            params["relationship_types"] = relationship_types
+        params: dict[str, Any] = {"user_id": user_id, "allowed_rel_types": allowed_types}
         if entity_types:
             params["entity_types"] = entity_types
         results = self.connection.execute_query(query, params)
