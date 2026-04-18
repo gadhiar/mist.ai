@@ -114,3 +114,36 @@ async def test_create_new_fact_learning_event_uses_provenance_label() -> None:
     assert (
         ":__Entity__ {id:" in about_query or "target:__Entity__" in about_query
     ), f"ADR-009: ABOUT-edge target must retain :__Entity__ filter, got: {about_query}"
+
+
+@pytest.mark.asyncio
+async def test_ensure_external_source_uses_provenance_label() -> None:
+    # Arrange
+    conn = FakeNeo4jConnection()
+    executor = FakeGraphExecutor(connection=conn)
+    writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
+
+    from backend.knowledge.curation.graph_writer import SourceMetadata
+
+    source = SourceMetadata(
+        source_uri="https://example.com/doc.pdf",
+        source_type="document",
+        title="Test Document",
+    )
+
+    # Act
+    await writer._ensure_external_source(
+        source_metadata=source,
+        now="2026-04-17T00:00:00Z",
+    )
+
+    # Assert
+    es_merges = [q for q, _ in conn.writes if "ExternalSource" in q and "MERGE" in q]
+    assert es_merges, f"Expected an ExternalSource MERGE, got writes: {conn.writes}"
+    merge_query = es_merges[0]
+    assert (
+        "__Provenance__:ExternalSource" in merge_query
+    ), f"ADR-009: ExternalSource must carry :__Provenance__, got: {merge_query}"
+    assert (
+        "__Entity__:ExternalSource" not in merge_query
+    ), f"ADR-009: ExternalSource must not carry :__Entity__, got: {merge_query}"

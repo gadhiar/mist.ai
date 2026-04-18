@@ -296,7 +296,7 @@ class CurationGraphWriter:
     async def _ensure_external_source(self, source_metadata: SourceMetadata, now: str) -> None:
         """Create or update an ExternalSource provenance node."""
         await self._executor.execute_write(
-            "MERGE (es:ExternalSource {source_uri: $source_uri}) "
+            "MERGE (es:__Provenance__:ExternalSource {source_uri: $source_uri}) "
             "ON CREATE SET es.source_type = $source_type, es.created_at = $now, "
             "es.title = $title, es.status = 'active' "
             "ON MATCH SET es.updated_at = $now",
