@@ -257,9 +257,11 @@ def cmd_graph_reset(args: argparse.Namespace) -> int:
     finally:
         connection.disconnect()
 
+    prov_removed = counts.get("provenance_nodes_removed", 0)
+    prov_msg = f", {prov_removed} provenance nodes" if prov_removed > 0 else ""
     print(
         f"[graph-reset] Removed {counts['nodes_removed']} nodes and "
-        f"{counts['relationships_removed']} relationships."
+        f"{counts['relationships_removed']} relationships{prov_msg}."
     )
     return 0
 

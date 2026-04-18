@@ -590,6 +590,11 @@ def _cypher_props(properties: dict[str, Any], prefix: str = "n") -> str:
 def reset_graph(connection: GraphConnection, include_derived: bool = False) -> dict[str, int]:
     """Wipe __Entity__ nodes and their relationships. Returns counts removed.
 
+    When ``include_derived=True``, also wipes all ``:__Provenance__`` nodes so
+    that a full reset produces a clean slate. Without the flag, provenance nodes
+    survive the reset — this preserves the "keep seed, wipe conversation"
+    pattern used during iterative gauntlet runs.
+
     Safety: caller MUST verify non-seed entity count before calling with
     include_derived=False; this function itself applies the guard and raises.
     """
@@ -606,7 +611,21 @@ def reset_graph(connection: GraphConnection, include_derived: bool = False) -> d
         "MATCH (:__Entity__)-[r]->(:__Entity__) RETURN count(r) AS count"
     )[0]["count"]
     connection.execute_write("MATCH (n:__Entity__) DETACH DELETE n")
-    return {"nodes_removed": before_nodes, "relationships_removed": before_rels}
+
+    result: dict[str, int] = {
+        "nodes_removed": before_nodes,
+        "relationships_removed": before_rels,
+        "provenance_nodes_removed": 0,
+    }
+
+    if include_derived:
+        before_provenance = connection.execute_query(
+            "MATCH (n:__Provenance__) RETURN count(n) AS count"
+        )[0]["count"]
+        connection.execute_write("MATCH (n:__Provenance__) DETACH DELETE n")
+        result["provenance_nodes_removed"] = before_provenance
+
+    return result
 
 
 # ---------------------------------------------------------------------------
