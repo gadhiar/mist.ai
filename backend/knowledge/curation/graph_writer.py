@@ -187,7 +187,7 @@ class CurationGraphWriter:
     async def _ensure_conversation_context(self, session_id: str, now: str) -> None:
         """Create or update the ConversationContext provenance node."""
         await self._executor.execute_write(
-            "MERGE (ctx:__Entity__:ConversationContext {conversation_id: $session_id}) "
+            "MERGE (ctx:__Provenance__:ConversationContext {conversation_id: $session_id}) "
             "ON CREATE SET ctx.id = $session_id, ctx.entity_type = 'ConversationContext', "
             "ctx.created_at = $now, ctx.updated_at = $now, ctx.status = 'active' "
             "ON MATCH SET ctx.updated_at = $now",
