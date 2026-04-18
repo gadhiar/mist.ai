@@ -312,7 +312,7 @@ class CurationGraphWriter:
         """Create or update VectorChunk nodes linked to an ExternalSource."""
         await self._executor.execute_write(
             "UNWIND $chunk_ids AS cid "
-            "MERGE (vc:VectorChunk {vector_store_id: cid}) "
+            "MERGE (vc:__Provenance__:VectorChunk {vector_store_id: cid}) "
             "ON CREATE SET vc.source_id = $source_uri, vc.created_at = $now "
             "ON MATCH SET vc.updated_at = $now",
             {"chunk_ids": chunk_ids, "source_uri": source_uri, "now": now},

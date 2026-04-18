@@ -147,3 +147,29 @@ async def test_ensure_external_source_uses_provenance_label() -> None:
     assert (
         "__Entity__:ExternalSource" not in merge_query
     ), f"ADR-009: ExternalSource must not carry :__Entity__, got: {merge_query}"
+
+
+@pytest.mark.asyncio
+async def test_ensure_vector_chunks_uses_provenance_label() -> None:
+    # Arrange
+    conn = FakeNeo4jConnection()
+    executor = FakeGraphExecutor(connection=conn)
+    writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
+
+    # Act
+    await writer._ensure_vector_chunks(
+        chunk_ids=["chunk-001", "chunk-002"],
+        source_uri="https://example.com/doc.pdf",
+        now="2026-04-17T00:00:00Z",
+    )
+
+    # Assert
+    vc_merges = [q for q, _ in conn.writes if "VectorChunk" in q and "MERGE" in q]
+    assert vc_merges, f"Expected a VectorChunk MERGE, got writes: {conn.writes}"
+    merge_query = vc_merges[0]
+    assert (
+        "__Provenance__:VectorChunk" in merge_query
+    ), f"ADR-009: VectorChunk must carry :__Provenance__, got: {merge_query}"
+    assert (
+        "__Entity__:VectorChunk" not in merge_query
+    ), f"ADR-009: VectorChunk must not carry :__Entity__, got: {merge_query}"
