@@ -329,3 +329,37 @@ def test_load_seed_yaml_real_file(tmp_path):
     assert counts["identity_relationships"] == 9 + 5 + 4  # targets expanded
     assert counts["anchor_relationships"] == 11
     assert counts.get("schema_objects", 0) >= 2  # constraint + type index minimum
+
+
+# ---------------------------------------------------------------------------
+# ADR-009 — admin.ensure_schema installs __Provenance__ DDL
+# Mirror coverage of test_graph_store_provenance.py for the seed path.
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_schema_installs_provenance_constraint():
+    """ADR-009: admin.ensure_schema (used by mist_admin seed) issues the
+    __Provenance__ uniqueness constraint.
+    """
+    connection = FakeNeo4jConnection()
+
+    admin.ensure_schema(connection)
+
+    issued = [q for q, _ in connection.writes]
+    assert any(
+        "CONSTRAINT provenance_id_unique" in q and "__Provenance__" in q and "p.id" in q
+        for q in issued
+    ), f"Expected __Provenance__ uniqueness constraint, got: {issued}"
+
+
+def test_ensure_schema_installs_provenance_type_index():
+    """ADR-009: admin.ensure_schema issues the provenance_type_idx index."""
+    connection = FakeNeo4jConnection()
+
+    admin.ensure_schema(connection)
+
+    issued = [q for q, _ in connection.writes]
+    assert any(
+        "INDEX provenance_type_idx" in q and "__Provenance__" in q and "p.entity_type" in q
+        for q in issued
+    ), f"Expected provenance_type_idx, got: {issued}"
