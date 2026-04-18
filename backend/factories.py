@@ -171,8 +171,11 @@ def build_conversation_handler(
     Builds a hybrid retriever with optional vector store support.
     If vector store creation fails (e.g. LanceDB not available),
     the retriever falls back to graph-only behaviour.
+
+    Enables per-turn JSONL debug logging when `MIST_DEBUG_JSONL=<path>` is set.
     """
     from backend.chat.conversation_handler import ConversationHandler
+    from backend.debug_jsonl_logger import DebugJSONLLogger
     from backend.errors import VectorStoreError
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
 
@@ -198,6 +201,10 @@ def build_conversation_handler(
 
     tracker = ToolUsageTracker(config.skill_derivation)
 
+    debug_logger = DebugJSONLLogger.from_env()
+    if debug_logger.enabled:
+        logger.info("Debug JSONL logging enabled at %s", debug_logger.path)
+
     return ConversationHandler(
         config=config,
         graph_store=gs,
@@ -205,6 +212,7 @@ def build_conversation_handler(
         retriever=retriever,
         llm_provider=provider,
         tool_usage_tracker=tracker,
+        debug_logger=debug_logger,
     )
 
 

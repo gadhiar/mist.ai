@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -23,6 +24,7 @@ from backend.llm import LLMRequest, StreamingLLMProvider
 from backend.llm.models import ToolCall as LLMToolCall
 
 if TYPE_CHECKING:
+    from backend.debug_jsonl_logger import DebugJSONLLogger, TurnRecord
     from backend.knowledge.extraction.pipeline import ExtractionPipeline
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
 
@@ -86,6 +88,7 @@ class ConversationHandler:
         retriever: KnowledgeRetriever,
         llm_provider: StreamingLLMProvider,
         tool_usage_tracker: ToolUsageTracker | None = None,
+        debug_logger: DebugJSONLLogger | None = None,
     ) -> None:
         """Initialize conversation handler.
 
@@ -97,12 +100,16 @@ class ConversationHandler:
             llm_provider: LLM inference provider (StreamingLLMProvider).
             tool_usage_tracker: Optional tracker for recording tool calls for
                 skill derivation. When None, tool usage is not recorded.
+            debug_logger: Optional DebugJSONLLogger for per-turn structured
+                observability. Produced by `DebugJSONLLogger.from_env()`; when
+                `MIST_DEBUG_JSONL` is unset the logger yields no-op records.
         """
         self.config = config
         self.graph_store = graph_store
         self._extraction_pipeline = extraction_pipeline
         self.retriever = retriever
         self._tool_usage_tracker = tool_usage_tracker
+        self._debug_logger = debug_logger
 
         # LLM provider (replaces ChatOllama)
         self._provider = llm_provider
@@ -249,7 +256,9 @@ class ConversationHandler:
                 temperature=self.config.llm.temperature,
                 max_tokens=400,
             )
+            _llm_start_1 = time.time()
             response = await self._provider.invoke(request)
+            _llm_duration_1_ms = (time.time() - _llm_start_1) * 1000
 
             # Check if LLM made tool calls
             tool_calls = []
@@ -326,7 +335,9 @@ class ConversationHandler:
                     temperature=self.config.llm.temperature,
                     max_tokens=400,
                 )
+                _llm_start_2 = time.time()
                 final_response = await self._provider.invoke(final_request)
+                _llm_duration_2_ms = (time.time() - _llm_start_2) * 1000
                 assistant_message = final_response.content
                 logger.info(
                     "[TOOLS] Final response: %s...",
@@ -356,6 +367,26 @@ class ConversationHandler:
                 tool_calls=tool_calls if tool_calls else None,
             )
 
+            # Debug JSONL: record this turn and attach the TurnRecord to the
+            # background extraction task so the extraction phase flushes a
+            # second JSONL line keyed by event_id.
+            turn_record = None
+            if self._debug_logger is not None and event_id:
+                turn_record = self._debug_logger.begin_turn(
+                    event_id=event_id,
+                    session_id=session_id,
+                    user_id=user_id,
+                    utterance=user_message,
+                )
+                if retrieval_result is not None:
+                    turn_record.record_retrieval(retrieval_result)
+                turn_record.record_llm_response(response, pass_num=1, timing_ms=_llm_duration_1_ms)
+                if response.tool_calls:
+                    turn_record.record_llm_response(
+                        final_response, pass_num=2, timing_ms=_llm_duration_2_ms
+                    )
+                turn_record.flush_turn()
+
             # Fire-and-forget background extraction
             if event_id and len(user_message.split()) >= 3:
                 asyncio.create_task(
@@ -364,6 +395,7 @@ class ConversationHandler:
                         conversation_history=session.get_history(max_history),
                         event_id=event_id,
                         session_id=session_id,
+                        turn_record=turn_record,
                     )
                 )
 
@@ -387,12 +419,17 @@ class ConversationHandler:
         conversation_history: list[dict[str, str]],
         event_id: str,
         session_id: str,
+        turn_record: TurnRecord | None = None,
     ) -> None:
         """Fire-and-forget background extraction.
 
         Called via asyncio.create_task after every user turn.
         Failures are logged but never propagated.
+
+        If `turn_record` is supplied, records extraction outcome + graph writes
+        to the per-turn JSONL debug log (phase: "extraction", keyed by event_id).
         """
+        _ex_start = time.time()
         try:
             result = await self._extraction_pipeline.extract_from_utterance(
                 utterance=utterance,
@@ -423,8 +460,23 @@ class ConversationHandler:
                     rel_count,
                     utterance[:60],
                 )
+
+            if turn_record is not None:
+                turn_record.record_extraction(
+                    result,
+                    duration_ms=(time.time() - _ex_start) * 1000,
+                    parse_ok=True,
+                )
+                turn_record.flush_extraction()
         except Exception as e:
             logger.error("Background extraction failed (non-fatal): %s", e)
+            if turn_record is not None:
+                turn_record.record_extraction(
+                    None,
+                    duration_ms=(time.time() - _ex_start) * 1000,
+                    parse_ok=False,
+                )
+                turn_record.flush_extraction()
 
     def _record_turn_event(
         self,

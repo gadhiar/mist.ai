@@ -144,6 +144,7 @@ class OntologyConstrainedExtractor:
                 ],
                 json_mode=True,
                 temperature=self.config.llm.temperature,
+                max_tokens=2048,
             )
             response = await self._llm.invoke(request)
             raw_output = response.content

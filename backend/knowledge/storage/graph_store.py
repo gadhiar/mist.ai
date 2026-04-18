@@ -32,15 +32,30 @@ class GraphStore:
         """
         self.connection = connection
         self.embedding_generator = embedding_generator
-        self._vector_indexes_available: bool = False
+        self._vector_indexes_available: bool | None = None  # None = lazy-probe
 
     @property
     def vector_indexes_available(self) -> bool:
-        """Return True if all vector indexes were successfully created.
+        """Return True if the entity vector index exists in Neo4j.
 
-        External callers can check this before attempting vector search
-        operations to avoid unnecessary query failures.
+        On first access, probes Neo4j's SHOW INDEXES to detect an existing
+        vector index. Previously this flag was set only by
+        `initialize_schema()`, which meant retrievers that built a fresh
+        GraphStore via the factory always observed False even when the index
+        was online. The lazy probe decouples "this instance ran init" from
+        "the index exists in the database".
         """
+        if self._vector_indexes_available is None:
+            try:
+                rows = self.connection.execute_query(
+                    "SHOW INDEXES YIELD name, type, state "
+                    "WHERE type = 'VECTOR' AND name = 'entity_embeddings'"
+                )
+                self._vector_indexes_available = bool(rows) and any(
+                    r.get("state") == "ONLINE" for r in rows
+                )
+            except Neo4jQueryError:
+                self._vector_indexes_available = False
         return self._vector_indexes_available
 
     def initialize_schema(self):
@@ -909,7 +924,7 @@ class GraphStore:
             >>> for r in results:
             >>>     print(f"{r['entity_id']}: {r['similarity']:.3f}")
         """
-        if not self._vector_indexes_available:
+        if not self.vector_indexes_available:
             logger.warning(
                 "search_similar_entities called but vector indexes are not available; "
                 "returning empty results"
@@ -977,7 +992,7 @@ class GraphStore:
                 }
             ]
         """
-        if not self._vector_indexes_available:
+        if not self.vector_indexes_available:
             logger.warning(
                 "search_document_chunks called but vector indexes are not available; "
                 "returning empty results"

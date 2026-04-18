@@ -211,7 +211,7 @@ class TestSearchSimilarEntitiesGracefulFallback:
             connection=FakeNeo4jConnection(),
             embedding_generator=FakeEmbeddingGenerator(),
         )
-        # _vector_indexes_available defaults to False
+        # Fake returns [] for SHOW INDEXES probe -> lazy flag resolves False
 
         # Act
         results = store.search_similar_entities("Python programming")
@@ -219,7 +219,7 @@ class TestSearchSimilarEntitiesGracefulFallback:
         # Assert
         assert results == []
 
-    def test_does_not_call_connection_when_vector_indexes_unavailable(self):
+    def test_does_not_issue_search_query_when_vector_indexes_unavailable(self):
         # Arrange
         fake_conn = FakeNeo4jConnection()
         store = GraphStore(connection=fake_conn, embedding_generator=FakeEmbeddingGenerator())
@@ -227,8 +227,8 @@ class TestSearchSimilarEntitiesGracefulFallback:
         # Act
         store.search_similar_entities("Python programming")
 
-        # Assert -- no query was issued to the database
-        assert fake_conn.queries == []
+        # Assert -- the SHOW INDEXES probe ran, but the vector search did not
+        assert not any("db.index.vector.queryNodes" in q for q, _ in fake_conn.queries)
 
     def test_returns_results_when_vector_indexes_available(self):
         # Arrange
@@ -291,7 +291,7 @@ class TestSearchDocumentChunksGracefulFallback:
             connection=FakeNeo4jConnection(),
             embedding_generator=FakeEmbeddingGenerator(),
         )
-        # _vector_indexes_available defaults to False
+        # Fake returns [] for SHOW INDEXES probe -> lazy flag resolves False
 
         # Act
         results = store.search_document_chunks("knowledge graph")
@@ -299,7 +299,7 @@ class TestSearchDocumentChunksGracefulFallback:
         # Assert
         assert results == []
 
-    def test_does_not_call_connection_when_vector_indexes_unavailable(self):
+    def test_does_not_issue_search_query_when_vector_indexes_unavailable(self):
         # Arrange
         fake_conn = FakeNeo4jConnection()
         store = GraphStore(connection=fake_conn, embedding_generator=FakeEmbeddingGenerator())
@@ -307,8 +307,8 @@ class TestSearchDocumentChunksGracefulFallback:
         # Act
         store.search_document_chunks("knowledge graph")
 
-        # Assert -- no query was issued to the database
-        assert fake_conn.queries == []
+        # Assert -- the SHOW INDEXES probe ran, but the chunk search did not
+        assert not any("db.index.vector.queryNodes" in q for q, _ in fake_conn.queries)
 
     def test_disables_flag_and_returns_empty_on_runtime_query_failure(self):
         # Arrange
