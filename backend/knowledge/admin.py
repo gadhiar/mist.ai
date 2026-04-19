@@ -521,15 +521,19 @@ def cross_layer_relationship_counts(connection: GraphConnection) -> list[dict[st
 # ---------------------------------------------------------------------------
 
 
-def dump_graph_json(connection: GraphConnection) -> dict[str, list[dict[str, Any]]]:
-    """Return the full __Entity__ subgraph as a JSON-serializable dict."""
-    node_query = """
-    MATCH (n:__Entity__)
+def _dump_subgraph(connection: GraphConnection, label: str) -> dict[str, list[dict[str, Any]]]:
+    """Return nodes and internal relationships for a single label family.
+
+    Strips the ``embedding`` field from node properties. Intended for use
+    by ``dump_graph_json``; not part of the public admin API.
+    """
+    node_query = f"""
+    MATCH (n:{label})
     RETURN n.id AS id, labels(n) AS labels, properties(n) AS properties
     ORDER BY n.id
     """
-    rel_query = """
-    MATCH (s:__Entity__)-[r]->(t:__Entity__)
+    rel_query = f"""
+    MATCH (s:{label})-[r]->(t:{label})
     RETURN s.id AS source, type(r) AS type, t.id AS target,
            properties(r) AS properties
     ORDER BY s.id, type(r), t.id
@@ -537,7 +541,7 @@ def dump_graph_json(connection: GraphConnection) -> dict[str, list[dict[str, Any
     nodes = [
         {
             "id": row["id"],
-            "labels": [label for label in row["labels"] if label != "__Entity__"],
+            "labels": [lbl for lbl in row["labels"] if lbl != label],
             "properties": _strip_embedding(row["properties"]),
         }
         for row in connection.execute_query(node_query)
@@ -554,17 +558,67 @@ def dump_graph_json(connection: GraphConnection) -> dict[str, list[dict[str, Any
     return {"nodes": nodes, "relationships": relationships}
 
 
-def dump_graph_cypher(connection: GraphConnection) -> str:
-    """Return the full __Entity__ subgraph as a Cypher script of MERGE statements.
+def dump_graph_json(
+    connection: GraphConnection,
+    *,
+    include_provenance: bool = False,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return the __Entity__ subgraph as a JSON-serializable dict.
+
+    When *include_provenance* is True three additional keys are included:
+
+    - ``provenance``: dict with ``nodes`` and ``relationships`` for the
+      ``:__Provenance__`` label family.
+    - ``cross_layer_edges``: list of edge dicts spanning ``:__Entity__`` and
+      ``:__Provenance__`` (both directions).
+
+    Default behaviour (``include_provenance=False``) is unchanged — only the
+    entity subgraph is returned.
+    """
+    result = _dump_subgraph(connection, "__Entity__")
+
+    if include_provenance:
+        result["provenance"] = _dump_subgraph(connection, "__Provenance__")
+
+        cross_query = """
+        MATCH (s)-[r]->(t)
+        WHERE (s:__Entity__ AND t:__Provenance__) OR (s:__Provenance__ AND t:__Entity__)
+        RETURN s.id AS source, type(r) AS type, t.id AS target,
+               properties(r) AS properties
+        ORDER BY s.id, type(r), t.id
+        """
+        result["cross_layer_edges"] = [
+            {
+                "source": row["source"],
+                "type": row["type"],
+                "target": row["target"],
+                "properties": row["properties"],
+            }
+            for row in connection.execute_query(cross_query)
+        ]
+
+    return result
+
+
+def dump_graph_cypher(
+    connection: GraphConnection,
+    *,
+    include_provenance: bool = False,
+) -> str:
+    """Return the __Entity__ subgraph as a Cypher script of MERGE statements.
 
     Intended for snapshotting and offline diffing. Embeddings are stripped.
     Re-importing produces a schema-equivalent subgraph.
+
+    When *include_provenance* is True the ``:__Provenance__`` subgraph and
+    cross-layer edges are appended as a second section in the script.
     """
-    payload = dump_graph_json(connection)
+    payload = dump_graph_json(connection, include_provenance=include_provenance)
     lines: list[str] = [
         "// MIST graph snapshot (Cypher)",
         f"// generated {datetime.now(UTC).isoformat()}",
         "",
+        "// --- :__Entity__ subgraph ---",
     ]
     for node in payload["nodes"]:
         labels = ":".join(["__Entity__", *node["labels"]]) if node["labels"] else "__Entity__"
@@ -582,6 +636,49 @@ def dump_graph_cypher(connection: GraphConnection) -> str:
             f"MATCH (s:__Entity__ {{id: {src}}}), (t:__Entity__ {{id: {tgt}}}) "
             f"MERGE (s)-[r:{rtype}]->(t) ON CREATE SET {props};"
         )
+
+    if include_provenance:
+        prov = payload["provenance"]
+        lines += [
+            "",
+            "// --- :__Provenance__ subgraph ---",
+        ]
+        for node in prov["nodes"]:
+            labels = (
+                ":".join(["__Provenance__", *node["labels"]])
+                if node["labels"]
+                else "__Provenance__"
+            )
+            props = _cypher_props(node["properties"])
+            lines.append(
+                f"MERGE (:{labels} {{id: {_cypher_value(node['id'])}}}) ON CREATE SET {props};"
+            )
+        lines.append("")
+        for rel in prov["relationships"]:
+            src = _cypher_value(rel["source"])
+            tgt = _cypher_value(rel["target"])
+            rtype = rel["type"]
+            props = _cypher_props(rel["properties"], prefix="r")
+            lines.append(
+                f"MATCH (s:__Provenance__ {{id: {src}}}), (t:__Provenance__ {{id: {tgt}}}) "
+                f"MERGE (s)-[r:{rtype}]->(t) ON CREATE SET {props};"
+            )
+
+        cross = payload["cross_layer_edges"]
+        lines += [
+            "",
+            "// --- cross-layer edges ---",
+        ]
+        for rel in cross:
+            src = _cypher_value(rel["source"])
+            tgt = _cypher_value(rel["target"])
+            rtype = rel["type"]
+            props = _cypher_props(rel["properties"], prefix="r")
+            lines.append(
+                f"MATCH (s {{id: {src}}}), (t {{id: {tgt}}}) "
+                f"MERGE (s)-[r:{rtype}]->(t) ON CREATE SET {props};"
+            )
+
     return "\n".join(lines) + "\n"
 
 

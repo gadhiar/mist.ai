@@ -127,12 +127,13 @@ def cmd_seed(args: argparse.Namespace) -> int:
 def cmd_graph_dump(args: argparse.Namespace) -> int:
     be = _load_backend()
     connection = _connect(be)
+    include_provenance: bool = getattr(args, "include_provenance", False)
     try:
         if args.format == "json":
-            payload = be.admin.dump_graph_json(connection)
+            payload = be.admin.dump_graph_json(connection, include_provenance=include_provenance)
             output = json.dumps(payload, indent=2, default=str)
         else:
-            output = be.admin.dump_graph_cypher(connection)
+            output = be.admin.dump_graph_cypher(connection, include_provenance=include_provenance)
     finally:
         connection.disconnect()
     if args.output:
@@ -800,6 +801,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--output",
         default=None,
         help="Write to file instead of stdout.",
+    )
+    p_dump.add_argument(
+        "--include-provenance",
+        action="store_true",
+        default=False,
+        dest="include_provenance",
+        help=(
+            "Also emit the :__Provenance__ subgraph and cross-layer edges. "
+            "Adds 'provenance' and 'cross_layer_edges' keys to JSON output; "
+            "appends two additional sections to Cypher output."
+        ),
     )
     p_dump.set_defaults(func=cmd_graph_dump)
 

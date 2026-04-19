@@ -188,3 +188,92 @@ def test_cross_layer_relationship_counts_issues_mixed_endpoint_match():
         "s:__Provenance__ AND t:__Entity__" in q for q in issued
     ), f"Expected reverse direction (Provenance->Entity) in same query, got: {issued}"
     assert result == [{"rel_type": "HAS_PROVENANCE", "count": 7}]
+
+
+# ---------------------------------------------------------------------------
+# Task 12 — graph-dump --include-provenance
+# ---------------------------------------------------------------------------
+
+
+def test_graph_dump_default_excludes_provenance():
+    """dump_graph_json with default args queries only MATCH (n:__Entity__) and
+    must NOT issue a MATCH (n:__Provenance__) query.
+    """
+    connection = FakeNeo4jConnection(
+        query_responses={
+            "MATCH (n:__Entity__)": [
+                {"id": "e1", "labels": ["__Entity__", "Person"], "properties": {"name": "Alice"}},
+            ],
+            "MATCH (s:__Entity__)-[r]->(t:__Entity__)": [],
+        }
+    )
+
+    result = admin.dump_graph_json(connection)
+
+    issued = [q for q, _ in connection.queries]
+    assert any(
+        "MATCH (n:__Entity__)" in q for q in issued
+    ), f"Expected MATCH (n:__Entity__) query, got: {issued}"
+    assert not any(
+        "MATCH (n:__Provenance__)" in q for q in issued
+    ), f"Provenance query must NOT be issued by default, got: {issued}"
+    # Return shape must contain entity nodes and relationships
+    assert "nodes" in result
+    assert "relationships" in result
+    # Provenance keys must be absent in the default output
+    assert "provenance" not in result
+    assert "cross_layer_edges" not in result
+
+
+def test_graph_dump_include_provenance_emits_both_subgraphs():
+    """dump_graph_json(include_provenance=True) must issue queries for both
+    MATCH (n:__Entity__) and MATCH (n:__Provenance__), plus a cross-layer
+    edge query, and return the results under separate keys.
+    """
+    connection = FakeNeo4jConnection(
+        query_responses={
+            "MATCH (n:__Entity__)": [
+                {"id": "e1", "labels": ["__Entity__", "Person"], "properties": {"name": "Alice"}},
+            ],
+            "MATCH (s:__Entity__)-[r]->(t:__Entity__)": [],
+            "MATCH (n:__Provenance__)": [
+                {
+                    "id": "p1",
+                    "labels": ["__Provenance__"],
+                    "properties": {"source": "conv-001"},
+                },
+            ],
+            "MATCH (s:__Provenance__)-[r]->(t:__Provenance__)": [],
+            # Cross-layer query — match on a substring common to the implementation
+            "s:__Entity__ AND t:__Provenance__": [
+                {"source": "e1", "type": "HAS_PROVENANCE", "target": "p1", "properties": {}},
+            ],
+        }
+    )
+
+    result = admin.dump_graph_json(connection, include_provenance=True)
+
+    issued = [q for q, _ in connection.queries]
+    assert any(
+        "MATCH (n:__Entity__)" in q for q in issued
+    ), f"Expected MATCH (n:__Entity__) query, got: {issued}"
+    assert any(
+        "MATCH (n:__Provenance__)" in q for q in issued
+    ), f"Expected MATCH (n:__Provenance__) query, got: {issued}"
+    assert any(
+        "s:__Entity__ AND t:__Provenance__" in q for q in issued
+    ), f"Expected cross-layer query, got: {issued}"
+
+    # Return shape must include provenance and cross_layer_edges keys
+    assert (
+        "provenance" in result
+    ), f"Expected 'provenance' key in result, got: {list(result.keys())}"
+    assert (
+        "cross_layer_edges" in result
+    ), f"Expected 'cross_layer_edges' key in result, got: {list(result.keys())}"
+    # Core entity keys must still be present
+    assert "nodes" in result
+    assert "relationships" in result
+    # Provenance section must itself contain nodes and relationships
+    assert "nodes" in result["provenance"]
+    assert "relationships" in result["provenance"]
