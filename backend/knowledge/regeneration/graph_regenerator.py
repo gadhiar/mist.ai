@@ -318,10 +318,16 @@ class GraphRegenerator:
         return utterances
 
     def _delete_graph_entities(self):
-        """Delete all __Entity__ nodes and their relationships.
+        """Delete all :__Entity__ nodes and their relationships.
 
-        This removes the materialized graph view but preserves
-        the source of truth (ConversationEvent and Utterance nodes).
+        Targets only the user-facing entity graph (nodes carrying the
+        :__Entity__ base label).  Provenance nodes (:__Provenance__:*)
+        are NOT deleted -- they are an independent audit trail and are
+        preserved across regenerations.
+
+        This removes the materialized entity-graph view but preserves the
+        source of truth (ConversationEvent, Utterance, and all
+        :__Provenance__ nodes).
 
         DETACH DELETE removes nodes AND all their relationships automatically.
         """
