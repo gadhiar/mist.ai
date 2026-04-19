@@ -127,3 +127,64 @@ def test_graph_reset_refuses_when_non_seed_entities_present_without_flag():
 
     with pytest.raises(Neo4jQueryError):
         admin.reset_graph(connection, include_derived=False)
+
+
+# ---------------------------------------------------------------------------
+# Task 11 — graph-stats provenance helpers
+# ---------------------------------------------------------------------------
+
+
+def test_provenance_counts_by_type_issues_provenance_match():
+    """provenance_counts_by_type must query MATCH (n:__Provenance__)."""
+    connection = FakeNeo4jConnection(
+        query_responses={
+            "MATCH (n:__Provenance__)": [{"entity_type": "Person", "count": 3}],
+        }
+    )
+
+    result = admin.provenance_counts_by_type(connection)
+
+    issued = [q for q, _ in connection.queries]
+    assert any(
+        "MATCH (n:__Provenance__)" in q for q in issued
+    ), f"Expected MATCH (n:__Provenance__) query, got: {issued}"
+    assert result == [{"entity_type": "Person", "count": 3}]
+
+
+def test_provenance_relationship_counts_issues_provenance_to_provenance_match():
+    """provenance_relationship_counts_by_type must query (:__Provenance__)-[r]->(:__Provenance__)."""
+    connection = FakeNeo4jConnection(
+        query_responses={
+            "(:__Provenance__)-[r]->(:__Provenance__)": [{"rel_type": "OBSERVED_IN", "count": 2}],
+        }
+    )
+
+    result = admin.provenance_relationship_counts_by_type(connection)
+
+    issued = [q for q, _ in connection.queries]
+    assert any(
+        "(:__Provenance__)-[r]->(:__Provenance__)" in q for q in issued
+    ), f"Expected (:__Provenance__)-[r]->(:__Provenance__) query, got: {issued}"
+    assert result == [{"rel_type": "OBSERVED_IN", "count": 2}]
+
+
+def test_cross_layer_relationship_counts_issues_mixed_endpoint_match():
+    """cross_layer_relationship_counts must query both directions:
+    (:__Entity__)-[r]->(:__Provenance__) OR (:__Provenance__)-[r]->(:__Entity__).
+    """
+    connection = FakeNeo4jConnection(
+        query_responses={
+            "s:__Entity__ AND t:__Provenance__": [{"rel_type": "HAS_PROVENANCE", "count": 7}],
+        }
+    )
+
+    result = admin.cross_layer_relationship_counts(connection)
+
+    issued = [q for q, _ in connection.queries]
+    assert any(
+        "s:__Entity__ AND t:__Provenance__" in q for q in issued
+    ), f"Expected cross-layer entity/provenance query, got: {issued}"
+    assert any(
+        "s:__Provenance__ AND t:__Entity__" in q for q in issued
+    ), f"Expected reverse direction (Provenance->Entity) in same query, got: {issued}"
+    assert result == [{"rel_type": "HAS_PROVENANCE", "count": 7}]

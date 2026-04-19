@@ -156,6 +156,9 @@ def cmd_graph_stats(args: argparse.Namespace) -> int:
         confidence = be.admin.get_confidence_distribution(connection)
         orphans = be.admin.find_orphan_relationships(connection)
         provenance = be.admin.count_provenance(connection)
+        prov_node_counts = be.admin.provenance_counts_by_type(connection)
+        prov_rel_counts = be.admin.provenance_relationship_counts_by_type(connection)
+        xlayer_counts = be.admin.cross_layer_relationship_counts(connection)
     finally:
         connection.disconnect()
 
@@ -198,6 +201,31 @@ def cmd_graph_stats(args: argparse.Namespace) -> int:
             f"  {row['source_labels']} -[{row['rel_type']}]-> "
             f"{row['target_labels']}  x{row['count']}"
         )
+
+    print(
+        f"\nProvenance Nodes (:__Provenance__) ({sum(r['count'] for r in prov_node_counts)} total):"
+    )
+    if not prov_node_counts:
+        print("  (none)")
+    for row in prov_node_counts:
+        print(f"  {row['entity_type']:<24} {row['count']:>6}")
+
+    print(
+        f"\nProvenance Relationships (:__Provenance__->:__Provenance__) ({sum(r['count'] for r in prov_rel_counts)} total):"
+    )
+    if not prov_rel_counts:
+        print("  (none)")
+    for row in prov_rel_counts:
+        print(f"  {row['rel_type']:<24} {row['count']:>6}")
+
+    print(
+        f"\nCross-Layer Relationships (:__Entity__ <-> :__Provenance__) ({sum(r['count'] for r in xlayer_counts)} total):"
+    )
+    if not xlayer_counts:
+        print("  (none)")
+    for row in xlayer_counts:
+        print(f"  {row['rel_type']:<24} {row['count']:>6}")
+
     return 0
 
 

@@ -485,6 +485,37 @@ def count_non_seed_entities(connection: GraphConnection) -> int:
     return result[0]["count"] if result else 0
 
 
+def provenance_counts_by_type(connection: GraphConnection) -> list[dict[str, Any]]:
+    """Return node counts grouped by entity_type for :__Provenance__ nodes only."""
+    query = """
+    MATCH (n:__Provenance__)
+    RETURN coalesce(n.entity_type, '(unspecified)') AS entity_type, count(n) AS count
+    ORDER BY count DESC, entity_type ASC
+    """
+    return connection.execute_query(query)
+
+
+def provenance_relationship_counts_by_type(connection: GraphConnection) -> list[dict[str, Any]]:
+    """Return relationship counts for edges between :__Provenance__ nodes."""
+    query = """
+    MATCH (:__Provenance__)-[r]->(:__Provenance__)
+    RETURN type(r) AS rel_type, count(r) AS count
+    ORDER BY count DESC, rel_type ASC
+    """
+    return connection.execute_query(query)
+
+
+def cross_layer_relationship_counts(connection: GraphConnection) -> list[dict[str, Any]]:
+    """Return counts of edges spanning :__Entity__ and :__Provenance__ (both directions)."""
+    query = """
+    MATCH (s)-[r]->(t)
+    WHERE (s:__Entity__ AND t:__Provenance__) OR (s:__Provenance__ AND t:__Entity__)
+    RETURN type(r) AS rel_type, count(r) AS count
+    ORDER BY count DESC, rel_type ASC
+    """
+    return connection.execute_query(query)
+
+
 # ---------------------------------------------------------------------------
 # Graph dump
 # ---------------------------------------------------------------------------
