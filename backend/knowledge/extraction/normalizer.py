@@ -83,6 +83,18 @@ class EntityNormalizer:
         r"(?:\s+v?|\bv)(\d+\.?\d*\.?\d*\.?\d*)([-.]?\w+)*$", re.IGNORECASE
     )
 
+    # Bug G guard: reserved names for the MIST system itself always resolve
+    # to the canonical mist-identity node (seeded in scripts/seed_data.yaml).
+    # Extraction that introduces new "mist" or "the-ai" entities pollutes
+    # the graph with duplicates of the system's own identity node.
+    RESERVED_NAMES: dict[str, str] = {
+        "mist": "mist-identity",
+        "mist.ai": "mist-identity",
+        "mist ai": "mist-identity",
+        "the ai": "mist-identity",
+        "the assistant": "mist-identity",
+    }
+
     SIMILARITY_THRESHOLD: float = 0.92
 
     def __init__(
@@ -129,7 +141,10 @@ class EntityNormalizer:
                 entity["id"] = "user"
                 continue
 
-            # Check pre-canonicalization aliases (e.g. "C++" before "+" is stripped)
+            # Check pre-canonicalization aliases (e.g. "C++" before "+" is stripped).
+            # Note: _PRE_CANON_ALIASES matches BEFORE _canonicalize runs, which means the
+            # Bug G reserved-namespace guard inside _canonicalize is bypassed for any key
+            # that lands here. Keys in RESERVED_NAMES must NOT appear in _PRE_CANON_ALIASES.
             raw_lower = entity_name.lower().strip()
             pre_canon = self._PRE_CANON_ALIASES.get(raw_lower)
             if pre_canon is not None:
@@ -192,6 +207,17 @@ class EntityNormalizer:
         Returns:
             Canonical entity ID string.
         """
+        # Reserved-namespace guard — exact-match lookup on lowercased trimmed input.
+        lowered = name.lower().strip()
+        if lowered in self.RESERVED_NAMES:
+            canonical = self.RESERVED_NAMES[lowered]
+            logger.warning(
+                "Reserved name '%s' remapped to canonical '%s'",
+                name,
+                canonical,
+            )
+            return canonical
+
         # Strip version numbers
         canonical = self.VERSION_PATTERN.sub("", name)
 

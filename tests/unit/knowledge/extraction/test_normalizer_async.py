@@ -54,3 +54,68 @@ class TestNormalizerAsync:
         )
         result = await normalizer.normalize(extraction)
         assert result.entities[0]["id"] == "javascript"
+
+
+class TestReservedNamespaceGuard:
+    """Bug G: reserved names for the MIST system resolve to mist-identity."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "input_name,expected_canonical",
+        [
+            ("MIST", "mist-identity"),
+            ("MIST.AI", "mist-identity"),
+            ("MIST AI", "mist-identity"),
+            ("mist", "mist-identity"),
+            ("mist.ai", "mist-identity"),
+            ("the AI", "mist-identity"),
+            ("the assistant", "mist-identity"),
+            ("The Assistant", "mist-identity"),
+        ],
+    )
+    async def test_reserved_name_maps_to_mist_identity(self, input_name, expected_canonical):
+        normalizer = EntityNormalizer(
+            embedding_generator=FakeEmbeddingGenerator(),
+            executor=None,
+        )
+        extraction = ExtractionResult(
+            entities=[{"id": input_name, "name": input_name, "type": "Organization"}],
+            relationships=[],
+        )
+        result = await normalizer.normalize(extraction)
+        assert result.entities[0]["id"] == expected_canonical, (
+            f"Expected {input_name} to canonicalize to {expected_canonical}, "
+            f"got {result.entities[0]['id']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_reserved_name_is_unchanged(self):
+        """Sanity check: ordinary names do NOT get remapped."""
+        normalizer = EntityNormalizer(
+            embedding_generator=FakeEmbeddingGenerator(),
+            executor=None,
+        )
+        extraction = ExtractionResult(
+            entities=[{"id": "mistletoe", "name": "Mistletoe", "type": "Concept"}],
+            relationships=[],
+        )
+        result = await normalizer.normalize(extraction)
+        assert result.entities[0]["id"] == "mistletoe"
+
+    @pytest.mark.asyncio
+    async def test_reserved_name_logs_warning(self, caplog):
+        import logging
+
+        normalizer = EntityNormalizer(
+            embedding_generator=FakeEmbeddingGenerator(),
+            executor=None,
+        )
+        extraction = ExtractionResult(
+            entities=[{"id": "MIST", "name": "MIST", "type": "Organization"}],
+            relationships=[],
+        )
+        with caplog.at_level(logging.WARNING, logger="backend.knowledge.extraction.normalizer"):
+            await normalizer.normalize(extraction)
+        assert any(
+            "reserved name" in r.message.lower() for r in caplog.records
+        ), f"Expected reserved-name warning, got logs: {[r.message for r in caplog.records]}"
