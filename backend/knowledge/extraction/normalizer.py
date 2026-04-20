@@ -91,8 +91,11 @@ class EntityNormalizer:
         "mist": "mist-identity",
         "mist.ai": "mist-identity",
         "mist ai": "mist-identity",
+        "mist-ai": "mist-identity",
         "the ai": "mist-identity",
+        "the-ai": "mist-identity",
         "the assistant": "mist-identity",
+        "the-assistant": "mist-identity",
     }
 
     SIMILARITY_THRESHOLD: float = 0.92

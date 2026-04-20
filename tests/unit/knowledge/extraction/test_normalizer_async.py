@@ -68,9 +68,13 @@ class TestReservedNamespaceGuard:
             ("MIST AI", "mist-identity"),
             ("mist", "mist-identity"),
             ("mist.ai", "mist-identity"),
+            ("mist-ai", "mist-identity"),
+            ("MIST-AI", "mist-identity"),
             ("the AI", "mist-identity"),
+            ("the-ai", "mist-identity"),
             ("the assistant", "mist-identity"),
             ("The Assistant", "mist-identity"),
+            ("the-assistant", "mist-identity"),
         ],
     )
     async def test_reserved_name_maps_to_mist_identity(self, input_name, expected_canonical):
