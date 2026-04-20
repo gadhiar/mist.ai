@@ -6,6 +6,7 @@ ToolCall captures structured tool invocations returned by the model.
 
 import json
 from dataclasses import dataclass
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -41,7 +42,7 @@ class UsageMetadata(BaseModel):
 class LLMRequest(BaseModel):
     """Parameters for an LLM generation call."""
 
-    messages: list[dict[str, str]]
+    messages: list[dict[str, Any]]
     tools: list[dict] | None = None
     temperature: float = 0.7
     max_tokens: int = 400
