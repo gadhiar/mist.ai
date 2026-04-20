@@ -59,6 +59,33 @@ class TestRelationshipUpsert:
 
 class TestProvenance:
     @pytest.mark.asyncio
+    async def test_new_entity_gets_provenance_extraction(self):
+        """Bug A: new entities from extraction must have provenance='extraction'."""
+        from backend.knowledge.curation.confidence import ConfidenceManager
+        from backend.knowledge.curation.graph_writer import CurationGraphWriter
+
+        conn = FakeNeo4jConnection()
+        executor = FakeGraphExecutor(connection=conn)
+        writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
+
+        entities = [make_entity_dict(entity_id="rust", display_name="Rust")]
+        await writer.write(
+            entities=entities,
+            relationships=[],
+            merge_actions=[],
+            supersession_actions=[],
+            event_id="evt-001",
+            session_id="sess-001",
+        )
+
+        # conn.writes is list[tuple[str, dict | None]]; index 0 is the Cypher string.
+        entity_writes = [q for q, _ in conn.writes if "MERGE (e:__Entity__" in q]
+        assert len(entity_writes) == 1, f"Expected 1 entity MERGE, got {len(entity_writes)}"
+        assert (
+            "e.provenance = 'extraction'" in entity_writes[0]
+        ), f"Expected provenance in ON CREATE SET clause, got:\n{entity_writes[0]}"
+
+    @pytest.mark.asyncio
     async def test_creates_conversation_context(self):
         from backend.knowledge.curation.confidence import ConfidenceManager
         from backend.knowledge.curation.graph_writer import CurationGraphWriter
