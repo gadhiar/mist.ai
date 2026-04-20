@@ -54,24 +54,54 @@ class TestGraphHopEntityFilter:
         assert not overlap, f"Provenance edge types found in _USER_FACING_REL_TYPES: {overlap}"
 
     def test_user_facing_rel_types_contains_required_types(self) -> None:
-        """Core user-facing relationship types must be present."""
+        """Core user-facing relationship types must be present.
+
+        Mirrors the canonical set defined in
+        backend/knowledge/ontologies/v1_0_0.py minus the provenance edges
+        and SUPERSEDES (out-of-date filter, not retrieval input).
+        """
         required = {
+            # MIST self-model edges
+            "HAS_TRAIT",
+            "HAS_CAPABILITY",
+            "HAS_PREFERENCE",
+            "IS_UNCERTAIN_ABOUT",
+            "ADAPTED_FOR",
+            "LEARNED_SELF",
+            # User profile + activity
             "USES",
             "LEARNING",
             "WORKS_ON",
             "WORKS_AT",
+            "WORKS_WITH",
             "KNOWS",
+            "KNOWS_PERSON",
+            "MEMBER_OF",
             "INTERESTED_IN",
+            "HAS_GOAL",
+            "PREFERS",
+            "DISLIKES",
+            "EXPERT_IN",
+            "STRUGGLES_WITH",
+            "DECIDED",
+            "EXPERIENCED",
+            # Structural / ontological
             "IS_A",
             "PART_OF",
-            "DEPENDS_ON",
             "RELATED_TO",
-            "HAS_TRAIT",
-            "HAS_CAPABILITY",
-            "HAS_PREFERENCE",
+            "DEPENDS_ON",
+            "USED_FOR",
         }
         missing = required - set(_USER_FACING_REL_TYPES)
         assert not missing, f"Missing required types in _USER_FACING_REL_TYPES: {missing}"
+
+    def test_user_facing_rel_types_excludes_supersedes(self) -> None:
+        """SUPERSEDES marks superseded knowledge; must not surface via expansion."""
+        assert "SUPERSEDES" not in _USER_FACING_REL_TYPES, (
+            "SUPERSEDES is a curation/conflict-resolution edge marking out-of-date "
+            "knowledge; including it in the traversal allowlist would mislead "
+            "retrieval. Out-of-date facts should be filtered upstream by status."
+        )
 
     # ---- get_entity_neighborhood (multi-hop expansion) --------------------------------
 

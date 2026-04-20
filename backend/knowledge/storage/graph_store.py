@@ -14,23 +14,44 @@ from backend.interfaces import EmbeddingProvider, GraphConnection
 logger = logging.getLogger(__name__)
 
 # ADR-009 v1.1: user-facing relationship types allowed during graph-hop expansion.
+# Mirrors the full user-facing edge set in backend/knowledge/ontologies/v1_0_0.py.
 # Provenance edge types (DERIVED_FROM, EXTRACTED_FROM, LEARNED_FROM, ABOUT,
 # SOURCED_FROM, REFERENCES) are intentionally excluded to preserve the
 # :__Entity__ vs :__Provenance__ separation at hop 2+.
+# SUPERSEDES is also excluded — it marks knowledge as out-of-date; surfacing
+# superseded relationships via retrieval would mislead. Out-of-date facts
+# should be filtered upstream by status, not traversed.
 _USER_FACING_REL_TYPES: list[str] = [
+    # MIST self-model edges (MistIdentity -> trait/cap/pref/uncertainty)
+    "HAS_TRAIT",
+    "HAS_CAPABILITY",
+    "HAS_PREFERENCE",
+    "IS_UNCERTAIN_ABOUT",
+    "ADAPTED_FOR",
+    "LEARNED_SELF",
+    # User profile + activity edges
     "USES",
     "LEARNING",
     "WORKS_ON",
     "WORKS_AT",
+    "WORKS_WITH",
     "KNOWS",
+    "KNOWS_PERSON",
+    "MEMBER_OF",
     "INTERESTED_IN",
+    "HAS_GOAL",
+    "PREFERS",
+    "DISLIKES",
+    "EXPERT_IN",
+    "STRUGGLES_WITH",
+    "DECIDED",
+    "EXPERIENCED",
+    # Structural / ontological edges between entities
     "IS_A",
     "PART_OF",
-    "DEPENDS_ON",
     "RELATED_TO",
-    "HAS_TRAIT",
-    "HAS_CAPABILITY",
-    "HAS_PREFERENCE",
+    "DEPENDS_ON",
+    "USED_FOR",
 ]
 
 
