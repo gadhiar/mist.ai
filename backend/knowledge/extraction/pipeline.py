@@ -486,7 +486,14 @@ class ExtractionPipeline:
         # Record timestamp for rate limiter (extraction proceeding)
         self._extraction_timestamps.append(time.monotonic())
 
-        # Stage 2: Extraction (LLM call)
+        # Stage 2: Extraction (LLM call).
+        # Note on Bug K two-layer defense: pre_processed.metadata may carry an
+        # "injection_warning" flag from the preprocessor (backend/knowledge/extraction/
+        # preprocessor.py _detect_injection). We intentionally do NOT gate here on that
+        # flag — enforcement lives in EXTRACTION_SYSTEM_PROMPT Rule 10, which instructs
+        # the LLM to return empty extraction on directive utterances. The metadata is a
+        # reserved signal for a future drop-on-flag policy; flipping to hard-drop here
+        # would require re-tuning the prompt rule and re-running Phase A gauntlet.
         stage_start = time.perf_counter()
         extraction = await self._extractor.extract(pre_processed)
         stage_2_ms = (time.perf_counter() - stage_start) * 1000
