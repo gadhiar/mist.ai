@@ -323,10 +323,10 @@ def test_load_seed_yaml_real_file(tmp_path):
     assert counts["mist_identity"] == 1
     assert counts["traits"] == 9
     assert counts["capabilities"] == 5
-    assert counts["preferences"] == 4
+    assert counts["preferences"] == 5
     assert counts["user"] == 1
     assert counts["entities"] == 11
-    assert counts["identity_relationships"] == 9 + 5 + 4  # targets expanded
+    assert counts["identity_relationships"] == 9 + 5 + 5  # targets expanded
     assert counts["anchor_relationships"] == 11
     assert counts.get("schema_objects", 0) >= 2  # constraint + type index minimum
 
