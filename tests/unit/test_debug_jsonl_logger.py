@@ -347,3 +347,312 @@ class TestConcurrency:
         for line in lines:
             assert line["phase"] == "turn"
             assert line["event_id"].startswith("t")
+
+
+# ---------------------------------------------------------------------------
+# Cluster 5 — phase gates
+# ---------------------------------------------------------------------------
+
+
+class TestPhaseGates:
+    """The three Cluster 5 record types each require MIST_DEBUG_JSONL to be set
+    AND their own boolean env var to be truthy. Neither alone is sufficient.
+    """
+
+    def test_llm_call_gate_requires_base_env_and_phase_env(self, tmp_path, monkeypatch):
+        path = tmp_path / "debug.jsonl"
+        logger = DebugJSONLLogger(path)
+        # Base enabled (path set), but phase flag not set -> gate closed.
+        monkeypatch.delenv("MIST_DEBUG_LLM_JSONL", raising=False)
+        assert logger.llm_call_enabled is False
+
+        monkeypatch.setenv("MIST_DEBUG_LLM_JSONL", "1")
+        assert logger.llm_call_enabled is True
+
+    def test_llm_call_gate_closed_when_base_disabled(self, monkeypatch):
+        # No output path -> base disabled -> phase gate is also closed.
+        monkeypatch.setenv("MIST_DEBUG_LLM_JSONL", "1")
+        logger = DebugJSONLLogger(None)
+        assert logger.llm_call_enabled is False
+
+    def test_retrieval_candidates_gate_independent_of_llm_call_gate(self, tmp_path, monkeypatch):
+        path = tmp_path / "debug.jsonl"
+        logger = DebugJSONLLogger(path)
+        monkeypatch.setenv("MIST_DEBUG_RETRIEVAL_JSONL", "1")
+        monkeypatch.delenv("MIST_DEBUG_LLM_JSONL", raising=False)
+
+        assert logger.retrieval_candidates_enabled is True
+        assert logger.llm_call_enabled is False
+
+    def test_llm_request_dump_gate_accepts_truthy_spellings(self, tmp_path, monkeypatch):
+        path = tmp_path / "debug.jsonl"
+        logger = DebugJSONLLogger(path)
+        for value in ("1", "true", "yes", "on", "TRUE", "On"):
+            monkeypatch.setenv("MIST_DEBUG_LLM_REQUESTS", value)
+            assert logger.llm_request_dump_enabled is True, f"value={value!r}"
+
+        for value in ("0", "false", "no", "off", ""):
+            monkeypatch.setenv("MIST_DEBUG_LLM_REQUESTS", value)
+            assert logger.llm_request_dump_enabled is False, f"value={value!r}"
+
+
+# ---------------------------------------------------------------------------
+# Cluster 5 — phase: "llm_call" record
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FakeLLMRequest:
+    messages: list = None
+    tools: list = None
+    temperature: float = 0.7
+    max_tokens: int = 400
+    top_p: float = 0.9
+    json_mode: bool = False
+
+    def __post_init__(self):
+        if self.messages is None:
+            self.messages = [{"role": "user", "content": "hi"}]
+
+
+class TestLLMCallRecord:
+    def test_record_llm_call_noop_when_gate_closed(self, tmp_path, monkeypatch):
+        path = tmp_path / "debug.jsonl"
+        monkeypatch.delenv("MIST_DEBUG_LLM_JSONL", raising=False)
+        logger = DebugJSONLLogger(path)
+
+        logger.record_llm_call(
+            request=FakeLLMRequest(),
+            response=FakeLLMResponse(),
+            latency_ms=12.3,
+        )
+        # File may exist (path.parent.mkdir) but must contain no JSONL lines.
+        if path.exists():
+            assert _read_jsonl(path) == []
+
+    def test_record_llm_call_emits_one_line_when_gate_open(self, tmp_path, monkeypatch):
+        path = tmp_path / "debug.jsonl"
+        monkeypatch.setenv("MIST_DEBUG_LLM_JSONL", "1")
+        logger = DebugJSONLLogger(path)
+
+        logger.record_llm_call(
+            request=FakeLLMRequest(
+                messages=[{"role": "user", "content": "hello"}],
+                temperature=0.5,
+                max_tokens=256,
+            ),
+            response=FakeLLMResponse(content="hi there"),
+            latency_ms=42.1,
+            event_id="evt-1",
+            session_id="sess-1",
+            call_site="chat.initial",
+            pass_num=1,
+        )
+
+        lines = _read_jsonl(path)
+        assert len(lines) == 1
+        line = lines[0]
+        assert line["phase"] == "llm_call"
+        assert line["event_id"] == "evt-1"
+        assert line["session_id"] == "sess-1"
+        assert line["call_site"] == "chat.initial"
+        assert line["pass_num"] == 1
+        assert line["latency_ms"] == 42.1
+        assert line["request"]["temperature"] == 0.5
+        assert line["request"]["max_tokens"] == 256
+        assert line["request"]["messages"][0]["content"] == "hello"
+        assert line["response"]["content"] == "hi there"
+        assert line["response"]["partial"] is False
+
+    def test_record_llm_call_captures_full_content_not_length(self, tmp_path, monkeypatch):
+        path = tmp_path / "debug.jsonl"
+        monkeypatch.setenv("MIST_DEBUG_LLM_JSONL", "1")
+        logger = DebugJSONLLogger(path)
+        long_content = "A" * 5000
+
+        logger.record_llm_call(
+            request=FakeLLMRequest(),
+            response=FakeLLMResponse(content=long_content),
+            latency_ms=1.0,
+        )
+
+        line = _read_jsonl(path)[0]
+        assert line["response"]["content"] == long_content
+
+    def test_record_llm_call_serializes_tool_calls_and_usage(self, tmp_path, monkeypatch):
+        path = tmp_path / "debug.jsonl"
+        monkeypatch.setenv("MIST_DEBUG_LLM_JSONL", "1")
+        logger = DebugJSONLLogger(path)
+
+        response = FakeLLMResponse(
+            content="calling tool",
+            tool_calls=[FakeToolCall(name="search_kg", id="tc-1")],
+            usage=FakeUsage(input_tokens=250, output_tokens=40),
+        )
+        logger.record_llm_call(
+            request=FakeLLMRequest(),
+            response=response,
+            latency_ms=99.0,
+        )
+
+        line = _read_jsonl(path)[0]
+        assert len(line["response"]["tool_calls"]) == 1
+        tc = line["response"]["tool_calls"][0]
+        assert tc["name"] == "search_kg"
+        assert tc["id"] == "tc-1"
+        assert tc["arguments"] == {"query": "test"}
+
+    def test_record_llm_call_optional_fields_default_to_none(self, tmp_path, monkeypatch):
+        path = tmp_path / "debug.jsonl"
+        monkeypatch.setenv("MIST_DEBUG_LLM_JSONL", "1")
+        logger = DebugJSONLLogger(path)
+
+        logger.record_llm_call(
+            request=FakeLLMRequest(),
+            response=FakeLLMResponse(),
+            latency_ms=1.0,
+        )
+        line = _read_jsonl(path)[0]
+        assert line["event_id"] is None
+        assert line["session_id"] is None
+        assert line["call_site"] is None
+        assert line["pass_num"] is None
+
+
+# ---------------------------------------------------------------------------
+# Cluster 5 — phase: "retrieval_candidates" record
+# ---------------------------------------------------------------------------
+
+
+class TestRetrievalCandidatesRecord:
+    def test_noop_when_gate_closed(self, tmp_path, monkeypatch):
+        path = tmp_path / "debug.jsonl"
+        monkeypatch.delenv("MIST_DEBUG_RETRIEVAL_JSONL", raising=False)
+        logger = DebugJSONLLogger(path)
+
+        logger.record_retrieval_candidates(
+            query="anything",
+            intent="hybrid",
+            graph_candidates=[{"entity_id": "x", "similarity": 0.9}],
+        )
+        if path.exists():
+            assert _read_jsonl(path) == []
+
+    def test_emits_full_pools_with_counts(self, tmp_path, monkeypatch):
+        path = tmp_path / "debug.jsonl"
+        monkeypatch.setenv("MIST_DEBUG_RETRIEVAL_JSONL", "1")
+        logger = DebugJSONLLogger(path)
+
+        graph = [
+            {"entity_id": "python", "similarity": 0.92},
+            {"entity_id": "rust", "similarity": 0.71},
+        ]
+        vector = [
+            {"chunk_id": "c1", "source_id": "doc-a", "similarity": 0.88},
+        ]
+        logger.record_retrieval_candidates(
+            query="what do I know about python",
+            intent="hybrid",
+            graph_candidates=graph,
+            vector_candidates=vector,
+            merged_count=3,
+            final_count=3,
+            event_id="evt-2",
+            session_id="sess-2",
+        )
+
+        line = _read_jsonl(path)[0]
+        assert line["phase"] == "retrieval_candidates"
+        assert line["query"] == "what do I know about python"
+        assert line["intent"] == "hybrid"
+        assert line["graph_candidate_count"] == 2
+        assert line["vector_candidate_count"] == 1
+        assert line["merged_count"] == 3
+        assert line["final_count"] == 3
+        assert line["graph_candidates"][0]["entity_id"] == "python"
+        assert line["vector_candidates"][0]["chunk_id"] == "c1"
+        assert line["event_id"] == "evt-2"
+        assert line["session_id"] == "sess-2"
+
+    def test_empty_pools_still_emit_line(self, tmp_path, monkeypatch):
+        path = tmp_path / "debug.jsonl"
+        monkeypatch.setenv("MIST_DEBUG_RETRIEVAL_JSONL", "1")
+        logger = DebugJSONLLogger(path)
+
+        logger.record_retrieval_candidates(
+            query="rare query",
+            intent="relational",
+            graph_candidates=None,
+            vector_candidates=None,
+            final_count=0,
+        )
+        line = _read_jsonl(path)[0]
+        assert line["graph_candidates"] == []
+        assert line["vector_candidates"] == []
+        assert line["graph_candidate_count"] == 0
+        assert line["vector_candidate_count"] == 0
+        assert line["final_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Cluster 5 — phase: "llm_request_raw" record
+# ---------------------------------------------------------------------------
+
+
+class TestLLMRequestDumpRecord:
+    def test_noop_when_gate_closed(self, tmp_path, monkeypatch):
+        path = tmp_path / "debug.jsonl"
+        monkeypatch.delenv("MIST_DEBUG_LLM_REQUESTS", raising=False)
+        logger = DebugJSONLLogger(path)
+
+        logger.record_llm_request_dump(
+            request_dict={"messages": []},
+            error_message="nope",
+        )
+        if path.exists():
+            assert _read_jsonl(path) == []
+
+    def test_emits_full_kwargs_and_error(self, tmp_path, monkeypatch):
+        path = tmp_path / "debug.jsonl"
+        monkeypatch.setenv("MIST_DEBUG_LLM_REQUESTS", "1")
+        logger = DebugJSONLLogger(path)
+
+        request_dict = {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": None,
+            "temperature": 0.7,
+            "max_tokens": 400,
+        }
+        logger.record_llm_request_dump(
+            request_dict=request_dict,
+            error_message="ValidationError: tool_calls wrong shape",
+            call_site="chat.initial",
+            session_id="sess-3",
+        )
+
+        line = _read_jsonl(path)[0]
+        assert line["phase"] == "llm_request_raw"
+        assert line["call_site"] == "chat.initial"
+        assert line["session_id"] == "sess-3"
+        assert line["error"].startswith("ValidationError")
+        assert line["request_dict"]["temperature"] == 0.7
+        assert line["request_dict"]["messages"][0]["content"] == "hi"
+
+    def test_non_serializable_values_are_stringified(self, tmp_path, monkeypatch):
+        """The underlying emit uses json.dumps(default=str); non-trivial objects
+        should stringify rather than raising, so a Bug C-class dump is never lost.
+        """
+        path = tmp_path / "debug.jsonl"
+        monkeypatch.setenv("MIST_DEBUG_LLM_REQUESTS", "1")
+        logger = DebugJSONLLogger(path)
+
+        class Opaque:
+            def __repr__(self) -> str:
+                return "<Opaque>"
+
+        logger.record_llm_request_dump(
+            request_dict={"weird": Opaque(), "messages": []},
+            error_message="boom",
+        )
+        line = _read_jsonl(path)[0]
+        assert "<Opaque>" in line["request_dict"]["weird"]
