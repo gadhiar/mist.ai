@@ -1,8 +1,8 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-04-21
+**Last Updated:** 2026-04-21 (end of day)
 **Branch:** main (synced with origin)
-**Status:** MVP Knowledge Integration — 5 of 8 architectural clusters complete (2, 3, 4, 5, 6). Cluster 1 next; Cluster 8 unblocked after Cluster 1.
+**Status:** MVP Knowledge Integration — 6 of 8 architectural clusters complete (1, 2, 3, 4, 5, 6). Cluster 8 unblocked; Cluster 7 folds into Cluster 8 at phase 10.
 
 ---
 
@@ -15,14 +15,15 @@
 - **LLM ctx_size:** 32K configured on llama-server; effective attention window ~8K (Gemma's trained context). Cluster 6's `context_budget.context_window=8192` default respects this.
 - **StreamingLLMProvider abstraction:** `LlamaServerProvider` (primary), `OllamaProvider` (fallback), optionally wrapped by `InstrumentedStreamingLLMProvider` (Cluster 5) for JSONL observability.
 - **ConversationHandler:** Cluster 3 persona injection + Cluster 6 `ContextBudgetPlanner` + `_build_request` Pydantic-dump helper (Cluster 5). `conversation_max_tokens=1024` (up from 400; Cluster 6 fix for Bug E).
+- **ExtractionPipeline:** 6 stages + Stage 1.5 `SubjectScopeClassifier` (Cluster 1) — classifies each utterance as `user-scope | system-scope | third-party | unknown` between pre-processing and ontology extraction. Metadata threaded into `EXTRACTION_USER_TEMPLATE` as a `subject_scope` hint.
 - **Voice Pipeline:** VAD -> Whisper -> Gemma 4 E4B -> Chatterbox Turbo TTS with streaming parallelism. ~4-5s TTFA.
 - **Audio Transport:** Binary WebSocket frames (MIST protocol: 16-byte header + PCM16), RMS normalization (-20 dBFS), interrupt fade-out.
 - **Log Streaming:** WebSocketLogHandler with per-logger gating, token bucket rate limiter, request ID propagation.
 - **Persistent Logging:** `./logs/mist-backend.log` at DEBUG level (survives container removal).
 - **Debug JSONL Observability:** `DebugJSONLLogger` with 5 record phases (`turn`, `extraction`, `llm_call`, `retrieval_candidates`, `llm_request_raw`). Each gated by its own env var. See Cluster 5 artifacts below.
-- **Knowledge Graph:** Extraction + curation pipeline + hybrid retrieval (graph + vector + RRF merge). ADR-009 provenance separation structurally enforced (Cluster 2). MIST identity retrieval injects persona (Cluster 3).
+- **Knowledge Graph:** Extraction + curation pipeline + hybrid retrieval (graph + vector + RRF merge). ADR-009 provenance separation structurally enforced (Cluster 2). MIST identity retrieval injects persona (Cluster 3). Ontology v1.0.0 carries 13 extractable entity types (12 external + MistIdentity) and 25 extractable relationship types (21 original + 4 MIST-scope: IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT, MIST_HAS_PREFERENCE) — Cluster 1.
 - **Knowledge Seed:** 32-entity baseline (`mist_admin seed` from `scripts/seed_data.yaml`): 1 MistIdentity + 9 MistTraits + 5 MistCapabilities + 5 MistPreferences + 11 user/technology entities + 1 User + 19 identity relationships + 11 anchor relationships + 32 embeddings.
-- **Tests:** **1022 unit tests + 3 xfailed.** Run inside container: `docker compose exec mist-backend python -m pytest tests/unit/`.
+- **Tests:** **1066 unit tests + 3 xfailed.** Run inside container: `docker compose exec mist-backend python -m pytest tests/unit/`.
 
 ### Frontend (Flutter)
 - **Status:** IN DEVELOPMENT (unchanged since 2026-04-08). Cluster 1/8 work is backend-focused; frontend touches parked in `mist-ai-frontend-audit-remediation` (status: parked).
@@ -43,22 +44,24 @@
 
 | Cluster | Scope | Status | Key commit range | Gauntlet artifact |
 |---|---|---|---|---|
-| 1 | Ontology expansion + subject-scope classifier | PENDING (next) | — | — |
+| 1 | Ontology expansion + subject-scope classifier | COMPLETE 2026-04-21 | 4dc7204 -> 3b10a24 | post-cluster-1-gauntlet-report-2026-04-21.md |
 | 2 | Graph provenance separation (ADR-009) | COMPLETE 2026-04-20 | c505c7a -> 8a31fcc | post-cluster-2-gauntlet-report-2026-04-20.md |
 | 3 | Identity layer + persona injection + AI-slop filter + dual temperature | COMPLETE 2026-04-21 | f306788 -> 6124e43 | post-cluster-3-gauntlet-report-2026-04-21.md |
 | 4 | Deterministic rails (Bugs A, C, G, K) | COMPLETE 2026-04-20 | 4eed4f2 -> 68ffc81 | post-cluster-4-gauntlet-report-2026-04-20.md |
 | 5 | Observability (llm_call + retrieval_candidates + llm_request_raw JSONL phases) | COMPLETE 2026-04-21 | 27af364 -> 3c8f0b2 | v6-cluster-5-diagnostic-report-2026-04-21.md |
 | 6 | Context budget (ContextBudgetPlanner) + max_tokens=1024 fix | COMPLETE 2026-04-21 | c4c4d71 -> c800e35 | post-cluster-6-gauntlet-report-2026-04-21.md |
 | 7 | Existing-data migration | Folds into Cluster 8 | — | — |
-| 8 | Vault-native memory (ADR-010 implementation, 12-phase, 4-6wk) | PENDING (after Cluster 1) | — | — |
+| 8 | Vault-native memory (ADR-010 implementation, 12-phase, 4-6wk) | PENDING (UNBLOCKED) | — | — |
 
 **Acceptance status** toward Phase 4 earned close:
-- Relationship correctness ≥ 80% — PENDING (baseline 44%; Cluster 1 target)
+- Relationship correctness ≥ 80% — **CLEARED** post-Cluster-1 on targeted probe (11/12 = 92% on v1-mist-scope-inputs.jsonl). V6 spontaneously produces 4 `mist-identity USES X` edges that would have been validator-dropped pre-Cluster-1.
 - Post-session retrieval semantic content ≥ 80% — effectively CLEARED on canonical probe post-Cluster-2 (9/10 user-facing facts)
-- Emoji violations = 0 — CLEARED post-Cluster-3 (0/46 V4+V5+V6 turns)
-- Empty responses < 10% — **CLEARED** post-Cluster-6 (0/30 V6)
-- LLMRequest validation errors = 0 — CLEARED post-Cluster-4 (held through Cluster 6)
-- Unit tests 900+/900+ green — CLEARED (1022 + 3 xfailed)
+- Emoji violations = 0 — CLEARED post-Cluster-3 (0/46 V4+V5+V6 turns); held post-Cluster-1 (0/47)
+- Empty responses < 10% — **CLEARED** post-Cluster-6 (0/30 V6); held post-Cluster-1 (0/30)
+- LLMRequest validation errors = 0 — CLEARED post-Cluster-4 (held through Clusters 5, 6, 1)
+- Unit tests 900+/900+ green — CLEARED (1066 + 3 xfailed)
+
+All five Phase 4 gates now clear. Only Cluster 8 (ADR-010 vault implementation) remains before earned close.
 
 **Bug status (P1/P2 from 2026-04-17 gauntlet):**
 - A (83% NULL provenance) — CLEARED (Cluster 4)
@@ -66,9 +69,9 @@
 - C (LLMRequest tool_calls schema) — CLEARED (Cluster 4)
 - E (empty LLM responses) — CLEARED (Cluster 6; root cause: max_tokens=400 truncating tool-call JSON)
 - G (reserved-namespace guard) — CLEARED (Cluster 4)
-- I (LEARNING->USES slippage) — PENDING (Cluster 1)
-- J (MIST-tooling attributed to Raj USES) — PENDING (Cluster 1)
-- K (prompt-injection written as fact) — CLEARED 2/3 layers (Cluster 4); remaining (Cluster 1)
+- I (LEARNING->USES slippage) — CLEARED (Cluster 1: scope classifier + prompt rebalance)
+- J (MIST-tooling attributed to Raj USES) — CLEARED (Cluster 1: validator accepts MistIdentity source on USES/DEPENDS_ON/WORKS_WITH; normalizer forces MistIdentity type on reserved names)
+- K (prompt-injection written as fact) — CLEARED (Cluster 4 pre-filter + prompt tightening held through Cluster 1; declarative-framing residual noted as P1)
 - N (retrieval returns only provenance plumbing) — STRUCTURALLY RESOLVED (Cluster 2)
 
 ---
@@ -76,11 +79,11 @@
 ## Active Work
 
 ### Current Focus
-1. **Cluster 1 (ontology + subject-scope classifier)** — extraction correctness 44% -> 80% gate. Deliverables: extend `RELATIONSHIP_CONSTRAINTS` with Organization/System-scope predicates; add `IMPLEMENTED_WITH` + `MIST_HAS_CAPABILITY`/`TRAIT`/`PREFERENCE` predicates; subject-scope classifier as Stage 1.5 pre-extraction; rewrite `EXTRACTION_SYSTEM_PROMPT` to remove "User is almost always the SUBJECT" bias. Parallelizable with Cluster 8.
-2. **Cluster 8 (ADR-010 vault implementation)** — 12-phase roadmap, 4-6 weeks. All hard gates cleared. Move ADR-010 from `proposed` to `accepted` when implementation begins.
-3. **Phase 4 gauntlet re-run** after Cluster 1 lands. Path to earned close.
+1. **Cluster 8 (ADR-010 vault implementation)** — 12-phase roadmap, 4-6 weeks. Sole remaining workstream deliverable before Phase 4 earned close. Move ADR-010 from `proposed` to `accepted` when implementation begins.
+2. **Phase 4 earned-close** via `/vault-end-session` + workstream completion once Cluster 8 lands.
 
-### Recently Completed (2026-04-21)
+### Recently Completed (2026-04-21, end of day)
+- **Cluster 1 (Ontology + subject-scope classifier):** 8 commits (`4dc7204` -> `3b10a24`) on main, pushed to origin. Extended validator `RELATIONSHIP_CONSTRAINTS` to accept Organization + MistIdentity as source for USES/DEPENDS_ON/WORKS_WITH. Added 4 new MIST-scope predicates: `IMPLEMENTED_WITH`, `MIST_HAS_CAPABILITY`, `MIST_HAS_TRAIT`, `MIST_HAS_PREFERENCE`. Added `MistIdentity` as extractable entity type (13 total). New `SubjectScopeClassifier` module running as Stage 1.5 AFTER significance + dedup gates, writing `subject_scope` metadata to PreProcessedInput, threaded into extraction user template. Rewrote `EXTRACTION_SYSTEM_PROMPT` removing user-centric bias; 3 user / 3 system / 1 third-party / 1 empty example balance. Normalizer `RESERVED_NAMES` now remaps both id AND entity_type to MistIdentity. Cluster 3 integration: `get_mist_identity_context` UNIONs HAS_* (seed) and MIST_HAS_* (extracted) into one merged set. Cluster 2 integration: `_USER_FACING_REL_TYPES` extended with new edges so multi-hop traversal expands through them. Bug J closure evidence in V6: `mist-identity -[USES]-> lancedb/neo4j/llamacpp/sentence-transformers` landed (all dropped pre-Cluster-1). V1 probe = 11/12 (92%). V6 = 0/30 empty, 0 emoji, 0 Bug C. +44 net new tests (1022 -> 1066).
 - **Cluster 6 (Context budget + max_tokens fix):** V6 empty-response rate 53% -> 0%. `LLMConfig.conversation_max_tokens=1024` (up from 400) at all three ConversationHandler invoke sites fixes the "GHOST turn" failure mode (tool-call JSON truncation). `ContextBudgetPlanner` with TokenCounter + HistoryStrategy protocols + SlidingWindowStrategy default provides defense-in-depth. Commits c4c4d71, d354f30, 997517f, c800e35. +32 net new tests.
 - **Cluster 5 (Observability):** Three JSONL record phases added to `DebugJSONLLogger` (`llm_call`, `retrieval_candidates`, `llm_request_raw`) each with its own env gate. `InstrumentedStreamingLLMProvider` wraps any concrete provider transparently; `llm_call_context` ContextVar threads caller metadata (`session_id`/`event_id`/`call_site`/`pass_num`). All factories wired. Commits 27af364, f5d0ec4, ab85115, e7ca7e2 + polish 3c8f0b2. +44 net new tests.
 - **Cluster 3 (Identity + AI-slop filter + dual temperature):** 6 deliverables — config split (`conversation_temperature=0.7`), slop detector library, pref-no-ai-slop seed, QueryClassifier identity intent at priority 0, `retrieve_mist_context()` + `MistContext` renderer with HARD RULES framing, response post-filter with regen + strip_fixable fallback. Bug B closed: 0 emoji across 46 V4+V5+V6 turns; consulting-voice markdown drift -56%. Commits f306788 -> 6124e43. +90 net new tests.
