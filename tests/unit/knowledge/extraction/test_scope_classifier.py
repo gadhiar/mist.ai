@@ -200,6 +200,92 @@ class TestFailureHandling:
         assert result.reasoning == "classification_failed"
 
     @pytest.mark.asyncio
+    async def test_returns_unknown_on_known_llm_error_warns_without_traceback(self, caplog):
+        """P0 #4: a known LLM error path logs a tight warning (no traceback)."""
+        import logging
+
+        from backend.errors import LLMConnectionError
+
+        # Arrange
+        class ConnErrLLM(StreamingLLMProvider):
+            model = "conn-err"
+
+            async def generate(self, request, *, stream: bool = False):  # pragma: no cover
+                raise LLMConnectionError("backend unreachable")
+                yield  # noqa: unreachable
+
+            def generate_sync(self, request, *, stream: bool = False):  # pragma: no cover
+                raise LLMConnectionError("backend unreachable")
+                yield  # noqa: unreachable
+
+            async def invoke(self, request):
+                raise LLMConnectionError("backend unreachable")
+
+        classifier = SubjectScopeClassifier(llm=ConnErrLLM())
+        pre = build_pre_processed("I use Rust.")
+
+        # Act
+        with caplog.at_level(
+            logging.WARNING, logger="backend.knowledge.extraction.scope_classifier"
+        ):
+            result = await classifier.classify(pre)
+
+        # Assert -- unknown result, single WARNING record, no exception traceback attached
+        assert result.scope == "unknown"
+        assert result.reasoning == "classification_failed"
+        warning_records = [
+            r
+            for r in caplog.records
+            if r.name == "backend.knowledge.extraction.scope_classifier"
+            and r.levelno == logging.WARNING
+        ]
+        assert len(warning_records) == 1
+        # Known-path logs with logger.warning -- exc_info is NOT attached.
+        assert warning_records[0].exc_info is None
+        assert "LLMConnectionError" in warning_records[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_returns_unknown_on_unknown_exception_logs_with_traceback(self, caplog):
+        """P0 #4: an unexpected exception path hits the terminal catch and logs with exc_info."""
+        import logging
+
+        # Arrange -- RuntimeError is outside the known-exception tuple.
+        class RaisingLLM(StreamingLLMProvider):
+            model = "raiser"
+
+            async def generate(self, request, *, stream: bool = False):  # pragma: no cover
+                raise RuntimeError("unexpected failure")
+                yield  # noqa: unreachable
+
+            def generate_sync(self, request, *, stream: bool = False):  # pragma: no cover
+                raise RuntimeError("unexpected failure")
+                yield  # noqa: unreachable
+
+            async def invoke(self, request):
+                raise RuntimeError("unexpected failure")
+
+        classifier = SubjectScopeClassifier(llm=RaisingLLM())
+        pre = build_pre_processed("Ambiguous.")
+
+        # Act
+        with caplog.at_level(logging.ERROR, logger="backend.knowledge.extraction.scope_classifier"):
+            result = await classifier.classify(pre)
+
+        # Assert -- unknown result, single ERROR record with exc_info captured.
+        assert result.scope == "unknown"
+        assert result.reasoning == "classification_failed"
+        error_records = [
+            r
+            for r in caplog.records
+            if r.name == "backend.knowledge.extraction.scope_classifier"
+            and r.levelno == logging.ERROR
+        ]
+        assert len(error_records) == 1
+        # logger.exception (equivalent to logger.error with exc_info=True) attaches exc_info.
+        assert error_records[0].exc_info is not None
+        assert error_records[0].exc_info[0] is RuntimeError
+
+    @pytest.mark.asyncio
     async def test_returns_unknown_on_timeout(self):
         """An invoke that exceeds the configured timeout must yield unknown."""
 

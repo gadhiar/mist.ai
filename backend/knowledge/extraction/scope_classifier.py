@@ -29,6 +29,7 @@ import time
 from dataclasses import dataclass
 from typing import Literal
 
+from backend.errors import LLMConnectionError, LLMResponseError
 from backend.interfaces import LLMProvider
 from backend.knowledge.config import ScopeClassifierConfig
 from backend.knowledge.extraction.preprocessor import PreProcessedInput
@@ -157,9 +158,26 @@ class SubjectScopeClassifier:
                 reasoning="classification_failed",
                 elapsed_ms=elapsed,
             )
-        except Exception as exc:
+        except (LLMConnectionError, LLMResponseError, json.JSONDecodeError, ValueError) as exc:
+            # Known failure modes -- tight warning log without traceback noise.
             elapsed = (time.perf_counter() - start) * 1000
-            logger.warning("Scope classifier LLM call failed after %.1fms: %s", elapsed, exc)
+            logger.warning(
+                "Scope classifier LLM call failed (%s) after %.1fms: %s",
+                type(exc).__name__,
+                elapsed,
+                exc,
+            )
+            return ScopeResult(
+                scope="unknown",
+                confidence=0.0,
+                reasoning="classification_failed",
+                elapsed_ms=elapsed,
+            )
+        except Exception:
+            # Last line of defense: preserve classifier's "never raise into pipeline"
+            # contract. Log with exc_info so the traceback is captured for triage.
+            elapsed = (time.perf_counter() - start) * 1000
+            logger.exception("Scope classifier raised unexpected exception after %.1fms", elapsed)
             return ScopeResult(
                 scope="unknown",
                 confidence=0.0,
