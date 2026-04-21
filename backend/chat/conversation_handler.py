@@ -386,7 +386,7 @@ class ConversationHandler:
             request = LLMRequest(
                 messages=messages,
                 tools=self._tool_schemas,
-                temperature=self.config.llm.temperature,
+                temperature=self.config.llm.conversation_temperature,
                 max_tokens=400,
             )
             _llm_start_1 = time.time()
@@ -465,7 +465,7 @@ class ConversationHandler:
                 logger.info("[TOOLS] Generating final response with tool results...")
                 final_request = LLMRequest(
                     messages=messages,
-                    temperature=self.config.llm.temperature,
+                    temperature=self.config.llm.conversation_temperature,
                     max_tokens=400,
                 )
                 _llm_start_2 = time.time()

@@ -375,3 +375,47 @@ class TestMistContextCaching:
         await conversation_handler._get_or_fetch_mist_context("sess-C")
 
         assert conversation_handler.retriever.retrieve_mist_context.call_count == 3
+
+
+class TestConversationTemperature:
+    """Cluster 3: ConversationHandler uses conversation_temperature, not extraction."""
+
+    @pytest.mark.asyncio
+    async def test_invoke_uses_conversation_temperature_default(self, conversation_handler):
+        """First-turn invoke must carry conversation_temperature (0.7), not extraction temp (0.0)."""
+        from backend.llm.models import LLMResponse
+
+        captured = []
+
+        async def capture(request):
+            captured.append(request)
+            return LLMResponse(content="plain response", tool_calls=None)
+
+        conversation_handler._provider.invoke = capture
+
+        await conversation_handler.handle_message(user_message="hello", session_id="temp-s1")
+
+        assert len(captured) >= 1, "invoke was not called"
+        assert (
+            captured[0].temperature == 0.7
+        ), f"Expected conversation_temperature 0.7, got {captured[0].temperature}"
+        # Guard: must not be the extraction default (0.0)
+        assert captured[0].temperature != 0.0
+
+    @pytest.mark.asyncio
+    async def test_invoke_honors_config_override(self, conversation_handler):
+        """Overriding config.llm.conversation_temperature flows through to invoke."""
+        from backend.llm.models import LLMResponse
+
+        conversation_handler.config.llm.conversation_temperature = 0.5
+
+        captured = []
+
+        async def capture(request):
+            captured.append(request)
+            return LLMResponse(content="plain response", tool_calls=None)
+
+        conversation_handler._provider.invoke = capture
+
+        await conversation_handler.handle_message(user_message="hello", session_id="temp-s2")
+        assert captured[0].temperature == 0.5
