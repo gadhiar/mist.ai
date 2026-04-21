@@ -67,6 +67,12 @@ class LLMConfig:
     base_url: str = "http://localhost:8080"  # llama-server default
     temperature: float = 0.0  # Deterministic for extraction
     conversation_temperature: float = 0.7  # Natural voice for conversation
+    # Cluster 6: max_tokens for conversation calls. Defaulted to 1024 (up from
+    # the historical 400) after the 2026-04-21 V6 diagnostic showed 15/30 V6
+    # turns were "GHOST" — completion_tokens=400 with empty content and no
+    # tool_calls, indicating truncated tool-call JSON cut off at max_tokens.
+    # 1024 gives tool-call emission room to complete.
+    conversation_max_tokens: int = 1024
     backend: str = "llamacpp"  # "llamacpp" or "ollama"
 
     @classmethod
@@ -79,6 +85,7 @@ class LLMConfig:
             base_url=os.getenv("LLM_SERVER_URL", default_url),
             temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
             conversation_temperature=float(os.getenv("LLM_CONVERSATION_TEMPERATURE", "0.7")),
+            conversation_max_tokens=int(os.getenv("LLM_CONVERSATION_MAX_TOKENS", "1024")),
             backend=backend,
         )
 
@@ -263,6 +270,45 @@ class QueryIntentConfig:
 
 
 @dataclass
+class ContextBudgetConfig:
+    """Cluster 6: budget-aware context assembly for ConversationHandler._build_messages.
+
+    The model's usable attention window is usually smaller than its configured
+    context window. Gemma 4 E4B at 32K ctx_size still degrades quality past
+    its trained context (~8K). This config caps the total prompt budget and
+    splits the remainder (after persona + tools + static) between retrieval
+    and history via weight-based allocation.
+
+    - `context_window` is the hard ceiling; output `max_tokens` is subtracted.
+    - `output_reserve_tokens` additionally reserves headroom for the completion.
+    - `safety_margin_tokens` is extra headroom for tokenizer inaccuracy.
+    - `retrieval_budget_ratio` allocates share of the remaining budget to
+      retrieval-context; history gets the rest.
+    - `history_strategy` names a strategy registered in
+      `backend.chat.context_budget` (defaults to sliding-window).
+    """
+
+    context_window: int = 8192  # Effective usable window for Gemma 4 E4B
+    output_reserve_tokens: int = 512  # Headroom for completion output
+    safety_margin_tokens: int = 256  # Absorbs tokenizer estimation error
+    retrieval_budget_ratio: float = 0.4  # 40% of flex budget to retrieval
+    history_strategy: str = "sliding_window"  # sliding_window | (future) summarized
+    enabled: bool = True  # Master switch; False keeps legacy behavior
+
+    @classmethod
+    def from_env(cls) -> "ContextBudgetConfig":
+        """Load context-budget configuration from environment variables."""
+        return cls(
+            context_window=int(os.getenv("MIST_CTX_BUDGET_WINDOW", "8192")),
+            output_reserve_tokens=int(os.getenv("MIST_CTX_BUDGET_OUTPUT_RESERVE", "512")),
+            safety_margin_tokens=int(os.getenv("MIST_CTX_BUDGET_SAFETY", "256")),
+            retrieval_budget_ratio=float(os.getenv("MIST_CTX_BUDGET_RETRIEVAL_RATIO", "0.4")),
+            history_strategy=os.getenv("MIST_CTX_BUDGET_HISTORY_STRATEGY", "sliding_window"),
+            enabled=os.getenv("MIST_CTX_BUDGET_ENABLED", "true").lower() == "true",
+        )
+
+
+@dataclass
 class SkillDerivationConfig:
     """Configuration for skill derivation from tool usage patterns."""
 
@@ -310,6 +356,9 @@ class KnowledgeConfig:
     # Skill derivation from tool usage
     skill_derivation: SkillDerivationConfig = None  # type: ignore[assignment]
 
+    # Cluster 6: budget-aware context assembly
+    context_budget: ContextBudgetConfig = None  # type: ignore[assignment]
+
     # Feature flags
     enable_knowledge_integration: bool = True  # Master switch for knowledge system
 
@@ -337,6 +386,8 @@ class KnowledgeConfig:
             self.query_intent = QueryIntentConfig()
         if self.skill_derivation is None:
             self.skill_derivation = SkillDerivationConfig()
+        if self.context_budget is None:
+            self.context_budget = ContextBudgetConfig()
 
     @classmethod
     def from_env(cls) -> "KnowledgeConfig":
@@ -351,6 +402,7 @@ class KnowledgeConfig:
             ingestion=IngestionConfig.from_env(),
             query_intent=QueryIntentConfig.from_env(),
             skill_derivation=SkillDerivationConfig.from_env(),
+            context_budget=ContextBudgetConfig.from_env(),
             enable_knowledge_integration=os.getenv("ENABLE_KNOWLEDGE_INTEGRATION", "true").lower()
             == "true",
             ontology_version=os.getenv("ONTOLOGY_VERSION", "1.0.0"),
