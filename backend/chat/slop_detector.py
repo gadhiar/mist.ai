@@ -13,6 +13,18 @@ Severity floor semantics:
 - severity_floor="critical" returns only critical findings
 - severity_floor="warning" returns critical + warning
 - severity_floor="info" returns all findings
+
+Pattern overlap note:
+High-code-point emoji characters such as the target, rocket, and party
+glyphs are matched by both the `emoji` pattern (covering the unicode
+ranges U+1F300-U+1F9FF, U+1FA70-U+1FAFF, and U+2600-U+27BF) and the
+`emoji_symbols` pattern (a literal character set of commonly seen
+decorative symbols). Therefore `detect()` may return two findings for
+the same character position — one per pattern. This overlap is inherited
+verbatim from the original script and is harmless for `strip_fixable()`
+because both patterns use an empty-string replacement, but callers of
+`detect()` should be aware that a raw count of findings is not the same
+as a count of unique character offsets.
 """
 
 from __future__ import annotations
@@ -143,7 +155,7 @@ class SlopDetector:
     def detect(
         self,
         text: str,
-        severity_floor: str = "critical",
+        severity_floor: SeverityLevel = "critical",
     ) -> list[SlopFinding]:
         """Return all findings at or above severity_floor.
 
