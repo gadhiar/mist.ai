@@ -65,7 +65,11 @@ _IDENTITY_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\byour\s+(?:preferences?|personality|traits?|capabilit(?:y|ies)|values?)\b", re.I),
     re.compile(r"\bare\s+you\s+(?:mist|the\s+(?:ai|assistant))\b", re.I),
     re.compile(r"\bwhat\s+can\s+you\s+do\b", re.I),
-    re.compile(r"\b(?:do|are|can|will)\s+you\s+(?:like|love|prefer|feel|think|have)\b", re.I),
+    re.compile(r"\b(?:do|are|can|will)\s+you\s+(?:like|love|prefer|feel|think)\b", re.I),
+    re.compile(
+        r"\b(?:do|have)\s+you\s+have\s+(?:any\s+)?(?:preferences?|traits?|capabilit(?:y|ies)|values?|opinions?)\b",
+        re.I,
+    ),
     re.compile(r"\b(?:describe|explain)\s+(?:yourself|your\s+\w+)\b", re.I),
     re.compile(r"\bwhat\s+capabilit(?:y|ies)\s+do\s+you\s+have\b", re.I),
 ]

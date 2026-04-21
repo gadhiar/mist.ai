@@ -302,9 +302,11 @@ class ConversationHandler:
             return cached
         try:
             ctx = await self.retriever.retrieve_mist_context()
-        except Exception as e:
+        except AttributeError as e:
+            # Legacy retriever without the method — fall back to empty persona.
             logger.warning(
-                "retrieve_mist_context failed for session %s: %s; using empty persona.",
+                "retrieve_mist_context unavailable on retriever for session %s: %s; "
+                "using empty persona.",
                 session_id,
                 e,
             )

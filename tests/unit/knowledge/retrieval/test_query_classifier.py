@@ -260,3 +260,31 @@ class TestIdentityIntent:
         result = classifier.classify("who are you?")
         assert result.intent == "identity"
         assert "mist" in result.suggested_stores
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "do you have any idea",
+            "do you have the latest data",
+            "do you have access to my calendar",
+        ],
+    )
+    def test_generic_have_query_not_identity(self, classifier, query):
+        """Regression guard: 'do you have X' should not misroute to identity."""
+        result = classifier.classify(query)
+        assert (
+            result.intent != "identity"
+        ), f"Query {query!r} misclassified as identity (generic 'have' pattern)"
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "do you have any preferences",
+            "do you have any traits",
+            "do you have any capabilities",
+        ],
+    )
+    def test_have_with_identity_noun_still_identity(self, classifier, query):
+        """Positive: 'do you have <identity-noun>' still classifies as identity."""
+        result = classifier.classify(query)
+        assert result.intent == "identity"
