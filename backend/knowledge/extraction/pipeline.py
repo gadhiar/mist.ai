@@ -466,25 +466,6 @@ class ExtractionPipeline:
         stage_1_ms = (time.perf_counter() - stage_start) * 1000
         logger.debug("Stage 1 (pre-processing): %.1fms", stage_1_ms)
 
-        # Stage 1.5: Subject-scope classification (Cluster 1).
-        # Terse LLM call that tags the utterance as user-scope, system-scope,
-        # or third-party so Stage 2 can weight the extraction prompt. Writes
-        # results into pre_processed.metadata. Never gates the pipeline --
-        # on any failure the scope is "unknown" and Stage 2 proceeds as if
-        # Stage 1.5 were disabled.
-        if self._scope_classifier is not None:
-            stage_start = time.perf_counter()
-            scope_result = await self._scope_classifier.classify(pre_processed)
-            stage_1_5_ms = (time.perf_counter() - stage_start) * 1000
-            pre_processed.metadata["subject_scope"] = scope_result.scope
-            pre_processed.metadata["subject_scope_confidence"] = scope_result.confidence
-            logger.debug(
-                "Stage 1.5 (scope classifier): %.1fms scope=%s confidence=%.2f",
-                stage_1_5_ms,
-                scope_result.scope,
-                scope_result.confidence,
-            )
-
         # -- Generate embedding for significance + dedup gates --
         embedding: list[float] | None = None
         if self._embedding_provider is not None:
@@ -509,6 +490,28 @@ class ExtractionPipeline:
         if embedding is not None and self._check_dedup(utterance, embedding):
             logger.info("Extraction skipped (duplicate) for '%s'", utterance[:60])
             return ValidationResult(valid=True)
+
+        # Stage 1.5: Subject-scope classification (Cluster 1).
+        # Terse LLM call that tags the utterance as user-scope, system-scope,
+        # or third-party so Stage 2 can weight the extraction prompt. Writes
+        # results into pre_processed.metadata. Never gates the pipeline --
+        # on any failure the scope is "unknown" and Stage 2 proceeds as if
+        # Stage 1.5 were disabled. Positioned AFTER rate-limit, significance,
+        # and dedup gates so dropped utterances never spawn a classifier LLM
+        # call; positioned BEFORE Stage 2 so the extractor can read the scope
+        # metadata in its prompt.
+        if self._scope_classifier is not None:
+            stage_start = time.perf_counter()
+            scope_result = await self._scope_classifier.classify(pre_processed)
+            stage_1_5_ms = (time.perf_counter() - stage_start) * 1000
+            pre_processed.metadata["subject_scope"] = scope_result.scope
+            pre_processed.metadata["subject_scope_confidence"] = scope_result.confidence
+            logger.debug(
+                "Stage 1.5 (scope classifier): %.1fms scope=%s confidence=%.2f",
+                stage_1_5_ms,
+                scope_result.scope,
+                scope_result.confidence,
+            )
 
         # Record timestamp for rate limiter (extraction proceeding)
         self._extraction_timestamps.append(time.monotonic())

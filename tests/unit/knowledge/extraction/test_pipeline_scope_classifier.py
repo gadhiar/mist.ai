@@ -57,19 +57,25 @@ def _empty_extractor() -> AsyncMock:
     return mock
 
 
-def _build_pipeline(*, extractor, scope_classifier) -> ExtractionPipeline:
+def _build_pipeline(
+    *,
+    extractor,
+    scope_classifier,
+    extraction_config: ExtractionConfig | None = None,
+) -> ExtractionPipeline:
     """Build a minimal ExtractionPipeline suitable for Stage 1.5 integration tests."""
     conn = FakeNeo4jConnection()
     embeddings = FakeEmbeddingGenerator()
     graph_store = GraphStore(connection=conn, embedding_generator=embeddings)
 
-    extraction_config = ExtractionConfig(
-        significance_threshold=0.0,
-        rate_limit_max_per_minute=1000,
-        dedup_similarity_threshold=0.95,
-        dedup_cache_size=200,
-        dedup_cache_ttl_seconds=300,
-    )
+    if extraction_config is None:
+        extraction_config = ExtractionConfig(
+            significance_threshold=0.0,
+            rate_limit_max_per_minute=1000,
+            dedup_similarity_threshold=0.95,
+            dedup_cache_size=200,
+            dedup_cache_ttl_seconds=300,
+        )
 
     return ExtractionPipeline(
         preprocessor=PreProcessor(),
@@ -86,6 +92,32 @@ def _build_pipeline(*, extractor, scope_classifier) -> ExtractionPipeline:
         extraction_config=extraction_config,
         scope_classifier=scope_classifier,
     )
+
+
+class _CountingClassifier:
+    """Captures every call to classify() so tests can assert call counts.
+
+    Mirrors SubjectScopeClassifier's public surface but does not hit any LLM;
+    every call returns a deterministic ScopeResult and increments `call_count`.
+    Lets ordering tests verify that gates skip Stage 1.5 without patching.
+    """
+
+    def __init__(self, scope: str = "user-scope", confidence: float = 0.9) -> None:
+        from backend.knowledge.extraction.scope_classifier import ScopeResult
+
+        self._scope = scope
+        self._confidence = confidence
+        self._result_cls = ScopeResult
+        self.call_count = 0
+
+    async def classify(self, pre_processed):  # noqa: ANN001, ANN201
+        self.call_count += 1
+        return self._result_cls(
+            scope=self._scope,  # type: ignore[arg-type]
+            confidence=self._confidence,
+            reasoning="stub",
+            elapsed_ms=0.0,
+        )
 
 
 class TestScopeClassifierInjection:
@@ -205,3 +237,138 @@ class TestStage15Disabled:
         # Assert -- metadata is set, value is 'unknown', extractor still ran
         pre_processed = extractor.extract.await_args.args[0]
         assert pre_processed.metadata["subject_scope"] == "unknown"
+
+
+class TestStage15OrderingAfterGates:
+    """P0 #3: scope classifier runs AFTER rate-limit, significance, and dedup gates.
+
+    The previous ordering ran Stage 1.5 between pre-processing and the
+    significance / dedup gates, spawning a classifier LLM call for every
+    non-rate-limited utterance even when the next gate dropped it.
+    Moving Stage 1.5 to after the gates means dropped utterances never
+    hit the classifier.
+    """
+
+    @pytest.mark.asyncio
+    async def test_classifier_skipped_when_rate_limited(self):
+        """A rate-limited utterance returns early without invoking the classifier."""
+        # Arrange -- rate limit max of 1, fill the window so the next call trips it.
+        extractor = _empty_extractor()
+        classifier = _CountingClassifier()
+        config = ExtractionConfig(
+            significance_threshold=0.0,
+            rate_limit_max_per_minute=1,
+            dedup_similarity_threshold=0.95,
+            dedup_cache_size=200,
+            dedup_cache_ttl_seconds=300,
+        )
+        pipeline = _build_pipeline(
+            extractor=extractor, scope_classifier=classifier, extraction_config=config
+        )
+        # Fill the rate-limiter window so the very next extraction is dropped.
+        import time as _time
+
+        pipeline._extraction_timestamps.append(_time.monotonic())
+
+        # Act
+        result = await pipeline.extract_from_utterance(
+            utterance="I use Rust.",
+            conversation_history=[],
+            event_id=TEST_EVENT_ID,
+            session_id=TEST_SESSION_ID,
+        )
+
+        # Assert
+        assert result is not None
+        assert classifier.call_count == 0
+        extractor.extract.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_classifier_skipped_when_significance_below_threshold(self):
+        """A below-threshold utterance returns early without invoking the classifier."""
+        # Arrange -- threshold 2.0 is unreachable; pass a non-registered extraction_source
+        # so the config threshold is used instead of the _SOURCE_THRESHOLDS default.
+        extractor = _empty_extractor()
+        classifier = _CountingClassifier()
+        config = ExtractionConfig(
+            significance_threshold=2.0,
+            rate_limit_max_per_minute=1000,
+            dedup_similarity_threshold=0.95,
+            dedup_cache_size=200,
+            dedup_cache_ttl_seconds=300,
+        )
+        pipeline = _build_pipeline(
+            extractor=extractor, scope_classifier=classifier, extraction_config=config
+        )
+
+        # Act -- extraction_source="test_unregistered" falls back to config.significance_threshold.
+        result = await pipeline.extract_from_utterance(
+            utterance="I use Rust.",
+            conversation_history=[],
+            event_id=TEST_EVENT_ID,
+            session_id=TEST_SESSION_ID,
+            extraction_source="test_unregistered",
+        )
+
+        # Assert
+        assert result is not None
+        assert classifier.call_count == 0
+        extractor.extract.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_classifier_skipped_when_duplicate_detected(self):
+        """A duplicate utterance returns early without invoking the classifier."""
+        # Arrange -- dedup threshold at 0.0 means every utterance once cached is a dup.
+        extractor = _empty_extractor()
+        classifier = _CountingClassifier()
+        config = ExtractionConfig(
+            significance_threshold=0.0,
+            rate_limit_max_per_minute=1000,
+            dedup_similarity_threshold=0.0,
+            dedup_cache_size=200,
+            dedup_cache_ttl_seconds=300,
+        )
+        pipeline = _build_pipeline(
+            extractor=extractor, scope_classifier=classifier, extraction_config=config
+        )
+        # Prime the dedup cache with an initial call; that first call passes.
+        await pipeline.extract_from_utterance(
+            utterance="I use Rust.",
+            conversation_history=[],
+            event_id=TEST_EVENT_ID,
+            session_id=TEST_SESSION_ID,
+        )
+        calls_after_first = classifier.call_count
+
+        # Act -- second identical call must be caught by the dedup gate.
+        result = await pipeline.extract_from_utterance(
+            utterance="I use Rust.",
+            conversation_history=[],
+            event_id=TEST_EVENT_ID,
+            session_id=TEST_SESSION_ID,
+        )
+
+        # Assert -- classifier count did not change on the second (dropped) call.
+        assert result is not None
+        assert classifier.call_count == calls_after_first
+
+    @pytest.mark.asyncio
+    async def test_classifier_invoked_when_all_gates_pass(self):
+        """Sanity companion: when gates pass, classifier IS invoked exactly once."""
+        # Arrange
+        extractor = _empty_extractor()
+        classifier = _CountingClassifier()
+        pipeline = _build_pipeline(extractor=extractor, scope_classifier=classifier)
+
+        # Act
+        await pipeline.extract_from_utterance(
+            utterance="I am learning Rust.",
+            conversation_history=[],
+            event_id=TEST_EVENT_ID,
+            session_id=TEST_SESSION_ID,
+        )
+
+        # Assert
+        assert classifier.call_count == 1
+        pre_processed = extractor.extract.await_args.args[0]
+        assert pre_processed.metadata["subject_scope"] == "user-scope"
