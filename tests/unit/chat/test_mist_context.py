@@ -132,3 +132,27 @@ class TestMistContextRender:
         assert "Preferred Guide" in block
         # Absolute MUST appear before preferred in the rendered order
         assert block.index("Absolute Rule") < block.index("Preferred Guide")
+
+
+class TestMistContextForwardCompat:
+    """Cluster 3 forward-compat: optional fields with safe defaults for Cluster 8 (ADR-010)."""
+
+    def test_default_forward_compat_fields(self):
+        ctx = MistContext(
+            display_name="MIST",
+            pronouns="she/her",
+            self_concept="",
+        )
+        assert ctx.vault_note_path is None
+        assert ctx.authored_by == "mist"
+
+    def test_forward_compat_fields_are_overridable(self):
+        ctx = MistContext(
+            display_name="MIST",
+            pronouns="she/her",
+            self_concept="",
+            vault_note_path="mist-memory/identity/mist.md",
+            authored_by="user-edit",
+        )
+        assert ctx.vault_note_path == "mist-memory/identity/mist.md"
+        assert ctx.authored_by == "user-edit"

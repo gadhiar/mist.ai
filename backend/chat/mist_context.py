@@ -50,6 +50,13 @@ class MistContext:
     traits: list[MistTrait] = field(default_factory=list)
     capabilities: list[MistCapability] = field(default_factory=list)
     preferences: list[MistPreference] = field(default_factory=list)
+    # Forward-compat for ADR-010 (Cluster 8 vault-owned identity). Safe
+    # defaults preserve today's behavior; populated by Cluster 8 when
+    # MistContext is derived from mist-memory/identity/mist.md.
+    vault_note_path: str | None = None
+    authored_by: str = (
+        "mist"  # "mist" | "mist-pending-review" | "user" | "user-edit" | "user-rejected"
+    )
 
     def as_system_prompt_block(self) -> str:
         """Render the persona as a system-prompt block with hard-constraint framing."""

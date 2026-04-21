@@ -76,54 +76,21 @@ KNOWLEDGE_TOOL_SCHEMAS = [
 # ---------------------------------------------------------------------------
 # Module-level system prompt templates (Cluster 3)
 #
-# _STATIC_SYSTEM_TEMPLATE_WITH_IDENTITY  — legacy path (mist_context=None)
-#   Includes the "You are MIST..." opener so the prompt is self-contained.
+# Consolidated into one body + an optional identity header (Fix O).
 #
-# _STATIC_SYSTEM_TEMPLATE_WITHOUT_IDENTITY — persona path (mist_context provided)
-#   Omits the opener because the MistContext persona block already introduces MIST.
+# _STATIC_IDENTITY_HEADER — prepended when mist_context=None (legacy fallback)
+#   so the prompt is self-contained without a MistContext persona block.
+#
+# _STATIC_SYSTEM_TEMPLATE_BODY — shared body used in both paths.
+#   When mist_context is provided the persona block already introduces MIST,
+#   so the header is omitted.
 # ---------------------------------------------------------------------------
 
-_STATIC_SYSTEM_TEMPLATE_WITH_IDENTITY = """You are MIST, a conversational AI assistant with a personal knowledge graph.
+_STATIC_IDENTITY_HEADER = (
+    "You are MIST, a conversational AI assistant with a personal knowledge graph.\n\n"
+)
 
-=== CONTEXT PROVIDED ===
-
-You receive relevant context automatically with each query (see below).
-This may include graph facts, document excerpts, or both depending on query type.
-Knowledge from conversations is captured automatically -- you do not need to extract it manually.
-
-=== AVAILABLE TOOLS ===
-
-You have one tool at your disposal:
-
-1. **query_knowledge_graph(query: str, limit: int = 20)**
-   - Search the personal knowledge graph for user-specific information
-   - Use when: User asks about THEIR preferences, skills, projects, past conversations
-   - Returns: Facts you've learned about the user (entities + relationships)
-   - Example: "What programming languages do I know?" -> use this tool
-
-=== TOOL USAGE STRATEGY ===
-
-**For user questions:**
-- Technical questions (how/what/why about MIST) -> Use auto-provided context (already below)
-- Personal questions (about user's info) -> Use query_knowledge_graph tool
-- Both types -> Use context + query_knowledge_graph
-
-**Autonomous Decision Making:**
-- You decide when to use the tool - no one tells you when
-- Context is automatically provided - use it! Cite sources when helpful.
-- Only call query_knowledge_graph when you need personal user context
-
-=== GUIDELINES ===
-
-- Be conversational and natural
-- Cite documentation sources when answering technical questions
-- Use tools to enhance responses, not replace conversation
-- Combine auto-provided context with your conversational abilities
-- Query the knowledge graph when personal context matters
-
-Remember: Context is already provided below. Think about whether you need personal user context from the knowledge graph."""
-
-_STATIC_SYSTEM_TEMPLATE_WITHOUT_IDENTITY = """=== CONTEXT PROVIDED ===
+_STATIC_SYSTEM_TEMPLATE_BODY = """=== CONTEXT PROVIDED ===
 
 You receive relevant context automatically with each query (see below).
 This may include graph facts, document excerpts, or both depending on query type.
@@ -352,7 +319,7 @@ class ConversationHandler:
             rider_messages = [
                 *messages,
                 {"role": "assistant", "content": current_response},
-                {"role": "system", "content": rider_content},
+                {"role": "user", "content": rider_content},
             ]
             rider_temp = max(0.3, round(self.config.llm.conversation_temperature - 0.2, 10))
             rider_request = LLMRequest(
@@ -815,12 +782,12 @@ class ConversationHandler:
         # 1. Persona block (Cluster 3)
         if mist_context is not None:
             messages.append({"role": "system", "content": mist_context.as_system_prompt_block()})
-            # Use the template without the redundant "You are MIST..." opener
-            # because the persona block already introduces MIST.
-            static_template = _STATIC_SYSTEM_TEMPLATE_WITHOUT_IDENTITY
+            # Persona block already introduces MIST — omit the identity header.
+            static_template = _STATIC_SYSTEM_TEMPLATE_BODY
         else:
-            # Fallback: no persona retrieved; keep the legacy full template.
-            static_template = _STATIC_SYSTEM_TEMPLATE_WITH_IDENTITY
+            # Fallback: no persona retrieved; prepend the identity header so the
+            # prompt is self-contained.
+            static_template = _STATIC_IDENTITY_HEADER + _STATIC_SYSTEM_TEMPLATE_BODY
 
         # 2. Static system template
         messages.append({"role": "system", "content": static_template})

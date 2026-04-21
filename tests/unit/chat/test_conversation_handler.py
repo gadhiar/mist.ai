@@ -170,13 +170,19 @@ class TestToolUsageTrackerDI:
 
 
 class TestShortMessageSkip:
-    def test_short_messages_skip_extraction(self):
-        """Messages with fewer than 3 words should not trigger extraction."""
-        pipeline = FakeExtractionPipeline()
+    # The word-count threshold is: len(user_message.split()) >= 3.
+    # Messages with fewer than 3 words skip both auto-RAG retrieval AND
+    # background extraction scheduling in handle_message.
+
+    @pytest.mark.asyncio
+    async def test_short_message_skips_extraction(self):
+        """handle_message should NOT trigger extraction for messages < 3 words."""
+        from unittest.mock import AsyncMock
 
         conn = FakeNeo4jConnection()
         gs = GraphStore(conn, FakeEmbeddingGenerator())
         config = build_test_config()
+        pipeline = FakeExtractionPipeline()
 
         handler = ConversationHandler(
             config=config,
@@ -185,16 +191,59 @@ class TestShortMessageSkip:
             retriever=_make_retriever(config, gs),
             llm_provider=FakeLLM(),
         )
-        assert handler is not None
 
-        # Simulate the guard logic from handle_message
-        short_messages = ["hi", "ok", "thanks"]
-        for msg in short_messages:
-            should_extract = len(msg.split()) >= 3
-            assert not should_extract, f"'{msg}' should skip extraction"
+        # Patch extraction pipeline to track calls
+        handler._extraction_pipeline.extract_from_utterance = AsyncMock()
 
-        long_message = "I really enjoy Python programming"
-        assert len(long_message.split()) >= 3
+        await handler.handle_message(
+            user_message="hi there",  # 2 words — below threshold
+            session_id="short-s1",
+        )
+
+        # Give any scheduled tasks a moment to run
+        import asyncio
+
+        await asyncio.sleep(0.01)
+
+        handler._extraction_pipeline.extract_from_utterance.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_long_message_triggers_extraction(self):
+        """handle_message SHOULD trigger extraction for messages >= 3 words.
+
+        The extraction task is gated on (event_id AND word_count >= 3). The
+        event store must be enabled so handle_message produces a non-None
+        event_id; without it the task is never created regardless of word count.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        # Enable in-memory event store so handle_message produces a non-None event_id.
+        config = build_test_config(event_store_enabled=True, event_store_db_path=":memory:")
+        pipeline = FakeExtractionPipeline()
+
+        handler = ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=pipeline,
+            retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
+        )
+
+        # Patch extraction pipeline to track calls
+        handler._extraction_pipeline.extract_from_utterance = AsyncMock()
+
+        await handler.handle_message(
+            user_message="I use Python for data pipelines",  # 6 words — above threshold
+            session_id="long-s1",
+        )
+
+        # Give the scheduled background task a moment to fire
+        await asyncio.sleep(0.05)
+
+        handler._extraction_pipeline.extract_from_utterance.assert_called()
 
 
 # =============================================================================
@@ -511,11 +560,14 @@ class TestPostFilterRegeneration:
         # At least one of the requests must be the regen request.
         assert len(captured_requests) >= 2
         regen_request = captured_requests[1]
-        regen_system_content = "\n".join(
-            m["content"] for m in regen_request.messages if m["role"] == "system"
+        # Rider is appended as role=user (Fix H: role=system is non-standard after
+        # an assistant turn per OpenAI spec). Check both roles for the violation text
+        # so the test remains unambiguous about what it's asserting.
+        regen_rider_content = "\n".join(
+            m["content"] for m in regen_request.messages if m["role"] in ("user", "system")
         )
         # Rider should mention "emoji" as a detected violation type.
-        assert "emoji" in regen_system_content.lower()
+        assert "emoji" in regen_rider_content.lower()
 
     @pytest.mark.asyncio
     async def test_regen_uses_lower_temperature(self, handler_with_queued_responses):

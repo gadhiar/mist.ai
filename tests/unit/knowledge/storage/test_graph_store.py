@@ -410,3 +410,16 @@ class TestGetMistIdentityContext:
         assert result["traits"] == []
         assert result["capabilities"] == []
         assert result["preferences"] == []
+
+    def test_query_failure_propagates(self):
+        """If any query raises, the exception propagates — persona is not silently empty."""
+        import pytest
+
+        # FakeNeo4jConnection.query_errors: pattern -> exception raised on matching query.
+        fake_conn = FakeNeo4jConnection(
+            query_errors={"HAS_TRAIT": RuntimeError("Simulated Neo4j transient error")}
+        )
+        store = GraphStore(connection=fake_conn, embedding_generator=FakeEmbeddingGenerator())
+
+        with pytest.raises(RuntimeError, match="transient error"):
+            store.get_mist_identity_context()
