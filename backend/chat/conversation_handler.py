@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from backend.chat.mist_context import MistContext
+from backend.chat.slop_detector import SlopDetector
 from backend.event_store.models import ConversationTurnEvent
 from backend.event_store.store import EventStore
 from backend.knowledge.config import KnowledgeConfig
@@ -230,6 +231,10 @@ class ConversationHandler:
         # clear_session or process restart.
         self._mist_context_cache: dict[str, MistContext] = {}
 
+        # Cluster 3: response post-filter for slop patterns
+        self._slop_detector = SlopDetector()
+        self._slop_max_regen_attempts = 2
+
         logger.info("ConversationHandler initialized with model: %s", llm_provider.model)
 
     async def _handle_query_knowledge_graph(
@@ -313,6 +318,56 @@ class ConversationHandler:
             )
         self._mist_context_cache[session_id] = ctx
         return ctx
+
+    async def _post_filter_response(
+        self,
+        initial_response: str,
+        messages: list[dict],
+        session_id: str,
+    ) -> str:
+        """Scan LLM response for critical slop. On detection, regenerate with a strict
+        rider up to _slop_max_regen_attempts times. Fallback after cap:
+        SlopDetector.strip_fixable mechanical cleanup + WARNING log.
+
+        Regeneration uses conversation_temperature - 0.2 (floor 0.3) to tighten
+        constraint-following without going fully deterministic, and tools=None
+        because style correction does not need tool calls.
+        """
+        current_response = initial_response if initial_response is not None else ""
+
+        for _attempt in range(self._slop_max_regen_attempts):
+            findings = self._slop_detector.detect(current_response, severity_floor="critical")
+            if not findings:
+                return current_response
+
+            violation_names = sorted({f.pattern_name for f in findings})
+            rider_content = (
+                f"Your previous response contained slop patterns: {', '.join(violation_names)}. "
+                f"Regenerate the same semantic answer without these patterns. "
+                f"Remember the HARD RULES: no emoji, no symbols, no arrows, plain text only."
+            )
+
+            rider_messages = [
+                *messages,
+                {"role": "assistant", "content": current_response},
+                {"role": "system", "content": rider_content},
+            ]
+            rider_temp = max(0.3, round(self.config.llm.conversation_temperature - 0.2, 10))
+            rider_request = LLMRequest(
+                messages=rider_messages,
+                tools=None,
+                temperature=rider_temp,
+                max_tokens=400,
+            )
+            rider_response = await self._provider.invoke(rider_request)
+            current_response = rider_response.content or ""
+
+        # Cap reached with critical findings still present
+        logger.warning(
+            "Slop post-filter cap reached (session=%s); falling back to strip_fixable",
+            session_id,
+        )
+        return self._slop_detector.strip_fixable(current_response)
 
     async def handle_message(
         self, user_message: str, session_id: str, user_id: str = "User", max_history: int = 10
@@ -480,6 +535,15 @@ class ConversationHandler:
             else:
                 # No tool calls, use response directly
                 assistant_message = response.content
+
+            # Cluster 3: slop post-filter before storing/returning.
+            # Uses the current messages list as context for any regeneration.
+            if assistant_message is not None:
+                assistant_message = await self._post_filter_response(
+                    initial_response=assistant_message,
+                    messages=messages,
+                    session_id=session_id,
+                )
 
             # Add assistant response to history
             session.add_message(

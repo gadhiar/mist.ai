@@ -419,3 +419,126 @@ class TestConversationTemperature:
 
         await conversation_handler.handle_message(user_message="hello", session_id="temp-s2")
         assert captured[0].temperature == 0.5
+
+
+# =============================================================================
+# Cluster 3 Task 8: Response post-filter (slop regen + strip fallback)
+# =============================================================================
+
+
+class TestPostFilterRegeneration:
+    """Cluster 3: response with critical slop triggers regeneration; fallback strips on cap."""
+
+    @pytest.fixture
+    def handler_with_queued_responses(self, conversation_handler):
+        """Patch the fake provider's invoke to return a scripted queue."""
+
+        def _builder(responses: list[str]):
+            # Make a shallow shared queue on the provider
+            conversation_handler._provider._scripted_queue = list(responses)
+
+            from backend.llm.models import LLMResponse
+
+            async def scripted_invoke(request):
+                q = conversation_handler._provider._scripted_queue
+                content = q.pop(0) if q else "fallback scripted response"
+                return LLMResponse(content=content, tool_calls=None)
+
+            conversation_handler._provider.invoke = scripted_invoke
+            return conversation_handler
+
+        return _builder
+
+    @pytest.mark.asyncio
+    async def test_clean_response_not_regenerated(self, handler_with_queued_responses):
+        handler = handler_with_queued_responses(["This is a plain response with no slop."])
+        result = await handler.handle_message(user_message="hello", session_id="pf-s1")
+        assert result == "This is a plain response with no slop."
+        # Queue fully consumed — exactly 1 invoke happened for this turn.
+        assert handler._provider._scripted_queue == []
+
+    @pytest.mark.asyncio
+    async def test_slop_response_triggers_regeneration(self, handler_with_queued_responses):
+        # Note: first response contains an emoji; post-filter should regenerate.
+        handler = handler_with_queued_responses(
+            [
+                "Great work \U0001f389 ship it.",  # attempt 1: slop
+                "Ship it.",  # attempt 2 (first regen): clean
+            ]
+        )
+        result = await handler.handle_message(user_message="hello", session_id="pf-s2")
+        assert "\U0001f389" not in result
+        assert "Ship it" in result
+
+    @pytest.mark.asyncio
+    async def test_two_regen_cap_then_strip_fallback(self, handler_with_queued_responses):
+        handler = handler_with_queued_responses(
+            [
+                "Great \U0001f389 work",  # attempt 1: slop
+                "Amazing \U0001f680 output",  # attempt 2 (first regen): still slop
+                "Even more \U0001f4af slop",  # attempt 3 (second regen): still slop — cap reached
+                "never consumed",  # should not be popped
+            ]
+        )
+        result = await handler.handle_message(user_message="hello", session_id="pf-s3")
+        # After cap, strip_fixable runs on the last response; emojis removed.
+        assert "\U0001f389" not in result
+        assert "\U0001f680" not in result
+        assert "\U0001f4af" not in result
+        # The fourth queue item remains, proving we stopped at 2 regen attempts.
+        assert "never consumed" in handler._provider._scripted_queue
+
+    @pytest.mark.asyncio
+    async def test_regen_rider_names_violation_patterns(self, handler_with_queued_responses):
+        """The regeneration request's system message must name the detected slop patterns."""
+        handler = handler_with_queued_responses(
+            [
+                "Great work \U0001f389",  # attempt 1: emoji
+                "Ship it.",  # attempt 2: clean
+            ]
+        )
+        captured_requests = []
+        original_invoke = handler._provider.invoke
+
+        async def capture(request):
+            captured_requests.append(request)
+            return await original_invoke(request)
+
+        handler._provider.invoke = capture
+
+        await handler.handle_message(user_message="hello", session_id="pf-s4")
+
+        # At least one of the requests must be the regen request.
+        assert len(captured_requests) >= 2
+        regen_request = captured_requests[1]
+        regen_system_content = "\n".join(
+            m["content"] for m in regen_request.messages if m["role"] == "system"
+        )
+        # Rider should mention "emoji" as a detected violation type.
+        assert "emoji" in regen_system_content.lower()
+
+    @pytest.mark.asyncio
+    async def test_regen_uses_lower_temperature(self, handler_with_queued_responses):
+        """Regeneration LLMRequest uses a tighter temperature (conversation_temp - 0.2 floor 0.3)."""
+        handler = handler_with_queued_responses(
+            [
+                "Great work \U0001f389",
+                "Ship it.",
+            ]
+        )
+        captured = []
+        original_invoke = handler._provider.invoke
+
+        async def capture(request):
+            captured.append(request)
+            return await original_invoke(request)
+
+        handler._provider.invoke = capture
+
+        await handler.handle_message(user_message="hello", session_id="pf-s5")
+
+        # First request: conversation_temperature (0.7 default)
+        assert captured[0].temperature == 0.7
+        # Second request (regen): conversation_temperature - 0.2 = 0.5
+        assert captured[1].temperature == 0.5
+        assert captured[1].temperature >= 0.3  # floor
