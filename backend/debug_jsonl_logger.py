@@ -215,6 +215,7 @@ class DebugJSONLLogger:
         session_id: str | None = None,
         call_site: str | None = None,
         pass_num: int | None = None,
+        model: str | None = None,
     ) -> None:
         """Emit a `phase: "llm_call"` JSONL line.
 
@@ -222,6 +223,11 @@ class DebugJSONLLogger:
         full non-streaming response (content, tool_calls, usage) at the provider
         boundary. Intended to diagnose Bug E-class empty-response regressions
         and tool_calls schema drift without re-running the gauntlet.
+
+        `model` is passed by the instrumented wrapper from its own attribute
+        (LLMRequest does not carry a model field — the provider instance does).
+        Falls back to `request.model` if that attribute happens to exist on a
+        duck-typed fake.
 
         No-op when `llm_call_enabled` is False.
         """
@@ -235,7 +241,7 @@ class DebugJSONLLogger:
             "session_id": session_id,
             "call_site": call_site,
             "pass_num": pass_num,
-            "model": getattr(request, "model", None),
+            "model": model if model is not None else getattr(request, "model", None),
             "latency_ms": latency_ms,
             "request": _serialize_request(request),
             "response": _serialize_response(response),

@@ -128,6 +128,7 @@ class InstrumentedStreamingLLMProvider(StreamingLLMProvider):
                     request=request,
                     response=response,
                     latency_ms=latency_ms,
+                    model=self.model,
                     **_filter_context(get_llm_call_context()),
                 )
             yield response
@@ -144,6 +145,7 @@ class InstrumentedStreamingLLMProvider(StreamingLLMProvider):
                     request=request,
                     response=response,
                     latency_ms=latency_ms,
+                    model=self.model,
                     **_filter_context(get_llm_call_context()),
                 )
             yield response

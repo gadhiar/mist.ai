@@ -123,7 +123,10 @@ class InternalKnowledgeDeriver:
                 json_mode=True,
                 temperature=self._temperature,
             )
-            response = await self._llm.invoke(request)
+            from backend.llm.instrumented_provider import llm_call_context
+
+            with llm_call_context(call_site="extraction.internal_derivation"):
+                response = await self._llm.invoke(request)
             raw = response.content
         except Exception as e:
             logger.error("Internal derivation LLM call failed: %s", e)

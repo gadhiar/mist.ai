@@ -146,7 +146,10 @@ class OntologyConstrainedExtractor:
                 temperature=self.config.llm.temperature,
                 max_tokens=2048,
             )
-            response = await self._llm.invoke(request)
+            from backend.llm.instrumented_provider import llm_call_context
+
+            with llm_call_context(call_site="extraction.ontology"):
+                response = await self._llm.invoke(request)
             raw_output = response.content
         except Exception as e:
             elapsed_ms = (time.perf_counter() - start_time) * 1000
