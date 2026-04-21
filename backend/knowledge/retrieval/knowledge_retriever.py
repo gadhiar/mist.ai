@@ -150,6 +150,30 @@ class KnowledgeRetriever:
         logger.info(f"Query intent: {intent}")
 
         # Step 2: Route by intent
+        # Priority 0: Identity intent — return persona block, skip graph/vector paths.
+        if intent == "identity":
+            ctx = await self.retrieve_mist_context()
+            total_time = (time.time() - start_time) * 1000
+            return RetrievalResult(
+                query=query,
+                user_id=user_id,
+                facts=[],
+                entities_found=0,
+                total_facts=0,
+                formatted_context=ctx.as_system_prompt_block(),
+                retrieval_time_ms=total_time,
+                vector_search_time_ms=0.0,
+                graph_traversal_time_ms=0.0,
+                config_used={
+                    "limit": limit,
+                    "similarity_threshold": similarity_threshold,
+                    "max_hops": max_hops,
+                },
+                intent=intent,
+                requires_mcp=False,
+                suggested_tools=(),
+            )
+
         if intent == "live":
             # Early return for live queries
             suggested = self._map_live_tools(query)
@@ -257,6 +281,70 @@ class KnowledgeRetriever:
         logger.info(f"Retrieval complete: {result.summary()}")
 
         return result
+
+    async def retrieve_mist_context(self):  # noqa: ANN201
+        """Fetch MIST's seeded identity + outgoing trait/capability/preference edges.
+
+        Returns a MistContext (backend.chat.mist_context) carrying traits,
+        capabilities, preferences, and an as_system_prompt_block() renderer.
+
+        Populated from the graph's mist-identity node via the structurally-scoped
+        GraphStore.get_mist_identity_context() Cypher. Consumed by ConversationHandler
+        for persona system-prompt injection.
+
+        Traversal is anchored at the mist-identity node so HAS_TRAIT /
+        HAS_CAPABILITY / HAS_PREFERENCE edges from user entities (if any
+        existed) are never picked up here. ADR-009 :__Entity__-only rule
+        honored at the Cypher layer.
+
+        Import of MistContext types is deferred to avoid the circular import:
+        backend.chat.__init__ re-exports ConversationHandler which imports
+        KnowledgeRetriever; a top-level import here would form a cycle.
+        """
+        # Deferred import to break backend.chat <-> backend.knowledge.retrieval cycle.
+        from backend.chat.mist_context import (  # noqa: PLC0415
+            MistCapability,
+            MistContext,
+            MistPreference,
+            MistTrait,
+        )
+
+        raw = self.graph_store.get_mist_identity_context()
+        identity = raw["identity"]
+        traits = [
+            MistTrait(
+                id=t["id"],
+                display_name=t["display_name"],
+                axis=t.get("axis", "Persona"),
+                description=t.get("description", ""),
+            )
+            for t in raw.get("traits", [])
+        ]
+        capabilities = [
+            MistCapability(
+                id=c["id"],
+                display_name=c["display_name"],
+                description=c.get("description", ""),
+            )
+            for c in raw.get("capabilities", [])
+        ]
+        preferences = [
+            MistPreference(
+                id=p["id"],
+                display_name=p["display_name"],
+                enforcement=p.get("enforcement", "informational"),
+                context=p.get("context", ""),
+            )
+            for p in raw.get("preferences", [])
+        ]
+        return MistContext(
+            display_name=identity.get("display_name", "MIST"),
+            pronouns=identity.get("pronouns", "she/her"),
+            self_concept=identity.get("self_concept", "") or "",
+            traits=traits,
+            capabilities=capabilities,
+            preferences=preferences,
+        )
 
     # -- Retrieval backends ---------------------------------------------------
 

@@ -84,6 +84,7 @@ class StubQueryClassifier:
             "relational": ("graph",),
             "hybrid": ("vector", "graph"),
             "live": ("mcp",),
+            "identity": ("mist",),
         }
         return QueryIntent(
             intent=self._intent,
@@ -618,3 +619,109 @@ class TestFormatContext:
 
         # Assert
         assert "my Python skills" in context
+
+
+# ---------------------------------------------------------------------------
+# TestRetrieveMistContext
+# ---------------------------------------------------------------------------
+
+_SEEDED_IDENTITY_RAW = {
+    "identity": {
+        "id": "mist-identity",
+        "display_name": "MIST",
+        "pronouns": "she/her",
+        "self_concept": "A cognitive architecture for personal knowledge.",
+    },
+    "traits": [
+        {"id": "trait-warm", "display_name": "Warm", "axis": "Persona", "description": "Friendly."},
+    ],
+    "capabilities": [
+        {"id": "cap-tool-use", "display_name": "Tool use", "description": "MCP tools."},
+    ],
+    "preferences": [
+        {
+            "id": "pref-no-emoji",
+            "display_name": "No emoji",
+            "enforcement": "absolute",
+            "context": "Hard rule.",
+        },
+        {
+            "id": "pref-no-ai-slop",
+            "display_name": "No slop",
+            "enforcement": "absolute",
+            "context": "Hard rule.",
+        },
+    ],
+}
+
+
+def _make_identity_retriever() -> KnowledgeRetriever:
+    """Build a KnowledgeRetriever wired for identity-intent retrieval tests."""
+    from unittest.mock import MagicMock
+
+    conn = FakeNeo4jConnection()
+    emb = FakeEmbeddingProvider()
+    graph_store = GraphStore(connection=conn, embedding_generator=emb)
+    # Replace with a sync stub — get_mist_identity_context is sync on GraphStore.
+    graph_store.get_mist_identity_context = MagicMock(return_value=_SEEDED_IDENTITY_RAW)  # type: ignore[method-assign]
+
+    classifier = StubQueryClassifier("identity")
+
+    return KnowledgeRetriever(
+        config=build_test_config(),
+        graph_store=graph_store,
+        vector_store=None,
+        query_classifier=classifier,
+        embedding_provider=emb,
+    )
+
+
+class TestRetrieveMistContext:
+    """Cluster 3: retrieve_mist_context pulls MistIdentity + edges; identity intent routes here."""
+
+    @pytest.mark.asyncio
+    async def test_returns_mist_context_object(self):
+        from backend.chat.mist_context import MistContext
+
+        retriever = _make_identity_retriever()
+        ctx = await retriever.retrieve_mist_context()
+        assert isinstance(ctx, MistContext)
+        assert ctx.display_name == "MIST"
+        assert ctx.pronouns == "she/her"
+
+    @pytest.mark.asyncio
+    async def test_includes_all_traits(self):
+        retriever = _make_identity_retriever()
+        ctx = await retriever.retrieve_mist_context()
+        trait_names = {t.display_name for t in ctx.traits}
+        assert trait_names == {"Warm"}
+
+    @pytest.mark.asyncio
+    async def test_includes_absolute_preferences(self):
+        retriever = _make_identity_retriever()
+        ctx = await retriever.retrieve_mist_context()
+        pref_ids = {p.id for p in ctx.preferences}
+        assert "pref-no-emoji" in pref_ids
+        assert "pref-no-ai-slop" in pref_ids
+
+    @pytest.mark.asyncio
+    async def test_identity_intent_routes_to_mist_context_retrieval(self):
+        """retrieve() with identity-classified query returns formatted persona block."""
+        retriever = _make_identity_retriever()
+        result = await retriever.retrieve(
+            query="what are your preferences?",
+            user_id="User",
+        )
+        assert result.intent == "identity"
+        # Formatted context should contain persona content.
+        assert "MIST" in result.formatted_context
+        assert "No emoji" in result.formatted_context
+        assert "No slop" in result.formatted_context
+        # No facts list for identity intent — persona surfaces via formatted_context.
+        assert result.facts == []
+
+    @pytest.mark.asyncio
+    async def test_identity_intent_does_not_require_mcp(self):
+        retriever = _make_identity_retriever()
+        result = await retriever.retrieve(query="who are you?", user_id="User")
+        assert result.requires_mcp is False
