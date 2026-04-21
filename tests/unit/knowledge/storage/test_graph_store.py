@@ -326,3 +326,87 @@ class TestSearchDocumentChunksGracefulFallback:
         # Assert -- returns empty and disables the flag
         assert results == []
         assert store.vector_indexes_available is False
+
+
+# -------------------------------------------------------------------
+# get_mist_identity_context()
+# -------------------------------------------------------------------
+
+
+class TestGetMistIdentityContext:
+    """Cluster 3: GraphStore.get_mist_identity_context fetches identity + edges."""
+
+    def test_returns_identity_traits_capabilities_preferences(self):
+        """Happy path: identity node plus all edge types present."""
+        identity_row = {
+            "id": "mist-identity",
+            "display_name": "MIST",
+            "pronouns": "she/her",
+            "self_concept": "A cognitive architecture.",
+        }
+        trait_rows = [
+            {
+                "id": "trait-warm",
+                "display_name": "Warm",
+                "axis": "Persona",
+                "description": "Friendly.",
+            },
+            {
+                "id": "trait-technical",
+                "display_name": "Technical",
+                "axis": "Persona",
+                "description": "Precise.",
+            },
+        ]
+        cap_rows = [
+            {"id": "cap-tool-use", "display_name": "Tool use", "description": "MCP tools."},
+        ]
+        pref_rows = [
+            {
+                "id": "pref-no-emoji",
+                "display_name": "No emoji",
+                "enforcement": "absolute",
+                "context": "Hard rule.",
+            },
+            {
+                "id": "pref-no-ai-slop",
+                "display_name": "No slop",
+                "enforcement": "absolute",
+                "context": "Hard rule.",
+            },
+        ]
+
+        # query_responses uses substring matching in insertion order: more specific
+        # edge-type patterns must come before the generic identity pattern because
+        # HAS_TRAIT/HAS_CAPABILITY/HAS_PREFERENCE queries also contain 'mist-identity'.
+        fake_conn = FakeNeo4jConnection(
+            query_responses={
+                "HAS_TRAIT": trait_rows,
+                "HAS_CAPABILITY": cap_rows,
+                "HAS_PREFERENCE": pref_rows,
+                "mist-identity'})": [identity_row],
+            }
+        )
+        store = GraphStore(connection=fake_conn, embedding_generator=FakeEmbeddingGenerator())
+        result = store.get_mist_identity_context()
+
+        assert result["identity"]["display_name"] == "MIST"
+        assert result["identity"]["pronouns"] == "she/her"
+        assert len(result["traits"]) == 2
+        assert len(result["capabilities"]) == 1
+        assert len(result["preferences"]) == 2
+        pref_ids = {p["id"] for p in result["preferences"]}
+        assert pref_ids == {"pref-no-emoji", "pref-no-ai-slop"}
+
+    def test_returns_default_identity_when_missing(self):
+        """If mist-identity node is absent, return a minimal safe default."""
+        # All queries return empty lists — node not in graph yet (pre-seed state).
+        fake_conn = FakeNeo4jConnection(query_results=[])
+        store = GraphStore(connection=fake_conn, embedding_generator=FakeEmbeddingGenerator())
+        result = store.get_mist_identity_context()
+
+        assert result["identity"]["display_name"] == "MIST"
+        assert result["identity"]["pronouns"] == "she/her"
+        assert result["traits"] == []
+        assert result["capabilities"] == []
+        assert result["preferences"] == []

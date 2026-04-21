@@ -1240,6 +1240,67 @@ class GraphStore:
         self.connection.execute_write(query)
         logger.debug("MistIdentity singleton ensured")
 
+    def get_mist_identity_context(self) -> dict:
+        """Fetch MIST identity + traits + capabilities + preferences from the graph.
+
+        Returns a dict with keys:
+            identity (single dict with id/display_name/pronouns/self_concept),
+            traits (list of dicts),
+            capabilities (list of dicts),
+            preferences (list of dicts).
+
+        Used by KnowledgeRetriever.retrieve_mist_context() for persona injection.
+        Traversal is anchored at the mist-identity node; HAS_TRAIT/HAS_CAPABILITY/
+        HAS_PREFERENCE edges target :__Entity__ nodes (ADR-009 :__Entity__-only rule).
+        Falls back to a minimal default identity dict when the node is absent
+        (pre-seed state).
+        """
+        identity_query = """
+            MATCH (m:__Entity__ {id: 'mist-identity'})
+            RETURN m.id AS id, m.display_name AS display_name,
+                   m.pronouns AS pronouns, m.self_concept AS self_concept
+        """
+        traits_query = """
+            MATCH (m:__Entity__ {id: 'mist-identity'})-[:HAS_TRAIT]->(t:__Entity__)
+            RETURN t.id AS id, t.display_name AS display_name,
+                   t.axis AS axis, t.description AS description
+            ORDER BY t.display_name
+        """
+        capabilities_query = """
+            MATCH (m:__Entity__ {id: 'mist-identity'})-[:HAS_CAPABILITY]->(c:__Entity__)
+            RETURN c.id AS id, c.display_name AS display_name,
+                   c.description AS description
+            ORDER BY c.display_name
+        """
+        preferences_query = """
+            MATCH (m:__Entity__ {id: 'mist-identity'})-[:HAS_PREFERENCE]->(p:__Entity__)
+            RETURN p.id AS id, p.display_name AS display_name,
+                   p.enforcement AS enforcement, p.context AS context
+            ORDER BY p.enforcement DESC, p.display_name
+        """
+        identity_rows = self.connection.execute_query(identity_query, {})
+        traits_rows = self.connection.execute_query(traits_query, {})
+        capabilities_rows = self.connection.execute_query(capabilities_query, {})
+        preferences_rows = self.connection.execute_query(preferences_query, {})
+
+        identity = (
+            identity_rows[0]
+            if identity_rows
+            else {
+                "id": "mist-identity",
+                "display_name": "MIST",
+                "pronouns": "she/her",
+                "self_concept": "",
+            }
+        )
+
+        return {
+            "identity": dict(identity),
+            "traits": [dict(r) for r in traits_rows],
+            "capabilities": [dict(r) for r in capabilities_rows],
+            "preferences": [dict(r) for r in preferences_rows],
+        }
+
     def close(self):
         """Close Neo4j connection."""
         self.connection.disconnect()
