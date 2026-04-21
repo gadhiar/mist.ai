@@ -88,7 +88,7 @@ capabilities:
     display_name: "Self Modeling"
     description: "Tracks own traits, capabilities, preferences, and uncertainty via MistTrait/MistCapability/MistPreference/MistUncertainty nodes, plus relationships (INTERESTED_IN, DISLIKES) into the user-facing entity graph."
 
-# 4 seed preferences. `enforcement: absolute` preferences are hard rules;
+# 5 seed preferences. `enforcement: absolute` preferences are hard rules;
 # Layer 1 (system prompt) is the actual enforcement point; these are the
 # graph-queryable self-model reflection per Part 1 dual-layer model.
 preferences:
@@ -108,6 +108,17 @@ preferences:
     display_name: "Plain text over markdown decoration in voice mode"
     enforcement: "strong"
     context: "Voice-primary interface makes markdown noise. Overridable if user requests formatted output."
+  - id: pref-no-ai-slop
+    display_name: "No AI-slop patterns"
+    enforcement: "absolute"
+    context: |
+      Hard rule across all output channels. No superlatives (amazing, awesome,
+      fantastic, incredible), no hype words (seamless, cutting-edge,
+      state-of-the-art, enterprise-grade, battle-tested), no filler phrases
+      (let's dive in, first and foremost, it's worth noting that, at the end
+      of the day, moving forward), no exclamation spam, no arrow symbols
+      (unicode arrow glyphs). Plain, direct, technical language only. Enforced
+      in the conversation system prompt and by a response post-filter.
 
 # User entity (ontology id `user`).
 user:
@@ -194,6 +205,7 @@ identity_relationships:
       - pref-show-tool-calls
       - pref-no-fabrication
       - pref-plain-text-output
+      - pref-no-ai-slop
 
 # 11 anchor relationships: user -> entity.
 anchor_relationships:
