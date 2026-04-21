@@ -21,14 +21,29 @@ logger = logging.getLogger(__name__)
 # SUPERSEDES is also excluded — it marks knowledge as out-of-date; surfacing
 # superseded relationships via retrieval would mislead. Out-of-date facts
 # should be filtered upstream by status, not traversed.
+#
+# Cluster 1 additions: IMPLEMENTED_WITH / MIST_HAS_TRAIT / MIST_HAS_CAPABILITY /
+# MIST_HAS_PREFERENCE link MistIdentity to external-domain targets (Concept,
+# Topic, Skill, Preference, Technology) grown via extraction. They must be
+# in the allowlist so seed-expansion anchored at mist-identity can reach
+# extracted self-model facts at hop >=1.
 _USER_FACING_REL_TYPES: list[str] = [
-    # MIST self-model edges (MistIdentity -> trait/cap/pref/uncertainty)
+    # MIST self-model edges (MistIdentity -> internal MistTrait/MistCapability/
+    # MistPreference/MistUncertainty targets; seeded at startup).
     "HAS_TRAIT",
     "HAS_CAPABILITY",
     "HAS_PREFERENCE",
     "IS_UNCERTAIN_ABOUT",
     "ADAPTED_FOR",
     "LEARNED_SELF",
+    # MIST-scope external edges (Cluster 1). MistIdentity -> external-domain
+    # Concept / Topic / Skill / Preference / Technology targets grown via
+    # extraction. Included so seed-expansion from mist-identity reaches
+    # extracted facts like "MIST uses LanceDB" or "MIST is curious".
+    "IMPLEMENTED_WITH",
+    "MIST_HAS_TRAIT",
+    "MIST_HAS_CAPABILITY",
+    "MIST_HAS_PREFERENCE",
     # User profile + activity edges
     "USES",
     "LEARNING",

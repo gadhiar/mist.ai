@@ -103,6 +103,26 @@ class TestGraphHopEntityFilter:
             "retrieval. Out-of-date facts should be filtered upstream by status."
         )
 
+    def test_user_facing_rel_types_includes_cluster_1_mist_scope_edges(self) -> None:
+        """Cluster 1 MIST-scope edges must be in the traversal allowlist.
+
+        IMPLEMENTED_WITH / MIST_HAS_TRAIT / MIST_HAS_CAPABILITY /
+        MIST_HAS_PREFERENCE link MistIdentity to external-domain targets
+        (Concept / Topic / Skill / Preference / Technology). Without them
+        in this allowlist, seed-expansion anchored at mist-identity
+        cannot reach extraction-grown self-model facts at hop >=1.
+        """
+        cluster_1_edges = {
+            "IMPLEMENTED_WITH",
+            "MIST_HAS_TRAIT",
+            "MIST_HAS_CAPABILITY",
+            "MIST_HAS_PREFERENCE",
+        }
+        missing = cluster_1_edges - set(_USER_FACING_REL_TYPES)
+        assert (
+            not missing
+        ), f"Cluster 1 MIST-scope edges missing from _USER_FACING_REL_TYPES: {missing}"
+
     # ---- get_entity_neighborhood (multi-hop expansion) --------------------------------
 
     def test_multi_hop_expansion_filters_all_path_nodes_to_entity(self) -> None:
