@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from backend.chat.context_budget import ContextBudgetPlanner
 from backend.chat.mist_context import MistContext
 from backend.chat.slop_detector import SlopDetector
 from backend.event_store.models import ConversationTurnEvent
@@ -148,6 +149,7 @@ class ConversationHandler:
         llm_provider: StreamingLLMProvider,
         tool_usage_tracker: ToolUsageTracker | None = None,
         debug_logger: DebugJSONLLogger | None = None,
+        budget_planner: ContextBudgetPlanner | None = None,
     ) -> None:
         """Initialize conversation handler.
 
@@ -162,6 +164,10 @@ class ConversationHandler:
             debug_logger: Optional DebugJSONLLogger for per-turn structured
                 observability. Produced by `DebugJSONLLogger.from_env()`; when
                 `MIST_DEBUG_JSONL` is unset the logger yields no-op records.
+            budget_planner: Optional ContextBudgetPlanner (Cluster 6). When
+                None and `config.context_budget.enabled` is True, one is
+                constructed from `config.context_budget`. When disabled, the
+                handler falls back to legacy pre-Cluster-6 message assembly.
         """
         self.config = config
         self.graph_store = graph_store
@@ -169,6 +175,15 @@ class ConversationHandler:
         self.retriever = retriever
         self._tool_usage_tracker = tool_usage_tracker
         self._debug_logger = debug_logger
+
+        # Cluster 6: budget-aware context assembly. Planner constructed from
+        # config when not injected; legacy behavior preserved when disabled.
+        if budget_planner is not None:
+            self._budget_planner: ContextBudgetPlanner | None = budget_planner
+        elif getattr(config, "context_budget", None) and config.context_budget.enabled:
+            self._budget_planner = ContextBudgetPlanner(config.context_budget)
+        else:
+            self._budget_planner = None
 
         # LLM provider (replaces ChatOllama)
         self._provider = llm_provider
@@ -364,7 +379,7 @@ class ConversationHandler:
                 messages=rider_messages,
                 tools=None,
                 temperature=rider_temp,
-                max_tokens=400,
+                max_tokens=self.config.llm.conversation_max_tokens,
             )
             with llm_call_context(
                 session_id=session_id,
@@ -445,6 +460,7 @@ class ConversationHandler:
             max_history,
             retrieval_result=retrieval_result,
             mist_context=mist_context,
+            max_output_tokens=self.config.llm.conversation_max_tokens,
         )
 
         try:
@@ -457,7 +473,7 @@ class ConversationHandler:
                 messages=messages,
                 tools=self._tool_schemas,
                 temperature=self.config.llm.conversation_temperature,
-                max_tokens=400,
+                max_tokens=self.config.llm.conversation_max_tokens,
             )
             _llm_start_1 = time.time()
             with llm_call_context(
@@ -543,7 +559,7 @@ class ConversationHandler:
                     session_id=session_id,
                     messages=messages,
                     temperature=self.config.llm.conversation_temperature,
-                    max_tokens=400,
+                    max_tokens=self.config.llm.conversation_max_tokens,
                 )
                 _llm_start_2 = time.time()
                 with llm_call_context(
@@ -813,66 +829,125 @@ class ConversationHandler:
         max_history: int,
         retrieval_result: RetrievalResult | None = None,
         mist_context: MistContext | None = None,
+        max_output_tokens: int = 400,
     ) -> list[dict[str, str]]:
         """Build message list for LLM.
 
         Ordering:
           1. Persona block from MistContext (when provided) -- identity + HARD RULES
           2. Static system template -- tool availability, strategy, guidelines
-          3. Retrieval context (when auto-RAG produced facts)
+          3. Retrieval context (when auto-RAG produced facts) — budget-pruned
           4. Live-data advisory (when retrieval requires MCP)
-          5. Conversation history
+          5. Conversation history — budget-pruned via history strategy
+
+        Cluster 6: when `self._budget_planner` is not None, a BudgetPlan is
+        computed before composition. The planner prunes retrieval context by
+        fact-priority score and history by strategy (sliding-window default)
+        so the total prompt fits within
+        `config.context_budget.context_window - max_output_tokens - reserves`.
 
         Args:
             session: Conversation session
-            max_history: Maximum history messages to include
+            max_history: Maximum history messages to include (upper bound;
+                the budget planner may prune further).
             retrieval_result: Optional hybrid retrieval result from auto-RAG
             mist_context: Optional MistContext to prepend as persona block.
-                When None, falls back to the legacy full static template
-                (includes "You are MIST..." opener) so existing callers are
-                unaffected.
+                When None, falls back to the legacy full static template.
+            max_output_tokens: Expected output budget for the coming LLM call.
+                Subtracted from the total budget so pruning leaves headroom.
 
         Returns:
-            List of messages for LLM
+            List of messages for LLM, budget-compliant when planner is active.
         """
+        # Compute persona + static text first so the planner can account for them.
+        persona_text = mist_context.as_system_prompt_block() if mist_context is not None else None
+        if mist_context is not None:
+            static_template = _STATIC_SYSTEM_TEMPLATE_BODY
+        else:
+            static_template = _STATIC_IDENTITY_HEADER + _STATIC_SYSTEM_TEMPLATE_BODY
+
+        # Live-data advisory is a fixed-cost segment when present.
+        live_advisory_text: str | None = None
+        if retrieval_result and retrieval_result.requires_mcp and retrieval_result.suggested_tools:
+            live_advisory_text = (
+                "=== LIVE DATA ADVISORY ===\n"
+                "This query appears to request real-time information. Consider using\n"
+                "available tools for current data rather than relying on stored knowledge.\n"
+                "Suggested tools: %s" % ", ".join(retrieval_result.suggested_tools)
+            )
+
+        raw_history = session.get_history(max_history)
+
+        # --- Cluster 6: budget planning ---
+        if self._budget_planner is not None:
+            plan = self._budget_planner.plan(
+                persona_text=persona_text,
+                static_text=static_template,
+                retrieval_result=retrieval_result,
+                live_advisory_text=live_advisory_text,
+                history=raw_history,
+                tools=self._tool_schemas,
+                max_output_tokens=max_output_tokens,
+            )
+            retrieval_text = plan.pruned_retrieval_text
+            history = plan.pruned_history
+            if not plan.fits:
+                logger.warning(
+                    "[BUDGET] Context budget exceeded: fixed_cost=%d total_budget=%d. "
+                    "Degrading to minimal prompt (no retrieval, no history).",
+                    plan.fixed_cost,
+                    plan.total_budget,
+                )
+            elif plan.facts_dropped or len(history) < len(raw_history):
+                logger.info(
+                    "[BUDGET] Pruned: retrieval=%d used / %d budget (%d facts kept, %d dropped) | "
+                    "history=%d used / %d budget (%d kept / %d raw) | fixed_cost=%d total=%d",
+                    plan.retrieval_used,
+                    plan.retrieval_budget,
+                    plan.facts_kept,
+                    plan.facts_dropped,
+                    plan.history_used,
+                    plan.history_budget,
+                    len(history),
+                    len(raw_history),
+                    plan.fixed_cost,
+                    plan.total_budget,
+                )
+        else:
+            # Legacy behavior (budget disabled): full retrieval text, no history pruning.
+            retrieval_text = (
+                retrieval_result.formatted_context
+                if retrieval_result and retrieval_result.total_facts > 0
+                else None
+            )
+            history = raw_history
+
+        # --- Compose messages ---
         messages: list[dict[str, str]] = []
 
         # 1. Persona block (Cluster 3)
-        if mist_context is not None:
-            messages.append({"role": "system", "content": mist_context.as_system_prompt_block()})
-            # Persona block already introduces MIST — omit the identity header.
-            static_template = _STATIC_SYSTEM_TEMPLATE_BODY
-        else:
-            # Fallback: no persona retrieved; prepend the identity header so the
-            # prompt is self-contained.
-            static_template = _STATIC_IDENTITY_HEADER + _STATIC_SYSTEM_TEMPLATE_BODY
+        if persona_text is not None:
+            messages.append({"role": "system", "content": persona_text})
 
         # 2. Static system template
         messages.append({"role": "system", "content": static_template})
 
-        # 3. Retrieval context (unchanged logic)
-        if retrieval_result and retrieval_result.total_facts > 0:
-            context_str = retrieval_result.formatted_context
-            logger.info(
-                "[AUTO-RAG] Injecting retrieval context: intent=%s, facts=%d, chunks=%d",
-                retrieval_result.intent,
-                retrieval_result.total_facts,
-                retrieval_result.document_chunks_used,
-            )
-            messages.append({"role": "system", "content": context_str})
-
-            # 4. Live-data advisory when query requires MCP tools
-            if retrieval_result.requires_mcp and retrieval_result.suggested_tools:
-                advisory = (
-                    "=== LIVE DATA ADVISORY ===\n"
-                    "This query appears to request real-time information. Consider using\n"
-                    "available tools for current data rather than relying on stored knowledge.\n"
-                    "Suggested tools: %s" % ", ".join(retrieval_result.suggested_tools)
+        # 3. Retrieval context (pruned by planner when active)
+        if retrieval_text:
+            if retrieval_result:
+                logger.info(
+                    "[AUTO-RAG] Injecting retrieval context: intent=%s, facts=%d, chunks=%d",
+                    retrieval_result.intent,
+                    retrieval_result.total_facts,
+                    retrieval_result.document_chunks_used,
                 )
-                messages.append({"role": "system", "content": advisory})
+            messages.append({"role": "system", "content": retrieval_text})
+
+        # 4. Live-data advisory
+        if live_advisory_text:
+            messages.append({"role": "system", "content": live_advisory_text})
 
         # 5. Conversation history
-        history = session.get_history(max_history)
         messages.extend(history)
 
         return messages

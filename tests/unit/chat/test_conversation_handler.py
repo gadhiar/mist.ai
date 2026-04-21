@@ -698,3 +698,104 @@ class TestBuildRequestPreValidationDump:
 
         with pytest.raises(ValidationError):
             handler._build_request(call_site="test", messages="invalid")
+
+
+class TestBudgetAwareBuildMessages:
+    """Cluster 6: _build_messages consults the ContextBudgetPlanner (when
+    enabled) to prune retrieval + history to fit a hard token budget.
+    """
+
+    def _handler_with_tiny_budget(self):
+        """Build a handler whose context_window is small enough to force history pruning.
+
+        The static system template is ~550 tokens on its own, so the budget
+        must exceed that for the planner to exercise history pruning (rather
+        than failing the fits=False degradation path).
+        """
+        from backend.chat.context_budget import ContextBudgetPlanner
+        from backend.knowledge.config import ContextBudgetConfig
+
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        config = build_test_config()
+        # 1200 total budget - 50 max_out - 50 reserve - 10 safety ≈ 1090 usable
+        # Static + persona ≈ 600 tokens, leaves ~490 for retrieval+history.
+        # 50 history messages * ~18 tokens each = 900 — forces pruning.
+        config.context_budget = ContextBudgetConfig(
+            context_window=1200,
+            output_reserve_tokens=50,
+            safety_margin_tokens=10,
+            retrieval_budget_ratio=0.3,
+            enabled=True,
+        )
+        return ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=FakeExtractionPipeline(),
+            retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
+            budget_planner=ContextBudgetPlanner(config.context_budget),
+        )
+
+    def test_long_history_is_pruned_to_recent_messages(self):
+        from backend.knowledge.models import ConversationSession
+
+        handler = self._handler_with_tiny_budget()
+        session = ConversationSession(session_id="budget-s1", user_id="U")
+        for i in range(50):
+            session.add_message("user", f"message {i} " + "x" * 40)
+            session.add_message("assistant", f"reply {i} " + "y" * 40)
+
+        messages = handler._build_messages(
+            session=session,
+            max_history=100,  # upper bound; planner prunes further
+            retrieval_result=None,
+            mist_context=None,
+            max_output_tokens=50,
+        )
+
+        # System prompt(s) still present.
+        assert any(m["role"] == "system" for m in messages)
+        # History (non-system messages) must be < 100 after pruning.
+        history_msgs = [m for m in messages if m["role"] != "system"]
+        assert len(history_msgs) < 100
+        # Last history message must be the most recent.
+        assert history_msgs[-1]["content"].startswith("reply 49")
+
+    def test_disabled_budget_preserves_legacy_behavior(self):
+        """When context_budget.enabled=False the handler skips pruning entirely."""
+        from backend.knowledge.config import ContextBudgetConfig
+        from backend.knowledge.models import ConversationSession
+
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        config = build_test_config()
+        config.context_budget = ContextBudgetConfig(
+            context_window=100,  # would force pruning if enabled
+            output_reserve_tokens=10,
+            safety_margin_tokens=5,
+            enabled=False,
+        )
+        handler = ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=FakeExtractionPipeline(),
+            retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
+        )
+        # Budget planner must not be constructed when disabled.
+        assert handler._budget_planner is None
+
+        session = ConversationSession(session_id="legacy-s1", user_id="U")
+        for i in range(5):
+            session.add_message("user", f"message {i}")
+
+        messages = handler._build_messages(
+            session=session,
+            max_history=10,
+            retrieval_result=None,
+            mist_context=None,
+        )
+        # All 5 history messages present (no pruning).
+        history_msgs = [m for m in messages if m["role"] != "system"]
+        assert len(history_msgs) == 5
