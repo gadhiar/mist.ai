@@ -123,3 +123,164 @@ class TestReservedNamespaceGuard:
         assert any(
             "reserved name" in r.message.lower() for r in caplog.records
         ), f"Expected reserved-name warning, got logs: {[r.message for r in caplog.records]}"
+
+
+class TestReservedNameTypeRemap:
+    """Cluster 1: reserved-name matches must override entity_type to MistIdentity.
+
+    An LLM frequently labels 'MIST' or 'MIST.AI' as Organization. Cluster 1
+    validator constraints require the mist-identity node to carry the
+    MistIdentity label for IMPLEMENTED_WITH / MIST_HAS_CAPABILITY /
+    MIST_HAS_TRAIT / MIST_HAS_PREFERENCE edges. The normalizer must rewrite
+    both id AND type so the graph-writer produces a validator-compliant node.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mist_name_remaps_id_and_type(self):
+        # Arrange
+        normalizer = EntityNormalizer(
+            embedding_generator=FakeEmbeddingGenerator(),
+            executor=None,
+        )
+        extraction = ExtractionResult(
+            entities=[{"id": "mist", "name": "MIST", "type": "Organization"}],
+            relationships=[],
+        )
+
+        # Act
+        result = await normalizer.normalize(extraction)
+
+        # Assert
+        assert result.entities[0]["id"] == "mist-identity"
+        assert result.entities[0]["type"] == "MistIdentity"
+
+    @pytest.mark.asyncio
+    async def test_mist_dot_ai_remaps(self):
+        # Arrange
+        normalizer = EntityNormalizer(
+            embedding_generator=FakeEmbeddingGenerator(),
+            executor=None,
+        )
+        extraction = ExtractionResult(
+            entities=[{"id": "mist-ai-1", "name": "MIST.AI", "type": "Organization"}],
+            relationships=[],
+        )
+
+        # Act
+        result = await normalizer.normalize(extraction)
+
+        # Assert
+        assert result.entities[0]["id"] == "mist-identity"
+        assert result.entities[0]["type"] == "MistIdentity"
+
+    @pytest.mark.asyncio
+    async def test_the_ai_remaps(self):
+        # Arrange
+        normalizer = EntityNormalizer(
+            embedding_generator=FakeEmbeddingGenerator(),
+            executor=None,
+        )
+        extraction = ExtractionResult(
+            entities=[{"id": "ai-agent", "name": "the AI", "type": "Concept"}],
+            relationships=[],
+        )
+
+        # Act
+        result = await normalizer.normalize(extraction)
+
+        # Assert
+        assert result.entities[0]["id"] == "mist-identity"
+        assert result.entities[0]["type"] == "MistIdentity"
+
+    @pytest.mark.asyncio
+    async def test_relationships_forwarded_after_remap(self):
+        # Arrange
+        normalizer = EntityNormalizer(
+            embedding_generator=FakeEmbeddingGenerator(),
+            executor=None,
+        )
+        extraction = ExtractionResult(
+            entities=[
+                {"id": "mist", "name": "MIST", "type": "Organization"},
+                {"id": "lancedb", "name": "LanceDB", "type": "Technology"},
+            ],
+            relationships=[
+                {"source": "mist", "target": "lancedb", "type": "USES"},
+            ],
+        )
+
+        # Act
+        result = await normalizer.normalize(extraction)
+
+        # Assert
+        mist_entity = next(e for e in result.entities if e["id"] == "mist-identity")
+        assert mist_entity["type"] == "MistIdentity"
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["source"] == "mist-identity"
+        assert result.relationships[0]["target"] == "lancedb"
+        assert result.relationships[0]["type"] == "USES"
+
+    @pytest.mark.asyncio
+    async def test_non_reserved_entities_unchanged(self):
+        # Arrange
+        normalizer = EntityNormalizer(
+            embedding_generator=FakeEmbeddingGenerator(),
+            executor=None,
+        )
+        extraction = ExtractionResult(
+            entities=[{"id": "python", "name": "Python", "type": "Technology"}],
+            relationships=[],
+        )
+
+        # Act
+        result = await normalizer.normalize(extraction)
+
+        # Assert
+        assert result.entities[0]["id"] == "python"
+        assert result.entities[0]["type"] == "Technology"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "input_name",
+        [
+            pytest.param("Mist", id="title-case"),
+            pytest.param("MIST", id="upper-case"),
+            pytest.param("mist", id="lower-case"),
+        ],
+    )
+    async def test_reserved_name_case_insensitive(self, input_name):
+        # Arrange
+        normalizer = EntityNormalizer(
+            embedding_generator=FakeEmbeddingGenerator(),
+            executor=None,
+        )
+        extraction = ExtractionResult(
+            entities=[{"id": input_name, "name": input_name, "type": "Organization"}],
+            relationships=[],
+        )
+
+        # Act
+        result = await normalizer.normalize(extraction)
+
+        # Assert
+        assert result.entities[0]["id"] == "mist-identity"
+        assert result.entities[0]["type"] == "MistIdentity"
+
+    @pytest.mark.asyncio
+    async def test_reserved_name_with_trailing_whitespace_remaps(self):
+        # Arrange
+        normalizer = EntityNormalizer(
+            embedding_generator=FakeEmbeddingGenerator(),
+            executor=None,
+        )
+        extraction = ExtractionResult(
+            entities=[{"id": "whitespace-mist", "name": "  mist  ", "type": "Organization"}],
+            relationships=[],
+        )
+
+        # Act
+        result = await normalizer.normalize(extraction)
+
+        # Assert
+        assert result.entities[0]["id"] == "mist-identity"
+        assert result.entities[0]["type"] == "MistIdentity"

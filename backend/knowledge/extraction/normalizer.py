@@ -87,15 +87,23 @@ class EntityNormalizer:
     # to the canonical mist-identity node (seeded in scripts/seed_data.yaml).
     # Extraction that introduces new "mist" or "the-ai" entities pollutes
     # the graph with duplicates of the system's own identity node.
-    RESERVED_NAMES: dict[str, str] = {
-        "mist": "mist-identity",
-        "mist.ai": "mist-identity",
-        "mist ai": "mist-identity",
-        "mist-ai": "mist-identity",
-        "the ai": "mist-identity",
-        "the-ai": "mist-identity",
-        "the assistant": "mist-identity",
-        "the-assistant": "mist-identity",
+    #
+    # Cluster 1 extension: each entry maps to a (canonical_id, canonical_type)
+    # tuple. The type override is required because Cluster 1 validator
+    # constraints check MistIdentity as the source of IMPLEMENTED_WITH /
+    # MIST_HAS_CAPABILITY / MIST_HAS_TRAIT / MIST_HAS_PREFERENCE edges; an
+    # LLM-guessed type of "Organization" on the mist-identity node breaks
+    # those constraints. Forcing type=MistIdentity on reserved-name matches
+    # keeps node schema aligned with edge-contract validation.
+    RESERVED_NAMES: dict[str, tuple[str, str]] = {
+        "mist": ("mist-identity", "MistIdentity"),
+        "mist.ai": ("mist-identity", "MistIdentity"),
+        "mist ai": ("mist-identity", "MistIdentity"),
+        "mist-ai": ("mist-identity", "MistIdentity"),
+        "the ai": ("mist-identity", "MistIdentity"),
+        "the-ai": ("mist-identity", "MistIdentity"),
+        "the assistant": ("mist-identity", "MistIdentity"),
+        "the-assistant": ("mist-identity", "MistIdentity"),
     }
 
     SIMILARITY_THRESHOLD: float = 0.92
@@ -144,11 +152,29 @@ class EntityNormalizer:
                 entity["id"] = "user"
                 continue
 
-            # Check pre-canonicalization aliases (e.g. "C++" before "+" is stripped).
-            # Note: _PRE_CANON_ALIASES matches BEFORE _canonicalize runs, which means the
-            # Bug G reserved-namespace guard inside _canonicalize is bypassed for any key
-            # that lands here. Keys in RESERVED_NAMES must NOT appear in _PRE_CANON_ALIASES.
+            # Bug G / Cluster 1 guard: reserved-name remap takes precedence
+            # over every other alias path and also overrides entity_type so
+            # the mist-identity node carries the MistIdentity label required
+            # by validator edge-contract constraints.
             raw_lower = entity_name.lower().strip()
+            reserved = self.RESERVED_NAMES.get(raw_lower)
+            if reserved is not None:
+                canonical_id, canonical_type = reserved
+                logger.warning(
+                    "Reserved name '%s' remapped to canonical id='%s' type='%s'",
+                    entity_name,
+                    canonical_id,
+                    canonical_type,
+                )
+                entity["type"] = canonical_type
+                id_map[old_id] = canonical_id
+                entity["id"] = canonical_id
+                continue
+
+            # Check pre-canonicalization aliases (e.g. "C++" before "+" is stripped).
+            # Note: _PRE_CANON_ALIASES matches BEFORE _canonicalize runs. Keys in
+            # RESERVED_NAMES must NOT appear in _PRE_CANON_ALIASES (the guard above
+            # would already have handled them, but keeping invariants explicit).
             pre_canon = self._PRE_CANON_ALIASES.get(raw_lower)
             if pre_canon is not None:
                 canonical_id = pre_canon
@@ -204,23 +230,17 @@ class EntityNormalizer:
         Lowercases, strips version numbers, replaces spaces/underscores
         with hyphens, and removes non-alphanumeric characters (except hyphens).
 
+        Reserved-name remapping (Bug G / Cluster 1) is handled upstream in
+        `normalize()` so that the caller can also override `entity["type"]`
+        to MistIdentity; this method is pure id-canonicalization for
+        non-reserved names.
+
         Args:
             name: The entity display name.
 
         Returns:
             Canonical entity ID string.
         """
-        # Reserved-namespace guard — exact-match lookup on lowercased trimmed input.
-        lowered = name.lower().strip()
-        if lowered in self.RESERVED_NAMES:
-            canonical = self.RESERVED_NAMES[lowered]
-            logger.warning(
-                "Reserved name '%s' remapped to canonical '%s'",
-                name,
-                canonical,
-            )
-            return canonical
-
         # Strip version numbers
         canonical = self.VERSION_PATTERN.sub("", name)
 
