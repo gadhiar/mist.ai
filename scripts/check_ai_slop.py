@@ -30,93 +30,22 @@ import re
 import subprocess  # nosec B404 - used only for safe git commands
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from pathlib import Path
 
+# Ensure the project root (parent of scripts/) is on sys.path so that
+# `backend` is importable whether the script is run as:
+#   python scripts/check_ai_slop.py   (from project root)
+#   python check_ai_slop.py           (from scripts/ dir)
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-@dataclass
-class SlopPattern:
-    """Represents a detectable AI slop pattern."""
-
-    name: str
-    pattern: re.Pattern
-    severity: str  # 'critical', 'warning', 'info'
-    fixable: bool
-    replacement: str = ""
-
-
-# Define AI slop patterns
-PATTERNS = [
-    # CRITICAL: Emojis (absolute no-no)
-    SlopPattern(
-        name="emoji",
-        pattern=re.compile(r"[\U0001F300-\U0001F9FF\U0001FA70-\U0001FAFF\U00002600-\U000027BF]"),
-        severity="critical",
-        fixable=True,
-        replacement="",
-    ),
-    # CRITICAL: Common emoji-like unicode symbols
-    SlopPattern(
-        name="emoji_symbols",
-        pattern=re.compile(r"[✓✗✅❌🎯🔧🚀💡⚠️📝📊🏗️🌟💪🤔👍👎🔥💯🎉🎊]"),
-        severity="critical",
-        fixable=True,
-        replacement="",  # Just remove them
-    ),
-    # CRITICAL: Arrow symbols (use -> instead)
-    SlopPattern(
-        name="arrow_symbols",
-        pattern=re.compile(r"[→←↔↑↓⇒⇐⇔⟹⟸⟺➜➝➞➟➠➡➢➣➤]"),
-        severity="critical",
-        fixable=True,
-        replacement="->",
-    ),
-    # WARNING: Superlative adjectives (can be disabled with --critical-only)
-    SlopPattern(
-        name="superlatives",
-        pattern=re.compile(
-            r"\b(amazing|awesome|fantastic|incredible|wonderful|"
-            r"outstanding|remarkable|extraordinary|exceptional|"
-            r"phenomenal|spectacular|fabulous|magnificent|marvelous)\b",
-            re.IGNORECASE,
-        ),
-        severity="warning",
-        fixable=False,
-    ),
-    # WARNING: Over-hyped technical terms (can be disabled with --critical-only)
-    # Note: "excellent", "revolutionary", "innovative", "groundbreaking" removed - sometimes valid
-    SlopPattern(
-        name="hype_words",
-        pattern=re.compile(
-            r"\b(seamless|cutting-edge|state-of-the-art|"
-            r"world-class|enterprise-grade|battle-tested|"
-            r"game-changing)\b",
-            re.IGNORECASE,
-        ),
-        severity="warning",
-        fixable=False,
-    ),
-    # INFO: Common AI filler phrases (can be disabled)
-    SlopPattern(
-        name="filler_phrases",
-        pattern=re.compile(
-            r"(let'?s dive (?:in|into)|first and foremost|"
-            r"it'?s worth noting that|at the end of the day|moving forward)",
-            re.IGNORECASE,
-        ),
-        severity="info",
-        fixable=False,
-    ),
-    # INFO: Excessive exclamation marks
-    SlopPattern(
-        name="exclamation_spam",
-        pattern=re.compile(r"!{3,}"),  # Changed from 2+ to 3+ (allow !!)
-        severity="info",
-        fixable=True,
-        replacement="!",
-    ),
-]
-
+# Canonical pattern catalogue lives in backend.chat.slop_detector so backend
+# code can import it. This script is the CLI wrapper.
+from backend.chat.slop_detector import (  # noqa: E402
+    PATTERNS,
+    SlopPattern,
+)
 
 # Files to always skip
 SKIP_PATTERNS = [
@@ -135,6 +64,8 @@ SKIP_PATTERNS = [
     r"\.lock$",
     r"package-lock\.json$",
     r"check_ai_slop\.py$",  # Skip self - contains patterns by design
+    r"slop_detector\.py$",  # Skip library source - contains pattern literals by design
+    r"test_slop_detector\.py$",  # Skip slop detector tests - contain literal test inputs
 ]
 
 
