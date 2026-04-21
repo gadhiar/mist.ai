@@ -1264,9 +1264,29 @@ class GraphStore:
             capabilities (list of dicts),
             preferences (list of dicts).
 
+        Each trait / capability / preference row carries an `origin` field
+        of "seeded" or "extracted":
+
+        - "seeded": the canonical seed path documented in ADR-008. MistIdentity
+          -[HAS_TRAIT]-> MistTrait (internal domain), MistIdentity
+          -[HAS_CAPABILITY]-> MistCapability, MistIdentity
+          -[HAS_PREFERENCE]-> MistPreference. These carry explicit `axis`
+          (traits) and `enforcement` (preferences, including the "absolute"
+          values pref-no-emoji / pref-no-ai-slop that drive the HARD RULES
+          framing in MistContext.as_system_prompt_block).
+
+        - "extracted": the Cluster 1 external path. MistIdentity
+          -[MIST_HAS_TRAIT]-> Concept / Topic / Skill / Preference, MistIdentity
+          -[MIST_HAS_CAPABILITY]-> Technology / Skill / Concept / Topic,
+          MistIdentity -[MIST_HAS_PREFERENCE]-> Preference / Concept /
+          Technology / Topic. Extracted targets use the external-entity
+          property set (display_name, description) and are mapped into the
+          renderer shape with `axis` defaulted to "Persona" and `enforcement`
+          defaulted to "informational" so they are NEVER surfaced as HARD
+          RULES -- absolute-enforcement prefs are seed-only by policy.
+
         Used by KnowledgeRetriever.retrieve_mist_context() for persona injection.
-        Traversal is anchored at the mist-identity node; HAS_TRAIT/HAS_CAPABILITY/
-        HAS_PREFERENCE edges target :__Entity__ nodes (ADR-009 :__Entity__-only rule).
+        Traversal is anchored at the mist-identity node across both paths.
         Falls back to a minimal default identity dict when the node is absent
         (pre-seed state).
         """
@@ -1275,28 +1295,73 @@ class GraphStore:
             RETURN m.id AS id, m.display_name AS display_name,
                    m.pronouns AS pronouns, m.self_concept AS self_concept
         """
-        traits_query = """
+        # Seeded path: HAS_TRAIT/HAS_CAPABILITY/HAS_PREFERENCE -> internal
+        # MistTrait / MistCapability / MistPreference nodes with canonical shape.
+        seeded_traits_query = """
             MATCH (m:__Entity__ {id: 'mist-identity'})-[:HAS_TRAIT]->(t:__Entity__)
             RETURN t.id AS id, t.display_name AS display_name,
-                   t.axis AS axis, t.description AS description
+                   t.axis AS axis, t.description AS description,
+                   t.entity_type AS entity_type
             ORDER BY t.display_name
         """
-        capabilities_query = """
+        seeded_capabilities_query = """
             MATCH (m:__Entity__ {id: 'mist-identity'})-[:HAS_CAPABILITY]->(c:__Entity__)
             RETURN c.id AS id, c.display_name AS display_name,
-                   c.description AS description
+                   c.description AS description,
+                   c.entity_type AS entity_type
             ORDER BY c.display_name
         """
-        preferences_query = """
+        seeded_preferences_query = """
             MATCH (m:__Entity__ {id: 'mist-identity'})-[:HAS_PREFERENCE]->(p:__Entity__)
             RETURN p.id AS id, p.display_name AS display_name,
-                   p.enforcement AS enforcement, p.context AS context
+                   p.enforcement AS enforcement, p.context AS context,
+                   p.entity_type AS entity_type
             ORDER BY p.enforcement DESC, p.display_name
         """
+        # Extracted path (Cluster 1): MIST_HAS_TRAIT / MIST_HAS_CAPABILITY /
+        # MIST_HAS_PREFERENCE -> external-domain nodes. These have display_name
+        # and description only; axis/enforcement/context are synthesized below.
+        extracted_traits_query = """
+            MATCH (m:__Entity__ {id: 'mist-identity'})-[:MIST_HAS_TRAIT]->(t:__Entity__)
+            RETURN t.id AS id, t.display_name AS display_name,
+                   t.description AS description,
+                   t.entity_type AS entity_type
+            ORDER BY t.display_name
+        """
+        extracted_capabilities_query = """
+            MATCH (m:__Entity__ {id: 'mist-identity'})-[:MIST_HAS_CAPABILITY]->(c:__Entity__)
+            RETURN c.id AS id, c.display_name AS display_name,
+                   c.description AS description,
+                   c.entity_type AS entity_type
+            ORDER BY c.display_name
+        """
+        extracted_preferences_query = """
+            MATCH (m:__Entity__ {id: 'mist-identity'})-[:MIST_HAS_PREFERENCE]->(p:__Entity__)
+            RETURN p.id AS id, p.display_name AS display_name,
+                   p.description AS description,
+                   p.entity_type AS entity_type
+            ORDER BY p.display_name
+        """
+        # IMPLEMENTED_WITH is a MIST-scope edge that also surfaces as a
+        # capability-flavored fact ("MIST is implemented with X"). Project
+        # it into the capabilities list so the persona block covers
+        # implementation-stack facts.
+        implemented_with_query = """
+            MATCH (m:__Entity__ {id: 'mist-identity'})-[:IMPLEMENTED_WITH]->(t:__Entity__)
+            RETURN t.id AS id, t.display_name AS display_name,
+                   t.description AS description,
+                   t.entity_type AS entity_type
+            ORDER BY t.display_name
+        """
+
         identity_rows = self.connection.execute_query(identity_query, {})
-        traits_rows = self.connection.execute_query(traits_query, {})
-        capabilities_rows = self.connection.execute_query(capabilities_query, {})
-        preferences_rows = self.connection.execute_query(preferences_query, {})
+        seeded_trait_rows = self.connection.execute_query(seeded_traits_query, {})
+        seeded_capability_rows = self.connection.execute_query(seeded_capabilities_query, {})
+        seeded_preference_rows = self.connection.execute_query(seeded_preferences_query, {})
+        extracted_trait_rows = self.connection.execute_query(extracted_traits_query, {})
+        extracted_capability_rows = self.connection.execute_query(extracted_capabilities_query, {})
+        extracted_preference_rows = self.connection.execute_query(extracted_preferences_query, {})
+        implemented_with_rows = self.connection.execute_query(implemented_with_query, {})
 
         identity = (
             identity_rows[0]
@@ -1309,11 +1374,74 @@ class GraphStore:
             }
         )
 
+        traits: list[dict] = [{**dict(r), "origin": "seeded"} for r in seeded_trait_rows]
+        for row in extracted_trait_rows:
+            entry = dict(row)
+            traits.append(
+                {
+                    "id": entry.get("id"),
+                    "display_name": entry.get("display_name"),
+                    # Default axis for extracted traits -- not a seed with a
+                    # canonical persona/platform distinction.
+                    "axis": "Persona",
+                    "description": entry.get("description") or "",
+                    "entity_type": entry.get("entity_type"),
+                    "origin": "extracted",
+                }
+            )
+
+        capabilities: list[dict] = [{**dict(r), "origin": "seeded"} for r in seeded_capability_rows]
+        for row in extracted_capability_rows:
+            entry = dict(row)
+            capabilities.append(
+                {
+                    "id": entry.get("id"),
+                    "display_name": entry.get("display_name"),
+                    "description": entry.get("description") or "",
+                    "entity_type": entry.get("entity_type"),
+                    "origin": "extracted",
+                }
+            )
+        for row in implemented_with_rows:
+            entry = dict(row)
+            name = entry.get("display_name") or ""
+            desc = entry.get("description") or ""
+            # Synthesize a capability-flavored description so the renderer
+            # surfaces "implemented with" facts naturally.
+            synth_desc = f"Implemented with {name}." if name else desc
+            if desc and name and name not in desc:
+                synth_desc = f"{synth_desc} {desc}"
+            capabilities.append(
+                {
+                    "id": entry.get("id"),
+                    "display_name": name,
+                    "description": synth_desc.strip(),
+                    "entity_type": entry.get("entity_type"),
+                    "origin": "extracted",
+                }
+            )
+
+        preferences: list[dict] = [{**dict(r), "origin": "seeded"} for r in seeded_preference_rows]
+        for row in extracted_preference_rows:
+            entry = dict(row)
+            preferences.append(
+                {
+                    "id": entry.get("id"),
+                    "display_name": entry.get("display_name"),
+                    # Absolute enforcement is seed-only -- extracted prefs default
+                    # to informational so HARD RULES stay gated on seed policy.
+                    "enforcement": "informational",
+                    "context": entry.get("description") or "",
+                    "entity_type": entry.get("entity_type"),
+                    "origin": "extracted",
+                }
+            )
+
         return {
             "identity": dict(identity),
-            "traits": [dict(r) for r in traits_rows],
-            "capabilities": [dict(r) for r in capabilities_rows],
-            "preferences": [dict(r) for r in preferences_rows],
+            "traits": traits,
+            "capabilities": capabilities,
+            "preferences": preferences,
         }
 
     def close(self):

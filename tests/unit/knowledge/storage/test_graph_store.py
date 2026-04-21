@@ -376,14 +376,22 @@ class TestGetMistIdentityContext:
             },
         ]
 
-        # query_responses uses substring matching in insertion order: more specific
-        # edge-type patterns must come before the generic identity pattern because
-        # HAS_TRAIT/HAS_CAPABILITY/HAS_PREFERENCE queries also contain 'mist-identity'.
+        # query_responses uses substring matching in insertion order. Cluster 1
+        # adds MIST_HAS_* queries whose substring (e.g. "MIST_HAS_TRAIT") also
+        # matches "HAS_TRAIT"; the more-specific MIST_HAS_* keys MUST be listed
+        # first so they win for the extracted queries. The :HAS_TRAIT]-> / etc.
+        # keys below are scoped to the bracket so they only match the seeded
+        # queries. The [] responses for the MIST_HAS_* keys make the extracted
+        # path return nothing, preserving the original counts.
         fake_conn = FakeNeo4jConnection(
             query_responses={
-                "HAS_TRAIT": trait_rows,
-                "HAS_CAPABILITY": cap_rows,
-                "HAS_PREFERENCE": pref_rows,
+                "MIST_HAS_TRAIT": [],
+                "MIST_HAS_CAPABILITY": [],
+                "MIST_HAS_PREFERENCE": [],
+                "IMPLEMENTED_WITH": [],
+                ":HAS_TRAIT]->": trait_rows,
+                ":HAS_CAPABILITY]->": cap_rows,
+                ":HAS_PREFERENCE]->": pref_rows,
                 "mist-identity'})": [identity_row],
             }
         )
@@ -397,6 +405,10 @@ class TestGetMistIdentityContext:
         assert len(result["preferences"]) == 2
         pref_ids = {p["id"] for p in result["preferences"]}
         assert pref_ids == {"pref-no-emoji", "pref-no-ai-slop"}
+        # All seed-path rows are tagged origin="seeded".
+        assert all(t["origin"] == "seeded" for t in result["traits"])
+        assert all(c["origin"] == "seeded" for c in result["capabilities"])
+        assert all(p["origin"] == "seeded" for p in result["preferences"])
 
     def test_returns_default_identity_when_missing(self):
         """If mist-identity node is absent, return a minimal safe default."""
@@ -417,9 +429,218 @@ class TestGetMistIdentityContext:
 
         # FakeNeo4jConnection.query_errors: pattern -> exception raised on matching query.
         fake_conn = FakeNeo4jConnection(
-            query_errors={"HAS_TRAIT": RuntimeError("Simulated Neo4j transient error")}
+            query_errors={":HAS_TRAIT]->": RuntimeError("Simulated Neo4j transient error")}
         )
         store = GraphStore(connection=fake_conn, embedding_generator=FakeEmbeddingGenerator())
 
         with pytest.raises(RuntimeError, match="transient error"):
             store.get_mist_identity_context()
+
+    def test_returns_extracted_trait_from_mist_has_trait_edge(self):
+        """P0 #1: MIST_HAS_TRAIT -> external target is surfaced in traits list.
+
+        Seeds a single extracted MIST_HAS_TRAIT edge pointing at a Concept
+        node (external domain) and asserts the Concept shows up in the
+        returned traits with origin="extracted", the synthesized
+        axis="Persona", and the target's description.
+        """
+        identity_row = {
+            "id": "mist-identity",
+            "display_name": "MIST",
+            "pronouns": "she/her",
+            "self_concept": "A cognitive architecture.",
+        }
+        extracted_trait_row = {
+            "id": "concept-curiosity",
+            "display_name": "Curiosity",
+            "description": "Tendency to ask clarifying questions.",
+            "entity_type": "Concept",
+        }
+        # MIST_HAS_* keys listed first so substring "HAS_TRAIT" on the seeded
+        # query still falls through to the seeded key below.
+        fake_conn = FakeNeo4jConnection(
+            query_responses={
+                "MIST_HAS_TRAIT": [extracted_trait_row],
+                "MIST_HAS_CAPABILITY": [],
+                "MIST_HAS_PREFERENCE": [],
+                "IMPLEMENTED_WITH": [],
+                ":HAS_TRAIT]->": [],
+                ":HAS_CAPABILITY]->": [],
+                ":HAS_PREFERENCE]->": [],
+                "mist-identity'})": [identity_row],
+            }
+        )
+        store = GraphStore(connection=fake_conn, embedding_generator=FakeEmbeddingGenerator())
+
+        result = store.get_mist_identity_context()
+
+        # The extracted Concept shows up as a trait on MistContext.
+        assert len(result["traits"]) == 1
+        trait = result["traits"][0]
+        assert trait["id"] == "concept-curiosity"
+        assert trait["display_name"] == "Curiosity"
+        assert trait["axis"] == "Persona"  # synthesized default
+        assert trait["description"] == "Tendency to ask clarifying questions."
+        assert trait["entity_type"] == "Concept"
+        assert trait["origin"] == "extracted"
+
+    def test_returns_extracted_capability_from_mist_has_capability_edge(self):
+        """P0 #1: MIST_HAS_CAPABILITY -> Technology target surfaces in capabilities."""
+        identity_row = {
+            "id": "mist-identity",
+            "display_name": "MIST",
+            "pronouns": "she/her",
+            "self_concept": "",
+        }
+        extracted_cap_row = {
+            "id": "tech-neo4j",
+            "display_name": "Neo4j",
+            "description": "Graph database used for knowledge storage.",
+            "entity_type": "Technology",
+        }
+        fake_conn = FakeNeo4jConnection(
+            query_responses={
+                "MIST_HAS_TRAIT": [],
+                "MIST_HAS_CAPABILITY": [extracted_cap_row],
+                "MIST_HAS_PREFERENCE": [],
+                "IMPLEMENTED_WITH": [],
+                ":HAS_TRAIT]->": [],
+                ":HAS_CAPABILITY]->": [],
+                ":HAS_PREFERENCE]->": [],
+                "mist-identity'})": [identity_row],
+            }
+        )
+        store = GraphStore(connection=fake_conn, embedding_generator=FakeEmbeddingGenerator())
+
+        result = store.get_mist_identity_context()
+
+        assert len(result["capabilities"]) == 1
+        cap = result["capabilities"][0]
+        assert cap["id"] == "tech-neo4j"
+        assert cap["entity_type"] == "Technology"
+        assert cap["origin"] == "extracted"
+
+    def test_returns_extracted_preference_as_informational_never_absolute(self):
+        """P0 #1: extracted preferences default to informational enforcement.
+
+        The HARD RULES framing (enforcement == "absolute") must remain
+        seed-only -- extraction cannot escalate a preference to absolute.
+        """
+        identity_row = {
+            "id": "mist-identity",
+            "display_name": "MIST",
+            "pronouns": "she/her",
+            "self_concept": "",
+        }
+        extracted_pref_row = {
+            "id": "pref-markdown",
+            "display_name": "Markdown-friendly output",
+            "description": "Prefer markdown-style formatting where possible.",
+            "entity_type": "Preference",
+        }
+        fake_conn = FakeNeo4jConnection(
+            query_responses={
+                "MIST_HAS_TRAIT": [],
+                "MIST_HAS_CAPABILITY": [],
+                "MIST_HAS_PREFERENCE": [extracted_pref_row],
+                "IMPLEMENTED_WITH": [],
+                ":HAS_TRAIT]->": [],
+                ":HAS_CAPABILITY]->": [],
+                ":HAS_PREFERENCE]->": [],
+                "mist-identity'})": [identity_row],
+            }
+        )
+        store = GraphStore(connection=fake_conn, embedding_generator=FakeEmbeddingGenerator())
+
+        result = store.get_mist_identity_context()
+
+        assert len(result["preferences"]) == 1
+        pref = result["preferences"][0]
+        assert pref["id"] == "pref-markdown"
+        assert pref["enforcement"] == "informational"
+        assert pref["origin"] == "extracted"
+        # Extracted preferences never inherit the absolute enforcement that
+        # drives the HARD RULES framing -- that is seed-only policy.
+        assert pref["enforcement"] != "absolute"
+
+    def test_seeded_and_extracted_paths_merge_into_same_list(self):
+        """Both origins coexist in one list, with seeded entries first."""
+        identity_row = {
+            "id": "mist-identity",
+            "display_name": "MIST",
+            "pronouns": "she/her",
+            "self_concept": "",
+        }
+        seeded_trait = {
+            "id": "trait-warm",
+            "display_name": "Warm",
+            "axis": "Persona",
+            "description": "Friendly.",
+        }
+        extracted_trait = {
+            "id": "concept-curiosity",
+            "display_name": "Curiosity",
+            "description": "Asks clarifying questions.",
+            "entity_type": "Concept",
+        }
+        fake_conn = FakeNeo4jConnection(
+            query_responses={
+                "MIST_HAS_TRAIT": [extracted_trait],
+                "MIST_HAS_CAPABILITY": [],
+                "MIST_HAS_PREFERENCE": [],
+                "IMPLEMENTED_WITH": [],
+                ":HAS_TRAIT]->": [seeded_trait],
+                ":HAS_CAPABILITY]->": [],
+                ":HAS_PREFERENCE]->": [],
+                "mist-identity'})": [identity_row],
+            }
+        )
+        store = GraphStore(connection=fake_conn, embedding_generator=FakeEmbeddingGenerator())
+
+        result = store.get_mist_identity_context()
+
+        assert len(result["traits"]) == 2
+        # Seeded rows are appended first, extracted after.
+        assert result["traits"][0]["origin"] == "seeded"
+        assert result["traits"][0]["id"] == "trait-warm"
+        assert result["traits"][1]["origin"] == "extracted"
+        assert result["traits"][1]["id"] == "concept-curiosity"
+
+    def test_implemented_with_edge_projects_into_capabilities(self):
+        """P0 #1: IMPLEMENTED_WITH -> Technology surfaces as a capability row."""
+        identity_row = {
+            "id": "mist-identity",
+            "display_name": "MIST",
+            "pronouns": "she/her",
+            "self_concept": "",
+        }
+        tech_row = {
+            "id": "tech-lancedb",
+            "display_name": "LanceDB",
+            "description": "Columnar vector store.",
+            "entity_type": "Technology",
+        }
+        fake_conn = FakeNeo4jConnection(
+            query_responses={
+                "MIST_HAS_TRAIT": [],
+                "MIST_HAS_CAPABILITY": [],
+                "MIST_HAS_PREFERENCE": [],
+                "IMPLEMENTED_WITH": [tech_row],
+                ":HAS_TRAIT]->": [],
+                ":HAS_CAPABILITY]->": [],
+                ":HAS_PREFERENCE]->": [],
+                "mist-identity'})": [identity_row],
+            }
+        )
+        store = GraphStore(connection=fake_conn, embedding_generator=FakeEmbeddingGenerator())
+
+        result = store.get_mist_identity_context()
+
+        assert len(result["capabilities"]) == 1
+        cap = result["capabilities"][0]
+        assert cap["id"] == "tech-lancedb"
+        assert cap["entity_type"] == "Technology"
+        assert cap["origin"] == "extracted"
+        # Description synthesized as "Implemented with <name>." so the
+        # capability renders naturally in the persona block.
+        assert "Implemented with LanceDB" in cap["description"]
