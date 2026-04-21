@@ -26,6 +26,7 @@ from backend.knowledge.extraction.normalizer import EntityNormalizer
 from backend.knowledge.extraction.ontology_extractor import OntologyConstrainedExtractor
 from backend.knowledge.extraction.pipeline import ExtractionPipeline
 from backend.knowledge.extraction.preprocessor import PreProcessor
+from backend.knowledge.extraction.scope_classifier import SubjectScopeClassifier
 from backend.knowledge.extraction.temporal import TemporalResolver
 from backend.knowledge.extraction.validator import ExtractionValidator
 from backend.knowledge.storage.graph_executor import GraphExecutor
@@ -160,6 +161,16 @@ def build_extraction_pipeline(
         # Ensure MistIdentity singleton exists (sync call, OK in factory context)
         gs.ensure_mist_identity()
 
+    # Stage 1.5: subject-scope classifier (Cluster 1). Only built when the
+    # feature flag is enabled in config. When disabled, pipeline skips
+    # Stage 1.5 entirely and Stage 2 treats scope as "unknown".
+    scope_classifier: SubjectScopeClassifier | None = None
+    if config.scope_classifier.enabled:
+        scope_classifier = SubjectScopeClassifier(
+            llm=provider,
+            config=config.scope_classifier,
+        )
+
     return ExtractionPipeline(
         preprocessor=PreProcessor(),
         extractor=OntologyConstrainedExtractor(config, llm=provider),
@@ -177,6 +188,7 @@ def build_extraction_pipeline(
         internal_deriver=internal_deriver,
         embedding_provider=gs.embedding_generator,
         extraction_config=config.extraction,
+        scope_classifier=scope_classifier,
     )
 
 

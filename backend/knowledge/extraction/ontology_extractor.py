@@ -68,6 +68,8 @@ class OntologyConstrainedExtractor:
             "Goal",
             "Preference",
             "Location",
+            # Cluster 1: MIST self-model entity type (13th).
+            "MistIdentity",
         }
     )
 
@@ -94,6 +96,11 @@ class OntologyConstrainedExtractor:
             "WORKS_WITH",
             "KNOWS_PERSON",
             "MEMBER_OF",
+            # Cluster 1: MIST-scope relationships for system-scope extractions.
+            "IMPLEMENTED_WITH",
+            "MIST_HAS_CAPABILITY",
+            "MIST_HAS_TRAIT",
+            "MIST_HAS_PREFERENCE",
         }
     )
 
@@ -129,10 +136,15 @@ class OntologyConstrainedExtractor:
             reference_date=pre_processed.reference_date.strftime("%Y-%m-%d"),
         )
 
-        # Format the user message
+        # Format the user message. `subject_scope` is written by Stage 1.5
+        # SubjectScopeClassifier into pre_processed.metadata["subject_scope"].
+        # Falls back to "unknown" when Stage 1.5 is disabled or missing so
+        # the template substitution never fails closed.
+        subject_scope = pre_processed.metadata.get("subject_scope", "unknown")
         user_message = EXTRACTION_USER_TEMPLATE.format(
             context=context_str,
             utterance=pre_processed.original_text,
+            subject_scope=subject_scope,
         )
 
         start_time = time.perf_counter()

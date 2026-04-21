@@ -308,6 +308,40 @@ class ContextBudgetConfig:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ScopeClassifierConfig:
+    """Configuration for Stage 1.5 subject-scope classifier (Cluster 1).
+
+    The classifier is a small LLM call that tags each utterance as
+    user-scope, system-scope, or third-party so the extraction prompt
+    can weight its output correctly. This addresses Bug I/J extraction
+    drift where MIST-self-reference utterances were mislabeled as
+    user-scope facts.
+
+    - `enabled` master switch. When False the pipeline skips Stage 1.5
+      and the extractor treats subject_scope as "unknown".
+    - `temperature` kept at 0.0 for deterministic classification.
+    - `max_tokens` capped at 96 -- the expected JSON payload is ~40 tokens.
+    - `timeout_seconds` soft upper bound before the call is considered
+      failed and scope is returned as "unknown".
+    """
+
+    enabled: bool = True
+    temperature: float = 0.0
+    max_tokens: int = 96
+    timeout_seconds: float = 5.0
+
+    @classmethod
+    def from_env(cls) -> "ScopeClassifierConfig":
+        """Load scope-classifier configuration from environment variables."""
+        return cls(
+            enabled=os.getenv("MIST_SCOPE_CLASSIFIER_ENABLED", "true").lower() == "true",
+            temperature=float(os.getenv("MIST_SCOPE_CLASSIFIER_TEMPERATURE", "0.0")),
+            max_tokens=int(os.getenv("MIST_SCOPE_CLASSIFIER_MAX_TOKENS", "96")),
+            timeout_seconds=float(os.getenv("MIST_SCOPE_CLASSIFIER_TIMEOUT_SECONDS", "5.0")),
+        )
+
+
 @dataclass
 class SkillDerivationConfig:
     """Configuration for skill derivation from tool usage patterns."""
@@ -359,6 +393,9 @@ class KnowledgeConfig:
     # Cluster 6: budget-aware context assembly
     context_budget: ContextBudgetConfig = None  # type: ignore[assignment]
 
+    # Cluster 1: Stage 1.5 subject-scope classifier
+    scope_classifier: ScopeClassifierConfig = None  # type: ignore[assignment]
+
     # Feature flags
     enable_knowledge_integration: bool = True  # Master switch for knowledge system
 
@@ -388,6 +425,8 @@ class KnowledgeConfig:
             self.skill_derivation = SkillDerivationConfig()
         if self.context_budget is None:
             self.context_budget = ContextBudgetConfig()
+        if self.scope_classifier is None:
+            self.scope_classifier = ScopeClassifierConfig()
 
     @classmethod
     def from_env(cls) -> "KnowledgeConfig":
@@ -403,6 +442,7 @@ class KnowledgeConfig:
             query_intent=QueryIntentConfig.from_env(),
             skill_derivation=SkillDerivationConfig.from_env(),
             context_budget=ContextBudgetConfig.from_env(),
+            scope_classifier=ScopeClassifierConfig.from_env(),
             enable_knowledge_integration=os.getenv("ENABLE_KNOWLEDGE_INTEGRATION", "true").lower()
             == "true",
             ontology_version=os.getenv("ONTOLOGY_VERSION", "1.0.0"),

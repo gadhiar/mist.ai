@@ -58,6 +58,16 @@ class PreProcessedInput:
 
     Contains the original utterance, conversation context formatted
     for the prompt, and metadata for downstream stages.
+
+    Metadata keys currently written or read by the pipeline:
+      - ``injection_warning`` (bool) + ``pattern`` (str): Bug K guard set
+        by ``_detect_injection`` on directive-language utterances.
+      - ``subject_scope`` (str): one of "user-scope", "system-scope",
+        "third-party", "unknown". Set by Stage 1.5 SubjectScopeClassifier
+        and consumed by OntologyConstrainedExtractor to weight the
+        extraction prompt. Absent when Stage 1.5 is disabled.
+      - ``subject_scope_confidence`` (float in [0.0, 1.0]): classifier
+        confidence paired with ``subject_scope``.
     """
 
     original_text: str

@@ -30,6 +30,7 @@ from backend.knowledge.extraction.confidence import ConfidenceScorer
 from backend.knowledge.extraction.normalizer import EntityNormalizer
 from backend.knowledge.extraction.ontology_extractor import OntologyConstrainedExtractor
 from backend.knowledge.extraction.preprocessor import PreProcessor
+from backend.knowledge.extraction.scope_classifier import SubjectScopeClassifier
 from backend.knowledge.extraction.temporal import TemporalResolver
 from backend.knowledge.extraction.validator import ExtractionValidator, ValidationResult
 from backend.knowledge.storage.graph_store import GraphStore
@@ -211,6 +212,7 @@ class ExtractionPipeline:
         internal_deriver: InternalKnowledgeDeriver | None = None,
         embedding_provider: EmbeddingProvider | None = None,
         extraction_config: ExtractionConfig | None = None,
+        scope_classifier: SubjectScopeClassifier | None = None,
     ) -> None:
         """Initialize the extraction pipeline with injected stage processors.
 
@@ -232,6 +234,11 @@ class ExtractionPipeline:
                 and dedup are disabled.
             extraction_config: Optional extraction config for gate thresholds.
                 When None, default ExtractionConfig values are used.
+            scope_classifier: Optional Stage 1.5 subject-scope classifier
+                (Cluster 1). When provided, runs between Stage 1 and
+                Stage 2 and writes the subject_scope + confidence into
+                PreProcessedInput.metadata. When None, Stage 1.5 is
+                skipped and Stage 2 treats scope as "unknown".
         """
         self.graph_store = graph_store
         self.event_store = event_store
@@ -245,6 +252,7 @@ class ExtractionPipeline:
         self._internal_deriver = internal_deriver
         self._embedding_provider = embedding_provider
         self._config = extraction_config or ExtractionConfig()
+        self._scope_classifier = scope_classifier
 
         # Rate limiter state
         self._extraction_timestamps: list[float] = []
@@ -457,6 +465,25 @@ class ExtractionPipeline:
         )
         stage_1_ms = (time.perf_counter() - stage_start) * 1000
         logger.debug("Stage 1 (pre-processing): %.1fms", stage_1_ms)
+
+        # Stage 1.5: Subject-scope classification (Cluster 1).
+        # Terse LLM call that tags the utterance as user-scope, system-scope,
+        # or third-party so Stage 2 can weight the extraction prompt. Writes
+        # results into pre_processed.metadata. Never gates the pipeline --
+        # on any failure the scope is "unknown" and Stage 2 proceeds as if
+        # Stage 1.5 were disabled.
+        if self._scope_classifier is not None:
+            stage_start = time.perf_counter()
+            scope_result = await self._scope_classifier.classify(pre_processed)
+            stage_1_5_ms = (time.perf_counter() - stage_start) * 1000
+            pre_processed.metadata["subject_scope"] = scope_result.scope
+            pre_processed.metadata["subject_scope_confidence"] = scope_result.confidence
+            logger.debug(
+                "Stage 1.5 (scope classifier): %.1fms scope=%s confidence=%.2f",
+                stage_1_5_ms,
+                scope_result.scope,
+                scope_result.confidence,
+            )
 
         # -- Generate embedding for significance + dedup gates --
         embedding: list[float] | None = None
