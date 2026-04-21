@@ -208,3 +208,55 @@ class TestClassifierEdgeCases:
             f"Query {query!r}: intent={result.intent!r} but "
             f"suggested_stores={result.suggested_stores!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Cluster 3: identity intent -- queries about MIST's own identity / traits
+# ---------------------------------------------------------------------------
+
+
+class TestIdentityIntent:
+    """Cluster 3: queries about MIST's identity route to identity intent."""
+
+    @pytest.fixture
+    def classifier(self):
+        from backend.knowledge.retrieval.query_classifier import QueryClassifier
+
+        return QueryClassifier()
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "what's your name?",
+            "who are you?",
+            "tell me about yourself",
+            "what are your preferences?",
+            "do you like emojis?",
+            "are you MIST?",
+            "what can you do?",
+            "describe your personality",
+            "what are your traits?",
+            "what capabilities do you have?",
+        ],
+    )
+    def test_identity_query_classifies_as_identity(self, classifier, query):
+        result = classifier.classify(query)
+        assert result.intent == "identity", f"Query {query!r} classified as {result.intent}"
+
+    def test_user_fact_query_is_not_identity(self, classifier):
+        result = classifier.classify("I use Python for data pipelines")
+        assert result.intent != "identity"
+
+    def test_document_query_is_not_identity(self, classifier):
+        result = classifier.classify("what are the benefits of Neo4j?")
+        assert result.intent != "identity"
+
+    def test_live_query_is_not_identity(self, classifier):
+        result = classifier.classify("what's the status of MIS-104 right now?")
+        assert result.intent != "identity"
+
+    def test_identity_intent_suggested_stores(self, classifier):
+        """Identity intent should have a 'mist' suggested store."""
+        result = classifier.classify("who are you?")
+        assert result.intent == "identity"
+        assert "mist" in result.suggested_stores

@@ -1,8 +1,9 @@
 """Query intent classifier for hybrid retrieval routing.
 
-Classifies user queries into one of four intent types to determine
+Classifies user queries into one of five intent types to determine
 which retrieval backends should handle the query:
 
+    identity  -> MIST identity context (priority 0, never misroutes)
     factual   -> vector store (document/content recall)
     relational -> graph store (entity/relationship traversal)
     hybrid    -> both vector + graph
@@ -53,6 +54,23 @@ _RELATIONAL_PATTERNS: list[re.Pattern[str]] = [
 ]
 
 # ---------------------------------------------------------------------------
+# IDENTITY patterns -- queries about MIST's own identity / traits / preferences
+# ---------------------------------------------------------------------------
+# Identity has PRIORITY 0 (checked before live/hybrid) because pure identity
+# queries must not be miscategorized.
+_IDENTITY_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\bwhat'?s\s+your\s+name\b", re.I),
+    re.compile(r"\bwho\s+are\s+you\b", re.I),
+    re.compile(r"\btell\s+me\s+about\s+yourself\b", re.I),
+    re.compile(r"\byour\s+(?:preferences?|personality|traits?|capabilit(?:y|ies)|values?)\b", re.I),
+    re.compile(r"\bare\s+you\s+(?:mist|the\s+(?:ai|assistant))\b", re.I),
+    re.compile(r"\bwhat\s+can\s+you\s+do\b", re.I),
+    re.compile(r"\b(?:do|are|can|will)\s+you\s+(?:like|love|prefer|feel|think|have)\b", re.I),
+    re.compile(r"\b(?:describe|explain)\s+(?:yourself|your\s+\w+)\b", re.I),
+    re.compile(r"\bwhat\s+capabilit(?:y|ies)\s+do\s+you\s+have\b", re.I),
+]
+
+# ---------------------------------------------------------------------------
 # LIVE patterns -- real-time / MCP tool queries
 # ---------------------------------------------------------------------------
 
@@ -91,6 +109,7 @@ _STORE_MAP: dict[str, tuple[str, ...]] = {
     "relational": ("graph",),
     "hybrid": ("vector", "graph"),
     "live": ("mcp",),
+    "identity": ("mist",),
 }
 
 
@@ -114,6 +133,11 @@ class QueryClassifier:
         Returns:
             QueryIntent with intent type, confidence, and suggested stores.
         """
+        # Priority 0: Identity -- pure identity queries must never misroute.
+        identity_score = self._score_patterns(query, _IDENTITY_PATTERNS)
+        if identity_score >= 1:
+            return self._build_result("identity", identity_score)
+
         factual_score = self._score_patterns(query, _FACTUAL_PATTERNS)
         relational_score = self._score_patterns(query, _RELATIONAL_PATTERNS)
         live_score, has_strong_live = self._score_live(query)

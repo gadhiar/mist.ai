@@ -75,9 +75,11 @@ class QueryIntent:
     on pattern-matched intent signals.
     """
 
-    intent: str  # "factual" | "relational" | "hybrid" | "live"
+    intent: str  # "factual" | "relational" | "hybrid" | "live" | "identity"
     confidence: float  # 0.0-1.0
-    suggested_stores: tuple[str, ...]  # ("vector",), ("graph",), ("vector", "graph"), ("mcp",)
+    suggested_stores: tuple[
+        str, ...
+    ]  # ("vector",), ("graph",), ("vector", "graph"), ("mcp",), ("mist",)
 
 
 # Re-export Phase 1B extraction models for convenience.
