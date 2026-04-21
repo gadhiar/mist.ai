@@ -78,32 +78,50 @@ def build_graph_store(
     return GraphStore(conn, embeddings)
 
 
-def build_llm_provider(config: KnowledgeConfig) -> StreamingLLMProvider:
+def build_llm_provider(
+    config: KnowledgeConfig,
+    debug_logger: "DebugJSONLLogger | None" = None,  # noqa: F821
+) -> StreamingLLMProvider:
     """Create the LLM provider based on config.
 
     Args:
         config: Knowledge subsystem configuration.
+        debug_logger: Optional DebugJSONLLogger. When provided and the logger's
+            `llm_call_enabled` gate is True, the returned provider is wrapped
+            in `InstrumentedStreamingLLMProvider` so every non-partial response
+            emits a `phase: "llm_call"` JSONL record. When the gate is False
+            (or the logger is None) the concrete provider is returned directly
+            with no wrapper overhead.
 
     Returns:
-        StreamingLLMProvider instance (LlamaServerProvider or OllamaProvider).
+        StreamingLLMProvider instance (LlamaServerProvider or OllamaProvider),
+        optionally wrapped by InstrumentedStreamingLLMProvider.
     """
     llm_config = config.llm
     if llm_config.backend == "llamacpp":
         from backend.llm.llama_server_provider import LlamaServerProvider
 
-        return LlamaServerProvider(
+        inner: StreamingLLMProvider = LlamaServerProvider(
             base_url=llm_config.base_url,
             model=llm_config.model,
         )
     elif llm_config.backend == "ollama":
         from backend.llm.ollama_provider import OllamaProvider
 
-        return OllamaProvider(
+        inner = OllamaProvider(
             base_url=llm_config.base_url,
             model=llm_config.model,
         )
     else:
         raise ValueError(f"Unknown LLM backend: {llm_config.backend}")
+
+    if debug_logger is not None and debug_logger.llm_call_enabled:
+        from backend.llm.instrumented_provider import InstrumentedStreamingLLMProvider
+
+        logger.info("LLM provider wrapped with observability instrumentation")
+        return InstrumentedStreamingLLMProvider(inner, debug_logger)
+
+    return inner
 
 
 def build_curation_pipeline(config: KnowledgeConfig, executor: GraphExecutor) -> CurationPipeline:
@@ -172,15 +190,38 @@ def build_conversation_handler(
     If vector store creation fails (e.g. LanceDB not available),
     the retriever falls back to graph-only behaviour.
 
-    Enables per-turn JSONL debug logging when `MIST_DEBUG_JSONL=<path>` is set.
+    Observability (Cluster 5):
+    - `MIST_DEBUG_JSONL=<path>` activates the base debug sink (turn + extraction).
+    - `MIST_DEBUG_LLM_JSONL=1` additionally wraps the provider with
+      InstrumentedStreamingLLMProvider to emit `phase: "llm_call"` records.
+    - `MIST_DEBUG_RETRIEVAL_JSONL=1` activates retrieval candidate records in
+      the KnowledgeRetriever.
+    - `MIST_DEBUG_LLM_REQUESTS=1` activates pre-validation LLMRequest dumps in
+      the ConversationHandler.
     """
     from backend.chat.conversation_handler import ConversationHandler
     from backend.debug_jsonl_logger import DebugJSONLLogger
     from backend.errors import VectorStoreError
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
 
+    debug_logger = DebugJSONLLogger.from_env()
+    if debug_logger.enabled:
+        gates = []
+        if debug_logger.llm_call_enabled:
+            gates.append("llm_call")
+        if debug_logger.retrieval_candidates_enabled:
+            gates.append("retrieval_candidates")
+        if debug_logger.llm_request_dump_enabled:
+            gates.append("llm_request_raw")
+        gate_summary = ", ".join(gates) if gates else "turn + extraction only"
+        logger.info(
+            "Debug JSONL logging enabled at %s (phases: %s)",
+            debug_logger.path,
+            gate_summary,
+        )
+
     gs = build_graph_store(config)
-    provider = llm_provider or build_llm_provider(config)
+    provider = llm_provider or build_llm_provider(config, debug_logger=debug_logger)
     pipeline = build_extraction_pipeline(
         config, graph_store=gs, llm_provider=provider, include_curation=True
     )
@@ -197,13 +238,10 @@ def build_conversation_handler(
         graph_store=gs,
         vector_store=vector_store,
         embedding_provider=gs.embedding_generator,
+        debug_logger=debug_logger,
     )
 
     tracker = ToolUsageTracker(config.skill_derivation)
-
-    debug_logger = DebugJSONLLogger.from_env()
-    if debug_logger.enabled:
-        logger.info("Debug JSONL logging enabled at %s", debug_logger.path)
 
     return ConversationHandler(
         config=config,
@@ -325,6 +363,7 @@ def build_knowledge_retriever(
     graph_store: GraphStore | None = None,
     vector_store: "VectorStoreProvider | None" = None,  # noqa: F821
     embedding_provider: EmbeddingProvider | None = None,
+    debug_logger: "DebugJSONLLogger | None" = None,  # noqa: F821
 ) -> "KnowledgeRetriever":  # noqa: F821
     """Create a fully wired KnowledgeRetriever with hybrid retrieval.
 
@@ -337,6 +376,8 @@ def build_knowledge_retriever(
         graph_store: Optional pre-built graph store.
         vector_store: Optional pre-built vector store.
         embedding_provider: Optional pre-built embedding provider.
+        debug_logger: Optional DebugJSONLLogger forwarded to the retriever for
+            Cluster 5 `retrieval_candidates` observability.
 
     Returns:
         Ready-to-use KnowledgeRetriever instance.
@@ -355,6 +396,7 @@ def build_knowledge_retriever(
         vector_store=vs,
         query_classifier=classifier,
         embedding_provider=ep,
+        debug_logger=debug_logger,
     )
 
 

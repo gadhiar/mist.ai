@@ -1,6 +1,7 @@
 """Tests for ConversationHandler Phase 2B refactor."""
 
 import pytest
+from pydantic import ValidationError
 
 from backend.chat.conversation_handler import ConversationHandler
 from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
@@ -594,3 +595,106 @@ class TestPostFilterRegeneration:
         # Second request (regen): conversation_temperature - 0.2 = 0.5
         assert captured[1].temperature == 0.5
         assert captured[1].temperature >= 0.3  # floor
+
+
+class TestBuildRequestPreValidationDump:
+    """Cluster 5: _build_request wraps LLMRequest(**kwargs). On Pydantic
+    ValidationError it emits a `phase: "llm_request_raw"` JSONL record via
+    the debug_logger (gated on MIST_DEBUG_LLM_REQUESTS=1) and re-raises.
+    """
+
+    def _build_handler(self, *, debug_logger):
+        from backend.debug_jsonl_logger import DebugJSONLLogger  # noqa: F401
+
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        config = build_test_config()
+        return ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=FakeExtractionPipeline(),
+            retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
+            debug_logger=debug_logger,
+        )
+
+    def test_valid_kwargs_return_llm_request_without_touching_logger(self, tmp_path, monkeypatch):
+        from backend.debug_jsonl_logger import DebugJSONLLogger
+
+        monkeypatch.setenv("MIST_DEBUG_LLM_REQUESTS", "1")
+        path = tmp_path / "d.jsonl"
+        debug_logger = DebugJSONLLogger(path)
+        handler = self._build_handler(debug_logger=debug_logger)
+
+        request = handler._build_request(
+            call_site="test",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.5,
+            max_tokens=128,
+        )
+
+        assert request.temperature == 0.5
+        assert request.max_tokens == 128
+        # No dump should be written on the happy path.
+        assert not path.exists() or path.read_text() == ""
+
+    def test_pydantic_validation_error_emits_dump_then_reraises(self, tmp_path, monkeypatch):
+        import json as _json
+
+        from backend.debug_jsonl_logger import DebugJSONLLogger
+
+        monkeypatch.setenv("MIST_DEBUG_LLM_REQUESTS", "1")
+        path = tmp_path / "d.jsonl"
+        debug_logger = DebugJSONLLogger(path)
+        handler = self._build_handler(debug_logger=debug_logger)
+
+        with pytest.raises(ValidationError):
+            # messages as str is invalid per LLMRequest schema.
+            handler._build_request(
+                call_site="chat.initial",
+                session_id="sess-X",
+                messages="not a list",
+                temperature=0.7,
+            )
+
+        lines = path.read_text(encoding="utf-8").splitlines()
+        records = [_json.loads(ln) for ln in lines if ln.strip()]
+        assert len(records) == 1
+        assert records[0]["phase"] == "llm_request_raw"
+        assert records[0]["call_site"] == "chat.initial"
+        assert records[0]["session_id"] == "sess-X"
+        assert records[0]["request_dict"]["messages"] == "not a list"
+        assert records[0]["error"]  # some error message present
+
+    def test_dump_skipped_when_gate_closed_but_exception_still_propagates(
+        self, tmp_path, monkeypatch
+    ):
+        from backend.debug_jsonl_logger import DebugJSONLLogger
+
+        monkeypatch.delenv("MIST_DEBUG_LLM_REQUESTS", raising=False)
+        path = tmp_path / "d.jsonl"
+        debug_logger = DebugJSONLLogger(path)
+        handler = self._build_handler(debug_logger=debug_logger)
+
+        with pytest.raises(ValidationError):
+            handler._build_request(
+                call_site="chat.initial",
+                messages=42,  # invalid
+            )
+
+        # Nothing written because gate is closed.
+        assert not path.exists() or path.read_text() == ""
+
+    def test_build_request_works_when_debug_logger_is_none(self):
+        # Handler constructed without a debug logger should still build valid
+        # requests and propagate exceptions without crashing on the missing dep.
+        handler = self._build_handler(debug_logger=None)
+
+        request = handler._build_request(
+            call_site="test",
+            messages=[{"role": "user", "content": "ok"}],
+        )
+        assert request.messages[0]["content"] == "ok"
+
+        with pytest.raises(ValidationError):
+            handler._build_request(call_site="test", messages="invalid")

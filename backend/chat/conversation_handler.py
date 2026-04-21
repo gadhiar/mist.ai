@@ -23,6 +23,7 @@ from backend.knowledge.models import ConversationSession, RetrievalFilters, Retr
 from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from backend.knowledge.storage.graph_store import GraphStore
 from backend.llm import LLMRequest, StreamingLLMProvider
+from backend.llm.instrumented_provider import llm_call_context
 from backend.llm.models import ToolCall as LLMToolCall
 
 if TYPE_CHECKING:
@@ -288,6 +289,41 @@ class ConversationHandler:
         self._mist_context_cache[session_id] = ctx
         return ctx
 
+    def _build_request(
+        self,
+        *,
+        call_site: str,
+        session_id: str | None = None,
+        **kwargs: Any,
+    ) -> LLMRequest:
+        """Construct an LLMRequest and dump kwargs on Pydantic validation failure.
+
+        Cluster 5 pre-validation observability: when the Pydantic BaseModel
+        validator raises (e.g. a future Bug C-class tool_calls schema drift),
+        this method emits a `phase: "llm_request_raw"` record containing the
+        raw kwargs BEFORE re-raising. The record is gated on
+        `MIST_DEBUG_LLM_REQUESTS=1`; when the gate is off this is a cheap
+        no-op pass-through to `LLMRequest(**kwargs)`.
+
+        `call_site` is a short string identifying the construction location
+        (e.g. "chat.initial", "chat.final", "chat.regen"). It is only used as
+        metadata on the debug record.
+        """
+        try:
+            return LLMRequest(**kwargs)
+        except Exception as exc:  # noqa: BLE001 — want to dump for any validation failure
+            if self._debug_logger is not None:
+                # Best-effort safe serialization: messages and tools may contain
+                # objects that don't JSON-serialize cleanly, but _emit uses
+                # default=str to stringify non-serializable values.
+                self._debug_logger.record_llm_request_dump(
+                    request_dict=kwargs,
+                    error_message=repr(exc),
+                    call_site=call_site,
+                    session_id=session_id,
+                )
+            raise
+
     async def _post_filter_response(
         self,
         initial_response: str,
@@ -322,13 +358,20 @@ class ConversationHandler:
                 {"role": "user", "content": rider_content},
             ]
             rider_temp = max(0.3, round(self.config.llm.conversation_temperature - 0.2, 10))
-            rider_request = LLMRequest(
+            rider_request = self._build_request(
+                call_site="chat.regen",
+                session_id=session_id,
                 messages=rider_messages,
                 tools=None,
                 temperature=rider_temp,
                 max_tokens=400,
             )
-            rider_response = await self._provider.invoke(rider_request)
+            with llm_call_context(
+                session_id=session_id,
+                call_site="chat.regen",
+                pass_num=_attempt + 1,
+            ):
+                rider_response = await self._provider.invoke(rider_request)
             current_response = rider_response.content or ""
 
         # Cap reached with critical findings still present
@@ -380,6 +423,7 @@ class ConversationHandler:
                         user_id=user_id,
                         limit=auto_inject_limit,
                         similarity_threshold=auto_inject_threshold,
+                        session_id=session_id,
                     )
                     logger.info(
                         "[HYBRID-RAG] Intent: %s, confidence: %.2f, facts: %d, chunks: %d",
@@ -407,14 +451,21 @@ class ConversationHandler:
             # LLM autonomously decides to use tools
             logger.info(f"Processing message in session {session_id}")
 
-            request = LLMRequest(
+            request = self._build_request(
+                call_site="chat.initial",
+                session_id=session_id,
                 messages=messages,
                 tools=self._tool_schemas,
                 temperature=self.config.llm.conversation_temperature,
                 max_tokens=400,
             )
             _llm_start_1 = time.time()
-            response = await self._provider.invoke(request)
+            with llm_call_context(
+                session_id=session_id,
+                call_site="chat.initial",
+                pass_num=1,
+            ):
+                response = await self._provider.invoke(request)
             _llm_duration_1_ms = (time.time() - _llm_start_1) * 1000
 
             # Check if LLM made tool calls
@@ -487,13 +538,20 @@ class ConversationHandler:
 
                 # Get final response with tool results
                 logger.info("[TOOLS] Generating final response with tool results...")
-                final_request = LLMRequest(
+                final_request = self._build_request(
+                    call_site="chat.final",
+                    session_id=session_id,
                     messages=messages,
                     temperature=self.config.llm.conversation_temperature,
                     max_tokens=400,
                 )
                 _llm_start_2 = time.time()
-                final_response = await self._provider.invoke(final_request)
+                with llm_call_context(
+                    session_id=session_id,
+                    call_site="chat.final",
+                    pass_num=2,
+                ):
+                    final_response = await self._provider.invoke(final_request)
                 _llm_duration_2_ms = (time.time() - _llm_start_2) * 1000
                 assistant_message = final_response.content
                 logger.info(

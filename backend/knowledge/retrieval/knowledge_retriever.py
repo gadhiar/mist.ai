@@ -8,7 +8,7 @@ are consulted.
 
 import logging
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from backend.errors import VectorStoreError
 from backend.interfaces import EmbeddingProvider, VectorStoreProvider
@@ -21,6 +21,9 @@ from backend.knowledge.models import (
 )
 from backend.knowledge.retrieval.query_classifier import QueryClassifier
 from backend.knowledge.storage import GraphStore
+
+if TYPE_CHECKING:
+    from backend.debug_jsonl_logger import DebugJSONLLogger
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +74,7 @@ class KnowledgeRetriever:
         vector_store: VectorStoreProvider | None = None,
         query_classifier: QueryClassifier | None = None,
         embedding_provider: EmbeddingProvider | None = None,
+        debug_logger: "DebugJSONLLogger | None" = None,
     ):
         """Initialize retriever.
 
@@ -83,6 +87,11 @@ class KnowledgeRetriever:
             embedding_provider: Optional embedding provider for query vectorisation.
                 When None and vector_store is provided, falls back to
                 graph_store.embedding_generator.
+            debug_logger: Optional DebugJSONLLogger for Cluster 5 observability.
+                When provided and `MIST_DEBUG_RETRIEVAL_JSONL=1`, retrieve()
+                emits a `phase: "retrieval_candidates"` record per call
+                capturing the full graph and vector candidate pools before
+                merge and rank truncation.
         """
         self.config = config
         self.graph_store = graph_store
@@ -91,6 +100,7 @@ class KnowledgeRetriever:
         self._embedding_provider = embedding_provider or getattr(
             graph_store, "embedding_generator", None
         )
+        self._debug_logger = debug_logger
 
         # Default retrieval parameters (can be overridden)
         self.default_limit = 20
@@ -107,6 +117,8 @@ class KnowledgeRetriever:
         similarity_threshold: float | None = None,
         max_hops: int | None = None,
         filters: RetrievalFilters | None = None,
+        session_id: str | None = None,
+        event_id: str | None = None,
     ) -> RetrievalResult:
         """Retrieve relevant knowledge for a query.
 
@@ -123,6 +135,10 @@ class KnowledgeRetriever:
             similarity_threshold: Min similarity for vector search (default 0.6).
             max_hops: Graph traversal depth (default 2).
             filters: Optional filters for retrieval.
+            session_id: Optional session identifier forwarded to the Cluster 5
+                `retrieval_candidates` debug record for cross-record joins.
+            event_id: Optional event identifier forwarded to the Cluster 5
+                `retrieval_candidates` debug record for cross-record joins.
 
         Returns:
             RetrievalResult with facts, formatted context, and intent metadata.
@@ -205,6 +221,8 @@ class KnowledgeRetriever:
 
         graph_facts: list[RetrievedFact] = []
         vector_facts: list[RetrievedFact] = []
+        graph_candidates_raw: list[dict] = []
+        vector_candidates_raw: list[VectorSearchResult] = []
         vector_time = 0.0
         graph_time = 0.0
         entities_found = 0
@@ -214,7 +232,7 @@ class KnowledgeRetriever:
         if intent in ("relational", "hybrid"):
             graph_start = time.time()
             graph_limit = intent_config.max_graph_results if intent == "hybrid" else limit
-            graph_facts = await self._relational_retrieve(
+            graph_candidates_raw, graph_facts = await self._relational_retrieve(
                 query=query,
                 user_id=user_id,
                 limit=graph_limit,
@@ -234,7 +252,7 @@ class KnowledgeRetriever:
         if intent in ("factual", "hybrid") and self._vector_store is not None:
             vector_start = time.time()
             vector_limit = intent_config.max_vector_results if intent == "hybrid" else limit
-            vector_facts = await self._factual_retrieve(
+            vector_candidates_raw, vector_facts = await self._factual_retrieve(
                 query=query,
                 embedding=query_embedding,
                 limit=vector_limit,
@@ -243,8 +261,10 @@ class KnowledgeRetriever:
             document_chunks_used = len(vector_facts)
 
         # Step 3: Merge results
+        merged_count: int | None = None
         if intent == "hybrid" and graph_facts and vector_facts:
             merged = self._merge_rrf(graph_facts, vector_facts, intent_config)
+            merged_count = len(merged)
             ranked_facts = merged[:limit]
         elif intent == "factual":
             ranked_facts = self._rank_facts(vector_facts, limit)
@@ -252,6 +272,18 @@ class KnowledgeRetriever:
             # relational or hybrid where one list is empty
             combined = graph_facts + vector_facts
             ranked_facts = self._rank_facts(combined, limit)
+
+        # Cluster 5: emit retrieval_candidates debug record if gate enabled.
+        self._maybe_record_retrieval_candidates(
+            query=query,
+            intent=intent,
+            graph_candidates_raw=graph_candidates_raw,
+            vector_candidates_raw=vector_candidates_raw,
+            merged_count=merged_count,
+            final_count=len(ranked_facts),
+            session_id=session_id,
+            event_id=event_id,
+        )
 
         # Step 4: Format context
         formatted_context = self._format_context(ranked_facts, query)
@@ -346,6 +378,60 @@ class KnowledgeRetriever:
             preferences=preferences,
         )
 
+    # -- Cluster 5 observability ----------------------------------------------
+
+    def _maybe_record_retrieval_candidates(
+        self,
+        *,
+        query: str,
+        intent: str,
+        graph_candidates_raw: list[dict],
+        vector_candidates_raw: list[VectorSearchResult],
+        merged_count: int | None,
+        final_count: int,
+        session_id: str | None,
+        event_id: str | None,
+    ) -> None:
+        """Emit the `retrieval_candidates` debug record when gate is enabled.
+
+        Serializes raw candidate pools to lightweight dicts so the JSONL payload
+        stays stable even if VectorSearchResult or the graph candidate shape
+        evolves. No-op when `_debug_logger.retrieval_candidates_enabled` is
+        False (cheap attribute read + env check).
+        """
+        if self._debug_logger is None or not self._debug_logger.retrieval_candidates_enabled:
+            return
+
+        graph_candidates = [
+            {
+                "entity_id": c.get("entity_id"),
+                "entity_type": c.get("entity_type"),
+                "similarity": c.get("similarity"),
+                "display_name": c.get("display_name"),
+            }
+            for c in graph_candidates_raw
+        ]
+        vector_candidates = [
+            {
+                "chunk_id": getattr(vsr, "chunk_id", None),
+                "source_id": getattr(vsr, "source_id", None),
+                "source_type": getattr(vsr, "source_type", None),
+                "similarity": getattr(vsr, "similarity", None),
+            }
+            for vsr in vector_candidates_raw
+        ]
+
+        self._debug_logger.record_retrieval_candidates(
+            query=query,
+            intent=intent,
+            graph_candidates=graph_candidates,
+            vector_candidates=vector_candidates,
+            merged_count=merged_count,
+            final_count=final_count,
+            session_id=session_id,
+            event_id=event_id,
+        )
+
     # -- Retrieval backends ---------------------------------------------------
 
     async def _relational_retrieve(
@@ -356,7 +442,7 @@ class KnowledgeRetriever:
         similarity_threshold: float,
         max_hops: int,
         filters: RetrievalFilters | None,
-    ) -> list[RetrievedFact]:
+    ) -> tuple[list[dict], list[RetrievedFact]]:
         """Retrieve facts via graph traversal (entity similarity + neighbourhood).
 
         This is the original retrieve() logic extracted into its own method.
@@ -370,12 +456,16 @@ class KnowledgeRetriever:
             filters: Optional retrieval filters.
 
         Returns:
-            Deduplicated, filtered list of RetrievedFact from the graph.
+            `(similar_entities, facts)` — the raw entity-similarity candidate
+            pool (for Cluster 5 observability) plus the deduplicated, filtered
+            RetrievedFact list from the graph. The raw pool is returned even
+            when the final fact list is empty so debug records can distinguish
+            "no candidates" from "candidates rejected by filters".
         """
         similar_entities = await self._vector_search(query, similarity_threshold, limit * 2)
 
         if not similar_entities:
-            return []
+            return [], []
 
         facts = await self._gather_facts(
             user_id=user_id,
@@ -384,14 +474,14 @@ class KnowledgeRetriever:
             filters=filters,
         )
 
-        return facts
+        return similar_entities, facts
 
     async def _factual_retrieve(
         self,
         query: str,
         embedding: list[float] | None,
         limit: int,
-    ) -> list[RetrievedFact]:
+    ) -> tuple[list[VectorSearchResult], list[RetrievedFact]]:
         """Retrieve facts from vector store (document chunks).
 
         Converts VectorSearchResult objects into RetrievedFact with
@@ -403,17 +493,18 @@ class KnowledgeRetriever:
             limit: Max results to return.
 
         Returns:
-            List of RetrievedFact mapped from vector search results.
+            `(vector_results, facts)` — raw VectorSearchResult candidates (for
+            Cluster 5 observability) plus the mapped RetrievedFact list.
         """
         if self._vector_store is None:
-            return []
+            return [], []
 
         if embedding is None and self._embedding_provider is not None:
             embedding = self._embedding_provider.generate_embedding(query)
 
         if embedding is None:
             logger.warning("No embedding available for factual retrieval")
-            return []
+            return [], []
 
         results = self._vector_store_search(embedding, limit)
 
@@ -437,7 +528,7 @@ class KnowledgeRetriever:
             )
             facts.append(fact)
 
-        return facts
+        return results, facts
 
     def _vector_store_search(self, embedding: list[float], limit: int) -> list[VectorSearchResult]:
         """Execute raw vector store search with error handling.

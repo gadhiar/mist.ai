@@ -725,3 +725,122 @@ class TestRetrieveMistContext:
         retriever = _make_identity_retriever()
         result = await retriever.retrieve(query="who are you?", user_id="User")
         assert result.requires_mcp is False
+
+
+# ---------------------------------------------------------------------------
+# Cluster 5 — retrieval_candidates observability record
+# ---------------------------------------------------------------------------
+
+
+class TestRetrievalCandidatesObservability:
+    """retrieve() emits one `phase: retrieval_candidates` JSONL record per call
+    when a DebugJSONLLogger with the retrieval_candidates gate open is wired in.
+    """
+
+    def _logger(self, path):
+        from backend.debug_jsonl_logger import DebugJSONLLogger
+
+        return DebugJSONLLogger(path)
+
+    def _read_jsonl(self, path) -> list[dict]:
+        import json as _json
+
+        return [
+            _json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_noop_when_debug_logger_is_none(self, tmp_path, monkeypatch):
+        """Baseline: no logger wired -> no file, no error."""
+        monkeypatch.setenv("MIST_DEBUG_RETRIEVAL_JSONL", "1")
+        retriever, _ = _make_retriever(intent="relational", search_similar_results=[])
+
+        await retriever.retrieve(query="hello", user_id="User")
+        # Nothing to assert except absence of error; the retriever has no logger.
+
+    @pytest.mark.asyncio
+    async def test_emits_record_when_gate_open(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MIST_DEBUG_RETRIEVAL_JSONL", "1")
+        path = tmp_path / "d.jsonl"
+        debug_logger = self._logger(path)
+
+        retriever, _ = _make_retriever(
+            intent="relational",
+            search_similar_results=[
+                {"entity_id": "python", "similarity": 0.92, "entity_type": "Technology"},
+                {"entity_id": "rust", "similarity": 0.71, "entity_type": "Technology"},
+            ],
+            user_rels_results=[
+                {
+                    "entity_id": "python",
+                    "entity_type": "Technology",
+                    "relationship_type": "USES",
+                    "properties": {},
+                }
+            ],
+        )
+        retriever._debug_logger = debug_logger  # wire after factory
+
+        await retriever.retrieve(
+            query="what do I know about python",
+            user_id="User",
+            session_id="sess-A",
+            event_id="evt-A",
+        )
+
+        records = self._read_jsonl(path)
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["phase"] == "retrieval_candidates"
+        assert rec["query"] == "what do I know about python"
+        assert rec["intent"] == "relational"
+        assert rec["session_id"] == "sess-A"
+        assert rec["event_id"] == "evt-A"
+        assert rec["graph_candidate_count"] == 2
+        assert rec["graph_candidates"][0]["entity_id"] == "python"
+        assert rec["graph_candidates"][0]["similarity"] == 0.92
+        assert rec["vector_candidate_count"] == 0  # relational intent skips vector
+
+    @pytest.mark.asyncio
+    async def test_no_record_when_gate_closed_even_with_logger(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("MIST_DEBUG_RETRIEVAL_JSONL", raising=False)
+        path = tmp_path / "d.jsonl"
+        debug_logger = self._logger(path)
+
+        retriever, _ = _make_retriever(
+            intent="relational",
+            search_similar_results=[],
+        )
+        retriever._debug_logger = debug_logger
+
+        await retriever.retrieve(query="anything", user_id="User")
+
+        assert not path.exists() or path.read_text() == ""
+
+    @pytest.mark.asyncio
+    async def test_empty_candidate_pools_still_emit_record(self, tmp_path, monkeypatch):
+        """A 'no candidates' retrieval is still diagnostically useful — it
+        tells the operator the query was issued but nothing matched.
+        """
+        monkeypatch.setenv("MIST_DEBUG_RETRIEVAL_JSONL", "1")
+        path = tmp_path / "d.jsonl"
+        debug_logger = self._logger(path)
+
+        retriever, _ = _make_retriever(
+            intent="relational",
+            search_similar_results=[],
+        )
+        retriever._debug_logger = debug_logger
+
+        await retriever.retrieve(
+            query="rare query that matches nothing",
+            user_id="User",
+            session_id="sess-B",
+        )
+
+        records = self._read_jsonl(path)
+        assert len(records) == 1
+        assert records[0]["graph_candidate_count"] == 0
+        assert records[0]["vector_candidate_count"] == 0
+        assert records[0]["final_count"] == 0
+        assert records[0]["query"] == "rare query that matches nothing"
