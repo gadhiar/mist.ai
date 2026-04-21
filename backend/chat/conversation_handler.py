@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from backend.chat.mist_context import MistContext
 from backend.event_store.models import ConversationTurnEvent
 from backend.event_store.store import EventStore
 from backend.knowledge.config import KnowledgeConfig
@@ -69,6 +70,95 @@ KNOWLEDGE_TOOL_SCHEMAS = [
         },
     },
 ]
+
+
+# ---------------------------------------------------------------------------
+# Module-level system prompt templates (Cluster 3)
+#
+# _STATIC_SYSTEM_TEMPLATE_WITH_IDENTITY  — legacy path (mist_context=None)
+#   Includes the "You are MIST..." opener so the prompt is self-contained.
+#
+# _STATIC_SYSTEM_TEMPLATE_WITHOUT_IDENTITY — persona path (mist_context provided)
+#   Omits the opener because the MistContext persona block already introduces MIST.
+# ---------------------------------------------------------------------------
+
+_STATIC_SYSTEM_TEMPLATE_WITH_IDENTITY = """You are MIST, a conversational AI assistant with a personal knowledge graph.
+
+=== CONTEXT PROVIDED ===
+
+You receive relevant context automatically with each query (see below).
+This may include graph facts, document excerpts, or both depending on query type.
+Knowledge from conversations is captured automatically -- you do not need to extract it manually.
+
+=== AVAILABLE TOOLS ===
+
+You have one tool at your disposal:
+
+1. **query_knowledge_graph(query: str, limit: int = 20)**
+   - Search the personal knowledge graph for user-specific information
+   - Use when: User asks about THEIR preferences, skills, projects, past conversations
+   - Returns: Facts you've learned about the user (entities + relationships)
+   - Example: "What programming languages do I know?" -> use this tool
+
+=== TOOL USAGE STRATEGY ===
+
+**For user questions:**
+- Technical questions (how/what/why about MIST) -> Use auto-provided context (already below)
+- Personal questions (about user's info) -> Use query_knowledge_graph tool
+- Both types -> Use context + query_knowledge_graph
+
+**Autonomous Decision Making:**
+- You decide when to use the tool - no one tells you when
+- Context is automatically provided - use it! Cite sources when helpful.
+- Only call query_knowledge_graph when you need personal user context
+
+=== GUIDELINES ===
+
+- Be conversational and natural
+- Cite documentation sources when answering technical questions
+- Use tools to enhance responses, not replace conversation
+- Combine auto-provided context with your conversational abilities
+- Query the knowledge graph when personal context matters
+
+Remember: Context is already provided below. Think about whether you need personal user context from the knowledge graph."""
+
+_STATIC_SYSTEM_TEMPLATE_WITHOUT_IDENTITY = """=== CONTEXT PROVIDED ===
+
+You receive relevant context automatically with each query (see below).
+This may include graph facts, document excerpts, or both depending on query type.
+Knowledge from conversations is captured automatically -- you do not need to extract it manually.
+
+=== AVAILABLE TOOLS ===
+
+You have one tool at your disposal:
+
+1. **query_knowledge_graph(query: str, limit: int = 20)**
+   - Search the personal knowledge graph for user-specific information
+   - Use when: User asks about THEIR preferences, skills, projects, past conversations
+   - Returns: Facts you've learned about the user (entities + relationships)
+   - Example: "What programming languages do I know?" -> use this tool
+
+=== TOOL USAGE STRATEGY ===
+
+**For user questions:**
+- Technical questions (how/what/why about MIST) -> Use auto-provided context (already below)
+- Personal questions (about user's info) -> Use query_knowledge_graph tool
+- Both types -> Use context + query_knowledge_graph
+
+**Autonomous Decision Making:**
+- You decide when to use the tool - no one tells you when
+- Context is automatically provided - use it! Cite sources when helpful.
+- Only call query_knowledge_graph when you need personal user context
+
+=== GUIDELINES ===
+
+- Be conversational and natural
+- Cite documentation sources when answering technical questions
+- Use tools to enhance responses, not replace conversation
+- Combine auto-provided context with your conversational abilities
+- Query the knowledge graph when personal context matters
+
+Remember: Context is already provided below. Think about whether you need personal user context from the knowledge graph."""
 
 
 class ConversationHandler:
@@ -135,6 +225,11 @@ class ConversationHandler:
         # Maps external session_id -> event store session_id
         self._es_session_ids: dict[str, str] = {}
 
+        # Cluster 3: MistContext cached per session for persona injection.
+        # Populated on first handle_message for a given session; stable until
+        # clear_session or process restart.
+        self._mist_context_cache: dict[str, MistContext] = {}
+
         logger.info("ConversationHandler initialized with model: %s", llm_provider.model)
 
     async def _handle_query_knowledge_graph(
@@ -186,6 +281,38 @@ class ConversationHandler:
             logger.info(f"Created new session: {session_id}")
 
         return self.sessions[session_id]
+
+    async def _get_or_fetch_mist_context(self, session_id: str) -> MistContext:
+        """Return cached MistContext for the session or fetch + cache on miss.
+
+        Fresh persona retrieval once per session lifetime; stable thereafter.
+        Clear by calling clear_session(session_id) or restarting the handler.
+
+        Failures from retrieve_mist_context (missing method, graph errors, etc.)
+        fall back to an empty MistContext with a warning log so existing tests
+        and callers with minimally-mocked retrievers remain green.
+        """
+        cached = self._mist_context_cache.get(session_id)
+        if cached is not None:
+            return cached
+        try:
+            ctx = await self.retriever.retrieve_mist_context()
+        except Exception as e:
+            logger.warning(
+                "retrieve_mist_context failed for session %s: %s; using empty persona.",
+                session_id,
+                e,
+            )
+            ctx = MistContext(
+                display_name="MIST",
+                pronouns="she/her",
+                self_concept="",
+                traits=[],
+                capabilities=[],
+                preferences=[],
+            )
+        self._mist_context_cache[session_id] = ctx
+        return ctx
 
     async def handle_message(
         self, user_message: str, session_id: str, user_id: str = "User", max_history: int = 10
@@ -244,7 +371,13 @@ class ConversationHandler:
                 logger.debug("[AUTO-RAG] Skipping retrieval for short message")
 
         # Build conversation with system prompt and optional retrieval context
-        messages = self._build_messages(session, max_history, retrieval_result=retrieval_result)
+        mist_context = await self._get_or_fetch_mist_context(session_id)
+        messages = self._build_messages(
+            session,
+            max_history,
+            retrieval_result=retrieval_result,
+            mist_context=mist_context,
+        )
 
         try:
             # LLM autonomously decides to use tools
@@ -588,60 +721,45 @@ class ConversationHandler:
         session: ConversationSession,
         max_history: int,
         retrieval_result: RetrievalResult | None = None,
+        mist_context: MistContext | None = None,
     ) -> list[dict[str, str]]:
-        """Build message list for LLM with system prompt, retrieval context, and history.
+        """Build message list for LLM.
+
+        Ordering:
+          1. Persona block from MistContext (when provided) -- identity + HARD RULES
+          2. Static system template -- tool availability, strategy, guidelines
+          3. Retrieval context (when auto-RAG produced facts)
+          4. Live-data advisory (when retrieval requires MCP)
+          5. Conversation history
 
         Args:
             session: Conversation session
             max_history: Maximum history messages to include
             retrieval_result: Optional hybrid retrieval result from auto-RAG
+            mist_context: Optional MistContext to prepend as persona block.
+                When None, falls back to the legacy full static template
+                (includes "You are MIST..." opener) so existing callers are
+                unaffected.
 
         Returns:
             List of messages for LLM
         """
-        system_prompt = """You are MIST, a conversational AI assistant with a personal knowledge graph.
+        messages: list[dict[str, str]] = []
 
-=== CONTEXT PROVIDED ===
+        # 1. Persona block (Cluster 3)
+        if mist_context is not None:
+            messages.append({"role": "system", "content": mist_context.as_system_prompt_block()})
+            # Use the template without the redundant "You are MIST..." opener
+            # because the persona block already introduces MIST.
+            static_template = _STATIC_SYSTEM_TEMPLATE_WITHOUT_IDENTITY
+        else:
+            # Fallback: no persona retrieved; keep the legacy full template.
+            static_template = _STATIC_SYSTEM_TEMPLATE_WITH_IDENTITY
 
-You receive relevant context automatically with each query (see below).
-This may include graph facts, document excerpts, or both depending on query type.
-Knowledge from conversations is captured automatically -- you do not need to extract it manually.
+        # 2. Static system template
+        messages.append({"role": "system", "content": static_template})
 
-=== AVAILABLE TOOLS ===
-
-You have one tool at your disposal:
-
-1. **query_knowledge_graph(query: str, limit: int = 20)**
-   - Search the personal knowledge graph for user-specific information
-   - Use when: User asks about THEIR preferences, skills, projects, past conversations
-   - Returns: Facts you've learned about the user (entities + relationships)
-   - Example: "What programming languages do I know?" -> use this tool
-
-=== TOOL USAGE STRATEGY ===
-
-**For user questions:**
-- Technical questions (how/what/why about MIST) -> Use auto-provided context (already below)
-- Personal questions (about user's info) -> Use query_knowledge_graph tool
-- Both types -> Use context + query_knowledge_graph
-
-**Autonomous Decision Making:**
-- You decide when to use the tool - no one tells you when
-- Context is automatically provided - use it! Cite sources when helpful.
-- Only call query_knowledge_graph when you need personal user context
-
-=== GUIDELINES ===
-
-- Be conversational and natural
-- Cite documentation sources when answering technical questions
-- Use tools to enhance responses, not replace conversation
-- Combine auto-provided context with your conversational abilities
-- Query the knowledge graph when personal context matters
-
-Remember: Context is already provided below. Think about whether you need personal user context from the knowledge graph."""
-
-        messages = [{"role": "system", "content": system_prompt}]
-
-        # Add retrieval context if available
+        # 3. Retrieval context (unchanged logic)
         if retrieval_result and retrieval_result.total_facts > 0:
             context_str = retrieval_result.formatted_context
             logger.info(
@@ -652,7 +770,7 @@ Remember: Context is already provided below. Think about whether you need person
             )
             messages.append({"role": "system", "content": context_str})
 
-            # Append live data advisory when query requires MCP tools
+            # 4. Live-data advisory when query requires MCP tools
             if retrieval_result.requires_mcp and retrieval_result.suggested_tools:
                 advisory = (
                     "=== LIVE DATA ADVISORY ===\n"
@@ -662,7 +780,7 @@ Remember: Context is already provided below. Think about whether you need person
                 )
                 messages.append({"role": "system", "content": advisory})
 
-        # Add conversation history
+        # 5. Conversation history
         history = session.get_history(max_history)
         messages.extend(history)
 
@@ -679,6 +797,8 @@ Remember: Context is already provided below. Think about whether you need person
                 except Exception as e:
                     logger.error("Failed to end event store session: %s", e)
                 del self._es_session_ids[session_id]
+            # Evict cached MistContext so the next session gets a fresh fetch.
+            self._mist_context_cache.pop(session_id, None)
             logger.info(f"Cleared session: {session_id}")
 
     def get_session_info(self, session_id: str) -> dict[str, Any] | None:
