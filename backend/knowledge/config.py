@@ -51,11 +51,22 @@ class EmbeddingConfig:
 
 @dataclass
 class LLMConfig:
-    """LLM model configuration."""
+    """LLM model configuration.
+
+    Temperature is split into two scopes:
+    - `temperature` (default 0.0) is used by the extraction pipeline for
+      JSON reliability. Extraction call sites read this field.
+    - `conversation_temperature` (default 0.7) is used by ConversationHandler
+      for natural assistant voice. Conversation call sites read this field.
+
+    Keeping the original `temperature` field as extraction-default avoids
+    a rename that would churn through 10+ extraction call sites.
+    """
 
     model: str = "qwen2.5:7b-instruct"
     base_url: str = "http://localhost:8080"  # llama-server default
     temperature: float = 0.0  # Deterministic for extraction
+    conversation_temperature: float = 0.7  # Natural voice for conversation
     backend: str = "llamacpp"  # "llamacpp" or "ollama"
 
     @classmethod
@@ -67,6 +78,7 @@ class LLMConfig:
             model=os.getenv("MODEL", "qwen2.5:7b-instruct"),
             base_url=os.getenv("LLM_SERVER_URL", default_url),
             temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
+            conversation_temperature=float(os.getenv("LLM_CONVERSATION_TEMPERATURE", "0.7")),
             backend=backend,
         )
 
