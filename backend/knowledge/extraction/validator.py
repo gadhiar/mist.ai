@@ -37,8 +37,15 @@ class ValidationResult:
 # IMPORTANT: These MUST match the EdgeTypeDefinition constraints in
 # backend.knowledge.ontologies.v1_0_0. If you update the ontology,
 # update this table too (or generate it programmatically in the future).
+#
+# Note on MIST-scope sources: USES / DEPENDS_ON / WORKS_WITH accept
+# Organization and MistIdentity in addition to the original sources so
+# that facts like "MIST uses LanceDB" or "Anthropic works with Python"
+# survive validation. LEARNING / PREFERS / INTERESTED_IN remain user-only
+# by design -- MIST-scope equivalents go through MIST_HAS_CAPABILITY,
+# MIST_HAS_PREFERENCE, and MIST_HAS_TRAIT.
 RELATIONSHIP_CONSTRAINTS: dict[str, tuple[set[str] | None, set[str] | None]] = {
-    "USES": ({"User", "Person"}, {"Technology"}),
+    "USES": ({"User", "Person", "Organization", "MistIdentity"}, {"Technology"}),
     "KNOWS": ({"User", "Person"}, {"Skill", "Concept", "Technology", "Topic"}),
     "WORKS_ON": ({"User", "Person"}, {"Project"}),
     "WORKS_AT": ({"User", "Person"}, {"Organization"}),
@@ -60,11 +67,20 @@ RELATIONSHIP_CONSTRAINTS: dict[str, tuple[set[str] | None, set[str] | None]] = {
         {"Technology", "Concept", "Project", "Organization"},
     ),
     "RELATED_TO": (None, None),  # Generic: any -> any
-    "DEPENDS_ON": ({"Technology", "Project"}, {"Technology"}),
+    "DEPENDS_ON": ({"Technology", "Project", "Organization", "MistIdentity"}, {"Technology"}),
     "USED_FOR": ({"Technology", "Skill"}, {"Concept", "Topic", "Project"}),
-    "WORKS_WITH": ({"Technology"}, {"Technology"}),
+    "WORKS_WITH": ({"Technology", "Organization", "MistIdentity"}, {"Technology"}),
     "KNOWS_PERSON": ({"User"}, {"Person"}),
     "MEMBER_OF": ({"User", "Person"}, {"Organization"}),
+    # MIST-scope relationships: let extraction attribute facts to MIST itself
+    # rather than silently dropping them or mis-attributing to the user.
+    "IMPLEMENTED_WITH": ({"MistIdentity", "Organization", "Project"}, {"Technology"}),
+    "MIST_HAS_CAPABILITY": ({"MistIdentity"}, {"Technology", "Skill", "Concept", "Topic"}),
+    "MIST_HAS_TRAIT": ({"MistIdentity"}, {"Concept", "Topic", "Preference", "Skill"}),
+    "MIST_HAS_PREFERENCE": (
+        {"MistIdentity"},
+        {"Preference", "Concept", "Technology", "Topic"},
+    ),
 }
 
 VALID_TEMPORAL_STATUSES: set[str] = {"current", "past", "future", "recurring"}

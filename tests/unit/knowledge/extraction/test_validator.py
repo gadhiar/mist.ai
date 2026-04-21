@@ -2,7 +2,10 @@
 
 import pytest
 
-from backend.knowledge.extraction.ontology_extractor import ExtractionResult
+from backend.knowledge.extraction.ontology_extractor import (
+    ExtractionResult,
+    OntologyConstrainedExtractor,
+)
 from backend.knowledge.extraction.validator import ExtractionValidator, ValidationResult
 
 
@@ -241,3 +244,247 @@ class TestSideEffectBoundary:
         assert len(result.entities) == 0
         assert len(result.relationships) == 0
         assert len(result.errors) > 0
+
+
+class TestMistScopePredicates:
+    """MIST-scope relationships let extraction attribute facts to MIST itself.
+
+    Regression coverage for Bug J (root cause memo:
+    project_mist_bug_j_root_cause.md). Before Cluster 1 the validator
+    hard-required {User, Person} as the source of USES/LEARNING/etc., so
+    correct emissions like "MIST USES LanceDB" were silently dropped.
+    These tests pin the new contract:
+
+      - Extended user-centric predicates accept Organization and MistIdentity
+        as sources where the ontology allows (USES, DEPENDS_ON, WORKS_WITH).
+      - New MIST-scope predicates (IMPLEMENTED_WITH, MIST_HAS_CAPABILITY,
+        MIST_HAS_TRAIT, MIST_HAS_PREFERENCE) route MIST-owned facts to
+        MistIdentity.
+      - LEARNING, PREFERS, and similar user-only predicates remain
+        user-scope only; MIST-scope equivalents MUST go through the
+        dedicated MIST_HAS_* edges.
+
+    The `_extend_ontology_extractor_allowlists` fixture keeps these tests
+    self-contained against the validator by ensuring MistIdentity and the
+    4 MIST-scope predicates are accepted at the entity-type / rel-type gate
+    regardless of whether the parallel Cluster 1 allowlist update has landed.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _extend_ontology_extractor_allowlists(self, monkeypatch):
+        # The validator's entity-type and relationship-type gates read from
+        # OntologyConstrainedExtractor.ALLOWED_*. We patch those allowlists
+        # for the duration of this class so the MIST-scope contract can be
+        # exercised independently of parallel ontology-extractor changes.
+        extended_entity_types = frozenset(
+            OntologyConstrainedExtractor.ALLOWED_ENTITY_TYPES | {"MistIdentity"}
+        )
+        extended_relationship_types = frozenset(
+            OntologyConstrainedExtractor.ALLOWED_RELATIONSHIP_TYPES
+            | {
+                "IMPLEMENTED_WITH",
+                "MIST_HAS_CAPABILITY",
+                "MIST_HAS_TRAIT",
+                "MIST_HAS_PREFERENCE",
+            }
+        )
+        monkeypatch.setattr(
+            OntologyConstrainedExtractor,
+            "ALLOWED_ENTITY_TYPES",
+            extended_entity_types,
+        )
+        monkeypatch.setattr(
+            OntologyConstrainedExtractor,
+            "ALLOWED_RELATIONSHIP_TYPES",
+            extended_relationship_types,
+        )
+
+    def test_mist_identity_uses_technology_accepted(self):
+        # Arrange -- "MIST uses LanceDB" regression scenario
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="mist-identity", entity_type="MistIdentity"),
+                _make_entity(entity_id="lancedb", entity_type="Technology"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="mist-identity",
+                    target="lancedb",
+                    rel_type="USES",
+                ),
+            ],
+        )
+
+        # Act
+        result = validator.validate(extraction)
+
+        # Assert
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["source"] == "mist-identity"
+        assert result.relationships[0]["type"] == "USES"
+
+    def test_organization_uses_technology_accepted(self):
+        # Arrange -- "Anthropic uses Python"
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="anthropic", entity_type="Organization"),
+                _make_entity(entity_id="python", entity_type="Technology"),
+            ],
+            relationships=[
+                _make_relationship(source="anthropic", target="python", rel_type="USES"),
+            ],
+        )
+
+        # Act
+        result = validator.validate(extraction)
+
+        # Assert
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["source"] == "anthropic"
+
+    def test_mist_identity_implemented_with_technology_accepted(self):
+        # Arrange -- "MIST is implemented with Python"
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="mist-identity", entity_type="MistIdentity"),
+                _make_entity(entity_id="python", entity_type="Technology"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="mist-identity",
+                    target="python",
+                    rel_type="IMPLEMENTED_WITH",
+                ),
+            ],
+        )
+
+        # Act
+        result = validator.validate(extraction)
+
+        # Assert
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["type"] == "IMPLEMENTED_WITH"
+
+    def test_mist_identity_has_capability_skill_accepted(self):
+        # Arrange -- "MIST has a reasoning capability"
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="mist-identity", entity_type="MistIdentity"),
+                _make_entity(entity_id="reasoning", entity_type="Skill"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="mist-identity",
+                    target="reasoning",
+                    rel_type="MIST_HAS_CAPABILITY",
+                ),
+            ],
+        )
+
+        # Act
+        result = validator.validate(extraction)
+
+        # Assert
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["type"] == "MIST_HAS_CAPABILITY"
+
+    def test_mist_identity_has_trait_concept_accepted(self):
+        # Arrange -- "MIST values transparency"
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="mist-identity", entity_type="MistIdentity"),
+                _make_entity(entity_id="transparency", entity_type="Concept"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="mist-identity",
+                    target="transparency",
+                    rel_type="MIST_HAS_TRAIT",
+                ),
+            ],
+        )
+
+        # Act
+        result = validator.validate(extraction)
+
+        # Assert
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["type"] == "MIST_HAS_TRAIT"
+
+    def test_mist_identity_has_preference_accepted(self):
+        # Arrange -- "MIST prefers plain-text responses"
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="mist-identity", entity_type="MistIdentity"),
+                _make_entity(entity_id="plain-text", entity_type="Preference"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="mist-identity",
+                    target="plain-text",
+                    rel_type="MIST_HAS_PREFERENCE",
+                ),
+            ],
+        )
+
+        # Act
+        result = validator.validate(extraction)
+
+        # Assert
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["type"] == "MIST_HAS_PREFERENCE"
+
+    def test_user_source_on_mist_has_trait_is_rejected(self):
+        # Arrange -- MIST_HAS_TRAIT is MistIdentity-only; user as source must fail
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="user", entity_type="User"),
+                _make_entity(entity_id="transparency", entity_type="Concept"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="user",
+                    target="transparency",
+                    rel_type="MIST_HAS_TRAIT",
+                ),
+            ],
+        )
+
+        # Act
+        result = validator.validate(extraction)
+
+        # Assert -- dropped with a source type-mismatch warning
+        assert len(result.relationships) == 0
+        assert any("MIST_HAS_TRAIT" in w and "Source type 'User'" in w for w in result.warnings)
+
+    def test_mist_identity_source_on_learning_is_rejected(self):
+        # Arrange -- LEARNING remains user-only; MIST-scope learning must use
+        # MIST_HAS_CAPABILITY instead
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="mist-identity", entity_type="MistIdentity"),
+                _make_entity(entity_id="rust", entity_type="Technology"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="mist-identity",
+                    target="rust",
+                    rel_type="LEARNING",
+                ),
+            ],
+        )
+
+        # Act
+        result = validator.validate(extraction)
+
+        # Assert -- dropped because MistIdentity is not in LEARNING sources
+        assert len(result.relationships) == 0
+        assert any("LEARNING" in w and "MistIdentity" in w for w in result.warnings)

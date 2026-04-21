@@ -1187,6 +1187,53 @@ DERIVED_FROM = EdgeTypeDefinition(
 )
 
 # ===================================================================
+# MIST-Scope Relationships (4)
+# ===================================================================
+# These edges let extraction attribute facts to MIST.AI itself (as a
+# MistIdentity node) or to third-party Organizations/Projects. Without
+# them, the validator drops MIST-scope facts such as "MIST uses LanceDB".
+
+IMPLEMENTED_WITH = EdgeTypeDefinition(
+    type_name="IMPLEMENTED_WITH",
+    description=(
+        "Indicates the source (MIST, an organization, or a project) is "
+        "implemented using the target technology."
+    ),
+    allowed_source_types=("MistIdentity", "Organization", "Project"),
+    allowed_target_types=("Technology",),
+)
+
+MIST_HAS_CAPABILITY = EdgeTypeDefinition(
+    type_name="MIST_HAS_CAPABILITY",
+    description=(
+        "Links MistIdentity to an external capability it exercises, such as "
+        "a technology, skill, concept, or topic area."
+    ),
+    allowed_source_types=("MistIdentity",),
+    allowed_target_types=("Technology", "Skill", "Concept", "Topic"),
+)
+
+MIST_HAS_TRAIT = EdgeTypeDefinition(
+    type_name="MIST_HAS_TRAIT",
+    description=(
+        "Links MistIdentity to a personality-, preference-, or topic-level "
+        "trait expressed as an external-domain entity."
+    ),
+    allowed_source_types=("MistIdentity",),
+    allowed_target_types=("Concept", "Topic", "Preference", "Skill"),
+)
+
+MIST_HAS_PREFERENCE = EdgeTypeDefinition(
+    type_name="MIST_HAS_PREFERENCE",
+    description=(
+        "Links MistIdentity to a preference it holds about tooling, concepts, "
+        "technologies, or topics."
+    ),
+    allowed_source_types=("MistIdentity",),
+    allowed_target_types=("Preference", "Concept", "Technology", "Topic"),
+)
+
+# ===================================================================
 # Collected edge type lists
 # ===================================================================
 
@@ -1232,8 +1279,18 @@ _STRUCTURAL_EDGE_TYPES: tuple[EdgeTypeDefinition, ...] = (
     DERIVED_FROM,
 )
 
+_MIST_SCOPE_EDGE_TYPES: tuple[EdgeTypeDefinition, ...] = (
+    IMPLEMENTED_WITH,
+    MIST_HAS_CAPABILITY,
+    MIST_HAS_TRAIT,
+    MIST_HAS_PREFERENCE,
+)
+
 ALL_EDGE_TYPES: list[EdgeTypeDefinition] = list(
-    _INTERNAL_EDGE_TYPES + _EXTERNAL_USER_CENTRIC_EDGE_TYPES + _STRUCTURAL_EDGE_TYPES
+    _INTERNAL_EDGE_TYPES
+    + _EXTERNAL_USER_CENTRIC_EDGE_TYPES
+    + _STRUCTURAL_EDGE_TYPES
+    + _MIST_SCOPE_EDGE_TYPES
 )
 
 ALL_EDGE_TYPE_NAMES: list[str] = [et.type_name for et in ALL_EDGE_TYPES]
@@ -1242,10 +1299,16 @@ ALL_EDGE_TYPE_NAMES: list[str] = [et.type_name for et in ALL_EDGE_TYPES]
 # Extractable subsets (what the LLM extractor may produce)
 # ===================================================================
 
-# All 12 external node types are extractable.
-EXTRACTABLE_NODE_TYPES: list[str] = [nt.type_name for nt in _EXTERNAL_NODE_TYPES]
+# All 12 external node types plus MistIdentity are extractable (13 total).
+# MistIdentity is also defined as an INTERNAL singleton node, but is promoted
+# to extractable so that MIST-scope facts (e.g. "MIST uses LanceDB") can be
+# attributed at extraction time.
+EXTRACTABLE_NODE_TYPES: list[str] = [nt.type_name for nt in _EXTERNAL_NODE_TYPES] + [
+    MIST_IDENTITY.type_name,
+]
 
-# 13 user-centric + 8 structural (excluding provenance: LEARNED_FROM, ABOUT, SUPERSEDES).
+# 13 user-centric + 8 structural (excluding provenance: LEARNED_FROM, ABOUT, SUPERSEDES)
+# + 4 MIST-scope.
 _EXTRACTABLE_STRUCTURAL_EDGE_TYPES: tuple[EdgeTypeDefinition, ...] = (
     IS_A,
     PART_OF,
@@ -1255,6 +1318,10 @@ _EXTRACTABLE_STRUCTURAL_EDGE_TYPES: tuple[EdgeTypeDefinition, ...] = (
     WORKS_WITH,
     KNOWS_PERSON,
     MEMBER_OF,
+    IMPLEMENTED_WITH,
+    MIST_HAS_CAPABILITY,
+    MIST_HAS_TRAIT,
+    MIST_HAS_PREFERENCE,
 )
 
 EXTRACTABLE_RELATIONSHIP_TYPES: list[str] = [
@@ -1271,15 +1338,17 @@ You are a knowledge-graph extraction engine for the MIST.AI cognitive assistant.
 Your job is to read a user utterance and produce structured entities and
 relationships that should be stored in MIST's persistent knowledge graph.
 
-ENTITY TYPES YOU MAY PRODUCE (12):
+ENTITY TYPES YOU MAY PRODUCE (13):
   User, Person, Organization, Technology, Skill, Project, Concept, Topic,
-  Event, Goal, Preference, Location
+  Event, Goal, Preference, Location, MistIdentity
 
-RELATIONSHIP TYPES YOU MAY PRODUCE (21):
+RELATIONSHIP TYPES YOU MAY PRODUCE (25):
   User-centric: USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL,
     PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED
   Structural: IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH,
     KNOWS_PERSON, MEMBER_OF
+  MIST-scope: IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT,
+    MIST_HAS_PREFERENCE
 
 RULES:
 1. Only extract entities and relationships that are clearly supported by the

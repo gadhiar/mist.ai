@@ -98,15 +98,20 @@ class TestEntityTypes:
         assert len(bridging_types) == 4
         assert type_name in bridging_names
 
-    def test_extractable_types_are_external_only(self):
+    def test_extractable_types_are_external_plus_mist_identity(self):
+        # Cluster 1 (Bug J): MistIdentity is promoted from INTERNAL-only to
+        # also extractable so that MIST-scope facts ("MIST uses LanceDB")
+        # survive extraction. The extractable set is the full 12 external
+        # types plus MistIdentity.
         external_names = {
             nt.type_name for nt in ALL_NODE_TYPES if nt.knowledge_domain == KnowledgeDomain.EXTERNAL
         }
+        expected = external_names | {"MistIdentity"}
 
         extractable_set = set(EXTRACTABLE_NODE_TYPES)
 
-        assert len(EXTRACTABLE_NODE_TYPES) == 12
-        assert extractable_set == external_names
+        assert len(EXTRACTABLE_NODE_TYPES) == 13
+        assert extractable_set == expected
 
 
 # -------------------------------------------------------------------
@@ -117,12 +122,29 @@ class TestEntityTypes:
 class TestRelationshipTypes:
     """Verify the complete set of relationship types in the ontology."""
 
-    def test_has_33_relationship_types(self):
-        assert len(ALL_EDGE_TYPES) == 33
+    def test_has_37_relationship_types(self):
+        # Cluster 1 added 4 MIST-scope edges: IMPLEMENTED_WITH,
+        # MIST_HAS_CAPABILITY, MIST_HAS_TRAIT, MIST_HAS_PREFERENCE.
+        assert len(ALL_EDGE_TYPES) == 37
 
     def test_extractable_relationships_count(self):
         # 13 user-centric + 8 structural (excludes LEARNED_FROM, ABOUT, SUPERSEDES)
-        assert len(EXTRACTABLE_RELATIONSHIP_TYPES) == 21
+        # + 4 MIST-scope (IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT,
+        # MIST_HAS_PREFERENCE).
+        assert len(EXTRACTABLE_RELATIONSHIP_TYPES) == 25
+
+    @pytest.mark.parametrize(
+        "type_name",
+        [
+            pytest.param("IMPLEMENTED_WITH", id="IMPLEMENTED_WITH"),
+            pytest.param("MIST_HAS_CAPABILITY", id="MIST_HAS_CAPABILITY"),
+            pytest.param("MIST_HAS_TRAIT", id="MIST_HAS_TRAIT"),
+            pytest.param("MIST_HAS_PREFERENCE", id="MIST_HAS_PREFERENCE"),
+        ],
+    )
+    def test_mist_scope_edges_are_extractable(self, type_name: str):
+        assert type_name in EXTRACTABLE_RELATIONSHIP_TYPES
+        assert type_name in {et.type_name for et in ALL_EDGE_TYPES}
 
 
 # -------------------------------------------------------------------
