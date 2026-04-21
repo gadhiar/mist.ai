@@ -1,151 +1,144 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-04-08
-**Branch:** main (feat/model-backend-migration pending merge)
-**Status:** Voice pipeline fully optimized (~2.5-3.5s TTFA target), binary audio transport, personality profiles, log streaming, llama-server backend
+**Last Updated:** 2026-04-21
+**Branch:** main (synced with origin)
+**Status:** MVP Knowledge Integration — 5 of 8 architectural clusters complete (2, 3, 4, 5, 6). Cluster 1 next; Cluster 8 unblocked after Cluster 1.
 
 ---
 
 ## Current Status
 
 ### Backend
-- **Status:** CONTAINERIZED (Docker + CUDA 12.4)
-- **Server:** FastAPI WebSocket on port 8001
-- **LLM Backend:** llama-server (llama.cpp) via StreamingLLMProvider abstraction; Ollama retained as fallback
-- **Voice Pipeline:** VAD -> Whisper -> Qwen 2.5 7B -> Chatterbox Turbo TTS (pipeline parallelism, binary PCM16 transport, ~2.5-3.5s TTFA target)
-- **Audio Transport:** Binary WebSocket frames (MIST protocol: 16-byte header + PCM16), RMS normalization (-20 dBFS), interrupt fade-out
-- **Personality System:** YAML-based personality configs per voice profile (openers, speaking style, mannerisms)
-- **Log Streaming:** WebSocketLogHandler with per-logger gating, token bucket rate limiter, request ID propagation
-- **Persistent Logging:** `./logs/mist-backend.log` at DEBUG level (survives container removal)
-- **Knowledge Graph:** Full extraction + curation pipeline (655 tests, 369 new)
-- **Configuration:** TTS_ENABLED=true, TTS_ENGINE=chatterbox, VOICE_PROFILE=friday, LLM_BACKEND=llama-server
-- **Code Quality:** [COMPLETE] Full suite -- Black, Ruff, Mypy, Bandit, Codespell, AI slop detection
-- **Tests:** 696 unit tests (run inside container), 20 audio protocol tests, 14 sentence detector tests, 7 personality config tests
+- **Status:** CONTAINERIZED (Docker + CUDA 12.4). All development against the container; Windows native venv is corrupted.
+- **Server:** FastAPI WebSocket on port 8001.
+- **LLM:** Gemma 4 E4B Q5_K_M dense (carteakey-full recipe) via llama-server (llama.cpp OpenAI-compatible API). Selected 2026-04-16 via gauntlet (ADR-008 revised). Serving at `http://mist-llm:8080`.
+- **LLM ctx_size:** 32K configured on llama-server; effective attention window ~8K (Gemma's trained context). Cluster 6's `context_budget.context_window=8192` default respects this.
+- **StreamingLLMProvider abstraction:** `LlamaServerProvider` (primary), `OllamaProvider` (fallback), optionally wrapped by `InstrumentedStreamingLLMProvider` (Cluster 5) for JSONL observability.
+- **ConversationHandler:** Cluster 3 persona injection + Cluster 6 `ContextBudgetPlanner` + `_build_request` Pydantic-dump helper (Cluster 5). `conversation_max_tokens=1024` (up from 400; Cluster 6 fix for Bug E).
+- **Voice Pipeline:** VAD -> Whisper -> Gemma 4 E4B -> Chatterbox Turbo TTS with streaming parallelism. ~4-5s TTFA.
+- **Audio Transport:** Binary WebSocket frames (MIST protocol: 16-byte header + PCM16), RMS normalization (-20 dBFS), interrupt fade-out.
+- **Log Streaming:** WebSocketLogHandler with per-logger gating, token bucket rate limiter, request ID propagation.
+- **Persistent Logging:** `./logs/mist-backend.log` at DEBUG level (survives container removal).
+- **Debug JSONL Observability:** `DebugJSONLLogger` with 5 record phases (`turn`, `extraction`, `llm_call`, `retrieval_candidates`, `llm_request_raw`). Each gated by its own env var. See Cluster 5 artifacts below.
+- **Knowledge Graph:** Extraction + curation pipeline + hybrid retrieval (graph + vector + RRF merge). ADR-009 provenance separation structurally enforced (Cluster 2). MIST identity retrieval injects persona (Cluster 3).
+- **Knowledge Seed:** 32-entity baseline (`mist_admin seed` from `scripts/seed_data.yaml`): 1 MistIdentity + 9 MistTraits + 5 MistCapabilities + 5 MistPreferences + 11 user/technology entities + 1 User + 19 identity relationships + 11 anchor relationships + 32 embeddings.
+- **Tests:** **1022 unit tests + 3 xfailed.** Run inside container: `docker compose exec mist-backend python -m pytest tests/unit/`.
 
-### Frontend
-- **Status:** IN DEVELOPMENT
-- **Platform:** Flutter desktop (Windows/macOS/Linux)
-- **Implementation:** WebSocket client, voice recording, nav rail, log viewer, binary audio playback [E2E PENDING]
-- **Nav Rail:** Expandable sidebar (72px/200px), 4 destinations (Chat, Logs, Voice Profiles stub, Settings stub)
-- **Log Viewer:** Level filter chips, text search (300ms debounce), group by request/component, ring buffer (5,000 entries)
-- **Audio Playback:** flutter_soloud PCM16 streaming, first-chunk immediate playback, jitter buffer, underrun tracking
-- **Pending:** Knowledge graph visualization, E2E validation of binary audio transport
-- **Code Quality:** [COMPLETE] Flutter analyzer configured with custom rules
+### Frontend (Flutter)
+- **Status:** IN DEVELOPMENT (unchanged since 2026-04-08). Cluster 1/8 work is backend-focused; frontend touches parked in `mist-ai-frontend-audit-remediation` (status: parked).
+- Navigation rail (72/200px), log viewer (filter/search/grouping, 5K ring buffer), binary audio playback via flutter_soloud.
+
+### Code Quality
+- Full pre-commit suite: black, ruff (D102 strict), bandit, codespell, AI-slop pattern checker, trim whitespace, fix end-of-files, large file + merge conflict + private key detection.
+- AI-slop pattern checker enforces no emoji/unicode-decorative/arrow symbols in new code.
+- CI configured via GitHub Actions.
+
+---
+
+## MVP Knowledge Integration — Cluster Status
+
+**Workstream:** `mist-ai-knowledge-integration-mvp-validation` (active, P0). Full detail in the knowledge-vault workstream note at `knowledge-vault/Projects/mist-ai/workstreams/mist-ai-knowledge-integration-mvp-validation.md`.
+
+**Plan artifact:** `~/.claude/plans/cluster-execution-roadmap.md` (canonical) + mirror at `mist.ai/.local/plans/cluster-execution-roadmap.md`.
+
+| Cluster | Scope | Status | Key commit range | Gauntlet artifact |
+|---|---|---|---|---|
+| 1 | Ontology expansion + subject-scope classifier | PENDING (next) | — | — |
+| 2 | Graph provenance separation (ADR-009) | COMPLETE 2026-04-20 | c505c7a -> 8a31fcc | post-cluster-2-gauntlet-report-2026-04-20.md |
+| 3 | Identity layer + persona injection + AI-slop filter + dual temperature | COMPLETE 2026-04-21 | f306788 -> 6124e43 | post-cluster-3-gauntlet-report-2026-04-21.md |
+| 4 | Deterministic rails (Bugs A, C, G, K) | COMPLETE 2026-04-20 | 4eed4f2 -> 68ffc81 | post-cluster-4-gauntlet-report-2026-04-20.md |
+| 5 | Observability (llm_call + retrieval_candidates + llm_request_raw JSONL phases) | COMPLETE 2026-04-21 | 27af364 -> 3c8f0b2 | v6-cluster-5-diagnostic-report-2026-04-21.md |
+| 6 | Context budget (ContextBudgetPlanner) + max_tokens=1024 fix | COMPLETE 2026-04-21 | c4c4d71 -> c800e35 | post-cluster-6-gauntlet-report-2026-04-21.md |
+| 7 | Existing-data migration | Folds into Cluster 8 | — | — |
+| 8 | Vault-native memory (ADR-010 implementation, 12-phase, 4-6wk) | PENDING (after Cluster 1) | — | — |
+
+**Acceptance status** toward Phase 4 earned close:
+- Relationship correctness ≥ 80% — PENDING (baseline 44%; Cluster 1 target)
+- Post-session retrieval semantic content ≥ 80% — effectively CLEARED on canonical probe post-Cluster-2 (9/10 user-facing facts)
+- Emoji violations = 0 — CLEARED post-Cluster-3 (0/46 V4+V5+V6 turns)
+- Empty responses < 10% — **CLEARED** post-Cluster-6 (0/30 V6)
+- LLMRequest validation errors = 0 — CLEARED post-Cluster-4 (held through Cluster 6)
+- Unit tests 900+/900+ green — CLEARED (1022 + 3 xfailed)
+
+**Bug status (P1/P2 from 2026-04-17 gauntlet):**
+- A (83% NULL provenance) — CLEARED (Cluster 4)
+- B (identity drift, emoji leak, AI slop) — CLEARED (Cluster 3)
+- C (LLMRequest tool_calls schema) — CLEARED (Cluster 4)
+- E (empty LLM responses) — CLEARED (Cluster 6; root cause: max_tokens=400 truncating tool-call JSON)
+- G (reserved-namespace guard) — CLEARED (Cluster 4)
+- I (LEARNING->USES slippage) — PENDING (Cluster 1)
+- J (MIST-tooling attributed to Raj USES) — PENDING (Cluster 1)
+- K (prompt-injection written as fact) — CLEARED 2/3 layers (Cluster 4); remaining (Cluster 1)
+- N (retrieval returns only provenance plumbing) — STRUCTURALLY RESOLVED (Cluster 2)
 
 ---
 
 ## Active Work
 
 ### Current Focus
-1. Merge feat/model-backend-migration to main
-2. E2E validation of binary audio transport + personality profiles [PENDING USER TEST]
-3. Knowledge graph visualization in Flutter
-4. Seed knowledge DB, run full e2e knowledge integration test
-5. Merge to origin/main when ready to push remotely
+1. **Cluster 1 (ontology + subject-scope classifier)** — extraction correctness 44% -> 80% gate. Deliverables: extend `RELATIONSHIP_CONSTRAINTS` with Organization/System-scope predicates; add `IMPLEMENTED_WITH` + `MIST_HAS_CAPABILITY`/`TRAIT`/`PREFERENCE` predicates; subject-scope classifier as Stage 1.5 pre-extraction; rewrite `EXTRACTION_SYSTEM_PROMPT` to remove "User is almost always the SUBJECT" bias. Parallelizable with Cluster 8.
+2. **Cluster 8 (ADR-010 vault implementation)** — 12-phase roadmap, 4-6 weeks. All hard gates cleared. Move ADR-010 from `proposed` to `accepted` when implementation begins.
+3. **Phase 4 gauntlet re-run** after Cluster 1 lands. Path to earned close.
 
-### Recently Completed (2026-04-08)
-- Model backend migration: Ollama replaced with llama-server (llama.cpp) behind StreamingLLMProvider abstraction
-- New backend/llm/ package: LlamaServerProvider (primary), OllamaProvider (fallback), build_llm_provider() factory
-- Docker: mist-ollama service replaced with mist-llm (ghcr.io/ggml-org/llama.cpp:server-cuda)
-- Dependencies: langchain-ollama, langchain-core removed; openai, httpx added; ollama kept for fallback
-- Error hierarchy: OllamaConnectionError -> LLMConnectionError, OllamaResponseError -> LLMResponseError
-- Conversation handler: langchain tool binding replaced with OpenAI-format JSON tool schemas
-- Voice pipeline: ollama.chat(stream=True) replaced with provider.generate_sync(request, stream=True)
-- New env vars: LLM_BACKEND, LLM_SERVER_URL, MODELS_DIR, LLM_MODEL_FILE, LLM_CTX_SIZE
-- All consumers receive LLM provider via DI (build_llm_provider() factory)
-- 696 tests passing (up from 670+)
+### Recently Completed (2026-04-21)
+- **Cluster 6 (Context budget + max_tokens fix):** V6 empty-response rate 53% -> 0%. `LLMConfig.conversation_max_tokens=1024` (up from 400) at all three ConversationHandler invoke sites fixes the "GHOST turn" failure mode (tool-call JSON truncation). `ContextBudgetPlanner` with TokenCounter + HistoryStrategy protocols + SlidingWindowStrategy default provides defense-in-depth. Commits c4c4d71, d354f30, 997517f, c800e35. +32 net new tests.
+- **Cluster 5 (Observability):** Three JSONL record phases added to `DebugJSONLLogger` (`llm_call`, `retrieval_candidates`, `llm_request_raw`) each with its own env gate. `InstrumentedStreamingLLMProvider` wraps any concrete provider transparently; `llm_call_context` ContextVar threads caller metadata (`session_id`/`event_id`/`call_site`/`pass_num`). All factories wired. Commits 27af364, f5d0ec4, ab85115, e7ca7e2 + polish 3c8f0b2. +44 net new tests.
+- **Cluster 3 (Identity + AI-slop filter + dual temperature):** 6 deliverables — config split (`conversation_temperature=0.7`), slop detector library, pref-no-ai-slop seed, QueryClassifier identity intent at priority 0, `retrieve_mist_context()` + `MistContext` renderer with HARD RULES framing, response post-filter with regen + strip_fixable fallback. Bug B closed: 0 emoji across 46 V4+V5+V6 turns; consulting-voice markdown drift -56%. Commits f306788 -> 6124e43. +90 net new tests.
 
-### Previously Completed (2026-03-27)
-- Binary WebSocket audio transport: MIST protocol (16-byte header + PCM16), replaces JSON float32 arrays (~7x bandwidth reduction)
-- Backend: audio_protocol.py (frame builder, RMS normalization, fade-out, PCM16 conversion), 20 tests
-- Server broadcast_messages() dispatches binary frames via send_bytes(), text via send_text()
-- Flutter: AudioPlaybackService rewritten for flutter_soloud PCM streaming (replaces audioplayers WAV-queue)
-- First-chunk immediate playback (no 6s pre-buffer), jitter buffer for subsequent chunks, underrun tracking
-- BinaryAudioFrame parser, WebSocket binary/text frame discrimination, VoiceNotifier binary routing
-- Personality profile system: YAML configs per voice profile (openers, speaking style, mannerisms)
-- FRIDAY personality config written (8 characteristic openers, all under 40 chars)
-- System prompt templated from personality config in generate_tokens_streaming()
-- First-sentence coalescing bypass for first-utterance priming
-- Jarvis and Cortana personality stubs
-- Linear tickets created: MIS-98 (pre-buffering), MIS-99 (personality), MIS-100 (Profiles screen), MIS-101 (FRIDAY review), MIS-102 (streaming TTS research)
-- MIS-45 marked Done, MIS-76 updated with merge conflict details
+### Previously Completed (2026-04-20)
+- **Cluster 4 (Deterministic rails):** Bug A fix (ON CREATE SET e.provenance='extraction'); Bug C fix (`list[dict[str, Any]]` widening in LLMRequest.messages); Bug G (RESERVED_NAMES table in EntityNormalizer); Bug K two-layer fix (pre-filter + prompt tightening).
+- **Cluster 2 (ADR-009 graph provenance separation):** 5 writer sites migrated to `:__Provenance__` base label; retrieval multi-hop filter anchored at `:__Entity__`; `mist_admin graph-reset --include-derived`; `graph-stats` three-section output. Canonical V6 turn-30 probe returns 9/10 user-facing facts vs morning's 0.
 
-### Previously Completed (2026-03-26)
-- Merged test/chatterbox-eval to main (Docker, Chatterbox, 10 commits)
-- Backend log streaming: WebSocketLogHandler, request ID propagation via contextvars, runtime log level control
-- Persistent file logging to ./logs/mist-backend.log (DEBUG level, survives container removal)
-- Flutter nav rail + log viewer (expandable sidebar, 4 destinations, filter/search/group, ring buffer)
-- Voice pipeline parallelism: LLM producer + TTS consumer via sentence queue
-- SentenceBoundaryDetector with abbreviation/decimal/ellipsis/list marker handling (14 tests)
-- True Ollama token streaming in KnowledgeIntegration (bypasses ConversationHandler tool chain)
-- Time-to-first-audio improved from 12-19s to ~4-5s
-- Eager embedding model loading, CUDA sync removal
-- FRIDAY voice profile created (46.2s reference WAV), all 3 profiles migrated to Chatterbox
-- Default voice profile switched to friday
-
-### Previously Completed (2026-03-25)
-- Knowledge extraction + curation pipeline merged to main (23 modified + 12 new files)
-- Chatterbox Turbo selected after 18-model TTS evaluation (replaces Sesame CSM-1B)
-- Docker Compose stack created (backend + Neo4j 5 + Ollama -- 3 services)
-- Flash attention confirmed working inside Linux container (PyTorch 2.6+cu124)
-- 655 backend tests passing (369 new from knowledge pipeline)
-
-### Known Issues
-- Native Windows venv is corrupted -- use Docker container going forward
-- GPU contention between llama-server and Chatterbox adds ~1.1x TTS overhead on single GPU
-- Binary audio transport implemented but not E2E validated yet (pending manual test)
-- Log handler uses bare import (`from log_handler import ...`) not relative
-- Knowledge DB has not been seeded -- RAG retrieval returns 0 facts
-- 50+ commits ahead of origin/main (not pushed per policy)
-- 48 P3 items in KNOWN_ISSUES.md from 2026-03-22 audit (opportunistic)
-- 1 pre-existing test failure: test_get_active_default expects "cortana" but config defaults to "jarvis"
+### Previously Completed (2026-04-16 -> 2026-04-08)
+- Gemma 4 E4B selected as production model via gauntlet (ADR-008 revised)
+- Model backend migration: Ollama -> llama-server via `StreamingLLMProvider` abstraction
+- Binary WebSocket audio transport (MIST protocol, ~7x bandwidth reduction)
+- Personality system (YAML per voice profile)
+- FRIDAY default voice profile
 
 ### Blockers
-None
+None. All upstream gates for Cluster 1 cleared.
 
 ---
 
-## Recent Changes
+## Debug Observability Quick-Start
 
-### Log Streaming + Nav Rail + Voice Optimization (2026-03-26)
-- Backend log streaming via WebSocketLogHandler (structured records, rate limiting, re-entrancy guard)
-- Request ID propagation via contextvars with spawn_with_context utility
-- Runtime log level control via log_config WebSocket messages
-- Flutter nav rail (72px collapsed / 200px expanded, 200ms animation, 4 destinations)
-- Log viewer: level filter chips, text search (300ms debounce), group by request/component
-- LogEntryTile: monospace, color-coded levels, tap-to-expand, right-click context menu
-- Ring buffer (5,000 entries, Queue for O(1)), 100ms batched updates, auto-scroll with 50px threshold
-- Voice pipeline parallelism: LLM token streaming -> sentence boundary detection -> TTS consumer
-- Pre-buffering (6s) and sentence coalescing (40 char min) for gapless audio
-- Time-to-first-audio: 12-19s -> ~4-5s (70-81% reduction)
-- 26 files changed, +4,616 lines
+`DebugJSONLLogger` writes structured JSONL records to the path set by `MIST_DEBUG_JSONL`. Three phase-specific gates layered on top:
 
-### Chatterbox TTS + Docker Stack (2026-03-25)
-- Chatterbox Turbo replaces Sesame CSM-1B as primary TTS engine
-  - Performance: 0.74x RTF vs 2.3x RTF (CSM)
-  - VRAM: 3.9GB vs 10GB (CSM)
-  - Zero-shot voice cloning, MIT license
-- Docker Compose stack: mist-backend + Neo4j 5 + mist-llm (llama-server)
-- Dev mode: docker-compose.override.yml mounts code as read-only volumes
-- Backend container: nvidia/cuda:12.4.0-devel-ubuntu22.04 + Python 3.11
-- PyTorch 2.6.0+cu124 with flash attention inside container
+```bash
+# From Git Bash on Windows: MSYS_NO_PATHCONV=1 prefix is REQUIRED
+# (see reference_docker_exec_path_mangling memory) or /app/... gets path-translated.
+MSYS_NO_PATHCONV=1 docker compose exec -T \
+  -e MIST_DEBUG_JSONL=/app/data/ingest/session.jsonl \
+  -e MIST_DEBUG_LLM_JSONL=1 \
+  -e MIST_DEBUG_RETRIEVAL_JSONL=1 \
+  -e MIST_DEBUG_LLM_REQUESTS=1 \
+  mist-backend python -m scripts.mist_admin replay \
+  /app/data/ingest/v6-inputs.jsonl \
+  --session-id diagnostic \
+  --output /app/data/ingest/report.jsonl
+```
 
-### Knowledge Pipeline Merge (2026-03-25)
-- 23 modified files + 12 new files merged to main
-- 655 tests total (369 new)
-- Full extraction + curation pipeline with automatic knowledge capture
+**Emitted phases when gates are open:**
+- `phase: "turn"` — per-turn wrapper with event_id/session_id/utterance + retrieval summary + llm_passes + total_turn_ms. (Pre-Cluster-5 infrastructure.)
+- `phase: "extraction"` — per-turn extraction stats (entities_count, avg_confidence, graph_writes). (Pre-Cluster-5 infrastructure.)
+- `phase: "llm_call"` — full request/response at every provider.invoke(). Content/tool_calls/usage/latency_ms. call_site-tagged: `chat.initial`, `chat.final`, `chat.regen`, `extraction.ontology`, `extraction.internal_derivation`.
+- `phase: "retrieval_candidates"` — full graph + vector candidate pools from `KnowledgeRetriever.retrieve()` BEFORE RRF merge + rank truncation. Gate: `MIST_DEBUG_RETRIEVAL_JSONL=1`.
+- `phase: "llm_request_raw"` — pre-validation LLMRequest kwargs dump on Pydantic ValidationError. Gate: `MIST_DEBUG_LLM_REQUESTS=1`.
 
-### Previous Milestones
-- Phase 1A: Ontology definitions (19 entity types, 30 relationship types)
-- Phase 1B: 6-stage extraction pipeline (OntologyConstrainedExtractor)
-- Phase 2A: Curation pipeline (dedup, conflict resolution, provenance tracking)
-- Phase 2B: ConversationHandler migration (automatic extraction, legacy removal)
-- Phase 3: Internal knowledge derivation (MIST self-model, Stage 9)
-- Phase 4 Tier 1+2: Periodic curation (decay, staleness, orphans, reflection, health, scheduler)
-- Backend audit: P0/P1/P2 fixes, KNOWN_ISSUES.md tracking P3 items
-- Code quality merge (PR #4): 16 pre-commit hooks, 7 CI checks
-- Removed obsolete React frontend (saved 127MB)
-- Flutter migration with Riverpod state management
+All records carry `ts_iso` + `session_id` + `event_id` for cross-record joins.
+
+---
+
+## Dependency Injection Contract
+
+All classes depending on external systems (Neo4j, LLM, embeddings, event store, vector store, debug logger) accept dependencies as required constructor parameters. Factories in `backend/factories.py` own all wiring with real implementations.
+
+**Factory entry points:**
+- `build_conversation_handler(config, llm_provider=None)` — composition root for chat. Reads `DebugJSONLLogger.from_env()` once, logs active phase gates, threads the logger through `build_llm_provider` (wraps with `InstrumentedStreamingLLMProvider` when `llm_call_enabled`) and `build_knowledge_retriever` (forwards `debug_logger`). Returns a `ConversationHandler` with all dependencies wired.
+- `build_extraction_pipeline(config, graph_store=None, llm_provider=None, include_curation=True, include_internal_derivation=True)` — extraction + curation + internal derivation pipeline.
+- `build_knowledge_retriever(config, graph_store=None, vector_store=None, embedding_provider=None, debug_logger=None)` — hybrid retriever (graph + vector + RRF).
+- `build_llm_provider(config, debug_logger=None)` — provider with optional instrumentation.
 
 ---
 
@@ -153,97 +146,121 @@ None
 
 ### Docker Stack
 ```
-docker/
-├── backend/
-│   ├── Dockerfile              # CUDA 12.4 + Python 3.11 + Chatterbox
-│   └── .dockerignore           # Excludes CSM training data
-docker-compose.yml              # 3-service stack (backend, neo4j, mist-llm)
-docker-compose.override.yml     # Dev mode volume mounts
+docker-compose.yml              # 3 services: mist-backend, mist-neo4j, mist-llm
+docker-compose.override.yml     # Dev mode volume mounts (backend/tests/scripts/voice_profiles bind-mounted)
+docker/backend/Dockerfile       # CUDA 12.4 + Python 3.11 + Chatterbox
 ```
+
+**Volume mounts** (backend code hot-reloadable):
+- `./data:/app/data` (graph snapshots, JSONL diagnostics, event store SQLite)
+- `./logs:/app/logs` (persistent logs)
+- `./backend:/app/backend`
+- `./tests:/app/tests`
+- `./scripts:/app/scripts`
+- `./voice_profiles:/app/voice_profiles`
 
 ### Backend Structure
 ```
 backend/
-├── server.py              # WebSocket server (port 8001), mixed text/binary broadcast
-├── voice_processor.py     # Voice pipeline orchestration (pipeline parallelism, binary frames)
-├── audio_protocol.py      # MIST binary frame builder, RMS normalization, PCM16 conversion
-├── log_handler.py         # WebSocketLogHandler (rate limiting, re-entrancy guard)
-├── request_context.py     # ContextVar propagation + spawn_with_context
-├── sentence_detector.py   # Sentence boundary detection for streaming TTS
-├── config.py              # Voice system configuration
-├── knowledge_config.py    # Knowledge graph configuration
-├── voice_models/          # ML model management (Chatterbox adapter)
-├── chat/                  # Conversation handling + tool usage
-├── llm/                   # LLM provider abstraction (StreamingLLMProvider, LlamaServerProvider, OllamaProvider)
-└── knowledge/             # Neo4j knowledge graph system
+├── server.py              # WebSocket server (port 8001)
+├── voice_processor.py     # Voice pipeline orchestration
+├── audio_protocol.py      # MIST binary frame builder
+├── log_handler.py         # WebSocketLogHandler
+├── request_context.py     # ContextVar propagation
+├── sentence_detector.py   # Streaming TTS sentence boundary detection
+├── debug_jsonl_logger.py  # Cluster 5: 5-phase JSONL sink with env gates
+├── factories.py           # Composition root
+├── errors.py              # MistError hierarchy
+├── interfaces.py          # Protocols (EmbeddingProvider, VectorStoreProvider, GraphConnection, EventStoreProvider)
+├── chat/
+│   ├── conversation_handler.py   # Persona + budget + slop + post-filter (Clusters 3, 5, 6)
+│   ├── mist_context.py           # Cluster 3 MistContext dataclasses + renderer
+│   ├── slop_detector.py          # Cluster 3 pattern catalogue
+│   └── context_budget.py         # Cluster 6 planner + TokenCounter + HistoryStrategy
+├── llm/
+│   ├── provider.py                   # Abstract StreamingLLMProvider ABC
+│   ├── llama_server_provider.py      # Primary concrete provider
+│   ├── ollama_provider.py            # Fallback concrete provider
+│   ├── instrumented_provider.py      # Cluster 5 wrapper + llm_call_context ContextVar
+│   └── models.py                     # LLMRequest/LLMResponse/ToolCall Pydantic models
+└── knowledge/
+    ├── config.py                     # KnowledgeConfig + nested configs
+    ├── models.py                     # RetrievalResult, RetrievedFact, QueryIntent, etc.
+    ├── embeddings.py                 # EmbeddingGenerator (Sentence Transformers)
+    ├── extraction/                   # 6-stage extraction pipeline + ontology constraints + validator
+    ├── curation/                     # Dedup + conflict resolver + graph writer + confidence + scheduler
+    ├── ingestion/                    # Markdown ingestion for vector store
+    ├── retrieval/
+    │   ├── knowledge_retriever.py    # Hybrid retrieval + identity-intent routing (Cluster 3)
+    │   └── query_classifier.py       # Intent classification (live/relational/factual/hybrid/identity)
+    ├── regeneration/                 # Graph regenerator (no-curation replay)
+    └── storage/
+        ├── neo4j_connection.py
+        ├── graph_executor.py         # Async/sync boundary
+        └── graph_store.py            # GraphStore + get_mist_identity_context (Cluster 3)
 ```
 
 ### Frontend Structure
-```
-mist_desktop/
-├── lib/
-│   ├── main.dart
-│   ├── providers/         # Riverpod state management
-│   │   ├── chat_provider.dart
-│   │   ├── log_provider.dart        # LogNotifier + LogState (ring buffer)
-│   │   └── navigation_provider.dart # Sidebar state
-│   ├── services/          # WebSocket, audio services
-│   ├── screens/           # UI screens
-│   │   ├── chat_screen.dart
-│   │   ├── log_screen.dart          # Log viewer with grouping
-│   │   └── stub_screen.dart         # Placeholder destinations
-│   ├── widgets/           # Reusable components
-│   │   ├── app_shell.dart           # Navigation rail + content area
-│   │   ├── log_entry_tile.dart      # Monospace log entry display
-│   │   └── log_toolbar.dart         # Filter chips, search, controls
-│   └── models/            # Data models
-│       ├── websocket_message.dart   # Includes log message types
-│       └── log_entry.dart           # LogEntry data class
-```
-
-### Key Integration Points
-- Flutter connects to backend via WebSocket (ws://localhost:8001)
-- Backend sends: transcriptions, LLM tokens, audio chunks, structured log entries
-- Frontend sends: audio data, text messages, interrupts, log_config (level control)
-- Services communicate via Docker container hostnames (mist-neo4j, mist-llm)
+Unchanged since 2026-04-08. See `mist_desktop/` directory for Flutter/Riverpod/flutter_soloud structure.
 
 ---
 
 ## Configuration
 
-### Environment Variables (.env)
+### Environment Variables (.env / .env.example)
 ```bash
-# Neo4j (containerized)
+# Neo4j
 NEO4J_URI=bolt://mist-neo4j:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=password
 
-# Features
-ENABLE_KNOWLEDGE_INTEGRATION=true
+# LLM backend
+LLM_BACKEND=llamacpp                       # llamacpp (default) | ollama (fallback)
+LLM_SERVER_URL=http://mist-llm:8080
+MODELS_DIR=./models                        # Host path; mounted read-only into mist-llm
+LLM_MODEL_FILE=unsloth/gemma-4-E4B-it-Q5_K_M.gguf
+LLM_CTX_SIZE=32768                         # llama-server ctx_size; effective attention ~8K
+LLM_TEMPERATURE=0.0                        # Extraction default
+LLM_CONVERSATION_TEMPERATURE=0.7           # Conversation default (Cluster 3 split)
+LLM_CONVERSATION_MAX_TOKENS=1024           # Cluster 6 Bug E fix (was hardcoded 400)
+MODEL=gemma-4-e4b
+
+# Cluster 6 context budget
+MIST_CTX_BUDGET_ENABLED=true
+MIST_CTX_BUDGET_WINDOW=8192
+MIST_CTX_BUDGET_OUTPUT_RESERVE=512
+MIST_CTX_BUDGET_SAFETY=256
+MIST_CTX_BUDGET_RETRIEVAL_RATIO=0.4
+MIST_CTX_BUDGET_HISTORY_STRATEGY=sliding_window
+
+# Cluster 5 observability (all off by default)
+# MIST_DEBUG_JSONL=/app/data/ingest/debug.jsonl
+# MIST_DEBUG_LLM_JSONL=1
+# MIST_DEBUG_RETRIEVAL_JSONL=1
+# MIST_DEBUG_LLM_REQUESTS=1
+
+# Voice / TTS
 TTS_ENABLED=true
 TTS_ENGINE=chatterbox
-
-# TTS Parameters
 VOICE_PROFILE=friday
-TTS_EXAGGERATION=0.5
-TTS_TEMPERATURE=0.8
-TTS_CFG_WEIGHT=0.5
 
-# LLM Backend
-LLM_BACKEND=llama-server          # "llama-server" (default) or "ollama" (fallback)
-LLM_SERVER_URL=http://mist-llm:8080  # llama-server endpoint
-MODELS_DIR=/models                # GGUF model directory (container path)
-LLM_MODEL_FILE=qwen2.5-7b-instruct-q4_k_m.gguf
-LLM_CTX_SIZE=8192                 # Context window size
+# Feature flags
+ENABLE_KNOWLEDGE_INTEGRATION=true
+
+# Event store (Layer 1)
+EVENT_STORE_DB_PATH=/app/data/event_store.db
+EVENT_STORE_AUDIO_DIR=/app/data/audio
+
+# Vector store (Layer 2)
+VECTOR_STORE_DATA_DIR=/app/data/vector_store
 ```
 
 ### Critical Settings
-- LLM_BACKEND=llama-server (default; set to "ollama" for fallback)
-- TTS_ENABLED=true (Chatterbox enabled by default)
-- TTS_ENGINE=chatterbox (legacy CSM still available but not recommended)
-- ENABLE_KNOWLEDGE_INTEGRATION=true (knowledge graph active)
-- Docker data root: D:\Users\rajga\DockerData (not default C:)
-- .env.example has all config with defaults
+- `LLM_BACKEND=llamacpp` (Gemma 4 E4B primary; `ollama` available for fallback)
+- `LLM_MODEL_FILE=unsloth/gemma-4-E4B-it-Q5_K_M.gguf` (carteakey-full recipe per ADR-008)
+- `MIST_CTX_BUDGET_ENABLED=true` (Cluster 6 default; disable only to confirm budget-related regressions)
+- Docker data root: `D:\Users\rajga\DockerData` (not default C:)
+- Git Bash on Windows: prefix `docker compose exec` with `MSYS_NO_PATHCONV=1` when passing `/app/...` paths in env vars
 
 ---
 
@@ -254,23 +271,21 @@ LLM_CTX_SIZE=8192                 # Context window size
 - FastAPI + Uvicorn (WebSocket server)
 - Docker (nvidia/cuda:12.4.0-devel-ubuntu22.04)
 - PyTorch 2.6.0+cu124 (flash attention enabled)
-- llama-server / llama.cpp (LLM inference -- Qwen 2.5 7B via GGUF, OpenAI-compatible API)
-- StreamingLLMProvider abstraction (LlamaServerProvider primary, OllamaProvider fallback)
-- openai + httpx (LLM client libraries)
-- Whisper (STT -- base model)
-- Chatterbox Turbo (TTS -- zero-shot voice cloning, MIT license)
-- Neo4j 5.x (knowledge graph)
-- Sentence Transformers (all-MiniLM-L6-v2, 384-dim embeddings)
-
-### Legacy (retained but not active)
-- Sesame CSM-1B (replaced by Chatterbox -- imports made lazy, no torchtune dependency)
+- llama-server / llama.cpp (LLM inference — Gemma 4 E4B Q5_K_M via GGUF, OpenAI-compatible API)
+- `StreamingLLMProvider` abstraction: `LlamaServerProvider` primary, `OllamaProvider` fallback, `InstrumentedStreamingLLMProvider` decorator
+- openai + httpx (LLM client)
+- Whisper (STT — base model)
+- Chatterbox Turbo (TTS — zero-shot voice cloning, MIT)
+- Neo4j 5.x (knowledge graph; `:__Entity__` user-facing, `:__Provenance__` audit-trail per ADR-009)
+- LanceDB (vector store Layer 2)
+- Sentence Transformers all-MiniLM-L6-v2 (384-dim embeddings)
+- SQLite (event store Layer 1)
+- Pydantic v2 (LLMRequest/Response + config)
 
 ### Frontend
 - Flutter 3.24+ / Dart 3.10+
 - Riverpod 3.x (state management)
-- web_socket_channel (WebSocket client)
-- record (audio recording)
-- audioplayers (TTS playback)
+- web_socket_channel, record, flutter_soloud, audioplayers
 
 ---
 
@@ -278,35 +293,35 @@ LLM_CTX_SIZE=8192                 # Context window size
 
 ### Starting the Stack
 ```bash
-# Start full stack (backend + Neo4j + llama-server)
-docker compose up -d
-
-# Or use dev script
-python scripts/start_dev.py
-
-# View logs
+docker compose up -d               # Full stack
 docker compose logs -f mist-backend
 ```
 
-### Running Tests
+### Running Tests (inside container; native venv is corrupted)
 ```bash
-# Run tests inside container (native venv is corrupted)
-docker compose run --rm --no-deps mist-backend pytest tests/unit/
-
-# Run specific test file
-docker compose run --rm --no-deps mist-backend pytest tests/unit/test_specific.py
+docker compose exec -T mist-backend python -m pytest tests/unit/                       # Full unit suite
+docker compose exec -T mist-backend python -m pytest tests/integration/                # Integration (Neo4j + llama-server must be up)
+docker compose exec -T mist-backend python -m pytest tests/unit/chat/ -v               # Targeted
 ```
 
-### Building and Rebuilding
+### Admin CLI (`mist_admin`)
 ```bash
-# Rebuild after Dockerfile changes
-docker compose build mist-backend
+# Inside container:
+docker compose exec -T mist-backend python -m scripts.mist_admin stack-status
+docker compose exec -T mist-backend python -m scripts.mist_admin graph-stats
+docker compose exec -T mist-backend python -m scripts.mist_admin graph-reset --include-derived --confirm
+docker compose exec -T mist-backend python -m scripts.mist_admin seed
+docker compose exec -T mist-backend python -m scripts.mist_admin chat "utterance" --session-id sid
+docker compose exec -T mist-backend python -m scripts.mist_admin replay /app/data/ingest/v6-inputs.jsonl --session-id sid --output /app/data/ingest/report.jsonl
+```
 
-# Full rebuild (no cache)
+### Rebuilding
+```bash
+docker compose build mist-backend          # After Dockerfile/requirements changes
 docker compose build --no-cache mist-backend
 ```
 
-### Code Quality Checks
+### Code Quality
 ```bash
 python scripts/check_ai_slop.py --critical-only
 pre-commit run --all-files
@@ -315,92 +330,111 @@ ruff check backend/ --fix
 cd mist_desktop && dart format . && flutter analyze
 ```
 
-### Flutter Development
-```bash
-cd mist_desktop
-flutter test
-flutter analyze
-flutter run -d windows
-```
-
 ---
 
 ## Testing
 
 ### Backend Tests
-- **Count:** 696 unit tests (369 from knowledge pipeline, 14 sentence detector, token streaming tests, LLM provider tests)
+- **Count:** 1022 unit tests + 3 xfailed
 - **Runner:** pytest inside Docker container
-- **Command:** `docker compose run --rm --no-deps mist-backend pytest tests/unit/`
-- **Note:** Tests must run inside container -- native Windows venv is missing dependencies
+- **Command:** `docker compose exec -T mist-backend python -m pytest tests/unit/`
+- **Note:** Tests must run inside container
 
-### Flutter Tests
-```bash
-cd mist_desktop
-flutter test
-flutter analyze
-```
+### Integration Reproducers
+Landed per-cluster for regression protection:
+- `tests/integration/test_cluster_3_reproducers.py` (7 tests) — persona injection, post-filter regen, identity-intent routing, temperature split
+- `tests/integration/test_cluster_5_reproducers.py` (6 tests) — all three observability phases emitting end-to-end
+- `tests/integration/test_cluster_6_reproducers.py` (4 tests) — budget-driven history pruning, max_tokens config wiring
 
-### Manual End-to-End Testing
-1. Start stack: `docker compose up -d`
-2. Run Flutter: `cd mist_desktop && flutter run -d windows`
-3. Test voice input and conversation flow
-4. Verify TTS audio playback
+---
+
+## Gauntlet Workflow (Cluster Validation)
+
+Each cluster validates acceptance via re-running the V4 (5-utterance smoke), V5 (11-utterance breadth), and V6 (30-turn cohesive session) gauntlets against the merged code.
+
+**Canonical protocol:**
+1. `mist_admin graph-reset --include-derived --confirm` — wipe graph (snapshots saved to `data/graph_snapshots/`).
+2. `mist_admin seed` — restore 32-entity baseline.
+3. `mist_admin replay /app/data/ingest/v6-inputs.jsonl --session-id <name> --output /app/data/ingest/<report>.jsonl` with observability env vars set per Debug section above.
+4. Analyze the JSONL diagnostic file + per-turn replay output; write a report under `mist.ai/data/ingest/` (gitignored per policy).
+5. Compare against the baseline from the prior cluster's gauntlet report.
+
+**Gauntlet input files:** `data/ingest/v4-inputs.jsonl`, `v5-inputs.jsonl`, `v6-inputs.jsonl` (committed).
+
+**Gauntlet reports:** `data/ingest/post-cluster-<N>-gauntlet-report-YYYY-MM-DD.md` (gitignored by `data/ingest/` convention).
 
 ---
 
 ## Next Steps
 
-### Immediate Priorities
-1. Merge feat/model-backend-migration branch to main
-2. Knowledge graph visualization in Flutter
-3. Seed knowledge DB, run full e2e knowledge integration test
-4. Merge to origin/main when ready
+### Immediate
+1. **Cluster 1 (ontology expansion + subject-scope classifier)** — closes Bugs I, J, partial K. Extraction correctness 44% -> 80% gate.
+2. **Cluster 8 (ADR-010 vault implementation)** — 12-phase roadmap, 4-6 weeks. Parallelizable with Cluster 1 if scoped carefully.
+3. **Phase 4 gauntlet re-run** after Cluster 1 lands -> path to earned close.
 
-### Short-term Goals
-1. Voice Profiles screen (currently stub) -- manage/preview voice profiles from Flutter
-2. Settings screen (currently stub) -- runtime config from Flutter
-3. Address P3 items from KNOWN_ISSUES.md (opportunistic)
+### Short-term (parked workstreams; unpark after MVP close)
+1. `mist-ai-context-compression-multi-session` — post-MVP
+2. `mist-ai-tool-calling-production-rigor` — post-MVP
+3. `mist-ai-frontend-audit-remediation` — parked; Critical + High items in backlog (MIS-77)
+4. `mist-ai-mist-personality-growth` — parked (post-MVP)
+5. Voice Profiles / Settings screens in Flutter
 
-### Long-term Goals
+### Long-term
 1. Command Center architecture (orchestrating agentic teams)
-2. Agent spawning and task delegation
-3. Model routing strategy (local Qwen vs cloud API)
-4. Vision integration (Qwen 2.5 Vision)
-5. Meta-reasoning layer for explainability
-6. Mobile app (Flutter iOS/Android)
+2. Vision integration (Gemma 4 vision)
+3. GTX 1070 dual-GPU addition (parked post-voice-integration)
+4. Mobile app (Flutter iOS/Android)
+
+---
+
+## Known Issues
+- GPU contention between llama-server and Chatterbox adds ~1.1x TTS overhead on single GPU
+- Binary audio transport implemented but not E2E validated yet (pending manual test)
+- 48 P3 items in KNOWN_ISSUES.md from 2026-03-22 audit (opportunistic resolution, tracked in `mist-ai-technical-debt-p3` parked workstream)
+- Git Bash on Windows path-mangles unix-absolute paths in env vars passed to `docker compose exec`; prefix with `MSYS_NO_PATHCONV=1`
 
 ---
 
 ## Important Files
 
 ### Documentation
-- **CLAUDE.md** -- AI integration guidelines
-- **README.md** -- Project overview and setup
-- **REPOSITORY_STRUCTURE.md** -- File organization
-- **CONTRIBUTING.md** -- Code quality standards
-- **KNOWN_ISSUES.md** -- 48 P3 items from backend audit
+- **CLAUDE.md** — AI integration guidelines (never push to remote)
+- **README.md** — Project overview and setup
+- **REPOSITORY_STRUCTURE.md** — File organization
+- **CONTRIBUTING.md** — Code quality standards
+- **KNOWN_ISSUES.md** — 48 P3 items from backend audit
+- **TESTING.md** — Test conventions
+- **tests/CLAUDE.md** — Backend test AI guidance
+- **mist_desktop/test/CLAUDE.md** — Flutter test AI guidance
 
 ### Configuration
-- **.env** -- Environment variables (never commit)
-- **.env.example** -- All config with defaults
-- **.gitattributes** -- Line ending normalization (WSL2/Windows)
-- **pyproject.toml** -- Python tool configuration
-- **analysis_options.yaml** -- Flutter/Dart linting
-- **.pre-commit-config.yaml** -- Pre-commit hooks
-- **docker-compose.yml** -- 3-service stack definition (backend, neo4j, mist-llm)
-- **docker-compose.override.yml** -- Dev mode volume mounts
+- **.env** — Environment variables (never commit)
+- **.env.example** — All config with defaults
+- **.gitattributes** — Line ending normalization (WSL2/Windows)
+- **pyproject.toml** — Python tool configuration
+- **.pre-commit-config.yaml** — Pre-commit hooks
+
+### Plan Artifacts
+- `~/.claude/plans/cluster-execution-roadmap.md` (canonical) + mirror at `mist.ai/.local/plans/cluster-execution-roadmap.md`
+- `~/.claude/plans/2026-04-21-cluster-3-identity-layer.md` (completed)
+
+### Vault Artifacts (persistent memory)
+- `knowledge-vault/Projects/mist-ai/workstreams/mist-ai-knowledge-integration-mvp-validation.md` — authoritative workstream state
+- `knowledge-vault/Projects/mist-ai/sessions/2026-04-21-mist-cluster-6-context-budget.md` — most recent session
+- `knowledge-vault/Decisions/ADR-008-revised-model-backend-selection.md`, `ADR-009-graph-provenance-separation.md` (accepted), `ADR-010-memory-storage-architecture.md` (proposed)
 
 ---
 
 ## Quick Reference
 
 | Area | Status | Notes |
-|------|--------|-------|
-| Backend | CONTAINERIZED | Docker + CUDA 12.4, llama-server (llama.cpp) |
+|---|---|---|
+| Backend | CONTAINERIZED | Docker + CUDA 12.4, Gemma 4 E4B via llama-server |
+| Knowledge integration | 5/8 clusters done | 2, 3, 4, 5, 6 complete; 1 next; 8 after |
+| Unit tests | 1022 + 3 xfailed | Run inside container |
+| Empty-response rate (V6) | 0/30 (0%) | Post-Cluster-6 validation |
 | TTS | Chatterbox Turbo | 0.74x RTF, 3.9GB VRAM |
-| Knowledge | COMPLETE | 655 tests, Neo4j integrated |
-| Frontend | IN DEV | Nav rail + log viewer operational |
-| Code Quality | COMPLETE | 16 pre-commit hooks, 7 CI checks |
-| Docker | COMPLETE | 3-service Compose stack (backend, neo4j, mist-llm) |
-| CI/CD | COMPLETE | GitHub Actions configured |
-| Line Endings | FIXED | .gitattributes normalizes to LF |
+| Frontend | IN DEV | Parked on knowledge MVP |
+| Code Quality | FULL SUITE | black, ruff, bandit, codespell, AI-slop, pre-commit |
+| Docker | COMPLETE | 3-service stack (mist-backend, mist-neo4j, mist-llm) |
+| CI/CD | CONFIGURED | GitHub Actions |
