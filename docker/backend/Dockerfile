@@ -61,7 +61,15 @@ RUN TORCH_VER=$(python -c "import torch; print(torch.__version__)") && \
     fi
 
 # 5. flash-attn standalone (optional)
-RUN pip install flash-attn --no-build-isolation || echo "flash-attn optional install skipped"
+# Build deps must be installed BEFORE flash-attn because --no-build-isolation
+# means pip will not create an ephemeral build env. flash-attn's setup.py
+# imports psutil, packaging, and invokes ninja; wheel is needed for the bdist
+# step. All four are required or the egg_info step fails before compilation
+# even starts. Without these, the install silently failed for months
+# (pre-2026-04-22).
+RUN pip install ninja packaging wheel psutil
+RUN pip install flash-attn --no-build-isolation \
+    || (echo "[FLASH-ATTN BUILD FAILED] See pip stderr above. Image build continues without flash-attn -- attention falls back to PyTorch SDPA." && exit 0)
 
 # 6. Test dependencies
 RUN pip install pytest>=8.0 pytest-asyncio>=0.24
