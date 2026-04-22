@@ -21,6 +21,11 @@ services:
       - EVENT_STORE_DB_PATH=/app/data/event_store.db
       - EVENT_STORE_AUDIO_DIR=/app/data/audio
       - VECTOR_STORE_DATA_DIR=/app/data/vector_store
+      # Cluster 8 / ADR-010: vault layer + sidecar index. Container paths align
+      # with the bind mounts below. Filewatcher observer_type left "auto"
+      # (resolves to inotify on this Linux container).
+      - MIST_VAULT_ROOT=/app/mist-memory
+      - MIST_SIDECAR_DB_PATH=/app/data/vault_sidecar.db
       - TTS_ENABLED=${TTS_ENABLED:-true}
       - TTS_ENGINE=${TTS_ENGINE:-chatterbox}
       - TTS_EXAGGERATION=${TTS_EXAGGERATION:-0.5}
@@ -31,6 +36,9 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      # Cluster 8 / ADR-010: vault bind mount. Host path overridable via
+      # VAULT_HOST_PATH; default ./mist-memory at repo root.
+      - ${VAULT_HOST_PATH:-./mist-memory}:/app/mist-memory
       - mist-hf-cache:/root/.cache/huggingface
       - mist-torch-cache:/root/.cache/torch
     depends_on:

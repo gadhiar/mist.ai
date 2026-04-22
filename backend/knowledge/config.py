@@ -342,6 +342,132 @@ class ScopeClassifierConfig:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class VaultConfig:
+    """Cluster 8 / ADR-010: vault layer (canonical user-approved history).
+
+    The vault is a markdown corpus rendered to disk at `root`. MIST appends
+    session-note turns and the user can edit prose directly with Obsidian or
+    any text editor. The sidecar index (`SidecarIndexConfig`) and filewatcher
+    (`FilewatcherConfig`) are paired subsystems that complete the layer.
+
+    Defaults match ADR-010 implementation defaults section: container-relative
+    `mist-memory/` root with host-side bind mount controlled by docker-compose
+    `VAULT_HOST_PATH`. Append sentinel is the canonical literal documented in
+    the ADR. Session soft caps drive auto-split behavior.
+
+    The default user id (`raj`) is used to bootstrap `users/<id>.md` from
+    `scripts/seed_data.yaml` on first run; MIST currently only models a single
+    user, so this is not yet user-selectable per request.
+    """
+
+    enabled: bool = True
+    root: str = "mist-memory"
+    default_user_id: str = "raj"
+    git_auto_init: bool = True
+    session_soft_cap_turns: int = 20
+    session_soft_cap_tokens: int = 6000
+    append_sentinel: str = "<!-- MIST_APPEND_HERE -->"
+    writer_queue_max_depth: int = 100
+
+    @classmethod
+    def from_env(cls) -> "VaultConfig":
+        """Load vault configuration from environment variables."""
+        return cls(
+            enabled=os.getenv("MIST_VAULT_ENABLED", "true").lower() == "true",
+            root=os.getenv("MIST_VAULT_ROOT", "mist-memory"),
+            default_user_id=os.getenv("MIST_VAULT_DEFAULT_USER_ID", "raj"),
+            git_auto_init=os.getenv("MIST_VAULT_GIT_AUTO_INIT", "true").lower() == "true",
+            session_soft_cap_turns=int(os.getenv("MIST_VAULT_SESSION_SOFT_CAP_TURNS", "20")),
+            session_soft_cap_tokens=int(os.getenv("MIST_VAULT_SESSION_SOFT_CAP_TOKENS", "6000")),
+            append_sentinel=os.getenv("MIST_VAULT_APPEND_SENTINEL", "<!-- MIST_APPEND_HERE -->"),
+            writer_queue_max_depth=int(os.getenv("MIST_VAULT_WRITER_QUEUE_MAX_DEPTH", "100")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SidecarIndexConfig:
+    """Cluster 8 / ADR-010: SQLite-backed sidecar index for the vault.
+
+    Holds two-tier chunks (file-level and heading-block-level) with paired
+    FTS5 + vec0 virtual tables. The index is rebuilt on vault file changes
+    via the filewatcher and is the retrieval substrate for the `historical`
+    query intent.
+
+    `embedding_dimension` MUST match `EmbeddingConfig.dimension` -- the vec0
+    table is created with a fixed schema and a mismatch produces silent
+    retrieval failure. Defaulted here to keep the layer self-contained;
+    cross-validated at builder wiring time.
+
+    `heading_context_weight` is the BM25 weight for the heading-context FTS
+    column relative to content (1.0). 0.3 is the Crosley pattern default
+    (frontmatter-as-heading-context, hybrid-retriever-obsidian post).
+    """
+
+    enabled: bool = True
+    db_path: str = "data/vault_sidecar.db"
+    embedding_dimension: int = 384
+    heading_context_weight: float = 0.3
+    chunk_max_chars: int = 6000
+    rebuild_on_startup: bool = False
+
+    @classmethod
+    def from_env(cls) -> "SidecarIndexConfig":
+        """Load sidecar-index configuration from environment variables."""
+        return cls(
+            enabled=os.getenv("MIST_SIDECAR_ENABLED", "true").lower() == "true",
+            db_path=os.getenv("MIST_SIDECAR_DB_PATH", "data/vault_sidecar.db"),
+            embedding_dimension=int(os.getenv("MIST_SIDECAR_EMBEDDING_DIMENSION", "384")),
+            heading_context_weight=float(os.getenv("MIST_SIDECAR_HEADING_CONTEXT_WEIGHT", "0.3")),
+            chunk_max_chars=int(os.getenv("MIST_SIDECAR_CHUNK_MAX_CHARS", "6000")),
+            rebuild_on_startup=os.getenv("MIST_SIDECAR_REBUILD_ON_STARTUP", "false").lower()
+            == "true",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FilewatcherConfig:
+    """Cluster 8 / ADR-010: watchdog-based filewatcher for vault edits.
+
+    Runs in a dedicated daemon thread inside the backend process. Bridges
+    to async via `loop.call_soon_threadsafe`. On vault file changes, schedules
+    a debounced sidecar reindex; on vault-note edits made outside MIST, marks
+    the corresponding `mist-session` / `mist-user` note as `authored_by:
+    user-edit` and queues affected graph subgraph rebuild.
+
+    `observer_type` selects the watchdog observer backend:
+      - `auto`: PollingObserver on Windows/WSL2 bind mounts; Inotify on
+        native Linux; FSEvents on macOS. Resolution lives in
+        `backend/vault/filewatcher.py`.
+      - `polling` / `inotify` / `fsevents`: explicit override for deployments
+        where auto-detection is wrong.
+
+    `debounce_ms` collapses bursts (e.g. Obsidian's atomic-replace-on-save
+    delete+create within ~100ms). 500ms is the ADR-010 default.
+
+    `staleness_slo_seconds` is the budget for sidecar lag behind vault content
+    under normal load. The mtime audit job runs every `audit_interval_seconds`
+    to catch dropped events (Windows ReadDirectoryChangesW overflow case).
+    """
+
+    enabled: bool = True
+    observer_type: str = "auto"
+    debounce_ms: int = 500
+    staleness_slo_seconds: int = 5
+    audit_interval_seconds: int = 60
+
+    @classmethod
+    def from_env(cls) -> "FilewatcherConfig":
+        """Load filewatcher configuration from environment variables."""
+        return cls(
+            enabled=os.getenv("MIST_FILEWATCHER_ENABLED", "true").lower() == "true",
+            observer_type=os.getenv("MIST_FILEWATCHER_OBSERVER_TYPE", "auto"),
+            debounce_ms=int(os.getenv("MIST_FILEWATCHER_DEBOUNCE_MS", "500")),
+            staleness_slo_seconds=int(os.getenv("MIST_FILEWATCHER_STALENESS_SLO_SECONDS", "5")),
+            audit_interval_seconds=int(os.getenv("MIST_FILEWATCHER_AUDIT_INTERVAL_SECONDS", "60")),
+        )
+
+
 @dataclass
 class SkillDerivationConfig:
     """Configuration for skill derivation from tool usage patterns."""
@@ -396,6 +522,11 @@ class KnowledgeConfig:
     # Cluster 1: Stage 1.5 subject-scope classifier
     scope_classifier: ScopeClassifierConfig = None  # type: ignore[assignment]
 
+    # Cluster 8 / ADR-010: vault-native memory architecture (Phase 1)
+    vault: VaultConfig = None  # type: ignore[assignment]
+    sidecar_index: SidecarIndexConfig = None  # type: ignore[assignment]
+    filewatcher: FilewatcherConfig = None  # type: ignore[assignment]
+
     # Feature flags
     enable_knowledge_integration: bool = True  # Master switch for knowledge system
 
@@ -427,6 +558,12 @@ class KnowledgeConfig:
             self.context_budget = ContextBudgetConfig()
         if self.scope_classifier is None:
             self.scope_classifier = ScopeClassifierConfig()
+        if self.vault is None:
+            self.vault = VaultConfig()
+        if self.sidecar_index is None:
+            self.sidecar_index = SidecarIndexConfig()
+        if self.filewatcher is None:
+            self.filewatcher = FilewatcherConfig()
 
     @classmethod
     def from_env(cls) -> "KnowledgeConfig":
@@ -443,6 +580,9 @@ class KnowledgeConfig:
             skill_derivation=SkillDerivationConfig.from_env(),
             context_budget=ContextBudgetConfig.from_env(),
             scope_classifier=ScopeClassifierConfig.from_env(),
+            vault=VaultConfig.from_env(),
+            sidecar_index=SidecarIndexConfig.from_env(),
+            filewatcher=FilewatcherConfig.from_env(),
             enable_knowledge_integration=os.getenv("ENABLE_KNOWLEDGE_INTEGRATION", "true").lower()
             == "true",
             ontology_version=os.getenv("ONTOLOGY_VERSION", "1.0.0"),
