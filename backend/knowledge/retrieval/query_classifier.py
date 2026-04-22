@@ -1,15 +1,19 @@
 """Query intent classifier for hybrid retrieval routing.
 
-Classifies user queries into one of five intent types to determine
+Classifies user queries into one of six intent types to determine
 which retrieval backends should handle the query:
 
-    identity  -> MIST identity context (priority 0, never misroutes)
-    factual   -> vector store (document/content recall)
+    identity   -> MIST identity context (priority 0, never misroutes)
+    historical -> vault sidecar (prose/conversation history recall)
+    factual    -> vector store (document/content recall)
     relational -> graph store (entity/relationship traversal)
-    hybrid    -> both vector + graph
-    live      -> MCP tool invocation (real-time state)
+    hybrid     -> graph + vector + vault sidecar (three-way RRF merge)
+    live       -> MCP tool invocation (real-time state)
 
 Mirrors the SignalDetector pattern: compiled regex, no LLM, pure heuristic.
+ADR-010 v2 specifies an embedding-exemplar variant; the regex form is the
+performant default. The exemplar variant remains available for future
+escalation if drift becomes measurable in gauntlet runs.
 """
 
 import re
@@ -51,6 +55,27 @@ _RELATIONAL_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\b(?:relate\s+to\s+my|based\s+on\s+my|require)\b", re.I),
     re.compile(r"\bwhat\s+projects\s+am\s+I\b", re.I),
     re.compile(r"\bwhat\s+technologies\b", re.I),
+]
+
+# ---------------------------------------------------------------------------
+# HISTORICAL patterns -- prose / conversation history recall (ADR-010 Phase 9)
+# ---------------------------------------------------------------------------
+# Routed to the vault sidecar (markdown session notes) rather than the graph.
+# Lexical heuristics from ADR-010 "Query Classifier Contract": "what did we
+# discuss" / "remember when" / "last time" bias toward `historical`.
+_HISTORICAL_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\bwhat\s+did\s+we\s+(?:discuss|talk\s+about|cover|say)\b", re.I),
+    re.compile(r"\bremember\s+when\b", re.I),
+    re.compile(r"\blast\s+(?:time|session|week|conversation)\b", re.I),
+    re.compile(r"\bpreviously\s+(?:we|i)\b", re.I),
+    re.compile(r"\bearlier\s+(?:we|i|today|this\s+week)\b", re.I),
+    re.compile(r"\bwe\s+talked\s+about\b", re.I),
+    re.compile(r"\b(?:before|earlier),?\s+(?:we|you|i)\s+(?:said|mentioned|discussed)\b", re.I),
+    re.compile(r"\bwhat\s+(?:was|were)\s+(?:we|i|you)\s+(?:saying|discussing)\b", re.I),
+    re.compile(
+        r"\b(?:our|the)\s+(?:last|previous|earlier)\s+(?:session|conversation|chat)\b", re.I
+    ),
+    re.compile(r"\bin\s+the\s+(?:last|previous|earlier)\s+session\b", re.I),
 ]
 
 # ---------------------------------------------------------------------------
@@ -111,9 +136,12 @@ _LIVE_PATTERNS: list[re.Pattern[str]] = [
 _STORE_MAP: dict[str, tuple[str, ...]] = {
     "factual": ("vector",),
     "relational": ("graph",),
-    "hybrid": ("vector", "graph"),
+    # Phase 9: hybrid now includes the vault sidecar as a third retriever.
+    "hybrid": ("vector", "graph", "vault"),
     "live": ("mcp",),
     "identity": ("mist",),
+    # Phase 9: historical routes to vault sidecar prose retrieval.
+    "historical": ("vault",),
 }
 
 
@@ -141,6 +169,13 @@ class QueryClassifier:
         identity_score = self._score_patterns(query, _IDENTITY_PATTERNS)
         if identity_score >= 1:
             return self._build_result("identity", identity_score)
+
+        # Priority 0.5: Historical -- "what did we discuss"-class queries
+        # belong on the vault sidecar (prose). Without this gate they fall
+        # into hybrid/relational and miss the vault-sidecar entirely.
+        historical_score = self._score_patterns(query, _HISTORICAL_PATTERNS)
+        if historical_score >= 1:
+            return self._build_result("historical", historical_score)
 
         factual_score = self._score_patterns(query, _FACTUAL_PATTERNS)
         relational_score = self._score_patterns(query, _RELATIONAL_PATTERNS)

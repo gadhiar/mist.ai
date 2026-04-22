@@ -142,9 +142,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Vault layer initialization failed (continuing without vault): %s", e)
 
-    # Initialize voice processor with the server-owned vault_writer so that
-    # the voice-path ConversationHandler shares a single started writer.
-    voice_processor = VoiceProcessor(config, message_queue, vault_writer=vault_writer)
+    # Initialize voice processor with the server-owned vault_writer + sidecar
+    # so that the voice-path ConversationHandler shares a single started writer
+    # AND the retriever's historical / three-way hybrid RRF paths route to
+    # the same initialized sidecar (Phase 9).
+    voice_processor = VoiceProcessor(
+        config,
+        message_queue,
+        vault_writer=vault_writer,
+        vault_sidecar=vault_sidecar,
+    )
     await voice_processor.initialize()
 
     # Start message broadcaster

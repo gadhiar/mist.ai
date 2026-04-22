@@ -623,7 +623,13 @@ class ConversationHandler:
             # path computation, no I/O. Returns None when vault layer is
             # disabled, in which case extraction proceeds without vault-note
             # provenance (legacy pre-Phase-6 behavior).
-            vault_note_path = self._get_or_allocate_vault_path(session_id)
+            #
+            # Phase 9: pass the user message so the slug can be derived from
+            # the first utterance content rather than the opaque session_id.
+            # On subsequent turns the cached path is reused regardless.
+            vault_note_path = self._get_or_allocate_vault_path(
+                session_id, first_utterance=user_message
+            )
 
             # --- Event Store Write (Layer 1) ---
             # Synchronous, <5ms target. Happens BEFORE any async extraction.
@@ -846,7 +852,11 @@ class ConversationHandler:
             )
             return None
 
-    def _get_or_allocate_vault_path(self, session_id: str) -> str | None:
+    def _get_or_allocate_vault_path(
+        self,
+        session_id: str,
+        first_utterance: str | None = None,
+    ) -> str | None:
         """Return the pre-allocated vault session-note path for `session_id`.
 
         ADR-010 Cluster 8 Phase 6 Step 0: pure path computation done once per
@@ -861,8 +871,20 @@ class ConversationHandler:
         on slug-derivation edge cases it falls back to the kebab-case
         sanitizer with `"session"` as the ultimate fallback.
 
+        Phase 9 slug improvement: when `first_utterance` is supplied on the
+        first call for this session, the slug is derived from significant
+        words in the utterance (stopwords filtered, top tokens kebab-joined)
+        instead of sanitizing the opaque `session_id`. This produces
+        human-readable session-note filenames like
+        `2026-04-22-vault-architecture.md` rather than
+        `2026-04-22-2dc1-...-id.md`. The slug is fixed at first allocation
+        and never changes for the session.
+
         Args:
             session_id: External session identifier.
+            first_utterance: Optional first user message in the session,
+                used to derive a content-meaningful slug. When None, falls
+                back to sanitizing `session_id` (Phase 5/6 behavior).
 
         Returns:
             Absolute vault note path, or None if vault layer is disabled.
@@ -877,7 +899,10 @@ class ConversationHandler:
         from datetime import UTC, datetime
 
         today = datetime.now(UTC).date().isoformat()
-        slug = self._derive_session_slug(session_id)
+        if first_utterance is not None:
+            slug = self._derive_session_slug_from_utterance(first_utterance, session_id)
+        else:
+            slug = self._derive_session_slug(session_id)
         path = self._vault_writer.session_path(today, slug)
         self._vault_paths[session_id] = path
         # Initialize the per-session vault turn counter only on first allocation.
@@ -940,10 +965,9 @@ class ConversationHandler:
     def _derive_session_slug(self, session_id: str) -> str:
         """Sanitize a session_id into a vault-compatible kebab-case slug.
 
-        Phase 5 uses a simple lower+alnum+hyphen normalization. Phase 9
-        will replace this with the entity-extracted topic slug from
-        ADR-010 "Session Slug Generation" once the extraction pipeline
-        feeds back into vault path allocation.
+        Used as a fallback when the first utterance is not available
+        (e.g. legacy callers, tests). Phase 9 introduced
+        `_derive_session_slug_from_utterance` as the preferred path.
         """
         import re
 
@@ -952,6 +976,159 @@ class ConversationHandler:
             slug = "session"
         # Truncate to a reasonable length
         return slug[:50]
+
+    # Stopwords filtered out of utterance-derived slugs. Mirrors the small
+    # set used by ExtractionPipeline._compute_significance so slug derivation
+    # uses the same notion of "significant" tokens.
+    _SLUG_STOPWORDS: frozenset[str] = frozenset(
+        {
+            "a",
+            "an",
+            "the",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "have",
+            "has",
+            "had",
+            "do",
+            "does",
+            "did",
+            "will",
+            "would",
+            "could",
+            "should",
+            "may",
+            "might",
+            "shall",
+            "can",
+            "to",
+            "of",
+            "in",
+            "for",
+            "on",
+            "with",
+            "at",
+            "by",
+            "from",
+            "as",
+            "into",
+            "and",
+            "or",
+            "but",
+            "if",
+            "while",
+            "about",
+            "up",
+            "it",
+            "its",
+            "i",
+            "me",
+            "my",
+            "we",
+            "our",
+            "you",
+            "your",
+            "he",
+            "him",
+            "his",
+            "she",
+            "her",
+            "they",
+            "them",
+            "their",
+            "this",
+            "that",
+            "these",
+            "those",
+            "what",
+            "which",
+            "who",
+            "whom",
+            "how",
+            "when",
+            "where",
+            "why",
+            "tell",
+            "let",
+            "please",
+            "want",
+            "need",
+            "so",
+            "just",
+            "very",
+            "much",
+            "some",
+            "any",
+            "all",
+            "no",
+            "not",
+        }
+    )
+
+    def _derive_session_slug_from_utterance(
+        self,
+        utterance: str,
+        session_id: str,
+    ) -> str:
+        """Derive a kebab-case slug from significant words in the first utterance.
+
+        ADR-010 "Session Slug Generation" specifies extracting the highest-
+        confidence Project/Concept/Topic/Goal entity from the first 3
+        utterances. Doing that synchronously at Step 0 would require either
+        blocking the response on extraction or renaming the file mid-session
+        (filewatcher / sidecar disruption). This method takes the pragmatic
+        middle ground: derive significant non-stopword tokens from the first
+        utterance and use them as the slug. The full entity-extraction-driven
+        approach is documented as future work pending VaultWriter atomic-rename
+        + filewatcher coordination support.
+
+        Algorithm:
+        1. Lowercase + tokenize (alphanumeric runs).
+        2. Filter stopwords (see `_SLUG_STOPWORDS`) and short tokens (< 3 chars).
+        3. Take the first 5 surviving tokens (preserve utterance order so
+           subject-verb-object reading is preserved).
+        4. Kebab-join.
+        5. Cap at 50 chars.
+        6. Fallback to a UUID-derived 8-char hex suffix on `session_id`
+           when no significant tokens survive (matches ADR-010 fallback).
+
+        Examples:
+        - "Tell me about the vault architecture for MIST" -> "vault-architecture-mist"
+        - "What's up?" -> "session-<hex8>"  (no significant tokens)
+        - "Hi" -> "session-<hex8>"  (single short token)
+
+        Args:
+            utterance: Raw first user utterance for the session.
+            session_id: Used only to seed the deterministic UUID fallback.
+
+        Returns:
+            Kebab-case slug, max 50 chars.
+        """
+        import hashlib
+        import re
+
+        tokens = re.findall(r"[a-z0-9]+", utterance.lower())
+        significant = [t for t in tokens if len(t) >= 3 and t not in self._SLUG_STOPWORDS][:5]
+
+        # 4-char session-id hash suffix guarantees per-session uniqueness even
+        # when two sessions open with similar utterances. Stable per session_id.
+        digest4 = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:4]
+
+        if not significant:
+            # No content tokens -- longer hash for the full identifier.
+            digest8 = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:8]
+            return f"session-{digest8}"
+
+        # Cap content portion to leave room for the hash suffix while staying
+        # under the 50-char total budget.
+        content_slug = "-".join(significant)
+        max_content_len = 50 - len(digest4) - 1  # -1 for the joining hyphen
+        return f"{content_slug[:max_content_len]}-{digest4}"
 
     def _format_document_context(self, doc_results: list[dict[str, Any]]) -> str:
         """Format document search results for injection into context.

@@ -14,7 +14,12 @@ For tests, bypass factories and pass fakes directly to constructors.
 import logging
 from typing import TYPE_CHECKING
 
-from backend.interfaces import EmbeddingProvider, EventStoreProvider, GraphConnection
+from backend.interfaces import (
+    EmbeddingProvider,
+    EventStoreProvider,
+    GraphConnection,
+    SidecarIndexProtocol,
+)
 
 if TYPE_CHECKING:
     from backend.vault import VaultFilewatcher, VaultWriter
@@ -214,6 +219,7 @@ def build_conversation_handler(
     config: KnowledgeConfig,
     llm_provider: StreamingLLMProvider | None = None,
     vault_writer: "VaultWriter | None" = None,
+    vault_sidecar: SidecarIndexProtocol | None = None,
 ):
     """Create a fully wired ConversationHandler.
 
@@ -235,12 +241,21 @@ def build_conversation_handler(
       Returns None when `config.vault.enabled` is False.
     - Lifecycle: caller (server lifespan or test) owns start/stop.
 
+    Cluster 8 Phase 9 (vault sidecar in retrieval):
+    - `vault_sidecar` is forwarded to `build_knowledge_retriever` so the
+      retriever's `historical` intent and three-way RRF merge route
+      to the sidecar. Caller is responsible for sidecar.initialize()
+      before this call.
+
     Args:
         config: Knowledge subsystem configuration.
         llm_provider: Optional pre-built LLM provider.
         vault_writer: Optional pre-built VaultWriter. When None, one is
             constructed from config. Pass an explicit None-equivalent by
             disabling config.vault.enabled.
+        vault_sidecar: Optional pre-built VaultSidecarIndex. When set the
+            retriever supports historical / hybrid vault retrieval; when
+            None those branches degrade to graph + vector only.
     """
     from backend.chat.conversation_handler import ConversationHandler
     from backend.debug_jsonl_logger import DebugJSONLLogger
@@ -282,6 +297,7 @@ def build_conversation_handler(
         vector_store=vector_store,
         embedding_provider=gs.embedding_generator,
         debug_logger=debug_logger,
+        vault_sidecar=vault_sidecar,
     )
 
     tracker = ToolUsageTracker(config.skill_derivation)
@@ -413,6 +429,7 @@ def build_knowledge_retriever(
     vector_store: "VectorStoreProvider | None" = None,  # noqa: F821
     embedding_provider: EmbeddingProvider | None = None,
     debug_logger: "DebugJSONLLogger | None" = None,  # noqa: F821
+    vault_sidecar: "SidecarIndexProtocol | None" = None,  # noqa: F821
 ) -> "KnowledgeRetriever":  # noqa: F821
     """Create a fully wired KnowledgeRetriever with hybrid retrieval.
 
@@ -427,6 +444,11 @@ def build_knowledge_retriever(
         embedding_provider: Optional pre-built embedding provider.
         debug_logger: Optional DebugJSONLLogger forwarded to the retriever for
             Cluster 5 `retrieval_candidates` observability.
+        vault_sidecar: Optional pre-built vault sidecar index (ADR-010 Phase 9).
+            When provided, the `historical` intent and the third leg of the
+            `hybrid` RRF merge route to it. Caller (typically server
+            lifespan) is responsible for sidecar.initialize() before this
+            call. None preserves pre-Phase-9 two-way merge behavior.
 
     Returns:
         Ready-to-use KnowledgeRetriever instance.
@@ -446,6 +468,7 @@ def build_knowledge_retriever(
         query_classifier=classifier,
         embedding_provider=ep,
         debug_logger=debug_logger,
+        vault_sidecar=vault_sidecar,
     )
 
 

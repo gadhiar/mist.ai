@@ -253,6 +253,18 @@ class QueryIntentConfig:
     max_vector_results: int = 20
     max_graph_results: int = 20
 
+    # ADR-010 Cluster 8 Phase 9: vault sidecar as a third RRF retriever.
+    # Default weights mirror the ADR table:
+    #   historical 0.2/0.7/0.1, structural 0.7/0.2/0.1,
+    #   identity 0.5/0.1/0.4, hybrid 0.4/0.4/0.2.
+    # We expose hybrid + historical defaults here. structural maps to
+    # the existing `relational` intent (graph-only path, no merge).
+    rrf_vault_weight: float = 0.4  # hybrid-intent default
+    max_vault_results: int = 20
+    rrf_historical_graph_weight: float = 0.2
+    rrf_historical_vector_weight: float = 0.1
+    rrf_historical_vault_weight: float = 0.7
+
     @classmethod
     def from_env(cls) -> "QueryIntentConfig":
         """Load configuration from environment variables."""
@@ -266,6 +278,11 @@ class QueryIntentConfig:
             rrf_graph_weight=float(os.getenv("RRF_GRAPH_WEIGHT", "0.5")),
             max_vector_results=int(os.getenv("MAX_VECTOR_RESULTS", "20")),
             max_graph_results=int(os.getenv("MAX_GRAPH_RESULTS", "20")),
+            rrf_vault_weight=float(os.getenv("RRF_VAULT_WEIGHT", "0.4")),
+            max_vault_results=int(os.getenv("MAX_VAULT_RESULTS", "20")),
+            rrf_historical_graph_weight=float(os.getenv("RRF_HISTORICAL_GRAPH_WEIGHT", "0.2")),
+            rrf_historical_vector_weight=float(os.getenv("RRF_HISTORICAL_VECTOR_WEIGHT", "0.1")),
+            rrf_historical_vault_weight=float(os.getenv("RRF_HISTORICAL_VAULT_WEIGHT", "0.7")),
         )
 
 

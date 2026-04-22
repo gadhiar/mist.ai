@@ -30,6 +30,7 @@ class KnowledgeIntegration:
         config: KnowledgeConfig,
         llm_provider: StreamingLLMProvider | None = None,
         vault_writer=None,
+        vault_sidecar=None,
     ):
         """Initialize knowledge integration.
 
@@ -40,6 +41,10 @@ class KnowledgeIntegration:
                 Passed directly into build_conversation_handler so the
                 voice-path handler shares the server-owned writer instead of
                 auto-building a second (unstarted) instance.
+            vault_sidecar: Optional initialized VaultSidecarIndex (Cluster 8
+                Phase 9). Forwarded into build_conversation_handler so the
+                retriever's `historical` and three-way `hybrid` RRF paths
+                route to the sidecar. None preserves pre-Phase-9 behavior.
         """
         self.enabled = False
         self.conversation_handler: ConversationHandler | None = None
@@ -58,6 +63,7 @@ class KnowledgeIntegration:
                 config=config,
                 llm_provider=llm_provider,
                 vault_writer=vault_writer,
+                vault_sidecar=vault_sidecar,
             )
 
             self.enabled = True

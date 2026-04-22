@@ -11,7 +11,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from backend.errors import VectorStoreError
-from backend.interfaces import EmbeddingProvider, VectorStoreProvider
+from backend.interfaces import EmbeddingProvider, SidecarIndexProtocol, VectorStoreProvider
 from backend.knowledge.config import KnowledgeConfig, QueryIntentConfig
 from backend.knowledge.models import (
     RetrievalFilters,
@@ -75,6 +75,7 @@ class KnowledgeRetriever:
         query_classifier: QueryClassifier | None = None,
         embedding_provider: EmbeddingProvider | None = None,
         debug_logger: "DebugJSONLLogger | None" = None,
+        vault_sidecar: SidecarIndexProtocol | None = None,
     ):
         """Initialize retriever.
 
@@ -92,6 +93,13 @@ class KnowledgeRetriever:
                 emits a `phase: "retrieval_candidates"` record per call
                 capturing the full graph and vector candidate pools before
                 merge and rank truncation.
+            vault_sidecar: Optional vault sidecar index (ADR-010 Cluster 8
+                Phase 9). When provided, the `historical` intent routes to
+                this backend (prose conversation history) and `hybrid`
+                merges three retrievers (graph + vector + vault) via RRF
+                with per-intent weights from `config.query_intent`. When
+                None, the historical intent degrades to hybrid and only
+                two-way merge fires.
         """
         self.config = config
         self.graph_store = graph_store
@@ -101,6 +109,9 @@ class KnowledgeRetriever:
             graph_store, "embedding_generator", None
         )
         self._debug_logger = debug_logger
+        # Phase 9 vault-sidecar branch. Optional so legacy callers and the
+        # ingestion path keep working without a sidecar.
+        self._vault_sidecar = vault_sidecar
 
         # Default retrieval parameters (can be overridden)
         self.default_limit = 20
@@ -214,17 +225,20 @@ class KnowledgeRetriever:
                 suggested_tools=suggested,
             )
 
-        # Generate embedding once for reuse across backends
+        # Generate embedding once for reuse across vector + vault backends
         query_embedding: list[float] | None = None
-        if intent in ("factual", "hybrid") and self._embedding_provider is not None:
+        if intent in ("factual", "hybrid", "historical") and self._embedding_provider is not None:
             query_embedding = self._embedding_provider.generate_embedding(query)
 
         graph_facts: list[RetrievedFact] = []
         vector_facts: list[RetrievedFact] = []
+        vault_facts: list[RetrievedFact] = []
         graph_candidates_raw: list[dict] = []
         vector_candidates_raw: list[VectorSearchResult] = []
+        vault_candidates_raw: list[dict] = []
         vector_time = 0.0
         graph_time = 0.0
+        vault_time = 0.0
         entities_found = 0
         document_chunks_used = 0
 
@@ -260,12 +274,47 @@ class KnowledgeRetriever:
             vector_time = (time.time() - vector_start) * 1000
             document_chunks_used = len(vector_facts)
 
+        # Phase 9: Vault-sidecar path (markdown session-note prose).
+        # Fires for `historical` (sole retriever) and `hybrid` (third leg of
+        # the RRF merge). The sidecar is optional -- when None the historical
+        # branch produces zero results and falls through to the empty-result
+        # formatter, but does not crash.
+        if (
+            intent in ("historical", "hybrid")
+            and self._vault_sidecar is not None
+            and query_embedding is not None
+        ):
+            vault_start = time.time()
+            vault_limit = intent_config.max_vault_results if intent == "hybrid" else limit
+            vault_candidates_raw, vault_facts = self._vault_sidecar_retrieve(
+                query=query,
+                embedding=query_embedding,
+                limit=vault_limit,
+            )
+            vault_time = (time.time() - vault_start) * 1000
+
         # Step 3: Merge results
         merged_count: int | None = None
-        if intent == "hybrid" and graph_facts and vector_facts:
-            merged = self._merge_rrf(graph_facts, vector_facts, intent_config)
+        if intent == "hybrid" and (graph_facts or vector_facts or vault_facts):
+            # Phase 9: three-way RRF if vault facts present, else fall back
+            # to the pre-Phase-9 two-way merge for backward compatibility
+            # with deployments without a sidecar.
+            if vault_facts:
+                merged = self._merge_rrf_three_way(
+                    graph_facts=graph_facts,
+                    vector_facts=vector_facts,
+                    vault_facts=vault_facts,
+                    config=intent_config,
+                    intent=intent,
+                )
+            else:
+                merged = self._merge_rrf(graph_facts, vector_facts, intent_config)
             merged_count = len(merged)
             ranked_facts = merged[:limit]
+        elif intent == "historical":
+            # Vault-only path; preserve sidecar's RRF ranking (already merged
+            # vec0 + FTS5 inside query_hybrid).
+            ranked_facts = vault_facts[:limit]
         elif intent == "factual":
             ranked_facts = self._rank_facts(vector_facts, limit)
         else:
@@ -305,6 +354,7 @@ class KnowledgeRetriever:
                 "similarity_threshold": similarity_threshold,
                 "max_hops": max_hops,
                 "filters": filters,
+                "vault_search_time_ms": vault_time,
             },
             intent=intent,
             document_chunks_used=document_chunks_used,
@@ -530,6 +580,78 @@ class KnowledgeRetriever:
 
         return results, facts
 
+    def _vault_sidecar_retrieve(
+        self,
+        query: str,
+        embedding: list[float],
+        limit: int,
+    ) -> tuple[list[dict], list[RetrievedFact]]:
+        """Retrieve session-note prose chunks from the vault sidecar.
+
+        ADR-010 Phase 9: third retrieval branch behind `historical` and
+        `hybrid` intents. Calls `SidecarIndexProtocol.query_hybrid` which
+        runs vec0 + FTS5 internally and merges via RRF before returning.
+        We treat the sidecar's output as a pre-merged ranked list and feed
+        it as a single leg into the retriever-level three-way RRF.
+
+        Each result row carries `path`, `heading`, `content`, `score`,
+        `frontmatter_json`, plus `vector_rank` / `fts_rank` / `sources`
+        from the sidecar's internal merge. We map these into RetrievedFact
+        with `subject="VaultNote"`, `predicate="MENTIONS"`,
+        `object=<heading-or-file-stem>` so the existing fact ranking and
+        formatting paths handle them transparently. `graph_distance` is
+        the vector-sentinel value so vault facts sort behind direct graph
+        matches when the same key appears in both.
+
+        Args:
+            query: User's natural language query (used for FTS lexical match).
+            embedding: Pre-computed query embedding (vec0 input).
+            limit: Maximum facts to return from this leg.
+
+        Returns:
+            (raw_rows, facts) -- raw rows preserved for Cluster 5 debug
+            observability; facts is the mapped RetrievedFact list.
+        """
+        if self._vault_sidecar is None:
+            return [], []
+
+        try:
+            rows = self._vault_sidecar.query_hybrid(
+                embedding=embedding,
+                text=query,
+                k=limit,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Vault sidecar query failed, degrading to no-vault retrieval: %s", exc)
+            return [], []
+
+        facts: list[RetrievedFact] = []
+        for row in rows:
+            path = row.get("path", "")
+            heading = row.get("heading") or "(file)"
+            content = row.get("content", "")
+            score = float(row.get("score", 0.0))
+            facts.append(
+                RetrievedFact(
+                    subject="VaultNote",
+                    subject_type="VaultSession",
+                    predicate="MENTIONS",
+                    object=heading,
+                    object_type="VaultChunk",
+                    properties={
+                        "path": path,
+                        "content": content,
+                        "vector_rank": row.get("vector_rank"),
+                        "fts_rank": row.get("fts_rank"),
+                        "sources": row.get("sources"),
+                    },
+                    similarity_score=score,
+                    graph_distance=_VECTOR_DISTANCE_SENTINEL,
+                )
+            )
+
+        return rows, facts
+
     def _vector_store_search(self, embedding: list[float], limit: int) -> list[VectorSearchResult]:
         """Execute raw vector store search with error handling.
 
@@ -550,6 +672,59 @@ class KnowledgeRetriever:
             return []
 
     # -- RRF merge ------------------------------------------------------------
+
+    @staticmethod
+    def _merge_rrf_three_way(
+        graph_facts: list[RetrievedFact],
+        vector_facts: list[RetrievedFact],
+        vault_facts: list[RetrievedFact],
+        config: QueryIntentConfig,
+        intent: str,
+    ) -> list[RetrievedFact]:
+        """Three-way RRF merge across graph + vector + vault sidecar.
+
+        ADR-010 Phase 9 RRF table (mirrored in QueryIntentConfig):
+          historical  graph=0.2, vector=0.1, vault=0.7
+          hybrid      graph=0.4, vector=0.4, vault=0.4 (default)
+          identity    handled via mist context (no merge)
+          structural  routed to relational (graph-only, no merge)
+
+        For intents not specifically tabled here, falls back to the existing
+        two-way weights with the vault leg using `rrf_vault_weight`.
+
+        Each fact contributes `weight * 1/(k + rank)` per appearance.
+        Deduplication uses (subject, predicate, object). Vault facts use
+        the vault-note path as part of the object key indirectly via the
+        heading, so two distinct vault chunks from different files do not
+        collide.
+        """
+        k = config.rrf_k
+
+        if intent == "historical":
+            graph_weight = config.rrf_historical_graph_weight
+            vector_weight = config.rrf_historical_vector_weight
+            vault_weight = config.rrf_historical_vault_weight
+        else:
+            graph_weight = config.rrf_graph_weight
+            vector_weight = config.rrf_vector_weight
+            vault_weight = config.rrf_vault_weight
+
+        scores: dict[tuple[str, str, str], float] = {}
+        fact_map: dict[tuple[str, str, str], RetrievedFact] = {}
+
+        for facts, weight in (
+            (graph_facts, graph_weight),
+            (vector_facts, vector_weight),
+            (vault_facts, vault_weight),
+        ):
+            for rank, fact in enumerate(facts, start=1):
+                key = (fact.subject, fact.predicate, fact.object)
+                scores[key] = scores.get(key, 0.0) + weight * (1.0 / (k + rank))
+                if key not in fact_map:
+                    fact_map[key] = fact
+
+        sorted_keys = sorted(scores, key=lambda k_: scores[k_], reverse=True)
+        return [fact_map[k_] for k_ in sorted_keys]
 
     @staticmethod
     def _merge_rrf(

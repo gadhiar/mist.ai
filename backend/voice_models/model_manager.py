@@ -45,6 +45,7 @@ class ModelManager:
         event_loop=None,
         llm_provider: StreamingLLMProvider | None = None,
         vault_writer=None,
+        vault_sidecar=None,
     ):
         """Initialize model manager.
 
@@ -55,10 +56,14 @@ class ModelManager:
             vault_writer: Optional pre-started VaultWriter (Cluster 8 Phase 5).
                 Passed through to KnowledgeIntegration so the voice-path
                 ConversationHandler shares the server-owned writer.
+            vault_sidecar: Optional initialized VaultSidecarIndex (Cluster 8
+                Phase 9). Passed through to KnowledgeIntegration so the
+                retriever's historical / hybrid RRF paths see the sidecar.
         """
         self.config = config
         self._llm_provider = llm_provider
         self._vault_writer = vault_writer
+        self._vault_sidecar = vault_sidecar
         self.stt = None
         self.tts = None
         self.llm_model = config.llm_model
@@ -74,6 +79,7 @@ class ModelManager:
                         config=knowledge_config,
                         llm_provider=llm_provider,
                         vault_writer=vault_writer,
+                        vault_sidecar=vault_sidecar,
                     )
                     if self.knowledge.is_enabled():
                         self.knowledge.set_voice_profile(config.voice_profile)

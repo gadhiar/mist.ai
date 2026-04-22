@@ -50,12 +50,15 @@ RELATIONAL_QUERIES = _mark_xfail([q for q in LABELED_QUERIES if q.intent == "rel
 HYBRID_QUERIES = _mark_xfail([q for q in LABELED_QUERIES if q.intent == "hybrid"])
 LIVE_QUERIES = _mark_xfail([q for q in LABELED_QUERIES if q.intent == "live"])
 
-VALID_INTENTS = {"factual", "relational", "hybrid", "live"}
+VALID_INTENTS = {"factual", "relational", "hybrid", "live", "historical", "identity"}
 VALID_STORES = {
     "factual": ("vector",),
     "relational": ("graph",),
-    "hybrid": ("vector", "graph"),
+    # Phase 9 (ADR-010): hybrid now includes vault sidecar as a third leg.
+    "hybrid": ("vector", "graph", "vault"),
     "live": ("mcp",),
+    "identity": ("mist",),
+    "historical": ("vault",),
 }
 
 
@@ -288,3 +291,76 @@ class TestIdentityIntent:
         """Positive: 'do you have <identity-noun>' still classifies as identity."""
         result = classifier.classify(query)
         assert result.intent == "identity"
+
+
+# ---------------------------------------------------------------------------
+# Phase 9: historical intent -- routes prose recall queries to vault sidecar
+# ---------------------------------------------------------------------------
+
+
+class TestHistoricalIntent:
+    """ADR-010 Phase 9: 'what did we discuss'-class queries route to the vault
+    sidecar so prose conversation history surfaces alongside graph facts.
+    """
+
+    @pytest.fixture
+    def classifier(self):
+        return QueryClassifier()
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "what did we discuss about persistent memory?",
+            "what did we talk about yesterday?",
+            "remember when we covered the vault architecture?",
+            "last time we talked about Neo4j",
+            "in our last session, what did you suggest?",
+            "previously we agreed on the schema",
+            "earlier today we set up the filewatcher",
+            "we talked about RRF merge weights",
+            "what was I saying about the LLM provider?",
+            "what did we cover in the previous conversation?",
+        ],
+    )
+    def test_historical_query_classifies_as_historical(self, classifier, query):
+        result = classifier.classify(query)
+        assert (
+            result.intent == "historical"
+        ), f"Query {query!r} classified as {result.intent} (expected historical)"
+
+    def test_historical_intent_suggested_stores(self, classifier):
+        result = classifier.classify("what did we discuss about Python?")
+        assert result.intent == "historical"
+        assert result.suggested_stores == ("vault",)
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "what is Python?",  # factual
+            "what do I know about Rust?",  # relational
+            "what's your name?",  # identity
+            "what's the status of MIS-104?",  # live
+        ],
+    )
+    def test_non_historical_queries_not_historical(self, classifier, query):
+        result = classifier.classify(query)
+        assert (
+            result.intent != "historical"
+        ), f"Query {query!r} misrouted to historical (got {result.intent})"
+
+    def test_historical_priority_below_identity(self, classifier):
+        # "what did we discuss about your preferences" overlaps both intents;
+        # identity wins because it has priority 0 (must never misroute).
+        result = classifier.classify("what did we discuss about your preferences")
+        assert result.intent == "identity"
+
+    def test_hybrid_intent_includes_vault_store(self, classifier):
+        # Phase 9: hybrid is now a three-way merge, so its suggested_stores
+        # tuple must include "vault" alongside "vector" and "graph".
+        # "describe my projects" matches both factual ("describe") and
+        # relational ("my") so the classifier returns hybrid.
+        result = classifier.classify("describe my projects in detail")
+        assert result.intent == "hybrid"
+        assert "vault" in result.suggested_stores
+        assert "vector" in result.suggested_stores
+        assert "graph" in result.suggested_stores

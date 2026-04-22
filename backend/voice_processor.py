@@ -47,7 +47,7 @@ def log_timestamp(msg: str):
 class VoiceProcessor:
     """Handles voice conversation processing."""
 
-    def __init__(self, config, message_queue, vault_writer=None):
+    def __init__(self, config, message_queue, vault_writer=None, vault_sidecar=None):
         """Initialize voice processor.
 
         Args:
@@ -58,10 +58,16 @@ class VoiceProcessor:
                 ConversationHandler so the vault layer shares a single
                 writer across the voice path. Server lifespan owns the
                 lifecycle.
+            vault_sidecar: Optional initialized VaultSidecarIndex (Cluster 8
+                Phase 9). Threaded through ModelManager -> KnowledgeIntegration
+                -> ConversationHandler so the retriever's historical and
+                three-way hybrid RRF paths route to the sidecar. Server
+                lifespan owns the lifecycle.
         """
         self.config = config
         self.message_queue = message_queue
         self._vault_writer = vault_writer
+        self._vault_sidecar = vault_sidecar
         self.models = None  # Will be initialized in initialize()
 
         # State
@@ -104,6 +110,7 @@ class VoiceProcessor:
             event_loop=self.loop,
             llm_provider=self._llm_provider,
             vault_writer=self._vault_writer,
+            vault_sidecar=self._vault_sidecar,
         )
 
         # Load models in thread pool to not block event loop

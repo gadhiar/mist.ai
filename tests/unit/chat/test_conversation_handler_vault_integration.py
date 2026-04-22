@@ -574,3 +574,136 @@ class TestPhase6PathPreAllocation:
         # Assert
         assert path is not None
         assert "pre-allocation" in path
+
+
+# ---------------------------------------------------------------------------
+# TestPhase9SlugDerivation -- session slug from first utterance content
+# ---------------------------------------------------------------------------
+
+
+class TestPhase9SlugDerivation:
+    """ADR-010 Phase 9: session-note slug derived from significant words in
+    the first user utterance, with a 4-char session-id hash for uniqueness.
+    """
+
+    def test_significant_words_become_slug(self) -> None:
+        handler = make_handler()
+        slug = handler._derive_session_slug_from_utterance(
+            "Tell me about the vault architecture for MIST",
+            session_id="sess-001",
+        )
+        # Stopwords removed (tell/me/about/the/for), short tokens removed (none here)
+        assert slug.startswith("vault-architecture-mist-")
+        # Hash suffix appended for uniqueness (4 hex chars)
+        assert len(slug.split("-")[-1]) == 4
+
+    def test_falls_back_to_hash_when_no_significant_words(self) -> None:
+        handler = make_handler()
+        # Single short token + stopword
+        slug = handler._derive_session_slug_from_utterance("Hi", session_id="abc-123")
+        assert slug.startswith("session-")
+        # 8-char hex digest
+        assert len(slug.split("-", 1)[1]) == 8
+
+    def test_short_tokens_filtered(self) -> None:
+        handler = make_handler()
+        slug = handler._derive_session_slug_from_utterance(
+            "I am the so",
+            session_id="x",
+        )
+        # All tokens are stopwords or <3 chars; falls back to hash.
+        assert slug.startswith("session-")
+
+    def test_punctuation_only_falls_back_to_hash(self) -> None:
+        handler = make_handler()
+        slug = handler._derive_session_slug_from_utterance("!!!???", session_id="x")
+        # Empty token list -> hash fallback.
+        assert slug.startswith("session-")
+
+    def test_two_similar_utterances_distinct_session_ids_get_distinct_slugs(self) -> None:
+        # Two sessions with the same opening content must NOT share a slug.
+        # The 4-char session-id hash provides uniqueness.
+        handler = make_handler()
+        slug_a = handler._derive_session_slug_from_utterance(
+            "Hello from session A",
+            session_id="session-a",
+        )
+        slug_b = handler._derive_session_slug_from_utterance(
+            "Hello from session B",
+            session_id="session-b",
+        )
+        assert slug_a != slug_b
+
+    def test_same_session_id_same_utterance_produces_same_slug(self) -> None:
+        # Determinism: same inputs -> same slug across calls.
+        handler = make_handler()
+        slug_1 = handler._derive_session_slug_from_utterance(
+            "Tell me about Python and async",
+            session_id="sess-stable",
+        )
+        slug_2 = handler._derive_session_slug_from_utterance(
+            "Tell me about Python and async",
+            session_id="sess-stable",
+        )
+        assert slug_1 == slug_2
+
+    def test_slug_caps_at_50_chars(self) -> None:
+        handler = make_handler()
+        long_utterance = (
+            "discussing extensive comprehensive complete thorough exhaustive "
+            "memory architecture rebuild determinism specification"
+        )
+        slug = handler._derive_session_slug_from_utterance(long_utterance, session_id="sess-long")
+        assert len(slug) <= 50
+
+    def test_slug_only_contains_lowercase_alnum_and_hyphens(self) -> None:
+        handler = make_handler()
+        slug = handler._derive_session_slug_from_utterance(
+            "What's the BEST! way to handle Foo & Bar?",
+            session_id="x",
+        )
+        assert all(c in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in slug)
+
+    @pytest.mark.asyncio
+    async def test_handle_message_uses_first_utterance_for_slug(self) -> None:
+        # Arrange
+        fake_vault = FakeVaultWriter()
+        handler = make_handler(vault_writer=fake_vault)
+
+        # Act
+        await handler.handle_message(
+            user_message="Discussing the vault architecture today",
+            session_id="my-session-1",
+        )
+        await asyncio.sleep(0.05)
+
+        # Assert -- the vault path slug derives from utterance content,
+        # not from "my-session-1" the session id.
+        assert len(fake_vault.append_calls) == 1
+        path = fake_vault.append_calls[0]["vault_note_path"]
+        assert "discussing" in path or "vault" in path or "architecture" in path
+
+    @pytest.mark.asyncio
+    async def test_first_utterance_locks_slug_for_subsequent_turns(self) -> None:
+        # Arrange
+        fake_vault = FakeVaultWriter()
+        handler = make_handler(vault_writer=fake_vault)
+        session_id = "lock-test"
+
+        # Act -- first utterance defines the slug; second turn must reuse it
+        # rather than re-deriving from the new utterance.
+        await handler.handle_message(
+            user_message="The vault architecture for MIST", session_id=session_id
+        )
+        await handler.handle_message(
+            user_message="Now lets talk about something completely different",
+            session_id=session_id,
+        )
+        await asyncio.sleep(0.05)
+
+        # Assert
+        assert len(fake_vault.append_calls) == 2
+        assert (
+            fake_vault.append_calls[0]["vault_note_path"]
+            == fake_vault.append_calls[1]["vault_note_path"]
+        )
