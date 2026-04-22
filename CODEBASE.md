@@ -1,8 +1,8 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-04-22 (early)
-**Branch:** main (3 commits ahead of origin: Phase 3 + Phase 4 + Phase 5)
-**Status:** MVP Knowledge Integration — 6 of 8 architectural clusters complete (1, 2, 3, 4, 5, 6); Cluster 8 IN PROGRESS (Phases 1+2+3+4+5 complete, 7 of 12 phases remain). Cluster 7 folds into Cluster 8 at phase 10.
+**Last Updated:** 2026-04-22 (Phase 6 complete)
+**Branch:** main (4 commits ahead of origin: Phase 3 + Phase 4 + Phase 5 + Phase 6)
+**Status:** MVP Knowledge Integration — 6 of 8 architectural clusters complete (1, 2, 3, 4, 5, 6); Cluster 8 IN PROGRESS (Phases 1+2+3+4+5+6 complete, 6 of 12 phases remain). Cluster 7 folds into Cluster 8 at phase 10.
 
 ---
 
@@ -23,8 +23,8 @@
 - **Debug JSONL Observability:** `DebugJSONLLogger` with 5 record phases (`turn`, `extraction`, `llm_call`, `retrieval_candidates`, `llm_request_raw`). Each gated by its own env var. See Cluster 5 artifacts below.
 - **Knowledge Graph:** Extraction + curation pipeline + hybrid retrieval (graph + vector + RRF merge). ADR-009 provenance separation structurally enforced (Cluster 2). MIST identity retrieval injects persona (Cluster 3). Ontology v1.0.0 carries 13 extractable entity types (12 external + MistIdentity) and 25 extractable relationship types (21 original + 4 MIST-scope: IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT, MIST_HAS_PREFERENCE) — Cluster 1.
 - **Knowledge Seed:** 32-entity baseline (`mist_admin seed` from `scripts/seed_data.yaml`): 1 MistIdentity + 9 MistTraits + 5 MistCapabilities + 5 MistPreferences + 11 user/technology entities + 1 User + 19 identity relationships + 11 anchor relationships + 32 embeddings.
-- **Vault Layer (Cluster 8, in progress):** `backend/vault/` package with `VaultWriter` (serialized `asyncio.Queue` consumer for session-note appends, identity/user upserts), `VaultSidecarIndex` (sqlite-vec `vec0` + FTS5 + RRF hybrid query over two-tier chunks), `VaultFilewatcher` (watchdog daemon thread with 500ms debounce + asyncio bridge + 60s mtime audit job + MIST-write coordination for user-edit detection), Pydantic frontmatter models for the four `mist-*` note types, and `AuthoredBy` 5-state authorship enum. Wired through `VaultConfig` / `SidecarIndexConfig` / `FilewatcherConfig` on `KnowledgeConfig`. **Phase 5 integrated:** single server-owned VaultWriter built and started in `server.py` lifespan, plumbed through `VoiceProcessor -> ModelManager -> KnowledgeIntegration -> ConversationHandler`, with per-turn vault append after event-store write (failure-isolated per ADR-010 Invariant 6). Filewatcher + sidecar share the same lifecycle. End-to-end stack proven: voice turns now land in vault session notes and auto-reindex the sidecar. Phase 6 (DERIVED_FROM sequencing) is next.
-- **Tests:** **1317 unit tests + 1 platform-skipped + 3 xfailed** (vs 1066 Cluster 1 baseline = +251 from Cluster 8 Phase 1+2+3+4+5). Run inside container: `docker compose exec mist-backend python -m pytest tests/unit/`.
+- **Vault Layer (Cluster 8, in progress):** `backend/vault/` package with `VaultWriter` (serialized `asyncio.Queue` consumer for session-note appends, identity/user upserts), `VaultSidecarIndex` (sqlite-vec `vec0` + FTS5 + RRF hybrid query over two-tier chunks), `VaultFilewatcher` (watchdog daemon thread with 500ms debounce + asyncio bridge + 60s mtime audit job + MIST-write coordination for user-edit detection), Pydantic frontmatter models for the four `mist-*` note types, and `AuthoredBy` 5-state authorship enum. Wired through `VaultConfig` / `SidecarIndexConfig` / `FilewatcherConfig` on `KnowledgeConfig`. **Phase 5 integrated:** single server-owned VaultWriter built and started in `server.py` lifespan, plumbed through `VoiceProcessor -> ModelManager -> KnowledgeIntegration -> ConversationHandler`, with per-turn vault append after event-store write (failure-isolated per ADR-010 Invariant 6). **Phase 6 integrated:** `vault_note_path` is pre-allocated synchronously at `handle_message` Step 0 (via `_get_or_allocate_vault_path`) and threaded through `_extract_knowledge_async` -> `ExtractionPipeline.extract_from_utterance` -> `CurationPipeline.curate_and_store` -> `CurationGraphWriter.write`. Every upserted entity now emits a `DERIVED_FROM` edge to a `:__Provenance__:VaultNote {path}` node (MERGE-idempotent on path). New `VaultNote` ontology node type registered as bridging; `DERIVED_FROM` edge extended to permit `VaultNote` targets and `MistIdentity` sources. The graph is now formally rebuildable from the vault. Filewatcher + sidecar share the same lifecycle. Phase 8 (DERIVED_FROM with `ontology_version`/`extraction_version`/`model_hash` stamps) is next.
+- **Tests:** **1350 unit tests + 1 platform-skipped + 3 xfailed** (vs 1066 Cluster 1 baseline = +284 from Cluster 8 Phase 1+2+3+4+5+6; Phase 6 alone added +33). Run inside container: `docker compose exec mist-backend python -m pytest tests/unit/`.
 
 ### Frontend (Flutter)
 - **Status:** IN DEVELOPMENT (unchanged since 2026-04-08). Cluster 1/8 work is backend-focused; frontend touches parked in `mist-ai-frontend-audit-remediation` (status: parked).
@@ -52,7 +52,7 @@
 | 5 | Observability (llm_call + retrieval_candidates + llm_request_raw JSONL phases) | COMPLETE 2026-04-21 | 27af364 -> 3c8f0b2 | v6-cluster-5-diagnostic-report-2026-04-21.md |
 | 6 | Context budget (ContextBudgetPlanner) + max_tokens=1024 fix | COMPLETE 2026-04-21 | c4c4d71 -> c800e35 | post-cluster-6-gauntlet-report-2026-04-21.md |
 | 7 | Existing-data migration | Folds into Cluster 8 phase 10 | — | — |
-| 8 | Vault-native memory (ADR-010 implementation, 12-phase) | IN PROGRESS — Phases 1+2+3+4+5 done (5 of 12); Phase 6 next | 8c06914 -> Phase 5 (Phase 1+2+3+4+5) | — |
+| 8 | Vault-native memory (ADR-010 implementation, 12-phase) | IN PROGRESS — Phases 1+2+3+4+5+6 done (6 of 12); Phase 8 next | 8c06914 -> Phase 6 | — |
 
 **Acceptance status** toward Phase 4 earned close:
 - Relationship correctness ≥ 80% — **CLEARED** post-Cluster-1 on targeted probe (11/12 = 92% on v1-mist-scope-inputs.jsonl). V6 spontaneously produces 4 `mist-identity USES X` edges that would have been validator-dropped pre-Cluster-1.

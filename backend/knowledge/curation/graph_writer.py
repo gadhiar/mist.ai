@@ -57,6 +57,7 @@ class WriteResult:
     provenance_edges_created: int = 0
     source_nodes_created: int = 0
     document_provenance_edges: int = 0
+    vault_note_provenance_edges: int = 0
 
 
 class CurationGraphWriter:
@@ -85,6 +86,7 @@ class CurationGraphWriter:
         event_id: str,
         session_id: str,
         source_metadata: SourceMetadata | None = None,
+        vault_note_path: str | None = None,
     ) -> WriteResult:
         """Write curated knowledge to the graph with provenance.
 
@@ -98,6 +100,13 @@ class CurationGraphWriter:
             source_metadata: Optional external source metadata. When provided,
                 provenance targets an ExternalSource node instead of
                 ConversationContext.
+            vault_note_path: Optional absolute path to the vault session note
+                this extraction derived from (ADR-010 Cluster 8 Phase 6). When
+                provided, every upserted entity gets a DERIVED_FROM edge to a
+                :__Provenance__:VaultNote node keyed by `path`. This is the
+                load-bearing change that makes the graph rebuildable from the
+                vault. None preserves legacy pre-Phase-6 behavior; document-
+                ingest paths leave it None.
 
         Returns:
             WriteResult with operation counts.
@@ -119,6 +128,13 @@ class CurationGraphWriter:
                     )
             else:
                 await self._ensure_conversation_context(session_id, now)
+
+        # Vault-note provenance anchor (ADR-010 Cluster 8 Phase 6). Created
+        # once per write call; DERIVED_FROM edges per entity in the loop below.
+        # MERGE-idempotent on path, so re-extraction of subsequent turns of the
+        # same session reuses the node without duplication.
+        if vault_note_path is not None and entities:
+            await self._ensure_vault_note(vault_note_path, event_id, now)
 
         # Upsert entities
         merge_lookup = {a.existing_entity_id: a for a in merge_actions}
@@ -152,6 +168,15 @@ class CurationGraphWriter:
             else:
                 await self._create_provenance_edge(entity_id, session_id, event_id, now)
                 result.provenance_edges_created += 1
+
+            # Vault-note DERIVED_FROM edge (ADR-010 Phase 6). Per (entity,
+            # vault_note) pair, MERGE-idempotent. event_id on the edge tracks
+            # the most recent turn that referenced the entity from this note.
+            # Phase 8 will add ontology_version + extraction_version + model_hash
+            # property stamps for rebuild determinism.
+            if vault_note_path is not None:
+                await self._create_vault_note_provenance(entity_id, vault_note_path, event_id, now)
+                result.vault_note_provenance_edges += 1
 
         if source_metadata is not None and result.document_provenance_edges > 0:
             logger.info(
@@ -317,6 +342,52 @@ class CurationGraphWriter:
             "ON CREATE SET vc.source_id = $source_uri, vc.created_at = $now "
             "ON MATCH SET vc.updated_at = $now",
             {"chunk_ids": chunk_ids, "source_uri": source_uri, "now": now},
+        )
+
+    async def _ensure_vault_note(self, vault_note_path: str, event_id: str, now: str) -> None:
+        """Create or update a VaultNote provenance node (ADR-010 Phase 6).
+
+        Keyed by `path`; one node per session-note file. `last_event_id` is
+        refreshed on every upsert so the node always reflects the most recent
+        conversation turn that wrote into the note. Per-turn provenance lives
+        on the DERIVED_FROM edge, not on this node.
+        """
+        await self._executor.execute_write(
+            "MERGE (vn:__Provenance__:VaultNote {path: $path}) "
+            "ON CREATE SET vn.first_event_id = $event_id, vn.last_event_id = $event_id, "
+            "vn.created_at = $now, vn.updated_at = $now, vn.status = 'active' "
+            "ON MATCH SET vn.last_event_id = $event_id, vn.updated_at = $now",
+            {"path": vault_note_path, "event_id": event_id, "now": now},
+        )
+
+    async def _create_vault_note_provenance(
+        self,
+        entity_id: str,
+        vault_note_path: str,
+        event_id: str,
+        now: str,
+    ) -> None:
+        """Create a DERIVED_FROM edge from entity to its source VaultNote.
+
+        ADR-010 Phase 6 load-bearing edge: anchors every extracted entity to
+        the canonical vault note that produced it, making the graph formally
+        rebuildable from the vault. MERGE-idempotent on (entity, vault_note);
+        event_id on the edge is refreshed on each call so a re-extraction of
+        the same entity from a later turn updates the audit timestamp without
+        duplicating the edge.
+        """
+        await self._executor.execute_write(
+            "MATCH (e:__Entity__ {id: $entity_id}) "
+            "MATCH (vn:VaultNote {path: $path}) "
+            "MERGE (e)-[r:DERIVED_FROM]->(vn) "
+            "ON CREATE SET r.event_id = $event_id, r.created_at = $now "
+            "ON MATCH SET r.event_id = $event_id, r.updated_at = $now",
+            {
+                "entity_id": entity_id,
+                "path": vault_note_path,
+                "event_id": event_id,
+                "now": now,
+            },
         )
 
     async def _create_document_provenance(

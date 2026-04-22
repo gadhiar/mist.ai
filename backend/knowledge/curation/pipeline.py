@@ -52,6 +52,7 @@ class CurationPipeline:
         event_id: str,
         session_id: str,
         source_metadata: SourceMetadata | None = None,
+        vault_note_path: str | None = None,
     ) -> CurationResult:
         """Run curation stages and write to graph.
 
@@ -66,6 +67,10 @@ class CurationPipeline:
             session_id: Conversation session ID.
             source_metadata: Optional external source metadata. Forwarded
                 to `CurationGraphWriter.write` for document provenance.
+            vault_note_path: Optional vault session-note path (ADR-010
+                Cluster 8 Phase 6). Forwarded to `CurationGraphWriter.write`
+                so every upserted entity gets a DERIVED_FROM edge to its
+                source vault note.
 
         Returns:
             CurationResult with combined stage results (may be partial
@@ -127,6 +132,7 @@ class CurationPipeline:
                 event_id=event_id,
                 session_id=session_id,
                 source_metadata=source_metadata,
+                vault_note_path=vault_note_path,
             )
             doc_prov_msg = ""
             if write_result.document_provenance_edges > 0:

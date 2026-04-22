@@ -616,6 +616,15 @@ class ConversationHandler:
                 tool_results=tool_results if tool_results else None,
             )
 
+            # --- Step 0: Vault path pre-allocation (ADR-010 Cluster 8 Phase 6) ---
+            # Compute the vault session note path BEFORE any downstream write
+            # so the path can be threaded through extraction -> curation ->
+            # graph_writer for the load-bearing DERIVED_FROM edge. Pure
+            # path computation, no I/O. Returns None when vault layer is
+            # disabled, in which case extraction proceeds without vault-note
+            # provenance (legacy pre-Phase-6 behavior).
+            vault_note_path = self._get_or_allocate_vault_path(session_id)
+
             # --- Event Store Write (Layer 1) ---
             # Synchronous, <5ms target. Happens BEFORE any async extraction.
             event_id = self._record_turn_event(
@@ -667,6 +676,7 @@ class ConversationHandler:
                         event_id=event_id,
                         session_id=session_id,
                         turn_record=turn_record,
+                        vault_note_path=vault_note_path,
                     )
                 )
 
@@ -691,6 +701,7 @@ class ConversationHandler:
         event_id: str,
         session_id: str,
         turn_record: TurnRecord | None = None,
+        vault_note_path: str | None = None,
     ) -> None:
         """Fire-and-forget background extraction.
 
@@ -699,6 +710,12 @@ class ConversationHandler:
 
         If `turn_record` is supplied, records extraction outcome + graph writes
         to the per-turn JSONL debug log (phase: "extraction", keyed by event_id).
+
+        `vault_note_path` (ADR-010 Cluster 8 Phase 6): pre-allocated vault session
+        note path for the current turn. Forwarded to `extract_from_utterance` so
+        every entity written by the curation graph writer carries a DERIVED_FROM
+        edge to its source vault note. None preserves legacy pre-Phase-6 behavior
+        (no vault-note provenance edges).
         """
         _ex_start = time.time()
         try:
@@ -707,6 +724,7 @@ class ConversationHandler:
                 conversation_history=conversation_history,
                 event_id=event_id,
                 session_id=session_id,
+                vault_note_path=vault_note_path,
             )
             # Log results at debug level. Result may be ValidationResult
             # (has .entities/.relationships) or CurationResult (has .write_result
@@ -828,6 +846,45 @@ class ConversationHandler:
             )
             return None
 
+    def _get_or_allocate_vault_path(self, session_id: str) -> str | None:
+        """Return the pre-allocated vault session-note path for `session_id`.
+
+        ADR-010 Cluster 8 Phase 6 Step 0: pure path computation done once per
+        session lifetime, returned synchronously so the path can be threaded
+        through downstream writes (event store, vault append, extraction
+        pipeline -> curation -> graph writer DERIVED_FROM emission) before
+        any of them dispatch.
+
+        Returns None when the vault layer is disabled (`vault_writer is None`),
+        which causes downstream callers to skip vault-note provenance and
+        retain legacy pre-Phase-6 behavior. Path computation never raises;
+        on slug-derivation edge cases it falls back to the kebab-case
+        sanitizer with `"session"` as the ultimate fallback.
+
+        Args:
+            session_id: External session identifier.
+
+        Returns:
+            Absolute vault note path, or None if vault layer is disabled.
+        """
+        if self._vault_writer is None:
+            return None
+
+        cached = self._vault_paths.get(session_id)
+        if cached is not None:
+            return cached
+
+        from datetime import UTC, datetime
+
+        today = datetime.now(UTC).date().isoformat()
+        slug = self._derive_session_slug(session_id)
+        path = self._vault_writer.session_path(today, slug)
+        self._vault_paths[session_id] = path
+        # Initialize the per-session vault turn counter only on first allocation.
+        # _write_to_vault increments it on every successful append.
+        self._vault_turn_counts.setdefault(session_id, 0)
+        return path
+
     async def _write_to_vault(
         self,
         session_id: str,
@@ -839,6 +896,10 @@ class ConversationHandler:
         Failure-isolated per ADR-010 Invariant 6: vault write errors are
         logged but never propagate. Returns the vault note path on success,
         None on failure or when vault layer is disabled.
+
+        Path allocation is delegated to `_get_or_allocate_vault_path` so the
+        same path can be reused by Phase 6's extraction-pipeline plumbing
+        without recomputation.
 
         Args:
             session_id: External session identifier.
@@ -852,17 +913,10 @@ class ConversationHandler:
             return None
 
         try:
-            # Pre-allocate path on first turn (Step 0 from ADR-010 Write Path).
-            if session_id not in self._vault_paths:
-                from datetime import UTC, datetime
+            vault_path = self._get_or_allocate_vault_path(session_id)
+            if vault_path is None:
+                return None
 
-                today = datetime.now(UTC).date().isoformat()
-                # Slug: session_id sanitized to kebab-case, with fallback.
-                slug = self._derive_session_slug(session_id)
-                self._vault_paths[session_id] = self._vault_writer.session_path(today, slug)
-                self._vault_turn_counts[session_id] = 0
-
-            vault_path = self._vault_paths[session_id]
             self._vault_turn_counts[session_id] += 1
             turn_index = self._vault_turn_counts[session_id]
 

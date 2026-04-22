@@ -887,6 +887,36 @@ VECTOR_CHUNK = NodeTypeDefinition(
     ),
 )
 
+VAULT_NOTE = NodeTypeDefinition(
+    type_name="VaultNote",
+    description=(
+        "Provenance reference to a vault session note (ADR-010 Cluster 8). "
+        "Created on conversation-turn graph writes to anchor every extracted "
+        "entity to the canonical session note that produced it. Keyed by "
+        "filesystem path; one node per note file regardless of turn count."
+    ),
+    knowledge_domain=KnowledgeDomain.BRIDGING,
+    required_properties=(
+        PropertyDefinition(
+            name="path",
+            type="string",
+            required=True,
+            description="Absolute filesystem path to the vault session note.",
+        ),
+    ),
+    optional_properties=(
+        PropertyDefinition(
+            name="event_id",
+            type="string",
+            required=False,
+            description=(
+                "Most recent event_id that referenced this vault note. "
+                "Per-turn provenance lives on the DERIVED_FROM edge, not here."
+            ),
+        ),
+    ),
+)
+
 # ===================================================================
 # Collected node type lists
 # ===================================================================
@@ -919,6 +949,7 @@ _BRIDGING_NODE_TYPES: tuple[NodeTypeDefinition, ...] = (
     CONVERSATION_CONTEXT,
     EXTERNAL_SOURCE,
     VECTOR_CHUNK,
+    VAULT_NOTE,
 )
 
 ALL_NODE_TYPES: list[NodeTypeDefinition] = list(
@@ -1181,9 +1212,15 @@ REFERENCES = EdgeTypeDefinition(
 
 DERIVED_FROM = EdgeTypeDefinition(
     type_name="DERIVED_FROM",
-    description="Links an extractable entity or learning event to the vector chunk or external source it was derived from.",
-    allowed_source_types=tuple(nt.type_name for nt in _EXTERNAL_NODE_TYPES) + ("LearningEvent",),
-    allowed_target_types=("VectorChunk", "ExternalSource"),
+    description=(
+        "Provenance edge linking an extractable entity (or learning event) to the "
+        "source it was derived from: a vector chunk or external source for "
+        "document-ingest paths, or a vault session note for conversation-turn "
+        "extractions (ADR-010 Cluster 8)."
+    ),
+    allowed_source_types=tuple(nt.type_name for nt in _EXTERNAL_NODE_TYPES)
+    + ("MistIdentity", "LearningEvent"),
+    allowed_target_types=("VectorChunk", "ExternalSource", "VaultNote"),
 )
 
 # ===================================================================

@@ -376,3 +376,201 @@ class TestSlugDerivation:
         # Path should not contain spaces or uppercase letters in the slug portion
         assert " " not in path
         assert "my" in path.lower()
+
+
+# ---------------------------------------------------------------------------
+# TestPhase6PathPreAllocation -- ADR-010 Step 0
+# ---------------------------------------------------------------------------
+
+
+class TestPhase6PathPreAllocation:
+    """ADR-010 Cluster 8 Phase 6: vault_note_path is allocated synchronously
+    at Step 0 of handle_message and threaded through to the extraction
+    pipeline so curation can emit DERIVED_FROM->VaultNote edges.
+    """
+
+    def test_get_or_allocate_returns_none_when_vault_disabled(self) -> None:
+        # Arrange
+        handler = make_handler(vault_writer=None)
+
+        # Act
+        path = handler._get_or_allocate_vault_path("any-session")
+
+        # Assert
+        assert path is None
+        # Counters and path map remain untouched
+        assert handler._vault_paths == {}
+        assert handler._vault_turn_counts == {}
+
+    def test_get_or_allocate_returns_path_when_vault_enabled(self) -> None:
+        # Arrange
+        fake_vault = FakeVaultWriter()
+        handler = make_handler(vault_writer=fake_vault)
+
+        # Act
+        path = handler._get_or_allocate_vault_path("session-x")
+
+        # Assert
+        assert path is not None
+        assert path.endswith(".md")
+        assert "session-x" in path
+        # State recorded for reuse + counter initialized to zero
+        assert handler._vault_paths["session-x"] == path
+        assert handler._vault_turn_counts["session-x"] == 0
+
+    def test_get_or_allocate_is_idempotent_within_session(self) -> None:
+        # Arrange
+        fake_vault = FakeVaultWriter()
+        handler = make_handler(vault_writer=fake_vault)
+
+        # Act -- multiple calls for same session must return identical path
+        path_1 = handler._get_or_allocate_vault_path("stable-session")
+        path_2 = handler._get_or_allocate_vault_path("stable-session")
+        path_3 = handler._get_or_allocate_vault_path("stable-session")
+
+        # Assert
+        assert path_1 == path_2 == path_3
+        assert path_1 is not None
+
+    def test_get_or_allocate_distinct_sessions_get_distinct_paths(self) -> None:
+        # Arrange
+        fake_vault = FakeVaultWriter()
+        handler = make_handler(vault_writer=fake_vault)
+
+        # Act
+        path_a = handler._get_or_allocate_vault_path("session-a")
+        path_b = handler._get_or_allocate_vault_path("session-b")
+
+        # Assert
+        assert path_a != path_b
+        assert path_a is not None
+        assert path_b is not None
+
+    def test_get_or_allocate_does_not_increment_counter(self) -> None:
+        # Arrange -- Step 0 path allocation MUST be free of side effects on the
+        # turn counter; only _write_to_vault increments it. This decoupling lets
+        # `handle_message` allocate the path before deciding whether to dispatch
+        # extraction without inflating the turn index.
+        fake_vault = FakeVaultWriter()
+        handler = make_handler(vault_writer=fake_vault)
+
+        # Act
+        handler._get_or_allocate_vault_path("counter-test")
+        handler._get_or_allocate_vault_path("counter-test")
+        handler._get_or_allocate_vault_path("counter-test")
+
+        # Assert
+        assert handler._vault_turn_counts["counter-test"] == 0
+
+    @pytest.mark.asyncio
+    async def test_handle_message_passes_vault_note_path_to_extraction(self) -> None:
+        # Arrange -- a handler with a real fake vault writer + a fake extraction
+        # pipeline that records every kwargs dict. handle_message must dispatch
+        # background extraction with vault_note_path matching the pre-allocated path.
+        fake_vault = FakeVaultWriter()
+        handler = make_handler(
+            vault_writer=fake_vault,
+            event_store_enabled=True,  # event_id required to dispatch extraction
+        )
+        # Replace pipeline with a recorder so we can inspect kwargs
+        recorder = FakeExtractionPipeline()
+        handler._extraction_pipeline = recorder
+
+        # Act
+        await handler.handle_message(
+            user_message="Talk about Python and Neo4j today.",
+            session_id="phase6-session",
+        )
+        await asyncio.sleep(0.05)  # let fire-and-forget extraction settle
+
+        # Assert -- the extraction pipeline received vault_note_path matching
+        # the path the vault writer wrote to.
+        assert len(recorder.calls) == 1
+        kwargs = recorder.calls[0]
+        assert "vault_note_path" in kwargs
+        assert kwargs["vault_note_path"] is not None
+        # Vault writer recorded the same path
+        assert len(fake_vault.append_calls) == 1
+        assert kwargs["vault_note_path"] == fake_vault.append_calls[0]["vault_note_path"]
+
+    @pytest.mark.asyncio
+    async def test_handle_message_passes_none_when_vault_disabled(self) -> None:
+        # Arrange
+        handler = make_handler(vault_writer=None, event_store_enabled=True)
+        recorder = FakeExtractionPipeline()
+        handler._extraction_pipeline = recorder
+
+        # Act
+        await handler.handle_message(
+            user_message="A long enough utterance to trigger extraction dispatch.",
+            session_id="no-vault-phase6",
+        )
+        await asyncio.sleep(0.05)
+
+        # Assert -- vault_note_path is None when the vault layer is disabled
+        assert len(recorder.calls) == 1
+        assert recorder.calls[0]["vault_note_path"] is None
+
+    @pytest.mark.asyncio
+    async def test_handle_message_two_turns_pass_same_vault_path_to_extraction(self) -> None:
+        # Arrange
+        fake_vault = FakeVaultWriter()
+        handler = make_handler(vault_writer=fake_vault, event_store_enabled=True)
+        recorder = FakeExtractionPipeline()
+        handler._extraction_pipeline = recorder
+
+        # Act -- two turns of the same session
+        session_id = "multi-turn-phase6"
+        await handler.handle_message(
+            user_message="First long utterance about Python and async.",
+            session_id=session_id,
+        )
+        await handler.handle_message(
+            user_message="Second long utterance about Neo4j and Cypher.",
+            session_id=session_id,
+        )
+        await asyncio.sleep(0.05)
+
+        # Assert -- both extraction dispatches receive the same vault_note_path,
+        # matching ADR-010 "Pre-allocated vault path" stability invariant.
+        assert len(recorder.calls) == 2
+        path_1 = recorder.calls[0]["vault_note_path"]
+        path_2 = recorder.calls[1]["vault_note_path"]
+        assert path_1 is not None
+        assert path_1 == path_2
+
+    @pytest.mark.asyncio
+    async def test_step_0_runs_even_when_extraction_skipped_for_short_message(self) -> None:
+        # Arrange -- short messages skip extraction dispatch but still produce
+        # a vault session note. The path must be allocated for both vault write
+        # and (deferred) extraction even though no extraction fires for a short turn.
+        fake_vault = FakeVaultWriter()
+        handler = make_handler(vault_writer=fake_vault, event_store_enabled=True)
+        recorder = FakeExtractionPipeline()
+        handler._extraction_pipeline = recorder
+
+        # Act -- a message under 3 words skips extraction dispatch.
+        await handler.handle_message(user_message="Hi", session_id="short-phase6")
+        await asyncio.sleep(0.05)
+
+        # Assert -- vault write happened (path allocated), extraction skipped.
+        assert len(fake_vault.append_calls) == 1
+        assert recorder.calls == []
+        assert "short-phase6" in handler._vault_paths
+
+    @pytest.mark.asyncio
+    async def test_path_allocated_before_event_store_write(self) -> None:
+        # Arrange + Assert -- structural check: _get_or_allocate_vault_path
+        # must be reachable before _record_turn_event so the path is available
+        # for extraction dispatch even when the event store is the source of
+        # the event_id. We verify by toggling the vault writer and confirming
+        # the path lookup never depends on event_id.
+        fake_vault = FakeVaultWriter()
+        handler = make_handler(vault_writer=fake_vault, event_store_enabled=False)
+
+        # Act -- pre-allocate without any event_store interaction
+        path = handler._get_or_allocate_vault_path("pre-allocation")
+
+        # Assert
+        assert path is not None
+        assert "pre-allocation" in path

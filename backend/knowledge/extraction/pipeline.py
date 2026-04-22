@@ -422,6 +422,7 @@ class ExtractionPipeline:
         reference_date: datetime | None = None,
         source_metadata: SourceMetadata | None = None,
         extraction_source: str = "conversation",
+        vault_note_path: str | None = None,
     ) -> ValidationResult | CurationResult:
         """Main entry point for live extraction.
 
@@ -442,6 +443,11 @@ class ExtractionPipeline:
             extraction_source: Source type for threshold lookup. One of
                 "conversation" (default), "orchestrator_summary", or
                 "agent_tool_output".
+            vault_note_path: Optional vault session-note path (ADR-010
+                Cluster 8 Phase 6). Forwarded through the curation pipeline
+                so every upserted entity gets a DERIVED_FROM edge to its
+                source vault note. None for non-conversation paths
+                (document ingest) or when the vault layer is disabled.
 
         Returns:
             ValidationResult with validated entities and relationships.
@@ -583,6 +589,7 @@ class ExtractionPipeline:
                 event_id=event_id,
                 session_id=session_id,
                 source_metadata=source_metadata,
+                vault_note_path=vault_note_path,
             )
             stage_78_ms = (time.perf_counter() - stage_start) * 1000
             logger.debug("Stages 7-8 (curation): %.1fms", stage_78_ms)

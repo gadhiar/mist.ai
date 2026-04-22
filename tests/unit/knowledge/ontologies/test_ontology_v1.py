@@ -29,8 +29,9 @@ from backend.knowledge.ontologies.v1_0_0 import (
 class TestEntityTypes:
     """Verify the complete set of entity types in the ontology."""
 
-    def test_has_21_entity_types(self):
-        assert len(ALL_NODE_TYPES) == 21
+    def test_has_22_entity_types(self):
+        # Cluster 8 Phase 6 (ADR-010) added VaultNote as a bridging/provenance type.
+        assert len(ALL_NODE_TYPES) == 22
 
     @pytest.mark.parametrize(
         "type_name",
@@ -86,17 +87,40 @@ class TestEntityTypes:
             pytest.param("ConversationContext", id="ConversationContext"),
             pytest.param("ExternalSource", id="ExternalSource"),
             pytest.param("VectorChunk", id="VectorChunk"),
+            pytest.param("VaultNote", id="VaultNote"),
         ],
     )
-    def test_bridging_domain_has_4_types(self, type_name: str):
+    def test_bridging_domain_has_5_types(self, type_name: str):
+        # Cluster 8 Phase 6 (ADR-010) added VaultNote.
         bridging_types = [
             nt for nt in ALL_NODE_TYPES if nt.knowledge_domain == KnowledgeDomain.BRIDGING
         ]
 
         bridging_names = [nt.type_name for nt in bridging_types]
 
-        assert len(bridging_types) == 4
+        assert len(bridging_types) == 5
         assert type_name in bridging_names
+
+    def test_vault_note_required_property_is_path(self):
+        # ADR-010 Phase 6: VaultNote nodes are MERGE-idempotent keyed by `path`.
+        # The schema must declare `path` as a required property.
+        from backend.knowledge.ontologies.v1_0_0 import VAULT_NOTE
+
+        required_names = [p.name for p in VAULT_NOTE.required_properties]
+        assert required_names == ["path"]
+        assert VAULT_NOTE.knowledge_domain == KnowledgeDomain.BRIDGING
+
+    def test_derived_from_allows_vault_note_target(self):
+        # ADR-010 Phase 6: DERIVED_FROM extends to entity -> VaultNote for the
+        # vault-rebuild contract. VectorChunk and ExternalSource targets remain.
+        from backend.knowledge.ontologies.v1_0_0 import DERIVED_FROM
+
+        assert "VaultNote" in DERIVED_FROM.allowed_target_types
+        assert "VectorChunk" in DERIVED_FROM.allowed_target_types
+        assert "ExternalSource" in DERIVED_FROM.allowed_target_types
+        # MistIdentity must be a permitted source so MIST-scope entities can
+        # carry vault-note provenance.
+        assert "MistIdentity" in DERIVED_FROM.allowed_source_types
 
     def test_extractable_types_are_external_plus_mist_identity(self):
         # Cluster 1 (Bug J): MistIdentity is promoted from INTERNAL-only to
