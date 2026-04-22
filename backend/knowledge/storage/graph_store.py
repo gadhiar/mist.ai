@@ -67,6 +67,15 @@ _USER_FACING_REL_TYPES: list[str] = [
     "RELATED_TO",
     "DEPENDS_ON",
     "USED_FOR",
+    # Post-MVP additive (2026-04-22): temporal + quantified + document edges.
+    # Paired with the Date / Milestone / Metric / Document node additions.
+    # Included in user-facing traversal because they carry semantic user
+    # content (not provenance): "when did X happen", "what's X's benchmark
+    # score", "what document is X about", "what came before X".
+    "OCCURRED_ON",
+    "HAS_METRIC",
+    "REFERENCES_DOCUMENT",
+    "PRECEDED_BY",
 ]
 
 
