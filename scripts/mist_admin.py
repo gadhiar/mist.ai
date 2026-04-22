@@ -412,7 +412,15 @@ def cmd_extract(args: argparse.Namespace) -> int:
 
 
 def cmd_retrieve(args: argparse.Namespace) -> int:
-    """Run hybrid retrieval on a query and print facts with scores + timing."""
+    """Run hybrid retrieval on a query and print facts with scores + timing.
+
+    Phase 9 / Phase 11: when the sidecar is enabled, the retriever's
+    `historical` intent + three-way RRF hybrid path can return vault
+    sidecar prose hits. Without the sidecar wired here, those branches
+    return zero results -- the CLI would silently misrepresent what
+    the production retriever can do. SQLite readers are race-safe with
+    the server's writer (single-writer rule applies to writes only).
+    """
     be = _load_backend()
     _, build_knowledge_retriever = _load_factories()
     config = be.get_config()
@@ -420,15 +428,20 @@ def cmd_retrieve(args: argparse.Namespace) -> int:
         f"[retrieve] query={args.query!r} user_id={args.user_id} "
         f"limit={args.limit} threshold={args.threshold}"
     )
-    retriever = build_knowledge_retriever(config)
-    result = asyncio.run(
-        retriever.retrieve(
-            query=args.query,
-            user_id=args.user_id,
-            limit=args.limit,
-            similarity_threshold=args.threshold,
+
+    sidecar = _build_cli_sidecar(config)
+    try:
+        retriever = build_knowledge_retriever(config, vault_sidecar=sidecar)
+        result = asyncio.run(
+            retriever.retrieve(
+                query=args.query,
+                user_id=args.user_id,
+                limit=args.limit,
+                similarity_threshold=args.threshold,
+            )
         )
-    )
+    finally:
+        _close_cli_sidecar(sidecar)
     _print_retrieval_result(result, show_context=args.show_context)
     return 0
 
@@ -586,7 +599,16 @@ def _read_replay_inputs(path: Path) -> list[dict[str, Any]]:
 
 
 def cmd_chat(args: argparse.Namespace) -> int:
-    """Full end-to-end chat turn through the production ConversationHandler."""
+    """Full end-to-end chat turn through the production ConversationHandler.
+
+    Vault constraint (ADR-010 Phase 5 single-writer rule): cmd_chat does
+    NOT construct a VaultWriter. Spinning up a second writer against a
+    vault root that the running server already owns deadlocks on the git
+    auto-init / consumer-loop coordination. The chat path exercises LLM
+    + extraction + graph writes; vault session-note writes are produced
+    only by the server's WebSocket path. To exercise vault writes from
+    the CLI, stop the server first.
+    """
     be = _load_backend()
     from backend.factories import build_conversation_handler
 
@@ -610,7 +632,14 @@ def cmd_chat(args: argparse.Namespace) -> int:
 
 
 def cmd_replay(args: argparse.Namespace) -> int:
-    """Replay utterances from a file through the chat path; aggregate results."""
+    """Replay utterances from a file through the chat path; aggregate results.
+
+    Same vault constraint as `cmd_chat` -- no VaultWriter construction
+    here. Replays validate LLM/extraction/retrieval quality against the
+    integrated graph; conversation-side DERIVED_FROM->VaultNote emission
+    is covered by the server-path unit tests
+    (test_conversation_handler_vault_integration, test_factories_vault).
+    """
     be = _load_backend()
     from backend.factories import build_conversation_handler
 
@@ -655,6 +684,44 @@ def _connect(be):
     connection = be.Neo4jConnection(config.neo4j)
     connection.connect()
     return connection
+
+
+def _build_cli_sidecar(config: Any) -> Any:
+    """Build a read-only VaultSidecarIndex for CLI retrieval commands.
+
+    ADR-010 Phase 5 single-writer rule: only ONE VaultWriter may operate
+    against a vault root at a time. The server lifespan owns the
+    production writer; a CLI process running concurrently with the server
+    must NOT spin up a second writer. Read-side access (sidecar query)
+    has no such restriction -- multiple SQLite readers are safe.
+
+    This helper is the CLI's sole vault entry point. `cmd_chat` and
+    `cmd_replay` deliberately do NOT take a writer; they exercise the
+    LLM + extraction + retrieval paths but vault session-note writes
+    are left to the server's WebSocket path.
+
+    Returns None when the sidecar subsystem is disabled in config.
+    """
+    if not config.sidecar_index.enabled:
+        return None
+
+    from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
+    from backend.vault.sidecar_index import VaultSidecarIndex
+
+    embedder = EmbeddingGenerator(config.embedding.model_name)
+    sidecar = VaultSidecarIndex(config.sidecar_index, embedder)
+    sidecar.initialize()
+    return sidecar
+
+
+def _close_cli_sidecar(sidecar: Any) -> None:
+    """Release the sidecar SQLite handle. No-op on None."""
+    if sidecar is None:
+        return
+    try:
+        sidecar.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("VaultSidecarIndex close error during CLI cleanup: %s", exc)
 
 
 def _resolve_snapshot_path(user_path: str | None) -> Path:

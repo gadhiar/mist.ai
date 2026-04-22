@@ -32,6 +32,12 @@ dependencies/csm/audio_data_*/
 *.wav
 !data/voice_profiles/**/*.yaml
 
+# Cluster 8 vault layer (ADR-010) -- runtime artifacts.
+data/vault_sidecar.db
+data/vault_sidecar.db-shm
+data/vault_sidecar.db-wal
+mist-memory/
+
 # Chatterbox evaluation venv and outputs
 venv-chatterbox/
 data/chatterbox_eval/

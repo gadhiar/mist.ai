@@ -134,6 +134,21 @@ PATTERNS: list[SlopPattern] = [
         fixable=True,
         replacement="!",
     ),
+    # WARNING: Structural-bold consulting voice (post-Cluster-8 V6 regression).
+    # Each finding represents one **bolded segment**. Two or more in a single
+    # response is a strong signal the LLM is structuring its answer like a
+    # consulting deliverable rather than conversational prose. Severity is
+    # "warning" not "critical" because legitimate bold (literal labels, CLI
+    # flags, file paths in some contexts) does occur. Not auto-stripped --
+    # the conversation post-filter checks finding *count* against a threshold
+    # before deciding to regenerate or accept. Each match is a single span
+    # delimited by `**...**` with no embedded asterisk or newline.
+    SlopPattern(
+        name="bold_consulting",
+        pattern=re.compile(r"\*\*[^*\n]{2,}\*\*"),
+        severity="warning",
+        fixable=False,
+    ),
 ]
 
 

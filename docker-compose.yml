@@ -33,14 +33,28 @@ services:
       - TTS_CFG_WEIGHT=${TTS_CFG_WEIGHT:-0.5}
       - VOICE_PROFILE=${VOICE_PROFILE:-friday}
       - ENABLE_KNOWLEDGE_INTEGRATION=${ENABLE_KNOWLEDGE_INTEGRATION:-true}
+    # Cluster 8 Phase 2 P0 follow-up (2026-04-22): non-root container user.
+    # UID 1000 matches the conventional first user on Linux hosts so bind-
+    # mounted host directories (./data, ./logs, ./mist-memory) are writable
+    # without chown gymnastics. Docker Desktop on Windows virtualizes
+    # ownership through WSL2; UID 1000 inside the container maps cleanly.
+    user: "1000:1000"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
       # Cluster 8 / ADR-010: vault bind mount. Host path overridable via
       # VAULT_HOST_PATH; default ./mist-memory at repo root.
       - ${VAULT_HOST_PATH:-./mist-memory}:/app/mist-memory
-      - mist-hf-cache:/root/.cache/huggingface
-      - mist-torch-cache:/root/.cache/torch
+      # Cluster 8 Phase 2 P0 follow-up: cache mount paths migrated from
+      # /root/.cache to /home/appuser/.cache. Existing pre-2026-04-22
+      # volumes contain root-owned content; on first up after this change,
+      # Docker will see the mount point owner is appuser and create fresh
+      # volume contents. The first-run cache rebuild costs roughly 3-4GB
+      # of HuggingFace + torch downloads. Old volumes can be pruned via
+      # `docker volume rm mist.ai_mist-hf-cache mist.ai_mist-torch-cache`
+      # AFTER confirming the new ones populate successfully.
+      - mist-hf-cache:/home/appuser/.cache/huggingface
+      - mist-torch-cache:/home/appuser/.cache/torch
     depends_on:
       mist-neo4j:
         condition: service_healthy

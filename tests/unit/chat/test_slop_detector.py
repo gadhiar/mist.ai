@@ -150,6 +150,66 @@ class TestAdditionalPatternCoverage:
         assert detector.strip_fixable(text) == text
 
 
+class TestBoldConsultingPattern:
+    """Cluster 8 polish (2026-04-22): structural-bold drift detection.
+
+    Each `**bolded segment**` is one finding at severity warning. The post-
+    filter does not currently regen on warning findings, so this serves
+    observability + future regen-threshold tuning. Single legitimate
+    bold segments (one per response) are not pathological; multiple
+    bolded segments per response indicate the LLM has drifted into
+    consulting-deliverable mode.
+    """
+
+    def test_no_bold_no_finding(self):
+        detector = SlopDetector()
+        findings = detector.detect(
+            "Plain conversational prose with no bold.", severity_floor="warning"
+        )
+        assert not any(f.pattern_name == "bold_consulting" for f in findings)
+
+    def test_single_bold_segment_yields_one_finding(self):
+        detector = SlopDetector()
+        text = "The flag to use is **--confirm** when running rebuild."
+        findings = detector.detect(text, severity_floor="warning")
+        bolds = [f for f in findings if f.pattern_name == "bold_consulting"]
+        assert len(bolds) == 1
+        assert bolds[0].matched_text == "**--confirm**"
+        assert bolds[0].severity == "warning"
+
+    def test_multiple_bold_segments_yield_one_finding_per_segment(self):
+        detector = SlopDetector()
+        # Two bolded spans (consulting-voice red flag).
+        text = "**Summary:** This addresses the issue. **Next steps:** Continue."
+        findings = detector.detect(text, severity_floor="warning")
+        bolds = [f for f in findings if f.pattern_name == "bold_consulting"]
+        assert len(bolds) == 2
+
+    def test_bold_pattern_is_not_fixable(self):
+        # Bold is sometimes legitimate (literal labels). Auto-strip would
+        # over-correct. The post-filter relies on count, not removal.
+        detector = SlopDetector()
+        text = "The flag is **--confirm**."
+        out = detector.strip_fixable(text)
+        assert "**--confirm**" in out
+
+    def test_bold_pattern_excluded_at_critical_floor(self):
+        # Severity is warning, so critical-floor scans should NOT flag it.
+        detector = SlopDetector()
+        text = "**Important:** see the docs."
+        findings = detector.detect(text, severity_floor="critical")
+        assert not any(f.pattern_name == "bold_consulting" for f in findings)
+
+    def test_bold_with_embedded_newline_does_not_match(self):
+        # A `**` followed by a newline before the closing `**` is not a
+        # single bold span (likely a corrupted markup, not consulting voice).
+        detector = SlopDetector()
+        text = "**This breaks across\nlines** so should not match as one bold."
+        findings = detector.detect(text, severity_floor="warning")
+        bolds = [f for f in findings if f.pattern_name == "bold_consulting"]
+        assert len(bolds) == 0
+
+
 class TestEdgeCases:
     """Boundary inputs: empty strings and mixed-severity text."""
 

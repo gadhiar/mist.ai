@@ -323,10 +323,13 @@ def test_load_seed_yaml_real_file(tmp_path):
     assert counts["mist_identity"] == 1
     assert counts["traits"] == 9
     assert counts["capabilities"] == 5
-    assert counts["preferences"] == 5
+    # Cluster 8 polish (2026-04-22): pref-no-structural-bold added to fight
+    # consulting-voice bold-markdown drift surfaced by post-Cluster-8 V6.
+    assert counts["preferences"] == 6
     assert counts["user"] == 1
     assert counts["entities"] == 11
-    assert counts["identity_relationships"] == 9 + 5 + 5  # targets expanded
+    # Identity relationships: 9 traits + 5 capabilities + 6 preferences.
+    assert counts["identity_relationships"] == 9 + 5 + 6
     assert counts["anchor_relationships"] == 11
     assert counts.get("schema_objects", 0) >= 2  # constraint + type index minimum
 

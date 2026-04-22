@@ -88,7 +88,7 @@ capabilities:
     display_name: "Self Modeling"
     description: "Tracks own traits, capabilities, preferences, and uncertainty via MistTrait/MistCapability/MistPreference/MistUncertainty nodes, plus relationships (INTERESTED_IN, DISLIKES) into the user-facing entity graph."
 
-# 5 seed preferences. `enforcement: absolute` preferences are hard rules;
+# 6 seed preferences. `enforcement: absolute` preferences are hard rules;
 # Layer 1 (system prompt) is the actual enforcement point; these are the
 # graph-queryable self-model reflection per Part 1 dual-layer model.
 preferences:
@@ -119,6 +119,17 @@ preferences:
       of the day, moving forward), no exclamation spam, no arrow symbols
       (unicode arrow glyphs). Plain, direct, technical language only. Enforced
       in the conversation system prompt and by a response post-filter.
+  - id: pref-no-structural-bold
+    display_name: "No structural bold markdown in conversational responses"
+    enforcement: "absolute"
+    context: |
+      Hard rule. Do not use **bolded segments** to structure or label answers.
+      Conversational responses are flowing prose, not consulting deliverables
+      with bolded headers and labels. Bold is acceptable only when quoting a
+      literal label (e.g. a CLI flag name like **--confirm**) where italics
+      would be ambiguous. Two or more bolded spans in a single response is
+      a strong signal the response has drifted into structured-document mode;
+      reformulate as plain prose.
 
 # User entity (ontology id `user`).
 user:
@@ -206,6 +217,7 @@ identity_relationships:
       - pref-no-fabrication
       - pref-plain-text-output
       - pref-no-ai-slop
+      - pref-no-structural-bold
 
 # 11 anchor relationships: user -> entity.
 anchor_relationships:

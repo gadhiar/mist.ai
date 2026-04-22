@@ -14,6 +14,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
 
+# Cluster 8 Phase 2 P0 follow-up (2026-04-22): non-root execution.
+# Create appuser UID 1000 (matches the conventional first user on Linux hosts
+# and Docker Desktop on Windows, so bind-mounted ./data, ./logs, ./mist-memory
+# are owned by a UID the container can write to). Cache dirs precreated +
+# chowned so the named volumes (mist-hf-cache, mist-torch-cache) inherit
+# correct permissions on first mount.
+RUN groupadd -g 1000 appgroup \
+    && useradd -m -u 1000 -g appgroup -s /bin/bash appuser \
+    && mkdir -p /home/appuser/.cache/huggingface /home/appuser/.cache/torch \
+    && chown -R appuser:appgroup /home/appuser \
+    && git config --system user.email "mist-backend@local" \
+    && git config --system user.name "MIST Backend"
+
 # Create venv inside container
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
@@ -65,6 +78,17 @@ COPY scripts/ /app/scripts/
 
 # Create data directories (populated by bind mount at runtime)
 RUN mkdir -p /app/data/voice_profiles /app/data/vector_store /app/data/audio
+
+# Cluster 8 Phase 2 P0 follow-up: hand off ownership to appuser AFTER all
+# root-owned dependency installation is done. /opt/venv ownership transfer
+# lets pip + python find their own site-packages without permission errors.
+# /app ownership transfer lets the runtime write to /app/data /app/logs
+# /app/mist-memory (bind mounts override these but the underlying mountpoint
+# directories must be writable for Docker to mount over them).
+RUN chown -R appuser:appgroup /opt/venv /app /home/appuser
+
+USER appuser
+ENV HOME=/home/appuser
 
 EXPOSE 8001
 
