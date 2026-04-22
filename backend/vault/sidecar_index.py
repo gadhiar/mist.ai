@@ -259,7 +259,11 @@ class VaultSidecarIndex:
         """
         self._require_connection()
         note_type = frontmatter.get("type") if frontmatter else None
-        frontmatter_json = json.dumps(frontmatter) if frontmatter else None
+        # PyYAML auto-converts ISO dates and datetimes to Python date/datetime
+        # objects; default=str stringifies them to ISO-8601 so json.dumps can
+        # serialize the frontmatter without round-trip loss. Other non-JSON
+        # types fall back to repr() via str() too.
+        frontmatter_json = json.dumps(frontmatter, default=str) if frontmatter else None
         dim = self.config.embedding_dimension
         now = int(time.time())
 

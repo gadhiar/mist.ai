@@ -1008,7 +1008,305 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_replay.set_defaults(func=cmd_replay)
 
+    # ---- Cluster 8 Phase 11: vault subcommands -----------------------------
+    p_vstatus = sub.add_parser(
+        "vault-status",
+        help="Report vault layer config + sidecar chunk count + on-disk note count.",
+    )
+    p_vstatus.set_defaults(func=cmd_vault_status)
+
+    p_vreindex = sub.add_parser(
+        "vault-reindex",
+        help="Walk vault root and re-index every .md into the sidecar.",
+    )
+    p_vreindex.add_argument(
+        "--scope",
+        default=None,
+        help=(
+            "Optional path to a single vault note. When provided only that "
+            "file is re-indexed. When omitted, all .md files under the vault "
+            "root are re-indexed."
+        ),
+    )
+    p_vreindex.set_defaults(func=cmd_vault_reindex)
+
+    p_vrebuild = sub.add_parser(
+        "vault-rebuild",
+        help="Drop the sidecar (vec0 + FTS5 + main table) and re-index from disk.",
+    )
+    p_vrebuild.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Required to actually drop + rebuild. Without --confirm the command "
+        "previews the work and exits without writing.",
+    )
+    p_vrebuild.set_defaults(func=cmd_vault_rebuild)
+
+    p_vmigrate = sub.add_parser(
+        "vault-migrate",
+        help="Apply registered ontology / schema migrations to vault notes.",
+    )
+    p_vmigrate.add_argument(
+        "--target-version",
+        default=None,
+        help="Target ontology version. Defaults to current config.ontology_version.",
+    )
+    p_vmigrate.set_defaults(func=cmd_vault_migrate)
+
     return parser
+
+
+# ---------------------------------------------------------------------------
+# Cluster 8 Phase 11 -- vault CLI subcommands
+# ---------------------------------------------------------------------------
+
+
+def _walk_vault_md_files(vault_root: Path) -> list[Path]:
+    """Return every `.md` file under `vault_root` in a deterministic order.
+
+    Skips hidden files and `.git/`. Matches the file filter applied by
+    VaultFilewatcher so the on-disk corpus and the live-reindex corpus
+    agree.
+    """
+    if not vault_root.exists():
+        return []
+    out: list[Path] = []
+    for p in vault_root.rglob("*.md"):
+        if any(part.startswith(".") for part in p.relative_to(vault_root).parts):
+            continue
+        out.append(p)
+    return sorted(out)
+
+
+def _read_vault_note(path: Path) -> tuple[str, dict | None, int]:
+    """Read a vault note file and return (content_after_frontmatter, frontmatter, mtime).
+
+    Frontmatter parsing uses the same `parse_frontmatter` helper the
+    VaultWriter uses, so this is symmetric with the live write path.
+    Returns (raw_text, None, mtime) when frontmatter parsing fails -- the
+    sidecar can still index the body in that case.
+    """
+    from backend.vault.models import parse_frontmatter
+
+    raw = path.read_text(encoding="utf-8")
+    mtime = int(path.stat().st_mtime)
+    try:
+        frontmatter, body = parse_frontmatter(raw)
+    except Exception:  # noqa: BLE001 -- corrupted frontmatter shouldn't block reindex
+        return raw, None, mtime
+    return body, frontmatter, mtime
+
+
+def cmd_vault_status(args: argparse.Namespace) -> int:
+    """Report vault layer health: config, on-disk note count, sidecar chunk count.
+
+    Read-only diagnostic. Builds a transient sidecar instance to call
+    `chunk_count()` and `health_check()`; closes it before returning so
+    no SQLite connections leak. Does not require Neo4j to be reachable.
+    """
+    be = _load_backend()
+    config = be.get_config()
+
+    print("[vault-status]")
+    print(f"  config.vault.enabled:           {config.vault.enabled}")
+    print(f"  config.vault.root:              {config.vault.root}")
+    print(f"  config.sidecar_index.enabled:   {config.sidecar_index.enabled}")
+    print(f"  config.sidecar_index.db_path:   {config.sidecar_index.db_path}")
+    print(f"  config.filewatcher.enabled:     {config.filewatcher.enabled}")
+    print(f"  config.filewatcher.observer:    {config.filewatcher.observer_type}")
+    print(f"  config.filewatcher.debounce_ms: {config.filewatcher.debounce_ms}")
+
+    if not config.vault.enabled:
+        print("\n[vault-status] Vault layer disabled; nothing else to report.")
+        return 0
+
+    vault_root = Path(config.vault.root)
+    md_files = _walk_vault_md_files(vault_root)
+    print(f"\n  on-disk .md files:              {len(md_files)}")
+    if md_files:
+        print(f"    first: {md_files[0]}")
+        print(f"    last:  {md_files[-1]}")
+
+    if not config.sidecar_index.enabled:
+        print("\n[vault-status] Sidecar disabled; skipping chunk counts.")
+        return 0
+
+    from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
+    from backend.vault.sidecar_index import VaultSidecarIndex
+
+    embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+    sidecar = VaultSidecarIndex(config.sidecar_index, embedding_provider)
+    try:
+        sidecar.initialize()
+        chunk_count = sidecar.chunk_count()
+        healthy = sidecar.health_check()
+    finally:
+        sidecar.close()
+
+    print(f"\n  sidecar chunk_count:            {chunk_count}")
+    print(f"  sidecar health_check:           {'OK' if healthy else 'DEGRADED'}")
+    return 0
+
+
+def cmd_vault_reindex(args: argparse.Namespace) -> int:
+    """Walk the vault root and re-index every `.md` into the sidecar.
+
+    With `--scope <path>`, only that single file is re-indexed. Without
+    `--scope`, every `.md` under the vault root is re-indexed.
+
+    Idempotent via the sidecar's MERGE semantics. Useful after editing
+    notes outside MIST (e.g. via Obsidian) when filewatcher events were
+    missed (Windows ReadDirectoryChangesW overflow).
+    """
+    be = _load_backend()
+    config = be.get_config()
+
+    if not config.vault.enabled or not config.sidecar_index.enabled:
+        print("[vault-reindex] Vault or sidecar disabled; nothing to do.")
+        return 0
+
+    vault_root = Path(config.vault.root)
+
+    if args.scope:
+        scope_path = Path(args.scope).resolve()
+        if not scope_path.exists():
+            print(f"[vault-reindex] Scope file not found: {scope_path}")
+            return 1
+        targets = [scope_path]
+    else:
+        targets = _walk_vault_md_files(vault_root)
+
+    if not targets:
+        print("[vault-reindex] No .md files to index.")
+        return 0
+
+    from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
+    from backend.vault.sidecar_index import VaultSidecarIndex
+
+    embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+    sidecar = VaultSidecarIndex(config.sidecar_index, embedding_provider)
+    sidecar.initialize()
+
+    total_chunks = 0
+    failures: list[tuple[Path, str]] = []
+    try:
+        for path in targets:
+            try:
+                body, frontmatter, mtime = _read_vault_note(path)
+                chunks = sidecar.upsert_file(
+                    path=str(path),
+                    content=body,
+                    mtime=mtime,
+                    frontmatter=frontmatter,
+                )
+                total_chunks += chunks
+            except Exception as exc:  # noqa: BLE001 -- per-file isolation
+                failures.append((path, repr(exc)))
+                print(f"[vault-reindex] FAIL {path}: {exc}")
+    finally:
+        sidecar.close()
+
+    print("\n[vault-reindex] Done.")
+    print(f"  files processed: {len(targets)}")
+    print(f"  failures:        {len(failures)}")
+    print(f"  total chunks:    {total_chunks}")
+    return 0 if not failures else 1
+
+
+def cmd_vault_rebuild(args: argparse.Namespace) -> int:
+    """Drop the sidecar tables and re-index every vault note from disk.
+
+    Heavier than `vault-reindex`: clears all chunks first so per-file
+    upserts cannot accumulate stale rows from notes that have since been
+    deleted. Use after schema changes to the sidecar or after suspected
+    corruption.
+
+    Requires `--confirm` because this drops the sidecar's contents
+    (re-buildable from disk, but still destructive on the SQLite file).
+    """
+    be = _load_backend()
+    config = be.get_config()
+
+    if not config.vault.enabled or not config.sidecar_index.enabled:
+        print("[vault-rebuild] Vault or sidecar disabled; nothing to do.")
+        return 0
+
+    vault_root = Path(config.vault.root)
+    targets = _walk_vault_md_files(vault_root)
+
+    if not args.confirm:
+        print("[vault-rebuild] DRY RUN -- pass --confirm to execute.")
+        print(f"  vault_root:       {vault_root}")
+        print(f"  sidecar db:       {config.sidecar_index.db_path}")
+        print(f"  files to reindex: {len(targets)}")
+        return 0
+
+    print(f"[vault-rebuild] Dropping sidecar at {config.sidecar_index.db_path}")
+    sidecar_db = Path(config.sidecar_index.db_path)
+    if sidecar_db.exists():
+        sidecar_db.unlink()
+
+    from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
+    from backend.vault.sidecar_index import VaultSidecarIndex
+
+    embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+    sidecar = VaultSidecarIndex(config.sidecar_index, embedding_provider)
+    sidecar.initialize()  # Recreates schema on the freshly-deleted db
+
+    total_chunks = 0
+    failures: list[tuple[Path, str]] = []
+    try:
+        for path in targets:
+            try:
+                body, frontmatter, mtime = _read_vault_note(path)
+                chunks = sidecar.upsert_file(
+                    path=str(path),
+                    content=body,
+                    mtime=mtime,
+                    frontmatter=frontmatter,
+                )
+                total_chunks += chunks
+            except Exception as exc:  # noqa: BLE001
+                failures.append((path, repr(exc)))
+                print(f"[vault-rebuild] FAIL {path}: {exc}")
+    finally:
+        sidecar.close()
+
+    print("\n[vault-rebuild] Done.")
+    print(f"  files processed: {len(targets)}")
+    print(f"  failures:        {len(failures)}")
+    print(f"  total chunks:    {total_chunks}")
+    return 0 if not failures else 1
+
+
+def cmd_vault_migrate(args: argparse.Namespace) -> int:
+    """Apply registered vault schema / ontology migrations.
+
+    Placeholder for ADR-010's "Ontology evolution" path. The current
+    ontology is v1.0.0 and there are no registered migrations. When a
+    future ontology bump (e.g. 1.1.0) ships, the migration script lives
+    here. Today this command is a structural no-op that reports the
+    current versions and exits successfully so operators can wire it
+    into runbooks now.
+    """
+    be = _load_backend()
+    config = be.get_config()
+
+    target = args.target_version or config.ontology_version
+
+    print("[vault-migrate]")
+    print(f"  config.ontology_version:    {config.ontology_version}")
+    print(f"  config.extraction_version:  {config.extraction_version}")
+    print(f"  target_version:             {target}")
+    print("\n  registered migrations:      (none)")
+    if target != config.ontology_version:
+        print(
+            f"\n[vault-migrate] No migration path registered for "
+            f"{config.ontology_version} -> {target}. No-op."
+        )
+    else:
+        print("\n[vault-migrate] Already at target version. No-op.")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
