@@ -81,6 +81,19 @@ RELATIONSHIP_CONSTRAINTS: dict[str, tuple[set[str] | None, set[str] | None]] = {
         {"MistIdentity"},
         {"Preference", "Concept", "Technology", "Topic"},
     ),
+    # Post-MVP additive (2026-04-22): temporal + quantified + document.
+    # Constraints MUST mirror the EdgeTypeDefinition entries in
+    # backend.knowledge.ontologies.v1_0_0 exactly.
+    "OCCURRED_ON": ({"Event", "Milestone"}, {"Date"}),
+    "HAS_METRIC": (
+        {"User", "Project", "Technology", "Skill", "Concept", "Goal"},
+        {"Metric"},
+    ),
+    "REFERENCES_DOCUMENT": (
+        {"User", "MistIdentity", "Project", "Concept", "Topic", "Goal", "Event"},
+        {"Document"},
+    ),
+    "PRECEDED_BY": ({"Event", "Milestone"}, {"Event", "Milestone", "Date"}),
 }
 
 VALID_TEMPORAL_STATUSES: set[str] = {"current", "past", "future", "recurring"}

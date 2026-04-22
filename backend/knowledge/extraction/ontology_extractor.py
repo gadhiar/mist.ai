@@ -70,6 +70,11 @@ class OntologyConstrainedExtractor:
             "Location",
             # Cluster 1: MIST self-model entity type (13th).
             "MistIdentity",
+            # Post-MVP additive (2026-04-22): temporal + quantified + document.
+            "Date",
+            "Milestone",
+            "Metric",
+            "Document",
         }
     )
 
@@ -101,6 +106,11 @@ class OntologyConstrainedExtractor:
             "MIST_HAS_CAPABILITY",
             "MIST_HAS_TRAIT",
             "MIST_HAS_PREFERENCE",
+            # Post-MVP additive (2026-04-22): temporal + quantified + document.
+            "OCCURRED_ON",
+            "HAS_METRIC",
+            "REFERENCES_DOCUMENT",
+            "PRECEDED_BY",
         }
     )
 

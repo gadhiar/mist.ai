@@ -488,3 +488,271 @@ class TestMistScopePredicates:
         # Assert -- dropped because MistIdentity is not in LEARNING sources
         assert len(result.relationships) == 0
         assert any("LEARNING" in w and "MistIdentity" in w for w in result.warnings)
+
+
+# -------------------------------------------------------------------
+# Post-MVP additive: temporal / quantified / document constraints (2026-04-22)
+# Mirrors the MIST-scope class pattern: happy-path accept + shape-mismatch
+# reject for each of the 4 new edge types.
+# -------------------------------------------------------------------
+
+
+class TestTemporalQuantifiedDocumentConstraints:
+    """RELATIONSHIP_CONSTRAINTS must mirror the ontology's EdgeTypeDefinition
+    entries exactly for the 4 post-MVP additive edges. Accept valid shapes
+    and reject shapes whose source or target type is outside the ontology
+    allowlist.
+    """
+
+    # --- OCCURRED_ON: (Event | Milestone) -> Date ---
+
+    def test_occurred_on_event_to_date_accepted(self):
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="v6-run", entity_type="Event"),
+                _make_entity(entity_id="2026-04-22", entity_type="Date"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="v6-run",
+                    target="2026-04-22",
+                    rel_type="OCCURRED_ON",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["type"] == "OCCURRED_ON"
+
+    def test_occurred_on_user_source_rejected(self):
+        # User is not in OCCURRED_ON.allowed_source_types
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="user", entity_type="User"),
+                _make_entity(entity_id="2026-04-22", entity_type="Date"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="user",
+                    target="2026-04-22",
+                    rel_type="OCCURRED_ON",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 0
+        assert any("OCCURRED_ON" in w and "Source type 'User'" in w for w in result.warnings)
+
+    # --- HAS_METRIC: (User | Project | Technology | Skill | Concept | Goal) -> Metric ---
+
+    def test_has_metric_technology_to_metric_accepted(self):
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="gemma-4-e4b", entity_type="Technology"),
+                _make_entity(entity_id="tool-selection-score", entity_type="Metric"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="gemma-4-e4b",
+                    target="tool-selection-score",
+                    rel_type="HAS_METRIC",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["type"] == "HAS_METRIC"
+
+    def test_has_metric_event_source_rejected(self):
+        # Event is not in HAS_METRIC.allowed_source_types
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="v6-run", entity_type="Event"),
+                _make_entity(entity_id="latency-ms", entity_type="Metric"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="v6-run",
+                    target="latency-ms",
+                    rel_type="HAS_METRIC",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 0
+        assert any("HAS_METRIC" in w and "Source type 'Event'" in w for w in result.warnings)
+
+    # --- REFERENCES_DOCUMENT: (User | MistIdentity | Project | Concept | Topic
+    #                           | Goal | Event) -> Document ---
+
+    def test_references_document_user_to_document_accepted(self):
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="user", entity_type="User"),
+                _make_entity(entity_id="adr-010", entity_type="Document"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="user",
+                    target="adr-010",
+                    rel_type="REFERENCES_DOCUMENT",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["type"] == "REFERENCES_DOCUMENT"
+
+    def test_references_document_person_source_rejected(self):
+        # Person is not in REFERENCES_DOCUMENT.allowed_source_types
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="colleague", entity_type="Person"),
+                _make_entity(entity_id="paper-x", entity_type="Document"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="colleague",
+                    target="paper-x",
+                    rel_type="REFERENCES_DOCUMENT",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 0
+        assert any(
+            "REFERENCES_DOCUMENT" in w and "Source type 'Person'" in w for w in result.warnings
+        )
+
+    # --- PRECEDED_BY: (Event | Milestone) -> (Event | Milestone | Date) ---
+
+    def test_preceded_by_milestone_to_date_accepted(self):
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="mvp-close", entity_type="Milestone"),
+                _make_entity(entity_id="2026-04-17", entity_type="Date"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="mvp-close",
+                    target="2026-04-17",
+                    rel_type="PRECEDED_BY",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["type"] == "PRECEDED_BY"
+
+    def test_preceded_by_project_source_rejected(self):
+        # Project is not in PRECEDED_BY.allowed_source_types
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="mist-ai", entity_type="Project"),
+                _make_entity(entity_id="v6-run", entity_type="Event"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="mist-ai",
+                    target="v6-run",
+                    rel_type="PRECEDED_BY",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 0
+        assert any("PRECEDED_BY" in w and "Source type 'Project'" in w for w in result.warnings)
+
+
+# -------------------------------------------------------------------
+# Standing drift guard (2026-04-22): RELATIONSHIP_CONSTRAINTS MUST
+# mirror EdgeTypeDefinition in the ontology exactly. Adding a new edge
+# type to the ontology without updating RELATIONSHIP_CONSTRAINTS is the
+# historical #1 bug class; this test turns the manual cross-check into
+# standing coverage.
+# -------------------------------------------------------------------
+
+
+class TestValidatorOntologyConsistency:
+    """The validator's RELATIONSHIP_CONSTRAINTS dict and the ontology's
+    EdgeTypeDefinition objects must agree on every extractable edge's
+    allowed source and target types. Drift between them silently
+    changes validation behavior and is genuinely hard to catch in
+    per-edge tests.
+    """
+
+    def test_every_extractable_edge_has_a_validator_constraint(self):
+        from backend.knowledge.extraction.validator import RELATIONSHIP_CONSTRAINTS
+        from backend.knowledge.ontologies.v1_0_0 import (
+            EXTRACTABLE_RELATIONSHIP_TYPES,
+        )
+
+        missing = [
+            name for name in EXTRACTABLE_RELATIONSHIP_TYPES if name not in RELATIONSHIP_CONSTRAINTS
+        ]
+        assert missing == [], (
+            f"Edges in EXTRACTABLE_RELATIONSHIP_TYPES but missing from "
+            f"validator RELATIONSHIP_CONSTRAINTS: {missing!r}. Update "
+            f"validator.py when adding a new edge to the ontology."
+        )
+
+    def test_validator_constraints_mirror_edge_type_definitions(self):
+        """For each edge that has BOTH a validator entry AND an ontology
+        EdgeTypeDefinition, the allowed_source_types / allowed_target_types
+        must match member-for-member.
+
+        The validator stores constraints as `tuple[set | None, set | None]`
+        where None means "any type permitted". The ontology stores
+        `allowed_source_types` / `allowed_target_types` as tuples. This
+        test normalizes to sets for comparison; `None` validator entries
+        skip the comparison (permissive by design).
+        """
+        from backend.knowledge.extraction.validator import RELATIONSHIP_CONSTRAINTS
+        from backend.knowledge.ontologies.v1_0_0 import ALL_EDGE_TYPES
+
+        edges_by_name = {e.type_name: e for e in ALL_EDGE_TYPES}
+        drift: list[str] = []
+
+        for edge_name, (val_src, val_tgt) in RELATIONSHIP_CONSTRAINTS.items():
+            onto_edge = edges_by_name.get(edge_name)
+            if onto_edge is None:
+                drift.append(f"{edge_name}: in validator but not in ontology " f"ALL_EDGE_TYPES")
+                continue
+            onto_src = set(onto_edge.allowed_source_types)
+            onto_tgt = set(onto_edge.allowed_target_types)
+            if val_src is not None and val_src != onto_src:
+                drift.append(
+                    f"{edge_name} sources: ontology={sorted(onto_src)!r} "
+                    f"validator={sorted(val_src)!r}"
+                )
+            if val_tgt is not None and val_tgt != onto_tgt:
+                drift.append(
+                    f"{edge_name} targets: ontology={sorted(onto_tgt)!r} "
+                    f"validator={sorted(val_tgt)!r}"
+                )
+
+        assert drift == [], "Validator-ontology drift:\n  " + "\n  ".join(drift)

@@ -1125,8 +1125,14 @@ LEARNED_SELF = EdgeTypeDefinition(
 
 USES = EdgeTypeDefinition(
     type_name="USES",
-    description="Indicates that a user or person actively uses a technology.",
-    allowed_source_types=("User", "Person"),
+    description=(
+        "Indicates that a user, person, organization, or MIST itself "
+        "actively uses a technology. Cluster 1 widened the source set "
+        "from {User, Person} to include Organization and MistIdentity "
+        "so that facts like 'MIST uses LanceDB' and 'Anthropic works "
+        "with Python' survive validation."
+    ),
+    allowed_source_types=("User", "Person", "Organization", "MistIdentity"),
     allowed_target_types=("Technology",),
 )
 
@@ -1256,8 +1262,12 @@ RELATED_TO = EdgeTypeDefinition(
 
 DEPENDS_ON = EdgeTypeDefinition(
     type_name="DEPENDS_ON",
-    description="Indicates a dependency from the source to the target.",
-    allowed_source_types=("Technology", "Project"),
+    description=(
+        "Indicates a dependency from the source to the target. Cluster 1 "
+        "widened sources from {Technology, Project} to include Organization "
+        "and MistIdentity so that MIST-scope dependencies land correctly."
+    ),
+    allowed_source_types=("Technology", "Project", "Organization", "MistIdentity"),
     allowed_target_types=("Technology",),
 )
 
@@ -1270,8 +1280,13 @@ USED_FOR = EdgeTypeDefinition(
 
 WORKS_WITH = EdgeTypeDefinition(
     type_name="WORKS_WITH",
-    description="Bidirectional compatibility between technologies.",
-    allowed_source_types=("Technology",),
+    description=(
+        "Bidirectional compatibility between technologies. Cluster 1 "
+        "widened sources from {Technology} to include Organization and "
+        "MistIdentity so facts like 'Anthropic works with Python' or "
+        "'MIST works with Neo4j' survive validation."
+    ),
+    allowed_source_types=("Technology", "Organization", "MistIdentity"),
     allowed_target_types=("Technology",),
     directional=False,
 )
