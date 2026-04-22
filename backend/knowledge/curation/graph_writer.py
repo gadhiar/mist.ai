@@ -22,6 +22,26 @@ PROPERTY_KEY_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
 @dataclass(frozen=True, slots=True)
+class RebuildStamps:
+    """Per-deployment rebuild-determinism stamps for DERIVED_FROM->VaultNote edges.
+
+    ADR-010 "Rebuild Determinism Model" requires every DERIVED_FROM->VaultNote
+    edge to carry the ontology, extraction-prompt, and model identifiers that
+    were active when the entity was extracted. `mist_admin vault-rebuild`
+    compares these against current values and migrates entities forward
+    (marking old edges `status=superseded`) when any stamp drifts.
+
+    Stable for the lifetime of the writer -- the LLM binary and ontology
+    version do not change mid-process. Constructed from `KnowledgeConfig`
+    in the factory and injected into `CurationGraphWriter`.
+    """
+
+    ontology_version: str
+    extraction_version: str
+    model_hash: str
+
+
+@dataclass(frozen=True, slots=True)
 class SourceMetadata:
     """Metadata for external (non-conversation) knowledge sources.
 
@@ -72,10 +92,14 @@ class CurationGraphWriter:
         executor: GraphExecutor,
         embedding_provider: EmbeddingProvider,
         confidence_manager: ConfidenceManager,
+        rebuild_stamps: RebuildStamps | None = None,
     ) -> None:
         self._executor = executor
         self._embedding_provider = embedding_provider
         self._confidence_manager = confidence_manager
+        # ADR-010 Phase 8: stamps appear on every DERIVED_FROM->VaultNote
+        # edge when set. None preserves Phase 6 behavior (event_id only).
+        self._rebuild_stamps = rebuild_stamps
 
     async def write(
         self,
@@ -375,19 +399,44 @@ class CurationGraphWriter:
         event_id on the edge is refreshed on each call so a re-extraction of
         the same entity from a later turn updates the audit timestamp without
         duplicating the edge.
+
+        Phase 8 (rebuild determinism): when `rebuild_stamps` was injected at
+        construction, the edge also carries `ontology_version`,
+        `extraction_version`, `model_hash`, and `derived_at`. These let
+        `mist_admin vault-rebuild` compare current vs. stamped versions and
+        migrate forward when any value drifts. Stamps are written on both
+        ON CREATE and ON MATCH so re-extractions land the current stamp set
+        rather than retaining the original.
         """
+        params: dict[str, str] = {
+            "entity_id": entity_id,
+            "path": vault_note_path,
+            "event_id": event_id,
+            "now": now,
+        }
+        if self._rebuild_stamps is None:
+            create_set = "r.event_id = $event_id, r.created_at = $now"
+            match_set = "r.event_id = $event_id, r.updated_at = $now"
+        else:
+            params["ontology_version"] = self._rebuild_stamps.ontology_version
+            params["extraction_version"] = self._rebuild_stamps.extraction_version
+            params["model_hash"] = self._rebuild_stamps.model_hash
+            stamp_clause = (
+                "r.ontology_version = $ontology_version, "
+                "r.extraction_version = $extraction_version, "
+                "r.model_hash = $model_hash, "
+                "r.derived_at = $now"
+            )
+            create_set = "r.event_id = $event_id, r.created_at = $now, " + stamp_clause
+            match_set = "r.event_id = $event_id, r.updated_at = $now, " + stamp_clause
+
         await self._executor.execute_write(
             "MATCH (e:__Entity__ {id: $entity_id}) "
             "MATCH (vn:VaultNote {path: $path}) "
             "MERGE (e)-[r:DERIVED_FROM]->(vn) "
-            "ON CREATE SET r.event_id = $event_id, r.created_at = $now "
-            "ON MATCH SET r.event_id = $event_id, r.updated_at = $now",
-            {
-                "entity_id": entity_id,
-                "path": vault_note_path,
-                "event_id": event_id,
-                "now": now,
-            },
+            f"ON CREATE SET {create_set} "
+            f"ON MATCH SET {match_set}",
+            params,
         )
 
     async def _create_document_provenance(

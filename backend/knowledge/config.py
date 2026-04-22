@@ -535,6 +535,17 @@ class KnowledgeConfig:
     enable_versioning: bool = True  # Track ontology versions
     enable_provenance: bool = True  # Track extraction provenance
 
+    # ADR-010 Cluster 8 Phase 8: rebuild determinism stamps. Stamped on every
+    # DERIVED_FROM->VaultNote edge so vault-rebuild can detect version drift
+    # and migrate forward when ontology / extraction prompt / model changes.
+    # `extraction_version` should bump when EXTRACTION_SYSTEM_PROMPT or the
+    # ontology contract changes. `model_hash` is an immutable identifier for
+    # the LLM binary actually running extraction (recipe + quantization +
+    # weights). Free-form strings; the only contract is that they change
+    # when the underlying parameter changes.
+    extraction_version: str = "2026-04-17-r1"
+    model_hash: str = "gemma-4-e4b-q5-k-m-carteakey-full-v1"
+
     # Auto-RAG configuration
     auto_inject_docs: bool = True  # Enable/disable auto-injection
     auto_inject_limit: int = 3  # Number of chunks to auto-inject
@@ -588,6 +599,8 @@ class KnowledgeConfig:
             ontology_version=os.getenv("ONTOLOGY_VERSION", "1.0.0"),
             enable_versioning=os.getenv("ENABLE_VERSIONING", "true").lower() == "true",
             enable_provenance=os.getenv("ENABLE_PROVENANCE", "true").lower() == "true",
+            extraction_version=os.getenv("EXTRACTION_VERSION", "2026-04-17-r1"),
+            model_hash=os.getenv("MIST_MODEL_HASH", "gemma-4-e4b-q5-k-m-carteakey-full-v1"),
             auto_inject_docs=os.getenv("AUTO_INJECT_DOCS", "true").lower() == "true",
             auto_inject_limit=int(os.getenv("AUTO_INJECT_LIMIT", "3")),
             auto_inject_threshold=float(os.getenv("AUTO_INJECT_THRESHOLD", "0.4")),

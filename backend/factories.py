@@ -132,12 +132,25 @@ def build_llm_provider(
 
 def build_curation_pipeline(config: KnowledgeConfig, executor: GraphExecutor) -> CurationPipeline:
     """Create a fully wired CurationPipeline."""
+    from backend.knowledge.curation.graph_writer import RebuildStamps
+
     embedding_provider = EmbeddingGenerator(config.embedding.model_name)
     confidence_mgr = ConfidenceManager()
+    # ADR-010 Phase 8 rebuild-determinism stamps. Written to every
+    # DERIVED_FROM->VaultNote edge so vault-rebuild can detect when the
+    # ontology, extraction prompt, or model binary has drifted from the
+    # values active at extraction time.
+    rebuild_stamps = RebuildStamps(
+        ontology_version=config.ontology_version,
+        extraction_version=config.extraction_version,
+        model_hash=config.model_hash,
+    )
     return CurationPipeline(
         deduplicator=EntityDeduplicator(executor, embedding_provider, confidence_mgr),
         conflict_resolver=ConflictResolver(executor),
-        graph_writer=CurationGraphWriter(executor, embedding_provider, confidence_mgr),
+        graph_writer=CurationGraphWriter(
+            executor, embedding_provider, confidence_mgr, rebuild_stamps=rebuild_stamps
+        ),
     )
 
 

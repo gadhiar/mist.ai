@@ -375,3 +375,189 @@ class TestWriteWithVaultNotePath:
             "ExternalSource) and must be excluded from user-facing traversal per "
             "ADR-009 + ADR-010."
         )
+
+
+# ---------------------------------------------------------------------------
+# TestPhase8RebuildStamps -- ontology_version + extraction_version + model_hash
+# ---------------------------------------------------------------------------
+
+
+class TestPhase8RebuildStamps:
+    """ADR-010 Phase 8: DERIVED_FROM edges carry rebuild-determinism stamps
+    when `RebuildStamps` is injected at construction. `vault-rebuild` compares
+    these against current values to detect ontology / prompt / model drift.
+    """
+
+    def _writer_with_stamps(
+        self,
+        ontology_version: str = "1.0.0",
+        extraction_version: str = "2026-04-17-r1",
+        model_hash: str = "gemma-4-e4b-q5-k-m-test",
+    ) -> tuple[CurationGraphWriter, FakeNeo4jConnection]:
+        from backend.knowledge.curation.graph_writer import RebuildStamps
+
+        conn = FakeNeo4jConnection()
+        executor = FakeGraphExecutor(connection=conn)
+        stamps = RebuildStamps(
+            ontology_version=ontology_version,
+            extraction_version=extraction_version,
+            model_hash=model_hash,
+        )
+        writer = CurationGraphWriter(
+            executor,
+            FakeEmbeddingGenerator(),
+            ConfidenceManager(),
+            rebuild_stamps=stamps,
+        )
+        return writer, conn
+
+    def test_rebuild_stamps_dataclass_is_frozen(self) -> None:
+        # Frozen so the stamps cannot drift mid-process; rebuild determinism
+        # depends on a stable per-deployment value set.
+        from dataclasses import FrozenInstanceError
+
+        from backend.knowledge.curation.graph_writer import RebuildStamps
+
+        stamps = RebuildStamps(
+            ontology_version="1.0.0",
+            extraction_version="2026-04-17-r1",
+            model_hash="gemma-4-e4b",
+        )
+
+        with pytest.raises(FrozenInstanceError):
+            stamps.ontology_version = "2.0.0"  # type: ignore[misc]
+
+    @pytest.mark.asyncio
+    async def test_edge_omits_stamps_when_rebuild_stamps_is_none(self) -> None:
+        # Arrange -- the Phase 6 default; preserves backward compatibility
+        # with deployments that have not yet adopted Phase 8 config wiring.
+        writer, conn = _make_writer()
+
+        # Act
+        await writer._create_vault_note_provenance(
+            entity_id="python",
+            vault_note_path="/vault/sessions/2026-04-22-foo.md",
+            event_id="evt-001",
+            now="2026-04-22T00:00:00Z",
+        )
+
+        # Assert -- only Phase 6 properties on the edge
+        edge_query = _writes_matching(conn, "DERIVED_FROM", "VaultNote")[0][0]
+        assert "ontology_version" not in edge_query
+        assert "extraction_version" not in edge_query
+        assert "model_hash" not in edge_query
+        assert "derived_at" not in edge_query
+        assert "r.event_id = $event_id" in edge_query
+
+    @pytest.mark.asyncio
+    async def test_edge_carries_all_three_stamps_when_set(self) -> None:
+        # Arrange
+        writer, conn = self._writer_with_stamps(
+            ontology_version="1.0.0",
+            extraction_version="2026-04-17-r1",
+            model_hash="gemma-4-e4b-q5-k-m-carteakey-full-v1",
+        )
+
+        # Act
+        await writer._create_vault_note_provenance(
+            entity_id="python",
+            vault_note_path="/vault/sessions/2026-04-22-foo.md",
+            event_id="evt-001",
+            now="2026-04-22T00:00:00Z",
+        )
+
+        # Assert -- all three stamps + derived_at appear on the edge,
+        # and parameters carry the configured values.
+        query, params = _writes_matching(conn, "DERIVED_FROM", "VaultNote")[0]
+        assert "r.ontology_version = $ontology_version" in query
+        assert "r.extraction_version = $extraction_version" in query
+        assert "r.model_hash = $model_hash" in query
+        assert "r.derived_at = $now" in query
+
+        assert params["ontology_version"] == "1.0.0"
+        assert params["extraction_version"] == "2026-04-17-r1"
+        assert params["model_hash"] == "gemma-4-e4b-q5-k-m-carteakey-full-v1"
+
+    @pytest.mark.asyncio
+    async def test_stamps_appear_on_both_create_and_match_branches(self) -> None:
+        # Arrange -- ADR-010 says re-extraction should land the CURRENT
+        # stamp set, not retain the original. So ON MATCH must update
+        # the stamps too, not just touch updated_at.
+        writer, conn = self._writer_with_stamps()
+
+        # Act
+        await writer._create_vault_note_provenance(
+            entity_id="python",
+            vault_note_path="/vault/sessions/2026-04-22-foo.md",
+            event_id="evt-001",
+            now="2026-04-22T00:00:00Z",
+        )
+
+        # Assert -- both ON CREATE and ON MATCH set the stamps
+        query = _writes_matching(conn, "DERIVED_FROM", "VaultNote")[0][0]
+        # Split on ON MATCH to verify both branches contain the stamps
+        on_create_idx = query.find("ON CREATE SET")
+        on_match_idx = query.find("ON MATCH SET")
+        assert on_create_idx >= 0 and on_match_idx > on_create_idx
+        on_create_clause = query[on_create_idx:on_match_idx]
+        on_match_clause = query[on_match_idx:]
+        for stamp in ("ontology_version", "extraction_version", "model_hash"):
+            assert stamp in on_create_clause, f"{stamp} missing from ON CREATE"
+            assert stamp in on_match_clause, f"{stamp} missing from ON MATCH"
+
+    @pytest.mark.asyncio
+    async def test_stamps_propagate_through_write_method(self) -> None:
+        # Arrange -- end-to-end via write(), not just the helper. Confirms
+        # the constructor injection survives the full write path.
+        writer, conn = self._writer_with_stamps(
+            ontology_version="1.0.0",
+            extraction_version="custom-version-test",
+            model_hash="custom-model-hash-test",
+        )
+        entities = [make_entity_dict(entity_id="python", display_name="Python")]
+
+        # Act
+        await writer.write(
+            entities=entities,
+            relationships=[],
+            merge_actions=[],
+            supersession_actions=[],
+            event_id="evt-001",
+            session_id="sess-001",
+            vault_note_path="/vault/sessions/2026-04-22-foo.md",
+        )
+
+        # Assert
+        edges = _writes_matching(conn, "DERIVED_FROM", "VaultNote")
+        assert len(edges) == 1
+        params = edges[0][1]
+        assert params["extraction_version"] == "custom-version-test"
+        assert params["model_hash"] == "custom-model-hash-test"
+
+
+class TestPhase8FactoryWiring:
+    """Verifies build_curation_pipeline constructs RebuildStamps from config."""
+
+    def test_factory_constructs_stamps_from_config(self) -> None:
+        from backend.factories import build_curation_pipeline
+        from backend.knowledge.curation.graph_writer import RebuildStamps
+        from tests.mocks.config import build_test_config
+        from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
+
+        # Arrange
+        config = build_test_config()
+        config.extraction_version = "factory-test-version"
+        config.model_hash = "factory-test-model"
+        config.ontology_version = "1.0.0"
+
+        executor = FakeGraphExecutor(connection=FakeNeo4jConnection())
+
+        # Act
+        pipeline = build_curation_pipeline(config, executor)
+
+        # Assert -- the pipeline's graph writer carries stamps matching config
+        stamps = pipeline._graph_writer._rebuild_stamps  # type: ignore[attr-defined]
+        assert isinstance(stamps, RebuildStamps)
+        assert stamps.ontology_version == "1.0.0"
+        assert stamps.extraction_version == "factory-test-version"
+        assert stamps.model_hash == "factory-test-model"

@@ -349,3 +349,63 @@ class TestKnowledgeConfigVaultWiring:
         assert config.vault is custom
         assert config.vault.root == "/tmp/custom-vault"
         assert config.vault.enabled is False
+
+
+class TestRebuildDeterminismStamps:
+    """ADR-010 Phase 8 config fields used to stamp DERIVED_FROM->VaultNote edges
+    so vault-rebuild can detect ontology / extraction prompt / model drift.
+    """
+
+    def test_default_extraction_version_matches_adr_010(self):
+        from backend.knowledge.config import (
+            EmbeddingConfig,
+            ExtractionConfig,
+            Neo4jConfig,
+        )
+
+        config = KnowledgeConfig(
+            neo4j=Neo4jConfig(),
+            llm=LLMConfig(),
+            embedding=EmbeddingConfig(),
+            extraction=ExtractionConfig(),
+        )
+
+        # ADR-010 example string -- matches vault writer's _EXTRACTION_VERSION
+        # constant. When extraction prompts or ontology change, bump this.
+        assert config.extraction_version == "2026-04-17-r1"
+
+    def test_default_model_hash_matches_active_llm(self):
+        from backend.knowledge.config import (
+            EmbeddingConfig,
+            ExtractionConfig,
+            Neo4jConfig,
+        )
+
+        config = KnowledgeConfig(
+            neo4j=Neo4jConfig(),
+            llm=LLMConfig(),
+            embedding=EmbeddingConfig(),
+            extraction=ExtractionConfig(),
+        )
+
+        # Default identifies the active Gemma 4 E4B Q5 K M build.
+        assert config.model_hash == "gemma-4-e4b-q5-k-m-carteakey-full-v1"
+
+    def test_from_env_reads_extraction_version_override(self):
+        with _env(EXTRACTION_VERSION="2027-01-01-r3"):
+            config = KnowledgeConfig.from_env()
+
+        assert config.extraction_version == "2027-01-01-r3"
+
+    def test_from_env_reads_model_hash_override(self):
+        with _env(MIST_MODEL_HASH="custom-llama-7b-v2"):
+            config = KnowledgeConfig.from_env()
+
+        assert config.model_hash == "custom-llama-7b-v2"
+
+    def test_from_env_falls_back_to_default_when_unset(self):
+        with _env(EXTRACTION_VERSION=None, MIST_MODEL_HASH=None):
+            config = KnowledgeConfig.from_env()
+
+        assert config.extraction_version == "2026-04-17-r1"
+        assert config.model_hash == "gemma-4-e4b-q5-k-m-carteakey-full-v1"
