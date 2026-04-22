@@ -30,11 +30,24 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Ontology constants (mirror of backend/knowledge/ontologies/v1_0_0.py)
+# Ontology constants (mirror of backend/knowledge/ontologies/v1_0_0.py).
+#
+# RESYNCED 2026-04-22. These frozensets MUST stay aligned with
+# EXTRACTABLE_NODE_TYPES and EXTRACTABLE_RELATIONSHIP_TYPES in
+# backend/knowledge/ontologies/v1_0_0.py. The harness is designed to
+# run standalone without a backend import at module load time, so the
+# mirror is intentional -- but drift here silently mis-scores extraction
+# quality (a type the model correctly produces gets counted as
+# "bad_entity_types" if missing from this list).
+#
+# Drift is caught by tests/unit/test_eval_harness_scorers.py which
+# cross-checks these frozensets against the ontology source of truth
+# every time the unit-test suite runs.
 # ---------------------------------------------------------------------------
 
 EXTRACTABLE_ENTITY_TYPES: frozenset[str] = frozenset(
     {
+        # External domain -- original (12).
         "User",
         "Person",
         "Organization",
@@ -47,11 +60,19 @@ EXTRACTABLE_ENTITY_TYPES: frozenset[str] = frozenset(
         "Goal",
         "Preference",
         "Location",
+        # External domain -- post-MVP additive 2026-04-22 (4).
+        "Date",
+        "Milestone",
+        "Metric",
+        "Document",
+        # MIST-scope identity -- Cluster 1 promoted from INTERNAL-only (1).
+        "MistIdentity",
     }
 )
 
 EXTRACTABLE_RELATIONSHIP_TYPES: frozenset[str] = frozenset(
     {
+        # External user-centric (13).
         "USES",
         "KNOWS",
         "WORKS_ON",
@@ -65,6 +86,7 @@ EXTRACTABLE_RELATIONSHIP_TYPES: frozenset[str] = frozenset(
         "STRUGGLES_WITH",
         "DECIDED",
         "EXPERIENCED",
+        # Structural (8 original).
         "IS_A",
         "PART_OF",
         "RELATED_TO",
@@ -73,6 +95,16 @@ EXTRACTABLE_RELATIONSHIP_TYPES: frozenset[str] = frozenset(
         "WORKS_WITH",
         "KNOWS_PERSON",
         "MEMBER_OF",
+        # Cluster 1 MIST-scope (4).
+        "IMPLEMENTED_WITH",
+        "MIST_HAS_CAPABILITY",
+        "MIST_HAS_TRAIT",
+        "MIST_HAS_PREFERENCE",
+        # Post-MVP additive temporal / quantified / document (4).
+        "OCCURRED_ON",
+        "HAS_METRIC",
+        "REFERENCES_DOCUMENT",
+        "PRECEDED_BY",
     }
 )
 
