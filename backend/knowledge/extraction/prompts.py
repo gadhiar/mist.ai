@@ -12,10 +12,10 @@ You MUST output ONLY valid JSON. No explanations. No markdown code fences. Just 
 ## ONTOLOGY CONSTRAINTS
 
 ### Allowed Entity Types (use EXACTLY these strings):
-User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location, MistIdentity
+User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location, Date, Milestone, Metric, Document, MistIdentity
 
 ### Allowed Relationship Types (use EXACTLY these strings):
-USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF, IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT, MIST_HAS_PREFERENCE
+USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF, IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT, MIST_HAS_PREFERENCE, OCCURRED_ON, HAS_METRIC, REFERENCES_DOCUMENT, PRECEDED_BY
 
 ### Subject Scope (passed in as SUBJECT SCOPE below)
 - `user-scope` utterances: the user is the subject. Use User-centric predicates (USES, LEARNING, WORKS_ON, etc.). source="user".
@@ -95,6 +95,24 @@ Subject scope: user-scope
 Utterance: "Hey, how's it going?"
 Output:
 {{"entities": [], "relationships": []}}
+
+### Example 9: Temporal -- Milestone anchored to a Date via OCCURRED_ON
+Subject scope: user-scope
+Utterance: "We shipped Cluster 8 Phase 6 on 2026-04-22"
+Output:
+{{"entities": [{{"id": "cluster-8-phase-6", "name": "Cluster 8 Phase 6", "type": "Milestone"}}, {{"id": "2026-04-22", "name": "2026-04-22", "type": "Date"}}], "relationships": [{{"source": "cluster-8-phase-6", "target": "2026-04-22", "type": "OCCURRED_ON", "properties": {{"confidence": 0.95, "temporal_status": "past", "start_date": "2026-04-22", "end_date": null, "temporal_expression": "on 2026-04-22", "context": null, "negated": false}}}}]}}
+
+### Example 10: Quantified -- Technology with a numeric Metric via HAS_METRIC
+Subject scope: unknown
+Utterance: "Gemma 4 E4B gets 0.94 tool_selection on the eval harness"
+Output:
+{{"entities": [{{"id": "gemma-4-e4b", "name": "Gemma 4 E4B", "type": "Technology"}}, {{"id": "tool-selection-0-94", "name": "0.94 tool_selection", "type": "Metric"}}], "relationships": [{{"source": "gemma-4-e4b", "target": "tool-selection-0-94", "type": "HAS_METRIC", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "eval harness", "negated": false}}}}]}}
+
+### Example 11: Document reference -- user references an ADR via REFERENCES_DOCUMENT
+Subject scope: user-scope
+Utterance: "I read ADR-010 yesterday and I like the vault-as-canon pattern"
+Output:
+{{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "adr-010", "name": "ADR-010", "type": "Document"}}], "relationships": [{{"source": "user", "target": "adr-010", "type": "REFERENCES_DOCUMENT", "properties": {{"confidence": 0.9, "temporal_status": "past", "start_date": null, "end_date": null, "temporal_expression": "yesterday", "context": null, "negated": false}}}}]}}
 """
 
 EXTRACTION_USER_TEMPLATE = """Context:
