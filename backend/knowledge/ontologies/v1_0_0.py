@@ -420,7 +420,7 @@ MIST_UNCERTAINTY = NodeTypeDefinition(
 )
 
 # ===================================================================
-# EXTERNAL Entity Types (12)
+# EXTERNAL Entity Types (16)
 # ===================================================================
 
 USER = NodeTypeDefinition(
@@ -726,8 +726,118 @@ LOCATION = NodeTypeDefinition(
     ),
 )
 
+# -------------------------------------------------------------------
+# Temporal / Quantified / Document (post-MVP additive, 2026-04-22)
+# Extends the ontology with entity types that appeared repeatedly in
+# conversation but had no structured representation: a specific calendar
+# Date, a named Milestone, a numeric Metric, and a referenced Document.
+# Additive to v1.0.0 (no version bump).
+# -------------------------------------------------------------------
+
+DATE = NodeTypeDefinition(
+    type_name="Date",
+    description="A specific calendar date referenced in conversation.",
+    knowledge_domain=KnowledgeDomain.EXTERNAL,
+    required_properties=(
+        PropertyDefinition(
+            name="iso_date",
+            type="string",
+            required=True,
+            description="ISO 8601 date in YYYY-MM-DD format.",
+        ),
+    ),
+)
+
+MILESTONE = NodeTypeDefinition(
+    type_name="Milestone",
+    description=(
+        "A discrete significant event in a user or project timeline. "
+        "Distinct from Event: a Milestone carries explicit user-assigned "
+        "importance and typically anchors to a Date."
+    ),
+    knowledge_domain=KnowledgeDomain.EXTERNAL,
+    optional_properties=(
+        PropertyDefinition(
+            name="significance",
+            type="string",
+            required=False,
+            description="User-assigned importance level.",
+            allowed_values=("high", "medium", "low"),
+        ),
+    ),
+)
+
+METRIC = NodeTypeDefinition(
+    type_name="Metric",
+    description=(
+        "A numeric measurement or quantified property. Attached to other "
+        "entities via HAS_METRIC to record benchmark scores, counts, "
+        "durations, or other scalar facts."
+    ),
+    knowledge_domain=KnowledgeDomain.EXTERNAL,
+    required_properties=(
+        PropertyDefinition(
+            name="value",
+            type="float",
+            required=True,
+            description="Numeric value of the measurement.",
+        ),
+        PropertyDefinition(
+            name="unit",
+            type="string",
+            required=True,
+            description=(
+                "Unit of measurement (e.g. 'seconds', 'tokens/sec', "
+                "'tool_selection', 'percent', 'count')."
+            ),
+        ),
+    ),
+    optional_properties=(
+        PropertyDefinition(
+            name="as_of_date",
+            type="string",
+            required=False,
+            description="ISO 8601 date the measurement was taken.",
+        ),
+    ),
+)
+
+DOCUMENT = NodeTypeDefinition(
+    type_name="Document",
+    description=(
+        "An extractable reference to an artifact (paper, book, ADR, spec, "
+        "article). Distinct from ExternalSource: Document is a content "
+        "entity the user or MIST discusses; ExternalSource is a provenance "
+        "record of how data entered the graph."
+    ),
+    knowledge_domain=KnowledgeDomain.EXTERNAL,
+    required_properties=(
+        PropertyDefinition(
+            name="title",
+            type="string",
+            required=True,
+            description="Human-readable title of the document.",
+        ),
+    ),
+    optional_properties=(
+        PropertyDefinition(
+            name="doc_type",
+            type="string",
+            required=False,
+            description="Category of document.",
+            allowed_values=("adr", "spec", "paper", "book", "article", "other"),
+        ),
+        PropertyDefinition(
+            name="identifier",
+            type="string",
+            required=False,
+            description=("Stable identifier: ADR-XXX, DOI, ISBN, URL, or similar."),
+        ),
+    ),
+)
+
 # ===================================================================
-# BRIDGING Entity Types (4)
+# BRIDGING Entity Types (5)
 # ===================================================================
 
 LEARNING_EVENT = NodeTypeDefinition(
@@ -942,6 +1052,11 @@ _EXTERNAL_NODE_TYPES: tuple[NodeTypeDefinition, ...] = (
     GOAL,
     PREFERENCE,
     LOCATION,
+    # Post-MVP additive expansion 2026-04-22: temporal + quantified + document.
+    DATE,
+    MILESTONE,
+    METRIC,
+    DOCUMENT,
 )
 
 _BRIDGING_NODE_TYPES: tuple[NodeTypeDefinition, ...] = (
@@ -1223,6 +1338,70 @@ DERIVED_FROM = EdgeTypeDefinition(
     allowed_target_types=("VectorChunk", "ExternalSource", "VaultNote"),
 )
 
+# -------------------------------------------------------------------
+# Temporal / Quantified / Document relationships (post-MVP additive, 2026-04-22)
+# Paired with the DATE / MILESTONE / METRIC / DOCUMENT node additions.
+# -------------------------------------------------------------------
+
+OCCURRED_ON = EdgeTypeDefinition(
+    type_name="OCCURRED_ON",
+    description=(
+        "Anchors an Event or Milestone to a specific Date. Use when an "
+        "event or milestone has a known calendar date."
+    ),
+    allowed_source_types=("Event", "Milestone"),
+    allowed_target_types=("Date",),
+)
+
+HAS_METRIC = EdgeTypeDefinition(
+    type_name="HAS_METRIC",
+    description=(
+        "Attaches a numeric measurement (Metric) to the entity it describes. "
+        "Use for benchmark scores, durations, counts, or other quantified "
+        "properties of a user, project, technology, skill, concept, or goal."
+    ),
+    allowed_source_types=(
+        "User",
+        "Project",
+        "Technology",
+        "Skill",
+        "Concept",
+        "Goal",
+    ),
+    allowed_target_types=("Metric",),
+)
+
+REFERENCES_DOCUMENT = EdgeTypeDefinition(
+    type_name="REFERENCES_DOCUMENT",
+    description=(
+        "Links an entity to a Document it references or discusses. Distinct "
+        "from provenance edges (SOURCED_FROM, DERIVED_FROM): REFERENCES_DOCUMENT "
+        "records that the subject mentioned or discussed the artifact, not "
+        "that the artifact was the provenance source for a fact."
+    ),
+    allowed_source_types=(
+        "User",
+        "MistIdentity",
+        "Project",
+        "Concept",
+        "Topic",
+        "Goal",
+        "Event",
+    ),
+    allowed_target_types=("Document",),
+)
+
+PRECEDED_BY = EdgeTypeDefinition(
+    type_name="PRECEDED_BY",
+    description=(
+        "Temporal ordering edge: the source Event or Milestone happened "
+        "after the target Event, Milestone, or Date. Use for explicit "
+        "timeline relationships between events."
+    ),
+    allowed_source_types=("Event", "Milestone"),
+    allowed_target_types=("Event", "Milestone", "Date"),
+)
+
 # ===================================================================
 # MIST-Scope Relationships (4)
 # ===================================================================
@@ -1314,6 +1493,11 @@ _STRUCTURAL_EDGE_TYPES: tuple[EdgeTypeDefinition, ...] = (
     SOURCED_FROM,
     REFERENCES,
     DERIVED_FROM,
+    # Post-MVP additive (2026-04-22): temporal + quantified + document edges.
+    OCCURRED_ON,
+    HAS_METRIC,
+    REFERENCES_DOCUMENT,
+    PRECEDED_BY,
 )
 
 _MIST_SCOPE_EDGE_TYPES: tuple[EdgeTypeDefinition, ...] = (
@@ -1336,16 +1520,20 @@ ALL_EDGE_TYPE_NAMES: list[str] = [et.type_name for et in ALL_EDGE_TYPES]
 # Extractable subsets (what the LLM extractor may produce)
 # ===================================================================
 
-# All 12 external node types plus MistIdentity are extractable (13 total).
+# All 16 external node types plus MistIdentity are extractable (17 total).
 # MistIdentity is also defined as an INTERNAL singleton node, but is promoted
 # to extractable so that MIST-scope facts (e.g. "MIST uses LanceDB") can be
 # attributed at extraction time.
+# Post-MVP additive (2026-04-22): Date, Milestone, Metric, Document joined the
+# EXTERNAL set.
 EXTRACTABLE_NODE_TYPES: list[str] = [nt.type_name for nt in _EXTERNAL_NODE_TYPES] + [
     MIST_IDENTITY.type_name,
 ]
 
-# 13 user-centric + 8 structural (excluding provenance: LEARNED_FROM, ABOUT, SUPERSEDES)
-# + 4 MIST-scope.
+# 13 user-centric + 8 original structural + 4 post-MVP structural
+# (OCCURRED_ON, HAS_METRIC, REFERENCES_DOCUMENT, PRECEDED_BY) + 4 MIST-scope.
+# Excludes provenance (LEARNED_FROM, ABOUT, SUPERSEDES, SOURCED_FROM, REFERENCES,
+# DERIVED_FROM) and internal (HAS_TRAIT etc.) edges.
 _EXTRACTABLE_STRUCTURAL_EDGE_TYPES: tuple[EdgeTypeDefinition, ...] = (
     IS_A,
     PART_OF,
@@ -1359,6 +1547,11 @@ _EXTRACTABLE_STRUCTURAL_EDGE_TYPES: tuple[EdgeTypeDefinition, ...] = (
     MIST_HAS_CAPABILITY,
     MIST_HAS_TRAIT,
     MIST_HAS_PREFERENCE,
+    # Post-MVP additive (2026-04-22): temporal + quantified + document edges.
+    OCCURRED_ON,
+    HAS_METRIC,
+    REFERENCES_DOCUMENT,
+    PRECEDED_BY,
 )
 
 EXTRACTABLE_RELATIONSHIP_TYPES: list[str] = [
@@ -1375,15 +1568,18 @@ You are a knowledge-graph extraction engine for the MIST.AI cognitive assistant.
 Your job is to read a user utterance and produce structured entities and
 relationships that should be stored in MIST's persistent knowledge graph.
 
-ENTITY TYPES YOU MAY PRODUCE (13):
+ENTITY TYPES YOU MAY PRODUCE (17):
   User, Person, Organization, Technology, Skill, Project, Concept, Topic,
-  Event, Goal, Preference, Location, MistIdentity
+  Event, Goal, Preference, Location, Date, Milestone, Metric, Document,
+  MistIdentity
 
-RELATIONSHIP TYPES YOU MAY PRODUCE (25):
+RELATIONSHIP TYPES YOU MAY PRODUCE (29):
   User-centric: USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL,
     PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED
   Structural: IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH,
     KNOWS_PERSON, MEMBER_OF
+  Temporal / quantified / document: OCCURRED_ON, HAS_METRIC,
+    REFERENCES_DOCUMENT, PRECEDED_BY
   MIST-scope: IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT,
     MIST_HAS_PREFERENCE
 

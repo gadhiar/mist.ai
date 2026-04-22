@@ -29,9 +29,11 @@ from backend.knowledge.ontologies.v1_0_0 import (
 class TestEntityTypes:
     """Verify the complete set of entity types in the ontology."""
 
-    def test_has_22_entity_types(self):
+    def test_has_26_entity_types(self):
         # Cluster 8 Phase 6 (ADR-010) added VaultNote as a bridging/provenance type.
-        assert len(ALL_NODE_TYPES) == 22
+        # Post-MVP additive (2026-04-22) added Date, Milestone, Metric, Document
+        # as EXTERNAL extractable types.
+        assert len(ALL_NODE_TYPES) == 26
 
     @pytest.mark.parametrize(
         "type_name",
@@ -68,16 +70,21 @@ class TestEntityTypes:
             pytest.param("Goal", id="Goal"),
             pytest.param("Preference", id="Preference"),
             pytest.param("Location", id="Location"),
+            # Post-MVP additive (2026-04-22):
+            pytest.param("Date", id="Date"),
+            pytest.param("Milestone", id="Milestone"),
+            pytest.param("Metric", id="Metric"),
+            pytest.param("Document", id="Document"),
         ],
     )
-    def test_external_domain_has_12_types(self, type_name: str):
+    def test_external_domain_has_16_types(self, type_name: str):
         external_types = [
             nt for nt in ALL_NODE_TYPES if nt.knowledge_domain == KnowledgeDomain.EXTERNAL
         ]
 
         external_names = [nt.type_name for nt in external_types]
 
-        assert len(external_types) == 12
+        assert len(external_types) == 16
         assert type_name in external_names
 
     @pytest.mark.parametrize(
@@ -125,8 +132,9 @@ class TestEntityTypes:
     def test_extractable_types_are_external_plus_mist_identity(self):
         # Cluster 1 (Bug J): MistIdentity is promoted from INTERNAL-only to
         # also extractable so that MIST-scope facts ("MIST uses LanceDB")
-        # survive extraction. The extractable set is the full 12 external
+        # survive extraction. The extractable set is the full external
         # types plus MistIdentity.
+        # Post-MVP additive (2026-04-22): 12 -> 16 external, 13 -> 17 extractable.
         external_names = {
             nt.type_name for nt in ALL_NODE_TYPES if nt.knowledge_domain == KnowledgeDomain.EXTERNAL
         }
@@ -134,7 +142,7 @@ class TestEntityTypes:
 
         extractable_set = set(EXTRACTABLE_NODE_TYPES)
 
-        assert len(EXTRACTABLE_NODE_TYPES) == 13
+        assert len(EXTRACTABLE_NODE_TYPES) == 17
         assert extractable_set == expected
 
 
@@ -146,16 +154,20 @@ class TestEntityTypes:
 class TestRelationshipTypes:
     """Verify the complete set of relationship types in the ontology."""
 
-    def test_has_37_relationship_types(self):
+    def test_has_41_relationship_types(self):
         # Cluster 1 added 4 MIST-scope edges: IMPLEMENTED_WITH,
         # MIST_HAS_CAPABILITY, MIST_HAS_TRAIT, MIST_HAS_PREFERENCE.
-        assert len(ALL_EDGE_TYPES) == 37
+        # Post-MVP additive (2026-04-22) added 4 temporal / quantified / document
+        # edges: OCCURRED_ON, HAS_METRIC, REFERENCES_DOCUMENT, PRECEDED_BY.
+        assert len(ALL_EDGE_TYPES) == 41
 
     def test_extractable_relationships_count(self):
-        # 13 user-centric + 8 structural (excludes LEARNED_FROM, ABOUT, SUPERSEDES)
-        # + 4 MIST-scope (IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT,
-        # MIST_HAS_PREFERENCE).
-        assert len(EXTRACTABLE_RELATIONSHIP_TYPES) == 25
+        # 13 user-centric + 8 original structural (excludes LEARNED_FROM, ABOUT,
+        # SUPERSEDES + provenance SOURCED_FROM/REFERENCES/DERIVED_FROM) + 4
+        # MIST-scope (IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT,
+        # MIST_HAS_PREFERENCE) + 4 post-MVP additive structural (OCCURRED_ON,
+        # HAS_METRIC, REFERENCES_DOCUMENT, PRECEDED_BY).
+        assert len(EXTRACTABLE_RELATIONSHIP_TYPES) == 29
 
     @pytest.mark.parametrize(
         "type_name",
@@ -169,6 +181,150 @@ class TestRelationshipTypes:
     def test_mist_scope_edges_are_extractable(self, type_name: str):
         assert type_name in EXTRACTABLE_RELATIONSHIP_TYPES
         assert type_name in {et.type_name for et in ALL_EDGE_TYPES}
+
+
+# -------------------------------------------------------------------
+# Post-MVP additive: temporal / quantified / document invariants (2026-04-22)
+# -------------------------------------------------------------------
+
+
+class TestNewNodeTypeInvariants:
+    """Each post-MVP additive node type must be EXTERNAL-domain, have the
+    promised required-property contract, and be present in the extractable
+    set so the LLM extractor sees it as a valid target.
+
+    `expected_allowed_values` pins the enum vocabulary for properties that
+    restrict inputs (Milestone.significance, Document.doc_type). Silent
+    widening of these enums would break downstream normalization and
+    retrieval filters, so this test catches it.
+    """
+
+    @pytest.mark.parametrize(
+        "type_const_name, expected_required, expected_optional, expected_allowed_values",
+        [
+            pytest.param(
+                "DATE",
+                ["iso_date"],
+                [],
+                {},
+                id="Date",
+            ),
+            pytest.param(
+                "MILESTONE",
+                [],
+                ["significance"],
+                {"significance": ("high", "medium", "low")},
+                id="Milestone",
+            ),
+            pytest.param(
+                "METRIC",
+                ["value", "unit"],
+                ["as_of_date"],
+                {},
+                id="Metric",
+            ),
+            pytest.param(
+                "DOCUMENT",
+                ["title"],
+                ["doc_type", "identifier"],
+                {
+                    "doc_type": (
+                        "adr",
+                        "spec",
+                        "paper",
+                        "book",
+                        "article",
+                        "other",
+                    ),
+                },
+                id="Document",
+            ),
+        ],
+    )
+    def test_new_node_type_contract(
+        self,
+        type_const_name: str,
+        expected_required: list[str],
+        expected_optional: list[str],
+        expected_allowed_values: dict[str, tuple[str, ...]],
+    ):
+        import backend.knowledge.ontologies.v1_0_0 as onto
+
+        node = getattr(onto, type_const_name)
+        assert node.knowledge_domain == KnowledgeDomain.EXTERNAL
+        required_names = [p.name for p in node.required_properties]
+        optional_names = [p.name for p in node.optional_properties]
+        assert required_names == expected_required
+        assert optional_names == expected_optional
+        assert node.type_name in EXTRACTABLE_NODE_TYPES
+
+        # Pin enum vocabularies for properties that use allowed_values.
+        all_props = list(node.required_properties) + list(node.optional_properties)
+        by_name = {p.name: p for p in all_props}
+        for prop_name, expected_values in expected_allowed_values.items():
+            actual = by_name[prop_name].allowed_values
+            assert actual == expected_values, (
+                f"{type_const_name}.{prop_name} allowed_values drifted: "
+                f"expected {expected_values!r}, got {actual!r}"
+            )
+
+
+class TestNewEdgeTypeInvariants:
+    """Each post-MVP additive edge must have the exact allowed source/target
+    sets from the plan and be present in the extractable relationship set.
+    """
+
+    @pytest.mark.parametrize(
+        "edge_const_name, expected_sources, expected_targets",
+        [
+            pytest.param(
+                "OCCURRED_ON",
+                ("Event", "Milestone"),
+                ("Date",),
+                id="OCCURRED_ON",
+            ),
+            pytest.param(
+                "HAS_METRIC",
+                ("User", "Project", "Technology", "Skill", "Concept", "Goal"),
+                ("Metric",),
+                id="HAS_METRIC",
+            ),
+            pytest.param(
+                "REFERENCES_DOCUMENT",
+                (
+                    "User",
+                    "MistIdentity",
+                    "Project",
+                    "Concept",
+                    "Topic",
+                    "Goal",
+                    "Event",
+                ),
+                ("Document",),
+                id="REFERENCES_DOCUMENT",
+            ),
+            pytest.param(
+                "PRECEDED_BY",
+                ("Event", "Milestone"),
+                ("Event", "Milestone", "Date"),
+                id="PRECEDED_BY",
+            ),
+        ],
+    )
+    def test_new_edge_type_contract(
+        self,
+        edge_const_name: str,
+        expected_sources: tuple[str, ...],
+        expected_targets: tuple[str, ...],
+    ):
+        import backend.knowledge.ontologies.v1_0_0 as onto
+
+        edge = getattr(onto, edge_const_name)
+        # Tuple equality (not set): catches accidental duplicates + ordering
+        # drift. The constants are tuple-typed, so this is the precise check.
+        assert edge.allowed_source_types == expected_sources
+        assert edge.allowed_target_types == expected_targets
+        assert edge.type_name in EXTRACTABLE_RELATIONSHIP_TYPES
 
 
 # -------------------------------------------------------------------
