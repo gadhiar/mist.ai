@@ -98,3 +98,25 @@ class VectorStoreError(MistError):
 
 class IngestionError(MistError):
     """Document ingestion pipeline failure."""
+
+
+# -- Vault (ADR-010, Cluster 8) -----------------------------------------------
+
+
+class VaultWriteError(MistError):
+    """Raised when a vault write operation fails irrecoverably.
+
+    Wraps the underlying cause (OSError, ValidationError, yaml.YAMLError).
+    Caught at VaultWriter boundary; never propagates into the chat path
+    per ADR-010 Invariant 6 (graph rebuildable from event store on
+    vault write failure).
+    """
+
+
+class SidecarIndexError(MistError):
+    """Raised when a vault sidecar index operation fails irrecoverably.
+
+    Wraps the underlying cause (sqlite3.OperationalError,
+    sqlite3.IntegrityError, struct.error). Caught at builder boundary
+    or upstream retrieval router; never propagates into chat path.
+    """
