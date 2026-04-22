@@ -29,6 +29,7 @@ from backend.llm.models import ToolCall as LLMToolCall
 
 if TYPE_CHECKING:
     from backend.debug_jsonl_logger import DebugJSONLLogger, TurnRecord
+    from backend.interfaces import VaultWriterProtocol
     from backend.knowledge.extraction.pipeline import ExtractionPipeline
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
 
@@ -150,6 +151,7 @@ class ConversationHandler:
         tool_usage_tracker: ToolUsageTracker | None = None,
         debug_logger: DebugJSONLLogger | None = None,
         budget_planner: ContextBudgetPlanner | None = None,
+        vault_writer: VaultWriterProtocol | None = None,
     ) -> None:
         """Initialize conversation handler.
 
@@ -168,6 +170,9 @@ class ConversationHandler:
                 None and `config.context_budget.enabled` is True, one is
                 constructed from `config.context_budget`. When disabled, the
                 handler falls back to legacy pre-Cluster-6 message assembly.
+            vault_writer: Optional VaultWriterProtocol (Cluster 8 Phase 5).
+                When set, every successful turn appends to the vault session
+                note. None preserves legacy pre-Cluster-8 behavior.
         """
         self.config = config
         self.graph_store = graph_store
@@ -175,6 +180,21 @@ class ConversationHandler:
         self.retriever = retriever
         self._tool_usage_tracker = tool_usage_tracker
         self._debug_logger = debug_logger
+
+        # Cluster 8 Phase 5: optional vault layer write integration. When set,
+        # every successful turn appends to the vault session note via
+        # VaultWriter.append_turn_to_session. None means vault layer disabled
+        # (legacy pre-Cluster-8 behavior preserved).
+        self._vault_writer = vault_writer
+
+        # Maps external session_id -> pre-allocated vault note path. Filled
+        # lazily on first turn via vault_writer.session_path(...). Stable
+        # for the session lifetime.
+        self._vault_paths: dict[str, str] = {}
+
+        # Tracks turn count per session for vault writes (independent of
+        # event_store turn numbering -- vault numbering starts at 1 per session).
+        self._vault_turn_counts: dict[str, int] = {}
 
         # Cluster 6: budget-aware context assembly. Planner constructed from
         # config when not injected; legacy behavior preserved when disabled.
@@ -607,6 +627,17 @@ class ConversationHandler:
                 tool_calls=tool_calls if tool_calls else None,
             )
 
+            # --- Vault Write (Layer 2, ADR-010 Cluster 8 Phase 5) ---
+            # Append turn to vault session note. Failure-isolated; logs and
+            # continues. Pre-extraction so the file mtime change reaches the
+            # filewatcher and triggers sidecar reindex without blocking the
+            # user response.
+            await self._write_to_vault(
+                session_id=session_id,
+                user_message=user_message,
+                assistant_message=assistant_message,
+            )
+
             # Debug JSONL: record this turn and attach the TurnRecord to the
             # background extraction task so the extraction phase flushes a
             # second JSONL line keyed by event_id.
@@ -796,6 +827,77 @@ class ConversationHandler:
                 exc_info=True,
             )
             return None
+
+    async def _write_to_vault(
+        self,
+        session_id: str,
+        user_message: str,
+        assistant_message: str,
+    ) -> str | None:
+        """Append the current turn to the vault session note.
+
+        Failure-isolated per ADR-010 Invariant 6: vault write errors are
+        logged but never propagate. Returns the vault note path on success,
+        None on failure or when vault layer is disabled.
+
+        Args:
+            session_id: External session identifier.
+            user_message: Raw user utterance.
+            assistant_message: Final assistant response.
+
+        Returns:
+            Absolute vault note path on success, None on failure / disabled.
+        """
+        if self._vault_writer is None:
+            return None
+
+        try:
+            # Pre-allocate path on first turn (Step 0 from ADR-010 Write Path).
+            if session_id not in self._vault_paths:
+                from datetime import UTC, datetime
+
+                today = datetime.now(UTC).date().isoformat()
+                # Slug: session_id sanitized to kebab-case, with fallback.
+                slug = self._derive_session_slug(session_id)
+                self._vault_paths[session_id] = self._vault_writer.session_path(today, slug)
+                self._vault_turn_counts[session_id] = 0
+
+            vault_path = self._vault_paths[session_id]
+            self._vault_turn_counts[session_id] += 1
+            turn_index = self._vault_turn_counts[session_id]
+
+            return await self._vault_writer.append_turn_to_session(
+                session_id=session_id,
+                turn_index=turn_index,
+                user_text=user_message,
+                mist_text=assistant_message,
+                vault_note_path=vault_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # ADR-010 Invariant 6: vault write failure is recoverable from
+            # event store. Log and continue.
+            logger.warning(
+                "Vault write failed for session %s (turn write swallowed per Invariant 6): %s",
+                session_id,
+                exc,
+            )
+            return None
+
+    def _derive_session_slug(self, session_id: str) -> str:
+        """Sanitize a session_id into a vault-compatible kebab-case slug.
+
+        Phase 5 uses a simple lower+alnum+hyphen normalization. Phase 9
+        will replace this with the entity-extracted topic slug from
+        ADR-010 "Session Slug Generation" once the extraction pipeline
+        feeds back into vault path allocation.
+        """
+        import re
+
+        slug = re.sub(r"[^a-z0-9-]+", "-", session_id.lower()).strip("-")
+        if not slug:
+            slug = "session"
+        # Truncate to a reasonable length
+        return slug[:50]
 
     def _format_document_context(self, doc_results: list[dict[str, Any]]) -> str:
         """Format document search results for injection into context.

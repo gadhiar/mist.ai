@@ -44,6 +44,7 @@ class ModelManager:
         config,
         event_loop=None,
         llm_provider: StreamingLLMProvider | None = None,
+        vault_writer=None,
     ):
         """Initialize model manager.
 
@@ -51,9 +52,13 @@ class ModelManager:
             config: VoiceConfig object
             event_loop: Optional event loop for async operations
             llm_provider: Optional LLM provider for inference calls
+            vault_writer: Optional pre-started VaultWriter (Cluster 8 Phase 5).
+                Passed through to KnowledgeIntegration so the voice-path
+                ConversationHandler shares the server-owned writer.
         """
         self.config = config
         self._llm_provider = llm_provider
+        self._vault_writer = vault_writer
         self.stt = None
         self.tts = None
         self.llm_model = config.llm_model
@@ -66,7 +71,9 @@ class ModelManager:
                 knowledge_config = _KnowledgeConfig.from_env()
                 if knowledge_config.enable_knowledge_integration:
                     self.knowledge = KnowledgeIntegration(
-                        config=knowledge_config, llm_provider=llm_provider
+                        config=knowledge_config,
+                        llm_provider=llm_provider,
+                        vault_writer=vault_writer,
                     )
                     if self.knowledge.is_enabled():
                         self.knowledge.set_voice_profile(config.voice_profile)

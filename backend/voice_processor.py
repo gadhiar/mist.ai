@@ -47,15 +47,21 @@ def log_timestamp(msg: str):
 class VoiceProcessor:
     """Handles voice conversation processing."""
 
-    def __init__(self, config, message_queue):
+    def __init__(self, config, message_queue, vault_writer=None):
         """Initialize voice processor.
 
         Args:
             config: VoiceConfig object
             message_queue: asyncio.Queue for sending messages to clients
+            vault_writer: Optional pre-started VaultWriter (Cluster 8 Phase 5).
+                Threaded through ModelManager -> KnowledgeIntegration ->
+                ConversationHandler so the vault layer shares a single
+                writer across the voice path. Server lifespan owns the
+                lifecycle.
         """
         self.config = config
         self.message_queue = message_queue
+        self._vault_writer = vault_writer
         self.models = None  # Will be initialized in initialize()
 
         # State
@@ -94,7 +100,10 @@ class VoiceProcessor:
 
         # Initialize model manager with event loop
         self.models = ModelManager(
-            self.config, event_loop=self.loop, llm_provider=self._llm_provider
+            self.config,
+            event_loop=self.loop,
+            llm_provider=self._llm_provider,
+            vault_writer=self._vault_writer,
         )
 
         # Load models in thread pool to not block event loop

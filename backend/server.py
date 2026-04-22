@@ -32,7 +32,12 @@ sys.path.insert(0, str(project_root / "backend"))
 # Import config BEFORE voice_processor to avoid CSM config conflict
 from config import DEFAULT_CONFIG  # isort:skip
 from voice_processor import VoiceProcessor  # isort:skip
-from factories import build_curation_scheduler  # isort:skip
+from factories import (  # isort:skip
+    build_curation_scheduler,
+    build_filewatcher,
+    build_sidecar_index,
+    build_vault_writer,
+)
 from knowledge.config import KnowledgeConfig  # isort:skip
 from log_handler import WebSocketLogHandler  # isort:skip
 
@@ -58,6 +63,11 @@ voice_processor: VoiceProcessor | None = None
 curation_scheduler = None
 log_handler: WebSocketLogHandler | None = None
 config = DEFAULT_CONFIG
+
+# Cluster 8 Phase 5: vault layer subsystems (initialized in lifespan)
+vault_writer = None
+vault_sidecar = None
+vault_filewatcher = None
 
 
 async def broadcast_messages():
@@ -87,28 +97,66 @@ async def broadcast_messages():
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
     global voice_processor, curation_scheduler, log_handler
+    global vault_writer, vault_sidecar, vault_filewatcher
 
     # Startup
     logger.info("=" * 60)
     logger.info("STARTING MIST.AI VOICE SERVER")
     logger.info("=" * 60)
 
-    # Initialize voice processor
-    voice_processor = VoiceProcessor(config, message_queue)
+    # Acquire event loop early -- needed by both filewatcher.start and VAD.
+    loop = asyncio.get_running_loop()
+
+    # Single config load shared between vault and curation subsystems.
+    knowledge_config = KnowledgeConfig.from_env()
+
+    # Cluster 8 Phase 5: vault layer subsystems are built FIRST so the
+    # single server-owned VaultWriter can be plumbed into VoiceProcessor
+    # -> ModelManager -> KnowledgeIntegration -> ConversationHandler. Each
+    # subsystem is optional via config and degrades cleanly when disabled.
+    vault_writer = None
+    vault_sidecar = None
+    vault_filewatcher = None
+
+    try:
+        vault_writer = build_vault_writer(knowledge_config)
+        if vault_writer is not None:
+            await vault_writer.start()
+            logger.info("Vault writer started at %s", knowledge_config.vault.root)
+
+        vault_sidecar = build_sidecar_index(knowledge_config)
+        if vault_sidecar is not None:
+            logger.info(
+                "Vault sidecar index initialized at %s",
+                knowledge_config.sidecar_index.db_path,
+            )
+
+        vault_filewatcher = build_filewatcher(knowledge_config, vault_sidecar)
+        if vault_filewatcher is not None:
+            vault_filewatcher.start(loop)
+            logger.info(
+                "Vault filewatcher started (observer=%s, debounce=%dms)",
+                knowledge_config.filewatcher.observer_type,
+                knowledge_config.filewatcher.debounce_ms,
+            )
+    except Exception as e:
+        logger.warning("Vault layer initialization failed (continuing without vault): %s", e)
+
+    # Initialize voice processor with the server-owned vault_writer so that
+    # the voice-path ConversationHandler shares a single started writer.
+    voice_processor = VoiceProcessor(config, message_queue, vault_writer=vault_writer)
     await voice_processor.initialize()
 
     # Start message broadcaster
     broadcaster_task = asyncio.create_task(broadcast_messages())
 
     # Attach WebSocket log handler to root logger
-    loop = asyncio.get_running_loop()
     log_handler = WebSocketLogHandler(event_loop=loop, message_queue=message_queue)
     logging.getLogger().addHandler(log_handler)
     logger.info("WebSocket log handler attached")
 
     # Start curation scheduler for periodic graph maintenance
     try:
-        knowledge_config = KnowledgeConfig.from_env()
         curation_scheduler = build_curation_scheduler(knowledge_config)
         await curation_scheduler.start()
         logger.info("Curation scheduler started")
@@ -125,6 +173,24 @@ async def lifespan(app: FastAPI):
     logger.info("Server shutting down...")
     if curation_scheduler is not None:
         await curation_scheduler.stop()
+
+    # Cluster 8 Phase 5: vault layer shutdown
+    if vault_filewatcher is not None:
+        try:
+            vault_filewatcher.stop()
+        except Exception as e:
+            logger.warning("Vault filewatcher stop error: %s", e)
+    if vault_writer is not None:
+        try:
+            await vault_writer.stop()
+        except Exception as e:
+            logger.warning("Vault writer stop error: %s", e)
+    if vault_sidecar is not None:
+        try:
+            vault_sidecar.close()
+        except Exception as e:
+            logger.warning("Vault sidecar close error: %s", e)
+
     logging.getLogger().removeHandler(log_handler)
     broadcaster_task.cancel()
     if voice_processor and voice_processor.models:

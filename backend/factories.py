@@ -12,8 +12,13 @@ For tests, bypass factories and pass fakes directly to constructors.
 """
 
 import logging
+from typing import TYPE_CHECKING
 
 from backend.interfaces import EmbeddingProvider, EventStoreProvider, GraphConnection
+
+if TYPE_CHECKING:
+    from backend.vault import VaultFilewatcher, VaultWriter
+    from backend.vault.sidecar_index import VaultSidecarIndex
 from backend.knowledge.config import KnowledgeConfig
 from backend.knowledge.curation.confidence import ConfidenceManager
 from backend.knowledge.curation.conflict_resolver import ConflictResolver
@@ -195,6 +200,7 @@ def build_extraction_pipeline(
 def build_conversation_handler(
     config: KnowledgeConfig,
     llm_provider: StreamingLLMProvider | None = None,
+    vault_writer: "VaultWriter | None" = None,
 ):
     """Create a fully wired ConversationHandler.
 
@@ -210,6 +216,18 @@ def build_conversation_handler(
       the KnowledgeRetriever.
     - `MIST_DEBUG_LLM_REQUESTS=1` activates pre-validation LLMRequest dumps in
       the ConversationHandler.
+
+    Cluster 8 Phase 5 (vault layer):
+    - When `vault_writer` is None, attempts to build one from `config.vault`.
+      Returns None when `config.vault.enabled` is False.
+    - Lifecycle: caller (server lifespan or test) owns start/stop.
+
+    Args:
+        config: Knowledge subsystem configuration.
+        llm_provider: Optional pre-built LLM provider.
+        vault_writer: Optional pre-built VaultWriter. When None, one is
+            constructed from config. Pass an explicit None-equivalent by
+            disabling config.vault.enabled.
     """
     from backend.chat.conversation_handler import ConversationHandler
     from backend.debug_jsonl_logger import DebugJSONLLogger
@@ -255,6 +273,11 @@ def build_conversation_handler(
 
     tracker = ToolUsageTracker(config.skill_derivation)
 
+    # Cluster 8 Phase 5: vault_writer is caller-provided (or None). Auto-build
+    # removed to avoid two writers racing on the same vault root -- the
+    # server lifespan owns the single VaultWriter and plumbs it through
+    # VoiceProcessor -> ModelManager -> KnowledgeIntegration -> here. Unit
+    # tests that want wiring coverage pass an explicit writer or None.
     return ConversationHandler(
         config=config,
         graph_store=gs,
@@ -263,6 +286,7 @@ def build_conversation_handler(
         llm_provider=provider,
         tool_usage_tracker=tracker,
         debug_logger=debug_logger,
+        vault_writer=vault_writer,
     )
 
 
@@ -443,3 +467,89 @@ def build_ingestion_pipeline(
         config=config.ingestion,
         graph_store=graph_store,
     )
+
+
+def build_vault_writer(config: KnowledgeConfig) -> "VaultWriter | None":
+    """Create a VaultWriter from config.vault.
+
+    Returns None when config.vault.enabled is False -- the caller (typically
+    build_conversation_handler) treats None as "no vault layer" and skips
+    write calls. Does NOT call .start() -- the lifecycle owner (server
+    lifespan or test) is responsible for start/stop.
+
+    Args:
+        config: Knowledge subsystem configuration.
+
+    Returns:
+        Unstarted VaultWriter, or None if vault is disabled.
+    """
+    if not config.vault.enabled:
+        logger.info("Vault layer disabled (config.vault.enabled=False); skipping VaultWriter")
+        return None
+    from backend.vault import VaultWriter
+
+    return VaultWriter(config.vault)
+
+
+def build_sidecar_index(
+    config: KnowledgeConfig,
+    embedding_provider: EmbeddingProvider | None = None,
+) -> "VaultSidecarIndex | None":
+    """Create and initialize a VaultSidecarIndex.
+
+    Returns None when config.sidecar_index.enabled is False. Calls .initialize()
+    before returning so the SQLite schema is in place. The caller is
+    responsible for calling .close() at shutdown.
+
+    Args:
+        config: Knowledge subsystem configuration.
+        embedding_provider: Optional embedding provider. When None, builds
+            EmbeddingGenerator from config.embedding.model_name.
+
+    Returns:
+        Initialized VaultSidecarIndex, or None if disabled.
+    """
+    if not config.sidecar_index.enabled:
+        logger.info("Sidecar index disabled; skipping VaultSidecarIndex")
+        return None
+    from backend.vault.sidecar_index import VaultSidecarIndex
+
+    embeddings = embedding_provider or EmbeddingGenerator(config.embedding.model_name)
+    index = VaultSidecarIndex(config.sidecar_index, embeddings)
+    index.initialize()
+    return index
+
+
+def build_filewatcher(
+    config: KnowledgeConfig,
+    sidecar_index: "VaultSidecarIndex | None" = None,
+) -> "VaultFilewatcher | None":
+    """Create a VaultFilewatcher.
+
+    Returns None when config.filewatcher.enabled is False, when config.vault
+    is disabled (no vault to watch), or when sidecar_index is None (nothing
+    to reindex into). The lifecycle owner (server lifespan) is responsible
+    for calling .start(loop) and .stop().
+
+    Args:
+        config: Knowledge subsystem configuration.
+        sidecar_index: The sidecar to reindex into on file events.
+
+    Returns:
+        Unstarted VaultFilewatcher, or None if filewatcher/vault/sidecar
+        is disabled.
+    """
+    if not config.filewatcher.enabled:
+        logger.info("Filewatcher disabled; skipping VaultFilewatcher")
+        return None
+    if not config.vault.enabled:
+        logger.info("Vault disabled; skipping VaultFilewatcher")
+        return None
+    if sidecar_index is None:
+        logger.warning(
+            "build_filewatcher called with sidecar_index=None; filewatcher cannot reindex"
+        )
+        return None
+    from backend.vault import VaultFilewatcher
+
+    return VaultFilewatcher(config.filewatcher, config.vault.root, sidecar_index)

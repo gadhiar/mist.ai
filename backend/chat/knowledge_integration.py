@@ -25,12 +25,21 @@ class KnowledgeIntegration:
     Wraps ConversationHandler to work with existing streaming architecture.
     """
 
-    def __init__(self, config: KnowledgeConfig, llm_provider: StreamingLLMProvider | None = None):
+    def __init__(
+        self,
+        config: KnowledgeConfig,
+        llm_provider: StreamingLLMProvider | None = None,
+        vault_writer=None,
+    ):
         """Initialize knowledge integration.
 
         Args:
             config: Complete knowledge system configuration
             llm_provider: Optional pre-built provider. When None, built from config.
+            vault_writer: Optional pre-started VaultWriter (Cluster 8 Phase 5).
+                Passed directly into build_conversation_handler so the
+                voice-path handler shares the server-owned writer instead of
+                auto-building a second (unstarted) instance.
         """
         self.enabled = False
         self.conversation_handler: ConversationHandler | None = None
@@ -46,7 +55,9 @@ class KnowledgeIntegration:
                 self._llm_provider = llm_provider
 
             self.conversation_handler = build_conversation_handler(
-                config=config, llm_provider=llm_provider
+                config=config,
+                llm_provider=llm_provider,
+                vault_writer=vault_writer,
             )
 
             self.enabled = True
