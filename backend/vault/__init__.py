@@ -7,13 +7,13 @@ graph rebuilds from the updated vault content.
 
 Public surface:
 
+- `VaultFilewatcher` -- watchdog-based filewatcher with debounced sidecar reindex
 - `VaultWriter` -- serialized appender for session notes, identity, users
 - `VaultSidecarIndex` -- SQLite-backed vec0 + FTS5 retrieval over vault chunks
 - frontmatter Pydantic models for the four `mist-*` note types
-
-Filewatcher (`backend.vault.filewatcher`) ships in Phase 4.
 """
 
+from backend.vault.filewatcher import VaultFilewatcher
 from backend.vault.models import (
     AuthoredBy,
     MistDecisionFrontmatter,
@@ -31,6 +31,7 @@ __all__ = [
     "MistIdentityFrontmatter",
     "MistSessionFrontmatter",
     "MistUserFrontmatter",
+    "VaultFilewatcher",
     "VaultWriter",
     "parse_frontmatter",
     "render_frontmatter",

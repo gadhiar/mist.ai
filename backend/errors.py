@@ -120,3 +120,13 @@ class SidecarIndexError(MistError):
     sqlite3.IntegrityError, struct.error). Caught at builder boundary
     or upstream retrieval router; never propagates into chat path.
     """
+
+
+class FilewatcherError(MistError):
+    """Raised when filewatcher setup or runtime fails irrecoverably.
+
+    Wraps the underlying cause (ImportError on observer backend,
+    OSError on observer.start). Caught at builder/lifecycle boundary;
+    a missing filewatcher degrades to "no live reindex" (audit job +
+    explicit reindex CLI cover the gap).
+    """

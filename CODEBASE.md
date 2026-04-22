@@ -1,8 +1,8 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-04-21 (end of day)
-**Branch:** main (synced with origin)
-**Status:** MVP Knowledge Integration — 6 of 8 architectural clusters complete (1, 2, 3, 4, 5, 6). Cluster 8 unblocked; Cluster 7 folds into Cluster 8 at phase 10.
+**Last Updated:** 2026-04-22 (early)
+**Branch:** main (2 commits ahead of origin: Phase 3 + Phase 4)
+**Status:** MVP Knowledge Integration — 6 of 8 architectural clusters complete (1, 2, 3, 4, 5, 6); Cluster 8 IN PROGRESS (Phases 1+2+3+4 complete, 8 of 12 phases remain). Cluster 7 folds into Cluster 8 at phase 10.
 
 ---
 
@@ -23,7 +23,8 @@
 - **Debug JSONL Observability:** `DebugJSONLLogger` with 5 record phases (`turn`, `extraction`, `llm_call`, `retrieval_candidates`, `llm_request_raw`). Each gated by its own env var. See Cluster 5 artifacts below.
 - **Knowledge Graph:** Extraction + curation pipeline + hybrid retrieval (graph + vector + RRF merge). ADR-009 provenance separation structurally enforced (Cluster 2). MIST identity retrieval injects persona (Cluster 3). Ontology v1.0.0 carries 13 extractable entity types (12 external + MistIdentity) and 25 extractable relationship types (21 original + 4 MIST-scope: IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT, MIST_HAS_PREFERENCE) — Cluster 1.
 - **Knowledge Seed:** 32-entity baseline (`mist_admin seed` from `scripts/seed_data.yaml`): 1 MistIdentity + 9 MistTraits + 5 MistCapabilities + 5 MistPreferences + 11 user/technology entities + 1 User + 19 identity relationships + 11 anchor relationships + 32 embeddings.
-- **Tests:** **1066 unit tests + 3 xfailed.** Run inside container: `docker compose exec mist-backend python -m pytest tests/unit/`.
+- **Vault Layer (Cluster 8, in progress):** `backend/vault/` package with `VaultWriter` (serialized `asyncio.Queue` consumer for session-note appends, identity/user upserts), `VaultSidecarIndex` (sqlite-vec `vec0` + FTS5 + RRF hybrid query over two-tier chunks), `VaultFilewatcher` (watchdog daemon thread with 500ms debounce + asyncio bridge + 60s mtime audit job + MIST-write coordination for user-edit detection), Pydantic frontmatter models for the four `mist-*` note types, and `AuthoredBy` 5-state authorship enum. Wired through `VaultConfig` / `SidecarIndexConfig` / `FilewatcherConfig` on `KnowledgeConfig` (Phases 1+2). End-to-end stack proven: vault writes auto-reindex; user edits via Obsidian-style append also auto-reindex and surface via hybrid query. Phase 5 (factory wiring + ConversationHandler integration) is next.
+- **Tests:** **1283 unit tests + 1 platform-skipped + 3 xfailed** (vs 1066 Cluster 1 baseline = +217 from Cluster 8 Phase 1+2+3+4). Run inside container: `docker compose exec mist-backend python -m pytest tests/unit/`.
 
 ### Frontend (Flutter)
 - **Status:** IN DEVELOPMENT (unchanged since 2026-04-08). Cluster 1/8 work is backend-focused; frontend touches parked in `mist-ai-frontend-audit-remediation` (status: parked).
@@ -50,8 +51,8 @@
 | 4 | Deterministic rails (Bugs A, C, G, K) | COMPLETE 2026-04-20 | 4eed4f2 -> 68ffc81 | post-cluster-4-gauntlet-report-2026-04-20.md |
 | 5 | Observability (llm_call + retrieval_candidates + llm_request_raw JSONL phases) | COMPLETE 2026-04-21 | 27af364 -> 3c8f0b2 | v6-cluster-5-diagnostic-report-2026-04-21.md |
 | 6 | Context budget (ContextBudgetPlanner) + max_tokens=1024 fix | COMPLETE 2026-04-21 | c4c4d71 -> c800e35 | post-cluster-6-gauntlet-report-2026-04-21.md |
-| 7 | Existing-data migration | Folds into Cluster 8 | — | — |
-| 8 | Vault-native memory (ADR-010 implementation, 12-phase, 4-6wk) | PENDING (UNBLOCKED) | — | — |
+| 7 | Existing-data migration | Folds into Cluster 8 phase 10 | — | — |
+| 8 | Vault-native memory (ADR-010 implementation, 12-phase) | IN PROGRESS — Phases 1+2+3+4 done (4 of 12); Phase 5 next | 8c06914 -> Phase 4 (Phase 1+2+3+4) | — |
 
 **Acceptance status** toward Phase 4 earned close:
 - Relationship correctness ≥ 80% — **CLEARED** post-Cluster-1 on targeted probe (11/12 = 92% on v1-mist-scope-inputs.jsonl). V6 spontaneously produces 4 `mist-identity USES X` edges that would have been validator-dropped pre-Cluster-1.
