@@ -84,12 +84,23 @@ class VaultWriter:
         await writer.stop()
     """
 
-    def __init__(self, config: VaultConfig) -> None:
+    def __init__(self, config: VaultConfig, debug_logger: Any = None) -> None:
+        """Initialize the vault writer.
+
+        Args:
+            config: VaultConfig with root path + lifecycle flags.
+            debug_logger: Optional DebugJSONLLogger (Cluster 8 Phase 12). When
+                set + `MIST_DEBUG_VAULT_JSONL=1`, every consumer-side write
+                op emits a `phase: "vault"` JSONL record with operation,
+                path, duration_ms, ok, and any error_message. None preserves
+                pre-Phase-12 silent operation.
+        """
         self.config = config
         self._root = Path(config.root)
         self._queue: asyncio.Queue[Any] = asyncio.Queue()
         self._consumer_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._stopped = False
+        self._debug_logger = debug_logger
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -318,7 +329,14 @@ class VaultWriter:
         Runs until the `_STOP` sentinel is dequeued. All handler exceptions
         are caught and set on the job's result_future; they never propagate
         into the caller's task.
+
+        Phase 12: every dispatch is timed and a `phase: "vault"` debug record
+        is emitted via the injected DebugJSONLLogger when the gate is on.
+        Recording failures are swallowed -- observability never breaks the
+        write path.
         """
+        import time as _time
+
         while True:
             item = await self._queue.get()
             if item is _STOP:
@@ -326,17 +344,25 @@ class VaultWriter:
                 break
 
             job: _WriteJob = item
+            _start = _time.perf_counter()
+            result_path: str | None = None
+            ok = False
+            error_message: str | None = None
             try:
                 result = await self._dispatch(job)
+                result_path = result if isinstance(result, str) else None
+                ok = True
                 if not job.result_future.done():
                     job.result_future.set_result(result)
             except VaultWriteError as exc:
+                error_message = repr(exc)
                 logger.error("VaultWriteError in consumer [%s]: %s", job.kind, exc)
                 if not job.result_future.done():
                     job.result_future.set_exception(exc)
             except Exception as exc:  # noqa: BLE001
                 wrapped = VaultWriteError(f"Unexpected error in vault consumer [{job.kind}]: {exc}")
                 wrapped.__cause__ = exc
+                error_message = repr(exc)
                 logger.error(
                     "Unexpected error in vault consumer [%s]: %s",
                     job.kind,
@@ -346,7 +372,59 @@ class VaultWriter:
                 if not job.result_future.done():
                     job.result_future.set_exception(wrapped)
             finally:
+                duration_ms = (_time.perf_counter() - _start) * 1000.0
+                self._maybe_record_vault_op(
+                    operation=job.kind,
+                    path=result_path,
+                    duration_ms=duration_ms,
+                    ok=ok,
+                    error_message=error_message,
+                    job_args=job.args,
+                )
                 self._queue.task_done()
+
+    def _maybe_record_vault_op(
+        self,
+        *,
+        operation: str,
+        path: str | None,
+        duration_ms: float,
+        ok: bool,
+        error_message: str | None,
+        job_args: dict[str, Any],
+    ) -> None:
+        """Emit a `phase: "vault"` debug record. No-op when logger is None.
+
+        Picks a small set of safe-to-serialize op-specific fields out of
+        `job_args` so the record carries useful context (turn_index for
+        appends, entity_count for backfills, user_id for upsert_user)
+        without leaking large payloads (utterance bodies, full markdown).
+        """
+        if self._debug_logger is None:
+            return
+        try:
+            extra: dict[str, Any] = {}
+            if operation == "append_turn":
+                extra["turn_index"] = job_args.get("turn_index")
+                extra["session_id"] = job_args.get("session_id")
+            elif operation == "update_entities":
+                extra["turn_index"] = job_args.get("turn_index")
+                slugs = job_args.get("entity_slugs") or []
+                extra["entity_count"] = len(slugs)
+            elif operation == "upsert_user":
+                extra["user_id"] = job_args.get("user_id")
+
+            self._debug_logger.record_vault_op(
+                operation=operation,
+                path=path,
+                duration_ms=duration_ms,
+                ok=ok,
+                error_message=error_message,
+                session_id=job_args.get("session_id"),
+                extra=extra or None,
+            )
+        except Exception as exc:  # noqa: BLE001 -- never break the write path
+            logger.debug("Vault debug record emission failed (non-fatal): %s", exc)
 
     async def _dispatch(self, job: _WriteJob) -> Any:
         """Route a job to its handler by `kind`."""

@@ -68,6 +68,8 @@ ENV_VAR = "MIST_DEBUG_JSONL"
 LLM_CALL_ENV_VAR = "MIST_DEBUG_LLM_JSONL"
 RETRIEVAL_CANDIDATES_ENV_VAR = "MIST_DEBUG_RETRIEVAL_JSONL"
 LLM_REQUEST_DUMP_ENV_VAR = "MIST_DEBUG_LLM_REQUESTS"
+# ADR-010 Cluster 8 Phase 12: vault-write observability gate.
+VAULT_ENV_VAR = "MIST_DEBUG_VAULT_JSONL"
 
 
 logger = logging.getLogger(__name__)
@@ -202,6 +204,72 @@ class DebugJSONLLogger:
         Requires both `MIST_DEBUG_JSONL=<path>` and `MIST_DEBUG_LLM_REQUESTS=1`.
         """
         return self.enabled and _env_flag(LLM_REQUEST_DUMP_ENV_VAR)
+
+    @property
+    def vault_enabled(self) -> bool:
+        """True when vault write records should be emitted (Phase 12).
+
+        Requires both `MIST_DEBUG_JSONL=<path>` (base sink) and
+        `MIST_DEBUG_VAULT_JSONL=1` (phase gate). Mirrors the Cluster 5
+        per-phase gating model so vault observability stays opt-in and
+        production turns are not slowed by JSON serialization unless an
+        operator is debugging.
+        """
+        return self.enabled and _env_flag(VAULT_ENV_VAR)
+
+    def record_vault_op(
+        self,
+        *,
+        operation: str,
+        path: str | None,
+        duration_ms: float,
+        ok: bool,
+        error_message: str | None = None,
+        session_id: str | None = None,
+        event_id: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit a `phase: "vault"` JSONL line (ADR-010 Phase 12).
+
+        Captures every successful (and failed-but-isolated-per-Invariant-6)
+        vault write op so operators can correlate filewatcher events,
+        sidecar reindex latency, and graph-side DERIVED_FROM emission with
+        the wall-clock cost of the underlying file mutation.
+
+        `operation` is one of:
+          - `append_turn_to_session` (per-turn append)
+          - `update_entities_extracted` (post-extraction wikilink backfill)
+          - `upsert_identity` (identity/mist.md write)
+          - `upsert_user` (users/<id>.md write)
+
+        `path` is the absolute vault note path on success, None on failure
+        before the path was known. `duration_ms` covers the consumer-side
+        execute time (excludes queue-wait latency, which is a separate
+        backpressure concern).
+
+        `extra` lets callers attach op-specific fields (turn_index,
+        entity_count, queue_depth, etc.) without requiring a record-schema
+        bump for every new op.
+
+        No-op when `vault_enabled` is False.
+        """
+        if not self.vault_enabled:
+            return
+
+        record: dict[str, Any] = {
+            "phase": "vault",
+            "ts_iso": _now_iso(),
+            "operation": operation,
+            "path": path,
+            "duration_ms": duration_ms,
+            "ok": ok,
+            "error_message": error_message,
+            "session_id": session_id,
+            "event_id": event_id,
+        }
+        if extra:
+            record["extra"] = extra
+        self._emit(record)
 
     # -- Cluster 5 record emitters ---------------------------------------------
 

@@ -395,6 +395,21 @@ class TestPhaseGates:
             monkeypatch.setenv("MIST_DEBUG_LLM_REQUESTS", value)
             assert logger.llm_request_dump_enabled is False, f"value={value!r}"
 
+    def test_vault_gate_requires_base_env_and_phase_env(self, tmp_path, monkeypatch):
+        # Phase 12 vault gate: separate from LLM/retrieval gates.
+        path = tmp_path / "debug.jsonl"
+        logger = DebugJSONLLogger(path)
+        monkeypatch.delenv("MIST_DEBUG_VAULT_JSONL", raising=False)
+        assert logger.vault_enabled is False
+
+        monkeypatch.setenv("MIST_DEBUG_VAULT_JSONL", "1")
+        assert logger.vault_enabled is True
+
+    def test_vault_gate_closed_when_base_disabled(self, monkeypatch):
+        monkeypatch.setenv("MIST_DEBUG_VAULT_JSONL", "1")
+        logger = DebugJSONLLogger(None)
+        assert logger.vault_enabled is False
+
 
 # ---------------------------------------------------------------------------
 # Cluster 5 — phase: "llm_call" record
@@ -656,3 +671,200 @@ class TestLLMRequestDumpRecord:
         )
         line = _read_jsonl(path)[0]
         assert "<Opaque>" in line["request_dict"]["weird"]
+
+
+# ---------------------------------------------------------------------------
+# Cluster 8 Phase 12 -- phase: "vault" record
+# ---------------------------------------------------------------------------
+
+
+class TestVaultRecord:
+    def test_noop_when_gate_closed(self, tmp_path, monkeypatch):
+        path = tmp_path / "debug.jsonl"
+        monkeypatch.delenv("MIST_DEBUG_VAULT_JSONL", raising=False)
+        logger = DebugJSONLLogger(path)
+
+        logger.record_vault_op(
+            operation="append_turn",
+            path="/v/s/x.md",
+            duration_ms=12.3,
+            ok=True,
+        )
+        if path.exists():
+            assert _read_jsonl(path) == []
+
+    def test_emits_phase_vault_with_required_fields(self, tmp_path, monkeypatch):
+        path = tmp_path / "debug.jsonl"
+        monkeypatch.setenv("MIST_DEBUG_VAULT_JSONL", "1")
+        logger = DebugJSONLLogger(path)
+
+        logger.record_vault_op(
+            operation="append_turn",
+            path="/v/s/2026-04-22-test.md",
+            duration_ms=8.5,
+            ok=True,
+            session_id="sess-1",
+        )
+
+        line = _read_jsonl(path)[0]
+        assert line["phase"] == "vault"
+        assert line["operation"] == "append_turn"
+        assert line["path"] == "/v/s/2026-04-22-test.md"
+        assert line["duration_ms"] == 8.5
+        assert line["ok"] is True
+        assert line["session_id"] == "sess-1"
+        assert line["error_message"] is None
+        assert "ts_iso" in line
+
+    def test_emits_failure_record_with_error_message(self, tmp_path, monkeypatch):
+        path = tmp_path / "debug.jsonl"
+        monkeypatch.setenv("MIST_DEBUG_VAULT_JSONL", "1")
+        logger = DebugJSONLLogger(path)
+
+        logger.record_vault_op(
+            operation="upsert_user",
+            path=None,
+            duration_ms=1.0,
+            ok=False,
+            error_message="VaultWriteError: disk full",
+        )
+
+        line = _read_jsonl(path)[0]
+        assert line["ok"] is False
+        assert line["path"] is None
+        assert "disk full" in line["error_message"]
+
+    def test_extra_dict_attached_when_provided(self, tmp_path, monkeypatch):
+        path = tmp_path / "debug.jsonl"
+        monkeypatch.setenv("MIST_DEBUG_VAULT_JSONL", "1")
+        logger = DebugJSONLLogger(path)
+
+        logger.record_vault_op(
+            operation="update_entities",
+            path="/v/s/x.md",
+            duration_ms=2.0,
+            ok=True,
+            extra={"turn_index": 5, "entity_count": 3},
+        )
+
+        line = _read_jsonl(path)[0]
+        assert line["extra"] == {"turn_index": 5, "entity_count": 3}
+
+    def test_extra_omitted_when_none(self, tmp_path, monkeypatch):
+        path = tmp_path / "debug.jsonl"
+        monkeypatch.setenv("MIST_DEBUG_VAULT_JSONL", "1")
+        logger = DebugJSONLLogger(path)
+
+        logger.record_vault_op(
+            operation="upsert_identity",
+            path="/v/identity/mist.md",
+            duration_ms=3.0,
+            ok=True,
+        )
+
+        line = _read_jsonl(path)[0]
+        assert "extra" not in line
+
+
+# ---------------------------------------------------------------------------
+# Cluster 8 Phase 12 -- VaultWriter integration
+# ---------------------------------------------------------------------------
+
+
+class TestVaultWriterDebugRecording:
+    """Per ADR-010 Phase 12 wiring: VaultWriter._consume calls
+    `_maybe_record_vault_op` after every dispatch so each consumer-side
+    write produces one `phase: "vault"` JSONL line.
+    """
+
+    @pytest.mark.asyncio
+    async def test_successful_append_records_one_line(self, tmp_path, monkeypatch):
+        from backend.knowledge.config import VaultConfig
+        from backend.vault.writer import VaultWriter
+
+        debug_path = tmp_path / "debug.jsonl"
+        monkeypatch.setenv("MIST_DEBUG_JSONL", str(debug_path))
+        monkeypatch.setenv("MIST_DEBUG_VAULT_JSONL", "1")
+        debug_logger = DebugJSONLLogger.from_env()
+
+        vault_root = tmp_path / "vault"
+        cfg = VaultConfig(root=str(vault_root), git_auto_init=False)
+        writer = VaultWriter(cfg, debug_logger=debug_logger)
+        await writer.start()
+
+        try:
+            await writer.append_turn_to_session(
+                session_id="sess-test",
+                turn_index=1,
+                user_text="hello",
+                mist_text="hi",
+            )
+        finally:
+            await writer.stop()
+
+        records = [r for r in _read_jsonl(debug_path) if r.get("phase") == "vault"]
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["operation"] == "append_turn"
+        assert rec["ok"] is True
+        assert rec["path"].endswith(".md")
+        assert rec["duration_ms"] >= 0
+        assert rec["extra"]["turn_index"] == 1
+        assert rec["extra"]["session_id"] == "sess-test"
+
+    @pytest.mark.asyncio
+    async def test_no_recording_when_logger_is_none(self, tmp_path, monkeypatch):
+        from backend.knowledge.config import VaultConfig
+        from backend.vault.writer import VaultWriter
+
+        debug_path = tmp_path / "debug.jsonl"
+        monkeypatch.setenv("MIST_DEBUG_JSONL", str(debug_path))
+        monkeypatch.setenv("MIST_DEBUG_VAULT_JSONL", "1")
+
+        vault_root = tmp_path / "vault"
+        cfg = VaultConfig(root=str(vault_root), git_auto_init=False)
+        writer = VaultWriter(cfg, debug_logger=None)
+        await writer.start()
+
+        try:
+            await writer.append_turn_to_session(
+                session_id="sess-test",
+                turn_index=1,
+                user_text="hello",
+                mist_text="hi",
+            )
+        finally:
+            await writer.stop()
+
+        if debug_path.exists():
+            records = [r for r in _read_jsonl(debug_path) if r.get("phase") == "vault"]
+            assert records == []
+
+    @pytest.mark.asyncio
+    async def test_no_recording_when_gate_closed(self, tmp_path, monkeypatch):
+        from backend.knowledge.config import VaultConfig
+        from backend.vault.writer import VaultWriter
+
+        debug_path = tmp_path / "debug.jsonl"
+        monkeypatch.setenv("MIST_DEBUG_JSONL", str(debug_path))
+        monkeypatch.delenv("MIST_DEBUG_VAULT_JSONL", raising=False)
+        debug_logger = DebugJSONLLogger.from_env()
+
+        vault_root = tmp_path / "vault"
+        cfg = VaultConfig(root=str(vault_root), git_auto_init=False)
+        writer = VaultWriter(cfg, debug_logger=debug_logger)
+        await writer.start()
+
+        try:
+            await writer.append_turn_to_session(
+                session_id="sess-test",
+                turn_index=1,
+                user_text="hi",
+                mist_text="hi",
+            )
+        finally:
+            await writer.stop()
+
+        if debug_path.exists():
+            records = [r for r in _read_jsonl(debug_path) if r.get("phase") == "vault"]
+            assert records == []

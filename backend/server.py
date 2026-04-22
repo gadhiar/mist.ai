@@ -119,7 +119,14 @@ async def lifespan(app: FastAPI):
     vault_filewatcher = None
 
     try:
-        vault_writer = build_vault_writer(knowledge_config)
+        # Phase 12 vault observability shares the existing JSONL sink. Built
+        # once here so the vault_writer can emit phase: "vault" records when
+        # MIST_DEBUG_VAULT_JSONL=1. Cheap construction; safe when the env
+        # var is unset (logger is then a no-op).
+        from backend.debug_jsonl_logger import DebugJSONLLogger
+
+        vault_debug_logger = DebugJSONLLogger.from_env()
+        vault_writer = build_vault_writer(knowledge_config, debug_logger=vault_debug_logger)
         if vault_writer is not None:
             await vault_writer.start()
             logger.info("Vault writer started at %s", knowledge_config.vault.root)

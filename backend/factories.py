@@ -505,7 +505,10 @@ def build_ingestion_pipeline(
     )
 
 
-def build_vault_writer(config: KnowledgeConfig) -> "VaultWriter | None":
+def build_vault_writer(
+    config: KnowledgeConfig,
+    debug_logger: "DebugJSONLLogger | None" = None,  # noqa: F821
+) -> "VaultWriter | None":
     """Create a VaultWriter from config.vault.
 
     Returns None when config.vault.enabled is False -- the caller (typically
@@ -515,6 +518,9 @@ def build_vault_writer(config: KnowledgeConfig) -> "VaultWriter | None":
 
     Args:
         config: Knowledge subsystem configuration.
+        debug_logger: Optional DebugJSONLLogger (Cluster 8 Phase 12). When
+            set + `MIST_DEBUG_VAULT_JSONL=1`, every consumer-side write op
+            emits a `phase: "vault"` JSONL record.
 
     Returns:
         Unstarted VaultWriter, or None if vault is disabled.
@@ -524,7 +530,7 @@ def build_vault_writer(config: KnowledgeConfig) -> "VaultWriter | None":
         return None
     from backend.vault import VaultWriter
 
-    return VaultWriter(config.vault)
+    return VaultWriter(config.vault, debug_logger=debug_logger)
 
 
 def build_sidecar_index(
