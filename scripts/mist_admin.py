@@ -121,7 +121,66 @@ def cmd_seed(args: argparse.Namespace) -> int:
     for layer, count in counts.items():
         print(f"  {layer}: {count}")
     print(f"[seed] Total writes: {sum(counts.values())}")
+
+    # ADR-010 Cluster 8 Phase 10: vault bootstrap. Mirrors the seeded
+    # identity/user data into the vault as canonical markdown notes and
+    # emits DERIVED_FROM edges from each seeded entity to its source vault
+    # note. Disabled with --no-vault-bootstrap. Skipped automatically when
+    # the vault subsystem is disabled in config.
+    if not getattr(args, "no_vault_bootstrap", False):
+        config = be.get_config()
+        if config.vault.enabled:
+            _do_vault_bootstrap(be, config, seed_data)
+        else:
+            print("[seed] Vault bootstrap skipped: config.vault.enabled is False")
+
     return 0
+
+
+def _do_vault_bootstrap(be: Any, config: Any, seed_data: dict[str, Any]) -> None:
+    """Run the vault bootstrap step for `cmd_seed` (Phase 10).
+
+    Builds and starts a VaultWriter, writes identity/mist.md +
+    users/<id>.md from seed_data, then emits DERIVED_FROM edges from each
+    seeded entity to its bootstrap note. All vault operations are
+    idempotent so re-running `seed` is safe. Vault errors are logged but
+    never propagate -- graph seed already succeeded by the time this runs.
+    """
+    import asyncio
+
+    from backend.vault.writer import VaultWriter
+
+    print("[seed] Vault bootstrap: writing identity/mist.md + users/<id>.md")
+
+    async def _run() -> dict[str, str]:
+        writer = VaultWriter(config.vault)
+        await writer.start()
+        try:
+            return await be.admin.bootstrap_vault_from_seed(writer, seed_data)
+        finally:
+            await writer.stop()
+
+    try:
+        paths = asyncio.run(_run())
+    except Exception as exc:  # noqa: BLE001 -- ADR-010 Invariant 6
+        print(f"[seed] Vault bootstrap failed (graph seed unaffected): {exc}")
+        return
+
+    print(f"[seed]   identity_path: {paths['identity_path']}")
+    print(f"[seed]   user_path:     {paths['user_path']}")
+
+    connection = _connect(be)
+    try:
+        edges = be.admin.emit_seed_vault_provenance(
+            connection,
+            seed_data,
+            identity_path=paths["identity_path"],
+            user_path=paths["user_path"],
+        )
+    finally:
+        connection.disconnect()
+
+    print(f"[seed] Vault bootstrap: wrote {edges} DERIVED_FROM edges to bootstrap notes")
 
 
 def cmd_graph_dump(args: argparse.Namespace) -> int:
@@ -787,6 +846,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-embeddings",
         action="store_true",
         help="Skip embedding generation (faster seed; vector retrieval will miss).",
+    )
+    p_seed.add_argument(
+        "--no-vault-bootstrap",
+        action="store_true",
+        help=(
+            "Skip vault bootstrap (Phase 10). When omitted and "
+            "config.vault.enabled is True, also writes identity/mist.md "
+            "and users/<id>.md and emits seed DERIVED_FROM edges."
+        ),
     )
     p_seed.set_defaults(func=cmd_seed)
 
