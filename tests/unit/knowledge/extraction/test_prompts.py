@@ -136,6 +136,47 @@ class TestSystemPromptExampleBalance:
         )
 
 
+class TestEventVsMilestoneDisambiguation:
+    """Post-MVP follow-up: prompt must disambiguate Event from Milestone.
+
+    Both `Event` (with legacy `event_type=milestone` enum value) and the
+    dedicated `Milestone` type can represent the same fact. Without an
+    explicit boundary in the system prompt, the model picks at random,
+    which produces two graph nodes for the same conceptual entity.
+    """
+
+    def test_prompt_includes_event_vs_milestone_rule(self):
+        """The rules section must explicitly distinguish Event from Milestone."""
+        prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
+        assert (
+            "event vs milestone" in prompt_lower or "milestone vs event" in prompt_lower
+        ), "Expected explicit Event-vs-Milestone disambiguation rule in EXTRACTION RULES"
+
+    def test_prompt_forbids_event_type_milestone_legacy_value(self):
+        """Rule 11 must explicitly retire the Event.event_type=milestone overlap."""
+        prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
+        assert 'event_type="milestone"' in prompt_lower or "event_type=milestone" in prompt_lower, (
+            "Expected the rule to call out Event.event_type='milestone' and route it "
+            "to the dedicated Milestone type; without this, the model may emit "
+            "Event(event_type=milestone) instead of Milestone for shipped/launched/promoted facts."
+        )
+
+    def test_examples_include_both_event_and_milestone_extractions(self):
+        """At least one few-shot must extract Event, and at least one Milestone.
+
+        The contrast pair (Example 9 = Milestone, Example 12 = Event) anchors
+        the rule with concrete output; the rule alone is too easy to skim past.
+        """
+        assert '"type": "Event"' in EXTRACTION_SYSTEM_PROMPT, (
+            "Expected an Event extraction in the few-shot examples; without one "
+            "the model has no anchor for when to prefer Event over Milestone."
+        )
+        assert '"type": "Milestone"' in EXTRACTION_SYSTEM_PROMPT, (
+            "Expected a Milestone extraction in the few-shot examples (Example 9 "
+            "since the 2026-04-23 ontology expansion)."
+        )
+
+
 class TestUserTemplate:
     """Cluster 1: user template must surface subject_scope to the model."""
 
