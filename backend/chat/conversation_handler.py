@@ -725,13 +725,23 @@ class ConversationHandler:
         """
         _ex_start = time.time()
         try:
-            result = await self._extraction_pipeline.extract_from_utterance(
-                utterance=utterance,
-                conversation_history=conversation_history,
-                event_id=event_id,
-                session_id=session_id,
-                vault_note_path=vault_note_path,
-            )
+            # Propagate session_id + event_id to every nested extraction LLM
+            # call (extraction.ontology, extraction.scope_classifier,
+            # extraction.internal_derivation). The inner llm_call_context
+            # blocks in those extractors only set call_site, and the
+            # ContextVar merges with inner-precedence -- so this outer set
+            # populates session_id + event_id on the emitted llm_call records
+            # without changing extractor signatures. asyncio.create_task
+            # captures the current ContextVar copy via copy_context(), so
+            # this works even though extraction is fire-and-forget.
+            with llm_call_context(session_id=session_id, event_id=event_id):
+                result = await self._extraction_pipeline.extract_from_utterance(
+                    utterance=utterance,
+                    conversation_history=conversation_history,
+                    event_id=event_id,
+                    session_id=session_id,
+                    vault_note_path=vault_note_path,
+                )
             # Log results at debug level. Result may be ValidationResult
             # (has .entities/.relationships) or CurationResult (has .write_result
             # with counts). Handle both without importing concrete types.

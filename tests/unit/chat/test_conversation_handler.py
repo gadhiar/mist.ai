@@ -104,6 +104,63 @@ class TestExtractKnowledgeAsync:
         assert pipeline.calls[0]["session_id"] == "sess-001"
 
     @pytest.mark.asyncio
+    async def test_extraction_call_propagates_session_and_event_to_llm_context(self):
+        """Regression: extraction LLM calls must inherit session_id + event_id from caller.
+
+        Pre-fix bug (2026-04-27): the extraction call sites
+        (ontology_extractor, scope_classifier, internal_derivation) only set
+        call_site in their llm_call_context blocks. The outer
+        _extract_knowledge_async path did not wrap them in a context with
+        session_id + event_id, so emitted phase=llm_call records had both
+        IDs as None. The V8 scorer's event_id-based join broke as a result.
+
+        Fix: _extract_knowledge_async wraps the extract_from_utterance call
+        in llm_call_context(session_id=..., event_id=...). The inner blocks
+        merge with inner-precedence so call_site is preserved while session
+        and event are inherited from the outer context.
+        """
+        # Arrange -- pipeline that captures the LLM call context state at the
+        # moment extract_from_utterance is invoked.
+        from backend.llm.instrumented_provider import get_llm_call_context
+
+        class CapturingPipeline:
+            def __init__(self):
+                self.captured_context: dict | None = None
+
+            async def extract_from_utterance(self, **kwargs):
+                self.captured_context = get_llm_call_context()
+                from backend.knowledge.extraction.validator import ValidationResult
+
+                return ValidationResult(valid=True, entities=[], relationships=[])
+
+        pipeline = CapturingPipeline()
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        config = build_test_config()
+
+        handler = ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=pipeline,
+            retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
+        )
+
+        # Act
+        await handler._extract_knowledge_async(
+            utterance="I use Python and React",
+            conversation_history=[{"role": "user", "content": "..."}],
+            event_id="evt-abc-123",
+            session_id="sess-xyz-789",
+        )
+
+        # Assert -- both IDs propagated; ready for inner llm_call_context
+        # blocks (call_site=...) to merge in.
+        assert pipeline.captured_context is not None
+        assert pipeline.captured_context.get("session_id") == "sess-xyz-789"
+        assert pipeline.captured_context.get("event_id") == "evt-abc-123"
+
+    @pytest.mark.asyncio
     async def test_extraction_failure_does_not_raise(self):
         pipeline = FakeFailingPipeline()
 
