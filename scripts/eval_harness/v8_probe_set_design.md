@@ -59,24 +59,77 @@ A production-ready MIST build, running this probe set with each line treated as 
 
 These thresholds are deliberately looser than V7's. If the run lands above them, the next step is to push toward 0.90/0.90 by adding one few-shot per absent bucket; if below, the prompt needs additional examples and possibly a rule clarification.
 
+## Baseline results (2026-04-27)
+
+Three iterations against the production stack with `MODEL=gemma-4-e4b`,
+`LLM_TEMPERATURE=0.0`, empty graph, single-turn replay.
+
+| Iteration | Prompts | Overall recall | OCCURRED_ON | HAS_METRIC | REFERENCES_DOCUMENT | PRECEDED_BY | Negative FP | Verdict |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| iter0 (baseline) | head | 0.688 | 0.75 PASS | 0.75 PASS | **0.50 FAIL** | 0.75 PASS | 0/4 | FAIL |
+| iter1 | + Rule 12 + Example 13 | 0.688 | 0.75 | 0.75 | **1.00 PASS** | **0.25 FAIL** | 0/4 | FAIL |
+| iter2 | + Rule 13 + Example 14 | **0.938 PASS** | 1.00 | 0.75 | 1.00 | 1.00 | 1/4 FAIL (v8-18) | FAIL |
+| iter3 (with backend fix) | same prompts as iter2 | 0.812 PASS | 0.75 | 0.75 | 1.00 | 0.75 | 1/4 FAIL (v8-18) | FAIL |
+
+Key findings:
+- Per-bucket thresholds (0.75) all VALIDATED at iter2: each new edge fires
+  reliably with one anchored few-shot. iter3 reproduced the per-bucket pass
+  with slightly lower per-bucket numbers (LLM_TEMPERATURE=0.0 is deterministic
+  per-call but the model's behavior varies across seedless runs).
+- Overall recall threshold (0.70) VALIDATED at iter2 (0.938) and iter3 (0.812).
+- **iter1 PRECEDED_BY regression demonstrated single-rule additions can pull
+  attention away from other edges**. Iter2 added a counter-anchor for
+  PRECEDED_BY which rebounded it AND further-improved OCCURRED_ON. The
+  takeaway: each new edge type generally needs its own rule + example pair
+  to compete in the prompt's attention budget.
+- **Negative FP rule (0/4) NOT validated**. v8-18 ("It is 3 hours until my
+  flight") consistently produces OCCURRED_ON because the model treats "flight"
+  as a future Event with a fuzzy date anchor. This is a defensible extraction
+  -- the probe was designed as a HAS_METRIC trap (count "3 hours") but the
+  model fails it via a different mechanism. Probe-design issue, not a
+  producer-side gap. Documented as a calibration limit; v8-18 redesign is a
+  followup.
+
+Reports: `data/runtime/v8-baseline-report.{md,json}` (iter0),
+`v8-iter{1,2,3}-report.{md,json}`. Gitignored under `data/runtime/`.
+
 ## How to run
 
-**Today (manual, single-run):**
+**Replay + score (canonical):**
 
 ```bash
-docker compose exec -T mist-backend python scripts/mist_admin.py replay \
+SESSION_ID="v8-probe-$(date +%Y%m%d-%H%M%S)"
+
+# IMPORTANT for Git Bash on Windows: prefix with MSYS_NO_PATHCONV=1 so the
+# /app/... env var value isn't translated to C:/Program Files/Git/app/...
+MSYS_NO_PATHCONV=1 docker compose exec -T \
+    -e "MIST_DEBUG_JSONL=/app/data/runtime/v8-debug.jsonl" \
+    -e "MIST_DEBUG_LLM_JSONL=1" \
+    mist-backend \
+    python scripts/mist_admin.py replay \
     data/ingest/v8-edge-production-inputs.jsonl \
-    --session-id v8-probe-$(date +%Y%m%d) \
-    --output data/ingest/v8-report.jsonl
+    --session-id "$SESSION_ID" \
+    --output data/ingest/v8-replay-output.jsonl
+
+# If the debug JSONL didn't sync to host (Docker Desktop on Windows can lag):
+MSYS_NO_PATHCONV=1 docker cp \
+    'mist-backend:/app/data/runtime/v8-debug.jsonl' \
+    'D:/Users/rajga/mist.ai/data/runtime/v8-debug.jsonl'
+
+# Score (NOT --session-id-filtered, since iter0 backend bug had session_id=None
+# on extraction records; safe to omit since debug JSONL is single-session):
+python scripts/eval_harness/score_v8_probe_run.py \
+    --input data/ingest/v8-edge-production-inputs.jsonl \
+    --debug-jsonl data/runtime/v8-debug.jsonl
 ```
 
-The `replay` command writes per-utterance results, but does NOT capture the extracted entity/edge types in its `--output` file (only utterance / response / duration / ok / error). To score the run, the future scorer needs one of:
-
-1. **`MIST_DEBUG_LLM_JSONL=1`** (preferred) -- captures the full LLM response content via `phase: llm_call` records in `MIST_DEBUG_JSONL`. The scorer parses the response JSON to extract entity types + relationship types per turn, then joins against this file by utterance.
-2. **Direct Neo4j query** -- after the replay completes, query for entities/edges created in the session_id. Higher fidelity (validates post-storage state) but requires graph access from the scorer.
-3. **New extraction-detail debug emission** -- add per-extraction entity/relationship type breakdown to `phase: extraction` records in `debug_jsonl_logger._LiveTurnRecord.record_extraction`. Cleanest long-term but requires a backend code change.
-
-Path (1) is the recommended route for the V8 scorer commit -- it requires only an env-var flip and parsing already-emitted JSON.
+The scorer (`scripts/eval_harness/score_v8_probe_run.py`) joins probes
+against `phase: llm_call` records (filtered to `call_site = "extraction.ontology"`).
+Join key is the utterance text recovered from the request user message
+(`Utterance: "<text>"` per `EXTRACTION_USER_TEMPLATE`). This avoids relying
+on extraction-side `event_id` propagation, which had a backend bug at first
+V8 run -- fixed in commit 3a3b31f, but the utterance-parse fallback stays
+for compatibility with older debug JSONL.
 
 ## Known limitations
 
@@ -84,12 +137,29 @@ Path (1) is the recommended route for the V8 scorer commit -- it requires only a
 - **Single-turn framing.** Each probe is independent. Real conversations build context; V8 is a discrete classifier check on isolated utterances.
 - **No ambiguity probes.** V7 had ambiguity buckets ("the framework I said I wanted to try again"). V8 prioritizes coverage breadth over depth -- ambiguity probes are V8.1 candidates.
 - **Asymmetric counts.** 4 negatives vs 5 in V7. The four buckets each get one negative; adding a fifth blanket negative ("how are you?") is V8.1.
-- **Threshold calibration is provisional.** The 0.75/0.70 numbers are pre-baseline guesses. The first V8 run becomes the calibration anchor.
+- **Threshold calibration was provisional, now anchored.** The 0.75/0.70 numbers were pre-baseline guesses; iter2/iter3 confirmed they're achievable. The first run informed the prompt-iteration cycle (Rules 12+13 + Examples 13+14, commit 9f61764). See "Baseline results" section above.
 
 ## Followups
 
-- `scripts/eval_harness/score_v8_probe_run.py` -- one-shot scorer. Joins V8 expected edges against `phase: llm_call` debug records (parses response JSON for entity/relationship types). Mirrors `score_v7_probe_run.py` structure: per-bucket recall, confusion matrix, acceptance verdict.
-- `v8-multi-turn` -- same intents but spread across 5-25 turns of conversation context.
-- `v8-edge-quality` -- structural validation of source/target type correctness.
-- Post-V8 prompt iteration: if recall is below 0.75 per bucket, add one few-shot per absent edge type.
-- Closure on the producer-side gap: re-run V6 gauntlet after V8 + few-shot additions to confirm the new edges land in unstructured conversation, not just engineered probes.
+- ~~`scripts/eval_harness/score_v8_probe_run.py`~~ SHIPPED in commit 48ed51c
+  (initial) + 2c69651 (utterance-join workaround for backend bug).
+- ~~Post-V8 prompt iteration~~ SHIPPED in commit 9f61764 (Rules 12+13 +
+  Examples 13+14). See "Baseline results" section above for iter1/iter2/iter3
+  numbers.
+- ~~Backend session_id/event_id propagation~~ FIXED in commit 3a3b31f
+  (`_extract_knowledge_async` wraps `extract_from_utterance` in
+  `llm_call_context(session_id=..., event_id=...)`). V8 scorer can switch to
+  event_id-based join when desired; utterance-parse fallback stays.
+- **v8-18 redesign** -- replace "It is 3 hours until my flight" with an
+  unambiguously-non-Event probe (e.g., "I have 3 books on my shelf" --
+  count without temporal anchor). Currently produces a stable false positive
+  on OCCURRED_ON.
+- `v8-multi-turn` -- same intents but spread across 5-25 turns of conversation
+  context. Tests whether new-edge production survives coreference / context
+  accumulation.
+- `v8-edge-quality` -- structural validation of source/target type correctness
+  (was `OCCURRED_ON` from `Event` to `Date`, or did the model invert the
+  direction?).
+- Closure on the producer-side gap: re-run the V6 conversational gauntlet
+  after V8 prompt iteration to confirm the new edges land in unstructured
+  conversation, not just engineered probes.
