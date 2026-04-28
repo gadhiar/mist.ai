@@ -68,8 +68,28 @@ RUN TORCH_VER=$(python -c "import torch; print(torch.__version__)") && \
 # even starts. Without these, the install silently failed for months
 # (pre-2026-04-22).
 RUN pip install ninja packaging wheel psutil
+# Known issue (2026-04-27, attempted fix did not work): the resulting
+# flash_attn_2_cuda*.so references the C++11 ABI version of
+# c10::Error::Error (symbol: NSt7__cxx1112basic_string), but PyTorch 2.6.0+cu124
+# from download.pytorch.org reports _GLIBCXX_USE_CXX11_ABI=False. Runtime
+# import then fails with `undefined symbol`. Investigation found:
+#   - Setting CXXFLAGS=-D_GLIBCXX_USE_CXX11_ABI=0 during the source build did
+#     not fix it (torch.utils.cpp_extension.BuildExtension overrides CXXFLAGS).
+#   - Installing the upstream precompiled wheel
+#     flash_attn-2.8.3+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
+#     produces a binary that ALSO references __cxx11 symbols despite the
+#     filename claiming cxx11abi=FALSE -- looks like an upstream wheel-naming
+#     inconsistency for v2.8.3.
+# Net effect: flash-attn will fail at runtime import on the voice path; voice
+# attention falls back to PyTorch SDPA (slower but functional). The build-time
+# import check below makes this loud at image-build time so future operators
+# don't ship without knowing.
+# Followups: try flash-attn 2.7.x or 2.9.x wheels; or rebuild against a torch
+# wheel with _GLIBCXX_USE_CXX11_ABI=True (cascades through chatterbox-tts).
 RUN pip install flash-attn --no-build-isolation \
     || (echo "[FLASH-ATTN BUILD FAILED] See pip stderr above. Image build continues without flash-attn -- attention falls back to PyTorch SDPA." && exit 0)
+RUN python -c "import flash_attn; print('[FLASH-ATTN IMPORT OK]', flash_attn.__version__)" \
+    || echo "[FLASH-ATTN IMPORT FAILED at build time] symbol mismatch with torch's ABI -- voice attention will fall back to PyTorch SDPA at runtime"
 
 # 6. Test dependencies
 RUN pip install pytest>=8.0 pytest-asyncio>=0.24
