@@ -177,6 +177,43 @@ class TestEventVsMilestoneDisambiguation:
         )
 
 
+class TestDocumentEngagementRule:
+    """V8 baseline iteration: prompt must steer document-engagement verbs to REFERENCES_DOCUMENT.
+
+    Without explicit guidance, the model picks LEARNING for "halfway through a
+    book" and WORKS_ON for "finished a paper" -- both produce wrong edges in
+    the knowledge graph (LEARNING is for technologies, WORKS_ON for projects).
+    Rule 12 retires those alternatives for Document targets.
+    """
+
+    def test_prompt_includes_document_engagement_rule(self):
+        """Rules section must explicitly cover active-reading verbs."""
+        prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
+        assert (
+            "document engagement" in prompt_lower
+        ), "Expected 'Document engagement' rule in EXTRACTION RULES"
+        assert (
+            "references_document" in prompt_lower
+        ), "Expected 'REFERENCES_DOCUMENT' anchor in the rule"
+
+    def test_prompt_explicitly_retires_learning_and_works_on_for_documents(self):
+        """The rule must call out both incorrect alternatives by name."""
+        prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
+        assert (
+            "learning" in prompt_lower and "works_on" in prompt_lower
+        ), "Expected explicit retirement of LEARNING and WORKS_ON for Document targets"
+
+    def test_examples_include_active_reading_document_extraction(self):
+        """At least one few-shot must show an active-reading verb on a Document.
+
+        Example 11 covers passive 'read'; Example 13 covers active engagement
+        ('working through'). The contrast pair anchors the rule with concrete output.
+        """
+        assert (
+            "working through" in EXTRACTION_SYSTEM_PROMPT.lower()
+        ), "Expected active-engagement few-shot using 'working through' verb"
+
+
 class TestUserTemplate:
     """Cluster 1: user template must surface subject_scope to the model."""
 
