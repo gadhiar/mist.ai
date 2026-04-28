@@ -45,7 +45,7 @@ Note on v8-07 (`Goal HAS_METRIC`): the probe is expected to produce TWO edges --
 | Bucket | Tag | Trap |
 |---|---|---|
 | Date no anchor | v8-17 | Date entity present, no Event/Milestone to anchor -- `OCCURRED_ON` would be a false positive |
-| Number not metric | v8-18 | "3 hours" is a temporal expression about a personal moment, not a measurement of a graph entity |
+| Number not metric | v8-18 | "3 books on my shelf" -- count of personal possessions, not a measurement of a graph entity (replaced "3 hours until my flight" 2026-04-28 after that probe consistently failed via OCCURRED_ON on "flight" treated as a future Event, which was not the intended trap) |
 | Document mention | v8-19 | "documents" is generic intent, not a named Document -- `REFERENCES_DOCUMENT` would be a false positive |
 | Temporal no precedence | v8-20 | Time-of-day pattern, not Events with explicit ordering -- `PRECEDED_BY` would be a false positive |
 
@@ -150,10 +150,10 @@ for compatibility with older debug JSONL.
   (`_extract_knowledge_async` wraps `extract_from_utterance` in
   `llm_call_context(session_id=..., event_id=...)`). V8 scorer can switch to
   event_id-based join when desired; utterance-parse fallback stays.
-- **v8-18 redesign** -- replace "It is 3 hours until my flight" with an
-  unambiguously-non-Event probe (e.g., "I have 3 books on my shelf" --
-  count without temporal anchor). Currently produces a stable false positive
-  on OCCURRED_ON.
+- ~~v8-18 redesign~~ DONE 2026-04-28 -- replaced "It is 3 hours until my
+  flight" with "I have 3 books on my shelf" (count without temporal anchor).
+  Removes the OCCURRED_ON false-positive failure mode while preserving the
+  HAS_METRIC trap intent.
 - `v8-multi-turn` -- same intents but spread across 5-25 turns of conversation
   context. Tests whether new-edge production survives coreference / context
   accumulation.
