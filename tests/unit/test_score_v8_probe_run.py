@@ -37,10 +37,10 @@ from eval_harness.score_v8_probe_run import (  # noqa: E402  -- after sys.path i
     PER_BUCKET_RECALL_THRESHOLD,
     ExtractionRecord,
     ProbeOutcome,
-    TurnIndexEntry,
     V8Probe,
     V8Report,
     build_indices,
+    extract_utterance_from_request,
     iter_debug_records,
     iter_probes,
     main,
@@ -74,7 +74,7 @@ def build_probe(
 
 def build_extraction_record(
     *,
-    event_id: str = "evt-1",
+    event_id: str | None = "evt-1",
     session_id: str | None = "v8-test",
     entities: tuple[str, ...] = ("Event", "Date"),
     relationships: tuple[str, ...] = ("OCCURRED_ON",),
@@ -91,13 +91,21 @@ def build_extraction_record(
     )
 
 
-def build_turn_entry(
-    *,
-    event_id: str = "evt-1",
-    session_id: str | None = "v8-test",
-    utterance: str = "I had a meeting on 2026-04-15",
-) -> TurnIndexEntry:
-    return TurnIndexEntry(event_id=event_id, session_id=session_id, utterance=utterance)
+def make_extraction_user_message(utterance: str, scope: str = "user-scope") -> str:
+    """Render an extraction user message exactly as EXTRACTION_USER_TEMPLATE does.
+
+    Mirrors backend/knowledge/extraction/prompts.py:EXTRACTION_USER_TEMPLATE so
+    extract_utterance_from_request can recover the utterance via the same
+    pattern at runtime.
+    """
+    return (
+        "Context:\n"
+        "(no prior context)\n"
+        f"Subject scope: {scope}\n"
+        f'Utterance: "{utterance}"\n'
+        "\n"
+        "Output:"
+    )
 
 
 def write_jsonl(path: Path, records: list[dict]) -> None:
@@ -128,11 +136,18 @@ def make_turn_record(
 
 def make_llm_call_record(
     *,
-    event_id: str = "evt-x",
-    session_id: str = "v8-test",
+    event_id: str | None = None,
+    session_id: str | None = None,
     call_site: str = EXTRACTION_CALL_SITE,
     response_content: str = '{"entities": [], "relationships": []}',
+    utterance: str = "test utterance",
 ) -> dict:
+    """Build a phase=llm_call record with the utterance embedded in the user message.
+
+    event_id and session_id default to None to mirror the current backend bug
+    where the extraction call site does not propagate conversation context.
+    Tests that exercise the propagated path can pass real values.
+    """
     return {
         "phase": "llm_call",
         "ts_iso": "2026-04-27T20:00:01+00:00",
@@ -142,7 +157,13 @@ def make_llm_call_record(
         "pass_num": None,
         "model": "gemma-4-e4b",
         "latency_ms": 200.0,
-        "request": {"messages": [], "tools": None},
+        "request": {
+            "messages": [
+                {"role": "system", "content": "system prompt..."},
+                {"role": "user", "content": make_extraction_user_message(utterance)},
+            ],
+            "tools": None,
+        },
         "response": {
             "content": response_content,
             "tool_calls": None,
@@ -371,33 +392,45 @@ class TestDebugRecordLoading:
         assert "malformed JSON" in captured.err
 
 
-class TestBuildIndices:
-    """Single-pass indexing of turn + extraction records."""
+class TestExtractUtteranceFromRequest:
+    """Recover the utterance from an extraction request user message."""
 
-    def test_indexes_turn_records_by_utterance(self, tmp_path):
-        # Arrange
-        records = iter(
-            [
-                make_turn_record(utterance="A", event_id="evt-A"),
-                make_turn_record(utterance="B", event_id="evt-B"),
+    def test_recovers_utterance_from_template(self):
+        request = {
+            "messages": [
+                {"role": "system", "content": "..."},
+                {
+                    "role": "user",
+                    "content": make_extraction_user_message("I had a meeting on 2026-04-15"),
+                },
             ]
-        )
+        }
 
-        # Act
-        utterance_index, extraction_index = build_indices(records)
+        result = extract_utterance_from_request(request)
 
-        # Assert
-        assert "A" in utterance_index
-        assert utterance_index["A"][0].event_id == "evt-A"
-        assert "B" in utterance_index
-        assert extraction_index == {}
+        assert result == "I had a meeting on 2026-04-15"
 
-    def test_indexes_extraction_records_by_event_id(self):
+    def test_returns_none_when_pattern_missing(self):
+        request = {"messages": [{"role": "user", "content": "no Utterance: marker here"}]}
+        assert extract_utterance_from_request(request) is None
+
+    def test_returns_none_when_messages_empty(self):
+        assert extract_utterance_from_request({"messages": []}) is None
+
+    def test_returns_none_when_request_not_dict(self):
+        assert extract_utterance_from_request(None) is None
+        assert extract_utterance_from_request("string") is None
+
+
+class TestBuildIndices:
+    """Single-pass indexing of extraction records keyed by utterance."""
+
+    def test_indexes_extraction_records_by_utterance(self):
         # Arrange
         records = iter(
             [
                 make_llm_call_record(
-                    event_id="evt-X",
+                    utterance="I had a meeting on 2026-04-15",
                     response_content='{"entities": [{"type": "Event"}], '
                     '"relationships": [{"type": "OCCURRED_ON"}]}',
                 ),
@@ -405,11 +438,11 @@ class TestBuildIndices:
         )
 
         # Act
-        utterance_index, extraction_index = build_indices(records)
+        index = build_indices(records)
 
         # Assert
-        assert "evt-X" in extraction_index
-        ext = extraction_index["evt-X"][0]
+        assert "I had a meeting on 2026-04-15" in index
+        ext = index["I had a meeting on 2026-04-15"][0]
         assert ext.extracted_entity_types == frozenset({"Event"})
         assert ext.extracted_relationship_types == frozenset({"OCCURRED_ON"})
         assert ext.parse_ok is True
@@ -419,33 +452,31 @@ class TestBuildIndices:
         # extraction.scope_classifier should be skipped.
         records = iter(
             [
-                make_llm_call_record(call_site="chat.initial"),
-                make_llm_call_record(
-                    call_site="extraction.scope_classifier",
-                    event_id="evt-scope",
-                ),
-                make_llm_call_record(call_site=EXTRACTION_CALL_SITE, event_id="evt-onto"),
+                make_llm_call_record(call_site="chat.initial", utterance="A"),
+                make_llm_call_record(call_site="extraction.scope_classifier", utterance="B"),
+                make_llm_call_record(call_site=EXTRACTION_CALL_SITE, utterance="C"),
             ]
         )
 
         # Act
-        _, extraction_index = build_indices(records)
+        index = build_indices(records)
 
         # Assert
-        assert "evt-onto" in extraction_index
-        assert "evt-scope" not in extraction_index
+        assert "C" in index
+        assert "A" not in index
+        assert "B" not in index
 
-    def test_aggregates_multiple_extraction_records_per_event(self):
-        # Arrange -- two extraction calls for the same event_id (e.g. retry).
+    def test_aggregates_multiple_extraction_records_per_utterance(self):
+        # Arrange -- two extraction calls for the same utterance (e.g. retry).
         records = iter(
             [
                 make_llm_call_record(
-                    event_id="evt-Y",
+                    utterance="X",
                     response_content='{"entities": [{"type": "Event"}], '
                     '"relationships": [{"type": "OCCURRED_ON"}]}',
                 ),
                 make_llm_call_record(
-                    event_id="evt-Y",
+                    utterance="X",
                     response_content='{"entities": [{"type": "Date"}], '
                     '"relationships": [{"type": "PRECEDED_BY"}]}',
                 ),
@@ -453,10 +484,22 @@ class TestBuildIndices:
         )
 
         # Act
-        _, extraction_index = build_indices(records)
+        index = build_indices(records)
 
         # Assert -- both records preserved; aggregation happens at score time.
-        assert len(extraction_index["evt-Y"]) == 2
+        assert len(index["X"]) == 2
+
+    def test_skips_extraction_with_unrecoverable_utterance(self):
+        # Arrange -- malformed user message; extract_utterance returns None.
+        record = make_llm_call_record(utterance="X")
+        record["request"]["messages"][-1]["content"] = "garbage with no marker"
+        records = iter([record])
+
+        # Act
+        index = build_indices(records)
+
+        # Assert
+        assert index == {}
 
 
 # ---------------------------------------------------------------------------
@@ -465,16 +508,14 @@ class TestBuildIndices:
 
 
 class TestScoreRun:
-    """End-to-end scoring against synthetic indices."""
+    """End-to-end scoring against the utterance-keyed extraction index."""
 
     def test_perfect_run(self):
         # Arrange -- one positive that produces the expected edge.
         probes = [build_probe(utterance="A", expected_edges=("OCCURRED_ON",))]
-        utterance_index = {"A": [build_turn_entry(event_id="evt-1", utterance="A")]}
-        extraction_index = {
-            "evt-1": [
+        index = {
+            "A": [
                 build_extraction_record(
-                    event_id="evt-1",
                     relationships=("OCCURRED_ON",),
                     entities=("Event", "Date"),
                 )
@@ -482,59 +523,39 @@ class TestScoreRun:
         }
 
         # Act
-        report = score_run(probes, utterance_index, extraction_index)
+        report = score_run(probes, index)
 
         # Assert
         assert report.outcomes[0].matched is True
         assert "OCCURRED_ON" in report.outcomes[0].extracted_edges
         assert report.overall_recall == 1.0
 
-    def test_aggregates_multiple_extractions_per_event(self):
-        # Arrange -- two extraction records per event_id; expect union.
+    def test_aggregates_multiple_extractions_per_utterance(self):
+        # Arrange -- two extraction records for the same utterance; expect union.
         probes = [build_probe(utterance="A", expected_edges=("OCCURRED_ON", "HAS_METRIC"))]
-        utterance_index = {"A": [build_turn_entry(event_id="evt-1", utterance="A")]}
-        extraction_index = {
-            "evt-1": [
-                build_extraction_record(
-                    event_id="evt-1",
-                    relationships=("OCCURRED_ON",),
-                    entities=("Event",),
-                ),
-                build_extraction_record(
-                    event_id="evt-1",
-                    relationships=("HAS_METRIC",),
-                    entities=("Metric",),
-                ),
+        index = {
+            "A": [
+                build_extraction_record(relationships=("OCCURRED_ON",), entities=("Event",)),
+                build_extraction_record(relationships=("HAS_METRIC",), entities=("Metric",)),
             ]
         }
 
         # Act
-        report = score_run(probes, utterance_index, extraction_index)
+        report = score_run(probes, index)
 
         # Assert -- both edges captured via union across retries.
         assert report.outcomes[0].extracted_edges == frozenset({"OCCURRED_ON", "HAS_METRIC"})
 
-    def test_missing_when_no_turn_entry(self):
-        # Arrange -- probe for utterance with no turn record at all.
+    def test_missing_when_no_extraction_matched(self):
+        # Arrange -- probe for utterance with no extraction record.
         probes = [build_probe(utterance="A")]
 
         # Act
-        report = score_run(probes, {}, {})
+        report = score_run(probes, {})
 
         # Assert
         assert report.outcomes[0].matched is False
         assert report.missing == 1
-
-    def test_missing_when_turn_has_no_extraction(self):
-        # Arrange -- turn entry exists but no extraction record matched.
-        probes = [build_probe(utterance="A")]
-        utterance_index = {"A": [build_turn_entry(event_id="evt-1", utterance="A")]}
-
-        # Act
-        report = score_run(probes, utterance_index, {})
-
-        # Assert
-        assert report.outcomes[0].matched is False
 
 
 class TestPerBucketStats:
@@ -812,33 +833,19 @@ class TestCLI:
         write_jsonl(
             debug_path,
             [
-                # Positive utterance
-                make_turn_record(
-                    utterance="I had a meeting on 2026-04-15",
-                    event_id="evt-pos",
-                    session_id="v8-cli-test",
-                ),
+                # Positive utterance -- extraction record carries the utterance
+                # in its request user message so the scorer can recover it.
                 make_llm_call_record(
-                    event_id="evt-pos",
                     session_id="v8-cli-test",
+                    utterance="I had a meeting on 2026-04-15",
                     response_content=edges_pos,
                 ),
-                # Negative utterance (always extracts nothing)
-                make_turn_record(
-                    utterance="I had a meeting on 2026-04-15 (negative)",
-                    event_id="evt-neg",
-                    session_id="v8-cli-test",
-                ),
+                # Negative utterance (always extracts nothing).
                 make_llm_call_record(
-                    event_id="evt-neg",
                     session_id="v8-cli-test",
+                    utterance="I had a meeting on 2026-04-15 (negative)",
                     response_content='{"entities": [], "relationships": []}',
                 ),
-                # Add per-edge-bucket synthetic positives so all 4 buckets
-                # have at least one expected probe; otherwise per-bucket
-                # recall on the missing buckets shows 0.0 and acceptance
-                # would fail for unrelated reasons. Here we simulate full
-                # production: each bucket has 1 expected, 1 produced.
             ],
         )
         return input_path, debug_path

@@ -61,6 +61,16 @@ NEGATIVE_TAG_INFIX = "-neg-"
 # learning events, not user-facing extraction).
 EXTRACTION_CALL_SITE = "extraction.ontology"
 
+# Backend bug workaround: extraction.ontology llm_call records currently have
+# session_id=None and event_id=None because the extraction call sites don't
+# propagate the conversation context to llm_call_context. The structurally-
+# clean join (utterance -> turn.event_id -> llm_call.event_id) therefore
+# breaks. Until the backend is fixed, we recover the utterance directly from
+# the prompt the extractor sent: backend.knowledge.extraction.prompts.
+# EXTRACTION_USER_TEMPLATE renders the utterance as `Utterance: "<text>"`
+# inside the user message, and we can parse it back out here.
+EXTRACTION_UTTERANCE_PATTERN = re.compile(r'Utterance:\s*"(.+?)"\s*\n\s*Output:', re.DOTALL)
+
 # The four post-MVP additive edges this probe set measures end-to-end
 # production for. Mirrors NEW edges added to backend/knowledge/ontologies/
 # v1_0_0.py on 2026-04-22 (OCCURRED_ON, HAS_METRIC, REFERENCES_DOCUMENT,
@@ -89,15 +99,6 @@ class V8Probe:
     def is_negative(self) -> bool:
         """True for negative-control probes (tag carries the -neg- infix)."""
         return NEGATIVE_TAG_INFIX in self.tag
-
-
-@dataclass(frozen=True, slots=True)
-class TurnIndexEntry:
-    """A phase=turn record's identifying fields, for joining to extraction."""
-
-    event_id: str | None
-    session_id: str | None
-    utterance: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,6 +262,26 @@ def iter_debug_records(
             yield rec
 
 
+def extract_utterance_from_request(request: dict) -> str | None:
+    """Recover the utterance from an extraction LLM request's user message.
+
+    Returns None if the request shape is unexpected or the pattern is absent.
+    Used as a join key when the backend bug strips event_id from extraction
+    llm_call records.
+    """
+    if not isinstance(request, dict):
+        return None
+    messages = request.get("messages") or []
+    if not messages:
+        return None
+    last = messages[-1]
+    if not isinstance(last, dict):
+        return None
+    content = last.get("content") or ""
+    match = EXTRACTION_UTTERANCE_PATTERN.search(content)
+    return match.group(1) if match else None
+
+
 def parse_extraction_json(
     content: str,
 ) -> tuple[bool, frozenset[str], frozenset[str]]:
@@ -303,88 +324,74 @@ def parse_extraction_json(
 
 def build_indices(
     records: Iterator[dict],
-) -> tuple[dict[str, list[TurnIndexEntry]], dict[str, list[ExtractionRecord]]]:
-    """Single-pass index of turn + extraction records from the debug JSONL.
+) -> dict[str, list[ExtractionRecord]]:
+    """Single-pass index of extraction records keyed by utterance.
 
-    Returns:
-        utterance_index: utterance -> list of turn entries (for join). Multiple
-            entries are kept; first-occurrence wins at lookup time.
-        extraction_index: event_id -> list of extraction records. Multiple
-            extraction calls per event_id (rare; retries) are kept and the
-            entity/relationship types are unioned at scoring time.
+    The utterance is recovered from the extraction request's user message
+    (see extract_utterance_from_request) because the backend currently
+    does not propagate session_id/event_id to extraction llm_call records.
+    Once that's fixed, this function can be split back into the original
+    two-step join (turn.event_id -> llm_call.event_id).
+
+    Multiple extraction calls per utterance (rare; retries) are kept; the
+    entity/relationship types are unioned at scoring time.
     """
-    utterance_index: dict[str, list[TurnIndexEntry]] = {}
-    extraction_index: dict[str, list[ExtractionRecord]] = {}
+    extraction_by_utterance: dict[str, list[ExtractionRecord]] = {}
     for rec in records:
-        phase = rec.get("phase")
-        if phase == "turn":
-            utterance = rec.get("utterance", "")
-            if utterance:
-                utterance_index.setdefault(utterance, []).append(
-                    TurnIndexEntry(
-                        event_id=rec.get("event_id"),
-                        session_id=rec.get("session_id"),
-                        utterance=utterance,
-                    )
-                )
-        elif phase == "llm_call":
-            if rec.get("call_site") != EXTRACTION_CALL_SITE:
-                continue
-            event_id = rec.get("event_id")
-            if event_id is None:
-                continue
-            response = rec.get("response") or {}
-            content = response.get("content") or ""
-            parse_ok, entity_types, rel_types = parse_extraction_json(content)
-            extraction_index.setdefault(event_id, []).append(
-                ExtractionRecord(
-                    event_id=event_id,
-                    session_id=rec.get("session_id"),
-                    extracted_entity_types=entity_types,
-                    extracted_relationship_types=rel_types,
-                    parse_ok=parse_ok,
-                    raw_response=content,
-                )
+        if rec.get("phase") != "llm_call":
+            continue
+        if rec.get("call_site") != EXTRACTION_CALL_SITE:
+            continue
+        request = rec.get("request") or {}
+        utterance = extract_utterance_from_request(request)
+        if not utterance:
+            continue
+        response = rec.get("response") or {}
+        content = response.get("content") or ""
+        parse_ok, entity_types, rel_types = parse_extraction_json(content)
+        extraction_by_utterance.setdefault(utterance, []).append(
+            ExtractionRecord(
+                event_id=rec.get("event_id"),
+                session_id=rec.get("session_id"),
+                extracted_entity_types=entity_types,
+                extracted_relationship_types=rel_types,
+                parse_ok=parse_ok,
+                raw_response=content,
             )
-    return utterance_index, extraction_index
+        )
+    return extraction_by_utterance
 
 
 def score_run(
     probes: list[V8Probe],
-    utterance_index: dict[str, list[TurnIndexEntry]],
-    extraction_index: dict[str, list[ExtractionRecord]],
+    extraction_by_utterance: dict[str, list[ExtractionRecord]],
 ) -> V8Report:
-    """Join probes against indices and emit a V8Report.
+    """Join probes against the utterance index and emit a V8Report.
 
-    For each probe, looks up all turn entries by utterance, then aggregates
-    extracted entity/relationship types from the extraction records linked
-    by event_id. A probe is matched=True iff at least one extraction record
-    was found.
+    For each probe, looks up all extraction records that were sent with
+    a matching utterance in their request prompt. Aggregates entity and
+    relationship types via union across multiple records (retries land
+    as separate records but we want the cumulative set of types produced).
+    A probe is matched=True iff at least one extraction record was found.
     """
     outcomes: list[ProbeOutcome] = []
     for probe in probes:
-        turn_entries = utterance_index.get(probe.utterance, [])
+        extractions = extraction_by_utterance.get(probe.utterance, [])
         all_edges: set[str] = set()
         all_entities: set[str] = set()
         any_parse_ok = False
-        matched = False
-        for entry in turn_entries:
-            if entry.event_id is None:
-                continue
-            extractions = extraction_index.get(entry.event_id, [])
-            for ext in extractions:
-                matched = True
-                if ext.parse_ok:
-                    any_parse_ok = True
-                all_edges |= ext.extracted_relationship_types
-                all_entities |= ext.extracted_entity_types
+        for ext in extractions:
+            if ext.parse_ok:
+                any_parse_ok = True
+            all_edges |= ext.extracted_relationship_types
+            all_entities |= ext.extracted_entity_types
         outcomes.append(
             ProbeOutcome(
                 probe=probe,
                 extracted_edges=frozenset(all_edges),
                 extracted_entities=frozenset(all_entities),
-                matched=matched,
-                parse_ok=any_parse_ok if matched else False,
+                matched=bool(extractions),
+                parse_ok=any_parse_ok if extractions else False,
             )
         )
     return V8Report(outcomes=outcomes)
@@ -581,10 +588,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     probes = list(iter_probes(args.input))
-    utterance_index, extraction_index = build_indices(
+    extraction_by_utterance = build_indices(
         iter_debug_records(args.debug_jsonl, session_id=args.session_id),
     )
-    report = score_run(probes, utterance_index, extraction_index)
+    report = score_run(probes, extraction_by_utterance)
 
     md = render_markdown(report)
     if args.output is not None:
