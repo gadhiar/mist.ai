@@ -14,3 +14,9 @@ services:
       # Filesystem polling required on Windows Docker Desktop
       # (inotify does not propagate across mount boundaries)
       - WATCHFILES_FORCE_POLLING=1
+      # Debug JSONL logger -- shell-overridable. Set in the host shell when
+      # running eval-harness validation (V7/V8 scoring scripts join on
+      # session_id against this file). Empty defaults so normal `up -d`
+      # leaves the logger disabled.
+      - MIST_DEBUG_JSONL=${MIST_DEBUG_JSONL:-}
+      - MIST_DEBUG_LLM_JSONL=${MIST_DEBUG_LLM_JSONL:-}

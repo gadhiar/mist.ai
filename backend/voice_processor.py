@@ -103,13 +103,20 @@ class VoiceProcessor:
         # Save event loop reference for VAD callbacks
         self.loop = asyncio.get_running_loop()
 
-        # Build LLM provider
+        # Build LLM provider. Pass the debug logger so the provider gets
+        # wrapped with InstrumentedStreamingLLMProvider when MIST_DEBUG_LLM_JSONL=1.
+        # Without this, the WebSocket text path's extraction calls bypass
+        # llm_call instrumentation (the conversation_handler factory's own
+        # build_llm_provider call short-circuits because llm_provider is
+        # passed in pre-built from here).
         try:
+            from backend.debug_jsonl_logger import DebugJSONLLogger
             from backend.factories import build_llm_provider
             from backend.knowledge.config import KnowledgeConfig
 
             knowledge_config = KnowledgeConfig.from_env()
-            self._llm_provider = build_llm_provider(knowledge_config)
+            debug_logger = DebugJSONLLogger.from_env()
+            self._llm_provider = build_llm_provider(knowledge_config, debug_logger=debug_logger)
         except Exception as e:
             logger.warning("LLM provider build failed, ModelManager will use None: %s", e)
             self._llm_provider = None
