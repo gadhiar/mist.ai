@@ -12,10 +12,10 @@ You MUST output ONLY valid JSON. No explanations. No markdown code fences. Just 
 ## ONTOLOGY CONSTRAINTS
 
 ### Allowed Entity Types (use EXACTLY these strings):
-User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location, Date, Milestone, Metric, Document, MistIdentity
+User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location, Date, Milestone, Metric, Document, Pattern, Convention, Mechanism, Strategy, DataStructure, MistIdentity
 
 ### Allowed Relationship Types (use EXACTLY these strings):
-USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF, IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT, MIST_HAS_PREFERENCE, OCCURRED_ON, HAS_METRIC, REFERENCES_DOCUMENT, PRECEDED_BY
+USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF, IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT, MIST_HAS_PREFERENCE, OCCURRED_ON, HAS_METRIC, REFERENCES_DOCUMENT, PRECEDED_BY, MECHANISM_OF, OPERATES_ON, INPUT_TO, IMPROVES, COMPRISES, APPLICABLE_TO, STRATEGY_FOR, NAMING_CONVENTION_OF
 
 ### Subject Scope (passed in as SUBJECT SCOPE below)
 - `user-scope` utterances: the user is the subject. Use User-centric predicates (USES, LEARNING, WORKS_ON, etc.). source="user".
@@ -45,6 +45,8 @@ USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXP
 11. Event vs Milestone -- pick the more specific type. Use `Milestone` for user-assigned-important timeline markers: shipped, launched, completed, achieved, promoted -- explicit accomplishments worth flagging. Use `Event` for meetings, decisions (paired with `DECIDED`), deadlines, conferences, life events, and generic notable occurrences (paired with `EXPERIENCED`). When a date is present, anchor either via `OCCURRED_ON`. Do NOT emit `Event` with `event_type="milestone"` -- the dedicated `Milestone` type is the canonical representation, and the `event_type=milestone` enum value is legacy.
 12. Document engagement -- when the user is reading, finishing, working through, halfway through, reviewing, or otherwise engaging with a named artifact (book, paper, ADR, RFC, spec, article, blog post), the artifact is a `Document` and the relationship is `REFERENCES_DOCUMENT`. Do NOT use `LEARNING` for this -- `LEARNING` is reserved for `Technology`, `Skill`, or `Concept` targets. Do NOT use `WORKS_ON` -- `WORKS_ON` is reserved for `Project` targets. The verb (read / finished / studying / reviewing / halfway through) does not change the edge type; the target type does.
 13. Temporal precedence -- when the user says "X happened after Y" / "X came after Y" / "X after Y" / "X following Y", emit a `PRECEDED_BY` edge from X to Y (X PRECEDED_BY Y means X happened after Y in time). X and Y are `Event` or `Milestone` entities; Y can also be a `Date`. Do NOT use `RELATED_TO` for explicit temporal ordering -- `RELATED_TO` drops the directional time signal. Do NOT use only `OCCURRED_ON` for "X after <date>" -- the precedence relationship is the load-bearing fact, not the date anchor.
+14. Mechanism / Pattern / Strategy entity selection -- when a noun phrase names a concrete operational component (a thing that performs a specific function inside a larger system: garbage collector, validator, retry-policy, exclusion-filter, rate-limiter, scheduler), classify it as `Mechanism`, NOT `Concept` and NOT `Technology`. When it names a reusable algorithmic shape (LRU, two-pointer, observer, hexagonal-architecture), classify it as `Pattern`. When it names a high-level approach to a goal (hybrid-retrieval, semantic-search, write-through-caching), classify it as `Strategy`. When it names a first-class data shape used by code (memoryfragment, hashmap, trie, preferencerecord), classify it as `DataStructure`. When it names a naming/formatting rule (camelCase, snake_case, PEP 8), classify it as `Convention`. These types absorb the most common RELATED_TO cases and unlock canonical predicates below; defaulting to `Concept` is a quality regression.
+15. Mechanism / Pattern / Strategy predicates -- prefer canonical predicates over `RELATED_TO` whenever a sentence expresses one of these shapes. (a) `MECHANISM_OF` -- "X is the mechanism by which Y works"; source is Mechanism or Pattern, target is Concept / Technology / Topic / Strategy. (b) `OPERATES_ON` -- "X acts on Y" / "X manages Y"; source is Mechanism / Technology / Strategy / Pattern, target is DataStructure / Concept / Topic. Direction is from the actor to the thing acted upon. (c) `INPUT_TO` -- "X feeds into Y" / "X is consumed by Y"; source is the data, target is the consumer. (d) `IMPROVES` -- "X optimises Y" / "X mitigates Y" / "X reduces Y" / "X speeds up Y"; merged optimization-or-mitigation predicate. (e) `COMPRISES` -- "X is made up of Y" / "X consists of Y"; source is the whole, target is the part. (f) `APPLICABLE_TO` -- "X applies to Y" / "X works for Y"; substrate-oriented. (g) `STRATEGY_FOR` -- "X is a strategy for Y"; goal-oriented. (h) `NAMING_CONVENTION_OF` -- "X is the naming convention used for Y"; source is Convention. Do NOT emit `RELATED_TO` when one of these canonical shapes fits.
 
 ## REFERENCE DATE
 Today's date: {reference_date}
@@ -134,6 +136,36 @@ Subject scope: unknown
 Utterance: "The deploy happened after the code review"
 Output:
 {{"entities": [{{"id": "deploy", "name": "Deploy", "type": "Event"}}, {{"id": "code-review", "name": "Code review", "type": "Event"}}], "relationships": [{{"source": "deploy", "target": "code-review", "type": "PRECEDED_BY", "properties": {{"confidence": 0.9, "temporal_status": "past", "start_date": null, "end_date": null, "temporal_expression": "after", "context": null, "negated": false}}}}]}}
+
+### Example 15: Mechanism / OPERATES_ON -- a concrete operational component acting on data
+Subject scope: unknown
+Utterance: "The garbage collector reclaims unused memory fragments"
+Output:
+{{"entities": [{{"id": "garbage-collector", "name": "Garbage collector", "type": "Mechanism"}}, {{"id": "memory-fragment", "name": "Memory fragment", "type": "DataStructure"}}], "relationships": [{{"source": "garbage-collector", "target": "memory-fragment", "type": "OPERATES_ON", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "reclaims unused", "negated": false}}}}]}}
+
+### Example 16: COMPRISES + INPUT_TO -- composition and data-flow direction
+Subject scope: unknown
+Utterance: "The retrieval pipeline consists of a query encoder and a reranker; user context feeds into the encoder"
+Output:
+{{"entities": [{{"id": "retrieval-pipeline", "name": "Retrieval pipeline", "type": "Strategy"}}, {{"id": "query-encoder", "name": "Query encoder", "type": "Mechanism"}}, {{"id": "reranker", "name": "Reranker", "type": "Mechanism"}}, {{"id": "user-context", "name": "User context", "type": "DataStructure"}}], "relationships": [{{"source": "retrieval-pipeline", "target": "query-encoder", "type": "COMPRISES", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false}}}}, {{"source": "retrieval-pipeline", "target": "reranker", "type": "COMPRISES", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false}}}}, {{"source": "user-context", "target": "query-encoder", "type": "INPUT_TO", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "feeds into", "negated": false}}}}]}}
+
+### Example 17: IMPROVES -- mechanism reduces a harm or boosts a metric (merged optimize/mitigate)
+Subject scope: unknown
+Utterance: "Speculative decoding speeds up token generation, and the LRU cache cuts down on lookup latency"
+Output:
+{{"entities": [{{"id": "speculative-decoding", "name": "Speculative decoding", "type": "Mechanism"}}, {{"id": "token-generation", "name": "Token generation", "type": "Concept"}}, {{"id": "lru-cache", "name": "LRU cache", "type": "Mechanism"}}, {{"id": "lookup-latency", "name": "Lookup latency", "type": "Metric"}}], "relationships": [{{"source": "speculative-decoding", "target": "token-generation", "type": "IMPROVES", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "speeds up", "negated": false}}}}, {{"source": "lru-cache", "target": "lookup-latency", "type": "IMPROVES", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "cuts down on", "negated": false}}}}]}}
+
+### Example 18: STRATEGY_FOR + APPLICABLE_TO + NAMING_CONVENTION_OF -- goal vs substrate vs naming rule
+Subject scope: unknown
+Utterance: "Hybrid retrieval is our strategy for memory recall and applies to long-context conversations. The MemoryFragment data structure follows camelCase naming"
+Output:
+{{"entities": [{{"id": "hybrid-retrieval", "name": "Hybrid retrieval", "type": "Strategy"}}, {{"id": "memory-recall", "name": "Memory recall", "type": "Goal"}}, {{"id": "long-context-conversations", "name": "Long-context conversations", "type": "Topic"}}, {{"id": "memoryfragment", "name": "MemoryFragment", "type": "DataStructure"}}, {{"id": "camelcase", "name": "camelCase", "type": "Convention"}}], "relationships": [{{"source": "hybrid-retrieval", "target": "memory-recall", "type": "STRATEGY_FOR", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false}}}}, {{"source": "hybrid-retrieval", "target": "long-context-conversations", "type": "APPLICABLE_TO", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false}}}}, {{"source": "camelcase", "target": "memoryfragment", "type": "NAMING_CONVENTION_OF", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false}}}}]}}
+
+### Example 19: Mechanism / Pattern type discrimination -- a Pattern (LRU) vs the Mechanism (cache) that uses it
+Subject scope: unknown
+Utterance: "The LRU pattern is applicable to cache eviction and the cache mechanism comprises a doubly-linked list"
+Output:
+{{"entities": [{{"id": "lru", "name": "LRU", "type": "Pattern"}}, {{"id": "cache-eviction", "name": "Cache eviction", "type": "Concept"}}, {{"id": "cache", "name": "Cache", "type": "Mechanism"}}, {{"id": "doubly-linked-list", "name": "Doubly-linked list", "type": "DataStructure"}}], "relationships": [{{"source": "lru", "target": "cache-eviction", "type": "APPLICABLE_TO", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false}}}}, {{"source": "cache", "target": "doubly-linked-list", "type": "COMPRISES", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false}}}}]}}
 """
 
 EXTRACTION_USER_TEMPLATE = """Context:

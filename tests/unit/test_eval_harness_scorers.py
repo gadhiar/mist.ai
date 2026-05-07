@@ -79,6 +79,16 @@ class TestScorerMembershipLandmarks:
         for type_name in ("Date", "Milestone", "Metric", "Document"):
             assert type_name in EXTRACTABLE_ENTITY_TYPES
 
+    def test_v1_1_0_additive_entity_types_are_extractable(self):
+        for type_name in (
+            "Pattern",
+            "Convention",
+            "Mechanism",
+            "Strategy",
+            "DataStructure",
+        ):
+            assert type_name in EXTRACTABLE_ENTITY_TYPES
+
     def test_mist_scope_edges_are_extractable(self):
         for edge_name in (
             "IMPLEMENTED_WITH",
@@ -94,5 +104,18 @@ class TestScorerMembershipLandmarks:
             "HAS_METRIC",
             "REFERENCES_DOCUMENT",
             "PRECEDED_BY",
+        ):
+            assert edge_name in EXTRACTABLE_RELATIONSHIP_TYPES
+
+    def test_v1_1_0_additive_edges_are_extractable(self):
+        for edge_name in (
+            "MECHANISM_OF",
+            "OPERATES_ON",
+            "INPUT_TO",
+            "IMPROVES",
+            "COMPRISES",
+            "APPLICABLE_TO",
+            "STRATEGY_FOR",
+            "NAMING_CONVENTION_OF",
         ):
             assert edge_name in EXTRACTABLE_RELATIONSHIP_TYPES

@@ -1,12 +1,17 @@
-"""MIST.AI Knowledge Ontology v1.0.0.
+"""MIST.AI Knowledge Ontology v1.x family (current: v1.1.0).
 
 Defines every node type, edge type, confidence policy, extraction rule, and
-universal property for the first stable release of the knowledge graph schema.
+universal property for the v1.x ontology snapshot. Module name retains the
+original v1_0_0 path; the active version is tracked by the `version` field
+on the exported `ONTOLOGY_V1_0_0` constant. v1.1.0 (2026-05-06) added
+Pattern / Convention / Mechanism / Strategy / DataStructure entity types
+and 8 new predicates (MECHANISM_OF, OPERATES_ON, INPUT_TO, IMPROVES,
+COMPRISES, APPLICABLE_TO, STRATEGY_FOR, NAMING_CONVENTION_OF).
 
 Exports
 -------
 ONTOLOGY_V1_0_0 : OntologyVersion
-    The complete, frozen ontology definition.
+    The complete, frozen ontology definition (currently version 1.1.0).
 ALL_NODE_TYPES / ALL_NODE_TYPE_NAMES
 ALL_EDGE_TYPES / ALL_EDGE_TYPE_NAMES
 EXTRACTABLE_NODE_TYPES / EXTRACTABLE_RELATIONSHIP_TYPES
@@ -836,6 +841,98 @@ DOCUMENT = NodeTypeDefinition(
     ),
 )
 
+# -------------------------------------------------------------------
+# Mechanism / Pattern / Strategy / Convention / DataStructure (v1.1.0
+# additive expansion, 2026-05-06). Surfaced from V6 deep-review where
+# 61 percent of relationships defaulted to RELATED_TO because there was
+# no canonical entity type for "the algorithm", "the convention", "the
+# implementation device", "the high-level approach", or "the first-class
+# data shape". Adding these unblocks predicate canonicalization for
+# MECHANISM_OF / OPERATES_ON / INPUT_TO / IMPROVES / COMPRISES /
+# APPLICABLE_TO / STRATEGY_FOR / NAMING_CONVENTION_OF.
+# -------------------------------------------------------------------
+
+PATTERN = NodeTypeDefinition(
+    type_name="Pattern",
+    description=(
+        "A reusable algorithmic or architectural pattern (e.g. LRU, "
+        "two-pointer, frequency-based eviction, hexagonal architecture). "
+        "Distinct from Concept: a Pattern is a named recurring solution "
+        "shape that applies to a domain; Concept is broader and not "
+        "necessarily prescriptive."
+    ),
+    knowledge_domain=KnowledgeDomain.EXTERNAL,
+    optional_properties=(
+        PropertyDefinition(
+            name="pattern_family",
+            type="string",
+            required=False,
+            description=(
+                "Family the pattern belongs to (e.g. 'caching', 'concurrency', "
+                "'data-structure', 'design')."
+            ),
+        ),
+    ),
+)
+
+CONVENTION = NodeTypeDefinition(
+    type_name="Convention",
+    description=(
+        "A naming, formatting, or stylistic convention (e.g. camelCase, "
+        "snake_case, kebab-case, PEP 8). Distinct from Concept: a "
+        "Convention is a normative rule about how something is written "
+        "or named; Concept is broader."
+    ),
+    knowledge_domain=KnowledgeDomain.EXTERNAL,
+    optional_properties=(
+        PropertyDefinition(
+            name="convention_kind",
+            type="string",
+            required=False,
+            description="Kind of convention.",
+            allowed_values=("naming", "formatting", "structural", "other"),
+        ),
+    ),
+)
+
+MECHANISM = NodeTypeDefinition(
+    type_name="Mechanism",
+    description=(
+        "An implementation device or component that performs a specific "
+        "function (e.g. garbage-collection-policy, exclusion-filter, "
+        "validator, rate-limiter). Distinct from Pattern: a Mechanism is "
+        "a concrete operational component; a Pattern is the abstract "
+        "shape it instantiates. Distinct from Technology: a Mechanism is "
+        "finer-grained and typically lives inside a Technology."
+    ),
+    knowledge_domain=KnowledgeDomain.EXTERNAL,
+)
+
+STRATEGY = NodeTypeDefinition(
+    type_name="Strategy",
+    description=(
+        "A high-level approach or plan for achieving a goal (e.g. "
+        "hybrid-retrieval, semantic-search, write-through-caching). "
+        "Distinct from Pattern: a Strategy is goal-oriented and may "
+        "compose multiple Patterns; a Pattern is a recurring shape. "
+        "Distinct from Mechanism: a Strategy is the plan, a Mechanism "
+        "is the device that realises part of it."
+    ),
+    knowledge_domain=KnowledgeDomain.EXTERNAL,
+)
+
+DATA_STRUCTURE = NodeTypeDefinition(
+    type_name="DataStructure",
+    description=(
+        "A first-class data shape used by a system (e.g. memoryfragment, "
+        "usercontext, preferencerecord, hashmap, trie). Distinct from "
+        "Concept: a DataStructure is concrete and addressable in code; "
+        "Concept is broader. Distinct from Document: a DataStructure is "
+        "a structured runtime entity, not a referenced artifact."
+    ),
+    knowledge_domain=KnowledgeDomain.EXTERNAL,
+)
+
 # ===================================================================
 # BRIDGING Entity Types (5)
 # ===================================================================
@@ -1057,6 +1154,13 @@ _EXTERNAL_NODE_TYPES: tuple[NodeTypeDefinition, ...] = (
     MILESTONE,
     METRIC,
     DOCUMENT,
+    # v1.1.0 additive expansion 2026-05-06: Pattern / Convention / Mechanism /
+    # Strategy / DataStructure. Surfaced from V6 deep-review RELATED_TO triage.
+    PATTERN,
+    CONVENTION,
+    MECHANISM,
+    STRATEGY,
+    DATA_STRUCTURE,
 )
 
 _BRIDGING_NODE_TYPES: tuple[NodeTypeDefinition, ...] = (
@@ -1418,6 +1522,130 @@ PRECEDED_BY = EdgeTypeDefinition(
 )
 
 # ===================================================================
+# v1.1.0 Additive Predicates (8)
+# 2026-05-06. Surfaced from V6 deep-review where 61 percent of
+# extracted relationships defaulted to RELATED_TO. These predicates
+# absorb the most common RELATED_TO clusters into queryable shapes.
+# Paired with the Pattern / Convention / Mechanism / Strategy /
+# DataStructure entity types added above.
+# ===================================================================
+
+MECHANISM_OF = EdgeTypeDefinition(
+    type_name="MECHANISM_OF",
+    description=(
+        "The source Mechanism implements or instantiates the target "
+        "Concept, System (Technology), Topic, or Strategy. Use for "
+        "'X is the mechanism by which Y operates' relationships."
+    ),
+    allowed_source_types=("Mechanism", "Pattern"),
+    allowed_target_types=("Concept", "Technology", "Topic", "Strategy"),
+)
+
+OPERATES_ON = EdgeTypeDefinition(
+    type_name="OPERATES_ON",
+    description=(
+        "The source Mechanism, Technology, or Strategy acts upon, "
+        "manipulates, or owns the lifecycle of the target DataStructure "
+        "or Concept. Absorbs both transient action and ongoing lifecycle "
+        "ownership semantics."
+    ),
+    allowed_source_types=("Mechanism", "Technology", "Strategy", "Pattern"),
+    allowed_target_types=("DataStructure", "Concept", "Topic"),
+)
+
+INPUT_TO = EdgeTypeDefinition(
+    type_name="INPUT_TO",
+    description=(
+        "The source DataStructure or Concept is consumed as input by the "
+        "target Mechanism, Strategy, or Technology. Direction is "
+        "load-bearing: 'X feeds into Y' is X INPUT_TO Y."
+    ),
+    allowed_source_types=("DataStructure", "Concept", "Document"),
+    allowed_target_types=("Mechanism", "Strategy", "Technology", "Pattern"),
+)
+
+IMPROVES = EdgeTypeDefinition(
+    type_name="IMPROVES",
+    description=(
+        "The source Mechanism, Strategy, Pattern, or Technology improves "
+        "the target Concept, System, or Metric (either by optimising a "
+        "desired property or mitigating a harm). Merges OPTIMIZES and "
+        "MITIGATES into one canonical predicate."
+    ),
+    allowed_source_types=(
+        "Mechanism",
+        "Strategy",
+        "Pattern",
+        "Technology",
+    ),
+    allowed_target_types=(
+        "Concept",
+        "Technology",
+        "Topic",
+        "Metric",
+        "Project",
+    ),
+)
+
+COMPRISES = EdgeTypeDefinition(
+    type_name="COMPRISES",
+    description=(
+        "The source System (Technology, Project, DataStructure, or "
+        "Mechanism) is composed of the target Component (DataStructure, "
+        "Mechanism, Concept, or Technology). 'X is made up of Y' is "
+        "X COMPRISES Y."
+    ),
+    allowed_source_types=(
+        "Technology",
+        "Project",
+        "DataStructure",
+        "Mechanism",
+        "Strategy",
+    ),
+    allowed_target_types=(
+        "DataStructure",
+        "Mechanism",
+        "Concept",
+        "Technology",
+        "Pattern",
+    ),
+)
+
+APPLICABLE_TO = EdgeTypeDefinition(
+    type_name="APPLICABLE_TO",
+    description=(
+        "The source Pattern or Strategy is applicable to the target "
+        "Concept, Topic, or Technology (the substrate where the approach "
+        "fits). Substrate-oriented; contrast STRATEGY_FOR which is "
+        "goal-oriented."
+    ),
+    allowed_source_types=("Pattern", "Strategy", "Mechanism"),
+    allowed_target_types=("Concept", "Topic", "Technology", "Skill"),
+)
+
+STRATEGY_FOR = EdgeTypeDefinition(
+    type_name="STRATEGY_FOR",
+    description=(
+        "The source Strategy or Pattern is a strategy for achieving the "
+        "target Goal, Concept, or Topic. Goal-oriented; contrast "
+        "APPLICABLE_TO which names the substrate."
+    ),
+    allowed_source_types=("Strategy", "Pattern"),
+    allowed_target_types=("Goal", "Concept", "Topic"),
+)
+
+NAMING_CONVENTION_OF = EdgeTypeDefinition(
+    type_name="NAMING_CONVENTION_OF",
+    description=(
+        "The source Convention is the naming, formatting, or stylistic "
+        "convention used for the target Concept, DataStructure, "
+        "Technology, or Topic."
+    ),
+    allowed_source_types=("Convention",),
+    allowed_target_types=("Concept", "DataStructure", "Technology", "Topic"),
+)
+
+# ===================================================================
 # MIST-Scope Relationships (4)
 # ===================================================================
 # These edges let extraction attribute facts to MIST.AI itself (as a
@@ -1513,6 +1741,16 @@ _STRUCTURAL_EDGE_TYPES: tuple[EdgeTypeDefinition, ...] = (
     HAS_METRIC,
     REFERENCES_DOCUMENT,
     PRECEDED_BY,
+    # v1.1.0 additive (2026-05-06): Pattern / Convention / Mechanism /
+    # Strategy / DataStructure predicates.
+    MECHANISM_OF,
+    OPERATES_ON,
+    INPUT_TO,
+    IMPROVES,
+    COMPRISES,
+    APPLICABLE_TO,
+    STRATEGY_FOR,
+    NAMING_CONVENTION_OF,
 )
 
 _MIST_SCOPE_EDGE_TYPES: tuple[EdgeTypeDefinition, ...] = (
@@ -1558,6 +1796,15 @@ _EXTRACTABLE_STRUCTURAL_EDGE_TYPES: tuple[EdgeTypeDefinition, ...] = (
     WORKS_WITH,
     KNOWS_PERSON,
     MEMBER_OF,
+    # v1.1.0 additive (2026-05-06).
+    MECHANISM_OF,
+    OPERATES_ON,
+    INPUT_TO,
+    IMPROVES,
+    COMPRISES,
+    APPLICABLE_TO,
+    STRATEGY_FOR,
+    NAMING_CONVENTION_OF,
     IMPLEMENTED_WITH,
     MIST_HAS_CAPABILITY,
     MIST_HAS_TRAIT,
@@ -1583,18 +1830,21 @@ You are a knowledge-graph extraction engine for the MIST.AI cognitive assistant.
 Your job is to read a user utterance and produce structured entities and
 relationships that should be stored in MIST's persistent knowledge graph.
 
-ENTITY TYPES YOU MAY PRODUCE (17):
+ENTITY TYPES YOU MAY PRODUCE (22):
   User, Person, Organization, Technology, Skill, Project, Concept, Topic,
   Event, Goal, Preference, Location, Date, Milestone, Metric, Document,
-  MistIdentity
+  Pattern, Convention, Mechanism, Strategy, DataStructure, MistIdentity
 
-RELATIONSHIP TYPES YOU MAY PRODUCE (29):
+RELATIONSHIP TYPES YOU MAY PRODUCE (37):
   User-centric: USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL,
     PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED
   Structural: IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH,
     KNOWS_PERSON, MEMBER_OF
   Temporal / quantified / document: OCCURRED_ON, HAS_METRIC,
     REFERENCES_DOCUMENT, PRECEDED_BY
+  Mechanism / Pattern / Strategy (v1.1.0): MECHANISM_OF, OPERATES_ON,
+    INPUT_TO, IMPROVES, COMPRISES, APPLICABLE_TO, STRATEGY_FOR,
+    NAMING_CONVENTION_OF
   MIST-scope: IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT,
     MIST_HAS_PREFERENCE
 
@@ -1627,12 +1877,16 @@ EXTRACTION_RULES = ExtractionRules(
 # ===================================================================
 
 ONTOLOGY_V1_0_0 = OntologyVersion(
-    version="1.0.0",
-    created_at=datetime(2026, 3, 22, tzinfo=UTC),
+    version="1.1.0",
+    created_at=datetime(2026, 5, 6, tzinfo=UTC),
     description=(
-        "First stable ontology for the MIST.AI knowledge graph. "
-        "Covers internal self-model, external world knowledge, and "
-        "bridging provenance types."
+        "Stable ontology for the MIST.AI knowledge graph. v1.1.0 additive "
+        "expansion (2026-05-06): Pattern, Convention, Mechanism, Strategy, "
+        "DataStructure entity types and MECHANISM_OF, OPERATES_ON, INPUT_TO, "
+        "IMPROVES, COMPRISES, APPLICABLE_TO, STRATEGY_FOR, "
+        "NAMING_CONVENTION_OF predicates surfaced from V6 deep-review "
+        "RELATED_TO triage. Backwards compatible with v1.0.0 / v1.0.1 graph "
+        "entities."
     ),
     node_types=tuple(ALL_NODE_TYPES),
     edge_types=tuple(ALL_EDGE_TYPES),
@@ -1644,7 +1898,7 @@ ONTOLOGY_V1_0_0 = OntologyVersion(
     ),
     universal_entity_properties=UNIVERSAL_ENTITY_PROPERTIES,
     universal_relationship_properties=UNIVERSAL_RELATIONSHIP_PROPERTIES,
-    parent_version=None,
+    parent_version="1.0.0",
     migration_script_path=None,
     active=True,
     deprecated=False,

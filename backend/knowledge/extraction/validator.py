@@ -94,6 +94,42 @@ RELATIONSHIP_CONSTRAINTS: dict[str, tuple[set[str] | None, set[str] | None]] = {
         {"Document"},
     ),
     "PRECEDED_BY": ({"Event", "Milestone"}, {"Event", "Milestone", "Date"}),
+    # v1.1.0 additive (2026-05-06): mechanism / pattern / strategy / convention.
+    # Surfaced from V6 deep-review where 61 percent of relationships defaulted
+    # to RELATED_TO. Constraints mirror EdgeTypeDefinition entries in
+    # backend.knowledge.ontologies.v1_0_0 exactly.
+    "MECHANISM_OF": (
+        {"Mechanism", "Pattern"},
+        {"Concept", "Technology", "Topic", "Strategy"},
+    ),
+    "OPERATES_ON": (
+        {"Mechanism", "Technology", "Strategy", "Pattern"},
+        {"DataStructure", "Concept", "Topic"},
+    ),
+    "INPUT_TO": (
+        {"DataStructure", "Concept", "Document"},
+        {"Mechanism", "Strategy", "Technology", "Pattern"},
+    ),
+    "IMPROVES": (
+        {"Mechanism", "Strategy", "Pattern", "Technology"},
+        {"Concept", "Technology", "Topic", "Metric", "Project"},
+    ),
+    "COMPRISES": (
+        {"Technology", "Project", "DataStructure", "Mechanism", "Strategy"},
+        {"DataStructure", "Mechanism", "Concept", "Technology", "Pattern"},
+    ),
+    "APPLICABLE_TO": (
+        {"Pattern", "Strategy", "Mechanism"},
+        {"Concept", "Topic", "Technology", "Skill"},
+    ),
+    "STRATEGY_FOR": (
+        {"Strategy", "Pattern"},
+        {"Goal", "Concept", "Topic"},
+    ),
+    "NAMING_CONVENTION_OF": (
+        {"Convention"},
+        {"Concept", "DataStructure", "Technology", "Topic"},
+    ),
 }
 
 VALID_TEMPORAL_STATUSES: set[str] = {"current", "past", "future", "recurring"}

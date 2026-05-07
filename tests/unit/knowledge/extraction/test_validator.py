@@ -688,6 +688,379 @@ class TestTemporalQuantifiedDocumentConstraints:
         assert any("PRECEDED_BY" in w and "Source type 'Project'" in w for w in result.warnings)
 
 
+class TestV110AdditiveConstraints:
+    """RELATIONSHIP_CONSTRAINTS must mirror the ontology's EdgeTypeDefinition
+    entries exactly for the 8 v1.1.0 additive edges (2026-05-06). Accept valid
+    shapes and reject shapes whose source or target type is outside the
+    ontology allowlist. Surfaced from V6 deep-review where 61 percent of
+    relationships defaulted to RELATED_TO; these predicates absorb the long
+    tail into queryable shapes.
+    """
+
+    # --- MECHANISM_OF: (Mechanism | Pattern) -> (Concept | Technology | Topic | Strategy) ---
+
+    def test_mechanism_of_mechanism_to_concept_accepted(self):
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="garbage-collector", entity_type="Mechanism"),
+                _make_entity(entity_id="memory-management", entity_type="Concept"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="garbage-collector",
+                    target="memory-management",
+                    rel_type="MECHANISM_OF",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["type"] == "MECHANISM_OF"
+
+    def test_mechanism_of_user_source_rejected(self):
+        # User is not in MECHANISM_OF.allowed_source_types
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="user", entity_type="User"),
+                _make_entity(entity_id="memory-management", entity_type="Concept"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="user",
+                    target="memory-management",
+                    rel_type="MECHANISM_OF",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 0
+        assert any("MECHANISM_OF" in w and "Source type 'User'" in w for w in result.warnings)
+
+    # --- OPERATES_ON: (Mechanism | Technology | Strategy | Pattern)
+    #                  -> (DataStructure | Concept | Topic) ---
+
+    def test_operates_on_mechanism_to_data_structure_accepted(self):
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="gc-policy", entity_type="Mechanism"),
+                _make_entity(entity_id="memory-fragment", entity_type="DataStructure"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="gc-policy",
+                    target="memory-fragment",
+                    rel_type="OPERATES_ON",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["type"] == "OPERATES_ON"
+
+    def test_operates_on_user_source_rejected(self):
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="user", entity_type="User"),
+                _make_entity(entity_id="memory-fragment", entity_type="DataStructure"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="user",
+                    target="memory-fragment",
+                    rel_type="OPERATES_ON",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 0
+        assert any("OPERATES_ON" in w and "Source type 'User'" in w for w in result.warnings)
+
+    # --- INPUT_TO: (DataStructure | Concept | Document)
+    #               -> (Mechanism | Strategy | Technology | Pattern) ---
+
+    def test_input_to_data_structure_to_mechanism_accepted(self):
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="user-context", entity_type="DataStructure"),
+                _make_entity(entity_id="query-encoder", entity_type="Mechanism"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="user-context",
+                    target="query-encoder",
+                    rel_type="INPUT_TO",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["type"] == "INPUT_TO"
+
+    def test_input_to_user_source_rejected(self):
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="user", entity_type="User"),
+                _make_entity(entity_id="query-encoder", entity_type="Mechanism"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="user",
+                    target="query-encoder",
+                    rel_type="INPUT_TO",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 0
+        assert any("INPUT_TO" in w and "Source type 'User'" in w for w in result.warnings)
+
+    # --- IMPROVES: (Mechanism | Strategy | Pattern | Technology)
+    #               -> (Concept | Technology | Topic | Metric | Project) ---
+
+    def test_improves_mechanism_to_concept_accepted(self):
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="speculative-decoding", entity_type="Mechanism"),
+                _make_entity(entity_id="token-throughput", entity_type="Concept"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="speculative-decoding",
+                    target="token-throughput",
+                    rel_type="IMPROVES",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["type"] == "IMPROVES"
+
+    def test_improves_user_source_rejected(self):
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="user", entity_type="User"),
+                _make_entity(entity_id="token-throughput", entity_type="Concept"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="user",
+                    target="token-throughput",
+                    rel_type="IMPROVES",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 0
+        assert any("IMPROVES" in w and "Source type 'User'" in w for w in result.warnings)
+
+    # --- COMPRISES: (Technology | Project | DataStructure | Mechanism | Strategy)
+    #                -> (DataStructure | Mechanism | Concept | Technology | Pattern) ---
+
+    def test_comprises_technology_to_data_structure_accepted(self):
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="cache", entity_type="Technology"),
+                _make_entity(entity_id="doubly-linked-list", entity_type="DataStructure"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="cache",
+                    target="doubly-linked-list",
+                    rel_type="COMPRISES",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["type"] == "COMPRISES"
+
+    def test_comprises_user_source_rejected(self):
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="user", entity_type="User"),
+                _make_entity(entity_id="doubly-linked-list", entity_type="DataStructure"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="user",
+                    target="doubly-linked-list",
+                    rel_type="COMPRISES",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 0
+        assert any("COMPRISES" in w and "Source type 'User'" in w for w in result.warnings)
+
+    # --- APPLICABLE_TO: (Pattern | Strategy | Mechanism)
+    #                    -> (Concept | Topic | Technology | Skill) ---
+
+    def test_applicable_to_pattern_to_concept_accepted(self):
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="lru", entity_type="Pattern"),
+                _make_entity(entity_id="cache-eviction", entity_type="Concept"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="lru",
+                    target="cache-eviction",
+                    rel_type="APPLICABLE_TO",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["type"] == "APPLICABLE_TO"
+
+    def test_applicable_to_user_source_rejected(self):
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="user", entity_type="User"),
+                _make_entity(entity_id="cache-eviction", entity_type="Concept"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="user",
+                    target="cache-eviction",
+                    rel_type="APPLICABLE_TO",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 0
+        assert any("APPLICABLE_TO" in w and "Source type 'User'" in w for w in result.warnings)
+
+    # --- STRATEGY_FOR: (Strategy | Pattern) -> (Goal | Concept | Topic) ---
+
+    def test_strategy_for_strategy_to_goal_accepted(self):
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="hybrid-retrieval", entity_type="Strategy"),
+                _make_entity(entity_id="memory-recall", entity_type="Goal"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="hybrid-retrieval",
+                    target="memory-recall",
+                    rel_type="STRATEGY_FOR",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["type"] == "STRATEGY_FOR"
+
+    def test_strategy_for_user_source_rejected(self):
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="user", entity_type="User"),
+                _make_entity(entity_id="memory-recall", entity_type="Goal"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="user",
+                    target="memory-recall",
+                    rel_type="STRATEGY_FOR",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 0
+        assert any("STRATEGY_FOR" in w and "Source type 'User'" in w for w in result.warnings)
+
+    # --- NAMING_CONVENTION_OF: (Convention) -> (Concept | DataStructure | Technology | Topic) ---
+
+    def test_naming_convention_of_convention_to_data_structure_accepted(self):
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="camelcase", entity_type="Convention"),
+                _make_entity(entity_id="memoryfragment", entity_type="DataStructure"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="camelcase",
+                    target="memoryfragment",
+                    rel_type="NAMING_CONVENTION_OF",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 1
+        assert result.relationships[0]["type"] == "NAMING_CONVENTION_OF"
+
+    def test_naming_convention_of_pattern_source_rejected(self):
+        # Pattern is not in NAMING_CONVENTION_OF.allowed_source_types -- only
+        # Convention is permitted. This guards against drift where a writer
+        # might incorrectly broaden the source set.
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="lru", entity_type="Pattern"),
+                _make_entity(entity_id="memoryfragment", entity_type="DataStructure"),
+            ],
+            relationships=[
+                _make_relationship(
+                    source="lru",
+                    target="memoryfragment",
+                    rel_type="NAMING_CONVENTION_OF",
+                ),
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert len(result.relationships) == 0
+        assert any(
+            "NAMING_CONVENTION_OF" in w and "Source type 'Pattern'" in w for w in result.warnings
+        )
+
+
 # -------------------------------------------------------------------
 # Standing drift guard (2026-04-22): RELATIONSHIP_CONSTRAINTS MUST
 # mirror EdgeTypeDefinition in the ontology exactly. Adding a new edge

@@ -75,6 +75,14 @@ class OntologyConstrainedExtractor:
             "Milestone",
             "Metric",
             "Document",
+            # v1.1.0 additive (2026-05-06): mechanism / pattern / strategy /
+            # convention / data-structure. Surfaced from V6 deep-review
+            # RELATED_TO triage.
+            "Pattern",
+            "Convention",
+            "Mechanism",
+            "Strategy",
+            "DataStructure",
         }
     )
 
@@ -111,6 +119,16 @@ class OntologyConstrainedExtractor:
             "HAS_METRIC",
             "REFERENCES_DOCUMENT",
             "PRECEDED_BY",
+            # v1.1.0 additive (2026-05-06): mechanism / pattern / strategy /
+            # convention. Absorbs ~80 percent of the RELATED_TO long tail.
+            "MECHANISM_OF",
+            "OPERATES_ON",
+            "INPUT_TO",
+            "IMPROVES",
+            "COMPRISES",
+            "APPLICABLE_TO",
+            "STRATEGY_FOR",
+            "NAMING_CONVENTION_OF",
         }
     )
 

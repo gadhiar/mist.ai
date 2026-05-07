@@ -29,11 +29,13 @@ from backend.knowledge.ontologies.v1_0_0 import (
 class TestEntityTypes:
     """Verify the complete set of entity types in the ontology."""
 
-    def test_has_26_entity_types(self):
+    def test_has_31_entity_types(self):
         # Cluster 8 Phase 6 (ADR-010) added VaultNote as a bridging/provenance type.
         # Post-MVP additive (2026-04-22) added Date, Milestone, Metric, Document
         # as EXTERNAL extractable types.
-        assert len(ALL_NODE_TYPES) == 26
+        # v1.1.0 additive (2026-05-06) added Pattern, Convention, Mechanism,
+        # Strategy, DataStructure as EXTERNAL extractable types.
+        assert len(ALL_NODE_TYPES) == 31
 
     @pytest.mark.parametrize(
         "type_name",
@@ -75,16 +77,22 @@ class TestEntityTypes:
             pytest.param("Milestone", id="Milestone"),
             pytest.param("Metric", id="Metric"),
             pytest.param("Document", id="Document"),
+            # v1.1.0 additive (2026-05-06):
+            pytest.param("Pattern", id="Pattern"),
+            pytest.param("Convention", id="Convention"),
+            pytest.param("Mechanism", id="Mechanism"),
+            pytest.param("Strategy", id="Strategy"),
+            pytest.param("DataStructure", id="DataStructure"),
         ],
     )
-    def test_external_domain_has_16_types(self, type_name: str):
+    def test_external_domain_has_21_types(self, type_name: str):
         external_types = [
             nt for nt in ALL_NODE_TYPES if nt.knowledge_domain == KnowledgeDomain.EXTERNAL
         ]
 
         external_names = [nt.type_name for nt in external_types]
 
-        assert len(external_types) == 16
+        assert len(external_types) == 21
         assert type_name in external_names
 
     @pytest.mark.parametrize(
@@ -135,6 +143,7 @@ class TestEntityTypes:
         # survive extraction. The extractable set is the full external
         # types plus MistIdentity.
         # Post-MVP additive (2026-04-22): 12 -> 16 external, 13 -> 17 extractable.
+        # v1.1.0 additive (2026-05-06): 16 -> 21 external, 17 -> 22 extractable.
         external_names = {
             nt.type_name for nt in ALL_NODE_TYPES if nt.knowledge_domain == KnowledgeDomain.EXTERNAL
         }
@@ -142,7 +151,7 @@ class TestEntityTypes:
 
         extractable_set = set(EXTRACTABLE_NODE_TYPES)
 
-        assert len(EXTRACTABLE_NODE_TYPES) == 17
+        assert len(EXTRACTABLE_NODE_TYPES) == 22
         assert extractable_set == expected
 
 
@@ -154,20 +163,25 @@ class TestEntityTypes:
 class TestRelationshipTypes:
     """Verify the complete set of relationship types in the ontology."""
 
-    def test_has_41_relationship_types(self):
+    def test_has_49_relationship_types(self):
         # Cluster 1 added 4 MIST-scope edges: IMPLEMENTED_WITH,
         # MIST_HAS_CAPABILITY, MIST_HAS_TRAIT, MIST_HAS_PREFERENCE.
         # Post-MVP additive (2026-04-22) added 4 temporal / quantified / document
         # edges: OCCURRED_ON, HAS_METRIC, REFERENCES_DOCUMENT, PRECEDED_BY.
-        assert len(ALL_EDGE_TYPES) == 41
+        # v1.1.0 additive (2026-05-06) added 8 mechanism/pattern/strategy edges:
+        # MECHANISM_OF, OPERATES_ON, INPUT_TO, IMPROVES, COMPRISES,
+        # APPLICABLE_TO, STRATEGY_FOR, NAMING_CONVENTION_OF.
+        assert len(ALL_EDGE_TYPES) == 49
 
     def test_extractable_relationships_count(self):
         # 13 user-centric + 8 original structural (excludes LEARNED_FROM, ABOUT,
         # SUPERSEDES + provenance SOURCED_FROM/REFERENCES/DERIVED_FROM) + 4
         # MIST-scope (IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT,
         # MIST_HAS_PREFERENCE) + 4 post-MVP additive structural (OCCURRED_ON,
-        # HAS_METRIC, REFERENCES_DOCUMENT, PRECEDED_BY).
-        assert len(EXTRACTABLE_RELATIONSHIP_TYPES) == 29
+        # HAS_METRIC, REFERENCES_DOCUMENT, PRECEDED_BY) + 8 v1.1.0 additive
+        # (MECHANISM_OF, OPERATES_ON, INPUT_TO, IMPROVES, COMPRISES,
+        # APPLICABLE_TO, STRATEGY_FOR, NAMING_CONVENTION_OF).
+        assert len(EXTRACTABLE_RELATIONSHIP_TYPES) == 37
 
     @pytest.mark.parametrize(
         "type_name",
@@ -356,5 +370,7 @@ class TestConfidencePolicies:
 class TestOntologyVersion:
     """Verify the top-level ontology version metadata."""
 
-    def test_version_is_1_0_0(self):
-        assert ONTOLOGY_V1_0_0.version == "1.0.0"
+    def test_version_is_1_1_0(self):
+        # v1.1.0 additive expansion 2026-05-06.
+        assert ONTOLOGY_V1_0_0.version == "1.1.0"
+        assert ONTOLOGY_V1_0_0.parent_version == "1.0.0"

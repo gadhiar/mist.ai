@@ -76,6 +76,20 @@ _USER_FACING_REL_TYPES: list[str] = [
     "HAS_METRIC",
     "REFERENCES_DOCUMENT",
     "PRECEDED_BY",
+    # v1.1.0 additive (2026-05-06): mechanism / pattern / strategy / convention
+    # predicates. Paired with the Pattern / Convention / Mechanism / Strategy /
+    # DataStructure entity additions. All content-level edges between extracted
+    # entities -- user-facing traversal so retrieval can pivot on "what
+    # mechanism implements X", "what does Y operate on", "what improves Z",
+    # etc. Provenance / ontology-metadata edges are gated separately.
+    "MECHANISM_OF",
+    "OPERATES_ON",
+    "INPUT_TO",
+    "IMPROVES",
+    "COMPRISES",
+    "APPLICABLE_TO",
+    "STRATEGY_FOR",
+    "NAMING_CONVENTION_OF",
 ]
 
 

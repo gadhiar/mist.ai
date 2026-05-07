@@ -65,6 +65,12 @@ EXTRACTABLE_ENTITY_TYPES: frozenset[str] = frozenset(
         "Milestone",
         "Metric",
         "Document",
+        # External domain -- v1.1.0 additive 2026-05-06 (5).
+        "Pattern",
+        "Convention",
+        "Mechanism",
+        "Strategy",
+        "DataStructure",
         # MIST-scope identity -- Cluster 1 promoted from INTERNAL-only (1).
         "MistIdentity",
     }
@@ -105,6 +111,15 @@ EXTRACTABLE_RELATIONSHIP_TYPES: frozenset[str] = frozenset(
         "HAS_METRIC",
         "REFERENCES_DOCUMENT",
         "PRECEDED_BY",
+        # v1.1.0 additive mechanism / pattern / strategy (8).
+        "MECHANISM_OF",
+        "OPERATES_ON",
+        "INPUT_TO",
+        "IMPROVES",
+        "COMPRISES",
+        "APPLICABLE_TO",
+        "STRATEGY_FOR",
+        "NAMING_CONVENTION_OF",
     }
 )
 
