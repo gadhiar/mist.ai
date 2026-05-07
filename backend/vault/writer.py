@@ -84,7 +84,12 @@ class VaultWriter:
         await writer.stop()
     """
 
-    def __init__(self, config: VaultConfig, debug_logger: Any = None) -> None:
+    def __init__(
+        self,
+        config: VaultConfig,
+        debug_logger: Any = None,
+        model_hash: str | None = None,
+    ) -> None:
         """Initialize the vault writer.
 
         Args:
@@ -94,6 +99,12 @@ class VaultWriter:
                 op emits a `phase: "vault"` JSONL record with operation,
                 path, duration_ms, ok, and any error_message. None preserves
                 pre-Phase-12 silent operation.
+            model_hash: Optional Phase 8 rebuild-determinism stamp. Mirrors the
+                same value used for graph DERIVED_FROM->VaultNote edges
+                (via `RebuildStamps` on `CurationGraphWriter`). When provided,
+                populates the `model_hash` frontmatter field on every newly
+                created session note. None preserves pre-fix behavior
+                (frontmatter `model_hash: null`).
         """
         self.config = config
         self._root = Path(config.root)
@@ -101,6 +112,7 @@ class VaultWriter:
         self._consumer_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._stopped = False
         self._debug_logger = debug_logger
+        self._model_hash = model_hash
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -250,6 +262,58 @@ class VaultWriter:
             },
         )
 
+    async def append_session_synthesis(
+        self, vault_note_path: str, synthesis_markdown: str
+    ) -> str | None:
+        """Append a MIST-authored synthesis section above the sentinel.
+
+        Gap #1b / ADR-011 bucket 2 end-of-session synthesis. The synthesis is
+        a "## Summary" markdown block (with What Was Accomplished, Decisions,
+        Next Actions, Context for Next Session subsections) that MIST writes
+        once at session end. Sits above the existing per-turn appends in the
+        same session note, mirroring how the user (Raj) writes session-end
+        summary notes in Claude+Obsidian.
+
+        Idempotent in spirit: if called multiple times on the same session
+        with the same synthesis, the file accumulates duplicate sections.
+        Callers should fire only once per session-end.
+
+        Args:
+            vault_note_path: Absolute path to the session note.
+            synthesis_markdown: Caller-provided markdown body. Must NOT
+                include the leading `## Summary` header; the writer adds
+                that wrapper. Caller provides only the inner content.
+
+        Returns:
+            The path on success, None when the file does not exist
+            (caller should mark_session_completed independently).
+        """
+        return await self._enqueue(
+            "append_session_synthesis",
+            {
+                "vault_note_path": vault_note_path,
+                "synthesis_markdown": synthesis_markdown,
+            },
+        )
+
+    async def mark_session_completed(self, vault_note_path: str) -> str | None:
+        """Flip a session note's frontmatter from `status: in-progress` to
+        `status: completed` (ADR-011 bucket 2: session-end signal).
+
+        Idempotent: a second call on an already-completed session is a no-op.
+        Graceful when the file does not exist (returns None silently).
+
+        Args:
+            vault_note_path: Absolute path to the session note to mark.
+
+        Returns:
+            The path on success, None when the file did not exist.
+        """
+        return await self._enqueue(
+            "mark_session_completed",
+            {"vault_note_path": vault_note_path},
+        )
+
     async def upsert_user(self, user_id: str, body_markdown: str) -> str:
         """Write or update a user fact sheet at `users/<user_id>.md`.
 
@@ -298,6 +362,33 @@ class VaultWriter:
         if not _SLUG_RE.fullmatch(session_slug):
             raise ValueError(f"session_slug must be lowercase kebab-case, got: {session_slug!r}")
         return str(self._root / "sessions" / f"{session_date}-{session_slug}.md")
+
+    def peek_turn_count(self, path: str) -> int:
+        """Read the `turn_count` from an existing session note's frontmatter.
+
+        Returns 0 if the file does not exist or its frontmatter cannot be
+        parsed. Pure read; never enqueues. Used by ConversationHandler to
+        seed its in-memory turn counter from disk on first allocation per
+        session, so backend restart does not reset turn numbering for an
+        ongoing session (e.g., session_id="default" reused across restarts).
+        """
+        p = Path(path)
+        if not p.exists():
+            return 0
+        try:
+            content = p.read_text(encoding="utf-8")
+            fm_dict, _body = parse_frontmatter(content)
+            count = fm_dict.get("turn_count", 0)
+            if isinstance(count, int):
+                return count
+            return int(count)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "peek_turn_count: failed to parse frontmatter at %s: %s; defaulting to 0",
+                path,
+                exc,
+            )
+            return 0
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -433,6 +524,8 @@ class VaultWriter:
             "update_entities": self._handle_update_entities,
             "upsert_identity": self._handle_upsert_identity,
             "upsert_user": self._handle_upsert_user,
+            "mark_session_completed": self._handle_mark_session_completed,
+            "append_session_synthesis": self._handle_append_session_synthesis,
         }
         handler = handlers.get(job.kind)
         if handler is None:
@@ -442,6 +535,92 @@ class VaultWriter:
     # ------------------------------------------------------------------
     # Handlers (run inside consumer; may do blocking I/O via executor)
     # ------------------------------------------------------------------
+
+    async def _handle_append_session_synthesis(self, args: dict[str, Any]) -> str | None:
+        vault_note_path: str = args["vault_note_path"]
+        synthesis_markdown: str = args["synthesis_markdown"]
+        path = Path(vault_note_path)
+        if not path.exists():
+            logger.debug(
+                "append_session_synthesis: file does not exist (graceful no-op): %s",
+                vault_note_path,
+            )
+            return None
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            self._append_synthesis_sync,
+            path,
+            synthesis_markdown,
+        )
+        return str(path)
+
+    def _append_synthesis_sync(self, path: Path, synthesis_markdown: str) -> None:
+        """Synchronous core: insert ## Summary block above the sentinel."""
+        content = path.read_text(encoding="utf-8")
+        synthesis_block = "\n## Summary\n\n" + synthesis_markdown.rstrip() + "\n\n"
+        sentinel_idx = content.find(_SENTINEL)
+        if sentinel_idx == -1:
+            # Sentinel missing -- append at EOF
+            new_content = content.rstrip("\n") + "\n" + synthesis_block + _SENTINEL + "\n"
+        else:
+            new_content = (
+                content[:sentinel_idx].rstrip("\n")
+                + "\n"
+                + synthesis_block
+                + content[sentinel_idx:]
+            )
+        path.write_text(new_content, encoding="utf-8")
+
+    async def _handle_mark_session_completed(self, args: dict[str, Any]) -> str | None:
+        vault_note_path: str = args["vault_note_path"]
+        path = Path(vault_note_path)
+        if not path.exists():
+            logger.debug(
+                "mark_session_completed: file does not exist (graceful no-op): %s",
+                vault_note_path,
+            )
+            return None
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            self._mark_completed_sync,
+            path,
+        )
+        return str(path)
+
+    def _mark_completed_sync(self, path: Path) -> None:
+        """Synchronous core: parse frontmatter, set status, rewrite file.
+
+        Idempotent: already-completed sessions remain unchanged.
+        """
+        content = path.read_text(encoding="utf-8")
+        fm_dict, body = parse_frontmatter(content)
+        if fm_dict.get("status") == "completed":
+            return  # idempotent no-op
+
+        # YAML may parse unquoted dates as date objects; coerce.
+        raw_date = fm_dict.get("date")
+        if hasattr(raw_date, "isoformat"):
+            raw_date = raw_date.isoformat()
+
+        fm = MistSessionFrontmatter(
+            session_id=fm_dict.get("session_id", path.stem),
+            date=raw_date or datetime.now(UTC).date().isoformat(),
+            turn_count=fm_dict.get("turn_count", 0),
+            participants=fm_dict.get("participants", ["user", "mist"]),
+            authored_by=fm_dict.get("authored_by", AuthoredBy.MIST),
+            status="completed",
+            append_sentinel_offset=fm_dict.get("append_sentinel_offset"),
+            related_entities=fm_dict.get("related_entities", []),
+            ontology_version=fm_dict.get("ontology_version", _ONTOLOGY_VERSION),
+            extraction_version=fm_dict.get("extraction_version", _EXTRACTION_VERSION),
+            model_hash=fm_dict.get("model_hash"),
+            tags=fm_dict.get("tags", []),
+        )
+        path.write_text(render_frontmatter(fm, body), encoding="utf-8")
 
     async def _handle_append_turn(self, args: dict[str, Any]) -> str:
         session_id: str = args["session_id"]
@@ -494,6 +673,7 @@ class VaultWriter:
                 turn_count=0,
                 ontology_version=_ONTOLOGY_VERSION,
                 extraction_version=_EXTRACTION_VERSION,
+                model_hash=self._model_hash,
             )
             initial_body = _SENTINEL + "\n"
             content = render_frontmatter(fm, initial_body)

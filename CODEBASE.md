@@ -1,8 +1,8 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-04-22 (post-MVP overnight: ontology expansion + scorer repair + flash-attn + V7 probe set)
-**Branch:** main (local-only; 7 Cluster-8 phase commits + 7 overnight commits ahead of origin, push gated on user review)
-**Status:** MVP Knowledge Integration **COMPLETE**. All 8 architectural clusters shipped. Post-MVP overnight round added: ontology additive expansion (4 new node types + 4 new edges, 17/29 total), eval-harness scorer resync (closed 5-week drift), Docker flash-attn fix (actually compiles now, morning stack restart required to activate), V7 tool-heavy probe set + design doc (unblocks `mist-ai-tool-calling-production-rigor` workstream). V6 gauntlet re-run post-expansion: 30/30 OK, no regressions, Document/Date/Metric node types produced spontaneously.
+**Last Updated:** 2026-05-06 (continuous-usage hardening in-flight: voice/chat path unification + vault layer completion + canonical write-pattern adoption)
+**Branch:** main (local-only; commits ahead of origin, push gated on workstream completion)
+**Status:** MVP Knowledge Integration COMPLETE; **continuous-usage hardening IN PROGRESS** under workstream `mist-ai-voice-chat-path-unification`. 2026-05-06 V6 deep review surfaced architectural divergence (voice/WebSocket text path used a parallel impl bypassing handle_message, extraction, vault writer) plus four vault-layer gaps. v1 unification landed (handle_message_streaming + StreamEvent types + voice path consumes canonical streaming bridge); 30/30 V6 turns succeeded through unified path with TTS disabled. Three of seven punch-list gaps fixed (Bug A relationship-provenance, model_hash on session frontmatter, durable per-session turn counter); four remaining (user.md C-pattern auto-render, session-end synthesis + status flip, conditional per-turn append, TTS lock decoupling). Ontology v1.1.0 expansion + V6/V7/V8 re-baseline pending after gaps close. ADR-011 codifies the three-bucket vault write pattern (mechanical state mirror / rebuild substrate / curated knowledge) as the canonical rule for future vault decisions.
 
 ---
 

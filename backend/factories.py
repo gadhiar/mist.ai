@@ -530,7 +530,11 @@ def build_vault_writer(
         return None
     from backend.vault import VaultWriter
 
-    return VaultWriter(config.vault, debug_logger=debug_logger)
+    # Phase 8 stamp: same model_hash that flows into RebuildStamps for graph
+    # DERIVED_FROM->VaultNote edges (line 151 above). Populates the
+    # `model_hash` frontmatter field on every newly created session note so
+    # vault rebuild can reconcile session-note vintage against current config.
+    return VaultWriter(config.vault, debug_logger=debug_logger, model_hash=config.model_hash)
 
 
 def build_sidecar_index(

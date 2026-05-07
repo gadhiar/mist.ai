@@ -483,8 +483,10 @@ class ModelManager:
         """
         # Use knowledge-augmented generation if available
         if self.knowledge and self.knowledge.is_enabled():
-            logger.info("Using knowledge-augmented LLM response (streaming tokens)")
-            yield from self.knowledge.generate_tokens_streaming(
+            logger.info(
+                "Using knowledge-augmented LLM response (canonical handle_message_streaming)"
+            )
+            yield from self.knowledge.generate_response_streaming(
                 user_text, event_loop=self.event_loop
             )
         else:

@@ -11,12 +11,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from backend.chat.context_budget import ContextBudgetPlanner
 from backend.chat.mist_context import MistContext
 from backend.chat.slop_detector import SlopDetector
+from backend.chat.stream_events import Complete, StreamEvent, Token
 from backend.event_store.models import ConversationTurnEvent
 from backend.event_store.store import EventStore
 from backend.knowledge.config import KnowledgeConfig
@@ -642,16 +644,15 @@ class ConversationHandler:
                 tool_calls=tool_calls if tool_calls else None,
             )
 
-            # --- Vault Write (Layer 2, ADR-010 Cluster 8 Phase 5) ---
-            # Append turn to vault session note. Failure-isolated; logs and
-            # continues. Pre-extraction so the file mtime change reaches the
-            # filewatcher and triggers sidecar reindex without blocking the
-            # user response.
-            await self._write_to_vault(
-                session_id=session_id,
-                user_message=user_message,
-                assistant_message=assistant_message,
-            )
+            # --- Vault Write deferred to extraction completion ---
+            # ADR-011 bucket 2 (rebuild substrate): the vault append happens
+            # inside `_extract_knowledge_async`, gated on extraction yielding
+            # at least one entity OR one relationship. This implements the
+            # 2026-05-06 canonical-vault-pattern decision to skip per-turn
+            # appends for zero-extraction turns ("Hi"/"Thanks") - those
+            # produce no graph state to anchor via DERIVED_FROM, so a vault
+            # note for them is pure noise. Substantive turns still anchor
+            # cleanly; the rebuild contract is preserved.
 
             # Debug JSONL: record this turn and attach the TurnRecord to the
             # background extraction task so the extraction phase flushes a
@@ -673,11 +674,13 @@ class ConversationHandler:
                     )
                 turn_record.flush_turn()
 
-            # Fire-and-forget background extraction
+            # Fire-and-forget background extraction (also performs the
+            # conditional vault append per ADR-011 bucket 2).
             if event_id and len(user_message.split()) >= 3:
                 asyncio.create_task(
                     self._extract_knowledge_async(
                         utterance=user_message,
+                        assistant_message=assistant_message,
                         conversation_history=session.get_history(max_history),
                         event_id=event_id,
                         session_id=session_id,
@@ -700,12 +703,65 @@ class ConversationHandler:
             )
             return error_msg
 
+    async def handle_message_streaming(
+        self,
+        user_message: str,
+        session_id: str,
+        user_id: str = "User",
+        max_history: int = 10,
+    ) -> AsyncIterator[StreamEvent]:
+        """Streaming canonical conversation pipeline.
+
+        v1: wraps handle_message and fake-streams the result character-by-character.
+        All canonical pipeline behavior (retrieval, mist context injection, tool
+        dispatch, slop filter, vault append, EventStore record, fire-and-forget
+        extraction) is inherited unchanged from handle_message.
+
+        Yields Token events for each character of the final response, then a
+        single terminal Complete event carrying the full final_response and a
+        duration_ms metric. Pattern matches Claude's per-turn shape: input goes
+        in, the LLM executes whatever it needs, response streams out, Complete
+        terminates. Caller (text client / voice TTS layer) decides presentation.
+
+        Thinking and Filler events are reserved for future iterations and are
+        not emitted by v1.
+
+        v2 plan: invert relationship — make handle_message_streaming the
+        canonical generator and have handle_message join its output to a string.
+        Add provider-level streaming with tool_calls support to recover the
+        ~5s LLM-side streaming benefit currently lost in v1's fake-stream
+        approach.
+
+        Args:
+            user_message: User's message.
+            session_id: Session identifier.
+            user_id: User identifier.
+            max_history: Maximum conversation history to include.
+
+        Yields:
+            Token events (one per character) followed by a terminal Complete event.
+        """
+        start = time.monotonic()
+        response = await self.handle_message(
+            user_message=user_message,
+            session_id=session_id,
+            user_id=user_id,
+            max_history=max_history,
+        )
+        duration_ms = (time.monotonic() - start) * 1000
+
+        for char in response:
+            yield Token(text=char)
+
+        yield Complete(final_response=response, duration_ms=duration_ms)
+
     async def _extract_knowledge_async(
         self,
         utterance: str,
         conversation_history: list[dict[str, str]],
         event_id: str,
         session_id: str,
+        assistant_message: str = "",
         turn_record: TurnRecord | None = None,
         vault_note_path: str | None = None,
     ) -> None:
@@ -722,6 +778,13 @@ class ConversationHandler:
         every entity written by the curation graph writer carries a DERIVED_FROM
         edge to its source vault note. None preserves legacy pre-Phase-6 behavior
         (no vault-note provenance edges).
+
+        `assistant_message` (ADR-011 bucket 2 - 2026-05-06): the assistant's
+        finalized response for this turn. After extraction completes, if the
+        result yielded at least one entity OR one relationship, the vault
+        append fires here (replacing the unconditional handle_message append).
+        Empty default keeps backwards compat for callers that don't yet thread
+        the response through.
         """
         _ex_start = time.time()
         try:
@@ -773,6 +836,28 @@ class ConversationHandler:
                     parse_ok=True,
                 )
                 turn_record.flush_extraction()
+
+            # ADR-011 bucket 2: conditional per-turn vault append. Skip the
+            # session-note write when extraction yielded zero entities AND
+            # zero relationships - those turns produce no graph state to
+            # anchor via DERIVED_FROM, so a vault note for them is pure noise.
+            # Substantive turns still write; the rebuild contract is preserved
+            # because every entity that gets a DERIVED_FROM edge has its
+            # vault note created here.
+            await self._maybe_append_session_turn(
+                session_id=session_id,
+                user_message=utterance,
+                assistant_message=assistant_message,
+                extraction_result=result,
+            )
+
+            # ADR-011 bucket 1 / C-pattern: re-render users/<user_id>.md when
+            # extraction touched user-scope (User entity or User-source/target
+            # edge). Fire-and-forget; failures are logged but never propagate.
+            # Skipped when vault layer disabled or extraction touched no
+            # user-scope state. The graph snapshot reflects post-curation state
+            # because curation completed before this point.
+            await self._maybe_refresh_user_vault(result)
         except Exception as e:
             logger.error("Background extraction failed (non-fatal): %s", e)
             if turn_record is not None:
@@ -782,6 +867,254 @@ class ConversationHandler:
                     parse_ok=False,
                 )
                 turn_record.flush_extraction()
+
+    async def end_session(self, session_id: str | None = None) -> None:
+        """Mark one (or all) active session(s) as completed.
+
+        Gap #1 / ADR-011 bucket 2: invoked on session-end signal (WebSocket
+        disconnect, idle timeout, explicit end). For each target session:
+
+        1. Generate a MIST-authored end-of-session synthesis (gap #1b)
+        2. Append the synthesis as `## Summary` above the sentinel
+        3. Flip frontmatter `status: in-progress` -> `status: completed`
+
+        Failure-isolated per Invariant 6: failures in synthesis or write are
+        logged but never propagated to the caller. Synthesis errors do not
+        block the status flip — a session note is closed even if MIST
+        couldn't summarize it.
+
+        Args:
+            session_id: Specific session to end. When None, ends every
+                tracked session_id.
+        """
+        if self._vault_writer is None:
+            return
+
+        targets: list[str]
+        if session_id is None:
+            targets = list(self._vault_paths.keys())
+        else:
+            targets = [session_id] if session_id in self._vault_paths else []
+
+        for sid in targets:
+            path = self._vault_paths.get(sid)
+            if not path:
+                continue
+            # Step 1+2: synthesis (gap #1b). Failure must not block status flip.
+            try:
+                synthesis = await self._generate_session_synthesis(sid)
+                if synthesis:
+                    await self._vault_writer.append_session_synthesis(path, synthesis)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Session synthesis failed for %s (non-fatal): %s", sid, exc)
+            # Step 3: status flip (gap #1a). Always attempts.
+            try:
+                await self._vault_writer.mark_session_completed(path)
+                logger.debug("Session %s marked completed at %s", sid, path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "end_session status flip failed for %s "
+                    "(non-fatal, swallowed per Invariant 6): %s",
+                    sid,
+                    exc,
+                )
+
+    async def _generate_session_synthesis(self, session_id: str) -> str | None:
+        """Build a session-end synthesis via one LLM call.
+
+        Reads the session's accumulated turn history and asks the LLM to
+        produce a markdown body with subsections: What Was Accomplished,
+        Decisions Made, Next Actions, Context for Next Session. Mirrors the
+        end-of-session protocol the user (Raj) follows in his own
+        Claude+Obsidian workflow.
+
+        Returns the markdown body (without a leading `## Summary` header --
+        the writer adds that). Returns None when the session has no turns
+        worth synthesizing (one-turn sessions, empty content).
+        """
+        session = self.sessions.get(session_id)
+        if session is None or len(session.messages) < 2:
+            return None  # no substantive content to summarize
+
+        transcript_parts: list[str] = []
+        for msg in session.messages:
+            role = msg.role.upper()
+            transcript_parts.append(f"**{role}:** {msg.content}\n")
+        transcript = "".join(transcript_parts)
+
+        prompt = (
+            "You are MIST writing a session-end summary for the user's "
+            "persistent memory vault. The conversation just ended. Read the "
+            "transcript and produce a concise markdown body with the four "
+            "subsections below. If a subsection has no content, write "
+            "`(none)`. Do NOT include a leading `## Summary` header -- only "
+            "the subsection content.\n\n"
+            "### What Was Accomplished\n"
+            "<bullet list of substantive accomplishments, each one line>\n\n"
+            "### Decisions Made\n"
+            "<bullet list of explicit decisions, each one line, or (none)>\n\n"
+            "### Next Actions\n"
+            "<bullet list of action items the user or MIST committed to, each "
+            "one line, or (none)>\n\n"
+            "### Context for Next Session\n"
+            "<one to three sentences of prose summarizing what would be "
+            "useful to remember when picking this conversation back up>\n\n"
+            "---\n\n"
+            "TRANSCRIPT:\n\n" + transcript
+        )
+
+        try:
+            request = LLMRequest(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=self.config.llm.conversation_temperature,
+                max_tokens=self.config.llm.conversation_max_tokens,
+                top_p=0.9,
+            )
+            with llm_call_context(
+                session_id=session_id,
+                call_site="session.synthesis",
+                pass_num=1,
+            ):
+                response = await self._provider.invoke(request)
+            content = (response.content or "").strip()
+            return content or None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Session synthesis LLM call failed for %s: %s", session_id, exc)
+            return None
+
+    async def _maybe_append_session_turn(
+        self,
+        session_id: str,
+        user_message: str,
+        assistant_message: str,
+        extraction_result: Any,
+    ) -> None:
+        """ADR-011 bucket 2: conditional per-turn vault session-note append.
+
+        Skipped when extraction yielded zero entities AND zero relationships.
+        Such turns ("Hi", "Thanks") produce no graph state, so a session-note
+        block for them is pure noise. The rebuild contract is preserved
+        because every extracted entity's DERIVED_FROM edge points to a vault
+        note that DOES exist (lazily created on first append).
+
+        Failure-isolated per Invariant 6: vault write errors are logged but
+        never propagate.
+        """
+        if self._vault_writer is None:
+            return
+        if not assistant_message:
+            return  # nothing to write
+        entities = getattr(extraction_result, "validated_entities", None)
+        relationships = getattr(extraction_result, "validated_relationships", None)
+        if entities is None and hasattr(extraction_result, "entities"):
+            entities = extraction_result.entities
+        if relationships is None and hasattr(extraction_result, "relationships"):
+            relationships = extraction_result.relationships
+        entities = entities or []
+        relationships = relationships or []
+        if not entities and not relationships:
+            logger.debug(
+                "Skipping vault append for session %s: extraction yielded "
+                "zero entities and zero relationships (ADR-011 bucket 2)",
+                session_id,
+            )
+            return
+        try:
+            await self._write_to_vault(
+                session_id=session_id,
+                user_message=user_message,
+                assistant_message=assistant_message,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Conditional vault append failed for session %s "
+                "(non-fatal, swallowed per Invariant 6): %s",
+                session_id,
+                exc,
+            )
+
+    async def _maybe_refresh_user_vault(self, extraction_result: Any) -> None:
+        """C-pattern user.md auto-render trigger (ADR-011 bucket 1).
+
+        Inspects the extraction result for any User-scope state change. If
+        present and vault layer is enabled, queries a 1-hop graph snapshot
+        of the User entity + outbound neighbors, renders the markdown body,
+        and calls VaultWriter.upsert_user. Fire-and-forget; never raises.
+
+        Skipped when:
+        - Vault writer is None (vault layer disabled)
+        - Extraction touched zero user-scope entities/relationships
+        - Result type doesn't expose validated_entities/relationships
+          (defensive fallback for unexpected pipeline shapes)
+        """
+        if self._vault_writer is None:
+            return
+        # Curation-enabled path returns CurationResult with
+        # validated_entities/relationships (added 2026-05-06). The
+        # validation-only path returns ValidationResult which has the same
+        # field names. We accept both via duck-typing.
+        entities = getattr(extraction_result, "validated_entities", None)
+        relationships = getattr(extraction_result, "validated_relationships", None)
+        if entities is None and hasattr(extraction_result, "entities"):
+            entities = extraction_result.entities
+        if relationships is None and hasattr(extraction_result, "relationships"):
+            relationships = extraction_result.relationships
+        if entities is None and relationships is None:
+            return
+        entities = entities or []
+        relationships = relationships or []
+
+        from backend.vault.user_snapshot import (
+            extraction_touched_user_scope,
+            query_user_snapshot,
+            render_user_snapshot_body,
+        )
+
+        user_id = self._user_id_for_vault()
+        if not extraction_touched_user_scope(entities, relationships, user_id=user_id):
+            return
+
+        try:
+            from datetime import UTC
+            from datetime import datetime as _dt
+
+            from backend.knowledge.storage.graph_executor import GraphExecutor
+
+            executor = GraphExecutor(self.graph_store.connection)
+            rendered_at = _dt.now(UTC).isoformat()
+            snapshot = await query_user_snapshot(executor, user_id, rendered_at)
+            body_md = render_user_snapshot_body(snapshot)
+            await self._vault_writer.upsert_user(user_id=user_id, body_markdown=body_md)
+            logger.debug(
+                "User vault refreshed (C-pattern): user_id=%s, %d edge types in snapshot",
+                user_id,
+                len(snapshot.edges_by_type),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # ADR-010 Invariant 6: vault write failure is recoverable; never
+            # propagate to the conversation pipeline.
+            logger.warning(
+                "User vault refresh failed (non-fatal, swallowed per Invariant 6): %s",
+                exc,
+            )
+
+    def _user_id_for_vault(self) -> str:
+        """Return the canonical user_id for vault writes.
+
+        Returns "user" by default to match the seed-bootstrap convention
+        (`scripts/seed_data.yaml` creates the User entity with `id: "user"`,
+        and `users/user.md` is what bootstrap_vault_from_seed writes to disk).
+        `VaultConfig.default_user_id` is honored ONLY if it has been
+        explicitly set to something other than the dataclass default "raj"
+        (which is vestigial and inconsistent with seed behavior). This keeps
+        single-user MIST predictable until VaultConfig is reconciled.
+        """
+        vault_config = getattr(self.config, "vault", None)
+        if vault_config is not None:
+            default_uid = getattr(vault_config, "default_user_id", None)
+            if default_uid and default_uid not in ("raj",):
+                return default_uid
+        return "user"
 
     def _record_turn_event(
         self,
@@ -916,8 +1249,14 @@ class ConversationHandler:
         path = self._vault_writer.session_path(today, slug)
         self._vault_paths[session_id] = path
         # Initialize the per-session vault turn counter only on first allocation.
-        # _write_to_vault increments it on every successful append.
-        self._vault_turn_counts.setdefault(session_id, 0)
+        # Seed from disk if a session note already exists at `path` so backend
+        # restart does not reset turn numbering for an ongoing session (e.g.,
+        # session_id="default" reused across restarts -- the V6 unified-path
+        # validation 2026-05-06 surfaced this as gap #4). When peek is not
+        # available on the writer (e.g., legacy fakes), default to 0.
+        if session_id not in self._vault_turn_counts:
+            peek = getattr(self._vault_writer, "peek_turn_count", None)
+            self._vault_turn_counts[session_id] = peek(path) if callable(peek) else 0
         return path
 
     async def _write_to_vault(

@@ -397,6 +397,21 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         async with active_connections_lock:
             active_connections.discard(websocket)
+        # Gap #1a / ADR-011 bucket 2: flip status of any active sessions
+        # this connection touched. Fire-and-forget; failures swallowed
+        # internally per Invariant 6. We end ALL tracked sessions on the
+        # handler since a single WebSocket connection corresponds to one
+        # default-session conversation in the current architecture.
+        try:
+            handler = (
+                voice_processor.models.knowledge.conversation_handler
+                if voice_processor and voice_processor.models and voice_processor.models.knowledge
+                else None
+            )
+            if handler is not None and hasattr(handler, "end_session"):
+                await handler.end_session()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Session-end signal handler failed (non-fatal): %s", exc, exc_info=False)
 
 
 if __name__ == "__main__":

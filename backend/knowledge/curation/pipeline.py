@@ -19,13 +19,21 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class CurationResult:
-    """Combined result of the curation pipeline."""
+    """Combined result of the curation pipeline.
+
+    `validated_entities` and `validated_relationships` carry forward the
+    post-validation inputs so downstream consumers (e.g., user.md C-pattern
+    auto-render trigger detection) can inspect what was extracted without
+    re-querying the graph or threading a separate ValidationResult through.
+    """
 
     write_result: WriteResult
     dedup_result: DeduplicationResult
     conflict_result: ConflictResolutionResult
     curation_time_ms: float
     stage_errors: list[str] = field(default_factory=list)
+    validated_entities: list[dict] = field(default_factory=list)
+    validated_relationships: list[dict] = field(default_factory=list)
 
 
 class CurationPipeline:
@@ -94,6 +102,8 @@ class CurationPipeline:
                 dedup_result=empty_dedup,
                 conflict_result=empty_conflict,
                 curation_time_ms=elapsed,
+                validated_entities=entities,
+                validated_relationships=relationships,
             )
 
         # Stage 7a: Deduplication
@@ -167,4 +177,6 @@ class CurationPipeline:
             conflict_result=conflict_result,
             curation_time_ms=elapsed,
             stage_errors=stage_errors,
+            validated_entities=entities,
+            validated_relationships=relationships,
         )

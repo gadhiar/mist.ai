@@ -191,6 +191,99 @@ class TestAppendTurnToSession:
         assert "<!-- MIST_APPEND_HERE -->" in body
 
     @pytest.mark.asyncio
+    async def test_new_file_frontmatter_carries_model_hash_when_provided(self, tmp_path: Path):
+        """Phase 8 stamps: when VaultWriter is constructed with a model_hash,
+        new session-note frontmatter must carry it.
+
+        Pre-fix (2026-05-06): model_hash was only populated on graph
+        DERIVED_FROM->VaultNote edges (via RebuildStamps in CurationGraphWriter).
+        Session-note frontmatter wrote None unconditionally because the writer
+        had no path to the config-driven model identifier.
+        """
+        config = _make_config(tmp_path)
+        writer = VaultWriter(config, model_hash="gemma-4-e4b-q5-k-m-test-v1")
+        await writer.start()
+        try:
+            path_str = writer.session_path("2026-04-21", "stamp-test")
+            await writer.append_turn_to_session("stamp-test", 1, "hi", "hello", path_str)
+            fm_dict, _ = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
+            assert fm_dict["model_hash"] == "gemma-4-e4b-q5-k-m-test-v1"
+        finally:
+            await writer.stop()
+
+    @pytest.mark.asyncio
+    async def test_new_file_frontmatter_model_hash_null_when_unset(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        """Default fixture omits model_hash; frontmatter should serialize null.
+
+        Confirms backwards-compat: existing callers that don't pass model_hash
+        get the same null behavior as before.
+        """
+        path_str = vault_writer.session_path("2026-04-21", "no-stamp-test")
+        await vault_writer.append_turn_to_session("no-stamp-test", 1, "hi", "hello", path_str)
+        fm_dict, _ = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
+        assert fm_dict["model_hash"] is None
+
+    @pytest.mark.asyncio
+    async def test_mark_session_completed_flips_status_in_frontmatter(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        """Gap #1a / ADR-011: WebSocket disconnect triggers session-end status flip."""
+        path_str = vault_writer.session_path("2026-04-21", "to-complete")
+        await vault_writer.append_turn_to_session("to-complete", 1, "u1", "m1", path_str)
+        # Pre-condition: status is in-progress
+        fm_dict, _ = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
+        assert fm_dict["status"] == "in-progress"
+
+        await vault_writer.mark_session_completed(path_str)
+
+        fm_dict, _ = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
+        assert fm_dict["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_mark_session_completed_is_idempotent(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        path_str = vault_writer.session_path("2026-04-21", "idempotent-complete")
+        await vault_writer.append_turn_to_session("idempotent-complete", 1, "u1", "m1", path_str)
+        await vault_writer.mark_session_completed(path_str)
+        await vault_writer.mark_session_completed(path_str)  # second call: no-op
+        fm_dict, _ = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
+        assert fm_dict["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_mark_session_completed_graceful_when_file_missing(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        """Missing file = no-op. Caller may invoke for never-appended sessions."""
+        path_str = vault_writer.session_path("2026-04-21", "never-existed")
+        # Should not raise even when path does not exist
+        await vault_writer.mark_session_completed(path_str)
+
+    @pytest.mark.asyncio
+    async def test_peek_turn_count_returns_zero_for_nonexistent_file(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        path = vault_writer.session_path("2026-04-21", "nonexistent")
+        assert vault_writer.peek_turn_count(path) == 0
+
+    @pytest.mark.asyncio
+    async def test_peek_turn_count_reflects_existing_frontmatter(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        """Seeds the durable-counter fix: ConversationHandler reads the current
+        turn_count from disk so backend restart doesn't reset turn numbering
+        for an ongoing session.
+        """
+        path = vault_writer.session_path("2026-04-21", "peek-existing")
+        await vault_writer.append_turn_to_session("peek-existing", 1, "u1", "m1", path)
+        assert vault_writer.peek_turn_count(path) == 1
+        await vault_writer.append_turn_to_session("peek-existing", 2, "u2", "m2", path)
+        await vault_writer.append_turn_to_session("peek-existing", 3, "u3", "m3", path)
+        assert vault_writer.peek_turn_count(path) == 3
+
+    @pytest.mark.asyncio
     async def test_appends_turn_block_above_sentinel(
         self, vault_writer: VaultWriter, tmp_path: Path
     ):

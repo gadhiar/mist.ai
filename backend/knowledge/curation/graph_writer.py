@@ -315,7 +315,7 @@ class CurationGraphWriter:
             "r.source_type = $source_type, r.created_at = $now, r.updated_at = $now, "
             "r.ontology_version = '1.0.0', r.status = 'active', "
             "r.evidence = [$event_id], r.temporal_status = $temporal_status, "
-            "r.context = $context "
+            "r.context = $context, r.provenance = 'extraction' "
             "ON MATCH SET r.confidence = $confidence, r.updated_at = $now, "
             "r.evidence = r.evidence + [$event_id]",
             {

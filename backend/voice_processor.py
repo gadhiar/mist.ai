@@ -73,7 +73,17 @@ class VoiceProcessor:
         # State
         self.is_speaking = False
         self.interrupt_flag = threading.Event()
+        # `generation_lock` protects LLM token generation only. Released as
+        # soon as LLM completes so the next turn's LLM can start while this
+        # turn's TTS is still rendering audio (gap #5 / 2026-05-06 unification).
         self.generation_lock = threading.Lock()
+        # `tts_render_lock` serializes TTS rendering across turns so two
+        # concurrent _tts_consumer threads do not interleave audio frames on
+        # the WebSocket. Acquired at the start of _tts_consumer's loop;
+        # held for the entire turn's TTS duration; released when the turn's
+        # sentence queue drains. Independent of generation_lock -- LLM for
+        # turn N+1 can run while TTS for turn N still holds this lock.
+        self.tts_render_lock = threading.Lock()
         self.latest_user_input = None
         self.input_lock = threading.Lock()
 
@@ -196,6 +206,14 @@ class VoiceProcessor:
         Runs in a dedicated thread. Processes sentences as they arrive
         from the LLM producer, generating and sending audio for each.
 
+        TTS rendering is serialized across turns via `self.tts_render_lock`
+        (acquired here, released when this turn's queue drains). LLM for
+        the next turn may already be running by the time we acquire -- in
+        that case we wait for the previous turn's TTS to finish before
+        emitting audio for this turn. Without this serialization, two
+        concurrent _tts_consumer threads would interleave audio frames on
+        the WebSocket and produce garbled playback.
+
         Args:
             sentence_queue: Queue of sentences to synthesize. None = stop signal.
             tts_start_time: Timestamp when TTS phase started (for logging).
@@ -211,6 +229,33 @@ class VoiceProcessor:
         # model lacks enough text context to match the reference voice.
         min_tts_chars = 40
 
+        with self.tts_render_lock:
+            self._tts_consumer_loop(
+                sentence_queue,
+                tts_start_time,
+                chunk_count,
+                chunk_seq,
+                first_chunk_time,
+                first_sentence_time,
+                first_sentence,
+                min_tts_chars,
+            )
+
+    def _tts_consumer_loop(
+        self,
+        sentence_queue: queue.Queue,
+        tts_start_time: float,
+        chunk_count: int,
+        chunk_seq: int,
+        first_chunk_time,
+        first_sentence_time,
+        first_sentence: bool,
+        min_tts_chars: int,
+    ) -> None:
+        """Inner loop body of _tts_consumer. Extracted so the outer method can
+        wrap the entire loop in `tts_render_lock` without restructuring the
+        existing logic.
+        """
         while True:
             try:
                 sentence = sentence_queue.get(timeout=1.0)
@@ -332,9 +377,14 @@ class VoiceProcessor:
             sentence_queue = queue.Queue()
             tts_start_time = time.time()
 
-            # Start TTS consumer thread (reads sentences, generates audio)
+            # Start TTS consumer thread (reads sentences, generates audio).
+            # Gap #5 (2026-05-06): we don't keep the thread reference. The
+            # thread runs in background, acquires `tts_render_lock` for the
+            # entire turn's TTS duration to serialize audio frames across
+            # turns, and exits naturally when the sentence_queue drains.
+            # generation_lock release no longer waits for TTS completion.
             if self.config.tts_enabled:
-                tts_thread = spawn_with_context(self._tts_consumer, sentence_queue, tts_start_time)
+                spawn_with_context(self._tts_consumer, sentence_queue, tts_start_time)
 
             # LLM producer: stream tokens, detect sentences, feed TTS
             log_timestamp("LLM: Generating response (streaming)...")
@@ -376,9 +426,14 @@ class VoiceProcessor:
                 for sentence in sentence_detector.flush():
                     sentence_queue.put(sentence)
                 sentence_queue.put(None)  # Signal end
-                tts_thread.join(timeout=120)
-                if tts_thread.is_alive():
-                    logger.warning("TTS consumer thread did not finish within 120s")
+                # Gap #5 (2026-05-06): do NOT join the TTS thread here.
+                # generation_lock release (in `finally`) must happen as soon
+                # as LLM generation completes so the next turn's LLM can run
+                # while this turn's audio is still rendering. The TTS thread
+                # continues in the background and exits naturally when its
+                # sentence_queue drains. Audio ordering across turns is
+                # preserved by `tts_render_lock` (held by _tts_consumer for
+                # the entire turn's TTS duration).
             else:
                 log_timestamp("TTS: Disabled (text-only mode)")
 
