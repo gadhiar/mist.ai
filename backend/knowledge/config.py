@@ -548,7 +548,7 @@ class KnowledgeConfig:
     enable_knowledge_integration: bool = True  # Master switch for knowledge system
 
     # System settings
-    ontology_version: str = "1.0.0"  # Current ontology version
+    ontology_version: str = "1.1.0"  # Current ontology version (additive 2026-05-06)
     enable_versioning: bool = True  # Track ontology versions
     enable_provenance: bool = True  # Track extraction provenance
 
@@ -560,7 +560,7 @@ class KnowledgeConfig:
     # the LLM binary actually running extraction (recipe + quantization +
     # weights). Free-form strings; the only contract is that they change
     # when the underlying parameter changes.
-    extraction_version: str = "2026-04-17-r1"
+    extraction_version: str = "2026-05-06-r1"
     model_hash: str = "gemma-4-e4b-q5-k-m-carteakey-full-v1"
 
     # Auto-RAG configuration
@@ -613,10 +613,10 @@ class KnowledgeConfig:
             filewatcher=FilewatcherConfig.from_env(),
             enable_knowledge_integration=os.getenv("ENABLE_KNOWLEDGE_INTEGRATION", "true").lower()
             == "true",
-            ontology_version=os.getenv("ONTOLOGY_VERSION", "1.0.0"),
+            ontology_version=os.getenv("ONTOLOGY_VERSION", "1.1.0"),
             enable_versioning=os.getenv("ENABLE_VERSIONING", "true").lower() == "true",
             enable_provenance=os.getenv("ENABLE_PROVENANCE", "true").lower() == "true",
-            extraction_version=os.getenv("EXTRACTION_VERSION", "2026-04-17-r1"),
+            extraction_version=os.getenv("EXTRACTION_VERSION", "2026-05-06-r1"),
             model_hash=os.getenv("MIST_MODEL_HASH", "gemma-4-e4b-q5-k-m-carteakey-full-v1"),
             auto_inject_docs=os.getenv("AUTO_INJECT_DOCS", "true").lower() == "true",
             auto_inject_limit=int(os.getenv("AUTO_INJECT_LIMIT", "3")),

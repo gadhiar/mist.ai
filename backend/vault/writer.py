@@ -39,8 +39,8 @@ _SENTINEL = "<!-- MIST_APPEND_HERE -->"
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-_ONTOLOGY_VERSION = "1.0.0"
-_EXTRACTION_VERSION = "2026-04-17-r1"
+_ONTOLOGY_VERSION = "1.1.0"
+_EXTRACTION_VERSION = "2026-05-06-r1"
 
 # ---------------------------------------------------------------------------
 # Internal job model

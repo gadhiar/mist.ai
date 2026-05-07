@@ -285,7 +285,7 @@ class TestVaultMigrate:
 
         assert rc == 0
         out = capsys.readouterr().out
-        assert "config.ontology_version:    1.0.0" in out
+        assert "config.ontology_version:    1.1.0" in out
         assert "Already at target version" in out
 
     def test_explicit_target_other_than_current_reports_no_migration(self, fake_backend, capsys):
