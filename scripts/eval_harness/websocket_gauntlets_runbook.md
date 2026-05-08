@@ -18,6 +18,19 @@ hardcoded server-side `session_id="default"`. Driver source lives at
 to drivers via this runbook + design docs (`v7_probe_set_design.md`,
 `v8_probe_set_design.md`), not via the driver files themselves.
 
+**Two distinct session-id conventions in this runbook -- do NOT
+conflate them:**
+
+| Path | session_id used | Where set | Score command |
+|---|---|---|---|
+| WebSocket drivers | `default` (server hardcoded in `voice_processor.py`) | server-side; cannot be overridden by the driver | `--session-id default` |
+| `mist_admin replay` (chat-path) | caller-supplied via `--session-id <tag>` | the replay process; arbitrary string | `--session-id <same tag>` |
+
+Reading the WebSocket gauntlet section below: every score command
+takes `--session-id default`. Reading the chat-path replay section:
+every score command takes the same `--session-id <tag>` you passed
+to `mist_admin replay`. They are not interchangeable.
+
 ## Prerequisites: WebSocket driver settings
 
 Each driver MUST disable WebSocket keepalive pings — otherwise turns
@@ -82,6 +95,18 @@ Then wait for healthy:
 ```bash
 until curl -s -m 3 http://localhost:8001/health 2>/dev/null \
     | grep -q "models_loaded.:true"; do sleep 3; done
+```
+
+**Verify the env vars actually applied.** If `MSYS_NO_PATHCONV=1` was
+omitted on the `up -d` line, the backend will have a path-rewritten
+`MIST_DEBUG_JSONL` value pointing at `C:/Program Files/Git/app/...`,
+and your gauntlet will write to the wrong file. Confirm before
+running:
+
+```bash
+docker compose exec mist-backend printenv MIST_DEBUG_JSONL MIST_DEBUG_LLM_JSONL
+# Expect: /app/data/runtime/v678-<run-tag>.jsonl  AND  1
+# If you see C:/Program Files/Git/app/... -- recreate with the prefix.
 ```
 
 ## Step 2: Run drivers in sequence
