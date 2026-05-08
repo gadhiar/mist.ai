@@ -343,8 +343,10 @@ class KnowledgeRetriever:
             event_id=event_id,
         )
 
-        # Step 4: Format context
-        formatted_context = self._format_context(ranked_facts, query)
+        # Step 4: Format context (intent forwarded so vault-only retrievals
+        # can emit a vault-framed header per ADR-010 invariant 4 instead of
+        # the legacy "from your graph" framing)
+        formatted_context = self._format_context(ranked_facts, query, intent=intent)
 
         total_time = (time.time() - start_time) * 1000
 
@@ -991,7 +993,9 @@ class KnowledgeRetriever:
 
         return sorted_facts[:limit]
 
-    def _format_context(self, facts: list[RetrievedFact], query: str) -> str:
+    def _format_context(
+        self, facts: list[RetrievedFact], query: str, intent: str | None = None
+    ) -> str:
         """Format facts as natural language context for LLM.
 
         Partitions facts into graph facts (graph_distance < 999) and
@@ -1007,7 +1011,16 @@ class KnowledgeRetriever:
         graph_facts = [f for f in facts if f.graph_distance < _VECTOR_DISTANCE_SENTINEL]
         doc_facts = [f for f in facts if f.graph_distance >= _VECTOR_DISTANCE_SENTINEL]
 
-        lines = [f"Relevant knowledge from your graph (query: '{query}'):", ""]
+        # Header framing per ADR-010 invariant 4. Vault-only retrieval
+        # (intent="historical") emits a "prose from your vault" header so
+        # the model does not treat vault chunks as authoritative results
+        # from the graph reasoning substrate. Other intents continue to
+        # use the legacy graph framing — they DO surface graph facts.
+        if intent == "historical":
+            header = f"Relevant prose from your vault (query: '{query}'):"
+        else:
+            header = f"Relevant knowledge from your graph (query: '{query}'):"
+        lines = [header, ""]
 
         # Format graph facts grouped by subject
         if graph_facts:

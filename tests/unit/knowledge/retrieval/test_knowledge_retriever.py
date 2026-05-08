@@ -609,6 +609,56 @@ class TestFormatContext:
         # Assert
         assert "Total facts: 2" in context
 
+    def test_historical_intent_uses_vault_prose_header(self):
+        """For historical (vault-only) intent, the formatted-context header
+        must NOT frame the content as "from your graph" — that framing
+        biases the model into treating the chunks as authoritative search
+        results from the reasoning substrate, when they are actually
+        prose excerpts from the vault sidecar (per ADR-010 invariant 4).
+        """
+        retriever = self._retriever()
+        vault_fact = build_retrieved_fact(
+            subject="VaultNote",
+            subject_type="VaultSession",
+            predicate="MENTIONS",
+            object="Section Heading",
+            object_type="VaultChunk",
+            properties={"text": "Some vault prose content.", "path": "/v/x.md"},
+            similarity_score=0.5,
+            graph_distance=_VECTOR_DISTANCE_SENTINEL,
+        )
+
+        context = retriever._format_context(
+            [vault_fact], "what did we discuss", intent="historical"
+        )
+
+        assert (
+            "from your graph" not in context
+        ), f"vault-only retrieval must not be framed as graph context; got: {context!r}"
+        # Header should use prose/vault framing instead
+        assert (
+            "vault" in context.lower() or "prose" in context.lower()
+        ), f"expected vault/prose framing in header; got: {context!r}"
+
+    def test_non_historical_intent_keeps_graph_header(self):
+        """Default (and non-historical) intents continue to use the
+        existing 'Relevant knowledge from your graph' header — the bias
+        framing is removed only on the vault-only path.
+        """
+        retriever = self._retriever()
+        fact = build_retrieved_fact(
+            subject="User",
+            predicate="USES",
+            object="Python",
+            graph_distance=0,
+        )
+
+        for intent in ("hybrid", "relational", "factual", None):
+            context = retriever._format_context([fact], "query", intent=intent)
+            assert (
+                "Relevant knowledge from your graph" in context
+            ), f"intent={intent!r} must keep the graph header; got: {context!r}"
+
     def test_query_text_appears_in_header(self):
         # Arrange
         retriever = self._retriever()

@@ -444,7 +444,14 @@ class ContextBudgetPlanner:
 
         kept: list[RetrievedFact] = []
         used = 0
-        header = f"Relevant knowledge from your graph (query: '{retrieval_result.query}'):\n"
+        # Header framing per ADR-010 invariant 4 — vault-only retrieval
+        # (intent="historical") must not be framed as graph context, so the
+        # model does not treat the chunks as authoritative search results
+        # from the reasoning substrate.
+        if retrieval_result.intent == "historical":
+            header = f"Relevant prose from your vault (query: '{retrieval_result.query}'):\n"
+        else:
+            header = f"Relevant knowledge from your graph (query: '{retrieval_result.query}'):\n"
         used += self._counter.count(header) + ApproximateTokenCounter.PER_MESSAGE_OVERHEAD_TOKENS
 
         for fact in scored:

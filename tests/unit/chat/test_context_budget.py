@@ -64,6 +64,7 @@ def _make_retrieval_result(
     *,
     query: str = "test query",
     formatted: str | None = None,
+    intent: str = "hybrid",
 ) -> RetrievalResult:
     if formatted is None:
         lines = [f"Relevant knowledge from your graph (query: '{query}'):"]
@@ -81,7 +82,7 @@ def _make_retrieval_result(
         vector_search_time_ms=0.0,
         graph_traversal_time_ms=0.0,
         config_used={},
-        intent="hybrid",
+        intent=intent,
     )
 
 
@@ -363,6 +364,47 @@ class TestContextBudgetPlanner:
         assert "H" in plan.pruned_retrieval_text
         # At least one lower-scoring fact got dropped.
         assert plan.facts_dropped >= 1
+
+    def test_pruner_uses_vault_header_for_historical_intent(self):
+        """Mirror the retriever-level header reframe at the budget-pruner
+        level. When intent='historical', the budget pruner must NOT emit
+        'Relevant knowledge from your graph' framing — that biases the
+        model into treating vault chunks as authoritative graph results
+        per ADR-010 invariant 4.
+        """
+        cfg = _default_config(
+            context_window=500,
+            output_reserve_tokens=50,
+            safety_margin_tokens=10,
+            retrieval_budget_ratio=0.1,
+        )
+        planner = ContextBudgetPlanner(config=cfg)
+
+        high = _make_fact(subject="H", similarity=0.95)
+        low_1 = _make_fact(subject="L1", similarity=0.1)
+        long_formatted = "BIG HEADER " * 200  # force pruning branch
+        result = _make_retrieval_result(
+            [high, low_1], formatted=long_formatted, intent="historical"
+        )
+
+        plan = planner.plan(
+            persona_text="p",
+            static_text="s",
+            retrieval_result=result,
+            live_advisory_text=None,
+            history=[],
+            tools=None,
+            max_output_tokens=50,
+        )
+
+        assert plan.pruned_retrieval_text is not None
+        assert "from your graph" not in plan.pruned_retrieval_text, (
+            f"vault-only retrieval must not emit graph framing in budget "
+            f"pruner; got: {plan.pruned_retrieval_text!r}"
+        )
+        assert "vault" in plan.pruned_retrieval_text.lower(), (
+            f"expected vault framing in pruner header; got: " f"{plan.pruned_retrieval_text!r}"
+        )
 
     def test_history_strategy_invoked_with_budget(self):
         planner = ContextBudgetPlanner(config=_default_config())
