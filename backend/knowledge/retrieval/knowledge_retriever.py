@@ -32,6 +32,15 @@ logger = logging.getLogger(__name__)
 # but NOT -1 (which would break the ascending sort).
 _VECTOR_DISTANCE_SENTINEL = 999
 
+# Canonical intent set accepted by retrieve(). Mirrors the routing branches in
+# the retrieve() method body. Validation against this set catches caller-side
+# typos (e.g. "Historical" with capital H) that would otherwise fall through
+# every routing branch silently and return empty results with the typo echoed
+# back in result.intent.
+_VALID_INTENTS: frozenset[str] = frozenset(
+    {"identity", "live", "factual", "relational", "historical", "hybrid"}
+)
+
 # Static keyword -> MCP tool mapping for live intent routing.
 _LIVE_TOOL_MAP: dict[str, str] = {
     "linear": "mcp__linear__list_issues",
@@ -155,6 +164,15 @@ class KnowledgeRetriever:
         Returns:
             RetrievalResult with facts, formatted context, and intent metadata.
         """
+        # Validate force_intent at the API surface so caller-side typos
+        # (e.g. "Historical" with capital H, "vault") are caught here
+        # rather than silently routing through unintended branches.
+        if force_intent is not None and force_intent not in _VALID_INTENTS:
+            raise ValueError(
+                f"force_intent must be one of {sorted(_VALID_INTENTS)} or None, "
+                f"got {force_intent!r}"
+            )
+
         start_time = time.time()
 
         # Use defaults if not specified

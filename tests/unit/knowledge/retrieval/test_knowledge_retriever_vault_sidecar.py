@@ -453,6 +453,38 @@ class TestVaultSidecarRetrieve:
 
         assert sidecar.calls[0]["k"] == 42
 
+    @pytest.mark.asyncio
+    async def test_force_intent_rejects_unknown_value(self) -> None:
+        """force_intent must validate against the canonical intent set.
+        Pre-fix, retrieve() accepted any string and silently routed to
+        unexpected paths (e.g. 'Historical' with capital H fell through
+        every routing branch and returned empty results with the typo
+        echoed in result.intent). Catching invalid values at the API
+        surface prevents silent failures on caller-side typos.
+        """
+        retriever, _ = _make_retriever_with_sidecar(intent="historical", sidecar=FakeSidecar())
+
+        with pytest.raises(ValueError, match="force_intent"):
+            await retriever.retrieve(query="anything", force_intent="Historical")
+
+        with pytest.raises(ValueError, match="force_intent"):
+            await retriever.retrieve(query="anything", force_intent="vault")
+
+    @pytest.mark.asyncio
+    async def test_force_intent_accepts_all_canonical_values(self) -> None:
+        """Sanity: every documented intent value is accepted without error.
+        Mirrors the canonical intent set defined in
+        backend/knowledge/retrieval/knowledge_retriever.py.
+        """
+        for intent in ("identity", "live", "factual", "relational", "historical", "hybrid"):
+            retriever, _ = _make_retriever_with_sidecar(intent="historical", sidecar=FakeSidecar())
+            # Must not raise — None means classifier-driven, valid string means override
+            await retriever.retrieve(query="x", force_intent=intent)
+
+        # And explicit None still works (classifier-driven)
+        retriever, _ = _make_retriever_with_sidecar(intent="historical", sidecar=FakeSidecar())
+        await retriever.retrieve(query="x", force_intent=None)
+
     def test_vault_sidecar_retrieve_drops_empty_content_chunks(self) -> None:
         """Sidecar rows with empty/whitespace-only content must be dropped
         before reaching `_format_context`. Surfacing empty-body chunks as
