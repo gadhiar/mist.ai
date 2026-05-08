@@ -118,6 +118,46 @@ def _make_sidecar_rows(*paths_and_headings: tuple[str, str]) -> list[dict]:
     return rows
 
 
+class GraphReadSpy:
+    """Records every call into the graph-store read methods used by the
+    relational and hybrid retrieve paths. Used by the ADR-010 invariant 4
+    contract test to assert that the graph receives ZERO reads when
+    auto-inject runs under force_intent='historical'.
+    """
+
+    def __init__(self) -> None:
+        self.search_similar_entities_calls: list[dict[str, Any]] = []
+        self.get_user_relationships_to_entities_calls: list[dict[str, Any]] = []
+        self.get_entity_neighborhood_calls: list[dict[str, Any]] = []
+
+    def install(self, graph_store: GraphStore) -> None:
+        """Replace the three graph-read methods with spy versions."""
+
+        def _spy_search(**kw: Any) -> list[dict]:
+            self.search_similar_entities_calls.append(dict(kw))
+            return []
+
+        def _spy_user_rels(**kw: Any) -> list[dict]:
+            self.get_user_relationships_to_entities_calls.append(dict(kw))
+            return []
+
+        def _spy_neighborhood(**kw: Any) -> list[dict]:
+            self.get_entity_neighborhood_calls.append(dict(kw))
+            return []
+
+        graph_store.search_similar_entities = _spy_search  # type: ignore[method-assign]
+        graph_store.get_user_relationships_to_entities = _spy_user_rels  # type: ignore[method-assign]
+        graph_store.get_entity_neighborhood = _spy_neighborhood  # type: ignore[method-assign]
+
+    @property
+    def total_calls(self) -> int:
+        return (
+            len(self.search_similar_entities_calls)
+            + len(self.get_user_relationships_to_entities_calls)
+            + len(self.get_entity_neighborhood_calls)
+        )
+
+
 def _make_retriever_with_sidecar(
     *,
     intent: str,
@@ -573,4 +613,108 @@ class TestVaultSidecarRetrieve:
         ), (
             "Vault chunks must store body under properties['text'] for "
             f"_format_context compatibility; got {dict(facts[0].properties)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestADR010Invariant4 -- end-to-end "no semantic read cross-pollination"
+# ---------------------------------------------------------------------------
+
+
+class TestADR010Invariant4:
+    """End-to-end contract test for ADR-010 invariant 4.
+
+    Invariant 4: "No semantic read cross-pollination. Reasoning queries
+    target graph. Prose/history queries target vault sidecar. Hybrid
+    merges happen at the retriever layer, never inside a store."
+
+    The earlier TestAutoInjectVaultOnly tests in
+    tests/unit/chat/test_conversation_handler.py prove that
+    ConversationHandler.handle_message passes force_intent="historical"
+    when invoking the retriever for auto-inject. This contract test
+    closes the loop: under force_intent="historical", the graph store
+    must receive ZERO read calls and the vault sidecar must be the sole
+    backend consulted. Together the two test layers prove the invariant
+    holds end-to-end through the auto-inject path.
+
+    A control test (relational intent DOES read the graph) is included
+    so that the spy itself is proven to fire when it should -- otherwise
+    a broken spy could let a regression slip through silently.
+    """
+
+    @pytest.mark.asyncio
+    async def test_force_intent_historical_does_not_query_graph(self) -> None:
+        """End-to-end ADR-010 invariant 4: vault-only retrieval must not
+        call any graph read method.
+        """
+        # Arrange -- wire BOTH a sidecar (with content so it returns rows)
+        # AND a graph-read spy. If the historical-intent path leaked into
+        # any graph method, the spy would catch it.
+        sidecar = FakeSidecar(rows=_make_sidecar_rows(("/v/s/x.md", "Section A")))
+        spy = GraphReadSpy()
+        cfg = build_test_config()
+        conn = FakeNeo4jConnection()
+        emb = FakeEmbeddingProvider()
+        gs = GraphStore(connection=conn, embedding_generator=emb)
+        spy.install(gs)
+        retriever = KnowledgeRetriever(
+            config=cfg,
+            graph_store=gs,
+            vector_store=None,
+            query_classifier=StubClassifier("historical"),
+            embedding_provider=emb,
+            vault_sidecar=sidecar,
+        )
+
+        # Act
+        result = await retriever.retrieve(
+            query="what did we discuss about memory?",
+            force_intent="historical",
+        )
+
+        # Assert -- vault sidecar consulted exactly once
+        assert len(sidecar.calls) == 1, (
+            f"vault sidecar must be queried exactly once on historical "
+            f"intent; got {len(sidecar.calls)} calls"
+        )
+        # Graph store received ZERO read calls (the invariant)
+        assert spy.total_calls == 0, (
+            f"graph store must not be read on historical intent (per "
+            f"ADR-010 invariant 4); got {spy.total_calls} calls. "
+            f"search_similar={len(spy.search_similar_entities_calls)}, "
+            f"user_rels={len(spy.get_user_relationships_to_entities_calls)}, "
+            f"neighborhood={len(spy.get_entity_neighborhood_calls)}"
+        )
+        # Sanity: result intent reflects the override
+        assert result.intent == "historical"
+
+    @pytest.mark.asyncio
+    async def test_relational_intent_does_query_graph_control(self) -> None:
+        """Control test: confirm the spy actually fires when the path
+        legitimately reads the graph. Without this, a broken spy could
+        let a regression slip through the invariant test silently.
+        """
+        spy = GraphReadSpy()
+        cfg = build_test_config()
+        conn = FakeNeo4jConnection()
+        emb = FakeEmbeddingProvider()
+        gs = GraphStore(connection=conn, embedding_generator=emb)
+        spy.install(gs)
+        retriever = KnowledgeRetriever(
+            config=cfg,
+            graph_store=gs,
+            vector_store=None,
+            query_classifier=StubClassifier("relational"),
+            embedding_provider=emb,
+            vault_sidecar=None,
+        )
+
+        await retriever.retrieve(query="what do I use at work?", force_intent="relational")
+
+        # Relational path consults graph_store.search_similar_entities at
+        # minimum -- spy MUST register at least one call.
+        assert len(spy.search_similar_entities_calls) >= 1, (
+            "relational intent must produce at least one search_similar_entities "
+            "call; if not, the spy is broken and the invariant test above is "
+            "void"
         )
