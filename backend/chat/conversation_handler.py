@@ -27,6 +27,7 @@ from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from backend.knowledge.storage.graph_store import GraphStore
 from backend.llm import LLMRequest, StreamingLLMProvider
 from backend.llm.instrumented_provider import llm_call_context
+from backend.llm.models import LLMResponse
 from backend.llm.models import ToolCall as LLMToolCall
 
 if TYPE_CHECKING:
@@ -444,38 +445,47 @@ class ConversationHandler:
         # Add user message to history
         session.add_message("user", user_message)
 
-        # AUTO-INJECT: Hybrid retrieval (configurable)
+        # Auto-inject runs against the vault sidecar only, per ADR-010
+        # invariant 4 ("No semantic read cross-pollination. Reasoning
+        # queries target graph. Prose/history queries target vault
+        # sidecar."). The vault carries canonical user-approved prose
+        # (sessions, decisions, identity, user fact sheets) and
+        # MIST-architecture documents. Graph traversal is the explicit
+        # `query_knowledge_graph` tool's job.
+        #
+        # Pre-fix history: auto-inject was running against the merged
+        # graph + vector + sidecar pipeline, which leaked graph hits
+        # into pass 1's system prompt as "Relevant knowledge from your
+        # graph (query: <user query>)". The model treated that framing
+        # as a definitive search result, producing FN (skipped tool when
+        # off-topic graph hits looked personal) and FP (tool-called when
+        # any user-related graph fact surfaced for an unrelated query).
+        # Bias compounded as the graph filled with extracted noise.
+        #
+        # `force_intent="historical"` bypasses the query classifier and
+        # routes the retriever exclusively to the vault sidecar. Graph
+        # is left untouched here — reserved for the tool path.
         retrieval_result: RetrievalResult | None = None
-        auto_inject_limit = self.config.auto_inject_limit
-        auto_inject_threshold = self.config.auto_inject_threshold
-        auto_inject_enabled = self.config.auto_inject_docs
-
+        auto_inject_enabled = self.config.auto_inject_docs and len(user_message.split()) >= 3
         if auto_inject_enabled:
-            # Skip auto-injection for very short messages
-            if len(user_message.split()) >= 3:
-                logger.info("[AUTO-RAG] Retrieving context for: '%s...'", user_message[:50])
-                try:
-                    retrieval_result = await self.retriever.retrieve(
-                        query=user_message,
-                        user_id=user_id,
-                        limit=auto_inject_limit,
-                        similarity_threshold=auto_inject_threshold,
-                        session_id=session_id,
-                    )
-                    logger.info(
-                        "[HYBRID-RAG] Intent: %s, confidence: %.2f, facts: %d, chunks: %d",
-                        retrieval_result.intent,
-                        retrieval_result.config_used.get("similarity_threshold", 0.0),
-                        retrieval_result.total_facts,
-                        retrieval_result.document_chunks_used,
-                    )
-                except Exception as e:
-                    logger.error("[AUTO-RAG] Error during hybrid retrieval: %s", e)
-                    retrieval_result = None
-            else:
-                logger.debug("[AUTO-RAG] Skipping retrieval for short message")
+            try:
+                retrieval_result = await self.retriever.retrieve(
+                    query=user_message,
+                    user_id=user_id,
+                    limit=self.config.auto_inject_limit,
+                    similarity_threshold=self.config.auto_inject_threshold,
+                    session_id=session_id,
+                    force_intent="historical",
+                )
+                logger.info(
+                    "[AUTO-RAG] Vault-only retrieval: chunks=%d (intent=%s)",
+                    retrieval_result.document_chunks_used,
+                    retrieval_result.intent,
+                )
+            except Exception as e:
+                logger.error("[AUTO-RAG] Error during vault-only retrieval: %s", e)
+                retrieval_result = None
 
-        # Build conversation with system prompt and optional retrieval context
         mist_context = await self._get_or_fetch_mist_context(session_id)
         messages = self._build_messages(
             session,
@@ -509,6 +519,8 @@ class ConversationHandler:
             # Check if LLM made tool calls
             tool_calls = []
             tool_results = []
+            final_response: LLMResponse | None = None
+            _llm_duration_2_ms: float = 0.0
 
             if response.tool_calls:
                 logger.info("[TOOLS] LLM made %d tool calls", len(response.tool_calls))
@@ -598,7 +610,11 @@ class ConversationHandler:
                 )
 
             else:
-                # No tool calls, use response directly
+                # No-tool path: pass 1 declined to tool-call, the response
+                # content is the final answer. Vault-only auto-inject was
+                # already provided in pass 1's context; graph access is
+                # reserved for the tool path that pass 1 declined to take.
+                # Single LLM call — no pass 2 on this branch.
                 assistant_message = response.content
 
             # Cluster 3: slop post-filter before storing/returning.
@@ -668,7 +684,7 @@ class ConversationHandler:
                 if retrieval_result is not None:
                     turn_record.record_retrieval(retrieval_result)
                 turn_record.record_llm_response(response, pass_num=1, timing_ms=_llm_duration_1_ms)
-                if response.tool_calls:
+                if final_response is not None:
                     turn_record.record_llm_response(
                         final_response, pass_num=2, timing_ms=_llm_duration_2_ms
                     )

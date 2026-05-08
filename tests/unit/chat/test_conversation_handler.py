@@ -305,6 +305,179 @@ class TestShortMessageSkip:
 
 
 # =============================================================================
+# Auto-inject vault-only contract (ADR-010 invariant 4)
+# =============================================================================
+
+
+class TestAutoInjectVaultOnly:
+    """Auto-inject must query vault sidecar only - never graph.
+
+    Per ADR-010 invariant 4 ("No semantic read cross-pollination.
+    Reasoning queries target graph. Prose/history queries target vault
+    sidecar. Hybrid merges happen at the retriever layer, never inside
+    a store."), the four-layer memory architecture establishes:
+      - Graph (Neo4j) = MIST's reasoning substrate. Typed entities and
+        relationships. Queried via the explicit `query_knowledge_graph`
+        tool when the model needs structured user facts.
+      - Vault sidecar (sqlite-vec + FTS5 over `mist-memory/`) = canonical
+        prose/history. Queried for auto-inject context.
+
+    Pre-fix, `handle_message` called `retriever.retrieve()` with the user
+    message as query, which traversed graph + vector + sidecar and
+    merged the result. Graph hits leaked into pass 1's system prompt as
+    "Relevant knowledge from your graph (query: <user query>)" framing,
+    which the model interpreted as a definitive search result. Two
+    failure modes followed:
+      - FN: when graph returned off-topic but personal-looking facts
+        (e.g., Rust query -> trait-engineer-mindset), the model concluded
+        "graph has no Rust info" and skipped the tool while textually
+        claiming "I have checked the knowledge graph."
+      - FP: when graph surfaced any user-related fact for an unrelated
+        query (e.g., haiku -> "afternoon - related to user"), the model
+        tool-called inappropriately.
+
+    The architecturally-correct fix per ADR-010: auto-inject queries the
+    vault sidecar only (force_intent="historical"). Graph is reserved
+    for the explicit tool path. No cross-pollination, no bias.
+    """
+
+    @staticmethod
+    def _spy_handler(call_order: list[str], retrieve_calls: list[dict]):
+        """Build a ConversationHandler with spies on retriever.retrieve
+        (capturing kwargs into retrieve_calls) and llm_provider.invoke
+        (recording call sequence into call_order).
+        """
+        config = build_test_config()  # auto_inject_docs default True
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        pipeline = FakeExtractionPipeline()
+        retriever = _make_retriever(config, gs)
+        fake_llm = FakeLLM()
+
+        original_invoke = fake_llm.invoke
+
+        async def spy_invoke(request):
+            call_order.append("provider")
+            return await original_invoke(request)
+
+        fake_llm.invoke = spy_invoke  # type: ignore[method-assign]
+
+        original_retrieve = retriever.retrieve
+
+        async def spy_retrieve(*args, **kwargs):
+            call_order.append("retriever")
+            retrieve_calls.append(dict(kwargs))
+            return await original_retrieve(*args, **kwargs)
+
+        retriever.retrieve = spy_retrieve  # type: ignore[method-assign]
+
+        handler = ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=pipeline,
+            retriever=retriever,
+            llm_provider=fake_llm,
+        )
+        return handler, fake_llm, retriever
+
+    @pytest.mark.asyncio
+    async def test_auto_inject_calls_retriever_with_historical_intent(self):
+        """Auto-inject must invoke retriever.retrieve() with
+        force_intent='historical' so only the vault sidecar is queried
+        (per ADR-010 invariant 4). The graph remains reserved for the
+        explicit query_knowledge_graph tool path.
+        """
+        call_order: list[str] = []
+        retrieve_calls: list[dict] = []
+        handler, _fake_llm, _retriever = self._spy_handler(call_order, retrieve_calls)
+
+        await handler.handle_message(
+            user_message="What's my experience level with Rust?",
+            session_id="auto-inject-historical-1",
+        )
+
+        # The first retrieve call is the auto-inject one. Tool-dispatched
+        # retrieves (when the model fires query_knowledge_graph) come
+        # later in the sequence.
+        assert retrieve_calls, "retriever.retrieve must be called for auto-inject"
+        auto_inject_kwargs = retrieve_calls[0]
+        assert auto_inject_kwargs.get("force_intent") == "historical", (
+            "Auto-inject must pass force_intent='historical' to scope to "
+            "vault sidecar only (per ADR-010 invariant 4); got kwargs="
+            f"{auto_inject_kwargs}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_tool_path_single_provider_invocation(self):
+        """When pass 1 produces a content response (no tool calls), only
+        ONE provider call is needed. The vault-only auto-inject context
+        was already injected for pass 1; no pass 2 is required because
+        graph access (the only thing pass 2 could add) is gated behind
+        the explicit tool path that pass 1 declined to take.
+        """
+        call_order: list[str] = []
+        retrieve_calls: list[dict] = []
+        handler, _fake_llm, _retriever = self._spy_handler(call_order, retrieve_calls)
+
+        await handler.handle_message(
+            user_message="What is the capital of Australia?",
+            session_id="single-pass-1",
+        )
+
+        provider_calls = [c for c in call_order if c == "provider"]
+        assert len(provider_calls) == 1, (
+            f"expected 1 provider invocation on no-tool path; got "
+            f"{len(provider_calls)}: {call_order}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_tool_path_two_provider_invocations(self):
+        """When pass 1 fires a tool call, pass 2 follows with the tool
+        result. Tool-decision pass + final-answer pass = 2 provider
+        invocations. Unchanged from prior behavior; the architectural
+        change is on the no-tool path only.
+        """
+        from backend.llm.models import LLMResponse, ToolCall
+
+        call_order: list[str] = []
+        retrieve_calls: list[dict] = []
+        handler, fake_llm, _retriever = self._spy_handler(call_order, retrieve_calls)
+
+        queued: list[LLMResponse] = [
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCall(
+                        id="call_1",
+                        name="query_knowledge_graph",
+                        arguments={"query": "user rust experience"},
+                    )
+                ],
+                partial=False,
+            ),
+            LLMResponse(content="You have intermediate Rust experience.", partial=False),
+        ]
+
+        async def queued_invoke(request):
+            call_order.append("provider")
+            fake_llm.calls.append(request)
+            return queued.pop(0)
+
+        fake_llm.invoke = queued_invoke  # type: ignore[method-assign]
+
+        await handler.handle_message(
+            user_message="What's my experience level with Rust?",
+            session_id="two-pass-tool-1",
+        )
+
+        provider_calls = [c for c in call_order if c == "provider"]
+        assert len(provider_calls) == 2, (
+            f"expected 2 provider invocations (initial+final), got "
+            f"{len(provider_calls)}: {call_order}"
+        )
+
+
+# =============================================================================
 # Cluster 3 Task 6: Persona injection in system prompt
 # =============================================================================
 

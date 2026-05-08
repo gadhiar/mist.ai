@@ -130,6 +130,7 @@ class KnowledgeRetriever:
         filters: RetrievalFilters | None = None,
         session_id: str | None = None,
         event_id: str | None = None,
+        force_intent: str | None = None,
     ) -> RetrievalResult:
         """Retrieve relevant knowledge for a query.
 
@@ -167,8 +168,16 @@ class KnowledgeRetriever:
             f"Parameters: limit={limit}, threshold={similarity_threshold}, max_hops={max_hops}"
         )
 
-        # Step 1: Classify intent
-        if self._query_classifier is not None:
+        # Step 1: Classify intent (or honor force_intent override).
+        # `force_intent` lets callers bypass the classifier when the
+        # routing decision is determined by the call site rather than the
+        # query content. Auto-inject (per ADR-010 invariant 4) passes
+        # force_intent="historical" to scope retrieval to the vault
+        # sidecar only; graph access is reserved for the explicit
+        # query_knowledge_graph tool path.
+        if force_intent is not None:
+            intent = force_intent
+        elif self._query_classifier is not None:
             intent_result = self._query_classifier.classify(query)
             intent = intent_result.intent
         else:
