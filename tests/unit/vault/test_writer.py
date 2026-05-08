@@ -641,6 +641,43 @@ class TestUpsertUser:
         content = user_path.read_text(encoding="utf-8")
         assert "Updated MIST body." in content
 
+    @pytest.mark.asyncio
+    async def test_provenance_not_duplicated_when_body_includes_one(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        r"""When body_markdown already contains a `## Provenance` section,
+        the writer must NOT append a second one.
+
+        Regression test for the conversation_handler /
+        user_snapshot.render_user_snapshot_body coordination bug: the
+        snapshot renderer returns a body that already includes
+        "## Provenance\n- rendered_at: ...\n- source: graph snapshot
+        ...". Pre-fix `_upsert_user_sync` appended its own minimal
+        Provenance section unconditionally, producing a duplicate that
+        accumulated across re-renders during continuous use.
+        """
+        body_with_provenance = (
+            "## Facts\n"
+            "- Uses Python\n"
+            "\n"
+            "## Provenance\n"
+            "- rendered_at: 2026-05-08T00:00:00+00:00\n"
+            "- source: graph snapshot (User entity + 1-hop outbound neighbors)\n"
+        )
+
+        path_str = await vault_writer.upsert_user("raj", body_with_provenance)
+
+        content = Path(path_str).read_text(encoding="utf-8")
+        _, body = parse_frontmatter(content)
+
+        # Exactly one Provenance section in the rendered file body.
+        assert body.count("## Provenance") == 1, (
+            f"expected exactly 1 '## Provenance' section, got "
+            f"{body.count('## Provenance')}: {body!r}"
+        )
+        # Caller-supplied source attribution preserved.
+        assert "source: graph snapshot (User entity + 1-hop outbound neighbors)" in body
+
 
 # ---------------------------------------------------------------------------
 # TestQueueSerialization

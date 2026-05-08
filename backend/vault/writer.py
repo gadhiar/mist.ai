@@ -917,7 +917,6 @@ class VaultWriter:
         """Synchronous core of `upsert_user`."""
         today = datetime.now(UTC).date().isoformat()
         now_iso = datetime.now(UTC).isoformat()
-        provenance_section = f"\n## Provenance\n" f"- rendered_at: {now_iso}\n"
 
         if path.exists():
             content = path.read_text(encoding="utf-8")
@@ -946,7 +945,19 @@ class VaultWriter:
             authored_by=AuthoredBy.MIST,
             last_updated=today,
         )
-        full_body = body_markdown.rstrip("\n") + "\n" + provenance_section
+        # Append a default `## Provenance` section ONLY when body_markdown
+        # does not already include one. The C-pattern user-snapshot
+        # renderer (backend/vault/user_snapshot.render_user_snapshot_body)
+        # supplies a richer Provenance with source attribution; trust the
+        # caller-provided section when present, fall back to a writer-
+        # supplied minimal section otherwise. Without this guard, mid-V6
+        # re-renders accumulated duplicate Provenance sections during
+        # continuous use.
+        if "## Provenance" in body_markdown:
+            full_body = body_markdown.rstrip("\n") + "\n"
+        else:
+            provenance_section = f"\n## Provenance\n- rendered_at: {now_iso}\n"
+            full_body = body_markdown.rstrip("\n") + "\n" + provenance_section
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(render_frontmatter(fm, full_body), encoding="utf-8")
 
