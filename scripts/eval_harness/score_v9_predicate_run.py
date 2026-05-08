@@ -227,14 +227,60 @@ def parse_extraction_json(content: str) -> tuple[bool, frozenset[str], frozenset
     return True, frozenset(entity_types), frozenset(rel_types)
 
 
-def build_extraction_index(records: Iterator[dict]) -> dict[str, list[ExtractionRecord]]:
-    """Index extraction llm_call records by utterance recovered from request."""
+# Buffer to add after the latest TURN ts_iso when scoping extraction records
+# by time window. Extraction llm_call typically completes within seconds of
+# its triggering turn; 60 seconds is generous and accommodates retries +
+# slow LLM responses without leaking subsequent sessions' extractions.
+_EXTRACTION_TS_BUFFER_SECONDS = 60
+
+
+def get_session_ts_window(records: Iterator[dict], session_id: str) -> tuple[str, str] | None:
+    """Return (earliest, latest) ts_iso for the session's TURN records.
+
+    Used to scope extraction llm_call records (which have session_id=None
+    because the extraction call site does not propagate the conversation
+    context) to a single replay run by time range. Returns None if no
+    TURN records match the requested session_id.
+
+    The session's TURN ts_iso bounds are used directly as the lower
+    bound; the caller adds an extraction-lag buffer to the upper bound
+    before filtering records.
+    """
+    ts_values: list[str] = []
+    for rec in records:
+        if rec.get("phase") != "turn":
+            continue
+        if rec.get("session_id") != session_id:
+            continue
+        ts = rec.get("ts_iso")
+        if isinstance(ts, str) and ts:
+            ts_values.append(ts)
+    if not ts_values:
+        return None
+    return (min(ts_values), max(ts_values))
+
+
+def build_extraction_index(
+    records: Iterator[dict], ts_range: tuple[str, str] | None = None
+) -> dict[str, list[ExtractionRecord]]:
+    """Index extraction llm_call records by utterance recovered from request.
+
+    When `ts_range=(min_ts, max_ts)` is supplied, only records with
+    `ts_iso` lexicographically within `[min_ts, max_ts]` are indexed.
+    ISO 8601 timestamps with consistent timezone are lexically ordered,
+    so string comparison is correct here. Caller is responsible for
+    extending `max_ts` with an extraction-lag buffer if needed.
+    """
     by_utterance: dict[str, list[ExtractionRecord]] = {}
     for rec in records:
         if rec.get("phase") != "llm_call":
             continue
         if rec.get("call_site") != EXTRACTION_CALL_SITE:
             continue
+        if ts_range is not None:
+            ts = rec.get("ts_iso")
+            if not isinstance(ts, str) or not (ts_range[0] <= ts <= ts_range[1]):
+                continue
         utterance = extract_utterance_from_request(rec.get("request") or {})
         if not utterance:
             continue
@@ -350,7 +396,15 @@ def main(argv: list[str] | None = None) -> int:
         "--session-id",
         type=str,
         default=None,
-        help="Filter llm_call records by session_id (extraction records have null session_id, so the filter applies to TURN records only; pass to scope to a single replay run via the per-turn filter would require scope at iter_debug_records level)",
+        help=(
+            "Scope the score to a single replay run. Extraction llm_call "
+            "records have session_id=None, so the filter applies via the "
+            "per-session TURN utterance set: only extractions whose "
+            "utterance appeared in TURN records of this session are "
+            "counted. When omitted, all extractions in the JSONL are "
+            "counted (multi-run aggregation -- caller's responsibility "
+            "to ensure single-run input)."
+        ),
     )
     parser.add_argument("--output", type=Path, default=None, help="Write markdown to file")
     parser.add_argument(
@@ -361,10 +415,37 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     probes = list(iter_probes(args.input))
-    # session_id filtering: extraction llm_call records have session_id=None,
-    # so filtering at iter time would drop them. Index ALL extraction records
-    # by utterance and rely on the curated V9 input to disambiguate.
-    extraction_by_utterance = build_extraction_index(iter_debug_records(args.debug_jsonl))
+    # Extraction llm_call records have session_id=None, so they cannot be
+    # filtered directly by session. We instead derive the time window of
+    # the requested session from its TURN records (which DO carry
+    # session_id) and bound the extraction index by ts_iso. This properly
+    # scopes when two replay runs land in the same JSONL file (the most
+    # likely multi-run accident).
+    ts_range: tuple[str, str] | None = None
+    if args.session_id is not None:
+        window = get_session_ts_window(iter_debug_records(args.debug_jsonl), args.session_id)
+        if window is None:
+            print(
+                f"WARN: session_id={args.session_id!r} matched no TURN records; "
+                "scoring will aggregate the entire JSONL.",
+                file=sys.stderr,
+            )
+        else:
+            from datetime import datetime, timedelta
+
+            min_ts, max_ts = window
+            try:
+                upper = (
+                    datetime.fromisoformat(max_ts)
+                    + timedelta(seconds=_EXTRACTION_TS_BUFFER_SECONDS)
+                ).isoformat()
+            except (TypeError, ValueError):
+                # Malformed ts_iso -- fall back to no buffer
+                upper = max_ts
+            ts_range = (min_ts, upper)
+    extraction_by_utterance = build_extraction_index(
+        iter_debug_records(args.debug_jsonl), ts_range=ts_range
+    )
     report = score_run(probes, extraction_by_utterance)
     md = render_markdown(report)
     if args.output is not None:
