@@ -685,8 +685,8 @@ class KnowledgeRetriever:
                         "path": path,
                         # `text` is the canonical key consumed by
                         # `_format_context` (the formatter is shared with
-                        # the document-chunk path which has historically
-                        # used "text"). `content` is retained as a
+                        # the document-chunk path, which has historically
+                        # used "text" too). `content` is retained as a
                         # deprecated alias for one release cycle to avoid
                         # silently breaking any out-of-tree consumer that
                         # may have read the previous key. Schedule alias

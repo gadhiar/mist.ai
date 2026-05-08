@@ -734,8 +734,13 @@ class TestUpsertUser:
             f"expected exactly 1 '## Provenance' section, got "
             f"{body.count('## Provenance')}: {body!r}"
         )
-        # Caller-supplied source attribution preserved.
-        assert "source: graph snapshot (User entity + 1-hop outbound neighbors)" in body
+        # Caller-supplied source attribution preserved. The substring
+        # "source: graph snapshot" is enough to verify the renderer's
+        # Provenance content was passed through verbatim; the full
+        # parenthetical "(User entity + 1-hop outbound neighbors)" is
+        # owned by user_snapshot.render_user_snapshot_body and would
+        # couple this writer test to that renderer's exact phrasing.
+        assert "source: graph snapshot" in body
 
 
 # ---------------------------------------------------------------------------

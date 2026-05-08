@@ -935,7 +935,19 @@ class VaultWriter:
                     path,
                     authored_by_val,
                 )
-                # Update only last_updated in frontmatter; preserve body
+                # Update only last_updated in frontmatter; preserve body.
+                # The Provenance-dedup logic at the bottom of this method
+                # (`_PROVENANCE_HEADING_RE` check) is intentionally NOT
+                # applied here: ADR-010 invariant 5 mandates that user
+                # edits are authoritative on conflict. If the user has
+                # taken ownership of the file, MIST does not rewrite or
+                # de-duplicate the body's Provenance section even when it
+                # was originally written by MIST. Side effect: a note
+                # that accumulated duplicate Provenance sections BEFORE
+                # the dedup fix landed will keep them after a user edit
+                # locked the body. A future workstream addressing
+                # invariant-5 vault re-derivation can revisit; for now
+                # the asymmetry is documented and accepted.
                 fm_dict["last_updated"] = today
                 import yaml as _yaml
 

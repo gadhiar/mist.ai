@@ -161,7 +161,8 @@ with open('data/ingest/v6-<run-tag>-websocket-output.jsonl') as f:
 total_chars = sum(len(r.get('response','')) for r in rows)
 empty = sum(1 for r in rows if not r.get('response'))
 emoji_count = sum(1 for r in rows for c in r.get('response','')
-                  if 0x1F300 <= ord(c) <= 0x1F9FF or 0x2600 <= ord(c) <= 0x27BF)
+                  if 0x1F300 <= ord(c) <= 0x1F9FF or 0x2600 <= ord(c) <= 0x27BF
+                  or 0x1FA70 <= ord(c) <= 0x1FAFF)  # Unicode 13+ supplementary plane
 errors = sum(1 for r in rows if r.get('error'))
 print(f'turns: {len(rows)}, empty: {empty}, errors: {errors}, '
       f'emoji chars: {emoji_count}, avg chars: {total_chars/len(rows):.0f}')
