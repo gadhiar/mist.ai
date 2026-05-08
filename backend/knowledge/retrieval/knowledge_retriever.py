@@ -635,11 +635,25 @@ class KnowledgeRetriever:
             return [], []
 
         facts: list[RetrievedFact] = []
+        kept_rows: list[dict] = []
         for row in rows:
             path = row.get("path", "")
             heading = row.get("heading") or "(file)"
             content = row.get("content", "")
             score = float(row.get("score", 0.0))
+            # Skip chunks with empty/whitespace-only content. The sidecar
+            # sometimes returns ranked rows that have a heading but no body
+            # (file-level chunks where the section is empty, or stale rows
+            # awaiting reindex). Surfacing these as `[doc-N] Source: <heading>`
+            # with no content beneath confused the model: the "Relevant
+            # Documents" framing implied authoritative context, but the
+            # empty body left the model to infer relevance from the heading
+            # alone -- which it did inconsistently, biasing tool-call
+            # decisions on small-talk and technical-explainer queries.
+            # Drop the noise at the source so it never reaches the prompt.
+            if not (content or "").strip():
+                continue
+            kept_rows.append(row)
             facts.append(
                 RetrievedFact(
                     subject="VaultNote",
@@ -649,7 +663,11 @@ class KnowledgeRetriever:
                     object_type="VaultChunk",
                     properties={
                         "path": path,
-                        "content": content,
+                        # `text` (not `content`) so _format_context renders
+                        # the chunk body. The formatter is shared with the
+                        # document-chunk path which has historically used
+                        # the "text" key (line 582 / line 1038).
+                        "text": content,
                         "vector_rank": row.get("vector_rank"),
                         "fts_rank": row.get("fts_rank"),
                         "sources": row.get("sources"),
@@ -659,7 +677,7 @@ class KnowledgeRetriever:
                 )
             )
 
-        return rows, facts
+        return kept_rows, facts
 
     def _vector_store_search(self, embedding: list[float], limit: int) -> list[VectorSearchResult]:
         """Execute raw vector store search with error handling.

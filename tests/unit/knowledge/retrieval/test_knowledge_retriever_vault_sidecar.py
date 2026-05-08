@@ -452,3 +452,93 @@ class TestVaultSidecarRetrieve:
         retriever._vault_sidecar_retrieve(query="x", embedding=[0.1] * 384, limit=42)
 
         assert sidecar.calls[0]["k"] == 42
+
+    def test_vault_sidecar_retrieve_drops_empty_content_chunks(self) -> None:
+        """Sidecar rows with empty/whitespace-only content must be dropped
+        before reaching `_format_context`. Surfacing empty-body chunks as
+        '[doc-N] Source: <heading>' with no body beneath biased the model
+        toward inappropriate tool-calls (the "Relevant Documents" framing
+        implied authoritative context the chunks did not actually provide).
+        """
+        sidecar = FakeSidecar(
+            rows=[
+                {
+                    "path": "/v/s/note-a.md",
+                    "heading": "Real Section",
+                    "content": "Substantive body about the topic.",
+                    "score": 0.5,
+                    "vector_rank": 1,
+                    "fts_rank": 1,
+                    "sources": ["vector"],
+                },
+                {
+                    "path": "/v/s/note-b.md",
+                    "heading": "Empty Section",
+                    "content": "",
+                    "score": 0.4,
+                    "vector_rank": 2,
+                    "fts_rank": 2,
+                    "sources": ["vector"],
+                },
+                {
+                    "path": "/v/s/note-c.md",
+                    "heading": "Whitespace Section",
+                    "content": "   \n\n  ",
+                    "score": 0.3,
+                    "vector_rank": 3,
+                    "fts_rank": 3,
+                    "sources": ["fts"],
+                },
+            ]
+        )
+        retriever, _ = _make_retriever_with_sidecar(intent="historical", sidecar=sidecar)
+
+        rows, facts = retriever._vault_sidecar_retrieve(query="x", embedding=[0.1] * 384, limit=10)
+
+        # Only the substantive chunk should survive
+        assert len(facts) == 1
+        assert facts[0].object == "Real Section"
+        assert facts[0].properties["text"] == "Substantive body about the topic."
+        # Raw rows returned should also exclude the empty chunks (so debug
+        # JSONL records reflect what actually got injected, not what the
+        # sidecar returned before filtering).
+        assert len(rows) == 1
+
+    def test_vault_sidecar_retrieve_populates_text_property(self) -> None:
+        """Vault chunks must populate properties['text'] so _format_context
+        can render the chunk content. Pre-fix the sidecar stored chunk
+        body under properties['content'], but the formatter (which is
+        shared with the document-chunk path) reads properties['text'].
+        Result: 'Relevant Documents' rendered with empty content body —
+        the model saw '[doc-1] Source: <heading> (similarity: X.XX)'
+        followed by an empty line, indistinguishable from a real
+        relevant document.
+        """
+        sidecar = FakeSidecar(
+            rows=[
+                {
+                    "path": "/v/s/2026-04-21-mist-cluster-1.md",
+                    "heading": "What Was Accomplished",
+                    "content": "Cluster 1 ontology expansion shipped 8 commits.",
+                    "score": 0.5,
+                    "vector_rank": 1,
+                    "fts_rank": 1,
+                    "sources": ["vector", "fts"],
+                }
+            ]
+        )
+        retriever, _ = _make_retriever_with_sidecar(intent="historical", sidecar=sidecar)
+
+        _rows, facts = retriever._vault_sidecar_retrieve(
+            query="ontology expansion", embedding=[0.1] * 384, limit=5
+        )
+
+        assert len(facts) == 1
+        # The formatter reads properties["text"]; the sidecar must populate
+        # that key (not just "content") for the chunk body to render.
+        assert facts[0].properties.get("text") == (
+            "Cluster 1 ontology expansion shipped 8 commits."
+        ), (
+            "Vault chunks must store body under properties['text'] for "
+            f"_format_context compatibility; got {dict(facts[0].properties)}"
+        )
