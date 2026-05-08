@@ -683,11 +683,16 @@ class KnowledgeRetriever:
                     object_type="VaultChunk",
                     properties={
                         "path": path,
-                        # `text` (not `content`) so _format_context renders
-                        # the chunk body. The formatter is shared with the
-                        # document-chunk path which has historically used
-                        # the "text" key (line 582 / line 1038).
+                        # `text` is the canonical key consumed by
+                        # `_format_context` (the formatter is shared with
+                        # the document-chunk path which has historically
+                        # used "text"). `content` is retained as a
+                        # deprecated alias for one release cycle to avoid
+                        # silently breaking any out-of-tree consumer that
+                        # may have read the previous key. Schedule alias
+                        # removal in a follow-up.
                         "text": content,
+                        "content": content,
                         "vector_rank": row.get("vector_rank"),
                         "fts_rank": row.get("fts_rank"),
                         "sources": row.get("sources"),

@@ -642,6 +642,65 @@ class TestUpsertUser:
         assert "Updated MIST body." in content
 
     @pytest.mark.asyncio
+    async def test_quoted_provenance_does_not_suppress_writer_section(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        r"""A quoted line `> ## Provenance` is not a real heading, so the
+        writer must still append its default Provenance. Pre-fix substring
+        check `"## Provenance" in body_markdown` matched the quoted text
+        and incorrectly suppressed the writer's section.
+        """
+        import re as _re
+
+        body = (
+            "## My Notes\n"
+            "Some content.\n"
+            "\n"
+            "> ## Provenance\n"
+            "> just discussing how Provenance works\n"
+        )
+
+        path_str = await vault_writer.upsert_user("raj", body)
+        _, rendered = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
+
+        # Anchored heading match: count line-anchored ## Provenance only
+        actual_headings = _re.findall(r"(?m)^##\s+Provenance\s*$", rendered)
+        assert len(actual_headings) == 1, (
+            f"quoted Provenance is not a real section; writer must append "
+            f"its default. Got {len(actual_headings)} actual headings: "
+            f"{rendered!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_lowercase_provenance_heading_counts_as_section(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        """Lowercase `## provenance` is the same logical section per
+        markdown convention; the writer must NOT add a near-duplicate
+        capital-P version. Pre-fix substring check was case-sensitive.
+        """
+        import re as _re
+
+        body = (
+            "## My Notes\n"
+            "Some content.\n"
+            "\n"
+            "## provenance\n"
+            "- rendered_at: 2026-05-08T00:00:00+00:00\n"
+        )
+
+        path_str = await vault_writer.upsert_user("raj", body)
+        _, rendered = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
+
+        # Total Provenance-like headings (case-insensitive) = 1
+        case_insensitive_count = len(_re.findall(r"(?im)^##\s+Provenance\s*$", rendered))
+        assert case_insensitive_count == 1, (
+            f"lowercase Provenance should count as the section heading; "
+            f"writer must not append a capital-P duplicate. Got "
+            f"{case_insensitive_count} headings: {rendered!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_provenance_not_duplicated_when_body_includes_one(
         self, vault_writer: VaultWriter, tmp_path: Path
     ):

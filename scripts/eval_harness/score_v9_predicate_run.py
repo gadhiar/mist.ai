@@ -51,6 +51,19 @@ EXTRACTION_CALL_SITE = "extraction.ontology"
 
 EXTRACTION_UTTERANCE_PATTERN = re.compile(r'Utterance:\s*"(.+?)"\s*\n\s*Output:', re.DOTALL)
 
+
+def _normalize_utterance(s: str) -> str:
+    """Normalize utterance text for join purposes.
+
+    Strips surrounding whitespace and collapses internal whitespace runs
+    to single spaces. The probe utterance and the extracted utterance
+    must agree on this normalization for the join to succeed; without
+    it, any prompt-template change that adds/removes whitespace around
+    or inside the utterance drops every probe to MISSING.
+    """
+    return " ".join(s.split())
+
+
 # The three v1.1.0 predicates that did NOT fire on V6 conversational sample.
 # This probe set isolates the question: do they fire under engineered
 # triggers? V9 acceptance is presence-of-life, not production quality.
@@ -284,6 +297,7 @@ def build_extraction_index(
         utterance = extract_utterance_from_request(rec.get("request") or {})
         if not utterance:
             continue
+        utterance = _normalize_utterance(utterance)
         response = rec.get("response") or {}
         content = response.get("content") or ""
         parse_ok, entity_types, rel_types = parse_extraction_json(content)
@@ -303,7 +317,7 @@ def score_run(
 ) -> V9Report:
     outcomes: list[ProbeOutcome] = []
     for probe in probes:
-        extractions = extraction_by_utterance.get(probe.utterance, [])
+        extractions = extraction_by_utterance.get(_normalize_utterance(probe.utterance), [])
         all_edges: set[str] = set()
         all_entities: set[str] = set()
         any_parse_ok = False

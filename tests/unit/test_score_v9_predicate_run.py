@@ -258,6 +258,55 @@ class TestSessionScopedScoring:
             "MECHANISM_OF | 1 | 1 | 1.00 | PASS" in out
         ), f"no --session-id must aggregate; got:\n{out}"
 
+    def test_utterance_join_tolerates_whitespace_variation(self, tmp_path: Path, capsys) -> None:
+        """The probe utterance and the extracted utterance must join even
+        when they differ in surrounding/internal whitespace. Without
+        whitespace normalization, any prompt-template change that adds or
+        removes whitespace would drop every probe to MISSING.
+        """
+        v9_input = tmp_path / "v9.jsonl"
+        v9_input.write_text(
+            json.dumps(
+                {
+                    "utterance": "Garbage collection is the mechanism for memory management.",
+                    "tag": "v9-01-mechanism-gc",
+                    "expected_behavior": {
+                        "expected_edges": ["MECHANISM_OF"],
+                        "expected_entities": ["Mechanism", "Concept"],
+                        "rationale": "test",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        # Extraction prompt rendered the utterance with extra surrounding
+        # and internal whitespace -- shouldn't break the join.
+        extracted_utt = "  Garbage collection  is the   mechanism for memory   management.  "
+        debug = tmp_path / "debug.jsonl"
+        _write_jsonl(
+            debug,
+            [
+                _turn(
+                    "sess-A",
+                    "Garbage collection is the mechanism for memory management.",
+                    "2026-05-08T10:00:00+00:00",
+                ),
+                _extraction_llm_call(
+                    extracted_utt,
+                    relationships=["MECHANISM_OF"],
+                    ts_iso="2026-05-08T10:00:05+00:00",
+                ),
+            ],
+        )
+
+        main(["--input", str(v9_input), "--debug-jsonl", str(debug)])
+        out = capsys.readouterr().out
+        assert "MECHANISM_OF | 1 | 1 | 1.00 | PASS" in out, (
+            f"whitespace-varied extraction must still join with the probe; " f"got:\n{out}"
+        )
+
     def test_unknown_session_id_warns_and_aggregates(self, tmp_path: Path, capsys) -> None:
         """When --session-id is supplied but matches no TURN records, the
         scorer must emit a stderr warning and fall back to aggregating

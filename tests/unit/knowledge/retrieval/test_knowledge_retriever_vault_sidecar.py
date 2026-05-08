@@ -576,6 +576,39 @@ class TestVaultSidecarRetrieve:
         # sidecar returned before filtering).
         assert len(rows) == 1
 
+    def test_vault_sidecar_retrieve_populates_both_text_and_content_keys(self) -> None:
+        """Reviewer P1 follow-up: properties['text'] is the canonical
+        consumption key (used by `_format_context`); properties['content']
+        is retained as a deprecated alias for one release cycle to avoid
+        silently breaking any out-of-tree consumer that may have been
+        reading the previous key. Both must be populated and identical
+        until the alias is removed.
+        """
+        sidecar = FakeSidecar(
+            rows=[
+                {
+                    "path": "/v/s/x.md",
+                    "heading": "Section",
+                    "content": "compat shim sample body",
+                    "score": 0.5,
+                    "vector_rank": 1,
+                    "fts_rank": 1,
+                    "sources": ["vector", "fts"],
+                }
+            ]
+        )
+        retriever, _ = _make_retriever_with_sidecar(intent="historical", sidecar=sidecar)
+
+        _rows, facts = retriever._vault_sidecar_retrieve(query="x", embedding=[0.1] * 384, limit=5)
+
+        assert len(facts) == 1
+        props = facts[0].properties
+        assert props.get("text") == "compat shim sample body"
+        assert props.get("content") == "compat shim sample body", (
+            "properties['content'] must be retained as a deprecated alias "
+            f"for one release cycle (reviewer P1 follow-up); got: {dict(props)!r}"
+        )
+
     def test_vault_sidecar_retrieve_populates_text_property(self) -> None:
         """Vault chunks must populate properties['text'] so _format_context
         can render the chunk content. Pre-fix the sidecar stored chunk

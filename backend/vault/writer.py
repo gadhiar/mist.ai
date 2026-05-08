@@ -38,6 +38,12 @@ logger = logging.getLogger(__name__)
 _SENTINEL = "<!-- MIST_APPEND_HERE -->"
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Multiline-anchored, case-insensitive match for a markdown `## Provenance`
+# heading at line start. Used by `_upsert_user_sync` to decide whether to
+# append a writer-supplied default Provenance section. The line anchor
+# rejects quoted forms like `> ## Provenance`; the case-insensitive flag
+# accepts `## provenance` as the same logical section.
+_PROVENANCE_HEADING_RE = re.compile(r"(?im)^##\s+Provenance\s*$")
 
 _ONTOLOGY_VERSION = "1.1.0"
 _EXTRACTION_VERSION = "2026-05-06-r1"
@@ -953,7 +959,17 @@ class VaultWriter:
         # supplied minimal section otherwise. Without this guard, mid-V6
         # re-renders accumulated duplicate Provenance sections during
         # continuous use.
-        if "## Provenance" in body_markdown:
+        #
+        # Detection uses a multiline anchored regex (case-insensitive) so
+        # quoted lines like `> ## Provenance` and lowercase variants like
+        # `## provenance` are correctly handled. A raw substring check
+        # would mismatch the quoted text and incorrectly suppress the
+        # writer's section. Note: a `## Provenance` heading inside a
+        # fenced code block would still match (regex is markdown-naive);
+        # body_markdown produced by user_snapshot.render_user_snapshot_body
+        # never contains code fences, so this trade-off is acceptable in
+        # practice.
+        if _PROVENANCE_HEADING_RE.search(body_markdown):
             full_body = body_markdown.rstrip("\n") + "\n"
         else:
             provenance_section = f"\n## Provenance\n- rendered_at: {now_iso}\n"
