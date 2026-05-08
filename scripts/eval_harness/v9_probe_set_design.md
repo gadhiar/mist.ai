@@ -40,10 +40,12 @@ If V9 produces ≥1 fire per predicate, the predicate works in principle and the
 
 ## Acceptance criteria
 
-- **Per-predicate recall ≥ 0.25** (each predicate fires on ≥1 of 4 probes).
+- **Per-predicate recall ≥ 0.50** (each predicate fires on ≥2 of 4 probes).
 - **No aggregate recall threshold** — aggregate would obscure per-predicate failure.
 
-If a predicate fails its 0.25 floor, the recommended remediation is targeted prompt iteration: add a few-shot example to `backend/knowledge/extraction/prompts.py` mirroring the failed probe's structure (anchored entity types + the missing predicate as the obvious extraction). Then re-run V9 to confirm recall recovery.
+**Threshold history.** Initial floor was 0.25 (presence-of-life check, >=1 of 4 probes). Raised to 0.50 on 2026-05-08 after Example 20 (`MECHANISM_OF -- phrasal variations`) lifted MECHANISM_OF from 0.25 to 0.50. The 0.50 floor better reflects "the predicate is robust enough to fire on multiple natural phrasings, not just the canonical one."
+
+If a predicate fails its 0.50 floor, the recommended remediation is targeted prompt iteration: add a few-shot example to `backend/knowledge/extraction/prompts.py` mirroring the failed probe's structure (anchored entity types + the missing predicate as the obvious extraction). Then re-run V9 to confirm recall recovery.
 
 ## How to run
 

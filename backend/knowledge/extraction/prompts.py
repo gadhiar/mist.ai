@@ -166,6 +166,12 @@ Subject scope: unknown
 Utterance: "The LRU pattern is applicable to cache eviction and the cache mechanism comprises a doubly-linked list"
 Output:
 {{"entities": [{{"id": "lru", "name": "LRU", "type": "Pattern"}}, {{"id": "cache-eviction", "name": "Cache eviction", "type": "Concept"}}, {{"id": "cache", "name": "Cache", "type": "Mechanism"}}, {{"id": "doubly-linked-list", "name": "Doubly-linked list", "type": "DataStructure"}}], "relationships": [{{"source": "lru", "target": "cache-eviction", "type": "APPLICABLE_TO", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false}}}}, {{"source": "cache", "target": "doubly-linked-list", "type": "COMPRISES", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false}}}}]}}
+
+### Example 20: MECHANISM_OF -- phrasal variations beyond "X is the mechanism for Y"
+Subject scope: unknown
+Utterance: "Speculative decoding is the mechanism behind faster token generation, and the retry-policy mechanism handles transient network failures"
+Output:
+{{"entities": [{{"id": "speculative-decoding", "name": "Speculative decoding", "type": "Mechanism"}}, {{"id": "token-generation", "name": "Token generation", "type": "Concept"}}, {{"id": "retry-policy", "name": "Retry policy", "type": "Mechanism"}}, {{"id": "transient-failure", "name": "Transient failure", "type": "Concept"}}], "relationships": [{{"source": "speculative-decoding", "target": "token-generation", "type": "MECHANISM_OF", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "behind faster", "negated": false}}}}, {{"source": "retry-policy", "target": "transient-failure", "type": "MECHANISM_OF", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "handles", "negated": false}}}}]}}
 """
 
 EXTRACTION_USER_TEMPLATE = """Context:

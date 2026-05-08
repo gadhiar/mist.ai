@@ -45,7 +45,9 @@ from pathlib import Path
 # "Acceptance criteria". The design doc is source of truth.
 # ---------------------------------------------------------------------------
 
-PER_PREDICATE_RECALL_THRESHOLD = 0.25  # >= 1 of 4 probes must fire
+PER_PREDICATE_RECALL_THRESHOLD = (
+    0.50  # >= 2 of 4 probes must fire (raised from 0.25 after Example 20 lifted MECHANISM_OF)
+)
 
 EXTRACTION_CALL_SITE = "extraction.ontology"
 
