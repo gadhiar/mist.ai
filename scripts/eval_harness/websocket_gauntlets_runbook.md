@@ -1,0 +1,181 @@
+# WebSocket Gauntlets Runbook (V6 / V7 / V8)
+
+How to run the live-server WebSocket-driven evaluation gauntlets cleanly,
+including the operational env-var traps that have repeatedly cost
+re-runs during continuous-usage hardening.
+
+## Drivers (host-side, gitignored under `.local/`)
+
+| Driver | Probes | Inputs | Scorer |
+|---|---|---|---|
+| `.local/v6_websocket_driver.py` | 30 conversational turns | `data/ingest/v6-inputs.jsonl` | qualitative (response review + Neo4j inspection) |
+| `.local/v7_websocket_driver.py` | 25 tool-selection probes | `data/ingest/v7-tool-heavy-inputs.jsonl` | `scripts/eval_harness/score_v7_probe_run.py` |
+| `.local/v8_websocket_driver.py` | 20 extraction-edge probes | `data/ingest/v8-edge-production-inputs.jsonl` | `scripts/eval_harness/score_v8_probe_run.py` |
+
+All three drivers connect to `ws://localhost:8001/ws` and use the
+hardcoded server-side `session_id="default"`. Driver source lives at
+`.local/` (gitignored, host-side); commit production-relevant changes
+to drivers via this runbook + design docs (`v7_probe_set_design.md`,
+`v8_probe_set_design.md`), not via the driver files themselves.
+
+## Prerequisites: WebSocket driver settings
+
+Each driver MUST disable WebSocket keepalive pings — otherwise turns
+that exceed ~20s under GPU contention will trigger
+`ConnectionClosedError: keepalive ping timeout` and abort the run.
+
+```python
+async with websockets.connect(
+    WS_URL,
+    max_size=8 * 1024 * 1024,
+    ping_interval=None,
+    ping_timeout=None,
+) as ws:
+    ...
+```
+
+Verified set as of 2026-05-08 in all three `.local/v{6,7,8}_websocket_driver.py`.
+If you create a new driver, copy this connect signature.
+
+## Step 1: Recreate the backend with debug instrumentation
+
+The V7 / V8 scorers join input probes against the backend's per-turn
+`MIST_DEBUG_JSONL` records. The volume-mounted `docker-compose.override.yml`
+exposes the env vars but defaults them to empty, so a fresh `docker
+compose up` produces no debug records. Recreate explicitly with the
+env vars set.
+
+**The exact command (use Git Bash on Windows):**
+
+```bash
+MSYS_NO_PATHCONV=1 \
+  TTS_ENABLED=false \
+  MIST_DEBUG_JSONL=/app/data/runtime/v678-<run-tag>.jsonl \
+  MIST_DEBUG_LLM_JSONL=1 \
+  docker compose up -d --force-recreate mist-backend
+```
+
+**Three env-var traps to NOT skip:**
+
+1. `MSYS_NO_PATHCONV=1` is required on Git Bash when passing
+   unix-absolute paths or POSIX-style env values to `docker compose`.
+   Without it, MSYS rewrites `/app/data/runtime/...` to
+   `C:/Program Files/Git/app/data/runtime/...` BEFORE compose sees the
+   value, and the backend writes to the wrong path. The prefix is
+   required on `up` (not just `exec`).
+
+2. `TTS_ENABLED=false` is required for any validation run that does
+   not exercise voice. With TTS enabled and rendering taking 60-180s
+   per turn, single turns can cross the 180s `handle_message_streaming`
+   bridge timeout, deadlocking the backend mid-gauntlet.
+
+3. `--force-recreate` wipes the in-memory `ConversationHandler.sessions`
+   dict (which holds the "default" session's turn history). Without
+   this, prior gauntlet runs' history bleeds into the current run's
+   tool-decision context. For a clean V6 -> V7 -> V8 sequence, recreate
+   between V6 and V7 if you want isolated tool-decision conditions
+   (the contamination effect is real and reproducible — see
+   workstream `mist-ai-voice-chat-path-unification` 2026-05-08 notes).
+
+Then wait for healthy:
+
+```bash
+until curl -s -m 3 http://localhost:8001/health 2>/dev/null \
+    | grep -q "models_loaded.:true"; do sleep 3; done
+```
+
+## Step 2: Run drivers in sequence
+
+```bash
+# V6 — conversational gauntlet (~14 min: 30 turns x ~10s + 18s grace + 30s settle)
+python -u .local/v6_websocket_driver.py
+
+# V7 — tool-selection gauntlet (~5 min: 25 turns x ~7s + 6s grace + 15s settle)
+python -u .local/v7_websocket_driver.py
+
+# V8 — extraction-edge gauntlet (~5 min: 20 turns x ~5s + 8s grace + 30s settle)
+python -u .local/v8_websocket_driver.py
+```
+
+Drivers run sequentially against the same `session_id="default"`. The
+chronological order matters: V6 populates conversational history; V7
+runs against that history (testing tool-decision robustness to prior
+context); V8 runs after V6+V7 with extraction-focused probes.
+
+For session-isolated runs (e.g., apples-to-apples comparison against
+a chat-path baseline), recreate the backend between drivers using the
+Step-1 command.
+
+## Step 3: Score V7 / V8
+
+```bash
+# V7
+MSYS_NO_PATHCONV=1 docker compose exec -T mist-backend \
+  python scripts/eval_harness/score_v7_probe_run.py \
+  --input data/ingest/v7-tool-heavy-inputs.jsonl \
+  --debug-jsonl /app/data/runtime/v678-<run-tag>.jsonl \
+  --session-id default
+
+# V8
+MSYS_NO_PATHCONV=1 docker compose exec -T mist-backend \
+  python scripts/eval_harness/score_v8_probe_run.py \
+  --input data/ingest/v8-edge-production-inputs.jsonl \
+  --debug-jsonl /app/data/runtime/v678-<run-tag>.jsonl \
+  --session-id default
+```
+
+V6 is qualitative — review the driver's output JSONL for empty
+responses, emoji leakage, AI-slop patterns, and average response
+length. Quick metric:
+
+```bash
+python -c "
+import json
+with open('data/ingest/v6-<run-tag>-websocket-output.jsonl') as f:
+    rows = [json.loads(l) for l in f]
+total_chars = sum(len(r.get('response','')) for r in rows)
+empty = sum(1 for r in rows if not r.get('response'))
+emoji_count = sum(1 for r in rows for c in r.get('response','')
+                  if 0x1F300 <= ord(c) <= 0x1F9FF or 0x2600 <= ord(c) <= 0x27BF)
+errors = sum(1 for r in rows if r.get('error'))
+print(f'turns: {len(rows)}, empty: {empty}, errors: {errors}, '
+      f'emoji chars: {emoji_count}, avg chars: {total_chars/len(rows):.0f}')
+"
+```
+
+## Apples-to-apples chat-path replay (no live server required)
+
+For session-isolated comparisons, run V7 via `mist_admin replay`
+inside the backend container. This spawns a fresh `ConversationHandler`
+with no shared session state, no WebSocket layer, and no TTS pipeline.
+
+```bash
+MSYS_NO_PATHCONV=1 docker compose exec -T \
+  -e MIST_DEBUG_JSONL=/app/data/runtime/v7-chat-replay-<tag>.jsonl \
+  -e MIST_DEBUG_LLM_JSONL=1 \
+  mist-backend python scripts/mist_admin.py replay \
+  data/ingest/v7-tool-heavy-inputs.jsonl \
+  --output data/ingest/v7-chat-replay-<tag>-output.jsonl \
+  --session-id v7-chat-replay-<tag>
+```
+
+Score with `--session-id v7-chat-replay-<tag>` to match the replay's
+session_id (not "default" — that's the WebSocket-path session).
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Backend log shows `Debug JSONL logging enabled at C:/Program Files/Git/app/...` | MSYS path-rewriting hit `MIST_DEBUG_JSONL` value | Add `MSYS_NO_PATHCONV=1` to the `docker compose up` line (not just `exec`) |
+| Driver dies mid-run with `ConnectionClosedError: keepalive ping timeout` | Default `ping_interval=20s` killed the connection during a slow turn | Verify `ping_interval=None, ping_timeout=None` in the driver's `websockets.connect` |
+| Single turn crosses 180s and the backend hangs | TTS rendering crossed the `handle_message_streaming` bridge timeout | Recreate backend with `TTS_ENABLED=false` for validation runs |
+| Scorer reports `0/N matched against debug JSONL` | Backend env didn't apply `MIST_DEBUG_JSONL` (running container started before env was set) OR voice_processor didn't wrap the LLM provider with `InstrumentedStreamingLLMProvider` | Recreate backend with `MIST_DEBUG_JSONL=...` set; verify backend logs show "LLM provider wrapped with observability instrumentation" |
+| V7 fails with FP that doesn't appear on chat-path replay | V6/V7/V8 share `session_id="default"`; prior turns' history is in scope | Recreate backend between V6 and V7 to wipe sessions; OR accept and document as session-contamination edge case |
+
+## References
+
+- `scripts/eval_harness/v7_probe_set_design.md` — V7 probe set + acceptance criteria
+- `scripts/eval_harness/v8_probe_set_design.md` — V8 probe set + acceptance criteria
+- `knowledge-vault/Projects/mist-ai/workstreams/mist-ai-voice-chat-path-unification.md` — origin of the V6/V7/V8 WebSocket-driven gauntlet pattern
+- 2026-05-07 transfer notes (vault session note) — codify ops learnings from re-baseline
+- 2026-05-08 transfer notes (vault session note) — V7 fix + vault-only refactor + this runbook
