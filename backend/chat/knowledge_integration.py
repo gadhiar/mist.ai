@@ -50,6 +50,11 @@ class KnowledgeIntegration:
         self.current_session_id = "default"
         self._llm_provider = llm_provider
         self._config = config
+        # Bridge side-channel: last Complete event captured per turn so callers
+        # can read duration_ms / tool_calls_used after generate_response_streaming
+        # returns (the generator yields only strings; ADR-015 stream_complete
+        # needs the metadata). Reset at the top of each streaming call.
+        self.last_complete: Complete | None = None
 
         try:
             if llm_provider is None:
@@ -114,7 +119,17 @@ class KnowledgeIntegration:
             Token text strings, one per Token event from handle_message_streaming.
             Stream ends when the queue sentinel arrives (Complete event seen
             on the producer side).
+
+        Side-effect:
+            Sets ``self.last_complete`` to the last ``Complete`` event seen on
+            the bridge (or ``None`` if the stream errored or returned no
+            Complete). Callers that need ``duration_ms`` / ``tool_calls_used``
+            for ADR-015 ``stream_complete`` payloads should read it after the
+            generator finishes.
         """
+        # Reset bridge side-channel for this turn's Complete metadata.
+        self.last_complete = None
+
         if not self.enabled or not self.conversation_handler:
             logger.warning("Knowledge integration not available, cannot generate response")
             yield "I'm sorry, the knowledge system is not available right now."
@@ -179,9 +194,12 @@ class KnowledgeIntegration:
             if isinstance(item, Token):
                 yield item.text
             elif isinstance(item, Complete):
-                # Producer side finished; DONE sentinel will arrive next.
-                # We don't yield the Complete event itself (caller wants strings).
-                pass
+                # Producer side finished; DONE sentinel will arrive next. We
+                # don't yield the Complete event itself (caller wants strings),
+                # but capture it on the integration object so callers can read
+                # self.last_complete after the generator returns to access
+                # duration_ms / tool_calls_used per ADR-015 stream_complete.
+                self.last_complete = item
 
     def set_session_id(self, session_id: str):
         """Set the current session ID."""
