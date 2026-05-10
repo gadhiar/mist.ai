@@ -7,10 +7,10 @@ per-logger gating, a token-bucket rate limiter, and a re-entrancy guard.
 
 import asyncio
 import contextlib
+import json
 import logging
 import threading
 import time
-from datetime import UTC, datetime
 from typing import Any
 
 from request_context import current_request_id
@@ -163,11 +163,16 @@ class WebSocketLogHandler(logging.Handler):
         return True
 
     def _enqueue(self, record: logging.LogRecord) -> None:
-        """Format and push a log record dict onto the async message queue."""
+        """Serialize a log record to JSON and push onto the async message queue.
+
+        The broadcaster (server.py:73-93) only handles bytes/str on the wire;
+        emitting a dict here previously caused silent drops (MIS-106 dead code
+        on the wire). Timestamp is unix milliseconds per ADR-015.
+        """
         request_id = current_request_id.get()
         record_dict: dict[str, Any] = {
             "type": "log",
-            "timestamp": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
+            "timestamp": int(record.created * 1000),
             "level": record.levelname,
             "levelno": record.levelno,
             "logger": record.name,
@@ -175,13 +180,13 @@ class WebSocketLogHandler(logging.Handler):
             "message": self.format(record),
         }
         with contextlib.suppress(RuntimeError):
-            asyncio.run_coroutine_threadsafe(self._queue.put(record_dict), self._loop)
+            asyncio.run_coroutine_threadsafe(self._queue.put(json.dumps(record_dict)), self._loop)
 
     def _enqueue_summary(self, count: int, duration: float) -> None:
-        """Enqueue a rate-limit recovery summary message (exempt from limiter)."""
+        """Enqueue a rate-limit recovery summary as JSON (exempt from limiter)."""
         record_dict: dict[str, Any] = {
             "type": "log",
-            "timestamp": datetime.now(tz=UTC).isoformat(),
+            "timestamp": int(time.time() * 1000),
             "level": "WARNING",
             "levelno": logging.WARNING,
             "logger": "backend.log_handler",
@@ -191,4 +196,4 @@ class WebSocketLogHandler(logging.Handler):
             ),
         }
         with contextlib.suppress(RuntimeError):
-            asyncio.run_coroutine_threadsafe(self._queue.put(record_dict), self._loop)
+            asyncio.run_coroutine_threadsafe(self._queue.put(json.dumps(record_dict)), self._loop)
