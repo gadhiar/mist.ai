@@ -189,6 +189,15 @@ class VoiceProcessor:
         """Called by VAD when user stops speaking - SPAWN NEW THREAD."""
         log_timestamp("Speech ended, spawning processing thread...")
 
+        # Extend ADR-017 vad_status with speech_ended (paired with the
+        # earlier speech_started emit in _on_speech_start). FE uses the
+        # pair to bracket the user's utterance; state_cycle('think')
+        # fires later at the start of _process_conversation_turn.
+        asyncio.run_coroutine_threadsafe(
+            self.message_queue.put(json.dumps({"type": "vad_status", "status": "speech_ended"})),
+            self.loop,
+        )
+
         # Process in separate thread (CSM pattern!)
         spawn_with_context(self._process_user_speech, audio_data, sample_rate)
 
