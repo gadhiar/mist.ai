@@ -4,9 +4,11 @@ Based on CSM demo architecture - production-ready for web frontend
 """
 
 import asyncio
+import json
 import logging
 import os
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -98,6 +100,23 @@ async def broadcast_messages():
         message_queue.task_done()
 
 
+async def heartbeat_loop(interval_seconds: float = 5.0) -> None:
+    """Emit heartbeat events to connected clients every ``interval_seconds``.
+
+    Per ADR-015 the FE uses heartbeats for ConnectionStatus liveness
+    (~10s without heartbeat -> 'disconnected', attempt reconnect).
+    Heartbeats are queued unconditionally; the broadcaster drains the
+    queue and noops when no clients are connected.
+    """
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            payload = json.dumps({"type": "heartbeat", "timestamp": int(time.time() * 1000)})
+            await message_queue.put(payload)
+        except Exception as e:  # noqa: BLE001
+            logger.error("Heartbeat enqueue failed: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
@@ -168,6 +187,8 @@ async def lifespan(app: FastAPI):
 
     # Start message broadcaster
     broadcaster_task = asyncio.create_task(broadcast_messages())
+    # Start heartbeat task (5s interval per ADR-015 Heartbeat semantics)
+    heartbeat_task = asyncio.create_task(heartbeat_loop())
 
     # Attach WebSocket log handler to root logger
     log_handler = WebSocketLogHandler(event_loop=loop, message_queue=message_queue)
@@ -211,6 +232,7 @@ async def lifespan(app: FastAPI):
             logger.warning("Vault sidecar close error: %s", e)
 
     logging.getLogger().removeHandler(log_handler)
+    heartbeat_task.cancel()
     broadcaster_task.cancel()
     if voice_processor and voice_processor.models:
         voice_processor.models.shutdown()
