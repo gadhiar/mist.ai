@@ -52,9 +52,14 @@ class KnowledgeIntegration:
         self._config = config
         # Bridge side-channel: last Complete event captured per turn so callers
         # can read duration_ms / tool_calls_used after generate_response_streaming
-        # returns (the generator yields only strings; ADR-015 stream_complete
+        # returns (the generator yields only strings; ADR-017 stream_complete
         # needs the metadata). Reset at the top of each streaming call.
         self.last_complete: Complete | None = None
+        # Bridge side-channel: last error captured per turn as (kind, message)
+        # so callers can emit a discriminated ADR-017 error event instead of
+        # yielding error strings as fake llm_token chunks. Closes Phase 1
+        # fix #3 (synthetic llm_token leak from bridge timeout) cleanly.
+        self.last_error: tuple[str, str] | None = None
 
         try:
             if llm_provider is None:
@@ -124,11 +129,12 @@ class KnowledgeIntegration:
             Sets ``self.last_complete`` to the last ``Complete`` event seen on
             the bridge (or ``None`` if the stream errored or returned no
             Complete). Callers that need ``duration_ms`` / ``tool_calls_used``
-            for ADR-015 ``stream_complete`` payloads should read it after the
+            for ADR-017 ``stream_complete`` payloads should read it after the
             generator finishes.
         """
-        # Reset bridge side-channel for this turn's Complete metadata.
+        # Reset bridge side-channels for this turn.
         self.last_complete = None
+        self.last_error = None
 
         if not self.enabled or not self.conversation_handler:
             logger.warning("Knowledge integration not available, cannot generate response")
@@ -158,7 +164,8 @@ class KnowledgeIntegration:
                 return
             except Exception as e:
                 logger.error("Error in knowledge integration: %s", e, exc_info=True)
-                yield f"I encountered an error: {e!s}"
+                # Capture on side-channel; caller emits discriminated error.
+                self.last_error = ("server", str(e))
                 return
 
         # Live-server / voice path: bridge async stream to sync via queue.
@@ -184,12 +191,17 @@ class KnowledgeIntegration:
                 item = q.get(timeout=180)
             except queue.Empty:
                 logger.error("handle_message_streaming bridge timed out after 180s")
-                yield "I encountered an error: response timeout"
+                # Phase 1 fix #3: capture timeout on side-channel instead of
+                # yielding error text as a fake token. Caller reads last_error
+                # after the generator returns and emits a discriminated
+                # ADR-017 error event.
+                self.last_error = ("timeout", "response timeout")
                 return
             if item is DONE:
                 return
             if isinstance(item, tuple) and len(item) == 2 and item[0] == "__error__":
-                yield f"I encountered an error: {item[1]}"
+                # Capture on side-channel; caller emits discriminated error.
+                self.last_error = ("server", str(item[1]))
                 return
             if isinstance(item, Token):
                 yield item.text
@@ -198,7 +210,7 @@ class KnowledgeIntegration:
                 # don't yield the Complete event itself (caller wants strings),
                 # but capture it on the integration object so callers can read
                 # self.last_complete after the generator returns to access
-                # duration_ms / tool_calls_used per ADR-015 stream_complete.
+                # duration_ms / tool_calls_used per ADR-017 stream_complete.
                 self.last_complete = item
 
     def set_session_id(self, session_id: str):

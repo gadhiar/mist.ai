@@ -167,7 +167,7 @@ class WebSocketLogHandler(logging.Handler):
 
         The broadcaster (server.py:73-93) only handles bytes/str on the wire;
         emitting a dict here previously caused silent drops (MIS-106 dead code
-        on the wire). Timestamp is unix milliseconds per ADR-015.
+        on the wire). Timestamp is unix milliseconds per ADR-017.
         """
         request_id = current_request_id.get()
         record_dict: dict[str, Any] = {

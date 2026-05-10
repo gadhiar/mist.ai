@@ -154,11 +154,11 @@ class VoiceProcessor:
         log_timestamp("Voice processor initialized")
 
     def _emit_state_cycle(self, state: str) -> None:
-        """Enqueue a ``state_cycle`` WebSocket event per ADR-015.
+        """Enqueue a ``state_cycle`` WebSocket event per ADR-017.
 
         Called at the explicit transition points of the voice/text turn
         pipeline (listen / think / speak / idle). Sleep tiers are FE-local
-        per ADR-014 and never emitted from BE. Caller is on a worker
+        per ADR-016 and never emitted from BE. Caller is on a worker
         thread; emission goes through the same threadsafe queue path as
         every other JSON event.
 
@@ -222,7 +222,15 @@ class VoiceProcessor:
             logger.error(f"Error processing user speech: {e}", exc_info=True)
             asyncio.run_coroutine_threadsafe(
                 self.message_queue.put(
-                    json.dumps({"type": "error", "message": f"Speech processing error: {e}"})
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "kind": "model",
+                            "message": f"Speech processing error: {e}",
+                            "retriable": True,
+                            "context": None,
+                        }
+                    )
                 ),
                 self.loop,
             )
@@ -404,7 +412,7 @@ class VoiceProcessor:
             # enter here -- MIST has the user message and is preparing reply.
             self._emit_state_cycle("think")
 
-            # Open a streaming turn per ADR-015. turn_id correlates stream_token
+            # Open a streaming turn per ADR-017. turn_id correlates stream_token
             # events through stream_complete / stream_cancelled, and lets FE
             # match tool_call_started/completed events to the right turn.
             turn_id = str(uuid.uuid4())
@@ -448,7 +456,7 @@ class VoiceProcessor:
                     self._emit_state_cycle("speak")
                     first_token_seen = True
 
-                # Send token to client for real-time text display per ADR-015.
+                # Send token to client for real-time text display per ADR-017.
                 asyncio.run_coroutine_threadsafe(
                     self.message_queue.put(
                         json.dumps({"type": "stream_token", "turn_id": turn_id, "token": token})
@@ -468,10 +476,29 @@ class VoiceProcessor:
             full_response = self.models.trim_to_last_sentence(full_response)
             log_timestamp(f"LLM complete ({llm_time:.2f}s, {len(full_response)} chars)")
 
-            # Emit stream_complete (clean end) or stream_cancelled (interrupt)
-            # per ADR-015. Closes the audit gap where text-mode cancellation
-            # was previously silent on the wire.
-            if interrupted:
+            # Emit one of error / stream_cancelled / stream_complete per
+            # ADR-017. Priority: error (set on the bridge side-channel by
+            # KnowledgeIntegration on bridge timeout or streaming exception)
+            # > cancellation (user interrupt) > clean completion.
+            knowledge = getattr(self.models, "knowledge", None)
+            last_error = getattr(knowledge, "last_error", None) if knowledge else None
+            if last_error is not None:
+                error_kind, error_message = last_error
+                asyncio.run_coroutine_threadsafe(
+                    self.message_queue.put(
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "kind": error_kind,
+                                "message": error_message,
+                                "retriable": True,
+                                "context": {"turn_id": turn_id},
+                            }
+                        )
+                    ),
+                    self.loop,
+                )
+            elif interrupted:
                 asyncio.run_coroutine_threadsafe(
                     self.message_queue.put(
                         json.dumps(
@@ -489,7 +516,6 @@ class VoiceProcessor:
                 # side-channel populated by KnowledgeIntegration. last_complete
                 # is None when knowledge is disabled or the stream finished
                 # before Complete was seen; default to 0 in that case.
-                knowledge = getattr(self.models, "knowledge", None)
                 last_complete = getattr(knowledge, "last_complete", None) if knowledge else None
                 tool_calls_used = last_complete.tool_calls_used if last_complete else 0
                 asyncio.run_coroutine_threadsafe(
@@ -524,7 +550,7 @@ class VoiceProcessor:
                 log_timestamp("TTS: Disabled (text-only mode)")
 
             # Text-only mode: stream_complete already signaled end-of-turn per
-            # ADR-015 (the JSON audio_complete variant is subsumed). The binary
+            # ADR-017 (the JSON audio_complete variant is subsumed). The binary
             # MSG_AUDIO_COMPLETE frame is still emitted by _tts_consumer when
             # TTS is enabled.
             if not self.config.tts_enabled:
@@ -535,7 +561,15 @@ class VoiceProcessor:
             logger.error("Error in conversation turn: %s", e, exc_info=True)
             asyncio.run_coroutine_threadsafe(
                 self.message_queue.put(
-                    json.dumps({"type": "error", "message": f"Generation error: {e}"})
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "kind": "model",
+                            "message": f"Generation error: {e}",
+                            "retriable": True,
+                            "context": None,
+                        }
+                    )
                 ),
                 self.loop,
             )

@@ -58,7 +58,7 @@ logging.getLogger().addHandler(_file_handler)
 
 logger = logging.getLogger(__name__)
 
-# WebSocket protocol version sent on session_started per ADR-015. Bump
+# WebSocket protocol version sent on session_started per ADR-017. Bump
 # minor on additive event/field additions, major on breaking changes.
 PROTOCOL_VERSION = "1.0.0"
 
@@ -103,7 +103,7 @@ async def broadcast_messages():
 async def heartbeat_loop(interval_seconds: float = 5.0) -> None:
     """Emit heartbeat events to connected clients every ``interval_seconds``.
 
-    Per ADR-015 the FE uses heartbeats for ConnectionStatus liveness
+    Per ADR-017 the FE uses heartbeats for ConnectionStatus liveness
     (~10s without heartbeat -> 'disconnected', attempt reconnect).
     Heartbeats are queued unconditionally; the broadcaster drains the
     queue and noops when no clients are connected.
@@ -187,7 +187,7 @@ async def lifespan(app: FastAPI):
 
     # Start message broadcaster
     broadcaster_task = asyncio.create_task(broadcast_messages())
-    # Start heartbeat task (5s interval per ADR-015 Heartbeat semantics)
+    # Start heartbeat task (5s interval per ADR-017 Heartbeat semantics)
     heartbeat_task = asyncio.create_task(heartbeat_loop())
 
     # Attach WebSocket log handler to root logger
@@ -295,13 +295,21 @@ async def websocket_endpoint(websocket: WebSocket):
 
     # Ensure voice processor is initialized
     if voice_processor is None:
-        await websocket.send_json({"type": "error", "message": "Server not ready"})
+        await websocket.send_json(
+            {
+                "type": "error",
+                "kind": "server",
+                "message": "Server not ready",
+                "retriable": True,
+                "context": None,
+            }
+        )
         await websocket.close(code=1013)
         async with active_connections_lock:
             active_connections.discard(websocket)
         return
 
-    # Send session_started handshake per ADR-015. The session_id is a fresh
+    # Send session_started handshake per ADR-017. The session_id is a fresh
     # UUID per WebSocket connection; internal subsystems still use the
     # default-session model (multi-session multiplexing is years away per
     # project context). The wire-level session_id is FE-visible only today.
@@ -326,7 +334,15 @@ async def websocket_endpoint(websocket: WebSocket):
 
             msg_type = data.get("type")
             if msg_type is None:
-                await websocket.send_json({"type": "error", "message": "Missing 'type' field"})
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "kind": "validation",
+                        "message": "Missing 'type' field",
+                        "retriable": False,
+                        "context": None,
+                    }
+                )
                 continue
 
             # Handle different message types
@@ -334,7 +350,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Complete audio from client (no VAD, just transcribe and process)
                 audio_payload = data.get("audio")
                 if audio_payload is None:
-                    await websocket.send_json({"type": "error", "message": "Missing 'audio' field"})
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "kind": "validation",
+                            "message": "Missing 'audio' field",
+                            "retriable": False,
+                            "context": None,
+                        }
+                    )
                     continue
                 audio_data = np.asarray(audio_payload, dtype=np.float32)
                 sample_rate = data.get("sample_rate", 16000)
