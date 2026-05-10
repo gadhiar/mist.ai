@@ -117,6 +117,45 @@ async def heartbeat_loop(interval_seconds: float = 5.0) -> None:
             logger.error("Heartbeat enqueue failed: %s", e)
 
 
+async def health_status_loop(interval_seconds: float = 30.0) -> None:
+    """Emit ADR-017 ``health_status`` events every ``interval_seconds``.
+
+    Three booleans for the FE's persistent bottom-left health indicator
+    (per prototype ``edges-v10`` ``Offline persistent indicator``):
+
+    - ``llm``: True iff ``voice_processor.models`` is initialized (LLM
+      backend loaded)
+    - ``agent``: True iff ``voice_processor.models.knowledge.enabled``
+      (knowledge subsystem operational; False means degraded MIST)
+    - ``local``: True always (if this loop is running, the BE is up)
+
+    Transition-event emission (v1.1+) would supplement this periodic
+    push; v1.0 is periodic only.
+    """
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            llm = bool(voice_processor and voice_processor.models)
+            agent = bool(
+                voice_processor
+                and voice_processor.models
+                and voice_processor.models.knowledge
+                and voice_processor.models.knowledge.enabled
+            )
+            local = True
+            payload = json.dumps(
+                {
+                    "type": "health_status",
+                    "llm": llm,
+                    "agent": agent,
+                    "local": local,
+                }
+            )
+            await message_queue.put(payload)
+        except Exception as e:  # noqa: BLE001
+            logger.error("Health status emit failed: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
@@ -189,6 +228,8 @@ async def lifespan(app: FastAPI):
     broadcaster_task = asyncio.create_task(broadcast_messages())
     # Start heartbeat task (5s interval per ADR-017 Heartbeat semantics)
     heartbeat_task = asyncio.create_task(heartbeat_loop())
+    # Start health-status task (30s interval per ADR-017 health_status)
+    health_status_task = asyncio.create_task(health_status_loop())
 
     # Attach WebSocket log handler to root logger
     log_handler = WebSocketLogHandler(event_loop=loop, message_queue=message_queue)
@@ -232,6 +273,7 @@ async def lifespan(app: FastAPI):
             logger.warning("Vault sidecar close error: %s", e)
 
     logging.getLogger().removeHandler(log_handler)
+    health_status_task.cancel()
     heartbeat_task.cancel()
     broadcaster_task.cancel()
     if voice_processor and voice_processor.models:
