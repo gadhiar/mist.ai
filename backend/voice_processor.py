@@ -152,6 +152,23 @@ class VoiceProcessor:
 
         log_timestamp("Voice processor initialized")
 
+    def _emit_state_cycle(self, state: str) -> None:
+        """Enqueue a ``state_cycle`` WebSocket event per ADR-015.
+
+        Called at the explicit transition points of the voice/text turn
+        pipeline (listen / think / speak / idle). Sleep tiers are FE-local
+        per ADR-014 and never emitted from BE. Caller is on a worker
+        thread; emission goes through the same threadsafe queue path as
+        every other JSON event.
+
+        Args:
+            state: One of 'idle', 'listen', 'think', 'speak'.
+        """
+        asyncio.run_coroutine_threadsafe(
+            self.message_queue.put(json.dumps({"type": "state_cycle", "state": state})),
+            self.loop,
+        )
+
     def _on_speech_start(self):
         """Called by VAD when user starts speaking."""
         # Send message to clients (using saved event loop reference)
@@ -159,6 +176,8 @@ class VoiceProcessor:
             self.message_queue.put(json.dumps({"type": "vad_status", "status": "speech_started"})),
             self.loop,
         )
+        # Voice path: user has begun speaking -> MIST is now listening.
+        self._emit_state_cycle("listen")
 
         # Check if we should interrupt
         if self.is_speaking:
@@ -360,6 +379,8 @@ class VoiceProcessor:
             self.message_queue.put(complete_frame),
             self.loop,
         )
+        # TTS-on mode: turn complete after final audio frame, MIST returns to idle.
+        self._emit_state_cycle("idle")
 
         tts_total = time.time() - tts_start_time
         log_timestamp(f"TTS consumer done ({tts_total:.2f}s, {chunk_count} chunks)")
@@ -378,6 +399,9 @@ class VoiceProcessor:
 
             self.interrupt_flag.clear()
             self.is_speaking = True
+            # Both voice (post-transcription) and text (composer submit) paths
+            # enter here -- MIST has the user message and is preparing reply.
+            self._emit_state_cycle("think")
 
             # === LLM + TTS Pipeline ===
             sentence_detector = SentenceBoundaryDetector()
@@ -398,11 +422,16 @@ class VoiceProcessor:
             llm_start = time.time()
             full_response = ""
 
+            first_token_seen = False
             for token in self.models.generate_llm_response(user_text):
                 if self.interrupt_flag.is_set():
                     log_timestamp("LLM generation interrupted")
                     break
                 full_response += token
+                if not first_token_seen:
+                    # First token of the turn -> MIST has begun replying.
+                    self._emit_state_cycle("speak")
+                    first_token_seen = True
 
                 # Send token to client for real-time text display
                 asyncio.run_coroutine_threadsafe(
@@ -451,6 +480,8 @@ class VoiceProcessor:
                     self.message_queue.put(json.dumps({"type": "audio_complete"})),
                     self.loop,
                 )
+                # Text-only mode: turn complete, MIST returns to idle.
+                self._emit_state_cycle("idle")
 
         except Exception as e:
             logger.error("Error in conversation turn: %s", e, exc_info=True)
@@ -460,6 +491,8 @@ class VoiceProcessor:
                 ),
                 self.loop,
             )
+            # Error aborts the turn; signal idle so FE animation returns to rest.
+            self._emit_state_cycle("idle")
 
         finally:
             self.is_speaking = False
