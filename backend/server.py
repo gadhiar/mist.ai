@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 import sys
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -54,6 +55,10 @@ _file_handler.setLevel(logging.DEBUG)  # Capture everything to disk
 logging.getLogger().addHandler(_file_handler)
 
 logger = logging.getLogger(__name__)
+
+# WebSocket protocol version sent on session_started per ADR-015. Bump
+# minor on additive event/field additions, major on breaking changes.
+PROTOCOL_VERSION = "1.0.0"
 
 # Global state
 active_connections: set[WebSocket] = set()
@@ -274,8 +279,23 @@ async def websocket_endpoint(websocket: WebSocket):
             active_connections.discard(websocket)
         return
 
-    # Send welcome message
-    await websocket.send_json({"type": "status", "message": "Connected to Mist.AI Voice Server"})
+    # Send session_started handshake per ADR-015. The session_id is a fresh
+    # UUID per WebSocket connection; internal subsystems still use the
+    # default-session model (multi-session multiplexing is years away per
+    # project context). The wire-level session_id is FE-visible only today.
+    session_id = str(uuid.uuid4())
+    await websocket.send_json(
+        {
+            "type": "session_started",
+            "session_id": session_id,
+            "protocol_version": PROTOCOL_VERSION,
+            "mist_state": "idle",
+            "capabilities": {
+                "tts_enabled": bool(config.tts_enabled),
+                "vad_enabled": True,
+            },
+        }
+    )
 
     try:
         while True:
