@@ -446,6 +446,31 @@ async def websocket_endpoint(websocket: WebSocket):
                     }
                 )
 
+            elif msg_type == "subscribe_logs":
+                # ADR-017 subscribe_logs: opt-in WebSocket log streaming.
+                # Streaming is off by default; FE toggles per session.
+                enabled = bool(data.get("enabled", False))
+                levels = data.get("levels")
+                if levels is not None and not isinstance(levels, list):
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "kind": "validation",
+                            "message": "subscribe_logs 'levels' must be a list of strings or null",
+                            "retriable": False,
+                            "context": None,
+                        }
+                    )
+                    continue
+                if log_handler is not None:
+                    log_handler.set_streaming(enabled, levels)
+                await websocket.send_json(
+                    {
+                        "type": "status",
+                        "message": f"Log streaming: {'enabled' if enabled else 'disabled'}",
+                    }
+                )
+
             elif msg_type == "config":
                 # Update configuration (future feature)
                 logger.info("Config update requested (not implemented)")

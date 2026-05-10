@@ -72,6 +72,14 @@ class WebSocketLogHandler(logging.Handler):
         self._drop_start: float = 0.0
         self._bucket_lock = threading.Lock()
 
+        # -- ADR-017 subscribe_logs streaming gate ---------------------------
+        # WebSocket log streaming is opt-in (off by default to avoid flooding
+        # clients with backend logs). FE sends `subscribe_logs {enabled,
+        # levels}` to toggle. `_level_filter=None` means all levels allowed;
+        # otherwise emit only records whose levelname is in the set.
+        self._streaming_enabled: bool = False
+        self._level_filter: frozenset[str] | None = None
+
     # -- Public API ----------------------------------------------------------
 
     def set_logger_level(self, logger_name: str, level: str) -> None:
@@ -87,6 +95,27 @@ class WebSocketLogHandler(logging.Handler):
             return
         key = "" if logger_name == "root" else logger_name
         self._gating_map[key] = level_int
+
+    def set_streaming(self, enabled: bool, levels: list[str] | None) -> None:
+        """Configure WebSocket log streaming per ADR-017 subscribe_logs.
+
+        Streaming is off by default. When enabled with ``levels=None`` all
+        log levels are emitted (subject to per-logger gating and the rate
+        limiter). When ``levels`` is a list, only records whose levelname is
+        in the list pass through (case-insensitive, normalized to uppercase).
+
+        Args:
+            enabled: True to start streaming, False to stop.
+            levels: List of level names (DEBUG/INFO/WARNING/ERROR/CRITICAL),
+                or None to allow all levels.
+        """
+        self._streaming_enabled = bool(enabled)
+        if levels is None:
+            self._level_filter = None
+        else:
+            valid = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+            normalized = frozenset(level.upper() for level in levels if level.upper() in valid)
+            self._level_filter = normalized if normalized else None
 
     # -- Handler implementation ----------------------------------------------
 
@@ -109,7 +138,17 @@ class WebSocketLogHandler(logging.Handler):
 
     def _guarded_emit(self, record: logging.LogRecord) -> None:
         """Core emit logic, called inside the re-entrancy guard."""
-        # Per-logger gating check.
+        # ADR-017 subscribe_logs gate: WebSocket log streaming is opt-in.
+        # When disabled, no log records reach the WebSocket. The persistent
+        # JSONL file log is unaffected (separate FileHandler attached at
+        # server.py startup).
+        if not self._streaming_enabled:
+            return
+        # ADR-017 level filter (None = all levels allowed).
+        if self._level_filter is not None and record.levelname not in self._level_filter:
+            return
+
+        # Per-logger gating check (e.g., httpx default WARNING to avoid spam).
         floor = self._gating_map.get(record.name, self._gating_map[""])
         if record.levelno < floor:
             return
