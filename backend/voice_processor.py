@@ -7,6 +7,7 @@ import queue
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -403,6 +404,18 @@ class VoiceProcessor:
             # enter here -- MIST has the user message and is preparing reply.
             self._emit_state_cycle("think")
 
+            # Open a streaming turn per ADR-015. turn_id correlates stream_token
+            # events through stream_complete / stream_cancelled, and lets FE
+            # match tool_call_started/completed events to the right turn.
+            turn_id = str(uuid.uuid4())
+            channel = "tts" if self.config.tts_enabled else "text"
+            asyncio.run_coroutine_threadsafe(
+                self.message_queue.put(
+                    json.dumps({"type": "stream_start", "turn_id": turn_id, "channel": channel})
+                ),
+                self.loop,
+            )
+
             # === LLM + TTS Pipeline ===
             sentence_detector = SentenceBoundaryDetector()
             sentence_queue = queue.Queue()
@@ -423,9 +436,11 @@ class VoiceProcessor:
             full_response = ""
 
             first_token_seen = False
+            interrupted = False
             for token in self.models.generate_llm_response(user_text):
                 if self.interrupt_flag.is_set():
                     log_timestamp("LLM generation interrupted")
+                    interrupted = True
                     break
                 full_response += token
                 if not first_token_seen:
@@ -433,9 +448,11 @@ class VoiceProcessor:
                     self._emit_state_cycle("speak")
                     first_token_seen = True
 
-                # Send token to client for real-time text display
+                # Send token to client for real-time text display per ADR-015.
                 asyncio.run_coroutine_threadsafe(
-                    self.message_queue.put(json.dumps({"type": "llm_token", "token": token})),
+                    self.message_queue.put(
+                        json.dumps({"type": "stream_token", "turn_id": turn_id, "token": token})
+                    ),
                     self.loop,
                 )
 
@@ -451,11 +468,44 @@ class VoiceProcessor:
             full_response = self.models.trim_to_last_sentence(full_response)
             log_timestamp(f"LLM complete ({llm_time:.2f}s, {len(full_response)} chars)")
 
-            # Send full response
-            asyncio.run_coroutine_threadsafe(
-                self.message_queue.put(json.dumps({"type": "llm_response", "text": full_response})),
-                self.loop,
-            )
+            # Emit stream_complete (clean end) or stream_cancelled (interrupt)
+            # per ADR-015. Closes the audit gap where text-mode cancellation
+            # was previously silent on the wire.
+            if interrupted:
+                asyncio.run_coroutine_threadsafe(
+                    self.message_queue.put(
+                        json.dumps(
+                            {
+                                "type": "stream_cancelled",
+                                "turn_id": turn_id,
+                                "partial_text": full_response,
+                            }
+                        )
+                    ),
+                    self.loop,
+                )
+            else:
+                # tool_calls_used / duration_ms come from the bridge
+                # side-channel populated by KnowledgeIntegration. last_complete
+                # is None when knowledge is disabled or the stream finished
+                # before Complete was seen; default to 0 in that case.
+                knowledge = getattr(self.models, "knowledge", None)
+                last_complete = getattr(knowledge, "last_complete", None) if knowledge else None
+                tool_calls_used = last_complete.tool_calls_used if last_complete else 0
+                asyncio.run_coroutine_threadsafe(
+                    self.message_queue.put(
+                        json.dumps(
+                            {
+                                "type": "stream_complete",
+                                "turn_id": turn_id,
+                                "full_text": full_response,
+                                "duration_ms": int(llm_time * 1000),
+                                "tool_calls_used": tool_calls_used,
+                            }
+                        )
+                    ),
+                    self.loop,
+                )
 
             # Flush remaining text to TTS
             if self.config.tts_enabled:
@@ -473,13 +523,11 @@ class VoiceProcessor:
             else:
                 log_timestamp("TTS: Disabled (text-only mode)")
 
-            # Send completion signal (text-only mode only; TTS consumer
-            # sends the binary MSG_AUDIO_COMPLETE frame when TTS is enabled)
+            # Text-only mode: stream_complete already signaled end-of-turn per
+            # ADR-015 (the JSON audio_complete variant is subsumed). The binary
+            # MSG_AUDIO_COMPLETE frame is still emitted by _tts_consumer when
+            # TTS is enabled.
             if not self.config.tts_enabled:
-                asyncio.run_coroutine_threadsafe(
-                    self.message_queue.put(json.dumps({"type": "audio_complete"})),
-                    self.loop,
-                )
                 # Text-only mode: turn complete, MIST returns to idle.
                 self._emit_state_cycle("idle")
 
