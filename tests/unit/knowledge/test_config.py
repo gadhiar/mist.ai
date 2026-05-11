@@ -228,7 +228,13 @@ class TestSidecarIndexConfigFromEnv:
 
 
 class TestFilewatcherConfigDefaults:
-    """FilewatcherConfig defaults match the ADR-010 filewatcher strategy section."""
+    """FilewatcherConfig defaults match the ADR-010 filewatcher strategy section.
+
+    Phase 5.5 Fix B: audit_interval_seconds is now derived from
+    staleness_slo_seconds // 2 (2 s at the default 5 s SLO) so that
+    dropped events are caught within the SLO budget. The previous hardcoded
+    60 s default made staleness_slo_seconds dead config.
+    """
 
     def test_defaults_match_adr_010(self):
         config = FilewatcherConfig()
@@ -237,7 +243,8 @@ class TestFilewatcherConfigDefaults:
         assert config.observer_type == "auto"
         assert config.debounce_ms == 500
         assert config.staleness_slo_seconds == 5
-        assert config.audit_interval_seconds == 60
+        # audit_interval_seconds == staleness_slo_seconds // 2 at default SLO
+        assert config.audit_interval_seconds == config.staleness_slo_seconds // 2
 
 
 class TestFilewatcherConfigFromEnv:
