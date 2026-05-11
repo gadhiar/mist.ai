@@ -12,6 +12,7 @@ For tests, bypass factories and pass fakes directly to constructors.
 """
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from backend.interfaces import (
@@ -23,6 +24,7 @@ from backend.interfaces import (
 
 if TYPE_CHECKING:
     from backend.vault import VaultFilewatcher, VaultWriter
+    from backend.vault.invalidation_bus import InvalidationBus
     from backend.vault.sidecar_index import VaultSidecarIndex
 from backend.knowledge.config import KnowledgeConfig
 from backend.knowledge.curation.confidence import ConfidenceManager
@@ -576,6 +578,8 @@ def build_sidecar_index(
 def build_filewatcher(
     config: KnowledgeConfig,
     sidecar_index: "VaultSidecarIndex | None" = None,
+    regenerator: "GraphRegenerator | None" = None,  # noqa: F821
+    writer: "VaultWriter | None" = None,
 ) -> "VaultFilewatcher | None":
     """Create a VaultFilewatcher.
 
@@ -584,14 +588,27 @@ def build_filewatcher(
     to reindex into). The lifecycle owner (server lifespan) is responsible
     for calling .start(loop) and .stop().
 
+    This is a thin wrapper around build_phase3_components for callers that
+    only need the filewatcher. For callers that also need the InvalidationBus
+    (e.g. ConversationHandler wiring -- Task 21), use build_phase3_components
+    directly to get the shared bus instance.
+
     Args:
         config: Knowledge subsystem configuration.
         sidecar_index: The sidecar to reindex into on file events.
+        regenerator: GraphRegenerator (curation) for vault-edit graph rebuild.
+            When None, a minimal no-op double is used (bus still fires).
+        writer: VaultWriter for session note writes. May be None.
 
     Returns:
         Unstarted VaultFilewatcher, or None if filewatcher/vault/sidecar
         is disabled.
     """
+    from backend.knowledge.curation.graph_regenerator import (
+        GraphRegenerator as CurationGraphRegenerator,
+    )
+    from backend.vault.invalidation_bus import InvalidationBus
+
     if not config.filewatcher.enabled:
         logger.info("Filewatcher disabled; skipping VaultFilewatcher")
         return None
@@ -603,6 +620,109 @@ def build_filewatcher(
             "build_filewatcher called with sidecar_index=None; filewatcher cannot reindex"
         )
         return None
+
     from backend.vault import VaultFilewatcher
 
-    return VaultFilewatcher(config.filewatcher, config.vault.root, sidecar_index)
+    # Callers that don't need the bus exposed should use build_phase3_components
+    # and carry the bus themselves. This wrapper builds a throwaway bus so the
+    # constructor signature is satisfied; it will receive events but nobody can
+    # subscribe to it. Task 21 migrates server.py to use build_phase3_components.
+    regen = regenerator or CurationGraphRegenerator(
+        graph_store=build_graph_store(config),
+        extraction_pipeline=build_extraction_pipeline(
+            config, include_curation=False, include_internal_derivation=False
+        ),
+    )
+    bus = InvalidationBus()
+    return VaultFilewatcher(
+        config.filewatcher,
+        config.vault.root,
+        sidecar_index,
+        regenerator=regen,
+        invalidation_bus=bus,
+        writer=writer,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase3Components -- bundles filewatcher + bus for shared-instance wiring
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Phase3Components:
+    """Holds a VaultFilewatcher and the InvalidationBus it publishes to.
+
+    Both share the SAME bus instance. ConversationHandler (Task 21) calls
+    `components.invalidation_bus.subscribe(listener)` to receive rebuild
+    completion events emitted by the filewatcher after vault-edit processing.
+
+    Produced by `build_phase3_components`. Consumed by the server lifespan
+    (Session A's scope) to wire the handler and start the filewatcher.
+    """
+
+    filewatcher: "VaultFilewatcher"
+    invalidation_bus: "InvalidationBus"
+
+
+def build_phase3_components(
+    config: KnowledgeConfig,
+    sidecar_index: "VaultSidecarIndex | None",
+    regenerator: "GraphRegenerator | None" = None,  # noqa: F821
+    writer: "VaultWriter | None" = None,
+) -> "Phase3Components | None":
+    """Create a Phase3Components: VaultFilewatcher + InvalidationBus (shared).
+
+    Returns None when config.filewatcher.enabled is False, config.vault is
+    disabled, or sidecar_index is None. These are the same guards as
+    build_filewatcher.
+
+    The InvalidationBus on the returned dataclass is the SAME instance wired
+    into the filewatcher, so any listener subscribed to `components.invalidation_bus`
+    will receive every rebuild-completion event published by the filewatcher.
+
+    Args:
+        config: Knowledge subsystem configuration.
+        sidecar_index: Initialized VaultSidecarIndex. None returns None.
+        regenerator: Optional pre-built curation GraphRegenerator. When None,
+            one is constructed from `config` (requires graph + LLM access).
+        writer: Optional pre-built VaultWriter. May be None.
+
+    Returns:
+        Phase3Components(filewatcher, invalidation_bus), or None when any
+        prerequisite is disabled.
+    """
+    from backend.knowledge.curation.graph_regenerator import (
+        GraphRegenerator as CurationGraphRegenerator,
+    )
+    from backend.vault import VaultFilewatcher
+    from backend.vault.invalidation_bus import InvalidationBus
+
+    if not config.filewatcher.enabled:
+        logger.info("Filewatcher disabled; skipping Phase3Components")
+        return None
+    if not config.vault.enabled:
+        logger.info("Vault disabled; skipping Phase3Components")
+        return None
+    if sidecar_index is None:
+        logger.warning(
+            "build_phase3_components called with sidecar_index=None; skipping Phase3Components"
+        )
+        return None
+
+    regen = regenerator or CurationGraphRegenerator(
+        graph_store=build_graph_store(config),
+        extraction_pipeline=build_extraction_pipeline(
+            config, include_curation=False, include_internal_derivation=False
+        ),
+    )
+    bus = InvalidationBus()
+    filewatcher = VaultFilewatcher(
+        config.filewatcher,
+        config.vault.root,
+        sidecar_index,
+        regenerator=regen,
+        invalidation_bus=bus,
+        writer=writer,
+    )
+    return Phase3Components(filewatcher=filewatcher, invalidation_bus=bus)
