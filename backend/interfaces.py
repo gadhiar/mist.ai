@@ -168,6 +168,17 @@ class GraphStoreProtocol(Protocol):
         """
         ...
 
+    async def get_orphaned_provenance_paths(self) -> list[str]:
+        """Return the list of distinct DERIVED_FROM.path values for orphaned triples.
+
+        Used by GraphRegenerator.retry_orphaned to enumerate provenance paths
+        whose async re-extraction previously failed so they can be retried.
+
+        Returns:
+            List of absolute path strings for which orphaned triples exist.
+        """
+        ...
+
     async def upsert_identity(
         self,
         parsed_identity: ParsedIdentity,

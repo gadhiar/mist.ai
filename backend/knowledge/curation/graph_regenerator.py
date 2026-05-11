@@ -149,6 +149,30 @@ class GraphRegenerator:
         )
         return 0
 
+    async def retry_orphaned(self) -> None:
+        """Retry orphaned triples by re-running async re-extraction.
+
+        Queries the graph for triples with status='orphaned', groups by
+        DERIVED_FROM.path, and re-runs re-extraction for each path that
+        still exists on disk. Paths that no longer exist are skipped (vault
+        file was deleted after the orphan was created).
+
+        Called by `mist_admin vault-rebuild --retry-orphaned` as an operator
+        handle for cases where the filewatcher missed events or async rebuild
+        previously failed.
+        """
+        paths = await self._graph_store.get_orphaned_provenance_paths()
+        ontology_version = self._graph_store.current_ontology_version()
+        for path_str in paths:
+            path = Path(path_str)
+            if path.exists():
+                await self._rebuild_async_extraction(path, ontology_version)
+            else:
+                logger.warning(
+                    "GraphRegenerator.retry_orphaned: path no longer exists on disk, skipping: %s",
+                    path,
+                )
+
     async def _rebuild_async_extraction(self, path: Path, ontology_version: str) -> None:
         """Bucket 2/3 async re-extraction via existing extraction pipeline.
 

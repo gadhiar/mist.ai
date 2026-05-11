@@ -32,6 +32,10 @@ class FakeGraphStore:
     Tracks triples in a list and records method call history.
     Idempotent upsert: calling upsert_identity / upsert_user with
     the same display_name twice writes only one triple (dedup by key).
+
+    Supports `get_orphaned_provenance_paths` for retry_orphaned tests:
+    returns the distinct set of derived_from_path values among triples
+    whose status == 'orphaned'.
     """
 
     _ONTOLOGY_VERSION = "1.1.0"
@@ -58,6 +62,16 @@ class FakeGraphStore:
 
     def current_ontology_version(self) -> str:
         return self._ONTOLOGY_VERSION
+
+    async def get_orphaned_provenance_paths(self) -> list[str]:
+        """Return distinct derived_from_path values for orphaned triples."""
+        seen: set[str] = set()
+        result: list[str] = []
+        for triple in self._triples:
+            if triple.status == "orphaned" and triple.derived_from_path not in seen:
+                seen.add(triple.derived_from_path)
+                result.append(triple.derived_from_path)
+        return result
 
     async def upsert_identity(self, parsed_identity, derived_from_path: str) -> int:
         """Write ParsedIdentity attributes as graph triples (idempotent)."""

@@ -179,3 +179,101 @@ def test_rebuild_idempotent_no_proliferation(
 
     # Exactly one HAS_TRAIT triple for "precise", regardless of rebuild count
     assert fake_graph_store.count_traits() == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: retry_orphaned (Task 22)
+# ---------------------------------------------------------------------------
+
+
+def test_retry_orphaned_reruns_extraction_for_orphaned_paths(
+    regenerator: GraphRegenerator,
+    fake_graph_store: FakeGraphStore,
+    fake_extraction: FakeExtractionPipeline,
+    tmp_path: Path,
+) -> None:
+    """retry_orphaned re-runs extraction for each orphaned provenance path."""
+    p = tmp_path / "sessions" / "2026-05-10-test.md"
+    p.parent.mkdir()
+    p.write_text(_SESSION_BODY, encoding="utf-8")
+
+    # Pre-seed a triple with 'orphaned' status for this path
+    fake_graph_store.add_triple(
+        subject="user",
+        predicate="USES",
+        object="python",
+        derived_from_path=str(p),
+        status="orphaned",
+    )
+
+    jobs_before = fake_extraction.scheduled_jobs
+    asyncio.run(regenerator.retry_orphaned())
+
+    # extraction should have been called once for the orphaned path
+    assert fake_extraction.scheduled_jobs == jobs_before + 1
+    assert fake_extraction.extract_from_file_calls[-1]["vault_note_path"] == str(p)
+
+
+def test_retry_orphaned_skips_nonexistent_paths(
+    regenerator: GraphRegenerator,
+    fake_graph_store: FakeGraphStore,
+    fake_extraction: FakeExtractionPipeline,
+) -> None:
+    """retry_orphaned skips paths that no longer exist on disk."""
+    fake_graph_store.add_triple(
+        subject="user",
+        predicate="USES",
+        object="python",
+        derived_from_path="/nonexistent/path/file.md",
+        status="orphaned",
+    )
+
+    asyncio.run(regenerator.retry_orphaned())
+
+    # No extraction should have been attempted for the missing path
+    assert fake_extraction.scheduled_jobs == 0
+
+
+def test_retry_orphaned_noop_when_no_orphans(
+    regenerator: GraphRegenerator,
+    fake_graph_store: FakeGraphStore,
+    fake_extraction: FakeExtractionPipeline,
+) -> None:
+    """retry_orphaned is a no-op when there are no orphaned triples."""
+    # All triples active
+    fake_graph_store.add_triple(
+        subject="user",
+        predicate="USES",
+        object="python",
+        derived_from_path="/some/path.md",
+        status="active",
+    )
+
+    asyncio.run(regenerator.retry_orphaned())
+
+    assert fake_extraction.scheduled_jobs == 0
+
+
+def test_retry_orphaned_deduplicates_paths(
+    regenerator: GraphRegenerator,
+    fake_graph_store: FakeGraphStore,
+    fake_extraction: FakeExtractionPipeline,
+    tmp_path: Path,
+) -> None:
+    """retry_orphaned calls extraction once per unique path even with multiple orphaned triples."""
+    p = tmp_path / "sessions" / "2026-05-10-test.md"
+    p.parent.mkdir()
+    p.write_text(_SESSION_BODY, encoding="utf-8")
+
+    # Two orphaned triples for the same path
+    fake_graph_store.add_triple(
+        "user", "USES", "python", derived_from_path=str(p), status="orphaned"
+    )
+    fake_graph_store.add_triple(
+        "user", "KNOWS", "django", derived_from_path=str(p), status="orphaned"
+    )
+
+    asyncio.run(regenerator.retry_orphaned())
+
+    # FakeGraphStore.get_orphaned_provenance_paths deduplicates; extraction called once
+    assert fake_extraction.scheduled_jobs == 1
