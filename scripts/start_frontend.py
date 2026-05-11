@@ -1,18 +1,23 @@
-"""Start the MIST Tauri frontend dev server.
+"""Start the MIST Tauri frontend (native shell window).
 
 Usage:
-    python scripts/start_frontend.py              # Run npm install (if needed) then npm run dev
-    python scripts/start_frontend.py --build      # Run npm run build instead of dev
+    python scripts/start_frontend.py              # Tauri shell + Vite (the native window)
+    python scripts/start_frontend.py --web        # Vite only, browser-accessible at :1420
+    python scripts/start_frontend.py --build      # Production Tauri bundle (npm run tauri build)
     python scripts/start_frontend.py --install    # Just run npm install and exit
 
 The Tauri frontend lives at mist.ai/mist-frontend/ as a nested git repo
 (Tauri 2.x + React 19 + react-three-fiber). It connects to the backend
 at ws://localhost:8001/ws per ADR-016 + ADR-017.
 
+Default mode (`npm run tauri dev`) launches the native Tauri shell window
+together with the Vite dev server. Use --web for browser-only verification
+(Vite at http://localhost:1420/) without spinning up the shell.
+
 Prerequisites:
     - Node.js 18+ and npm on PATH
+    - Rust toolchain (cargo, rustc) for Tauri dev/build; install via rustup
     - Backend stack running (python scripts/start_dev.py)
-    - Rust toolchain for Tauri (cargo, rustc) installed once via rustup
 
 For a double-clickable shortcut see scripts/start_frontend.bat.
 """
@@ -50,6 +55,17 @@ def check_npm() -> bool:
     return True
 
 
+def check_cargo() -> bool:
+    """Verify Rust toolchain (cargo) is on PATH; required for Tauri dev/build."""
+    cargo = shutil.which("cargo")
+    if not cargo:
+        print("  [WARN] cargo (Rust) not found on PATH. Tauri dev/build requires it.")
+        print("         Install via https://rustup.rs/ and reopen the shell.")
+        return False
+    print(f"  [OK] cargo: {cargo}")
+    return True
+
+
 def ensure_node_modules() -> bool:
     """Run npm install if node_modules/ is missing."""
     node_modules = FRONTEND_DIR / "node_modules"
@@ -73,12 +89,35 @@ def ensure_node_modules() -> bool:
         return False
 
 
-def run_dev() -> None:
-    """Run npm run dev (Vite + Tauri shell)."""
+def run_tauri_dev() -> None:
+    """Run `npm run tauri dev` — starts Vite AND opens the native Tauri shell window.
+
+    First-run cost: Tauri compiles the Rust shell crate (cargo build), which can
+    take 2-10 minutes depending on dependencies. Subsequent runs are cached.
+    """
     print()
-    print("Starting Tauri dev server...")
+    print("Starting Tauri shell + Vite dev server...")
+    print("  Vite:  http://localhost:1420 (also accessible via browser)")
+    print("  Shell: native window will open after cargo build completes.")
+    print("  First run: cargo build can take several minutes.")
+    print("  Make sure the backend is running: python scripts/start_dev.py")
+    print()
+    try:
+        subprocess.run(
+            ["npm", "run", "tauri", "dev"],
+            cwd=str(FRONTEND_DIR),
+            shell=(sys.platform == "win32"),
+        )
+    except KeyboardInterrupt:
+        print("\n  Tauri shell stopped.")
+
+
+def run_vite_only() -> None:
+    """Run `npm run dev` — Vite only; no native Tauri shell. Browser-accessible at :1420."""
+    print()
+    print("Starting Vite dev server (browser-only mode, no Tauri shell)...")
     print("  Vite: http://localhost:1420")
-    print("  Tauri shell window will open when build is ready.")
+    print("  Note: native Tauri features (file dialogs, OS integration) are unavailable.")
     print("  Make sure the backend is running: python scripts/start_dev.py")
     print()
     try:
@@ -88,16 +127,16 @@ def run_dev() -> None:
             shell=(sys.platform == "win32"),
         )
     except KeyboardInterrupt:
-        print("\n  Frontend stopped.")
+        print("\n  Vite stopped.")
 
 
 def run_build() -> None:
-    """Run npm run build (production Tauri bundle)."""
+    """Run `npm run tauri build` — production Tauri bundle (installer + binary)."""
     print()
     print("Building Tauri production bundle...")
     try:
         result = subprocess.run(
-            ["npm", "run", "build"],
+            ["npm", "run", "tauri", "build"],
             cwd=str(FRONTEND_DIR),
             shell=(sys.platform == "win32"),
         )
@@ -114,8 +153,21 @@ def run_build() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="MIST Tauri frontend dev/build manager")
-    parser.add_argument("--build", action="store_true", help="Run npm run build instead of dev")
-    parser.add_argument("--install", action="store_true", help="Just run npm install and exit")
+    parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Run Vite only (browser-accessible at :1420); skip the Tauri shell.",
+    )
+    parser.add_argument(
+        "--build",
+        action="store_true",
+        help="Build the production Tauri bundle (npm run tauri build).",
+    )
+    parser.add_argument(
+        "--install",
+        action="store_true",
+        help="Just run npm install and exit.",
+    )
     args = parser.parse_args()
 
     print("=" * 50)
@@ -135,11 +187,23 @@ def main() -> None:
         print("  [OK] npm install only. Done.")
         return
 
+    # Tauri (shell + build) requires cargo. Vite-only does not.
+    needs_cargo = args.build or not args.web
+    if needs_cargo and not check_cargo():
+        print()
+        print("  Cannot run Tauri shell or build without cargo.")
+        print("  Use --web to run Vite in browser-only mode without the Tauri shell.")
+        sys.exit(1)
+
     if args.build:
         run_build()
         return
 
-    run_dev()
+    if args.web:
+        run_vite_only()
+        return
+
+    run_tauri_dev()
 
 
 if __name__ == "__main__":
