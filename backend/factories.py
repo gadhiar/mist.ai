@@ -319,7 +319,7 @@ def build_conversation_handler(
     tracker = ToolUsageTracker(config.skill_derivation)
 
     # ADR-014: vault-root MIST.md auto-load into every turn's prompt.
-    conventions_loader = ConventionsLoader(vault_root=Path(config.vault.host_path))
+    conventions_loader = ConventionsLoader(vault_root=Path(config.vault.root))
 
     # Cluster 8 Phase 5: vault_writer is caller-provided (or None). Auto-build
     # removed to avoid two writers racing on the same vault root -- the
