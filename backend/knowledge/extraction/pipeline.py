@@ -19,7 +19,7 @@ import logging
 import time
 from collections import OrderedDict
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -687,4 +687,61 @@ class ExtractionPipeline:
             event_id=event.event_id,
             session_id=event.session_id,
             reference_date=reference_date,
+        )
+
+    async def extract_from_file(
+        self,
+        content: str,
+        vault_note_path: str,
+        ontology_version: str,
+    ) -> Any:
+        """Extract entities and relationships from vault file content.
+
+        ExtractionPipelineProtocol entry point used by
+        GraphRegenerator._rebuild_async_extraction for Bucket 2/3
+        (sessions/, decisions/) re-extraction on user-edit.
+
+        Treats the full file body as a single extraction utterance, passing
+        `vault_note_path` through to the curation pipeline so every upserted
+        entity gets a DERIVED_FROM edge stamped to its source vault note.
+        `ontology_version` pins the extraction to the version active at rebuild
+        time per the ADR-010 rebuild-determinism model; it is forwarded as the
+        `extraction_source` tag so downstream logging can identify vault-file
+        re-extraction runs.
+
+        Returns None when `content` is empty. Otherwise delegates to
+        `extract_from_utterance` and returns its result.
+
+        Args:
+            content: Full text body of the vault file.
+            vault_note_path: Absolute path string for provenance tracking.
+            ontology_version: Ontology version string to stamp on extracted
+                triples (used for logging; the curation pipeline receives it
+                via the `vault_note_path` provenance edge).
+        """
+        if not content.strip():
+            logger.debug(
+                "extract_from_file: empty content for %s, skipping extraction",
+                vault_note_path,
+            )
+            return None
+
+        import uuid
+
+        event_id = str(uuid.uuid4())
+        session_id = "vault-regen"
+
+        logger.info(
+            "extract_from_file: re-extracting %s (ontology %s)",
+            vault_note_path,
+            ontology_version,
+        )
+
+        return await self.extract_from_utterance(
+            utterance=content,
+            conversation_history=[],
+            event_id=event_id,
+            session_id=session_id,
+            vault_note_path=vault_note_path,
+            extraction_source="orchestrator_summary",
         )

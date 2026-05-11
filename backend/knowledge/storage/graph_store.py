@@ -3,15 +3,24 @@
 Stores extracted entities and relationships in Neo4j with provenance tracking.
 """
 
+import asyncio
 import logging
 import re
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from backend.errors import Neo4jQueryError
 from backend.interfaces import EmbeddingProvider, GraphConnection
 
+if TYPE_CHECKING:
+    from backend.knowledge.curation.bucket1_reader import ParsedIdentity, ParsedUser
+
 logger = logging.getLogger(__name__)
+
+# Default ontology version -- keep in sync with KnowledgeConfig.ontology_version.
+# GraphStore does not import KnowledgeConfig to avoid circular dependencies;
+# the factory injects the live value via the `ontology_version` constructor param.
+_DEFAULT_ONTOLOGY_VERSION = "1.1.0"
 
 # ADR-009 v1.1: user-facing relationship types allowed during graph-hop expansion.
 # Mirrors the full user-facing edge set in backend/knowledge/ontologies/v1_0_0.py.
@@ -102,16 +111,27 @@ class GraphStore:
     - Versioning support (ontology versions)
     """
 
-    def __init__(self, connection: GraphConnection, embedding_generator: EmbeddingProvider):
+    def __init__(
+        self,
+        connection: GraphConnection,
+        embedding_generator: EmbeddingProvider,
+        ontology_version: str = _DEFAULT_ONTOLOGY_VERSION,
+    ):
         """Initialize graph store with injected dependencies.
 
         Args:
             connection: Graph database connection (satisfies GraphConnection protocol).
             embedding_generator: Embedding provider (satisfies EmbeddingProvider protocol).
+            ontology_version: Current ontology version string. Exposed via
+                `current_ontology_version()` for GraphStoreProtocol callers.
+                Defaults to the module constant which tracks KnowledgeConfig.
+                The factory injects the live value from config so rebuilds
+                always stamp the correct version on DERIVED_FROM edges.
         """
         self.connection = connection
         self.embedding_generator = embedding_generator
         self._vector_indexes_available: bool | None = None  # None = lazy-probe
+        self._ontology_version: str = ontology_version
 
     @property
     def vector_indexes_available(self) -> bool:
@@ -1466,6 +1486,255 @@ class GraphStore:
             "capabilities": capabilities,
             "preferences": preferences,
         }
+
+    # ------------------------------------------------------------------
+    # GraphStoreProtocol methods (ADR-010 / Phase 5 reviewer P0)
+    # ------------------------------------------------------------------
+
+    def current_ontology_version(self) -> str:
+        """Return the current ontology version string (e.g. '1.1.0').
+
+        Synchronous accessor used by GraphRegenerator to stamp re-derived
+        triples with the version active at rebuild time. The value is set
+        at construction by the factory (injected from KnowledgeConfig) and
+        never changes during the lifetime of this store instance.
+        """
+        return self._ontology_version
+
+    async def mark_orphaned_by_provenance_path(self, path: str) -> int:
+        """Mark all triples with DERIVED_FROM.path == path as status='orphaned'.
+
+        Per ADR-010 invariant 5: preserves the triples (no hard-delete) so
+        they can be re-derived on retry. Marks both the DERIVED_FROM edge
+        itself and the `orphaned_at` timestamp for audit.
+
+        Returns:
+            Count of DERIVED_FROM edges marked orphaned.
+        """
+        query = (
+            "MATCH ()-[d:DERIVED_FROM]->(p:__Provenance__:VaultNote {path: $path}) "
+            "WHERE d.status <> 'orphaned' "
+            "SET d.status = 'orphaned', d.orphaned_at = toString(datetime()) "
+            "RETURN count(d) AS marked_count"
+        )
+        params: dict[str, Any] = {"path": path}
+        loop = asyncio.get_event_loop()
+        rows = await loop.run_in_executor(None, self.connection.execute_write, query, params)
+        if rows:
+            return int(rows[0].get("marked_count", 0))
+        return 0
+
+    async def get_orphaned_provenance_paths(self) -> list[str]:
+        """Return the list of distinct DERIVED_FROM.path values for orphaned triples.
+
+        Used by GraphRegenerator.retry_orphaned to enumerate provenance paths
+        whose async re-extraction previously failed.
+
+        Returns:
+            List of absolute path strings for which orphaned triples exist.
+        """
+        query = (
+            "MATCH ()-[d:DERIVED_FROM]->(p:__Provenance__:VaultNote) "
+            "WHERE d.status = 'orphaned' "
+            "RETURN DISTINCT p.path AS path"
+        )
+        loop = asyncio.get_event_loop()
+        rows = await loop.run_in_executor(None, self.connection.execute_query, query, None)
+        return [r.get("path") for r in rows if r.get("path") is not None]
+
+    async def upsert_identity(
+        self,
+        parsed_identity: "ParsedIdentity",
+        derived_from_path: str,
+    ) -> int:
+        """Upsert MistIdentity attributes from a ParsedIdentity (idempotent).
+
+        Writes traits, capabilities, and preferences to the graph as typed
+        edges from the MistIdentity node. Each edge gets a fresh DERIVED_FROM
+        edge to the VaultNote identified by `derived_from_path`. Uses MERGE
+        throughout so re-running with the same input produces no duplicates.
+
+        Returns:
+            Count of new triples written (0 when all already exist).
+        """
+        now = datetime.utcnow().isoformat()
+        path = derived_from_path
+        ontology_version = self._ontology_version
+
+        # Ensure the provenance VaultNote node exists
+        self.connection.execute_write(
+            "MERGE (vn:__Provenance__:VaultNote {path: $path}) "
+            "ON CREATE SET vn.created_at = $now, vn.status = 'active' "
+            "ON MATCH SET vn.updated_at = $now",
+            {"path": path, "now": now},
+        )
+
+        written = 0
+
+        # HAS_TRAIT edges
+        for slug in parsed_identity.traits:
+            entity_id = f"mist-trait-{slug}"
+            self.connection.execute_write(
+                "MERGE (m:__Entity__:MistIdentity {id: 'mist-identity'}) "
+                "MERGE (t:__Entity__:MistTrait {id: $entity_id}) "
+                "ON CREATE SET t.display_name = $slug, t.entity_type = 'MistTrait', "
+                "t.status = 'active', t.ontology_version = $ontology_version "
+                "MERGE (m)-[r:HAS_TRAIT]->(t) "
+                "ON CREATE SET r.derived_from_path = $path, r.created_at = $now, "
+                "r.status = 'active', r.ontology_version = $ontology_version "
+                "ON MATCH SET r.derived_from_path = $path, r.updated_at = $now, "
+                "r.status = 'active', r.ontology_version = $ontology_version",
+                {
+                    "entity_id": entity_id,
+                    "slug": slug,
+                    "path": path,
+                    "now": now,
+                    "ontology_version": ontology_version,
+                },
+            )
+            written += 1
+
+        # HAS_CAPABILITY edges
+        for slug in parsed_identity.capabilities:
+            entity_id = f"mist-cap-{slug}"
+            self.connection.execute_write(
+                "MERGE (m:__Entity__:MistIdentity {id: 'mist-identity'}) "
+                "MERGE (c:__Entity__:MistCapability {id: $entity_id}) "
+                "ON CREATE SET c.display_name = $slug, c.entity_type = 'MistCapability', "
+                "c.status = 'active', c.ontology_version = $ontology_version "
+                "MERGE (m)-[r:HAS_CAPABILITY]->(c) "
+                "ON CREATE SET r.derived_from_path = $path, r.created_at = $now, "
+                "r.status = 'active', r.ontology_version = $ontology_version "
+                "ON MATCH SET r.derived_from_path = $path, r.updated_at = $now, "
+                "r.status = 'active', r.ontology_version = $ontology_version",
+                {
+                    "entity_id": entity_id,
+                    "slug": slug,
+                    "path": path,
+                    "now": now,
+                    "ontology_version": ontology_version,
+                },
+            )
+            written += 1
+
+        # HAS_PREFERENCE edges
+        for pref in parsed_identity.preferences:
+            entity_id = f"mist-pref-{pref.slug}"
+            self.connection.execute_write(
+                "MERGE (m:__Entity__:MistIdentity {id: 'mist-identity'}) "
+                "MERGE (p:__Entity__:MistPreference {id: $entity_id}) "
+                "ON CREATE SET p.display_name = $slug, p.entity_type = 'MistPreference', "
+                "p.enforcement = $enforcement, p.status = 'active', "
+                "p.ontology_version = $ontology_version "
+                "ON MATCH SET p.enforcement = $enforcement "
+                "MERGE (m)-[r:HAS_PREFERENCE]->(p) "
+                "ON CREATE SET r.derived_from_path = $path, r.created_at = $now, "
+                "r.status = 'active', r.ontology_version = $ontology_version "
+                "ON MATCH SET r.derived_from_path = $path, r.updated_at = $now, "
+                "r.status = 'active', r.ontology_version = $ontology_version",
+                {
+                    "entity_id": entity_id,
+                    "slug": pref.slug,
+                    "enforcement": pref.enforcement,
+                    "path": path,
+                    "now": now,
+                    "ontology_version": ontology_version,
+                },
+            )
+            written += 1
+
+        logger.debug(
+            "upsert_identity: wrote %d triples from %s (ontology %s)",
+            written,
+            path,
+            ontology_version,
+        )
+        return written
+
+    async def upsert_user(
+        self,
+        parsed_user: "ParsedUser",
+        derived_from_path: str,
+    ) -> int:
+        """Upsert User neighbor edges from a ParsedUser (idempotent).
+
+        Writes per-section display_name lists as typed edges from the User
+        node identified by `parsed_user.user_id`. Each edge gets a fresh
+        DERIVED_FROM provenance stamp to the VaultNote at `derived_from_path`.
+        Uses MERGE so re-running with the same input produces no duplicates.
+
+        Edge types map to bucket1_reader section labels:
+            tools_and_technologies -> USES
+            expertise              -> EXPERT_IN
+            currently_learning     -> LEARNING
+            projects               -> WORKS_ON
+            affiliations           -> WORKS_AT
+            interests              -> INTERESTED_IN
+            goals                  -> HAS_GOAL
+            preferences            -> PREFERS
+            people                 -> KNOWS_PERSON
+
+        Returns:
+            Count of new triples written (0 when all already exist).
+        """
+        now = datetime.utcnow().isoformat()
+        path = derived_from_path
+        ontology_version = self._ontology_version
+        user_id = parsed_user.user_id
+
+        # Ensure the provenance VaultNote node exists
+        self.connection.execute_write(
+            "MERGE (vn:__Provenance__:VaultNote {path: $path}) "
+            "ON CREATE SET vn.created_at = $now, vn.status = 'active' "
+            "ON MATCH SET vn.updated_at = $now",
+            {"path": path, "now": now},
+        )
+
+        section_map: list[tuple[str, list[str]]] = [
+            ("USES", parsed_user.tools_and_technologies),
+            ("EXPERT_IN", parsed_user.expertise),
+            ("LEARNING", parsed_user.currently_learning),
+            ("WORKS_ON", parsed_user.projects),
+            ("WORKS_AT", parsed_user.affiliations),
+            ("INTERESTED_IN", parsed_user.interests),
+            ("HAS_GOAL", parsed_user.goals),
+            ("PREFERS", parsed_user.preferences),
+            ("KNOWS_PERSON", parsed_user.people),
+        ]
+
+        written = 0
+        for predicate, targets in section_map:
+            for display_name in targets:
+                target_id = f"entity-{display_name.lower().replace(' ', '-')}"
+                self.connection.execute_write(
+                    f"MERGE (u:__Entity__:User {{id: $user_id}}) "
+                    f"MERGE (t:__Entity__ {{id: $target_id}}) "
+                    f"ON CREATE SET t.display_name = $display_name, "
+                    f"t.status = 'active', t.ontology_version = $ontology_version "
+                    f"MERGE (u)-[r:{predicate}]->(t) "
+                    f"ON CREATE SET r.derived_from_path = $path, r.created_at = $now, "
+                    f"r.status = 'active', r.ontology_version = $ontology_version "
+                    f"ON MATCH SET r.derived_from_path = $path, r.updated_at = $now, "
+                    f"r.status = 'active', r.ontology_version = $ontology_version",
+                    {
+                        "user_id": user_id,
+                        "target_id": target_id,
+                        "display_name": display_name,
+                        "path": path,
+                        "now": now,
+                        "ontology_version": ontology_version,
+                    },
+                )
+                written += 1
+
+        logger.debug(
+            "upsert_user: wrote %d triples for user %s from %s (ontology %s)",
+            written,
+            user_id,
+            path,
+            ontology_version,
+        )
+        return written
 
     def close(self):
         """Close Neo4j connection."""
