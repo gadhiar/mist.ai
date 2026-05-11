@@ -32,7 +32,6 @@ from backend.knowledge.curation.conflict_resolver import ConflictResolver
 from backend.knowledge.curation.deduplication import EntityDeduplicator
 from backend.knowledge.curation.graph_writer import CurationGraphWriter
 from backend.knowledge.curation.pipeline import CurationPipeline
-from backend.knowledge.embeddings import EmbeddingGenerator
 from backend.knowledge.extraction.confidence import ConfidenceScorer
 from backend.knowledge.extraction.normalizer import EntityNormalizer
 from backend.knowledge.extraction.ontology_extractor import OntologyConstrainedExtractor
@@ -87,8 +86,11 @@ def build_graph_store(
 ) -> GraphStore:
     """Create a GraphStore with injected dependencies."""
     conn = connection or build_neo4j_connection(config)
-    embeddings = embedding_generator or EmbeddingGenerator(config.embedding.model_name)
-    return GraphStore(conn, embeddings)
+    if embedding_generator is None:
+        from backend.knowledge.embeddings import EmbeddingGenerator
+
+        embedding_generator = EmbeddingGenerator(config.embedding.model_name)
+    return GraphStore(conn, embedding_generator)
 
 
 def build_llm_provider(
@@ -140,6 +142,7 @@ def build_llm_provider(
 def build_curation_pipeline(config: KnowledgeConfig, executor: GraphExecutor) -> CurationPipeline:
     """Create a fully wired CurationPipeline."""
     from backend.knowledge.curation.graph_writer import RebuildStamps
+    from backend.knowledge.embeddings import EmbeddingGenerator
 
     embedding_provider = EmbeddingGenerator(config.embedding.model_name)
     confidence_mgr = ConfidenceManager()
@@ -380,6 +383,7 @@ def build_curation_scheduler(
     from backend.knowledge.curation.self_reflection import SelfReflectionJob
     from backend.knowledge.curation.skill_derivation import SkillDerivationJob
     from backend.knowledge.curation.staleness import StalenessDetector
+    from backend.knowledge.embeddings import EmbeddingGenerator
     from backend.knowledge.extraction.internal_derivation import InternalKnowledgeDeriver
     from backend.knowledge.extraction.signal_detector import SignalDetector
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
@@ -517,7 +521,11 @@ def build_ingestion_pipeline(
     from backend.knowledge.ingestion.pipeline import IngestionPipeline
 
     vs = vector_store or build_vector_store(config)
-    ep = embedding_provider or EmbeddingGenerator(config.embedding.model_name)
+    if embedding_provider is None:
+        from backend.knowledge.embeddings import EmbeddingGenerator
+
+        embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+    ep = embedding_provider
     return IngestionPipeline(
         vector_store=vs,
         embedding_provider=ep,
@@ -581,8 +589,11 @@ def build_sidecar_index(
         return None
     from backend.vault.sidecar_index import VaultSidecarIndex
 
-    embeddings = embedding_provider or EmbeddingGenerator(config.embedding.model_name)
-    index = VaultSidecarIndex(config.sidecar_index, embeddings)
+    if embedding_provider is None:
+        from backend.knowledge.embeddings import EmbeddingGenerator
+
+        embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+    index = VaultSidecarIndex(config.sidecar_index, embedding_provider)
     index.initialize()
     return index
 
