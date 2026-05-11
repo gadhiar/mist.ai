@@ -11,6 +11,7 @@ from tests.mocks.config import build_test_config
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeNeo4jConnection
 from tests.mocks.ollama import FakeLLM
+from tests.unit.conftest import make_test_conventions_loader
 
 
 def _make_retriever(config, gs):
@@ -52,6 +53,7 @@ class TestConstructorDI:
             extraction_pipeline=pipeline,
             retriever=_make_retriever(config, gs),
             llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
         )
         assert handler._extraction_pipeline is pipeline
 
@@ -67,6 +69,7 @@ class TestConstructorDI:
             extraction_pipeline=pipeline,
             retriever=_make_retriever(config, gs),
             llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
         )
         tool_names = [s["function"]["name"] for s in handler._tool_schemas]
         assert "extract_knowledge" not in tool_names
@@ -89,6 +92,7 @@ class TestExtractKnowledgeAsync:
             extraction_pipeline=pipeline,
             retriever=_make_retriever(config, gs),
             llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
         )
 
         await handler._extract_knowledge_async(
@@ -144,6 +148,7 @@ class TestExtractKnowledgeAsync:
             extraction_pipeline=pipeline,
             retriever=_make_retriever(config, gs),
             llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
         )
 
         # Act
@@ -174,6 +179,7 @@ class TestExtractKnowledgeAsync:
             extraction_pipeline=pipeline,
             retriever=_make_retriever(config, gs),
             llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
         )
 
         # Should not raise
@@ -201,6 +207,7 @@ class TestToolUsageTrackerDI:
             extraction_pipeline=pipeline,
             retriever=_make_retriever(config, gs),
             llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
             tool_usage_tracker=tracker,
         )
 
@@ -221,6 +228,7 @@ class TestToolUsageTrackerDI:
             extraction_pipeline=pipeline,
             retriever=_make_retriever(config, gs),
             llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
         )
 
         # Assert
@@ -248,6 +256,7 @@ class TestShortMessageSkip:
             extraction_pipeline=pipeline,
             retriever=_make_retriever(config, gs),
             llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
         )
 
         # Patch extraction pipeline to track calls
@@ -288,6 +297,7 @@ class TestShortMessageSkip:
             extraction_pipeline=pipeline,
             retriever=_make_retriever(config, gs),
             llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
         )
 
         # Patch extraction pipeline to track calls
@@ -377,6 +387,7 @@ class TestAutoInjectVaultOnly:
             extraction_pipeline=pipeline,
             retriever=retriever,
             llm_provider=fake_llm,
+            conventions_loader=make_test_conventions_loader(),
         )
         return handler, fake_llm, retriever
 
@@ -495,6 +506,7 @@ def conversation_handler():
         extraction_pipeline=pipeline,
         retriever=_make_retriever(config, gs),
         llm_provider=FakeLLM(),
+        conventions_loader=make_test_conventions_loader(),
     )
 
 
@@ -845,6 +857,7 @@ class TestBuildRequestPreValidationDump:
             extraction_pipeline=FakeExtractionPipeline(),
             retriever=_make_retriever(config, gs),
             llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
             debug_logger=debug_logger,
         )
 
@@ -964,6 +977,7 @@ class TestBudgetAwareBuildMessages:
             extraction_pipeline=FakeExtractionPipeline(),
             retriever=_make_retriever(config, gs),
             llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
             budget_planner=ContextBudgetPlanner(config.context_budget),
         )
 
@@ -1012,6 +1026,7 @@ class TestBudgetAwareBuildMessages:
             extraction_pipeline=FakeExtractionPipeline(),
             retriever=_make_retriever(config, gs),
             llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
         )
         # Budget planner must not be constructed when disabled.
         assert handler._budget_planner is None

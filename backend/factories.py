@@ -257,10 +257,13 @@ def build_conversation_handler(
             retriever supports historical / hybrid vault retrieval; when
             None those branches degrade to graph + vector only.
     """
+    from pathlib import Path
+
     from backend.chat.conversation_handler import ConversationHandler
     from backend.debug_jsonl_logger import DebugJSONLLogger
     from backend.errors import VectorStoreError
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
+    from backend.vault.conventions import ConventionsLoader
 
     debug_logger = DebugJSONLLogger.from_env()
     if debug_logger.enabled:
@@ -302,6 +305,9 @@ def build_conversation_handler(
 
     tracker = ToolUsageTracker(config.skill_derivation)
 
+    # ADR-014: vault-root MIST.md auto-load into every turn's prompt.
+    conventions_loader = ConventionsLoader(vault_root=Path(config.vault.host_path))
+
     # Cluster 8 Phase 5: vault_writer is caller-provided (or None). Auto-build
     # removed to avoid two writers racing on the same vault root -- the
     # server lifespan owns the single VaultWriter and plumbs it through
@@ -313,6 +319,7 @@ def build_conversation_handler(
         extraction_pipeline=pipeline,
         retriever=retriever,
         llm_provider=provider,
+        conventions_loader=conventions_loader,
         tool_usage_tracker=tracker,
         debug_logger=debug_logger,
         vault_writer=vault_writer,

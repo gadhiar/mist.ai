@@ -29,6 +29,7 @@ from backend.llm import LLMRequest, StreamingLLMProvider
 from backend.llm.instrumented_provider import llm_call_context
 from backend.llm.models import LLMResponse
 from backend.llm.models import ToolCall as LLMToolCall
+from backend.vault.conventions import ConventionsLoader
 
 if TYPE_CHECKING:
     from backend.debug_jsonl_logger import DebugJSONLLogger, TurnRecord
@@ -151,6 +152,7 @@ class ConversationHandler:
         extraction_pipeline: ExtractionPipeline,
         retriever: KnowledgeRetriever,
         llm_provider: StreamingLLMProvider,
+        conventions_loader: ConventionsLoader,
         tool_usage_tracker: ToolUsageTracker | None = None,
         debug_logger: DebugJSONLLogger | None = None,
         budget_planner: ContextBudgetPlanner | None = None,
@@ -164,6 +166,9 @@ class ConversationHandler:
             extraction_pipeline: Pipeline for automatic knowledge extraction.
             retriever: Pre-built knowledge retriever (supports hybrid retrieval).
             llm_provider: LLM inference provider (StreamingLLMProvider).
+            conventions_loader: ConventionsLoader for vault-root MIST.md auto-load
+                (ADR-014). Inserted as a user message in every turn's prompt between
+                system messages and conversation history.
             tool_usage_tracker: Optional tracker for recording tool calls for
                 skill derivation. When None, tool usage is not recorded.
             debug_logger: Optional DebugJSONLLogger for per-turn structured
@@ -181,6 +186,7 @@ class ConversationHandler:
         self.graph_store = graph_store
         self._extraction_pipeline = extraction_pipeline
         self.retriever = retriever
+        self._conventions_loader = conventions_loader
         self._tool_usage_tracker = tool_usage_tracker
         self._debug_logger = debug_logger
 
@@ -1645,7 +1651,19 @@ class ConversationHandler:
         if live_advisory_text:
             messages.append({"role": "system", "content": live_advisory_text})
 
-        # 5. Conversation history
+        # 5. Vault conventions (ADR-014): MIST.md auto-load as user message.
+        # Mirrors Claude Code's CLAUDE.md user-message-after-system-prompt position.
+        # Omitted when no conventions file exists (vault-less or test contexts).
+        conventions_content = self._conventions_loader.load_vault_root()
+        if conventions_content is not None:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": self._conventions_loader.format_for_prompt(conventions_content),
+                }
+            )
+
+        # 6. Conversation history
         messages.extend(history)
 
         return messages
