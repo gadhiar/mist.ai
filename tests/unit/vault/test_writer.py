@@ -855,3 +855,179 @@ class TestBackpressure:
             assert result == path_str
         finally:
             await writer.stop()
+
+
+# ---------------------------------------------------------------------------
+# TestMarkAuthoredByUserEdit
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def tmp_vault(tmp_path: Path) -> Path:
+    """Return a temporary vault root with the standard subdirectory layout."""
+    vault = tmp_path / "vault"
+    for sub in ("sessions", "identity", "users", "decisions", "meta"):
+        (vault / sub).mkdir(parents=True, exist_ok=True)
+    return vault
+
+
+@pytest.fixture()
+def writer(tmp_vault: Path) -> VaultWriter:
+    """Return a VaultWriter instance (not started) for sync helper tests."""
+    config = VaultConfig(
+        enabled=True,
+        root=str(tmp_vault),
+        default_user_id="raj",
+        git_auto_init=False,
+        session_soft_cap_turns=20,
+        session_soft_cap_tokens=6000,
+        append_sentinel="<!-- MIST_APPEND_HERE -->",
+        writer_queue_max_depth=100,
+    )
+    return VaultWriter(config)
+
+
+def test_mark_authored_by_user_edit_updates_frontmatter(writer: VaultWriter, tmp_vault: Path):
+    p = tmp_vault / "users" / "raj.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        "---\n" "type: mist-user\n" "user_id: raj\n" "authored_by: mist\n" "---\n" "# Raj\n",
+        encoding="utf-8",
+    )
+    asyncio.run(writer.mark_authored_by_user_edit(p))
+    text = p.read_text(encoding="utf-8")
+    assert "authored_by: user-edit" in text
+    assert "authored_by: mist" not in text
+
+
+def test_mark_authored_by_user_edit_idempotent(writer: VaultWriter, tmp_vault: Path):
+    p = tmp_vault / "users" / "raj.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        "---\n" "type: mist-user\n" "authored_by: user-edit\n" "---\n" "body\n",
+        encoding="utf-8",
+    )
+    asyncio.run(writer.mark_authored_by_user_edit(p))
+    text = p.read_text(encoding="utf-8")
+    # Already user-edit; no change
+    assert text.count("authored_by: user-edit") == 1
+
+
+def test_mark_authored_by_user_edit_preserves_body_and_other_frontmatter(
+    writer: VaultWriter, tmp_vault: Path
+):
+    p = tmp_vault / "users" / "raj.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    original = (
+        "---\n"
+        "type: mist-user\n"
+        "user_id: raj\n"
+        "authored_by: pipeline\n"
+        "status: active\n"
+        "---\n"
+        "# Body heading\n"
+        "\nSome content here.\n"
+    )
+    p.write_text(original, encoding="utf-8")
+    asyncio.run(writer.mark_authored_by_user_edit(p))
+    text = p.read_text(encoding="utf-8")
+    assert "authored_by: user-edit" in text
+    assert "type: mist-user" in text
+    assert "user_id: raj" in text
+    assert "status: active" in text
+    assert "# Body heading" in text
+    assert "Some content here." in text
+
+
+# ---------------------------------------------------------------------------
+# TestSessionIdUniqueness  (Phase 3 Task 18)
+# ---------------------------------------------------------------------------
+# The 2026-05-10 audit found 5 of 7 session notes had session_id: default
+# because KnowledgeIntegration.current_session_id initializes to "default"
+# and that raw string was written directly into frontmatter.
+#
+# Fix contract: _append_turn_sync derives the frontmatter session_id from
+# the path stem (<date>-<slug>) rather than the raw external session_id arg.
+# This ensures the frontmatter identifier is always human-readable and unique,
+# regardless of what the caller passes as the external session_id.
+
+
+class TestSessionIdUniqueness:
+    @pytest.mark.asyncio
+    async def test_frontmatter_session_id_never_equals_default(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        """Regression: passing external session_id='default' must NOT write
+        session_id: default into frontmatter.
+
+        Pre-fix: _append_turn_sync set session_id = <external session_id arg>
+        on file creation, so session_id='default' produced session_id: default.
+        Post-fix: session_id is derived from path.stem, which carries the slug
+        allocated by ConversationHandler._get_or_allocate_vault_path.
+        """
+        path_str = vault_writer.session_path("2026-05-10", "plan-new-feature-37a8")
+        await vault_writer.append_turn_to_session("default", 1, "hi there", "hello", path_str)
+        fm_dict, _ = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
+        assert fm_dict["session_id"] != "default", (
+            "session_id in frontmatter must never be 'default'; " f"got {fm_dict['session_id']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_frontmatter_session_id_matches_path_stem(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        """Frontmatter session_id derives from the path stem (which carries the
+        pre-allocated slug+hash), not the raw external session_id argument.
+
+        This guarantees the frontmatter identifier matches the filename,
+        making programmatic lookup via session_id reliable.
+        """
+        path_str = vault_writer.session_path("2026-05-10", "vault-architecture-3a7f")
+        await vault_writer.append_turn_to_session(
+            "some-opaque-uuid-1234", 1, "tell me about the vault", "sure", path_str
+        )
+        path = Path(path_str)
+        fm_dict, _ = parse_frontmatter(path.read_text(encoding="utf-8"))
+        # path.stem is "2026-05-10-vault-architecture-3a7f"
+        # The slug portion after the date prefix is "vault-architecture-3a7f"
+        expected_session_id = "vault-architecture-3a7f"
+        assert fm_dict["session_id"] == expected_session_id, (
+            f"Expected session_id derived from path stem slug; " f"got {fm_dict['session_id']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_frontmatter_session_id_stable_across_subsequent_turns(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        """session_id must not change between turns of the same session.
+
+        The path stem is fixed; all appends should preserve the same
+        frontmatter session_id.
+        """
+        path_str = vault_writer.session_path("2026-05-10", "stable-session-ab12")
+        for i in range(1, 4):
+            await vault_writer.append_turn_to_session(
+                "default", i, f"user {i}", f"mist {i}", path_str
+            )
+        fm_dict, _ = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
+        assert fm_dict["session_id"] == "stable-session-ab12"
+        assert fm_dict["turn_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_two_sessions_with_same_slug_get_distinct_ids_via_hash(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        """Two different sessions with similar utterances get distinct filenames
+        via the hash suffix in the slug, which means distinct session_ids in
+        frontmatter.
+        """
+        path1 = vault_writer.session_path("2026-05-10", "topic-abc1")
+        path2 = vault_writer.session_path("2026-05-10", "topic-abc2")
+        await vault_writer.append_turn_to_session("default", 1, "u", "m", path1)
+        await vault_writer.append_turn_to_session("default", 1, "u", "m", path2)
+        fm1, _ = parse_frontmatter(Path(path1).read_text(encoding="utf-8"))
+        fm2, _ = parse_frontmatter(Path(path2).read_text(encoding="utf-8"))
+        assert fm1["session_id"] != fm2["session_id"], (
+            "Two sessions with different slugs must have different session_ids; "
+            f"both got {fm1['session_id']!r}"
+        )

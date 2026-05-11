@@ -19,6 +19,7 @@ from backend.knowledge.retrieval.query_classifier import QueryClassifier
 from backend.llm.models import LLMResponse
 from tests.mocks.config import build_test_config
 from tests.mocks.ollama import FakeLLM
+from tests.unit.conftest import make_test_conventions_loader
 
 pytestmark = pytest.mark.integration
 
@@ -125,6 +126,7 @@ def _build_handler(
         extraction_pipeline=MagicMock(extract_from_utterance=AsyncMock()),
         retriever=retriever,
         llm_provider=fake_llm,
+        conventions_loader=make_test_conventions_loader(),
     )
     return handler, fake_llm
 

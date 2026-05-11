@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
+    from backend.knowledge.curation.bucket1_reader import ParsedIdentity, ParsedUser
     from backend.knowledge.models import DocumentChunk, VectorSearchResult
     from backend.llm.models import LLMRequest, LLMResponse
 
@@ -137,3 +138,98 @@ class SidecarIndexProtocol(Protocol):
     ) -> list[dict]: ...
     def chunk_count(self) -> int: ...
     def health_check(self) -> bool: ...
+
+
+class GraphStoreProtocol(Protocol):
+    """Contract for graph store operations used by GraphRegenerator.
+
+    Extends the base graph storage surface with methods required for
+    ADR-010 invariant 5 closure: orphan-marking DERIVED_FROM-scoped
+    triples and re-deriving them deterministically or via LLM extraction.
+
+    Implemented by `backend.knowledge.storage.graph_store.GraphStore`
+    (production). Test doubles implement this protocol directly without
+    inheriting from it.
+    """
+
+    async def mark_orphaned_by_provenance_path(self, path: str) -> int:
+        """Mark all triples with DERIVED_FROM.path == path as status='orphaned'.
+
+        Preserves the triples per ADR-010 (no hard-delete). Returns the
+        count of triples marked.
+        """
+        ...
+
+    def current_ontology_version(self) -> str:
+        """Return the current ontology version string (e.g. '1.1.0').
+
+        Used by GraphRegenerator to stamp re-derived triples with the
+        version active at rebuild time.
+        """
+        ...
+
+    async def get_orphaned_provenance_paths(self) -> list[str]:
+        """Return the list of distinct DERIVED_FROM.path values for orphaned triples.
+
+        Used by GraphRegenerator.retry_orphaned to enumerate provenance paths
+        whose async re-extraction previously failed so they can be retried.
+
+        Returns:
+            List of absolute path strings for which orphaned triples exist.
+        """
+        ...
+
+    async def upsert_identity(
+        self,
+        parsed_identity: ParsedIdentity,
+        derived_from_path: str,
+    ) -> int:
+        """Upsert MistIdentity attributes from a ParsedIdentity.
+
+        Writes traits, capabilities, and preferences to the graph as typed
+        edges from the MistIdentity node. Sets DERIVED_FROM.path on each
+        written triple to `derived_from_path`. Returns count of triples
+        written.
+        """
+        ...
+
+    async def upsert_user(
+        self,
+        parsed_user: ParsedUser,
+        derived_from_path: str,
+    ) -> int:
+        """Upsert User neighbor edges from a ParsedUser.
+
+        Writes per-section display_name lists as typed edges from the User
+        node. Sets DERIVED_FROM.path on each triple. Returns count of
+        triples written.
+        """
+        ...
+
+
+class ExtractionPipelineProtocol(Protocol):
+    """Contract for the extraction pipeline surface used by GraphRegenerator.
+
+    Covers the vault-file re-extraction path (Bucket 2/3). The full
+    ExtractionPipeline satisfies this protocol via duck-typing; only the
+    method required by GraphRegenerator is listed here.
+    """
+
+    async def extract_from_file(
+        self,
+        content: str,
+        vault_note_path: str,
+        ontology_version: str,
+    ) -> Any:
+        """Extract entities and relationships from vault file content.
+
+        Args:
+            content: Full text of the vault file.
+            vault_note_path: Absolute path string for provenance tracking.
+            ontology_version: Ontology version string to stamp on extracted
+                triples.
+
+        Returns:
+            Implementation-defined extraction result.
+        """
+        ...

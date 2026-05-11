@@ -22,6 +22,7 @@ from tests.mocks.config import build_test_config
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeNeo4jConnection
 from tests.mocks.ollama import FakeLLM
+from tests.unit.conftest import make_test_conventions_loader
 
 
 def _make_retriever(config, gs):
@@ -45,6 +46,7 @@ def _make_handler(default_response: str = "Hello there.") -> ConversationHandler
         extraction_pipeline=FakeExtractionPipeline(),
         retriever=_make_retriever(config, gs),
         llm_provider=FakeLLM(default_response=default_response),
+        conventions_loader=make_test_conventions_loader(),
     )
 
 

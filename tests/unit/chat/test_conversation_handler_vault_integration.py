@@ -19,6 +19,7 @@ from tests.mocks.config import build_test_config
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeNeo4jConnection
 from tests.mocks.ollama import FakeLLM
+from tests.unit.conftest import make_test_conventions_loader
 
 # ---------------------------------------------------------------------------
 # FakeVaultWriter test double
@@ -183,6 +184,7 @@ def make_handler(vault_writer=None, event_store_enabled: bool = True):
         extraction_pipeline=pipeline,
         retriever=_make_retriever(config, gs),
         llm_provider=FakeLLM(),
+        conventions_loader=make_test_conventions_loader(),
         vault_writer=vault_writer,
     )
 

@@ -29,12 +29,15 @@ from backend.llm import LLMRequest, StreamingLLMProvider
 from backend.llm.instrumented_provider import llm_call_context
 from backend.llm.models import LLMResponse
 from backend.llm.models import ToolCall as LLMToolCall
+from backend.vault.conventions import ConventionsLoader
 
 if TYPE_CHECKING:
     from backend.debug_jsonl_logger import DebugJSONLLogger, TurnRecord
     from backend.interfaces import VaultWriterProtocol
+    from backend.knowledge.curation.graph_regenerator import RebuildResult
     from backend.knowledge.extraction.pipeline import ExtractionPipeline
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
+    from backend.vault.invalidation_bus import InvalidationBus
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +47,18 @@ KNOWLEDGE_TOOL_SCHEMAS = [
         "function": {
             "name": "query_knowledge_graph",
             "description": (
-                "Search the knowledge graph for relevant information about the user. "
-                "Use when: user asks about past info, preferences, or knowledge; "
-                "you need context about entities, technologies, projects; "
-                "you want to personalize based on what you know."
+                "Search the typed knowledge graph for structured facts and relationships"
+                " about the user. The graph is your reasoning substrate -- typed entities"
+                " and edges you can traverse for inference, multi-hop reasoning, and"
+                " relational lookups.\n\n"
+                "USE for: questions about specific entities/relationships/typed facts;"
+                " multi-hop reasoning over the user's stack, projects, or learning;"
+                " how-to or debugging questions whose answer depends on the user's"
+                " libraries/tools/projects; explicit graph queries.\n\n"
+                "DO NOT USE for: pure conversational filler (greetings, thanks);"
+                " general-knowledge with no user-specific anchor; questions already"
+                " answered by the vault prose in context; purely creative tasks"
+                " without user-specific reasoning."
             ),
             "parameters": {
                 "type": "object",
@@ -96,43 +107,68 @@ _STATIC_IDENTITY_HEADER = (
     "You are MIST, a conversational AI assistant with a personal knowledge graph.\n\n"
 )
 
-_STATIC_SYSTEM_TEMPLATE_BODY = """=== CONTEXT PROVIDED ===
+_STATIC_SYSTEM_TEMPLATE_BODY = """\
+=== MEMORY ARCHITECTURE ===
 
-You receive relevant context automatically with each query (see below).
-This may include graph facts, document excerpts, or both depending on query type.
-Knowledge from conversations is captured automatically -- you do not need to extract it manually.
+You have two memory layers with distinct semantic roles.
 
-=== AVAILABLE TOOLS ===
+NOTES (vault prose; relevant excerpts auto-surfaced below):
+  - HISTORICAL and FACTUAL substrate -- past sessions, identity
+    notes, user fact sheets, decisions, prior conversations
+  - The relevant prose for this turn is already in the context below.
+    Auto-retrieval covers most history-and-recall queries.
+  - At present, no tool exposes deeper vault search. Treat the prose
+    below as the only available view of the notes.
 
-You have one tool at your disposal:
+KNOWLEDGE GRAPH (typed triples; tool-only access):
+  - REASONING substrate -- structured entities, relationships, and
+    inferred beliefs you can traverse and query
+  - Access only via the query_knowledge_graph tool
+  - Use when the question requires multi-hop reasoning, typed-fact
+    lookup, or relational queries that prose cannot reliably answer
 
-1. **query_knowledge_graph(query: str, limit: int = 20)**
-   - Search the personal knowledge graph for user-specific information
-   - Use when: User asks about THEIR preferences, skills, projects, past conversations
-   - Returns: Facts you've learned about the user (entities + relationships)
-   - Example: "What programming languages do I know?" -> use this tool
+=== TOOL USAGE RULES ===
 
-=== TOOL USAGE STRATEGY ===
+USE query_knowledge_graph when the question requires REASONING over
+user-specific structured knowledge:
 
-**For user questions:**
-- Technical questions (how/what/why about MIST) -> Use auto-provided context (already below)
-- Personal questions (about user's info) -> Use query_knowledge_graph tool
-- Both types -> Use context + query_knowledge_graph
+- User asks about specific entities, relationships, or typed facts
+  ("what tech do I use for ML?", "which projects involve data?")
+- User explicitly asks to query the graph
+- Question requires multi-hop reasoning or traversal over the user's
+  structure -- including how-to questions, debugging, or complex
+  reasoning whose answer depends on the user's stack, libraries,
+  tools, projects, or learning
+- Vault prose is insufficient and the answer needs typed-fact lookup
 
-**Autonomous Decision Making:**
-- You decide when to use the tool - no one tells you when
-- Context is automatically provided - use it! Cite sources when helpful.
-- Only call query_knowledge_graph when you need personal user context
+=== TOOL USAGE INVARIANTS ===
+
+DO NOT call query_knowledge_graph when:
+
+- The message is purely conversational -- greetings, acknowledgements,
+  social closings ("Hi", "Good morning", "Thanks", "Sounds good",
+  "That's helpful")
+- The question is general-knowledge with no user-specific anchor
+  (Python syntax in the abstract, how a public protocol works,
+  capital of France, generic best practices)
+- The vault prose below already contains a complete answer
+- The question is purely creative with no user-specific reasoning
+  required ("write me a poem", "tell a joke")
+
+When unsure whether the tool is warranted, ASK YOURSELF: does the answer depend on user-specific structured knowledge that prose alone
+cannot give? If yes, call the tool. If no, answer from prose or
+general knowledge.
+
+Knowledge from conversations is captured automatically -- you do not
+need to extract it manually.
 
 === GUIDELINES ===
 
 - Be conversational and natural
-- Cite documentation sources when answering technical questions
-- Use tools to enhance responses, not replace conversation
-- Combine auto-provided context with your conversational abilities
-- Query the knowledge graph when personal context matters
-
-Remember: Context is already provided below. Think about whether you need personal user context from the knowledge graph."""
+- Cite sources from the prose below when helpful
+- Default to NOT calling the tool when uncertain; the prose-only path
+  is usually the right answer for non-reasoning queries
+"""
 
 
 class ConversationHandler:
@@ -151,10 +187,12 @@ class ConversationHandler:
         extraction_pipeline: ExtractionPipeline,
         retriever: KnowledgeRetriever,
         llm_provider: StreamingLLMProvider,
+        conventions_loader: ConventionsLoader,
         tool_usage_tracker: ToolUsageTracker | None = None,
         debug_logger: DebugJSONLLogger | None = None,
         budget_planner: ContextBudgetPlanner | None = None,
         vault_writer: VaultWriterProtocol | None = None,
+        invalidation_bus: InvalidationBus | None = None,
     ) -> None:
         """Initialize conversation handler.
 
@@ -164,6 +202,9 @@ class ConversationHandler:
             extraction_pipeline: Pipeline for automatic knowledge extraction.
             retriever: Pre-built knowledge retriever (supports hybrid retrieval).
             llm_provider: LLM inference provider (StreamingLLMProvider).
+            conventions_loader: ConventionsLoader for vault-root MIST.md auto-load
+                (ADR-014). Inserted as a user message in every turn's prompt between
+                system messages and conversation history.
             tool_usage_tracker: Optional tracker for recording tool calls for
                 skill derivation. When None, tool usage is not recorded.
             debug_logger: Optional DebugJSONLLogger for per-turn structured
@@ -176,11 +217,17 @@ class ConversationHandler:
             vault_writer: Optional VaultWriterProtocol (Cluster 8 Phase 5).
                 When set, every successful turn appends to the vault session
                 note. None preserves legacy pre-Cluster-8 behavior.
+            invalidation_bus: Optional InvalidationBus (Phase 3 Task 21). When
+                set, the handler subscribes `_on_vault_rebuild` to receive
+                rebuild-completion events from the filewatcher and evict stale
+                `_mist_context_cache` entries. When None, no subscription is
+                registered and the cache is not driven by vault edits.
         """
         self.config = config
         self.graph_store = graph_store
         self._extraction_pipeline = extraction_pipeline
         self.retriever = retriever
+        self._conventions_loader = conventions_loader
         self._tool_usage_tracker = tool_usage_tracker
         self._debug_logger = debug_logger
 
@@ -236,6 +283,13 @@ class ConversationHandler:
         # Populated on first handle_message for a given session; stable until
         # clear_session or process restart.
         self._mist_context_cache: dict[str, MistContext] = {}
+
+        # Phase 3 Task 21: optional InvalidationBus subscription.
+        # When set, _on_vault_rebuild is called after each vault-file rebuild
+        # (filewatcher -> GraphRegenerator -> bus) to evict stale cache entries.
+        self._invalidation_bus: InvalidationBus | None = invalidation_bus
+        if invalidation_bus is not None:
+            invalidation_bus.subscribe(self._on_vault_rebuild)
 
         # Cluster 3: response post-filter for slop patterns
         self._slop_detector = SlopDetector()
@@ -326,6 +380,56 @@ class ConversationHandler:
             )
         self._mist_context_cache[session_id] = ctx
         return ctx
+
+    async def _on_vault_rebuild(self, event: RebuildResult) -> None:
+        """Evict mist_context cache entries affected by a vault rebuild.
+
+        Subscribed to InvalidationBus on __init__ (when bus is provided).
+        Coordination guarantee: filewatcher publishes AFTER graph rebuild
+        completes, so the next mist_context fetch reads correct re-derived state.
+
+        Eviction rules:
+        - identity/mist.md -> clear ALL active sessions (persona changed)
+        - users/<user>.md  -> clear sessions whose user_id matches the stem
+        - other paths      -> no-op (sessions/*, decisions/*, etc.)
+        """
+        parts = event.path.parts
+
+        if "identity" in parts and event.path.name == "mist.md":
+            # Persona definition changed -- all cached contexts are stale.
+            cleared_count = len(self._mist_context_cache)
+            self._mist_context_cache.clear()
+            logger.info(
+                "_on_vault_rebuild: identity/mist.md rebuilt; cleared all %d session caches",
+                cleared_count,
+            )
+            return
+
+        if "users" in parts:
+            user_id = event.path.stem
+            # Targeted eviction: keep caches for sessions belonging to other users.
+            # user_id is resolved from self.sessions, which is populated by
+            # get_or_create_session (called on every handle_message). Sessions
+            # with no entry in self.sessions have no associated user_id and are
+            # left untouched (conservative: don't evict what we can't classify).
+            stale_sids = {
+                sid
+                for sid, session in self.sessions.items()
+                if session.user_id == user_id and sid in self._mist_context_cache
+            }
+            for sid in stale_sids:
+                del self._mist_context_cache[sid]
+            if stale_sids:
+                logger.info(
+                    "_on_vault_rebuild: users/%s.md rebuilt; evicted %d session cache(s): %s",
+                    user_id,
+                    len(stale_sids),
+                    sorted(stale_sids),
+                )
+            return
+
+        # Other paths (sessions/*, decisions/*) do not affect mist_context.
+        logger.debug("_on_vault_rebuild: path=%s; no mist_context eviction needed", event.path)
 
     def _build_request(
         self,
@@ -1645,7 +1749,19 @@ class ConversationHandler:
         if live_advisory_text:
             messages.append({"role": "system", "content": live_advisory_text})
 
-        # 5. Conversation history
+        # 5. Vault conventions (ADR-014): MIST.md auto-load as user message.
+        # Mirrors Claude Code's CLAUDE.md user-message-after-system-prompt position.
+        # Omitted when no conventions file exists (vault-less or test contexts).
+        conventions_content = self._conventions_loader.load_vault_root()
+        if conventions_content is not None:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": self._conventions_loader.format_for_prompt(conventions_content),
+                }
+            )
+
+        # 6. Conversation history
         messages.extend(history)
 
         return messages

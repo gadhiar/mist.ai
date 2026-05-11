@@ -1104,10 +1104,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_vrebuild.add_argument(
         "--confirm",
         action="store_true",
-        help="Required to actually drop + rebuild. Without --confirm the command "
-        "previews the work and exits without writing.",
+        help="Required to actually drop + rebuild the sidecar. Without --confirm "
+        "the legacy sidecar-only path previews the work and exits without writing.",
     )
-    p_vrebuild.set_defaults(func=cmd_vault_rebuild)
+    p_vrebuild.add_argument(
+        "--scope",
+        default=None,
+        help=(
+            "Graph rebuild scope: '<path>' to rebuild one vault file's subgraph, "
+            "'all' to rebuild every non-excluded .md. Requires --confirm to be "
+            "omitted (scope enables graph-aware mode; sidecar-only mode uses "
+            "--confirm). When omitted together with --retry-orphaned the legacy "
+            "sidecar-only rebuild is used."
+        ),
+    )
+    p_vrebuild.add_argument(
+        "--retry-orphaned",
+        action="store_true",
+        help=(
+            "Retry async re-extraction for Bucket 2/3 paths whose previous "
+            "re-extraction failed (orphaned triples remain marked until retry "
+            "succeeds). Takes priority over --scope when both are provided."
+        ),
+    )
+    p_vrebuild.set_defaults(func=_cmd_vault_rebuild_sidecar)
 
     p_vmigrate = sub.add_parser(
         "vault-migrate",
@@ -1280,7 +1300,62 @@ def cmd_vault_reindex(args: argparse.Namespace) -> int:
     return 0 if not failures else 1
 
 
-def cmd_vault_rebuild(args: argparse.Namespace) -> int:
+async def cmd_vault_rebuild(
+    scope: str | None,
+    retry_orphaned: bool,
+    ctx: Any,
+) -> int:
+    """Rebuild sidecar and/or graph from vault content.
+
+    New async entry-point for graph-aware vault rebuild modes added in Phase 3
+    Task 22. Three distinct modes:
+
+    - ``retry_orphaned=True``: retry async re-extraction for Bucket 2/3 paths
+      whose previous re-extraction failed (orphaned triples remain marked until
+      retry succeeds).
+    - ``scope='all'``: iterate every .md under vault_root (skipping excluded
+      conventions docs and meta/) and call regenerator.rebuild_from_path on
+      each file.
+    - ``scope='<path>'``: rebuild the graph subgraph for a single vault file.
+    - ``scope=None, retry_orphaned=False``: legacy sidecar-only rebuild via
+      ctx.sidecar.rebuild_all().
+
+    Args:
+        scope: None, 'all', or an absolute/relative path string.
+        retry_orphaned: When True, retry orphaned triples; all other args
+            are ignored.
+        ctx: Admin context exposing .regenerator, .sidecar, and .vault_root.
+
+    Returns:
+        0 on success.
+    """
+    if retry_orphaned:
+        await ctx.regenerator.retry_orphaned()
+        return 0
+
+    if scope is None:
+        # Legacy: sidecar-only rebuild (no graph regeneration).
+        await ctx.sidecar.rebuild_all()
+        return 0
+
+    if scope == "all":
+        from backend.vault.sidecar_index import _is_excluded_from_indexing
+
+        for vault_file in ctx.vault_root.rglob("*.md"):
+            if _is_excluded_from_indexing(vault_file):
+                continue
+            await ctx.regenerator.rebuild_from_path(vault_file)
+        return 0
+
+    # scope == '<path>': single-file rebuild
+    path = Path(scope)
+    if not path.is_absolute():
+        path = ctx.vault_root / path
+    await ctx.regenerator.rebuild_from_path(path)
+    return 0
+
+
+def _cmd_vault_rebuild_sidecar(args: argparse.Namespace) -> int:
     """Drop the sidecar tables and re-index every vault note from disk.
 
     Heavier than `vault-reindex`: clears all chunks first so per-file
@@ -1290,6 +1365,10 @@ def cmd_vault_rebuild(args: argparse.Namespace) -> int:
 
     Requires `--confirm` because this drops the sidecar's contents
     (re-buildable from disk, but still destructive on the SQLite file).
+
+    This is the legacy argparse handler invoked by the `vault-rebuild`
+    subcommand when neither --scope nor --retry-orphaned is passed. The new
+    async `cmd_vault_rebuild` function handles graph-aware modes.
     """
     be = _load_backend()
     config = be.get_config()

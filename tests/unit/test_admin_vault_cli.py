@@ -251,7 +251,9 @@ class TestVaultRebuild:
         sidecar_path = tmp_path / "sidecar.db"
         sidecar_path.write_text("placeholder", encoding="utf-8")
 
-        rc = mist_admin.cmd_vault_rebuild(argparse.Namespace(confirm=False))
+        # _cmd_vault_rebuild_sidecar is the argparse-facing sidecar-only handler;
+        # the public async cmd_vault_rebuild is the graph-aware version (Task 22).
+        rc = mist_admin._cmd_vault_rebuild_sidecar(argparse.Namespace(confirm=False))
 
         assert rc == 0
         out = capsys.readouterr().out
@@ -264,7 +266,7 @@ class TestVaultRebuild:
         _write_session_note(vault_root, "2026-04-22-a.md", "# A\ncontent")
         _write_session_note(vault_root, "2026-04-22-b.md", "# B\ncontent")
 
-        rc = mist_admin.cmd_vault_rebuild(argparse.Namespace(confirm=True))
+        rc = mist_admin._cmd_vault_rebuild_sidecar(argparse.Namespace(confirm=True))
 
         assert rc == 0
         out = capsys.readouterr().out
