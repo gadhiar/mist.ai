@@ -35,6 +35,7 @@ from backend.errors import FilewatcherError, SidecarIndexError
 from backend.interfaces import SidecarIndexProtocol
 from backend.knowledge.config import FilewatcherConfig
 from backend.vault.models import parse_frontmatter
+from backend.vault.sidecar_index import _is_excluded_from_indexing
 
 logger = logging.getLogger(__name__)
 
@@ -430,9 +431,18 @@ class VaultFilewatcher:
         event and the reindex read. Any SidecarIndexError is logged and
         swallowed so the watcher stays alive.
 
+        Vault conventions docs (MIST.md, CLAUDE.md) and meta/ files are
+        excluded from sidecar indexing per ADR-014; they have a dedicated
+        load path via ConventionsLoader and would surface as noise if
+        auto-injected.
+
         Args:
             path: Absolute path to the vault markdown file.
         """
+        if _is_excluded_from_indexing(path):
+            logger.debug("VaultFilewatcher: skipping excluded path %s", path)
+            return
+
         try:
             content = Path(path).read_text(encoding="utf-8")
         except OSError as exc:
