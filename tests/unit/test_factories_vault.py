@@ -28,6 +28,7 @@ from backend.knowledge.config import (
 )
 from tests.mocks.config import build_test_config
 from tests.mocks.embeddings import FakeEmbeddingGenerator
+from tests.unit.conftest import make_test_conventions_loader
 
 # ---------------------------------------------------------------------------
 # Platform-availability markers
@@ -416,6 +417,7 @@ class TestBuildConversationHandlerVaultWiring:
             extraction_pipeline=_FakePipeline(),
             retriever=retriever,
             llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
             vault_writer=explicit_writer,
         )
 
@@ -448,6 +450,7 @@ class TestBuildConversationHandlerVaultWiring:
             extraction_pipeline=_FakePipeline(),
             retriever=retriever,
             llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
         )
 
         # Assert -- defaults to None when not supplied
