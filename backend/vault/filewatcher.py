@@ -34,8 +34,11 @@ from watchdog.events import (
 from backend.errors import FilewatcherError, SidecarIndexError
 from backend.interfaces import SidecarIndexProtocol
 from backend.knowledge.config import FilewatcherConfig
+from backend.knowledge.curation.graph_regenerator import GraphRegenerator
+from backend.vault.invalidation_bus import InvalidationBus
 from backend.vault.models import parse_frontmatter
 from backend.vault.sidecar_index import _is_excluded_from_indexing
+from backend.vault.writer import VaultWriter
 
 logger = logging.getLogger(__name__)
 
@@ -142,10 +145,16 @@ class VaultFilewatcher:
         config: FilewatcherConfig,
         vault_root: str | Path,
         sidecar_index: SidecarIndexProtocol,
+        regenerator: GraphRegenerator,
+        invalidation_bus: InvalidationBus,
+        writer: VaultWriter,
     ) -> None:
         self.config = config
         self.vault_root = Path(vault_root)
         self._sidecar = sidecar_index
+        self._regenerator = regenerator
+        self._invalidation_bus = invalidation_bus
+        self._writer = writer
 
         self._observer = None  # Set at start()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -416,7 +425,11 @@ class VaultFilewatcher:
         if self._loop is None:
             return
         if action == "reindex":
-            self._loop.create_task(self._do_reindex(path))
+            now = time.monotonic()
+            is_mist_write = (
+                path in self._mist_writes_in_flight and self._mist_writes_in_flight[path] > now
+            )
+            self._loop.create_task(self._do_reindex(path, is_mist_write=is_mist_write))
         elif action == "delete":
             self._loop.create_task(self._do_delete(path))
 
@@ -424,7 +437,7 @@ class VaultFilewatcher:
     # Reindex and delete coroutines
     # ------------------------------------------------------------------
 
-    async def _do_reindex(self, path: str) -> None:
+    async def _do_reindex(self, path: str, *, is_mist_write: bool = False) -> None:
         """Read and reindex a vault file in the sidecar index.
 
         Handles the race-condition case where the file is deleted between the
@@ -436,8 +449,19 @@ class VaultFilewatcher:
         load path via ConventionsLoader and would surface as noise if
         auto-injected.
 
+        On user-edit (is_mist_write=False), sequences three post-sidecar steps
+        per ADR-010 invariant 5:
+        1. mark_authored_by_user_edit — flip authored_by frontmatter field
+        2. regenerator.rebuild_from_path — orphan + re-derive graph subgraph
+        3. invalidation_bus.publish — notify consumers to evict stale caches
+
+        MIST-write origin (is_mist_write=True) skips the invariant-5 steps to
+        avoid recursive rebuild triggered by internal vault writes.
+
         Args:
             path: Absolute path to the vault markdown file.
+            is_mist_write: True when the event originated from a MIST internal
+                write (determined at schedule time from _mist_writes_in_flight).
         """
         if _is_excluded_from_indexing(path):
             logger.debug("VaultFilewatcher: skipping excluded path %s", path)
@@ -490,6 +514,23 @@ class VaultFilewatcher:
             return
 
         self._known_mtimes[path] = mtime
+
+        if is_mist_write:
+            # MIST internal write: sidecar reindex done; skip invariant-5 steps
+            # to avoid recursive rebuild on internal vault writes.
+            return
+
+        # ADR-010 Invariant 5: user-edit sequencing
+        # Step 1 — authored_by writeback (suppress recursive filewatcher fire)
+        self.mark_mist_write(path)
+        try:
+            await self._writer.mark_authored_by_user_edit(Path(path))
+        finally:
+            self.clear_mist_write(path)
+        # Step 2 — graph subgraph rebuild
+        rebuild_result = await self._regenerator.rebuild_from_path(Path(path))
+        # Step 3 — coordinated cache invalidation
+        await self._invalidation_bus.publish(rebuild_result)
 
     async def _do_delete(self, path: str) -> None:
         """Remove a deleted vault file from the sidecar index.

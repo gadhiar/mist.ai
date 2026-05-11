@@ -106,8 +106,54 @@ class FakeSidecarIndex:
 
 
 # ---------------------------------------------------------------------------
+# Stub dependencies for new required constructor params (Task 19)
+# ---------------------------------------------------------------------------
+
+
+class _StubWriter:
+    """Minimal stub for VaultWriter (Task 19 required param)."""
+
+    async def mark_authored_by_user_edit(self, path: Path) -> None:  # noqa: ARG002
+        pass
+
+
+class _StubGraphRegenerator:
+    """Minimal stub for GraphRegenerator (Task 19 required param)."""
+
+    async def rebuild_from_path(self, path: Path):  # noqa: ARG002
+        return None
+
+
+class _StubInvalidationBus:
+    """Minimal stub for InvalidationBus (Task 19 required param)."""
+
+    async def publish(self, event: object) -> None:  # noqa: ARG002
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _make_filewatcher(
+    config: FilewatcherConfig,
+    vault_root: Path,
+    sidecar: FakeSidecarIndex,
+    *,
+    regenerator=None,
+    invalidation_bus=None,
+    writer=None,
+) -> VaultFilewatcher:
+    """Construct VaultFilewatcher with stub Phase 3 deps for pre-Task-19 tests."""
+    return VaultFilewatcher(
+        config,
+        vault_root,
+        sidecar,
+        regenerator=regenerator or _StubGraphRegenerator(),
+        invalidation_bus=invalidation_bus or _StubInvalidationBus(),
+        writer=writer or _StubWriter(),
+    )
 
 
 def _make_config(**kwargs) -> FilewatcherConfig:
@@ -153,7 +199,7 @@ async def fake_sidecar() -> FakeSidecarIndex:
 async def watcher(vault_root: Path, fake_sidecar: FakeSidecarIndex):
     """Started VaultFilewatcher (polling observer, fast debounce). Stopped on teardown."""
     config = _make_config()
-    fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+    fw = _make_filewatcher(config, vault_root, fake_sidecar)
     fw.start(loop=asyncio.get_running_loop())
     yield fw
     fw.stop()
@@ -193,7 +239,7 @@ class TestObserverSelection:
     @pytest.mark.asyncio
     async def test_auto_resolves_to_working_observer(self, vault_root: Path, fake_sidecar):
         config = _make_config(observer_type="auto")
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
 
         fw.start(loop=asyncio.get_running_loop())
         assert fw.is_running is True
@@ -202,7 +248,7 @@ class TestObserverSelection:
     @pytest.mark.asyncio
     async def test_polling_explicit_selection_works(self, vault_root: Path, fake_sidecar):
         config = _make_config(observer_type="polling")
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
 
         fw.start(loop=asyncio.get_running_loop())
         assert fw.is_running is True
@@ -212,7 +258,7 @@ class TestObserverSelection:
     @pytest.mark.skipif(platform.system() != "Linux", reason="inotify is Linux-only")
     async def test_inotify_works_on_linux(self, vault_root: Path, fake_sidecar):
         config = _make_config(observer_type="inotify")
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
 
         fw.start(loop=asyncio.get_running_loop())
         assert fw.is_running is True
@@ -223,7 +269,7 @@ class TestObserverSelection:
         self, vault_root: Path, fake_sidecar
     ):
         config = _make_config(observer_type="totally_invalid")
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
 
         with pytest.raises(FilewatcherError, match="Unknown observer_type"):
             fw.start(loop=asyncio.get_running_loop())
@@ -234,7 +280,7 @@ class TestObserverSelection:
         self, vault_root: Path, fake_sidecar
     ):
         config = _make_config(observer_type="inotify")
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
 
         with pytest.raises(FilewatcherError, match="only available on Linux"):
             fw.start(loop=asyncio.get_running_loop())
@@ -245,7 +291,7 @@ class TestObserverSelection:
         self, vault_root: Path, fake_sidecar
     ):
         config = _make_config(observer_type="fsevents")
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
 
         with pytest.raises(FilewatcherError, match="only available on macOS"):
             fw.start(loop=asyncio.get_running_loop())
@@ -260,7 +306,7 @@ class TestStartStop:
     @pytest.mark.asyncio
     async def test_is_running_true_after_start(self, vault_root: Path, fake_sidecar):
         config = _make_config()
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
 
         fw.start(loop=asyncio.get_running_loop())
         assert fw.is_running is True
@@ -269,7 +315,7 @@ class TestStartStop:
     @pytest.mark.asyncio
     async def test_is_running_false_after_stop(self, vault_root: Path, fake_sidecar):
         config = _make_config()
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
 
         fw.start(loop=asyncio.get_running_loop())
         fw.stop()
@@ -279,7 +325,7 @@ class TestStartStop:
     @pytest.mark.asyncio
     async def test_start_is_idempotent(self, vault_root: Path, fake_sidecar):
         config = _make_config()
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
 
         fw.start(loop=asyncio.get_running_loop())
         fw.start(loop=asyncio.get_running_loop())  # second call is no-op
@@ -290,7 +336,7 @@ class TestStartStop:
     @pytest.mark.asyncio
     async def test_stop_is_idempotent(self, vault_root: Path, fake_sidecar):
         config = _make_config()
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
 
         fw.start(loop=asyncio.get_running_loop())
         fw.stop()
@@ -301,7 +347,7 @@ class TestStartStop:
     @pytest.mark.asyncio
     async def test_stop_before_start_is_safe(self, vault_root: Path, fake_sidecar):
         config = _make_config()
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
 
         # Should not raise
         fw.stop()
@@ -313,7 +359,7 @@ class TestStartStop:
         from watchdog.events import FileModifiedEvent
 
         config = _make_config(debounce_ms=5000)  # long debounce so timers stay pending
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
         fw.start(loop=asyncio.get_running_loop())
 
         # Dispatch a synthetic event to create a pending timer.
@@ -332,7 +378,7 @@ class TestStartStop:
     @pytest.mark.asyncio
     async def test_observer_thread_stops_within_timeout(self, vault_root: Path, fake_sidecar):
         config = _make_config()
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
         fw.start(loop=asyncio.get_running_loop())
         observer = fw._observer
 
@@ -671,7 +717,7 @@ class TestMistWriteCoordination:
 
         # Arrange: tiny TTL so mark expires almost immediately
         config = _make_config(debounce_ms=50)
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
         fw._mist_write_ttl_seconds = 0.05  # 50ms TTL
         fw.start(loop=asyncio.get_running_loop())
 
@@ -709,7 +755,7 @@ class TestMtimeAuditJob:
 
         # Act: start (which scans mtimes)
         config = _make_config(audit_interval_seconds=3600)
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
         fw.start(loop=asyncio.get_running_loop())
         # Give tiny window for startup scan
         await asyncio.sleep(0.05)
@@ -726,7 +772,7 @@ class TestMtimeAuditJob:
         # Arrange: start watcher (baseline mtime captured)
         md_file = _make_md_file(vault_root / "sessions", name="drift.md")
         config = _make_config(audit_interval_seconds=3600)
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
         fw.start(loop=asyncio.get_running_loop())
         await asyncio.sleep(0.05)
 
@@ -749,7 +795,7 @@ class TestMtimeAuditJob:
     ):
         # Arrange: start watcher with no files
         config = _make_config(audit_interval_seconds=3600)
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
         fw.start(loop=asyncio.get_running_loop())
         await asyncio.sleep(0.05)
 
@@ -772,7 +818,7 @@ class TestMtimeAuditJob:
         # Arrange: add a ghost path to _known_mtimes that does not exist on disk
         ghost_path = str(vault_root / "sessions" / "ghost.md")
         config = _make_config(audit_interval_seconds=3600)
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
         fw.start(loop=asyncio.get_running_loop())
         fw._known_mtimes[ghost_path] = int(time.time())
 
@@ -798,7 +844,7 @@ class TestMtimeAuditJob:
         os.symlink(str(symlink_target), str(symlink_path))
 
         config = _make_config(audit_interval_seconds=3600)
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
         fw.start(loop=asyncio.get_running_loop())
 
         # Act: audit should not crash
@@ -931,7 +977,7 @@ class TestPendingPaths:
 
         # Arrange: long debounce so path stays pending
         config = _make_config(debounce_ms=5000)
-        fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+        fw = _make_filewatcher(config, vault_root, fake_sidecar)
         fw.start(loop=asyncio.get_running_loop())
 
         md_file = _make_md_file(vault_root / "sessions", name="pending.md")

@@ -1,9 +1,11 @@
-"""Phase 3 additions to VaultFilewatcher tests — Task 11.
+"""Phase 3 additions to VaultFilewatcher tests — Tasks 11 and 19.
 
-Tests the exclusion of MIST.md, CLAUDE.md, and meta/ from the sidecar
-reindex path. Uses the same FakeSidecarIndex from test_filewatcher.py
-(duplicated here for self-containedness) and drives _do_reindex directly
-so no debounce delay is needed.
+Task 11: Tests the exclusion of MIST.md, CLAUDE.md, and meta/ from the sidecar
+reindex path.
+
+Task 19: Tests the invariant-5 wiring: user-edit detection sequences
+mark_authored_by_user_edit -> regenerator.rebuild_from_path ->
+invalidation_bus.publish. MIST-write origin must bypass all three steps.
 
 All async tests are decorated with @pytest.mark.asyncio (asyncio_mode=strict).
 """
@@ -12,12 +14,24 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
 
 from backend.knowledge.config import FilewatcherConfig
 from backend.vault.filewatcher import VaultFilewatcher
+
+# ---------------------------------------------------------------------------
+# Stub types
+# ---------------------------------------------------------------------------
+
+
+class RebuildResultStub:
+    """Minimal stand-in for RebuildResult — satisfies bus.publish type."""
+
+    pass
+
 
 # ---------------------------------------------------------------------------
 # Fake sidecar index (minimal surface for Task 11)
@@ -77,6 +91,42 @@ class FakeSidecarIndex:
 
 
 # ---------------------------------------------------------------------------
+# Fake dependencies for Task 19
+# ---------------------------------------------------------------------------
+
+
+class FakeVaultWriter:
+    """Minimal test double for VaultWriter (invariant-5 surface only)."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def mark_authored_by_user_edit(self, path: Path) -> None:
+        self.calls.append("authored_by")
+
+
+class FakeGraphRegenerator:
+    """Minimal test double for GraphRegenerator."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def rebuild_from_path(self, path: Path) -> RebuildResultStub:
+        self.calls.append("rebuild")
+        return RebuildResultStub()
+
+
+class FakeInvalidationBus:
+    """Minimal test double for InvalidationBus."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def publish(self, event: object) -> None:
+        self.calls.append("publish")
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -117,10 +167,41 @@ async def fake_sidecar() -> FakeSidecarIndex:
 async def watcher(vault_root: Path, fake_sidecar: FakeSidecarIndex):
     """Started VaultFilewatcher (polling, fast debounce). Stopped on teardown."""
     config = _make_config()
-    fw = VaultFilewatcher(config, vault_root, fake_sidecar)
+    fw = VaultFilewatcher(
+        config,
+        vault_root,
+        fake_sidecar,
+        regenerator=FakeGraphRegenerator(),
+        invalidation_bus=FakeInvalidationBus(),
+        writer=FakeVaultWriter(),
+    )
     fw.start(loop=asyncio.get_running_loop())
     yield fw
     fw.stop()
+
+
+@pytest.fixture
+def filewatcher_setup(tmp_path: Path):
+    """Compose a VaultFilewatcher with all Phase 3 fakes for invariant-5 tests.
+
+    Returns: (fw, sidecar, regenerator, bus, vault_root, writer)
+    """
+    vault_root = tmp_path / "vault"
+    vault_root.mkdir(parents=True)
+    config = _make_config()
+    sidecar = FakeSidecarIndex()
+    regenerator = FakeGraphRegenerator()
+    bus = FakeInvalidationBus()
+    writer = FakeVaultWriter()
+    fw = VaultFilewatcher(
+        config,
+        vault_root,
+        sidecar,
+        regenerator=regenerator,
+        invalidation_bus=bus,
+        writer=writer,
+    )
+    return fw, sidecar, regenerator, bus, vault_root, writer
 
 
 # ---------------------------------------------------------------------------
@@ -184,3 +265,55 @@ class TestFilewatcherExclusions:
         assert (
             fake_sidecar.upsert_file_calls == []
         ), f"Expected no upsert calls for meta/schema.md, got {fake_sidecar.upsert_file_calls}"
+
+
+# ---------------------------------------------------------------------------
+# TestInvariant5Wiring (Task 19)
+#
+# Tests that _do_reindex sequences mark_authored_by_user_edit ->
+# rebuild_from_path -> publish on user-edit, and skips all three steps
+# when is_mist_write=True.
+# ---------------------------------------------------------------------------
+
+
+class TestInvariant5Wiring:
+    def test_user_edit_triggers_authored_by_then_rebuild_then_publish(
+        self,
+        filewatcher_setup,
+    ):
+        """User-edit path must call authored_by, rebuild, publish in order."""
+        fw, sidecar, regenerator, bus, vault_root, writer = filewatcher_setup
+        order: list[str] = []
+        writer.mark_authored_by_user_edit = AsyncMock(
+            side_effect=lambda p: order.append("authored_by")
+        )
+        regenerator.rebuild_from_path = AsyncMock(
+            side_effect=lambda p: order.append("rebuild") or RebuildResultStub()
+        )
+        bus.publish = AsyncMock(side_effect=lambda e: order.append("publish"))
+
+        p = vault_root / "users" / "raj.md"
+        p.parent.mkdir()
+        p.write_text("body", encoding="utf-8")
+        asyncio.run(fw._do_reindex(str(p), is_mist_write=False))
+
+        assert order == ["authored_by", "rebuild", "publish"]
+
+    def test_mist_write_does_not_trigger_invariant5_steps(
+        self,
+        filewatcher_setup,
+    ):
+        """MIST-write origin must not call authored_by, rebuild, or publish."""
+        fw, sidecar, regenerator, bus, vault_root, writer = filewatcher_setup
+        writer.mark_authored_by_user_edit = AsyncMock()
+        regenerator.rebuild_from_path = AsyncMock()
+        bus.publish = AsyncMock()
+
+        p = vault_root / "sessions" / "2026-05-10-test.md"
+        p.parent.mkdir()
+        p.write_text("body", encoding="utf-8")
+        asyncio.run(fw._do_reindex(str(p), is_mist_write=True))
+
+        writer.mark_authored_by_user_edit.assert_not_called()
+        regenerator.rebuild_from_path.assert_not_called()
+        bus.publish.assert_not_called()
