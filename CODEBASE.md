@@ -1,6 +1,6 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-05-06 (continuous-usage hardening in-flight: voice/chat path unification + vault layer completion + canonical write-pattern adoption)
+**Last Updated:** 2026-05-11 (Flutter Desktop decommissioned; mist-frontend/ Tauri repo is canonical FE; continuous-usage hardening + FE/BE integration Wave 2 in flight)
 **Branch:** main (local-only; commits ahead of origin, push gated on workstream completion)
 **Status:** MVP Knowledge Integration COMPLETE; **continuous-usage hardening IN PROGRESS** under workstream `mist-ai-voice-chat-path-unification`. 2026-05-06 V6 deep review surfaced architectural divergence (voice/WebSocket text path used a parallel impl bypassing handle_message, extraction, vault writer) plus four vault-layer gaps. v1 unification landed (handle_message_streaming + StreamEvent types + voice path consumes canonical streaming bridge); 30/30 V6 turns succeeded through unified path with TTS disabled. Three of seven punch-list gaps fixed (Bug A relationship-provenance, model_hash on session frontmatter, durable per-session turn counter); four remaining (user.md C-pattern auto-render, session-end synthesis + status flip, conditional per-turn append, TTS lock decoupling). Ontology v1.1.0 expansion + V6/V7/V8 re-baseline pending after gaps close. ADR-011 codifies the three-bucket vault write pattern (mechanical state mirror / rebuild substrate / curated knowledge) as the canonical rule for future vault decisions.
 
@@ -26,9 +26,11 @@
 - **Vault Layer (Cluster 8, in progress):** `backend/vault/` package with `VaultWriter` (serialized `asyncio.Queue` consumer for session-note appends, identity/user upserts), `VaultSidecarIndex` (sqlite-vec `vec0` + FTS5 + RRF hybrid query over two-tier chunks), `VaultFilewatcher` (watchdog daemon thread with 500ms debounce + asyncio bridge + 60s mtime audit job + MIST-write coordination for user-edit detection), Pydantic frontmatter models for the four `mist-*` note types, and `AuthoredBy` 5-state authorship enum. Wired through `VaultConfig` / `SidecarIndexConfig` / `FilewatcherConfig` on `KnowledgeConfig`. **Phase 5 integrated:** single server-owned VaultWriter built and started in `server.py` lifespan, plumbed through `VoiceProcessor -> ModelManager -> KnowledgeIntegration -> ConversationHandler`, with per-turn vault append after event-store write (failure-isolated per ADR-010 Invariant 6). **Phase 6 integrated:** `vault_note_path` is pre-allocated synchronously at `handle_message` Step 0 (via `_get_or_allocate_vault_path`) and threaded through `_extract_knowledge_async` -> `ExtractionPipeline.extract_from_utterance` -> `CurationPipeline.curate_and_store` -> `CurationGraphWriter.write`. Every upserted entity now emits a `DERIVED_FROM` edge to a `:__Provenance__:VaultNote {path}` node (MERGE-idempotent on path). New `VaultNote` ontology node type registered as bridging; `DERIVED_FROM` edge extended to permit `VaultNote` targets and `MistIdentity` sources. The graph is now formally rebuildable from the vault. **Phase 8 integrated:** rebuild-determinism stamps. New `RebuildStamps` frozen dataclass (`ontology_version`, `extraction_version`, `model_hash`) constructed by `build_curation_pipeline` from `KnowledgeConfig` and injected into `CurationGraphWriter`. Every `DERIVED_FROM`->`VaultNote` edge now carries the three stamps + `derived_at` timestamp on both ON CREATE and ON MATCH branches so re-extractions land the current stamps. New config fields `KnowledgeConfig.extraction_version` (default `"2026-04-17-r1"`, env `EXTRACTION_VERSION`) and `KnowledgeConfig.model_hash` (default `"gemma-4-e4b-q5-k-m-carteakey-full-v1"`, env `MIST_MODEL_HASH`). **Phase 9 integrated:** retrieval routing + slug improvement. QueryClassifier extended with a `historical` intent (regex patterns matching "what did we discuss"/"remember when"/"last time"/etc.) routed to the vault sidecar; `hybrid` now produces three-way RRF merges across graph + vector + vault sidecar via `_merge_rrf_three_way`. New `QueryIntentConfig` fields per ADR-010 weight table (`rrf_vault_weight=0.4` hybrid; historical-specific `0.2/0.1/0.7` graph/vector/vault). `KnowledgeRetriever` accepts an optional `vault_sidecar: SidecarIndexProtocol` plumbed top-down through `VoiceProcessor -> ModelManager -> KnowledgeIntegration -> build_conversation_handler -> build_knowledge_retriever`; `_vault_sidecar_retrieve` wraps `query_hybrid` and converts vec0+FTS5 results to `RetrievedFact` rows. Session slug derivation now extracts significant words from the FIRST USER UTTERANCE (stopwords + short tokens filtered, top 5 retained) with a 4-char SHA-256(session_id) suffix for guaranteed per-session uniqueness — produces filenames like `2026-04-22-vault-architecture-mist-a3f1.md` instead of opaque `2026-04-22-<sanitized-session-id>.md`. **Phase 10 integrated:** seed vault bootstrap (absorbs Cluster 7 migration). `mist_admin seed` now extends to `bootstrap_vault_from_seed` (async helper in `backend/knowledge/admin.py`) which calls `VaultWriter.upsert_identity` (rendered from seeded MistTraits/Capabilities/Preferences) and `VaultWriter.upsert_user` (rendered from the seeded user dict via `_build_user_body_markdown`). After the writes, `emit_seed_vault_provenance` MERGE-creates two `:__Provenance__:VaultNote` nodes (one per bootstrap note) and emits per-entity `DERIVED_FROM` edges from each seeded entity (mist-identity + traits/caps/prefs -> identity/mist.md; user + anchor entities -> users/<id>.md). Edges carry `event_id='seed'` literal (no Phase 8 stamps -- seed entities are deterministic via re-run, not extraction-rebuild). New `--no-vault-bootstrap` flag opts out; bootstrap also auto-skips when `config.vault.enabled` is False. Filewatcher + sidecar share the same lifecycle. Phase 11 (CLI subcommands `vault-status` / `vault-reindex` / `vault-rebuild` / `vault-migrate`) is next.
 - **Tests:** **1488 unit tests + 1 platform-skipped + 3 xfailed** (vs 1066 Cluster 1 baseline = +422; post-MVP additive +44: A1 ontology invariants +8, A2 validator constraints +8 + ontology-consistency guard +2, B1 scorer drift guards +7, plus the vault-phase test counts through Phase 12). Run inside container: `docker compose exec mist-backend python -m pytest tests/unit/`.
 
-### Frontend (Flutter)
-- **Status:** IN DEVELOPMENT (unchanged since 2026-04-08). Cluster 1/8 work is backend-focused; frontend touches parked in `mist-ai-frontend-audit-remediation` (status: parked).
-- Navigation rail (72/200px), log viewer (filter/search/grouping, 5K ring buffer), binary audio playback via flutter_soloud.
+### Frontend (Tauri 2.x + React 19 + react-three-fiber)
+- **Repo:** separate at `D:/Users/rajga/mist-frontend/` (no remote configured; intentional per `feedback_no_push_docs`).
+- **Status:** Production-ready as of 2026-05-08 spatial-app reframe. FE/BE integration Wave 1 shipped 2026-05-10 (handshake, heartbeat, state_cycle, turn-streaming, vad_status, log streaming, health_status, error discrimination) on branch `integration/v1`. Subsequent waves cover backend tool-call events, cards, graph_subgraph, and frontend visual polish.
+- **Protocol contracts:** ADR-016 (LLM-mediated frontend tool calls; BE-decided routing) + ADR-017 (WebSocket message contract; discriminated events, lifecycle, error model). Both live in `knowledge-vault/Decisions/`.
+- **Flutter Desktop (`mist_desktop/`):** Decommissioned 2026-05-11. Git history at commit `e18c092` preserves the Flutter source. Workstream `mist-ai-frontend-audit-remediation` archived under `knowledge-vault/_archive/legacy-flutter-frontend/`.
 
 ### Code Quality
 - Full pre-commit suite: black, ruff (D102 strict), bandit, codespell, AI-slop pattern checker, trim whitespace, fix end-of-files, large file + merge conflict + private key detection.
@@ -212,7 +214,7 @@ backend/
 ```
 
 ### Frontend Structure
-Unchanged since 2026-04-08. See `mist_desktop/` directory for Flutter/Riverpod/flutter_soloud structure.
+Frontend lives in a separate repo at `D:/Users/rajga/mist-frontend/` (Tauri 2.x + React 19 + react-three-fiber). See that repo for its internal layout. Backend integration is contract-only via ADR-016 + ADR-017.
 
 ---
 
@@ -293,10 +295,11 @@ VECTOR_STORE_DATA_DIR=/app/data/vector_store
 - SQLite (event store Layer 1)
 - Pydantic v2 (LLMRequest/Response + config)
 
-### Frontend
-- Flutter 3.24+ / Dart 3.10+
-- Riverpod 3.x (state management)
-- web_socket_channel, record, flutter_soloud, audioplayers
+### Frontend (separate repo at `D:/Users/rajga/mist-frontend/`)
+- Tauri 2.x (cross-platform desktop shell)
+- React 19 + TypeScript strict
+- three.js + @react-three/fiber + drei (3D composition)
+- Vite (build), native WebSocket via Tauri shell
 
 ---
 
@@ -338,7 +341,7 @@ python scripts/check_ai_slop.py --critical-only
 pre-commit run --all-files
 black backend/
 ruff check backend/ --fix
-cd mist_desktop && dart format . && flutter analyze
+# Frontend formatting / lint lives in mist-frontend repo (npm scripts).
 ```
 
 ---
@@ -433,7 +436,7 @@ Each cluster validates acceptance via re-running the V4 (5-utterance smoke), V5 
 2. `mist-ai-context-compression-multi-session` — post-MVP (multi-session context compression, Vault windowing, RRF reranking tuning).
 3. `mist-ai-frontend-audit-remediation` — parked; Critical + High items in backlog (MIS-77).
 4. `mist-ai-mist-personality-growth` — parked (growth engine over Vault identity edits).
-5. Voice Profiles / Settings screens in Flutter (frontend follow-on once backend is stable).
+5. Voice Profiles / Settings affordances in the Tauri frontend (separate repo; follow-on once backend integration waves stabilize).
 
 ### Post-MVP ontology / extraction follow-ups
 1. **End-to-end edge production for new types.** V6 produced `Document / Date / Metric` nodes but no `OCCURRED_ON / HAS_METRIC / REFERENCES_DOCUMENT / PRECEDED_BY` edges -- build a targeted V8 probe set with utterances that explicitly motivate each new edge type and verify pipeline lands them.
@@ -445,7 +448,7 @@ Each cluster validates acceptance via re-running the V4 (5-utterance smoke), V5 
 1. Command Center architecture (orchestrating agentic teams)
 2. Vision integration (Gemma 4 vision)
 3. GTX 1070 dual-GPU addition (parked post-voice-integration)
-4. Mobile app (Flutter iOS/Android)
+4. Mobile app (TBD; Tauri Mobile or separate native shell — out of scope for current roadmap)
 
 ---
 
@@ -467,7 +470,7 @@ Each cluster validates acceptance via re-running the V4 (5-utterance smoke), V5 
 - **KNOWN_ISSUES.md** — 48 P3 items from backend audit
 - **TESTING.md** — Test conventions
 - **tests/CLAUDE.md** — Backend test AI guidance
-- **mist_desktop/test/CLAUDE.md** — Flutter test AI guidance
+- Frontend test guidance lives in the mist-frontend repo
 
 ### Configuration
 - **.env** — Environment variables (never commit)

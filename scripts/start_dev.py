@@ -1,15 +1,18 @@
-"""Start the MIST.AI development stack via Docker Compose.
+"""Start the MIST.AI backend development stack via Docker Compose.
 
 Usage:
-    python scripts/start_dev.py              # Start full stack + Flutter frontend
-    python scripts/start_dev.py --deps-only  # Start backend stack only (no Flutter)
+    python scripts/start_dev.py              # Start backend stack
     python scripts/start_dev.py --stop       # Stop all services
     python scripts/start_dev.py --logs       # Tail backend logs
     python scripts/start_dev.py --restart    # Restart backend container (pick up code changes)
+    python scripts/start_dev.py --build      # Rebuild images before starting
+
+The MIST frontend lives in a separate repository at ./mist-frontend/
+(Tauri 2.x + React 19 + react-three-fiber). Start it separately with `npm run dev`
+from that directory. It connects to this backend via WebSocket per ADR-016 / ADR-017.
 
 Prerequisites:
     - Docker Desktop with NVIDIA Container Toolkit
-    - Flutter SDK on PATH (for frontend)
 """
 
 import argparse
@@ -154,27 +157,6 @@ def pull_model(model: str = "qwen2.5:7b-instruct") -> bool:
         return False
 
 
-def start_frontend() -> subprocess.Popen | None:
-    """Start the Flutter frontend (native Windows)."""
-    import shutil
-    from pathlib import Path
-
-    print("  Launching Flutter frontend...")
-    flutter_cmd = shutil.which("flutter") or r"C:\Users\rajga\flutter\bin\flutter"
-    project_root = Path(__file__).resolve().parent.parent
-    try:
-        proc = subprocess.Popen(
-            [flutter_cmd, "run", "-d", "windows"],
-            cwd=str(project_root / "mist_desktop"),
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
-        )
-        print("  [OK] Flutter frontend launching (mist_desktop)")
-        return proc
-    except FileNotFoundError:
-        print("  [FAIL] flutter not found. Is Flutter SDK on PATH?")
-        return None
-
-
 def tail_logs() -> None:
     """Tail backend container logs."""
     with contextlib.suppress(KeyboardInterrupt):
@@ -196,16 +178,11 @@ def restart_backend() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="MIST.AI dev stack manager (Docker)")
+    parser = argparse.ArgumentParser(description="MIST.AI backend dev stack manager (Docker)")
     parser.add_argument("--stop", action="store_true", help="Stop all services")
     parser.add_argument("--logs", action="store_true", help="Tail backend logs")
     parser.add_argument("--restart", action="store_true", help="Restart backend container")
     parser.add_argument("--build", action="store_true", help="Rebuild images before starting")
-    parser.add_argument(
-        "--deps-only",
-        action="store_true",
-        help="Start backend stack only, no Flutter frontend",
-    )
     args = parser.parse_args()
 
     if args.stop:
@@ -221,24 +198,24 @@ def main() -> None:
         return
 
     print("=" * 50)
-    print("  MIST.AI Development Stack (Docker)")
+    print("  MIST.AI Backend Development Stack (Docker)")
     print("=" * 50)
     print()
 
     # 1. Docker
-    print("[1/5] Checking Docker...")
+    print("[1/4] Checking Docker...")
     if not check_docker():
         sys.exit(1)
 
     # 2. Start stack
-    print("[2/5] Starting services...")
+    print("[2/4] Starting services...")
     if not start_stack(build=args.build):
         sys.exit(1)
 
     # 3. Wait for services
     #    Neo4j and Ollama: port checks (fast, no model loading).
     #    Backend: wait for Docker healthcheck (models take ~90s to load).
-    print("[3/5] Waiting for services...")
+    print("[3/4] Waiting for services...")
     neo4j_ok = wait_for_service("Neo4j", "localhost", 7687, max_wait=60)
     ollama_ok = wait_for_service("Ollama", "localhost", 11434, max_wait=30)
     print("  Backend loading models (Whisper + Chatterbox + LLM)...")
@@ -246,7 +223,7 @@ def main() -> None:
 
     # 4. Model
     if ollama_ok:
-        print("[4/5] Checking LLM model...")
+        print("[4/4] Checking LLM model...")
         pull_model()
 
     if not (neo4j_ok and ollama_ok and backend_ok):
@@ -257,75 +234,22 @@ def main() -> None:
         print("=" * 50)
         sys.exit(1)
 
-    if args.deps_only:
-        print()
-        print("=" * 50)
-        print("  Backend stack ready.")
-        print()
-        print("  Neo4j:    bolt://localhost:7687 (browser: http://localhost:7474)")
-        print("  Ollama:   http://localhost:11434")
-        print("  Backend:  ws://localhost:8001/ws")
-        print()
-        print("  Logs:     python scripts/start_dev.py --logs")
-        print("  Restart:  python scripts/start_dev.py --restart")
-        print("  Stop:     python scripts/start_dev.py --stop")
-        print("=" * 50)
-        return
-
-    # 5. Frontend
-    print("[5/5] Starting frontend...")
-    frontend_proc = start_frontend()
-    frontend_ok = frontend_proc is not None
-
     print()
     print("=" * 50)
-    print("  Stack running." if frontend_ok else "  Backend running (frontend failed).")
+    print("  Backend stack ready.")
     print()
-    print("  Neo4j:    bolt://localhost:7687")
+    print("  Neo4j:    bolt://localhost:7687 (browser: http://localhost:7474)")
     print("  Ollama:   http://localhost:11434")
     print("  Backend:  ws://localhost:8001/ws")
-    print("  Frontend: Flutter desktop" if frontend_ok else "  Frontend: [NOT RUNNING]")
     print()
-    print("  Restart backend: python scripts/start_dev.py --restart")
-    print("  View logs:       python scripts/start_dev.py --logs")
-    print("  Stop all:        python scripts/start_dev.py --stop")
-    print("  Run tests:       docker compose exec mist-backend pytest tests/unit/ -v")
+    print("  Frontend: separate repo at ./mist-frontend/")
+    print("            Start with `npm run dev` from that directory.")
+    print()
+    print("  Logs:     python scripts/start_dev.py --logs")
+    print("  Restart:  python scripts/start_dev.py --restart")
+    print("  Stop:     python scripts/start_dev.py --stop")
+    print("  Tests:    docker compose exec mist-backend pytest tests/unit/ -v")
     print("=" * 50)
-
-    # Keep alive while Flutter runs
-    if frontend_proc:
-        import atexit
-        import contextlib
-
-        def cleanup():
-            print()
-            print("Shutting down...")
-            with contextlib.suppress(OSError):
-                frontend_proc.terminate()
-            with contextlib.suppress(Exception):
-                frontend_proc.wait(timeout=5)
-            stop()
-
-        atexit.register(cleanup)
-        if sys.platform == "win32":
-            import ctypes
-
-            kernel32 = ctypes.windll.kernel32
-
-            def console_handler(event):
-                if event in (0, 2):
-                    cleanup()
-                    return True
-                return False
-
-            handler_func = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_ulong)(console_handler)
-            kernel32.SetConsoleCtrlHandler(handler_func, True)
-
-        try:
-            while frontend_proc.poll() is None:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            pass
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 A transparent, locally-run cognitive architecture with persistent memory, autonomous reasoning, and real-time voice interaction.
 
-**Status:** Fully functional voice conversation system with knowledge graph integration and autonomous tool usage. Desktop UI in development.
+**Status:** Fully functional voice conversation system with knowledge graph integration and autonomous tool usage. Spatial frontend in active development (separate repo, see Frontend section below).
 
 ## What Is This?
 
@@ -17,26 +17,27 @@ MIST.AI is a cognitive architecture built from first principles. It combines a l
 
 ```
 +------------------------------------------------------------------+
-|  Flutter Desktop (mist_desktop/)                                  |
-|  - Windows/macOS/Linux support                                    |
-|  - Voice recording and playback                                   |
-|  - Real-time conversation UI                                      |
-|  - WebSocket communication                                        |
+|  Tauri Frontend (separate repo: mist-frontend/ (nested in this repo))    |
+|  - Tauri 2.x + React 19 + react-three-fiber                      |
+|  - Spatial composition (forms, ring, graph, cards)               |
+|  - Voice + text input; streaming text + binary audio output      |
+|  - WebSocket per ADR-016 (BE-mediated tool calls)                |
+|                   + ADR-017 (message contract)                    |
 +------------------------------+-----------------------------------+
                                | WebSocket (Port 8001)
 +------------------------------+-----------------------------------+
 |  Backend Server (FastAPI)                                         |
 |  +------------------------------------------------------------+  |
 |  |  Voice Pipeline                                             |  |
-|  |  VAD (Silero) -> STT (Whisper) -> LLM (Qwen 2.5 7B) -> TTS (Sesame CSM-1B)  |
+|  |  VAD (Silero) -> STT (Whisper) -> LLM (Gemma 4 E4B)         |  |
+|  |                                -> TTS (Chatterbox Turbo)    |  |
 |  +------------------------------------------------------------+  |
 |  +------------------------------------------------------------+  |
-|  |  Knowledge System (Neo4j)                                   |  |
-|  |  - Entity extraction (LLMGraphTransformer)                  |  |
-|  |  - Vector search (Sentence Transformers, 384-dim)           |  |
-|  |  - Multi-hop graph traversal                                |  |
-|  |  - Auto-RAG document injection                              |  |
-|  |  - Autonomous tool usage (extract / query)                  |  |
+|  |  Knowledge System (four-layer per ADR-010)                  |  |
+|  |  - Event store (SQLite, raw turn evidence)                  |  |
+|  |  - Vault (mist-memory/ markdown, canonical history)         |  |
+|  |  - Graph (Neo4j, MIST's reasoning substrate)                |  |
+|  |  - Sidecar index (sqlite-vec + FTS5, hybrid retrieval)      |  |
 |  +------------------------------------------------------------+  |
 +------------------------------------------------------------------+
 ```
@@ -45,95 +46,101 @@ MIST.AI is a cognitive architecture built from first principles. It combines a l
 
 **Backend (Python 3.11+)**
 
-| Component   | Technology                          |
-|-------------|-------------------------------------|
-| LLM         | Qwen 2.5 7B Instruct via Ollama    |
-| STT         | OpenAI Whisper (base, 1.4GB)        |
-| TTS         | Sesame CSM-1B (streaming synthesis) |
-| VAD         | Silero VAD                          |
-| Server      | FastAPI + Uvicorn + WebSockets      |
-| Database    | Neo4j 5.x                          |
-| Embeddings  | Sentence Transformers (all-MiniLM-L6-v2) |
-| Graph       | LangChain LLMGraphTransformer       |
+| Component   | Technology                                  |
+|-------------|---------------------------------------------|
+| LLM         | Gemma 4 E4B Q5_K_M via llama-server         |
+| STT         | OpenAI Whisper                              |
+| TTS         | Chatterbox Turbo (zero-shot voice cloning)  |
+| VAD         | Silero VAD                                  |
+| Server      | FastAPI + Uvicorn + WebSockets              |
+| Database    | Neo4j 5.x (knowledge graph)                 |
+| Vector idx  | sqlite-vec + FTS5 (vault sidecar)           |
+| Embeddings  | Sentence Transformers (all-MiniLM-L6-v2)    |
+| Container   | Docker Compose (CUDA 12.4 + Python 3.11)    |
 
-**Frontend (Flutter 3.24+ / Dart 3.10+)**
+**Frontend (separate repo at `mist-frontend/ (nested in this repo)`)**
 
-| Component        | Technology               |
-|------------------|--------------------------|
-| State management | Riverpod 3.x             |
-| Audio            | record + audioplayers     |
-| Communication    | web_socket_channel        |
-| UI               | Material Design 3         |
+| Component        | Technology                              |
+|------------------|-----------------------------------------|
+| Shell            | Tauri 2.x (cross-platform desktop)      |
+| Framework        | React 19 + TypeScript strict            |
+| 3D rendering     | three.js + @react-three/fiber + drei    |
+| Build            | Vite                                    |
+| Communication    | Native WebSocket via Tauri shell        |
+
+Connect: backend exposes `ws://localhost:8001/ws`; frontend connects with the protocol documented in ADR-016 (backend-mediated tool calls) and ADR-017 (WebSocket message contract).
 
 **Requirements:** Windows 11 / macOS / Linux, NVIDIA GPU with 12GB+ VRAM, CUDA 12.4+, 32GB RAM
 
 ## Quick Start
 
+**Backend (this repo):**
+
 ```bash
-# Clone and set up
+# Clone and configure
 git clone https://github.com/gadhiar/mist.ai.git
 cd mist.ai
+cp .env.example .env         # Edit Neo4j credentials, model paths, TTS toggle
 
-# Pull the LLM
-ollama pull qwen2.5:7b-instruct
+# Start the Docker stack (backend + Neo4j + llama-server)
+docker compose up -d
 
-# Python environment
-python -m venv venv
-venv\Scripts\activate        # Windows
-# source venv/bin/activate   # macOS/Linux
-pip install -r requirements.txt
+# Or via the dev script
+python scripts/start_dev.py
 
-# Configure .env (Neo4j credentials, model selection, TTS toggle)
-cp .env.example .env         # Edit with your settings
-
-# Initialize Neo4j
-neo4j start
-python initialize_schema.py
-
-# Start backend
-python backend/server.py     # Listens on ws://localhost:8001
-
-# Flutter frontend
-cd mist_desktop && flutter pub get && flutter run -d windows
+# Verify backend is up
+docker compose logs -f mist-backend
 ```
+
+**Frontend (separate repo):**
+
+The frontend lives at `mist-frontend/ (nested in this repo)` (Tauri 2.x + React 19 + r3f). See that repo's own README for setup. In short:
+
+```bash
+cd mist-frontend
+npm install
+npm run dev    # Vite dev server on localhost:1420 + Tauri shell
+```
+
+The frontend connects to this backend automatically at `ws://localhost:8001/ws` once both are running.
 
 ## Key Capabilities
 
 - Real-time voice conversation with natural interruption support (<100ms)
 - Persistent knowledge graph -- entities, relationships, and provenance tracked in Neo4j
-- Autonomous tool usage -- the LLM decides when to extract knowledge or query the graph
-- Auto-RAG -- automatic document injection for context-aware responses
+- Vault layer (ADR-010) -- canonical markdown corpus with user-editable history
+- Autonomous tool usage -- the LLM decides when to query the graph
+- Hybrid retrieval (graph + vector + RRF merge) with intent-driven routing
 - Gap-free audio streaming with voice activity detection
 - Full pipeline: Speech -> Transcription -> LLM -> Audio synthesis
+- Spatial frontend with WebGL-driven 60fps composition (separate Tauri repo)
 
 ## Project Status
 
 **Completed**
 
-- WebSocket backend server
-- Voice pipeline (VAD -> STT -> LLM -> TTS)
-- Real-time audio streaming with interruption support
-- Knowledge graph integration (Neo4j)
-- Entity extraction (LLMGraphTransformer)
-- Hybrid retrieval (vector search + graph traversal)
-- Autonomous tool usage (MCP-like pattern)
-- Auto-RAG document injection
-- Provenance tracking (utterance -> entity mapping)
-- Flutter desktop app scaffolding with WebSocket integration
+- WebSocket backend server with binary audio protocol
+- Voice pipeline (VAD -> STT -> LLM -> TTS) with streaming parallelism (~4-5s TTFA)
+- Knowledge graph integration (Neo4j) with ADR-009 provenance separation
+- Entity extraction + curation pipeline (ontology v1.0.0+)
+- Hybrid retrieval (vector + graph + RRF) with intent classifier
+- Vault layer (ADR-010) with sidecar index + filewatcher
+- MIST.md auto-load primitive (ADR-014)
+- WebSocket FE/BE protocol contract (ADR-016 + ADR-017)
 - CLI voice client
+- Spatial Tauri frontend (separate repo, production-ready 2026-05-08)
 
 **In Progress**
 
-- Flutter UI polish and audio playback integration
-- Knowledge graph visualization in Flutter
-- Rich content support (markdown, images, links)
+- FE/BE integration: Wave 1 shipped 2026-05-10 (handshake, heartbeat, state_cycle, turn-streaming, error discrimination, vad_status, log streaming, health_status); subsequent waves cover tool-call events, cards, graph_subgraph, visual polish
+- Cognitive substrate (ADR-012 v2 in design)
+- Conversation summary layer (ADR-018 candidate)
 
 **Planned**
 
-- Vision integration (Qwen 2.5 Vision)
-- Meta-reasoning layer for explainability
-- Strategic cloud delegation
-- Mobile app (Flutter iOS/Android)
+- Vision integration (multimodal Gemma)
+- Hook taxonomy + dispatcher (ADR-019 candidate)
+- Settings hierarchy and spec/config split (ADR-020, proposed)
 
 ## Project Structure
 
@@ -142,18 +149,22 @@ See [REPOSITORY_STRUCTURE.md](REPOSITORY_STRUCTURE.md) for the full tree. Key di
 ```
 mist.ai/
   backend/              # Python -- FastAPI server, voice pipeline, knowledge system
-  mist_desktop/         # Flutter -- cross-platform desktop UI
-  dependencies/csm/     # Modified Sesame CSM TTS fork (Apache 2.0)
+  mist-memory/          # ADR-010 vault layer (sessions, identity, users, decisions)
+  data/                 # Runtime artifacts (event store, sidecar SQLite, snapshots)
+  dependencies/csm/     # Legacy Sesame CSM TTS fork (Apache 2.0); Chatterbox Turbo is current
   docs/                 # Guides, setup, architecture decisions
 ```
+
+The frontend repo at `mist-frontend/ (nested in this repo)` has its own structure (Vite + Tauri + React).
 
 ## Documentation
 
 - [Repository Structure](REPOSITORY_STRUCTURE.md)
 - [Contributing](CONTRIBUTING.md)
-- [Knowledge Integration Quickstart](docs/QUICKSTART_KNOWLEDGE_INTEGRATION.md)
-- [Neo4j Query Reference](docs/NEO4J_QUERIES.md)
-- [Windows Dev Setup](docs/guides/windows_dev_setup.md)
+- [Codebase Status](CODEBASE.md)
+- [Testing Guide](TESTING.md)
+- [Known Issues](KNOWN_ISSUES.md)
+- ADRs live under `docs/decisions/` (project-scoped) and `knowledge-vault/Decisions/` (cross-project + integration ADRs)
 
 ## License
 
@@ -161,7 +172,8 @@ MIT -- see [LICENSE](LICENSE).
 
 ## Acknowledgments
 
-- [Ollama](https://ollama.ai/) -- local LLM infrastructure
-- [Sesame CSM](https://huggingface.co/sesame-ai/csm-1b) -- conversational TTS
+- [llama.cpp](https://github.com/ggerganov/llama.cpp) -- local LLM inference
+- [Chatterbox](https://huggingface.co/ResembleAI/chatterbox) -- conversational TTS
 - [Neo4j](https://neo4j.com/) -- graph database
-- [LangChain](https://langchain.com/) -- LLM framework and graph transformers
+- [LangChain](https://langchain.com/) -- ontology-constrained extraction
+- [sqlite-vec](https://github.com/asg017/sqlite-vec) -- vector indexing

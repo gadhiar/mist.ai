@@ -67,7 +67,7 @@ jobs:
 
       - name: Spell check with codespell
         run: |
-          codespell --skip="*.git,*.venv,venv,*.pyc,*.egg-info,*.lock,mist_desktop,dependencies" --ignore-words-list="crate,nd,te,thre,hass,bloc,lod"
+          codespell --skip="*.git,*.venv,venv,*.pyc,*.egg-info,*.lock,dependencies" --ignore-words-list="crate,nd,te,thre,hass,bloc,lod"
           if [ $? -ne 0 ]; then
             echo "Spelling errors found. Review output above."
             exit 1

@@ -608,7 +608,7 @@ class VoiceProcessor:
                     spawn_with_context(self._process_conversation_turn, pending_input)
 
     def process_complete_audio(self, audio_data, sample_rate):
-        """Process complete audio from client (no VAD needed - Flutter controls recording)."""
+        """Process complete audio from client (no VAD needed; the client controls recording window)."""
         log_timestamp(f"Processing complete audio: {len(audio_data)} samples @ {sample_rate}Hz")
 
         # Transcribe and process immediately in a new thread

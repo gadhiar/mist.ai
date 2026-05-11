@@ -25,9 +25,6 @@ dependencies/csm/test_output/
 data/vector_store/
 data/chatterbox_eval/
 
-# Flutter frontend (not needed in backend container)
-mist_desktop/
-
 # Python caches
 __pycache__/
 *.pyc

@@ -1,34 +1,38 @@
 # MIST.AI - Repository Structure
 
-Production-ready repository with Flutter desktop frontend + Python backend.
+Python backend repository. Frontend is in a separate repo at `./mist-frontend/ (nested in this repo)` (Tauri 2.x + React 19 + react-three-fiber).
 
 ---
 
 ## Root Directory Files
 
 ### Configuration
-- `.env` - Environment variables (Neo4j, API keys)
-- `.python-version` - Python version specification
+- `.env` - Environment variables (Neo4j, model paths, feature flags)
+- `.env.example` - Template with all configurable variables
+- `.python-version` - Python version (3.11)
 - `requirements.txt` - Python dependencies
+- `pyproject.toml` - Tool config (black, ruff, bandit, codespell, pytest)
+- `docker-compose.yml` + `docker-compose.override.yml` - 3-service stack (backend + Neo4j + llama-server)
+- `.pre-commit-config.yaml` - Pre-commit hook chain
+- `.gitignore`, `.dockerignore`, `.gitattributes` - VCS / container ignores
 
 ### Documentation
-- `README.md` - Main project documentation
-- `E2E_TEST_GUIDE.md` - End-to-end testing instructions
-- `knowledge-vault/02-Sessions/Knowledge-Integration-Status.md` - Knowledge integration status
-- `QUICKSTART_KNOWLEDGE_INTEGRATION.md` - Quick start guide
-- `NEO4J_QUERIES.md` - Useful Neo4j queries reference
-- `LICENSE` - License file
+- `README.md` - Project overview and quick start
+- `CLAUDE.md` - AI integration guide and project rules
+- `CODEBASE.md` - Current codebase status, recent changes, active work
+- `CONTRIBUTING.md` - Contribution guide and code standards
+- `TESTING.md` - Test conventions
+- `KNOWN_ISSUES.md` - P3 backlog from audits
+- `REPOSITORY_STRUCTURE.md` - This file
+- `LICENSE` - MIT license
 - `NOTICE` - Attribution notices
 
-### Utility Scripts
-- `regenerate_graph.py` - Rebuild knowledge graph from utterances
-- `initialize_schema.py` - Initialize Neo4j schema (indexes, constraints)
-- `wipe_neo4j.py` - Clean Neo4j database
-- `export_graph.py` - Export graph structure for analysis
-
-### Test Scripts
-- `test_neo4j_connection.py` - Quick Neo4j connection test
-- `test_conversation_handler.py` - Test conversation flow with knowledge integration
+### Scripts (`scripts/`)
+- `start_dev.py` - Docker compose stack manager (start / stop / restart / logs)
+- `mist_admin.py` - Admin CLI (seed, replay, graph-stats, graph-reset, vault-rebuild, etc.)
+- `check_ai_slop.py` - AI-slop pattern checker (used by pre-commit)
+- `seed_data.yaml` - Knowledge graph seed entities and relationships
+- `eval_harness/` - Phase 3 evaluator + scorers for V1-V8 gauntlets
 
 ---
 
@@ -36,361 +40,270 @@ Production-ready repository with Flutter desktop frontend + Python backend.
 
 ```
 backend/
-├── server.py                    # Main WebSocket server (port 8001)
-├── config.py                    # Voice/system configuration
-├── voice_processor.py           # Voice processing pipeline
-├── knowledge_config.py          # Knowledge graph configuration
-│
-├── voice_models/
-│   └── model_manager.py         # ML models + knowledge integration
+├── server.py                    # FastAPI WebSocket server (port 8001)
+├── voice_processor.py           # Voice pipeline orchestration
+├── audio_protocol.py            # MIST binary audio frame builder
+├── log_handler.py               # WebSocketLogHandler with rate limiter
+├── request_context.py           # ContextVar propagation
+├── sentence_detector.py         # Streaming TTS sentence boundary detection
+├── debug_jsonl_logger.py        # 5-phase JSONL diagnostic sink
+├── factories.py                 # Composition root (DI wiring)
+├── errors.py                    # MistError hierarchy
+├── interfaces.py                # Protocols (Embedding, VectorStore, GraphConnection, etc.)
 │
 ├── chat/                        # Conversation handling
-│   ├── __init__.py
-│   ├── conversation_handler.py  # MCP-like autonomous tool use
-│   └── knowledge_integration.py # Integration bridge for voice system
+│   ├── conversation_handler.py  # Pass-loop + persona + budget + post-filter
+│   ├── knowledge_integration.py # Bridge to voice system
+│   ├── mist_context.py          # Identity / persona renderer
+│   ├── slop_detector.py         # AI-slop pattern filter
+│   └── context_budget.py        # Cluster 6 ContextBudgetPlanner
 │
-└── knowledge/                   # Knowledge graph system
-    ├── config.py               # Extraction configuration
-    ├── models.py               # Data models (Entity, Utterance, etc.)
-    │
-    ├── extraction/             # Ontology-constrained extraction pipeline (stages 1-6)
-    │   ├── pipeline.py          # ExtractionPipeline orchestrator
-    │   ├── ontology_extractor.py # Single LLM call with ontology constraints
-    │   ├── preprocessor.py      # Context assembly (no LLM)
-    │   ├── confidence.py        # Hedge detection, third-party cap
-    │   ├── temporal.py          # Relative to absolute date resolution
-    │   ├── normalizer.py        # Canonical IDs, alias + embedding dedup
-    │   └── validator.py         # Schema + constraint validation
-    │
-    ├── curation/               # Per-conversation curation (stages 7-8)
-    │   ├── pipeline.py          # CurationPipeline orchestrator
-    │   ├── confidence.py        # Confidence arithmetic
-    │   ├── deduplication.py     # 3-tier entity dedup against graph
-    │   ├── conflict_resolver.py # Supersession, contradiction, progression
-    │   └── graph_writer.py      # MERGE upserts + provenance
-    │
-    ├── retrieval/              # Knowledge retrieval
-    │   └── knowledge_retriever.py
-    │
-    ├── storage/                # Neo4j storage
-    │   └── graph_store.py
-    │
-    └── embeddings/             # Vector embeddings
-        └── embedding_generator.py
+├── llm/                         # LLM provider abstraction
+│   ├── provider.py              # Abstract StreamingLLMProvider
+│   ├── llama_server_provider.py # Primary (Gemma 4 E4B via llama.cpp)
+│   ├── ollama_provider.py       # Fallback
+│   ├── instrumented_provider.py # Cluster 5 telemetry wrapper
+│   └── models.py                # LLMRequest / LLMResponse / ToolCall (Pydantic)
+│
+├── knowledge/                   # Knowledge graph system
+│   ├── config.py                # KnowledgeConfig + nested configs
+│   ├── models.py                # RetrievalResult, QueryIntent, etc.
+│   ├── embeddings.py            # Sentence Transformers all-MiniLM-L6-v2
+│   ├── extraction/              # 6-stage extraction + subject-scope classifier
+│   ├── curation/                # Dedup, conflict resolver, graph writer, regenerator
+│   ├── ingestion/               # Markdown ingestion for vector store
+│   ├── retrieval/               # Hybrid retrieval (graph + vector + RRF)
+│   ├── regeneration/            # No-curation replay
+│   └── storage/                 # Neo4j executor, graph store, connection
+│
+└── vault/                       # ADR-010 vault layer (Cluster 8)
+    ├── conventions.py           # MIST.md auto-load primitive (ADR-014)
+    ├── sidecar_index.py         # sqlite-vec + FTS5 over markdown chunks
+    ├── filewatcher.py           # watchdog daemon thread, 500ms debounce
+    └── (writers, models, etc.)
 ```
 
 ---
 
-## Flutter Frontend Structure
+## Frontend (Separate Repository)
 
-```
-mist_desktop/                    # Flutter desktop app
-├── lib/
-│   ├── main.dart               # App entry point
-│   │
-│   ├── config/
-│   │   ├── app_config.dart     # App configuration (WebSocket URL, etc.)
-│   │   └── theme_config.dart   # Material theme (dark mode)
-│   │
-│   ├── models/
-│   │   ├── message_model.dart  # Chat message model
-│   │   └── websocket_message.dart # WebSocket message types
-│   │
-│   ├── providers/              # Riverpod state providers
-│   │   ├── chat_provider.dart  # Chat state & logic
-│   │   ├── websocket_provider.dart # WebSocket connection state
-│   │   ├── audio_provider.dart # Audio recording/playback state
-│   │   └── speech_provider.dart # Speech processing state
-│   │
-│   ├── services/               # Business logic services
-│   │   ├── websocket_service.dart # WebSocket client
-│   │   ├── audio_recording_service.dart # Voice recording
-│   │   ├── audio_playback_service.dart # TTS audio playback
-│   │   └── speech_service.dart # Speech coordination
-│   │
-│   ├── screens/
-│   │   └── chat_screen.dart    # Main chat UI
-│   │
-│   └── widgets/                # Reusable UI components
-│       ├── chat_message_widget.dart
-│       ├── connection_status_widget.dart
-│       └── voice_input_button.dart
-│
-├── windows/                     # Windows platform code
-├── pubspec.yaml                 # Flutter dependencies
-└── README.md                    # Flutter app documentation
-```
+The MIST frontend lives at `./mist-frontend/ (nested in this repo)` (separate git repo, no remote configured per current intent). Stack: Tauri 2.x shell + React 19 + TypeScript strict + react-three-fiber for 3D composition. See that repository's own documentation for its internal structure.
+
+Integration with this backend is contract-only:
+- ADR-016 (LLM-mediated frontend tool calls — backend decides routing)
+- ADR-017 (WebSocket message contract — discriminated events, lifecycle, error model)
+
+Both ADRs live in `knowledge-vault/Decisions/` (cross-project ADR home), since the message contract spans both repos.
+
+The Flutter Desktop app at `mist_desktop/` was decommissioned 2026-05-11 after the pivot to the Tauri frontend. Git history at commit `e18c092` preserves the Flutter source code if reference is needed.
 
 ---
 
-## Documentation Structure
+## Vault Layer (`mist-memory/`)
+
+Per ADR-010 four-layer memory architecture. Filesystem markdown corpus + sidecar index.
+
+```
+mist-memory/
+├── MIST.md                      # Vault conventions (auto-loaded per ADR-014)
+├── sessions/                    # YYYY-MM-DD-<slug>.md per turn-stream session
+├── identity/
+│   └── mist.md                  # MIST self-model (traits, prefs, capabilities)
+├── users/
+│   └── <user-id>.md             # User canonical fact sheet
+├── decisions/                   # Per-vault decision notes (DEC-NNN)
+└── meta/
+    ├── schema.md
+    └── changelog.md
+```
+
+Sidecar index at `data/vault_sidecar.db` (sqlite-vec `vec0` + FTS5 over heading-block + file-level chunks).
+
+---
+
+## Documentation (`docs/`)
 
 ```
 docs/
-├── guides/
-│   ├── windows_dev_setup.md        # Development environment setup
-│   └── TORCH_COMPILE_FIX.md        # PyTorch optimization fix
-│
-└── decisions/
-    ├── adr_001_vision.md           # Project vision & philosophy
-    └── adr_007_sesame_csm.md       # TTS selection rationale
-
-Root documentation:
-├── README.md                        # Main project readme
-├── knowledge-vault/08-Reference/Flutter-Migration-Plan.md        # Comprehensive Flutter migration guide (1600 lines)
-├── knowledge-vault/02-Sessions/Knowledge-Integration-Status.md            # Knowledge graph integration status
-├── QUICKSTART_KNOWLEDGE_INTEGRATION.md # Quick KG setup
-├── E2E_TEST_GUIDE.md               # End-to-end testing guide
-├── NEO4J_QUERIES.md                # Useful Neo4j query reference
-└── REPOSITORY_STRUCTURE.md          # This file
+├── decisions/                   # Repo-scoped ADRs (snake_case adr_NNN_*.md)
+│   ├── adr_001_vision.md
+│   ├── adr_007_sesame_csm.md
+│   └── adr_008_lancedb_vector_store.md
+├── audit/                       # Historical audit reports (Flutter-era; superseded)
+├── guides/                      # Setup + reference guides
+└── superpowers/specs/           # Phase implementation specs
 ```
+
+Cross-project ADRs (memory architecture, integration contracts, etc.) live in `knowledge-vault/Decisions/` with the `ADR-NNN-kebab-case.md` convention. See vault for the authoritative cross-project decision set.
 
 ---
 
 ## Key Features
 
-### 1. Knowledge Graph System
-- **Extraction**: Converts conversations to structured knowledge
-- **Storage**: Neo4j with provenance tracking
-- **Retrieval**: Vector search + graph traversal
-- **Regeneration**: Rebuild from immutable utterances
+### 1. Knowledge System (four-layer per ADR-010)
+- **Event store** (SQLite, append-only) - raw turn evidence
+- **Vault** (mist-memory/ markdown) - canonical, user-editable history
+- **Graph** (Neo4j) - MIST's reasoning substrate; typed entities + relationships
+- **Sidecar index** (sqlite-vec + FTS5) - hybrid retrieval over vault
 
-### 2. MCP-Like Conversation
-- **Autonomous tool use**: LLM queries knowledge graph on demand
-- **One tool**: `query_knowledge_graph` (extraction is automatic)
-- **Session management**: Track conversation history
-- **Graceful fallback**: Works without Neo4j
+### 2. Conversation Pipeline
+- LLM-decided tool use (currently `query_knowledge_graph`)
+- Pass-loop in `ConversationHandler` with bounded depth
+- Context budget planner (Cluster 6)
+- AI-slop post-filter with regen / strip fallback
+- Persona injection (MistIdentity, Cluster 3)
 
-### 3. Voice System (Backend)
-- **WebSocket server**: Real-time voice communication (port 8001)
-- **STT**: Whisper-based speech recognition
-- **TTS**: Sesame CSM-1B speech synthesis
-- **VAD**: Voice activity detection (Silero)
+### 3. Voice Pipeline
+- VAD (Silero) -> STT (Whisper) -> LLM (Gemma 4 E4B via llama-server) -> TTS (Chatterbox Turbo)
+- Streaming parallelism (~4-5s TTFA)
+- Binary WebSocket audio protocol (MIST 16-byte frame header)
+- Interrupt fade-out, RMS normalization
 
-### 4. Flutter Desktop Frontend
-- **Cross-platform**: Windows, macOS, Linux support
-- **Voice recording**: Real-time audio capture
-- **Audio playback**: TTS audio from backend
-- **WebSocket client**: Real-time backend communication
-- **State management**: Riverpod 3.x for reactive UI
+### 4. Observability
+- DebugJSONLLogger with 5 phases (turn, extraction, llm_call, retrieval_candidates, llm_request_raw)
+- Per-phase env-gated emission
+- Telemetry events flow to frontend per ADR-017
 
 ---
 
 ## Integration Points
 
-### Flutter Frontend -> Backend
+### Tauri Frontend -> Backend
 ```
-Flutter App (mist_desktop/)
-  -> WebSocket (ws://localhost:8001)
+Tauri Frontend (./mist-frontend/ (nested in this repo))
+  -> WebSocket (ws://localhost:8001/ws)
 Backend Server (server.py)
-  -> Receives audio/text messages
-Voice Processor -> STT -> LLM -> TTS
-  -> Sends transcription/tokens/audio
-Flutter App (displays messages, plays audio)
+  -> binary audio frames OR text messages
+Voice / chat pipelines:
+  STT -> LLM -> TTS pipelines on voice path
+  ConversationHandler pass-loop on text path
+  -> discriminated events (state_cycle, stream_token, stream_complete,
+     tool_call_*, vad_status, health_status, etc.) per ADR-017
+Tauri Frontend renders spatial composition
 ```
 
 ### Backend -> Knowledge Graph
-```python
-# In model_manager.py:
-if self.knowledge and self.knowledge.is_enabled():
-    # Use knowledge-augmented LLM
-    for token in self.knowledge.generate_response_streaming(user_text):
-        yield token
-else:
-    # Fallback to standard LLM
-    ...
-```
+- `KnowledgeRetriever.retrieve()` -> graph + vector + RRF merge -> facts injected into context
+- `ExtractionPipeline.extract_from_utterance()` (fire-and-forget) -> typed entities + relationships -> CurationPipeline -> GraphStore -> Neo4j MERGE upserts with DERIVED_FROM provenance
 
-### Knowledge Graph -> Neo4j
-```
-ConversationHandler
-  -> (autonomous tool use)
-query_knowledge_graph -> KnowledgeRetriever -> GraphStore -> Neo4j
-[automatic] asyncio.create_task -> ExtractionPipeline -> CurationPipeline -> Neo4j
-```
+### Backend -> Vault
+- `VaultWriter.append_turn_to_session()` after event-store write (per-turn)
+- `VaultSidecarIndex` reindex on filewatcher events (500ms debounce)
+- `mist_admin vault-rebuild --scope <path>` for ontology version bumps
 
 ---
 
 ## Environment Variables
 
-Required in `.env`:
+See `.env.example` for the full list. Required for runtime:
+
 ```bash
 # Neo4j
-NEO4J_URI=bolt://localhost:7687
+NEO4J_URI=bolt://mist-neo4j:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=password
 
-# Features
+# LLM backend
+LLM_BACKEND=llamacpp
+LLM_SERVER_URL=http://mist-llm:8080
+LLM_MODEL_FILE=unsloth/gemma-4-E4B-it-Q5_K_M.gguf
+MODEL=gemma-4-e4b
+
+# Voice / TTS
+TTS_ENABLED=true
+TTS_ENGINE=chatterbox
+VOICE_PROFILE=friday
+
+# Feature flags
 ENABLE_KNOWLEDGE_INTEGRATION=true
 
-# Optional
-HF_TOKEN=your_huggingface_token
-MODEL=qwen2.5:7b-instruct
+# Event store + vector store
+EVENT_STORE_DB_PATH=/app/data/event_store.db
+EVENT_STORE_AUDIO_DIR=/app/data/audio
+VECTOR_STORE_DATA_DIR=/app/data/vector_store
 ```
 
----
-
-## Dependencies
-
-Key packages (from requirements.txt):
-- `neo4j` - Graph database driver
-- `langchain-ollama` - LLM integration
-- `sentence-transformers` - Embeddings
-- `fastapi` - WebSocket server
-- `torch` - ML models
-- `sounddevice` - Audio I/O
+Optional observability gates: `MIST_DEBUG_JSONL`, `MIST_DEBUG_LLM_JSONL`, `MIST_DEBUG_RETRIEVAL_JSONL`, `MIST_DEBUG_LLM_REQUESTS`.
 
 ---
 
 ## Usage
 
-### Start System
+### Start the backend stack
 ```bash
-# 1. Start Neo4j
-neo4j start
+# Via Docker compose
+docker compose up -d
 
-# 2. Start backend
-venv/Scripts/python.exe backend/server.py
+# Or via dev script
+python scripts/start_dev.py
 
-# 3. Start Flutter frontend (separate terminal)
-cd mist_desktop
-flutter run -d windows
+# Tail logs
+docker compose logs -f mist-backend
 ```
 
-### Run Tests
+### Run tests (inside container; native Windows venv is corrupted)
 ```bash
-# Test Neo4j connection
-venv/Scripts/python.exe test_neo4j_connection.py
-
-# Test conversation handler
-venv/Scripts/python.exe test_conversation_handler.py --mode simple
+docker compose exec mist-backend python -m pytest tests/unit/ -q
 ```
 
-### Maintenance
+### Admin commands
 ```bash
-# Regenerate graph from utterances
-venv/Scripts/python.exe regenerate_graph.py
+docker compose exec mist-backend python -m scripts.mist_admin stack-status
+docker compose exec mist-backend python -m scripts.mist_admin graph-stats
+docker compose exec mist-backend python -m scripts.mist_admin seed
+docker compose exec mist-backend python -m scripts.mist_admin chat "utterance" --session-id sid
+docker compose exec mist-backend python -m scripts.mist_admin replay /app/data/ingest/v6-inputs.jsonl --session-id sid --output /app/data/ingest/report.jsonl
+```
 
-# Initialize/reset schema
-venv/Scripts/python.exe initialize_schema.py
-
-# Wipe database (careful!)
-venv/Scripts/python.exe wipe_neo4j.py
+### Start the frontend (separate repo)
+```bash
+cd mist-frontend
+npm install
+npm run dev   # Vite dev server on localhost:1420 + Tauri shell window
 ```
 
 ---
 
 ## Development Workflow
 
-### Adding New Knowledge Features
+### Adding new knowledge features
 1. Define data models in `backend/knowledge/models.py`
 2. Add extraction logic in `backend/knowledge/extraction/`
 3. Add retrieval logic in `backend/knowledge/retrieval/`
-4. Update ConversationHandler tools if needed
+4. Update `ConversationHandler` tool catalog if needed
+5. Add unit tests under `tests/unit/knowledge/`
 
-### Adding New Voice Features
-1. Modify `backend/voice_processor.py` for processing
-2. Update `backend/voice_models/model_manager.py` for models
-3. Add WebSocket message types in `backend/server.py`
-4. Update Flutter message handlers in `mist_desktop/lib/providers/chat_provider.dart`
+### Adding new voice features
+1. Modify `backend/voice_processor.py` for pipeline changes
+2. Update `backend/voice_models/model_manager.py` for model integration
+3. Add WebSocket message types to ADR-017 if FE coordination required
+4. Emit the new events from `server.py` / `voice_processor.py`
 
-### Adding Flutter UI Features
-1. Create new widgets in `mist_desktop/lib/widgets/`
-2. Add state providers in `mist_desktop/lib/providers/`
-3. Update screens in `mist_desktop/lib/screens/`
-4. Add services if needed in `mist_desktop/lib/services/`
+### Adding new vault primitives
+1. Extend `backend/vault/` (writer / sidecar / filewatcher) per ADR-010 invariants
+2. Update Pydantic schemas if frontmatter shape changes
+3. Add CLI surface via `scripts/mist_admin.py` if needed
 
-### Testing
-1. Backend unit tests: Test individual components
-2. Integration: Use `test_conversation_handler.py`
-3. E2E: Follow `E2E_TEST_GUIDE.md`
-4. Flutter tests: `cd mist_desktop && flutter test`
+### Frontend changes
+Frontend lives in a separate repo at `./mist-frontend/ (nested in this repo)`. See that repo's contributing guide. Cross-repo coordination happens via ADR-016 / ADR-017 protocol updates.
 
 ---
 
-## Production Checklist
+## Tests
 
-Before deploying:
-- [ ] Update Neo4j password in `.env`
-- [ ] Configure CORS in `server.py`
-- [ ] Set proper log levels
-- [ ] Test with production Neo4j instance
-- [ ] Verify knowledge extraction quality
-- [ ] Monitor performance metrics
-- [ ] Set up Neo4j backups
-
----
-
-## File Count Summary
-
-**Root files:** ~20
-- Config: 3 (.env, .gitignore, .python-version)
-- Docs: 7 (README + guides)
-- Scripts: 6 (test, init, regenerate, wipe, export)
-
-**Backend files:** ~20 Python modules
-- Voice: 3 (server, processor, config)
-- Chat: 2 (handler, integration)
-- Knowledge: 8 (extraction, retrieval, storage, embeddings)
-- Config: 2 (config, knowledge_config)
-
-**Flutter files:** ~20 Dart files
-- Screens: 1 (chat_screen)
-- Providers: 4 (chat, websocket, audio, speech)
-- Services: 4 (websocket, audio recording/playback, speech)
-- Widgets: 3 (message, status, voice button)
-- Models: 2 (message, websocket_message)
-- Config: 2 (app_config, theme_config)
-
-**Documentation:** 7 comprehensive guides
-
-**Tests:** 3 test scripts (neo4j, conversation, vector search)
-
----
-
-## Migration History
-
-### React -> Flutter Migration (Dec 2024)
-**Removed:**
-- React/TypeScript frontend (~127MB)
-- Old frontend architecture docs
-
-**Added:**
-- Flutter desktop app (mist_desktop/)
-- Comprehensive Flutter migration plan (1600 lines)
-- Riverpod state management
-- Audio recording/playback services
-- WebSocket integration
-
-**Reason:** Flutter provides:
-- True cross-platform (Windows/macOS/Linux/iOS/Android)
-- Better desktop performance
-- Native audio handling
-- Single codebase for mobile expansion
+- **Unit tests:** `tests/unit/` (>1400 tests as of 2026-05-11). Run inside container.
+- **Integration tests:** `tests/integration/` (cluster-scoped reproducers; require live Neo4j + llama-server)
+- **Drift guards:** `tests/unit/test_eval_harness_scorers.py` locks scorer frozensets to ontology; `tests/unit/knowledge/extraction/test_validator.py::TestValidatorOntologyConsistency` locks validator to ontology
+- **Eval harness:** `scripts/eval_harness/` runs V1-V8 gauntlets; reports in `data/ingest/`
 
 ---
 
 ## Current Status
 
-**Backend:**  Production-ready
-- Voice pipeline complete
-- Knowledge graph integrated
-- Autonomous tool usage working
-- WebSocket server stable
+See `CODEBASE.md` for live status, active workstreams, recent commits, and active issues.
 
-**Frontend:**  In Development
-- Flutter UI scaffolding complete
-- WebSocket connection working
-- Voice recording implemented
-- Audio playback needs TTS enabling (TTS_ENABLED=false in .env)
-- Graph visualization planned
+**Backend:** Production-ready, fully containerized, post-MVP knowledge integration complete (8 clusters), continuous-usage hardening in progress.
 
----
+**Frontend:** Production-ready Tauri spatial app (separate repo at `./mist-frontend/ (nested in this repo)`); FE/BE integration Wave 1 shipped 2026-05-10, subsequent waves cover tool-call events, cards, graph_subgraph, and visual polish.
 
-## Next Steps
-
-1. **Enable TTS** in backend (.env: TTS_ENABLED=true)
-2. **Test audio playback** in Flutter app
-3. **Polish Flutter UI** - animations, error states
-4. **Add graph visualization** in Flutter
-5. **Production deployment** prep
+**Flutter Desktop:** Decommissioned 2026-05-11. Git history at `e18c092` preserves the Flutter source.

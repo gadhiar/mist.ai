@@ -60,6 +60,11 @@ pnpm-debug.log*
 frontend/dist/
 frontend/.vite/
 
+# Tauri frontend lives in mist-frontend/ as a nested git repo
+# (its own .git, branches, history). Outer mist.ai/ does not track its
+# contents. To work on the frontend: cd mist-frontend && git status.
+mist-frontend/
+
 # Docs
 docs/
 
@@ -67,17 +72,6 @@ docs/
 .claude/
 CLAUDE.md
 CODEBASE.md
-
-# Flutter/Dart specific
-mist_desktop/.dart_tool/
-mist_desktop/.flutter-plugins
-mist_desktop/.flutter-plugins-dependencies
-mist_desktop/build/
-mist_desktop/windows/flutter/ephemeral/
-mist_desktop/macos/Flutter/ephemeral/
-mist_desktop/linux/flutter/ephemeral/
-mist_desktop/.packages
-mist_desktop/pubspec.lock
 
 # Local scratch workspace (mirrored plans, exploratory artifacts)
 .local/
@@ -88,7 +82,3 @@ data/event_store.db-shm
 data/event_store.db-wal
 data/graph_snapshots/
 data/ingest/
-
-# Stray screenshots under mist_desktop
-mist_desktop/*.png
-mist_desktop/*.jpg
