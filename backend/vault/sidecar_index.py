@@ -582,7 +582,16 @@ class VaultSidecarIndex:
                 merged[key]["sources"].append("fts")
 
         sorted_results = sorted(merged.values(), key=lambda r: r["score"], reverse=True)
-        return sorted_results[:k]
+        # Filter out empty-content rows before applying the limit so that the
+        # returned list always satisfies the requested count. Without this, empty
+        # heading-block chunks (headings with no body text) consume limit slots,
+        # leaving the caller with fewer results than configured. The filter is
+        # applied here -- the natural owner of the filter+limit invariant --
+        # rather than at call sites, so all query paths (auto-inject, retriever)
+        # get the same guarantee. The caller's safety-net filter is kept as
+        # defense-in-depth but no longer controls list length.
+        non_empty = [r for r in sorted_results if (r.get("content") or "").strip()]
+        return non_empty[:k]
 
     # ------------------------------------------------------------------
     # Diagnostics

@@ -824,6 +824,70 @@ class TestQueryHybrid:
         # Assert
         assert results == []
 
+    def test_empty_content_rows_never_surfaced(self, sidecar_index):
+        # Arrange -- note with one empty-body heading block and one real block.
+        # _extract_heading_blocks produces content="" for EmptyHead, non-empty for RealHead.
+        # The file-level chunk also carries the full note body (non-empty).
+        note = "## EmptyHead\n\n## RealHead\n\nReal text about retrieval."
+        sidecar_index.upsert_file("nonempty_check.md", note, 1000)
+        emb = FakeEmbeddingGenerator().generate_embedding("Real text about retrieval")
+
+        # Act
+        results = sidecar_index.query_hybrid(emb, "Real text about retrieval", k=10)
+
+        # Assert -- no returned row has empty/whitespace-only content
+        for row in results:
+            assert (row.get("content") or "").strip(), (
+                f"Empty-content row surfaced: path={row.get('path')!r}, "
+                f"heading={row.get('heading')!r}"
+            )
+
+    def test_limit_satisfied_when_corpus_has_empty_content_rows(self, sidecar_index):
+        # Arrange -- 5 notes each contributing one empty heading block and one
+        # real heading block (plus a file-level chunk). With k=5 and 5 notes,
+        # the corpus has 5 empty-content chunks that MUST NOT count against the
+        # limit. The returned list must be exactly 5 (the requested limit).
+        gen = FakeEmbeddingGenerator()
+        for i in range(5):
+            # Each note: EmptySection has no body; ContentSection has real text.
+            note = f"## EmptySection\n\n## ContentSection\n\nContent for note {i} about retrieval."
+            sidecar_index.upsert_file(f"limit_test_{i}.md", note, 1000)
+        emb = gen.generate_embedding("Content for note 0 about retrieval")
+
+        # Act -- request exactly 5 results
+        results = sidecar_index.query_hybrid(emb, "Content about retrieval", k=5)
+
+        # Assert -- must return 5 rows (empty rows must not consume limit slots)
+        assert len(results) == 5, (
+            f"Expected 5 results but got {len(results)}; "
+            f"empty-content rows likely consumed limit slots"
+        )
+        for row in results:
+            assert (
+                row.get("content") or ""
+            ).strip(), f"Empty-content row in results: heading={row.get('heading')!r}"
+
+    def test_returns_natural_max_when_non_empty_corpus_smaller_than_limit(self, sidecar_index):
+        # Arrange -- 2 notes each with one empty heading block and one real block.
+        # Corpus has 4 non-empty chunks (2 file-level + 2 real heading blocks).
+        # Request k=10 -- must return min(10, 4) = 4 rows, not crash or return empty.
+        gen = FakeEmbeddingGenerator()
+        for i in range(2):
+            note = f"## EmptyHead\n\n## RealHead\n\nSmall corpus content {i}."
+            sidecar_index.upsert_file(f"small_corpus_{i}.md", note, 1000)
+        emb = gen.generate_embedding("Small corpus content")
+
+        # Act
+        results = sidecar_index.query_hybrid(emb, "Small corpus content", k=10)
+
+        # Assert -- all returned rows are non-empty; count <= 4 (natural max)
+        assert len(results) <= 10
+        assert len(results) >= 1
+        for row in results:
+            assert (
+                row.get("content") or ""
+            ).strip(), f"Empty-content row in results: heading={row.get('heading')!r}"
+
 
 # ---------------------------------------------------------------------------
 # TestChunkCount
