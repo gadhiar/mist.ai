@@ -51,6 +51,33 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
 # The Provenance section is boilerplate; skip it during chunking.
 _PROVENANCE_HEADING = "Provenance"
 
+# Vault conventions docs and meta/ directories are loaded via ConventionsLoader
+# (ADR-014). Indexing them would surface as noise in auto-inject when a query
+# semantically matches schema content.
+_EXCLUDED_FILENAMES = frozenset({"MIST.md", "CLAUDE.md"})
+_EXCLUDED_PARENT_DIRS = frozenset({"meta"})
+
+
+def _is_excluded_from_indexing(path: str | Path) -> bool:
+    """Return True if path should not be indexed by the sidecar.
+
+    Vault conventions docs (MIST.md, CLAUDE.md) and meta/ files have
+    dedicated load paths (ConventionsLoader) and would surface as noise
+    if auto-injected.
+
+    Args:
+        path: Vault-relative or absolute path to the note file.
+
+    Returns:
+        True if the path should be excluded from sidecar indexing.
+    """
+    p = Path(path) if not isinstance(path, Path) else path
+    if p.name in _EXCLUDED_FILENAMES:
+        return True
+    if any(part in _EXCLUDED_PARENT_DIRS for part in p.parts):
+        return True
+    return False
+
 
 def _quote_fts5(text: str) -> str:
     """Wrap text in double-quotes for literal FTS5 matching.
@@ -258,6 +285,9 @@ class VaultSidecarIndex:
             SidecarIndexError: On any database or embedding error.
         """
         self._require_connection()
+        if _is_excluded_from_indexing(path):
+            logger.debug("sidecar: skipping excluded path %s", path)
+            return 0
         note_type = frontmatter.get("type") if frontmatter else None
         # PyYAML auto-converts ISO dates and datetimes to Python date/datetime
         # objects; default=str stringifies them to ISO-8601 so json.dumps can

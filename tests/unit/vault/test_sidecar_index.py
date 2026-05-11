@@ -962,3 +962,89 @@ class TestQuoteFts5:
     def test_colon_triggers_quoting(self):
         result = _quote_fts5("type:session")
         assert result.startswith('"')
+
+
+# ---------------------------------------------------------------------------
+# Fixtures for exclusion tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def tmp_vault(tmp_path):
+    """Return a temporary directory representing the vault root."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    return vault
+
+
+# ---------------------------------------------------------------------------
+# TestExclusion
+# ---------------------------------------------------------------------------
+
+
+class TestExclusion:
+    """Verify that MIST.md, CLAUDE.md, and meta/* are not indexed."""
+
+    def test_sidecar_skips_mist_md(self, sidecar_index, tmp_vault):
+        mist_md = tmp_vault / "MIST.md"
+        mist_md.write_text("---\ntype: meta-conventions\n---\n# Conventions\n", encoding="utf-8")
+        sidecar_index.upsert_file(
+            path=str(mist_md),
+            content=mist_md.read_text(encoding="utf-8"),
+            mtime=int(mist_md.stat().st_mtime),
+            frontmatter={"type": "meta-conventions"},
+        )
+        rows = list(
+            sidecar_index._conn.execute(
+                "SELECT * FROM vault_chunks WHERE path = ?", (str(mist_md),)
+            )
+        )
+        assert rows == []
+
+    def test_sidecar_skips_claude_md(self, sidecar_index, tmp_vault):
+        claude_md = tmp_vault / "CLAUDE.md"
+        claude_md.write_text("# Claude conventions\n", encoding="utf-8")
+        sidecar_index.upsert_file(
+            path=str(claude_md),
+            content=claude_md.read_text(encoding="utf-8"),
+            mtime=int(claude_md.stat().st_mtime),
+            frontmatter={},
+        )
+        rows = list(
+            sidecar_index._conn.execute(
+                "SELECT * FROM vault_chunks WHERE path = ?", (str(claude_md),)
+            )
+        )
+        assert rows == []
+
+    def test_sidecar_skips_meta_files(self, sidecar_index, tmp_vault):
+        meta_dir = tmp_vault / "meta"
+        meta_dir.mkdir()
+        schema = meta_dir / "schema.md"
+        schema.write_text("# Schema\n", encoding="utf-8")
+        sidecar_index.upsert_file(
+            path=str(schema),
+            content=schema.read_text(encoding="utf-8"),
+            mtime=int(schema.stat().st_mtime),
+            frontmatter={},
+        )
+        rows = list(
+            sidecar_index._conn.execute("SELECT * FROM vault_chunks WHERE path = ?", (str(schema),))
+        )
+        assert rows == []
+
+    def test_sidecar_indexes_normal_session_note(self, sidecar_index, tmp_vault):
+        sessions = tmp_vault / "sessions"
+        sessions.mkdir()
+        note = sessions / "2026-05-10-test.md"
+        note.write_text("---\ntype: mist-session\n---\n# Turn 1\nbody\n", encoding="utf-8")
+        sidecar_index.upsert_file(
+            path=str(note),
+            content=note.read_text(encoding="utf-8"),
+            mtime=int(note.stat().st_mtime),
+            frontmatter={"type": "mist-session"},
+        )
+        rows = list(
+            sidecar_index._conn.execute("SELECT * FROM vault_chunks WHERE path = ?", (str(note),))
+        )
+        assert len(rows) >= 1
