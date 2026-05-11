@@ -155,12 +155,17 @@ def test_rebuild_bucket2_session_defers_extraction(
     p.parent.mkdir()
     p.write_text(_SESSION_BODY, encoding="utf-8")
 
-    result: RebuildResult = asyncio.run(regenerator.rebuild_from_path(p))
+    async def _run():
+        result = await regenerator.rebuild_from_path(p)
+        # Drain in-flight tasks so the inner wait_for pipeline call completes.
+        await regenerator.aclose()
+        return result
+
+    result: RebuildResult = asyncio.run(_run())
 
     assert result.bucket == "2"
     assert result.deferred is True
-    # Extraction was scheduled (create_task fires within the same event loop
-    # since asyncio.run runs the loop to completion)
+    # Extraction completed (create_task + aclose drain ensures pipeline ran)
     assert fake_extraction.scheduled_jobs >= 1
 
 

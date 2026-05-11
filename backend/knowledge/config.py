@@ -462,26 +462,64 @@ class FilewatcherConfig:
     `debounce_ms` collapses bursts (e.g. Obsidian's atomic-replace-on-save
     delete+create within ~100ms). 500ms is the ADR-010 default.
 
-    `staleness_slo_seconds` is the budget for sidecar lag behind vault content
-    under normal load. The mtime audit job runs every `audit_interval_seconds`
-    to catch dropped events (Windows ReadDirectoryChangesW overflow case).
+    SLO-driven audit interval (Phase 5.5 Fix B):
+    `staleness_slo_seconds` is the ADR-010 <5s staleness budget for sidecar
+    lag behind vault content under normal load. `audit_interval_seconds` is
+    derived from `staleness_slo_seconds` -- the audit job runs at half the SLO
+    (`staleness_slo_seconds // 2`) so that dropped events are caught within the
+    SLO budget. Operators can override `audit_interval_seconds` explicitly via
+    `MIST_FILEWATCHER_AUDIT_INTERVAL_SECONDS`; that value wins over the SLO-
+    derived default. This replaces the previous hardcoded 60 s audit default
+    which was unrelated to the SLO and made `staleness_slo_seconds` dead config.
     """
 
     enabled: bool = True
     observer_type: str = "auto"
     debounce_ms: int = 500
     staleness_slo_seconds: int = 5
-    audit_interval_seconds: int = 60
+    audit_interval_seconds: int = 2  # Default: staleness_slo_seconds // 2 (5 // 2 = 2)
 
     @classmethod
     def from_env(cls) -> "FilewatcherConfig":
-        """Load filewatcher configuration from environment variables."""
+        """Load filewatcher configuration from environment variables.
+
+        `audit_interval_seconds` is derived from `staleness_slo_seconds // 2`
+        when `MIST_FILEWATCHER_AUDIT_INTERVAL_SECONDS` is not explicitly set.
+        An explicit env-var value always wins over the SLO-derived default.
+        """
+        staleness_slo = int(os.getenv("MIST_FILEWATCHER_STALENESS_SLO_SECONDS", "5"))
+        explicit_audit = os.getenv("MIST_FILEWATCHER_AUDIT_INTERVAL_SECONDS")
+        audit_interval = int(explicit_audit) if explicit_audit is not None else staleness_slo // 2
         return cls(
             enabled=os.getenv("MIST_FILEWATCHER_ENABLED", "true").lower() == "true",
             observer_type=os.getenv("MIST_FILEWATCHER_OBSERVER_TYPE", "auto"),
             debounce_ms=int(os.getenv("MIST_FILEWATCHER_DEBOUNCE_MS", "500")),
-            staleness_slo_seconds=int(os.getenv("MIST_FILEWATCHER_STALENESS_SLO_SECONDS", "5")),
-            audit_interval_seconds=int(os.getenv("MIST_FILEWATCHER_AUDIT_INTERVAL_SECONDS", "60")),
+            staleness_slo_seconds=staleness_slo,
+            audit_interval_seconds=audit_interval,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class GraphRegeneratorConfig:
+    """Configuration for the vault GraphRegenerator (curation/graph_regenerator.py).
+
+    `rebuild_timeout_s` caps each async LLM re-extraction call dispatched on
+    Bucket 2/3 vault edits. Without a timeout a hung llama-server call would
+    hold the asyncio Task open indefinitely, preventing clean shutdown and
+    potentially leaking resources across deploys.
+
+    Default 300 s (5 minutes) gives extraction ample room for large session
+    notes while bounding the worst-case hang. Operators with faster or slower
+    inference infrastructure can tune via the env var.
+    """
+
+    rebuild_timeout_s: int = 300
+
+    @classmethod
+    def from_env(cls) -> "GraphRegeneratorConfig":
+        """Load graph-regenerator configuration from environment variables."""
+        return cls(
+            rebuild_timeout_s=int(os.getenv("MIST_GRAPH_REGENERATOR_REBUILD_TIMEOUT_S", "300")),
         )
 
 
@@ -544,6 +582,9 @@ class KnowledgeConfig:
     sidecar_index: SidecarIndexConfig = None  # type: ignore[assignment]
     filewatcher: FilewatcherConfig = None  # type: ignore[assignment]
 
+    # Phase 5.5 Fix A: graph regenerator async lifecycle config
+    graph_regenerator: GraphRegeneratorConfig = None  # type: ignore[assignment]
+
     # Feature flags
     enable_knowledge_integration: bool = True  # Master switch for knowledge system
 
@@ -592,6 +633,8 @@ class KnowledgeConfig:
             self.sidecar_index = SidecarIndexConfig()
         if self.filewatcher is None:
             self.filewatcher = FilewatcherConfig()
+        if self.graph_regenerator is None:
+            self.graph_regenerator = GraphRegeneratorConfig()
 
     @classmethod
     def from_env(cls) -> "KnowledgeConfig":
@@ -611,6 +654,7 @@ class KnowledgeConfig:
             vault=VaultConfig.from_env(),
             sidecar_index=SidecarIndexConfig.from_env(),
             filewatcher=FilewatcherConfig.from_env(),
+            graph_regenerator=GraphRegeneratorConfig.from_env(),
             enable_knowledge_integration=os.getenv("ENABLE_KNOWLEDGE_INTEGRATION", "true").lower()
             == "true",
             ontology_version=os.getenv("ONTOLOGY_VERSION", "1.1.0"),

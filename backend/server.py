@@ -275,6 +275,16 @@ async def lifespan(app: FastAPI):
             vault_filewatcher.stop()
         except Exception as e:
             logger.warning("Vault filewatcher stop error: %s", e)
+
+    # Phase 5.5 Fix A: drain in-flight GraphRegenerator Bucket 2/3 tasks.
+    # After filewatcher.stop so no new tasks are queued; before vault_writer.stop
+    # so any extraction that writes vault notes completes before the writer closes.
+    if vault_filewatcher is not None and hasattr(vault_filewatcher, "_regenerator"):
+        try:
+            await vault_filewatcher._regenerator.aclose()
+        except Exception as e:
+            logger.warning("GraphRegenerator aclose error (non-fatal): %s", e)
+
     if vault_writer is not None:
         try:
             await vault_writer.stop()
