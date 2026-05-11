@@ -8,6 +8,14 @@ Satisfies the GraphStoreProtocol surface required by GraphRegenerator:
 
 Also exposes assertion helpers for test readability:
   - add_triple / get_triple / count_traits / has_trait
+
+Schema alignment (Phase 5.5 Bucket 1 fix):
+  The real mark_orphaned_by_provenance_path queries DERIVED_FROM relationship-
+  type edges pointing at :__Provenance__:VaultNote nodes. This fake mirrors
+  that schema: upsert_identity and upsert_user write FakeDerivedFromEdge
+  records, and mark_orphaned_by_provenance_path marks those edges by path.
+  This ensures the fake catches the same class of bug as the real Neo4j
+  implementation rather than masking it via property-based triple matching.
 """
 
 from __future__ import annotations
@@ -26,22 +34,41 @@ class FakeTriple:
     status: str = "active"
 
 
+@dataclass
+class FakeDerivedFromEdge:
+    """Provenance edge: typed entity -> VaultNote (mirrors DERIVED_FROM schema).
+
+    Keyed by (entity_id, path). status mirrors the real Neo4j edge status
+    so mark_orphaned_by_provenance_path can find edges by path.
+    """
+
+    entity_id: str
+    path: str
+    status: str = "active"
+
+
 class FakeGraphStore:
     """In-memory test double for GraphStoreProtocol.
 
-    Tracks triples in a list and records method call history.
-    Idempotent upsert: calling upsert_identity / upsert_user with
-    the same display_name twice writes only one triple (dedup by key).
+    Tracks typed triples and DERIVED_FROM provenance edges separately.
+    Idempotent upsert: calling upsert_identity / upsert_user with the same
+    display_name twice writes only one triple and one provenance edge (dedup).
+
+    mark_orphaned_by_provenance_path mirrors the real Neo4j implementation:
+    it finds DERIVED_FROM edges by path and marks their status='orphaned'.
+    This catches the bug class where upsert writes typed edges but omits the
+    DERIVED_FROM provenance edge, leaving mark_orphaned with nothing to find.
 
     Supports `get_orphaned_provenance_paths` for retry_orphaned tests:
-    returns the distinct set of derived_from_path values among triples
-    whose status == 'orphaned'.
+    returns the distinct set of paths for which DERIVED_FROM edges are orphaned.
     """
 
     _ONTOLOGY_VERSION = "1.1.0"
 
     def __init__(self) -> None:
         self._triples: list[FakeTriple] = []
+        # DERIVED_FROM provenance edges (entity_id, path) -> FakeDerivedFromEdge
+        self._provenance_edges: dict[tuple[str, str], FakeDerivedFromEdge] = {}
         self.mark_orphaned_calls: list[str] = []
         self.upsert_identity_calls: list[dict] = []
         self.upsert_user_calls: list[dict] = []
@@ -51,59 +78,93 @@ class FakeGraphStore:
     # ------------------------------------------------------------------
 
     async def mark_orphaned_by_provenance_path(self, path: str) -> int:
-        """Mark all triples with derived_from_path == path as 'orphaned'."""
+        """Mark all DERIVED_FROM edges pointing at path as 'orphaned'.
+
+        Mirrors the real Cypher: MATCH ()-[d:DERIVED_FROM]->(vn:VaultNote {path})
+        WHERE d.status <> 'orphaned' SET d.status = 'orphaned'.
+        Returns count of edges marked.
+
+        Also propagates orphaned status to any FakeTriple records sharing the
+        same derived_from_path so that triple-level assertions in existing tests
+        (triple.status == 'orphaned') continue to hold after the schema migration
+        from property-based to relationship-based provenance tracking.
+        """
         self.mark_orphaned_calls.append(path)
         count = 0
+        for edge in self._provenance_edges.values():
+            if edge.path == path and edge.status != "orphaned":
+                edge.status = "orphaned"
+                count += 1
+        # Propagate to _triples so triple-level assertions remain valid.
         for triple in self._triples:
             if triple.derived_from_path == path and triple.status != "orphaned":
                 triple.status = "orphaned"
-                count += 1
         return count
 
     def current_ontology_version(self) -> str:
         return self._ONTOLOGY_VERSION
 
     async def get_orphaned_provenance_paths(self) -> list[str]:
-        """Return distinct derived_from_path values for orphaned triples."""
+        """Return distinct paths for which DERIVED_FROM edges are orphaned.
+
+        Mirrors real Cypher: MATCH ()-[d:DERIVED_FROM]->(vn:VaultNote)
+        WHERE d.status = 'orphaned' RETURN DISTINCT vn.path.
+        """
         seen: set[str] = set()
         result: list[str] = []
-        for triple in self._triples:
-            if triple.status == "orphaned" and triple.derived_from_path not in seen:
-                seen.add(triple.derived_from_path)
-                result.append(triple.derived_from_path)
+        for edge in self._provenance_edges.values():
+            if edge.status == "orphaned" and edge.path not in seen:
+                seen.add(edge.path)
+                result.append(edge.path)
         return result
 
     async def upsert_identity(self, parsed_identity, derived_from_path: str) -> int:
-        """Write ParsedIdentity attributes as graph triples (idempotent)."""
+        """Write ParsedIdentity attributes as graph triples (idempotent).
+
+        Mirrors the real upsert_identity: for each typed entity, writes a typed
+        triple AND a DERIVED_FROM provenance edge to the VaultNote at
+        derived_from_path. mark_orphaned_by_provenance_path finds edges by path.
+        """
         self.upsert_identity_calls.append(
             {"parsed_identity": parsed_identity, "derived_from_path": derived_from_path}
         )
         written = 0
         for trait_slug in parsed_identity.traits:
+            entity_id = f"mist-trait-{trait_slug}"
             written += self._upsert_triple(
                 subject="mist-identity",
                 predicate="HAS_TRAIT",
                 object=trait_slug,
                 derived_from_path=derived_from_path,
             )
+            self._upsert_provenance_edge(entity_id, derived_from_path)
         for cap_slug in parsed_identity.capabilities:
+            entity_id = f"mist-cap-{cap_slug}"
             written += self._upsert_triple(
                 subject="mist-identity",
                 predicate="HAS_CAPABILITY",
                 object=cap_slug,
                 derived_from_path=derived_from_path,
             )
+            self._upsert_provenance_edge(entity_id, derived_from_path)
         for pref in parsed_identity.preferences:
+            entity_id = f"mist-pref-{pref.slug}"
             written += self._upsert_triple(
                 subject="mist-identity",
                 predicate="HAS_PREFERENCE",
                 object=pref.slug,
                 derived_from_path=derived_from_path,
             )
+            self._upsert_provenance_edge(entity_id, derived_from_path)
         return written
 
     async def upsert_user(self, parsed_user, derived_from_path: str) -> int:
-        """Write ParsedUser edge targets as graph triples (idempotent)."""
+        """Write ParsedUser edge targets as graph triples (idempotent).
+
+        Mirrors the real upsert_user: for each typed entity, writes a typed
+        triple AND a DERIVED_FROM provenance edge to the VaultNote at
+        derived_from_path. mark_orphaned_by_provenance_path finds edges by path.
+        """
         self.upsert_user_calls.append(
             {"parsed_user": parsed_user, "derived_from_path": derived_from_path}
         )
@@ -122,12 +183,14 @@ class FakeGraphStore:
         }
         for predicate, targets in section_map.items():
             for target in targets:
+                target_id = f"entity-{target.lower().replace(' ', '-')}"
                 written += self._upsert_triple(
                     subject=user_id,
                     predicate=predicate,
                     object=target,
                     derived_from_path=derived_from_path,
                 )
+                self._upsert_provenance_edge(target_id, derived_from_path)
         return written
 
     # ------------------------------------------------------------------
@@ -142,7 +205,17 @@ class FakeGraphStore:
         derived_from_path: str = "",
         status: str = "active",
     ) -> None:
-        """Pre-seed a triple (for testing orphan-mark behavior)."""
+        """Pre-seed a triple and its DERIVED_FROM provenance edge.
+
+        Used by tests that arrange graph state before calling regenerator/
+        mark_orphaned methods. Writes both the typed triple record and a
+        FakeDerivedFromEdge so mark_orphaned_by_provenance_path (which queries
+        _provenance_edges) can find the triple.
+
+        The provenance edge status mirrors the triple status: seeding an orphaned
+        triple also seeds an orphaned provenance edge so get_orphaned_provenance_paths
+        returns the path correctly.
+        """
         self._triples.append(
             FakeTriple(
                 subject=subject,
@@ -152,6 +225,14 @@ class FakeGraphStore:
                 status=status,
             )
         )
+        if derived_from_path:
+            entity_id = f"{subject}-{object}"
+            key = (entity_id, derived_from_path)
+            self._provenance_edges[key] = FakeDerivedFromEdge(
+                entity_id=entity_id,
+                path=derived_from_path,
+                status=status,
+            )
 
     def get_triple(self, subject: str, predicate: str, object: str) -> FakeTriple | None:
         """Retrieve a triple by (subject, predicate, object) key."""
@@ -202,3 +283,20 @@ class FakeGraphStore:
             )
         )
         return 1
+
+    def _upsert_provenance_edge(self, entity_id: str, path: str) -> None:
+        """MERGE a DERIVED_FROM provenance edge (entity_id, path) -> VaultNote.
+
+        Idempotent: re-upsert resets status to 'active' (mirrors ON MATCH SET).
+        Keyed by (entity_id, path) so one edge per (entity, source) pair.
+        """
+        key = (entity_id, path)
+        existing = self._provenance_edges.get(key)
+        if existing is not None:
+            existing.status = "active"
+        else:
+            self._provenance_edges[key] = FakeDerivedFromEdge(
+                entity_id=entity_id,
+                path=path,
+                status="active",
+            )

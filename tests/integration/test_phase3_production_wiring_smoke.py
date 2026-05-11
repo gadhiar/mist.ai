@@ -156,9 +156,9 @@ class _NoopSidecarIndex:
 def _cleanup_smoke_nodes(graph_store, user_id: str, path: str) -> None:
     """Remove smoke-test nodes from Neo4j to leave the graph clean.
 
-    Matches both the __Entity__:User node (written by upsert_user's Bucket 1
-    path: id = user_id) and the __Provenance__:VaultNote node (keyed by path).
-    Also removes the entity-rust target node seeded by the rebuild.
+    Matches the __Entity__:User node, the __Provenance__:VaultNote node (keyed
+    by path), and the target entity nodes written by Bucket 1 upsert_user via
+    the natural path (id = "entity-python", "entity-rust").
     """
     try:
         conn = graph_store.connection
@@ -170,11 +170,13 @@ def _cleanup_smoke_nodes(graph_store, user_id: str, path: str) -> None:
             "MATCH (vn:__Provenance__:VaultNote {path: $path}) DETACH DELETE vn",
             {"path": path},
         )
-        # Clean up any entity nodes that were written by the Bucket 1 rebuild
-        conn.execute_write(
-            "MATCH (e:__Entity__ {id: $eid}) DETACH DELETE e",
-            {"eid": "smoke-test-user-python"},
-        )
+        # Clean up target entity nodes written by upsert_user natural path.
+        # upsert_user generates id = "entity-{display_name.lower()...}".
+        for eid in ("entity-python", "entity-rust"):
+            conn.execute_write(
+                "MATCH (e:__Entity__ {id: $eid}) DETACH DELETE e",
+                {"eid": eid},
+            )
     except Exception:  # noqa: BLE001 -- cleanup; don't mask assertion failures
         pass
 
@@ -408,29 +410,29 @@ class TestVaultUserEditInvariant5ProductionWiring:
         )
 
         # ------------------------------------------------------------------
-        # Arrange: pre-seed a DERIVED_FROM-style triple in Neo4j.
+        # Arrange: pre-seed via natural upsert_user path.
         #
-        # upsert_user() writes derived_from_path as a property on the USES
-        # edge, not as a DERIVED_FROM relationship to a VaultNote. The orphan-
-        # mark Cypher in mark_orphaned_by_provenance_path queries for
-        # DERIVED_FROM relationship type, so it would find nothing if we seeded
-        # via upsert_user. Instead, write the provenance structure that the LLM
-        # extraction path (CurationGraphWriter) creates: an entity node with a
-        # DERIVED_FROM edge pointing at a VaultNote node keyed by path.
-        # This correctly exercises mark_orphaned_by_provenance_path.
+        # upsert_user now writes DERIVED_FROM edges from each typed entity to
+        # the VaultNote (Phase 5.5 Bucket 1 fix). mark_orphaned_by_provenance_path
+        # queries that relationship-type, so the natural upsert path is all that
+        # is needed. No manual Cypher seeding required.
         # ------------------------------------------------------------------
+        from backend.knowledge.curation.bucket1_reader import ParsedUser
+
         _path_str = str(user_file)
-        graph_store.connection.execute_write(
-            "MERGE (vn:__Provenance__:VaultNote {path: $path}) "
-            "ON CREATE SET vn.status = 'active', vn.created_at = '2026-05-11T00:00:00' "
-            "MERGE (e:__Entity__ {id: 'smoke-test-user-python'}) "
-            "ON CREATE SET e.display_name = 'python', e.status = 'active' "
-            "MERGE (e)-[d:DERIVED_FROM]->(vn) "
-            "ON CREATE SET d.status = 'active', d.created_at = '2026-05-11T00:00:00', "
-            "d.ontology_version = '1.1.0' "
-            "ON MATCH SET d.status = 'active'",
-            {"path": _path_str},
+        initial_parsed = ParsedUser(
+            user_id="smoke-test-user",
+            tools_and_technologies=["python"],
+            expertise=[],
+            currently_learning=[],
+            projects=[],
+            affiliations=[],
+            interests=[],
+            goals=[],
+            preferences=[],
+            people=[],
         )
+        await graph_store.upsert_user(initial_parsed, derived_from_path=_path_str)
 
         # Confirm the provenance edge landed and is not already orphaned
         orphaned_before = await graph_store.get_orphaned_provenance_paths()

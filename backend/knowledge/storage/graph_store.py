@@ -1592,6 +1592,23 @@ class GraphStore:
                     "ontology_version": ontology_version,
                 },
             )
+            # DERIVED_FROM provenance edge: typed entity -> VaultNote.
+            # mark_orphaned_by_provenance_path queries this relationship-type,
+            # so Bucket 1 edges must carry it to be findable on user-edit.
+            self.connection.execute_write(
+                "MATCH (t:__Entity__:MistTrait {id: $entity_id}) "
+                "MATCH (vn:__Provenance__:VaultNote {path: $path}) "
+                "MERGE (t)-[df:DERIVED_FROM]->(vn) "
+                "ON CREATE SET df.created_at = $now, "
+                "df.ontology_version = $ontology_version, df.status = 'active' "
+                "ON MATCH SET df.status = 'active'",
+                {
+                    "entity_id": entity_id,
+                    "path": path,
+                    "now": now,
+                    "ontology_version": ontology_version,
+                },
+            )
             written += 1
 
         # HAS_CAPABILITY edges
@@ -1610,6 +1627,21 @@ class GraphStore:
                 {
                     "entity_id": entity_id,
                     "slug": slug,
+                    "path": path,
+                    "now": now,
+                    "ontology_version": ontology_version,
+                },
+            )
+            # DERIVED_FROM provenance edge: typed entity -> VaultNote.
+            self.connection.execute_write(
+                "MATCH (c:__Entity__:MistCapability {id: $entity_id}) "
+                "MATCH (vn:__Provenance__:VaultNote {path: $path}) "
+                "MERGE (c)-[df:DERIVED_FROM]->(vn) "
+                "ON CREATE SET df.created_at = $now, "
+                "df.ontology_version = $ontology_version, df.status = 'active' "
+                "ON MATCH SET df.status = 'active'",
+                {
+                    "entity_id": entity_id,
                     "path": path,
                     "now": now,
                     "ontology_version": ontology_version,
@@ -1636,6 +1668,21 @@ class GraphStore:
                     "entity_id": entity_id,
                     "slug": pref.slug,
                     "enforcement": pref.enforcement,
+                    "path": path,
+                    "now": now,
+                    "ontology_version": ontology_version,
+                },
+            )
+            # DERIVED_FROM provenance edge: typed entity -> VaultNote.
+            self.connection.execute_write(
+                "MATCH (p:__Entity__:MistPreference {id: $entity_id}) "
+                "MATCH (vn:__Provenance__:VaultNote {path: $path}) "
+                "MERGE (p)-[df:DERIVED_FROM]->(vn) "
+                "ON CREATE SET df.created_at = $now, "
+                "df.ontology_version = $ontology_version, df.status = 'active' "
+                "ON MATCH SET df.status = 'active'",
+                {
+                    "entity_id": entity_id,
                     "path": path,
                     "now": now,
                     "ontology_version": ontology_version,
@@ -1720,6 +1767,23 @@ class GraphStore:
                         "user_id": user_id,
                         "target_id": target_id,
                         "display_name": display_name,
+                        "path": path,
+                        "now": now,
+                        "ontology_version": ontology_version,
+                    },
+                )
+                # DERIVED_FROM provenance edge: target entity -> VaultNote.
+                # mark_orphaned_by_provenance_path queries this relationship-type,
+                # so Bucket 1 edges must carry it to be findable on user-edit.
+                self.connection.execute_write(
+                    "MATCH (t:__Entity__ {id: $target_id}) "
+                    "MATCH (vn:__Provenance__:VaultNote {path: $path}) "
+                    "MERGE (t)-[df:DERIVED_FROM]->(vn) "
+                    "ON CREATE SET df.created_at = $now, "
+                    "df.ontology_version = $ontology_version, df.status = 'active' "
+                    "ON MATCH SET df.status = 'active'",
+                    {
+                        "target_id": target_id,
                         "path": path,
                         "now": now,
                         "ontology_version": ontology_version,
