@@ -25,6 +25,7 @@ from backend.knowledge.config import ContextBudgetConfig, KnowledgeConfig
 from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from tests.mocks.config import build_test_config
 from tests.mocks.ollama import FakeLLM
+from tests.unit.conftest import make_test_conventions_loader
 
 pytestmark = pytest.mark.integration
 
@@ -82,6 +83,7 @@ def _build_handler(
         extraction_pipeline=MagicMock(extract_from_utterance=AsyncMock()),
         retriever=retriever,
         llm_provider=fake_llm,
+        conventions_loader=make_test_conventions_loader(),
     )
     return handler, fake_llm
 
@@ -97,7 +99,12 @@ class TestBudgetAwareLongSession:
         """50 turns of ~30-token history — the planner must prune so the
         LLMRequest stays within budget and no crash occurs.
         """
-        handler, fake_llm = _build_handler(context_window=2000)
+        # context_window=4096 leaves flex_budget ~2900 - ~1121 (system template) ~= 1800
+        # tokens for history. 50 turns x 2 messages x ~30 tokens = ~3000 tokens, so
+        # pruning is still required to fit. Raised from original 2000 because the
+        # Phase 3 system template rewrite (Task 13) grew fixed_cost past the prior
+        # total_budget of 826.
+        handler, fake_llm = _build_handler(context_window=4096)
         assert handler._budget_planner is not None
 
         # Pre-populate 50 turns of synthetic history.
@@ -200,6 +207,7 @@ class TestBudgetIntegrationWithCustomCounter:
             extraction_pipeline=MagicMock(extract_from_utterance=AsyncMock()),
             retriever=retriever,
             llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
             budget_planner=planner,
         )
 
