@@ -1127,7 +1127,7 @@ def build_parser() -> argparse.ArgumentParser:
             "succeeds). Takes priority over --scope when both are provided."
         ),
     )
-    p_vrebuild.set_defaults(func=_cmd_vault_rebuild_sidecar)
+    p_vrebuild.set_defaults(func=_dispatch_vault_rebuild)
 
     p_vmigrate = sub.add_parser(
         "vault-migrate",
@@ -1146,6 +1146,68 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 # Cluster 8 Phase 11 -- vault CLI subcommands
 # ---------------------------------------------------------------------------
+
+
+def _dispatch_vault_rebuild(args: argparse.Namespace) -> int:
+    """Route vault-rebuild to the appropriate handler based on flags.
+
+    When --scope or --retry-orphaned is set, delegates to the new async
+    cmd_vault_rebuild which handles graph-aware rebuild modes. Without
+    either flag, falls through to the legacy sidecar-only rebuild handler
+    so bare `vault-rebuild --confirm` continues to work unchanged.
+
+    This is a module-level function (not a closure) so it is patchable in
+    tests via ``monkeypatch.setattr(mist_admin, '_dispatch_vault_rebuild',
+    ...)``.  The lazy heavy imports are deferred into the branch body so that
+    the argparse help path and the legacy sidecar path do not pay the
+    sentence_transformers / Neo4j driver import cost.
+    """
+    if args.scope or args.retry_orphaned:
+        import asyncio
+
+        ctx = _build_vault_rebuild_ctx()
+        return asyncio.run(
+            cmd_vault_rebuild(
+                scope=args.scope,
+                retry_orphaned=args.retry_orphaned,
+                ctx=ctx,
+            )
+        )
+    return _cmd_vault_rebuild_sidecar(args)
+
+
+def _build_vault_rebuild_ctx():
+    """Construct the admin context object required by cmd_vault_rebuild.
+
+    Lazily imports all heavy backend dependencies (Neo4j driver,
+    sentence_transformers, sidecar) so the legacy sidecar-only path and the
+    ``--help`` path remain unaffected.
+    """
+    be = _load_backend()
+    config = be.get_config()
+
+    from backend.factories import build_extraction_pipeline, build_graph_store
+    from backend.knowledge.curation.graph_regenerator import (
+        GraphRegenerator as CurationGraphRegenerator,
+    )
+    from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
+    from backend.vault.sidecar_index import VaultSidecarIndex
+
+    class _RebuildCtx:
+        pass
+
+    ctx = _RebuildCtx()
+    ctx.vault_root = Path(config.vault.root)
+    gs = build_graph_store(config)
+    pipeline = build_extraction_pipeline(config, graph_store=gs)
+    ctx.regenerator = CurationGraphRegenerator(
+        config=config,
+        extraction_pipeline=pipeline,
+        graph_store=gs,
+    )
+    embedder = EmbeddingGenerator(config.embedding.model_name)
+    ctx.sidecar = VaultSidecarIndex(config.sidecar_index, embedder)
+    return ctx
 
 
 def _walk_vault_md_files(vault_root: Path) -> list[Path]:

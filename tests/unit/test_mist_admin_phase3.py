@@ -15,6 +15,7 @@ LLM, or sidecar dependency is required.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import sys
 from pathlib import Path
@@ -281,3 +282,101 @@ def test_vault_rebuild_no_flags_calls_legacy_sidecar_rebuild(
     assert mock_admin_context.sidecar.rebuild_all_called is True
     assert mock_admin_context.regenerator.rebuild_calls == []
     assert mock_admin_context.regenerator.retry_orphaned_called is False
+
+
+# ---------------------------------------------------------------------------
+# Tests: argparse dispatch routing (Fix A -- P0 #4)
+#
+# These tests verify that the argparse subparser for vault-rebuild routes to
+# the new async cmd_vault_rebuild when --scope or --retry-orphaned is set,
+# and falls through to the legacy _cmd_vault_rebuild_sidecar otherwise.
+# ---------------------------------------------------------------------------
+
+
+class TestVaultRebuildArgparseDispatch:
+    """Argparse dispatch from vault-rebuild subcommand routes correctly."""
+
+    def _build_parser(self) -> argparse.ArgumentParser:
+        """Reconstruct the mist_admin argument parser."""
+        return mist_admin.build_parser()
+
+    def _patch_all(self, monkeypatch: pytest.MonkeyPatch) -> tuple[list, list]:
+        """Patch cmd_vault_rebuild, _build_vault_rebuild_ctx, and _cmd_vault_rebuild_sidecar.
+
+        Returns (new_path_calls, legacy_calls) recording which handler was invoked.
+        The ctx builder is patched to a no-op so heavy backend deps are never imported
+        during routing tests.
+        """
+        new_path_calls: list[dict] = []
+        legacy_calls: list[object] = []
+
+        async def fake_cmd_vault_rebuild(
+            scope: str | None,
+            retry_orphaned: bool,
+            ctx: object,
+        ) -> int:
+            new_path_calls.append({"scope": scope, "retry_orphaned": retry_orphaned})
+            return 0
+
+        def fake_sidecar(args: object) -> int:
+            legacy_calls.append(args)
+            return 0
+
+        def fake_build_ctx() -> object:
+            return object()  # opaque sentinel; cmd_vault_rebuild is patched anyway
+
+        monkeypatch.setattr(mist_admin, "cmd_vault_rebuild", fake_cmd_vault_rebuild)
+        monkeypatch.setattr(mist_admin, "_cmd_vault_rebuild_sidecar", fake_sidecar)
+        monkeypatch.setattr(mist_admin, "_build_vault_rebuild_ctx", fake_build_ctx)
+        return new_path_calls, legacy_calls
+
+    def test_scope_flag_routes_to_cmd_vault_rebuild(
+        self,
+        tmp_vault: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """vault-rebuild --scope=foo.md invokes cmd_vault_rebuild, not the sidecar handler."""
+        new_path_calls, legacy_calls = self._patch_all(monkeypatch)
+
+        parser = self._build_parser()
+        args = parser.parse_args(["vault-rebuild", "--scope", "foo.md"])
+
+        # _dispatch_vault_rebuild is what set_defaults(func=...) points to
+        args.func(args)
+
+        assert len(new_path_calls) == 1
+        assert new_path_calls[0]["scope"] == "foo.md"
+        assert new_path_calls[0]["retry_orphaned"] is False
+        assert legacy_calls == []
+
+    def test_retry_orphaned_flag_routes_to_cmd_vault_rebuild(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """vault-rebuild --retry-orphaned invokes cmd_vault_rebuild, not the sidecar handler."""
+        new_path_calls, legacy_calls = self._patch_all(monkeypatch)
+
+        parser = self._build_parser()
+        args = parser.parse_args(["vault-rebuild", "--retry-orphaned"])
+
+        args.func(args)
+
+        assert len(new_path_calls) == 1
+        assert new_path_calls[0]["scope"] is None
+        assert new_path_calls[0]["retry_orphaned"] is True
+        assert legacy_calls == []
+
+    def test_no_flags_routes_to_legacy_sidecar(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """vault-rebuild (no flags) invokes _cmd_vault_rebuild_sidecar, not cmd_vault_rebuild."""
+        new_path_calls, legacy_calls = self._patch_all(monkeypatch)
+
+        parser = self._build_parser()
+        args = parser.parse_args(["vault-rebuild"])
+
+        args.func(args)
+
+        assert legacy_calls != []
+        assert new_path_calls == []

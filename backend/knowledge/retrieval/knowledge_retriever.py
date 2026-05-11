@@ -1085,17 +1085,37 @@ class KnowledgeRetriever:
 
         # Format document facts
         if doc_facts:
-            lines.append("### Relevant Documents")
-            for idx, fact in enumerate(doc_facts, start=1):
-                title = fact.object
-                score = fact.similarity_score
-                chunk_text = fact.properties.get("text", "")
-                truncated = chunk_text[:500] if len(chunk_text) > 500 else chunk_text
-                lines.append(f"[doc-{idx}] Source: {title} (similarity: {score:.2f})")
-                lines.append(f"    {truncated}")
-            lines.append("")
+            if intent == "historical":
+                # Vault-only retrieval: render as plain prose blocks.
+                # No subheader, no [doc-N] prefix, no similarity score, no footer.
+                # The outer header already provides framing ("Relevant prose from your
+                # vault..."). Adding search-result UI signals ([doc-N], similarity:,
+                # Total facts:) biases the model into treating vault chunks as
+                # authoritative reasoning-substrate results (ADR-010 invariant 4).
+                for fact in doc_facts:
+                    chunk_text = fact.properties.get("text", "")
+                    if chunk_text:
+                        lines.append(chunk_text)
+                        lines.append("")  # blank line between blocks
+            else:
+                # Graph tool-invoked results: retain the scored-result format so the
+                # model can distinguish ranked retrieval hits by source and confidence.
+                lines.append("### Relevant Documents")
+                for idx, fact in enumerate(doc_facts, start=1):
+                    title = fact.object
+                    score = fact.similarity_score
+                    chunk_text = fact.properties.get("text", "")
+                    truncated = chunk_text[:500] if len(chunk_text) > 500 else chunk_text
+                    lines.append(f"[doc-{idx}] Source: {title} (similarity: {score:.2f})")
+                    lines.append(f"    {truncated}")
+                lines.append("")
 
-        # Add metadata
+                # Add metadata footer only for non-historical paths
+                lines.append("---")
+                lines.append(f"Total facts: {len(facts)}")
+            return "\n".join(lines)
+
+        # Add metadata (graph-facts-only path, no doc_facts)
         lines.append("---")
         lines.append(f"Total facts: {len(facts)}")
 

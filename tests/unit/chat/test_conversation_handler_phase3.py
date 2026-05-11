@@ -193,6 +193,33 @@ def test_tool_description_does_not_use_unbounded_personalize_trigger():
 
 
 # ---------------------------------------------------------------------------
+# Fix B (P1 #5): "Default to NOT calling the tool" must be absent
+# ---------------------------------------------------------------------------
+
+
+def test_static_template_does_not_contain_default_to_not_phrase():
+    """The stale 'Default to NOT calling the tool' bullet must not appear.
+
+    That phrase directly contradicts the 'ask yourself' decision rule above it.
+    On Gemma 4 E4B the literal 'Default to NOT' beat the abstract decision rule
+    and suppressed legitimate USE cases.
+    """
+    body = _STATIC_SYSTEM_TEMPLATE_BODY
+    assert "Default to NOT calling the tool" not in body
+
+
+def test_static_template_contains_fabrication_risk_replacement():
+    """The replacement bullet must reference fabrication risk as the tie-breaker.
+
+    This aligns the closing guideline with the 'ask yourself' decision rule:
+    call the tool when prose would otherwise force the model to infer
+    user-specific facts not stated in the available context.
+    """
+    body = _STATIC_SYSTEM_TEMPLATE_BODY
+    assert "fabrication" in body.lower()
+
+
+# ---------------------------------------------------------------------------
 # Task 21: ConversationHandler subscribes to InvalidationBus
 # ---------------------------------------------------------------------------
 

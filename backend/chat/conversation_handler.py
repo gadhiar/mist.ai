@@ -166,8 +166,9 @@ need to extract it manually.
 
 - Be conversational and natural
 - Cite sources from the prose below when helpful
-- Default to NOT calling the tool when uncertain; the prose-only path
-  is usually the right answer for non-reasoning queries
+- When you can't decide, prefer the answer that minimizes fabrication
+  risk -- call the tool when the answer would otherwise rely on
+  inferring user-specific facts the prose does not state
 """
 
 

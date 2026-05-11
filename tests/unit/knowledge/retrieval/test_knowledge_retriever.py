@@ -670,6 +670,82 @@ class TestFormatContext:
         # Assert
         assert "my Python skills" in context
 
+    # -----------------------------------------------------------------------
+    # Fix C (P1 #6): intent="historical" must render as plain prose
+    # -----------------------------------------------------------------------
+
+    def _make_doc_fact(
+        self, title: str = "Vault Note", text: str = "Some vault prose."
+    ) -> "RetrievedFact":
+        """Build a document-class fact (graph_distance == sentinel) for formatting tests."""
+        return build_retrieved_fact(
+            subject="VaultNote",
+            subject_type="VaultChunk",
+            predicate="CONTAINS",
+            object=title,
+            object_type="markdown",
+            properties={"text": text},
+            similarity_score=0.82,
+            graph_distance=_VECTOR_DISTANCE_SENTINEL,
+        )
+
+    def test_historical_intent_omits_relevant_documents_subheader(self):
+        """intent='historical' must not emit '### Relevant Documents'."""
+        retriever = self._retriever()
+        fact = self._make_doc_fact()
+
+        context = retriever._format_context([fact], "what happened", intent="historical")
+
+        assert "### Relevant Documents" not in context
+
+    def test_historical_intent_omits_doc_n_prefix(self):
+        """intent='historical' must not emit '[doc-N]' prefixes."""
+        retriever = self._retriever()
+        fact = self._make_doc_fact()
+
+        context = retriever._format_context([fact], "what happened", intent="historical")
+
+        assert "[doc-" not in context
+
+    def test_historical_intent_omits_similarity_score(self):
+        """intent='historical' must not emit 'similarity: 0.XX' strings."""
+        retriever = self._retriever()
+        fact = self._make_doc_fact()
+
+        context = retriever._format_context([fact], "what happened", intent="historical")
+
+        assert "similarity: 0." not in context
+
+    def test_historical_intent_omits_total_facts_footer(self):
+        """intent='historical' must not emit the 'Total facts: N' footer."""
+        retriever = self._retriever()
+        fact = self._make_doc_fact()
+
+        context = retriever._format_context([fact], "what happened", intent="historical")
+
+        assert "Total facts:" not in context
+
+    def test_historical_intent_includes_chunk_text_as_plain_prose(self):
+        """intent='historical' must include the chunk text itself in plain form."""
+        retriever = self._retriever()
+        fact = self._make_doc_fact(text="The user discussed their learning goals.")
+
+        context = retriever._format_context([fact], "what happened", intent="historical")
+
+        assert "The user discussed their learning goals." in context
+
+    def test_non_historical_intent_retains_tool_result_formatting(self):
+        """Non-historical intent must keep the scored-result format (doc-N, similarity, Total facts)."""
+        retriever = self._retriever()
+        fact = self._make_doc_fact()
+
+        for intent in ("relational", "hybrid", "factual", None):
+            context = retriever._format_context([fact], "query", intent=intent)
+            assert "### Relevant Documents" in context, f"intent={intent!r} lost subheader"
+            assert "[doc-1]" in context, f"intent={intent!r} lost doc prefix"
+            assert "similarity: 0." in context, f"intent={intent!r} lost similarity score"
+            assert "Total facts:" in context, f"intent={intent!r} lost footer"
+
 
 # ---------------------------------------------------------------------------
 # TestRetrieveMistContext
