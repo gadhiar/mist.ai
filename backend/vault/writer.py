@@ -38,6 +38,8 @@ logger = logging.getLogger(__name__)
 _SENTINEL = "<!-- MIST_APPEND_HERE -->"
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Matches the leading YYYY-MM-DD- date prefix in a session filename stem.
+_STEM_DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-")
 # Multiline-anchored, case-insensitive match for a markdown `## Provenance`
 # heading at line start. Used by `_upsert_user_sync` to decide whether to
 # append a writer-supplied default Provenance section. The line anchor
@@ -47,6 +49,37 @@ _PROVENANCE_HEADING_RE = re.compile(r"(?im)^##\s+Provenance\s*$")
 
 _ONTOLOGY_VERSION = "1.1.0"
 _EXTRACTION_VERSION = "2026-05-06-r1"
+
+
+def _session_id_from_path(path: Path) -> str:
+    """Derive a deterministic frontmatter session_id from the session note path.
+
+    The filename stem has the form ``YYYY-MM-DD-<slug>``. Stripping the date
+    prefix returns the pre-allocated human-readable slug (e.g.
+    ``plan-new-feature-37a8``), which is used as the canonical session_id in
+    frontmatter.
+
+    This eliminates the legacy fallback that wrote the raw external session_id
+    argument directly into frontmatter. Five of seven session notes in the
+    2026-05-10 audit had ``session_id: default`` because
+    KnowledgeIntegration.current_session_id is initialised to ``"default"``
+    and that raw string propagated into the frontmatter without transformation.
+
+    Args:
+        path: Absolute path to the session note file. The filename stem must
+            start with a ``YYYY-MM-DD-`` date prefix.
+
+    Returns:
+        The slug portion of the stem (everything after the date prefix). Falls
+        back to the full stem if the prefix is not present (defensive -- the
+        caller should always pass a well-formed path from `session_path`).
+    """
+    stem = path.stem
+    m = _STEM_DATE_PREFIX_RE.match(stem)
+    if m:
+        return stem[m.end() :]
+    return stem
+
 
 # ---------------------------------------------------------------------------
 # Internal job model
@@ -704,9 +737,21 @@ class VaultWriter:
         """
         today = datetime.now(UTC).date().isoformat()
 
+        # Derive the canonical frontmatter session_id from the pre-allocated
+        # filename stem rather than the raw external session_id arg.
+        #
+        # The filename stem has the form YYYY-MM-DD-<slug>, where <slug> was
+        # computed by ConversationHandler._get_or_allocate_vault_path from the
+        # first utterance content. Using the stem's slug guarantees:
+        #   1. The frontmatter session_id is always human-readable.
+        #   2. It matches the filename for reliable programmatic lookup.
+        #   3. The literal "default" (or any other opaque external ID) is never
+        #      written into frontmatter (2026-05-10 audit: 5/7 sessions broken).
+        canonical_session_id = _session_id_from_path(path)
+
         if not path.exists():
             fm = MistSessionFrontmatter(
-                session_id=session_id,
+                session_id=canonical_session_id,
                 date=today,
                 turn_count=0,
                 ontology_version=_ONTOLOGY_VERSION,
@@ -727,9 +772,12 @@ class VaultWriter:
         if hasattr(raw_date, "isoformat"):
             raw_date = raw_date.isoformat()
 
-        # Rebuild frontmatter model from parsed dict (tolerates missing optional fields)
+        # Rebuild frontmatter model from parsed dict (tolerates missing optional fields).
+        # Fall back to canonical_session_id (path-derived) rather than the raw
+        # external session_id so that pre-existing notes without a session_id
+        # field are also upgraded to the deterministic identifier.
         fm = MistSessionFrontmatter(
-            session_id=fm_dict.get("session_id", session_id),
+            session_id=fm_dict.get("session_id", canonical_session_id),
             date=raw_date,
             turn_count=fm_dict.get("turn_count", 0),
             participants=fm_dict.get("participants", ["user", "mist"]),
