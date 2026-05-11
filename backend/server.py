@@ -37,7 +37,7 @@ from config import DEFAULT_CONFIG  # isort:skip
 from voice_processor import VoiceProcessor  # isort:skip
 from factories import (  # isort:skip
     build_curation_scheduler,
-    build_filewatcher,
+    build_phase3_components,
     build_sidecar_index,
     build_vault_writer,
 )
@@ -75,6 +75,8 @@ config = DEFAULT_CONFIG
 vault_writer = None
 vault_sidecar = None
 vault_filewatcher = None
+# Phase 5.5: shared InvalidationBus wired from filewatcher to ConversationHandler
+vault_invalidation_bus = None
 
 
 async def broadcast_messages():
@@ -160,7 +162,7 @@ async def health_status_loop(interval_seconds: float = 30.0) -> None:
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
     global voice_processor, curation_scheduler, log_handler
-    global vault_writer, vault_sidecar, vault_filewatcher
+    global vault_writer, vault_sidecar, vault_filewatcher, vault_invalidation_bus
 
     # Startup
     logger.info("=" * 60)
@@ -201,8 +203,18 @@ async def lifespan(app: FastAPI):
                 knowledge_config.sidecar_index.db_path,
             )
 
-        vault_filewatcher = build_filewatcher(knowledge_config, vault_sidecar)
-        if vault_filewatcher is not None:
+        # Phase 5.5: migrate from build_filewatcher (throwaway bus) to
+        # build_phase3_components so the shared InvalidationBus instance can
+        # be forwarded to VoiceProcessor -> ModelManager -> KnowledgeIntegration
+        # -> build_conversation_handler, wiring ConversationHandler._on_vault_rebuild
+        # for ADR-010 invariant-5 cache invalidation on vault edits.
+        phase3 = build_phase3_components(
+            config=knowledge_config,
+            sidecar_index=vault_sidecar,
+        )
+        if phase3 is not None:
+            vault_filewatcher = phase3.filewatcher
+            vault_invalidation_bus = phase3.invalidation_bus
             vault_filewatcher.start(loop)
             logger.info(
                 "Vault filewatcher started (observer=%s, debounce=%dms)",
@@ -212,15 +224,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Vault layer initialization failed (continuing without vault): %s", e)
 
-    # Initialize voice processor with the server-owned vault_writer + sidecar
-    # so that the voice-path ConversationHandler shares a single started writer
-    # AND the retriever's historical / three-way hybrid RRF paths route to
-    # the same initialized sidecar (Phase 9).
+    # Initialize voice processor with the server-owned vault_writer, sidecar,
+    # and invalidation_bus so that the voice-path ConversationHandler shares a
+    # single started writer, the retriever routes to the same initialized sidecar
+    # (Phase 9), and _on_vault_rebuild is subscribed to the shared bus for
+    # ADR-010 invariant-5 cache invalidation (Phase 5.5).
     voice_processor = VoiceProcessor(
         config,
         message_queue,
         vault_writer=vault_writer,
         vault_sidecar=vault_sidecar,
+        invalidation_bus=vault_invalidation_bus,
     )
     await voice_processor.initialize()
 

@@ -30,6 +30,7 @@ class KnowledgeIntegration:
         llm_provider: StreamingLLMProvider | None = None,
         vault_writer=None,
         vault_sidecar=None,
+        invalidation_bus=None,
     ):
         """Initialize knowledge integration.
 
@@ -44,12 +45,19 @@ class KnowledgeIntegration:
                 Phase 9). Forwarded into build_conversation_handler so the
                 retriever's `historical` and three-way `hybrid` RRF paths
                 route to the sidecar. None preserves pre-Phase-9 behavior.
+            invalidation_bus: Optional InvalidationBus shared with the filewatcher
+                (Phase 5.5). Forwarded into build_conversation_handler so
+                ConversationHandler can subscribe `_on_vault_rebuild` and
+                evict stale `_mist_context_cache` entries on vault edits.
+                Must be the same instance returned by build_phase3_components.
+                None preserves pre-Phase-5.5 behavior (no cache invalidation).
         """
         self.enabled = False
         self.conversation_handler: ConversationHandler | None = None
         self.current_session_id = "default"
         self._llm_provider = llm_provider
         self._config = config
+        self._invalidation_bus = invalidation_bus
         # Bridge side-channel: last Complete event captured per turn so callers
         # can read duration_ms / tool_calls_used after generate_response_streaming
         # returns (the generator yields only strings; ADR-017 stream_complete
@@ -73,6 +81,7 @@ class KnowledgeIntegration:
                 llm_provider=llm_provider,
                 vault_writer=vault_writer,
                 vault_sidecar=vault_sidecar,
+                invalidation_bus=invalidation_bus,
             )
 
             self.enabled = True

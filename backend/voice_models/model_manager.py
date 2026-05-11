@@ -46,6 +46,7 @@ class ModelManager:
         llm_provider: StreamingLLMProvider | None = None,
         vault_writer=None,
         vault_sidecar=None,
+        invalidation_bus=None,
     ):
         """Initialize model manager.
 
@@ -59,11 +60,18 @@ class ModelManager:
             vault_sidecar: Optional initialized VaultSidecarIndex (Cluster 8
                 Phase 9). Passed through to KnowledgeIntegration so the
                 retriever's historical / hybrid RRF paths see the sidecar.
+            invalidation_bus: Optional InvalidationBus shared with the filewatcher
+                (Phase 5.5). Passed through to KnowledgeIntegration so
+                ConversationHandler subscribes `_on_vault_rebuild` for
+                ADR-010 invariant-5 cache invalidation. Must be the same
+                instance returned by build_phase3_components. None preserves
+                pre-Phase-5.5 behavior.
         """
         self.config = config
         self._llm_provider = llm_provider
         self._vault_writer = vault_writer
         self._vault_sidecar = vault_sidecar
+        self._invalidation_bus = invalidation_bus
         self.stt = None
         self.tts = None
         self.llm_model = config.llm_model
@@ -80,6 +88,7 @@ class ModelManager:
                         llm_provider=llm_provider,
                         vault_writer=vault_writer,
                         vault_sidecar=vault_sidecar,
+                        invalidation_bus=invalidation_bus,
                     )
                     if self.knowledge.is_enabled():
                         self.knowledge.set_voice_profile(config.voice_profile)

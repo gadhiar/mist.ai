@@ -48,7 +48,9 @@ def log_timestamp(msg: str):
 class VoiceProcessor:
     """Handles voice conversation processing."""
 
-    def __init__(self, config, message_queue, vault_writer=None, vault_sidecar=None):
+    def __init__(
+        self, config, message_queue, vault_writer=None, vault_sidecar=None, invalidation_bus=None
+    ):
         """Initialize voice processor.
 
         Args:
@@ -64,11 +66,18 @@ class VoiceProcessor:
                 -> ConversationHandler so the retriever's historical and
                 three-way hybrid RRF paths route to the sidecar. Server
                 lifespan owns the lifecycle.
+            invalidation_bus: Optional InvalidationBus shared with the filewatcher
+                (Phase 5.5). Threaded through ModelManager -> KnowledgeIntegration
+                -> ConversationHandler so _on_vault_rebuild is subscribed for
+                ADR-010 invariant-5 cache invalidation. Must be the same
+                instance returned by build_phase3_components. Server lifespan
+                owns the lifecycle. None preserves pre-Phase-5.5 behavior.
         """
         self.config = config
         self.message_queue = message_queue
         self._vault_writer = vault_writer
         self._vault_sidecar = vault_sidecar
+        self._invalidation_bus = invalidation_bus
         self.models = None  # Will be initialized in initialize()
 
         # State
@@ -129,6 +138,7 @@ class VoiceProcessor:
             llm_provider=self._llm_provider,
             vault_writer=self._vault_writer,
             vault_sidecar=self._vault_sidecar,
+            invalidation_bus=self._invalidation_bus,
         )
 
         # Load models in thread pool to not block event loop
