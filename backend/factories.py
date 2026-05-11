@@ -222,6 +222,7 @@ def build_conversation_handler(
     llm_provider: StreamingLLMProvider | None = None,
     vault_writer: "VaultWriter | None" = None,
     vault_sidecar: SidecarIndexProtocol | None = None,
+    invalidation_bus: "InvalidationBus | None" = None,
 ):
     """Create a fully wired ConversationHandler.
 
@@ -249,6 +250,12 @@ def build_conversation_handler(
       to the sidecar. Caller is responsible for sidecar.initialize()
       before this call.
 
+    Phase 3 Task 21 (invalidation bus):
+    - `invalidation_bus` must be the SAME instance wired into the filewatcher
+      (from `build_phase3_components`). The handler subscribes its
+      `_on_vault_rebuild` listener so vault-edit rebuilds evict stale
+      `_mist_context_cache` entries. When None, no subscription is registered.
+
     Args:
         config: Knowledge subsystem configuration.
         llm_provider: Optional pre-built LLM provider.
@@ -258,6 +265,10 @@ def build_conversation_handler(
         vault_sidecar: Optional pre-built VaultSidecarIndex. When set the
             retriever supports historical / hybrid vault retrieval; when
             None those branches degrade to graph + vector only.
+        invalidation_bus: Optional InvalidationBus shared with the filewatcher.
+            When provided the handler registers `_on_vault_rebuild` to receive
+            rebuild-completion events and evict stale mist_context caches. The
+            bus must be the same instance returned by `build_phase3_components`.
     """
     from pathlib import Path
 
@@ -325,6 +336,7 @@ def build_conversation_handler(
         tool_usage_tracker=tracker,
         debug_logger=debug_logger,
         vault_writer=vault_writer,
+        invalidation_bus=invalidation_bus,
     )
 
 

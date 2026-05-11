@@ -34,8 +34,10 @@ from backend.vault.conventions import ConventionsLoader
 if TYPE_CHECKING:
     from backend.debug_jsonl_logger import DebugJSONLLogger, TurnRecord
     from backend.interfaces import VaultWriterProtocol
+    from backend.knowledge.curation.graph_regenerator import RebuildResult
     from backend.knowledge.extraction.pipeline import ExtractionPipeline
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
+    from backend.vault.invalidation_bus import InvalidationBus
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +192,7 @@ class ConversationHandler:
         debug_logger: DebugJSONLLogger | None = None,
         budget_planner: ContextBudgetPlanner | None = None,
         vault_writer: VaultWriterProtocol | None = None,
+        invalidation_bus: InvalidationBus | None = None,
     ) -> None:
         """Initialize conversation handler.
 
@@ -214,6 +217,11 @@ class ConversationHandler:
             vault_writer: Optional VaultWriterProtocol (Cluster 8 Phase 5).
                 When set, every successful turn appends to the vault session
                 note. None preserves legacy pre-Cluster-8 behavior.
+            invalidation_bus: Optional InvalidationBus (Phase 3 Task 21). When
+                set, the handler subscribes `_on_vault_rebuild` to receive
+                rebuild-completion events from the filewatcher and evict stale
+                `_mist_context_cache` entries. When None, no subscription is
+                registered and the cache is not driven by vault edits.
         """
         self.config = config
         self.graph_store = graph_store
@@ -275,6 +283,13 @@ class ConversationHandler:
         # Populated on first handle_message for a given session; stable until
         # clear_session or process restart.
         self._mist_context_cache: dict[str, MistContext] = {}
+
+        # Phase 3 Task 21: optional InvalidationBus subscription.
+        # When set, _on_vault_rebuild is called after each vault-file rebuild
+        # (filewatcher -> GraphRegenerator -> bus) to evict stale cache entries.
+        self._invalidation_bus: InvalidationBus | None = invalidation_bus
+        if invalidation_bus is not None:
+            invalidation_bus.subscribe(self._on_vault_rebuild)
 
         # Cluster 3: response post-filter for slop patterns
         self._slop_detector = SlopDetector()
@@ -365,6 +380,56 @@ class ConversationHandler:
             )
         self._mist_context_cache[session_id] = ctx
         return ctx
+
+    async def _on_vault_rebuild(self, event: RebuildResult) -> None:
+        """Evict mist_context cache entries affected by a vault rebuild.
+
+        Subscribed to InvalidationBus on __init__ (when bus is provided).
+        Coordination guarantee: filewatcher publishes AFTER graph rebuild
+        completes, so the next mist_context fetch reads correct re-derived state.
+
+        Eviction rules:
+        - identity/mist.md -> clear ALL active sessions (persona changed)
+        - users/<user>.md  -> clear sessions whose user_id matches the stem
+        - other paths      -> no-op (sessions/*, decisions/*, etc.)
+        """
+        parts = event.path.parts
+
+        if "identity" in parts and event.path.name == "mist.md":
+            # Persona definition changed -- all cached contexts are stale.
+            cleared_count = len(self._mist_context_cache)
+            self._mist_context_cache.clear()
+            logger.info(
+                "_on_vault_rebuild: identity/mist.md rebuilt; cleared all %d session caches",
+                cleared_count,
+            )
+            return
+
+        if "users" in parts:
+            user_id = event.path.stem
+            # Targeted eviction: keep caches for sessions belonging to other users.
+            # user_id is resolved from self.sessions, which is populated by
+            # get_or_create_session (called on every handle_message). Sessions
+            # with no entry in self.sessions have no associated user_id and are
+            # left untouched (conservative: don't evict what we can't classify).
+            stale_sids = {
+                sid
+                for sid, session in self.sessions.items()
+                if session.user_id == user_id and sid in self._mist_context_cache
+            }
+            for sid in stale_sids:
+                del self._mist_context_cache[sid]
+            if stale_sids:
+                logger.info(
+                    "_on_vault_rebuild: users/%s.md rebuilt; evicted %d session cache(s): %s",
+                    user_id,
+                    len(stale_sids),
+                    sorted(stale_sids),
+                )
+            return
+
+        # Other paths (sessions/*, decisions/*) do not affect mist_context.
+        logger.debug("_on_vault_rebuild: path=%s; no mist_context eviction needed", event.path)
 
     def _build_request(
         self,
