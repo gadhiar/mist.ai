@@ -105,3 +105,40 @@ class TestConventionsLoaderWiring:
         )
 
         assert not any("VAULT CONVENTIONS" in m.get("content", "") for m in messages)
+
+
+# ---------------------------------------------------------------------------
+# Task 12: Static template vocabulary and invariant assertions
+# ---------------------------------------------------------------------------
+
+
+from backend.chat.conversation_handler import _STATIC_SYSTEM_TEMPLATE_BODY
+
+
+def test_static_template_uses_notes_and_knowledge_graph_vocabulary():
+    body = _STATIC_SYSTEM_TEMPLATE_BODY
+    assert "NOTES (vault prose" in body
+    assert "KNOWLEDGE GRAPH (typed triples" in body
+    assert "REASONING substrate" in body
+    assert "HISTORICAL and FACTUAL substrate" in body
+
+
+def test_static_template_has_negative_invariants():
+    body = _STATIC_SYSTEM_TEMPLATE_BODY
+    assert "DO NOT call query_knowledge_graph when" in body
+    # Specific exclusions
+    assert "greetings" in body.lower()
+    assert "general-knowledge" in body.lower()
+    assert "creative" in body.lower()
+
+
+def test_static_template_does_not_use_stale_graph_facts_phrase():
+    body = _STATIC_SYSTEM_TEMPLATE_BODY
+    assert "graph facts, document excerpts, or both" not in body
+    # And does not use the unbounded "personalize based on what you know"
+    assert "personalize based on what you know" not in body
+
+
+def test_static_template_includes_decision_rule():
+    body = _STATIC_SYSTEM_TEMPLATE_BODY
+    assert "does the answer depend on user-specific structured knowledge" in body.lower()
