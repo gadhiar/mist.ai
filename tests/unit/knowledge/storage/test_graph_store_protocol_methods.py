@@ -718,3 +718,200 @@ class TestMarkOrphanedAfterUpsert:
         assert (
             triple_b is not None and triple_b.status == "active"
         ), "Triple from path_b must remain active after marking path_a orphaned"
+
+
+# ---------------------------------------------------------------------------
+# TestMarkOrphanedTypedEdges
+# Phase 5.5 tie-up (P3 #1): mark_orphaned_by_provenance_path must ALSO mark
+# the typed edges (r.derived_from_path == path) so retrieval can filter on
+# the edge's own status field without a JOIN through DERIVED_FROM.
+# ---------------------------------------------------------------------------
+
+
+class TestMarkOrphanedTypedEdges:
+    """mark_orphaned_by_provenance_path must mark typed edges by derived_from_path.
+
+    The real GraphStore issues a second Cypher statement that sets
+    r.status='orphaned' on all relationships where r.derived_from_path==path.
+    The FakeGraphStore propagates the same update to FakeTriple.status.
+
+    Tests in this class exercise both the real GraphStore (via FakeNeo4jConnection
+    write inspection) and the FakeGraphStore (via triple-level state assertions).
+    """
+
+    @pytest.mark.asyncio
+    async def test_mark_orphaned_issues_typed_edge_write(self):
+        """mark_orphaned_by_provenance_path must issue a write that updates typed edges.
+
+        The second write (beyond the existing DERIVED_FROM write) must reference
+        derived_from_path so it can select typed edges whose r.derived_from_path
+        matches the path being orphaned.
+        """
+        conn = FakeNeo4jConnection(write_results=[{"marked_count": 1}])
+        store = _store_with_conn(conn)
+
+        await store.mark_orphaned_by_provenance_path("/app/mist-memory/users/raj.md")
+
+        # Must have at least two writes: one for DERIVED_FROM edges, one for typed edges
+        assert len(conn.writes) >= 2, (
+            f"Expected at least 2 writes (DERIVED_FROM + typed edges); got {len(conn.writes)}: "
+            f"{[q[:60] for q, _ in conn.writes]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_mark_orphaned_typed_edge_write_references_derived_from_path(self):
+        """The typed-edge write must match on r.derived_from_path = $path."""
+        conn = FakeNeo4jConnection(write_results=[{"marked_count": 1}])
+        store = _store_with_conn(conn)
+        target_path = "/app/mist-memory/users/raj.md"
+
+        await store.mark_orphaned_by_provenance_path(target_path)
+
+        # At least one write must reference derived_from_path as a selector
+        writes_with_derived_from_path = [
+            (q, p)
+            for q, p in conn.writes
+            if "derived_from_path" in q and p is not None and target_path in str(p.values())
+        ]
+        assert writes_with_derived_from_path, (
+            "Expected a write that selects edges by derived_from_path; "
+            f"writes were: {[(q[:80], p) for q, p in conn.writes]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_mark_orphaned_typed_edge_write_sets_status_orphaned(self):
+        """The typed-edge write must SET r.status='orphaned'."""
+        conn = FakeNeo4jConnection(write_results=[{"marked_count": 1}])
+        store = _store_with_conn(conn)
+
+        await store.mark_orphaned_by_provenance_path("/app/mist-memory/users/raj.md")
+
+        # At least one write beyond the DERIVED_FROM write must set 'orphaned'
+        orphaned_writes = [q for q, _ in conn.writes if "orphaned" in q.lower()]
+        assert len(orphaned_writes) >= 2, (
+            f"Expected at least 2 writes setting 'orphaned' (one for DERIVED_FROM, "
+            f"one for typed edges); got {len(orphaned_writes)}: {orphaned_writes}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fake_graph_store_mark_orphaned_marks_typed_triples(self):
+        """FakeGraphStore.mark_orphaned must mark FakeTriple.status='orphaned'.
+
+        This is the core assertion for the retrieval filter: after marking,
+        any FakeTriple with derived_from_path==path must have status='orphaned'
+        so that retrieval queries filtering on r.status can exclude them.
+        """
+        from tests.fakes.graph_store import FakeGraphStore
+
+        store = FakeGraphStore()
+        path = "/app/mist-memory/users/raj.md"
+        store.add_triple(subject="User", predicate="USES", object="Python", derived_from_path=path)
+
+        await store.mark_orphaned_by_provenance_path(path)
+
+        triple = store.get_triple("User", "USES", "Python")
+        assert triple is not None
+        assert (
+            triple.status == "orphaned"
+        ), f"FakeTriple.status must be 'orphaned' after mark_orphaned; got {triple.status!r}"
+
+    @pytest.mark.asyncio
+    async def test_fake_graph_store_mark_orphaned_leaves_other_path_triples_active(self):
+        """mark_orphaned on path A must leave triples from path B active."""
+        from tests.fakes.graph_store import FakeGraphStore
+
+        store = FakeGraphStore()
+        path_a = "/app/mist-memory/users/raj.md"
+        path_b = "/app/mist-memory/users/alice.md"
+        store.add_triple(
+            subject="User", predicate="USES", object="Python", derived_from_path=path_a
+        )
+        store.add_triple(subject="User", predicate="USES", object="Rust", derived_from_path=path_b)
+
+        await store.mark_orphaned_by_provenance_path(path_a)
+
+        triple_b = store.get_triple("User", "USES", "Rust")
+        assert (
+            triple_b is not None and triple_b.status == "active"
+        ), f"Triple from path_b must remain active; got {triple_b.status!r}"
+
+    @pytest.mark.asyncio
+    async def test_mark_orphaned_idempotent_on_typed_edges(self):
+        """Calling mark_orphaned twice on the same path must not double-count."""
+        from tests.fakes.graph_store import FakeGraphStore
+
+        store = FakeGraphStore()
+        path = "/app/mist-memory/users/raj.md"
+        store.add_triple(subject="User", predicate="USES", object="Python", derived_from_path=path)
+        store.add_triple(
+            subject="User", predicate="EXPERT_IN", object="FastAPI", derived_from_path=path
+        )
+
+        first_count = await store.mark_orphaned_by_provenance_path(path)
+        second_count = await store.mark_orphaned_by_provenance_path(path)
+
+        assert first_count == 2, f"Expected 2 on first call; got {first_count}"
+        assert second_count == 0, f"Expected 0 on second call (idempotent); got {second_count}"
+
+
+# ---------------------------------------------------------------------------
+# TestRetrievalOrphanFilter
+# Phase 5.5 tie-up (P3 #1): the three retrieval Cypher queries in GraphStore
+# must filter on the edge's own status field.
+# ---------------------------------------------------------------------------
+
+
+class TestRetrievalQueryOrphanFilter:
+    """GraphStore retrieval queries must include a status filter on the edge.
+
+    Specifically, get_user_relationships_to_entities, get_entity_neighborhood,
+    and get_all_user_relationships must include:
+        WHERE (r.status IS NULL OR r.status <> 'orphaned')
+    or an equivalent predicate so that typed edges marked by
+    mark_orphaned_by_provenance_path are excluded from retrieval.
+    """
+
+    def test_get_user_relationships_to_entities_filters_orphaned_edges(self):
+        """get_user_relationships_to_entities Cypher must exclude orphaned edges."""
+        conn = FakeNeo4jConnection(query_results=[])
+        store = _store_with_conn(conn)
+
+        store.get_user_relationships_to_entities(
+            user_id="User", entity_ids=["python"], relationship_types=None
+        )
+
+        assert conn.queries, "Expected at least one query"
+        query_text, _ = conn.queries[-1]
+        # The query must filter on edge status
+        assert "orphaned" in query_text.lower(), (
+            "get_user_relationships_to_entities must filter on orphaned edge status; "
+            f"query was:\n{query_text}"
+        )
+
+    def test_get_entity_neighborhood_filters_orphaned_edges(self):
+        """get_entity_neighborhood Cypher must exclude orphaned edges."""
+        conn = FakeNeo4jConnection(query_results=[])
+        store = _store_with_conn(conn)
+
+        store.get_entity_neighborhood(entity_id="python", max_hops=1)
+
+        assert conn.queries, "Expected at least one query"
+        query_text, _ = conn.queries[-1]
+        assert "orphaned" in query_text.lower(), (
+            "get_entity_neighborhood must filter on orphaned edge status; "
+            f"query was:\n{query_text}"
+        )
+
+    def test_get_all_user_relationships_filters_orphaned_edges(self):
+        """get_all_user_relationships Cypher must exclude orphaned edges."""
+        conn = FakeNeo4jConnection(query_results=[])
+        store = _store_with_conn(conn)
+
+        store.get_all_user_relationships(user_id="User")
+
+        assert conn.queries, "Expected at least one query"
+        query_text, _ = conn.queries[-1]
+        assert "orphaned" in query_text.lower(), (
+            "get_all_user_relationships must filter on orphaned edge status; "
+            f"query was:\n{query_text}"
+        )

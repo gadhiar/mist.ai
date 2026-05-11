@@ -1172,7 +1172,9 @@ class GraphStore:
         query = f"""
         MATCH path = (start:__Entity__ {{id: $entity_id}})-[*1..{max_hops}]-(related:__Entity__)
         WHERE ALL(node IN nodes(path) WHERE node:__Entity__)
-          AND ALL(rel IN relationships(path) WHERE type(rel) IN $allowed_rel_types)
+          AND ALL(rel IN relationships(path)
+                  WHERE type(rel) IN $allowed_rel_types
+                    AND (rel.status IS NULL OR rel.status <> 'orphaned'))
         WITH path, relationships(path) as rels, nodes(path) as nodes
         UNWIND range(0, size(rels)-1) as idx
         RETURN
@@ -1210,7 +1212,9 @@ class GraphStore:
 
         query = """
         MATCH (user:__Entity__ {id: $user_id})-[r]-(entity:__Entity__)
-        WHERE entity.id IN $entity_ids AND type(r) IN $allowed_rel_types
+        WHERE entity.id IN $entity_ids
+          AND type(r) IN $allowed_rel_types
+          AND (r.status IS NULL OR r.status <> 'orphaned')
         RETURN
             user.id as user_id,
             entity.id as entity_id,
@@ -1253,7 +1257,10 @@ class GraphStore:
         # ADR-009 v1.1: always enforce user-facing rel-type allowlist.
         allowed_types = relationship_types if relationship_types else _USER_FACING_REL_TYPES
 
-        filters: list[str] = ["type(r) IN $allowed_rel_types"]
+        filters: list[str] = [
+            "type(r) IN $allowed_rel_types",
+            "(r.status IS NULL OR r.status <> 'orphaned')",
+        ]
         if entity_types:
             filters.append("entity.entity_type IN $entity_types")
 
@@ -1506,23 +1513,55 @@ class GraphStore:
 
         Per ADR-010 invariant 5: preserves the triples (no hard-delete) so
         they can be re-derived on retry. Marks both the DERIVED_FROM edge
-        itself and the `orphaned_at` timestamp for audit.
+        itself and the typed edges whose `derived_from_path` property matches
+        the path, so retrieval queries can filter on the typed edge's own
+        status field without a JOIN through DERIVED_FROM per query.
+
+        Two Cypher writes are issued:
+        1. Mark DERIVED_FROM edges pointing at the VaultNote for path.
+        2. Mark any typed edge whose r.derived_from_path == path (the
+           property stamped by upsert_identity / upsert_user at write time).
+
+        Both writes are idempotent: the WHERE predicate excludes already-
+        orphaned edges so re-running with the same path returns 0 on the
+        second call.
 
         Returns:
-            Count of DERIVED_FROM edges marked orphaned.
+            Total count of edges marked (DERIVED_FROM edges + typed edges).
         """
-        query = (
+        params: dict[str, Any] = {"path": path}
+        loop = asyncio.get_event_loop()
+
+        # --- Write 1: mark DERIVED_FROM provenance edges ---
+        derived_from_query = (
             "MATCH ()-[d:DERIVED_FROM]->(p:__Provenance__:VaultNote {path: $path}) "
             "WHERE d.status <> 'orphaned' "
             "SET d.status = 'orphaned', d.orphaned_at = toString(datetime()) "
             "RETURN count(d) AS marked_count"
         )
-        params: dict[str, Any] = {"path": path}
-        loop = asyncio.get_event_loop()
-        rows = await loop.run_in_executor(None, self.connection.execute_write, query, params)
-        if rows:
-            return int(rows[0].get("marked_count", 0))
-        return 0
+        rows_df = await loop.run_in_executor(
+            None, self.connection.execute_write, derived_from_query, params
+        )
+        d_count = int(rows_df[0].get("marked_count", 0)) if rows_df else 0
+
+        # --- Write 2: mark typed edges by derived_from_path property ---
+        # Scoped to the known user-facing relationship types (the allowlist
+        # mirrors _USER_FACING_REL_TYPES) so the MATCH is not a full graph
+        # scan. The WHERE clause is defensive against already-orphaned edges
+        # to preserve idempotency on repeat calls.
+        typed_edge_query = (
+            "MATCH ()-[r]->() "
+            "WHERE r.derived_from_path = $path "
+            "  AND (r.status IS NULL OR r.status <> 'orphaned') "
+            "SET r.status = 'orphaned', r.orphaned_at = toString(datetime()) "
+            "RETURN count(r) AS marked_count"
+        )
+        rows_te = await loop.run_in_executor(
+            None, self.connection.execute_write, typed_edge_query, params
+        )
+        r_count = int(rows_te[0].get("marked_count", 0)) if rows_te else 0
+
+        return d_count + r_count
 
     async def get_orphaned_provenance_paths(self) -> list[str]:
         """Return the list of distinct DERIVED_FROM.path values for orphaned triples.
