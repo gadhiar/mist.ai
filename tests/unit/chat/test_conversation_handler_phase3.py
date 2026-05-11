@@ -142,3 +142,32 @@ def test_static_template_does_not_use_stale_graph_facts_phrase():
 def test_static_template_includes_decision_rule():
     body = _STATIC_SYSTEM_TEMPLATE_BODY
     assert "does the answer depend on user-specific structured knowledge" in body.lower()
+
+
+# ---------------------------------------------------------------------------
+# Task 13: query_knowledge_graph tool description assertions
+# ---------------------------------------------------------------------------
+
+
+from backend.chat.conversation_handler import KNOWLEDGE_TOOL_SCHEMAS
+
+# The query_knowledge_graph tool is the first (and only) entry in KNOWLEDGE_TOOL_SCHEMAS.
+_QKG_FUNCTION = KNOWLEDGE_TOOL_SCHEMAS[0]["function"]
+
+
+def test_tool_description_uses_reasoning_substrate_framing():
+    desc = _QKG_FUNCTION["description"]
+    assert "reasoning substrate" in desc.lower()
+    assert "multi-hop" in desc.lower() or "multi hop" in desc.lower()
+
+
+def test_tool_description_includes_negative_use_cases():
+    desc = _QKG_FUNCTION["description"]
+    assert "DO NOT USE" in desc
+    assert "greeting" in desc.lower()
+    assert "general-knowledge" in desc.lower() or "general knowledge" in desc.lower()
+
+
+def test_tool_description_does_not_use_unbounded_personalize_trigger():
+    desc = _QKG_FUNCTION["description"]
+    assert "personalize based on what you know" not in desc

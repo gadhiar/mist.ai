@@ -45,10 +45,18 @@ KNOWLEDGE_TOOL_SCHEMAS = [
         "function": {
             "name": "query_knowledge_graph",
             "description": (
-                "Search the knowledge graph for relevant information about the user. "
-                "Use when: user asks about past info, preferences, or knowledge; "
-                "you need context about entities, technologies, projects; "
-                "you want to personalize based on what you know."
+                "Search the typed knowledge graph for structured facts and relationships"
+                " about the user. The graph is your reasoning substrate -- typed entities"
+                " and edges you can traverse for inference, multi-hop reasoning, and"
+                " relational lookups.\n\n"
+                "USE for: questions about specific entities/relationships/typed facts;"
+                " multi-hop reasoning over the user's stack, projects, or learning;"
+                " how-to or debugging questions whose answer depends on the user's"
+                " libraries/tools/projects; explicit graph queries.\n\n"
+                "DO NOT USE for: pure conversational filler (greetings, thanks);"
+                " general-knowledge with no user-specific anchor; questions already"
+                " answered by the vault prose in context; purely creative tasks"
+                " without user-specific reasoning."
             ),
             "parameters": {
                 "type": "object",

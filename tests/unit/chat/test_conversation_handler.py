@@ -961,11 +961,12 @@ class TestBudgetAwareBuildMessages:
         conn = FakeNeo4jConnection()
         gs = GraphStore(conn, FakeEmbeddingGenerator())
         config = build_test_config()
-        # 1200 total budget - 50 max_out - 50 reserve - 10 safety ≈ 1090 usable
-        # Static + persona ≈ 600 tokens, leaves ~490 for retrieval+history.
+        # 1700 total budget - 50 max_out - 50 reserve - 10 safety ≈ 1590 usable
+        # Static + persona + tool schema ≈ 1122 tokens (schema grew in Task 13),
+        # leaves ~468 for retrieval+history.
         # 50 history messages * ~18 tokens each = 900 — forces pruning.
         config.context_budget = ContextBudgetConfig(
-            context_window=1200,
+            context_window=1700,
             output_reserve_tokens=50,
             safety_margin_tokens=10,
             retrieval_budget_ratio=0.3,
