@@ -320,6 +320,38 @@ class VaultWriter:
             {"vault_note_path": vault_note_path},
         )
 
+    async def mark_authored_by_user_edit(self, path: Path) -> None:
+        """Set frontmatter authored_by=user-edit on a vault file.
+
+        Implements ADR-010 Invariant 5 writeback: when the filewatcher detects
+        that a human edited a vault file, the pipeline calls this method to
+        flip `authored_by` so subsequent `upsert_user` calls respect the
+        user-authoritative constraint and do not overwrite the body.
+
+        Idempotent: a second call on a file already at `authored_by: user-edit`
+        is a no-op (no rewrite, no temp file created).
+
+        Suppressed from filewatcher recursive fire via mark_mist_write_context
+        (caller is responsible for wrapping in that context manager when
+        invoking from inside filewatcher event handling).
+
+        Args:
+            path: Absolute path to the vault markdown file to update.
+        """
+        text = path.read_text(encoding="utf-8")
+        new_text = re.sub(
+            r"^authored_by:\s*\S+",
+            "authored_by: user-edit",
+            text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        if new_text == text:
+            return
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(new_text, encoding="utf-8")
+        tmp.replace(path)
+
     async def upsert_user(self, user_id: str, body_markdown: str) -> str:
         """Write or update a user fact sheet at `users/<user_id>.md`.
 

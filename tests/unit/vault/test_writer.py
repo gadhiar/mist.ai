@@ -855,3 +855,85 @@ class TestBackpressure:
             assert result == path_str
         finally:
             await writer.stop()
+
+
+# ---------------------------------------------------------------------------
+# TestMarkAuthoredByUserEdit
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def tmp_vault(tmp_path: Path) -> Path:
+    """Return a temporary vault root with the standard subdirectory layout."""
+    vault = tmp_path / "vault"
+    for sub in ("sessions", "identity", "users", "decisions", "meta"):
+        (vault / sub).mkdir(parents=True, exist_ok=True)
+    return vault
+
+
+@pytest.fixture()
+def writer(tmp_vault: Path) -> VaultWriter:
+    """Return a VaultWriter instance (not started) for sync helper tests."""
+    config = VaultConfig(
+        enabled=True,
+        root=str(tmp_vault),
+        default_user_id="raj",
+        git_auto_init=False,
+        session_soft_cap_turns=20,
+        session_soft_cap_tokens=6000,
+        append_sentinel="<!-- MIST_APPEND_HERE -->",
+        writer_queue_max_depth=100,
+    )
+    return VaultWriter(config)
+
+
+def test_mark_authored_by_user_edit_updates_frontmatter(writer: VaultWriter, tmp_vault: Path):
+    p = tmp_vault / "users" / "raj.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        "---\n" "type: mist-user\n" "user_id: raj\n" "authored_by: mist\n" "---\n" "# Raj\n",
+        encoding="utf-8",
+    )
+    asyncio.run(writer.mark_authored_by_user_edit(p))
+    text = p.read_text(encoding="utf-8")
+    assert "authored_by: user-edit" in text
+    assert "authored_by: mist" not in text
+
+
+def test_mark_authored_by_user_edit_idempotent(writer: VaultWriter, tmp_vault: Path):
+    p = tmp_vault / "users" / "raj.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        "---\n" "type: mist-user\n" "authored_by: user-edit\n" "---\n" "body\n",
+        encoding="utf-8",
+    )
+    asyncio.run(writer.mark_authored_by_user_edit(p))
+    text = p.read_text(encoding="utf-8")
+    # Already user-edit; no change
+    assert text.count("authored_by: user-edit") == 1
+
+
+def test_mark_authored_by_user_edit_preserves_body_and_other_frontmatter(
+    writer: VaultWriter, tmp_vault: Path
+):
+    p = tmp_vault / "users" / "raj.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    original = (
+        "---\n"
+        "type: mist-user\n"
+        "user_id: raj\n"
+        "authored_by: pipeline\n"
+        "status: active\n"
+        "---\n"
+        "# Body heading\n"
+        "\nSome content here.\n"
+    )
+    p.write_text(original, encoding="utf-8")
+    asyncio.run(writer.mark_authored_by_user_edit(p))
+    text = p.read_text(encoding="utf-8")
+    assert "authored_by: user-edit" in text
+    assert "type: mist-user" in text
+    assert "user_id: raj" in text
+    assert "status: active" in text
+    assert "# Body heading" in text
+    assert "Some content here." in text
