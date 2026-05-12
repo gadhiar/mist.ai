@@ -163,10 +163,6 @@ entities:
     entity_type: Technology
     display_name: "llama.cpp"
     category: "llm-inference"
-  - id: flutter
-    entity_type: Technology
-    display_name: "Flutter"
-    category: "ui-framework"
   - id: cognitive-architecture
     entity_type: Concept
     display_name: "Cognitive Architecture"
@@ -227,7 +223,6 @@ anchor_relationships:
   - {source: user, type: EXPERT_IN, target: software-engineering}
   - {source: user, type: USES, target: neo4j}
   - {source: user, type: USES, target: llama-cpp}
-  - {source: user, type: USES, target: flutter}
   - {source: user, type: INTERESTED_IN, target: cognitive-architecture}
   - {source: user, type: USES, target: rtx-4070-super}
   - {source: user, type: USES, target: ryzen-7-7800x3d}

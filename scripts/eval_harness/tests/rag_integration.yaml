@@ -82,7 +82,7 @@ cases:
       Knowledge graph results:
       - User WORKS_ON MIST.AI (current, confidence 0.95)
       - User WORKS_ON Wedding AR app (parked, confidence 0.90)
-      - User USES Flutter (current, confidence 0.85)
+      - User USES Tauri (current, confidence 0.85)
       - User PREFERS dark mode UIs (confidence 0.80)
     prompt: "What projects am I actively working on right now?"
     expected:

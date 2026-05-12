@@ -61,7 +61,7 @@ _ENTITY_NAMES: dict[str, list[str]] = {
     "User": ["raj"],
     "Person": ["Alice", "Bob", "Carol", "Dave"],
     "Organization": ["Anthropic", "Google", "Mozilla"],
-    "Technology": ["Python", "FastAPI", "Neo4j", "Flutter", "Ollama", "PyTorch"],
+    "Technology": ["Python", "FastAPI", "Neo4j", "Tauri", "Ollama", "PyTorch"],
     "Skill": ["system-design", "graph-databases", "NLP"],
     "Project": ["MIST.AI", "knowledge-vault", "hana"],
     "Concept": ["event-sourcing", "dependency-injection", "ontology"],
@@ -322,8 +322,8 @@ The backend uses Python with FastAPI for the WebSocket server.
 Ollama runs the Qwen 2.5 7B model for inference.
 
 ## Frontend
-The frontend uses Flutter for desktop applications.
-Riverpod handles state management.
+The frontend uses Tauri with React for desktop applications.
+TypeScript handles type safety.
 
 ## Knowledge System
 Neo4j stores the knowledge graph.
@@ -464,7 +464,7 @@ def sample_chunks(fake_embedding_provider: FakeEmbeddingProvider) -> list[Docume
         "This document describes the system architecture for MIST.AI.",
         "The backend uses Python with FastAPI for the WebSocket server.",
         "Ollama runs the Qwen 2.5 7B model for inference.",
-        "The frontend uses Flutter for desktop applications.",
+        "The frontend uses Tauri with React for desktop applications.",
         "Neo4j stores the knowledge graph.",
     ]
     sections = [

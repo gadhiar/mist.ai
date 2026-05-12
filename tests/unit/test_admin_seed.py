@@ -327,10 +327,12 @@ def test_load_seed_yaml_real_file(tmp_path):
     # consulting-voice bold-markdown drift surfaced by post-Cluster-8 V6.
     assert counts["preferences"] == 6
     assert counts["user"] == 1
-    assert counts["entities"] == 11
+    # 2026-05-11: flutter Technology entity removed post-decommission (ba829cf).
+    assert counts["entities"] == 10
     # Identity relationships: 9 traits + 5 capabilities + 6 preferences.
     assert counts["identity_relationships"] == 9 + 5 + 6
-    assert counts["anchor_relationships"] == 11
+    # 2026-05-11: anchor_relationships drops by 1 with the flutter USES edge removed.
+    assert counts["anchor_relationships"] == 10
     assert counts.get("schema_objects", 0) >= 2  # constraint + type index minimum
 
 
