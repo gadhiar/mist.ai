@@ -1361,3 +1361,187 @@ class TestFrontendSummonCards:
         with pytest.raises(ValueError, match="non-empty"):
             await handler._handle_summon_cards(header="X", cards=[])
         assert handler._turn_ws_events == []
+
+
+class TestGraphSubgraphEmit:
+    """ADR-017 Wave 2: graph_subgraph emit after query_knowledge_graph success.
+
+    The retriever drives the FE graph form via depth-1 focal+neighbors
+    layout. Empty hits skip the emit so the FE keeps prior graphData.
+    """
+
+    def _build_handler(self):
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        config = build_test_config()
+        return ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=FakeExtractionPipeline(),
+            retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
+        )
+
+    def _make_result(self, facts: list, query: str = "test"):
+        from backend.knowledge.models import RetrievalResult
+
+        return RetrievalResult(
+            query=query,
+            user_id="User",
+            facts=facts,
+            entities_found=len(facts),
+            total_facts=len(facts),
+            formatted_context="...",
+            retrieval_time_ms=1.0,
+            vector_search_time_ms=0.5,
+            graph_traversal_time_ms=0.5,
+            config_used={},
+        )
+
+    def _make_fact(
+        self,
+        subject: str = "User",
+        predicate: str = "USES",
+        obj: str = "Python",
+        obj_type: str = "Technology",
+        similarity: float = 0.9,
+    ):
+        from backend.knowledge.models import RetrievedFact
+
+        return RetrievedFact(
+            subject=subject,
+            subject_type="Person",
+            predicate=predicate,
+            object=obj,
+            object_type=obj_type,
+            properties={},
+            similarity_score=similarity,
+            graph_distance=0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_emits_graph_subgraph_after_kg_query(self):
+        """When retriever returns N>0 facts, the buffer carries graph_subgraph.
+
+        Focal + neighbors populated; edges link focal id to each neighbor;
+        the event is a dict matching the ADR-017 shape.
+        """
+        handler = self._build_handler()
+        handler._current_session_id = "s1"
+        facts = [
+            self._make_fact(obj="Python", obj_type="Technology", similarity=0.95),
+            self._make_fact(obj="Neo4j", obj_type="Technology", similarity=0.88),
+            self._make_fact(obj="FastAPI", obj_type="Technology", similarity=0.85),
+        ]
+
+        async def stub_retrieve(**kwargs):
+            return self._make_result(facts, query=kwargs.get("query", "test"))
+
+        handler.retriever.retrieve = stub_retrieve
+
+        result = await handler._handle_query_knowledge_graph(query="what do I use")
+
+        # Tool returned the formatted context, not the placeholder
+        assert "No information found" not in result
+
+        # Buffer should have exactly one graph_subgraph event
+        graph_events = [e for e in handler._turn_ws_events if e["type"] == "graph_subgraph"]
+        assert len(graph_events) == 1
+        event = graph_events[0]
+        assert event["focal"]["label"] == "User"
+        assert event["focal"]["kind"] == "Person"
+        assert event["focal"]["x"] == 0.0 and event["focal"]["y"] == 0.0
+        assert len(event["neighbors"]) == 3
+        neighbor_ids = {n["id"] for n in event["neighbors"]}
+        assert neighbor_ids == {"Python", "Neo4j", "FastAPI"}
+        # Edges link focal -> each neighbor
+        assert all(e["from"] == "User" for e in event["edges"])
+        edge_targets = {e["to"] for e in event["edges"]}
+        assert edge_targets == {"Python", "Neo4j", "FastAPI"}
+
+    @pytest.mark.asyncio
+    async def test_skips_emit_on_empty_hits(self):
+        """Retriever returns 0 facts -> no graph_subgraph event."""
+        handler = self._build_handler()
+        handler._current_session_id = "s1"
+
+        async def stub_retrieve(**kwargs):
+            return self._make_result([], query="x")
+
+        handler.retriever.retrieve = stub_retrieve
+
+        result = await handler._handle_query_knowledge_graph(query="unknown thing")
+        assert "No information found" in result
+        graph_events = [e for e in handler._turn_ws_events if e["type"] == "graph_subgraph"]
+        assert graph_events == []
+
+    def test_neighbors_on_unit_circle(self):
+        """Each neighbor is at distance ~1.0 from focal (origin)."""
+        import math as _math
+
+        from backend.chat.conversation_handler import _build_graph_subgraph_payload
+
+        facts = [self._make_fact(obj=f"E{i}", similarity=0.9 - i * 0.01) for i in range(4)]
+        result = self._make_result(facts)
+
+        payload = _build_graph_subgraph_payload(result, seed="s1:1")
+        assert payload is not None
+        for n in payload["neighbors"]:
+            distance = _math.sqrt(n["x"] ** 2 + n["y"] ** 2)
+            assert abs(distance - 1.0) < 1e-9, f"neighbor not on unit circle: {n}"
+
+    def test_distant_points_at_radius_1_6(self):
+        """Each distant point sits at radius 1.6 from origin."""
+        import math as _math
+
+        from backend.chat.conversation_handler import _build_graph_subgraph_payload
+
+        facts = [self._make_fact(obj="X")]
+        result = self._make_result(facts)
+
+        payload = _build_graph_subgraph_payload(result, seed="s1:1")
+        assert payload is not None
+        assert 5 <= len(payload["distant"]) <= 8
+        for p in payload["distant"]:
+            distance = _math.sqrt(p["x"] ** 2 + p["y"] ** 2)
+            assert abs(distance - 1.6) < 1e-9, f"distant not at radius 1.6: {p}"
+
+    def test_deterministic_distant_placement_for_same_seed(self):
+        """Same seed produces identical distant placements; different seed differs.
+
+        The Wave 2 prompt scoped this as "deterministic within a turn"
+        which the seed parameter mechanism delivers.
+        """
+        from backend.chat.conversation_handler import _build_graph_subgraph_payload
+
+        facts = [self._make_fact(obj="X")]
+        result = self._make_result(facts)
+
+        a = _build_graph_subgraph_payload(result, seed="sess-1:turn-7")
+        b = _build_graph_subgraph_payload(result, seed="sess-1:turn-7")
+        c = _build_graph_subgraph_payload(result, seed="sess-1:turn-8")
+
+        assert a is not None and b is not None and c is not None
+        assert a["distant"] == b["distant"], "same seed must produce identical distant"
+        assert a["distant"] != c["distant"], "different seed should produce different distant"
+
+    def test_neighbor_cap_enforced_at_six(self):
+        """When the retriever returns more than 6 facts, only 6 neighbors render."""
+        from backend.chat.conversation_handler import _build_graph_subgraph_payload
+
+        facts = [self._make_fact(obj=f"E{i}", similarity=0.9 - i * 0.01) for i in range(10)]
+        result = self._make_result(facts)
+
+        payload = _build_graph_subgraph_payload(result, seed="s1:1")
+        assert payload is not None
+        assert len(payload["neighbors"]) == 6
+        assert len(payload["edges"]) == 6
+
+    def test_returns_none_for_empty_facts(self):
+        """The helper returns None when no facts present; caller must skip emit."""
+        from backend.chat.conversation_handler import _build_graph_subgraph_payload
+
+        result = self._make_result([])
+        payload = _build_graph_subgraph_payload(result, seed="s1:1")
+        assert payload is None

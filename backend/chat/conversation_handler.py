@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import random
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -87,6 +89,87 @@ def _summarize_tool_result(tool_name: str, result: str) -> str:
 
 
 _VALID_CARD_PATTERNS: frozenset[str] = frozenset({"lines", "dots", "schematic", "photo"})
+
+# ADR-017 Wave 2: graph_subgraph layout caps.
+_GRAPH_SUBGRAPH_NEIGHBOR_CAP: int = 6
+_GRAPH_SUBGRAPH_DISTANT_MIN: int = 5
+_GRAPH_SUBGRAPH_DISTANT_MAX: int = 8
+_GRAPH_SUBGRAPH_DISTANT_RADIUS: float = 1.6
+
+
+def _build_graph_subgraph_payload(
+    result: RetrievalResult,
+    seed: str,
+) -> dict[str, Any] | None:
+    """Build an ADR-017 graph_subgraph event payload from a retrieval result.
+
+    Returns None when result has no facts so callers can omit the emit
+    (the FE keeps prior graphData when no event arrives).
+
+    Layout:
+    - focal: top-confidence fact's subject at the origin.
+    - neighbors: up to _GRAPH_SUBGRAPH_NEIGHBOR_CAP distinct object entities
+      across facts whose subject matches the focal id. Placed angularly on
+      the unit circle (i / N around 2 pi). Weight is the per-fact similarity
+      score (falls back to 1.0 if score is zero or negative).
+    - distant: 5-8 background points at radius 1.6, seeded by `seed` so
+      the FE re-bake is stable for identical inputs within a turn.
+
+    `seed` should incorporate session_id and turn_index so different turns
+    produce different distant fields and identical dispatches within one
+    turn produce identical placements.
+    """
+    if not result.facts:
+        return None
+
+    top_fact = max(result.facts, key=lambda f: f.similarity_score)
+    focal_id = top_fact.subject
+    focal_kind = top_fact.subject_type
+
+    neighbors_by_id: dict[str, dict[str, Any]] = {}
+    edges: list[dict[str, Any]] = []
+    for fact in result.facts:
+        if fact.subject != focal_id:
+            continue
+        if fact.object in neighbors_by_id:
+            continue
+        if len(neighbors_by_id) >= _GRAPH_SUBGRAPH_NEIGHBOR_CAP:
+            break
+        neighbors_by_id[fact.object] = {
+            "id": fact.object,
+            "label": fact.object,
+            "kind": fact.object_type,
+        }
+        weight = float(fact.similarity_score) if fact.similarity_score > 0 else 1.0
+        edges.append({"from": focal_id, "to": fact.object, "weight": weight})
+
+    n = len(neighbors_by_id)
+    neighbors: list[dict[str, Any]] = []
+    for i, data in enumerate(neighbors_by_id.values()):
+        angle = (2.0 * math.pi * i / n) if n > 0 else 0.0
+        neighbors.append({**data, "x": math.cos(angle), "y": math.sin(angle)})
+
+    # Non-security: deterministic UI layout seeded by caller (session+turn).
+    # B311 is suppressed because pseudo-randomness is exactly what we want here.
+    rng = random.Random(seed)  # nosec B311
+    n_distant = rng.randint(_GRAPH_SUBGRAPH_DISTANT_MIN, _GRAPH_SUBGRAPH_DISTANT_MAX)
+    distant: list[dict[str, float]] = []
+    for _ in range(n_distant):
+        theta = rng.uniform(0.0, 2.0 * math.pi)
+        distant.append(
+            {
+                "x": _GRAPH_SUBGRAPH_DISTANT_RADIUS * math.cos(theta),
+                "y": _GRAPH_SUBGRAPH_DISTANT_RADIUS * math.sin(theta),
+            }
+        )
+
+    return {
+        "type": "graph_subgraph",
+        "focal": {"x": 0.0, "y": 0.0, "label": focal_id, "kind": focal_kind},
+        "neighbors": neighbors,
+        "edges": edges,
+        "distant": distant,
+    }
 
 
 KNOWLEDGE_TOOL_SCHEMAS = [
@@ -403,6 +486,12 @@ class ConversationHandler:
         # chars so the bridge forwards them to the canonical message_queue.
         self._turn_ws_events: list[dict[str, Any]] = []
 
+        # ADR-017 Wave 2: per-turn context used by tool handlers that need
+        # session/turn awareness (graph_subgraph distant-points RNG seed).
+        # Set at the top of handle_message; read inside dispatch handlers.
+        self._current_session_id: str | None = None
+        self._current_turn_index: int = 0
+
         logger.info("ConversationHandler initialized with model: %s", llm_provider.model)
 
     async def _handle_query_knowledge_graph(
@@ -412,7 +501,13 @@ class ConversationHandler:
         relationship_types: list[str] | None = None,
         limit: int = 20,
     ) -> str:
-        """Execute the query_knowledge_graph tool."""
+        """Execute the query_knowledge_graph tool.
+
+        ADR-017 Wave 2: on successful retrieval with at least one fact,
+        appends a graph_subgraph WS event to the per-turn buffer so the
+        FE graph form can render the focal + neighbors. Empty retrievals
+        skip the emit (the FE keeps prior graphData).
+        """
         try:
             filters = None
             if entity_types or relationship_types:
@@ -430,6 +525,16 @@ class ConversationHandler:
                     f"No information found for query: '{query}'. "
                     "You may want to ask the user about this topic."
                 )
+
+            # ADR-017 Wave 2: emit graph_subgraph alongside the textual
+            # tool result so the FE renders the focal + depth-1 neighborhood
+            # for this query. Seed RNG with session+turn for layout stability.
+            graph_payload = _build_graph_subgraph_payload(
+                result,
+                seed=f"{self._current_session_id}:{self._current_turn_index}",
+            )
+            if graph_payload is not None:
+                self._turn_ws_events.append(graph_payload)
 
             return result.formatted_context
 
@@ -740,6 +845,8 @@ class ConversationHandler:
         # (tool_call_*, cards_*, graph_subgraph) accumulate here during this
         # turn and are drained by handle_message_streaming as WSEvent yields.
         self._turn_ws_events = []
+        self._current_session_id = session_id
+        self._current_turn_index += 1
 
         # Get or create session
         session = self.get_or_create_session(session_id, user_id)
