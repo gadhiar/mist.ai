@@ -1,18 +1,30 @@
 """Start the MIST.AI backend development stack via Docker Compose.
 
 Usage:
-    python scripts/start_dev.py              # Start backend stack
-    python scripts/start_dev.py --stop       # Stop all services
-    python scripts/start_dev.py --logs       # Tail backend logs
-    python scripts/start_dev.py --restart    # Restart backend container (pick up code changes)
-    python scripts/start_dev.py --build      # Rebuild images before starting
+    python scripts/start_dev.py                 # Start backend stack
+    python scripts/start_dev.py --with-frontend # Start backend + launch Tauri shell
+    python scripts/start_dev.py --build         # Rebuild backend image then start
+    python scripts/start_dev.py --full-restart  # docker compose down + up (respects --build)
+    python scripts/start_dev.py --stop          # Stop all services
+    python scripts/start_dev.py --logs          # Tail backend logs
+    python scripts/start_dev.py --restart       # Restart backend container (pick up code changes)
 
-The MIST frontend lives in a separate repository at ./mist-frontend/
-(Tauri 2.x + React 19 + react-three-fiber). Start it separately with `npm run dev`
-from that directory. It connects to this backend via WebSocket per ADR-016 / ADR-017.
+Common workflows:
+    # Full clean restart with frontend (rebuild backend image, restart stack,
+    # launch Tauri shell). Use after pulling new BE deps like psutil/pynvml.
+    python scripts/start_dev.py --full-restart --build --with-frontend
+
+    # Quick verify after BE code change (no Dockerfile change):
+    python scripts/start_dev.py --restart && python scripts/start_dev.py --with-frontend
+
+The MIST Tauri frontend lives at ./mist-frontend/ as a nested git repo
+(Tauri 2.x + React 19 + react-three-fiber). --with-frontend launches it
+via scripts/start_frontend.py after the backend is healthy. Connection
+to backend is over WebSocket per ADR-016 / ADR-017.
 
 Prerequisites:
     - Docker Desktop with NVIDIA Container Toolkit
+    - Node.js 18+ + Rust toolchain (cargo) for --with-frontend
 """
 
 import argparse
@@ -21,6 +33,10 @@ import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+FRONTEND_LAUNCHER = REPO_ROOT / "scripts" / "start_frontend.py"
 
 
 def check_port(host: str, port: int, timeout: float = 2.0) -> bool:
@@ -56,7 +72,7 @@ def check_docker() -> bool:
 
 
 def start_stack(build: bool = False) -> bool:
-    """Start the Docker Compose stack (backend + Neo4j + Ollama)."""
+    """Start the Docker Compose stack (backend + Neo4j + llama-server)."""
     print("  Starting Docker Compose stack...")
     cmd = ["docker", "compose", "up", "-d"]
     if build:
@@ -177,13 +193,68 @@ def restart_backend() -> None:
     print("  Backend restarted.")
 
 
+def launch_frontend() -> None:
+    """Launch the Tauri frontend via scripts/start_frontend.py.
+
+    Spawns the existing frontend launcher as a subprocess so we reuse its
+    npm install + cargo check + `npm run tauri dev` orchestration. Stdio
+    is inherited so the user sees Vite + Tauri build output in the same
+    terminal. Blocks until the frontend exits (user Ctrl+C or window
+    close); the backend stack keeps running independently.
+
+    First run: Tauri compiles the Rust shell crate (2-10 min); subsequent
+    runs are cached.
+    """
+    if not FRONTEND_LAUNCHER.exists():
+        print(f"  [FAIL] Frontend launcher not found: {FRONTEND_LAUNCHER}")
+        sys.exit(1)
+    print()
+    print("=" * 50)
+    print("  Launching Tauri frontend (mist-frontend/)")
+    print("=" * 50)
+    print("  Handing off to scripts/start_frontend.py — Ctrl+C stops the")
+    print("  Tauri shell only; the backend stack stays up. Stop backend")
+    print("  later with: python scripts/start_dev.py --stop")
+    print()
+    try:
+        subprocess.run([sys.executable, str(FRONTEND_LAUNCHER)], check=False)
+    except KeyboardInterrupt:
+        print()
+        print("  Tauri shell stopped. Backend stays running.")
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="MIST.AI backend dev stack manager (Docker)")
-    parser.add_argument("--stop", action="store_true", help="Stop all services")
-    parser.add_argument("--logs", action="store_true", help="Tail backend logs")
-    parser.add_argument("--restart", action="store_true", help="Restart backend container")
-    parser.add_argument("--build", action="store_true", help="Rebuild images before starting")
+    parser = argparse.ArgumentParser(
+        description="MIST.AI dev stack manager: backend Docker stack + optional Tauri frontend.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--stop", action="store_true", help="Stop all services (docker compose down)"
+    )
+    parser.add_argument("--logs", action="store_true", help="Tail backend container logs")
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Restart backend container only (pick up Python code changes; no image rebuild)",
+    )
+    parser.add_argument(
+        "--build",
+        action="store_true",
+        help="Rebuild backend image before starting (use after Dockerfile / requirements.txt changes)",
+    )
+    parser.add_argument(
+        "--full-restart",
+        action="store_true",
+        help="Full stack restart: docker compose down + up. Combine with --build for a clean rebuild + restart.",
+    )
+    parser.add_argument(
+        "--with-frontend",
+        action="store_true",
+        help="After the backend is healthy, launch the Tauri frontend (scripts/start_frontend.py).",
+    )
     args = parser.parse_args()
+
+    # Terminal actions (no startup flow) ---------------------------------
 
     if args.stop:
         stop()
@@ -195,7 +266,20 @@ def main() -> None:
 
     if args.restart:
         restart_backend()
+        if args.with_frontend:
+            launch_frontend()
         return
+
+    # Full-restart pre-stage: bring the stack down before normal startup.
+    # Subsequent `docker compose up` either reuses cached images (no --build)
+    # or rebuilds first (with --build) — same flow as a fresh start, just
+    # gated behind an explicit teardown.
+    if args.full_restart:
+        print("Full-restart: bringing stack down before relaunch...")
+        stop()
+        print()
+
+    # Normal startup flow ------------------------------------------------
 
     print("=" * 50)
     print("  MIST.AI Backend Development Stack (Docker)")
@@ -242,14 +326,21 @@ def main() -> None:
     print("  Ollama:   http://localhost:11434")
     print("  Backend:  ws://localhost:8001/ws")
     print()
-    print("  Frontend: separate repo at ./mist-frontend/")
-    print("            Start with `npm run dev` from that directory.")
+    if args.with_frontend:
+        print("  Frontend: launching Tauri shell via scripts/start_frontend.py...")
+    else:
+        print("  Frontend: separate nested repo at ./mist-frontend/")
+        print("            Launch with: python scripts/start_frontend.py")
+        print("            Or together: python scripts/start_dev.py --with-frontend")
     print()
     print("  Logs:     python scripts/start_dev.py --logs")
     print("  Restart:  python scripts/start_dev.py --restart")
     print("  Stop:     python scripts/start_dev.py --stop")
     print("  Tests:    docker compose exec mist-backend pytest tests/unit/ -v")
     print("=" * 50)
+
+    if args.with_frontend:
+        launch_frontend()
 
 
 if __name__ == "__main__":
