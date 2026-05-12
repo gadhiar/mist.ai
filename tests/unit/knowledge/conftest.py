@@ -319,7 +319,7 @@ This document describes the system architecture for MIST.AI.
 
 ## Backend
 The backend uses Python with FastAPI for the WebSocket server.
-Ollama runs the Qwen 2.5 7B model for inference.
+llama-server runs the Gemma 4 E4B Q5_K_M model for inference.
 
 ## Frontend
 The frontend uses Tauri with React for desktop applications.
@@ -463,7 +463,7 @@ def sample_chunks(fake_embedding_provider: FakeEmbeddingProvider) -> list[Docume
     texts = [
         "This document describes the system architecture for MIST.AI.",
         "The backend uses Python with FastAPI for the WebSocket server.",
-        "Ollama runs the Qwen 2.5 7B model for inference.",
+        "llama-server runs the Gemma 4 E4B Q5_K_M model for inference.",
         "The frontend uses Tauri with React for desktop applications.",
         "Neo4j stores the knowledge graph.",
     ]

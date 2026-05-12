@@ -13,7 +13,10 @@ class VoiceConfig(BaseModel):
 
     # Model paths
     whisper_model: str = "base"
-    llm_model: str = "qwen2.5:7b-instruct"
+    # 2026-05-11: default aligned with docker-compose.yml MODEL env var
+    # (gemma-4-e4b). Qwen 2.5 7B was the pre-2026-04-22 default; replaced by
+    # Gemma 4 E4B Q5_K_M per ADR-008 model-backend-selection.
+    llm_model: str = "gemma-4-e4b"
     tts_device: str = "cuda"
 
     # VAD settings
