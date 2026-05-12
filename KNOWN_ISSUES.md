@@ -2,11 +2,53 @@
 
 **Created:** 2026-03-22
 **Source:** Comprehensive 8-agent backend audit (6 sectional + integration + fix rounds)
-**Last Updated:** 2026-03-23
+**Last Updated:** 2026-05-11
 
 > This file tracks unresolved issues found during the pre-Phase-2 audit.
 > Items here are P3 (maintenance risk) -- not blocking, but should be
 > addressed before production use. Check items off as they are resolved.
+
+---
+
+## Deferred Legacy Cleanup (2026-05-11)
+
+Stale references identified during the Wave 2 BE-emits cleanup sweep
+(commits `4d0ffeb` Flutter + `dea865f` Ollama/Qwen). These were held
+from the active sweep because they sat in the Wave-2 forbidden zone
+(`backend/knowledge/**`) or required architectural decisions.
+
+- [ ] **`backend/knowledge/config.py:66, 84` -- Qwen defaults.**
+  `model: str = "qwen2.5:7b-instruct"` and the `os.getenv("MODEL",
+  "qwen2.5:7b-instruct")` fallback are pre-Gemma-4-E4B defaults. In
+  docker, `MODEL=gemma-4-e4b` env var overrides so production is
+  unaffected. Cosmetic / correctness fix; trivial single-line update
+  once the forbidden-zone constraint lifts.
+
+- [ ] **`backend/knowledge/extraction/ontology_extractor.py:5` --
+  Qwen docstring.** Reads "Uses Qwen 2.5 7B via Ollama with
+  format='json' for structured output." Stack moved to llama-server +
+  Gemma 4 E4B. Pure documentation; never read at runtime. Trivial.
+
+- [ ] **`backend/llm/ollama_provider.py` -- OllamaProvider fate.**
+  Wired as the alt LLM backend in `factories.py:123-129` when
+  `llm_config.backend == "ollama"`. Production uses `"llamacpp"` so
+  the Ollama branch never executes. Removing it locks the project to
+  llama-server and eliminates the dev/non-Docker fallback. Needs an
+  architectural decision (ADR-level discussion): commit fully to
+  llama-server, or maintain multi-backend support?
+
+- [ ] **LanceDB references -- vector store actual production usage.**
+  `CLAUDE.md` marks LanceDB as legacy (sqlite-vec sidecar per
+  ADR-010 replaced it for the vault). But `factories.build_vector_store`
+  still constructs `LanceDBVectorStore`, consumed by
+  `build_knowledge_retriever` for the auto-inject and extraction
+  pipelines. Needs 1-2 hours to trace: is LanceDB actually called in
+  any current retrieval path, or is it dormant? Result determines
+  whether removal is safe (dormant) or requires an ADR-aligned
+  migration to sqlite-vec (live). Touches `factories.py`,
+  `backend/knowledge/storage/vector_store.py`,
+  `backend/knowledge/config.py`, and
+  `backend/knowledge/extraction/prompts.py` few-shot examples.
 
 ---
 
