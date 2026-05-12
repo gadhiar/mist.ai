@@ -10,7 +10,7 @@ import queue
 from collections.abc import Generator
 
 from backend.chat.conversation_handler import ConversationHandler
-from backend.chat.stream_events import Complete, Token
+from backend.chat.stream_events import Complete, Token, WSEvent
 from backend.factories import build_conversation_handler
 from backend.knowledge.config import KnowledgeConfig
 from backend.llm import StreamingLLMProvider
@@ -109,18 +109,20 @@ class KnowledgeIntegration:
         user_text: str,
         session_id: str | None = None,
         event_loop: asyncio.AbstractEventLoop | None = None,
-    ) -> Generator[str, None, None]:
-        """Bridge handle_message_streaming (async generator) to sync token iteration.
+    ) -> Generator[str | dict, None, None]:
+        """Bridge handle_message_streaming (async generator) to sync iteration.
 
-        The voice_processor worker thread iterates this generator and forwards
-        each token to the WebSocket client + SentenceBoundaryDetector + TTS.
+        The voice_processor worker thread iterates this generator and routes
+        each yielded item: strings are tokens (existing stream_token path),
+        dicts are pre-formed FE-bound event payloads (ADR-017 Wave 2:
+        tool_call_started/completed, cards_summon/dismiss, graph_subgraph)
+        forwarded as-is onto the canonical message_queue.
+
         Internally drains `ConversationHandler.handle_message_streaming` on the
-        provided event loop via a thread-safe queue.
-
-        All canonical pipeline behavior (retrieval, mist context injection,
-        tool dispatch, slop filter, vault append, EventStore record,
-        fire-and-forget extraction) is inherited unchanged from
-        handle_message_streaming and runs on the event loop.
+        provided event loop via a thread-safe queue. All canonical pipeline
+        behavior (retrieval, mist context injection, tool dispatch, slop
+        filter, vault append, EventStore record, fire-and-forget extraction)
+        is inherited unchanged from handle_message_streaming.
 
         Args:
             user_text: User's message.
@@ -130,7 +132,8 @@ class KnowledgeIntegration:
                 `asyncio.run` (test/CLI contexts).
 
         Yields:
-            Token text strings, one per Token event from handle_message_streaming.
+            Either a string (token text from a Token event) OR a dict (the
+            payload of a WSEvent, ready to json.dumps onto the message_queue).
             Stream ends when the queue sentinel arrives (Complete event seen
             on the producer side).
 
@@ -160,13 +163,15 @@ class KnowledgeIntegration:
 
                     nest_asyncio.apply()
 
-                async def _drain_inline() -> list[str]:
-                    out: list[str] = []
+                async def _drain_inline() -> list[str | dict]:
+                    out: list[str | dict] = []
                     async for event in self.conversation_handler.handle_message_streaming(
                         user_message=user_text, session_id=sid
                     ):
                         if isinstance(event, Token):
                             out.append(event.text)
+                        elif isinstance(event, WSEvent):
+                            out.append(event.payload)
                     return out
 
                 yield from asyncio.run(_drain_inline())
@@ -214,9 +219,14 @@ class KnowledgeIntegration:
                 return
             if isinstance(item, Token):
                 yield item.text
+            elif isinstance(item, WSEvent):
+                # ADR-017 Wave 2: forward FE-bound event payload as a dict.
+                # voice_processor distinguishes dict vs str and routes dicts
+                # directly onto the message_queue (json.dumps + put).
+                yield item.payload
             elif isinstance(item, Complete):
                 # Producer side finished; DONE sentinel will arrive next. We
-                # don't yield the Complete event itself (caller wants strings),
+                # don't yield the Complete event itself (caller wants tokens),
                 # but capture it on the integration object so callers can read
                 # self.last_complete after the generator returns to access
                 # duration_ms / tool_calls_used per ADR-017 stream_complete.

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -18,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 from backend.chat.context_budget import ContextBudgetPlanner
 from backend.chat.mist_context import MistContext
 from backend.chat.slop_detector import SlopDetector
-from backend.chat.stream_events import Complete, StreamEvent, Token
+from backend.chat.stream_events import Complete, StreamEvent, Token, WSEvent
 from backend.event_store.models import ConversationTurnEvent
 from backend.event_store.store import EventStore
 from backend.knowledge.config import KnowledgeConfig
@@ -40,6 +41,50 @@ if TYPE_CHECKING:
     from backend.vault.invalidation_bus import InvalidationBus
 
 logger = logging.getLogger(__name__)
+
+
+def _summarize_tool_args(tool_name: str, arguments: dict[str, Any]) -> str:
+    """One-line human-readable args summary for tool_call_started events.
+
+    ADR-017 Wave 2: tool-call observability. Per-tool heuristics keep
+    summaries short and informative for the FE chrome's inline tool-call
+    indicator. Generic fallback for unknown tools enumerates kwargs.
+    """
+    if tool_name == "query_knowledge_graph":
+        query = str(arguments.get("query", ""))
+        limit = arguments.get("limit", 20)
+        return f"query={query[:40]!r} limit={limit}"
+    if tool_name == "frontend.summon_cards":
+        header = str(arguments.get("header", ""))
+        cards = arguments.get("cards", [])
+        n = len(cards) if isinstance(cards, list) else 0
+        return f"header={header[:30]!r} cards={n}"
+    if tool_name == "frontend.dismiss_cards":
+        return ""
+    return ", ".join(f"{k}={str(v)[:30]!r}" for k, v in arguments.items())[:120]
+
+
+def _summarize_tool_result(tool_name: str, result: str) -> str:
+    """One-line human-readable result summary for tool_call_completed events.
+
+    Detection order: error prefix > empty-results prefix > tool-specific
+    heuristic > length fallback.
+    """
+    if not result:
+        return "empty"
+    if result.startswith("Tool error:") or result.startswith("Error"):
+        return "error"
+    if result.startswith("No information found"):
+        return "0 facts"
+    if tool_name == "query_knowledge_graph":
+        n_facts = result.count("\n- ")
+        return f"{n_facts} facts" if n_facts > 0 else "results retrieved"
+    if tool_name == "frontend.summon_cards":
+        return "cards displayed"
+    if tool_name == "frontend.dismiss_cards":
+        return "dismissed"
+    return f"{len(result)} chars"
+
 
 KNOWLEDGE_TOOL_SCHEMAS = [
     {
@@ -296,6 +341,13 @@ class ConversationHandler:
         self._slop_detector = SlopDetector()
         self._slop_max_regen_attempts = 2
 
+        # ADR-017 Wave 2: per-turn FE-bound event buffer. Reset at the top of
+        # every handle_message; appended during tool dispatch
+        # (tool_call_started/completed, cards_summon/dismiss, graph_subgraph);
+        # drained by handle_message_streaming as WSEvent yields before Token
+        # chars so the bridge forwards them to the canonical message_queue.
+        self._turn_ws_events: list[dict[str, Any]] = []
+
         logger.info("ConversationHandler initialized with model: %s", llm_provider.model)
 
     async def _handle_query_knowledge_graph(
@@ -339,6 +391,48 @@ class ConversationHandler:
         if handler is None:
             return f"Tool not found: {tool_call.name}"
         return await handler(**tool_call.arguments)
+
+    async def _dispatch_tool_with_observability(self, tool_call: LLMToolCall) -> str:
+        """Dispatch a tool call with FE-bound observability events.
+
+        Appends tool_call_started before _dispatch_tool runs and
+        tool_call_completed after (success or failure) into the per-turn
+        WS event buffer. Returns the tool result string; on exception,
+        substitutes a "Tool error: ..." sentinel for the result and
+        records the exception repr in the completed event's error field.
+
+        Duration via perf_counter to avoid wall-clock drift, in integer
+        milliseconds. Events drain via handle_message_streaming as WSEvent
+        yields per ADR-017 Wave 2.
+        """
+        tool_call_id = uuid.uuid4().hex[:8]
+        self._turn_ws_events.append(
+            {
+                "type": "tool_call_started",
+                "tool_call_id": tool_call_id,
+                "name": tool_call.name,
+                "args_summary": _summarize_tool_args(tool_call.name, tool_call.arguments),
+            }
+        )
+        start = time.perf_counter()
+        error: str | None = None
+        try:
+            tool_result = await self._dispatch_tool(tool_call)
+        except Exception as exc:
+            tool_result = f"Tool error: {exc!r}"
+            error = repr(exc)
+        duration_ms = int((time.perf_counter() - start) * 1000)
+        self._turn_ws_events.append(
+            {
+                "type": "tool_call_completed",
+                "tool_call_id": tool_call_id,
+                "name": tool_call.name,
+                "duration_ms": duration_ms,
+                "result_summary": _summarize_tool_result(tool_call.name, tool_result),
+                "error": error,
+            }
+        )
+        return tool_result
 
     def get_or_create_session(self, session_id: str, user_id: str = "User") -> ConversationSession:
         """Get existing session or create new one."""
@@ -544,6 +638,11 @@ class ConversationHandler:
         Returns:
             Assistant's response
         """
+        # ADR-017 Wave 2: clear per-turn FE-bound event buffer. Events
+        # (tool_call_*, cards_*, graph_subgraph) accumulate here during this
+        # turn and are drained by handle_message_streaming as WSEvent yields.
+        self._turn_ws_events = []
+
         # Get or create session
         session = self.get_or_create_session(session_id, user_id)
 
@@ -635,8 +734,11 @@ class ConversationHandler:
                     logger.info("[TOOLS] Executing tool: %s", tc.name)
                     logger.info("[TOOLS]   Args: %s", tc.arguments)
 
-                    # Dispatch to handler
-                    tool_result = await self._dispatch_tool(tc)
+                    # ADR-017 Wave 2: dispatch with observability wrap. Emits
+                    # tool_call_started before _dispatch_tool runs and
+                    # tool_call_completed after (success or failure) into the
+                    # per-turn buffer drained by handle_message_streaming.
+                    tool_result = await self._dispatch_tool_with_observability(tc)
 
                     # Log the result (truncated if too long)
                     result_preview = (
@@ -870,6 +972,14 @@ class ConversationHandler:
             max_history=max_history,
         )
         duration_ms = (time.monotonic() - start) * 1000
+
+        # ADR-017 Wave 2: drain per-turn FE-bound events accumulated by
+        # handle_message (tool_call_started/completed, cards_*, graph_subgraph).
+        # Emitted BEFORE Token chars so the FE sees tool-call indicators and
+        # graph subgraph data before / alongside the response prose.
+        for event_payload in self._turn_ws_events:
+            yield WSEvent(payload=event_payload)
+        self._turn_ws_events = []
 
         for char in response:
             yield Token(text=char)

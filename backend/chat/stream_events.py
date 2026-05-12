@@ -2,7 +2,9 @@
 
 `ConversationHandler.handle_message_streaming` yields a sequence of these
 events. Token + Complete are the load-bearing pair emitted by v1; Thinking
-and Filler are extensibility hooks reserved for future iterations.
+and Filler are extensibility hooks reserved for future iterations. WSEvent
+carries pre-formed FE-bound JSON payloads (tool_call_started, cards_summon,
+graph_subgraph, etc.) emitted mid-turn for ADR-017 observability.
 
 Pattern motivated by Claude's per-turn shape: input goes in, the LLM
 executes whatever it needs (retrieval, tool calls, regen), tokens stream
@@ -12,6 +14,7 @@ fired before Complete yields and is invisible to the caller.
 """
 
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,3 +74,21 @@ class Complete(StreamEvent):
     final_response: str
     tool_calls_used: int = 0
     duration_ms: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class WSEvent(StreamEvent):
+    """Pre-formed FE-bound JSON event payload emitted mid-turn.
+
+    Carries tool_call_started, tool_call_completed, cards_summon,
+    cards_dismiss, graph_subgraph, and other ADR-017 discriminated events
+    that originate inside the conversation pipeline. The pipeline does not
+    hold a WebSocket reference; the bridge in `knowledge_integration` and
+    `voice_processor` translates these yields into queue puts on the
+    canonical message_queue without coupling the handler to the WS layer.
+
+    `payload` is the full event body including the ADR-017 `type` field;
+    the bridge serializes it via json.dumps and forwards as-is.
+    """
+
+    payload: dict[str, Any]

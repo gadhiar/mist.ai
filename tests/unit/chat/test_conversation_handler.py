@@ -1045,3 +1045,196 @@ class TestBudgetAwareBuildMessages:
         # All 5 history messages present (no pruning).
         history_msgs = [m for m in messages if m["role"] != "system"]
         assert len(history_msgs) == 5
+
+
+class TestToolCallObservability:
+    """ADR-017 Wave 2: tool_call_started / tool_call_completed event emission.
+
+    The dispatch wrap (_dispatch_tool_with_observability) buffers WS events
+    into self._turn_ws_events. handle_message_streaming drains the buffer
+    into WSEvent yields. These tests exercise the wrap directly for tight
+    isolation and ordering guarantees.
+    """
+
+    def _build_handler(self):
+
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        config = build_test_config()
+        return ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=FakeExtractionPipeline(),
+            retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_emits_started_before_dispatch(self):
+        """tool_call_started must be appended BEFORE _dispatch_tool runs.
+
+        Captures buffer state at dispatch time by patching _dispatch_tool.
+        The captured snapshot must contain exactly one started event; the
+        completed event lands only after dispatch returns.
+        """
+        from backend.llm.models import ToolCall as LLMToolCall
+
+        handler = self._build_handler()
+        captured_at_dispatch: list[dict] = []
+
+        async def patched_dispatch(tc):
+            captured_at_dispatch.extend(handler._turn_ws_events)
+            return "test result"
+
+        handler._dispatch_tool = patched_dispatch
+        tc = LLMToolCall(id="oai-1", name="query_knowledge_graph", arguments={"query": "test"})
+
+        await handler._dispatch_tool_with_observability(tc)
+
+        assert (
+            len(captured_at_dispatch) == 1
+        ), f"buffer at dispatch time must have exactly tool_call_started; got {captured_at_dispatch}"
+        assert captured_at_dispatch[0]["type"] == "tool_call_started"
+        assert captured_at_dispatch[0]["name"] == "query_knowledge_graph"
+
+    @pytest.mark.asyncio
+    async def test_emits_completed_after_success(self):
+        """tool_call_completed appended after successful dispatch.
+
+        error=None, duration_ms is a non-negative integer, result_summary
+        is non-empty.
+        """
+        from backend.llm.models import ToolCall as LLMToolCall
+
+        handler = self._build_handler()
+
+        async def patched_dispatch(tc):
+            return "results retrieved"
+
+        handler._dispatch_tool = patched_dispatch
+        tc = LLMToolCall(id="oai-2", name="query_knowledge_graph", arguments={"query": "x"})
+
+        result = await handler._dispatch_tool_with_observability(tc)
+
+        assert result == "results retrieved"
+        assert len(handler._turn_ws_events) == 2
+        completed = handler._turn_ws_events[1]
+        assert completed["type"] == "tool_call_completed"
+        assert completed["error"] is None
+        assert isinstance(completed["duration_ms"], int)
+        assert completed["duration_ms"] >= 0
+        assert completed["result_summary"] != ""
+
+    @pytest.mark.asyncio
+    async def test_emits_completed_after_failure(self):
+        """When _dispatch_tool raises, completed event records error repr.
+
+        Result becomes a "Tool error: ..." sentinel; tool_call_completed
+        carries the exception repr in its error field.
+        """
+        from backend.llm.models import ToolCall as LLMToolCall
+
+        handler = self._build_handler()
+
+        async def patched_dispatch(tc):
+            raise ValueError("simulated tool failure")
+
+        handler._dispatch_tool = patched_dispatch
+        tc = LLMToolCall(id="oai-3", name="query_knowledge_graph", arguments={"query": "x"})
+
+        result = await handler._dispatch_tool_with_observability(tc)
+
+        assert result.startswith("Tool error:")
+        assert "simulated tool failure" in result
+        completed = handler._turn_ws_events[1]
+        assert completed["type"] == "tool_call_completed"
+        assert completed["error"] is not None
+        assert "simulated tool failure" in completed["error"]
+        assert isinstance(completed["duration_ms"], int)
+        assert completed["duration_ms"] >= 0
+
+    @pytest.mark.asyncio
+    async def test_tool_call_id_consistent_across_started_and_completed(self):
+        """Same tool_call_id ties the started and completed events together."""
+        from backend.llm.models import ToolCall as LLMToolCall
+
+        handler = self._build_handler()
+
+        async def patched_dispatch(tc):
+            return "ok"
+
+        handler._dispatch_tool = patched_dispatch
+        tc = LLMToolCall(id="oai-4", name="query_knowledge_graph", arguments={"query": "x"})
+
+        await handler._dispatch_tool_with_observability(tc)
+
+        started, completed = handler._turn_ws_events
+        assert started["tool_call_id"] == completed["tool_call_id"]
+        # Distinct from the LLM-side tool_call id (tc.id is OpenAI message correlation;
+        # our tool_call_id is the FE-side observability id).
+        assert started["tool_call_id"] != tc.id
+
+    @pytest.mark.asyncio
+    async def test_args_summary_truncates_long_query(self):
+        """args_summary truncates query strings to 40 chars.
+
+        Uses the repr-formatted form so quoting is consistent with the
+        rest of the summarizer surface.
+        """
+        from backend.chat.conversation_handler import _summarize_tool_args
+
+        long_query = "x" * 100
+        summary = _summarize_tool_args("query_knowledge_graph", {"query": long_query, "limit": 20})
+
+        # The query portion of the summary should contain a 40-char excerpt
+        # of the original (truncated via slicing). Length check: the inner
+        # query string (with repr quotes) is the truncated portion.
+        # Example: query='xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' limit=20
+        assert "x" * 40 in summary
+        assert "x" * 41 not in summary
+        assert "limit=20" in summary
+
+    @pytest.mark.asyncio
+    async def test_buffer_drained_by_streaming(self):
+        """handle_message_streaming yields WSEvent for each buffered event
+        and clears the buffer for the next turn.
+        """
+        from backend.chat.stream_events import WSEvent
+
+        handler = self._build_handler()
+        # Pre-populate the buffer as if a prior dispatch had run.
+        handler._turn_ws_events = [
+            {"type": "tool_call_started", "tool_call_id": "abc", "name": "x", "args_summary": ""},
+            {
+                "type": "tool_call_completed",
+                "tool_call_id": "abc",
+                "name": "x",
+                "duration_ms": 1,
+                "result_summary": "ok",
+                "error": None,
+            },
+        ]
+
+        # Patch handle_message to return immediately so streaming runs.
+        async def stub_handle(**kwargs):
+            return "hello"
+
+        handler.handle_message = stub_handle
+
+        emitted_events: list[dict] = []
+        emitted_tokens: list[str] = []
+        async for event in handler.handle_message_streaming(user_message="hi", session_id="s1"):
+            if isinstance(event, WSEvent):
+                emitted_events.append(event.payload)
+            elif hasattr(event, "text"):
+                emitted_tokens.append(event.text)
+
+        assert len(emitted_events) == 2
+        assert emitted_events[0]["type"] == "tool_call_started"
+        assert emitted_events[1]["type"] == "tool_call_completed"
+        # WS events must appear BEFORE Token chars (FE sees observability
+        # before / alongside the response prose).
+        assert "".join(emitted_tokens) == "hello"
+        # Buffer cleared after drain.
+        assert handler._turn_ws_events == []

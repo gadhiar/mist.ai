@@ -464,11 +464,25 @@ class VoiceProcessor:
 
             first_token_seen = False
             interrupted = False
-            for token in self.models.generate_llm_response(user_text):
+            for item in self.models.generate_llm_response(user_text):
                 if self.interrupt_flag.is_set():
                     log_timestamp("LLM generation interrupted")
                     interrupted = True
                     break
+
+                # ADR-017 Wave 2: dict items are pre-formed FE-bound event
+                # payloads (tool_call_started/completed, cards_summon/dismiss,
+                # graph_subgraph) yielded from the conversation pipeline. They
+                # are forwarded onto the message_queue as-is.
+                if isinstance(item, dict):
+                    asyncio.run_coroutine_threadsafe(
+                        self.message_queue.put(json.dumps(item)),
+                        self.loop,
+                    )
+                    continue
+
+                # String items are response tokens.
+                token = item
                 full_response += token
                 if not first_token_seen:
                     # First token of the turn -> MIST has begun replying.
