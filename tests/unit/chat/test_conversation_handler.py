@@ -961,12 +961,14 @@ class TestBudgetAwareBuildMessages:
         conn = FakeNeo4jConnection()
         gs = GraphStore(conn, FakeEmbeddingGenerator())
         config = build_test_config()
-        # 1700 total budget - 50 max_out - 50 reserve - 10 safety ≈ 1590 usable
-        # Static + persona + tool schema ≈ 1122 tokens (schema grew in Task 13),
-        # leaves ~468 for retrieval+history.
-        # 50 history messages * ~18 tokens each = 900 — forces pruning.
+        # 3000 total budget - 50 max_out - 50 reserve - 10 safety ~= 2890 usable
+        # Static + persona + tool schemas ~= 1960 tokens (schemas grew with
+        # Wave 2 tool catalog additions: tool_call observability, cards,
+        # query_vault, switch_form), leaves ~930 for retrieval+history.
+        # 50 history messages * ~36 tokens each (user + assistant pair * msg
+        # body) -> well above 930 -> forces pruning.
         config.context_budget = ContextBudgetConfig(
-            context_window=1700,
+            context_window=3000,
             output_reserve_tokens=50,
             safety_margin_tokens=10,
             retrieval_budget_ratio=0.3,
@@ -1545,3 +1547,312 @@ class TestGraphSubgraphEmit:
         result = self._make_result([])
         payload = _build_graph_subgraph_payload(result, seed="s1:1")
         assert payload is None
+
+
+class TestQueryVault:
+    """ADR-017 Wave 2 (vault_results) -- query_vault tool emit contract.
+
+    Tool routes to retriever.retrieve(force_intent='historical'). Tests
+    stub the retriever to return controlled RetrievedFact lists so the
+    vault_results emit can be exercised without a real vault sidecar.
+    """
+
+    def _build_handler(self):
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        config = build_test_config()
+        return ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=FakeExtractionPipeline(),
+            retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
+        )
+
+    def _make_vault_fact(
+        self,
+        path: str = "sessions/2026-05-11-test.md",
+        section: str | None = "Backend",
+        text: str = "This is a vault chunk about the backend architecture.",
+        similarity: float = 0.92,
+        sources: list[str] | None = None,
+    ):
+        from backend.knowledge.models import RetrievedFact
+
+        return RetrievedFact(
+            subject="VaultNote",
+            subject_type="VaultSession",
+            predicate="MENTIONS",
+            object=section or "(file)",
+            object_type="VaultChunk",
+            properties={
+                "path": path,
+                "text": text,
+                "content": text,
+                "sources": sources or ["vector", "fts"],
+            },
+            similarity_score=similarity,
+            graph_distance=99,
+        )
+
+    def _make_result(self, facts: list, query: str = "test query"):
+        from backend.knowledge.models import RetrievalResult
+
+        return RetrievalResult(
+            query=query,
+            user_id="User",
+            facts=facts,
+            entities_found=0,
+            total_facts=len(facts),
+            formatted_context="prose context for the LLM",
+            retrieval_time_ms=1.0,
+            vector_search_time_ms=0.5,
+            graph_traversal_time_ms=0.0,
+            config_used={},
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_formatted_context_on_hits(self):
+        """Tool returns the retriever's formatted_context on N>0 vault facts."""
+        handler = self._build_handler()
+        facts = [self._make_vault_fact()]
+
+        async def stub_retrieve(**kwargs):
+            assert kwargs.get("force_intent") == "historical"
+            return self._make_result(facts)
+
+        handler.retriever.retrieve = stub_retrieve
+
+        result = await handler._handle_query_vault(query="backend")
+        assert result == "prose context for the LLM"
+
+    @pytest.mark.asyncio
+    async def test_emits_vault_results_event(self):
+        """On hits, vault_results event lands in the per-turn buffer."""
+        handler = self._build_handler()
+        facts = [
+            self._make_vault_fact(
+                path="sessions/2026-05-11-test.md",
+                section="Backend",
+                text="x" * 300,
+                similarity=0.88,
+            ),
+            self._make_vault_fact(
+                path="decisions/DEC-001.md",
+                section=None,
+                text="A decision about Python.",
+                similarity=0.71,
+            ),
+        ]
+
+        async def stub_retrieve(**kwargs):
+            return self._make_result(facts)
+
+        handler.retriever.retrieve = stub_retrieve
+
+        await handler._handle_query_vault(query="backend", limit=5, display_hint="panel")
+
+        events = [e for e in handler._turn_ws_events if e["type"] == "vault_results"]
+        assert len(events) == 1
+        event = events[0]
+        assert event["query"] == "backend"
+        assert event["total_results"] == 2
+        assert event["display_hint"] == "panel"
+        assert len(event["results"]) == 2
+
+        # First result: long content -> snippet truncated
+        first = event["results"][0]
+        assert first["note_path"] == "sessions/2026-05-11-test.md"
+        assert first["section"] == "Backend"
+        assert first["full_text"] == "x" * 300
+        assert first["snippet"].endswith("...")
+        assert len(first["snippet"]) == 203  # 200 chars + "..."
+        assert first["similarity"] == 0.88
+        assert "vector" in first["sources"]
+
+        # Second result: '(file)' heading becomes None
+        second = event["results"][1]
+        assert second["section"] is None
+        assert second["full_text"] == "A decision about Python."
+
+    @pytest.mark.asyncio
+    async def test_skips_emit_on_zero_hits(self):
+        """0 vault facts -> no vault_results emit + descriptive tool result."""
+        handler = self._build_handler()
+
+        async def stub_retrieve(**kwargs):
+            return self._make_result([])
+
+        handler.retriever.retrieve = stub_retrieve
+
+        result = await handler._handle_query_vault(query="unknown thing")
+        assert "No vault content" in result
+        events = [e for e in handler._turn_ws_events if e["type"] == "vault_results"]
+        assert events == []
+
+    @pytest.mark.asyncio
+    async def test_validates_display_hint_enum(self):
+        """Invalid display_hint raises ValueError; no event emitted."""
+        handler = self._build_handler()
+        with pytest.raises(ValueError, match="invalid display_hint"):
+            await handler._handle_query_vault(query="x", display_hint="carousel")
+        assert handler._turn_ws_events == []
+
+    @pytest.mark.asyncio
+    async def test_validates_query_not_empty(self):
+        """Empty / whitespace query rejected."""
+        handler = self._build_handler()
+        with pytest.raises(ValueError, match="non-empty"):
+            await handler._handle_query_vault(query="")
+        with pytest.raises(ValueError, match="non-empty"):
+            await handler._handle_query_vault(query="   ")
+
+    @pytest.mark.asyncio
+    async def test_validates_limit_bounds(self):
+        """Limit must be 1-10."""
+        handler = self._build_handler()
+        with pytest.raises(ValueError, match="between 1 and 10"):
+            await handler._handle_query_vault(query="x", limit=0)
+        with pytest.raises(ValueError, match="between 1 and 10"):
+            await handler._handle_query_vault(query="x", limit=11)
+
+    def test_tool_registered_in_schema(self):
+        """query_vault appears in the handler's tool_schemas catalog."""
+        handler = self._build_handler()
+        tool_names = [s["function"]["name"] for s in handler._tool_schemas]
+        assert "query_vault" in tool_names
+
+    def test_chunk_id_stable_across_calls(self):
+        """Same (path, section) produces the same chunk_id."""
+        from backend.chat.conversation_handler import _chunk_id_for
+
+        a = _chunk_id_for("sessions/2026-05-11.md", "Backend")
+        b = _chunk_id_for("sessions/2026-05-11.md", "Backend")
+        c = _chunk_id_for("sessions/2026-05-11.md", "Frontend")
+        d = _chunk_id_for("decisions/DEC-001.md", "Backend")
+        assert a == b
+        assert a != c
+        assert a != d
+
+    def test_note_title_derivation(self):
+        """Title is derived from filename stem; date prefix stripped."""
+        from backend.chat.conversation_handler import _derive_note_title_from_path
+
+        assert _derive_note_title_from_path("sessions/2026-05-11-test-alpha.md") == "Test Alpha"
+        assert _derive_note_title_from_path("decisions/DEC-001-foo.md") == "Dec 001 Foo"
+        assert _derive_note_title_from_path("identity/mist.md") == "Mist"
+        assert _derive_note_title_from_path("") == "Untitled"
+
+
+class TestFrontendSwitchForm:
+    """ADR-017 Wave 2 -- frontend.switch_form tool + form_switch event."""
+
+    def _build_handler(self):
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        config = build_test_config()
+        return ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=FakeExtractionPipeline(),
+            retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
+        )
+
+    def test_tool_registered_in_schema(self):
+        handler = self._build_handler()
+        tool_names = [s["function"]["name"] for s in handler._tool_schemas]
+        assert "frontend.switch_form" in tool_names
+
+    @pytest.mark.asyncio
+    async def test_emits_form_switch_event(self):
+        """Tool appends form_switch with the canonical ADR-017 shape."""
+        handler = self._build_handler()
+        result = await handler._handle_switch_form(
+            form="graph", reason="rendering knowledge graph results"
+        )
+        assert "Switched" in result
+        assert handler._turn_ws_events == [
+            {
+                "type": "form_switch",
+                "form": "graph",
+                "reason": "rendering knowledge graph results",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_validates_form_enum(self):
+        handler = self._build_handler()
+        with pytest.raises(ValueError, match="invalid form"):
+            await handler._handle_switch_form(form="invalid", reason="any")
+        assert handler._turn_ws_events == []
+
+    @pytest.mark.asyncio
+    async def test_validates_reason_required(self):
+        handler = self._build_handler()
+        with pytest.raises(ValueError, match="non-empty"):
+            await handler._handle_switch_form(form="graph", reason="")
+        with pytest.raises(ValueError, match="non-empty"):
+            await handler._handle_switch_form(form="graph", reason="   ")
+
+    @pytest.mark.asyncio
+    async def test_query_knowledge_graph_does_not_auto_switch_form(self):
+        """Per user direction: no auto-form-switch when query_knowledge_graph
+        fires. The LLM must chain frontend.switch_form explicitly.
+        """
+        from backend.knowledge.models import RetrievalResult, RetrievedFact
+
+        handler = self._build_handler()
+        handler._current_session_id = "s1"
+        facts = [
+            RetrievedFact(
+                subject="User",
+                subject_type="Person",
+                predicate="USES",
+                object="Python",
+                object_type="Technology",
+                properties={},
+                similarity_score=0.95,
+                graph_distance=0,
+            )
+        ]
+        result = RetrievalResult(
+            query="x",
+            user_id="User",
+            facts=facts,
+            entities_found=1,
+            total_facts=1,
+            formatted_context="...",
+            retrieval_time_ms=1.0,
+            vector_search_time_ms=0.5,
+            graph_traversal_time_ms=0.5,
+            config_used={},
+        )
+
+        async def stub_retrieve(**kwargs):
+            return result
+
+        handler.retriever.retrieve = stub_retrieve
+        await handler._handle_query_knowledge_graph(query="what do I use")
+
+        form_switches = [e for e in handler._turn_ws_events if e["type"] == "form_switch"]
+        assert form_switches == [], "query_knowledge_graph must not auto-emit form_switch"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_chain_includes_observability(self):
+        """End-to-end via _dispatch_tool_with_observability: started,
+        form_switch, completed in that order.
+        """
+        from backend.llm.models import ToolCall as LLMToolCall
+
+        handler = self._build_handler()
+        tc = LLMToolCall(
+            id="oai-fs-1",
+            name="frontend.switch_form",
+            arguments={"form": "graph", "reason": "showing graph data"},
+        )
+        await handler._dispatch_tool_with_observability(tc)
+        event_types = [e["type"] for e in handler._turn_ws_events]
+        assert event_types == ["tool_call_started", "form_switch", "tool_call_completed"]

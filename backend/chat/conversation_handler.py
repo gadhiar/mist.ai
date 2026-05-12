@@ -25,7 +25,12 @@ from backend.chat.stream_events import Complete, StreamEvent, Token, WSEvent
 from backend.event_store.models import ConversationTurnEvent
 from backend.event_store.store import EventStore
 from backend.knowledge.config import KnowledgeConfig
-from backend.knowledge.models import ConversationSession, RetrievalFilters, RetrievalResult
+from backend.knowledge.models import (
+    ConversationSession,
+    RetrievalFilters,
+    RetrievalResult,
+    RetrievedFact,
+)
 from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from backend.knowledge.storage.graph_store import GraphStore
 from backend.llm import LLMRequest, StreamingLLMProvider
@@ -56,6 +61,14 @@ def _summarize_tool_args(tool_name: str, arguments: dict[str, Any]) -> str:
         query = str(arguments.get("query", ""))
         limit = arguments.get("limit", 20)
         return f"query={query[:40]!r} limit={limit}"
+    if tool_name == "query_vault":
+        query = str(arguments.get("query", ""))
+        limit = arguments.get("limit", 5)
+        hint = arguments.get("display_hint", "auto")
+        return f"query={query[:40]!r} limit={limit} hint={hint!r}"
+    if tool_name == "frontend.switch_form":
+        form = arguments.get("form", "")
+        return f"form={form!r}"
     if tool_name == "frontend.summon_cards":
         header = str(arguments.get("header", ""))
         cards = arguments.get("cards", [])
@@ -81,6 +94,14 @@ def _summarize_tool_result(tool_name: str, result: str) -> str:
     if tool_name == "query_knowledge_graph":
         n_facts = result.count("\n- ")
         return f"{n_facts} facts" if n_facts > 0 else "results retrieved"
+    if tool_name == "query_vault":
+        if result.startswith("No vault content"):
+            return "0 chunks"
+        # Each chunk is rendered as a prose block separated by blank lines
+        n_chunks = result.count("\n\n") + 1
+        return f"{n_chunks} chunks"
+    if tool_name == "frontend.switch_form":
+        return result if result and len(result) < 80 else "form switched"
     if tool_name == "frontend.summon_cards":
         return "cards displayed"
     if tool_name == "frontend.dismiss_cards":
@@ -90,11 +111,111 @@ def _summarize_tool_result(tool_name: str, result: str) -> str:
 
 _VALID_CARD_PATTERNS: frozenset[str] = frozenset({"lines", "dots", "schematic", "photo"})
 
+# ADR-017 Wave 2 (vault_results): valid display hints the LLM can pass via
+# the query_vault tool to recommend FE presentation mode. 'auto' lets the
+# FE decide based on its own UX rules (count + content length); 'cards'
+# and 'panel' are explicit overrides.
+_VALID_VAULT_DISPLAY_HINTS: frozenset[str] = frozenset({"auto", "cards", "panel"})
+
+# vault_results event: per-result snippet truncation length.
+_VAULT_SNIPPET_MAX_CHARS: int = 200
+
 # ADR-017 Wave 2: graph_subgraph layout caps.
 _GRAPH_SUBGRAPH_NEIGHBOR_CAP: int = 6
 _GRAPH_SUBGRAPH_DISTANT_MIN: int = 5
 _GRAPH_SUBGRAPH_DISTANT_MAX: int = 8
 _GRAPH_SUBGRAPH_DISTANT_RADIUS: float = 1.6
+
+
+def _derive_note_title_from_path(path: str) -> str:
+    """Best-effort human-readable title from a vault relative path.
+
+    Strategy: take the filename stem, strip date prefixes, replace
+    separators with spaces, title-case. Returns the path as-is if
+    derivation fails. Cheap; no disk reads.
+
+    Future enhancement: enrich at the sidecar layer so the chunk carries
+    frontmatter.title directly when present (currently dropped at the
+    retriever boundary). Tracked alongside the ADR-021 citation contract
+    work since both surfaces benefit from richer chunk metadata.
+    """
+    if not path:
+        return "Untitled"
+    # Filename stem, no directory, no extension
+    stem = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if stem.endswith(".md"):
+        stem = stem[:-3]
+    # Strip a leading YYYY-MM-DD- date prefix if present
+    if len(stem) >= 11 and stem[4] == "-" and stem[7] == "-" and stem[10] == "-":
+        stem = stem[11:]
+    # Replace separators with spaces and title-case
+    pretty = stem.replace("-", " ").replace("_", " ").strip()
+    return pretty.title() if pretty else "Untitled"
+
+
+def _chunk_id_for(path: str, section: str | None) -> str:
+    """Stable chunk identifier from (path, section).
+
+    Used by the FE to track a chunk across emits (e.g., re-querying the
+    same content) and as a click-handle for navigation. SHA-1 truncated
+    to 12 hex chars is plenty of entropy for an FE-side identifier.
+    """
+    import hashlib
+
+    key = f"{path}::{section or ''}"
+    # nosec B324: SHA-1 here is a non-security keyed identifier, not a digest of secrets.
+    return hashlib.sha1(key.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+
+
+def _build_vault_results_payload(
+    query: str,
+    facts: list[RetrievedFact],
+    display_hint: str,
+    total_results: int,
+) -> dict[str, Any]:
+    """Build an ADR-017 vault_results event payload from VaultNote facts.
+
+    Each VaultNote fact carries the underlying chunk in its `properties`
+    map (path, text, sources). This helper extracts the FE-bound shape
+    so the FE can render either as cards (snippet + note_title) or as
+    an expandable panel (snippet + full_text + note_path).
+
+    `display_hint` is the LLM-supplied presentation recommendation; the
+    FE may honor or override per its own UX rules.
+    """
+    results: list[dict[str, Any]] = []
+    for fact in facts:
+        props = fact.properties or {}
+        path = str(props.get("path", "") or "")
+        # Sidecar returns "(file)" for file-level (heading-less) chunks; map back to None.
+        section_raw = fact.object if fact.object else None
+        section: str | None = None if section_raw in (None, "(file)") else str(section_raw)
+        # `text` is the canonical key; `content` retained as deprecated alias.
+        content = str(props.get("text") or props.get("content") or "")
+        snippet = content[:_VAULT_SNIPPET_MAX_CHARS]
+        if len(content) > _VAULT_SNIPPET_MAX_CHARS:
+            snippet = snippet + "..."
+        sources_raw = props.get("sources") or []
+        sources = [str(s) for s in sources_raw if isinstance(s, str)]
+        results.append(
+            {
+                "chunk_id": _chunk_id_for(path, section),
+                "note_path": path,
+                "note_title": _derive_note_title_from_path(path),
+                "section": section,
+                "snippet": snippet,
+                "full_text": content,
+                "similarity": float(fact.similarity_score),
+                "sources": sources,
+            }
+        )
+    return {
+        "type": "vault_results",
+        "query": query,
+        "total_results": total_results,
+        "display_hint": display_hint,
+        "results": results,
+    }
 
 
 def _build_graph_subgraph_payload(
@@ -215,6 +336,79 @@ KNOWLEDGE_TOOL_SCHEMAS = [
                     },
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_vault",
+            "description": (
+                "Search the vault (your prose notes: sessions, decisions, identity,"
+                " user fact sheets) via hybrid semantic + keyword retrieval.\n\n"
+                "USE for: questions about past conversations, prior decisions, the"
+                " user's notes on a topic, anything written down in prose. The"
+                " vault is the canonical user-approved history.\n\n"
+                "DO NOT USE for: typed-graph entity questions (use"
+                " query_knowledge_graph for those); current-state lookups against"
+                " live data sources; questions already answered by the prose in"
+                " your current context.\n\n"
+                "Pair with frontend.switch_form when displaying results would"
+                " benefit from a panel form."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to search for (natural language)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max chunks to return (1-10, default 5)",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 10,
+                    },
+                    "display_hint": {
+                        "type": "string",
+                        "enum": list(_VALID_VAULT_DISPLAY_HINTS),
+                        "default": "auto",
+                        "description": (
+                            "Suggested FE presentation. 'auto' lets the FE decide"
+                            " based on count + content length; 'cards' for short"
+                            " tile view; 'panel' for expandable long-form review."
+                        ),
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "frontend.switch_form",
+            "description": (
+                "Switch the visible FE form. USE when the form needs to match"
+                " what you're doing: 'graph' for showing knowledge graph results,"
+                " 'cloud' for ambient or casual conversation, 'ring' for the"
+                " default focused conversation view. Always provide a brief"
+                " reason for the switch (one sentence) so the user has context."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "form": {
+                        "type": "string",
+                        "enum": ["ring", "cloud", "graph"],
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Short explanation of why switching (1 sentence)",
+                    },
+                },
+                "required": ["form", "reason"],
             },
         },
     },
@@ -542,6 +736,79 @@ class ConversationHandler:
             logger.error("Error querying knowledge graph: %s", e)
             return f"Error searching knowledge graph: {e!s}"
 
+    async def _handle_query_vault(
+        self,
+        query: str,
+        limit: int = 5,
+        display_hint: str = "auto",
+    ) -> str:
+        """Execute the query_vault tool.
+
+        Routes the query through the existing retriever with
+        force_intent='historical' so it lands on the vault sidecar
+        exclusively (ADR-010 invariant 4 -- prose queries target vault,
+        not graph). Emits a vault_results WS event with structured chunk
+        data for FE rendering while returning the LLM-facing formatted
+        text from the retriever.
+        """
+        if display_hint not in _VALID_VAULT_DISPLAY_HINTS:
+            raise ValueError(
+                f"invalid display_hint: {display_hint!r};"
+                f" must be one of {sorted(_VALID_VAULT_DISPLAY_HINTS)}"
+            )
+        if not query or not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be a non-empty string")
+        if limit < 1 or limit > 10:
+            raise ValueError(f"limit must be between 1 and 10; got {limit}")
+
+        try:
+            result = await self.retriever.retrieve(
+                query=query,
+                user_id="User",
+                limit=limit,
+                force_intent="historical",
+            )
+            vault_facts = [f for f in result.facts if f.subject == "VaultNote"]
+            if vault_facts:
+                self._turn_ws_events.append(
+                    _build_vault_results_payload(
+                        query=query,
+                        facts=vault_facts,
+                        display_hint=display_hint,
+                        total_results=result.total_facts,
+                    )
+                )
+
+            if result.total_facts == 0:
+                return (
+                    f"No vault content found for query: '{query}'."
+                    " You may want to ask the user about this topic."
+                )
+            return result.formatted_context
+        except Exception as e:
+            logger.error("Error querying vault: %s", e)
+            return f"Error searching vault: {e!s}"
+
+    async def _handle_switch_form(self, form: str, reason: str) -> str:
+        """Execute the frontend.switch_form tool.
+
+        Appends a form_switch WS event with the target form + reason per
+        the ADR-017 canonical shape. Returns a short summary to the LLM
+        so the final-pass response can reference the switch contextually.
+        """
+        if form not in ("ring", "cloud", "graph"):
+            raise ValueError(f"invalid form: {form!r}; must be one of ['ring', 'cloud', 'graph']")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("reason must be a non-empty string")
+        self._turn_ws_events.append(
+            {
+                "type": "form_switch",
+                "form": form,
+                "reason": reason,
+            }
+        )
+        return f"Switched to {form} form"
+
     async def _handle_summon_cards(self, header: str, cards: list[dict[str, Any]]) -> str:
         """Execute the frontend.summon_cards tool.
 
@@ -587,6 +854,8 @@ class ConversationHandler:
         """Dispatch a tool call to its handler."""
         handlers = {
             "query_knowledge_graph": self._handle_query_knowledge_graph,
+            "query_vault": self._handle_query_vault,
+            "frontend.switch_form": self._handle_switch_form,
             "frontend.summon_cards": self._handle_summon_cards,
             "frontend.dismiss_cards": self._handle_dismiss_cards,
         }
