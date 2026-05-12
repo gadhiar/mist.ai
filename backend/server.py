@@ -119,6 +119,52 @@ async def heartbeat_loop(interval_seconds: float = 5.0) -> None:
             logger.error("Heartbeat enqueue failed: %s", e)
 
 
+async def system_status_loop(interval_seconds: float = 5.0) -> None:
+    """Emit ADR-017 ``system_status`` events every ``interval_seconds``.
+
+    Snapshots CPU / RAM / GPU via :mod:`backend.system_metrics` and pushes the
+    payload onto :data:`message_queue` for the broadcaster to fan out to
+    connected clients. Cadence defaults to 5s (BE prompt + config default);
+    overridable via ``config.system_status.interval_seconds``.
+
+    Failures during a single tick (psutil hiccup, NVML driver crash,
+    serialization error) are logged and swallowed so the periodic emit
+    survives the next interval. The collector itself emits placeholder GPU
+    payloads on NVML failure, so most paths return cleanly.
+    """
+    from backend import system_metrics
+
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            snapshot = system_metrics.collect_metrics()
+            payload = json.dumps(
+                {
+                    "type": "system_status",
+                    "timestamp": snapshot.timestamp,
+                    "cpu": {
+                        "percent": snapshot.cpu.percent,
+                        "cores": snapshot.cpu.cores,
+                    },
+                    "ram": {
+                        "used_gb": snapshot.ram.used_gb,
+                        "total_gb": snapshot.ram.total_gb,
+                        "percent": snapshot.ram.percent,
+                    },
+                    "gpu": {
+                        "name": snapshot.gpu.name,
+                        "utilization_percent": snapshot.gpu.utilization_percent,
+                        "vram_used_gb": snapshot.gpu.vram_used_gb,
+                        "vram_total_gb": snapshot.gpu.vram_total_gb,
+                        "temperature_c": snapshot.gpu.temperature_c,
+                    },
+                }
+            )
+            await message_queue.put(payload)
+        except Exception as e:  # noqa: BLE001
+            logger.error("system_status emit failed: %s", e)
+
+
 async def health_status_loop(interval_seconds: float = 30.0) -> None:
     """Emit ADR-017 ``health_status`` events every ``interval_seconds``.
 
@@ -245,6 +291,24 @@ async def lifespan(app: FastAPI):
     # Start health-status task (30s interval per ADR-017 health_status)
     health_status_task = asyncio.create_task(health_status_loop())
 
+    # Start system-status task (5s interval per ADR-017 system_status).
+    # GPU init is best-effort; failure produces placeholder GPU blocks
+    # (gpu.name='none') rather than crashing the lifespan.
+    system_status_task = None
+    if config.system_status.enabled:
+        from backend import system_metrics
+
+        if config.system_status.gpu_enabled:
+            system_metrics.init_gpu()
+        system_status_task = asyncio.create_task(
+            system_status_loop(interval_seconds=float(config.system_status.interval_seconds))
+        )
+        logger.info(
+            "System-status emit task started (interval=%ds, gpu=%s)",
+            config.system_status.interval_seconds,
+            config.system_status.gpu_enabled,
+        )
+
     # Attach WebSocket log handler to root logger
     log_handler = WebSocketLogHandler(event_loop=loop, message_queue=message_queue)
     logging.getLogger().addHandler(log_handler)
@@ -297,6 +361,11 @@ async def lifespan(app: FastAPI):
             logger.warning("Vault sidecar close error: %s", e)
 
     logging.getLogger().removeHandler(log_handler)
+    if system_status_task is not None:
+        system_status_task.cancel()
+        from backend import system_metrics
+
+        system_metrics.shutdown_gpu()
     health_status_task.cancel()
     heartbeat_task.cancel()
     broadcaster_task.cancel()
