@@ -73,7 +73,8 @@ def _summarize_tool_args(tool_name: str, arguments: dict[str, Any]) -> str:
     if tool_name == "query_knowledge_graph":
         query = str(arguments.get("query", ""))
         limit = arguments.get("limit", 20)
-        return f"query={query[:40]!r} limit={limit}"
+        verbosity = arguments.get("verbosity", "compact")
+        return f"query={query[:40]!r} limit={limit} v={verbosity!r}"
     if tool_name == "query_vault":
         query = str(arguments.get("query", ""))
         limit = arguments.get("limit", 5)
@@ -105,6 +106,16 @@ def _summarize_tool_result(tool_name: str, result: str) -> str:
     if result.startswith("No information found"):
         return "0 facts"
     if tool_name == "query_knowledge_graph":
+        # Compact mode result starts with "Focal:"; extract neighbor count.
+        if result.startswith("Focal:"):
+            if "Related (" in result:
+                try:
+                    count = int(result.split("Related (", 1)[1].split(")", 1)[0])
+                    return f"focal + {count} related"
+                except (ValueError, IndexError):
+                    return "focal entity"
+            return "focal entity"
+        # Full mode result has '\n- ' fact bullets.
         n_facts = result.count("\n- ")
         return f"{n_facts} facts" if n_facts > 0 else "results retrieved"
     if tool_name == "query_vault":
@@ -178,6 +189,42 @@ def _chunk_id_for(path: str, section: str | None) -> str:
     key = f"{path}::{section or ''}"
     # nosec B324: SHA-1 here is a non-security keyed identifier, not a digest of secrets.
     return hashlib.sha1(key.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+
+
+def _format_kg_compact_for_llm(facts: list[RetrievedFact]) -> str:
+    """Compact LLM-facing summary of knowledge-graph retrieval results.
+
+    Trades detail for context budget. The LLM sees the focal entity, a
+    deduplicated list of neighbor labels (up to 6 to match the
+    graph_subgraph layout cap), and a nudge to chain a follow-up query
+    for entity-specific detail. The FE has the full graph rendered
+    (graph_subgraph event carries focal + neighbors + edges + distant),
+    so the user can browse the wider context while MIST stays focused
+    on the focal in her reasoning prompt.
+
+    Caller selects this via verbosity='compact' (the default). Pass
+    verbosity='full' to get the legacy formatted_context with every
+    fact verbatim -- meaningfully larger but useful when MIST needs to
+    answer detailed questions in one turn.
+    """
+    if not facts:
+        return "No graph results."
+    top_fact = max(facts, key=lambda f: f.similarity_score)
+    focal = top_fact.subject
+    focal_type = top_fact.subject_type
+
+    seen_neighbors: list[str] = []
+    for f in facts:
+        if f.subject == focal and f.object not in seen_neighbors:
+            seen_neighbors.append(f.object)
+            if len(seen_neighbors) >= 6:
+                break
+
+    lines = [f"Focal: {focal} ({focal_type})"]
+    if seen_neighbors:
+        lines.append(f"Related ({len(seen_neighbors)}): {', '.join(seen_neighbors)}")
+    lines.append("(Graph rendered for user. Chain another query for entity-specific detail.)")
+    return "\n".join(lines)
 
 
 def _build_vault_results_payload(
@@ -334,7 +381,14 @@ KNOWLEDGE_TOOL_SCHEMAS = [
                 "DO NOT USE for: pure conversational filler (greetings, thanks);"
                 " general-knowledge with no user-specific anchor; questions already"
                 " answered by the vault prose in context; purely creative tasks"
-                " without user-specific reasoning."
+                " without user-specific reasoning.\n\n"
+                "Result format: default 'compact' returns only the focal entity"
+                " plus the labels of related neighbors (count + names) for context-"
+                "budget efficiency. The full graph is rendered for the user on the"
+                " graph form. Chain another query_knowledge_graph or query_vault for"
+                " entity-specific detail. Pass verbosity='full' when you must see"
+                " every fact verbatim in one turn (avoid this for browsing-style"
+                " questions; it bloats context fast)."
             ),
             "parameters": {
                 "type": "object",
@@ -357,6 +411,15 @@ KNOWLEDGE_TOOL_SCHEMAS = [
                         "type": "integer",
                         "description": "Maximum facts to retrieve (default 20)",
                         "default": 20,
+                    },
+                    "verbosity": {
+                        "type": "string",
+                        "enum": ["compact", "full"],
+                        "default": "compact",
+                        "description": (
+                            "Result detail level. 'compact' (default) = focal +"
+                            " neighbor labels; 'full' = every fact verbatim."
+                        ),
                     },
                 },
                 "required": ["query"],
@@ -718,6 +781,7 @@ class ConversationHandler:
         entity_types: list[str] | None = None,
         relationship_types: list[str] | None = None,
         limit: int = 20,
+        verbosity: str = "compact",
     ) -> str:
         """Execute the query_knowledge_graph tool.
 
@@ -725,7 +789,20 @@ class ConversationHandler:
         appends a graph_subgraph WS event to the per-turn buffer so the
         FE graph form can render the focal + neighbors. Empty retrievals
         skip the emit (the FE keeps prior graphData).
+
+        LLM-context split (BE/FE differentiation):
+        - 'compact' (default): the LLM-facing result is the focal entity
+          plus a deduped neighbor-label list (up to 6). Optimizes for
+          context budget. MIST chains a follow-up query for entity-specific
+          detail.
+        - 'full': the LLM-facing result is the legacy formatted_context
+          with every fact verbatim. Use when answering a single-turn
+          detailed question where chaining isn't practical.
+
+        In both modes the FE receives the same graph_subgraph payload.
         """
+        if verbosity not in ("compact", "full"):
+            raise ValueError(f"invalid verbosity: {verbosity!r}; must be 'compact' or 'full'")
         try:
             filters = None
             if entity_types or relationship_types:
@@ -754,7 +831,9 @@ class ConversationHandler:
             if graph_payload is not None:
                 self._turn_ws_events.append(graph_payload)
 
-            return result.formatted_context
+            if verbosity == "full":
+                return result.formatted_context
+            return _format_kg_compact_for_llm(result.facts)
 
         except Exception as e:
             logger.error("Error querying knowledge graph: %s", e)

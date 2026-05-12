@@ -1595,6 +1595,167 @@ class TestGraphSubgraphEmit:
         assert payload is None
 
 
+class TestQueryKnowledgeGraphCompactLLMContext:
+    """ADR-017 Wave 2 BE/FE differentiation: query_knowledge_graph trims
+    the LLM-facing result to focal + neighbor labels (compact, default),
+    while the graph_subgraph WS event still carries the full graph.
+
+    verbosity='full' opt-in returns the legacy formatted_context with
+    every fact verbatim for cases where one-turn detail is needed.
+    """
+
+    def _build_handler(self):
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        config = build_test_config()
+        return ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=FakeExtractionPipeline(),
+            retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
+        )
+
+    def _make_facts(self, count: int = 3):
+        from backend.knowledge.models import RetrievedFact
+
+        names = ["Python", "Neo4j", "FastAPI", "MIST.AI", "llama-cpp", "Tauri", "PyTorch"]
+        return [
+            RetrievedFact(
+                subject="User",
+                subject_type="Person",
+                predicate="USES",
+                object=names[i],
+                object_type="Technology",
+                properties={},
+                similarity_score=0.95 - i * 0.01,
+                graph_distance=0,
+            )
+            for i in range(count)
+        ]
+
+    def _make_result(self, facts):
+        from backend.knowledge.models import RetrievalResult
+
+        return RetrievalResult(
+            query="x",
+            user_id="User",
+            facts=facts,
+            entities_found=len(facts),
+            total_facts=len(facts),
+            formatted_context="### FULL LEGACY FORMATTED CONTEXT\n- User USES Python\n- User USES Neo4j\n",
+            retrieval_time_ms=1.0,
+            vector_search_time_ms=0.5,
+            graph_traversal_time_ms=0.5,
+            config_used={},
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_compact_returns_focal_and_neighbors_only(self):
+        """Default verbosity (omitted) returns the compact format."""
+        handler = self._build_handler()
+        handler._current_session_id = "s1"
+        facts = self._make_facts(count=3)
+
+        async def stub_retrieve(**kwargs):
+            return self._make_result(facts)
+
+        handler.retriever.retrieve = stub_retrieve
+
+        result = await handler._handle_query_knowledge_graph(query="what do I use")
+
+        assert result.startswith("Focal: User (Person)")
+        assert "Related (3): Python, Neo4j, FastAPI" in result
+        assert "Chain another query" in result
+        # The full formatted_context must NOT leak into the compact LLM result.
+        assert "FULL LEGACY FORMATTED CONTEXT" not in result
+
+    @pytest.mark.asyncio
+    async def test_compact_caps_neighbors_at_six(self):
+        """Up to 6 neighbor labels appear; the rest are visible only in
+        graph_subgraph for the FE.
+        """
+        handler = self._build_handler()
+        handler._current_session_id = "s1"
+        facts = self._make_facts(count=7)
+
+        async def stub_retrieve(**kwargs):
+            return self._make_result(facts)
+
+        handler.retriever.retrieve = stub_retrieve
+
+        result = await handler._handle_query_knowledge_graph(query="x")
+        assert "Related (6)" in result
+        # 7th name must not appear in the LLM result.
+        assert "PyTorch" not in result
+
+    @pytest.mark.asyncio
+    async def test_full_verbosity_returns_formatted_context(self):
+        """verbosity='full' returns the legacy verbose formatted_context."""
+        handler = self._build_handler()
+        handler._current_session_id = "s1"
+        facts = self._make_facts(count=2)
+
+        async def stub_retrieve(**kwargs):
+            return self._make_result(facts)
+
+        handler.retriever.retrieve = stub_retrieve
+
+        result = await handler._handle_query_knowledge_graph(query="x", verbosity="full")
+        assert "FULL LEGACY FORMATTED CONTEXT" in result
+        assert "Focal:" not in result
+
+    @pytest.mark.asyncio
+    async def test_invalid_verbosity_raises(self):
+        handler = self._build_handler()
+        with pytest.raises(ValueError, match="invalid verbosity"):
+            await handler._handle_query_knowledge_graph(query="x", verbosity="overview")
+
+    @pytest.mark.asyncio
+    async def test_graph_subgraph_emit_unchanged_by_verbosity(self):
+        """Both compact and full verbosity emit the same graph_subgraph
+        event to the FE. Only the LLM-facing result differs.
+        """
+        handler = self._build_handler()
+        handler._current_session_id = "s1"
+        facts = self._make_facts(count=3)
+
+        async def stub_retrieve(**kwargs):
+            return self._make_result(facts)
+
+        handler.retriever.retrieve = stub_retrieve
+
+        await handler._handle_query_knowledge_graph(query="x", verbosity="compact")
+        compact_events = [e for e in handler._turn_ws_events if e["type"] == "graph_subgraph"]
+        assert len(compact_events) == 1
+
+        handler._turn_ws_events = []
+        await handler._handle_query_knowledge_graph(query="x", verbosity="full")
+        full_events = [e for e in handler._turn_ws_events if e["type"] == "graph_subgraph"]
+        assert len(full_events) == 1
+
+        # Same shape -- focal, neighbors, edges, distant identical.
+        assert compact_events[0]["focal"]["label"] == full_events[0]["focal"]["label"]
+        assert len(compact_events[0]["neighbors"]) == len(full_events[0]["neighbors"])
+
+    @pytest.mark.asyncio
+    async def test_zero_facts_short_circuit_unchanged(self):
+        """Zero results -> 'No information found' regardless of verbosity."""
+        handler = self._build_handler()
+        handler._current_session_id = "s1"
+
+        async def stub_retrieve(**kwargs):
+            return self._make_result([])
+
+        handler.retriever.retrieve = stub_retrieve
+
+        result_compact = await handler._handle_query_knowledge_graph(query="x")
+        result_full = await handler._handle_query_knowledge_graph(query="x", verbosity="full")
+        assert "No information found" in result_compact
+        assert "No information found" in result_full
+
+
 class TestQueryVault:
     """ADR-017 Wave 2 (vault_results) -- query_vault tool emit contract.
 
