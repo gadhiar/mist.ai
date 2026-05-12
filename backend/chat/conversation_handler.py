@@ -50,6 +50,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _ToolNotFoundError(Exception):
+    """Raised by _dispatch_tool when the LLM invokes an unregistered tool.
+
+    The observability wrap turns this into a tool_call_completed event with
+    a 'ToolNotFound' error label. Module-private (leading underscore) so
+    nothing outside the conversation pipeline can rely on it.
+    """
+
+    def __init__(self, tool_name: str) -> None:
+        super().__init__(f"Tool not found: {tool_name}")
+        self.tool_name = tool_name
+
+
 def _summarize_tool_args(tool_name: str, arguments: dict[str, Any]) -> str:
     """One-line human-readable args summary for tool_call_started events.
 
@@ -260,6 +273,10 @@ def _build_graph_subgraph_payload(
             "id": fact.object,
             "label": fact.object,
             "kind": fact.object_type,
+            # ADR-017 line 118 requires `meta` on graph nodes. We do not yet
+            # carry a per-entity description; emit empty string so the FE
+            # never receives undefined for a documented field.
+            "meta": "",
         }
         weight = float(fact.similarity_score) if fact.similarity_score > 0 else 1.0
         edges.append({"from": focal_id, "to": fact.object, "weight": weight})
@@ -286,7 +303,14 @@ def _build_graph_subgraph_payload(
 
     return {
         "type": "graph_subgraph",
-        "focal": {"x": 0.0, "y": 0.0, "label": focal_id, "kind": focal_kind},
+        "focal": {
+            "x": 0.0,
+            "y": 0.0,
+            "label": focal_id,
+            "kind": focal_kind,
+            # ADR-017 line 118 documents `meta` on the focal too.
+            "meta": "",
+        },
         "neighbors": neighbors,
         "edges": edges,
         "distant": distant,
@@ -768,6 +792,17 @@ class ConversationHandler:
                 limit=limit,
                 force_intent="historical",
             )
+
+            # Zero-result short-circuit: skip the vault_results emit so the FE
+            # keeps prior state, and signal absence to the LLM. Has to run
+            # before the emit branch to avoid the "FE sees results panel +
+            # LLM tells user no results" inconsistency.
+            if result.total_facts == 0:
+                return (
+                    f"No vault content found for query: '{query}'."
+                    " You may want to ask the user about this topic."
+                )
+
             vault_facts = [f for f in result.facts if f.subject == "VaultNote"]
             if vault_facts:
                 self._turn_ws_events.append(
@@ -777,12 +812,6 @@ class ConversationHandler:
                         display_hint=display_hint,
                         total_results=result.total_facts,
                     )
-                )
-
-            if result.total_facts == 0:
-                return (
-                    f"No vault content found for query: '{query}'."
-                    " You may want to ask the user about this topic."
                 )
             return result.formatted_context
         except Exception as e:
@@ -851,7 +880,13 @@ class ConversationHandler:
         return "Dismissed cards panel"
 
     async def _dispatch_tool(self, tool_call: LLMToolCall) -> str:
-        """Dispatch a tool call to its handler."""
+        """Dispatch a tool call to its handler.
+
+        Raises ToolNotFoundError when the LLM calls a tool name not in the
+        handler registry. The observability wrap catches and emits as a
+        tool_call_completed with error set; the LLM-facing result is the
+        sentinel string so the LLM can self-correct on the next turn.
+        """
         handlers = {
             "query_knowledge_graph": self._handle_query_knowledge_graph,
             "query_vault": self._handle_query_vault,
@@ -861,7 +896,7 @@ class ConversationHandler:
         }
         handler = handlers.get(tool_call.name)
         if handler is None:
-            return f"Tool not found: {tool_call.name}"
+            raise _ToolNotFoundError(tool_call.name)
         return await handler(**tool_call.arguments)
 
     async def _dispatch_tool_with_observability(self, tool_call: LLMToolCall) -> str:
@@ -870,8 +905,9 @@ class ConversationHandler:
         Appends tool_call_started before _dispatch_tool runs and
         tool_call_completed after (success or failure) into the per-turn
         WS event buffer. Returns the tool result string; on exception,
-        substitutes a "Tool error: ..." sentinel for the result and
-        records the exception repr in the completed event's error field.
+        substitutes a "Tool error: ..." sentinel and records a sanitized
+        error label on the completed event (type name + message; no
+        repr() that could leak module paths or internal state).
 
         Duration via perf_counter to avoid wall-clock drift, in integer
         milliseconds. Events drain via handle_message_streaming as WSEvent
@@ -890,9 +926,17 @@ class ConversationHandler:
         error: str | None = None
         try:
             tool_result = await self._dispatch_tool(tool_call)
+        except _ToolNotFoundError as exc:
+            tool_result = (
+                f"Tool not found: {exc.tool_name}." " Pick a tool from the registered catalog."
+            )
+            error = f"ToolNotFound: {exc.tool_name}"
         except Exception as exc:
-            tool_result = f"Tool error: {exc!r}"
-            error = repr(exc)
+            tool_result = f"Tool error: {type(exc).__name__}: {exc}"
+            # Sanitized FE-facing error: type name + message only. repr(exc)
+            # would leak module paths, internal kwargs, and Python frame
+            # detail that the FE has no business displaying.
+            error = f"{type(exc).__name__}: {exc}"
         duration_ms = int((time.perf_counter() - start) * 1000)
         self._turn_ws_events.append(
             {
@@ -1439,21 +1483,26 @@ class ConversationHandler:
             Token events (one per character) followed by a terminal Complete event.
         """
         start = time.monotonic()
-        response = await self.handle_message(
-            user_message=user_message,
-            session_id=session_id,
-            user_id=user_id,
-            max_history=max_history,
-        )
-        duration_ms = (time.monotonic() - start) * 1000
+        response: str = ""
+        try:
+            response = await self.handle_message(
+                user_message=user_message,
+                session_id=session_id,
+                user_id=user_id,
+                max_history=max_history,
+            )
+        finally:
+            # ADR-017 Wave 2: drain per-turn FE-bound events. The drain runs
+            # under finally so it fires even if handle_message is ever
+            # refactored to raise (current handle_message catches internally,
+            # but this guards against regression). FE always sees the events
+            # that were buffered before the failure point so tool_call_started
+            # never orphans a missing tool_call_completed.
+            for event_payload in self._turn_ws_events:
+                yield WSEvent(payload=event_payload)
+            self._turn_ws_events = []
 
-        # ADR-017 Wave 2: drain per-turn FE-bound events accumulated by
-        # handle_message (tool_call_started/completed, cards_*, graph_subgraph).
-        # Emitted BEFORE Token chars so the FE sees tool-call indicators and
-        # graph subgraph data before / alongside the response prose.
-        for event_payload in self._turn_ws_events:
-            yield WSEvent(payload=event_payload)
-        self._turn_ws_events = []
+        duration_ms = (time.monotonic() - start) * 1000
 
         for char in response:
             yield Token(text=char)

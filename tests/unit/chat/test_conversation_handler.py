@@ -1198,6 +1198,52 @@ class TestToolCallObservability:
         assert "limit=20" in summary
 
     @pytest.mark.asyncio
+    async def test_tool_not_found_emits_error_event(self):
+        """An unregistered tool name surfaces as a tool_call_completed with
+        ToolNotFound error label (not as a silent string sentinel).
+        """
+        from backend.llm.models import ToolCall as LLMToolCall
+
+        handler = self._build_handler()
+        tc = LLMToolCall(id="oai-nf", name="bogus.tool", arguments={})
+
+        result = await handler._dispatch_tool_with_observability(tc)
+
+        assert result.startswith("Tool not found:")
+        assert "bogus.tool" in result
+        events = handler._turn_ws_events
+        assert len(events) == 2
+        assert events[0]["type"] == "tool_call_started"
+        completed = events[1]
+        assert completed["type"] == "tool_call_completed"
+        assert completed["error"] == "ToolNotFound: bogus.tool"
+
+    @pytest.mark.asyncio
+    async def test_error_field_does_not_leak_repr(self):
+        """tool_call_completed.error is sanitized to type+message, not repr().
+
+        repr(ValueError('x')) is "ValueError('x')" (with parens + quotes).
+        The sanitized form is "ValueError: x" (cleaner for FE display, no
+        leaked frame detail).
+        """
+        from backend.llm.models import ToolCall as LLMToolCall
+
+        handler = self._build_handler()
+
+        async def patched_dispatch(tc):
+            raise ValueError("simulated failure")
+
+        handler._dispatch_tool = patched_dispatch
+        tc = LLMToolCall(id="oai-san", name="query_knowledge_graph", arguments={"query": "x"})
+
+        await handler._dispatch_tool_with_observability(tc)
+
+        completed = handler._turn_ws_events[1]
+        assert completed["error"] == "ValueError: simulated failure"
+        assert "(" not in completed["error"]
+        assert "'" not in completed["error"]
+
+    @pytest.mark.asyncio
     async def test_buffer_drained_by_streaming(self):
         """handle_message_streaming yields WSEvent for each buffered event
         and clears the buffer for the next turn.
