@@ -86,6 +86,9 @@ def _summarize_tool_result(tool_name: str, result: str) -> str:
     return f"{len(result)} chars"
 
 
+_VALID_CARD_PATTERNS: frozenset[str] = frozenset({"lines", "dots", "schematic", "photo"})
+
+
 KNOWLEDGE_TOOL_SCHEMAS = [
     {
         "type": "function",
@@ -130,6 +133,58 @@ KNOWLEDGE_TOOL_SCHEMAS = [
                 },
                 "required": ["query"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "frontend.summon_cards",
+            "description": (
+                "Display a panel of cards to the user. Use when the user asks to see"
+                " options, results, or visual choices laid out as a panel. Cards are"
+                " short labeled tiles in a 2x2 or 1xN layout depending on count. The"
+                " pattern field selects the visual texture: 'lines' (default), 'dots',"
+                " 'schematic', or 'photo'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "header": {
+                        "type": "string",
+                        "description": "Short panel title (1-4 words)",
+                    },
+                    "cards": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "label": {"type": "string"},
+                                "pattern": {
+                                    "type": "string",
+                                    "enum": list(_VALID_CARD_PATTERNS),
+                                    "default": "lines",
+                                },
+                            },
+                            "required": ["id", "label"],
+                        },
+                        "minItems": 1,
+                        "maxItems": 8,
+                    },
+                },
+                "required": ["header", "cards"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "frontend.dismiss_cards",
+            "description": (
+                "Dismiss any panel of cards currently visible. Use when the user"
+                " indicates they're done with the panel or want to move on."
+            ),
+            "parameters": {"type": "object", "properties": {}},
         },
     },
 ]
@@ -382,10 +437,53 @@ class ConversationHandler:
             logger.error("Error querying knowledge graph: %s", e)
             return f"Error searching knowledge graph: {e!s}"
 
+    async def _handle_summon_cards(self, header: str, cards: list[dict[str, Any]]) -> str:
+        """Execute the frontend.summon_cards tool.
+
+        Normalizes each card's pattern (default 'lines'), validates against
+        the closed enum, then appends a cards_summon WS event to the per-turn
+        buffer per ADR-017 Wave 2. Returns a short string to the LLM so the
+        final-pass response can reference what was displayed.
+        """
+        if not isinstance(cards, list) or not cards:
+            raise ValueError("cards must be a non-empty list")
+        normalized: list[dict[str, str]] = []
+        for raw in cards:
+            if not isinstance(raw, dict):
+                raise ValueError(f"card must be an object; got {type(raw).__name__}")
+            card_id = raw.get("id")
+            label = raw.get("label")
+            if not isinstance(card_id, str) or not card_id:
+                raise ValueError("card.id must be a non-empty string")
+            if not isinstance(label, str) or not label:
+                raise ValueError("card.label must be a non-empty string")
+            pattern = raw.get("pattern", "lines")
+            if pattern not in _VALID_CARD_PATTERNS:
+                raise ValueError(
+                    f"invalid card.pattern: {pattern!r};"
+                    f" must be one of {sorted(_VALID_CARD_PATTERNS)}"
+                )
+            normalized.append({"id": card_id, "label": label, "pattern": pattern})
+        self._turn_ws_events.append(
+            {"type": "cards_summon", "panel": {"header": header, "cards": normalized}}
+        )
+        return f"Displayed {len(normalized)} cards"
+
+    async def _handle_dismiss_cards(self) -> str:
+        """Execute the frontend.dismiss_cards tool.
+
+        Appends a cards_dismiss WS event (empty payload per ADR-017) to the
+        per-turn buffer. Returns a short string to the LLM.
+        """
+        self._turn_ws_events.append({"type": "cards_dismiss"})
+        return "Dismissed cards panel"
+
     async def _dispatch_tool(self, tool_call: LLMToolCall) -> str:
         """Dispatch a tool call to its handler."""
         handlers = {
             "query_knowledge_graph": self._handle_query_knowledge_graph,
+            "frontend.summon_cards": self._handle_summon_cards,
+            "frontend.dismiss_cards": self._handle_dismiss_cards,
         }
         handler = handlers.get(tool_call.name)
         if handler is None:

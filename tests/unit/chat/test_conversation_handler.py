@@ -1238,3 +1238,126 @@ class TestToolCallObservability:
         assert "".join(emitted_tokens) == "hello"
         # Buffer cleared after drain.
         assert handler._turn_ws_events == []
+
+
+class TestFrontendSummonCards:
+    """ADR-017 Wave 2: frontend.summon_cards / frontend.dismiss_cards tools.
+
+    The two tools are registered in KNOWLEDGE_TOOL_SCHEMAS and routed via
+    _dispatch_tool. Handlers append cards_summon / cards_dismiss WS events
+    to the per-turn buffer; the same drain mechanism as tool_call_*
+    delivers them to the FE via the bridge.
+    """
+
+    def _build_handler(self):
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        config = build_test_config()
+        return ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=FakeExtractionPipeline(),
+            retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
+        )
+
+    def test_summon_cards_tool_registered(self):
+        """The tool name appears in the handler's tool_schemas catalog."""
+        handler = self._build_handler()
+        tool_names = [s["function"]["name"] for s in handler._tool_schemas]
+        assert "frontend.summon_cards" in tool_names
+        assert "frontend.dismiss_cards" in tool_names
+
+    @pytest.mark.asyncio
+    async def test_summon_cards_emits_panel_event(self):
+        """Dispatch with valid args emits cards_summon with correct shape.
+
+        cards_summon panel.cards each carries id, label, and pattern (default
+        'lines' for any input card missing the field).
+        """
+        handler = self._build_handler()
+        result = await handler._handle_summon_cards(
+            header="Choices",
+            cards=[
+                {"id": "c1", "label": "Alpha"},
+                {"id": "c2", "label": "Beta", "pattern": "dots"},
+            ],
+        )
+
+        assert "Displayed 2 cards" in result
+        assert len(handler._turn_ws_events) == 1
+        event = handler._turn_ws_events[0]
+        assert event["type"] == "cards_summon"
+        assert event["panel"]["header"] == "Choices"
+        assert len(event["panel"]["cards"]) == 2
+        # Pattern default fills in for the card that omitted it.
+        assert event["panel"]["cards"][0]["pattern"] == "lines"
+        assert event["panel"]["cards"][1]["pattern"] == "dots"
+
+    @pytest.mark.asyncio
+    async def test_summon_cards_returns_summary_string(self):
+        """Returns a short non-empty string to the LLM for the final pass."""
+        handler = self._build_handler()
+        result = await handler._handle_summon_cards(
+            header="Test",
+            cards=[{"id": "x", "label": "X"}],
+        )
+        assert isinstance(result, str)
+        assert result != ""
+        assert "1" in result
+
+    @pytest.mark.asyncio
+    async def test_summon_cards_validates_pattern_enum(self):
+        """Invalid pattern raises ValueError; no WS event emitted."""
+        handler = self._build_handler()
+        with pytest.raises(ValueError, match="invalid card.pattern"):
+            await handler._handle_summon_cards(
+                header="Test",
+                cards=[{"id": "c1", "label": "X", "pattern": "rainbow"}],
+            )
+        assert handler._turn_ws_events == []
+
+    @pytest.mark.asyncio
+    async def test_dismiss_cards_emits_event(self):
+        """frontend.dismiss_cards appends cards_dismiss (empty payload)."""
+        handler = self._build_handler()
+        result = await handler._handle_dismiss_cards()
+        assert result == "Dismissed cards panel"
+        assert handler._turn_ws_events == [{"type": "cards_dismiss"}]
+
+    @pytest.mark.asyncio
+    async def test_summon_cards_dispatch_with_observability_full_event_chain(self):
+        """End-to-end via _dispatch_tool_with_observability: started, cards_summon,
+        completed in that order.
+        """
+        from backend.llm.models import ToolCall as LLMToolCall
+
+        handler = self._build_handler()
+        tc = LLMToolCall(
+            id="oai-cards-1",
+            name="frontend.summon_cards",
+            arguments={
+                "header": "Pick",
+                "cards": [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}],
+            },
+        )
+
+        result = await handler._dispatch_tool_with_observability(tc)
+
+        assert "Displayed 2 cards" in result
+        event_types = [e["type"] for e in handler._turn_ws_events]
+        assert event_types == ["tool_call_started", "cards_summon", "tool_call_completed"]
+        # tool_call_started/completed share a tool_call_id distinct from tc.id.
+        started = handler._turn_ws_events[0]
+        completed = handler._turn_ws_events[2]
+        assert started["tool_call_id"] == completed["tool_call_id"]
+        assert started["name"] == "frontend.summon_cards"
+
+    @pytest.mark.asyncio
+    async def test_summon_cards_requires_non_empty_list(self):
+        """Empty cards list rejected by the handler."""
+        handler = self._build_handler()
+        with pytest.raises(ValueError, match="non-empty"):
+            await handler._handle_summon_cards(header="X", cards=[])
+        assert handler._turn_ws_events == []
