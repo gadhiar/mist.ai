@@ -17,6 +17,14 @@ pyarrow>=17.0
 sqlite-vec>=0.1.3
 watchdog>=3.0.0
 
+# System telemetry (ADR-017 system_status emit)
+# psutil: cross-platform CPU / RAM sampling for the 5s system_status event.
+# pynvml: NVIDIA NVML wrapper for GPU utilization / VRAM / temperature.
+# Both degrade gracefully on systems without an NVIDIA GPU (init_gpu()
+# returns False; collect_metrics() emits placeholder GPU payload).
+psutil>=5.9
+pynvml>=11.5
+
 # Visualization
 plotly==5.18.0
 
