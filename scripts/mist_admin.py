@@ -1200,8 +1200,13 @@ def _build_vault_rebuild_ctx():
     ctx.vault_root = Path(config.vault.root)
     gs = build_graph_store(config)
     pipeline = build_extraction_pipeline(config, graph_store=gs)
+    # The curation GraphRegenerator (Bucket-aware, post-Phase 3) does not
+    # accept a config kwarg; rebuild_timeout_s falls back to the class default
+    # (300 s), identical to GraphRegeneratorConfig's default. Env-var override
+    # via MIST_GRAPH_REGENERATOR_REBUILD_TIMEOUT_S not honored on this code
+    # path -- acceptable because vault-rebuild is an admin tool, not a hot
+    # path. Production wiring uses build_phase3_components which is unaffected.
     ctx.regenerator = CurationGraphRegenerator(
-        config=config,
         extraction_pipeline=pipeline,
         graph_store=gs,
     )
