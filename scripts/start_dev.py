@@ -141,38 +141,6 @@ def wait_for_container_healthy(
     return False
 
 
-def pull_model(model: str = "qwen2.5:7b-instruct") -> bool:
-    """Ensure the LLM model is available in Ollama."""
-    print(f"  Checking model {model}...")
-    try:
-        result = subprocess.run(
-            ["docker", "compose", "exec", "mist-ollama", "ollama", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if model in result.stdout:
-            print(f"  [OK] Model {model} available")
-            return True
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-
-    print(f"  Pulling {model} (first time only, may take several minutes)...")
-    try:
-        result = subprocess.run(
-            ["docker", "compose", "exec", "mist-ollama", "ollama", "pull", model],
-            timeout=600,
-        )
-        if result.returncode == 0:
-            print(f"  [OK] Model {model} pulled")
-            return True
-        print(f"  [FAIL] Could not pull {model}")
-        return False
-    except subprocess.TimeoutExpired:
-        print("  [FAIL] Model pull timed out")
-        return False
-
-
 def tail_logs() -> None:
     """Tail backend container logs."""
     with contextlib.suppress(KeyboardInterrupt):
@@ -287,30 +255,26 @@ def main() -> None:
     print()
 
     # 1. Docker
-    print("[1/4] Checking Docker...")
+    print("[1/3] Checking Docker...")
     if not check_docker():
         sys.exit(1)
 
     # 2. Start stack
-    print("[2/4] Starting services...")
+    print("[2/3] Starting services...")
     if not start_stack(build=args.build):
         sys.exit(1)
 
     # 3. Wait for services
-    #    Neo4j and Ollama: port checks (fast, no model loading).
+    #    Neo4j: port check (fast, no model loading).
     #    Backend: wait for Docker healthcheck (models take ~90s to load).
-    print("[3/4] Waiting for services...")
+    #    llama-server (mist-llm): in-network only; backend healthcheck implicitly
+    #    verifies it via the LLM client wired into the FastAPI app.
+    print("[3/3] Waiting for services...")
     neo4j_ok = wait_for_service("Neo4j", "localhost", 7687, max_wait=60)
-    ollama_ok = wait_for_service("Ollama", "localhost", 11434, max_wait=30)
     print("  Backend loading models (Whisper + Chatterbox + LLM)...")
     backend_ok = wait_for_container_healthy("mist-backend", max_wait=180)
 
-    # 4. Model
-    if ollama_ok:
-        print("[4/4] Checking LLM model...")
-        pull_model()
-
-    if not (neo4j_ok and ollama_ok and backend_ok):
+    if not (neo4j_ok and backend_ok):
         print()
         print("=" * 50)
         print("  Stack NOT fully ready. Check logs:")
@@ -323,7 +287,6 @@ def main() -> None:
     print("  Backend stack ready.")
     print()
     print("  Neo4j:    bolt://localhost:7687 (browser: http://localhost:7474)")
-    print("  Ollama:   http://localhost:11434")
     print("  Backend:  ws://localhost:8001/ws")
     print()
     if args.with_frontend:
