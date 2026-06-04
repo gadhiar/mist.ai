@@ -67,8 +67,10 @@ class TestConventionsLoaderWiring:
         self, tmp_path: Path
     ) -> None:
         """When MIST.md exists in vault root, _build_messages inserts a user message
-        containing the conventions content, positioned after all system messages
-        and before the actual conversation history.
+        containing the conventions content. Post 2026-05-25 KV-cache discipline
+        fix (parity audit v2.1 G6), the conventions message sits immediately
+        after the static system template and before any variable content
+        (retrieval, advisory, history) so the cache prefix maximizes reuse.
         """
         (tmp_path / "MIST.md").write_text("VAULT CONVENTIONS BODY", encoding="utf-8")
         loader = ConventionsLoader(tmp_path)
@@ -90,10 +92,11 @@ class TestConventionsLoaderWiring:
         ]
         assert len(conventions_msgs) == 1
 
-        # It must come AFTER all system messages.
-        sys_indices = [i for i, m in enumerate(messages) if m["role"] == "system"]
+        # It must come immediately after the static system template (the only
+        # system message when persona/retrieval/advisory are all None).
         conv_index = messages.index(conventions_msgs[0])
-        assert conv_index > max(sys_indices)
+        assert conv_index == 1
+        assert messages[0]["role"] == "system"
 
         # It must come BEFORE the actual user message ("hello").
         user_non_conv_indices = [
@@ -102,6 +105,65 @@ class TestConventionsLoaderWiring:
             if m["role"] == "user" and "VAULT CONVENTIONS" not in m["content"]
         ]
         assert conv_index < min(user_non_conv_indices)
+
+    def test_build_messages_kv_cache_prefix_orders_mist_md_before_retrieval(
+        self, tmp_path: Path
+    ) -> None:
+        """KV-cache discipline regression test (parity audit v2.1 G6).
+
+        With both MIST.md vault conventions AND retrieval context present,
+        the conventions user message must precede the retrieval system
+        message so the stable prefix (persona + static template + MIST.md)
+        survives variable-content invalidation across turns.
+
+        Pre-2026-05-25 the order was retrieval BEFORE conventions which
+        broke MIST.md KV-cache reuse on every turn.
+        """
+        from backend.knowledge.models import RetrievalResult
+
+        (tmp_path / "MIST.md").write_text("VAULT_CONVENTIONS_SENTINEL", encoding="utf-8")
+        loader = ConventionsLoader(tmp_path)
+        handler = _make_handler(conventions_loader=loader)
+
+        session = ConversationSession(session_id="p3-kv-cache", user_id="raj")
+        session.add_message("user", "hello")
+
+        retrieval = RetrievalResult(
+            query="test",
+            user_id="raj",
+            facts=[],
+            entities_found=0,
+            total_facts=1,
+            formatted_context="RETRIEVAL_SENTINEL",
+            retrieval_time_ms=1.0,
+            vector_search_time_ms=0.0,
+            graph_traversal_time_ms=0.0,
+            config_used={},
+            intent="relational",
+        )
+
+        messages = handler._build_messages(
+            session=session,
+            max_history=10,
+            retrieval_result=retrieval,
+            mist_context=None,
+        )
+
+        # Locate the two messages by sentinel content.
+        conv_index = next(
+            i for i, m in enumerate(messages) if "VAULT_CONVENTIONS_SENTINEL" in m["content"]
+        )
+        retr_index = next(i for i, m in enumerate(messages) if "RETRIEVAL_SENTINEL" in m["content"])
+
+        # MIST.md must come BEFORE retrieval (the KV-cache discipline fix).
+        assert conv_index < retr_index, (
+            "MIST.md must precede retrieval to preserve KV-cache reuse across "
+            "turns (G6). Got conv_index=%d, retr_index=%d." % (conv_index, retr_index)
+        )
+
+        # Conventions still carry the user role; retrieval still carries system.
+        assert messages[conv_index]["role"] == "user"
+        assert messages[retr_index]["role"] == "system"
 
     def test_build_messages_omits_conventions_user_message_when_no_mist_md(
         self, tmp_path: Path

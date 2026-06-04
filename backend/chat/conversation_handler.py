@@ -2438,6 +2438,18 @@ class ConversationHandler:
             history = raw_history
 
         # --- Compose messages ---
+        # Ordering rationale (KV-cache discipline, G6 in parity audit v2.1):
+        # llama.cpp's KV cache is prefix-based -- once a token mismatches, all
+        # subsequent positions must re-process. So stable content goes at the
+        # front; variable content goes at the tail. Order:
+        #   1. Persona block       (stable within session; cached MistContext)
+        #   2. Static template     (stable across all sessions)
+        #   3. MIST.md             (stable across turns; mtime-cached)
+        #   4. Retrieval text      (VARIES per turn -- breaks cache here)
+        #   5. Live-data advisory  (conditional, varies)
+        #   6. History             (variable, growing tail)
+        # Pre-2026-05-25 the order was 1,2,4,5,3,6 which broke MIST.md cache
+        # reuse every turn even though its content was unchanged.
         messages: list[dict[str, str]] = []
 
         # 1. Persona block (Cluster 3)
@@ -2447,7 +2459,21 @@ class ConversationHandler:
         # 2. Static system template
         messages.append({"role": "system", "content": static_template})
 
-        # 3. Retrieval context (pruned by planner when active)
+        # 3. Vault conventions (ADR-014): MIST.md auto-load as user message.
+        # Mirrors Claude Code's CLAUDE.md user-message-after-system-prompt
+        # position. Placed before retrieval to preserve KV-cache reuse across
+        # turns (parity audit v2.1 G6). Omitted when no conventions file
+        # exists (vault-less or test contexts).
+        conventions_content = self._conventions_loader.load_vault_root()
+        if conventions_content is not None:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": self._conventions_loader.format_for_prompt(conventions_content),
+                }
+            )
+
+        # 4. Retrieval context (pruned by planner when active)
         if retrieval_text:
             if retrieval_result:
                 logger.info(
@@ -2458,21 +2484,9 @@ class ConversationHandler:
                 )
             messages.append({"role": "system", "content": retrieval_text})
 
-        # 4. Live-data advisory
+        # 5. Live-data advisory
         if live_advisory_text:
             messages.append({"role": "system", "content": live_advisory_text})
-
-        # 5. Vault conventions (ADR-014): MIST.md auto-load as user message.
-        # Mirrors Claude Code's CLAUDE.md user-message-after-system-prompt position.
-        # Omitted when no conventions file exists (vault-less or test contexts).
-        conventions_content = self._conventions_loader.load_vault_root()
-        if conventions_content is not None:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": self._conventions_loader.format_for_prompt(conventions_content),
-                }
-            )
 
         # 6. Conversation history
         messages.extend(history)
