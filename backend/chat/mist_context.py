@@ -76,25 +76,33 @@ class MistContext:
                 "HARD RULES (non-negotiable — violating these breaks the response contract):"
             )
             for p in absolute:
-                lines.append(f"- {p.display_name}. {p.context.strip()}")
+                ctx = (p.context or "").strip()
+                lines.append(f"- {p.display_name}. {ctx}" if ctx else f"- {p.display_name}.")
             lines.append("")
 
         if self.traits:
             lines.append("Traits:")
             for t in self.traits:
-                lines.append(f"- {t.display_name} ({t.axis}): {t.description.strip()}")
+                desc = (t.description or "").strip()
+                lines.append(
+                    f"- {t.display_name} ({t.axis}): {desc}"
+                    if desc
+                    else f"- {t.display_name} ({t.axis})"
+                )
             lines.append("")
 
         if self.capabilities:
             lines.append("Capabilities:")
             for c in self.capabilities:
-                lines.append(f"- {c.display_name}: {c.description.strip()}")
+                desc = (c.description or "").strip()
+                lines.append(f"- {c.display_name}: {desc}" if desc else f"- {c.display_name}")
             lines.append("")
 
         if non_absolute:
             lines.append("Preferences (soft guidance):")
             for p in non_absolute:
-                lines.append(f"- {p.display_name}. {p.context.strip()}")
+                ctx = (p.context or "").strip()
+                lines.append(f"- {p.display_name}. {ctx}" if ctx else f"- {p.display_name}.")
             lines.append("")
 
         return "\n".join(lines).rstrip() + "\n"
