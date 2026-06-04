@@ -333,7 +333,15 @@ class VoiceProcessor:
                     except queue.Empty:
                         break
                     if next_item is None:
-                        # End-of-stream -- generate what we have
+                        # End-of-stream -- generate what we have. Put the
+                        # sentinel back on the queue so the OUTER loop also
+                        # sees it on its next iteration and breaks cleanly
+                        # (otherwise the consumer hangs on get(timeout=1.0)
+                        # forever, state_cycle('idle') never emits, and
+                        # the FE stays stuck in SPEAK -- the canonical
+                        # tool-using-turn hang surfaced by the 2026-05-25
+                        # smoke walk).
+                        sentence_queue.put(None)
                         break
                     sentence = sentence + " " + next_item
             first_sentence = False
