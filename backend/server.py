@@ -60,7 +60,8 @@ logger = logging.getLogger(__name__)
 
 # WebSocket protocol version sent on session_started per ADR-017. Bump
 # minor on additive event/field additions, major on breaking changes.
-PROTOCOL_VERSION = "1.0.0"
+# v1.1.0 (2026-05-25): documents vault_results + system_status (shipped 2026-05-11).
+PROTOCOL_VERSION = "1.1.0"
 
 # Global state
 active_connections: set[WebSocket] = set()
