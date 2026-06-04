@@ -59,58 +59,42 @@ This includes:
 
 ## Project Context
 
-### Current Architecture (Updated: 2026-04-08)
+### Current Architecture (Updated: 2026-05-11)
 
 **Backend (Python):**
 - Python 3.11+
-- FastAPI + Uvicorn (WebSocket server)
+- FastAPI + Uvicorn (WebSocket server, port 8001)
 - Docker Compose (backend + Neo4j 5 + llama-server)
-- llama-server (LLM inference - Qwen 2.5 7B via llama.cpp)
-- Whisper (STT - base model)
+- llama-server (LLM inference - Gemma 4 E4B Q5_K_M via llama.cpp)
+- Whisper (STT)
 - Chatterbox Turbo (TTS - MIT license, zero-shot voice cloning)
 - Neo4j 5.x (knowledge graph)
 - PyTorch 2.6.0 + CUDA 12.4 (Linux container)
-- Voice pipeline: VAD -> STT (Whisper) -> LLM (Qwen 2.5) -> TTS (Chatterbox Turbo) with streaming parallelism (~4-5s TTFA)
+- Voice pipeline: VAD -> STT (Whisper) -> LLM (Gemma 4 E4B) -> TTS (Chatterbox Turbo) with streaming parallelism (~4-5s TTFA)
 - Log streaming: WebSocketLogHandler with request ID propagation, persistent file logging
-- Status: PRODUCTION READY
+- Vault layer (ADR-010): mist-memory/ markdown corpus + sqlite-vec sidecar index + watchdog filewatcher
+- Status: PRODUCTION READY (continuous-usage hardening + FE/BE integration in progress)
 - Deployment: Docker Compose (nvidia/cuda:12.4.0-devel-ubuntu22.04)
 
-**Frontend (Flutter):**
-- Cross-platform desktop (Windows/macOS/Linux)
-- WebSocket client connecting to backend
-- Voice recording and audio playback
-- Navigation rail (4 destinations: Chat, Logs, Voice Profiles stub, Settings stub)
-- Log viewer with level filtering, search, grouping, ring buffer
-- Riverpod state management
-- Status: IN DEVELOPMENT
+**Frontend (separate repository at `D:/Users/rajga/mist-frontend/`):**
+- Tauri 2.x cross-platform desktop shell
+- React 19 + TypeScript strict
+- three.js + @react-three/fiber + drei (spatial 3D composition)
+- Vite build
+- Native WebSocket via Tauri shell, connecting to backend at `ws://localhost:8001/ws`
+- Integration contracts: ADR-016 (LLM-mediated FE tool calls; BE-decided routing) + ADR-017 (WebSocket message contract). Both live in `knowledge-vault/Decisions/`.
+- Status: production-ready as of 2026-05-08; FE/BE Wave 1 shipped 2026-05-10 on branch `integration/v1`.
+- The Flutter Desktop frontend at `mist_desktop/` was decommissioned 2026-05-11. Git history at commit `e18c092` preserves the Flutter source if reference is needed.
 
 **Key Technologies:**
 - Python 3.11+, FastAPI, llama-server, openai (Python client), Neo4j, PyTorch
 - Docker Compose (backend + Neo4j + llama-server), PyTorch 2.6+cu124
-- Flutter 3.24+, Dart 3.10+, Riverpod 3.x
+- Tauri 2.x + React 19 + react-three-fiber + TypeScript (frontend, separate repo)
 - Chatterbox Turbo TTS (MIT license, zero-shot voice cloning)
 
 ### Current Branch Status
 
-Branch: `main`
-- Backend containerized (Docker Compose: backend + Neo4j + llama-server)
-- Chatterbox Turbo TTS (0.74x RTF, 3.9GB VRAM), default voice profile: friday
-- Voice pipeline parallelism: LLM token streaming -> sentence detection -> TTS consumer (~4-5s TTFA)
-- Log streaming via WebSocket + persistent file logging (./logs/mist-backend.log)
-- Flutter nav rail + log viewer operational
-- 655+ backend tests, 14 sentence detector tests, token streaming tests
-- Flash attention enabled via Linux container (PyTorch 2.6+cu124)
-- Native Windows venv corrupted -- use container for all backend work
-- 43 commits ahead of origin/main (not pushed)
-
-### Recent Major Changes
-
-1. Voice pipeline optimization: streaming parallelism, 12-19s TTFA down to ~4-5s
-2. Backend log streaming with WebSocketLogHandler, request ID propagation
-3. Flutter navigation rail + log viewer (filter, search, grouping)
-4. Chatterbox TTS integration (replaced Sesame CSM-1B)
-5. Docker Compose containerization (backend + Neo4j + llama-server)
-6. Knowledge extraction + curation pipeline (655 tests)
+See `CODEBASE.md` for live branch status, active workstreams, recent commits, and outstanding issues.
 
 ---
 
@@ -129,13 +113,14 @@ When starting any work session, read these files in order:
 ### When Deep Context Needed
 
 For architectural decisions or understanding design rationale:
-- `docs/decisions/adr_*.md` - Architecture Decision Records
-- `docs/design/*.md` - Design documents and architecture
+- `docs/decisions/adr_*.md` - Repo-scoped ADRs
+- `knowledge-vault/Decisions/ADR-*.md` - Cross-project + integration ADRs (memory architecture, vault layer, FE/BE protocol)
+- `docs/superpowers/specs/` - Phase implementation specs
 
 For specific areas:
-- `FLUTTER_MIGRATION_PLAN.md` - Flutter implementation details
-- `INTEGRATION_STATUS.md` - Knowledge graph integration status
-- `E2E_TEST_GUIDE.md` - Testing procedures
+- `CODEBASE.md` - Recent work, cluster status, current blockers
+- `TESTING.md` - Test conventions
+- `KNOWN_ISSUES.md` - P3 backlog
 
 ### Documentation Update Requirements
 
@@ -147,7 +132,7 @@ Update these files when making significant changes:
 
 **When Applicable:**
 - Update REPOSITORY_STRUCTURE.md when adding new directories/major files
-- Create ADR in docs/decisions/ for architectural decisions
+- Create ADR (repo-scoped under `docs/decisions/`, cross-project under `knowledge-vault/Decisions/`)
 - Update relevant guide files when changing workflows
 
 ---
@@ -207,100 +192,9 @@ Key classes/functions overview if module is complex.
 import statements...
 ```
 
-### Flutter/Dart Code Style
+### Frontend Code Style
 
-**Follow Effective Dart:**
-- Use `prefer_single_quotes: true`
-- Prefer `const` constructors where possible
-- Avoid `print()` - use proper logging
-- Use `lowerCamelCase` for variables/methods
-- Use `UpperCamelCase` for classes/types
-
-**Widget Structure:**
-```dart
-class WidgetName extends ConsumerWidget {
-  const WidgetName({super.key});
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    // Read providers at top
-    final state = ref.watch(stateProvider);
-
-    // Build UI
-    return Widget();
-  }
-}
-```
-
-## Flutter Frontend Guidelines
-
-### Widget Architecture
-
-Prioritize modularization, reusability, and testability when building widgets.
-
-- **Widget modularization**
-  - Monolithic single-widget screens are an anti-pattern. Break screens into
-    smaller widgets with clear ownership boundaries.
-  - Structure widgets so they can be rendered and tested in isolation -- avoid
-    deep coupling to global providers or parent context.
-  - Keep widget files under ~200 lines. If a widget grows beyond that, extract
-    sub-widgets or helper methods.
-
-- **Reusability**
-  - Build smaller, composable widgets that can be reused across screens.
-  - Prefer passing data and callbacks via constructor parameters over reading
-    providers directly -- this makes widgets testable without provider overrides.
-  - Extract shared UI patterns (message bubbles, status indicators) into
-    dedicated widget files under `widgets/`.
-
-- **Readability and logic isolation**
-  - If a widget has complex state logic, extract it into a dedicated Notifier
-    or service class rather than inlining it in the widget.
-  - Keep `build()` methods focused on rendering. Move side-effect setup
-    (listeners, subscriptions) into `initState()` or provider callbacks.
-
-### Riverpod State Management
-
-- **Provider types and when to use them:**
-  - `Provider` -- immutable services (WebSocketService, AudioRecordingService)
-  - `NotifierProvider` -- mutable state with methods (ChatNotifier)
-  - `StreamProvider` -- reactive streams (connectionStatus, isRecording)
-  - `FutureProvider` -- one-shot async data
-
-- **Provider DI pattern:** Services are created in `Provider` definitions and
-  injected into Notifiers via `ref.read()` in `build()`. This mirrors the
-  backend's factory pattern in `backend/factories.py`.
-
-- **Do not over-centralize state.** ChatNotifier currently owns messages,
-  processing state, and AI response streaming. As features grow, split into
-  focused notifiers (e.g., separate voice state from chat state).
-
-- **Avoid `ref.watch()` in callbacks.** Use `ref.read()` inside event handlers
-  and `ref.watch()` only in `build()` methods or provider definitions.
-
-### Service Layer
-
-Services (`lib/services/`) encapsulate platform/external interactions:
-- `WebSocketService` -- backend communication (connect, send, receive)
-- `AudioRecordingService` -- mic capture and PCM buffer management
-- `AudioPlaybackService` -- TTS audio queue and WAV playback
-- `SpeechService` -- platform-native STT (legacy, being replaced by backend Whisper)
-
-**Rules:**
-- Services must be stateless singletons managed by Riverpod `Provider`.
-- Services expose `Stream`s for reactive state, not callbacks.
-- Services handle their own `dispose()` via `ref.onDispose()` in the provider.
-- No direct `print()` -- use `Logger` from the `logger` package.
-
-### Testability
-
-- New widgets and logic should include corresponding tests.
-  See `mist_desktop/test/CLAUDE.md` for conventions and infrastructure.
-- Prefer accepting data and callbacks via constructor params over reaching
-  directly into providers -- makes widgets testable without full provider trees.
-- Extract complex logic (message parsing, audio format conversion, WebSocket
-  protocol handling) into pure functions or service methods testable without
-  widget rendering.
+Frontend code lives in a separate repository at `D:/Users/rajga/mist-frontend/`. See that repository's own contributing guide and CLAUDE.md (when refreshed post-spatial-app-reframe) for TypeScript / React / Tauri conventions. The two repos coordinate at the protocol layer (ADR-016 + ADR-017), not at the code-style layer.
 
 ---
 
@@ -387,7 +281,7 @@ Co-Authored-By: Claude <noreply@anthropic.com>
 - Must be air-gapped capable (local-first design)
 
 **Model Choices:**
-- LLM: Qwen 2.5 7B Instruct (via llama-server)
+- LLM: Gemma 4 E4B Q5_K_M (via llama-server)
 - Embeddings: all-MiniLM-L6-v2 (384-dim, fast)
 - STT: Whisper base (1.4GB model)
 - TTS: Chatterbox Turbo (0.74x RTF, 3.9GB VRAM, zero-shot cloning)
@@ -447,7 +341,7 @@ Co-Authored-By: Claude <noreply@anthropic.com>
 
 **ChatGPT/Claude Web:**
 - Good for architectural discussions
-- Document decisions in ADRs (docs/decisions/)
+- Document decisions in ADRs (docs/decisions/ or knowledge-vault/Decisions/)
 - Don't copy-paste code without review
 - Remove AI filler phrases before committing
 
@@ -543,12 +437,17 @@ Never silently consume error responses.
 ## Subdirectory Guides
 
 - `tests/CLAUDE.md` -- Backend test conventions and AI guidance
-- `mist_desktop/test/CLAUDE.md` -- Flutter frontend test conventions
+
+Frontend test conventions live in the mist-frontend repo at `D:/Users/rajga/mist-frontend/`.
 
 ## Testing
 
 See `TESTING.md` for conventions and `tests/CLAUDE.md` for AI-specific
-test guidance. Run tests: `pytest tests/unit/`
+test guidance. Run tests inside the backend container:
+
+```bash
+docker compose exec mist-backend python -m pytest tests/unit/
+```
 
 ---
 
@@ -686,7 +585,7 @@ implementation tasks.
 **When to use agentic teams:**
 - 2+ independent tasks with no shared state or sequential dependencies
 - Test writing for multiple components (each test file = independent agent)
-- Implementing features across different modules (backend vs frontend)
+- Implementing features across different modules (backend areas, or backend vs frontend coordination)
 - Audit, review, or exploration tasks covering different subsystems
 
 **How to dispatch:**
@@ -703,18 +602,18 @@ Format: `**Role:** You are a [seniority] [domain] [title] with deep expertise
 in [specific technologies/patterns]. You have [relevant experience].`
 
 Examples:
-- Implementation: "You are a senior Flutter/Dart architect with deep expertise
-  in Riverpod state management, Material 3 design, and desktop app UX."
 - Implementation: "You are a senior Python backend engineer with expertise in
   asyncio, threading, and WebSocket server architecture."
+- Implementation: "You are a senior knowledge-graph engineer with deep expertise
+  in Neo4j Cypher, ontology design, and entity extraction pipelines."
 - Review: "You are a principal engineer reviewing code for thread safety,
   performance, and production readiness."
 - Research: "You are a systems researcher with expertise in distributed
   architectures and protocol design."
 
-Match the role to the task domain. Be specific about technologies -- "Flutter
-expert" is weaker than "Flutter desktop architect with Riverpod and Material 3
-expertise."
+Match the role to the task domain. Be specific about technologies -- "Python
+expert" is weaker than "Python asyncio + WebSocket expert with Neo4j driver
+experience."
 
 **Rules:**
 - Each agent gets a clear scope -- no overlapping file edits
@@ -778,8 +677,8 @@ They're placeholders for planned features:
 3. Update CODEBASE.md at session end
 
 **Code Quality:**
-- Format: black (Python), flutter format (Dart)
-- Lint: ruff (Python), flutter analyze (Dart)
+- Format: black (Python)
+- Lint: ruff (Python)
 - Type hints required (Python)
 - Docstrings for public APIs
 
@@ -799,4 +698,4 @@ They're placeholders for planned features:
 
 For questions or clarifications, ask the user directly. When in doubt, check existing code for patterns and conventions.
 
-Last Updated: 2026-04-08
+Last Updated: 2026-05-11 (Flutter Desktop decommissioned; mist-frontend/ Tauri repo canonical for FE)
