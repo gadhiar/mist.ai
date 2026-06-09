@@ -1784,7 +1784,16 @@ class TestQueryVault:
         text: str = "This is a vault chunk about the backend architecture.",
         similarity: float = 0.92,
         sources: list[str] | None = None,
+        display_similarity: float | None = None,
     ):
+        """Build a VaultNote RetrievedFact mirroring _vault_sidecar_retrieve.
+
+        `similarity` populates `similarity_score` (the RRF fusion score).
+        `display_similarity` is the real cosine the sidecar carries onto
+        properties (Task 2) and is what the vault_results payload emits:
+        a float for vector hits, None for FTS-only. It is independent of
+        `similarity_score`, so set it explicitly when asserting the emit.
+        """
         from backend.knowledge.models import RetrievedFact
 
         return RetrievedFact(
@@ -1798,6 +1807,7 @@ class TestQueryVault:
                 "text": text,
                 "content": text,
                 "sources": sources or ["vector", "fts"],
+                "display_similarity": display_similarity,
             },
             similarity_score=similarity,
             graph_distance=99,
@@ -1839,17 +1849,23 @@ class TestQueryVault:
         """On hits, vault_results event lands in the per-turn buffer."""
         handler = self._build_handler()
         facts = [
+            # Vector hit: real cosine carried, emitted as the displayed score.
             self._make_vault_fact(
                 path="sessions/2026-05-11-test.md",
                 section="Backend",
                 text="x" * 300,
                 similarity=0.88,
+                display_similarity=0.88,
+                sources=["vector"],
             ),
+            # FTS-only hit: no cosine, displayed similarity is None.
             self._make_vault_fact(
                 path="decisions/DEC-001.md",
                 section=None,
                 text="A decision about Python.",
                 similarity=0.71,
+                display_similarity=None,
+                sources=["fts"],
             ),
         ]
 
@@ -1875,13 +1891,17 @@ class TestQueryVault:
         assert first["full_text"] == "x" * 300
         assert first["snippet"].endswith("...")
         assert len(first["snippet"]) == 203  # 200 chars + "..."
+        # Displayed similarity is the real cosine (display_similarity), not
+        # the RRF fusion score (similarity_score).
         assert first["similarity"] == 0.88
         assert "vector" in first["sources"]
 
-        # Second result: '(file)' heading becomes None
+        # Second result: '(file)' heading becomes None; FTS-only hit has no
+        # cosine, so the emitted similarity is None (FE renders "lexical").
         second = event["results"][1]
         assert second["section"] is None
         assert second["full_text"] == "A decision about Python."
+        assert second["similarity"] is None
 
     @pytest.mark.asyncio
     async def test_skips_emit_on_zero_hits(self):

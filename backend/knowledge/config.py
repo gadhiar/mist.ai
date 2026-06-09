@@ -247,7 +247,11 @@ class QueryIntentConfig:
     min_confidence: float = 0.3
 
     # RRF merge parameters
-    rrf_k: int = 60
+    # rrf_k lowered from 60 to 15 for steeper rank separation on broad
+    # queries (Task 2). Smaller k weights the top ranks more heavily, so
+    # high-ranked hits dominate the fused score instead of the long flat
+    # tail that k=60 produced. Override via the RRF_K env var.
+    rrf_k: int = 15
     rrf_vector_weight: float = 0.5
     rrf_graph_weight: float = 0.5
     max_vector_results: int = 20
@@ -273,7 +277,7 @@ class QueryIntentConfig:
             confidence_base=float(os.getenv("QUERY_CONFIDENCE_BASE", "0.5")),
             confidence_per_match=float(os.getenv("QUERY_CONFIDENCE_PER_MATCH", "0.1")),
             min_confidence=float(os.getenv("QUERY_MIN_CONFIDENCE", "0.3")),
-            rrf_k=int(os.getenv("RRF_K", "60")),
+            rrf_k=int(os.getenv("RRF_K", "15")),
             rrf_vector_weight=float(os.getenv("RRF_VECTOR_WEIGHT", "0.5")),
             rrf_graph_weight=float(os.getenv("RRF_GRAPH_WEIGHT", "0.5")),
             max_vector_results=int(os.getenv("MAX_VECTOR_RESULTS", "20")),

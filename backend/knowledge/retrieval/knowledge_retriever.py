@@ -644,11 +644,19 @@ class KnowledgeRetriever:
         if self._vault_sidecar is None:
             return [], []
 
+        # rrf_k lives on QueryIntentConfig (config.query_intent). Thread it
+        # into the sidecar's internal vec0+FTS5 RRF merge so the lowered
+        # default (Task 2) takes effect end-to-end rather than the sidecar's
+        # own hardcoded fallback. Defensive `or QueryIntentConfig()` mirrors
+        # the pattern in retrieve() for a None query_intent.
+        intent_config = self.config.query_intent or QueryIntentConfig()
+
         try:
             rows = self._vault_sidecar.query_hybrid(
                 embedding=embedding,
                 text=query,
                 k=limit,
+                rrf_k=intent_config.rrf_k,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Vault sidecar query failed, degrading to no-vault retrieval: %s", exc)
@@ -696,6 +704,11 @@ class KnowledgeRetriever:
                         "vector_rank": row.get("vector_rank"),
                         "fts_rank": row.get("fts_rank"),
                         "sources": row.get("sources"),
+                        # Real cosine in (0, 1] for vector hits, None for
+                        # FTS-only hits (Task 1). Carried so the vault_results
+                        # FE payload can display the true similarity instead
+                        # of the RRF fusion score; None renders as "lexical".
+                        "display_similarity": row.get("display_similarity"),
                     },
                     similarity_score=score,
                     graph_distance=_VECTOR_DISTANCE_SENTINEL,

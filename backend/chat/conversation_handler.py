@@ -265,7 +265,15 @@ def _build_vault_results_payload(
                 "section": section,
                 "snippet": snippet,
                 "full_text": content,
-                "similarity": float(fact.similarity_score),
+                # Emit the real cosine similarity carried from the sidecar
+                # (Task 2), NOT fact.similarity_score (the RRF fusion score,
+                # which read as a misleading uniform ~2% in the FE). None for
+                # FTS-only hits; the FE renders null as a "lexical" indicator.
+                "similarity": (
+                    float(props["display_similarity"])
+                    if props.get("display_similarity") is not None
+                    else None
+                ),
                 "sources": sources,
             }
         )
