@@ -618,16 +618,28 @@ def cmd_chat(args: argparse.Namespace) -> int:
     print(f"[chat] session_id={session_id} user_id={user_id}")
     print(f"[chat] utterance: {args.utterance!r}")
     print("[chat] Building conversation handler (may load embedding model)...")
-    handler = build_conversation_handler(config)
 
-    result = asyncio.run(run_chat(handler, args.utterance, session_id, user_id))
-    _print_chat_result(result)
+    # ADR-010 Phase 9: wire the read-only vault sidecar so the CLI chat path
+    # exercises the same vault auto-RAG / "Relevant Documents" retrieval the
+    # server's WebSocket path does (server lifespan: build_sidecar_index ->
+    # vault_sidecar= into build_conversation_handler). `_build_cli_sidecar`
+    # returns None when config.sidecar_index.enabled is False, mirroring the
+    # server's enablement guard, and uses a reader (no writer) per the
+    # single-writer rule so it is safe to run alongside the server.
+    sidecar = _build_cli_sidecar(config)
+    try:
+        handler = build_conversation_handler(config, vault_sidecar=sidecar)
 
-    if args.output:
-        out_path = Path(args.output)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
-        print(f"\n[chat] Wrote result to {out_path}")
+        result = asyncio.run(run_chat(handler, args.utterance, session_id, user_id))
+        _print_chat_result(result)
+
+        if args.output:
+            out_path = Path(args.output)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+            print(f"\n[chat] Wrote result to {out_path}")
+    finally:
+        _close_cli_sidecar(sidecar)
     return 0 if result["ok"] else 1
 
 
@@ -656,18 +668,29 @@ def cmd_replay(args: argparse.Namespace) -> int:
     user_id = args.user_id or "User"
     print(f"[replay] {len(inputs)} inputs, session_id={session_id}, user_id={user_id}")
     print("[replay] Building conversation handler (may load embedding model)...")
-    handler = build_conversation_handler(config)
 
-    results = asyncio.run(run_replay(handler, inputs, session_id, user_id))
-    _print_replay_summary(results)
+    # ADR-010 Phase 9: wire the read-only vault sidecar so replay validates
+    # retrieval quality against the SAME vault auto-RAG path production uses
+    # (server lifespan: build_sidecar_index -> vault_sidecar= into
+    # build_conversation_handler). `_build_cli_sidecar` returns None when
+    # config.sidecar_index.enabled is False, mirroring the server's
+    # enablement guard, and is a reader (no writer) per the single-writer rule.
+    sidecar = _build_cli_sidecar(config)
+    try:
+        handler = build_conversation_handler(config, vault_sidecar=sidecar)
 
-    if args.output:
-        out_path = Path(args.output)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("w", encoding="utf-8") as f:
-            for r in results:
-                f.write(json.dumps(r, default=str) + "\n")
-        print(f"\n[replay] Wrote {len(results)} records to {out_path}")
+        results = asyncio.run(run_replay(handler, inputs, session_id, user_id))
+        _print_replay_summary(results)
+
+        if args.output:
+            out_path = Path(args.output)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with out_path.open("w", encoding="utf-8") as f:
+                for r in results:
+                    f.write(json.dumps(r, default=str) + "\n")
+            print(f"\n[replay] Wrote {len(results)} records to {out_path}")
+    finally:
+        _close_cli_sidecar(sidecar)
 
     fail_count = sum(1 for r in results if not r["ok"])
     return 0 if fail_count == 0 else 1
