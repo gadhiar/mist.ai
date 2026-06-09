@@ -22,15 +22,32 @@ from unittest.mock import AsyncMock, MagicMock
 from backend.chat.conversation_handler import ConversationHandler
 
 
+class _FakeVaultWriter:
+    """Explicit writer fake: records the two writeback calls the C-pattern
+    can make. Defined inline (not promoted to tests/mocks/) per the scoped
+    review fix. Unlike MagicMock, the keyword-only signatures here will fail
+    the test if upsert_user_snapshot's interface drifts.
+    """
+
+    def __init__(self) -> None:
+        self.upsert_user_snapshot_calls: list[tuple[str, str]] = []
+        self.upsert_user_calls: list[tuple[str, str]] = []
+
+    async def upsert_user_snapshot(self, *, user_id: str, body_markdown: str) -> str:
+        self.upsert_user_snapshot_calls.append((user_id, body_markdown))
+        return f"users/{user_id}-graph-snapshot.md"
+
+    async def upsert_user(self, *, user_id: str, body_markdown: str) -> str:
+        self.upsert_user_calls.append((user_id, body_markdown))
+        return f"users/{user_id}.md"
+
+
 def test_refresh_writes_snapshot_not_user_md(monkeypatch):
     # Arrange: construct a ConversationHandler without running __init__ and
     # wire only the attributes _maybe_refresh_user_vault reads.
     handler = ConversationHandler.__new__(ConversationHandler)
-    handler._vault_writer = MagicMock()
-    handler._vault_writer.upsert_user_snapshot = AsyncMock(
-        return_value="users/user-graph-snapshot.md"
-    )
-    handler._vault_writer.upsert_user = AsyncMock(return_value="users/user.md")
+    fake_writer = _FakeVaultWriter()
+    handler._vault_writer = fake_writer
     handler.graph_store = MagicMock()
     handler._user_id_for_vault = lambda: "user"
 
@@ -64,11 +81,7 @@ def test_refresh_writes_snapshot_not_user_md(monkeypatch):
     # Act
     asyncio.run(handler._maybe_refresh_user_vault(extraction_result))
 
-    # Assert: the snapshot writeback fired; the curated user.md writer did not.
-    handler._vault_writer.upsert_user_snapshot.assert_awaited_once()
-    handler._vault_writer.upsert_user.assert_not_awaited()
-
-    # The snapshot write carries the real user_id and the rendered body.
-    _, kwargs = handler._vault_writer.upsert_user_snapshot.call_args
-    assert kwargs.get("user_id") == "user"
-    assert kwargs.get("body_markdown") == "BODY"
+    # Assert: the snapshot writeback fired exactly once with the real user_id
+    # and the rendered body; the curated user.md writer was never called.
+    assert fake_writer.upsert_user_snapshot_calls == [("user", "BODY")]
+    assert fake_writer.upsert_user_calls == []
