@@ -547,6 +547,68 @@ class TestDeletePath:
 
 
 # ---------------------------------------------------------------------------
+# TestDistinctPaths
+# ---------------------------------------------------------------------------
+
+
+class TestDistinctPaths:
+    """distinct_paths() enumerates the set of indexed file paths.
+
+    Used by the filewatcher startup reconcile to seed _known_mtimes with
+    sidecar-known paths so files deleted while the watcher was down land in
+    the audit's vanish-delete set. Must return one entry per file even when a
+    file produced multiple chunks (file-level + heading-block).
+    """
+
+    def test_returns_empty_for_empty_index(self, sidecar_index):
+        # Act / Assert
+        assert sidecar_index.distinct_paths() == []
+
+    def test_returns_each_upserted_path(self, sidecar_index):
+        # Arrange
+        sidecar_index.upsert_file("a.md", "content a", 1000)
+        sidecar_index.upsert_file("b.md", "content b", 1000)
+
+        # Act / Assert -- both paths present, order-independent
+        assert set(sidecar_index.distinct_paths()) == {"a.md", "b.md"}
+
+    def test_one_entry_per_file_for_multi_chunk_note(self, sidecar_index):
+        # Arrange -- a headed note produces a file-level chunk plus per-heading
+        # chunks, i.e. multiple rows in vault_chunks sharing one path.
+        n = sidecar_index.upsert_file("headed.md", _HEADED_NOTE, 1000)
+        assert n > 1  # confirm the note is genuinely multi-chunk
+
+        # Act
+        paths = sidecar_index.distinct_paths()
+
+        # Assert -- DISTINCT collapses the chunks to a single path entry
+        assert paths.count("headed.md") == 1
+        assert set(paths) == {"headed.md"}
+
+    def test_excludes_deleted_path(self, sidecar_index):
+        # Arrange
+        sidecar_index.upsert_file("keep.md", "content keep", 1000)
+        sidecar_index.upsert_file("gone.md", "content gone", 1000)
+
+        # Act -- delete one file, then enumerate
+        sidecar_index.delete_path("gone.md")
+
+        # Assert -- only the surviving path remains
+        assert set(sidecar_index.distinct_paths()) == {"keep.md"}
+
+    def test_preserves_absolute_path_format(self, sidecar_index):
+        # Arrange -- production stores absolute OS-native path strings (the
+        # filewatcher passes str(Path(...)) rooted at vault_root). distinct_paths
+        # must return them verbatim so the startup reconcile can compare them
+        # against the disk-walk keys without normalization drift.
+        abs_path = str(Path("/vault/sessions/note.md"))
+        sidecar_index.upsert_file(abs_path, "content", 1000)
+
+        # Act / Assert
+        assert sidecar_index.distinct_paths() == [abs_path]
+
+
+# ---------------------------------------------------------------------------
 # TestQueryVector
 # ---------------------------------------------------------------------------
 

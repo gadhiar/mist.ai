@@ -647,6 +647,33 @@ class VaultSidecarIndex:
         except (sqlite3.OperationalError, sqlite3.IntegrityError) as exc:
             raise SidecarIndexError(f"chunk_count failed: {exc}") from exc
 
+    def distinct_paths(self) -> list[str]:
+        """Return the distinct file paths currently indexed.
+
+        One entry per file regardless of how many chunks (file-level plus
+        heading-block) that file produced. The startup reconcile in
+        `VaultFilewatcher._scan_vault_mtimes` uses this to seed its
+        `_known_mtimes` baseline with sidecar-known paths, so a vault file
+        deleted while the filewatcher was down lands in the audit's
+        vanish-delete set and its orphaned chunks are pruned on the first
+        audit pass.
+
+        Returns:
+            List of the stored `path` values, exactly as written by
+            `upsert_file` (no normalization).
+
+        Raises:
+            SidecarIndexError: On database error.
+        """
+        self._require_connection()
+        try:
+            rows = self._conn.execute(  # type: ignore[union-attr]
+                "SELECT DISTINCT path FROM vault_chunks"
+            ).fetchall()
+            return [row[0] for row in rows]
+        except (sqlite3.OperationalError, sqlite3.IntegrityError) as exc:
+            raise SidecarIndexError(f"distinct_paths failed: {exc}") from exc
+
     def health_check(self) -> bool:
         """Return True if the connection is open and the schema is intact.
 

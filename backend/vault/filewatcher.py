@@ -642,6 +642,18 @@ class VaultFilewatcher:
         Called once at `start()` as a baseline snapshot. Does NOT trigger
         any reindex -- the sidecar is assumed to already reflect whatever
         state it was last written to.
+
+        After the disk walk, the sidecar's known paths are folded into the
+        baseline with an mtime sentinel of 0 for any path not already seen on
+        disk. This reconciles between-session deletions: a vault file removed
+        while the filewatcher was DOWN is absent from the disk walk, so without
+        this seed it would never enter `_known_mtimes` and the audit's
+        vanish-delete would never prune its orphaned sidecar chunks. Seeding it
+        with `setdefault(p, 0)` lands it in the baseline (without clobbering the
+        real mtime of any still-present file) so the first `_run_audit` treats
+        it as "known but gone" and deletes it. Sidecar paths are stored in the
+        same absolute `str(Path(...))` form the disk walk produces, so the
+        audit's path comparison stays consistent.
         """
         try:
             for dirpath, _dirnames, filenames in os.walk(self.vault_root):
@@ -654,6 +666,13 @@ class VaultFilewatcher:
                         self._known_mtimes[full] = int(Path(full).stat().st_mtime)
         except Exception as exc:  # noqa: BLE001
             logger.warning("VaultFilewatcher: initial mtime scan failed: %s", exc)
+
+        if self._sidecar is not None:
+            try:
+                for p in self._sidecar.distinct_paths():
+                    self._known_mtimes.setdefault(p, 0)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Filewatcher: sidecar path seed failed: %s", exc)
 
     def _create_observer(self):
         """Instantiate the watchdog observer for the configured observer_type.
