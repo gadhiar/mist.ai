@@ -1,11 +1,20 @@
-"""Graph Regeneration Module.
+"""Graph Regeneration Module -- QUARANTINED (ADR-010).
 
-Rebuilds the knowledge graph from immutable utterances.
+The legacy utterance-based regeneration path is DISABLED. This module
+used to rebuild the knowledge graph by replaying immutable event-store
+utterances; ADR-010 supersedes that model -- vault markdown is the source
+of truth and the graph is re-derived from the curated vault (see
+backend/knowledge/curation/graph_regenerator.py). Replaying raw utterances
+would re-introduce synthetic eval pollution, so both public entry points
+(`regenerate_all`, `regenerate_conversation`) raise NotImplementedError
+immediately.
 
-This proves the architecture works:
-- Utterances are the source of truth
-- Knowledge graph is a materialized view
-- Can always rebuild from scratch
+The class is NOT deleted: it remains importable only to preserve the
+dependency-injection construction contract and the ADR-009
+provenance-deletion invariant exercised by `_delete_graph_entities`. A
+future maintainer must NOT "fix" this by removing the guard raises.
+
+Replacement: `mist_admin vault-rebuild --scope all`.
 """
 
 import logging
@@ -20,15 +29,20 @@ logger = logging.getLogger(__name__)
 
 
 class GraphRegenerator:
-    """Regenerates knowledge graph from immutable utterances.
+    """Legacy utterance-based knowledge-graph regenerator -- QUARANTINED (ADR-010).
 
-    The knowledge graph is a materialized view built from utterances.
-    This class rebuilds the entire graph or specific conversations.
+    Both public entry points (`regenerate_all`, `regenerate_conversation`)
+    raise NotImplementedError immediately: re-deriving the graph from
+    event-store utterances is superseded by ADR-010 vault-rebuild and would
+    re-introduce eval pollution. Use `mist_admin vault-rebuild --scope all`.
 
-    Example:
-        regenerator = GraphRegenerator(config)
-        report = await regenerator.regenerate_all()
-        print(f"Processed {report.processed} utterances")
+    The class is retained (not deleted) only to preserve the
+    dependency-injection construction contract and the ADR-009
+    provenance-deletion invariant in `_delete_graph_entities`. Do NOT remove
+    the guard raises to "restore" the old behavior.
+
+    There is intentionally no live usage example -- the regeneration API is
+    disabled. See the module docstring for the full rationale.
     """
 
     def __init__(
@@ -51,22 +65,21 @@ class GraphRegenerator:
         logger.info("GraphRegenerator initialized")
 
     async def regenerate_all(self) -> RegenerationReport:
-        """Regenerate entire knowledge graph from all utterances.
+        """QUARANTINED (ADR-010): always raises NotImplementedError.
 
-        Process:
-        1. Fetch all utterances from Neo4j
-        2. Delete entity graph (preserve utterances)
-        3. Re-extract entities from each utterance
-        4. Store extracted entities
-        5. Return statistics
+        This entry point previously regenerated the entire knowledge graph
+        from all event-store utterances (fetch utterances, delete the entity
+        graph, re-extract, store). That path is disabled because re-deriving
+        from raw utterances re-introduces eval pollution; the graph is now
+        rebuilt from the curated vault. Use `mist_admin vault-rebuild
+        --scope all`. The legacy body below is retained for reference but is
+        unreachable.
 
-        Returns:
-            RegenerationReport with statistics
-
-        Example:
-            >>> report = await regenerator.regenerate_all()
-            >>> print(f"Created {report.entities_created} entities")
+        Raises:
+            NotImplementedError: Always -- the legacy regeneration path is
+                superseded by ADR-010 vault-rebuild.
         """
+        # QUARANTINED per ADR-010 -- do not remove this raise; see module docstring
         raise NotImplementedError(
             "Legacy utterance-based regeneration is superseded by ADR-010 "
             "vault-rebuild. Re-deriving the graph from event-store utterances "
@@ -162,19 +175,24 @@ class GraphRegenerator:
             raise
 
     async def regenerate_conversation(self, conversation_id: str) -> RegenerationReport:
-        """Regenerate graph for a specific conversation.
+        """QUARANTINED (ADR-010): always raises NotImplementedError.
 
-        Useful for:
-        - Testing on subset of data
-        - Incremental regeneration
-        - Development and debugging
+        This entry point previously regenerated the graph for a single
+        conversation by replaying its event-store utterances. That path is
+        disabled (re-deriving from raw utterances re-introduces eval
+        pollution); the graph is now rebuilt from the curated vault. Use
+        `mist_admin vault-rebuild --scope all`. The legacy body below is
+        retained for reference but is unreachable.
 
         Args:
-            conversation_id: ID of conversation to regenerate
+            conversation_id: Formerly the conversation to regenerate; now
+                unused because the method raises before any work.
 
-        Returns:
-            RegenerationReport with statistics
+        Raises:
+            NotImplementedError: Always -- the legacy regeneration path is
+                superseded by ADR-010 vault-rebuild.
         """
+        # QUARANTINED per ADR-010 -- do not remove this raise; see module docstring
         raise NotImplementedError(
             "Legacy utterance-based regeneration is superseded by ADR-010 "
             "vault-rebuild. Re-deriving the graph from event-store utterances "
