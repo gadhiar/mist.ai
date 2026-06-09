@@ -364,7 +364,7 @@ class KnowledgeRetriever:
         # Step 4: Format context (intent forwarded so vault-only retrievals
         # can emit a vault-framed header per ADR-010 invariant 4 instead of
         # the legacy "from your graph" framing)
-        formatted_context = self._format_context(ranked_facts, query, intent=intent)
+        formatted_context = self.format_context(ranked_facts, query, intent=intent)
 
         total_time = (time.time() - start_time) * 1000
 
@@ -692,7 +692,7 @@ class KnowledgeRetriever:
                     properties={
                         "path": path,
                         # `text` is the canonical key consumed by
-                        # `_format_context` (the formatter is shared with
+                        # `format_context` (the formatter is shared with
                         # the document-chunk path, which has historically
                         # used "text" too). `content` is retained as a
                         # deprecated alias for one release cycle to avoid
@@ -1029,10 +1029,16 @@ class KnowledgeRetriever:
 
         return sorted_facts[:limit]
 
-    def _format_context(
+    def format_context(
         self, facts: list[RetrievedFact], query: str, intent: str | None = None
     ) -> str:
-        """Format facts as natural language context for LLM.
+        """Render retrieved facts as natural-language context for the LLM.
+
+        Canonical PUBLIC renderer: a pure fact-list -> string function with no
+        side effects. Used internally by `retrieve()` and externally by callers
+        that must re-render after filtering a result's facts (e.g. the
+        conversation handler's user-profile dedup, which drops the profile
+        chunk and recomputes `formatted_context` from the survivors).
 
         Partitions facts into graph facts (graph_distance < 999) and
         document facts (graph_distance == 999) and formats each group

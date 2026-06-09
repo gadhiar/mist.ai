@@ -527,7 +527,7 @@ class TestVaultSidecarRetrieve:
 
     def test_vault_sidecar_retrieve_drops_empty_content_chunks(self) -> None:
         """Sidecar rows with empty/whitespace-only content must be dropped
-        before reaching `_format_context`. Surfacing empty-body chunks as
+        before reaching `format_context`. Surfacing empty-body chunks as
         '[doc-N] Source: <heading>' with no body beneath biased the model
         toward inappropriate tool-calls (the "Relevant Documents" framing
         implied authoritative context the chunks did not actually provide).
@@ -578,7 +578,7 @@ class TestVaultSidecarRetrieve:
 
     def test_vault_sidecar_retrieve_populates_both_text_and_content_keys(self) -> None:
         """Reviewer P1 follow-up: properties['text'] is the canonical
-        consumption key (used by `_format_context`); properties['content']
+        consumption key (used by `format_context`); properties['content']
         is retained as a deprecated alias for one release cycle to avoid
         silently breaking any out-of-tree consumer that may have been
         reading the previous key. Both must be populated and identical
@@ -610,7 +610,7 @@ class TestVaultSidecarRetrieve:
         )
 
     def test_vault_sidecar_retrieve_populates_text_property(self) -> None:
-        """Vault chunks must populate properties['text'] so _format_context
+        """Vault chunks must populate properties['text'] so format_context
         can render the chunk content. Pre-fix the sidecar stored chunk
         body under properties['content'], but the formatter (which is
         shared with the document-chunk path) reads properties['text'].
@@ -645,7 +645,7 @@ class TestVaultSidecarRetrieve:
             "Cluster 1 ontology expansion shipped 8 commits."
         ), (
             "Vault chunks must store body under properties['text'] for "
-            f"_format_context compatibility; got {dict(facts[0].properties)}"
+            f"format_context compatibility; got {dict(facts[0].properties)}"
         )
 
 

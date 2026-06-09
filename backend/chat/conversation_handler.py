@@ -2111,10 +2111,11 @@ class ConversationHandler:
         retrieval_result.document_chunks_used = max(
             0, retrieval_result.document_chunks_used - dropped
         )
-        # Re-render the LLM-facing context from the surviving facts using the
-        # retriever's own formatter (the exact function that produced the
-        # original), preserving the historical "Relevant prose" framing.
-        retrieval_result.formatted_context = self.retriever._format_context(
+        # Re-render the LLM-facing context from the surviving facts via the
+        # retriever's canonical public renderer (the exact function that
+        # produced the original), preserving the historical "Relevant prose"
+        # framing.
+        retrieval_result.formatted_context = self.retriever.format_context(
             kept, retrieval_result.query, intent=retrieval_result.intent
         )
         logger.debug(

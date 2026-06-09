@@ -501,7 +501,7 @@ class TestGracefulFallback:
 
 
 class TestFormatContext:
-    """_format_context() produces LLM-ready strings from retrieved facts."""
+    """format_context() produces LLM-ready strings from retrieved facts."""
 
     def _retriever(self) -> KnowledgeRetriever:
         """Build a retriever instance for direct method testing."""
@@ -521,7 +521,7 @@ class TestFormatContext:
         retriever = self._retriever()
 
         # Act
-        context = retriever._format_context([], "What do I know about Python?")
+        context = retriever.format_context([], "What do I know about Python?")
 
         # Assert
         assert "No relevant knowledge found" in context
@@ -540,7 +540,7 @@ class TestFormatContext:
         ]
 
         # Act
-        context = retriever._format_context(facts, "Python usage")
+        context = retriever.format_context(facts, "Python usage")
 
         # Assert
         assert "### User" in context
@@ -562,7 +562,7 @@ class TestFormatContext:
         )
 
         # Act
-        context = retriever._format_context([doc_fact], "architecture")
+        context = retriever.format_context([doc_fact], "architecture")
 
         # Assert
         assert "### Relevant Documents" in context
@@ -587,7 +587,7 @@ class TestFormatContext:
         ]
 
         # Act
-        context = retriever._format_context(facts, "skills")
+        context = retriever.format_context(facts, "skills")
 
         # Assert -- excluded keys not present, allowed key present
         assert "created_at" not in context
@@ -604,7 +604,7 @@ class TestFormatContext:
         ]
 
         # Act
-        context = retriever._format_context(facts, "query")
+        context = retriever.format_context(facts, "query")
 
         # Assert
         assert "Total facts: 2" in context
@@ -628,9 +628,7 @@ class TestFormatContext:
             graph_distance=_VECTOR_DISTANCE_SENTINEL,
         )
 
-        context = retriever._format_context(
-            [vault_fact], "what did we discuss", intent="historical"
-        )
+        context = retriever.format_context([vault_fact], "what did we discuss", intent="historical")
 
         assert (
             "from your graph" not in context
@@ -654,7 +652,7 @@ class TestFormatContext:
         )
 
         for intent in ("hybrid", "relational", "factual", None):
-            context = retriever._format_context([fact], "query", intent=intent)
+            context = retriever.format_context([fact], "query", intent=intent)
             assert (
                 "Relevant knowledge from your graph" in context
             ), f"intent={intent!r} must keep the graph header; got: {context!r}"
@@ -665,7 +663,7 @@ class TestFormatContext:
         facts = [build_retrieved_fact()]
 
         # Act
-        context = retriever._format_context(facts, "my Python skills")
+        context = retriever.format_context(facts, "my Python skills")
 
         # Assert
         assert "my Python skills" in context
@@ -694,7 +692,7 @@ class TestFormatContext:
         retriever = self._retriever()
         fact = self._make_doc_fact()
 
-        context = retriever._format_context([fact], "what happened", intent="historical")
+        context = retriever.format_context([fact], "what happened", intent="historical")
 
         assert "### Relevant Documents" not in context
 
@@ -703,7 +701,7 @@ class TestFormatContext:
         retriever = self._retriever()
         fact = self._make_doc_fact()
 
-        context = retriever._format_context([fact], "what happened", intent="historical")
+        context = retriever.format_context([fact], "what happened", intent="historical")
 
         assert "[doc-" not in context
 
@@ -712,7 +710,7 @@ class TestFormatContext:
         retriever = self._retriever()
         fact = self._make_doc_fact()
 
-        context = retriever._format_context([fact], "what happened", intent="historical")
+        context = retriever.format_context([fact], "what happened", intent="historical")
 
         assert "similarity: 0." not in context
 
@@ -721,7 +719,7 @@ class TestFormatContext:
         retriever = self._retriever()
         fact = self._make_doc_fact()
 
-        context = retriever._format_context([fact], "what happened", intent="historical")
+        context = retriever.format_context([fact], "what happened", intent="historical")
 
         assert "Total facts:" not in context
 
@@ -730,7 +728,7 @@ class TestFormatContext:
         retriever = self._retriever()
         fact = self._make_doc_fact(text="The user discussed their learning goals.")
 
-        context = retriever._format_context([fact], "what happened", intent="historical")
+        context = retriever.format_context([fact], "what happened", intent="historical")
 
         assert "The user discussed their learning goals." in context
 
@@ -740,7 +738,7 @@ class TestFormatContext:
         fact = self._make_doc_fact()
 
         for intent in ("relational", "hybrid", "factual", None):
-            context = retriever._format_context([fact], "query", intent=intent)
+            context = retriever.format_context([fact], "query", intent=intent)
             assert "### Relevant Documents" in context, f"intent={intent!r} lost subheader"
             assert "[doc-1]" in context, f"intent={intent!r} lost doc prefix"
             assert "similarity: 0." in context, f"intent={intent!r} lost similarity score"
