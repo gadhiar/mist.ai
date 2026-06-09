@@ -17,6 +17,8 @@ Test classes:
     TestHealthCheck       -- state assertions
 """
 
+from pathlib import Path
+
 import pytest
 
 from backend.errors import SidecarIndexError
@@ -24,6 +26,7 @@ from backend.knowledge.config import SidecarIndexConfig
 from backend.vault.sidecar_index import (
     VaultSidecarIndex,
     _extract_heading_blocks,
+    _is_excluded_from_indexing,
     _quote_fts5,
 )
 from tests.mocks.embeddings import FakeEmbeddingGenerator
@@ -58,6 +61,61 @@ def sidecar_index(tmp_path):
     idx.initialize()
     yield idx
     idx.close()
+
+
+# ---------------------------------------------------------------------------
+# TestExclusion
+# ---------------------------------------------------------------------------
+
+
+class TestIsExcludedFromIndexing:
+    """The C-pattern graph snapshot (users/<uid>-graph-snapshot.md) is a
+    machine-owned derived cache and must be excluded from sidecar indexing so
+    it never competes with the curated users/<uid>.md in retrieval. The
+    exclusion is suffix-based and must not disturb the existing exact-match
+    exclusions (MIST.md, CLAUDE.md, meta/).
+    """
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            pytest.param(Path("users/user-graph-snapshot.md"), id="default-user"),
+            pytest.param(Path("users/raj-graph-snapshot.md"), id="named-user"),
+            pytest.param(
+                Path("/abs/vault/users/test-user-graph-snapshot.md"),
+                id="absolute-hyphenated-user",
+            ),
+        ],
+    )
+    def test_graph_snapshot_is_excluded(self, path):
+        assert _is_excluded_from_indexing(path) is True
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            pytest.param(Path("users/user.md"), id="curated-user-md"),
+            pytest.param(Path("users/raj.md"), id="curated-named-user"),
+            pytest.param(Path("sessions/2026-06-09-x.md"), id="session-note"),
+            pytest.param(Path("decisions/DEC-001-foo.md"), id="decision-note"),
+            # A non-users file that merely ends with the marker should still be
+            # excluded ONLY if it carries the suffix; but to avoid clobbering a
+            # legitimately-named note outside users/, the guard also confirms a
+            # users/ parent. A stray file with the suffix but no users/ parent
+            # is left indexable.
+            pytest.param(
+                Path("research/my-graph-snapshot.md"),
+                id="suffix-but-not-under-users",
+            ),
+        ],
+    )
+    def test_non_snapshot_paths_not_excluded(self, path):
+        assert _is_excluded_from_indexing(path) is False
+
+    def test_existing_exact_match_exclusions_still_hold(self):
+        assert _is_excluded_from_indexing(Path("MIST.md")) is True
+        assert _is_excluded_from_indexing(Path("CLAUDE.md")) is True
+        assert _is_excluded_from_indexing(Path("meta/schema.md")) is True
+        assert _is_excluded_from_indexing(Path("vault/meta/changelog.md")) is True
 
 
 # ---------------------------------------------------------------------------

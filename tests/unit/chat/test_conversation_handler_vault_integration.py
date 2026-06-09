@@ -34,6 +34,8 @@ class FakeVaultWriter:
         self.stop_calls: int = 0
         self.append_calls: list[dict] = []
         self.upsert_user_calls: list[dict] = []  # records (user_id, body_markdown)
+        # C-pattern writeback now targets the derived snapshot, not user.md.
+        self.upsert_user_snapshot_calls: list[dict] = []
         self.mark_completed_calls: list[str] = []  # records vault_note_paths
         self.fail_on_append: bool = False  # Toggle per test to simulate failure
         # Maps vault_note_path -> existing turn_count "on disk". Used to
@@ -114,6 +116,22 @@ class FakeVaultWriter:
             record["body_markdown"] = kwargs["body_markdown"]
         self.upsert_user_calls.append(record)
         return f"/tmp/vault/users/{record.get('user_id', 'user')}.md"
+
+    async def upsert_user_snapshot(self, *args, **kwargs) -> str:
+        # C-pattern derived snapshot writeback. Records both positional and
+        # keyword forms; targets the <user_id>-graph-snapshot.md stem.
+        record: dict = {}
+        if args:
+            if len(args) >= 1:
+                record["user_id"] = args[0]
+            if len(args) >= 2:
+                record["body_markdown"] = args[1]
+        if "user_id" in kwargs:
+            record["user_id"] = kwargs["user_id"]
+        if "body_markdown" in kwargs:
+            record["body_markdown"] = kwargs["body_markdown"]
+        self.upsert_user_snapshot_calls.append(record)
+        return f"/tmp/vault/users/{record.get('user_id', 'user')}-graph-snapshot.md"
 
 
 # ---------------------------------------------------------------------------
@@ -482,8 +500,11 @@ class TestSessionEnd:
 
 
 class TestUserVaultCPatternTrigger:
-    """ADR-011 bucket 1 / C-pattern: users/<user_id>.md re-renders iff
-    extraction touched user-scope (User entity OR User-source/target edge).
+    """ADR-011 bucket 1 / C-pattern: the derived user snapshot
+    (users/<user_id>-graph-snapshot.md) re-renders iff extraction touched
+    user-scope (User entity OR User-source/target edge). The hand-curated
+    users/<user_id>.md is user-authoritative (ADR-010 Invariant 5) and is
+    NEVER written by this path.
 
     The C-pattern is the design call from 2026-05-06: don't re-render on
     every turn (noisy, churns filewatcher); don't make MIST decide via
@@ -525,11 +546,16 @@ class TestUserVaultCPatternTrigger:
         )
         await asyncio.sleep(0.1)  # let fire-and-forget extraction settle
 
-        # Assert: upsert_user was called exactly once
+        # Assert: the C-pattern wrote the DERIVED snapshot exactly once and
+        # never touched the curated users/<uid>.md (upsert_user).
+        assert len(fake_vault.upsert_user_snapshot_calls) == 1, (
+            "expected 1 upsert_user_snapshot call, got "
+            f"{len(fake_vault.upsert_user_snapshot_calls)}"
+        )
         assert (
-            len(fake_vault.upsert_user_calls) == 1
-        ), f"expected 1 upsert_user call, got {len(fake_vault.upsert_user_calls)}"
-        call = fake_vault.upsert_user_calls[0]
+            len(fake_vault.upsert_user_calls) == 0
+        ), "C-pattern must NOT write the curated user.md (upsert_user)"
+        call = fake_vault.upsert_user_snapshot_calls[0]
         assert call["user_id"] == "user"
         assert "# " in call["body_markdown"], "body should be a rendered markdown body"
 
@@ -565,8 +591,11 @@ class TestUserVaultCPatternTrigger:
         await asyncio.sleep(0.1)
 
         assert (
+            len(fake_vault.upsert_user_snapshot_calls) == 0
+        ), "C-pattern: must NOT write the user snapshot when extraction has no user-scope"
+        assert (
             len(fake_vault.upsert_user_calls) == 0
-        ), "C-pattern: must NOT call upsert_user when extraction has no user-scope"
+        ), "C-pattern must never call upsert_user (curated user.md)"
 
 
 class TestVaultWriteFailureIsolation:

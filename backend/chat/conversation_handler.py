@@ -1925,7 +1925,12 @@ class ConversationHandler:
             rendered_at = _dt.now(UTC).isoformat()
             snapshot = await query_user_snapshot(executor, user_id, rendered_at)
             body_md = render_user_snapshot_body(snapshot)
-            await self._vault_writer.upsert_user(user_id=user_id, body_markdown=body_md)
+            # Write to the SEPARATE machine-owned derived snapshot file
+            # (users/<user_id>-graph-snapshot.md), NOT the hand-curated
+            # users/<user_id>.md. The curated profile is user-authoritative
+            # (ADR-010 Invariant 5) and must never be clobbered by the
+            # C-pattern writeback.
+            await self._vault_writer.upsert_user_snapshot(user_id=user_id, body_markdown=body_md)
             logger.debug(
                 "User vault refreshed (C-pattern): user_id=%s, %d edge types in snapshot",
                 user_id,

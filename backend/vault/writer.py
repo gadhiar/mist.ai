@@ -412,6 +412,45 @@ class VaultWriter:
             },
         )
 
+    async def upsert_user_snapshot(self, user_id: str, body_markdown: str) -> str:
+        """Write or update the graph-derived user snapshot.
+
+        Persists the C-pattern machine writeback to a SEPARATE derived file
+        `users/<user_id>-graph-snapshot.md`, decoupled from the hand-curated
+        `users/<user_id>.md`. This snapshot is a machine-owned derived cache
+        (graph-equivalent of the user's outbound edges), regenerated after
+        extraction; it never competes with the curated profile in retrieval
+        (excluded from sidecar indexing, see sidecar_index._is_excluded_from_indexing).
+
+        Unlike `upsert_user`, the body is ALWAYS overwritten: the ADR-010
+        Invariant-5 guard (which protects `authored_by: user`/`user-edit`
+        bodies) does NOT apply here, because the snapshot is not user-editable.
+        Frontmatter stays `mist-user` with `authored_by: mist`; the filename
+        STEM is `<user_id>-graph-snapshot` while the `user_id` frontmatter
+        field remains the real user_id.
+
+        Args:
+            user_id: User identifier. Used verbatim in the `user_id`
+                frontmatter field and as the basis for the filename stem
+                `<user_id>-graph-snapshot`.
+            body_markdown: Caller-provided markdown body. A `## Provenance`
+                section is appended automatically only when the body does not
+                already supply one (same handling as `upsert_user`).
+
+        Returns:
+            Absolute path to the snapshot note.
+
+        Raises:
+            VaultWriteError: If the file write fails.
+        """
+        return await self._enqueue(
+            "upsert_user_snapshot",
+            {
+                "user_id": user_id,
+                "body_markdown": body_markdown,
+            },
+        )
+
     def session_path(self, session_date: str, session_slug: str) -> str:
         """Return the absolute vault path for a session note.
 
@@ -573,7 +612,7 @@ class VaultWriter:
                 extra["turn_index"] = job_args.get("turn_index")
                 slugs = job_args.get("entity_slugs") or []
                 extra["entity_count"] = len(slugs)
-            elif operation == "upsert_user":
+            elif operation in ("upsert_user", "upsert_user_snapshot"):
                 extra["user_id"] = job_args.get("user_id")
 
             self._debug_logger.record_vault_op(
@@ -595,6 +634,7 @@ class VaultWriter:
             "update_entities": self._handle_update_entities,
             "upsert_identity": self._handle_upsert_identity,
             "upsert_user": self._handle_upsert_user,
+            "upsert_user_snapshot": self._handle_upsert_user_snapshot,
             "mark_session_completed": self._handle_mark_session_completed,
             "append_session_synthesis": self._handle_append_session_synthesis,
         }
@@ -1061,6 +1101,55 @@ class VaultWriter:
         # body_markdown produced by user_snapshot.render_user_snapshot_body
         # never contains code fences, so this trade-off is acceptable in
         # practice.
+        if _PROVENANCE_HEADING_RE.search(body_markdown):
+            full_body = body_markdown.rstrip("\n") + "\n"
+        else:
+            provenance_section = f"\n## Provenance\n- rendered_at: {now_iso}\n"
+            full_body = body_markdown.rstrip("\n") + "\n" + provenance_section
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(render_frontmatter(fm, full_body), encoding="utf-8")
+
+    async def _handle_upsert_user_snapshot(self, args: dict[str, Any]) -> str:
+        user_id: str = args["user_id"]
+        body_markdown: str = args["body_markdown"]
+
+        # Filename STEM is decoupled from the user_id frontmatter field: the
+        # derived snapshot lives at users/<user_id>-graph-snapshot.md so it
+        # never collides with the curated users/<user_id>.md.
+        path = self._root / "users" / f"{user_id}-graph-snapshot.md"
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                self._upsert_user_snapshot_sync,
+                path,
+                user_id,
+                body_markdown,
+            )
+        except OSError as exc:
+            raise VaultWriteError(f"Failed to write user snapshot {path}: {exc}") from exc
+
+        return str(path)
+
+    def _upsert_user_snapshot_sync(self, path: Path, user_id: str, body_markdown: str) -> None:
+        """Synchronous core of `upsert_user_snapshot`.
+
+        Always overwrites the body. Unlike `_upsert_user_sync`, there is NO
+        Invariant-5 `authored_by` user/user-edit guard: the snapshot is a
+        machine-owned derived cache, regenerated on every user-scope extraction,
+        and is never the user-authoritative profile. Authorship is always
+        `mist`. Provenance dedup is preserved (a caller-supplied `## Provenance`
+        section is trusted; otherwise a minimal writer section is appended) so
+        repeated re-renders do not accumulate duplicate Provenance sections.
+        """
+        today = datetime.now(UTC).date().isoformat()
+        now_iso = datetime.now(UTC).isoformat()
+
+        fm = MistUserFrontmatter(
+            user_id=user_id,
+            authored_by=AuthoredBy.MIST,
+            last_updated=today,
+        )
         if _PROVENANCE_HEADING_RE.search(body_markdown):
             full_body = body_markdown.rstrip("\n") + "\n"
         else:

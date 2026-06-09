@@ -57,13 +57,29 @@ _PROVENANCE_HEADING = "Provenance"
 _EXCLUDED_FILENAMES = frozenset({"MIST.md", "CLAUDE.md"})
 _EXCLUDED_PARENT_DIRS = frozenset({"meta"})
 
+# Filename suffix for the C-pattern graph-derived user snapshot
+# (users/<user_id>-graph-snapshot.md). This is a machine-owned derived cache
+# written by VaultWriter.upsert_user_snapshot; indexing it would let it
+# compete with the curated users/<user_id>.md in auto-inject retrieval, and
+# (via the shared use in scripts/mist_admin vault-rebuild + filewatcher) would
+# risk a derived-artifact re-ingestion loop. Suffix-matched (not exact) because
+# the user_id stem is dynamic.
+_GRAPH_SNAPSHOT_SUFFIX = "-graph-snapshot.md"
+_GRAPH_SNAPSHOT_PARENT = "users"
+
 
 def _is_excluded_from_indexing(path: str | Path) -> bool:
     """Return True if path should not be indexed by the sidecar.
 
     Vault conventions docs (MIST.md, CLAUDE.md) and meta/ files have
     dedicated load paths (ConventionsLoader) and would surface as noise
-    if auto-injected.
+    if auto-injected. The C-pattern graph snapshot
+    (users/<user_id>-graph-snapshot.md) is a machine-owned derived cache and
+    is excluded so it never competes with the curated users/<user_id>.md.
+
+    This function is shared by `upsert_file` (initial index), the filewatcher
+    live re-index, and the `vault-rebuild` graph-regeneration scope; excluding
+    the snapshot here covers all three paths.
 
     Args:
         path: Vault-relative or absolute path to the note file.
@@ -75,6 +91,11 @@ def _is_excluded_from_indexing(path: str | Path) -> bool:
     if p.name in _EXCLUDED_FILENAMES:
         return True
     if any(part in _EXCLUDED_PARENT_DIRS for part in p.parts):
+        return True
+    # Graph-derived user snapshot: suffix-match, gated on a `users` parent so a
+    # legitimately-named note elsewhere (e.g. research/my-graph-snapshot.md) is
+    # still indexable.
+    if p.name.endswith(_GRAPH_SNAPSHOT_SUFFIX) and _GRAPH_SNAPSHOT_PARENT in p.parts:
         return True
     return False
 
