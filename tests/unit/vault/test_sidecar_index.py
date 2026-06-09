@@ -1131,21 +1131,56 @@ class TestExtractHeadingBlocks:
 
 
 class TestQuoteFts5:
-    def test_plain_text_unchanged(self):
-        assert _quote_fts5("hello world") == "hello world"
+    """`_quote_fts5` builds a robust FTS5 MATCH expression: it tokenizes the
+    input on FTS5 metacharacters/whitespace, drops empty fragments, and wraps
+    each surviving token as a double-quoted string literal joined by spaces
+    (implicit AND). This neutralizes every metacharacter and bareword operator.
+    """
 
-    def test_double_quote_is_escaped(self):
-        result = _quote_fts5('"quoted"')
-        assert result.startswith('"')
-        assert result.endswith('"')
+    def test_plain_words_each_quoted(self):
+        # Each bareword becomes a quoted string literal; space-join preserves
+        # the original implicit-AND term-combination semantics.
+        assert _quote_fts5("hello world") == '"hello" "world"'
 
-    def test_asterisk_triggers_quoting(self):
-        result = _quote_fts5("star*")
-        assert result.startswith('"')
+    def test_single_word_quoted(self):
+        assert _quote_fts5("fox") == '"fox"'
 
-    def test_colon_triggers_quoting(self):
-        result = _quote_fts5("type:session")
-        assert result.startswith('"')
+    def test_embedded_double_quote_is_doubled(self):
+        # An embedded `"` is escaped by doubling (the FTS5 literal-quote escape),
+        # and the metacharacter quotes act as token delimiters.
+        result = _quote_fts5('say "hi" now')
+        assert result == '"say" "hi" "now"'
+
+    def test_asterisk_split_out(self):
+        # '*' is a metacharacter and splits tokens; only the real word survives.
+        assert _quote_fts5("star*") == '"star"'
+
+    def test_colon_split_out(self):
+        # 'type:session' tokenizes into two literals (the ':' is a delimiter),
+        # so the field-prefix syntax can never reach FTS5.
+        assert _quote_fts5("type:session") == '"type" "session"'
+
+    def test_question_mark_split_out(self):
+        # The headline bug: a trailing '?' must not survive into the expression.
+        assert _quote_fts5("what about me?") == '"what" "about" "me"'
+
+    def test_bareword_operators_become_literals(self):
+        # AND/OR/NOT/NEAR are quoted -> literal words, not operators.
+        assert _quote_fts5("not sure") == '"not" "sure"'
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param("???", id="all-question-marks"),
+            pytest.param("", id="empty"),
+            pytest.param("   ", id="whitespace-only"),
+            pytest.param("()*:.-+^", id="all-metachars"),
+        ],
+    )
+    def test_no_indexable_tokens_returns_empty(self, text):
+        # A query with no real tokens yields an empty MATCH expression; query_fts
+        # short-circuits this to [] without touching the database.
+        assert _quote_fts5(text) == ""
 
 
 # ---------------------------------------------------------------------------

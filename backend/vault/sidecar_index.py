@@ -42,8 +42,19 @@ from backend.knowledge.config import SidecarIndexConfig
 
 logger = logging.getLogger(__name__)
 
-# FTS5 special characters that require quoting the query to avoid parse errors.
-_FTS5_SPECIAL = re.compile(r'["\*(:\-]')
+# Token splitter for FTS5 query construction. A "token" is a maximal run of
+# characters that are NOT FTS5 syntax. We deliberately split on every character
+# that FTS5 treats as a metacharacter or operator delimiter so that no
+# metacharacter can ever leak into the MATCH expression unquoted:
+#   "  '  (  )  *  :  .  -  +  ^  ?  and ASCII whitespace
+# Everything else (letters, digits, `_`, and any non-ASCII/unicode letter) is a
+# token character. Splitting on `.` `-` `+` etc. means a token like "C++" yields
+# the bareword "C", and "type:session" yields "type" + "session" -- the real
+# content words, each of which is then wrapped as an FTS5 string literal. This
+# also neutralizes the bareword operators AND/OR/NOT/NEAR: once a word is wrapped
+# in double quotes it is a string literal, not an operator (so "not sure" matches
+# the literal words rather than invoking the NOT operator).
+_FTS5_TOKEN_SPLIT = re.compile(r'[\s"\'()*:.\-+^?]+')
 
 # Heading regex: one or more '#' followed by a space and heading text.
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
@@ -101,21 +112,39 @@ def _is_excluded_from_indexing(path: str | Path) -> bool:
 
 
 def _quote_fts5(text: str) -> str:
-    """Wrap text in double-quotes for literal FTS5 matching.
+    """Build a robust FTS5 MATCH expression from arbitrary user text.
 
-    Applied when the query contains FTS5 special characters. SQLite FTS5
-    treats `"..."` as a phrase query, which is safe for arbitrary text.
+    Natural-language input routinely contains FTS5 metacharacters (`? " ' ( )
+    * : . - + ^`) and bareword operators (`AND OR NOT NEAR`). Feeding such text
+    to FTS5 verbatim raises `sqlite3.OperationalError: fts5: syntax error`
+    (e.g. a trailing `?` on any question). This builder makes the MATCH
+    expression robust to ANY input by:
+
+    1. Tokenizing the text on FTS5 metacharacters and whitespace, dropping
+       empty / punctuation-only fragments.
+    2. Wrapping each surviving token as an FTS5 string literal -- double-quoted,
+       with any embedded `"` doubled (the FTS5 escape for a literal quote).
+
+    Because every token becomes a quoted string literal, bareword operators are
+    treated as literal words, never as operators (a user typing "not sure" must
+    not be parsed as the NOT operator). Tokens are space-joined, which FTS5
+    evaluates as an implicit AND -- preserving the original builder's
+    term-combination semantics (multi-word bareword queries were implicitly
+    AND-ed). A query with no real tokens (e.g. "???") yields an empty string;
+    `query_fts` treats an empty MATCH expression as "no lexical hits" rather
+    than issuing it.
 
     Args:
         text: Raw user-supplied query text.
 
     Returns:
-        Query string safe for use in a MATCH expression.
+        A MATCH expression of space-joined quoted string literals, or the empty
+        string if `text` contains no FTS5-indexable tokens.
     """
-    if _FTS5_SPECIAL.search(text):
-        escaped = text.replace('"', '""')
-        return f'"{escaped}"'
-    return text
+    tokens = [tok for tok in _FTS5_TOKEN_SPLIT.split(text) if tok]
+    if not tokens:
+        return ""
+    return " ".join(f'"{tok.replace(chr(34), chr(34) * 2)}"' for tok in tokens)
 
 
 def _extract_heading_blocks(content: str) -> list[tuple[str, int, str]]:
@@ -474,8 +503,11 @@ class VaultSidecarIndex:
         Results are returned with ``score = -bm25(...)`` so that higher is
         better, consistent with `query_vector`.
 
-        Special FTS5 characters in `text` are phrase-quoted to avoid parse
-        errors. If the query produces an FTS5 error despite quoting, an empty
+        The MATCH expression is built by `_quote_fts5`, which tokenizes `text`
+        and wraps each token as a quoted FTS5 string literal -- robust to any
+        natural-language punctuation/operators. A query with no indexable
+        tokens (e.g. "???" or "") yields no lexical hits without touching the
+        database. If the query somehow still produces an FTS5 error, an empty
         list is returned and a warning is logged.
 
         Args:
@@ -491,6 +523,11 @@ class VaultSidecarIndex:
         """
         self._require_connection()
         safe_text = _quote_fts5(text)
+        # No indexable tokens (e.g. an all-punctuation query like "???"): an
+        # empty MATCH expression would itself be an FTS5 syntax error. Skip the
+        # query entirely -- there are no lexical hits to find.
+        if not safe_text:
+            return []
         weight = self.config.heading_context_weight
 
         try:
