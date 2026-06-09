@@ -266,7 +266,14 @@ class RetrievalResult:
         return [f for f in self.facts if f.subject == entity_id or f.object == entity_id]
 
     def summary(self) -> str:
-        """Brief summary of retrieval."""
+        """Brief summary of retrieval.
+
+        The vault-only path (intent == "historical") has no graph entities by
+        design, so it reports chunk count rather than "0 entities" to avoid
+        reading like a failed retrieval.
+        """
+        if self.intent == "historical":
+            return f"Retrieved {self.total_facts} vault chunks in {self.retrieval_time_ms:.1f}ms"
         return f"Retrieved {self.total_facts} facts from {self.entities_found} entities in {self.retrieval_time_ms:.1f}ms"
 
     def __str__(self):
