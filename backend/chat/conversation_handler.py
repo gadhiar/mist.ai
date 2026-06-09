@@ -16,6 +16,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from backend.chat.context_budget import ContextBudgetPlanner
@@ -642,6 +643,35 @@ need to extract it manually.
   risk -- call the tool when the answer would otherwise rely on
   inferring user-specific facts the prose does not state
 """
+
+
+# ---------------------------------------------------------------------------
+# User-profile always-inject (ADR-010)
+#
+# The curated users/<user_id>.md is the source of truth ABOUT the user
+# (authored_by: user). When the user is known, its body is injected into
+# EVERY turn's context as an always-present block -- exactly the way
+# ConventionsLoader always injects vault-root MIST.md. This is independent of
+# retrieval similarity/intent: a meta-query like "what do you know about me?"
+# embeds closer to MIST's own first-person identity prose than to the user's
+# third-person profile, so a similarity-gated retriever ranks the profile
+# below the cutoff and never surfaces it. The user's own fact sheet must
+# never be subject to a similarity gate; this block guarantees it is present.
+#
+# The auto-inject retrieval path de-duplicates against this block (the
+# profile chunk is dropped from the "Relevant prose from your vault" assembly)
+# so the body appears exactly once.
+# ---------------------------------------------------------------------------
+
+
+def _format_user_profile_block(body: str) -> str:
+    """Wrap the curated user-profile body in an LLM-visible labeled block.
+
+    Mirrors `ConventionsLoader.format_for_prompt`: a clearly delimited header
+    so the model treats the content as the canonical user fact sheet rather
+    than as one ranked retrieval hit among many.
+    """
+    return f"=== WHAT YOU KNOW ABOUT THE USER (user profile) ===\n\n{body.strip()}\n"
 
 
 class ConversationHandler:
@@ -1962,6 +1992,137 @@ class ConversationHandler:
                 return default_uid
         return "user"
 
+    def _resolve_user_profile_path(self) -> Path | None:
+        """Locate the curated `users/<user_id>.md` profile file on disk.
+
+        Resolution order:
+        1. Exact-case match `users/<resolved_user_id>.md` under the vault root.
+        2. Case-insensitive fallback: the first file in `users/` whose stem
+           equals the resolved user_id ignoring case. This handles the casing
+           nuance where a request carries user_id "User" while the seed writes
+           `users/user.md` to disk (`_user_id_for_vault` already lower-cases
+           to "user" by default, but a configured `default_user_id` may differ
+           in case from the on-disk filename).
+
+        Returns the resolved `Path`, or None when no matching file exists or
+        the vault root / users dir is absent. Never raises.
+        """
+        try:
+            vault_root = Path(self.config.vault.root)
+        except (AttributeError, TypeError):
+            return None
+
+        user_id = self._user_id_for_vault()
+        users_dir = vault_root / "users"
+
+        exact = users_dir / f"{user_id}.md"
+        if exact.is_file():
+            return exact
+
+        # Case-insensitive fallback within users/.
+        try:
+            if not users_dir.is_dir():
+                return None
+            target = user_id.casefold()
+            for candidate in sorted(users_dir.glob("*.md")):
+                if candidate.stem.casefold() == target:
+                    return candidate
+        except OSError:
+            return None
+        return None
+
+    def _load_user_profile_block(self) -> tuple[Path | None, str | None]:
+        """Load + format the known user's curated profile for always-injection.
+
+        Reads `users/<resolved_user_id>.md` (see `_resolve_user_profile_path`),
+        strips the YAML frontmatter via `parse_frontmatter`, and wraps the
+        markdown body in the labeled profile block. The profile is ~400 words,
+        so this is a small always-on read; the OS page cache makes the per-turn
+        cost negligible.
+
+        Returns `(resolved_path, formatted_block)` on success, or
+        `(None, None)` when the profile file is absent, unreadable, or has an
+        empty body. Graceful by contract: callers inject nothing on None and
+        never error (ADR-010 Invariant 6 -- vault-read failure is recoverable).
+        """
+        path = self._resolve_user_profile_path()
+        if path is None:
+            return None, None
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Could not read user profile %s (non-fatal): %s", path, exc)
+            return None, None
+
+        # Lazy import to avoid a module-level vault dependency in the hot path.
+        from backend.vault.models import parse_frontmatter
+
+        _frontmatter, body = parse_frontmatter(raw)
+        if not body or not body.strip():
+            return None, None
+        return path, _format_user_profile_block(body)
+
+    def _dedup_profile_from_retrieval(
+        self, retrieval_result: RetrievalResult, profile_path: Path
+    ) -> None:
+        """Drop the user-profile chunk from a retrieval result, in place.
+
+        The curated profile is always-injected as its own block, so any copy
+        the auto-inject retrieved must be removed to avoid a duplicate body.
+        Filters `retrieval_result.facts` by source path, then re-renders
+        `formatted_context` from the surviving facts via the retriever's
+        canonical formatter so the budget-planner path (re-renders from facts)
+        and the legacy path (reads formatted_context) stay consistent.
+
+        Path matching is tolerant of the sidecar storing vault-RELATIVE paths
+        (e.g. "users/user.md") while `profile_path` is absolute: we compare the
+        normalized POSIX tail "users/<filename>". No-op when no fact matches.
+        """
+        try:
+            vault_root = Path(self.config.vault.root)
+            profile_rel = profile_path.relative_to(vault_root).as_posix()
+        except (AttributeError, TypeError, ValueError):
+            # profile_path not under vault_root (unexpected); fall back to the
+            # users/<name> tail which is what the sidecar stores anyway.
+            profile_rel = f"users/{profile_path.name}"
+
+        profile_name = profile_path.name
+
+        def _is_profile_fact(fact: RetrievedFact) -> bool:
+            raw_path = str((fact.properties or {}).get("path", "") or "")
+            if not raw_path:
+                return False
+            norm = raw_path.replace("\\", "/")
+            return (
+                norm == profile_rel
+                or norm.endswith(f"/users/{profile_name}")
+                or (norm == f"users/{profile_name}")
+            )
+
+        kept = [f for f in retrieval_result.facts if not _is_profile_fact(f)]
+        if len(kept) == len(retrieval_result.facts):
+            return  # profile chunk not in the auto-inject; nothing to dedup.
+
+        dropped = len(retrieval_result.facts) - len(kept)
+        retrieval_result.facts = kept
+        retrieval_result.total_facts = len(kept)
+        # document_chunks_used is best-effort metadata; decrement so it stays
+        # consistent with the surviving vault chunks (floor at 0).
+        retrieval_result.document_chunks_used = max(
+            0, retrieval_result.document_chunks_used - dropped
+        )
+        # Re-render the LLM-facing context from the surviving facts using the
+        # retriever's own formatter (the exact function that produced the
+        # original), preserving the historical "Relevant prose" framing.
+        retrieval_result.formatted_context = self.retriever._format_context(
+            kept, retrieval_result.query, intent=retrieval_result.intent
+        )
+        logger.debug(
+            "[USER-PROFILE] Deduped %d profile chunk(s) from auto-inject (path=%s)",
+            dropped,
+            profile_rel,
+        )
+
     def _record_turn_event(
         self,
         session_id: str,
@@ -2394,6 +2555,25 @@ class ConversationHandler:
         else:
             static_template = _STATIC_IDENTITY_HEADER + _STATIC_SYSTEM_TEMPLATE_BODY
 
+        # Always-inject the known user's curated profile (ADR-010). Resolved
+        # once here so the same path drives BOTH the dedup below and the
+        # injection further down. `profile_block` is the labeled context block
+        # (None when no profile file exists -- graceful skip); `profile_path`
+        # is the resolved on-disk file used to dedup the auto-inject copy.
+        profile_path, profile_block = self._load_user_profile_block()
+
+        # Dedup against the auto-inject: drop the profile's own chunk from the
+        # retrieval result so the body is injected exactly once (at the
+        # always-present block above), never duplicated inside the "Relevant
+        # prose from your vault" assembly. Mutating `retrieval_result` in place
+        # (facts + formatted_context) ensures BOTH the budget-planner path
+        # (which re-renders from facts) and the legacy path (which reads
+        # formatted_context) observe the deduped result consistently. The
+        # sidecar INDEX is untouched -- the profile stays retrievable for
+        # content queries (e.g. "Slalom"); only the injection layer dedups.
+        if profile_path is not None and retrieval_result is not None:
+            self._dedup_profile_from_retrieval(retrieval_result, profile_path)
+
         # Live-data advisory is a fixed-cost segment when present.
         live_advisory_text: str | None = None
         if retrieval_result and retrieval_result.requires_mcp and retrieval_result.suggested_tools:
@@ -2485,6 +2665,17 @@ class ConversationHandler:
                     "content": self._conventions_loader.format_for_prompt(conventions_content),
                 }
             )
+
+        # 3b. User profile (ADR-010): always-inject the known user's curated
+        # users/<user_id>.md body, independent of retrieval similarity/intent
+        # -- the analog of the MIST.md conventions always-inject above. Placed
+        # in the stable prefix (before variable retrieval/advisory/history) so
+        # it does not break KV-cache reuse across turns, and deduped against
+        # the auto-inject earlier so the body appears exactly once. Omitted
+        # when no profile file exists (graceful skip).
+        if profile_block is not None:
+            logger.debug("[USER-PROFILE] Injecting curated profile from %s", profile_path)
+            messages.append({"role": "user", "content": profile_block})
 
         # 4. Retrieval context (pruned by planner when active)
         if retrieval_text:

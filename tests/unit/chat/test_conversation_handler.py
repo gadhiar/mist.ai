@@ -1044,8 +1044,13 @@ class TestBudgetAwareBuildMessages:
             retrieval_result=None,
             mist_context=None,
         )
-        # All 5 history messages present (no pruning).
-        history_msgs = [m for m in messages if m["role"] != "system"]
+        # All 5 history messages present (no pruning). Count by content so the
+        # assertion is robust to always-present prefix blocks injected as
+        # non-system messages (vault conventions / the curated user-profile
+        # block), which are not conversation history.
+        history_msgs = [
+            m for m in messages if m["role"] == "user" and m["content"].startswith("message ")
+        ]
         assert len(history_msgs) == 5
 
 
