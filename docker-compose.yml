@@ -18,14 +18,20 @@ services:
       - LLM_BACKEND=llamacpp
       - MODEL=${MODEL:-gemma-4-e4b}
       - LLM_TEMPERATURE=${LLM_TEMPERATURE:-1.0}
-      - EVENT_STORE_DB_PATH=/app/data/event_store.db
+      # Memory store paths are env-overridable so eval/gauntlet runs can
+      # redirect the three stores (event store, vault, sidecar) to throwaway
+      # locations and avoid polluting live memory. Defaults are unchanged --
+      # the ${VAR:-default} form resolves to the current live container paths
+      # when the override is unset. See scripts/eval_harness/websocket_gauntlets_runbook.md
+      # ("Isolating eval runs from live memory").
+      - EVENT_STORE_DB_PATH=${EVENT_STORE_DB_PATH:-/app/data/event_store.db}
       - EVENT_STORE_AUDIO_DIR=/app/data/audio
       - VECTOR_STORE_DATA_DIR=/app/data/vector_store
       # Cluster 8 / ADR-010: vault layer + sidecar index. Container paths align
       # with the bind mounts below. Filewatcher observer_type left "auto"
       # (resolves to inotify on this Linux container).
-      - MIST_VAULT_ROOT=/app/mist-memory
-      - MIST_SIDECAR_DB_PATH=/app/data/vault_sidecar.db
+      - MIST_VAULT_ROOT=${MIST_VAULT_ROOT:-/app/mist-memory}
+      - MIST_SIDECAR_DB_PATH=${MIST_SIDECAR_DB_PATH:-/app/data/vault_sidecar.db}
       - TTS_ENABLED=${TTS_ENABLED:-true}
       - TTS_ENGINE=${TTS_ENGINE:-chatterbox}
       - TTS_EXAGGERATION=${TTS_EXAGGERATION:-0.5}

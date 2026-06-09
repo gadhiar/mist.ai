@@ -169,6 +169,61 @@ print(f'turns: {len(rows)}, empty: {empty}, errors: {errors}, '
 "
 ```
 
+## Isolating eval runs from live memory (throwaway-trio)
+
+Any driver that exercises the memory layer writes into three live stores:
+the event store DB, the vault corpus, and the sidecar index DB. Run against
+the live container defaults and the run's synthetic utterances land in the
+user's canonical memory permanently (this is how the synthetic `37A8`
+corpus polluted production memory). Redirect all three to a per-run
+throwaway directory before invoking the driver so live memory is untouched.
+
+**The integration point is `scripts/mist_admin.py` (`replay` / `chat`).**
+Those subcommands call `get_config()` -> `build_conversation_handler(...)`,
+which drives the full retrieval + extraction + graph + (server-path) vault
+pipeline. `scripts/eval_harness/run.py` is a llama-server-only model A/B
+harness -- it never imports `backend/` and never touches the memory layer,
+so it needs no isolation and is NOT where these env vars go.
+
+The three stores and their override env vars (read by `*.from_env()` in
+`backend/knowledge/config.py`; defaults in `docker-compose.yml` use the
+`${VAR:-default}` form so they resolve to the live paths when unset):
+
+| Store | Env var | Live default |
+|---|---|---|
+| Sidecar index DB | `MIST_SIDECAR_DB_PATH` | `/app/data/vault_sidecar.db` |
+| Event store DB | `EVENT_STORE_DB_PATH` | `/app/data/event_store.db` |
+| Vault root | `MIST_VAULT_ROOT` | `/app/mist-memory` |
+
+Set all three to one throwaway dir for the run. Pass them with `-e` on
+`docker compose exec` so they apply to the spawned process only -- the
+live backend container's env is unchanged and stays up:
+
+```bash
+MSYS_NO_PATHCONV=1 docker compose exec -T \
+  -e MIST_SIDECAR_DB_PATH=/app/data/eval-run/vault_sidecar.db \
+  -e EVENT_STORE_DB_PATH=/app/data/eval-run/event_store.db \
+  -e MIST_VAULT_ROOT=/app/data/eval-run/vault \
+  mist-backend python scripts/mist_admin.py replay \
+  data/ingest/<corpus>.jsonl \
+  --output data/ingest/<corpus>-eval-output.jsonl \
+  --session-id eval-<tag>
+```
+
+Notes:
+
+- Use a single throwaway dir under `/app/data/` (bind-mounted, so artifacts
+  survive on the host for inspection) and pick a fresh `eval-run/<tag>/`
+  per run for clean isolation. `data/` is gitignored; the throwaway stores
+  are disposable -- delete the dir when done.
+- `get_config()` memoizes a module-global `_config` and `load_dotenv()`
+  runs at import, so the overrides must be in the process env BEFORE
+  `backend.knowledge.config` is first imported. The `-e` flags on `docker
+  compose exec` satisfy this -- they are set on the new process before
+  Python starts, so the first `get_config()` reads the throwaway paths.
+- The live container is not recreated and the live backend's env is not
+  modified -- only the `exec`-spawned process sees the overrides.
+
 ## Apples-to-apples chat-path replay (no live server required)
 
 For session-isolated comparisons, run V7 via `mist_admin replay`
