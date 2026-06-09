@@ -1,9 +1,32 @@
-"""Tests for GraphRegenerator ExtractionPipeline migration."""
+"""Tests for the legacy utterance-based GraphRegenerator.
+
+QUARANTINED per ADR-010: vault markdown is the source of truth and the
+graph is re-derived from the curated vault (see
+backend/knowledge/curation/graph_regenerator.py). The legacy
+utterance-based regenerator in backend/knowledge/regeneration/ rebuilt
+the graph by replaying event-store utterances, which would re-introduce
+synthetic eval pollution. Its public entry points (`regenerate_all`,
+`regenerate_conversation`) now raise NotImplementedError immediately.
+
+What remains tested here:
+  - The two public methods are quarantined (raise NotImplementedError
+    pointing at ADR-010 vault-rebuild).
+  - Constructor dependency injection still wires correctly (the class is
+    not deleted, only its replay entry points are disabled).
+  - The ADR-009 provenance-preservation invariant of the
+    `_delete_graph_entities` helper is preserved as documentation of the
+    dormant class's contract.
+
+What was removed (meaningless post-quarantine): assertions that
+`_extract_and_store` re-extracts entities and creates nodes during a
+regeneration run. That path is no longer reachable from any public entry
+point, so verifying node creation no longer documents live behavior.
+"""
+
+import asyncio
 
 import pytest
 
-from backend.knowledge.extraction.validator import ValidationResult
-from backend.knowledge.models import Utterance
 from backend.knowledge.regeneration.graph_regenerator import GraphRegenerator
 from tests.mocks.config import build_test_config
 from tests.mocks.embeddings import FakeEmbeddingGenerator
@@ -11,59 +34,30 @@ from tests.mocks.neo4j import FakeNeo4jConnection, FakeNeo4jRecord
 
 
 class FakeExtractionPipeline:
-    """Records calls for verification."""
+    """Minimal pipeline stub for constructor-DI verification."""
 
     def __init__(self):
         self.calls: list[dict] = []
 
-    async def extract_from_utterance(self, **kwargs):
+    async def extract_from_utterance(self, **kwargs):  # pragma: no cover - quarantined
         self.calls.append(kwargs)
-        return ValidationResult(
-            valid=True,
-            entities=[
-                {
-                    "id": "python",
-                    "type": "Technology",
-                    "name": "Python",
-                    "confidence": 0.85,
-                    "description": "",
-                }
-            ],
-            relationships=[],
-        )
+        raise AssertionError("extract_from_utterance must not run on a quarantined regenerator")
 
 
-class TestExtractAndStore:
-    @pytest.mark.asyncio
-    async def test_uses_pipeline_with_synthetic_ids(self):
-        from datetime import datetime
+class TestQuarantine:
+    """The public replay entry points are disabled per ADR-010."""
 
-        from backend.knowledge.storage.graph_store import GraphStore
+    def test_regenerate_all_raises_quarantine(self):
+        reg = GraphRegenerator.__new__(GraphRegenerator)
 
-        conn = FakeNeo4jConnection()
-        gs = GraphStore(conn, FakeEmbeddingGenerator())
-        pipeline = FakeExtractionPipeline()
+        with pytest.raises(NotImplementedError, match="ADR-010"):
+            asyncio.run(reg.regenerate_all())
 
-        regenerator = GraphRegenerator(
-            config=build_test_config(),
-            extraction_pipeline=pipeline,
-            graph_store=gs,
-        )
+    def test_regenerate_conversation_raises_quarantine(self):
+        reg = GraphRegenerator.__new__(GraphRegenerator)
 
-        utterance = Utterance(
-            utterance_id="utt-001",
-            conversation_id="conv-001",
-            text="I use Python",
-            timestamp=datetime.now(),
-        )
-
-        entities, rels = await regenerator._extract_and_store(utterance)
-
-        assert len(pipeline.calls) == 1
-        assert pipeline.calls[0]["event_id"] == "regen_utt-001"
-        assert pipeline.calls[0]["session_id"] == "conv-001"
-        assert entities == 1
-        assert rels == 0
+        with pytest.raises(NotImplementedError, match="ADR-010"):
+            asyncio.run(reg.regenerate_conversation("conv-001"))
 
 
 class TestConstructorDI:
@@ -79,6 +73,7 @@ class TestConstructorDI:
             extraction_pipeline=pipeline,
             graph_store=gs,
         )
+
         assert regenerator._pipeline is pipeline
         assert regenerator.graph_store is gs
 
@@ -91,6 +86,10 @@ class TestAdr009DeleteEntitiesPreservesProvenance:
     test verifies that _delete_graph_entities:
       - issues a DETACH DELETE scoped to :__Entity__
       - does NOT issue any delete query targeting :__Provenance__
+
+    The helper is no longer reachable from a public entry point (the
+    replay methods are quarantined), but the invariant is retained as
+    documentation of the dormant class's contract.
     """
 
     def test_delete_graph_entities_preserves_provenance_nodes(self):

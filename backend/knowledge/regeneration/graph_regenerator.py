@@ -67,6 +67,13 @@ class GraphRegenerator:
             >>> report = await regenerator.regenerate_all()
             >>> print(f"Created {report.entities_created} entities")
         """
+        raise NotImplementedError(
+            "Legacy utterance-based regeneration is superseded by ADR-010 "
+            "vault-rebuild. Re-deriving the graph from event-store utterances "
+            "would re-introduce eval pollution. Use `mist_admin vault-rebuild "
+            "--scope all` instead."
+        )
+
         start_time = datetime.now()
 
         logger.info("=" * 60)
@@ -168,6 +175,13 @@ class GraphRegenerator:
         Returns:
             RegenerationReport with statistics
         """
+        raise NotImplementedError(
+            "Legacy utterance-based regeneration is superseded by ADR-010 "
+            "vault-rebuild. Re-deriving the graph from event-store utterances "
+            "would re-introduce eval pollution. Use `mist_admin vault-rebuild "
+            "--scope all` instead."
+        )
+
         start_time = datetime.now()
 
         logger.info(f"Regenerating conversation: {conversation_id}")
