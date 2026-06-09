@@ -6,8 +6,13 @@ Tests cover the new async cmd_vault_rebuild signature added in Task 22:
 - scope="all"   -> iterates vault tree and calls rebuild_from_path for each
                    non-excluded .md file
 - retry_orphaned=True -> calls regenerator.retry_orphaned()
-- scope=None, retry_orphaned=False -> legacy sidecar-only rebuild path (no
-                                       regenerator call)
+
+The legacy sidecar-only rebuild (scope=None, retry_orphaned=False) is NOT
+handled inside cmd_vault_rebuild. _dispatch_vault_rebuild routes that case to
+_cmd_vault_rebuild_sidecar before this coroutine is reached, so cmd_vault_rebuild
+is only entered with a truthy scope or retry_orphaned. The dispatch-level routing
+test (TestVaultRebuildArgparseDispatch.test_no_flags_routes_to_legacy_sidecar)
+covers the no-flags case.
 
 All tests use fakes for the admin context and regenerator so no real Neo4j,
 LLM, or sidecar dependency is required.
@@ -48,13 +53,28 @@ class FakeRegenerator:
 
 
 class FakeSidecar:
-    """Minimal fake for the sidecar used by cmd_vault_rebuild legacy path."""
+    """Inert sidecar sentinel carried on the admin context.
+
+    cmd_vault_rebuild does NOT call any sidecar method (the legacy sidecar-only
+    rebuild lives in _cmd_vault_rebuild_sidecar, reached via the dispatch before
+    this coroutine). This fake deliberately defines no methods so that any
+    attribute access from cmd_vault_rebuild is recorded in `touched_attrs` and
+    surfaces as a test signal rather than silently conforming. The real
+    VaultSidecarIndex has no `rebuild_all` method; pretending it does is what
+    previously masked the dead `scope is None` branch.
+    """
 
     def __init__(self) -> None:
-        self.rebuild_all_called: bool = False
+        self.touched_attrs: list[str] = []
 
-    async def rebuild_all(self) -> None:
-        self.rebuild_all_called = True
+    def __getattr__(self, name: str) -> object:
+        # __getattr__ only fires for attributes not found normally (i.e. not
+        # touched_attrs, which __init__ sets via __dict__). Record and fail loud.
+        self.__dict__["touched_attrs"].append(name)
+        raise AttributeError(
+            f"cmd_vault_rebuild touched sidecar.{name}; it must not call the "
+            f"sidecar (legacy rebuild is handled by _cmd_vault_rebuild_sidecar)"
+        )
 
 
 class MockAdminContext:
@@ -108,7 +128,7 @@ def test_vault_rebuild_scope_path_invokes_regenerator(
 
     assert rc == 0
     assert mock_admin_context.regenerator.rebuild_calls == [p]
-    assert mock_admin_context.sidecar.rebuild_all_called is False
+    assert mock_admin_context.sidecar.touched_attrs == []
 
 
 def test_vault_rebuild_scope_relative_path_resolves_against_vault_root(
@@ -236,7 +256,7 @@ def test_vault_rebuild_retry_orphaned_invokes_retry_path(
     assert rc == 0
     assert mock_admin_context.regenerator.retry_orphaned_called is True
     assert mock_admin_context.regenerator.rebuild_calls == []
-    assert mock_admin_context.sidecar.rebuild_all_called is False
+    assert mock_admin_context.sidecar.touched_attrs == []
 
 
 def test_vault_rebuild_retry_orphaned_takes_priority_over_scope(
@@ -262,26 +282,50 @@ def test_vault_rebuild_retry_orphaned_takes_priority_over_scope(
 
 
 # ---------------------------------------------------------------------------
-# Tests: legacy mode (no flags)
+# Tests: legacy no-flags case is handled upstream, not inside cmd_vault_rebuild
+#
+# The former `scope is None` branch of cmd_vault_rebuild called a nonexistent
+# `sidecar.rebuild_all()` and was dead: _dispatch_vault_rebuild routes the
+# no-flags case to _cmd_vault_rebuild_sidecar before cmd_vault_rebuild runs.
+# These tests pin the corrected contract.
 # ---------------------------------------------------------------------------
 
 
-def test_vault_rebuild_no_flags_calls_legacy_sidecar_rebuild(
+def test_cmd_vault_rebuild_never_touches_sidecar_on_retry_path(
     mock_admin_context: MockAdminContext,
 ) -> None:
-    """scope=None, retry_orphaned=False calls legacy sidecar rebuild; no regenerator call."""
+    """cmd_vault_rebuild must not call any sidecar method (legacy path lives elsewhere).
+
+    The inert FakeSidecar raises AttributeError on any access. retry_orphaned is
+    the one combination still routed into cmd_vault_rebuild that previously sat
+    adjacent to the dead branch, so it is the safest guard that the sidecar is
+    never reached from this coroutine.
+    """
     rc = asyncio.run(
         mist_admin.cmd_vault_rebuild(
             scope=None,
-            retry_orphaned=False,
+            retry_orphaned=True,
             ctx=mock_admin_context,
         )
     )
 
     assert rc == 0
-    assert mock_admin_context.sidecar.rebuild_all_called is True
-    assert mock_admin_context.regenerator.rebuild_calls == []
-    assert mock_admin_context.regenerator.retry_orphaned_called is False
+    assert mock_admin_context.sidecar.touched_attrs == []
+
+
+def test_cmd_vault_rebuild_source_has_no_rebuild_all_reference() -> None:
+    """The removed dead branch must not regrow: no `rebuild_all` in cmd_vault_rebuild.
+
+    `rebuild_all` exists nowhere on the real VaultSidecarIndex; a reference here
+    is necessarily the dead branch returning. Inspect the coroutine source rather
+    than executing the (now-unreachable) scope=None, retry_orphaned=False input,
+    which the dispatch can never produce.
+    """
+    import inspect
+
+    src = inspect.getsource(mist_admin.cmd_vault_rebuild)
+
+    assert "rebuild_all" not in src
 
 
 # ---------------------------------------------------------------------------

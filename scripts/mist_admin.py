@@ -1384,8 +1384,11 @@ async def cmd_vault_rebuild(
       conventions docs and meta/) and call regenerator.rebuild_from_path on
       each file.
     - ``scope='<path>'``: rebuild the graph subgraph for a single vault file.
-    - ``scope=None, retry_orphaned=False``: legacy sidecar-only rebuild via
-      ctx.sidecar.rebuild_all().
+
+    The legacy sidecar-only rebuild (``scope=None, retry_orphaned=False``) is not
+    handled here: _dispatch_vault_rebuild routes that case to
+    _cmd_vault_rebuild_sidecar before this function is ever called, so this
+    coroutine is only reached with a truthy scope or retry_orphaned.
 
     Args:
         scope: None, 'all', or an absolute/relative path string.
@@ -1400,11 +1403,10 @@ async def cmd_vault_rebuild(
         await ctx.regenerator.retry_orphaned()
         return 0
 
-    if scope is None:
-        # Legacy: sidecar-only rebuild (no graph regeneration).
-        await ctx.sidecar.rebuild_all()
-        return 0
-
+    # No `scope is None` branch here: _dispatch_vault_rebuild only routes to this
+    # function when args.scope or args.retry_orphaned is truthy, so the no-scope /
+    # no-retry case is handled upstream by _cmd_vault_rebuild_sidecar (the working
+    # sidecar drop+reindex). Reaching this point with scope=None is unreachable.
     if scope == "all":
         from backend.vault.sidecar_index import _is_excluded_from_indexing
 
