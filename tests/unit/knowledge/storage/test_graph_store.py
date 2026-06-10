@@ -644,3 +644,48 @@ class TestGetMistIdentityContext:
         # Description synthesized as "Implemented with <name>." so the
         # capability renders naturally in the persona block.
         assert "Implemented with LanceDB" in cap["description"]
+
+
+class TestCurrentBeliefFilters:
+    """C1: reads filter to current beliefs (coalesce-tolerant of legacy edges)."""
+
+    def _store(self):
+        from backend.knowledge.storage.graph_store import GraphStore
+        from tests.mocks.embeddings import FakeEmbeddingGenerator
+        from tests.mocks.neo4j import FakeNeo4jConnection
+
+        conn = FakeNeo4jConnection()
+        return conn, GraphStore(connection=conn, embedding_generator=FakeEmbeddingGenerator())
+
+    def test_user_relationships_filter_to_latest_and_currently_valid(self):
+        conn, store = self._store()
+        store.get_user_relationships_to_entities("user", ["rust"])
+        query, params = conn.queries[-1]
+        assert "coalesce(r.is_latest_belief, true)" in query
+        assert "r.valid_to IS NULL OR r.valid_to > $now" in query
+        assert "r.valid_from IS NULL OR r.valid_from = '-inf' OR r.valid_from <= $now" in query
+        assert "now" in params
+
+    def test_all_user_relationships_filter_to_latest_and_currently_valid(self):
+        conn, store = self._store()
+        store.get_all_user_relationships("user")
+        query, params = conn.queries[-1]
+        assert "coalesce(r.is_latest_belief, true)" in query
+        assert "r.valid_from IS NULL OR r.valid_from = '-inf' OR r.valid_from <= $now" in query
+        assert "now" in params
+
+    def test_neighborhood_filters_to_latest(self):
+        conn, store = self._store()
+        store.get_entity_neighborhood("rust", max_hops=2)
+        query, _ = conn.queries[-1]
+        assert "coalesce(rel.is_latest_belief, true)" in query
+
+    def test_identity_context_filters_to_latest_and_currently_valid(self):
+        conn, store = self._store()
+        store.get_mist_identity_context()
+        identity_queries = [q for q, _ in conn.queries if "mist-identity" in q and "-[r:" in q]
+        assert identity_queries, "identity queries must name the rel variable r"
+        assert len(identity_queries) == 7
+        for query in identity_queries:
+            assert "coalesce(r.is_latest_belief, true)" in query
+            assert "r.valid_from IS NULL OR r.valid_from = '-inf' OR r.valid_from <= $now" in query

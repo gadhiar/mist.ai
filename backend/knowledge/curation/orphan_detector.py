@@ -70,6 +70,7 @@ class OrphanDetector:
             "AND NOT EXISTS { "
             "  MATCH (e)-[r]-() "
             "  WHERE type(r) <> 'EXTRACTED_FROM' "
+            "  AND coalesce(r.is_latest_belief, true) "
             "} "
             "RETURN e.id AS id, e.entity_type AS entity_type, "
             "e.confidence AS confidence",

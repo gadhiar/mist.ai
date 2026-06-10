@@ -171,6 +171,7 @@ class InternalKnowledgeDeriver:
             results = await self._executor.execute_query(
                 "MATCH (m:MistIdentity)-[r]->(e:__Entity__) "
                 "WHERE e.knowledge_domain = 'internal' AND e.status = 'active' "
+                "AND coalesce(r.is_latest_belief, true) "
                 "RETURN e.id AS id, e.entity_type AS type, "
                 "e.display_name AS name, type(r) AS rel_type "
                 "ORDER BY e.entity_type, e.display_name"

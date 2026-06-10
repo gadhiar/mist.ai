@@ -24,6 +24,7 @@ import yaml
 
 from backend.errors import Neo4jConnectionError, Neo4jQueryError
 from backend.interfaces import GraphConnection
+from backend.knowledge.ontologies import EXTRACTABLE_RELATIONSHIP_TYPES
 
 SEED_METADATA_FIELDS = (
     "confidence",
@@ -97,6 +98,16 @@ def ensure_schema(connection: GraphConnection) -> dict[str, int]:
         "CREATE INDEX provenance_type_idx IF NOT EXISTS FOR (p:__Provenance__) ON (p.entity_type)",
     ):
         connection.execute_write(cypher)
+        counts["indexes"] += 1
+    # C1: per-predicate relationship range index on the engine's probe key.
+    # Neo4j 5 Community supports relationship range indexes; booleans like
+    # is_latest_belief are deliberately NOT indexed (poor selectivity) --
+    # reads stay entity-anchored.
+    for rel_name in EXTRACTABLE_RELATIONSHIP_TYPES:
+        connection.execute_write(
+            f"CREATE INDEX rel_{rel_name.lower()}_src_utt_idx IF NOT EXISTS "
+            f"FOR ()-[r:{rel_name}]-() ON (r.source_utterance_id)"
+        )
         counts["indexes"] += 1
     vector_cypher = (
         "CREATE VECTOR INDEX entity_embeddings IF NOT EXISTS "
@@ -536,9 +547,24 @@ def _merge_relationship(
     meta = _seed_metadata(now_iso)
     create_only, merge_meta = _split_seed_metadata(meta)
     merge_params = {"ontology_version": ontology_version, **merge_meta}
+    # C1: seed edges satisfy the current-belief read filters and the engine's
+    # fetch shape. 'seed' is the canonical synthetic source; NULL-valued
+    # bitemporal fields are omitted (absent == null for every C1 read).
+    create_only = {
+        **create_only,
+        "source_utterance_id": "seed",
+        "recorded_at": now_iso,
+        "is_latest_belief": True,
+        "correction": False,
+        "evidence": ["seed"],
+    }
+    # MERGE keys the seed VERSION so ON MATCH never clobbers engine-written
+    # bitemporal versions between the same pair (post-C1 there can be many
+    # edges per pair). Legacy seed edges get version_key='seed' via the
+    # one-shot backfill, which the cutover runs BEFORE any re-seed.
     query = f"""
     MATCH (s:__Entity__ {{id: $source_id}}), (t:__Entity__ {{id: $target_id}})
-    MERGE (s)-[r:{rel_type}]->(t)
+    MERGE (s)-[r:{rel_type} {{version_key: 'seed'}}]->(t)
     ON CREATE SET r += $create_only, r += $merge_params
     ON MATCH SET r += $merge_params
     """

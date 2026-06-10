@@ -55,9 +55,12 @@ _CONNECTIVITY_QUERY = """\
 MATCH (e:__Entity__)
 WHERE e.status = 'active'
 OPTIONAL MATCH (e)-[r]-()
+WHERE coalesce(r.is_latest_belief, true)
 RETURN count(DISTINCT e) AS entity_count,
        count(r) AS rel_count
 """
+# Connectivity counts CURRENT beliefs; superseded bitemporal history versions
+# are excluded so the score does not inflate as history accumulates (C1).
 
 _CONSISTENCY_QUERY = """\
 MATCH (e:__Entity__)

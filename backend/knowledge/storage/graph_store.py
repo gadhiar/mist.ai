@@ -6,7 +6,7 @@ Stores extracted entities and relationships in Neo4j with provenance tracking.
 import asyncio
 import logging
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from backend.errors import Neo4jQueryError
@@ -1174,7 +1174,8 @@ class GraphStore:
         WHERE ALL(node IN nodes(path) WHERE node:__Entity__)
           AND ALL(rel IN relationships(path)
                   WHERE type(rel) IN $allowed_rel_types
-                    AND (rel.status IS NULL OR rel.status <> 'orphaned'))
+                    AND (rel.status IS NULL OR rel.status <> 'orphaned')
+                    AND coalesce(rel.is_latest_belief, true))
         WITH path, relationships(path) as rels, nodes(path) as nodes
         UNWIND range(0, size(rels)-1) as idx
         RETURN
@@ -1210,11 +1211,17 @@ class GraphStore:
         # ADR-009 v1.1: always enforce user-facing rel-type allowlist.
         allowed_types = relationship_types if relationship_types else _USER_FACING_REL_TYPES
 
+        # C1 currency: latest belief AND valid now. The valid_from arm keeps
+        # future-dated facts out of "currently true" reads (design 11); '-inf'
+        # is the ALWAYS sentinel.
         query = """
         MATCH (user:__Entity__ {id: $user_id})-[r]-(entity:__Entity__)
         WHERE entity.id IN $entity_ids
           AND type(r) IN $allowed_rel_types
           AND (r.status IS NULL OR r.status <> 'orphaned')
+          AND coalesce(r.is_latest_belief, true)
+          AND (r.valid_to IS NULL OR r.valid_to > $now)
+          AND (r.valid_from IS NULL OR r.valid_from = '-inf' OR r.valid_from <= $now)
         RETURN
             user.id as user_id,
             entity.id as entity_id,
@@ -1231,6 +1238,7 @@ class GraphStore:
             "user_id": user_id,
             "entity_ids": entity_ids,
             "allowed_rel_types": allowed_types,
+            "now": datetime.now(UTC).isoformat(),
         }
 
         results = self.connection.execute_query(query, params)
@@ -1260,6 +1268,10 @@ class GraphStore:
         filters: list[str] = [
             "type(r) IN $allowed_rel_types",
             "(r.status IS NULL OR r.status <> 'orphaned')",
+            # C1 currency (latest belief, valid now; '-inf' = ALWAYS sentinel).
+            "coalesce(r.is_latest_belief, true)",
+            "(r.valid_to IS NULL OR r.valid_to > $now)",
+            "(r.valid_from IS NULL OR r.valid_from = '-inf' OR r.valid_from <= $now)",
         ]
         if entity_types:
             filters.append("entity.entity_type IN $entity_types")
@@ -1277,7 +1289,11 @@ class GraphStore:
         ORDER BY entity.entity_type, entity.id
         """
 
-        params: dict[str, Any] = {"user_id": user_id, "allowed_rel_types": allowed_types}
+        params: dict[str, Any] = {
+            "user_id": user_id,
+            "allowed_rel_types": allowed_types,
+            "now": datetime.now(UTC).isoformat(),
+        }
         if entity_types:
             params["entity_types"] = entity_types
         results = self.connection.execute_query(query, params)
@@ -1347,22 +1363,30 @@ class GraphStore:
         """
         # Seeded path: HAS_TRAIT/HAS_CAPABILITY/HAS_PREFERENCE -> internal
         # MistTrait / MistCapability / MistPreference nodes with canonical shape.
-        seeded_traits_query = """
-            MATCH (m:__Entity__ {id: 'mist-identity'})-[:HAS_TRAIT]->(t:__Entity__)
+        # C1 currency filter on every persona edge: latest belief AND valid
+        # now ('-inf' = ALWAYS sentinel; legacy unstamped edges coalesce true).
+        currency = """WHERE coalesce(r.is_latest_belief, true)
+              AND (r.valid_to IS NULL OR r.valid_to > $now)
+              AND (r.valid_from IS NULL OR r.valid_from = '-inf' OR r.valid_from <= $now)"""
+        seeded_traits_query = f"""
+            MATCH (m:__Entity__ {{id: 'mist-identity'}})-[r:HAS_TRAIT]->(t:__Entity__)
+            {currency}
             RETURN t.id AS id, t.display_name AS display_name,
                    t.axis AS axis, t.description AS description,
                    t.entity_type AS entity_type
             ORDER BY t.display_name
         """
-        seeded_capabilities_query = """
-            MATCH (m:__Entity__ {id: 'mist-identity'})-[:HAS_CAPABILITY]->(c:__Entity__)
+        seeded_capabilities_query = f"""
+            MATCH (m:__Entity__ {{id: 'mist-identity'}})-[r:HAS_CAPABILITY]->(c:__Entity__)
+            {currency}
             RETURN c.id AS id, c.display_name AS display_name,
                    c.description AS description,
                    c.entity_type AS entity_type
             ORDER BY c.display_name
         """
-        seeded_preferences_query = """
-            MATCH (m:__Entity__ {id: 'mist-identity'})-[:HAS_PREFERENCE]->(p:__Entity__)
+        seeded_preferences_query = f"""
+            MATCH (m:__Entity__ {{id: 'mist-identity'}})-[r:HAS_PREFERENCE]->(p:__Entity__)
+            {currency}
             RETURN p.id AS id, p.display_name AS display_name,
                    p.enforcement AS enforcement, p.context AS context,
                    p.entity_type AS entity_type
@@ -1371,22 +1395,25 @@ class GraphStore:
         # Extracted path (Cluster 1): MIST_HAS_TRAIT / MIST_HAS_CAPABILITY /
         # MIST_HAS_PREFERENCE -> external-domain nodes. These have display_name
         # and description only; axis/enforcement/context are synthesized below.
-        extracted_traits_query = """
-            MATCH (m:__Entity__ {id: 'mist-identity'})-[:MIST_HAS_TRAIT]->(t:__Entity__)
+        extracted_traits_query = f"""
+            MATCH (m:__Entity__ {{id: 'mist-identity'}})-[r:MIST_HAS_TRAIT]->(t:__Entity__)
+            {currency}
             RETURN t.id AS id, t.display_name AS display_name,
                    t.description AS description,
                    t.entity_type AS entity_type
             ORDER BY t.display_name
         """
-        extracted_capabilities_query = """
-            MATCH (m:__Entity__ {id: 'mist-identity'})-[:MIST_HAS_CAPABILITY]->(c:__Entity__)
+        extracted_capabilities_query = f"""
+            MATCH (m:__Entity__ {{id: 'mist-identity'}})-[r:MIST_HAS_CAPABILITY]->(c:__Entity__)
+            {currency}
             RETURN c.id AS id, c.display_name AS display_name,
                    c.description AS description,
                    c.entity_type AS entity_type
             ORDER BY c.display_name
         """
-        extracted_preferences_query = """
-            MATCH (m:__Entity__ {id: 'mist-identity'})-[:MIST_HAS_PREFERENCE]->(p:__Entity__)
+        extracted_preferences_query = f"""
+            MATCH (m:__Entity__ {{id: 'mist-identity'}})-[r:MIST_HAS_PREFERENCE]->(p:__Entity__)
+            {currency}
             RETURN p.id AS id, p.display_name AS display_name,
                    p.description AS description,
                    p.entity_type AS entity_type
@@ -1396,22 +1423,30 @@ class GraphStore:
         # capability-flavored fact ("MIST is implemented with X"). Project
         # it into the capabilities list so the persona block covers
         # implementation-stack facts.
-        implemented_with_query = """
-            MATCH (m:__Entity__ {id: 'mist-identity'})-[:IMPLEMENTED_WITH]->(t:__Entity__)
+        implemented_with_query = f"""
+            MATCH (m:__Entity__ {{id: 'mist-identity'}})-[r:IMPLEMENTED_WITH]->(t:__Entity__)
+            {currency}
             RETURN t.id AS id, t.display_name AS display_name,
                    t.description AS description,
                    t.entity_type AS entity_type
             ORDER BY t.display_name
         """
 
+        now_params = {"now": datetime.now(UTC).isoformat()}
         identity_rows = self.connection.execute_query(identity_query, {})
-        seeded_trait_rows = self.connection.execute_query(seeded_traits_query, {})
-        seeded_capability_rows = self.connection.execute_query(seeded_capabilities_query, {})
-        seeded_preference_rows = self.connection.execute_query(seeded_preferences_query, {})
-        extracted_trait_rows = self.connection.execute_query(extracted_traits_query, {})
-        extracted_capability_rows = self.connection.execute_query(extracted_capabilities_query, {})
-        extracted_preference_rows = self.connection.execute_query(extracted_preferences_query, {})
-        implemented_with_rows = self.connection.execute_query(implemented_with_query, {})
+        seeded_trait_rows = self.connection.execute_query(seeded_traits_query, now_params)
+        seeded_capability_rows = self.connection.execute_query(
+            seeded_capabilities_query, now_params
+        )
+        seeded_preference_rows = self.connection.execute_query(seeded_preferences_query, now_params)
+        extracted_trait_rows = self.connection.execute_query(extracted_traits_query, now_params)
+        extracted_capability_rows = self.connection.execute_query(
+            extracted_capabilities_query, now_params
+        )
+        extracted_preference_rows = self.connection.execute_query(
+            extracted_preferences_query, now_params
+        )
+        implemented_with_rows = self.connection.execute_query(implemented_with_query, now_params)
 
         identity = (
             identity_rows[0]
