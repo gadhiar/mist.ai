@@ -29,6 +29,7 @@ override-before-import eval invocation relies on.
 
 from backend.knowledge.config import (
     EventStoreConfig,
+    Neo4jConfig,
     SidecarIndexConfig,
     VaultConfig,
 )
@@ -127,3 +128,28 @@ class TestThrowawayTrioIsolatedTogether:
         assert sidecar.db_path == "/app/data/eval-run/vault_sidecar.db"
         assert event_store.db_path == "/app/data/eval-run/event_store.db"
         assert vault.root == "/app/data/eval-run/vault"
+
+
+class TestNeo4jUriOverridable:
+    """Neo4jConfig.from_env honors NEO4J_URI / NEO4J_DATABASE (the 4th leg).
+
+    Neo4j Community has one user database, so eval isolation selects a separate
+    INSTANCE via NEO4J_URI rather than a database name. This guardrail locks
+    that the URI/database are env-overridable; a regression to a hardcoded URI
+    would break eval isolation silently.
+    """
+
+    def test_from_env_honors_neo4j_uri_override(self, monkeypatch):
+        monkeypatch.setenv("NEO4J_URI", "bolt://mist-neo4j-eval:7687")
+        config = Neo4jConfig.from_env()
+        assert config.uri == "bolt://mist-neo4j-eval:7687"
+
+    def test_from_env_honors_neo4j_database_override(self, monkeypatch):
+        monkeypatch.setenv("NEO4J_DATABASE", "evaldb")
+        config = Neo4jConfig.from_env()
+        assert config.database == "evaldb"
+
+    def test_from_env_uses_live_default_when_unset(self, monkeypatch):
+        monkeypatch.delenv("NEO4J_URI", raising=False)
+        config = Neo4jConfig.from_env()
+        assert config.uri == "bolt://localhost:7687"
