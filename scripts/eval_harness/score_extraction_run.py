@@ -13,6 +13,7 @@ Standalone, mirrors scripts/eval_harness/score_v8_probe_run.py.
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sys
@@ -380,3 +381,129 @@ def score_run(probes: list[GoldProbe], produced_index: dict[str, Produced]) -> R
             }
         )
     return report
+
+
+ENTITY_PRECISION_GATE = 0.90
+ENTITY_RECALL_GATE = 0.80
+REL_PRECISION_GATE = 0.90
+REL_RECALL_GATE = 0.80
+TYPING_ACCURACY_GATE = 0.90
+RELATED_TO_RATE_LIMIT = 0.10
+
+
+def score_reconciliation() -> None:
+    """Hook: reconciliation-action accuracy.
+
+    The reconciliation engine (C2) does not yet emit reconciliation telemetry to
+    the debug stream. Until C2 lands this reports SKIPPED.
+    """
+    print("reconciliation-action accuracy: SKIPPED (requires C2 telemetry)", file=sys.stderr)
+
+
+def _row(name: str, value: float, gate: float | None, op: str) -> str:
+    if gate is None:
+        return f"| {name} | {value:.3f} | - | - |"
+    ok = value >= gate if op == ">=" else value <= gate
+    return f"| {name} | {value:.3f} | {op} {gate:.2f} | {'PASS' if ok else 'FAIL'} |"
+
+
+def render_markdown(report: Report) -> str:
+    lines = [
+        "# Extraction Accuracy Report (F2)",
+        "",
+        f"- Probes: {report.total_probes} (matched in debug log: {report.matched_probes})",
+        "",
+        "| Metric | Value | Gate | Pass |",
+        "|---|---|---|---|",
+        _row("Entity precision", report.entity_precision, ENTITY_PRECISION_GATE, ">="),
+        _row("Entity recall", report.entity_recall, ENTITY_RECALL_GATE, ">="),
+        _row("Relationship precision", report.rel_precision, REL_PRECISION_GATE, ">="),
+        _row("Relationship recall", report.rel_recall, REL_RECALL_GATE, ">="),
+        _row("Typing accuracy", report.typing_accuracy, TYPING_ACCURACY_GATE, ">="),
+        _row("RELATED_TO rate", report.related_to_rate, RELATED_TO_RATE_LIMIT, "<="),
+        _row("Valid-time accuracy", report.valid_time_accuracy, None, ""),
+        f"| Negative-control violations | {report.negative_violations} | == 0 | "
+        f"{'PASS' if report.negative_violations == 0 else 'FAIL'} |",
+        "",
+        f"Matched probes: {report.matched_probes}/{report.total_probes}.",
+        "Reconciliation-action accuracy: SKIPPED (requires C2 telemetry).",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def render_json(report: Report) -> str:
+    return json.dumps(
+        {
+            "total_probes": report.total_probes,
+            "matched_probes": report.matched_probes,
+            "entity_precision": report.entity_precision,
+            "entity_recall": report.entity_recall,
+            "rel_precision": report.rel_precision,
+            "rel_recall": report.rel_recall,
+            "typing_accuracy": report.typing_accuracy,
+            "related_to_rate": report.related_to_rate,
+            "valid_time_accuracy": report.valid_time_accuracy,
+            "per_probe": report.per_probe,
+        },
+        indent=2,
+    )
+
+
+def _gates_pass(report: Report) -> bool:
+    return (
+        report.matched_probes == report.total_probes  # a broken join must not pass
+        and report.negative_violations == 0  # no hallucinated facts on negative controls
+        and report.entity_precision >= ENTITY_PRECISION_GATE
+        and report.entity_recall >= ENTITY_RECALL_GATE
+        and report.rel_precision >= REL_PRECISION_GATE
+        and report.rel_recall >= REL_RECALL_GATE
+        and report.typing_accuracy >= TYPING_ACCURACY_GATE
+        and report.related_to_rate <= RELATED_TO_RATE_LIMIT
+    )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Score a MIST extraction run against a gold corpus.")
+    p.add_argument("--gold", required=True, type=Path, help="Gold corpus JSONL.")
+    p.add_argument(
+        "--debug-jsonl", required=True, type=Path, help="MIST_DEBUG_JSONL from the replay run."
+    )
+    p.add_argument("--session-id", default=None, help="Filter debug records by session_id.")
+    p.add_argument(
+        "--output", default=None, type=Path, help="Write markdown report (default stdout)."
+    )
+    p.add_argument(
+        "--json-output", default=None, type=Path, help="Write a machine-readable JSON report."
+    )
+    p.add_argument("--strict", action="store_true", help="Exit 1 if any core gate fails.")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if not args.gold.exists():
+        print(f"error: gold corpus not found: {args.gold}", file=sys.stderr)
+        return 2
+    if not args.debug_jsonl.exists():
+        print(f"error: debug jsonl not found: {args.debug_jsonl}", file=sys.stderr)
+        return 2
+    probes = iter_gold_probes(args.gold)
+    records = iter_debug_records(args.debug_jsonl, session_id=args.session_id)
+    report = score_run(probes, build_produced_index(records))
+    score_reconciliation()
+    md = render_markdown(report)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(md, encoding="utf-8")
+    else:
+        print(md)
+    if args.json_output:
+        args.json_output.parent.mkdir(parents=True, exist_ok=True)
+        args.json_output.write_text(render_json(report), encoding="utf-8")
+    if args.strict and not _gates_pass(report):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

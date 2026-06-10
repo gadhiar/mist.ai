@@ -234,3 +234,81 @@ class TestScoreRun:
         produced = {"x": _produced("x", [GoldEntity("a", "Topic")], [], {"a": "Topic"})}
         r = score_run([probe], produced)
         assert r.negative_probes == 1 and r.negative_violations == 1
+
+
+from eval_harness.score_extraction_run import main, render_json, render_markdown  # noqa: E402
+
+
+class TestRenderAndCli:
+    def test_render_markdown_contains_metric_rows(self):
+        from eval_harness.score_extraction_run import Report
+
+        md = render_markdown(Report(total_probes=1, matched_probes=1))
+        assert "Entity precision" in md
+        assert "RELATED_TO rate" in md
+        assert "SKIPPED" in md  # reconciliation hook
+
+    def test_render_json_is_valid_json(self):
+        from eval_harness.score_extraction_run import Report
+
+        payload = json.loads(render_json(Report(total_probes=2, matched_probes=1)))
+        assert payload["total_probes"] == 2
+        assert "entity_precision" in payload
+
+    def test_main_writes_report_and_returns_zero(self, tmp_path):
+        gold = tmp_path / "gold.jsonl"
+        gold.write_text(
+            json.dumps(
+                {
+                    "utterance": "I use Rust",
+                    "tag": "t1",
+                    "expected_entities": [{"id": "rust", "type": "Technology"}],
+                    "expected_relationships": [
+                        {
+                            "source": "user",
+                            "source_type": "User",
+                            "predicate": "USES",
+                            "target": "rust",
+                            "target_type": "Technology",
+                        }
+                    ],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        debug = tmp_path / "debug.jsonl"
+        content = json.dumps(
+            {
+                "entities": [{"id": "rust", "type": "Technology"}],
+                "relationships": [
+                    {"source": "user", "target": "rust", "type": "USES", "properties": {}}
+                ],
+            }
+        )
+        debug.write_text(
+            json.dumps(
+                {
+                    "phase": "llm_call",
+                    "call_site": "extraction.ontology",
+                    "request": {
+                        "messages": [
+                            {"role": "user", "content": 'Utterance: "I use Rust"\nOutput:'}
+                        ]
+                    },
+                    "response": {"content": content},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "report.md"
+        rc = main(["--gold", str(gold), "--debug-jsonl", str(debug), "--output", str(out)])
+        assert rc == 0
+        assert "Entity precision" in out.read_text(encoding="utf-8")
+
+    def test_main_returns_2_on_missing_file(self, tmp_path):
+        rc = main(
+            ["--gold", str(tmp_path / "nope.jsonl"), "--debug-jsonl", str(tmp_path / "nope2.jsonl")]
+        )
+        assert rc == 2
