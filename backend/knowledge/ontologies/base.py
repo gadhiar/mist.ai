@@ -62,6 +62,31 @@ class TemporalStatus(StrEnum):
     RECURRING = "recurring"
 
 
+class Cardinality(StrEnum):
+    """How many concurrent current targets an edge type permits per source.
+
+    SINGLE: at most one valid-time-open edge per (source, type) across all
+    targets -- a new open assertion supersedes the prior one (e.g. WORKS_AT).
+    MULTI: targets accumulate independently.
+    """
+
+    SINGLE = "single"
+    MULTI = "multi"
+
+
+class TemporalClass(StrEnum):
+    """How an edge type participates in valid-time reconciliation.
+
+    STATIVE: a state over an interval -- reconciled with valid-time.
+    EVENT: a point occurrence -- accumulates, never superseded by time.
+    DURABLE: timeless structural fact -- no valid-time reconciliation.
+    """
+
+    STATIVE = "stative"
+    EVENT = "event"
+    DURABLE = "durable"
+
+
 # ---------------------------------------------------------------------------
 # Frozen dataclasses
 # ---------------------------------------------------------------------------
@@ -102,6 +127,15 @@ class EdgeTypeDefinition:
     directional: bool = True
     required_properties: tuple[PropertyDefinition, ...] = ()
     optional_properties: tuple[PropertyDefinition, ...] = ()
+    # C1 reconciliation semantics (design 4.1). Declarative -- the
+    # reconciliation engine reads these; it contains no predicate names
+    # (Inv-A6). Defaults preserve pre-C1 behavior: accumulate-only.
+    # Undirected edges use the existing `directional=False` flag; there is
+    # deliberately no separate `symmetric` field.
+    cardinality: Cardinality = Cardinality.MULTI
+    temporal_class: TemporalClass = TemporalClass.STATIVE
+    contradicts: tuple[str, ...] = ()
+    progression_supersedes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
