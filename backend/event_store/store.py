@@ -331,6 +331,50 @@ class EventStore:
         result = cursor.fetchone()
         return result[0] if result else 0
 
+    def append_epoch(
+        self,
+        ontology_version: str,
+        extraction_version: str,
+        model_hash: str,
+        activated_at: str,
+    ) -> int:
+        """Append a new epoch unless the latest already has this stamp triple.
+
+        Idempotent on an unchanged triple: returns the existing epoch_id without
+        inserting. Returns the (new or existing) epoch_id.
+        """
+        current = self.get_current_epoch()
+        if current is not None and (
+            current["ontology_version"],
+            current["extraction_version"],
+            current["model_hash"],
+        ) == (ontology_version, extraction_version, model_hash):
+            return int(current["epoch_id"])
+
+        prev_id = int(current["epoch_id"]) if current is not None else None
+        conn = self._get_connection()
+        cursor = conn.execute(
+            """
+            INSERT INTO epoch_ledger (
+                ontology_version, extraction_version, model_hash, activated_at, prev_epoch_id
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (ontology_version, extraction_version, model_hash, activated_at, prev_id),
+        )
+        return int(cursor.lastrowid)
+
+    def get_current_epoch(self) -> dict[str, Any] | None:
+        """Return the latest epoch row as a dict, or None if the ledger is empty."""
+        conn = self._get_connection()
+        row = conn.execute("SELECT * FROM epoch_ledger ORDER BY epoch_id DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
+
+    def list_epochs(self) -> list[dict[str, Any]]:
+        """Return all epochs in insertion order (oldest first)."""
+        conn = self._get_connection()
+        rows = conn.execute("SELECT * FROM epoch_ledger ORDER BY epoch_id ASC").fetchall()
+        return [dict(r) for r in rows]
+
     def close(self) -> None:
         """Close the database connection."""
         if self._conn is not None:

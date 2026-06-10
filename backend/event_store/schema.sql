@@ -95,3 +95,14 @@ CREATE TABLE IF NOT EXISTS materialized_graph_registry (
 CREATE INDEX IF NOT EXISTS idx_turns_session ON conversation_turn_events(session_id);
 CREATE INDEX IF NOT EXISTS idx_turns_timestamp ON conversation_turn_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_turns_ontology ON conversation_turn_events(ontology_version);
+
+-- Append-only epoch ledger (F3): records each (ontology, extraction, model)
+-- epoch so the graph is a projection of (log, epoch). Never mutated.
+CREATE TABLE IF NOT EXISTS epoch_ledger (
+    epoch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ontology_version TEXT NOT NULL,
+    extraction_version TEXT NOT NULL,
+    model_hash TEXT NOT NULL,
+    activated_at TEXT NOT NULL,
+    prev_epoch_id INTEGER
+);
