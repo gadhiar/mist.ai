@@ -28,10 +28,10 @@ if TYPE_CHECKING:
     from backend.vault.sidecar_index import VaultSidecarIndex
 from backend.knowledge.config import KnowledgeConfig
 from backend.knowledge.curation.confidence import ConfidenceManager
-from backend.knowledge.curation.conflict_resolver import ConflictResolver
 from backend.knowledge.curation.deduplication import EntityDeduplicator
 from backend.knowledge.curation.graph_writer import CurationGraphWriter
 from backend.knowledge.curation.pipeline import CurationPipeline
+from backend.knowledge.curation.reconciliation import ReconciliationEngine
 from backend.knowledge.extraction.confidence import ConfidenceScorer
 from backend.knowledge.extraction.normalizer import EntityNormalizer
 from backend.knowledge.extraction.ontology_extractor import OntologyConstrainedExtractor
@@ -139,17 +139,21 @@ def build_llm_provider(
     return inner
 
 
-def build_curation_pipeline(config: KnowledgeConfig, executor: GraphExecutor) -> CurationPipeline:
-    """Create a fully wired CurationPipeline."""
+def build_curation_pipeline(
+    config: KnowledgeConfig,
+    executor: GraphExecutor,
+    debug_logger: "DebugJSONLLogger | None" = None,  # noqa: F821
+) -> CurationPipeline:
+    """Create a fully wired CurationPipeline (bitemporal engine, C2)."""
     from backend.knowledge.curation.graph_writer import RebuildStamps
     from backend.knowledge.embeddings import EmbeddingGenerator
 
     embedding_provider = EmbeddingGenerator(config.embedding.model_name)
     confidence_mgr = ConfidenceManager()
-    # ADR-010 Phase 8 rebuild-determinism stamps. Written to every
-    # DERIVED_FROM->VaultNote edge so vault-rebuild can detect when the
-    # ontology, extraction prompt, or model binary has drifted from the
-    # values active at extraction time.
+    # ADR-010 Phase 8 rebuild-determinism stamps. Written to every fact edge
+    # (C1 4.7) and every DERIVED_FROM->VaultNote edge so rebuilds can detect
+    # when the ontology, extraction prompt, or model binary has drifted from
+    # the values active at extraction time.
     rebuild_stamps = RebuildStamps(
         ontology_version=config.ontology_version,
         extraction_version=config.extraction_version,
@@ -157,7 +161,11 @@ def build_curation_pipeline(config: KnowledgeConfig, executor: GraphExecutor) ->
     )
     return CurationPipeline(
         deduplicator=EntityDeduplicator(executor, embedding_provider, confidence_mgr),
-        conflict_resolver=ConflictResolver(executor),
+        reconciliation_engine=ReconciliationEngine(
+            executor=executor,
+            rebuild_stamps=rebuild_stamps,
+            debug_logger=debug_logger,
+        ),
         graph_writer=CurationGraphWriter(
             executor, embedding_provider, confidence_mgr, rebuild_stamps=rebuild_stamps
         ),
@@ -170,12 +178,17 @@ def build_extraction_pipeline(
     llm_provider: StreamingLLMProvider | None = None,
     include_curation: bool = True,
     include_internal_derivation: bool = True,
+    debug_logger: "DebugJSONLLogger | None" = None,  # noqa: F821
 ) -> ExtractionPipeline:
     """Create a fully wired ExtractionPipeline."""
     gs = graph_store or build_graph_store(config)
     executor = build_graph_executor(config, gs.connection)
 
-    curation = build_curation_pipeline(config, executor) if include_curation else None
+    curation = (
+        build_curation_pipeline(config, executor, debug_logger=debug_logger)
+        if include_curation
+        else None
+    )
 
     provider = llm_provider or build_llm_provider(config)
 
@@ -290,6 +303,8 @@ def build_conversation_handler(
             gates.append("retrieval_candidates")
         if debug_logger.llm_request_dump_enabled:
             gates.append("llm_request_raw")
+        if debug_logger.reconciliation_enabled:
+            gates.append("reconciliation")
         gate_summary = ", ".join(gates) if gates else "turn + extraction only"
         logger.info(
             "Debug JSONL logging enabled at %s (phases: %s)",
@@ -300,7 +315,11 @@ def build_conversation_handler(
     gs = build_graph_store(config)
     provider = llm_provider or build_llm_provider(config, debug_logger=debug_logger)
     pipeline = build_extraction_pipeline(
-        config, graph_store=gs, llm_provider=provider, include_curation=True
+        config,
+        graph_store=gs,
+        llm_provider=provider,
+        include_curation=True,
+        debug_logger=debug_logger,
     )
 
     # Build vector store with graceful fallback

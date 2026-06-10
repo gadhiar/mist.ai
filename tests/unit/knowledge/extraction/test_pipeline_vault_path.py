@@ -58,15 +58,15 @@ class _RecordingCurationPipeline:
 
         # Return a CurationResult-shaped object with empty defaults so the
         # pipeline's logging path doesn't crash.
-        from backend.knowledge.curation.conflict_resolver import ConflictResolutionResult
         from backend.knowledge.curation.deduplication import DeduplicationResult
         from backend.knowledge.curation.graph_writer import WriteResult
         from backend.knowledge.curation.pipeline import CurationResult
+        from backend.knowledge.curation.reconciliation import ReconcileTurnResult
 
         return CurationResult(
             write_result=WriteResult(),
             dedup_result=DeduplicationResult(entities=[], merge_actions=[], entities_merged=0),
-            conflict_result=ConflictResolutionResult(relationships=[]),
+            reconcile_result=ReconcileTurnResult(),
             curation_time_ms=0.0,
         )
 

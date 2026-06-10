@@ -18,7 +18,7 @@ from backend.knowledge.curation.confidence import ConfidenceManager
 from backend.knowledge.curation.graph_writer import CurationGraphWriter
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
-from tests.unit.knowledge.curation.conftest import make_entity_dict, make_relationship_dict
+from tests.unit.knowledge.curation.conftest import make_entity_dict
 
 
 def _make_writer() -> tuple[CurationGraphWriter, FakeNeo4jConnection]:
@@ -201,9 +201,7 @@ class TestWriteWithVaultNotePath:
         # Act
         await writer.write(
             entities=entities,
-            relationships=[],
             merge_actions=[],
-            supersession_actions=[],
             event_id="evt-001",
             session_id="sess-001",
             vault_note_path="/vault/sessions/2026-04-22-foo.md",
@@ -230,9 +228,7 @@ class TestWriteWithVaultNotePath:
         # Act
         result = await writer.write(
             entities=entities,
-            relationships=[],
             merge_actions=[],
-            supersession_actions=[],
             event_id="evt-001",
             session_id="sess-001",
             vault_note_path="/vault/sessions/2026-04-22-foo.md",
@@ -246,19 +242,16 @@ class TestWriteWithVaultNotePath:
         assert result.vault_note_provenance_edges == 3
 
     @pytest.mark.asyncio
-    async def test_write_does_not_emit_vault_node_when_only_relationships(self) -> None:
-        # Arrange -- relationships without entities don't anchor to a vault note
-        # because the entities they reference were created in a prior write call
-        # (which already anchored them).
+    async def test_write_does_not_emit_vault_node_without_entities(self) -> None:
+        # Arrange -- no entities means nothing to anchor to a vault note
+        # (relationship writes moved to the ReconciliationEngine at the C2
+        # cutover; write() is now entity-only and early-returns on empty).
         writer, conn = _make_writer()
-        relationships = [make_relationship_dict()]
 
         # Act
         await writer.write(
             entities=[],
-            relationships=relationships,
             merge_actions=[],
-            supersession_actions=[],
             event_id="evt-001",
             session_id="sess-001",
             vault_note_path="/vault/sessions/2026-04-22-foo.md",
@@ -280,9 +273,7 @@ class TestWriteWithVaultNotePath:
         # Act -- no vault_note_path
         result = await writer.write(
             entities=entities,
-            relationships=[],
             merge_actions=[],
-            supersession_actions=[],
             event_id="evt-001",
             session_id="sess-001",
         )
@@ -304,9 +295,7 @@ class TestWriteWithVaultNotePath:
         # Act
         result = await writer.write(
             entities=entities,
-            relationships=[],
             merge_actions=[],
-            supersession_actions=[],
             event_id="evt-001",
             session_id="sess-001",
             vault_note_path="/vault/sessions/2026-04-22-foo.md",
@@ -331,18 +320,14 @@ class TestWriteWithVaultNotePath:
         # Act
         await writer.write(
             entities=entities_t1,
-            relationships=[],
             merge_actions=[],
-            supersession_actions=[],
             event_id="evt-turn-1",
             session_id="sess-001",
             vault_note_path=path,
         )
         await writer.write(
             entities=entities_t2,
-            relationships=[],
             merge_actions=[],
-            supersession_actions=[],
             event_id="evt-turn-2",
             session_id="sess-001",
             vault_note_path=path,
@@ -519,9 +504,7 @@ class TestPhase8RebuildStamps:
         # Act
         await writer.write(
             entities=entities,
-            relationships=[],
             merge_actions=[],
-            supersession_actions=[],
             event_id="evt-001",
             session_id="sess-001",
             vault_note_path="/vault/sessions/2026-04-22-foo.md",

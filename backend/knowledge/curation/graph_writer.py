@@ -1,8 +1,9 @@
 """Curated knowledge graph writer with provenance tracking.
 
-Stage 8: Writes deduplicated, conflict-resolved entities and relationships
-to Neo4j using MERGE semantics. Creates ConversationContext provenance
-anchors, EXTRACTED_FROM edges, and LearningEvent entities.
+Stage 8 (entities): Writes deduplicated entities to Neo4j using MERGE
+semantics. Creates ConversationContext provenance anchors, EXTRACTED_FROM
+edges, and LearningEvent entities. Relationship writes moved to the
+bitemporal ReconciliationEngine at the C2 cutover (curation/reconciliation.py).
 """
 
 import logging
@@ -12,7 +13,6 @@ from datetime import UTC, datetime
 
 from backend.interfaces import EmbeddingProvider
 from backend.knowledge.curation.confidence import ConfidenceManager
-from backend.knowledge.curation.conflict_resolver import SupersessionAction
 from backend.knowledge.curation.deduplication import MergeAction
 from backend.knowledge.storage.graph_executor import GraphExecutor
 
@@ -66,13 +66,13 @@ class SourceMetadata:
 
 @dataclass(slots=True)
 class WriteResult:
-    """Counts of graph write operations performed."""
+    """Counts of graph write operations performed.
+
+    Relationship counts live on ReconcileTurnResult since the C2 cutover.
+    """
 
     entities_created: int = 0
     entities_updated: int = 0
-    relationships_created: int = 0
-    relationships_updated: int = 0
-    relationships_superseded: int = 0
     learning_events_created: int = 0
     provenance_edges_created: int = 0
     source_nodes_created: int = 0
@@ -104,21 +104,20 @@ class CurationGraphWriter:
     async def write(
         self,
         entities: list[dict],
-        relationships: list[dict],
         merge_actions: list[MergeAction],
-        supersession_actions: list[SupersessionAction],
         event_id: str,
         session_id: str,
         source_metadata: SourceMetadata | None = None,
         vault_note_path: str | None = None,
     ) -> WriteResult:
-        """Write curated knowledge to the graph with provenance.
+        """Write curated entities to the graph with provenance.
+
+        Relationships are written by the ReconciliationEngine (C2 cutover),
+        not here.
 
         Args:
             entities: Deduplicated entity list.
-            relationships: Conflict-resolved relationship list.
             merge_actions: Merge instructions from deduplication.
-            supersession_actions: Supersession instructions from conflict resolution.
             event_id: Source event ID for provenance.
             session_id: Conversation session ID.
             source_metadata: Optional external source metadata. When provided,
@@ -135,14 +134,14 @@ class CurationGraphWriter:
         Returns:
             WriteResult with operation counts.
         """
-        if not entities and not relationships and not supersession_actions:
+        if not entities:
             return WriteResult()
 
         result = WriteResult()
         now = datetime.now(UTC).isoformat()
 
         # Create/update provenance anchor (external source or conversation)
-        if entities or relationships:
+        if entities:
             if source_metadata is not None:
                 await self._ensure_external_source(source_metadata, now)
                 result.source_nodes_created += 1
@@ -210,27 +209,6 @@ class CurationGraphWriter:
                 source_metadata.source_type,
             )
 
-        # Upsert relationships
-        for rel in relationships:
-            await self._upsert_relationship(rel, now, event_id)
-            result.relationships_created += 1
-
-        # Apply supersession actions
-        for action in supersession_actions:
-            await self._apply_supersession(action, now)
-            result.relationships_superseded += 1
-
-            # LearningEvent for contradictions, progressions, and corrections
-            if action.reason in ("contradiction", "progression", "correction"):
-                await self._create_learning_event(
-                    action,
-                    session_id,
-                    event_id,
-                    now,
-                    source_metadata=source_metadata,
-                )
-                result.learning_events_created += 1
-
         return result
 
     async def _ensure_conversation_context(self, session_id: str, now: str) -> None:
@@ -266,7 +244,7 @@ class CurationGraphWriter:
             "ON CREATE SET e.entity_type = $entity_type, e.display_name = $display_name, "
             "e.knowledge_domain = $domain, e.confidence = $confidence, "
             "e.source_type = $source_type, e.created_at = $now, e.updated_at = $now, "
-            "e.ontology_version = '1.0.0', e.embedding = $embedding, "
+            "e.ontology_version = $ontology_version, e.embedding = $embedding, "
             "e.description = $description, e.aliases = $aliases, e.status = 'active', "
             "e.provenance = 'extraction' "
             "ON MATCH SET e.confidence = CASE WHEN e.confidence < $reinforced "
@@ -288,45 +266,11 @@ class CurationGraphWriter:
                 "embedding": embedding,
                 "description": description,
                 "aliases": aliases,
-            },
-        )
-
-    async def _upsert_relationship(self, rel: dict, now: str, event_id: str) -> None:
-        """MERGE a relationship into the graph."""
-        source = rel.get("source", "")
-        target = rel.get("target", "")
-        rel_type = rel.get("type", "")
-        confidence = rel.get("confidence", 0.8)
-        source_type = rel.get("source_type", "extracted")
-        temporal_status = rel.get("temporal_status", "current")
-        context = rel.get("context", "")
-
-        # Sanitize rel_type for use in Cypher
-        sanitized_type = re.sub(r"[^A-Z_]", "", rel_type.upper())
-        if not sanitized_type:
-            logger.warning("Invalid relationship type '%s', skipping", rel_type)
-            return
-
-        await self._executor.execute_write(
-            f"MATCH (s:__Entity__ {{id: $source}}) "
-            f"MATCH (t:__Entity__ {{id: $target}}) "
-            f"MERGE (s)-[r:{sanitized_type}]->(t) "
-            "ON CREATE SET r.confidence = $confidence, r.source_event_id = $event_id, "
-            "r.source_type = $source_type, r.created_at = $now, r.updated_at = $now, "
-            "r.ontology_version = '1.0.0', r.status = 'active', "
-            "r.evidence = [$event_id], r.temporal_status = $temporal_status, "
-            "r.context = $context, r.provenance = 'extraction' "
-            "ON MATCH SET r.confidence = $confidence, r.updated_at = $now, "
-            "r.evidence = r.evidence + [$event_id]",
-            {
-                "source": source,
-                "target": target,
-                "confidence": confidence,
-                "event_id": event_id,
-                "source_type": source_type,
-                "now": now,
-                "temporal_status": temporal_status,
-                "context": context,
+                # 4.7 drift fix: stamped from config via RebuildStamps, no
+                # hardcoded version literal.
+                "ontology_version": (
+                    self._rebuild_stamps.ontology_version if self._rebuild_stamps else "1.2.0"
+                ),
             },
         )
 
@@ -494,22 +438,6 @@ class CurationGraphWriter:
 
         return edges
 
-    async def _apply_supersession(self, action: SupersessionAction, now: str) -> None:
-        """Mark an existing relationship as superseded."""
-        sanitized_type = re.sub(r"[^A-Z_]", "", action.old_rel_type.upper())
-        await self._executor.execute_write(
-            f"MATCH (s:__Entity__)-[r:{sanitized_type}]->(t:__Entity__ {{id: $old_target}}) "
-            "WHERE r.status = 'active' "
-            "SET r.status = 'superseded', r.updated_at = $now, "
-            "r.superseded_by = $new_target, r.supersession_reason = $reason",
-            {
-                "old_target": action.old_target_id,
-                "new_target": action.new_target_id,
-                "now": now,
-                "reason": action.reason,
-            },
-        )
-
     def _learned_from_clause(
         self, source_metadata: SourceMetadata | None, session_id: str
     ) -> tuple[str, dict]:
@@ -531,37 +459,42 @@ class CurationGraphWriter:
             {"session_id": session_id},
         )
 
-    async def _create_learning_event(
+    async def create_belief_change_learning_event(
         self,
-        action: SupersessionAction,
+        reason: str,
+        predicate: str,
+        old_target_id: str,
         session_id: str,
         event_id: str,
         now: str,
         source_metadata: SourceMetadata | None = None,
     ) -> None:
-        """Create a LearningEvent entity for a contradiction or progression."""
-        learning_id = f"learning-{event_id}-{action.old_rel_type}-{action.old_target_id}"
+        """Create a LearningEvent for a reconciliation belief change (C2).
+
+        Called by CurationPipeline for every close-bearing engine action
+        (single_supersession / contradiction / progression / cease / retract).
+        Unlike the legacy supersession variant, ABOUT points at the OLD
+        (closed) target -- close actions do not carry the superseding target.
+        """
+        learning_id = f"learning-{event_id}-{predicate}-{old_target_id}"
         learned_clause, learned_params = self._learned_from_clause(source_metadata, session_id)
         await self._executor.execute_write(
             "MERGE (le:__Provenance__:LearningEvent {id: $learning_id}) "
             "ON CREATE SET le.entity_type = 'LearningEvent', "
             "le.display_name = $display_name, le.knowledge_domain = 'bridging', "
-            "le.learning_type = $reason, le.old_relationship = $old_rel, "
-            "le.old_target = $old_target, le.new_target = $new_target, "
+            "le.learning_type = $reason, le.old_relationship = $predicate, "
+            "le.old_target = $old_target, "
             "le.created_at = $now, le.status = 'active' "
             "WITH le " + learned_clause + "WITH le "
-            "MATCH (target:__Entity__ {id: $about_target}) "
+            "MATCH (target:__Entity__ {id: $old_target}) "
             "MERGE (le)-[:ABOUT]->(target)",
             {
                 "learning_id": learning_id,
-                "display_name": f"{action.reason}: {action.old_rel_type} "
-                f"{action.old_target_id} -> {action.new_target_id}",
-                "reason": action.reason,
-                "old_rel": action.old_rel_type,
-                "old_target": action.old_target_id,
-                "new_target": action.new_target_id,
+                "display_name": f"{reason}: {predicate} {old_target_id}",
+                "reason": reason,
+                "predicate": predicate,
+                "old_target": old_target_id,
                 "now": now,
-                "about_target": action.new_target_id,
                 **learned_params,
             },
         )

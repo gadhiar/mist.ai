@@ -107,15 +107,21 @@ class FakeValidationResult:
 class FakeWriteResult:
     entities_created: int = 2
     entities_updated: int = 1
-    relationships_created: int = 1
-    relationships_updated: int = 0
-    relationships_superseded: int = 0
+
+
+@dataclass
+class FakeReconcileResult:
+    appended: int = 1
+    closed: int = 0
+    reinforced: int = 0
+    structural: int = 0
 
 
 @dataclass
 class FakeCurationResult:
     validation_result: FakeValidationResult = None
     write_result: FakeWriteResult = None
+    reconcile_result: FakeReconcileResult = None
     curation_time_ms: float = 45.6
 
     def __post_init__(self):
@@ -123,6 +129,8 @@ class FakeCurationResult:
             self.validation_result = FakeValidationResult()
         if self.write_result is None:
             self.write_result = FakeWriteResult()
+        if self.reconcile_result is None:
+            self.reconcile_result = FakeReconcileResult()
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +285,7 @@ class TestEnabledExtractionRecord:
         assert line["extraction"]["entity_count"] == 2
         assert line["graph_writes"] is not None
         assert line["graph_writes"]["entities_created"] == 2
-        assert line["graph_writes"]["relationships_created"] == 1
+        assert line["graph_writes"]["relationships_appended"] == 1
 
     def test_extraction_and_turn_records_share_event_id(self, tmp_path):
         path = tmp_path / "debug.jsonl"

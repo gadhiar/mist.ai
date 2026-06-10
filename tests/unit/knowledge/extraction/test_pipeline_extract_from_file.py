@@ -136,7 +136,7 @@ class TestExtractFromFileForwardsPath:
 
                 result = MagicMock()
                 result.dedup_result.entities_merged = 0
-                result.conflict_result.conflicts_detected = 0
+                result.reconcile_result.closed = 0
                 return result
 
         recording = _RecordingCuration()

@@ -814,12 +814,14 @@ def _print_extraction_result(result, mode: str) -> None:
     # CurationResult-only fields
     wr = getattr(result, "write_result", None)
     if wr is not None:
+        rr = getattr(result, "reconcile_result", None)
         print(f"\n[extract:{mode}] Graph writes:")
         print(f"  entities_created:      {getattr(wr, 'entities_created', 0)}")
         print(f"  entities_updated:      {getattr(wr, 'entities_updated', 0)}")
-        print(f"  relationships_created: {getattr(wr, 'relationships_created', 0)}")
-        print(f"  relationships_updated: {getattr(wr, 'relationships_updated', 0)}")
-        print(f"  relationships_superseded: {getattr(wr, 'relationships_superseded', 0)}")
+        print(f"  relationships_appended: {getattr(rr, 'appended', 0)}")
+        print(f"  relationships_closed:   {getattr(rr, 'closed', 0)}")
+        print(f"  relationships_reinforced: {getattr(rr, 'reinforced', 0)}")
+        print(f"  relationships_structural: {getattr(rr, 'structural', 0)}")
     curation_ms = getattr(result, "curation_time_ms", None)
     if curation_ms is not None:
         print(f"  curation_time_ms:      {curation_ms:.1f}")

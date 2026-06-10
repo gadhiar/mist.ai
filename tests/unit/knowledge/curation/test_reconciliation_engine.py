@@ -58,6 +58,9 @@ class TestReconcileTurn:
         assert params["valid_from"] == RECORDED_AT
         assert params["valid_to"] is None
         assert params["ontology_version"] == "1.2.0"
+        # Bug A regression guard (rel side): extraction-time edges must carry
+        # provenance='extraction' (moved here from the old writer tests).
+        assert "r.provenance = 'extraction'" in query
 
     @pytest.mark.asyncio
     async def test_stated_start_date_lands_in_valid_from(self):

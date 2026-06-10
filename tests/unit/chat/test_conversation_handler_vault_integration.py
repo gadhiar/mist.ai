@@ -516,10 +516,10 @@ class TestUserVaultCPatternTrigger:
     async def test_user_vault_re_renders_when_extraction_touches_user_source(self):
         # Arrange: extraction pipeline that returns a CurationResult-like
         # object with a User-source relationship in validated_relationships.
-        from backend.knowledge.curation.conflict_resolver import ConflictResolutionResult
         from backend.knowledge.curation.deduplication import DeduplicationResult
         from backend.knowledge.curation.graph_writer import WriteResult
         from backend.knowledge.curation.pipeline import CurationResult
+        from backend.knowledge.curation.reconciliation import ReconcileTurnResult
 
         class FakeUserScopePipeline:
             async def extract_from_utterance(self, **kwargs):
@@ -528,7 +528,7 @@ class TestUserVaultCPatternTrigger:
                     dedup_result=DeduplicationResult(
                         entities=[], merge_actions=[], entities_merged=0
                     ),
-                    conflict_result=ConflictResolutionResult(relationships=[]),
+                    reconcile_result=ReconcileTurnResult(),
                     curation_time_ms=1.0,
                     validated_entities=[],
                     validated_relationships=[
@@ -561,10 +561,10 @@ class TestUserVaultCPatternTrigger:
 
     @pytest.mark.asyncio
     async def test_user_vault_does_not_re_render_when_extraction_misses_user(self):
-        from backend.knowledge.curation.conflict_resolver import ConflictResolutionResult
         from backend.knowledge.curation.deduplication import DeduplicationResult
         from backend.knowledge.curation.graph_writer import WriteResult
         from backend.knowledge.curation.pipeline import CurationResult
+        from backend.knowledge.curation.reconciliation import ReconcileTurnResult
 
         class FakeNoUserPipeline:
             async def extract_from_utterance(self, **kwargs):
@@ -573,7 +573,7 @@ class TestUserVaultCPatternTrigger:
                     dedup_result=DeduplicationResult(
                         entities=[], merge_actions=[], entities_merged=0
                     ),
-                    conflict_result=ConflictResolutionResult(relationships=[]),
+                    reconcile_result=ReconcileTurnResult(),
                     curation_time_ms=1.0,
                     validated_entities=[{"entity_id": "neo4j", "entity_type": "Technology"}],
                     validated_relationships=[

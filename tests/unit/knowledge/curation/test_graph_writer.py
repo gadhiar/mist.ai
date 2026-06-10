@@ -1,10 +1,15 @@
-"""Tests for CurationGraphWriter."""
+"""Tests for CurationGraphWriter (entity + provenance writes).
+
+Relationship writes and supersession moved to the ReconciliationEngine at
+the C2 cutover -- see test_reconciliation_engine.py for that coverage
+(including the Bug-A r.provenance='extraction' regression guard).
+"""
 
 import pytest
 
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
-from tests.unit.knowledge.curation.conftest import make_entity_dict, make_relationship_dict
+from tests.unit.knowledge.curation.conftest import make_entity_dict
 
 
 class TestEntityUpsert:
@@ -20,9 +25,7 @@ class TestEntityUpsert:
         entities = [make_entity_dict(entity_id="python", display_name="Python")]
         result = await writer.write(
             entities=entities,
-            relationships=[],
             merge_actions=[],
-            supersession_actions=[],
             event_id="evt-001",
             session_id="sess-001",
         )
@@ -31,30 +34,35 @@ class TestEntityUpsert:
         conn.assert_write_executed("MERGE")
         conn.assert_write_executed("__Entity__")
 
-
-class TestRelationshipUpsert:
     @pytest.mark.asyncio
-    async def test_creates_relationship_with_merge(self):
+    async def test_entity_version_stamp_is_parameterized(self):
+        """4.7 drift fix: no hardcoded ontology version literal in the MERGE."""
         from backend.knowledge.curation.confidence import ConfidenceManager
-        from backend.knowledge.curation.graph_writer import CurationGraphWriter
+        from backend.knowledge.curation.graph_writer import CurationGraphWriter, RebuildStamps
 
         conn = FakeNeo4jConnection()
         executor = FakeGraphExecutor(connection=conn)
-        writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
+        writer = CurationGraphWriter(
+            executor,
+            FakeEmbeddingGenerator(),
+            ConfidenceManager(),
+            rebuild_stamps=RebuildStamps(
+                ontology_version="9.9.9", extraction_version="x", model_hash="m"
+            ),
+        )
 
-        relationships = [make_relationship_dict(source="user", target="python", rel_type="USES")]
-        result = await writer.write(
-            entities=[],
-            relationships=relationships,
+        await writer.write(
+            entities=[make_entity_dict(entity_id="rust")],
             merge_actions=[],
-            supersession_actions=[],
             event_id="evt-001",
             session_id="sess-001",
         )
 
-        assert result.relationships_created + result.relationships_updated >= 1
-        conn.assert_write_executed("MERGE")
-        conn.assert_write_executed("USES")
+        entity_writes = [(q, p) for q, p in conn.writes if "MERGE (e:__Entity__" in q]
+        assert len(entity_writes) == 1
+        query, params = entity_writes[0]
+        assert "e.ontology_version = $ontology_version" in query
+        assert params["ontology_version"] == "9.9.9"
 
 
 class TestProvenance:
@@ -71,9 +79,7 @@ class TestProvenance:
         entities = [make_entity_dict(entity_id="rust", display_name="Rust")]
         await writer.write(
             entities=entities,
-            relationships=[],
             merge_actions=[],
-            supersession_actions=[],
             event_id="evt-001",
             session_id="sess-001",
         )
@@ -84,42 +90,6 @@ class TestProvenance:
         assert (
             "e.provenance = 'extraction'" in entity_writes[0]
         ), f"Expected provenance in ON CREATE SET clause, got:\n{entity_writes[0]}"
-
-    @pytest.mark.asyncio
-    async def test_new_relationship_gets_provenance_extraction(self):
-        """Bug A (rel-side): new relationships from extraction must have
-        provenance='extraction'.
-
-        Cluster 4's original Bug A fix added e.provenance='extraction' to entity
-        ON CREATE only; the relationship MERGE was overlooked, leaving 100% of
-        extraction-time relationships with provenance=NULL until the 2026-05-06
-        V6 review caught it. Cross-layer audit, rebuild-from-vault, and any
-        Cypher filtered by r.provenance depend on this field being populated
-        for extraction-time edges.
-        """
-        from backend.knowledge.curation.confidence import ConfidenceManager
-        from backend.knowledge.curation.graph_writer import CurationGraphWriter
-
-        conn = FakeNeo4jConnection()
-        executor = FakeGraphExecutor(connection=conn)
-        writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
-
-        relationships = [make_relationship_dict(source="user", target="python", rel_type="USES")]
-        await writer.write(
-            entities=[],
-            relationships=relationships,
-            merge_actions=[],
-            supersession_actions=[],
-            event_id="evt-002",
-            session_id="sess-002",
-        )
-
-        rel_writes = [q for q, _ in conn.writes if "MERGE (s)-[r:" in q and "USES" in q]
-        assert len(rel_writes) == 1, f"Expected 1 relationship MERGE, got {len(rel_writes)}"
-        assert "r.provenance = 'extraction'" in rel_writes[0], (
-            "Expected r.provenance = 'extraction' in ON CREATE SET clause; "
-            f"Bug A regression on rel side. Got:\n{rel_writes[0]}"
-        )
 
     @pytest.mark.asyncio
     async def test_creates_conversation_context(self):
@@ -133,9 +103,7 @@ class TestProvenance:
         entities = [make_entity_dict(entity_id="python")]
         await writer.write(
             entities=entities,
-            relationships=[],
             merge_actions=[],
-            supersession_actions=[],
             event_id="evt-001",
             session_id="sess-001",
         )
@@ -144,37 +112,31 @@ class TestProvenance:
         conn.assert_write_executed("EXTRACTED_FROM")
 
 
-class TestSupersession:
+class TestBeliefChangeLearningEvent:
     @pytest.mark.asyncio
-    async def test_marks_old_relationship_superseded(self):
+    async def test_creates_learning_event_for_belief_change(self):
         from backend.knowledge.curation.confidence import ConfidenceManager
-        from backend.knowledge.curation.conflict_resolver import SupersessionAction
         from backend.knowledge.curation.graph_writer import CurationGraphWriter
 
         conn = FakeNeo4jConnection()
         executor = FakeGraphExecutor(connection=conn)
         writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
 
-        actions = [
-            SupersessionAction(
-                old_rel_type="WORKS_AT",
-                old_target_id="old-company",
-                new_target_id="new-company",
-                reason="functional_supersession",
-            )
-        ]
-
-        result = await writer.write(
-            entities=[],
-            relationships=[],
-            merge_actions=[],
-            supersession_actions=actions,
-            event_id="evt-001",
+        await writer.create_belief_change_learning_event(
+            reason="contradiction",
+            predicate="DISLIKES",
+            old_target_id="rust",
             session_id="sess-001",
+            event_id="evt-001",
+            now="2026-06-10T12:00:00+00:00",
         )
 
-        assert result.relationships_superseded == 1
-        conn.assert_write_executed("superseded")
+        learning_writes = [(q, p) for q, p in conn.writes if "LearningEvent" in q]
+        assert len(learning_writes) == 1
+        query, params = learning_writes[0]
+        assert params["learning_id"] == "learning-evt-001-DISLIKES-rust"
+        assert params["reason"] == "contradiction"
+        assert "MERGE (le)-[:ABOUT]->(target)" in query
 
 
 class TestEmptyInput:
@@ -189,13 +151,10 @@ class TestEmptyInput:
 
         result = await writer.write(
             entities=[],
-            relationships=[],
             merge_actions=[],
-            supersession_actions=[],
             event_id="evt-001",
             session_id="sess-001",
         )
 
         assert result.entities_created == 0
-        assert result.relationships_created == 0
         conn.assert_no_writes()

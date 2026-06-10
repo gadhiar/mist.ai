@@ -1,36 +1,47 @@
-"""Curation pipeline orchestrator.
+"""Curation pipeline orchestrator (C2 cutover).
 
-Stages 7-8: Coordinates deduplication, conflict resolution, and graph
-writing. Called by ExtractionPipeline after Stage 6 validation when
-curation is enabled.
+Stage 7a: EntityDeduplicator -- match against existing graph entities.
+Stage 7b+8 (relationships): ReconciliationEngine -- schema-driven bitemporal
+reconcile + write (replaces the deleted ConflictResolver and the writer's
+relationship path).
+Stage 8 (entities): CurationGraphWriter -- entity MERGE + provenance.
+
+All graph mutation for a turn runs inside one asyncio.Lock acquisition
+(Inv-A9): extraction tasks are fire-and-forget concurrent, so the
+dedup-read -> reconcile-read-modify-write sequence must serialize.
 """
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from backend.knowledge.curation.conflict_resolver import ConflictResolutionResult, ConflictResolver
 from backend.knowledge.curation.deduplication import DeduplicationResult, EntityDeduplicator
 from backend.knowledge.curation.graph_writer import CurationGraphWriter, SourceMetadata, WriteResult
+from backend.knowledge.curation.reconciliation import (
+    ActionKind,
+    ReconcileTurnResult,
+    ReconciliationEngine,
+)
 from backend.knowledge.extraction.validator import ValidationResult
 
 logger = logging.getLogger(__name__)
+
+_LEARNING_REASONS = {"single_supersession", "contradiction", "progression", "cease", "retract"}
 
 
 @dataclass(slots=True)
 class CurationResult:
     """Combined result of the curation pipeline.
 
-    `validated_entities` and `validated_relationships` carry forward the
-    post-validation inputs so downstream consumers (e.g., user.md C-pattern
-    auto-render trigger detection) can inspect what was extracted without
-    re-querying the graph or threading a separate ValidationResult through.
+    `validated_entities`/`validated_relationships` carry forward post-validation
+    inputs for downstream trigger detection (e.g. user.md C-pattern render).
     """
 
     write_result: WriteResult
     dedup_result: DeduplicationResult
-    conflict_result: ConflictResolutionResult
+    reconcile_result: ReconcileTurnResult
     curation_time_ms: float
     stage_errors: list[str] = field(default_factory=list)
     validated_entities: list[dict] = field(default_factory=list)
@@ -38,22 +49,19 @@ class CurationResult:
 
 
 class CurationPipeline:
-    """Orchestrates stages 7-8 of the knowledge pipeline.
-
-    Stage 7a: EntityDeduplicator -- match against existing graph entities.
-    Stage 7b: ConflictResolver -- detect supersessions and contradictions.
-    Stage 8:  CurationGraphWriter -- MERGE entities/relationships + provenance.
-    """
+    """Orchestrates stages 7-8 of the knowledge pipeline (bitemporal)."""
 
     def __init__(
         self,
         deduplicator: EntityDeduplicator,
-        conflict_resolver: ConflictResolver,
+        reconciliation_engine: ReconciliationEngine,
         graph_writer: CurationGraphWriter,
+        write_lock: asyncio.Lock | None = None,
     ) -> None:
         self._deduplicator = deduplicator
-        self._conflict_resolver = conflict_resolver
+        self._engine = reconciliation_engine
         self._graph_writer = graph_writer
+        self._write_lock = write_lock or asyncio.Lock()
 
     async def curate_and_store(
         self,
@@ -64,115 +72,100 @@ class CurationPipeline:
         vault_note_path: str | None = None,
         recorded_at: str | None = None,
     ) -> CurationResult:
-        """Run curation stages and write to graph.
+        """Run curation stages and write to graph, serialized per turn.
 
-        Short-circuits on empty entities. Each stage wrapped in
-        try/except -- failures are logged and pipeline continues with
-        best-effort data. No rollback -- MERGE is idempotent, partial
-        writes are recoverable via regeneration.
-
-        Args:
-            validation_result: Output of Stage 6 validation.
-            event_id: Source event ID for provenance.
-            session_id: Conversation session ID.
-            source_metadata: Optional external source metadata. Forwarded
-                to `CurationGraphWriter.write` for document provenance.
-            vault_note_path: Optional vault session-note path (ADR-010
-                Cluster 8 Phase 6). Forwarded to `CurationGraphWriter.write`
-                so every upserted entity gets a DERIVED_FROM edge to its
-                source vault note.
-
-        Returns:
-            CurationResult with combined stage results (may be partial
-            if a stage failed).
+        recorded_at: the source event's timestamp (fact-time, C1). Defaults to
+        wall-clock only for non-conversation paths (document ingest) that
+        carry no event.
         """
         start = time.perf_counter()
         stage_errors: list[str] = []
-        # Fact-time for bitemporal edges; wall-clock only for non-conversation
-        # paths (document ingest) that carry no event. Consumed by the
-        # reconciliation engine at the Task-8 cutover.
         recorded_at = recorded_at or datetime.now(UTC).isoformat()
 
         entities = validation_result.entities
         relationships = validation_result.relationships
-
-        # Defaults for graceful degradation
         empty_dedup = DeduplicationResult(entities=[], merge_actions=[], entities_merged=0)
-        empty_conflict = ConflictResolutionResult(relationships=[])
 
-        # Short-circuit on empty
         if not entities and not relationships:
-            elapsed = (time.perf_counter() - start) * 1000
             return CurationResult(
                 write_result=WriteResult(),
                 dedup_result=empty_dedup,
-                conflict_result=empty_conflict,
-                curation_time_ms=elapsed,
+                reconcile_result=ReconcileTurnResult(),
+                curation_time_ms=(time.perf_counter() - start) * 1000,
                 validated_entities=entities,
                 validated_relationships=relationships,
             )
 
-        # Stage 7a: Deduplication
-        try:
-            dedup_result = await self._deduplicator.deduplicate(entities)
-            logger.debug("Stage 7a (dedup): %d merged", dedup_result.entities_merged)
-        except Exception as e:
-            logger.error("Stage 7a (dedup) failed, continuing with raw entities: %s", e)
-            stage_errors.append(f"Dedup failed: {e}")
-            dedup_result = DeduplicationResult(
-                entities=entities, merge_actions=[], entities_merged=0
-            )
-
-        # Stage 7b: Conflict resolution
-        try:
-            conflict_result = await self._conflict_resolver.resolve(
-                dedup_result.entities, relationships
-            )
-            logger.debug(
-                "Stage 7b (conflict): %d detected, %d resolved",
-                conflict_result.conflicts_detected,
-                conflict_result.conflicts_resolved,
-            )
-        except Exception as e:
-            logger.error("Stage 7b (conflict) failed, continuing with raw relationships: %s", e)
-            stage_errors.append(f"Conflict resolution failed: {e}")
-            conflict_result = ConflictResolutionResult(relationships=relationships)
-
-        # Stage 8: Graph write + provenance
-        try:
-            write_result = await self._graph_writer.write(
-                entities=dedup_result.entities,
-                relationships=conflict_result.relationships,
-                merge_actions=dedup_result.merge_actions,
-                supersession_actions=conflict_result.supersession_actions,
-                event_id=event_id,
-                session_id=session_id,
-                source_metadata=source_metadata,
-                vault_note_path=vault_note_path,
-            )
-            doc_prov_msg = ""
-            if write_result.document_provenance_edges > 0:
-                doc_prov_msg = (
-                    ", %d document provenance edges" % write_result.document_provenance_edges
+        async with self._write_lock:  # Inv-A9: one turn's read-modify-write at a time
+            # Stage 7a: Deduplication
+            try:
+                dedup_result = await self._deduplicator.deduplicate(entities)
+                logger.debug("Stage 7a (dedup): %d merged", dedup_result.entities_merged)
+            except Exception as e:
+                logger.error("Stage 7a (dedup) failed, continuing with raw entities: %s", e)
+                stage_errors.append(f"Dedup failed: {e}")
+                dedup_result = DeduplicationResult(
+                    entities=entities, merge_actions=[], entities_merged=0
                 )
-            logger.debug(
-                "Stage 8 (write): %d entities, %d relationships, %d provenance edges%s",
-                write_result.entities_created + write_result.entities_updated,
-                write_result.relationships_created,
-                write_result.provenance_edges_created,
-                doc_prov_msg,
-            )
-        except Exception as e:
-            logger.error("Stage 8 (write) failed: %s", e)
-            stage_errors.append(f"Graph write failed: {e}")
-            write_result = WriteResult()
+
+            # Stage 8 (entities + provenance)
+            try:
+                write_result = await self._graph_writer.write(
+                    entities=dedup_result.entities,
+                    merge_actions=dedup_result.merge_actions,
+                    event_id=event_id,
+                    session_id=session_id,
+                    source_metadata=source_metadata,
+                    vault_note_path=vault_note_path,
+                )
+            except Exception as e:
+                logger.error("Stage 8 (entity write) failed: %s", e)
+                stage_errors.append(f"Graph write failed: {e}")
+                write_result = WriteResult()
+
+            # Stage 7b+8 (relationships): bitemporal reconcile + write
+            try:
+                reconcile_result = await self._engine.reconcile_turn(
+                    relationships,
+                    recorded_at=recorded_at,
+                    event_id=event_id,
+                    session_id=session_id,
+                )
+                logger.debug(
+                    "Stage 7b/8 (reconcile): %d appended, %d closed, %d reinforced, %d flags",
+                    reconcile_result.appended,
+                    reconcile_result.closed,
+                    reconcile_result.reinforced,
+                    len(reconcile_result.flags),
+                )
+            except Exception as e:
+                logger.error("Stage 7b/8 (reconcile) failed: %s", e)
+                stage_errors.append(f"Reconciliation failed: {e}")
+                reconcile_result = ReconcileTurnResult()
+
+            # LearningEvents for belief changes (audit layer)
+            try:
+                now_iso = datetime.now(UTC).isoformat()
+                for act in reconcile_result.actions:
+                    if act.kind is ActionKind.CLOSE_TRANSACTION and act.reason in _LEARNING_REASONS:
+                        await self._graph_writer.create_belief_change_learning_event(
+                            reason=act.reason,
+                            predicate=act.predicate,
+                            old_target_id=act.target,
+                            session_id=session_id,
+                            event_id=event_id,
+                            now=now_iso,
+                            source_metadata=source_metadata,
+                        )
+                        write_result.learning_events_created += 1
+            except Exception as e:
+                logger.error("LearningEvent emission failed: %s", e)
+                stage_errors.append(f"LearningEvent emission failed: {e}")
 
         elapsed = (time.perf_counter() - start) * 1000
         if stage_errors:
             logger.warning(
-                "Curation completed with %d stage errors in %.1fms",
-                len(stage_errors),
-                elapsed,
+                "Curation completed with %d stage errors in %.1fms", len(stage_errors), elapsed
             )
         else:
             logger.info("Curation complete in %.1fms", elapsed)
@@ -180,7 +173,7 @@ class CurationPipeline:
         return CurationResult(
             write_result=write_result,
             dedup_result=dedup_result,
-            conflict_result=conflict_result,
+            reconcile_result=reconcile_result,
             curation_time_ms=elapsed,
             stage_errors=stage_errors,
             validated_entities=entities,

@@ -603,12 +603,12 @@ class ExtractionPipeline:
             total_ms = (time.perf_counter() - pipeline_start) * 1000
             logger.info(
                 "Pipeline complete in %.1fms: %d entities, %d relationships "
-                "(curation: %d merged, %d conflicts) from '%s'",
+                "(curation: %d merged, %d closed) from '%s'",
                 total_ms,
                 len(result.entities),
                 len(result.relationships),
                 curation_result.dedup_result.entities_merged,
-                curation_result.conflict_result.conflicts_detected,
+                curation_result.reconcile_result.closed,
                 utterance[:60],
             )
 

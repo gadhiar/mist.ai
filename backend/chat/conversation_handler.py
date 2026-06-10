@@ -1687,10 +1687,12 @@ class ConversationHandler:
                 entity_count = len(result.entities)
                 rel_count = len(result.relationships)
             elif hasattr(result, "write_result"):
-                # CurationResult path (curation enabled)
+                # CurationResult path (curation enabled). Relationship counts
+                # live on reconcile_result since the C2 cutover.
                 wr = result.write_result
                 entity_count = wr.entities_created + wr.entities_updated
-                rel_count = wr.relationships_created
+                rr = result.reconcile_result
+                rel_count = rr.appended + rr.structural
             else:
                 entity_count = 0
                 rel_count = 0

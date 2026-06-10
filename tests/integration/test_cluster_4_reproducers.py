@@ -41,9 +41,7 @@ class TestBugAProvenance:
         }
         await writer.write(
             entities=[entity],
-            relationships=[],
             merge_actions=[],
-            supersession_actions=[],
             event_id="evt-bug-a",
             session_id="sess-bug-a",
         )

@@ -22,7 +22,7 @@ Record shape:
      "event_id": "...",
      "parse_ok": true,
      "extraction": {entity_count, relationship_count, avg_confidence, duration_ms},
-     "graph_writes": {entities_created, entities_updated, relationships_created, ...} | null}
+     "graph_writes": {entities_created, entities_updated, relationships_appended, ...} | null}
 
 Cluster 5 extension: three additional record types, each independently gated:
 
@@ -687,12 +687,16 @@ class _LiveTurnRecord(TurnRecord):
         }
 
         if write_result is not None:
+            # Relationship counts come from the reconciliation engine since the
+            # C2 cutover; entity counts stay on WriteResult.
+            reconcile = getattr(result, "reconcile_result", None)
             self._graph_writes = {
                 "entities_created": getattr(write_result, "entities_created", 0),
                 "entities_updated": getattr(write_result, "entities_updated", 0),
-                "relationships_created": getattr(write_result, "relationships_created", 0),
-                "relationships_updated": getattr(write_result, "relationships_updated", 0),
-                "relationships_superseded": getattr(write_result, "relationships_superseded", 0),
+                "relationships_appended": getattr(reconcile, "appended", 0),
+                "relationships_closed": getattr(reconcile, "closed", 0),
+                "relationships_reinforced": getattr(reconcile, "reinforced", 0),
+                "relationships_structural": getattr(reconcile, "structural", 0),
             }
 
     def flush_extraction(self) -> None:

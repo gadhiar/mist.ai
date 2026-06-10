@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 
 from backend.knowledge.curation.confidence import ConfidenceManager
-from backend.knowledge.curation.conflict_resolver import SupersessionAction
 from backend.knowledge.curation.graph_writer import CurationGraphWriter
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
@@ -43,16 +42,12 @@ async def test_create_learning_event_uses_provenance_label() -> None:
     executor = FakeGraphExecutor(connection=conn)
     writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
 
-    action = SupersessionAction(
-        old_rel_type="KNOWS",
-        old_target_id="entity-old-001",
-        new_target_id="entity-new-002",
+    # Act (C2 cutover: action-shaped public method replaces the
+    # SupersessionAction-typed private one)
+    await writer.create_belief_change_learning_event(
         reason="contradiction",
-    )
-
-    # Act
-    await writer._create_learning_event(
-        action=action,
+        predicate="KNOWS",
+        old_target_id="entity-old-001",
         session_id="test-session-456",
         event_id="evt-001",
         now="2026-04-17T00:00:00Z",

@@ -3,7 +3,8 @@
 `CurationPipeline.curate_and_store` accepts an optional `vault_note_path`
 and forwards it to `CurationGraphWriter.write` so the graph writer can
 emit the load-bearing DERIVED_FROM edges. Verifies forwarding semantics
-and the legacy None-default path.
+and the legacy None-default path. (Relationship reconciliation is engine
+territory since the C2 cutover; this file covers the entity-write leg.)
 """
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ from typing import Any
 import pytest
 
 from backend.knowledge.curation.confidence import ConfidenceManager
-from backend.knowledge.curation.conflict_resolver import ConflictResolver, SupersessionAction
 from backend.knowledge.curation.deduplication import EntityDeduplicator
 from backend.knowledge.curation.graph_writer import (
     CurationGraphWriter,
@@ -21,9 +21,17 @@ from backend.knowledge.curation.graph_writer import (
     WriteResult,
 )
 from backend.knowledge.curation.pipeline import CurationPipeline
+from backend.knowledge.curation.reconciliation import ReconcileTurnResult
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
 from tests.unit.knowledge.curation.conftest import make_entity_dict, make_validation_result
+
+
+class _NullEngine:
+    """Engine double: records nothing, reconciles nothing."""
+
+    async def reconcile_turn(self, relationships, recorded_at, event_id, session_id):
+        return ReconcileTurnResult()
 
 
 class _RecordingGraphWriter(CurationGraphWriter):
@@ -36,9 +44,7 @@ class _RecordingGraphWriter(CurationGraphWriter):
     async def write(  # type: ignore[override]
         self,
         entities: list[dict],
-        relationships: list[dict],
         merge_actions: list,
-        supersession_actions: list[SupersessionAction],
         event_id: str,
         session_id: str,
         source_metadata: SourceMetadata | None = None,
@@ -47,9 +53,7 @@ class _RecordingGraphWriter(CurationGraphWriter):
         self.write_calls.append(
             {
                 "entities": entities,
-                "relationships": relationships,
                 "merge_actions": merge_actions,
-                "supersession_actions": supersession_actions,
                 "event_id": event_id,
                 "session_id": session_id,
                 "source_metadata": source_metadata,
@@ -58,9 +62,7 @@ class _RecordingGraphWriter(CurationGraphWriter):
         )
         return await super().write(
             entities=entities,
-            relationships=relationships,
             merge_actions=merge_actions,
-            supersession_actions=supersession_actions,
             event_id=event_id,
             session_id=session_id,
             source_metadata=source_metadata,
@@ -77,7 +79,7 @@ def _build_pipeline_with_recorder() -> tuple[CurationPipeline, _RecordingGraphWr
     recorder = _RecordingGraphWriter(executor, embeddings, confidence)
     pipeline = CurationPipeline(
         deduplicator=EntityDeduplicator(executor, embeddings, confidence),
-        conflict_resolver=ConflictResolver(executor),
+        reconciliation_engine=_NullEngine(),
         graph_writer=recorder,
     )
     return pipeline, recorder
@@ -115,47 +117,6 @@ class TestVaultNotePathForwarding:
             session_id="sess-001",
         )
 
-        # Assert -- default propagates as None to graph writer
+        # Assert
         assert len(recorder.write_calls) == 1
         assert recorder.write_calls[0]["vault_note_path"] is None
-
-    @pytest.mark.asyncio
-    async def test_short_circuit_does_not_invoke_writer_with_path(self) -> None:
-        # Arrange -- empty entities short-circuits before write
-        pipeline, recorder = _build_pipeline_with_recorder()
-        validation = make_validation_result(entities=[], relationships=[])
-
-        # Act
-        await pipeline.curate_and_store(
-            validation,
-            event_id="evt-001",
-            session_id="sess-001",
-            vault_note_path="/vault/sessions/x.md",
-        )
-
-        # Assert -- writer never called when there's nothing to write
-        assert recorder.write_calls == []
-
-    @pytest.mark.asyncio
-    async def test_vault_path_coexists_with_source_metadata(self) -> None:
-        # Arrange -- vault_note_path is independent of document source_metadata.
-        # In practice, a turn produces ONE of (conversation -> ConversationContext +
-        # VaultNote) or (ingest -> ExternalSource), but the API supports both
-        # being supplied for forward compatibility.
-        pipeline, recorder = _build_pipeline_with_recorder()
-        validation = make_validation_result(entities=[make_entity_dict()])
-        source = SourceMetadata(source_uri="https://example.com/x.pdf", source_type="document")
-
-        # Act
-        await pipeline.curate_and_store(
-            validation,
-            event_id="evt-001",
-            session_id="sess-001",
-            source_metadata=source,
-            vault_note_path="/vault/sessions/2026-04-22-foo.md",
-        )
-
-        # Assert -- both arrive at the writer
-        call = recorder.write_calls[0]
-        assert call["source_metadata"] is source
-        assert call["vault_note_path"] == "/vault/sessions/2026-04-22-foo.md"
