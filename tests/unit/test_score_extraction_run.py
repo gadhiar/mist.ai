@@ -119,3 +119,118 @@ class TestBuildProducedIndex:
         index = build_produced_index(records)
         assert "I use Rust" in index
         assert index["I use Rust"].entities == (GoldEntity(id="rust", type="Technology"),)
+
+
+from eval_harness.score_extraction_run import GoldProbe, Produced, score_run  # noqa: E402
+
+
+def _produced(utterance, entities, rels, type_by_id):
+    return Produced(
+        utterance=utterance,
+        parse_ok=True,
+        entities=tuple(entities),
+        entity_type_by_id=type_by_id,
+        relationships=tuple(rels),
+    )
+
+
+class TestScoreRun:
+    def test_perfect_match_scores_1(self):
+        probe = GoldProbe(
+            tag="t",
+            utterance="I use Rust",
+            entities=(GoldEntity("rust", "Technology"),),
+            relationships=(GoldRel("user", "User", "USES", "rust", "Technology"),),
+        )
+        produced = {
+            "I use Rust": _produced(
+                "I use Rust",
+                [GoldEntity("rust", "Technology")],
+                [{"source": "user", "target": "rust", "predicate": "USES", "properties": {}}],
+                {"rust": "Technology", "user": "User"},
+            )
+        }
+        r = score_run([probe], produced)
+        assert r.entity_precision == 1.0 and r.entity_recall == 1.0
+        assert r.rel_precision == 1.0 and r.rel_recall == 1.0
+        assert r.typing_accuracy == 1.0
+        assert r.related_to_rate == 0.0
+
+    def test_mistyped_relationship_fails_typing(self):
+        # USES with target type Person is constraint-invalid (allowed target = Technology).
+        probe = GoldProbe(
+            tag="t",
+            utterance="x",
+            entities=(GoldEntity("sarah", "Person"),),
+            relationships=(),
+        )
+        produced = {
+            "x": _produced(
+                "x",
+                [GoldEntity("sarah", "Person")],
+                [{"source": "user", "target": "sarah", "predicate": "USES", "properties": {}}],
+                {"sarah": "Person", "user": "User"},
+            )
+        }
+        r = score_run([probe], produced)
+        assert r.typing_accuracy == 0.0  # 0 of 1 produced rels constraint-valid
+
+    def test_related_to_rate(self):
+        probe = GoldProbe(tag="t", utterance="x", entities=(), relationships=())
+        produced = {
+            "x": _produced(
+                "x",
+                [],
+                [
+                    {"source": "a", "target": "b", "predicate": "RELATED_TO", "properties": {}},
+                    {"source": "a", "target": "c", "predicate": "USES", "properties": {}},
+                ],
+                {},
+            )
+        }
+        r = score_run([probe], produced)
+        assert r.related_to_rate == 0.5
+
+    def test_valid_time_accuracy_prefix_match(self):
+        probe = GoldProbe(
+            tag="t",
+            utterance="x",
+            entities=(GoldEntity("rust", "Technology"),),
+            relationships=(
+                GoldRel("user", "User", "USES", "rust", "Technology", valid_from="2026-05"),
+            ),
+        )
+        produced = {
+            "x": _produced(
+                "x",
+                [GoldEntity("rust", "Technology")],
+                [
+                    {
+                        "source": "user",
+                        "target": "rust",
+                        "predicate": "USES",
+                        "properties": {"start_date": "2026-05-01"},
+                    }
+                ],
+                {"rust": "Technology", "user": "User"},
+            )
+        }
+        r = score_run([probe], produced)
+        assert r.valid_time_accuracy == 1.0  # gold "2026-05" prefix-matches produced "2026-05-01"
+
+    def test_unmatched_probe_counts_as_missing_recall(self):
+        probe = GoldProbe(
+            tag="t",
+            utterance="never produced",
+            entities=(GoldEntity("rust", "Technology"),),
+            relationships=(GoldRel("user", "User", "USES", "rust", "Technology"),),
+        )
+        r = score_run([probe], {})
+        assert r.entity_recall == 0.0 and r.rel_recall == 0.0
+        assert r.matched_probes == 0
+
+    def test_negative_probe_violation_counted(self):
+        probe = GoldProbe(tag="neg", utterance="x", entities=(), relationships=())
+        produced = {"x": _produced("x", [GoldEntity("a", "Topic")], [], {"a": "Topic"})}
+        r = score_run([probe], produced)
+        assert r.negative_probes == 1 and r.negative_violations == 1
