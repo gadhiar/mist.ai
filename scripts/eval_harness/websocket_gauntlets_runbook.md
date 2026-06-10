@@ -224,6 +224,73 @@ Notes:
 - The live container is not recreated and the live backend's env is not
   modified -- only the `exec`-spawned process sees the overrides.
 
+### The 4th leg: isolating Neo4j (throwaway-quad)
+
+The trio above redirects the event store / vault / sidecar. The graph is the
+4th store and the Phase-2 source of truth, so an eval run must NOT touch the
+live Neo4j either. Neo4j Community has a single user database, so isolation is
+by a SEPARATE INSTANCE (`mist-neo4j-eval`), selected via `NEO4J_URI`. The
+backend refuses (fail-closed) to connect to the live graph when
+`MIST_EVAL_ISOLATION=1` is set -- so every eval run MUST set it.
+
+Lifecycle:
+
+```bash
+# 1. Bring up the disposable eval Neo4j (same project network; tmpfs-backed).
+docker compose -f docker-compose.yml -f docker-compose.eval-neo4j.yml \
+  --profile eval up -d mist-neo4j-eval
+
+# 2. Seed the eval graph's MIST-identity anchors (writes to the EVAL instance).
+MSYS_NO_PATHCONV=1 docker compose exec -T \
+  -e MIST_EVAL_ISOLATION=1 \
+  -e NEO4J_URI=bolt://mist-neo4j-eval:7687 \
+  mist-backend python scripts/mist_admin.py seed
+
+# 3. Run the eval/replay against the quad (trio + eval Neo4j).
+MSYS_NO_PATHCONV=1 docker compose exec -T \
+  -e MIST_EVAL_ISOLATION=1 \
+  -e NEO4J_URI=bolt://mist-neo4j-eval:7687 \
+  -e MIST_SIDECAR_DB_PATH=/app/data/eval-run/vault_sidecar.db \
+  -e EVENT_STORE_DB_PATH=/app/data/eval-run/event_store.db \
+  -e MIST_VAULT_ROOT=/app/data/eval-run/vault \
+  mist-backend python scripts/mist_admin.py replay \
+  data/ingest/<corpus>.jsonl \
+  --output data/ingest/<corpus>-eval-output.jsonl \
+  --session-id eval-<tag>
+
+# 4. Teardown (removes the container + its tmpfs graph).
+docker compose -f docker-compose.yml -f docker-compose.eval-neo4j.yml \
+  --profile eval rm -sfv mist-neo4j-eval
+```
+
+Notes:
+- `MIST_EVAL_ISOLATION=1` is mandatory. With it set, if `NEO4J_URI` still
+  resolves to the live host `mist-neo4j`, the run aborts with
+  `EvalIsolationError` before any connection -- this is the fail-closed guard.
+- The live `mist-neo4j` is never recreated; only the `exec`-spawned process
+  sees the `-e` overrides.
+- `tmpfs` means the eval graph is RAM-backed and vanishes on teardown -- no
+  volume to clean.
+
+### Acceptance check (Inv-A8 / success criterion #7)
+
+Prove an eval run leaves the live graph untouched:
+
+```bash
+# Before: record the live graph's entity count.
+MSYS_NO_PATHCONV=1 docker compose exec -T mist-backend \
+  python scripts/mist_admin.py stack-status   # note the live node/edge counts
+
+# Run a small replay through the quad (steps 1-3 above) with a 2-3 line corpus.
+
+# After: re-read the live graph's counts -- they MUST be identical.
+MSYS_NO_PATHCONV=1 docker compose exec -T mist-backend \
+  python scripts/mist_admin.py stack-status
+
+# Negative control: re-run step 3 WITHOUT -e NEO4J_URI (still MIST_EVAL_ISOLATION=1).
+# Expected: the run aborts with EvalIsolationError and writes nothing.
+```
+
 ## Apples-to-apples chat-path replay (no live server required)
 
 For session-isolated comparisons, run V7 via `mist_admin replay`
