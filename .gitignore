@@ -84,4 +84,5 @@ data/event_store.db-wal
 data/graph_snapshots/
 data/ingest/
 data/runtime/
+data/eval-run/
 data/*-backup-*
