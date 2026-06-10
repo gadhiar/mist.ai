@@ -289,6 +289,22 @@ def cmd_graph_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_graph_backfill_bitemporal(args: argparse.Namespace) -> int:
+    """One-shot idempotent C1 backfill: stamp bitemporal fields on legacy edges."""
+    be = _load_backend()
+    connection = _connect(be)
+    try:
+        result = be.admin.backfill_bitemporal(
+            connection,
+            ontology_version=be.get_config().ontology_version,
+            dry_run=args.dry_run,
+        )
+        print(f"[backfill] {result}")
+        return 0
+    finally:
+        connection.disconnect()
+
+
 def cmd_graph_reset(args: argparse.Namespace) -> int:
     be = _load_backend()
     connection = _connect(be)
@@ -997,6 +1013,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow wiping entities whose provenance is not 'seed'.",
     )
     p_reset.set_defaults(func=cmd_graph_reset)
+
+    p_backfill = sub.add_parser(
+        "graph-backfill-bitemporal",
+        help="One-shot idempotent C1 backfill: stamp bitemporal fields on legacy edges.",
+    )
+    p_backfill.add_argument("--dry-run", action="store_true", help="Count candidates only.")
+    p_backfill.set_defaults(func=cmd_graph_backfill_bitemporal)
 
     p_status = sub.add_parser("stack-status", help="Probe Neo4j + LLM + backend health.")
     p_status.add_argument(

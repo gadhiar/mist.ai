@@ -1009,3 +1009,66 @@ def probe_tcp(host: str, port: int, timeout: float = 3.0) -> bool:
             return True
     except OSError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# C1 bitemporal backfill (one-shot migration)
+# ---------------------------------------------------------------------------
+
+_BACKFILL_GUARD = "r.source_utterance_id IS NULL AND type(r) IN $extractable"
+
+
+def backfill_bitemporal(
+    connection: GraphConnection,
+    ontology_version: str,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """One-shot, idempotent bitemporal backfill for pre-C1 fact edges.
+
+    Stamps the C1 fields on every extractable-type edge that lacks
+    `source_utterance_id` (the guard that makes re-runs no-ops). SET-to-NULL
+    in Cypher removes a property -- absent equals null for every C1 read, so
+    only populated fields materialize:
+    - source_utterance_id + version_key: 'seed' for legacy seed edges
+      (event_id='seed'), else source_event_id, else a stable
+      'legacy-' + elementId(r) marker (design 4.4).
+    - recorded_at: the legacy created_at (best available fact-time).
+    - recorded_until / is_latest_belief: from the legacy status property
+      ('superseded' edges are transaction-closed at their updated_at).
+    - valid_to: legacy temporal_status='past' closes at updated_at.
+      (valid_from stays absent = open lower bound; the legacy 'future'
+      status is dropped -- both documented deviations from design 4.4,
+      acceptable at post-reset scale.)
+    - ontology_version: corrected to the current version (drift fix, 4.7).
+
+    The graph is small (post-reset scale); a single UPDATE is sufficient --
+    APOC batching is unnecessary until edge counts demand it.
+    """
+    params: dict[str, Any] = {"extractable": list(EXTRACTABLE_RELATIONSHIP_TYPES)}
+    if dry_run:
+        rows = connection.execute_query(
+            f"MATCH (:__Entity__)-[r]->(:__Entity__) WHERE {_BACKFILL_GUARD} "
+            "RETURN count(r) AS n",
+            params,
+        )
+        return {"candidates": int(rows[0]["n"]) if rows else 0}
+
+    params["ontology_version"] = ontology_version
+    rows = connection.execute_write(
+        f"MATCH (:__Entity__)-[r]->(:__Entity__) WHERE {_BACKFILL_GUARD} "
+        "SET r.source_utterance_id = CASE WHEN r.event_id = 'seed' THEN 'seed' "
+        "ELSE coalesce(r.source_event_id, 'legacy-' + elementId(r)) END, "
+        "r.version_key = CASE WHEN r.event_id = 'seed' THEN 'seed' "
+        "ELSE coalesce(r.source_event_id, 'legacy-' + elementId(r)) END, "
+        "r.recorded_at = coalesce(r.recorded_at, r.created_at), "
+        "r.recorded_until = CASE WHEN r.status = 'superseded' "
+        "THEN coalesce(r.updated_at, r.created_at) ELSE NULL END, "
+        "r.is_latest_belief = (coalesce(r.status, 'active') <> 'superseded'), "
+        "r.correction = false, "
+        "r.valid_to = CASE WHEN r.temporal_status = 'past' "
+        "THEN coalesce(r.updated_at, r.created_at) ELSE NULL END, "
+        "r.ontology_version = $ontology_version "
+        "RETURN count(r) AS updated",
+        params,
+    )
+    return {"edges_backfilled": int(rows[0]["updated"]) if rows else 0}
