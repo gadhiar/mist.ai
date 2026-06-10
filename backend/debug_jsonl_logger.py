@@ -70,6 +70,8 @@ RETRIEVAL_CANDIDATES_ENV_VAR = "MIST_DEBUG_RETRIEVAL_JSONL"
 LLM_REQUEST_DUMP_ENV_VAR = "MIST_DEBUG_LLM_REQUESTS"
 # ADR-010 Cluster 8 Phase 12: vault-write observability gate.
 VAULT_ENV_VAR = "MIST_DEBUG_VAULT_JSONL"
+# C2: reconciliation-action observability gate (design 8.4).
+RECONCILIATION_ENV_VAR = "MIST_DEBUG_RECONCILIATION_JSONL"
 
 
 logger = logging.getLogger(__name__)
@@ -216,6 +218,53 @@ class DebugJSONLLogger:
         operator is debugging.
         """
         return self.enabled and _env_flag(VAULT_ENV_VAR)
+
+    @property
+    def reconciliation_enabled(self) -> bool:
+        """True when reconciliation-action records should be emitted (C2).
+
+        Requires both `MIST_DEBUG_JSONL=<path>` (base sink) and
+        `MIST_DEBUG_RECONCILIATION_JSONL=1` (phase gate).
+        """
+        return self.enabled and _env_flag(RECONCILIATION_ENV_VAR)
+
+    def record_reconciliation(
+        self,
+        *,
+        event_id: str | None,
+        session_id: str | None,
+        predicate: str,
+        source: str,
+        target: str,
+        action: str,
+        reason: str,
+        edge_ref: str | None,
+        valid_from: str | None,
+        valid_to: str | None,
+    ) -> None:
+        """Emit one reconciliation-action record (phase: reconciliation).
+
+        One record per engine action (design 8.4 + the standing
+        intense-observability directive). No-op when the gate is off.
+        """
+        if not self.reconciliation_enabled:
+            return
+        self._emit(
+            {
+                "phase": "reconciliation",
+                "ts_iso": _now_iso(),
+                "event_id": event_id,
+                "session_id": session_id,
+                "predicate": predicate,
+                "source": source,
+                "target": target,
+                "action": action,
+                "reason": reason,
+                "edge_ref": edge_ref,
+                "valid_from": valid_from,
+                "valid_to": valid_to,
+            }
+        )
 
     def record_vault_op(
         self,
