@@ -12,9 +12,9 @@
 #   last_seen_at: <seed run timestamp>
 #
 # Spec: see ~/.claude/plans/nimble-forage-cinder.md Parts 1-2.
-# Version: 1.0.0 matches ontology_version.
+# Version: 1.2.0 matches ontology_version.
 
-ontology_version: "1.0.0"
+ontology_version: "1.2.0"
 
 # MistIdentity singleton — anchors MIST's self-model. See Part 1.
 mist_identity:

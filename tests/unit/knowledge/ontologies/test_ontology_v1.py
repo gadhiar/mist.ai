@@ -370,7 +370,7 @@ class TestConfidencePolicies:
 class TestOntologyVersion:
     """Verify the top-level ontology version metadata."""
 
-    def test_version_is_1_1_0(self):
-        # v1.1.0 additive expansion 2026-05-06.
-        assert ONTOLOGY_V1_0_0.version == "1.1.0"
-        assert ONTOLOGY_V1_0_0.parent_version == "1.0.0"
+    def test_version_is_1_2_0(self):
+        # v1.2.0 reconciliation-semantics annotation 2026-06-10 (C1).
+        assert ONTOLOGY_V1_0_0.version == "1.2.0"
+        assert ONTOLOGY_V1_0_0.parent_version == "1.1.0"

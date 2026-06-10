@@ -5,6 +5,7 @@ definition so callers can import from ``backend.knowledge.ontologies`` directly.
 """
 
 from backend.knowledge.ontologies.base import (
+    Cardinality,
     ConfidencePolicy,
     EdgeTypeDefinition,
     EntityStatus,
@@ -15,6 +16,7 @@ from backend.knowledge.ontologies.base import (
     PropertyDefinition,
     RelationshipStatus,
     SourceType,
+    TemporalClass,
     TemporalStatus,
 )
 from backend.knowledge.ontologies.v1_0_0 import (
@@ -22,6 +24,7 @@ from backend.knowledge.ontologies.v1_0_0 import (
     ALL_EDGE_TYPES,
     ALL_NODE_TYPE_NAMES,
     ALL_NODE_TYPES,
+    EDGE_TYPES_BY_NAME,
     EXTRACTABLE_NODE_TYPES,
     EXTRACTABLE_RELATIONSHIP_TYPES,
     ONTOLOGY_V1_0_0,
@@ -34,6 +37,8 @@ __all__ = [
     "EntityStatus",
     "RelationshipStatus",
     "TemporalStatus",
+    "Cardinality",
+    "TemporalClass",
     # Base dataclasses
     "PropertyDefinition",
     "NodeTypeDefinition",
@@ -48,6 +53,7 @@ __all__ = [
     "ALL_NODE_TYPE_NAMES",
     "ALL_EDGE_TYPES",
     "ALL_EDGE_TYPE_NAMES",
+    "EDGE_TYPES_BY_NAME",
     "EXTRACTABLE_NODE_TYPES",
     "EXTRACTABLE_RELATIONSHIP_TYPES",
 ]

@@ -22,6 +22,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from backend.knowledge.ontologies.base import (
+    Cardinality,
     ConfidencePolicy,
     EdgeTypeDefinition,
     ExtractionRules,
@@ -29,6 +30,7 @@ from backend.knowledge.ontologies.base import (
     NodeTypeDefinition,
     OntologyVersion,
     PropertyDefinition,
+    TemporalClass,
 )
 
 # ===================================================================
@@ -1238,6 +1240,8 @@ USES = EdgeTypeDefinition(
     ),
     allowed_source_types=("User", "Person", "Organization", "MistIdentity"),
     allowed_target_types=("Technology",),
+    contradicts=("DISLIKES",),
+    progression_supersedes=("STRUGGLES_WITH",),
 )
 
 KNOWS = EdgeTypeDefinition(
@@ -1259,6 +1263,7 @@ WORKS_AT = EdgeTypeDefinition(
     description="Indicates employment or membership at an organization.",
     allowed_source_types=("User", "Person"),
     allowed_target_types=("Organization",),
+    cardinality=Cardinality.SINGLE,
 )
 
 INTERESTED_IN = EdgeTypeDefinition(
@@ -1266,6 +1271,7 @@ INTERESTED_IN = EdgeTypeDefinition(
     description="Indicates interest in a technology, concept, topic, or skill.",
     allowed_source_types=("User",),
     allowed_target_types=("Technology", "Concept", "Topic", "Skill"),
+    contradicts=("DISLIKES",),
 )
 
 HAS_GOAL = EdgeTypeDefinition(
@@ -1280,6 +1286,7 @@ PREFERS = EdgeTypeDefinition(
     description="Indicates a positive preference for something.",
     allowed_source_types=("User",),
     allowed_target_types=("Preference", "Technology", "Concept"),
+    contradicts=("DISLIKES",),
 )
 
 DISLIKES = EdgeTypeDefinition(
@@ -1287,6 +1294,7 @@ DISLIKES = EdgeTypeDefinition(
     description="Indicates a negative preference or aversion.",
     allowed_source_types=("User",),
     allowed_target_types=("Technology", "Concept", "Topic", "Preference"),
+    contradicts=("USES", "PREFERS", "INTERESTED_IN"),
 )
 
 EXPERT_IN = EdgeTypeDefinition(
@@ -1294,6 +1302,8 @@ EXPERT_IN = EdgeTypeDefinition(
     description="Indicates expert-level proficiency in a technology, skill, or concept.",
     allowed_source_types=("User", "Person"),
     allowed_target_types=("Technology", "Skill", "Concept"),
+    contradicts=("STRUGGLES_WITH",),
+    progression_supersedes=("LEARNING", "STRUGGLES_WITH"),
 )
 
 LEARNING = EdgeTypeDefinition(
@@ -1308,6 +1318,7 @@ STRUGGLES_WITH = EdgeTypeDefinition(
     description="Indicates difficulty with a technology, skill, or concept.",
     allowed_source_types=("User",),
     allowed_target_types=("Technology", "Skill", "Concept"),
+    contradicts=("EXPERT_IN",),
 )
 
 DECIDED = EdgeTypeDefinition(
@@ -1315,6 +1326,7 @@ DECIDED = EdgeTypeDefinition(
     description="Links the user to a decision event.",
     allowed_source_types=("User",),
     allowed_target_types=("Event",),
+    temporal_class=TemporalClass.EVENT,
 )
 
 EXPERIENCED = EdgeTypeDefinition(
@@ -1322,6 +1334,7 @@ EXPERIENCED = EdgeTypeDefinition(
     description="Links a user or person to an event they experienced.",
     allowed_source_types=("User", "Person"),
     allowed_target_types=("Event",),
+    temporal_class=TemporalClass.EVENT,
 )
 
 # ===================================================================
@@ -1347,6 +1360,7 @@ IS_A = EdgeTypeDefinition(
         "Organization",
         "Location",
     ),
+    temporal_class=TemporalClass.DURABLE,
 )
 
 PART_OF = EdgeTypeDefinition(
@@ -1354,6 +1368,7 @@ PART_OF = EdgeTypeDefinition(
     description="Indicates that the source entity is a component or sub-part of the target.",
     allowed_source_types=("Technology", "Concept", "Skill", "Project"),
     allowed_target_types=("Technology", "Concept", "Project", "Organization"),
+    temporal_class=TemporalClass.DURABLE,
 )
 
 RELATED_TO = EdgeTypeDefinition(
@@ -1362,6 +1377,7 @@ RELATED_TO = EdgeTypeDefinition(
     allowed_source_types=tuple(ALL_NODE_TYPE_NAMES),
     allowed_target_types=tuple(ALL_NODE_TYPE_NAMES),
     directional=False,
+    temporal_class=TemporalClass.DURABLE,
 )
 
 DEPENDS_ON = EdgeTypeDefinition(
@@ -1470,6 +1486,8 @@ OCCURRED_ON = EdgeTypeDefinition(
     ),
     allowed_source_types=("Event", "Milestone"),
     allowed_target_types=("Date",),
+    cardinality=Cardinality.SINGLE,
+    temporal_class=TemporalClass.EVENT,
 )
 
 HAS_METRIC = EdgeTypeDefinition(
@@ -1488,6 +1506,8 @@ HAS_METRIC = EdgeTypeDefinition(
         "Goal",
     ),
     allowed_target_types=("Metric",),
+    # 4.6 keyed supersession deferred to C3 (accumulate is the design's safe fallback).
+    temporal_class=TemporalClass.EVENT,
 )
 
 REFERENCES_DOCUMENT = EdgeTypeDefinition(
@@ -1519,6 +1539,7 @@ PRECEDED_BY = EdgeTypeDefinition(
     ),
     allowed_source_types=("Event", "Milestone"),
     allowed_target_types=("Event", "Milestone", "Date"),
+    temporal_class=TemporalClass.DURABLE,
 )
 
 # ===================================================================
@@ -1539,6 +1560,7 @@ MECHANISM_OF = EdgeTypeDefinition(
     ),
     allowed_source_types=("Mechanism", "Pattern"),
     allowed_target_types=("Concept", "Technology", "Topic", "Strategy"),
+    temporal_class=TemporalClass.DURABLE,
 )
 
 OPERATES_ON = EdgeTypeDefinition(
@@ -1551,6 +1573,7 @@ OPERATES_ON = EdgeTypeDefinition(
     ),
     allowed_source_types=("Mechanism", "Technology", "Strategy", "Pattern"),
     allowed_target_types=("DataStructure", "Concept", "Topic"),
+    temporal_class=TemporalClass.DURABLE,
 )
 
 INPUT_TO = EdgeTypeDefinition(
@@ -1562,6 +1585,7 @@ INPUT_TO = EdgeTypeDefinition(
     ),
     allowed_source_types=("DataStructure", "Concept", "Document"),
     allowed_target_types=("Mechanism", "Strategy", "Technology", "Pattern"),
+    temporal_class=TemporalClass.DURABLE,
 )
 
 IMPROVES = EdgeTypeDefinition(
@@ -1609,6 +1633,7 @@ COMPRISES = EdgeTypeDefinition(
         "Technology",
         "Pattern",
     ),
+    temporal_class=TemporalClass.DURABLE,
 )
 
 APPLICABLE_TO = EdgeTypeDefinition(
@@ -1621,6 +1646,7 @@ APPLICABLE_TO = EdgeTypeDefinition(
     ),
     allowed_source_types=("Pattern", "Strategy", "Mechanism"),
     allowed_target_types=("Concept", "Topic", "Technology", "Skill"),
+    temporal_class=TemporalClass.DURABLE,
 )
 
 STRATEGY_FOR = EdgeTypeDefinition(
@@ -1632,6 +1658,7 @@ STRATEGY_FOR = EdgeTypeDefinition(
     ),
     allowed_source_types=("Strategy", "Pattern"),
     allowed_target_types=("Goal", "Concept", "Topic"),
+    temporal_class=TemporalClass.DURABLE,
 )
 
 NAMING_CONVENTION_OF = EdgeTypeDefinition(
@@ -1643,6 +1670,7 @@ NAMING_CONVENTION_OF = EdgeTypeDefinition(
     ),
     allowed_source_types=("Convention",),
     allowed_target_types=("Concept", "DataStructure", "Technology", "Topic"),
+    temporal_class=TemporalClass.DURABLE,
 )
 
 # ===================================================================
@@ -1651,6 +1679,9 @@ NAMING_CONVENTION_OF = EdgeTypeDefinition(
 # These edges let extraction attribute facts to MIST.AI itself (as a
 # MistIdentity node) or to third-party Organizations/Projects. Without
 # them, the validator drops MIST-scope facts such as "MIST uses LanceDB".
+# C1 note: the MIST_HAS_* trio keeps default semantics (MULTI/STATIVE,
+# no contradicts/progression) so the reconciliation engine treats
+# self-model facts as accumulate-only; separate-layer handling is R1 (9.6).
 
 IMPLEMENTED_WITH = EdgeTypeDefinition(
     type_name="IMPLEMENTED_WITH",
@@ -1769,6 +1800,11 @@ ALL_EDGE_TYPES: list[EdgeTypeDefinition] = list(
 
 ALL_EDGE_TYPE_NAMES: list[str] = [et.type_name for et in ALL_EDGE_TYPES]
 
+# C1: name -> definition index. The reconciliation engine and validator look
+# up semantics by predicate name; the tuple on OntologyVersion stays the
+# canonical ordered form.
+EDGE_TYPES_BY_NAME: dict[str, EdgeTypeDefinition] = {et.type_name: et for et in ALL_EDGE_TYPES}
+
 # ===================================================================
 # Extractable subsets (what the LLM extractor may produce)
 # ===================================================================
@@ -1877,16 +1913,18 @@ EXTRACTION_RULES = ExtractionRules(
 # ===================================================================
 
 ONTOLOGY_V1_0_0 = OntologyVersion(
-    version="1.1.0",
-    created_at=datetime(2026, 5, 6, tzinfo=UTC),
+    version="1.2.0",
+    created_at=datetime(2026, 6, 10, tzinfo=UTC),
     description=(
         "Stable ontology for the MIST.AI knowledge graph. v1.1.0 additive "
         "expansion (2026-05-06): Pattern, Convention, Mechanism, Strategy, "
         "DataStructure entity types and MECHANISM_OF, OPERATES_ON, INPUT_TO, "
         "IMPROVES, COMPRISES, APPLICABLE_TO, STRATEGY_FOR, "
         "NAMING_CONVENTION_OF predicates surfaced from V6 deep-review "
-        "RELATED_TO triage. Backwards compatible with v1.0.0 / v1.0.1 graph "
-        "entities."
+        "RELATED_TO triage. v1.2.0 (2026-06-10): reconciliation semantics "
+        "(cardinality, temporal_class, contradicts, progression_supersedes) "
+        "declared on all extractable predicates -- C1, no new types. "
+        "Backwards compatible with v1.0.0 / v1.0.1 / v1.1.0 graph entities."
     ),
     node_types=tuple(ALL_NODE_TYPES),
     edge_types=tuple(ALL_EDGE_TYPES),
@@ -1898,7 +1936,7 @@ ONTOLOGY_V1_0_0 = OntologyVersion(
     ),
     universal_entity_properties=UNIVERSAL_ENTITY_PROPERTIES,
     universal_relationship_properties=UNIVERSAL_RELATIONSHIP_PROPERTIES,
-    parent_version="1.0.0",
+    parent_version="1.1.0",
     migration_script_path=None,
     active=True,
     deprecated=False,

@@ -28,3 +28,99 @@ class TestSemanticsFieldsExist:
         assert TemporalClass.STATIVE.value == "stative"
         assert TemporalClass.EVENT.value == "event"
         assert TemporalClass.DURABLE.value == "durable"
+
+
+from backend.knowledge.ontologies.v1_0_0 import (  # noqa: E402
+    EDGE_TYPES_BY_NAME,
+    EXTRACTABLE_RELATIONSHIP_TYPES,
+    ONTOLOGY_V1_0_0,
+)
+
+# Snapshot of the design 4.1 semantics table. Drift here is intentional-only.
+EXPECTED_SINGLE = {"WORKS_AT", "OCCURRED_ON"}
+EXPECTED_EVENT = {"DECIDED", "EXPERIENCED", "OCCURRED_ON", "HAS_METRIC"}
+EXPECTED_DURABLE = {
+    "IS_A",
+    "PART_OF",
+    "RELATED_TO",
+    "PRECEDED_BY",
+    "MECHANISM_OF",
+    "OPERATES_ON",
+    "INPUT_TO",
+    "COMPRISES",
+    "APPLICABLE_TO",
+    "STRATEGY_FOR",
+    "NAMING_CONVENTION_OF",
+}
+EXPECTED_CONTRADICTS = {
+    "USES": {"DISLIKES"},
+    "PREFERS": {"DISLIKES"},
+    "INTERESTED_IN": {"DISLIKES"},
+    "DISLIKES": {"USES", "PREFERS", "INTERESTED_IN"},
+    "EXPERT_IN": {"STRUGGLES_WITH"},
+    "STRUGGLES_WITH": {"EXPERT_IN"},
+}
+EXPECTED_PROGRESSION = {
+    "EXPERT_IN": {"LEARNING", "STRUGGLES_WITH"},
+    "USES": {"STRUGGLES_WITH"},
+}
+
+
+class TestSemanticsTable:
+    def test_version_bumped(self):
+        assert ONTOLOGY_V1_0_0.version == "1.2.0"
+
+    def test_name_index_covers_all_edges(self):
+        assert set(EDGE_TYPES_BY_NAME) == {e.type_name for e in ONTOLOGY_V1_0_0.edge_types}
+
+    def test_single_cardinality_set(self):
+        single = {
+            n
+            for n in EXTRACTABLE_RELATIONSHIP_TYPES
+            if EDGE_TYPES_BY_NAME[n].cardinality is Cardinality.SINGLE
+        }
+        assert single == EXPECTED_SINGLE
+
+    def test_temporal_class_sets(self):
+        event = {
+            n
+            for n in EXTRACTABLE_RELATIONSHIP_TYPES
+            if EDGE_TYPES_BY_NAME[n].temporal_class is TemporalClass.EVENT
+        }
+        durable = {
+            n
+            for n in EXTRACTABLE_RELATIONSHIP_TYPES
+            if EDGE_TYPES_BY_NAME[n].temporal_class is TemporalClass.DURABLE
+        }
+        assert event == EXPECTED_EVENT
+        assert durable == EXPECTED_DURABLE
+
+    def test_contradicts_table(self):
+        declared = {
+            n: set(EDGE_TYPES_BY_NAME[n].contradicts)
+            for n in EXTRACTABLE_RELATIONSHIP_TYPES
+            if EDGE_TYPES_BY_NAME[n].contradicts
+        }
+        assert declared == EXPECTED_CONTRADICTS
+
+    def test_contradicts_is_pairwise_symmetric(self):
+        for name in EXTRACTABLE_RELATIONSHIP_TYPES:
+            for other in EDGE_TYPES_BY_NAME[name].contradicts:
+                assert (
+                    name in EDGE_TYPES_BY_NAME[other].contradicts
+                ), f"{name} contradicts {other} but not vice versa"
+
+    def test_progression_table_and_targets_exist(self):
+        declared = {
+            n: set(EDGE_TYPES_BY_NAME[n].progression_supersedes)
+            for n in EXTRACTABLE_RELATIONSHIP_TYPES
+            if EDGE_TYPES_BY_NAME[n].progression_supersedes
+        }
+        assert declared == EXPECTED_PROGRESSION
+        for _name, supers in declared.items():
+            for s in supers:
+                assert s in EDGE_TYPES_BY_NAME
+
+    def test_undirected_edges_use_directional_flag(self):
+        assert EDGE_TYPES_BY_NAME["WORKS_WITH"].directional is False
+        assert EDGE_TYPES_BY_NAME["RELATED_TO"].directional is False
