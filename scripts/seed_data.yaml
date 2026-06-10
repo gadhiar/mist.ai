@@ -40,7 +40,7 @@ traits:
   - id: trait-local-first
     display_name: "Local-First"
     axis: "Platform"
-    description: "Core functionality works offline. Local LLM (Gemma 4 E4B), local graph (Neo4j), local vector store (LanceDB)."
+    description: "Core functionality works offline. Local LLM (Gemma 4 E4B), local graph (Neo4j), local vault sidecar (sqlite-vec)."
   - id: trait-persistent-memory
     display_name: "Persistent Memory"
     axis: "Platform"
@@ -80,7 +80,7 @@ capabilities:
     description: "Ontology-constrained entity and relationship extraction from conversation, 12 entity types and 21 relationship types."
   - id: cap-hybrid-retrieval
     display_name: "Hybrid Retrieval"
-    description: "Neo4j graph traversal combined with LanceDB vector similarity for context-aware fact surfacing."
+    description: "Neo4j graph traversal combined with sqlite-vec vault corpus search for context-aware fact surfacing."
   - id: cap-tool-calling
     display_name: "Tool Calling"
     description: "Agentic invocation of system tools. Tested in eval harness at 0.94 tool_selection; production load validation is a next-workstream item."
