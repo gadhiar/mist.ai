@@ -1,0 +1,34 @@
+# docker-compose.eval-neo4j.yml
+# Disposable Neo4j for eval/gauntlet isolation (F1).
+#
+# Neo4j Community has a single user database, so eval isolation is by SEPARATE
+# INSTANCE, not a separate database name. This service joins the main compose
+# project's default network (so mist-backend resolves it by service name) but is
+# gated behind the `eval` profile, so a normal `docker compose up` never starts
+# it. Graph state lives on tmpfs, so it is wiped when the container is removed.
+#
+# Usage (from repo root):
+#   docker compose -f docker-compose.yml -f docker-compose.eval-neo4j.yml \
+#     --profile eval up -d mist-neo4j-eval
+#   # ... run eval with: -e NEO4J_URI=bolt://mist-neo4j-eval:7687 -e MIST_EVAL_ISOLATION=1 ...
+#   docker compose -f docker-compose.yml -f docker-compose.eval-neo4j.yml \
+#     --profile eval rm -sfv mist-neo4j-eval     # teardown
+services:
+  mist-neo4j-eval:
+    image: neo4j:5
+    container_name: mist-neo4j-eval
+    profiles: ["eval"]
+    ports:
+      - "7475:7474"   # HTTP (host 7475, avoids clashing with live 7474)
+      - "7688:7687"   # Bolt (host 7688, avoids clashing with live 7687)
+    environment:
+      - NEO4J_AUTH=${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-password}
+      - NEO4J_PLUGINS=["apoc"]
+    tmpfs:
+      - /data         # ephemeral: graph state in RAM, wiped on container removal
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
