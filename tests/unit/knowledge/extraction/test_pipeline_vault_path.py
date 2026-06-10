@@ -43,6 +43,7 @@ class _RecordingCurationPipeline:
         session_id: str,
         source_metadata=None,
         vault_note_path: str | None = None,
+        recorded_at: str | None = None,
     ):
         self.calls.append(
             {
@@ -51,6 +52,7 @@ class _RecordingCurationPipeline:
                 "session_id": session_id,
                 "source_metadata": source_metadata,
                 "vault_note_path": vault_note_path,
+                "recorded_at": recorded_at,
             }
         )
 

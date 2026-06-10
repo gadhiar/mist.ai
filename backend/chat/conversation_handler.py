@@ -15,7 +15,7 @@ import random
 import time
 import uuid
 from collections.abc import AsyncIterator
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -1493,7 +1493,7 @@ class ConversationHandler:
 
             # --- Event Store Write (Layer 1) ---
             # Synchronous, <5ms target. Happens BEFORE any async extraction.
-            event_id = self._record_turn_event(
+            event_id, recorded_at = self._record_turn_event(
                 session_id=session_id,
                 user_message=user_message,
                 assistant_message=assistant_message,
@@ -1544,6 +1544,7 @@ class ConversationHandler:
                         session_id=session_id,
                         turn_record=turn_record,
                         vault_note_path=vault_note_path,
+                        recorded_at=recorded_at,
                     )
                 )
 
@@ -1635,6 +1636,7 @@ class ConversationHandler:
         assistant_message: str = "",
         turn_record: TurnRecord | None = None,
         vault_note_path: str | None = None,
+        recorded_at: str | None = None,
     ) -> None:
         """Fire-and-forget background extraction.
 
@@ -1675,6 +1677,7 @@ class ConversationHandler:
                     event_id=event_id,
                     session_id=session_id,
                     vault_note_path=vault_note_path,
+                    recorded_at=recorded_at,
                 )
             # Log results at debug level. Result may be ValidationResult
             # (has .entities/.relationships) or CurationResult (has .write_result
@@ -2132,7 +2135,7 @@ class ConversationHandler:
         context_window: list[dict[str, str]] | None = None,
         retrieval_result: RetrievalResult | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
-    ) -> str | None:
+    ) -> tuple[str | None, str | None]:
         """Record a conversation turn to the event store.
 
         Synchronous write, targets <5ms. Failures are logged but never
@@ -2147,10 +2150,12 @@ class ConversationHandler:
             tool_calls: Tool calls made during this turn, if any.
 
         Returns:
-            The event_id on success, None if event store is disabled or on failure.
+            (event_id, recorded_at_iso) on success -- recorded_at is the event's
+            UTC-aware timestamp, the fact-time authority for bitemporal edges
+            (C1). (None, None) when the event store is disabled or on failure.
         """
         if self.event_store is None:
-            return None
+            return None, None
 
         try:
             # Ensure an event store session exists for this session_id
@@ -2174,10 +2179,14 @@ class ConversationHandler:
                     "document_chunks_used": retrieval_result.document_chunks_used,
                 }
 
+            # UTC-aware fact-time: this exact instant becomes recorded_at on
+            # every bitemporal edge the turn produces (never wall-clock at
+            # write time, design 4.2).
+            recorded_at = datetime.now(UTC)
             event = ConversationTurnEvent(
                 session_id=es_session_id,
                 turn_index=turn_index,
-                timestamp=datetime.now(),
+                timestamp=recorded_at,
                 user_utterance=user_message,
                 system_response=assistant_message,
                 context_window=context_window,
@@ -2190,7 +2199,7 @@ class ConversationHandler:
 
             event_id = self.event_store.append_turn(event)
             logger.debug("Recorded turn event %s for session %s", event_id, session_id)
-            return event_id
+            return event_id, recorded_at.isoformat()
 
         except Exception as e:
             # Log but never propagate -- event store failure must not
@@ -2201,7 +2210,7 @@ class ConversationHandler:
                 e,
                 exc_info=True,
             )
-            return None
+            return None, None
 
     def _get_or_allocate_vault_path(
         self,

@@ -128,6 +128,7 @@ class TestExtractFromFileForwardsPath:
                 session_id,
                 source_metadata=None,
                 vault_note_path=None,
+                recorded_at=None,
             ):
                 self.calls.append({"vault_note_path": vault_note_path})
                 # Return a minimal object the pipeline code won't crash on

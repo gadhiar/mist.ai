@@ -18,7 +18,7 @@ import hashlib
 import logging
 import time
 from collections import OrderedDict
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -423,6 +423,7 @@ class ExtractionPipeline:
         source_metadata: SourceMetadata | None = None,
         extraction_source: str = "conversation",
         vault_note_path: str | None = None,
+        recorded_at: str | None = None,
     ) -> ValidationResult | CurationResult:
         """Main entry point for live extraction.
 
@@ -452,8 +453,12 @@ class ExtractionPipeline:
         Returns:
             ValidationResult with validated entities and relationships.
         """
+        if recorded_at is None:
+            recorded_at = datetime.now(UTC).isoformat()
         if reference_date is None:
-            reference_date = datetime.now()
+            # Temporal resolution anchors to the event's fact-time so a rebuild
+            # resolves "last year" identically to the live turn (C1).
+            reference_date = datetime.fromisoformat(recorded_at)
 
         pipeline_start = time.perf_counter()
 
@@ -590,6 +595,7 @@ class ExtractionPipeline:
                 session_id=session_id,
                 source_metadata=source_metadata,
                 vault_note_path=vault_note_path,
+                recorded_at=recorded_at,
             )
             stage_78_ms = (time.perf_counter() - stage_start) * 1000
             logger.debug("Stages 7-8 (curation): %.1fms", stage_78_ms)
@@ -680,6 +686,12 @@ class ExtractionPipeline:
         reference_date = (
             event.timestamp if isinstance(event.timestamp, datetime) else datetime.now()
         )
+        # Fact-time for bitemporal edges: the stored event timestamp (C1).
+        recorded_at = (
+            event.timestamp.isoformat()
+            if isinstance(event.timestamp, datetime)
+            else str(event.timestamp)
+        )
 
         return await self.extract_from_utterance(
             utterance=event.user_utterance,
@@ -687,6 +699,7 @@ class ExtractionPipeline:
             event_id=event.event_id,
             session_id=event.session_id,
             reference_date=reference_date,
+            recorded_at=recorded_at,
         )
 
     async def extract_from_file(

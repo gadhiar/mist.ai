@@ -2088,3 +2088,39 @@ class TestFrontendSwitchForm:
         await handler._dispatch_tool_with_observability(tc)
         event_types = [e["type"] for e in handler._turn_ws_events]
         assert event_types == ["tool_call_started", "form_switch", "tool_call_completed"]
+
+
+class TestRecordTurnEventRecordedAt:
+    """C1: the event timestamp is the fact-time authority for bitemporal edges."""
+
+    def _handler(self, config):
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        return ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=FakeExtractionPipeline(),
+            retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
+        )
+
+    def test_returns_event_id_and_utc_aware_recorded_at(self):
+        from datetime import datetime
+
+        handler = self._handler(
+            build_test_config(event_store_enabled=True, event_store_db_path=":memory:")
+        )
+        event_id, recorded_at = handler._record_turn_event(
+            session_id="s1", user_message="I use Rust", assistant_message="Noted."
+        )
+        assert event_id is not None
+        assert datetime.fromisoformat(recorded_at).tzinfo is not None
+        turns = handler.event_store.get_all_turns_for_reextraction()
+        assert turns[-1]["timestamp"] == recorded_at
+
+    def test_disabled_event_store_returns_none_pair(self):
+        handler = self._handler(build_test_config())
+        assert handler._record_turn_event(
+            session_id="s1", user_message="x", assistant_message="y"
+        ) == (None, None)

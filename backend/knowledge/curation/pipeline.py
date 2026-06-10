@@ -8,6 +8,7 @@ curation is enabled.
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from backend.knowledge.curation.conflict_resolver import ConflictResolutionResult, ConflictResolver
 from backend.knowledge.curation.deduplication import DeduplicationResult, EntityDeduplicator
@@ -61,6 +62,7 @@ class CurationPipeline:
         session_id: str,
         source_metadata: SourceMetadata | None = None,
         vault_note_path: str | None = None,
+        recorded_at: str | None = None,
     ) -> CurationResult:
         """Run curation stages and write to graph.
 
@@ -86,6 +88,10 @@ class CurationPipeline:
         """
         start = time.perf_counter()
         stage_errors: list[str] = []
+        # Fact-time for bitemporal edges; wall-clock only for non-conversation
+        # paths (document ingest) that carry no event. Consumed by the
+        # reconciliation engine at the Task-8 cutover.
+        recorded_at = recorded_at or datetime.now(UTC).isoformat()
 
         entities = validation_result.entities
         relationships = validation_result.relationships
