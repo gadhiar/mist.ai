@@ -53,9 +53,15 @@ Tiered: core user-centric predicates gate; the v1.1.0 long-tail is tracked-not-g
 ## How to run (isolated via F1's throwaway-quad)
 
 ```bash
-# 1. Eval Neo4j up (F1)
+# 1. Eval Neo4j up (F1). Isolate ALL stores on seed too: seed's vault bootstrap
+#    writes identity/user notes, so without the trio overrides it touches the
+#    live vault (Inv-A8). Match the replay's isolation.
 docker compose -f docker-compose.yml -f docker-compose.eval-neo4j.yml --profile eval up -d mist-neo4j-eval
-MSYS_NO_PATHCONV=1 docker compose exec -T -e MIST_EVAL_ISOLATION=1 -e NEO4J_URI=bolt://mist-neo4j-eval:7687 \
+MSYS_NO_PATHCONV=1 docker compose exec -T \
+  -e MIST_EVAL_ISOLATION=1 -e NEO4J_URI=bolt://mist-neo4j-eval:7687 \
+  -e MIST_SIDECAR_DB_PATH=/app/data/eval-run/vault_sidecar.db \
+  -e EVENT_STORE_DB_PATH=/app/data/eval-run/event_store.db \
+  -e MIST_VAULT_ROOT=/app/data/eval-run/vault \
   mist-backend python scripts/mist_admin.py seed
 
 # 2. Replay the gold corpus, emitting the extraction debug log
@@ -78,9 +84,24 @@ MSYS_NO_PATHCONV=1 docker compose exec -T mist-backend python scripts/eval_harne
 docker compose -f docker-compose.yml -f docker-compose.eval-neo4j.yml --profile eval rm -sfv mist-neo4j-eval
 ```
 
-## Baseline results (YYYY-MM-DD)
+## Baseline results (2026-06-10)
 
-_Filled by Task 5._
+Gemma 4 E4B Q5_K_M, ontology v1.1.0, seed graph, isolated quad (eval Neo4j + throwaway trio). All 12 probes matched in the debug log; every probe produced an extraction record.
+
+| Metric | Value | Gate | Pass |
+|---|---|---|---|
+| Entity precision | 0.652 | >= 0.90 | FAIL |
+| Entity recall | 1.000 | >= 0.80 | PASS |
+| Relationship precision | 0.750 | >= 0.90 | FAIL |
+| Relationship recall | 0.818 | >= 0.80 | PASS |
+| Typing accuracy | 0.833 | >= 0.90 | FAIL |
+| RELATED_TO rate | 0.000 | <= 0.10 | PASS |
+| Valid-time accuracy | 1.000 | (tracked) | - |
+| Negative-control violations | 0 | == 0 | PASS |
+
+Reconciliation-action accuracy: SKIPPED (requires C2 telemetry).
+
+Reading: recall and negative-control discipline are already strong -- entity recall 1.000, relationship recall 0.818, 0/2 negative-control violations, and RELATED_TO rate 0.000 (the v1.1.0 ontology expansion eliminated the default-predicate problem). The open gap is precision: entity precision 0.652 and relationship precision 0.750 mean the extractor over-produces (correct facts plus extras), and typing accuracy 0.833 means roughly 1 in 6 produced relationships is constraint-invalid. Precision and typing are the targets for C1 (ontology / decomposition) and C3 (extraction accuracy). The provisional gates are intentionally unmet at baseline -- this is the regression-signal floor the canonical-graph work improves on, not a release gate (12-record seed; expand toward 60-100 before treating gates as commitments).
 
 ## Known limitations
 - ~12-record seed: regression signal, not statistical certification of 0.90. Expand toward 60-100 (per-category) before treating gates as commitments.

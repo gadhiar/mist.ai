@@ -241,9 +241,14 @@ docker compose -f docker-compose.yml -f docker-compose.eval-neo4j.yml \
   --profile eval up -d mist-neo4j-eval
 
 # 2. Seed the eval graph's MIST-identity anchors (writes to the EVAL instance).
+#    Isolate the trio too -- seed's vault bootstrap writes identity/user notes,
+#    so without these overrides it would touch the live vault (Inv-A8).
 MSYS_NO_PATHCONV=1 docker compose exec -T \
   -e MIST_EVAL_ISOLATION=1 \
   -e NEO4J_URI=bolt://mist-neo4j-eval:7687 \
+  -e MIST_SIDECAR_DB_PATH=/app/data/eval-run/vault_sidecar.db \
+  -e EVENT_STORE_DB_PATH=/app/data/eval-run/event_store.db \
+  -e MIST_VAULT_ROOT=/app/data/eval-run/vault \
   mist-backend python scripts/mist_admin.py seed
 
 # 3. Run the eval/replay against the quad (trio + eval Neo4j).
