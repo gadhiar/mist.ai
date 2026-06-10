@@ -589,8 +589,9 @@ class VaultSidecarIndex:
 
         Returns:
             List of result dicts with ``score=rrf_combined`` (the RRF ordering
-            value), ``display_similarity`` (the true cosine in (0, 1] for hits
-            seen by the vector leg, None for FTS-only hits) for UI display,
+            value), ``display_similarity`` (the distance-derived similarity,
+            1/(1+distance) in (0, 1], for hits seen by the vector leg, None for
+            FTS-only hits) for UI display,
             ``vector_rank``, ``fts_rank`` (None if absent from that list),
             and ``sources`` list. Empty if both retrievers return nothing.
         """
@@ -612,10 +613,11 @@ class VaultSidecarIndex:
                     "frontmatter": result["frontmatter"],
                     "note_type": result["note_type"],
                     "score": 0.0,
-                    # display_similarity carries the true cosine (1/(1+distance),
-                    # in (0, 1]) for UI display. Distinct from `score`, which is
-                    # the RRF ordering value consumed downstream. The vector leg
-                    # is the sole source of a cosine; FTS-only hits get None.
+                    # display_similarity carries the distance-derived similarity
+                    # (1/(1+distance), in (0, 1]) for UI display. Distinct from
+                    # `score`, which is the RRF ordering value consumed
+                    # downstream. The vector leg is the sole source of this
+                    # score; FTS-only hits get None.
                     "display_similarity": result["score"],
                     "vector_rank": rank,
                     "fts_rank": None,
@@ -636,9 +638,10 @@ class VaultSidecarIndex:
                     "frontmatter": result["frontmatter"],
                     "note_type": result["note_type"],
                     "score": 0.0,
-                    # FTS-only hit: no cosine available. A chunk also seen by the
-                    # vector leg keeps its cosine via the else-branch below, which
-                    # only updates fts_rank and never touches display_similarity.
+                    # FTS-only hit: no vector score available. A chunk also seen
+                    # by the vector leg keeps its score via the else-branch
+                    # below, which only updates fts_rank and never touches
+                    # display_similarity.
                     "display_similarity": None,
                     "vector_rank": None,
                     "fts_rank": rank,

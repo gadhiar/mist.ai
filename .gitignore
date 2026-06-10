@@ -76,9 +76,12 @@ CODEBASE.md
 # Local scratch workspace (mirrored plans, exploratory artifacts)
 .local/
 
-# Runtime data artifacts (event store SQLite, graph snapshots, ingest workspace)
+# Runtime data artifacts (event store SQLite, graph snapshots, ingest workspace,
+# replay/runtime scratch, and timestamped pre-op backups)
 data/event_store.db
 data/event_store.db-shm
 data/event_store.db-wal
 data/graph_snapshots/
 data/ingest/
+data/runtime/
+data/*-backup-*

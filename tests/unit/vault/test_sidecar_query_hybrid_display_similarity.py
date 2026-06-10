@@ -1,12 +1,12 @@
-"""query_hybrid must carry a real per-result display_similarity (cosine for
-vector hits, None for FTS-only hits) distinct from the RRF ordering score.
+"""query_hybrid must carry a real per-result display_similarity (a distance-derived
+score for vector hits, None for FTS-only hits) distinct from the RRF ordering score.
 
 The vault-results panel displays display_similarity as the human-readable
 relevance percentage. Before this field existed, the panel showed the RRF
 ordering score (1/(rrf_k+rank)), which collapses to a near-uniform ~2% for
 every hit. These tests pin the contract that display_similarity carries the
-true cosine (1/(1+distance), in (0, 1]) for vector hits and None for FTS-only
-hits, and that it is distinct from the RRF score field.
+distance-derived score (1/(1+distance), in (0, 1]) for vector hits and None for
+FTS-only hits, and that it is distinct from the RRF score field.
 
 Setup mirrors the real VaultSidecarIndex API used throughout
 test_sidecar_index.py: SidecarIndexConfig + FakeEmbeddingGenerator, seeding
@@ -38,7 +38,7 @@ def _make_index(tmp_path):
     return idx
 
 
-def test_vector_hit_carries_cosine_not_rrf(tmp_path):
+def test_vector_hit_carries_distance_score_not_rrf(tmp_path):
     # Arrange -- two single-chunk notes; query with the embedding of the first.
     idx = _make_index(tmp_path)
     gen = FakeEmbeddingGenerator(dimension=_EMBEDDING_DIMENSION)
@@ -49,15 +49,15 @@ def test_vector_hit_carries_cosine_not_rrf(tmp_path):
     # Act
     rows = idx.query_hybrid(embedding=query, text="cocktails", k=5)
 
-    # Assert -- top hit carries a true cosine in (0, 1], not the RRF score.
+    # Assert -- top hit carries a distance-derived score in (0, 1], not the RRF score.
     assert len(rows) >= 1
     top = rows[0]
     assert 0.0 < top["display_similarity"] <= 1.0
-    # The RRF ordering score for rank 1 is 1/(60+1) ~= 0.0164; a real cosine is
-    # not equal to it. This is the bug the field fixes (panel showed RRF as %).
+    # The RRF ordering score for rank 1 is 1/(60+1) ~= 0.0164; the distance-derived
+    # score is not equal to it. This is the bug the field fixes (panel showed RRF as %).
     assert top["display_similarity"] != pytest.approx(top["score"])
 
-    # Cosines vary per result (distinct distances), unlike the near-uniform RRF.
+    # Distance-derived scores vary per result (distinct distances), unlike the near-uniform RRF.
     sims = [r["display_similarity"] for r in rows if r["display_similarity"] is not None]
     assert len(sims) >= 2
     assert len({round(s, 4) for s in sims}) > 1
@@ -65,20 +65,20 @@ def test_vector_hit_carries_cosine_not_rrf(tmp_path):
     idx.close()
 
 
-def test_vector_hit_display_similarity_matches_query_vector_cosine(tmp_path):
-    # Arrange -- a single note; the cosine carried through query_hybrid must be
+def test_vector_hit_display_similarity_matches_query_vector_score(tmp_path):
+    # Arrange -- a single note; the score carried through query_hybrid must be
     # exactly the score query_vector computes for the same chunk.
     idx = _make_index(tmp_path)
     gen = FakeEmbeddingGenerator(dimension=_EMBEDDING_DIMENSION)
-    content = "exact cosine carry-through verification content"
+    content = "exact distance-score carry-through verification content"
     idx.upsert_file("exact.md", content, 1000)
     query = gen.generate_embedding(content)
 
     # Act
     vec_rows = idx.query_vector(query, k=5)
-    hybrid_rows = idx.query_hybrid(embedding=query, text="cosine verification", k=5)
+    hybrid_rows = idx.query_hybrid(embedding=query, text="distance-score verification", k=5)
 
-    # Assert -- the cosine surfaced by query_hybrid equals query_vector's score.
+    # Assert -- the score surfaced by query_hybrid equals query_vector's score.
     vec_score_by_path = {r["path"]: r["score"] for r in vec_rows}
     found = next((r for r in hybrid_rows if r["path"] == "exact.md"), None)
     assert found is not None
@@ -105,7 +105,7 @@ def test_fts_only_hit_has_none_display_similarity(tmp_path):
     rows = idx.query_hybrid(embedding=query, text="uniquelexicaltoken", k=3)
 
     # Assert -- lex.md is present as an FTS-only hit (no vector rank), and every
-    # FTS-only hit has display_similarity=None (FTS has no cosine).
+    # FTS-only hit has display_similarity=None (FTS has no vector score).
     fts_only = [r for r in rows if r["vector_rank"] is None]
     assert fts_only, "expected at least one FTS-only hit"
     lex = next((r for r in rows if r["path"] == "lex.md"), None)
@@ -116,9 +116,9 @@ def test_fts_only_hit_has_none_display_similarity(tmp_path):
     idx.close()
 
 
-def test_vector_hit_keeps_cosine_even_when_also_fts_matched(tmp_path):
+def test_vector_hit_keeps_score_even_when_also_fts_matched(tmp_path):
     # Arrange -- a chunk seen by BOTH legs (vector first, then FTS) must retain
-    # its cosine; the FTS else-branch must not overwrite display_similarity.
+    # its score; the FTS else-branch must not overwrite display_similarity.
     idx = _make_index(tmp_path)
     gen = FakeEmbeddingGenerator(dimension=_EMBEDDING_DIMENSION)
     content = "both sources match this retrieval document"
@@ -128,7 +128,7 @@ def test_vector_hit_keeps_cosine_even_when_also_fts_matched(tmp_path):
     # Act
     rows = idx.query_hybrid(embedding=query, text="both sources match retrieval", k=5)
 
-    # Assert -- the dual-source hit carries a real cosine, not None.
+    # Assert -- the dual-source hit carries a distance-derived score, not None.
     found = next((r for r in rows if r["path"] == "both.md"), None)
     assert found is not None
     assert "vector" in found["sources"]

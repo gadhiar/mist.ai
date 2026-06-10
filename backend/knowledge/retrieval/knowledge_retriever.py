@@ -704,10 +704,11 @@ class KnowledgeRetriever:
                         "vector_rank": row.get("vector_rank"),
                         "fts_rank": row.get("fts_rank"),
                         "sources": row.get("sources"),
-                        # Real cosine in (0, 1] for vector hits, None for
-                        # FTS-only hits (Task 1). Carried so the vault_results
-                        # FE payload can display the true similarity instead
-                        # of the RRF fusion score; None renders as "lexical".
+                        # Distance-derived similarity in (0, 1] for vector hits,
+                        # None for FTS-only hits (Task 1). Carried so the
+                        # vault_results FE payload can display a per-result
+                        # similarity instead of the RRF fusion score; None
+                        # renders as "lexical".
                         "display_similarity": row.get("display_similarity"),
                     },
                     similarity_score=score,

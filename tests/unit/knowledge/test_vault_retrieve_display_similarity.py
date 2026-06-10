@@ -7,7 +7,7 @@ Verifies two things about KnowledgeRetriever._vault_sidecar_retrieve:
    (config.query_intent.rrf_k), so the retriever reads it via
    `self.config.query_intent.rrf_k`.
 2. The per-row `display_similarity` value returned by query_hybrid
-   (real cosine for vector hits, None for FTS-only) is carried onto
+   (distance-derived score for vector hits, None for FTS-only) is carried onto
    the resulting RetrievedFact.properties so it can be surfaced to the
    vault_results FE payload as the displayed similarity.
 """
