@@ -13,6 +13,11 @@ from backend.knowledge.extraction.ontology_extractor import (
     ExtractionResult,
     OntologyConstrainedExtractor,
 )
+from backend.knowledge.ontologies import (
+    ALL_NODE_TYPE_NAMES,
+    EDGE_TYPES_BY_NAME,
+    EXTRACTABLE_RELATIONSHIP_TYPES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,105 +37,32 @@ class ValidationResult:
     errors: list[str] = field(default_factory=list)
 
 
-# Maps relationship type -> (allowed_source_types, allowed_target_types).
-# None means any type is allowed in that position.
-# IMPORTANT: These MUST match the EdgeTypeDefinition constraints in
-# backend.knowledge.ontologies.v1_0_0. If you update the ontology,
-# update this table too (or generate it programmatically in the future).
-#
-# Note on MIST-scope sources: USES / DEPENDS_ON / WORKS_WITH accept
-# Organization and MistIdentity in addition to the original sources so
-# that facts like "MIST uses LanceDB" or "Anthropic works with Python"
-# survive validation. LEARNING / PREFERS / INTERESTED_IN remain user-only
-# by design -- MIST-scope equivalents go through MIST_HAS_CAPABILITY,
-# MIST_HAS_PREFERENCE, and MIST_HAS_TRAIT.
-RELATIONSHIP_CONSTRAINTS: dict[str, tuple[set[str] | None, set[str] | None]] = {
-    "USES": ({"User", "Person", "Organization", "MistIdentity"}, {"Technology"}),
-    "KNOWS": ({"User", "Person"}, {"Skill", "Concept", "Technology", "Topic"}),
-    "WORKS_ON": ({"User", "Person"}, {"Project"}),
-    "WORKS_AT": ({"User", "Person"}, {"Organization"}),
-    "INTERESTED_IN": ({"User"}, {"Technology", "Concept", "Topic", "Skill"}),
-    "HAS_GOAL": ({"User"}, {"Goal"}),
-    "PREFERS": ({"User"}, {"Preference", "Technology", "Concept"}),
-    "DISLIKES": ({"User"}, {"Technology", "Concept", "Topic", "Preference"}),
-    "EXPERT_IN": ({"User", "Person"}, {"Technology", "Skill", "Concept"}),
-    "LEARNING": ({"User"}, {"Technology", "Skill", "Concept"}),
-    "STRUGGLES_WITH": ({"User"}, {"Technology", "Skill", "Concept"}),
-    "DECIDED": ({"User"}, {"Event"}),
-    "EXPERIENCED": ({"User", "Person"}, {"Event"}),
-    "IS_A": (
-        {"Technology", "Skill", "Concept", "Topic", "Organization", "Location"},
-        {"Technology", "Skill", "Concept", "Topic", "Organization", "Location"},
-    ),
-    "PART_OF": (
-        {"Technology", "Concept", "Skill", "Project"},
-        {"Technology", "Concept", "Project", "Organization"},
-    ),
-    "RELATED_TO": (None, None),  # Generic: any -> any
-    "DEPENDS_ON": ({"Technology", "Project", "Organization", "MistIdentity"}, {"Technology"}),
-    "USED_FOR": ({"Technology", "Skill"}, {"Concept", "Topic", "Project"}),
-    "WORKS_WITH": ({"Technology", "Organization", "MistIdentity"}, {"Technology"}),
-    "KNOWS_PERSON": ({"User"}, {"Person"}),
-    "MEMBER_OF": ({"User", "Person"}, {"Organization"}),
-    # MIST-scope relationships: let extraction attribute facts to MIST itself
-    # rather than silently dropping them or mis-attributing to the user.
-    "IMPLEMENTED_WITH": ({"MistIdentity", "Organization", "Project"}, {"Technology"}),
-    "MIST_HAS_CAPABILITY": ({"MistIdentity"}, {"Technology", "Skill", "Concept", "Topic"}),
-    "MIST_HAS_TRAIT": ({"MistIdentity"}, {"Concept", "Topic", "Preference", "Skill"}),
-    "MIST_HAS_PREFERENCE": (
-        {"MistIdentity"},
-        {"Preference", "Concept", "Technology", "Topic"},
-    ),
-    # Post-MVP additive (2026-04-22): temporal + quantified + document.
-    # Constraints MUST mirror the EdgeTypeDefinition entries in
-    # backend.knowledge.ontologies.v1_0_0 exactly.
-    "OCCURRED_ON": ({"Event", "Milestone"}, {"Date"}),
-    "HAS_METRIC": (
-        {"User", "Project", "Technology", "Skill", "Concept", "Goal"},
-        {"Metric"},
-    ),
-    "REFERENCES_DOCUMENT": (
-        {"User", "MistIdentity", "Project", "Concept", "Topic", "Goal", "Event"},
-        {"Document"},
-    ),
-    "PRECEDED_BY": ({"Event", "Milestone"}, {"Event", "Milestone", "Date"}),
-    # v1.1.0 additive (2026-05-06): mechanism / pattern / strategy / convention.
-    # Surfaced from V6 deep-review where 61 percent of relationships defaulted
-    # to RELATED_TO. Constraints mirror EdgeTypeDefinition entries in
-    # backend.knowledge.ontologies.v1_0_0 exactly.
-    "MECHANISM_OF": (
-        {"Mechanism", "Pattern"},
-        {"Concept", "Technology", "Topic", "Strategy"},
-    ),
-    "OPERATES_ON": (
-        {"Mechanism", "Technology", "Strategy", "Pattern"},
-        {"DataStructure", "Concept", "Topic"},
-    ),
-    "INPUT_TO": (
-        {"DataStructure", "Concept", "Document"},
-        {"Mechanism", "Strategy", "Technology", "Pattern"},
-    ),
-    "IMPROVES": (
-        {"Mechanism", "Strategy", "Pattern", "Technology"},
-        {"Concept", "Technology", "Topic", "Metric", "Project"},
-    ),
-    "COMPRISES": (
-        {"Technology", "Project", "DataStructure", "Mechanism", "Strategy"},
-        {"DataStructure", "Mechanism", "Concept", "Technology", "Pattern"},
-    ),
-    "APPLICABLE_TO": (
-        {"Pattern", "Strategy", "Mechanism"},
-        {"Concept", "Topic", "Technology", "Skill"},
-    ),
-    "STRATEGY_FOR": (
-        {"Strategy", "Pattern"},
-        {"Goal", "Concept", "Topic"},
-    ),
-    "NAMING_CONVENTION_OF": (
-        {"Convention"},
-        {"Concept", "DataStructure", "Technology", "Topic"},
-    ),
-}
+def _derive_relationship_constraints() -> dict[str, tuple[set[str] | None, set[str] | None]]:
+    """Derive source/target constraints from the ontology (Inv-A6).
+
+    One source of truth: `EdgeTypeDefinition.allowed_source_types/-target_types`.
+    A definition that permits every known node type maps to None ("any"),
+    preserving the validator's historical RELATED_TO escape-hatch shape.
+    """
+    all_types = set(ALL_NODE_TYPE_NAMES)
+    constraints: dict[str, tuple[set[str] | None, set[str] | None]] = {}
+    for name in EXTRACTABLE_RELATIONSHIP_TYPES:
+        defn = EDGE_TYPES_BY_NAME[name]
+        src = set(defn.allowed_source_types)
+        tgt = set(defn.allowed_target_types)
+        constraints[name] = (
+            None if src >= all_types else src,
+            None if tgt >= all_types else tgt,
+        )
+    return constraints
+
+
+# Derived at import. The standing drift guard
+# (TestValidatorOntologyConsistency) keeps asserting the mirror property;
+# it is now true by construction.
+RELATIONSHIP_CONSTRAINTS: dict[str, tuple[set[str] | None, set[str] | None]] = (
+    _derive_relationship_constraints()
+)
 
 VALID_TEMPORAL_STATUSES: set[str] = {"current", "past", "future", "recurring"}
 

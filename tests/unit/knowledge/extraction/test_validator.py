@@ -1129,3 +1129,26 @@ class TestValidatorOntologyConsistency:
                 )
 
         assert drift == [], "Validator-ontology drift:\n  " + "\n  ".join(drift)
+
+
+class TestConstraintsDerivedFromOntology:
+    """Inv-A6: the validator's constraint table is derived, not hand-copied."""
+
+    def test_related_to_is_unconstrained(self):
+        from backend.knowledge.extraction.validator import RELATIONSHIP_CONSTRAINTS
+
+        assert RELATIONSHIP_CONSTRAINTS["RELATED_TO"] == (None, None)
+
+    def test_uses_matches_ontology_definition(self):
+        from backend.knowledge.extraction.validator import RELATIONSHIP_CONSTRAINTS
+        from backend.knowledge.ontologies import EDGE_TYPES_BY_NAME
+
+        src, tgt = RELATIONSHIP_CONSTRAINTS["USES"]
+        assert src == set(EDGE_TYPES_BY_NAME["USES"].allowed_source_types)
+        assert tgt == set(EDGE_TYPES_BY_NAME["USES"].allowed_target_types)
+
+    def test_covers_exactly_the_extractable_predicates(self):
+        from backend.knowledge.extraction.validator import RELATIONSHIP_CONSTRAINTS
+        from backend.knowledge.ontologies import EXTRACTABLE_RELATIONSHIP_TYPES
+
+        assert set(RELATIONSHIP_CONSTRAINTS) == set(EXTRACTABLE_RELATIONSHIP_TYPES)
