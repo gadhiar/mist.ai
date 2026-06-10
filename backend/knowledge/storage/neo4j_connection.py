@@ -10,6 +10,7 @@ from neo4j.exceptions import Neo4jError, ServiceUnavailable
 
 from backend.errors import MistError, Neo4jConnectionError, Neo4jQueryError
 from backend.knowledge.config import Neo4jConfig
+from backend.knowledge.eval_isolation import assert_neo4j_isolated
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +34,10 @@ class Neo4jConnection:
         """Establish connection to Neo4j database.
 
         Raises:
+            EvalIsolationError: If an eval-isolated run targets the live graph.
             Neo4jConnectionError: If connection fails.
         """
+        assert_neo4j_isolated(self.config)
         if self._driver is None:
             logger.info(f"Connecting to Neo4j at {self.config.uri}")
 

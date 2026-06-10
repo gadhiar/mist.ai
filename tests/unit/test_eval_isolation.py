@@ -50,3 +50,14 @@ class TestAssertNeo4jIsolated:
         cfg = Neo4jConfig(uri="bolt://prod-neo4j:7687")
         with pytest.raises(EvalIsolationError):
             assert_neo4j_isolated(cfg)
+
+
+class TestConnectGuard:
+    def test_connect_refuses_live_in_eval_mode_before_driver(self, monkeypatch):
+        # Eval mode + live URI -> refuse at the guard, before any real driver.
+        monkeypatch.setenv("MIST_EVAL_ISOLATION", "1")
+        from backend.knowledge.storage.neo4j_connection import Neo4jConnection
+
+        conn = Neo4jConnection(Neo4jConfig(uri="bolt://mist-neo4j:7687"))
+        with pytest.raises(EvalIsolationError):
+            conn.connect()
