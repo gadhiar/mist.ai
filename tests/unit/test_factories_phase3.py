@@ -85,7 +85,11 @@ class _FakeSidecarIndex:
 class _FakeVaultWriter:
     """Minimal VaultWriter double."""
 
-    pass
+    def __init__(self) -> None:
+        self.mist_write_marker = None
+
+    def set_mist_write_marker(self, marker) -> None:
+        self.mist_write_marker = marker
 
 
 class _FakeGraphRegenerator:
@@ -245,6 +249,44 @@ class TestPhase3Components:
         )
 
         assert result.filewatcher._writer is writer
+
+    @requires_sentence_transformers
+    def test_build_phase3_components_raises_without_writer(self, tmp_path):
+        # deep review vault-layer-adr010-1: server.py composed phase3 with
+        # writer=None, silently disabling the invariant-5 chain in production.
+        # The factory must reject that composition loudly.
+        from backend.factories import build_phase3_components
+
+        config = _make_config(tmp_path)
+        sidecar = _FakeSidecarIndex()
+        regenerator = _FakeGraphRegenerator()
+
+        with pytest.raises(ValueError, match="invariant-5"):
+            build_phase3_components(
+                config=config,
+                sidecar_index=sidecar,
+                regenerator=regenerator,
+            )
+
+    @requires_sentence_transformers
+    def test_build_phase3_components_wires_mist_write_marker(self, tmp_path):
+        # The writer's consumer must self-mark its writes via the
+        # filewatcher's marker, or every MIST append runs the user-edit path.
+        from backend.factories import build_phase3_components
+
+        config = _make_config(tmp_path)
+        sidecar = _FakeSidecarIndex()
+        regenerator = _FakeGraphRegenerator()
+        writer = _FakeVaultWriter()
+
+        result = build_phase3_components(
+            config=config,
+            sidecar_index=sidecar,
+            regenerator=regenerator,
+            writer=writer,
+        )
+
+        assert writer.mist_write_marker == result.filewatcher.mark_mist_write
 
     def test_build_phase3_components_returns_none_when_filewatcher_disabled(self, tmp_path):
         # Replicate guard logic platform-neutrally: disabled filewatcher -> None.

@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import pytest
+
 from backend.errors import Neo4jQueryError
 from backend.knowledge.storage.graph_store import GraphStore
 from tests.mocks.embeddings import FakeEmbeddingGenerator
@@ -703,3 +705,28 @@ class TestCurrentBeliefFilters:
             assert "r.status IS NULL OR r.status <> 'orphaned'" in query
             assert "coalesce(r.is_latest_belief, true)" in query
             assert "r.valid_from IS NULL OR r.valid_from = '-inf' OR r.valid_from <= $now" in query
+
+
+class TestOrphanMarking:
+    """Invariant-5 orphan marking must catch legacy null-status edges."""
+
+    def _store(self):
+        from backend.knowledge.storage.graph_store import GraphStore
+        from tests.mocks.embeddings import FakeEmbeddingGenerator
+        from tests.mocks.neo4j import FakeNeo4jConnection
+
+        conn = FakeNeo4jConnection()
+        return conn, GraphStore(connection=conn, embedding_generator=FakeEmbeddingGenerator())
+
+    @pytest.mark.asyncio
+    async def test_derived_from_marking_is_null_safe(self):
+        # Three-valued logic: a bare `d.status <> 'orphaned'` filters OUT
+        # null-status edges, silently no-opping the orphan marking for every
+        # extraction-created DERIVED_FROM edge that predates the status field.
+        conn, store = self._store()
+
+        await store.mark_orphaned_by_provenance_path("/vault/users/raj.md")
+
+        derived_writes = [q for q, _ in conn.writes if "DERIVED_FROM" in q]
+        assert derived_writes
+        assert "coalesce(d.status, 'active') <> 'orphaned'" in derived_writes[0]

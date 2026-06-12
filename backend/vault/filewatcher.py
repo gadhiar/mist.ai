@@ -46,8 +46,12 @@ logger = logging.getLogger(__name__)
 def _is_tracked_path(path: str) -> bool:
     """Return True if the path should be tracked by the filewatcher.
 
-    Filters to `.md` files only, excluding hidden files (basename starts with
-    `.`) and anything inside a `.git` subdirectory.
+    Filters to `.md` files only, excluding any path with a hidden component
+    (`.git/`, `.trash/`, `.obsidian/`, dotfiles). Parity with
+    `scripts/mist_admin._walk_vault_md_files` is load-bearing: the live
+    index and a CLI rebuild must agree on corpus membership, and a note the
+    user deletes into Obsidian's `.trash/` must not keep surfacing in
+    retrieval.
 
     Args:
         path: Absolute or relative filesystem path string.
@@ -59,11 +63,9 @@ def _is_tracked_path(path: str) -> bool:
     # Must be a .md file
     if p.suffix.lower() != ".md":
         return False
-    # Exclude hidden files
-    if p.name.startswith("."):
-        return False
-    # Exclude .git subtree (any part of the path is ".git")
-    return ".git" not in p.parts
+    # Reject any hidden path part. The vault never legitimately sits under
+    # a dot-directory in this deployment, so checking absolute parts is safe.
+    return not any(part.startswith(".") for part in p.parts)
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +149,7 @@ class VaultFilewatcher:
         sidecar_index: SidecarIndexProtocol,
         regenerator: GraphRegenerator,
         invalidation_bus: InvalidationBus,
-        writer: VaultWriter,
+        writer: VaultWriter | None,
     ) -> None:
         self.config = config
         self.vault_root = Path(vault_root)
@@ -177,6 +179,11 @@ class VaultFilewatcher:
 
         # asyncio.TimerHandle for the periodic audit job
         self._audit_handle: asyncio.TimerHandle | None = None
+
+        # Strong references to in-flight reindex/delete/audit tasks so their
+        # exceptions surface immediately (done-callback) instead of at GC,
+        # and so stop() can cancel them.
+        self._tasks: set[asyncio.Task] = set()
 
         self._running: bool = False
 
@@ -268,6 +275,12 @@ class VaultFilewatcher:
         for handle, _action in self._pending.values():
             handle.cancel()
         self._pending.clear()
+
+        # Cancel in-flight reindex/delete/audit tasks so shutdown does not
+        # abandon them mid invariant-5 sequence.
+        for task in list(self._tasks):
+            task.cancel()
+        self._tasks.clear()
 
         # Stop the observer thread
         if self._observer is not None:
@@ -372,13 +385,17 @@ class VaultFilewatcher:
         else:
             # modified or created: debounced reindex. Cancels any pending
             # "delete" action for the same path (Obsidian atomic-save case).
-            self._schedule_action(path, "reindex")
+            # Classification is captured HERE, at event arrival, and carried
+            # through the debounce: by fire time the MIST-write marker may
+            # have expired, and re-deriving it then misclassifies MIST writes
+            # as user edits.
+            self._schedule_action(path, "reindex", is_mist_write=is_mist_write)
 
     # ------------------------------------------------------------------
     # Debounce scheduling
     # ------------------------------------------------------------------
 
-    def _schedule_action(self, path: str, action: str) -> None:
+    def _schedule_action(self, path: str, action: str, *, is_mist_write: bool = False) -> None:
         """Schedule (or reschedule) a debounced action for `path`.
 
         Cancels any existing pending action for this path (regardless of
@@ -393,11 +410,13 @@ class VaultFilewatcher:
         Args:
             path: Vault markdown file path.
             action: Either "reindex" or "delete".
+            is_mist_write: Origin classification captured by the caller at
+                event/detection time; carried through the debounce window.
         """
         self._cancel_pending(path)
         delay = self.config.debounce_ms / 1000.0
         if self._loop is not None:
-            handle = self._loop.call_later(delay, self._fire_action, path, action)
+            handle = self._loop.call_later(delay, self._fire_action, path, action, is_mist_write)
             self._pending[path] = (handle, action)
 
     def _cancel_pending(self, path: str) -> None:
@@ -411,7 +430,7 @@ class VaultFilewatcher:
             handle, _action = entry
             handle.cancel()
 
-    def _fire_action(self, path: str, action: str) -> None:
+    def _fire_action(self, path: str, action: str, is_mist_write: bool = False) -> None:
         """Called when the debounce timer fires for `path`.
 
         Removes the path from the pending dict and dispatches the appropriate
@@ -420,18 +439,41 @@ class VaultFilewatcher:
         Args:
             path: Vault markdown file path.
             action: Either "reindex" (call upsert_file) or "delete" (call delete_path).
+            is_mist_write: Classification captured at event/detection time.
         """
         self._pending.pop(path, None)
         if self._loop is None:
             return
         if action == "reindex":
+            # OR with a fire-time marker check: a MIST write whose marker
+            # landed after the triggering event (writer marks right before
+            # the file mutation) must still classify as MIST-origin.
+            # Bias is deliberate: a false MIST skips one authored_by flip
+            # (self-heals on the next real edit); a false user-edit corrupts
+            # authorship and orphans provenance.
             now = time.monotonic()
-            is_mist_write = (
+            marker_active = (
                 path in self._mist_writes_in_flight and self._mist_writes_in_flight[path] > now
             )
-            self._loop.create_task(self._do_reindex(path, is_mist_write=is_mist_write))
+            self._spawn(self._do_reindex(path, is_mist_write=is_mist_write or marker_active))
         elif action == "delete":
-            self._loop.create_task(self._do_delete(path))
+            self._spawn(self._do_delete(path))
+
+    def _spawn(self, coro) -> None:
+        """Create a tracked task whose exception surfaces immediately."""
+        if self._loop is None:
+            return
+        task = self._loop.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._on_task_done)
+
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("VaultFilewatcher task failed: %s", exc, exc_info=exc)
 
     # ------------------------------------------------------------------
     # Reindex and delete coroutines
@@ -520,17 +562,38 @@ class VaultFilewatcher:
             # to avoid recursive rebuild on internal vault writes.
             return
 
-        # ADR-010 Invariant 5: user-edit sequencing
-        # Step 1 — authored_by writeback (suppress recursive filewatcher fire)
-        self.mark_mist_write(path)
+        if self._writer is None:
+            # Wiring regression guard: without a writer the invariant-5 chain
+            # cannot run -- user edits would index but never flip authored_by,
+            # rebuild the graph, or evict caches. Fail loudly, not with an
+            # AttributeError inside a fire-and-forget task.
+            logger.error(
+                "VaultFilewatcher has no VaultWriter wired -- ADR-010 "
+                "invariant-5 chain DISABLED for user edit at %s",
+                path,
+            )
+            return
+
+        # ADR-010 Invariant 5: user-edit sequencing. The authored_by
+        # writeback runs through the writer queue, whose handler self-marks
+        # the path as a MIST write, so no local suppression wrap is needed.
         try:
+            # Step 1 — authored_by writeback
             await self._writer.mark_authored_by_user_edit(Path(path))
-        finally:
-            self.clear_mist_write(path)
-        # Step 2 — graph subgraph rebuild
-        rebuild_result = await self._regenerator.rebuild_from_path(Path(path))
-        # Step 3 — coordinated cache invalidation
-        await self._invalidation_bus.publish(rebuild_result)
+            # Step 2 — graph subgraph rebuild
+            rebuild_result = await self._regenerator.rebuild_from_path(Path(path))
+            # Step 3 — coordinated cache invalidation
+            await self._invalidation_bus.publish(rebuild_result)
+        except Exception as exc:  # noqa: BLE001 -- watcher must survive
+            # Drop the recorded mtime so the next audit pass re-schedules
+            # this path and the invariant-5 sequence is retried.
+            self._known_mtimes.pop(path, None)
+            logger.exception(
+                "VaultFilewatcher: invariant-5 sequence failed for %s "
+                "(will retry via audit): %s",
+                path,
+                exc,
+            )
 
     async def _do_delete(self, path: str) -> None:
         """Remove a deleted vault file from the sidecar index.
@@ -575,7 +638,7 @@ class VaultFilewatcher:
         """
         if not self._running or self._loop is None:
             return
-        self._loop.create_task(self._run_audit())
+        self._spawn(self._run_audit())
         # Reschedule for the next interval
         self._schedule_audit()
 
@@ -590,8 +653,13 @@ class VaultFilewatcher:
         self._cleanup_stale_mist_writes()
 
         try:
+            walk_errors: list[str] = []
+
+            def _on_walk_error(err: OSError) -> None:
+                walk_errors.append(str(getattr(err, "filename", err)))
+
             disk_paths: set[str] = set()
-            for dirpath, _dirnames, filenames in os.walk(self.vault_root):
+            for dirpath, _dirnames, filenames in os.walk(self.vault_root, onerror=_on_walk_error):
                 for fname in filenames:
                     full = str(Path(dirpath) / fname)
                     if not _is_tracked_path(full):
@@ -604,8 +672,38 @@ class VaultFilewatcher:
                         continue
                     known = self._known_mtimes.get(full)
                     if known is None or stat_mtime > known:
-                        # New or updated file: trigger debounced reindex
-                        self._schedule_action(full, "reindex")
+                        # New or updated file: trigger debounced reindex.
+                        # Classify at detection time: the writer marks paths
+                        # right before mutating them, so an audit-caught MIST
+                        # write inside the marker TTL still classifies right.
+                        now = time.monotonic()
+                        is_mist = (
+                            full in self._mist_writes_in_flight
+                            and self._mist_writes_in_flight[full] > now
+                        )
+                        self._schedule_action(full, "reindex", is_mist_write=is_mist)
+
+            # Prune guard: a transiently unreadable vault root yields an
+            # empty/partial walk WITHOUT raising (os.walk swallows scandir
+            # errors unless onerror reports them), and treating that as mass
+            # deletion would empty the sidecar and black out retrieval until
+            # a full re-embed. Skipping one prune cycle costs nothing at the
+            # audit cadence. A genuinely empty-but-readable vault still
+            # prunes (all files legitimately deleted).
+            if walk_errors:
+                logger.warning(
+                    "VaultFilewatcher audit: walk errors (%s) -- skipping "
+                    "vanish-prune this cycle",
+                    "; ".join(walk_errors[:5]),
+                )
+                return
+            if not disk_paths and self._known_mtimes and not self.vault_root.is_dir():
+                logger.warning(
+                    "VaultFilewatcher audit: vault root unavailable with %d "
+                    "known paths -- skipping vanish-prune this cycle",
+                    len(self._known_mtimes),
+                )
+                return
 
             # Files in _known_mtimes that no longer exist on disk
             for tracked_path in list(self._known_mtimes.keys()):
@@ -615,7 +713,7 @@ class VaultFilewatcher:
                         tracked_path,
                     )
                     self._known_mtimes.pop(tracked_path, None)
-                    self._loop.create_task(self._do_delete(tracked_path))
+                    self._spawn(self._do_delete(tracked_path))
 
         except Exception as exc:  # noqa: BLE001
             logger.exception("VaultFilewatcher audit job failed: %s", exc)

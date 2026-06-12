@@ -544,3 +544,64 @@ class TestPhase8FactoryWiring:
         assert stamps.ontology_version == "1.0.0"
         assert stamps.extraction_version == "factory-test-version"
         assert stamps.model_hash == "factory-test-model"
+
+
+# ---------------------------------------------------------------------------
+# Deep review concurrency-async-1 companion: DERIVED_FROM status lifecycle
+# ---------------------------------------------------------------------------
+
+
+class TestProvenanceStatusLifecycle:
+    """DERIVED_FROM edges must carry status=active on CREATE and reset it on
+    MATCH: mark_orphaned_by_provenance_path filters on status, and a
+    re-extraction after a vault edit must heal a previously orphaned edge.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unstamped_provenance_edge_sets_active_status(self) -> None:
+        writer, conn = _make_writer()
+
+        await writer._create_vault_note_provenance(
+            entity_id="python",
+            vault_note_path="/vault/sessions/x.md",
+            event_id="evt-1",
+            now="2026-06-12T00:00:00Z",
+        )
+
+        edges = _writes_matching(conn, "MERGE (e)-[r:DERIVED_FROM]->(vn)")
+        assert edges, f"expected a DERIVED_FROM MERGE, got: {conn.writes}"
+        query = edges[0][0]
+        on_create = query.split("ON CREATE SET")[1].split("ON MATCH SET")[0]
+        on_match = query.split("ON MATCH SET")[1]
+        assert "r.status = 'active'" in on_create
+        assert "r.status = 'active'" in on_match
+
+    @pytest.mark.asyncio
+    async def test_stamped_provenance_edge_sets_active_status(self) -> None:
+        from backend.knowledge.curation.graph_writer import RebuildStamps
+
+        conn = FakeNeo4jConnection()
+        writer = CurationGraphWriter(
+            FakeGraphExecutor(connection=conn),
+            FakeEmbeddingGenerator(),
+            ConfidenceManager(),
+            rebuild_stamps=RebuildStamps(
+                ontology_version="1.2.1",
+                extraction_version="v-test",
+                model_hash="m-test",
+            ),
+        )
+
+        await writer._create_vault_note_provenance(
+            entity_id="python",
+            vault_note_path="/vault/sessions/x.md",
+            event_id="evt-1",
+            now="2026-06-12T00:00:00Z",
+        )
+
+        edges = _writes_matching(conn, "MERGE (e)-[r:DERIVED_FROM]->(vn)")
+        query = edges[0][0]
+        on_create = query.split("ON CREATE SET")[1].split("ON MATCH SET")[0]
+        on_match = query.split("ON MATCH SET")[1]
+        assert "r.status = 'active'" in on_create
+        assert "r.status = 'active'" in on_match

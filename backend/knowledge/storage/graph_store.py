@@ -1583,9 +1583,12 @@ class GraphStore:
         loop = asyncio.get_event_loop()
 
         # --- Write 1: mark DERIVED_FROM provenance edges ---
+        # coalesce: legacy DERIVED_FROM edges predate the status property;
+        # under three-valued logic a bare `d.status <> 'orphaned'` filters
+        # null-status edges OUT and the orphan-marking silently no-ops.
         derived_from_query = (
             "MATCH ()-[d:DERIVED_FROM]->(p:__Provenance__:VaultNote {path: $path}) "
-            "WHERE d.status <> 'orphaned' "
+            "WHERE coalesce(d.status, 'active') <> 'orphaned' "
             "SET d.status = 'orphaned', d.orphaned_at = toString(datetime()) "
             "RETURN count(d) AS marked_count"
         )

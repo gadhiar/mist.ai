@@ -358,9 +358,12 @@ class CurationGraphWriter:
             "event_id": event_id,
             "now": now,
         }
+        # status='active' on BOTH branches: mark_orphaned_by_provenance_path
+        # filters on status, and re-extraction after a vault edit must heal a
+        # previously orphaned provenance edge back to active.
         if self._rebuild_stamps is None:
-            create_set = "r.event_id = $event_id, r.created_at = $now"
-            match_set = "r.event_id = $event_id, r.updated_at = $now"
+            create_set = "r.event_id = $event_id, r.created_at = $now, r.status = 'active'"
+            match_set = "r.event_id = $event_id, r.updated_at = $now, r.status = 'active'"
         else:
             params["ontology_version"] = self._rebuild_stamps.ontology_version
             params["extraction_version"] = self._rebuild_stamps.extraction_version
@@ -369,7 +372,8 @@ class CurationGraphWriter:
                 "r.ontology_version = $ontology_version, "
                 "r.extraction_version = $extraction_version, "
                 "r.model_hash = $model_hash, "
-                "r.derived_at = $now"
+                "r.derived_at = $now, "
+                "r.status = 'active'"
             )
             create_set = "r.event_id = $event_id, r.created_at = $now, " + stamp_clause
             match_set = "r.event_id = $event_id, r.updated_at = $now, " + stamp_clause

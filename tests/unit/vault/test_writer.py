@@ -887,6 +887,15 @@ def writer(tmp_vault: Path) -> VaultWriter:
     return VaultWriter(config)
 
 
+async def _mark_via_consumer(writer: VaultWriter, p: Path) -> None:
+    """Run the queued authored_by writeback with a live consumer."""
+    await writer.start()
+    try:
+        await writer.mark_authored_by_user_edit(p)
+    finally:
+        await writer.stop()
+
+
 def test_mark_authored_by_user_edit_updates_frontmatter(writer: VaultWriter, tmp_vault: Path):
     p = tmp_vault / "users" / "raj.md"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -894,7 +903,7 @@ def test_mark_authored_by_user_edit_updates_frontmatter(writer: VaultWriter, tmp
         "---\n" "type: mist-user\n" "user_id: raj\n" "authored_by: mist\n" "---\n" "# Raj\n",
         encoding="utf-8",
     )
-    asyncio.run(writer.mark_authored_by_user_edit(p))
+    asyncio.run(_mark_via_consumer(writer, p))
     text = p.read_text(encoding="utf-8")
     assert "authored_by: user-edit" in text
     assert "authored_by: mist" not in text
@@ -907,7 +916,7 @@ def test_mark_authored_by_user_edit_idempotent(writer: VaultWriter, tmp_vault: P
         "---\n" "type: mist-user\n" "authored_by: user-edit\n" "---\n" "body\n",
         encoding="utf-8",
     )
-    asyncio.run(writer.mark_authored_by_user_edit(p))
+    asyncio.run(_mark_via_consumer(writer, p))
     text = p.read_text(encoding="utf-8")
     # Already user-edit; no change
     assert text.count("authored_by: user-edit") == 1
@@ -929,7 +938,7 @@ def test_mark_authored_by_user_edit_preserves_body_and_other_frontmatter(
         "\nSome content here.\n"
     )
     p.write_text(original, encoding="utf-8")
-    asyncio.run(writer.mark_authored_by_user_edit(p))
+    asyncio.run(_mark_via_consumer(writer, p))
     text = p.read_text(encoding="utf-8")
     assert "authored_by: user-edit" in text
     assert "type: mist-user" in text
@@ -937,6 +946,19 @@ def test_mark_authored_by_user_edit_preserves_body_and_other_frontmatter(
     assert "status: active" in text
     assert "# Body heading" in text
     assert "Some content here." in text
+
+
+def test_enqueue_on_unstarted_writer_fails_fast(writer: VaultWriter, tmp_vault: Path):
+    # A write on a never-started (or stopped) writer must raise instead of
+    # awaiting a future no consumer will ever resolve.
+    from backend.errors import VaultWriteError
+
+    p = tmp_vault / "users" / "raj.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("---\nauthored_by: mist\n---\nbody\n", encoding="utf-8")
+
+    with pytest.raises(VaultWriteError, match="not running"):
+        asyncio.run(writer.mark_authored_by_user_edit(p))
 
 
 # ---------------------------------------------------------------------------

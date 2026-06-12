@@ -258,6 +258,7 @@ async def lifespan(app: FastAPI):
         phase3 = build_phase3_components(
             config=knowledge_config,
             sidecar_index=vault_sidecar,
+            writer=vault_writer,
         )
         if phase3 is not None:
             vault_filewatcher = phase3.filewatcher

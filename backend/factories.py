@@ -728,11 +728,19 @@ def build_phase3_components(
         sidecar_index: Initialized VaultSidecarIndex. None returns None.
         regenerator: Optional pre-built curation GraphRegenerator. When None,
             one is constructed from `config` (requires graph + LLM access).
-        writer: Optional pre-built VaultWriter. May be None.
+        writer: Pre-built VaultWriter. REQUIRED whenever the vault is
+            enabled: without it the filewatcher cannot run the ADR-010
+            invariant-5 chain (authored_by writeback -> graph rebuild ->
+            cache invalidation) and user edits silently stop propagating.
 
     Returns:
         Phase3Components(filewatcher, invalidation_bus), or None when any
         prerequisite is disabled.
+
+    Raises:
+        ValueError: When the vault is enabled but `writer` is None -- the
+            composition would silently disable invariant 5 (the exact
+            production wiring bug the deep review surfaced).
     """
     from backend.knowledge.curation.graph_regenerator import (
         GraphRegenerator as CurationGraphRegenerator,
@@ -751,6 +759,13 @@ def build_phase3_components(
             "build_phase3_components called with sidecar_index=None; skipping Phase3Components"
         )
         return None
+    if writer is None:
+        raise ValueError(
+            "build_phase3_components requires writer= when the vault is "
+            "enabled: a writer-less filewatcher cannot run the ADR-010 "
+            "invariant-5 chain, so user edits would index but never flip "
+            "authored_by, rebuild the graph, or evict caches."
+        )
 
     regen = regenerator or CurationGraphRegenerator(
         graph_store=build_graph_store(config),
@@ -767,4 +782,10 @@ def build_phase3_components(
         invalidation_bus=bus,
         writer=writer,
     )
+    # MIST-write self-marking: consumer handlers mark each path right before
+    # mutating it so the filewatcher classifies the resulting event as
+    # MIST-origin. Without this every per-turn session append runs the
+    # user-edit invariant-5 sequence (authored_by corruption + provenance
+    # orphaning + a wasted full-note re-extraction per turn).
+    writer.set_mist_write_marker(filewatcher.mark_mist_write)
     return Phase3Components(filewatcher=filewatcher, invalidation_bus=bus)

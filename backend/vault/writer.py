@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -152,6 +153,33 @@ class VaultWriter:
         self._stopped = False
         self._debug_logger = debug_logger
         self._model_hash = model_hash
+        # Filewatcher MIST-write marker (VaultFilewatcher.mark_mist_write),
+        # wired by build_phase3_components. Every consumer handler calls it
+        # immediately before mutating a file so the filewatcher classifies
+        # the resulting event as MIST-origin instead of a user edit. There
+        # is deliberately NO clear-after-write: the watchdog event may
+        # arrive after the write completes, so an eager clear would re-open
+        # the user-edit misclassification; expired markers are reaped by
+        # the filewatcher's TTL cleanup.
+        self._mist_write_marker: Callable[[str], None] | None = None
+
+    def set_mist_write_marker(self, marker: Callable[[str], None]) -> None:
+        """Wire the filewatcher's mark_mist_write so consumer writes self-mark.
+
+        Args:
+            marker: Callable receiving the absolute path string about to be
+                written (typically `VaultFilewatcher.mark_mist_write`).
+        """
+        self._mist_write_marker = marker
+
+    def _mark_mist_write(self, path: Path | str) -> None:
+        """Mark `path` as a MIST-origin write; never breaks the write path."""
+        if self._mist_write_marker is None:
+            return
+        try:
+            self._mist_write_marker(str(path))
+        except Exception as exc:  # noqa: BLE001 -- marking must not block writes
+            logger.debug("MIST-write marker failed for %s (non-fatal): %s", path, exc)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -361,29 +389,20 @@ class VaultWriter:
         flip `authored_by` so subsequent `upsert_user` calls respect the
         user-authoritative constraint and do not overwrite the body.
 
-        Idempotent: a second call on a file already at `authored_by: user-edit`
-        is a no-op (no rewrite, no temp file created).
+        Serialized through the consumer queue like every other write: the
+        target may be the ACTIVE session note (user edits today's note in
+        Obsidian while chatting), and an inline read-modify-write would race
+        the consumer's append and silently drop a turn.
 
-        Suppressed from filewatcher recursive fire via mark_mist_write_context
-        (caller is responsible for wrapping in that context manager when
-        invoking from inside filewatcher event handling).
+        Idempotent: a second call on a file already at `authored_by: user-edit`
+        is a no-op (no rewrite, no temp file created). The handler self-marks
+        the path as a MIST write so the writeback does not re-fire the
+        filewatcher's user-edit sequence.
 
         Args:
             path: Absolute path to the vault markdown file to update.
         """
-        text = path.read_text(encoding="utf-8")
-        new_text = re.sub(
-            r"^authored_by:\s*\S+",
-            "authored_by: user-edit",
-            text,
-            count=1,
-            flags=re.MULTILINE,
-        )
-        if new_text == text:
-            return
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(new_text, encoding="utf-8")
-        tmp.replace(path)
+        await self._enqueue("mark_authored_by", {"path": str(path)})
 
     async def upsert_user(self, user_id: str, body_markdown: str) -> str:
         """Write or update a user fact sheet at `users/<user_id>.md`.
@@ -510,7 +529,14 @@ class VaultWriter:
         Logs a warning if the queue depth exceeds `writer_queue_max_depth`
         (backpressure signal per ADR-010 -- caller is not blocked per
         Invariant 6).
+
+        Raises:
+            VaultWriteError: When the consumer is not running (never started,
+                already stopped, or crashed) -- enqueueing would await a
+                future nothing will ever resolve.
         """
+        if self._stopped or self._consumer_task is None or self._consumer_task.done():
+            raise VaultWriteError(f"VaultWriter consumer is not running; cannot enqueue {kind!r}")
         if self._queue.qsize() > self.config.writer_queue_max_depth:
             logger.warning(
                 "VaultWriter queue depth %d exceeds limit %d -- backpressure",
@@ -637,6 +663,7 @@ class VaultWriter:
             "upsert_user_snapshot": self._handle_upsert_user_snapshot,
             "mark_session_completed": self._handle_mark_session_completed,
             "append_session_synthesis": self._handle_append_session_synthesis,
+            "mark_authored_by": self._handle_mark_authored_by,
         }
         handler = handlers.get(job.kind)
         if handler is None:
@@ -658,6 +685,7 @@ class VaultWriter:
             )
             return None
 
+        self._mark_mist_write(path)
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
             None,
@@ -694,6 +722,7 @@ class VaultWriter:
             )
             return None
 
+        self._mark_mist_write(path)
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
             None,
@@ -733,6 +762,34 @@ class VaultWriter:
         )
         path.write_text(render_frontmatter(fm, body), encoding="utf-8")
 
+    async def _handle_mark_authored_by(self, args: dict[str, Any]) -> None:
+        path = Path(args["path"])
+        # Self-mark inside the handler (not at enqueue time): the queue may
+        # be deep enough that an enqueue-time marker expires before the
+        # write executes, which would re-fire the user-edit sequence.
+        self._mark_mist_write(path)
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(None, self._mark_authored_by_sync, path)
+        except OSError as exc:
+            raise VaultWriteError(f"Failed authored_by writeback on {path}: {exc}") from exc
+
+    def _mark_authored_by_sync(self, path: Path) -> None:
+        """Synchronous core: flip frontmatter authored_by to user-edit."""
+        text = path.read_text(encoding="utf-8")
+        new_text = re.sub(
+            r"^authored_by:\s*\S+",
+            "authored_by: user-edit",
+            text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        if new_text == text:
+            return
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(new_text, encoding="utf-8")
+        tmp.replace(path)
+
     async def _handle_append_turn(self, args: dict[str, Any]) -> str:
         session_id: str = args["session_id"]
         turn_index: int = args["turn_index"]
@@ -746,6 +803,7 @@ class VaultWriter:
 
         path = Path(vault_note_path)
 
+        self._mark_mist_write(path)
         loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(
@@ -863,6 +921,7 @@ class VaultWriter:
         entity_slugs: list[str] = args["entity_slugs"]
 
         path = Path(vault_note_path)
+        self._mark_mist_write(path)
         loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(
@@ -948,6 +1007,7 @@ class VaultWriter:
         preferences: list[dict] = args["preferences"]
 
         path = self._root / "identity" / "mist.md"
+        self._mark_mist_write(path)
         loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(
@@ -970,9 +1030,29 @@ class VaultWriter:
         capabilities: list[dict],
         preferences: list[dict],
     ) -> None:
-        """Synchronous core of `upsert_identity`."""
+        """Synchronous core of `upsert_identity`.
+
+        Preserves hand-edited files: when the existing file carries
+        `authored_by: user-edit` (the value the invariant-5 writeback stamps
+        on real human edits), the bootstrap does NOT overwrite it --
+        identity/mist.md is the bucket-3 curated persona file whose user
+        edits are the most authoritative content in the vault. Files still
+        carrying the machine-stamped birth value are refreshed normally so
+        seed_data.yaml updates flow through.
+        """
         today = datetime.now(UTC).date().isoformat()
         now_iso = datetime.now(UTC).isoformat()
+
+        if path.exists():
+            existing = path.read_text(encoding="utf-8")
+            fm_dict, _body = parse_frontmatter(existing)
+            if fm_dict.get("authored_by") == "user-edit":
+                logger.warning(
+                    "Identity note %s has authored_by=user-edit -- bootstrap "
+                    "skipped to preserve hand edits (ADR-010 invariant 5)",
+                    path,
+                )
+                return
 
         fm = MistIdentityFrontmatter(
             authored_by=AuthoredBy.USER,
@@ -1025,6 +1105,7 @@ class VaultWriter:
         body_markdown: str = args["body_markdown"]
 
         path = self._root / "users" / f"{user_id}.md"
+        self._mark_mist_write(path)
         loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(
@@ -1117,6 +1198,7 @@ class VaultWriter:
         # derived snapshot lives at users/<user_id>-graph-snapshot.md so it
         # never collides with the curated users/<user_id>.md.
         path = self._root / "users" / f"{user_id}-graph-snapshot.md"
+        self._mark_mist_write(path)
         loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(
