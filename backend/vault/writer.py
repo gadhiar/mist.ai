@@ -48,8 +48,11 @@ _STEM_DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-")
 # accepts `## provenance` as the same logical section.
 _PROVENANCE_HEADING_RE = re.compile(r"(?im)^##\s+Provenance\s*$")
 
-_ONTOLOGY_VERSION = "1.1.0"
-_EXTRACTION_VERSION = "2026-05-06-r1"
+# Stamp mirrors of KnowledgeConfig defaults (the writer is wired with
+# VaultConfig only). Keep in lockstep with backend/knowledge/config.py --
+# TestExtractionVersionDriftGuard pins the prompt<->version pairing.
+_ONTOLOGY_VERSION = "1.2.1"
+_EXTRACTION_VERSION = "2026-06-12-r1"
 
 
 def _session_id_from_path(path: Path) -> str:

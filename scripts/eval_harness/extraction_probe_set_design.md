@@ -86,6 +86,21 @@ docker compose -f docker-compose.yml -f docker-compose.eval-neo4j.yml --profile 
 
 ## Baseline results (2026-06-10)
 
+**[2026-06-12 CORRECTION -- deep review foundation-f123-3] The numbers below
+are NON-COMPARABLE against the corrected corpus.** The original gold labels
+omitted the prompt-mandated `user` anchor entity (Extraction Rule 1) on the 8
+user-scope probes, so a contract-COMPLIANT extraction scored one guaranteed
+entity false positive per probe: entity precision 0.652 = 15/23 is exactly 15
+TP + 8 anchor FPs. The "extractor over-produces entities" diagnosis below is
+a harness artifact -- artifact-corrected entity precision on this run is
+~1.000, so TYPING (0.833) and relationship precision (0.750), not entity
+precision, are the real C3 targets. The corpus now lists the `user` anchor on
+ext-01/02/03/04/06/07/08/09; ext-04's `user EXPERIENCED team-offsite` anchor
+EDGE remains intentionally unlabeled (the probe scores the
+date-anchoring shape, not the anchor edge). Re-run this baseline procedure
+against the corrected corpus at C3 kickoff and replace the table below; the
+C1/C2 no-regression reference must also re-baseline.
+
 Gemma 4 E4B Q5_K_M, ontology v1.1.0, seed graph, isolated quad (eval Neo4j + throwaway trio). All 12 probes matched in the debug log; every probe produced an extraction record.
 
 | Metric | Value | Gate | Pass |

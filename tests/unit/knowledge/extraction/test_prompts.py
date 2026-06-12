@@ -245,3 +245,37 @@ class TestUserTemplate:
 
         # Assert
         assert rendered == expected
+
+
+class TestExtractionVersionDriftGuard:
+    """foundation-f123-4: the extraction cache keys on extraction_version,
+    so a prompt edit without a version bump would make R1 rebuilds silently
+    serve extractions produced by the OLD prompt. This pin makes the
+    honor-system pairing mechanical.
+    """
+
+    # sha256(EXTRACTION_SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE) pinned for
+    # extraction_version = "2026-06-12-r1".
+    PINNED_SHA256 = "06a6f0a7ced948aa578745b5fba67a84f504185725f1fc81b8cbc1f0116bfc5a"
+
+    def test_prompt_content_matches_pinned_extraction_version(self):
+        import hashlib
+
+        digest = hashlib.sha256(
+            (EXTRACTION_SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE).encode("utf-8")
+        ).hexdigest()
+        assert digest == self.PINNED_SHA256, (
+            "Extraction prompt content changed WITHOUT an extraction_version "
+            "bump. Update KnowledgeConfig.extraction_version (field default + "
+            "EXTRACTION_VERSION env default) and backend/vault/writer.py "
+            "_EXTRACTION_VERSION, then re-pin PINNED_SHA256 here. The "
+            "extraction cache keys on the version string -- skipping the bump "
+            "makes R1 rebuilds silently serve stale extractions."
+        )
+
+    def test_config_default_matches_pinned_version(self):
+        from backend.knowledge.config import KnowledgeConfig
+        from backend.vault.writer import _EXTRACTION_VERSION
+
+        assert KnowledgeConfig.extraction_version == "2026-06-12-r1"
+        assert _EXTRACTION_VERSION == "2026-06-12-r1"
