@@ -767,6 +767,9 @@ class ConversationHandler:
         # shutdown so cancellation cannot land mid commit-protocol (which
         # would retire a belief without writing its successor).
         self._extraction_tasks: dict[asyncio.Task, str] = {}
+        # Always-on extraction-failure counter (independent of the
+        # MIST_DEBUG_JSONL gate) so a persistent failure is countable.
+        self._extraction_failures: int = 0
 
         # Cluster 6: budget-aware context assembly. Planner constructed from
         # config when not injected; legacy behavior preserved when disabled.
@@ -938,6 +941,27 @@ class ConversationHandler:
                     f"No vault content found for query: '{query}'."
                     " You may want to ask the user about this topic."
                 )
+
+            # The curated profile is ALWAYS-injected as its own block; the
+            # tool path must mirror the auto-inject dedup or the body appears
+            # twice in one prompt (deep review phase1-conversation-2). The
+            # sidecar keeps the profile indexed on purpose -- only the
+            # injection layer dedups.
+            profile_path = self._resolve_user_profile_path()
+            if profile_path is not None:
+                is_profile = self._profile_fact_matcher(profile_path)
+                kept = [f for f in result.facts if not is_profile(f)]
+                if len(kept) != len(result.facts):
+                    result.facts = kept
+                    result.total_facts = len(kept)
+                    if not kept:
+                        return (
+                            f"No vault content found for query: '{query}'."
+                            " You may want to ask the user about this topic."
+                        )
+                    result.formatted_context = self.retriever.format_context(
+                        kept, query, intent=result.intent
+                    )
 
             vault_facts = [f for f in result.facts if f.subject == "VaultNote"]
             if vault_facts:
@@ -1771,7 +1795,20 @@ class ConversationHandler:
             # because curation completed before this point.
             await self._maybe_refresh_user_vault(result)
         except Exception as e:
-            logger.error("Background extraction failed (non-fatal): %s", e)
+            # Always-on structured signal: counter + ids + full traceback.
+            # With the debug-JSONL gate off (default), this containment is the
+            # ONLY record of a persistent extraction failure (Neo4j down, LLM
+            # schema regression) while the user-visible reply keeps flowing.
+            self._extraction_failures += 1
+            logger.error(
+                "Background extraction failed (non-fatal) "
+                "[session=%s event=%s failure_count=%d]: %s",
+                session_id,
+                event_id,
+                self._extraction_failures,
+                e,
+                exc_info=True,
+            )
             if turn_record is not None:
                 turn_record.record_extraction(
                     None,
@@ -2091,11 +2128,20 @@ class ConversationHandler:
            to "user" by default, but a configured `default_user_id` may differ
            in case from the on-disk filename).
 
-        Returns the resolved `Path`, or None when no matching file exists or
-        the vault root / users dir is absent. Never raises.
+        Returns the resolved `Path`, or None when the vault layer is disabled,
+        no matching file exists, or the vault root / users dir is absent.
+        Never raises.
         """
         try:
-            vault_root = Path(self.config.vault.root)
+            vault_cfg = self.config.vault
+            # Profile injection is a vault feature: with the layer disabled
+            # the default root still points at the REAL mist-memory, and an
+            # ungated read leaks the live profile into vault-less contexts
+            # (surfaced by the budget-accounting fix: unit tests were
+            # silently injecting the live curated profile).
+            if vault_cfg is None or not vault_cfg.enabled:
+                return None
+            vault_root = Path(vault_cfg.root)
         except (AttributeError, TypeError):
             return None
 
@@ -2149,21 +2195,14 @@ class ConversationHandler:
             return None, None
         return path, _format_user_profile_block(body)
 
-    def _dedup_profile_from_retrieval(
-        self, retrieval_result: RetrievalResult, profile_path: Path
-    ) -> None:
-        """Drop the user-profile chunk from a retrieval result, in place.
-
-        The curated profile is always-injected as its own block, so any copy
-        the auto-inject retrieved must be removed to avoid a duplicate body.
-        Filters `retrieval_result.facts` by source path, then re-renders
-        `formatted_context` from the surviving facts via the retriever's
-        canonical formatter so the budget-planner path (re-renders from facts)
-        and the legacy path (reads formatted_context) stay consistent.
+    def _profile_fact_matcher(self, profile_path: Path):
+        """Build a predicate matching facts sourced from the curated profile.
 
         Path matching is tolerant of the sidecar storing vault-RELATIVE paths
-        (e.g. "users/user.md") while `profile_path` is absolute: we compare the
-        normalized POSIX tail "users/<filename>". No-op when no fact matches.
+        (e.g. "users/user.md") while `profile_path` is absolute: we compare
+        the normalized POSIX tail "users/<filename>". Shared by the
+        auto-inject dedup AND the query_vault tool path so the profile body
+        can never appear twice in one prompt.
         """
         try:
             vault_root = Path(self.config.vault.root)
@@ -2185,6 +2224,22 @@ class ConversationHandler:
                 or norm.endswith(f"/users/{profile_name}")
                 or (norm == f"users/{profile_name}")
             )
+
+        return _is_profile_fact
+
+    def _dedup_profile_from_retrieval(
+        self, retrieval_result: RetrievalResult, profile_path: Path
+    ) -> None:
+        """Drop the user-profile chunk from a retrieval result, in place.
+
+        The curated profile is always-injected as its own block, so any copy
+        the auto-inject retrieved must be removed to avoid a duplicate body.
+        Filters `retrieval_result.facts` by source path, then re-renders
+        `formatted_context` from the surviving facts via the retriever's
+        canonical formatter so the budget-planner path (re-renders from facts)
+        and the legacy path (reads formatted_context) stay consistent.
+        """
+        _is_profile_fact = self._profile_fact_matcher(profile_path)
 
         kept = [f for f in retrieval_result.facts if not _is_profile_fact(f)]
         if len(kept) == len(retrieval_result.facts):
@@ -2208,7 +2263,7 @@ class ConversationHandler:
         logger.debug(
             "[USER-PROFILE] Deduped %d profile chunk(s) from auto-inject (path=%s)",
             dropped,
-            profile_rel,
+            profile_path,
         )
 
     def _record_turn_event(
@@ -2680,6 +2735,16 @@ class ConversationHandler:
 
         raw_history = session.get_history(max_history)
 
+        # Pre-load the conventions block so the planner can charge it as a
+        # fixed segment (it is appended unconditionally below). Formatted
+        # form is what gets counted -- that is what lands in the message.
+        conventions_content = self._conventions_loader.load_vault_root()
+        conventions_message = (
+            self._conventions_loader.format_for_prompt(conventions_content)
+            if conventions_content is not None
+            else None
+        )
+
         # --- Cluster 6: budget planning ---
         if self._budget_planner is not None:
             plan = self._budget_planner.plan(
@@ -2690,6 +2755,12 @@ class ConversationHandler:
                 history=raw_history,
                 tools=self._tool_schemas,
                 max_output_tokens=max_output_tokens,
+                # Always-injected blocks below MUST be charged as fixed cost
+                # or they silently eat the 8K quality envelope past the
+                # 256-token safety margin (deep review phase1-conversation-1).
+                extra_fixed_texts=[
+                    t for t in (conventions_message, profile_block) if t is not None
+                ],
             )
             retrieval_text = plan.pruned_retrieval_text
             history = plan.pruned_history
@@ -2751,14 +2822,8 @@ class ConversationHandler:
         # position. Placed before retrieval to preserve KV-cache reuse across
         # turns (parity audit v2.1 G6). Omitted when no conventions file
         # exists (vault-less or test contexts).
-        conventions_content = self._conventions_loader.load_vault_root()
-        if conventions_content is not None:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": self._conventions_loader.format_for_prompt(conventions_content),
-                }
-            )
+        if conventions_message is not None:
+            messages.append({"role": "user", "content": conventions_message})
 
         # 3b. User profile (ADR-010): always-inject the known user's curated
         # users/<user_id>.md body, independent of retrieval similarity/intent

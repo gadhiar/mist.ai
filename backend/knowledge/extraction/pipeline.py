@@ -449,6 +449,11 @@ class ExtractionPipeline:
                 so every upserted entity gets a DERIVED_FROM edge to its
                 source vault note. None for non-conversation paths
                 (document ingest) or when the vault layer is disabled.
+            recorded_at: Fact-time ISO-8601 timestamp of the source event
+                (C1). Defaults to now(UTC). Anchors `reference_date` so a
+                rebuild resolves relative dates identically to the live turn,
+                and flows to the reconciliation engine as the bitemporal
+                recorded_at.
 
         Returns:
             ValidationResult with validated entities and relationships.
@@ -717,10 +722,10 @@ class ExtractionPipeline:
         Treats the full file body as a single extraction utterance, passing
         `vault_note_path` through to the curation pipeline so every upserted
         entity gets a DERIVED_FROM edge stamped to its source vault note.
-        `ontology_version` pins the extraction to the version active at rebuild
-        time per the ADR-010 rebuild-determinism model; it is forwarded as the
-        `extraction_source` tag so downstream logging can identify vault-file
-        re-extraction runs.
+        `extraction_source` is hardcoded to "orchestrator_summary", which
+        selects the 0.2 significance threshold from `_SOURCE_THRESHOLDS`;
+        there is no vault-specific source tag. `ontology_version` is used
+        only in the re-extraction log line below.
 
         Returns None when `content` is empty. Otherwise delegates to
         `extract_from_utterance` and returns its result.
@@ -728,9 +733,7 @@ class ExtractionPipeline:
         Args:
             content: Full text body of the vault file.
             vault_note_path: Absolute path string for provenance tracking.
-            ontology_version: Ontology version string to stamp on extracted
-                triples (used for logging; the curation pipeline receives it
-                via the `vault_note_path` provenance edge).
+            ontology_version: Ontology version string for the log line.
         """
         if not content.strip():
             logger.debug(

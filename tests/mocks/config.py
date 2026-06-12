@@ -49,10 +49,11 @@ def build_test_config(
     All parameters are keyword-only for type safety and IDE autocomplete.
 
     Vault parameters:
-        vault_root: Path to the vault directory. If None, vault is left in
-            disabled-default state (KnowledgeConfig.__post_init__ fills a
-            disabled-by-default VaultConfig()). When set, a VaultConfig is
-            constructed at that path and used.
+        vault_root: Path to the vault directory. If None, an explicitly
+            DISABLED VaultConfig with a placeholder root is constructed --
+            the production VaultConfig() defaults to enabled=True with
+            root="mist-memory", which silently leaked LIVE-vault reads
+            (curated profile injection) into vault-less unit tests.
         vault_enabled: Whether vault code paths execute. Defaults False so
             most unit tests do not exercise vault writes. Set True for
             integration tests that need the real vault flow.
@@ -69,14 +70,16 @@ def build_test_config(
     resolved_neo4j_user = neo4j_user or os.getenv("NEO4J_USER", "neo4j")
     resolved_neo4j_password = neo4j_password or os.getenv("NEO4J_PASSWORD", "test")
 
-    vault_config = None
-    if vault_root is not None:
-        vault_config = VaultConfig(
-            enabled=vault_enabled,
-            root=vault_root,
-            default_user_id=vault_user_id,
-            git_auto_init=vault_git_auto_init,
-        )
+    vault_config = VaultConfig(
+        enabled=vault_enabled if vault_root is not None else False,
+        root=vault_root or "test-vault-unset",
+        # Vault-less tests keep the dataclass-default user id so
+        # _user_id_for_vault resolves to "user" exactly as before; an
+        # explicit vault_root opts into TEST_VAULT_USER_ID (matches
+        # tests/fixtures/test-vault/users/test-user.md).
+        default_user_id=vault_user_id if vault_root is not None else "raj",
+        git_auto_init=vault_git_auto_init,
+    )
     return KnowledgeConfig(
         neo4j=Neo4jConfig(
             uri=resolved_neo4j_uri,

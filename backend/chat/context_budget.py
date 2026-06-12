@@ -330,6 +330,7 @@ class ContextBudgetPlanner:
         history: list[dict[str, Any]],
         tools: list[dict] | None,
         max_output_tokens: int,
+        extra_fixed_texts: list[str] | None = None,
     ) -> BudgetPlan:
         """Plan the budget allocation for a single turn.
 
@@ -341,6 +342,12 @@ class ContextBudgetPlanner:
             history: Conversation history messages in chronological order.
             tools: Tool schema array passed alongside messages.
             max_output_tokens: `LLMRequest.max_tokens` for the coming call.
+            extra_fixed_texts: Additional always-injected blocks (vault
+                conventions, curated user profile) in their FORMATTED message
+                form. Counting them is load-bearing: unaccounted always-on
+                blocks eat the quality envelope past the 256-token safety
+                margin while the planner believes pruned retrieval/history
+                still fits.
 
         Returns:
             BudgetPlan describing what survives the budget, what got pruned,
@@ -356,6 +363,7 @@ class ContextBudgetPlanner:
 
         # Fixed segments that never get pruned.
         fixed_texts = [t for t in (persona_text, static_text, live_advisory_text) if t]
+        fixed_texts += [t for t in (extra_fixed_texts or []) if t]
         fixed_cost = self._fixed_segment_tokens(fixed_texts)
         fixed_cost += self._tools_schema_tokens(tools)
 

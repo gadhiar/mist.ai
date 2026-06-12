@@ -656,9 +656,11 @@ class _LiveTurnRecord(TurnRecord):
             }
             return
 
-        # CurationResult wraps a ValidationResult and adds a write_result +
-        # curation_time_ms. Prefer the inner ValidationResult when present so
-        # entity/relationship counts reflect extracted content, not curation side.
+        # Result-shape tolerance: a raw ValidationResult carries
+        # entities/relationships; the post-C2 CurationResult carries
+        # validated_entities/validated_relationships (it does NOT wrap a
+        # ValidationResult). Without the validated_* fallback the production
+        # curation path logged entity_count=0 on every turn.
         inner = getattr(result, "validation_result", None)
         if inner is not None:
             entities = getattr(inner, "entities", None)
@@ -666,16 +668,24 @@ class _LiveTurnRecord(TurnRecord):
         else:
             entities = getattr(result, "entities", None)
             relationships = getattr(result, "relationships", None)
+        if entities is None and relationships is None:
+            entities = getattr(result, "validated_entities", None)
+            relationships = getattr(result, "validated_relationships", None)
 
         write_result = getattr(result, "write_result", None)
 
+        def _confidence_of(item) -> float | None:
+            # Validator output is list[dict]; legacy paths may carry objects.
+            if isinstance(item, dict):
+                value = item.get("confidence", (item.get("properties") or {}).get("confidence"))
+                return float(value) if value is not None else None
+            return float(item.confidence) if hasattr(item, "confidence") else None
+
         confidences: list[float] = []
-        if entities:
-            confidences.extend(float(e.confidence) for e in entities if hasattr(e, "confidence"))
-        if relationships:
-            confidences.extend(
-                float(r.confidence) for r in relationships if hasattr(r, "confidence")
-            )
+        for item in (entities or []) + (relationships or []):
+            value = _confidence_of(item)
+            if value is not None:
+                confidences.append(value)
         avg_conf = sum(confidences) / len(confidences) if confidences else None
 
         self._extraction = {

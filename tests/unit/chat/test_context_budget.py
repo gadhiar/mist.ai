@@ -307,6 +307,27 @@ class TestContextBudgetPlanner:
         assert plan.facts_kept == 0
         assert plan.facts_dropped == 0
 
+    def test_extra_fixed_texts_are_charged_as_fixed_cost(self):
+        # deep review phase1-conversation-1: the always-injected conventions
+        # and user-profile blocks bypassed fixed-cost accounting, eating the
+        # quality envelope while the planner believed pruned content fit.
+        planner = ContextBudgetPlanner(config=_default_config())
+        kwargs = {
+            "persona_text": "p",
+            "static_text": "s",
+            "retrieval_result": None,
+            "live_advisory_text": None,
+            "history": [],
+            "tools": None,
+            "max_output_tokens": 100,
+        }
+
+        base = planner.plan(**kwargs)
+        with_extra = planner.plan(**kwargs, extra_fixed_texts=["X" * 400, "Y" * 200])
+
+        assert with_extra.fixed_cost > base.fixed_cost
+        assert with_extra.history_budget <= base.history_budget
+
     def test_fixed_over_budget_returns_not_fits(self):
         # Huge persona + tiny window forces overflow.
         planner = ContextBudgetPlanner(config=_default_config(context_window=200))
