@@ -590,8 +590,9 @@ NOTES (vault prose; relevant excerpts auto-surfaced below):
     notes, user fact sheets, decisions, prior conversations
   - The relevant prose for this turn is already in the context below.
     Auto-retrieval covers most history-and-recall queries.
-  - At present, no tool exposes deeper vault search. Treat the prose
-    below as the only available view of the notes.
+  - When the user asks about past sessions, decisions, or notes that
+    the excerpts below do not fully answer, call query_vault for
+    deeper search over the full note corpus.
 
 KNOWLEDGE GRAPH (typed triples; tool-only access):
   - REASONING substrate -- structured entities, relationships, and
@@ -614,9 +615,19 @@ user-specific structured knowledge:
   tools, projects, or learning
 - Vault prose is insufficient and the answer needs typed-fact lookup
 
+USE query_vault when the question needs PROSE or HISTORY recall beyond
+the excerpts already injected below:
+
+- User asks what was discussed, decided, or written in past sessions
+  and the injected excerpts do not contain the answer
+- User references a note, decision, or session by name or date that
+  the excerpts below do not cover
+- Prefer query_vault for narrative/prose recall; prefer
+  query_knowledge_graph for typed-fact or multi-hop questions
+
 === TOOL USAGE INVARIANTS ===
 
-DO NOT call query_knowledge_graph when:
+DO NOT call query_knowledge_graph OR query_vault when:
 
 - The message is purely conversational -- greetings, acknowledgements,
   social closings ("Hi", "Good morning", "Thanks", "Sounds good",
@@ -628,9 +639,10 @@ DO NOT call query_knowledge_graph when:
 - The question is purely creative with no user-specific reasoning
   required ("write me a poem", "tell a joke")
 
-When unsure whether the tool is warranted, ASK YOURSELF: does the answer depend on user-specific structured knowledge that prose alone
-cannot give? If yes, call the tool. If no, answer from prose or
-general knowledge.
+When unsure whether a tool is warranted, ASK YOURSELF: does the answer depend on user-specific knowledge that the prose below alone
+cannot give? If yes, call the right tool (typed facts -> graph;
+prose/history -> vault). If no, answer from prose or general
+knowledge.
 
 Knowledge from conversations is captured automatically -- you do not
 need to extract it manually.
@@ -1037,7 +1049,10 @@ class ConversationHandler:
         milliseconds. Events drain via handle_message_streaming as WSEvent
         yields per ADR-017 Wave 2.
         """
-        tool_call_id = uuid.uuid4().hex[:8]
+        # Propagate the provider-assigned id so FE events, message history,
+        # and JSONL records all join on ONE tool_call_id (ADR-017 UUID
+        # convention); mint only when the provider sent none.
+        tool_call_id = tool_call.id or str(uuid.uuid4())
         self._turn_ws_events.append(
             {
                 "type": "tool_call_started",
@@ -1626,6 +1641,13 @@ class ConversationHandler:
             # but this guards against regression). FE always sees the events
             # that were buffered before the failure point so tool_call_started
             # never orphans a missing tool_call_completed.
+            # Count dispatched tools BEFORE clearing the heterogeneous buffer
+            # (graph_subgraph / vault / cards events accumulate here too) so
+            # stream_complete.tool_calls_used reflects reality instead of the
+            # dataclass default 0 (deep review febe-observability-1).
+            tool_calls_used = sum(
+                1 for p in self._turn_ws_events if p.get("type") == "tool_call_started"
+            )
             for event_payload in self._turn_ws_events:
                 yield WSEvent(payload=event_payload)
             self._turn_ws_events = []
@@ -1635,7 +1657,11 @@ class ConversationHandler:
         for char in response:
             yield Token(text=char)
 
-        yield Complete(final_response=response, duration_ms=duration_ms)
+        yield Complete(
+            final_response=response,
+            tool_calls_used=tool_calls_used,
+            duration_ms=duration_ms,
+        )
 
     async def _extract_knowledge_async(
         self,

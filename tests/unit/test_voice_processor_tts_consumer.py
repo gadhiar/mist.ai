@@ -147,3 +147,71 @@ class TestSentinelPropagation:
         thread.join(timeout=5.0)
 
         assert not thread.is_alive(), "Interrupt during get should break out"
+
+
+class TestSentinelOnProducerException:
+    """Deep review febe-observability-2: the LLM producer raising must not
+    leave the TTS consumer spinning forever on an empty queue while holding
+    tts_render_lock (voice output dead until restart).
+    """
+
+    def test_consumer_released_when_llm_producer_raises(self) -> None:
+        vp = _make_voice_processor()
+
+        def _raising_gen(_text):
+            raise RuntimeError("llama down")
+            yield  # pragma: no cover -- makes this a generator function
+
+        vp.models = types.SimpleNamespace(
+            generate_llm_response=_raising_gen,
+            trim_to_last_sentence=lambda s: s,
+            generate_tts_audio=lambda _t: iter([]),
+        )
+
+        vp._process_conversation_turn("hello")
+
+        # The finally-path sentinel lets the consumer drain and release the
+        # render lock; pre-fix this acquire timed out.
+        acquired = vp.tts_render_lock.acquire(timeout=5.0)
+        assert acquired, "TTS consumer still holds tts_render_lock -- sentinel never arrived"
+        vp.tts_render_lock.release()
+
+
+class TestStaleIdleSuppression:
+    """Deep review febe-observability-3: a previous turn's late TTS-consumer
+    idle emit must not clobber the next turn's think/speak state.
+    """
+
+    def _run_loop(self, vp, turn_epoch):
+        emitted: list[str] = []
+        vp._emit_state_cycle = emitted.append
+        q: queue.Queue = queue.Queue()
+        q.put(None)
+        vp._tts_consumer_loop(
+            sentence_queue=q,
+            tts_start_time=time.time(),
+            chunk_count=0,
+            chunk_seq=0,
+            first_chunk_time=None,
+            first_sentence_time=None,
+            first_sentence=True,
+            min_tts_chars=40,
+            turn_epoch=turn_epoch,
+        )
+        return emitted
+
+    def test_stale_epoch_skips_idle(self) -> None:
+        vp = _make_voice_processor()
+        vp._turn_epoch = 2  # a newer turn already started
+
+        emitted = self._run_loop(vp, turn_epoch=1)
+
+        assert "idle" not in emitted
+
+    def test_current_epoch_emits_idle(self) -> None:
+        vp = _make_voice_processor()
+        vp._turn_epoch = 1
+
+        emitted = self._run_loop(vp, turn_epoch=1)
+
+        assert emitted == ["idle"]

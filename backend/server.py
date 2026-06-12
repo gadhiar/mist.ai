@@ -66,6 +66,9 @@ PROTOCOL_VERSION = "1.1.0"
 # Global state
 active_connections: set[WebSocket] = set()
 active_connections_lock = asyncio.Lock()
+# Connections that opted into log streaming (ADR-017: per-connection
+# ephemeral). The global handler gate derives from "any subscriber present".
+log_subscribers: set[WebSocket] = set()
 message_queue: asyncio.Queue[str | bytes] = asyncio.Queue()
 voice_processor: VoiceProcessor | None = None
 curation_scheduler = None
@@ -427,23 +430,24 @@ async def health():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for voice conversation.
+    """WebSocket endpoint for voice + text conversation.
 
-    Message types:
-    - From client:
-        {"type": "audio", "audio": [...], "sample_rate": 16000}
-        {"type": "text", "text": "user message"}
-        {"type": "interrupt"}
-        {"type": "reset_vad"}
+    The authoritative message contract is ADR-017 (WebSocket Message
+    Contract, knowledge-vault/Decisions/) -- this docstring only enumerates
+    the surface; field-level schemas live in the ADR.
 
-    - To client:
-        {"type": "vad_status", "status": "speech_started"}
-        {"type": "transcription", "text": "..."}
-        {"type": "llm_token", "token": "..."}
-        {"type": "llm_response", "text": "full response"}
-        {"type": "audio_chunk", "audio": [...], "sample_rate": 24000, "chunk_num": 1}
-        {"type": "audio_complete"}
-        {"type": "error", "message": "..."}
+    Inbound (client -> server):
+        audio, text, interrupt, reset_vad, log_config, subscribe_logs
+
+    Outbound (server -> client):
+        session_started, heartbeat, health_status, system_status,
+        vad_status, transcription, state_cycle,
+        stream_start / stream_token / stream_complete / stream_cancelled,
+        tool_call_started / tool_call_completed, cards_summon /
+        cards_dismiss, graph_subgraph, vault_results, form_switch,
+        discriminated error, status, log_config_ack, log,
+        plus binary audio frames (MIST protocol: MSG_AUDIO_CHUNK /
+        MSG_AUDIO_COMPLETE).
     """
     await websocket.accept(headers=None)
     async with active_connections_lock:
@@ -620,20 +624,24 @@ async def websocket_endpoint(websocket: WebSocket):
                         }
                     )
                     continue
+                # ADR-017: subscription state is per-connection ephemeral.
+                # Track subscribers so a disconnect cannot leave the global
+                # handler gate stuck on (every later client would receive the
+                # full log stream without opting in).
+                if enabled:
+                    log_subscribers.add(websocket)
+                else:
+                    log_subscribers.discard(websocket)
                 if log_handler is not None:
-                    log_handler.set_streaming(enabled, levels)
+                    if log_subscribers:
+                        log_handler.set_streaming(True, levels)
+                    else:
+                        log_handler.set_streaming(False, None)
                 await websocket.send_json(
                     {
                         "type": "status",
                         "message": f"Log streaming: {'enabled' if enabled else 'disabled'}",
                     }
-                )
-
-            elif msg_type == "config":
-                # Update configuration (future feature)
-                logger.info("Config update requested (not implemented)")
-                await websocket.send_json(
-                    {"type": "status", "message": "Config updates not yet supported"}
                 )
 
             else:
@@ -646,6 +654,12 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         async with active_connections_lock:
             active_connections.discard(websocket)
+        # ADR-017: log subscription is per-connection ephemeral -- drop this
+        # connection's subscription and close the global gate when no
+        # subscriber remains.
+        log_subscribers.discard(websocket)
+        if not log_subscribers and log_handler is not None:
+            log_handler.set_streaming(False, None)
         # Gap #1a / ADR-011 bucket 2: flip status of any active sessions
         # this connection touched. Fire-and-forget; failures swallowed
         # internally per Invariant 6. We end ALL tracked sessions on the

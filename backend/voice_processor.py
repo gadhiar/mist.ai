@@ -33,7 +33,7 @@ from audio_protocol import (
     generate_fade_out,
     rms_normalize,
 )
-from request_context import new_request_id, spawn_with_context
+from request_context import current_request_id, new_request_id, spawn_with_context
 from voice_models.model_manager import ModelManager
 
 logger = logging.getLogger(__name__)
@@ -96,6 +96,11 @@ class VoiceProcessor:
         self.tts_render_lock = threading.Lock()
         self.latest_user_input = None
         self.input_lock = threading.Lock()
+        # Monotonic turn counter (incremented under generation_lock). A
+        # previous turn's still-draining TTS consumer compares its captured
+        # epoch against this to skip a LATE state_cycle 'idle' that would
+        # clobber the next turn's think/speak state on the FE.
+        self._turn_epoch = 0
 
         # VAD
         self.vad_processor = None
@@ -214,6 +219,12 @@ class VoiceProcessor:
     def _process_user_speech(self, audio_data, sample_rate):
         """Process user speech (runs in separate thread)."""
         try:
+            # Rotate the request id at VOICE INGRESS so the STT phase (Whisper
+            # logs + the transcription emit) groups under THIS turn's id, not
+            # the previous turn's contextvars snapshot
+            # (deep review febe-observability-10).
+            request_id = new_request_id()
+
             # Transcribe
             log_timestamp(f"Transcribing audio ({len(audio_data)} samples @ {sample_rate}Hz)...")
             t_start = time.time()
@@ -235,7 +246,7 @@ class VoiceProcessor:
                 return
 
             # Otherwise, process immediately (don't set latest_user_input)
-            self._process_conversation_turn(user_text)
+            self._process_conversation_turn(user_text, request_id=request_id)
 
         except Exception as e:
             logger.error(f"Error processing user speech: {e}", exc_info=True)
@@ -254,7 +265,12 @@ class VoiceProcessor:
                 self.loop,
             )
 
-    def _tts_consumer(self, sentence_queue: queue.Queue, tts_start_time: float) -> None:
+    def _tts_consumer(
+        self,
+        sentence_queue: queue.Queue,
+        tts_start_time: float,
+        turn_epoch: int | None = None,
+    ) -> None:
         """Consume sentences from queue, generate TTS, send audio to client.
 
         Runs in a dedicated thread. Processes sentences as they arrive
@@ -271,6 +287,8 @@ class VoiceProcessor:
         Args:
             sentence_queue: Queue of sentences to synthesize. None = stop signal.
             tts_start_time: Timestamp when TTS phase started (for logging).
+            turn_epoch: This turn's epoch; the final idle emit is skipped when
+                a newer turn has started (None = always emit, legacy callers).
         """
         chunk_count = 0
         chunk_seq = 0
@@ -293,6 +311,7 @@ class VoiceProcessor:
                 first_sentence_time,
                 first_sentence,
                 min_tts_chars,
+                turn_epoch,
             )
 
     def _tts_consumer_loop(
@@ -305,6 +324,7 @@ class VoiceProcessor:
         first_sentence_time,
         first_sentence: bool,
         min_tts_chars: int,
+        turn_epoch: int | None = None,
     ) -> None:
         """Inner loop body of _tts_consumer. Extracted so the outer method can
         wrap the entire loop in `tts_render_lock` without restructuring the
@@ -415,22 +435,54 @@ class VoiceProcessor:
             self.message_queue.put(complete_frame),
             self.loop,
         )
-        # TTS-on mode: turn complete after final audio frame, MIST returns to idle.
-        self._emit_state_cycle("idle")
+        # TTS-on mode: turn complete after final audio frame, MIST returns to
+        # idle -- UNLESS a newer turn already started (early generation_lock
+        # release lets turn N+1 emit think/speak while this consumer drains;
+        # a late idle would clobber the live turn's FE state, since
+        # state_cycle carries no turn_id). MSG_AUDIO_COMPLETE above stays
+        # unconditional: the FE audio pipeline needs the terminal frame.
+        if turn_epoch is None or turn_epoch == self._turn_epoch:
+            self._emit_state_cycle("idle")
+        else:
+            log_timestamp("TTS consumer: newer turn in flight; skipping stale idle emit")
 
         tts_total = time.time() - tts_start_time
         log_timestamp(f"TTS consumer done ({tts_total:.2f}s, {chunk_count} chunks)")
 
-    def _process_conversation_turn(self, user_text):
-        """Process one conversation turn with LLM-TTS pipeline parallelism."""
+    def _process_conversation_turn(self, user_text, request_id: str | None = None):
+        """Process one conversation turn with LLM-TTS pipeline parallelism.
+
+        Args:
+            user_text: The user's utterance for this turn.
+            request_id: Adopt this id (voice path mints it at speech ingress
+                so STT logs and the turn share one id); None mints fresh
+                (text path, pending-input respawns).
+        """
         if not self.generation_lock.acquire(blocking=False):
-            log_timestamp("Generation already in progress, skipping")
+            # Latest-wins queueing (mirrors the voice path): the in-flight
+            # turn's finally-block drain picks this up. Silently dropping the
+            # input left the FE turn promise waiting forever
+            # (deep review febe-observability-11).
+            with self.input_lock:
+                self.latest_user_input = user_text
+            log_timestamp("Generation already in progress; queued latest input")
             return
+
+        # Hoisted above try: the finally path must reach the queue (and know
+        # whether a consumer exists) even when the failure happens before the
+        # LLM loop (deep review febe-observability-2).
+        sentence_queue = queue.Queue()
+        tts_consumer_spawned = False
+        self._turn_epoch += 1  # under generation_lock
+        turn_epoch = self._turn_epoch
 
         try:
             from backend.sentence_detector import SentenceBoundaryDetector
 
-            new_request_id()
+            if request_id is None:
+                new_request_id()
+            else:
+                current_request_id.set(request_id)
             log_timestamp(f"Starting conversation turn for: '{user_text}'")
 
             self.interrupt_flag.clear()
@@ -453,7 +505,6 @@ class VoiceProcessor:
 
             # === LLM + TTS Pipeline ===
             sentence_detector = SentenceBoundaryDetector()
-            sentence_queue = queue.Queue()
             tts_start_time = time.time()
 
             # Start TTS consumer thread (reads sentences, generates audio).
@@ -463,7 +514,8 @@ class VoiceProcessor:
             # turns, and exits naturally when the sentence_queue drains.
             # generation_lock release no longer waits for TTS completion.
             if self.config.tts_enabled:
-                spawn_with_context(self._tts_consumer, sentence_queue, tts_start_time)
+                spawn_with_context(self._tts_consumer, sentence_queue, tts_start_time, turn_epoch)
+                tts_consumer_spawned = True
 
             # LLM producer: stream tokens, detect sentences, feed TTS
             log_timestamp("LLM: Generating response (streaming)...")
@@ -614,10 +666,20 @@ class VoiceProcessor:
                 ),
                 self.loop,
             )
-            # Error aborts the turn; signal idle so FE animation returns to rest.
-            self._emit_state_cycle("idle")
+            # Error aborts the turn; signal idle so FE animation returns to
+            # rest -- unless a newer turn already started (stale epoch).
+            if turn_epoch == self._turn_epoch:
+                self._emit_state_cycle("idle")
 
         finally:
+            if tts_consumer_spawned:
+                # Guarantee the consumer's stop sentinel on EVERY exit path:
+                # without it an LLM exception leaves the consumer spinning on
+                # an empty queue holding tts_render_lock forever -- voice
+                # output dead until restart (febe-observability-2). A second
+                # None on the clean path is harmless (consumer breaks on the
+                # first).
+                sentence_queue.put(None)
             self.is_speaking = False
             self.generation_lock.release()
 

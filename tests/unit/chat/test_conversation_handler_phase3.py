@@ -206,7 +206,10 @@ def test_static_template_uses_notes_and_knowledge_graph_vocabulary():
 
 def test_static_template_has_negative_invariants():
     body = _STATIC_SYSTEM_TEMPLATE_BODY
-    assert "DO NOT call query_knowledge_graph when" in body
+    # febe-observability-4: the invariants cover BOTH tools symmetrically --
+    # granting query_vault without the symmetric do-not-call list risks
+    # trading suppression for over-triggering on small talk.
+    assert "DO NOT call query_knowledge_graph OR query_vault when" in body
     # Specific exclusions
     assert "greetings" in body.lower()
     assert "general-knowledge" in body.lower()
@@ -222,7 +225,18 @@ def test_static_template_does_not_use_stale_graph_facts_phrase():
 
 def test_static_template_includes_decision_rule():
     body = _STATIC_SYSTEM_TEMPLATE_BODY
-    assert "does the answer depend on user-specific structured knowledge" in body.lower()
+    assert "does the answer depend on user-specific knowledge" in body.lower()
+    # The rule routes between the two tools rather than denying one exists
+    # (febe-observability-4: the old prompt claimed no vault tool existed
+    # while query_vault was registered, suppressing it entirely).
+    assert "typed facts -> graph" in body.lower()
+    assert "prose/history -> vault" in body.lower()
+
+
+def test_static_template_describes_query_vault():
+    body = _STATIC_SYSTEM_TEMPLATE_BODY
+    assert "USE query_vault when" in body
+    assert "no tool exposes deeper vault search" not in body
 
 
 # ---------------------------------------------------------------------------

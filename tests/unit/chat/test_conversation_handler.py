@@ -1178,9 +1178,10 @@ class TestToolCallObservability:
 
         started, completed = handler._turn_ws_events
         assert started["tool_call_id"] == completed["tool_call_id"]
-        # Distinct from the LLM-side tool_call id (tc.id is OpenAI message correlation;
-        # our tool_call_id is the FE-side observability id).
-        assert started["tool_call_id"] != tc.id
+        # Deep review febe-observability-8: the FE-visible id PROPAGATES the
+        # provider-assigned tool_call id so FE events, message history, and
+        # JSONL records all join on one identifier.
+        assert started["tool_call_id"] == tc.id
 
     @pytest.mark.asyncio
     async def test_args_summary_truncates_long_query(self):
