@@ -269,3 +269,145 @@ class TestSemanticsTableBehavior:
         )
         assert result.appended == 2  # new version + exactly one clamped copy
         assert result.closed == 1
+
+
+class TestPastTenseMapping:
+    """temporal_status='past' with no stated end maps ASSERT -> CEASE.
+
+    A bare past-tense fact must not mint an OPEN current belief, reinforce
+    the belief the user just said ended, or supersede the same-turn current
+    fact of a SINGLE predicate (deep review recon-engine-2).
+    """
+
+    @pytest.mark.asyncio
+    async def test_past_tense_fact_ceases_open_prior(self):
+        # "I used to use jira" over a standing open USES jira: close it.
+        prior = _belief_row(edge_ref="ref-uses", target="jira")
+        conn = FakeNeo4jConnection(query_responses={"[r:USES]": [prior]})
+        result = await _engine(conn).reconcile_turn(
+            [_rel(predicate="USES", target="jira", props={"temporal_status": "past"})],
+            recorded_at=RECORDED_AT,
+            event_id="e1",
+            session_id="s1",
+        )
+        assert result.closed == 1
+        assert result.appended == 1  # the clamped copy, no open version
+        assert any("past_tense_cease" in f for f in result.flags)
+
+    @pytest.mark.asyncio
+    async def test_past_tense_fact_does_not_reinforce_ended_belief(self):
+        prior = _belief_row(edge_ref="ref-uses", target="jira")
+        conn = FakeNeo4jConnection(query_responses={"[r:USES]": [prior]})
+        result = await _engine(conn).reconcile_turn(
+            [_rel(predicate="USES", target="jira", props={"temporal_status": "past"})],
+            recorded_at=RECORDED_AT,
+            event_id="e1",
+            session_id="s1",
+        )
+        assert result.reinforced == 0
+
+    @pytest.mark.asyncio
+    async def test_fresh_past_tense_fact_flags_without_prior(self):
+        conn = FakeNeo4jConnection()
+        result = await _engine(conn).reconcile_turn(
+            [_rel(predicate="USES", target="java", props={"temporal_status": "past"})],
+            recorded_at=RECORDED_AT,
+            event_id="e1",
+            session_id="s1",
+        )
+        assert result.appended == 0 and result.closed == 0
+        assert any("cease_without_prior" in f for f in result.flags)
+
+    @pytest.mark.asyncio
+    async def test_same_turn_employer_transition_keeps_new_employer(self):
+        # "I left Titan and joined Acme": titan (past) must not supersede
+        # acme (current) -- pre-fix the SINGLE machinery inverted the turn.
+        conn = FakeNeo4jConnection()
+        result = await _engine(conn).reconcile_turn(
+            [
+                _rel(predicate="WORKS_AT", target="acme"),
+                _rel(predicate="WORKS_AT", target="titan", props={"temporal_status": "past"}),
+            ],
+            recorded_at=RECORDED_AT,
+            event_id="e1",
+            session_id="s1",
+        )
+        assert result.appended == 1  # acme open version only
+        assert result.closed == 0  # titan-as-cease never touches acme
+        open_appends = [
+            p for q, p in conn.writes if "version_key: $vk" in q and p["valid_to"] is None
+        ]
+        assert len(open_appends) == 1 and open_appends[0]["target"] == "acme"
+
+    @pytest.mark.asyncio
+    async def test_past_with_stated_end_date_stays_assert(self):
+        # The resolver filled end_date: the closed-assertion path handles it.
+        conn = FakeNeo4jConnection()
+        result = await _engine(conn).reconcile_turn(
+            [
+                _rel(
+                    predicate="WORKS_AT",
+                    target="titan",
+                    props={"temporal_status": "past", "end_date": "2024-01-01"},
+                )
+            ],
+            recorded_at=RECORDED_AT,
+            event_id="e1",
+            session_id="s1",
+        )
+        assert result.appended == 1  # closed historical version recorded
+        _, params = conn.writes[0]
+        assert params["valid_to"] is not None
+
+
+class TestConfidenceForwarding:
+    @pytest.mark.asyncio
+    async def test_validator_shaped_confidence_reaches_edge(self):
+        # Validator output carries confidence ONLY under properties; the old
+        # top-level read flattened every edge to 0.8 (ontology-semantics-4).
+        conn = FakeNeo4jConnection()
+        rel = {
+            "source": "user",
+            "target": "rust",
+            "type": "USES",
+            "properties": {"confidence": 0.6},
+        }
+        await _engine(conn).reconcile_turn(
+            [rel], recorded_at=RECORDED_AT, event_id="e1", session_id="s1"
+        )
+        _, params = conn.writes[0]
+        assert params["confidence"] == 0.6
+
+
+class TestDanglingAppends:
+    @pytest.mark.asyncio
+    async def test_missing_endpoint_append_flags_instead_of_counting(self):
+        # MATCH..MATCH..MERGE writes zero rows when an endpoint node is
+        # missing; counting that as applied reports success while the fact
+        # silently vanishes (recon-engine-3a).
+        conn = FakeNeo4jConnection(write_results=[{"n": 0}])
+        result = await _engine(conn).reconcile_turn(
+            [_rel()], recorded_at=RECORDED_AT, event_id="e1", session_id="s1"
+        )
+        assert result.appended == 0
+        assert any(f.startswith("append_dangling:USES:user->rust") for f in result.flags)
+
+
+class TestClampedCopyTemporalStatus:
+    @pytest.mark.asyncio
+    async def test_clamped_copy_written_as_past(self):
+        # A copy with a closed valid_to is not a current state; inheriting
+        # the prior's 'current' contradicts its own interval (recon-engine-7).
+        prior_row = _belief_row(edge_ref="ref-acme", target="acme")
+        conn = FakeNeo4jConnection(query_responses={"t.id <> $target": [prior_row]})
+        await _engine(conn).reconcile_turn(
+            [_rel(predicate="WORKS_AT", target="initech")],
+            recorded_at=RECORDED_AT,
+            event_id="e1",
+            session_id="s1",
+        )
+        appends = [(q, p) for q, p in conn.writes if "version_key: $vk" in q]
+        copies = [p for _, p in appends if p["valid_to"] is not None]
+        opens = [p for _, p in appends if p["valid_to"] is None]
+        assert copies and copies[0]["temporal_status"] == "past"
+        assert opens and opens[0]["temporal_status"] == "current"

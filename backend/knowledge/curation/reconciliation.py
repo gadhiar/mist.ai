@@ -71,6 +71,7 @@ class EdgeAssertion:
     valid_from_stated: str | None
     valid_to_stated: str | None
     assertion_kind: AssertionKind
+    past_mapped: bool = False  # True when temporal_status='past' coerced ASSERT->CEASE
 
     @classmethod
     def from_rel_dict(cls, rel: dict[str, Any], defn: EdgeTypeDefinition) -> EdgeAssertion:
@@ -78,7 +79,10 @@ class EdgeAssertion:
 
         Temporal bounds come from properties.start_date/end_date (where the
         temporal resolver writes them); temporal_status checks properties
-        first, then the legacy top-level key the old writer read.
+        first, then the legacy top-level key the old writer read. Confidence
+        and source_type follow the same props-first pattern -- validator
+        output carries them ONLY under properties, and a top-level-only read
+        would flatten every edge to the 0.8 default.
         """
         props = rel.get("properties") or {}
         source, target = rel.get("source", ""), rel.get("target", "")
@@ -89,19 +93,35 @@ class EdgeAssertion:
             kind = AssertionKind(raw_kind.lower())
         except ValueError:
             kind = AssertionKind.ASSERT  # deterministic fallback, never destructive
+        temporal_status = str(
+            props.get("temporal_status") or rel.get("temporal_status") or "current"
+        )
+        # Interim pre-C3 past-tense mapping: the extraction prompt routes
+        # cessation through temporal_status ('don't use anymore' -> past) and
+        # the temporal resolver fills end_date for only ~a dozen patterns, so
+        # a bare past-tense fact would otherwise mint an OPEN current belief
+        # (or REINFORCE the belief the user just said ended), and a same-turn
+        # SINGLE pair ('left Titan, joined Acme') would supersede backwards.
+        # CEASE closes overlapping open same-fact priors at recorded_at and
+        # never touches other targets, mirroring the backfill's past->closed
+        # semantics so live writes and migration agree. C3's assertion_kind
+        # signal supersedes this mapping.
+        past_mapped = False
+        if kind is AssertionKind.ASSERT and temporal_status == "past" and not props.get("end_date"):
+            kind = AssertionKind.CEASE
+            past_mapped = True
         return cls(
             source=source,
             predicate=rel.get("type", ""),
             target=target,
-            confidence=float(rel.get("confidence", 0.8)),
-            source_type=str(rel.get("source_type", "extracted")),
+            confidence=float(props.get("confidence", rel.get("confidence", 0.8))),
+            source_type=str(props.get("source_type") or rel.get("source_type") or "extracted"),
             context=str(rel.get("context", "") or props.get("context", "") or ""),
-            temporal_status=str(
-                props.get("temporal_status") or rel.get("temporal_status") or "current"
-            ),
+            temporal_status=temporal_status,
             valid_from_stated=props.get("start_date"),
             valid_to_stated=props.get("end_date"),
             assertion_kind=kind,
+            past_mapped=past_mapped,
         )
 
 
@@ -244,17 +264,28 @@ def plan_edge(
         # re-plans against the closed prior and flags cease_without_prior --
         # non-destructive convergence (copy-first would leave a permanently
         # un-closeable open prior because the copy satisfies the eid probe).
+        cease_reason = "cease_past_tense" if assertion.past_mapped else "cease"
         actions = []
+        if assertion.past_mapped:
+            # Surface model-inferred cessation in flags + telemetry (spec 6.2
+            # accuracy gating): the closes are append-only and transaction-
+            # recoverable if the 'past' reading was wrong.
+            actions.append(
+                ReconcileAction(kind=ActionKind.FLAG_AMBIGUOUS, reason="past_tense_cease", **base)
+            )
         for b in hit:
             actions.append(
                 ReconcileAction(
-                    kind=ActionKind.CLOSE_TRANSACTION, reason="cease", edge_ref=b.edge_ref, **base
+                    kind=ActionKind.CLOSE_TRANSACTION,
+                    reason=cease_reason,
+                    edge_ref=b.edge_ref,
+                    **base,
                 )
             )
             actions.append(
                 ReconcileAction(
                     kind=ActionKind.APPEND_CLOSED_COPY,
-                    reason="cease",
+                    reason=cease_reason,
                     edge_ref=b.edge_ref,
                     valid_to=stop.isoformat(),
                     copy_of=b,
@@ -561,14 +592,26 @@ class ReconciliationEngine:
                 result.flags.append(f"{act.reason}:{act.predicate}:{act.source}->{act.target}")
                 continue
             if act.kind is ActionKind.STRUCTURAL_UPSERT:
-                await self._apply_structural(act, assertion, recorded_at, event_id, now)
-                result.structural += 1
+                if await self._apply_structural(act, assertion, recorded_at, event_id, now):
+                    result.structural += 1
+                else:
+                    result.flags.append(
+                        f"structural_dangling:{act.predicate}:{act.source}->{act.target}"
+                    )
                 continue
             if act.kind in (ActionKind.APPEND_VERSION, ActionKind.APPEND_CLOSED_COPY):
-                await self._apply_append(
+                applied = await self._apply_append(
                     act, assertion, recorded_at, event_id, now, copy_of=act.copy_of
                 )
-                result.appended += 1
+                if applied:
+                    result.appended += 1
+                else:
+                    # MATCH..MATCH..MERGE silently writes zero rows when an
+                    # endpoint node is missing; counting that as applied would
+                    # report success while the fact vanished.
+                    result.flags.append(
+                        f"append_dangling:{act.predicate}:{act.source}->{act.target}"
+                    )
                 continue
             if act.kind is ActionKind.CLOSE_TRANSACTION:
                 await self._executor.execute_write(
@@ -605,11 +648,11 @@ class ReconciliationEngine:
         event_id: str,
         now: str,
         copy_of: BeliefRow | None,
-    ) -> None:
+    ) -> bool:
         stype = _sanitize(act.predicate)
         src = copy_of or assertion
         vf = act.valid_from if copy_of is None else copy_of.valid_from
-        await self._executor.execute_write(
+        rows = await self._executor.execute_write(
             f"MATCH (s:__Entity__ {{id: $source}}) "
             f"MATCH (t:__Entity__ {{id: $target}}) "
             f"MERGE (s)-[r:{stype} {{version_key: $vk}}]->(t) "
@@ -622,7 +665,8 @@ class ReconciliationEngine:
             "r.evidence = $evidence, r.supersession_reason = $reason, "
             "r.provenance = 'extraction', r.ontology_version = $ontology_version, "
             "r.extraction_version = $extraction_version, r.model_hash = $model_hash, "
-            "r.created_at = $now, r.updated_at = $now",
+            "r.created_at = $now, r.updated_at = $now "
+            "RETURN count(r) AS n",
             {
                 "source": act.source,
                 "target": act.target,
@@ -635,7 +679,11 @@ class ReconciliationEngine:
                 "confidence": src.confidence,
                 "source_type": src.source_type,
                 "context": src.context,
-                "temporal_status": src.temporal_status,
+                # A version with a closed valid_to is by definition not a
+                # current state; copying the prior's 'current' verbatim onto
+                # clamped copies and retract markers contradicts their own
+                # interval and poisons any consumer keying on the legacy field.
+                "temporal_status": ("past" if act.valid_to is not None else src.temporal_status),
                 "evidence": list(copy_of.evidence) if copy_of else [event_id],
                 "reason": act.reason if copy_of is not None else "",
                 "ontology_version": self._stamps.ontology_version,
@@ -644,6 +692,9 @@ class ReconciliationEngine:
                 "now": now,
             },
         )
+        # Real Neo4j always returns one row for RETURN count(r); legacy fakes
+        # returning no rows are treated as applied.
+        return bool(int(rows[0].get("n", 1)) if rows else 1)
 
     async def _apply_structural(
         self,
@@ -652,9 +703,9 @@ class ReconciliationEngine:
         recorded_at: str,
         event_id: str,
         now: str,
-    ) -> None:
+    ) -> bool:
         stype = _sanitize(act.predicate)
-        await self._executor.execute_write(
+        rows = await self._executor.execute_write(
             f"MATCH (s:__Entity__ {{id: $source}}) "
             f"MATCH (t:__Entity__ {{id: $target}}) "
             f"MERGE (s)-[r:{stype}]->(t) "
@@ -670,7 +721,8 @@ class ReconciliationEngine:
             "THEN $confidence ELSE r.confidence END, "
             "r.evidence = CASE WHEN $eid IN coalesce(r.evidence, []) "
             "THEN r.evidence ELSE coalesce(r.evidence, []) + [$eid] END, "
-            "r.updated_at = $now",
+            "r.updated_at = $now "
+            "RETURN count(r) AS n",
             {
                 "source": act.source,
                 "target": act.target,
@@ -685,6 +737,7 @@ class ReconciliationEngine:
                 "now": now,
             },
         )
+        return bool(int(rows[0].get("n", 1)) if rows else 1)
 
     # -- telemetry ---------------------------------------------------------------
 

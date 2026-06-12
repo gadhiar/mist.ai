@@ -122,6 +122,31 @@ class TestAssert:
         actions = _plan(_assertion(predicate="EXPERT_IN"), _existing(progressions=[prior]))
         assert actions[1].reason == "progression"
 
+    def test_backdated_reassertion_after_retract_appends_new_version(self):
+        # A RETRACT leaves an empty [t,t) marker as latest belief; a later
+        # backdated re-assertion must append a new open version, NOT
+        # reinforce the empty marker (which would leave the fact permanently
+        # not-current). The marker is left transaction-open: its empty
+        # interval can never read as current, so closing it is unnecessary.
+        marker = _belief(
+            vf="2026-06-01T00:00:00+00:00",
+            vt="2026-06-01T00:00:00+00:00",  # [t, t): empty retraction marker
+            ref="r-marker",
+        )
+        actions = _plan(_assertion(vf="2020"), _existing(same_fact=[marker]))
+        assert [a.kind for a in actions] == [ActionKind.APPEND_VERSION]
+
+    def test_always_reassertion_after_retract_appends_new_version(self):
+        # "Actually, I have always used X" after a retraction.
+        marker = _belief(
+            vf="2026-06-01T00:00:00+00:00",
+            vt="2026-06-01T00:00:00+00:00",
+            ref="r-marker",
+        )
+        actions = _plan(_assertion(vf="-inf"), _existing(same_fact=[marker]))
+        assert [a.kind for a in actions] == [ActionKind.APPEND_VERSION]
+        assert actions[0].valid_from == "-inf"
+
     def test_same_belief_in_contradictions_and_progressions_closes_once(self):
         # EXPERT_IN lists STRUGGLES_WITH in both contradicts and
         # progression_supersedes; the duplicate candidate must collapse to one

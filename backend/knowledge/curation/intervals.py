@@ -75,7 +75,15 @@ def parse_to_bound(value: str | None) -> datetime | None:
 
 
 def overlaps(a: Interval, b: Interval) -> bool:
-    """Closed-open intersection is non-empty. None-aware (-inf / +inf)."""
+    """Closed-open intersection is non-empty. None-aware (-inf / +inf).
+
+    Empty intervals ([t, t) retraction markers) hold no instants and overlap
+    nothing: without this guard a backdated re-assertion after a RETRACT
+    would REINFORCE the empty marker instead of appending a new open version,
+    leaving the fact permanently not-current.
+    """
+    if is_empty(a) or is_empty(b):
+        return False
     a_start = a.start or datetime.min.replace(tzinfo=UTC)
     b_start = b.start or datetime.min.replace(tzinfo=UTC)
     a_end = a.end or datetime.max.replace(tzinfo=UTC)

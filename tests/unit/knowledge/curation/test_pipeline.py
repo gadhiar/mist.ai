@@ -45,7 +45,7 @@ class _SpyEngine:
             self.in_flight -= 1
 
 
-def _build_pipeline(*, connection=None, engine=None):
+def _build_pipeline(*, connection=None, engine=None, graph_writer=None, deduplicator=None):
     """Build a CurationPipeline with fakes for testing."""
     from backend.knowledge.curation.confidence import ConfidenceManager
     from backend.knowledge.curation.deduplication import EntityDeduplicator
@@ -60,9 +60,9 @@ def _build_pipeline(*, connection=None, engine=None):
 
     return (
         CurationPipeline(
-            deduplicator=EntityDeduplicator(executor, embeddings, confidence),
+            deduplicator=deduplicator or EntityDeduplicator(executor, embeddings, confidence),
             reconciliation_engine=eng,
-            graph_writer=CurationGraphWriter(executor, embeddings, confidence),
+            graph_writer=graph_writer or CurationGraphWriter(executor, embeddings, confidence),
         ),
         conn,
         eng,
@@ -108,6 +108,74 @@ class TestShortCircuit:
         assert result.reconcile_result.appended == 0
         assert eng.calls == []
         conn.assert_no_writes()
+
+
+class _FailingGraphWriter:
+    """Stage-8 double that always fails."""
+
+    async def write(self, **kwargs):
+        raise RuntimeError("neo4j down")
+
+
+class _RenamingDeduplicator:
+    """Stage-7a double that merges 'py' into the existing 'python' node."""
+
+    async def deduplicate(self, entities):
+        from backend.knowledge.curation.deduplication import DeduplicationResult
+
+        renames = {}
+        for e in entities:
+            if e.get("id") == "py":
+                renames["py"] = "python"
+                e["id"] = "python"
+        return DeduplicationResult(
+            entities=entities,
+            merge_actions=[],
+            entities_merged=len(renames),
+            id_renames=renames,
+        )
+
+
+class TestStage8FailureGate:
+    @pytest.mark.asyncio
+    async def test_reconcile_skipped_when_entity_write_fails(self):
+        # deep review recon-engine-3(b): CLOSE_TRANSACTION matches priors by
+        # elementId and succeeds even when the turn's new entity nodes were
+        # never created -- reconciling after an entity-write failure converts
+        # a transient Neo4j error into net silent belief deletion.
+        pipeline, _conn, eng = _build_pipeline(graph_writer=_FailingGraphWriter())
+
+        validation = make_validation_result(
+            entities=[make_entity_dict()],
+            relationships=[make_relationship_dict()],
+        )
+        result = await pipeline.curate_and_store(
+            validation, "evt-001", "sess-001", recorded_at=RECORDED_AT
+        )
+
+        assert eng.calls == [], "engine must not run after entity-write failure"
+        assert any("Reconciliation skipped" in e for e in result.stage_errors)
+        assert result.reconcile_result.appended == 0
+
+
+class TestEndpointRemap:
+    @pytest.mark.asyncio
+    async def test_relationship_endpoints_remapped_after_dedup(self):
+        # deep review recon-engine-3(c): Stage 7a rewrites merged entity ids
+        # in place but relationships keep the incoming ids, which have no
+        # node -- the engine's MATCH..MERGE would silently drop the fact.
+        pipeline, _conn, eng = _build_pipeline(deduplicator=_RenamingDeduplicator())
+
+        validation = make_validation_result(
+            entities=[make_entity_dict(entity_id="py")],
+            relationships=[make_relationship_dict(source="user", target="py")],
+        )
+        await pipeline.curate_and_store(validation, "evt-001", "sess-001")
+
+        assert len(eng.calls) == 1
+        sent_rels = eng.calls[0][0]
+        assert sent_rels[0]["target"] == "python"
+        assert sent_rels[0]["source"] == "user"
 
 
 class TestEngineStage:

@@ -24,7 +24,7 @@ import yaml
 
 from backend.errors import Neo4jConnectionError, Neo4jQueryError
 from backend.interfaces import GraphConnection
-from backend.knowledge.ontologies import EXTRACTABLE_RELATIONSHIP_TYPES
+from backend.knowledge.ontologies import EDGE_TYPES_BY_NAME, EXTRACTABLE_RELATIONSHIP_TYPES
 
 SEED_METADATA_FIELDS = (
     "confidence",
@@ -1057,6 +1057,14 @@ def backfill_bitemporal(
     The graph is small (post-reset scale); a single UPDATE is sufficient --
     APOC batching is unnecessary until edge counts demand it.
     """
+    # Undirected predicates the engine reads/writes ONLY in lexical
+    # (min)->(max) direction. Closed ontology set -- the f-string TYPE
+    # interpolation below is allowlist-bounded (Cypher cannot parameterize
+    # relationship types).
+    undirected_types = [
+        name for name in EXTRACTABLE_RELATIONSHIP_TYPES if not EDGE_TYPES_BY_NAME[name].directional
+    ]
+
     params: dict[str, Any] = {
         "backfill_types": list(EXTRACTABLE_RELATIONSHIP_TYPES) + list(_BACKFILL_INTERNAL_TYPES)
     }
@@ -1066,7 +1074,18 @@ def backfill_bitemporal(
             "RETURN count(r) AS n",
             params,
         )
-        return {"candidates": int(rows[0]["n"]) if rows else 0}
+        reverse_candidates = 0
+        for name in undirected_types:
+            rev = connection.execute_query(
+                f"MATCH (a:__Entity__)-[r:{name}]->(b:__Entity__) "
+                "WHERE a.id > b.id RETURN count(r) AS n",
+                None,
+            )
+            reverse_candidates += int(rev[0]["n"]) if rev else 0
+        return {
+            "candidates": int(rows[0]["n"]) if rows else 0,
+            "undirected_reverse_candidates": reverse_candidates,
+        }
 
     params["ontology_version"] = ontology_version
     rows = connection.execute_write(
@@ -1086,4 +1105,27 @@ def backfill_bitemporal(
         "RETURN count(r) AS updated",
         params,
     )
-    return {"edges_backfilled": int(rows[0]["updated"]) if rows else 0}
+
+    # Canonicalize legacy undirected edges (design 4.1): a reverse-direction
+    # WORKS_WITH/RELATED_TO row is invisible to the engine's same-fact
+    # fetches, so re-assertions append a canonical twin instead of
+    # reinforcing and the pair coexists as permanent duplicates. MERGE on
+    # version_key keeps this idempotent and collision-safe: when a canonical
+    # twin already exists, the twin wins and the reverse row is dropped.
+    # Runs AFTER stamping so reversed rows carry version_key.
+    reversed_total = 0
+    for name in undirected_types:
+        rev_rows = connection.execute_write(
+            f"MATCH (a:__Entity__)-[r:{name}]->(b:__Entity__) WHERE a.id > b.id "
+            f"MERGE (b)-[c:{name} {{version_key: r.version_key}}]->(a) "
+            "ON CREATE SET c = properties(r) "
+            "WITH r DELETE r "
+            "RETURN count(r) AS reversed",
+            None,
+        )
+        reversed_total += int(rev_rows[0].get("reversed", 0)) if rev_rows else 0
+
+    return {
+        "edges_backfilled": int(rows[0]["updated"]) if rows else 0,
+        "undirected_canonicalized": reversed_total,
+    }

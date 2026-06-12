@@ -5,7 +5,7 @@ Produces merge instructions for the graph writer.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from backend.interfaces import EmbeddingProvider
 from backend.knowledge.curation.confidence import ConfidenceManager
@@ -33,6 +33,11 @@ class DeduplicationResult:
     entities: list[dict]
     merge_actions: list[MergeAction]
     entities_merged: int
+    # old incoming id -> existing graph id, captured BEFORE the in-place
+    # entity['id'] rewrite destroys the old id. The pipeline uses this to
+    # remap relationship endpoints; without it, rels referencing a merged
+    # id point at a node that does not exist and drop silently.
+    id_renames: dict[str, str] = field(default_factory=dict)
 
 
 class EntityDeduplicator:
@@ -66,6 +71,7 @@ class EntityDeduplicator:
 
         result_entities: list[dict] = []
         merge_actions: list[MergeAction] = []
+        id_renames: dict[str, str] = {}
         merged_count = 0
 
         for entity in entities:
@@ -83,6 +89,11 @@ class EntityDeduplicator:
                         merge_instructions=instructions,
                     )
                 )
+                # Capture the rename BEFORE the in-place rewrite (the rewrite
+                # destroys the old id, and incoming_entity references the
+                # same mutated dict).
+                if existing["id"] != entity_id:
+                    id_renames[entity_id] = existing["id"]
                 # Rewrite entity ID to existing
                 entity["id"] = existing["id"]
                 merged_count += 1
@@ -93,6 +104,7 @@ class EntityDeduplicator:
             entities=result_entities,
             merge_actions=merge_actions,
             entities_merged=merged_count,
+            id_renames=id_renames,
         )
 
     async def _find_existing(self, entity_id: str, entity_type: str) -> dict | None:

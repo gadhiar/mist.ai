@@ -38,5 +38,24 @@ class TestBackfillBitemporal:
     def test_dry_run_counts_without_writing(self):
         conn = FakeNeo4jConnection(query_results=[{"n": 7}])
         result = backfill_bitemporal(conn, ontology_version="1.2.0", dry_run=True)
-        assert result == {"candidates": 7}
+        assert result["candidates"] == 7
+        # The fake returns the same row for every per-type reverse count, so
+        # the exact total is fake-shaped; what matters is the key exists and
+        # the dry run surfaced the canonicalization workload.
+        assert "undirected_reverse_candidates" in result
         conn.assert_no_writes()
+
+    def test_wet_run_canonicalizes_reverse_undirected_edges(self):
+        # recon-engine-5: the engine reads/writes only the lexical
+        # (min)->(max) direction, so reverse-direction legacy WORKS_WITH /
+        # RELATED_TO rows are invisible to same-fact fetches and accumulate
+        # as permanent duplicates. Backfill must reverse them idempotently.
+        conn = FakeNeo4jConnection(write_results=[{"updated": 3}])
+        result = backfill_bitemporal(conn, ontology_version="1.2.0")
+        canonicalize_writes = [q for q, _ in conn.writes if "WHERE a.id > b.id" in q]
+        assert any("[r:WORKS_WITH]" in q for q in canonicalize_writes)
+        assert any("[r:RELATED_TO]" in q for q in canonicalize_writes)
+        for q in canonicalize_writes:
+            assert "MERGE (b)-[c:" in q and "{version_key: r.version_key}" in q
+            assert "DELETE r" in q
+        assert "undirected_canonicalized" in result

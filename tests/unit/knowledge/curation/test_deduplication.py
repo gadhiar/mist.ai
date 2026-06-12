@@ -55,6 +55,68 @@ class TestExactIdMatch:
         assert len(result.entities) == 1
         assert result.entities[0]["id"] == "rust"
 
+    @pytest.mark.asyncio
+    async def test_rename_map_captures_old_id_before_rewrite(self):
+        # deep review recon-engine-3(c): the in-place entity['id'] rewrite
+        # destroys the old id, so relationships referencing it would point at
+        # a nonexistent node; the rename map is the pipeline's remap source.
+        from backend.knowledge.curation.confidence import ConfidenceManager
+        from backend.knowledge.curation.deduplication import EntityDeduplicator
+
+        conn = FakeNeo4jConnection(
+            query_responses={
+                "toLower(e.id)": [
+                    {
+                        "id": "python",
+                        "entity_type": "Technology",
+                        "display_name": "Python",
+                        "aliases": ["py"],
+                        "description": "",
+                        "confidence": 0.80,
+                        "source_type": "extracted",
+                    }
+                ],
+            }
+        )
+        dedup = EntityDeduplicator(
+            FakeGraphExecutor(connection=conn), FakeEmbeddingGenerator(), ConfidenceManager()
+        )
+
+        entities = [make_entity_dict(entity_id="py", display_name="Python")]
+        result = await dedup.deduplicate(entities)
+
+        assert result.id_renames == {"py": "python"}
+        assert result.entities[0]["id"] == "python"
+
+    @pytest.mark.asyncio
+    async def test_rename_map_empty_when_ids_already_match(self):
+        from backend.knowledge.curation.confidence import ConfidenceManager
+        from backend.knowledge.curation.deduplication import EntityDeduplicator
+
+        conn = FakeNeo4jConnection(
+            query_responses={
+                "toLower(e.id)": [
+                    {
+                        "id": "python",
+                        "entity_type": "Technology",
+                        "display_name": "Python",
+                        "aliases": [],
+                        "description": "",
+                        "confidence": 0.80,
+                        "source_type": "extracted",
+                    }
+                ],
+            }
+        )
+        dedup = EntityDeduplicator(
+            FakeGraphExecutor(connection=conn), FakeEmbeddingGenerator(), ConfidenceManager()
+        )
+
+        result = await dedup.deduplicate([make_entity_dict(entity_id="python")])
+
+        assert result.entities_merged == 1
+        assert result.id_renames == {}
+
 
 class TestPropertyMerge:
     @pytest.mark.asyncio

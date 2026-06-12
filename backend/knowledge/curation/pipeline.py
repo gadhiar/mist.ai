@@ -109,6 +109,7 @@ class CurationPipeline:
                 )
 
             # Stage 8 (entities + provenance)
+            entity_write_failed = False
             try:
                 write_result = await self._graph_writer.write(
                     entities=dedup_result.entities,
@@ -122,26 +123,55 @@ class CurationPipeline:
                 logger.error("Stage 8 (entity write) failed: %s", e)
                 stage_errors.append(f"Graph write failed: {e}")
                 write_result = WriteResult()
+                entity_write_failed = True
 
             # Stage 7b+8 (relationships): bitemporal reconcile + write
-            try:
-                reconcile_result = await self._engine.reconcile_turn(
-                    relationships,
-                    recorded_at=recorded_at,
-                    event_id=event_id,
-                    session_id=session_id,
+            if entity_write_failed:
+                # Closes must never land without their replacement appends: the
+                # engine's CLOSE_TRANSACTION matches priors by elementId and
+                # succeeds even when the turn's new entity nodes were never
+                # created, so reconciling after an entity-write failure turns
+                # a transient Neo4j error into net silent belief deletion.
+                # The turn's writes are MERGE-idempotent and replay
+                # convergently if re-run later.
+                logger.error(
+                    "Stage 7b/8 (reconcile) skipped: entity write failed for event %s", event_id
                 )
-                logger.debug(
-                    "Stage 7b/8 (reconcile): %d appended, %d closed, %d reinforced, %d flags",
-                    reconcile_result.appended,
-                    reconcile_result.closed,
-                    reconcile_result.reinforced,
-                    len(reconcile_result.flags),
-                )
-            except Exception as e:
-                logger.error("Stage 7b/8 (reconcile) failed: %s", e)
-                stage_errors.append(f"Reconciliation failed: {e}")
+                stage_errors.append("Reconciliation skipped: entity write failed")
                 reconcile_result = ReconcileTurnResult()
+            else:
+                # Stage 7a rewrote merged entity ids in place; relationships
+                # still reference the incoming ids, which may have no node.
+                # Remap endpoints the same way the Stage-5 normalizer does.
+                rels_for_engine = relationships
+                if dedup_result.id_renames:
+                    renames = dedup_result.id_renames
+                    rels_for_engine = [
+                        {
+                            **rel,
+                            "source": renames.get(rel.get("source", ""), rel.get("source", "")),
+                            "target": renames.get(rel.get("target", ""), rel.get("target", "")),
+                        }
+                        for rel in relationships
+                    ]
+                try:
+                    reconcile_result = await self._engine.reconcile_turn(
+                        rels_for_engine,
+                        recorded_at=recorded_at,
+                        event_id=event_id,
+                        session_id=session_id,
+                    )
+                    logger.debug(
+                        "Stage 7b/8 (reconcile): %d appended, %d closed, %d reinforced, %d flags",
+                        reconcile_result.appended,
+                        reconcile_result.closed,
+                        reconcile_result.reinforced,
+                        len(reconcile_result.flags),
+                    )
+                except Exception as e:
+                    logger.error("Stage 7b/8 (reconcile) failed: %s", e)
+                    stage_errors.append(f"Reconciliation failed: {e}")
+                    reconcile_result = ReconcileTurnResult()
 
             # LearningEvents for belief changes (audit layer)
             try:
