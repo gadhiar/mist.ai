@@ -312,3 +312,48 @@ class TestRenderAndCli:
             ["--gold", str(tmp_path / "nope.jsonl"), "--debug-jsonl", str(tmp_path / "nope2.jsonl")]
         )
         assert rc == 2
+
+
+class TestUtteranceJoinRoundTrip:
+    """tests-quality-10: the scorers join debug records to gold probes by
+    regexing the utterance out of the rendered prompt. If the pattern drifts
+    from EXTRACTION_USER_TEMPLATE, every probe silently fails to join and
+    runs score as empty -- pin the round-trip against the REAL render.
+    """
+
+    class _Defaults(dict):
+        def __missing__(self, key):
+            return ""
+
+    def _render(self, utterance: str) -> str:
+        from backend.knowledge.extraction.prompts import EXTRACTION_USER_TEMPLATE
+
+        return EXTRACTION_USER_TEMPLATE.format_map(self._Defaults(utterance=utterance))
+
+    def test_extraction_scorer_pattern_matches_real_template_render(self):
+        from eval_harness.score_extraction_run import EXTRACTION_UTTERANCE_PATTERN
+
+        utterance = "I use Rust for my backend work"
+        m = EXTRACTION_UTTERANCE_PATTERN.search(self._render(utterance))
+        assert m is not None, "score_extraction_run pattern no longer matches the template"
+        assert m.group(1) == utterance
+
+    def test_v8_scorer_pattern_matches_real_template_render(self):
+        from eval_harness.score_v8_probe_run import (
+            EXTRACTION_UTTERANCE_PATTERN as V8_PATTERN,
+        )
+
+        utterance = "We shipped the vault layer yesterday"
+        m = V8_PATTERN.search(self._render(utterance))
+        assert m is not None, "score_v8_probe_run pattern no longer matches the template"
+        assert m.group(1) == utterance
+
+    def test_v9_scorer_pattern_matches_real_template_render(self):
+        from eval_harness.score_v9_predicate_run import (
+            EXTRACTION_UTTERANCE_PATTERN as V9_PATTERN,
+        )
+
+        utterance = "The scheduler operates on the task queue"
+        m = V9_PATTERN.search(self._render(utterance))
+        assert m is not None, "score_v9_predicate_run pattern no longer matches the template"
+        assert m.group(1) == utterance

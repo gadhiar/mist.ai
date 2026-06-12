@@ -92,8 +92,39 @@ class TestReconcileTurn:
         )
         assert result.appended == 2  # new version + clamped copy
         assert result.closed == 1
-        close_writes = [q for q, _ in conn.writes if "recorded_until" in q and "SET" in q]
-        assert close_writes, "transaction close must be written"
+        # Close-only discriminator + forwarding (tests-quality-7): the old
+        # 'recorded_until in query' filter also matched append queries, so
+        # the assertion stayed green even if the close never ran.
+        close_writes = [
+            (q, p) for q, p in conn.writes if "SET r.recorded_until = $recorded_at" in q
+        ]
+        assert len(close_writes) == 1
+        assert close_writes[0][1]["ref"] == "ref-acme"
+        assert close_writes[0][1]["recorded_at"] == RECORDED_AT
+        # Clamped-copy forwarding pins src=copy_of (prior's payload, not the
+        # incoming assertion's).
+        copies = [p for q, p in conn.writes if "version_key: $vk" in q and p["target"] == "acme"]
+        assert len(copies) == 1
+        assert copies[0]["valid_to"] == RECORDED_AT
+        assert copies[0]["evidence"] == ["e0"]
+        assert copies[0]["confidence"] == 0.8
+
+    @pytest.mark.asyncio
+    async def test_reinforce_forwards_prior_ref_and_assertion_confidence(self):
+        # tests-quality-7: reinforcement must hit the PRIOR edge with the
+        # NEW assertion's confidence and evidence id.
+        prior_row = _belief_row(edge_ref="ref-uses-rust")
+        conn = FakeNeo4jConnection(query_responses={"t.id = $target": [prior_row]})
+        result = await _engine(conn).reconcile_turn(
+            [_rel()], recorded_at=RECORDED_AT, event_id="e1", session_id="s1"
+        )
+        assert result.reinforced == 1
+        reinforce_writes = [(q, p) for q, p in conn.writes if "$conf" in q]
+        assert len(reinforce_writes) == 1
+        _, params = reinforce_writes[0]
+        assert params["ref"] == "ref-uses-rust"
+        assert params["conf"] == 0.9
+        assert params["eid"] == "e1"
 
     @pytest.mark.asyncio
     async def test_turn_replay_is_noop(self):
@@ -150,12 +181,18 @@ class TestReviewAdditions:
         # primary version, so partial application replays convergently.
         prior_row = _belief_row(edge_ref="ref-acme", target="acme")
         conn = FakeNeo4jConnection(query_responses={"t.id <> $target": [prior_row]})
-        await _engine(conn).reconcile_turn(
+        result = await _engine(conn).reconcile_turn(
             [_rel(predicate="WORKS_AT", target="initech")],
             recorded_at=RECORDED_AT,
             event_id="e1",
             session_id="s1",
         )
+        # Scenario guard (tests-quality-6): if the conflict-fetch query
+        # reshapes and the fake's substring key stops matching, this test
+        # must FAIL rather than degrade to a trivially-true single-write
+        # ordering assertion.
+        assert result.appended == 2 and result.closed == 1
+        assert len(conn.writes) == 3
         last_query, last_params = conn.writes[-1]
         assert "MERGE (s)-[r:WORKS_AT {version_key: $vk}]->(t)" in last_query
         assert last_params["target"] == "initech"  # the primary, not the copy
@@ -204,6 +241,135 @@ class TestReviewAdditions:
         )
         appended_types = [q for q, _ in conn.writes if "version_key: $vk" in q]
         assert "DISLIKES" in appended_types[0] and "USES" in appended_types[1]
+
+
+class TestCrashReplayConvergence:
+    """Commit-protocol crash-window walks (deep review tests-quality-2).
+
+    The apply order is closes/clamped-copies FIRST, probe-bearing primary
+    LAST, so a crash mid-commit must replay convergently: version_key MERGE
+    keys absorb re-applied copies and nothing destructive repeats.
+    """
+
+    @pytest.mark.asyncio
+    async def test_supersession_crash_after_copy_replays_to_one_close_and_same_vk(self):
+        from backend.errors import Neo4jQueryError
+
+        # Run 1: the clamped copy lands, then the transaction close dies.
+        prior_row = _belief_row(edge_ref="ref-acme", target="acme")
+        conn1 = FakeNeo4jConnection(
+            query_responses={"t.id <> $target": [prior_row]},
+            write_errors={"SET r.recorded_until = $recorded_at": Neo4jQueryError("die")},
+        )
+        with pytest.raises(Neo4jQueryError):
+            await _engine(conn1).reconcile_turn(
+                [_rel(predicate="WORKS_AT", target="initech")],
+                recorded_at=RECORDED_AT,
+                event_id="e1",
+                session_id="s1",
+            )
+        copy_writes_1 = [p for q, p in conn1.writes if "version_key: $vk" in q]
+        assert len(copy_writes_1) == 1, "the clamped copy must land before the close"
+        crashed_copy_vk = copy_writes_1[0]["vk"]
+
+        # Run 2 (replay): post-crash graph = open prior still latest PLUS the
+        # landed copy row (is_latest_belief=true, valid_to clamped). The
+        # primary never landed, so the (initech) probe misses.
+        landed_copy_row = _belief_row(
+            edge_ref="ref-acme-copy",
+            target="acme",
+            valid_to=RECORDED_AT,
+            recorded_at=RECORDED_AT,
+            source_utterance_id="e1",
+        )
+        conn2 = FakeNeo4jConnection(
+            query_responses={"t.id <> $target": [prior_row, landed_copy_row]}
+        )
+        result = await _engine(conn2).reconcile_turn(
+            [_rel(predicate="WORKS_AT", target="initech")],
+            recorded_at=RECORDED_AT,
+            event_id="e1",
+            session_id="s1",
+        )
+
+        # The landed copy's clamped interval no longer overlaps the new open
+        # version, so only the ORIGINAL prior is closed -- exactly once.
+        close_writes = [
+            (q, p) for q, p in conn2.writes if "SET r.recorded_until = $recorded_at" in q
+        ]
+        assert len(close_writes) == 1
+        assert close_writes[0][1]["ref"] == "ref-acme"
+        # The re-applied copy re-MERGEs onto the SAME version_key: no second
+        # distinct vk for one logical copy across crash + replay.
+        copy_writes_2 = [
+            p for q, p in conn2.writes if "version_key: $vk" in q and p["target"] == "acme"
+        ]
+        assert len(copy_writes_2) == 1
+        assert copy_writes_2[0]["vk"] == crashed_copy_vk
+        # Primary lands last, replay converges to the intended end state.
+        assert conn2.writes[-1][1]["target"] == "initech"
+        assert result.closed == 1
+
+    @pytest.mark.asyncio
+    async def test_cease_crash_after_close_replays_non_destructively(self):
+        from backend.errors import Neo4jQueryError
+
+        # Run 1: CEASE closes the prior, then the clamped copy dies.
+        prior_row = _belief_row(edge_ref="ref-uses", target="rust")
+        conn1 = FakeNeo4jConnection(
+            query_responses={"t.id = $target": [prior_row]},
+            write_errors={"version_key: $vk": Neo4jQueryError("die")},
+        )
+        with pytest.raises(Neo4jQueryError):
+            await _engine(conn1).reconcile_turn(
+                [{**_rel(), "assertion_kind": "cease"}],
+                recorded_at=RECORDED_AT,
+                event_id="e1",
+                session_id="s1",
+            )
+        assert any("SET r.recorded_until = $recorded_at" in q for q, _ in conn1.writes)
+
+        # Run 2 (replay): the close landed, so the same-fact fetch (filtered
+        # to latest beliefs) returns nothing -- the cease flags and writes
+        # NOTHING. Non-destructive convergence.
+        conn2 = FakeNeo4jConnection()
+        result = await _engine(conn2).reconcile_turn(
+            [{**_rel(), "assertion_kind": "cease"}],
+            recorded_at=RECORDED_AT,
+            event_id="e1",
+            session_id="s1",
+        )
+        assert any("cease_without_prior" in f for f in result.flags)
+        conn2.assert_no_writes()
+
+
+class TestSingleWithMultipleOpenPriors:
+    @pytest.mark.asyncio
+    async def test_dirty_multi_prior_single_closes_every_prior(self):
+        # Pre-invariant dirty data: TWO open WORKS_AT priors (legacy rows
+        # predating the SINGLE invariant). A new assertion must close BOTH,
+        # each with its own clamped copy (tests-quality-4).
+        acme = _belief_row(edge_ref="r1", target="acme", valid_from=None)
+        globex = _belief_row(edge_ref="r2", target="globex", valid_from=None)
+        conn = FakeNeo4jConnection(query_responses={"t.id <> $target": [acme, globex]})
+        result = await _engine(conn).reconcile_turn(
+            [_rel(predicate="WORKS_AT", target="initech")],
+            recorded_at=RECORDED_AT,
+            event_id="e1",
+            session_id="s1",
+        )
+        assert result.appended == 3  # new version + two clamped copies
+        assert result.closed == 2
+        close_refs = {
+            p["ref"] for q, p in conn.writes if "SET r.recorded_until = $recorded_at" in q
+        }
+        assert close_refs == {"r1", "r2"}
+        copy_targets = {
+            p["target"]
+            for q, p in conn.writes
+            if "version_key: $vk" in q and p["target"] != "initech"
+        }
+        assert copy_targets == {"acme", "globex"}
 
 
 class TestSemanticsTableBehavior:

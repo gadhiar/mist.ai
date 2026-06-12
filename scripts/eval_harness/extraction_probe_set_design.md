@@ -74,11 +74,13 @@ MSYS_NO_PATHCONV=1 docker compose exec -T \
   mist-backend python scripts/mist_admin.py replay \
   data/ingest/extraction-gold-2026-06-10.jsonl --session-id ext-baseline
 
-# 3. Score
+# 3. Score (--strict: fail loudly on a broken probe join or any
+# negative-control violation instead of silently scoring a partial run)
 MSYS_NO_PATHCONV=1 docker compose exec -T mist-backend python scripts/eval_harness/score_extraction_run.py \
   --gold data/ingest/extraction-gold-2026-06-10.jsonl \
   --debug-jsonl data/runtime/extraction-baseline.jsonl \
-  --output data/runtime/extraction-baseline-report.md
+  --output data/runtime/extraction-baseline-report.md \
+  --strict
 
 # 4. Teardown (F1)
 docker compose -f docker-compose.yml -f docker-compose.eval-neo4j.yml --profile eval rm -sfv mist-neo4j-eval

@@ -100,12 +100,17 @@ class TestExtractKnowledgeAsync:
             conversation_history=[{"role": "user", "content": "I use Python and React"}],
             event_id="evt-001",
             session_id="sess-001",
+            recorded_at="2026-06-12T09:00:00+00:00",
         )
 
         assert len(pipeline.calls) == 1
         assert pipeline.calls[0]["utterance"] == "I use Python and React"
         assert pipeline.calls[0]["event_id"] == "evt-001"
         assert pipeline.calls[0]["session_id"] == "sess-001"
+        # C1 fact-time threading: a regression here silently falls back to
+        # wall-clock and rebuilds resolve relative dates differently than the
+        # live turn did (deep review tests-quality-1).
+        assert pipeline.calls[0]["recorded_at"] == "2026-06-12T09:00:00+00:00"
 
     @pytest.mark.asyncio
     async def test_extraction_call_propagates_session_and_event_to_llm_context(self):

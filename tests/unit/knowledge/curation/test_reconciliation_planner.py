@@ -147,6 +147,25 @@ class TestAssert:
         assert [a.kind for a in actions] == [ActionKind.APPEND_VERSION]
         assert actions[0].valid_from == "-inf"
 
+    def test_single_with_multiple_open_priors_closes_each(self):
+        # Pre-invariant dirty data: two fully-open legacy priors (vf=None
+        # mirrors post-backfill rows with valid_from absent). The plan must
+        # close BOTH with per-prior clamped copies carrying each prior's own
+        # (source, target), all clamped at recorded_at (tests-quality-4).
+        acme = _belief(predicate="WORKS_AT", target="acme", vf=None, ref="r1")
+        globex = _belief(predicate="WORKS_AT", target="globex", vf=None, ref="r2")
+        actions = _plan(
+            _assertion(predicate="WORKS_AT", target="initech"),
+            _existing(single_conflicts=[acme, globex]),
+        )
+        kinds = [a.kind for a in actions]
+        assert kinds.count(ActionKind.APPEND_VERSION) == 1
+        assert kinds.count(ActionKind.APPEND_CLOSED_COPY) == 2
+        assert kinds.count(ActionKind.CLOSE_TRANSACTION) == 2
+        copies = [a for a in actions if a.kind is ActionKind.APPEND_CLOSED_COPY]
+        assert {(c.edge_ref, c.target) for c in copies} == {("r1", "acme"), ("r2", "globex")}
+        assert all(c.valid_to == RECORDED_AT.isoformat() for c in copies)
+
     def test_same_belief_in_contradictions_and_progressions_closes_once(self):
         # EXPERT_IN lists STRUGGLES_WITH in both contradicts and
         # progression_supersedes; the duplicate candidate must collapse to one

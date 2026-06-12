@@ -135,6 +135,7 @@ class TestVaultNotePathForwarding:
             event_id=TEST_EVENT_ID,
             session_id=TEST_SESSION_ID,
             vault_note_path="/vault/sessions/2026-04-22-foo.md",
+            recorded_at="2026-06-12T09:00:00+00:00",
         )
 
         # Assert
@@ -142,6 +143,9 @@ class TestVaultNotePathForwarding:
         assert recorder.calls[0]["vault_note_path"] == "/vault/sessions/2026-04-22-foo.md"
         assert recorder.calls[0]["event_id"] == TEST_EVENT_ID
         assert recorder.calls[0]["session_id"] == TEST_SESSION_ID
+        # C1 fact-time threading (tests-quality-1): the engine's bitemporal
+        # recorded_at must be the event's fact-time, never wall-clock.
+        assert recorder.calls[0]["recorded_at"] == "2026-06-12T09:00:00+00:00"
 
     @pytest.mark.asyncio
     async def test_defaults_vault_note_path_to_none(self) -> None:
@@ -188,3 +192,7 @@ class TestVaultNotePathForwarding:
         # Assert -- curation called, vault_note_path defaulted to None
         assert len(recorder.calls) == 1
         assert recorder.calls[0]["vault_note_path"] is None
+        # R1 rebuild fact-time contract (tests-quality-1): replaying a stored
+        # event anchors recorded_at to the EVENT's timestamp so the rebuild
+        # resolves relative dates identically to the original live turn.
+        assert recorder.calls[0]["recorded_at"] == event.timestamp.isoformat()

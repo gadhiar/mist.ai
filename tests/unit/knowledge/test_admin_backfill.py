@@ -36,8 +36,15 @@ class TestBackfillBitemporal:
         assert "r.version_key" in query
 
     def test_dry_run_counts_without_writing(self):
+        from backend.knowledge.admin import _BACKFILL_GUARD
+
         conn = FakeNeo4jConnection(query_results=[{"n": 7}])
         result = backfill_bitemporal(conn, ontology_version="1.2.0", dry_run=True)
+        # Dry/wet parity pin (tests-quality-9): the dry count must use the
+        # SAME candidate-selection predicate the wet run writes with.
+        query, params = conn.queries[0]
+        assert _BACKFILL_GUARD in query
+        assert "HAS_TRAIT" in params["backfill_types"]
         assert result["candidates"] == 7
         # The fake returns the same row for every per-type reverse count, so
         # the exact total is fake-shaped; what matters is the key exists and
