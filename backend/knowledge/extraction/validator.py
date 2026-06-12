@@ -178,21 +178,41 @@ class ExtractionValidator:
                 source_type = entity_type_map.get(source, "")
                 target_type = entity_type_map.get(target, "")
 
-                if allowed_sources is not None and source_type not in allowed_sources:
-                    warnings.append(
-                        f"Source type '{source_type}' not valid for {rel_type} "
-                        f"(expected {allowed_sources}), dropped: "
-                        f"{source} -[{rel_type}]-> {target}"
+                defn = EDGE_TYPES_BY_NAME.get(rel_type)
+                if defn is not None and not defn.directional:
+                    # Undirected predicates: the (source, target) sets describe
+                    # an unordered pair, and the write path canonicalizes
+                    # lexically -- accept whichever orientation the LLM emitted.
+                    forward = (allowed_sources is None or source_type in allowed_sources) and (
+                        allowed_targets is None or target_type in allowed_targets
                     )
-                    continue
+                    reverse = (allowed_sources is None or target_type in allowed_sources) and (
+                        allowed_targets is None or source_type in allowed_targets
+                    )
+                    if not (forward or reverse):
+                        warnings.append(
+                            f"Pair types ('{source_type}', '{target_type}') not valid "
+                            f"for undirected {rel_type} in either orientation "
+                            f"(expected {allowed_sources} with {allowed_targets}), dropped: "
+                            f"{source} -[{rel_type}]-> {target}"
+                        )
+                        continue
+                else:
+                    if allowed_sources is not None and source_type not in allowed_sources:
+                        warnings.append(
+                            f"Source type '{source_type}' not valid for {rel_type} "
+                            f"(expected {allowed_sources}), dropped: "
+                            f"{source} -[{rel_type}]-> {target}"
+                        )
+                        continue
 
-                if allowed_targets is not None and target_type not in allowed_targets:
-                    warnings.append(
-                        f"Target type '{target_type}' not valid for {rel_type} "
-                        f"(expected {allowed_targets}), dropped: "
-                        f"{source} -[{rel_type}]-> {target}"
-                    )
-                    continue
+                    if allowed_targets is not None and target_type not in allowed_targets:
+                        warnings.append(
+                            f"Target type '{target_type}' not valid for {rel_type} "
+                            f"(expected {allowed_targets}), dropped: "
+                            f"{source} -[{rel_type}]-> {target}"
+                        )
+                        continue
 
             # Check confidence threshold
             confidence = props.get("confidence", 0.9)

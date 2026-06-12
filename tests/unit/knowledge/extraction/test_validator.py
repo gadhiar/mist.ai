@@ -497,6 +497,70 @@ class TestMistScopePredicates:
 # -------------------------------------------------------------------
 
 
+class TestUndirectedOrientation:
+    """directional=False signatures describe an unordered pair (v1.2.1).
+
+    The LLM may emit either orientation of an undirected predicate and the
+    write path canonicalizes lexically, so validation must accept both.
+    """
+
+    def _pair_extraction(self, *, source: str, target: str) -> ExtractionResult:
+        return _make_extraction(
+            entities=[
+                _make_entity(entity_id="zulip-org", entity_type="Organization"),
+                _make_entity(entity_id="python", entity_type="Technology"),
+            ],
+            relationships=[_make_relationship(rel_type="WORKS_WITH", source=source, target=target)],
+        )
+
+    def test_works_with_forward_orientation_survives(self):
+        validator = ExtractionValidator()
+
+        result = validator.validate(self._pair_extraction(source="zulip-org", target="python"))
+
+        assert len(result.relationships) == 1
+
+    def test_works_with_reverse_orientation_survives(self):
+        validator = ExtractionValidator()
+
+        result = validator.validate(self._pair_extraction(source="python", target="zulip-org"))
+
+        assert len(result.relationships) == 1
+
+    def test_works_with_invalid_pair_dropped_in_both_orientations(self):
+        # (Organization, Organization) satisfies neither orientation.
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="acme", entity_type="Organization"),
+                _make_entity(entity_id="initech", entity_type="Organization"),
+            ],
+            relationships=[
+                _make_relationship(rel_type="WORKS_WITH", source="acme", target="initech")
+            ],
+        )
+
+        result = validator.validate(extraction)
+
+        assert result.relationships == []
+        assert any("WORKS_WITH" in w for w in result.warnings)
+
+    def test_directed_predicates_remain_orientation_sensitive(self):
+        # WORKS_AT is directed: Organization -> User must still be dropped.
+        validator = ExtractionValidator()
+        extraction = _make_extraction(
+            entities=[
+                _make_entity(entity_id="user", entity_type="User"),
+                _make_entity(entity_id="acme", entity_type="Organization"),
+            ],
+            relationships=[_make_relationship(rel_type="WORKS_AT", source="acme", target="user")],
+        )
+
+        result = validator.validate(extraction)
+
+        assert result.relationships == []
+
+
 class TestTemporalQuantifiedDocumentConstraints:
     """RELATIONSHIP_CONSTRAINTS must mirror the ontology's EdgeTypeDefinition
     entries exactly for the 4 post-MVP additive edges. Accept valid shapes

@@ -52,23 +52,24 @@ EXPECTED_DURABLE = {
     "STRATEGY_FOR",
     "NAMING_CONVENTION_OF",
 }
+# USES carries no contradicts/progression: usage (behavior) and dislike or
+# struggle (sentiment/competence) are orthogonal dimensions that co-occur
+# ("I use Jira but I hate it"); pairing them erased co-true current beliefs.
 EXPECTED_CONTRADICTS = {
-    "USES": {"DISLIKES"},
     "PREFERS": {"DISLIKES"},
     "INTERESTED_IN": {"DISLIKES"},
-    "DISLIKES": {"USES", "PREFERS", "INTERESTED_IN"},
+    "DISLIKES": {"PREFERS", "INTERESTED_IN"},
     "EXPERT_IN": {"STRUGGLES_WITH"},
     "STRUGGLES_WITH": {"EXPERT_IN"},
 }
 EXPECTED_PROGRESSION = {
     "EXPERT_IN": {"LEARNING", "STRUGGLES_WITH"},
-    "USES": {"STRUGGLES_WITH"},
 }
 
 
 class TestSemanticsTable:
     def test_version_bumped(self):
-        assert ONTOLOGY_V1_0_0.version == "1.2.0"
+        assert ONTOLOGY_V1_0_0.version == "1.2.1"
 
     def test_name_index_covers_all_edges(self):
         assert set(EDGE_TYPES_BY_NAME) == {e.type_name for e in ONTOLOGY_V1_0_0.edge_types}

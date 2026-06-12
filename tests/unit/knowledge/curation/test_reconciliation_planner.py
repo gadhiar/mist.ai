@@ -86,10 +86,10 @@ class TestAssert:
     def test_reassertion_of_overlapping_fact_reinforces_and_stops(self):
         # Design 5.2: reinforce returns early -- no supersessions.
         existing = _existing(
-            same_fact=[_belief()],
-            contradictions=[_belief(predicate="DISLIKES", ref="r2")],
+            same_fact=[_belief(predicate="DISLIKES")],
+            contradictions=[_belief(predicate="PREFERS", ref="r2")],
         )
-        actions = _plan(_assertion(), existing)
+        actions = _plan(_assertion(predicate="DISLIKES"), existing)
         assert [a.kind for a in actions] == [ActionKind.REINFORCE]
         assert actions[0].edge_ref == "r1"
 
@@ -111,8 +111,8 @@ class TestAssert:
         assert closed.reason == "single_supersession"
 
     def test_contradiction_closes_same_target_only(self):
-        prior = _belief(predicate="DISLIKES", ref="r3")
-        actions = _plan(_assertion(), _existing(contradictions=[prior]))
+        prior = _belief(predicate="PREFERS", ref="r3")
+        actions = _plan(_assertion(predicate="DISLIKES"), _existing(contradictions=[prior]))
         kinds = [a.kind for a in actions]
         assert ActionKind.APPEND_CLOSED_COPY in kinds and ActionKind.CLOSE_TRANSACTION in kinds
         assert actions[1].reason == "contradiction"
@@ -121,6 +121,23 @@ class TestAssert:
         prior = _belief(predicate="LEARNING", ref="r4")
         actions = _plan(_assertion(predicate="EXPERT_IN"), _existing(progressions=[prior]))
         assert actions[1].reason == "progression"
+
+    def test_same_belief_in_contradictions_and_progressions_closes_once(self):
+        # EXPERT_IN lists STRUGGLES_WITH in both contradicts and
+        # progression_supersedes; the duplicate candidate must collapse to one
+        # copy + one close so counters and telemetry match actual writes.
+        prior = _belief(predicate="STRUGGLES_WITH", ref="r7")
+        actions = _plan(
+            _assertion(predicate="EXPERT_IN"),
+            _existing(contradictions=[prior], progressions=[prior]),
+        )
+        kinds = [a.kind for a in actions]
+        assert kinds == [
+            ActionKind.APPEND_VERSION,
+            ActionKind.APPEND_CLOSED_COPY,
+            ActionKind.CLOSE_TRANSACTION,
+        ]
+        assert actions[1].reason == "contradiction"  # first reason wins
 
     def test_future_dated_open_fact_clamps_prior_at_future_start(self):
         prior = _belief(

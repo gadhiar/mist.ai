@@ -294,6 +294,20 @@ def plan_edge(
     candidates += [(b, "contradiction") for b in existing.contradictions]
     candidates += [(b, "progression") for b in existing.progressions]
 
+    # A predicate listed in both contradicts and progression_supersedes (e.g.
+    # EXPERT_IN / STRUGGLES_WITH) yields the same belief row twice; collapse
+    # to one close per edge version so counters and telemetry match actual
+    # writes. First reason wins (single_supersession > contradiction >
+    # progression by append order above).
+    seen_refs: set[str] = set()
+    unique: list[tuple[BeliefRow, str]] = []
+    for b, reason in candidates:
+        if b.edge_ref in seen_refs:
+            continue
+        seen_refs.add(b.edge_ref)
+        unique.append((b, reason))
+    candidates = unique
+
     overlapping = [(b, r) for b, r in candidates if overlaps(b.interval(), new_iv)]
     if new_end is not None:
         # A closed (historical) assertion never retires anything. If it
@@ -507,6 +521,10 @@ class ReconciliationEngine:
             )
         progressions: list[BeliefRow] = []
         for pred in defn.progression_supersedes:
+            if pred in defn.contradicts:
+                # Already fetched as a contradiction; the planner dedups by
+                # edge_ref, so a second identical fetch is pure waste.
+                continue
             progressions += await self._fetch_latest(
                 a.source, pred, target=a.target, exclude_target=None
             )

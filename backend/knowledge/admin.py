@@ -307,7 +307,7 @@ def apply_seed(
     from each node's `display_name + description` text.
     """
     now = datetime.now(UTC).isoformat()
-    ontology_version = seed_data.get("ontology_version", "1.2.0")
+    ontology_version = seed_data.get("ontology_version", "1.2.1")
     counts: dict[str, int] = {}
 
     schema_counts = ensure_schema(connection)

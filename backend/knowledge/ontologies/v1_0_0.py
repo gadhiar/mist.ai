@@ -1240,8 +1240,9 @@ USES = EdgeTypeDefinition(
     ),
     allowed_source_types=("User", "Person", "Organization", "MistIdentity"),
     allowed_target_types=("Technology",),
-    contradicts=("DISLIKES",),
-    progression_supersedes=("STRUGGLES_WITH",),
+    # v1.2.1: no contradicts/progression. Usage (behavior) is orthogonal to
+    # DISLIKES (sentiment) and STRUGGLES_WITH (competence) -- "I use Jira but
+    # I hate it" is co-true; pairing them erased current beliefs.
 )
 
 KNOWS = EdgeTypeDefinition(
@@ -1294,7 +1295,7 @@ DISLIKES = EdgeTypeDefinition(
     description="Indicates a negative preference or aversion.",
     allowed_source_types=("User",),
     allowed_target_types=("Technology", "Concept", "Topic", "Preference"),
-    contradicts=("USES", "PREFERS", "INTERESTED_IN"),
+    contradicts=("PREFERS", "INTERESTED_IN"),
 )
 
 EXPERT_IN = EdgeTypeDefinition(
@@ -1913,7 +1914,7 @@ EXTRACTION_RULES = ExtractionRules(
 # ===================================================================
 
 ONTOLOGY_V1_0_0 = OntologyVersion(
-    version="1.2.0",
+    version="1.2.1",
     created_at=datetime(2026, 6, 10, tzinfo=UTC),
     description=(
         "Stable ontology for the MIST.AI knowledge graph. v1.1.0 additive "
@@ -1924,6 +1925,10 @@ ONTOLOGY_V1_0_0 = OntologyVersion(
         "RELATED_TO triage. v1.2.0 (2026-06-10): reconciliation semantics "
         "(cardinality, temporal_class, contradicts, progression_supersedes) "
         "declared on all extractable predicates -- C1, no new types. "
+        "v1.2.1 (2026-06-12): corrective semantics from the deep review -- "
+        "USES carries no contradicts/progression (behavior is orthogonal to "
+        "sentiment and competence; the USES<->DISLIKES pair and "
+        "USES-supersedes-STRUGGLES_WITH erased co-true current beliefs). "
         "Backwards compatible with v1.0.0 / v1.0.1 / v1.1.0 graph entities."
     ),
     node_types=tuple(ALL_NODE_TYPES),

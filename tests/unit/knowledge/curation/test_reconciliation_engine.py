@@ -204,3 +204,68 @@ class TestReviewAdditions:
         )
         appended_types = [q for q, _ in conn.writes if "version_key: $vk" in q]
         assert "DISLIKES" in appended_types[0] and "USES" in appended_types[1]
+
+
+class TestSemanticsTableBehavior:
+    """Regression guards for the v1.2.1 semantics-table corrections.
+
+    Usage (behavior) is orthogonal to dislike (sentiment) and struggle
+    (competence): asserting one must never retire the other. These drive
+    the REAL ontology table through _fetch_existing, so they fail if the
+    erasure pairs are ever reintroduced.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dislikes_does_not_retire_open_uses_fact(self):
+        # "I hate jira" after a standing "I use jira": both must stay current.
+        prior_uses = _belief_row(edge_ref="ref-uses", target="jira")
+        conn = FakeNeo4jConnection(query_responses={"[r:USES]": [prior_uses]})
+        result = await _engine(conn).reconcile_turn(
+            [_rel(predicate="DISLIKES", target="jira")],
+            recorded_at=RECORDED_AT,
+            event_id="e1",
+            session_id="s1",
+        )
+        assert result.appended == 1 and result.closed == 0
+
+    @pytest.mark.asyncio
+    async def test_uses_does_not_retire_open_dislikes_fact(self):
+        # "I use jira" after a standing "I hate jira": the aversion survives.
+        prior_dislikes = _belief_row(edge_ref="ref-dislikes", target="jira")
+        conn = FakeNeo4jConnection(query_responses={"[r:DISLIKES]": [prior_dislikes]})
+        result = await _engine(conn).reconcile_turn(
+            [_rel(predicate="USES", target="jira")],
+            recorded_at=RECORDED_AT,
+            event_id="e1",
+            session_id="s1",
+        )
+        assert result.appended == 1 and result.closed == 0
+
+    @pytest.mark.asyncio
+    async def test_uses_does_not_retire_open_struggles_with_fact(self):
+        # "I've used Docker for a year and still struggle with it" -- co-true.
+        prior_struggle = _belief_row(edge_ref="ref-struggle", target="docker")
+        conn = FakeNeo4jConnection(query_responses={"[r:STRUGGLES_WITH]": [prior_struggle]})
+        result = await _engine(conn).reconcile_turn(
+            [_rel(predicate="USES", target="docker")],
+            recorded_at=RECORDED_AT,
+            event_id="e1",
+            session_id="s1",
+        )
+        assert result.appended == 1 and result.closed == 0
+
+    @pytest.mark.asyncio
+    async def test_expert_in_supersedes_struggle_exactly_once(self):
+        # STRUGGLES_WITH sits in both EXPERT_IN.contradicts and
+        # .progression_supersedes; the duplicate fetch+candidate must collapse
+        # to ONE clamped copy and ONE close (counters = actual writes).
+        prior_struggle = _belief_row(edge_ref="ref-struggle", target="docker")
+        conn = FakeNeo4jConnection(query_responses={"[r:STRUGGLES_WITH]": [prior_struggle]})
+        result = await _engine(conn).reconcile_turn(
+            [_rel(predicate="EXPERT_IN", target="docker")],
+            recorded_at=RECORDED_AT,
+            event_id="e1",
+            session_id="s1",
+        )
+        assert result.appended == 2  # new version + exactly one clamped copy
+        assert result.closed == 1

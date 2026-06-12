@@ -269,7 +269,7 @@ class CurationGraphWriter:
                 # 4.7 drift fix: stamped from config via RebuildStamps, no
                 # hardcoded version literal.
                 "ontology_version": (
-                    self._rebuild_stamps.ontology_version if self._rebuild_stamps else "1.2.0"
+                    self._rebuild_stamps.ontology_version if self._rebuild_stamps else "1.2.1"
                 ),
             },
         )

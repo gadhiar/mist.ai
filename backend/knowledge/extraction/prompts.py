@@ -25,7 +25,9 @@ USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXP
 
 ### Relationship Direction Rules:
 - Structural relationships flow from specific to general: "React" IS_A "Framework".
-- USES / DEPENDS_ON / WORKS_WITH accept User, MistIdentity, or Organization as source.
+- USES accepts User, Person, Organization, or MistIdentity as source.
+- DEPENDS_ON sources are Technology, Project, Organization, or MistIdentity (never User).
+- WORKS_WITH is undirected between Technology/Organization/MistIdentity and Technology; either orientation is valid.
 - IMPLEMENTED_WITH / MIST_HAS_* predicates require a MistIdentity source (id="mist-identity").
 
 ## OUTPUT SCHEMA

@@ -131,7 +131,10 @@ class EdgeTypeDefinition:
     # reconciliation engine reads these; it contains no predicate names
     # (Inv-A6). Defaults preserve pre-C1 behavior: accumulate-only.
     # Undirected edges use the existing `directional=False` flag; there is
-    # deliberately no separate `symmetric` field.
+    # deliberately no separate `symmetric` field. For directional=False the
+    # (allowed_source_types, allowed_target_types) sets describe an UNORDERED
+    # pair: validation accepts either orientation and the write path
+    # canonicalizes lexically, so the stored direction carries no meaning.
     cardinality: Cardinality = Cardinality.MULTI
     temporal_class: TemporalClass = TemporalClass.STATIVE
     contradicts: tuple[str, ...] = ()
