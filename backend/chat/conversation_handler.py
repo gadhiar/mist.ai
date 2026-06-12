@@ -749,6 +749,13 @@ class ConversationHandler:
         # event_store turn numbering -- vault numbering starts at 1 per session).
         self._vault_turn_counts: dict[str, int] = {}
 
+        # In-flight background extraction tasks (task -> session_id). Strong
+        # references keep them GC-safe; end_session drains a session's tasks
+        # before the Summary/status flip, and aclose() drains everything at
+        # shutdown so cancellation cannot land mid commit-protocol (which
+        # would retire a belief without writing its successor).
+        self._extraction_tasks: dict[asyncio.Task, str] = {}
+
         # Cluster 6: budget-aware context assembly. Planner constructed from
         # config when not injected; legacy behavior preserved when disabled.
         if budget_planner is not None:
@@ -1533,9 +1540,10 @@ class ConversationHandler:
                 turn_record.flush_turn()
 
             # Fire-and-forget background extraction (also performs the
-            # conditional vault append per ADR-011 bucket 2).
+            # conditional vault append per ADR-011 bucket 2). Tracked so
+            # end_session/aclose can drain instead of abandoning to GC.
             if event_id and len(user_message.split()) >= 3:
-                asyncio.create_task(
+                task = asyncio.create_task(
                     self._extract_knowledge_async(
                         utterance=user_message,
                         assistant_message=assistant_message,
@@ -1547,6 +1555,8 @@ class ConversationHandler:
                         recorded_at=recorded_at,
                     )
                 )
+                self._extraction_tasks[task] = session_id
+                task.add_done_callback(lambda t: self._extraction_tasks.pop(t, None))
 
             return assistant_message
 
@@ -1776,6 +1786,11 @@ class ConversationHandler:
             path = self._vault_paths.get(sid)
             if not path:
                 continue
+            # Step 0: drain the session's in-flight extraction tasks so a
+            # background _maybe_append_session_turn cannot land turn blocks
+            # AFTER the Summary/status flip (FE heartbeat-loss reconnects
+            # routinely hit this window).
+            await self._drain_extraction_tasks(session_id=sid)
             # Step 1+2: synthesis (gap #1b). Failure must not block status flip.
             try:
                 synthesis = await self._generate_session_synthesis(sid)
@@ -1794,6 +1809,47 @@ class ConversationHandler:
                     sid,
                     exc,
                 )
+            # A resumed conversation must allocate a FRESH note: appending
+            # turns (and a second Summary on the next disconnect) to a
+            # completed note corrupts the session record.
+            self._vault_paths.pop(sid, None)
+            self._vault_turn_counts.pop(sid, None)
+
+    async def _drain_extraction_tasks(
+        self, session_id: str | None = None, timeout: float = 60.0
+    ) -> None:
+        """Await in-flight extraction tasks (optionally one session's).
+
+        Bounded by `timeout` so a hung llama-server cannot block shutdown;
+        tasks still running after the bound are cancelled (their writes are
+        MERGE-idempotent and replay convergently on a later re-extraction).
+        """
+        tasks = [
+            t
+            for t, sid in list(self._extraction_tasks.items())
+            if not t.done() and (session_id is None or sid == session_id)
+        ]
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        for t in pending:
+            t.cancel()
+        if pending:
+            logger.warning(
+                "Cancelled %d extraction task(s) still running after %.0fs drain timeout",
+                len(pending),
+                timeout,
+            )
+
+    async def aclose(self) -> None:
+        """Drain all in-flight extraction tasks (server shutdown hook).
+
+        Mirrors GraphRegenerator.aclose (Phase 5.5 Fix A): without the drain,
+        loop teardown cancels extraction mid commit-protocol -- which can
+        permanently retire a belief without writing its successor -- and
+        silently drops the turn's vault append and DERIVED_FROM anchoring.
+        """
+        await self._drain_extraction_tasks(session_id=None)
 
     async def _generate_session_synthesis(self, session_id: str) -> str | None:
         """Build a session-end synthesis via one LLM call.

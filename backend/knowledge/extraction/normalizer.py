@@ -5,6 +5,7 @@ against existing graph entities using static aliases, exact matches,
 alias matches, and embedding similarity. Target <50ms.
 """
 
+import asyncio
 import logging
 import re
 
@@ -310,7 +311,11 @@ class EntityNormalizer:
 
         # Tier 3: Embedding similarity
         try:
-            candidate_embedding = self._embedding_generator.generate_embedding(canonical_id)
+            # Off-loop: model.encode blocks the event loop for ~10ms per
+            # new entity (same pattern as curation-side call sites).
+            candidate_embedding = await asyncio.get_running_loop().run_in_executor(
+                None, self._embedding_generator.generate_embedding, canonical_id
+            )
             results = await self._executor.execute_query(
                 "CALL db.index.vector.queryNodes('entity_embeddings', 5, $candidate_embedding) "
                 "YIELD node, score "

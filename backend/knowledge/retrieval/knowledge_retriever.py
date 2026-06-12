@@ -313,7 +313,7 @@ class KnowledgeRetriever:
         ):
             vault_start = time.time()
             vault_limit = intent_config.max_vault_results if intent == "hybrid" else limit
-            vault_candidates_raw, vault_facts = self._vault_sidecar_retrieve(
+            vault_candidates_raw, vault_facts = await self._vault_sidecar_retrieve(
                 query=query,
                 embedding=query_embedding,
                 limit=vault_limit,
@@ -609,7 +609,7 @@ class KnowledgeRetriever:
 
         return results, facts
 
-    def _vault_sidecar_retrieve(
+    async def _vault_sidecar_retrieve(
         self,
         query: str,
         embedding: list[float],
@@ -652,12 +652,21 @@ class KnowledgeRetriever:
         intent_config = self.config.query_intent or QueryIntentConfig()
 
         try:
-            rows = self._vault_sidecar.query_hybrid(
-                embedding=embedding,
-                text=query,
-                k=limit,
-                rrf_k=intent_config.rrf_k,
-            )
+            sidecar = self._vault_sidecar
+
+            def _query() -> list[dict]:
+                return sidecar.query_hybrid(
+                    embedding=embedding,
+                    text=query,
+                    k=limit,
+                    rrf_k=intent_config.rrf_k,
+                )
+
+            # Route through the sidecar's dedicated worker: query embedding +
+            # sqlite work must stay off the event loop, and all sidecar DB
+            # access is confined to that single thread.
+            run_async = getattr(sidecar, "run_async", None)
+            rows = await run_async(_query) if run_async is not None else _query()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Vault sidecar query failed, degrading to no-vault retrieval: %s", exc)
             return [], []

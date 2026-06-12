@@ -6,6 +6,7 @@ edges, and LearningEvent entities. Relationship writes moved to the
 bitemporal ReconciliationEngine at the C2 cutover (curation/reconciliation.py).
 """
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass
@@ -234,10 +235,13 @@ class CurationGraphWriter:
         description = entity.get("description") or ""
         domain = self._confidence_manager.determine_domain(entity_type)
 
-        # Generate embedding
+        # Generate embedding off-loop: model.encode blocks ~10ms warm
+        # (seconds cold) and this runs under the curation write lock.
         embedding = entity.get("embedding")
         if embedding is None:
-            embedding = self._embedding_provider.generate_embedding(display_name)
+            embedding = await asyncio.get_running_loop().run_in_executor(
+                None, self._embedding_provider.generate_embedding, display_name
+            )
 
         await self._executor.execute_write(
             "MERGE (e:__Entity__ {id: $entity_id}) "

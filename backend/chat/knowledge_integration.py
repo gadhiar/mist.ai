@@ -198,39 +198,51 @@ class KnowledgeIntegration:
             finally:
                 q.put(DONE)
 
-        asyncio.run_coroutine_threadsafe(_drain(), event_loop)
+        fut = asyncio.run_coroutine_threadsafe(_drain(), event_loop)
 
-        while True:
-            try:
-                item = q.get(timeout=180)
-            except queue.Empty:
-                logger.error("handle_message_streaming bridge timed out after 180s")
-                # Phase 1 fix #3: capture timeout on side-channel instead of
-                # yielding error text as a fake token. Caller reads last_error
-                # after the generator returns and emits a discriminated
-                # ADR-017 error event.
-                self.last_error = ("timeout", "response timeout")
-                return
-            if item is DONE:
-                return
-            if isinstance(item, tuple) and len(item) == 2 and item[0] == "__error__":
-                # Capture on side-channel; caller emits discriminated error.
-                self.last_error = ("server", str(item[1]))
-                return
-            if isinstance(item, Token):
-                yield item.text
-            elif isinstance(item, WSEvent):
-                # ADR-017 Wave 2: forward FE-bound event payload as a dict.
-                # voice_processor distinguishes dict vs str and routes dicts
-                # directly onto the message_queue (json.dumps + put).
-                yield item.payload
-            elif isinstance(item, Complete):
-                # Producer side finished; DONE sentinel will arrive next. We
-                # don't yield the Complete event itself (caller wants tokens),
-                # but capture it on the integration object so callers can read
-                # self.last_complete after the generator returns to access
-                # duration_ms / tool_calls_used per ADR-017 stream_complete.
-                self.last_complete = item
+        try:
+            while True:
+                try:
+                    item = q.get(timeout=180)
+                except queue.Empty:
+                    logger.error("handle_message_streaming bridge timed out after 180s")
+                    # Cancel the in-flight turn: abandoning it leaves a zombie
+                    # handle_message running concurrently with the NEXT turn on
+                    # shared per-turn handler state (history interleaving,
+                    # stolen _turn_ws_events, a vault append for a turn the
+                    # user saw fail).
+                    fut.cancel()
+                    # Phase 1 fix #3: capture timeout on side-channel instead of
+                    # yielding error text as a fake token. Caller reads last_error
+                    # after the generator returns and emits a discriminated
+                    # ADR-017 error event.
+                    self.last_error = ("timeout", "response timeout")
+                    return
+                if item is DONE:
+                    return
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__error__":
+                    # Capture on side-channel; caller emits discriminated error.
+                    self.last_error = ("server", str(item[1]))
+                    return
+                if isinstance(item, Token):
+                    yield item.text
+                elif isinstance(item, WSEvent):
+                    # ADR-017 Wave 2: forward FE-bound event payload as a dict.
+                    # voice_processor distinguishes dict vs str and routes dicts
+                    # directly onto the message_queue (json.dumps + put).
+                    yield item.payload
+                elif isinstance(item, Complete):
+                    # Producer side finished; DONE sentinel will arrive next. We
+                    # don't yield the Complete event itself (caller wants tokens),
+                    # but capture it on the integration object so callers can read
+                    # self.last_complete after the generator returns to access
+                    # duration_ms / tool_calls_used per ADR-017 stream_complete.
+                    self.last_complete = item
+        finally:
+            # GeneratorExit (voice interrupt closes this generator early) and
+            # any consumer-side exception must not leave the producer turn
+            # running as a zombie. cancel() on a finished future is a no-op.
+            fut.cancel()
 
     def set_session_id(self, session_id: str):
         """Set the current session ID."""

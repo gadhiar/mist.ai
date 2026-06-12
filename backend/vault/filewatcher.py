@@ -509,50 +509,69 @@ class VaultFilewatcher:
             logger.debug("VaultFilewatcher: skipping excluded path %s", path)
             return
 
-        try:
-            content = Path(path).read_text(encoding="utf-8")
-        except OSError as exc:
-            logger.warning(
-                "VaultFilewatcher: file deleted between event and reindex, skipping %s (%s)",
-                path,
-                exc,
-            )
-            return
-        except UnicodeDecodeError as exc:
-            logger.warning("VaultFilewatcher: UTF-8 decode error on %s, skipping (%s)", path, exc)
-            return
+        def _read_and_upsert() -> int | None:
+            """Blocking unit: file I/O + frontmatter parse + sidecar upsert.
 
-        try:
-            frontmatter, _body = parse_frontmatter(content)
-        except (
-            Exception
-        ) as exc:  # noqa: BLE001 -- parse_frontmatter should not raise but guard anyway
-            logger.warning(
-                "VaultFilewatcher: frontmatter parse failed on %s, using empty dict (%s)",
-                path,
-                exc,
-            )
-            frontmatter = {}
+            Runs on the sidecar's dedicated worker thread -- upsert_file
+            embeds every chunk inside a sqlite transaction, and on the event
+            loop that stalls heartbeats and voice frames after every turn.
+            Returns the indexed mtime, or None when the path was skipped.
+            """
+            try:
+                content = Path(path).read_text(encoding="utf-8")
+            except OSError as exc:
+                logger.warning(
+                    "VaultFilewatcher: file deleted between event and reindex, skipping %s (%s)",
+                    path,
+                    exc,
+                )
+                return None
+            except UnicodeDecodeError as exc:
+                logger.warning(
+                    "VaultFilewatcher: UTF-8 decode error on %s, skipping (%s)", path, exc
+                )
+                return None
 
-        try:
-            mtime = int(Path(path).stat().st_mtime)
-        except OSError as exc:
-            logger.warning(
-                "VaultFilewatcher: stat failed for %s after read, skipping (%s)", path, exc
-            )
-            return
+            try:
+                frontmatter, _body = parse_frontmatter(content)
+            except (
+                Exception
+            ) as exc:  # noqa: BLE001 -- parse_frontmatter should not raise but guard anyway
+                logger.warning(
+                    "VaultFilewatcher: frontmatter parse failed on %s, using empty dict (%s)",
+                    path,
+                    exc,
+                )
+                frontmatter = {}
 
-        try:
-            self._sidecar.upsert_file(path, content, mtime, frontmatter)
-        except SidecarIndexError as exc:
-            logger.error("VaultFilewatcher: sidecar upsert_file failed for %s: %s", path, exc)
-            return
-        except Exception as exc:  # noqa: BLE001 -- unexpected errors must not kill the watcher
-            logger.exception(
-                "VaultFilewatcher: unexpected error during upsert_file for %s: %s",
-                path,
-                exc,
-            )
+            try:
+                mtime = int(Path(path).stat().st_mtime)
+            except OSError as exc:
+                logger.warning(
+                    "VaultFilewatcher: stat failed for %s after read, skipping (%s)", path, exc
+                )
+                return None
+
+            try:
+                self._sidecar.upsert_file(path, content, mtime, frontmatter)
+            except SidecarIndexError as exc:
+                logger.error("VaultFilewatcher: sidecar upsert_file failed for %s: %s", path, exc)
+                return None
+            except Exception as exc:  # noqa: BLE001 -- must not kill the watcher
+                logger.exception(
+                    "VaultFilewatcher: unexpected error during upsert_file for %s: %s",
+                    path,
+                    exc,
+                )
+                return None
+            return mtime
+
+        run_async = getattr(self._sidecar, "run_async", None)
+        if run_async is not None:
+            mtime = await run_async(_read_and_upsert)
+        else:  # test doubles without the worker API
+            mtime = _read_and_upsert()
+        if mtime is None:
             return
 
         self._known_mtimes[path] = mtime
@@ -601,20 +620,26 @@ class VaultFilewatcher:
         Args:
             path: Absolute path to the deleted vault markdown file.
         """
-        try:
-            self._sidecar.delete_path(path)
-        except SidecarIndexError as exc:
-            logger.error("VaultFilewatcher: sidecar delete_path failed for %s: %s", path, exc)
-            return
-        except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                "VaultFilewatcher: unexpected error during delete_path for %s: %s",
-                path,
-                exc,
-            )
-            return
 
-        self._known_mtimes.pop(path, None)
+        def _delete() -> bool:
+            try:
+                self._sidecar.delete_path(path)
+                return True
+            except SidecarIndexError as exc:
+                logger.error("VaultFilewatcher: sidecar delete_path failed for %s: %s", path, exc)
+                return False
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "VaultFilewatcher: unexpected error during delete_path for %s: %s",
+                    path,
+                    exc,
+                )
+                return False
+
+        run_async = getattr(self._sidecar, "run_async", None)
+        deleted = await run_async(_delete) if run_async is not None else _delete()
+        if deleted:
+            self._known_mtimes.pop(path, None)
 
     # ------------------------------------------------------------------
     # mtime audit job
@@ -653,35 +678,52 @@ class VaultFilewatcher:
         self._cleanup_stale_mist_writes()
 
         try:
-            walk_errors: list[str] = []
 
-            def _on_walk_error(err: OSError) -> None:
-                walk_errors.append(str(getattr(err, "filename", err)))
+            def _scan() -> tuple[set[str], list[tuple[str, int]], list[str]]:
+                """Blocking disk walk; runs on an executor thread.
 
-            disk_paths: set[str] = set()
-            for dirpath, _dirnames, filenames in os.walk(self.vault_root, onerror=_on_walk_error):
-                for fname in filenames:
-                    full = str(Path(dirpath) / fname)
-                    if not _is_tracked_path(full):
-                        continue
-                    disk_paths.add(full)
-                    try:
-                        stat_mtime = int(Path(full).stat().st_mtime)
-                    except OSError:
-                        # Broken symlink or race-deleted file -- skip
-                        continue
-                    known = self._known_mtimes.get(full)
-                    if known is None or stat_mtime > known:
-                        # New or updated file: trigger debounced reindex.
-                        # Classify at detection time: the writer marks paths
-                        # right before mutating them, so an audit-caught MIST
-                        # write inside the marker TTL still classifies right.
-                        now = time.monotonic()
-                        is_mist = (
-                            full in self._mist_writes_in_flight
-                            and self._mist_writes_in_flight[full] > now
-                        )
-                        self._schedule_action(full, "reindex", is_mist_write=is_mist)
+                Only the filesystem scan happens off-loop -- classification
+                and scheduling touch loop-confined state (_known_mtimes,
+                _mist_writes_in_flight) and stay on the event loop.
+                """
+                walk_errors: list[str] = []
+
+                def _on_walk_error(err: OSError) -> None:
+                    walk_errors.append(str(getattr(err, "filename", err)))
+
+                disk: set[str] = set()
+                stats: list[tuple[str, int]] = []
+                for dirpath, _dirnames, filenames in os.walk(
+                    self.vault_root, onerror=_on_walk_error
+                ):
+                    for fname in filenames:
+                        full = str(Path(dirpath) / fname)
+                        if not _is_tracked_path(full):
+                            continue
+                        disk.add(full)
+                        try:
+                            stats.append((full, int(Path(full).stat().st_mtime)))
+                        except OSError:
+                            # Broken symlink or race-deleted file -- skip
+                            continue
+                return disk, stats, walk_errors
+
+            loop = asyncio.get_running_loop()
+            disk_paths, stats, walk_errors = await loop.run_in_executor(None, _scan)
+
+            for full, stat_mtime in stats:
+                known = self._known_mtimes.get(full)
+                if known is None or stat_mtime > known:
+                    # New or updated file: trigger debounced reindex.
+                    # Classify at detection time: the writer marks paths
+                    # right before mutating them, so an audit-caught MIST
+                    # write inside the marker TTL still classifies right.
+                    now = time.monotonic()
+                    is_mist = (
+                        full in self._mist_writes_in_flight
+                        and self._mist_writes_in_flight[full] > now
+                    )
+                    self._schedule_action(full, "reindex", is_mist_write=is_mist)
 
             # Prune guard: a transiently unreadable vault root yields an
             # empty/partial walk WITHOUT raising (os.walk swallows scandir

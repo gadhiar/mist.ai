@@ -208,6 +208,73 @@ def make_handler(vault_writer=None, event_store_enabled: bool = True):
 
 
 # ---------------------------------------------------------------------------
+# TestExtractionTaskLifecycle (deep review concurrency-async-4 / -8)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractionTaskLifecycle:
+    @pytest.mark.asyncio
+    async def test_end_session_pops_vault_path_for_fresh_note(self):
+        # A resumed conversation must allocate a fresh note; appending turns
+        # and a second Summary to a completed note corrupts the record.
+        fake_vault = FakeVaultWriter()
+        handler = make_handler(vault_writer=fake_vault)
+        handler._vault_paths["s1"] = "/tmp/vault/sessions/2026-06-12-s1.md"
+        handler._vault_turn_counts["s1"] = 3
+
+        await handler.end_session("s1")
+
+        assert fake_vault.mark_completed_calls == ["/tmp/vault/sessions/2026-06-12-s1.md"]
+        assert "s1" not in handler._vault_paths
+        assert "s1" not in handler._vault_turn_counts
+
+    @pytest.mark.asyncio
+    async def test_end_session_drains_session_extraction_tasks_first(self):
+        # Background extraction must not land turn blocks AFTER the
+        # Summary/status flip when a reconnect fires end_session mid-turn.
+        order: list[str] = []
+
+        class _OrderedVault(FakeVaultWriter):
+            async def mark_session_completed(self, vault_note_path):
+                order.append("completed")
+                return await super().mark_session_completed(vault_note_path)
+
+        fake_vault = _OrderedVault()
+        handler = make_handler(vault_writer=fake_vault)
+        handler._vault_paths["s1"] = "/tmp/vault/sessions/2026-06-12-s1.md"
+
+        async def _slow_extraction():
+            await asyncio.sleep(0.05)
+            order.append("extraction")
+
+        task = asyncio.create_task(_slow_extraction())
+        handler._extraction_tasks[task] = "s1"
+
+        await handler.end_session("s1")
+
+        assert order == ["extraction", "completed"]
+
+    @pytest.mark.asyncio
+    async def test_aclose_drains_all_inflight_extractions(self):
+        # Shutdown must drain, not abandon: cancellation mid commit-protocol
+        # retires a belief without writing its successor.
+        handler = make_handler(vault_writer=FakeVaultWriter())
+        flags: list[str] = []
+
+        async def _bg(name: str):
+            await asyncio.sleep(0.02)
+            flags.append(name)
+
+        for name, sid in (("a", "s1"), ("b", "s2")):
+            t = asyncio.create_task(_bg(name))
+            handler._extraction_tasks[t] = sid
+
+        await handler.aclose()
+
+        assert sorted(flags) == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
 # TestVaultWriteOnSuccessfulTurn
 # ---------------------------------------------------------------------------
 

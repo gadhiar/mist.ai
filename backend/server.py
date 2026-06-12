@@ -249,6 +249,13 @@ async def lifespan(app: FastAPI):
                 "Vault sidecar index initialized at %s",
                 knowledge_config.sidecar_index.db_path,
             )
+            # Warm the sidecar's embedding model off-loop: otherwise the
+            # first vault event after startup lazy-loads a SentenceTransformer
+            # (seconds) on whichever thread fires it, under live traffic.
+            try:
+                await loop.run_in_executor(None, vault_sidecar.warmup)
+            except Exception as e:  # noqa: BLE001 -- warmup is best-effort
+                logger.warning("Sidecar embedder warmup failed (non-fatal): %s", e)
 
         # Phase 5.5: migrate from build_filewatcher (throwaway bus) to
         # build_phase3_components so the shared InvalidationBus instance can
@@ -350,6 +357,20 @@ async def lifespan(app: FastAPI):
             await vault_filewatcher._regenerator.aclose()
         except Exception as e:
             logger.warning("GraphRegenerator aclose error (non-fatal): %s", e)
+
+    # Drain in-flight conversation extraction tasks BEFORE the writer stops:
+    # loop teardown would otherwise cancel them mid commit-protocol (belief
+    # retired, successor never written) and drop their vault appends.
+    try:
+        ch = (
+            voice_processor.models.knowledge.conversation_handler
+            if voice_processor and voice_processor.models and voice_processor.models.knowledge
+            else None
+        )
+        if ch is not None and hasattr(ch, "aclose"):
+            await ch.aclose()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("ConversationHandler aclose error (non-fatal): %s", e)
 
     if vault_writer is not None:
         try:

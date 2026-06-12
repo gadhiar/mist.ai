@@ -696,8 +696,20 @@ class VaultWriter:
         return str(path)
 
     def _append_synthesis_sync(self, path: Path, synthesis_markdown: str) -> None:
-        """Synchronous core: insert ## Summary block above the sentinel."""
+        """Synchronous core: insert ## Summary block above the sentinel.
+
+        Idempotent: a note that already carries a Summary block or reads
+        status: completed is left unchanged. Every FE heartbeat-loss
+        reconnect fires end_session, and re-appending accumulated one
+        Summary section per disconnect.
+        """
         content = path.read_text(encoding="utf-8")
+        if "\n## Summary\n" in content or re.search(r"(?m)^status:\s*completed\s*$", content):
+            logger.debug(
+                "append_session_synthesis: note already synthesized or completed, skipping %s",
+                path,
+            )
+            return
         synthesis_block = "\n## Summary\n\n" + synthesis_markdown.rstrip() + "\n\n"
         sentinel_idx = content.find(_SENTINEL)
         if sentinel_idx == -1:

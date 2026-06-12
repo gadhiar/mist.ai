@@ -4,6 +4,7 @@ Stage 7a: 3-tier dedup (exact ID -> alias -> embedding similarity).
 Produces merge instructions for the graph writer.
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 
@@ -138,7 +139,11 @@ class EntityDeduplicator:
 
         # Tier 3: Embedding similarity
         try:
-            candidate_embedding = self._embedding_provider.generate_embedding(entity_id)
+            # Off-loop: model.encode blocks ~10ms warm (seconds cold) and
+            # this runs under the curation write lock on the event loop.
+            candidate_embedding = await asyncio.get_running_loop().run_in_executor(
+                None, self._embedding_provider.generate_embedding, entity_id
+            )
             results = await self._executor.execute_query(
                 "CALL db.index.vector.queryNodes('entity_embeddings', 5, $embedding) "
                 "YIELD node, score "

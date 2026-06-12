@@ -26,12 +26,14 @@ This module is sync. Async callers (filewatcher, ConversationHandler)
 wrap calls via `asyncio.get_event_loop().run_in_executor`.
 """
 
+import asyncio
 import json
 import logging
 import re
 import sqlite3
 import struct
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import sqlite_vec
@@ -251,6 +253,36 @@ class VaultSidecarIndex:
         self.config = config
         self._embeddings = embedding_provider
         self._conn: sqlite3.Connection | None = None
+        # Dedicated single worker thread for async callers (filewatcher,
+        # retriever). upsert_file embeds every chunk inside a sqlite
+        # transaction -- run on the event loop it stalls heartbeats and
+        # voice frames for tens to hundreds of ms per turn. max_workers=1
+        # keeps sqlite access serialized.
+        self._worker: ThreadPoolExecutor | None = None
+
+    def _ensure_worker(self) -> ThreadPoolExecutor:
+        if self._worker is None:
+            self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vault-sidecar")
+        return self._worker
+
+    async def run_async(self, fn, /, *args):
+        """Run a sidecar operation on the dedicated single worker thread.
+
+        Async callers MUST route every sidecar call through this so blocking
+        embedding + sqlite work stays off the event loop and all DB access
+        stays serialized on one thread. Sync callers without a running loop
+        (CLI rebuild/reindex) keep calling methods directly.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._ensure_worker(), fn, *args)
+
+    def warmup(self) -> None:
+        """Eagerly load the embedding model (blocking; call off-loop).
+
+        Without this the first vault event after startup lazy-loads a
+        SentenceTransformer on whatever thread fires it.
+        """
+        self._embeddings.generate_embedding("warmup")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -273,7 +305,12 @@ class VaultSidecarIndex:
             db_path = Path(self.config.db_path)
             db_path.parent.mkdir(parents=True, exist_ok=True)
 
-            conn = sqlite3.connect(str(db_path))
+            # check_same_thread=False: the connection is opened on the
+            # caller's thread (loop thread at server startup, main thread in
+            # the CLI) but production access runs on the dedicated single
+            # worker via run_async. Access is serialized -- never concurrent
+            # across threads -- which is the contract sqlite actually needs.
+            conn = sqlite3.connect(str(db_path), check_same_thread=False)
             conn.row_factory = sqlite3.Row
 
             conn.enable_load_extension(True)
@@ -291,7 +328,10 @@ class VaultSidecarIndex:
             raise SidecarIndexError(f"Failed to initialize sidecar index: {exc}") from exc
 
     def close(self) -> None:
-        """Close the database connection. Idempotent."""
+        """Close the database connection and worker thread. Idempotent."""
+        if self._worker is not None:
+            self._worker.shutdown(wait=False)
+            self._worker = None
         if self._conn is not None:
             try:
                 self._conn.close()

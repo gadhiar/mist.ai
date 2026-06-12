@@ -451,15 +451,19 @@ class TestHybridThreeWayMerge:
 
 
 class TestVaultSidecarRetrieve:
-    def test_vault_sidecar_retrieve_returns_empty_when_sidecar_none(self) -> None:
+    @pytest.mark.asyncio
+    async def test_vault_sidecar_retrieve_returns_empty_when_sidecar_none(self) -> None:
         retriever, _ = _make_retriever_with_sidecar(intent="historical", sidecar=None)
 
-        rows, facts = retriever._vault_sidecar_retrieve(query="x", embedding=[0.1] * 384, limit=5)
+        rows, facts = await retriever._vault_sidecar_retrieve(
+            query="x", embedding=[0.1] * 384, limit=5
+        )
 
         assert rows == []
         assert facts == []
 
-    def test_vault_sidecar_retrieve_handles_missing_heading(self) -> None:
+    @pytest.mark.asyncio
+    async def test_vault_sidecar_retrieve_handles_missing_heading(self) -> None:
         # Arrange -- a file-level chunk has heading=None in the schema
         sidecar = FakeSidecar(
             rows=[
@@ -477,7 +481,7 @@ class TestVaultSidecarRetrieve:
         retriever, _ = _make_retriever_with_sidecar(intent="historical", sidecar=sidecar)
 
         # Act
-        rows, facts = retriever._vault_sidecar_retrieve(
+        rows, facts = await retriever._vault_sidecar_retrieve(
             query="anything", embedding=[0.1] * 384, limit=5
         )
 
@@ -485,11 +489,12 @@ class TestVaultSidecarRetrieve:
         assert len(facts) == 1
         assert facts[0].object == "(file)"
 
-    def test_vault_sidecar_retrieve_passes_limit_as_k(self) -> None:
+    @pytest.mark.asyncio
+    async def test_vault_sidecar_retrieve_passes_limit_as_k(self) -> None:
         sidecar = FakeSidecar()
         retriever, _ = _make_retriever_with_sidecar(intent="historical", sidecar=sidecar)
 
-        retriever._vault_sidecar_retrieve(query="x", embedding=[0.1] * 384, limit=42)
+        await retriever._vault_sidecar_retrieve(query="x", embedding=[0.1] * 384, limit=42)
 
         assert sidecar.calls[0]["k"] == 42
 
@@ -525,7 +530,8 @@ class TestVaultSidecarRetrieve:
         retriever, _ = _make_retriever_with_sidecar(intent="historical", sidecar=FakeSidecar())
         await retriever.retrieve(query="x", force_intent=None)
 
-    def test_vault_sidecar_retrieve_drops_empty_content_chunks(self) -> None:
+    @pytest.mark.asyncio
+    async def test_vault_sidecar_retrieve_drops_empty_content_chunks(self) -> None:
         """Sidecar rows with empty/whitespace-only content must be dropped
         before reaching `format_context`. Surfacing empty-body chunks as
         '[doc-N] Source: <heading>' with no body beneath biased the model
@@ -565,7 +571,9 @@ class TestVaultSidecarRetrieve:
         )
         retriever, _ = _make_retriever_with_sidecar(intent="historical", sidecar=sidecar)
 
-        rows, facts = retriever._vault_sidecar_retrieve(query="x", embedding=[0.1] * 384, limit=10)
+        rows, facts = await retriever._vault_sidecar_retrieve(
+            query="x", embedding=[0.1] * 384, limit=10
+        )
 
         # Only the substantive chunk should survive
         assert len(facts) == 1
@@ -576,7 +584,8 @@ class TestVaultSidecarRetrieve:
         # sidecar returned before filtering).
         assert len(rows) == 1
 
-    def test_vault_sidecar_retrieve_populates_both_text_and_content_keys(self) -> None:
+    @pytest.mark.asyncio
+    async def test_vault_sidecar_retrieve_populates_both_text_and_content_keys(self) -> None:
         """Reviewer P1 follow-up: properties['text'] is the canonical
         consumption key (used by `format_context`); properties['content']
         is retained as a deprecated alias for one release cycle to avoid
@@ -599,7 +608,9 @@ class TestVaultSidecarRetrieve:
         )
         retriever, _ = _make_retriever_with_sidecar(intent="historical", sidecar=sidecar)
 
-        _rows, facts = retriever._vault_sidecar_retrieve(query="x", embedding=[0.1] * 384, limit=5)
+        _rows, facts = await retriever._vault_sidecar_retrieve(
+            query="x", embedding=[0.1] * 384, limit=5
+        )
 
         assert len(facts) == 1
         props = facts[0].properties
@@ -609,7 +620,8 @@ class TestVaultSidecarRetrieve:
             f"for one release cycle (reviewer P1 follow-up); got: {dict(props)!r}"
         )
 
-    def test_vault_sidecar_retrieve_populates_text_property(self) -> None:
+    @pytest.mark.asyncio
+    async def test_vault_sidecar_retrieve_populates_text_property(self) -> None:
         """Vault chunks must populate properties['text'] so format_context
         can render the chunk content. Pre-fix the sidecar stored chunk
         body under properties['content'], but the formatter (which is
@@ -634,7 +646,7 @@ class TestVaultSidecarRetrieve:
         )
         retriever, _ = _make_retriever_with_sidecar(intent="historical", sidecar=sidecar)
 
-        _rows, facts = retriever._vault_sidecar_retrieve(
+        _rows, facts = await retriever._vault_sidecar_retrieve(
             query="ontology expansion", embedding=[0.1] * 384, limit=5
         )
 

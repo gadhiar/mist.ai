@@ -143,12 +143,20 @@ def build_curation_pipeline(
     config: KnowledgeConfig,
     executor: GraphExecutor,
     debug_logger: "DebugJSONLLogger | None" = None,  # noqa: F821
+    embedding_provider: "EmbeddingProvider | None" = None,  # noqa: F821
 ) -> CurationPipeline:
-    """Create a fully wired CurationPipeline (bitemporal engine, C2)."""
+    """Create a fully wired CurationPipeline (bitemporal engine, C2).
+
+    Pass `embedding_provider` to share an already-warmed model: a private
+    EmbeddingGenerator here is never warmed by ModelManager, so the first
+    turn reaching tier-3 dedup or a new-entity write lazy-loads a
+    SentenceTransformer ON the event loop UNDER the curation lock.
+    """
     from backend.knowledge.curation.graph_writer import RebuildStamps
     from backend.knowledge.embeddings import EmbeddingGenerator
 
-    embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+    if embedding_provider is None:
+        embedding_provider = EmbeddingGenerator(config.embedding.model_name)
     confidence_mgr = ConfidenceManager()
     # ADR-010 Phase 8 rebuild-determinism stamps. Written to every fact edge
     # (C1 4.7) and every DERIVED_FROM->VaultNote edge so rebuilds can detect
@@ -185,7 +193,15 @@ def build_extraction_pipeline(
     executor = build_graph_executor(config, gs.connection)
 
     curation = (
-        build_curation_pipeline(config, executor, debug_logger=debug_logger)
+        build_curation_pipeline(
+            config,
+            executor,
+            debug_logger=debug_logger,
+            # Share the graph store's embedding model: ModelManager warms
+            # exactly that instance at startup (off-loop), so curation never
+            # cold-loads a second SentenceTransformer under the write lock.
+            embedding_provider=gs.embedding_generator,
+        )
         if include_curation
         else None
     )
