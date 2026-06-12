@@ -1,6 +1,6 @@
 # MIST.AI - Repository Structure
 
-Python backend repository. Frontend is in a separate repo at `./mist-frontend/ (nested in this repo)` (Tauri 2.x + React 19 + react-three-fiber).
+Python backend repository. Frontend is in a separate repo at `./mist-frontend/` (Tauri 2.x + React 19 + react-three-fiber).
 
 ---
 
@@ -70,11 +70,16 @@ backend/
 │   ├── models.py                # RetrievalResult, QueryIntent, etc.
 │   ├── embeddings.py            # Sentence Transformers all-MiniLM-L6-v2
 │   ├── extraction/              # 6-stage extraction + subject-scope classifier
-│   ├── curation/                # Dedup, conflict resolver, graph writer, regenerator
+│   ├── curation/                # Dedup, ReconciliationEngine (reconciliation.py,
+│   │                            #   bitemporal C2; replaced conflict_resolver.py),
+│   │                            #   intervals.py, graph writer, regenerator, health
 │   ├── ingestion/               # Markdown ingestion for vector store
-│   ├── retrieval/               # Hybrid retrieval (graph + vector + RRF)
-│   ├── regeneration/            # No-curation replay
-│   └── storage/                 # Neo4j executor, graph store, connection
+│   ├── retrieval/               # Hybrid retrieval (graph + vector + vault RRF)
+│   ├── regeneration/            # Legacy no-curation replay (quarantined; R1 redesigns)
+│   ├── storage/                 # Neo4j executor, graph store, connection
+│   ├── eval_isolation.py        # F1 fail-closed eval Neo4j allowlist guard
+│   ├── canonical_serialize.py   # F3 wall-clock-free graph form
+│   └── extraction_cache.py      # F3 content-addressed extraction cache
 │
 └── vault/                       # ADR-010 vault layer (Cluster 8)
     ├── conventions.py           # MIST.md auto-load primitive (ADR-014)
@@ -87,7 +92,7 @@ backend/
 
 ## Frontend (Separate Repository)
 
-The MIST frontend lives at `./mist-frontend/ (nested in this repo)` (separate git repo, no remote configured per current intent). Stack: Tauri 2.x shell + React 19 + TypeScript strict + react-three-fiber for 3D composition. See that repository's own documentation for its internal structure.
+The MIST frontend lives at `./mist-frontend/` (separate git repo, no remote configured per current intent). Stack: Tauri 2.x shell + React 19 + TypeScript strict + react-three-fiber for 3D composition. See that repository's own documentation for its internal structure.
 
 Integration with this backend is contract-only:
 - ADR-016 (LLM-mediated frontend tool calls — backend decides routing)
@@ -170,7 +175,7 @@ Cross-project ADRs (memory architecture, integration contracts, etc.) live in `k
 
 ### Tauri Frontend -> Backend
 ```
-Tauri Frontend (./mist-frontend/ (nested in this repo))
+Tauri Frontend (./mist-frontend/)
   -> WebSocket (ws://localhost:8001/ws)
 Backend Server (server.py)
   -> binary audio frames OR text messages
@@ -200,7 +205,7 @@ See `.env.example` for the full list. Required for runtime:
 ```bash
 # Neo4j
 NEO4J_URI=bolt://mist-neo4j:7687
-NEO4J_USER=neo4j
+NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=password
 
 # LLM backend
@@ -285,7 +290,7 @@ npm run dev   # Vite dev server on localhost:1420 + Tauri shell window
 3. Add CLI surface via `scripts/mist_admin.py` if needed
 
 ### Frontend changes
-Frontend lives in a separate repo at `./mist-frontend/ (nested in this repo)`. See that repo's contributing guide. Cross-repo coordination happens via ADR-016 / ADR-017 protocol updates.
+Frontend lives in a separate repo at `./mist-frontend/`. See that repo's contributing guide. Cross-repo coordination happens via ADR-016 / ADR-017 protocol updates.
 
 ---
 
@@ -304,6 +309,6 @@ See `CODEBASE.md` for live status, active workstreams, recent commits, and activ
 
 **Backend:** Production-ready, fully containerized, post-MVP knowledge integration complete (8 clusters), continuous-usage hardening in progress.
 
-**Frontend:** Production-ready Tauri spatial app (separate repo at `./mist-frontend/ (nested in this repo)`); FE/BE integration Wave 1 shipped 2026-05-10, subsequent waves cover tool-call events, cards, graph_subgraph, and visual polish.
+**Frontend:** Production-ready Tauri spatial app (separate repo at `./mist-frontend/`); FE/BE integration Wave 1 shipped 2026-05-10, subsequent waves cover tool-call events, cards, graph_subgraph, and visual polish.
 
 **Flutter Desktop:** Decommissioned 2026-05-11. Git history at `e18c092` preserves the Flutter source.

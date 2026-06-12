@@ -9,15 +9,27 @@ services:
     container_name: mist-backend
     ports:
       - "8001:8001"
+    # The full documented config surface reaches the backend process via
+    # env_file (deep review drift-hygiene-3: the explicit allowlist below
+    # silently dropped most .env knobs, including in-span operator-tuning
+    # config like RRF/ctx-budget/debug gates). The explicit entries below
+    # remain for values that must be container-correct regardless of the
+    # host-side .env (in-network URIs, container paths) -- compose's
+    # `environment` entries take precedence over env_file.
+    env_file:
+      - path: .env
+        required: false
     environment:
-      - NEO4J_URI=${NEO4J_URI:-bolt://mist-neo4j:7687}
+      - NEO4J_URI=bolt://mist-neo4j:7687
       - NEO4J_USERNAME=${NEO4J_USERNAME:-neo4j}
       - NEO4J_PASSWORD=${NEO4J_PASSWORD:-password}
       - NEO4J_DATABASE=${NEO4J_DATABASE:-neo4j}
       - LLM_SERVER_URL=http://mist-llm:8080
       - LLM_BACKEND=llamacpp
       - MODEL=${MODEL:-gemma-4-e4b}
-      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-1.0}
+      # Extraction default is deterministic 0.0 (config.py + .env.example);
+      # the old 1.0 fallback silently overrode it for every container run.
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.0}
       # Memory store paths are env-overridable so eval/gauntlet runs can
       # redirect the three stores (event store, vault, sidecar) to throwaway
       # locations and avoid polluting live memory. Defaults are unchanged --

@@ -76,7 +76,7 @@ This includes:
 - Status: PRODUCTION READY (continuous-usage hardening + FE/BE integration in progress)
 - Deployment: Docker Compose (nvidia/cuda:12.4.0-devel-ubuntu22.04)
 
-**Frontend (separate repository at `D:/Users/rajga/mist-frontend/`):**
+**Frontend (separate git repository nested at `./mist-frontend/` (own .git, no remote)):**
 - Tauri 2.x cross-platform desktop shell
 - React 19 + TypeScript strict
 - three.js + @react-three/fiber + drei (spatial 3D composition)
@@ -194,7 +194,7 @@ import statements...
 
 ### Frontend Code Style
 
-Frontend code lives in a separate repository at `D:/Users/rajga/mist-frontend/`. See that repository's own contributing guide and CLAUDE.md (when refreshed post-spatial-app-reframe) for TypeScript / React / Tauri conventions. The two repos coordinate at the protocol layer (ADR-016 + ADR-017), not at the code-style layer.
+Frontend code lives in a separate git repository nested at `./mist-frontend/` (own .git, no remote). See that repository's own contributing guide and CLAUDE.md (when refreshed post-spatial-app-reframe) for TypeScript / React / Tauri conventions. The two repos coordinate at the protocol layer (ADR-016 + ADR-017), not at the code-style layer.
 
 ---
 
@@ -438,7 +438,7 @@ Never silently consume error responses.
 
 - `tests/CLAUDE.md` -- Backend test conventions and AI guidance
 
-Frontend test conventions live in the mist-frontend repo at `D:/Users/rajga/mist-frontend/`.
+Frontend test conventions live in the nested mist-frontend repo at `./mist-frontend/`.
 
 ## Testing
 

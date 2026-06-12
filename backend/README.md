@@ -157,7 +157,7 @@ class VoiceConfig(BaseModel):
 
     # TTS
     tts_device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    voice_profile: str = "cortana"  # Selected via VOICE_PROFILE env var
+    voice_profile: str = "friday"  # Selected via VOICE_PROFILE env var
     use_voice_context: bool = True
 ```
 
@@ -168,16 +168,19 @@ class VoiceConfig(BaseModel):
 - **Language:** Auto-detect
 - **Latency:** ~200-500ms per utterance
 
-### LLM: Ollama
-- **Default Model:** Qwen 2.5 (7B)
-- **System Prompt:** Conversational AI assistant (M.I.S.T)
-- **Token Limit:** 400 tokens max (150 tokens preferred for quality)
+### LLM: llama-server (llama.cpp)
+- **Default Model:** Gemma 4 E4B Q5_K_M (carteakey-full recipe, ADR-008 revised)
+- **System Prompt:** Conversational AI assistant (M.I.S.T) with persona +
+  memory-architecture blocks
+- **Token Limit:** 1024 conversation max_tokens (Cluster 6); 0.0 extraction /
+  0.7 conversation temperature split
+- **Fallback:** OllamaProvider remains wired for `LLM_BACKEND=ollama`
 
-### TTS: Sesame CSM-1B
-- **Model:** Fine-tuned via LoRA on voice training dataset
+### TTS: Chatterbox Turbo
+- **Model:** Zero-shot voice cloning from reference WAV (MIT license)
 - **Sample Rate:** 24kHz
-- **Voice:** Consistent voice from fine-tuned model
-- **Latency:** ~2-3s RTF (Real-Time Factor)
+- **Latency:** ~0.74x RTF in-container
+- **Legacy:** Sesame CSM-1B retained under `dependencies/csm/` for rollback only
 
 ## Running the Server
 

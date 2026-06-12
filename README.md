@@ -17,7 +17,7 @@ MIST.AI is a cognitive architecture built from first principles. It combines a l
 
 ```
 +------------------------------------------------------------------+
-|  Tauri Frontend (separate repo: mist-frontend/ (nested in this repo))    |
+|  Tauri Frontend (nested repo: ./mist-frontend/)    |
 |  - Tauri 2.x + React 19 + react-three-fiber                      |
 |  - Spatial composition (forms, ring, graph, cards)               |
 |  - Voice + text input; streaming text + binary audio output      |
@@ -58,7 +58,7 @@ MIST.AI is a cognitive architecture built from first principles. It combines a l
 | Embeddings  | Sentence Transformers (all-MiniLM-L6-v2)    |
 | Container   | Docker Compose (CUDA 12.4 + Python 3.11)    |
 
-**Frontend (separate repo at `mist-frontend/ (nested in this repo)`)**
+**Frontend (separate git repo nested at `./mist-frontend/`)**
 
 | Component        | Technology                              |
 |------------------|-----------------------------------------|
@@ -94,7 +94,7 @@ docker compose logs -f mist-backend
 
 **Frontend (separate repo):**
 
-The frontend lives at `mist-frontend/ (nested in this repo)` (Tauri 2.x + React 19 + r3f). See that repo's own README for setup. In short:
+The frontend lives at `./mist-frontend/` (separate git repo nested in this one) (Tauri 2.x + React 19 + r3f). See that repo's own README for setup. In short:
 
 ```bash
 cd mist-frontend
@@ -155,7 +155,7 @@ mist.ai/
   docs/                 # Guides, setup, architecture decisions
 ```
 
-The frontend repo at `mist-frontend/ (nested in this repo)` has its own structure (Vite + Tauri + React).
+The frontend repo nested at `./mist-frontend/` has its own structure (Vite + Tauri + React).
 
 ## Documentation
 

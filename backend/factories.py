@@ -379,17 +379,19 @@ def build_conversation_handler(
 
 
 def build_graph_regenerator(config: KnowledgeConfig):
-    """Create a fully wired GraphRegenerator (no curation)."""
-    from backend.knowledge.regeneration.graph_regenerator import GraphRegenerator
+    """Quarantined: the legacy utterance->graph regenerator is superseded.
 
-    gs = build_graph_store(config)
-    pipeline = build_extraction_pipeline(
-        config, graph_store=gs, include_curation=False, include_internal_derivation=False
-    )
-    return GraphRegenerator(
-        config=config,
-        extraction_pipeline=pipeline,
-        graph_store=gs,
+    Raises immediately instead of constructing graph/LLM wiring for a
+    component ADR-010 retired (the utterance->graph rebuild is being
+    redesigned under sub-project A R1). Kept as a tombstone so stale
+    callers fail with direction instead of resurrecting the legacy path
+    (deep review vault-layer-adr010-7).
+    """
+    raise RuntimeError(
+        "build_graph_regenerator is quarantined (ADR-010): the legacy "
+        "regeneration path is superseded. Use 'mist_admin vault-rebuild' for "
+        "vault-derived rebuilds; the utterance->graph regenerator ships with "
+        "sub-project A R1."
     )
 
 

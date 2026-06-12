@@ -734,9 +734,14 @@ class GraphStore:
             embed_parts.append(description)
         embedding = self.embedding_generator.generate_embedding(" ".join(embed_parts))
 
-        query = """
-        MATCH (u:Utterance {utterance_id: $utterance_id})
-        MERGE (e:__Entity__ {id: $node_id})
+        # The :User label is an invariant of the user node, not a seed-only
+        # decoration: persona/identity reads anchor on it, and an
+        # extraction-created label-less user node broke them in production
+        # (deep review cypher-data-integrity-2a). SET is idempotent.
+        user_label_set = "SET e:User" if node_id == "user" else ""
+        query = f"""
+        MATCH (u:Utterance {{utterance_id: $utterance_id}})
+        MERGE (e:__Entity__ {{id: $node_id}})
         ON CREATE SET
             e.entity_type = $entity_type,
             e.display_name = $display_name,
@@ -750,6 +755,7 @@ class GraphStore:
             e.entity_type = CASE WHEN e.entity_type = 'Unknown'
                 THEN $entity_type ELSE e.entity_type END,
             e.embedding = $embedding
+        {user_label_set}
         MERGE (u)-[:HAS_ENTITY]->(e)
         """
 
@@ -1846,7 +1852,12 @@ class GraphStore:
             for display_name in targets:
                 target_id = f"entity-{display_name.lower().replace(' ', '-')}"
                 self.connection.execute_write(
-                    f"MERGE (u:__Entity__:User {{id: $user_id}}) "
+                    # Label-safe user MERGE: match on :__Entity__ {id} and SET
+                    # the :User label, so a label-less extraction-created user
+                    # node is healed instead of tripping entity_id_unique
+                    # (deep review cypher-data-integrity-2b).
+                    f"MERGE (u:__Entity__ {{id: $user_id}}) "
+                    f"SET u:User "
                     f"MERGE (t:__Entity__ {{id: $target_id}}) "
                     f"ON CREATE SET t.display_name = $display_name, "
                     f"t.status = 'active', t.ontology_version = $ontology_version "

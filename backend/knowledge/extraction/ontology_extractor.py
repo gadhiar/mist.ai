@@ -2,7 +2,8 @@
 
 Stage 2: Single LLM call with ontology-constrained prompt. Replaces the
 previous LLMGraphTransformer + PropertyEnricher two-pass approach.
-Uses Qwen 2.5 7B via Ollama with format="json" for structured output.
+Runs against the configured StreamingLLMProvider (Gemma 4 E4B via
+llama-server in production) with JSON-structured output.
 """
 
 from __future__ import annotations
@@ -25,6 +26,10 @@ from backend.knowledge.extraction.preprocessor import PreProcessedInput
 from backend.knowledge.extraction.prompts import (
     EXTRACTION_SYSTEM_PROMPT,
     EXTRACTION_USER_TEMPLATE,
+)
+from backend.knowledge.ontologies import (
+    EXTRACTABLE_NODE_TYPES,
+    EXTRACTABLE_RELATIONSHIP_TYPES,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,83 +59,13 @@ class OntologyConstrainedExtractor:
     relationship types, and property schemas.
     """
 
-    ALLOWED_ENTITY_TYPES: frozenset[str] = frozenset(
-        {
-            "User",
-            "Person",
-            "Organization",
-            "Technology",
-            "Skill",
-            "Project",
-            "Concept",
-            "Topic",
-            "Event",
-            "Goal",
-            "Preference",
-            "Location",
-            # Cluster 1: MIST self-model entity type (13th).
-            "MistIdentity",
-            # Post-MVP additive (2026-04-22): temporal + quantified + document.
-            "Date",
-            "Milestone",
-            "Metric",
-            "Document",
-            # v1.1.0 additive (2026-05-06): mechanism / pattern / strategy /
-            # convention / data-structure. Surfaced from V6 deep-review
-            # RELATED_TO triage.
-            "Pattern",
-            "Convention",
-            "Mechanism",
-            "Strategy",
-            "DataStructure",
-        }
-    )
+    # Derived from the ontology registry (Inv-A6): hand-maintained mirrors
+    # drifted silently as types were added across Cluster 1 / post-MVP /
+    # v1.1.0. One source of truth; the prompt enumeration is the only
+    # remaining mirror and is pinned by the extraction-version drift guard.
+    ALLOWED_ENTITY_TYPES: frozenset[str] = frozenset(EXTRACTABLE_NODE_TYPES)
 
-    ALLOWED_RELATIONSHIP_TYPES: frozenset[str] = frozenset(
-        {
-            "USES",
-            "KNOWS",
-            "WORKS_ON",
-            "WORKS_AT",
-            "INTERESTED_IN",
-            "HAS_GOAL",
-            "PREFERS",
-            "DISLIKES",
-            "EXPERT_IN",
-            "LEARNING",
-            "STRUGGLES_WITH",
-            "DECIDED",
-            "EXPERIENCED",
-            "IS_A",
-            "PART_OF",
-            "RELATED_TO",
-            "DEPENDS_ON",
-            "USED_FOR",
-            "WORKS_WITH",
-            "KNOWS_PERSON",
-            "MEMBER_OF",
-            # Cluster 1: MIST-scope relationships for system-scope extractions.
-            "IMPLEMENTED_WITH",
-            "MIST_HAS_CAPABILITY",
-            "MIST_HAS_TRAIT",
-            "MIST_HAS_PREFERENCE",
-            # Post-MVP additive (2026-04-22): temporal + quantified + document.
-            "OCCURRED_ON",
-            "HAS_METRIC",
-            "REFERENCES_DOCUMENT",
-            "PRECEDED_BY",
-            # v1.1.0 additive (2026-05-06): mechanism / pattern / strategy /
-            # convention. Absorbs ~80 percent of the RELATED_TO long tail.
-            "MECHANISM_OF",
-            "OPERATES_ON",
-            "INPUT_TO",
-            "IMPROVES",
-            "COMPRISES",
-            "APPLICABLE_TO",
-            "STRATEGY_FOR",
-            "NAMING_CONVENTION_OF",
-        }
-    )
+    ALLOWED_RELATIONSHIP_TYPES: frozenset[str] = frozenset(EXTRACTABLE_RELATIONSHIP_TYPES)
 
     def __init__(self, config: KnowledgeConfig, llm: LLMProvider) -> None:
         """Initialize the extractor.

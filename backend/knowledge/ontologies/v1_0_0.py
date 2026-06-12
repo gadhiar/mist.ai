@@ -1,17 +1,16 @@
-"""MIST.AI Knowledge Ontology v1.x family (current: v1.1.0).
+"""MIST.AI Knowledge Ontology v1.x family.
 
 Defines every node type, edge type, confidence policy, extraction rule, and
 universal property for the v1.x ontology snapshot. Module name retains the
-original v1_0_0 path; the active version is tracked by the `version` field
-on the exported `ONTOLOGY_V1_0_0` constant. v1.1.0 (2026-05-06) added
-Pattern / Convention / Mechanism / Strategy / DataStructure entity types
-and 8 new predicates (MECHANISM_OF, OPERATES_ON, INPUT_TO, IMPROVES,
-COMPRISES, APPLICABLE_TO, STRATEGY_FOR, NAMING_CONVENTION_OF).
+original v1_0_0 path; the ACTIVE version is tracked solely by the `version`
+field on the exported `ONTOLOGY_V1_0_0` constant (do not duplicate the
+version number here -- this docstring drifted twice). Version history lives
+in the constant's `description` field.
 
 Exports
 -------
 ONTOLOGY_V1_0_0 : OntologyVersion
-    The complete, frozen ontology definition (currently version 1.1.0).
+    The complete, frozen ontology definition (see its `version` field).
 ALL_NODE_TYPES / ALL_NODE_TYPE_NAMES
 ALL_EDGE_TYPES / ALL_EDGE_TYPE_NAMES
 EXTRACTABLE_NODE_TYPES / EXTRACTABLE_RELATIONSHIP_TYPES

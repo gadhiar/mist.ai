@@ -442,10 +442,12 @@ def _seed_internal_nodes(
         }
         if immutable:
             merge_params["mutable"] = False
+        _assert_known_entity_label(label, context=f"seed node {item.get('id', '?')!r}")
         query = f"""
-        MERGE (n:__Entity__:{label} {{id: $id}})
+        MERGE (n:__Entity__ {{id: $id}})
         ON CREATE SET n += $create_only, n += $merge_params
         ON MATCH SET n += $merge_params
+        SET n:{label}
         """
         connection.execute_write(
             query,
@@ -457,6 +459,22 @@ def _seed_internal_nodes(
         )
         count += 1
     return count
+
+
+def _assert_known_entity_label(label: str, *, context: str) -> None:
+    """Refuse Cypher label interpolation outside the ontology's node types.
+
+    Labels cannot be parameterized; the closed ontology set is the
+    allowlist that makes the f-string interpolation safe
+    (deep review cypher-data-integrity-1).
+    """
+    from backend.knowledge.ontologies import ALL_NODE_TYPE_NAMES
+
+    if label not in ALL_NODE_TYPE_NAMES:
+        raise ValueError(
+            f"Seed entity label {label!r} ({context}) is not a known ontology "
+            "node type; refusing to interpolate it into Cypher."
+        )
 
 
 def _seed_anchor_entity(
@@ -474,6 +492,7 @@ def _seed_anchor_entity(
     preserved since Neo4j `+=` is a merge not a replace.
     """
     label = entity["entity_type"]
+    _assert_known_entity_label(label, context=f"seed entity {entity.get('id', '?')!r}")
     meta = _seed_metadata(now_iso)
     create_only, merge_meta = _split_seed_metadata(meta)
     merge_params = {
@@ -481,10 +500,15 @@ def _seed_anchor_entity(
         **{k: v for k, v in entity.items() if k != "id"},
         **merge_meta,
     }
+    # Label-safe MERGE: match on :__Entity__ {id} alone and SET the typed
+    # label afterwards, so a pre-existing label-less node
+    # (extraction-created) is HEALED instead of tripping the
+    # entity_id_unique constraint (deep review cypher-data-integrity-2b).
     query = f"""
-    MERGE (n:__Entity__:{label} {{id: $id}})
+    MERGE (n:__Entity__ {{id: $id}})
     ON CREATE SET n += $create_only, n += $merge_params
     ON MATCH SET n += $merge_params
+    SET n:{label}
     """
     connection.execute_write(
         query,

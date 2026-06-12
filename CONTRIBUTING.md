@@ -1,6 +1,6 @@
 # Contributing to MIST.AI
 
-Thank you for your interest in contributing to MIST.AI. This document outlines the code quality standards and development workflow for the backend repository. Frontend contributions live in a separate repo (`./mist-frontend/ (nested in this repo)`); see that repo's own contributing guidance.
+Thank you for your interest in contributing to MIST.AI. This document outlines the code quality standards and development workflow for the backend repository. Frontend contributions live in a separate repo (`./mist-frontend/`); see that repo's own contributing guidance.
 
 ---
 
@@ -37,7 +37,7 @@ pre-commit install
 
 **Frontend (separate repo):**
 
-The MIST frontend lives at `./mist-frontend/ (nested in this repo)` (Tauri 2.x + React 19 + r3f). See that repository's own contributing guide for FE conventions.
+The MIST frontend lives at `./mist-frontend/` (Tauri 2.x + React 19 + r3f). See that repository's own contributing guide for FE conventions.
 
 ---
 

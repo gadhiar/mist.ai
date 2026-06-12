@@ -243,6 +243,10 @@ class CurationGraphWriter:
                 None, self._embedding_provider.generate_embedding, display_name
             )
 
+        # :User label is an invariant of the user node (persona/identity
+        # reads anchor on it); the extraction path must stamp it, not just
+        # seed/rebuild (deep review cypher-data-integrity-2a). Idempotent.
+        user_label_set = " SET e:User" if entity_id == "user" else ""
         await self._executor.execute_write(
             "MERGE (e:__Entity__ {id: $entity_id}) "
             "ON CREATE SET e.entity_type = $entity_type, e.display_name = $display_name, "
@@ -257,7 +261,7 @@ class CurationGraphWriter:
             "e.display_name = CASE WHEN size(e.display_name) < size($display_name) "
             "THEN $display_name ELSE e.display_name END, "
             "e.description = CASE WHEN size(coalesce(e.description, '')) < size($description) "
-            "THEN $description ELSE e.description END",
+            "THEN $description ELSE e.description END" + user_label_set,
             {
                 "entity_id": entity_id,
                 "entity_type": entity_type,

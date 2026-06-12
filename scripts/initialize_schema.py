@@ -51,10 +51,10 @@ def main():
         print("SCHEMA INITIALIZATION COMPLETE")
         print("=" * 60)
         print("\nNext steps:")
-        print("  1. Run: python regenerate_graph.py")
-        print("     (This will add embeddings to all entities)")
-        print("  2. Run: python test_vector_search.py")
-        print("     (Test semantic search)")
+        print("  1. Run: python -m scripts.mist_admin seed")
+        print("     (Restore the seed baseline: entities + relationships + embeddings)")
+        print("  2. Optional: python -m scripts.mist_admin vault-rebuild --scope all")
+        print("     (Re-derive graph content from the vault corpus)")
         print()
 
     except Exception as e:

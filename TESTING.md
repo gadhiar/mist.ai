@@ -31,10 +31,13 @@ Principles:
 - Target: entire suite runs in under 30 seconds.
 - Run with: `pytest tests/unit/`
 
-### `integration/` -- Real Neo4j + Ollama
+### `integration/` -- Real Neo4j + llama-server
 
 - Verifies queries work against real database, LLM responses parse correctly.
-- Requires running Neo4j and Ollama instances.
+- Requires the Docker stack running (mist-neo4j + mist-llm via
+  `docker compose up -d`); the bitemporal currency tests additionally
+  target the disposable eval instance (`--profile eval up mist-neo4j-eval`)
+  and skip cleanly when it is absent.
 - Run with: `pytest tests/integration/ -v`
 - Fixtures in `tests/integration/conftest.py` handle connection setup/teardown.
 

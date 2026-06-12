@@ -2,7 +2,7 @@
 
 **Created:** 2026-03-22
 **Source:** Comprehensive 8-agent backend audit (6 sectional + integration + fix rounds)
-**Last Updated:** 2026-05-11
+**Last Updated:** 2026-06-12 (deep-review drift sweep: 3 items closed)
 
 > This file tracks unresolved issues found during the pre-Phase-2 audit.
 > Items here are P3 (maintenance risk) -- not blocking, but should be
@@ -17,17 +17,13 @@ Stale references identified during the Wave 2 BE-emits cleanup sweep
 from the active sweep because they sat in the Wave-2 forbidden zone
 (`backend/knowledge/**`) or required architectural decisions.
 
-- [ ] **`backend/knowledge/config.py:66, 84` -- Qwen defaults.**
-  `model: str = "qwen2.5:7b-instruct"` and the `os.getenv("MODEL",
-  "qwen2.5:7b-instruct")` fallback are pre-Gemma-4-E4B defaults. In
-  docker, `MODEL=gemma-4-e4b` env var overrides so production is
-  unaffected. Cosmetic / correctness fix; trivial single-line update
-  once the forbidden-zone constraint lifts.
+- [x] **`backend/knowledge/config.py:66, 84` -- Qwen defaults.** --
+  resolved 2026-06-12 (deep-review drift sweep): defaults updated to
+  `gemma-4-e4b`.
 
-- [ ] **`backend/knowledge/extraction/ontology_extractor.py:5` --
-  Qwen docstring.** Reads "Uses Qwen 2.5 7B via Ollama with
-  format='json' for structured output." Stack moved to llama-server +
-  Gemma 4 E4B. Pure documentation; never read at runtime. Trivial.
+- [x] **`backend/knowledge/extraction/ontology_extractor.py:5` --
+  Qwen docstring.** -- resolved 2026-06-12 (deep-review drift sweep):
+  docstring now names the StreamingLLMProvider / Gemma 4 E4B stack.
 
 - [ ] **`backend/llm/ollama_provider.py` -- OllamaProvider fate.**
   Wired as the alt LLM backend in `factories.py:123-129` when
@@ -132,10 +128,10 @@ from the active sweep because they sat in the Wave-2 forbidden zone
   transaction within a transaction" errors. Current architecture is
   single-threaded so this is latent.
 
-- [ ] **store.py -- conversation_handler.py still uses naive `datetime.now()`.**
-  `_record_turn_event` creates `ConversationTurnEvent` with
-  `timestamp=datetime.now()` (local time), while store.py now uses UTC.
-  Inconsistency between the two timestamp sources.
+- [x] **store.py -- conversation_handler.py still uses naive `datetime.now()`.**
+  -- resolved by the C1 fact-time work: `_record_turn_event` now creates
+  `ConversationTurnEvent` with `timestamp=datetime.now(UTC)`
+  (conversation_handler.py, verified 2026-06-12 deep-review sweep).
 
 - [ ] **schema.sql -- No UNIQUE(session_id, turn_index) constraint.** Duplicate
   turn indices could be inserted without error.

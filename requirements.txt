@@ -8,7 +8,8 @@ networkx==3.2.1
 neo4j==5.24.0
 
 # Vector Store & Embeddings
-chromadb==0.4.24
+# (chromadb removed 2026-06-12: never imported; LanceDB is the legacy Layer-2
+# store and the vault sqlite-vec sidecar is current per ADR-010.)
 sentence-transformers==3.3.1
 lancedb>=0.20
 pyarrow>=17.0
@@ -22,7 +23,11 @@ watchdog>=3.0.0
 # pynvml: NVIDIA NVML wrapper for GPU utilization / VRAM / temperature.
 # Both degrade gracefully on systems without an NVIDIA GPU (init_gpu()
 # returns False; collect_metrics() emits placeholder GPU payload).
-psutil>=5.9
+# psutil pinned to the version in the current image (pinned file; floating
+# specifiers drift). pynvml is NOT installed in the backend image today --
+# in-container GPU telemetry runs in placeholder mode; the spec below is
+# for host-side/dev installs until the image adds it deliberately.
+psutil==7.2.2
 pynvml>=11.5
 
 # Visualization
@@ -46,6 +51,9 @@ numpy>=1.24.0
 openai-whisper>=20231117
 
 # Development & Code Quality
+# NOTE: docker/backend/Dockerfile installs its own pytest line AFTER this
+# file, so the container's effective pytest version is the Dockerfile's --
+# keep the two in sync when bumping.
 pytest==7.4.4
 pytest-asyncio>=0.23.0
 pytest-cov==4.1.0

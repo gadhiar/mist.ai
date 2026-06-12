@@ -63,7 +63,7 @@ class LLMConfig:
     a rename that would churn through 10+ extraction call sites.
     """
 
-    model: str = "qwen2.5:7b-instruct"
+    model: str = "gemma-4-e4b"
     base_url: str = "http://localhost:8080"  # llama-server default
     temperature: float = 0.0  # Deterministic for extraction
     conversation_temperature: float = 0.7  # Natural voice for conversation
@@ -81,7 +81,7 @@ class LLMConfig:
         backend = os.getenv("LLM_BACKEND", "llamacpp")
         default_url = "http://localhost:11434" if backend == "ollama" else "http://localhost:8080"
         return cls(
-            model=os.getenv("MODEL", "qwen2.5:7b-instruct"),
+            model=os.getenv("MODEL", "gemma-4-e4b"),
             base_url=os.getenv("LLM_SERVER_URL", default_url),
             temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
             conversation_temperature=float(os.getenv("LLM_CONVERSATION_TEMPERATURE", "0.7")),
