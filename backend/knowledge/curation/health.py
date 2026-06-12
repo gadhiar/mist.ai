@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from backend.knowledge.ontologies.v1_0_0 import ONTOLOGY_V1_0_0
 from backend.knowledge.storage.graph_executor import GraphExecutor
@@ -56,11 +57,15 @@ MATCH (e:__Entity__)
 WHERE e.status = 'active'
 OPTIONAL MATCH (e)-[r]-()
 WHERE coalesce(r.is_latest_belief, true)
+  AND (r.valid_to IS NULL OR r.valid_to > $now)
+  AND (r.valid_from IS NULL OR r.valid_from = '-inf' OR r.valid_from <= $now)
 RETURN count(DISTINCT e) AS entity_count,
        count(r) AS rel_count
 """
-# Connectivity counts CURRENT beliefs; superseded bitemporal history versions
-# are excluded so the score does not inflate as history accumulates (C1).
+# Connectivity counts CURRENT beliefs: transaction-closed versions fail the
+# is_latest_belief arm and the engine's clamped history copies (which stay
+# is_latest_belief=true with a past valid_to) fail the valid_to arm, so the
+# score does not inflate as belief churn accumulates history (C1).
 
 _CONSISTENCY_QUERY = """\
 MATCH (e:__Entity__)
@@ -195,7 +200,9 @@ class GraphHealthScorer:
 
     async def _score_connectivity(self) -> tuple[float, int]:
         """min(100, avg_rels_per_entity * 20). Returns (score, rel_count)."""
-        records = await self._executor.execute_query(_CONNECTIVITY_QUERY)
+        records = await self._executor.execute_query(
+            _CONNECTIVITY_QUERY, {"now": datetime.now(UTC).isoformat()}
+        )
         if not records or records[0]["entity_count"] == 0:
             return 0.0, 0
 

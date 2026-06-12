@@ -1169,13 +1169,19 @@ class GraphStore:
         # Caller may pass a tighter subset; fall back to the module-level allowlist.
         allowed_types = relationship_types if relationship_types else _USER_FACING_REL_TYPES
 
+        # C1 currency on every hop: clamped history copies and RETRACT
+        # tombstones carry is_latest_belief=true with a past/empty valid_to,
+        # so the interval arms are load-bearing here, not defensive.
         query = f"""
         MATCH path = (start:__Entity__ {{id: $entity_id}})-[*1..{max_hops}]-(related:__Entity__)
         WHERE ALL(node IN nodes(path) WHERE node:__Entity__)
           AND ALL(rel IN relationships(path)
                   WHERE type(rel) IN $allowed_rel_types
                     AND (rel.status IS NULL OR rel.status <> 'orphaned')
-                    AND coalesce(rel.is_latest_belief, true))
+                    AND coalesce(rel.is_latest_belief, true)
+                    AND (rel.valid_to IS NULL OR rel.valid_to > $now)
+                    AND (rel.valid_from IS NULL OR rel.valid_from = '-inf'
+                         OR rel.valid_from <= $now))
         WITH path, relationships(path) as rels, nodes(path) as nodes
         UNWIND range(0, size(rels)-1) as idx
         RETURN
@@ -1188,7 +1194,11 @@ class GraphStore:
             properties(rels[idx]) as properties
         """
 
-        params: dict[str, Any] = {"entity_id": entity_id, "allowed_rel_types": allowed_types}
+        params: dict[str, Any] = {
+            "entity_id": entity_id,
+            "allowed_rel_types": allowed_types,
+            "now": datetime.now(UTC).isoformat(),
+        }
         results = self.connection.execute_query(query, params)
 
         return [dict(record) for record in results]
@@ -1365,7 +1375,12 @@ class GraphStore:
         # MistTrait / MistCapability / MistPreference nodes with canonical shape.
         # C1 currency filter on every persona edge: latest belief AND valid
         # now ('-inf' = ALWAYS sentinel; legacy unstamped edges coalesce true).
-        currency = """WHERE coalesce(r.is_latest_belief, true)
+        # Orphan arm is the ONLY retirement channel for persona edges: HAS_*
+        # is not extractable, so vault user-edits retire them via
+        # status='orphaned' (rebuild_from_path) and nothing interval-closes
+        # them.
+        currency = """WHERE (r.status IS NULL OR r.status <> 'orphaned')
+              AND coalesce(r.is_latest_belief, true)
               AND (r.valid_to IS NULL OR r.valid_to > $now)
               AND (r.valid_from IS NULL OR r.valid_from = '-inf' OR r.valid_from <= $now)"""
         seeded_traits_query = f"""

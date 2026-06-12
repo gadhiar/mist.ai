@@ -674,11 +674,21 @@ class TestCurrentBeliefFilters:
         assert "r.valid_from IS NULL OR r.valid_from = '-inf' OR r.valid_from <= $now" in query
         assert "now" in params
 
-    def test_neighborhood_filters_to_latest(self):
+    def test_neighborhood_filters_to_latest_and_currently_valid(self):
+        # Hop expansion runs on every default retrieval (max_hops=2); without
+        # the interval arms, clamped history copies and RETRACT tombstones
+        # (is_latest_belief=true, past/empty valid_to) re-enter the prompt.
         conn, store = self._store()
         store.get_entity_neighborhood("rust", max_hops=2)
-        query, _ = conn.queries[-1]
-        assert "coalesce(rel.is_latest_belief, true)" in query
+        query, params = conn.queries[-1]
+        normalized = " ".join(query.split())  # arm spans a line break
+        assert "coalesce(rel.is_latest_belief, true)" in normalized
+        assert "rel.valid_to IS NULL OR rel.valid_to > $now" in normalized
+        assert (
+            "rel.valid_from IS NULL OR rel.valid_from = '-inf' OR rel.valid_from <= $now"
+            in normalized
+        )
+        assert "now" in params
 
     def test_identity_context_filters_to_latest_and_currently_valid(self):
         conn, store = self._store()
@@ -687,5 +697,9 @@ class TestCurrentBeliefFilters:
         assert identity_queries, "identity queries must name the rel variable r"
         assert len(identity_queries) == 7
         for query in identity_queries:
+            # Orphan arm: vault user-edits retire persona edges via
+            # status='orphaned' (their only retirement channel -- HAS_* is
+            # not extractable so the engine never interval-closes them).
+            assert "r.status IS NULL OR r.status <> 'orphaned'" in query
             assert "coalesce(r.is_latest_belief, true)" in query
             assert "r.valid_from IS NULL OR r.valid_from = '-inf' OR r.valid_from <= $now" in query

@@ -1015,7 +1015,20 @@ def probe_tcp(host: str, port: int, timeout: float = 3.0) -> bool:
 # C1 bitemporal backfill (one-shot migration)
 # ---------------------------------------------------------------------------
 
-_BACKFILL_GUARD = "r.source_utterance_id IS NULL AND type(r) IN $extractable"
+# Seeded persona edges (HAS_TRAIT/HAS_CAPABILITY/HAS_PREFERENCE, plus the
+# internal-derivation IS_UNCERTAIN_ABOUT) are not extractable types but are
+# written under the same version_key='seed' MERGE contract as anchor edges.
+# Backfill MUST stamp them too: an unstamped pre-C1 persona edge never
+# matches the seed MERGE, so every re-seed duplicates it
+# (deep review read-path-currency-4).
+_BACKFILL_INTERNAL_TYPES = (
+    "HAS_TRAIT",
+    "HAS_CAPABILITY",
+    "HAS_PREFERENCE",
+    "IS_UNCERTAIN_ABOUT",
+)
+
+_BACKFILL_GUARD = "r.source_utterance_id IS NULL AND type(r) IN $backfill_types"
 
 
 def backfill_bitemporal(
@@ -1044,7 +1057,9 @@ def backfill_bitemporal(
     The graph is small (post-reset scale); a single UPDATE is sufficient --
     APOC batching is unnecessary until edge counts demand it.
     """
-    params: dict[str, Any] = {"extractable": list(EXTRACTABLE_RELATIONSHIP_TYPES)}
+    params: dict[str, Any] = {
+        "backfill_types": list(EXTRACTABLE_RELATIONSHIP_TYPES) + list(_BACKFILL_INTERNAL_TYPES)
+    }
     if dry_run:
         rows = connection.execute_query(
             f"MATCH (:__Entity__)-[r]->(:__Entity__) WHERE {_BACKFILL_GUARD} "

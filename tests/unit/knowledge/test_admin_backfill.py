@@ -10,9 +10,21 @@ class TestBackfillBitemporal:
         result = backfill_bitemporal(conn, ontology_version="1.2.0")
         query, params = conn.writes[0]
         assert "r.source_utterance_id IS NULL" in query  # idempotency guard
-        assert "type(r) IN $extractable" in query
+        assert "type(r) IN $backfill_types" in query
         assert params["ontology_version"] == "1.2.0"
         assert result["edges_backfilled"] == 3
+
+    def test_seeded_internal_persona_edges_within_scope(self):
+        # read-path-currency-4: HAS_TRAIT etc. are seeded under the same
+        # version_key='seed' MERGE contract as anchor edges; excluding them
+        # from backfill leaves pre-C1 persona edges unstamped, so the next
+        # re-seed MERGE misses them and duplicates every identity edge.
+        conn = FakeNeo4jConnection(write_results=[{"updated": 1}])
+        backfill_bitemporal(conn, ontology_version="1.2.0")
+        _, params = conn.writes[0]
+        for predicate in ("HAS_TRAIT", "HAS_CAPABILITY", "HAS_PREFERENCE", "IS_UNCERTAIN_ABOUT"):
+            assert predicate in params["backfill_types"]
+        assert "USES" in params["backfill_types"]  # extractables still covered
 
     def test_seed_edges_map_to_canonical_seed_source(self):
         conn = FakeNeo4jConnection(write_results=[{"updated": 1}])

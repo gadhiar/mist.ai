@@ -175,15 +175,25 @@ async def query_user_snapshot(graph_executor, user_id: str, rendered_at: str) ->
         if k in _PROFILE_FIELDS and v is not None:
             profile_attrs[k] = str(v)
 
+    # Canonical 4-arm currency filter: the snapshot mirrors CURRENT graph
+    # state, so transaction-closed versions (is_latest_belief arm), clamped
+    # history copies and RETRACT tombstones (valid_to arm), future-dated
+    # facts (valid_from arm), and orphaned vault-edit edges (status arm)
+    # must not render. $now binds to rendered_at so the read stays
+    # deterministic for tests and consistent with the stamped instant.
     neighbor_rows = await graph_executor.execute_query(
         "MATCH (u:__Entity__ {id: $user_id})-[r]->(n:__Entity__) "
+        "WHERE (r.status IS NULL OR r.status <> 'orphaned') "
+        "AND coalesce(r.is_latest_belief, true) "
+        "AND (r.valid_to IS NULL OR r.valid_to > $now) "
+        "AND (r.valid_from IS NULL OR r.valid_from = '-inf' OR r.valid_from <= $now) "
         "RETURN type(r) AS rel_type, "
         "       n.id AS entity_id, "
         "       n.entity_type AS entity_type, "
         "       coalesce(n.display_name, n.id) AS display_name, "
         "       n.description AS description, "
         "       coalesce(r.confidence, 1.0) AS confidence",
-        {"user_id": user_id},
+        {"user_id": user_id, "now": rendered_at},
     )
     edges_by_type: dict[str, list[NeighborRef]] = {}
     for nr in neighbor_rows:
