@@ -153,8 +153,10 @@ UNIVERSAL_ENTITY_PROPERTIES: tuple[PropertyDefinition, ...] = (
 )
 
 # ===================================================================
-# Universal Relationship Properties (15)
+# Universal Relationship Properties (12)
 # ===================================================================
+# v1.3.0 (2026-06-13): started/ended/duration retired (superseded by the
+# bitemporal valid-time interval); count dropped 15 -> 12.
 
 UNIVERSAL_RELATIONSHIP_PROPERTIES: tuple[PropertyDefinition, ...] = (
     PropertyDefinition(
@@ -219,24 +221,9 @@ UNIVERSAL_RELATIONSHIP_PROPERTIES: tuple[PropertyDefinition, ...] = (
         required=False,
         description="Contextual note about the relationship.",
     ),
-    PropertyDefinition(
-        name="started",
-        type="datetime",
-        required=False,
-        description="When the relationship began.",
-    ),
-    PropertyDefinition(
-        name="ended",
-        type="datetime",
-        required=False,
-        description="When the relationship ended.",
-    ),
-    PropertyDefinition(
-        name="duration",
-        type="string",
-        required=False,
-        description="Human-readable duration of the relationship.",
-    ),
+    # v1.3.0 (2026-06-13): the started/ended/duration triad was retired here.
+    # Relationship temporal extent is now carried by the bitemporal valid-time
+    # interval on the edge, not by these free-standing schema props.
     PropertyDefinition(
         name="frequency",
         type="string",
@@ -1337,6 +1324,35 @@ EXPERIENCED = EdgeTypeDefinition(
     temporal_class=TemporalClass.EVENT,
 )
 
+# v1.3.0 additive (2026-06-13). RECOMMENDS captures third-party suggestion
+# ("my mentor suggested DuckDB") as a point event, distinct from the user's
+# own USES/PREFERS. HAS_HABIT captures recurring user routines ("I journal
+# every night"); the recurrence descriptor lives in temporal_expression, not
+# a structural prop. Paired with the retirement of the started/ended/duration
+# universal relationship props, which are superseded by the bitemporal
+# valid-time interval.
+RECOMMENDS = EdgeTypeDefinition(
+    type_name="RECOMMENDS",
+    description="Source person recommended or suggested the target to the user.",
+    allowed_source_types=("Person", "User"),
+    allowed_target_types=(
+        "Technology",
+        "Concept",
+        "Document",
+        "Strategy",
+        "Project",
+        "Organization",
+    ),
+    temporal_class=TemporalClass.EVENT,
+)
+
+HAS_HABIT = EdgeTypeDefinition(
+    type_name="HAS_HABIT",
+    description="Recurring routine or habitual activity of the user; recurrence descriptor in temporal_expression.",
+    allowed_source_types=("User",),
+    allowed_target_types=("Concept", "Skill", "Topic", "Event"),
+)
+
 # ===================================================================
 # Structural / Social / Provenance Relationships (14)
 # ===================================================================
@@ -1750,6 +1766,10 @@ _EXTERNAL_USER_CENTRIC_EDGE_TYPES: tuple[EdgeTypeDefinition, ...] = (
     STRUGGLES_WITH,
     DECIDED,
     EXPERIENCED,
+    # v1.3.0 additive (2026-06-13). Extractable by construction: this tuple
+    # feeds both ALL_EDGE_TYPES and EXTRACTABLE_RELATIONSHIP_TYPES.
+    RECOMMENDS,
+    HAS_HABIT,
 )
 
 _STRUCTURAL_EDGE_TYPES: tuple[EdgeTypeDefinition, ...] = (
@@ -1871,9 +1891,10 @@ ENTITY TYPES YOU MAY PRODUCE (22):
   Event, Goal, Preference, Location, Date, Milestone, Metric, Document,
   Pattern, Convention, Mechanism, Strategy, DataStructure, MistIdentity
 
-RELATIONSHIP TYPES YOU MAY PRODUCE (37):
+RELATIONSHIP TYPES YOU MAY PRODUCE (39):
   User-centric: USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL,
-    PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED
+    PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED,
+    RECOMMENDS, HAS_HABIT
   Structural: IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH,
     KNOWS_PERSON, MEMBER_OF
   Temporal / quantified / document: OCCURRED_ON, HAS_METRIC,
@@ -1913,7 +1934,7 @@ EXTRACTION_RULES = ExtractionRules(
 # ===================================================================
 
 ONTOLOGY_V1_0_0 = OntologyVersion(
-    version="1.2.1",
+    version="1.3.0",
     created_at=datetime(2026, 6, 10, tzinfo=UTC),
     description=(
         "Stable ontology for the MIST.AI knowledge graph. v1.1.0 additive "
@@ -1928,6 +1949,10 @@ ONTOLOGY_V1_0_0 = OntologyVersion(
         "USES carries no contradicts/progression (behavior is orthogonal to "
         "sentiment and competence; the USES<->DISLIKES pair and "
         "USES-supersedes-STRUGGLES_WITH erased co-true current beliefs). "
+        "v1.3.0 (2026-06-13): additive RECOMMENDS (third-party suggestion, "
+        "EVENT) and HAS_HABIT (recurring user routine) predicates; retired "
+        "the started/ended/duration universal relationship properties, "
+        "superseded by the bitemporal valid-time interval. "
         "Backwards compatible with v1.0.0 / v1.0.1 / v1.1.0 graph entities."
     ),
     node_types=tuple(ALL_NODE_TYPES),
@@ -1940,7 +1965,7 @@ ONTOLOGY_V1_0_0 = OntologyVersion(
     ),
     universal_entity_properties=UNIVERSAL_ENTITY_PROPERTIES,
     universal_relationship_properties=UNIVERSAL_RELATIONSHIP_PROPERTIES,
-    parent_version="1.1.0",
+    parent_version="1.2.1",
     migration_script_path=None,
     active=True,
     deprecated=False,

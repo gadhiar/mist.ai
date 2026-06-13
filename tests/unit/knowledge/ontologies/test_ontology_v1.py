@@ -163,7 +163,7 @@ class TestEntityTypes:
 class TestRelationshipTypes:
     """Verify the complete set of relationship types in the ontology."""
 
-    def test_has_49_relationship_types(self):
+    def test_has_51_relationship_types(self):
         # Cluster 1 added 4 MIST-scope edges: IMPLEMENTED_WITH,
         # MIST_HAS_CAPABILITY, MIST_HAS_TRAIT, MIST_HAS_PREFERENCE.
         # Post-MVP additive (2026-04-22) added 4 temporal / quantified / document
@@ -171,7 +171,9 @@ class TestRelationshipTypes:
         # v1.1.0 additive (2026-05-06) added 8 mechanism/pattern/strategy edges:
         # MECHANISM_OF, OPERATES_ON, INPUT_TO, IMPROVES, COMPRISES,
         # APPLICABLE_TO, STRATEGY_FOR, NAMING_CONVENTION_OF.
-        assert len(ALL_EDGE_TYPES) == 49
+        # v1.3.0 additive (2026-06-13) added 2 user-centric edges: RECOMMENDS,
+        # HAS_HABIT.
+        assert len(ALL_EDGE_TYPES) == 51
 
     def test_extractable_relationships_count(self):
         # 13 user-centric + 8 original structural (excludes LEARNED_FROM, ABOUT,
@@ -180,8 +182,9 @@ class TestRelationshipTypes:
         # MIST_HAS_PREFERENCE) + 4 post-MVP additive structural (OCCURRED_ON,
         # HAS_METRIC, REFERENCES_DOCUMENT, PRECEDED_BY) + 8 v1.1.0 additive
         # (MECHANISM_OF, OPERATES_ON, INPUT_TO, IMPROVES, COMPRISES,
-        # APPLICABLE_TO, STRATEGY_FOR, NAMING_CONVENTION_OF).
-        assert len(EXTRACTABLE_RELATIONSHIP_TYPES) == 37
+        # APPLICABLE_TO, STRATEGY_FOR, NAMING_CONVENTION_OF) + 2 v1.3.0 additive
+        # user-centric (RECOMMENDS, HAS_HABIT).
+        assert len(EXTRACTABLE_RELATIONSHIP_TYPES) == 39
 
     @pytest.mark.parametrize(
         "type_name",
@@ -370,7 +373,16 @@ class TestConfidencePolicies:
 class TestOntologyVersion:
     """Verify the top-level ontology version metadata."""
 
-    def test_version_is_1_2_1(self):
-        # v1.2.1 semantics correction 2026-06-12 (deep review).
-        assert ONTOLOGY_V1_0_0.version == "1.2.1"
-        assert ONTOLOGY_V1_0_0.parent_version == "1.1.0"
+    def test_version_is_1_3_0(self):
+        # v1.3.0 additive (2026-06-13): RECOMMENDS + HAS_HABIT predicates;
+        # retired started/ended/duration universal relationship props.
+        assert ONTOLOGY_V1_0_0.version == "1.3.0"
+        assert ONTOLOGY_V1_0_0.parent_version == "1.2.1"
+
+    def test_vault_writer_ontology_version_paired(self):
+        # The vault writer stamps _ONTOLOGY_VERSION into session-note
+        # frontmatter; it must track the active ontology version so rebuilt
+        # notes record the schema they were written under.
+        from backend.vault.writer import _ONTOLOGY_VERSION
+
+        assert ONTOLOGY_V1_0_0.version == _ONTOLOGY_VERSION

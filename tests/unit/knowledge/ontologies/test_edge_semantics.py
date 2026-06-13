@@ -38,7 +38,9 @@ from backend.knowledge.ontologies.v1_0_0 import (  # noqa: E402
 
 # Snapshot of the design 4.1 semantics table. Drift here is intentional-only.
 EXPECTED_SINGLE = {"WORKS_AT", "OCCURRED_ON"}
-EXPECTED_EVENT = {"DECIDED", "EXPERIENCED", "OCCURRED_ON", "HAS_METRIC"}
+# v1.3.0 (2026-06-13): RECOMMENDS is a point event (someone recommended X) --
+# it accumulates and is never superseded by valid time, like DECIDED.
+EXPECTED_EVENT = {"DECIDED", "EXPERIENCED", "OCCURRED_ON", "HAS_METRIC", "RECOMMENDS"}
 EXPECTED_DURABLE = {
     "IS_A",
     "PART_OF",
@@ -69,7 +71,7 @@ EXPECTED_PROGRESSION = {
 
 class TestSemanticsTable:
     def test_version_bumped(self):
-        assert ONTOLOGY_V1_0_0.version == "1.2.1"
+        assert ONTOLOGY_V1_0_0.version == "1.3.0"
 
     def test_name_index_covers_all_edges(self):
         assert set(EDGE_TYPES_BY_NAME) == {e.type_name for e in ONTOLOGY_V1_0_0.edge_types}
@@ -125,3 +127,31 @@ class TestSemanticsTable:
     def test_undirected_edges_use_directional_flag(self):
         assert EDGE_TYPES_BY_NAME["WORKS_WITH"].directional is False
         assert EDGE_TYPES_BY_NAME["RELATED_TO"].directional is False
+
+
+class TestV130Predicates:
+    """v1.3.0 (2026-06-13): RECOMMENDS + HAS_HABIT predicate definitions and
+    retirement of the started/ended/duration universal relationship props
+    (superseded by the bitemporal valid-time interval).
+    """
+
+    def test_recommends_predicate_defined(self):
+        defn = EDGE_TYPES_BY_NAME["RECOMMENDS"]
+        assert defn.allowed_source_types == ("Person", "User")
+        assert defn.temporal_class is TemporalClass.EVENT
+        # Pin the default so it can't silently flip.
+        assert defn.cardinality is Cardinality.MULTI
+        assert defn.contradicts == ()
+
+    def test_has_habit_predicate_defined(self):
+        defn = EDGE_TYPES_BY_NAME["HAS_HABIT"]
+        assert defn.allowed_source_types == ("User",)
+        assert defn.cardinality is Cardinality.MULTI
+        # Default; pin it -- habits close via cease, not via a fresh interval.
+        assert defn.temporal_class is TemporalClass.STATIVE
+
+    def test_universal_props_drop_started_ended_duration(self):
+        from backend.knowledge.ontologies.v1_0_0 import UNIVERSAL_RELATIONSHIP_PROPERTIES
+
+        names = {p.name for p in UNIVERSAL_RELATIONSHIP_PROPERTIES}
+        assert {"started", "ended", "duration"}.isdisjoint(names)
