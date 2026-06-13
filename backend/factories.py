@@ -12,7 +12,10 @@ For tests, bypass factories and pass fakes directly to constructors.
 """
 
 import logging
+import os
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from backend.interfaces import (
@@ -46,6 +49,52 @@ from backend.knowledge.storage.neo4j_connection import Neo4jConnection
 from backend.llm import StreamingLLMProvider
 
 logger = logging.getLogger(__name__)
+
+# Replay-determinism clock seam (config-from-env, mirroring LLM_TEMPERATURE et
+# al. in KnowledgeConfig.from_env). PRODUCTION leaves MIST_FIXED_CLOCK unset ->
+# every clock falls back to wall-clock (behavior unchanged). The F2 replay path
+# sets it to a single fixed ISO-8601 instant shared by det1 and det2 so the
+# user-snapshot `rendered_at` stamped into the chat system prompt is reproducible
+# (a wall-clock value perturbs the turn-1 greedy reply and diverges the
+# conversation history). See scripts/eval_harness/extraction_probe_set_design.md.
+_FIXED_CLOCK_ENV = "MIST_FIXED_CLOCK"
+
+
+def resolve_fixed_rendered_at() -> str | None:
+    """Return the replay-pinned ISO timestamp, or None for wall-clock.
+
+    Reads `MIST_FIXED_CLOCK`. Unset (the production default) yields None, which
+    every caller maps to live `datetime.now(UTC)`. When set, the value is
+    validated as ISO 8601 and returned verbatim so it round-trips byte-for-byte
+    into the seeded `users/<id>.md` Provenance block.
+
+    Raises:
+        ValueError: when the env var is set but not parseable as ISO 8601. A
+            malformed pin must fail loudly rather than silently degrade an eval
+            run to nondeterministic wall-clock.
+    """
+    raw = os.getenv(_FIXED_CLOCK_ENV)
+    if raw is None or raw.strip() == "":
+        return None
+    value = raw.strip()
+    # Validate (and normalize-check) -- raises ValueError on a bad pin.
+    datetime.fromisoformat(value)
+    return value
+
+
+def build_now_fn() -> Callable[[], datetime]:
+    """Build the injectable clock for ConversationHandler.
+
+    Production (no `MIST_FIXED_CLOCK`): returns a wall-clock callable
+    (`lambda: datetime.now(UTC)`). Replay (env set): returns a callable that
+    yields the SAME fixed tz-aware instant on every call, so det1 and det2 share
+    one constant and the user-snapshot timestamp is reproducible.
+    """
+    fixed = resolve_fixed_rendered_at()
+    if fixed is None:
+        return lambda: datetime.now(UTC)
+    fixed_dt = datetime.fromisoformat(fixed)
+    return lambda: fixed_dt
 
 
 def build_vector_store(config: KnowledgeConfig) -> "LanceDBVectorStore":  # noqa: F821
@@ -375,6 +424,9 @@ def build_conversation_handler(
         debug_logger=debug_logger,
         vault_writer=vault_writer,
         invalidation_bus=invalidation_bus,
+        # Replay-determinism clock seam: wall-clock in production (env unset),
+        # a fixed instant under MIST_FIXED_CLOCK for reproducible replays.
+        now_fn=build_now_fn(),
     )
 
 

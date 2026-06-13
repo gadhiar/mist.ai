@@ -14,7 +14,7 @@ import math
 import random
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -708,6 +708,7 @@ class ConversationHandler:
         budget_planner: ContextBudgetPlanner | None = None,
         vault_writer: VaultWriterProtocol | None = None,
         invalidation_bus: InvalidationBus | None = None,
+        now_fn: Callable[[], datetime] | None = None,
     ) -> None:
         """Initialize conversation handler.
 
@@ -737,8 +738,18 @@ class ConversationHandler:
                 rebuild-completion events from the filewatcher and evict stale
                 `_mist_context_cache` entries. When None, no subscription is
                 registered and the cache is not driven by vault edits.
+            now_fn: Injectable clock returning a tz-aware datetime. Used at the
+                C-pattern user-snapshot writeback (`_maybe_refresh_user_vault`)
+                to stamp `rendered_at`. Defaults to `lambda: datetime.now(UTC)`
+                (real wall-clock -- unchanged production behavior). The replay
+                path injects a FIXED clock so the user-snapshot timestamp is
+                reproducible and the greedy chat reply does not diverge run to
+                run (wired in `backend.factories.build_conversation_handler`).
         """
         self.config = config
+        # Injectable clock (DI seam). Default = real wall-clock so production
+        # behavior is unchanged; the replay path supplies a fixed value.
+        self._now_fn: Callable[[], datetime] = now_fn or (lambda: datetime.now(UTC))
         self.graph_store = graph_store
         self._extraction_pipeline = extraction_pipeline
         self.retriever = retriever
@@ -2070,13 +2081,14 @@ class ConversationHandler:
             return
 
         try:
-            from datetime import UTC
-            from datetime import datetime as _dt
-
             from backend.knowledge.storage.graph_executor import GraphExecutor
 
             executor = GraphExecutor(self.graph_store.connection)
-            rendered_at = _dt.now(UTC).isoformat()
+            # Injected clock (DI seam): production default is wall-clock; the
+            # replay path supplies a FIXED instant so the snapshot's rendered_at
+            # -- and therefore the currency-filter $now bound below -- is
+            # reproducible across runs (see ConversationHandler.now_fn).
+            rendered_at = self._now_fn().isoformat()
             snapshot = await query_user_snapshot(executor, user_id, rendered_at)
             body_md = render_user_snapshot_body(snapshot)
             # Write to the SEPARATE machine-owned derived snapshot file
@@ -2084,7 +2096,9 @@ class ConversationHandler:
             # users/<user_id>.md. The curated profile is user-authoritative
             # (ADR-010 Invariant 5) and must never be clobbered by the
             # C-pattern writeback.
-            await self._vault_writer.upsert_user_snapshot(user_id=user_id, body_markdown=body_md)
+            await self._vault_writer.upsert_user_snapshot(
+                user_id=user_id, body_markdown=body_md, rendered_at=rendered_at
+            )
             logger.debug(
                 "User vault refreshed (C-pattern): user_id=%s, %d edge types in snapshot",
                 user_id,

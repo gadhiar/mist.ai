@@ -67,14 +67,21 @@ class FakeAsyncVaultWriter:
         self.identity_calls: list[dict] = []
         self.user_calls: list[dict] = []
 
-    async def upsert_identity(self, traits, capabilities, preferences) -> str:
+    async def upsert_identity(self, traits, capabilities, preferences, rendered_at=None) -> str:
         self.identity_calls.append(
-            {"traits": traits, "capabilities": capabilities, "preferences": preferences}
+            {
+                "traits": traits,
+                "capabilities": capabilities,
+                "preferences": preferences,
+                "rendered_at": rendered_at,
+            }
         )
         return f"{self.root}/identity/mist.md"
 
-    async def upsert_user(self, user_id: str, body_markdown: str) -> str:
-        self.user_calls.append({"user_id": user_id, "body_markdown": body_markdown})
+    async def upsert_user(self, user_id: str, body_markdown: str, rendered_at=None) -> str:
+        self.user_calls.append(
+            {"user_id": user_id, "body_markdown": body_markdown, "rendered_at": rendered_at}
+        )
         return f"{self.root}/users/{user_id}.md"
 
 

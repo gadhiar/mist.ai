@@ -148,7 +148,15 @@ def _do_vault_bootstrap(be: Any, config: Any, seed_data: dict[str, Any]) -> None
     """
     import asyncio
 
+    from backend.factories import resolve_fixed_rendered_at
     from backend.vault.writer import VaultWriter
+
+    # Replay-determinism clock seam: MIST_FIXED_CLOCK (when set) pins the seeded
+    # notes' rendered_at so the seeded users/<id>.md the chat prompt reads is
+    # byte-identical across replay runs. Unset in production -> wall-clock.
+    rendered_at = resolve_fixed_rendered_at()
+    if rendered_at is not None:
+        print(f"[seed] Vault bootstrap: pinning rendered_at to {rendered_at} (fixed clock)")
 
     print("[seed] Vault bootstrap: writing identity/mist.md + users/<id>.md")
 
@@ -156,7 +164,9 @@ def _do_vault_bootstrap(be: Any, config: Any, seed_data: dict[str, Any]) -> None
         writer = VaultWriter(config.vault)
         await writer.start()
         try:
-            return await be.admin.bootstrap_vault_from_seed(writer, seed_data)
+            return await be.admin.bootstrap_vault_from_seed(
+                writer, seed_data, rendered_at=rendered_at
+            )
         finally:
             await writer.stop()
 

@@ -33,7 +33,9 @@ class _FakeVaultWriter:
         self.upsert_user_snapshot_calls: list[tuple[str, str]] = []
         self.upsert_user_calls: list[tuple[str, str]] = []
 
-    async def upsert_user_snapshot(self, *, user_id: str, body_markdown: str) -> str:
+    async def upsert_user_snapshot(
+        self, *, user_id: str, body_markdown: str, rendered_at: str | None = None
+    ) -> str:
         self.upsert_user_snapshot_calls.append((user_id, body_markdown))
         return f"users/{user_id}-graph-snapshot.md"
 
@@ -50,6 +52,11 @@ def test_refresh_writes_snapshot_not_user_md(monkeypatch):
     handler._vault_writer = fake_writer
     handler.graph_store = MagicMock()
     handler._user_id_for_vault = lambda: "user"
+    # __new__ bypasses __init__, so wire the injectable clock the writeback
+    # reads (production default is wall-clock; any callable suffices here).
+    from datetime import UTC, datetime
+
+    handler._now_fn = lambda: datetime.now(UTC)
 
     extraction_result = MagicMock(
         validated_entities=[MagicMock()],

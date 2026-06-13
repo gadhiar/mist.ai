@@ -156,6 +156,7 @@ def _build_user_body_markdown(user_seed: dict[str, Any]) -> str:
 async def bootstrap_vault_from_seed(
     vault_writer: Any,
     seed_data: dict[str, Any],
+    rendered_at: str | None = None,
 ) -> dict[str, str]:
     """Render `identity/mist.md` and `users/<id>.md` from seed_data.
 
@@ -174,6 +175,11 @@ async def bootstrap_vault_from_seed(
     Args:
         vault_writer: Started VaultWriter instance.
         seed_data: Loaded seed_data.yaml dict.
+        rendered_at: Optional ISO 8601 timestamp string threaded to the
+            writer so the seeded identity/user notes are byte-reproducible.
+            The seeded `users/<id>.md` is read into the chat system prompt;
+            pinning this value makes the F2 replay chain deterministic. None
+            means wall-clock -- the unchanged production seed behavior.
 
     Returns:
         `{"identity_path": <abs>, "user_path": <abs>}`.
@@ -187,11 +193,13 @@ async def bootstrap_vault_from_seed(
         traits=list(seed_data.get("traits", [])),
         capabilities=list(seed_data.get("capabilities", [])),
         preferences=list(seed_data.get("preferences", [])),
+        rendered_at=rendered_at,
     )
     user_seed = seed_data["user"]
     user_path = await vault_writer.upsert_user(
         user_id=user_seed["id"],
         body_markdown=_build_user_body_markdown(user_seed),
+        rendered_at=rendered_at,
     )
     return {"identity_path": identity_path, "user_path": user_path}
 

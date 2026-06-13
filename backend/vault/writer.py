@@ -302,6 +302,7 @@ class VaultWriter:
         traits: list[dict],
         capabilities: list[dict],
         preferences: list[dict],
+        rendered_at: str | None = None,
     ) -> str:
         """Write or overwrite the MIST identity note at `identity/mist.md`.
 
@@ -316,6 +317,11 @@ class VaultWriter:
                 `description`.
             preferences: Dicts with at least `display_name`, `description`,
                 and optionally `enforcement` and `context`.
+            rendered_at: Optional ISO 8601 timestamp string. When supplied,
+                pins the frontmatter `last_updated` date and the Provenance
+                `rendered_at` so the seeded identity note is byte-reproducible
+                (seed bootstrap under replay). None means wall-clock -- the
+                unchanged production default.
 
         Returns:
             Absolute path to the identity note.
@@ -329,6 +335,7 @@ class VaultWriter:
                 "traits": traits,
                 "capabilities": capabilities,
                 "preferences": preferences,
+                "rendered_at": rendered_at,
             },
         )
 
@@ -407,7 +414,9 @@ class VaultWriter:
         """
         await self._enqueue("mark_authored_by", {"path": str(path)})
 
-    async def upsert_user(self, user_id: str, body_markdown: str) -> str:
+    async def upsert_user(
+        self, user_id: str, body_markdown: str, rendered_at: str | None = None
+    ) -> str:
         """Write or update a user fact sheet at `users/<user_id>.md`.
 
         On existing files where `authored_by` is `user` or `user-edit`,
@@ -419,6 +428,11 @@ class VaultWriter:
             user_id: User identifier (used as filename stem).
             body_markdown: Caller-provided markdown body. A `## Provenance`
                 section is appended automatically.
+            rendered_at: Optional ISO 8601 timestamp string. When supplied,
+                it pins both the frontmatter `last_updated` date and the
+                appended Provenance `rendered_at`, making the written file
+                byte-reproducible (used by the seed bootstrap under replay).
+                None means wall-clock -- the unchanged production default.
 
         Returns:
             Absolute path to the user note.
@@ -431,10 +445,13 @@ class VaultWriter:
             {
                 "user_id": user_id,
                 "body_markdown": body_markdown,
+                "rendered_at": rendered_at,
             },
         )
 
-    async def upsert_user_snapshot(self, user_id: str, body_markdown: str) -> str:
+    async def upsert_user_snapshot(
+        self, user_id: str, body_markdown: str, rendered_at: str | None = None
+    ) -> str:
         """Write or update the graph-derived user snapshot.
 
         Persists the C-pattern machine writeback to a SEPARATE derived file
@@ -458,6 +475,13 @@ class VaultWriter:
             body_markdown: Caller-provided markdown body. A `## Provenance`
                 section is appended automatically only when the body does not
                 already supply one (same handling as `upsert_user`).
+            rendered_at: Optional ISO 8601 timestamp string. When supplied, it
+                pins the frontmatter `last_updated` date and any appended
+                Provenance `rendered_at` for reproducible writes. None means
+                wall-clock -- the unchanged production default. The C-pattern
+                snapshot body already carries its own Provenance from
+                `render_user_snapshot_body`, so this only affects the fallback
+                writer section and the frontmatter date.
 
         Returns:
             Absolute path to the snapshot note.
@@ -470,6 +494,7 @@ class VaultWriter:
             {
                 "user_id": user_id,
                 "body_markdown": body_markdown,
+                "rendered_at": rendered_at,
             },
         )
 
@@ -1020,6 +1045,7 @@ class VaultWriter:
         traits: list[dict] = args["traits"]
         capabilities: list[dict] = args["capabilities"]
         preferences: list[dict] = args["preferences"]
+        rendered_at: str | None = args.get("rendered_at")
 
         path = self._root / "identity" / "mist.md"
         self._mark_mist_write(path)
@@ -1032,6 +1058,7 @@ class VaultWriter:
                 traits,
                 capabilities,
                 preferences,
+                rendered_at,
             )
         except OSError as exc:
             raise VaultWriteError(f"Failed to write identity note {path}: {exc}") from exc
@@ -1044,6 +1071,7 @@ class VaultWriter:
         traits: list[dict],
         capabilities: list[dict],
         preferences: list[dict],
+        rendered_at: str | None = None,
     ) -> None:
         """Synchronous core of `upsert_identity`.
 
@@ -1054,9 +1082,13 @@ class VaultWriter:
         edits are the most authoritative content in the vault. Files still
         carrying the machine-stamped birth value are refreshed normally so
         seed_data.yaml updates flow through.
+
+        `rendered_at`, when supplied, pins the frontmatter `last_updated` date
+        and the Provenance timestamp for reproducible writes (None ->
+        wall-clock).
         """
-        today = datetime.now(UTC).date().isoformat()
-        now_iso = datetime.now(UTC).isoformat()
+        now_iso = rendered_at if rendered_at is not None else datetime.now(UTC).isoformat()
+        today = now_iso[:10]
 
         if path.exists():
             existing = path.read_text(encoding="utf-8")
@@ -1118,6 +1150,7 @@ class VaultWriter:
     async def _handle_upsert_user(self, args: dict[str, Any]) -> str:
         user_id: str = args["user_id"]
         body_markdown: str = args["body_markdown"]
+        rendered_at: str | None = args.get("rendered_at")
 
         path = self._root / "users" / f"{user_id}.md"
         self._mark_mist_write(path)
@@ -1129,16 +1162,24 @@ class VaultWriter:
                 path,
                 user_id,
                 body_markdown,
+                rendered_at,
             )
         except OSError as exc:
             raise VaultWriteError(f"Failed to write user note {path}: {exc}") from exc
 
         return str(path)
 
-    def _upsert_user_sync(self, path: Path, user_id: str, body_markdown: str) -> None:
-        """Synchronous core of `upsert_user`."""
-        today = datetime.now(UTC).date().isoformat()
-        now_iso = datetime.now(UTC).isoformat()
+    def _upsert_user_sync(
+        self, path: Path, user_id: str, body_markdown: str, rendered_at: str | None = None
+    ) -> None:
+        """Synchronous core of `upsert_user`.
+
+        `rendered_at`, when supplied, pins the frontmatter `last_updated` date
+        and the appended Provenance timestamp so the written file is
+        reproducible (seed bootstrap under replay). None -> wall-clock.
+        """
+        now_iso = rendered_at if rendered_at is not None else datetime.now(UTC).isoformat()
+        today = now_iso[:10]
 
         if path.exists():
             content = path.read_text(encoding="utf-8")
@@ -1208,6 +1249,7 @@ class VaultWriter:
     async def _handle_upsert_user_snapshot(self, args: dict[str, Any]) -> str:
         user_id: str = args["user_id"]
         body_markdown: str = args["body_markdown"]
+        rendered_at: str | None = args.get("rendered_at")
 
         # Filename STEM is decoupled from the user_id frontmatter field: the
         # derived snapshot lives at users/<user_id>-graph-snapshot.md so it
@@ -1222,13 +1264,16 @@ class VaultWriter:
                 path,
                 user_id,
                 body_markdown,
+                rendered_at,
             )
         except OSError as exc:
             raise VaultWriteError(f"Failed to write user snapshot {path}: {exc}") from exc
 
         return str(path)
 
-    def _upsert_user_snapshot_sync(self, path: Path, user_id: str, body_markdown: str) -> None:
+    def _upsert_user_snapshot_sync(
+        self, path: Path, user_id: str, body_markdown: str, rendered_at: str | None = None
+    ) -> None:
         """Synchronous core of `upsert_user_snapshot`.
 
         Always overwrites the body. Unlike `_upsert_user_sync`, there is NO
@@ -1238,9 +1283,13 @@ class VaultWriter:
         `mist`. Provenance dedup is preserved (a caller-supplied `## Provenance`
         section is trusted; otherwise a minimal writer section is appended) so
         repeated re-renders do not accumulate duplicate Provenance sections.
+
+        `rendered_at`, when supplied, pins the frontmatter `last_updated` date
+        and the fallback Provenance timestamp for reproducible writes (None ->
+        wall-clock).
         """
-        today = datetime.now(UTC).date().isoformat()
-        now_iso = datetime.now(UTC).isoformat()
+        now_iso = rendered_at if rendered_at is not None else datetime.now(UTC).isoformat()
+        today = now_iso[:10]
 
         fm = MistUserFrontmatter(
             user_id=user_id,
