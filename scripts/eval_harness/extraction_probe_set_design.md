@@ -39,6 +39,28 @@ One JSON object per line:
 | ext-10..11 | negative controls: directive (Bug K), small talk |
 | ext-12 | structural (IS_A) |
 
+## Corpus rules (gold labeling policy)
+
+### Date-entity policy (locked 2026-06-12, C3 T1)
+
+Date entities appear in gold ONLY when an edge targets them:
+- OCCURRED_ON anchor (e.g. ext-04): `Event -[OCCURRED_ON]-> Date` -- Date entity in gold.
+- PRECEDED_BY date-target (Rule 13): `X -[PRECEDED_BY]-> Date` -- Date entity in gold.
+
+A date that merely scopes a stative fact (e.g. "I started using Rust in May
+2026") belongs in `valid_from`/`valid_to` on the relationship, not as a
+standalone Date entity (see ext-09). Do not add a Date node to gold for
+temporal qualifiers of non-event facts.
+
+### Anchor-entity / anchor-edge policy
+
+Every user-scope predicate (USES, DISLIKES, WORKS_AT, LEARNING, EXPERT_IN,
+KNOWS_PERSON, EXPERIENCED, etc.) requires the `user` entity in
+`expected_entities` AND the corresponding outgoing edge from `user` in
+`expected_relationships`. This follows Extraction Rule 1. The deep-review
+correction (Batch G, 2026-06-10) added anchor entities; C3 T1 (2026-06-12)
+added the missing anchor edge on ext-04.
+
 ## Metrics + provisional gates
 
 Tiered: core user-centric predicates gate; the v1.1.0 long-tail is tracked-not-gated until C3 tuning. All thresholds are provisional until the baseline (below); a ~12-record seed is a regression signal, not statistical certification.
@@ -92,11 +114,10 @@ Re-baseline executed 2026-06-12 at C3 kickoff per the deep-review correction
 (foundation-f123-3): the original gold labels omitted the prompt-mandated
 `user` anchor entity (Extraction Rule 1) on the 8 user-scope probes
 (ext-01/02/03/04/06/07/08/09), so the 2026-06-10 run's entity precision 0.652
-was a harness artifact (15 TP + 8 guaranteed anchor FPs). ext-04's
-`user EXPERIENCED team-offsite` anchor EDGE remains intentionally unlabeled
-(the probe scores the date-anchoring shape, not the anchor edge). All
-pre-correction numbers are NON-COMPARABLE; this table is the C3
-no-regression reference.
+was a harness artifact (15 TP + 8 guaranteed anchor FPs). The ext-04 anchor
+edge was labeled on 2026-06-12 (C3 T1) -- the gold contract now matches
+Extraction Rule 1 for both entities and edges. All pre-correction numbers are
+NON-COMPARABLE; this table is the C3 no-regression reference.
 
 Gemma 4 E4B Q5_K_M, ontology v1.2.1, main @ de5e566, seed graph, isolated
 quad (eval Neo4j + throwaway trio). All 12 probes matched in the debug log;
@@ -107,8 +128,8 @@ every probe produced an extraction record. Run artifacts:
 |---|---|---|---|
 | Entity precision | 0.957 | >= 0.90 | PASS |
 | Entity recall | 0.957 | >= 0.80 | PASS |
-| Relationship precision | 0.833 | >= 0.90 | FAIL |
-| Relationship recall | 0.909 | >= 0.80 | PASS |
+| Relationship precision | 0.917 | >= 0.90 | PASS |
+| Relationship recall | 0.917 | >= 0.80 | PASS |
 | Typing accuracy | 1.000 | >= 0.90 | PASS |
 | RELATED_TO rate | 0.083 | <= 0.10 | PASS |
 | Valid-time accuracy | 1.000 | (tracked) | - |
@@ -116,18 +137,17 @@ every probe produced an extraction record. Run artifacts:
 
 Reconciliation-action accuracy: SKIPPED (requires C2 telemetry).
 
-Reading: 7 of 8 gates pass at baseline. The artifact correction confirmed
-entity precision was never the problem (0.957), and typing accuracy moved
-0.833 -> 1.000 between the 2026-06-10 run (ontology v1.1.0, hardcoded
+Reading (corrected, post-C3-T1): all 8 gates pass. The artifact correction
+confirmed entity precision was never the problem (0.957), and typing accuracy
+moved 0.833 -> 1.000 between the 2026-06-10 run (ontology v1.1.0, hardcoded
 constraints) and this run (v1.2.1, ontology-derived RELATIONSHIP_CONSTRAINTS
-via C1). The single open gap -- and C3's primary lever -- is relationship
-precision 0.833 (the extractor produces correct facts plus extra
-relationships). RELATED_TO rate moved 0.000 -> 0.083 (one default-predicate
+via C1). Relationship precision moved from the gold-artifact 0.833 to 0.917
+once ext-04's anchor edge was labeled (C3 T1); relationship recall likewise
+corrected from 0.909 to 0.917. RELATED_TO rate is 0.083 (one default-predicate
 edge on this run); below gate but worth watching at corpus expansion.
-Strict-mode exit is non-zero on the relationship-precision gate alone --
-expected at baseline; this is the regression-signal floor C3 improves on,
-not a release gate (12-record seed; expand toward 60-100 before treating
-gates as commitments).
+All gates pass at this corrected baseline -- C3's remaining tasks target
+further precision improvements, not gate recovery (12-record seed; expand
+toward 60-100 before treating gates as commitments).
 
 ### Superseded baseline (2026-06-10, pre-correction corpus -- NON-COMPARABLE)
 
