@@ -499,6 +499,185 @@ the stated end as a cessation). Every cease/retract/same-turn-pair gold edge is
 both extracted (rel-TP) and correctly kinded -- 0 NOT-FOUND, 0 MIS-KIND in those
 buckets. Determinism confirmed: both runs byte-identical (sha256 above).
 
+### Phase C checkpoint (prompt r3) -- rel precision + RECOMMENDS/HAS_HABIT + date-entity
+
+Phase C (the precision levers: ontology v1.3.0 adding RECOMMENDS + HAS_HABIT and
+retiring started/ended/duration props at T10; extraction prompt r3 adding the
+date-entity discrimination rule + recommendation/habit extraction rules +
+Examples 23/24 at T11; the scorer-parity sync) is committed (branch
+`feat/subproject-a-c3-extraction-accuracy`, HEAD region `c49bec1` prompt r3 +
+`d17e9bb` scorer parity). Re-measurement of the SAME deterministic
+extraction-only 60-probe F2 instrument on the r3 prompt + v1.3.0 ontology. Two
+replays on FRESH isolated quads (sessions `ext-c3-phc-d1` / `ext-c3-phc-d2`,
+distinct throwaway trios + a FRESH `mist-neo4j-eval` instance each -- the eval
+Neo4j was torn down and recreated between d1 and d2 so both replays start from an
+identical 138-write / 32-embedding seed; full pin `LLM_TEMPERATURE=0.0
+LLM_CONVERSATION_TEMPERATURE=0.0 PYTHONHASHSEED=0
+MIST_FIXED_CLOCK=2026-06-13T00:00:00+00:00` + `--extraction-only`). d1 scored
+WITHOUT `--strict`; d2 scored WITH `--strict` (exit 1 -- the EXPECTED gate-miss
+signal, NOT an error: rel precision 0.831 < 0.90 headline gate; the report is
+captured regardless).
+
+**Determinism still holds on r3 (kernel property unchanged by the prompt +
+ontology edits).** The two score JSONs are BYTE-IDENTICAL (SHA-256
+`a7c00a370634c4bc5edf6b200c7de145778b8c05eef4572dba51ce44656d50a1` on both) on
+aggregate metrics AND the full 60-entry `per_probe` FP/FN arrays AND
+`assertion_kind_buckets` (`diff -q` empty; single byte-identical JSON covers all
+three). The debug logs carry 60 `extraction.ontology` + 60
+`extraction.scope_classifier` records and ZERO `chat.*` records. Artifacts:
+`data/runtime/extraction-ext-c3-phc-d{1,2}.{jsonl,json}` + `-report.md`.
+
+Gemma 4 E4B Q5_K_M, ontology v1.3.0, seed graph, isolated quad. All 60 probes
+matched.
+
+| Metric | r3 | k/n (r3) | r2 | delta r2 | r1 baseline | delta r1 | Gate | Pass |
+|---|---|---|---|---|---|---|---|---|
+| Matched probes | 60/60 | 60/60 | 60/60 | 0 | 60/60 | 0 | == total | PASS |
+| Entity precision | 0.855 | 106/124 | 0.795 | +0.060 | 0.769 | +0.086 | >= 0.90 | FAIL |
+| Entity recall | 0.898 | 106/118 | 0.856 | +0.042 | 0.873 | +0.025 | >= 0.80 | PASS |
+| Relationship precision | 0.831 | 54/65 | 0.734 | +0.097 | 0.672 | +0.159 | >= 0.90 | FAIL |
+| Relationship recall | 0.844 | 54/64 | 0.746 | +0.098 | 0.714 | +0.130 | >= 0.80 | PASS |
+| Typing accuracy | 0.892 | 58/65 | 0.828 | +0.064 | 0.761 | +0.131 | >= 0.90 | FAIL |
+| RELATED_TO rate | 0.000 | 0/65 | 0.000 | 0 | 0.000 | 0 | <= 0.10 | PASS |
+| Valid-time accuracy | 0.875 | 7/8 | 0.875 | 0 | 0.875 | 0 | (tracked) | - |
+| Negative-control violations | 0 | 0 | 0 | 0 | 0 | 0 | == 0 | PASS |
+
+Reconciliation-action accuracy: SKIPPED (requires C2 telemetry).
+
+(k/n: entity P denominator = produced entities, recall denominator = gold
+entities; rel analogous; typing = constraint-valid of produced rels; RELATED_TO
+= default-predicate edges of produced rels; valid-time = correct of date-bearing
+gold edges on matched probes.) r1 = the extraction-only authoritative floor
+(prompt r1); r2 = the Phase B checkpoint (prompt r2). The rel-recall denominator
+moved 63 -> 64 (and assert bucket gold_total 51 -> 52) because the gold corpus
+gained ext-08's `priya -[RECOMMENDS]-> duckdb` edge at commit `82dd50b`
+(ontology v1.3.0 / T10) -- the RECOMMENDS predicate did not exist in gold at the
+r2 baseline (deliberate-FN placeholder), so this is the intended gold update that
+pairs with the T10 ontology change, not a scorer or determinism drift. The F2
+scorer (`score_extraction_run.py`) is byte-unchanged since r2; the `d17e9bb`
+parity sync only touched the gauntlet `scorers.py` mirror.
+
+No regressions vs r2: all four precision/recall/typing metrics up (rel precision
++0.097 and rel recall +0.098 are the largest movers), no neg-control increase, no
+new RELATED_TO. Three gates remain FAIL (entity P 0.855, rel P 0.831, typing
+0.892 -- all below the 0.90 bar); the four passing gates (entity R, rel R,
+RELATED_TO, neg-control) hold.
+
+**Per-category FP/FN breakdown (byte-identical across d1/d2).** From the
+`per_probe` diagnostics; counts are absolute FP/FN tallies summed within the
+category. r1 floor counts in parentheses for trajectory.
+
+| Category | n | entity FP | entity FN | rel FP | rel FN |
+|---|---|---|---|---|---|
+| Core user facts | 10 | 3 | 1 | 0 | 2 |
+| Events + dates | 5 | 3 | 3 | 3 | 3 |
+| Quantified | 3 | 5 | 4 | 3 | 2 |
+| Skill state | 5 | 0 | 0 | 0 | 0 |
+| Third-party | 5 | 2 | 1 | 2 | 1 |
+| Valid-time | 5 | 1 | 0 | 0 | 0 |
+| Negative controls | 6 | 0 | 0 | 0 | 0 |
+| Structural | 3 | 1 | 1 | 0 | 0 |
+| Cessation | 5 | 0 | 0 | 0 | 0 |
+| Retraction | 5 | 0 | 0 | 0 | 0 |
+| Same-turn pair | 2 | 1 | 0 | 1 | 0 |
+| Habit / recurrence | 3 | 1 | 1 | 1 | 1 |
+| Date-discrimination | 3 | 1 | 1 | 1 | 1 |
+| TOTAL | 60 | 18 | 12 | 11 | 10 |
+
+Trajectory vs the r1 floor (rel FP 22 / FN 18; entity FP 31 / FN 15): Third-party
+collapsed from rel FP 9 / FN 7 to FP 2 / FN 1 (RECOMMENDS landed), Habit from rel
+FP 4 / FN 3 to FP 1 / FN 1 (HAS_HABIT landed), Skill state / Cessation /
+Retraction are now fully clean. The residual rel load is in Events+dates and
+Quantified, where the gap is entity-surface/typing mismatch driving the matched
+edge off its gold tuple rather than a missing predicate.
+
+**Per-probe rel FP/FN diagnostics (all 11 FP + 10 FN; cause class).** The rel-key
+match is exact on `(source, predicate, target)`, so an entity-surface or
+entity-type mismatch on either endpoint splits one logical edge into a paired
+FP+FN. Cause classes: `entity-surface` = right predicate, endpoint canonical id
+differs from gold (e.g. `12000-requests-per-second` vs `requests-per-second-12000`);
+`entity-typing` = right id, wrong entity type (Milestone vs Project etc.) shifts
+the typing but the tuple key still matches unless the id also moved; `over-extract`
+= an extra edge with no gold counterpart; `anchor-miss` = the user-sourced anchor
+edge absent; `mis-predicate` = wrong predicate chosen.
+
+| Probe | FP/FN | Edge (source -[pred]-> target) | Cause class |
+|---|---|---|---|
+| ext-01-uses | FN | rust -[USED_FOR]-> backend-work | non-anchor USED_FOR miss (2nd edge dropped) |
+| ext-14-uses-usedfor | FN | terraform -[USED_FOR]-> cloud-infrastructure | entity-typing (target Concept vs gold Topic shifts key) |
+| ext-20-event-on-date | FN | user -[EXPERIENCED]-> birthday-party | anchor-miss (user entity FN; EXPERIENCED anchor dropped) |
+| ext-21-milestone-on-date | FP | mobile-app -[OCCURRED_ON]-> 2026-06-01 | entity-surface (Project surface `mobile-app` vs gold Milestone `mobile-app-launch`) |
+| ext-21-milestone-on-date | FN | mobile-app-launch -[OCCURRED_ON]-> 2026-06-01 | entity-surface (paired with FP above) |
+| ext-22-milestone-on-date | FP | closing-on-house -[OCCURRED_ON]-> 2026-03-12 | entity-surface (Event surface vs gold Milestone `house-closing`) |
+| ext-22-milestone-on-date | FP | user -[EXPERIENCED]-> closing-on-house | over-extract (EXPERIENCED on the mis-typed Event surface) |
+| ext-22-milestone-on-date | FN | house-closing -[OCCURRED_ON]-> 2026-03-12 | entity-surface (paired with FP above) |
+| ext-24-metric | FP | api -[HAS_METRIC]-> requests-per-second-12000 | entity-surface (metric id ordering vs gold `12000-requests-per-second`) |
+| ext-24-metric | FN | api -[HAS_METRIC]-> 12000-requests-per-second | entity-surface (paired with FP above) |
+| ext-25-metric | FP | coverage-87-percent -[APPLICABLE_TO]-> codebase | over-extract (spurious APPLICABLE_TO) |
+| ext-25-metric | FP | test-suite -[HAS_METRIC]-> coverage-87-percent | entity-surface (metric id `coverage-87-percent` vs gold `87-percent-coverage`) |
+| ext-25-metric | FN | test-suite -[HAS_METRIC]-> 87-percent-coverage | entity-surface (paired with FP above) |
+| ext-29-third-party-knows | FP | anjali -[WORKS_AT]-> biotech | over-extract (WORKS_AT not in gold; scope creep on third party) |
+| ext-29-third-party-knows | FN | user -[KNOWS_PERSON]-> anjali | anchor-miss (user entity FN; KNOWS_PERSON anchor dropped) |
+| ext-31-third-party-recommends | FP | graphql -[STRATEGY_FOR]-> new-service | over-extract (RECOMMENDS + KNOWS_PERSON gold edges BOTH correct; this is a spurious 3rd edge) |
+| ext-54-same-turn-single-pair | FP | user -[WORKS_ON]-> project | over-extract (generic `project` entity; not in gold) |
+| ext-56-habit | FP | user -[HAS_HABIT]-> pull-requests | entity-surface (HAS_HABIT fires; target `pull-requests` Topic vs gold `pr-review` Concept) |
+| ext-56-habit | FN | user -[HAS_HABIT]-> pr-review | entity-surface (paired with FP above) |
+| ext-58-dateentity-stative-since | FP | user -[HAS_HABIT]-> mentoring-junior-engineers | mis-predicate (emitted HAS_HABIT; gold is EXPERT_IN mentoring) |
+| ext-58-dateentity-stative-since | FN | user -[EXPERT_IN]-> mentoring | mis-predicate (paired with FP above) |
+
+Dominant cause class: entity-surface mismatch (metric id ordering, Milestone-vs-
+Project/Event surface) -- 7 of the 11 rel FPs and 7 of the 10 rel FNs are
+surface/typing-driven paired FP+FN, where the predicate is correct but an endpoint
+id/type differs from gold and splits the key. Genuine over-extractions (no gold
+counterpart): ext-22 EXPERIENCED, ext-25 APPLICABLE_TO, ext-29 WORKS_AT, ext-31
+STRATEGY_FOR, ext-54 WORKS_ON -- 5 FPs. Anchor-edge misses: ext-20, ext-29 -- 2
+FNs. One genuine mis-predicate: ext-58 (HAS_HABIT chosen over EXPERT_IN on a
+"since <date>" stative -- the new HAS_HABIT predicate over-firing on a
+non-recurrence stative). The ext-35 "until <date>" cease-vs-assert case from the
+r2 buckets is NOT a rel FP/FN here (ext-35 is rel-CLEAN); it only ever surfaced as
+a bucket mis-kind, and the valid-time miss (7/8) is a date-precision mismatch on a
+single date-bearing edge, not a rel-key FP/FN.
+
+**Assertion-kind buckets (r3).** Scored on the same certified extraction-only run
+(`ext-c3-phc-d1`; byte-identical on `d2`).
+
+| Kind | correct/found (r3) | found/gold_total (r3) | correct/found (r2) | found/gold_total (r2) | correct/found (r1) | found/gold_total (r1) |
+|---|---|---|---|---|---|---|
+| assert | 42/42 | 42/52 | 34/35 | 35/51 | 28/33 | 33/51 |
+| cease | 7/7 | 7/7 | 7/7 | 7/7 | 6/7 | 7/7 |
+| retract | 5/5 | 5/5 | 5/5 | 5/5 | 0/5 | 5/5 |
+
+Reading: no bucket regresses below Phase B. `cease` and `retract` hold perfect
+(7/7, 5/5 found AND correct). `assert` correct/found is now PERFECT (42/42 vs r2's
+34/35) -- the single r2 mis-derivation (ext-35-validtime-until kinded CEASE) is
+gone; every found assert-gold edge derives as assert. assert `found/gold_total`
+rose 35/51 -> 42/52: the gold denominator gained one edge (ext-08 RECOMMENDS, see
+above) and `found` rose by 7 (the RECOMMENDS/HAS_HABIT edges that were structural
+FNs at r2 are now extracted, lifting rel recall). The 10 still-unfound assert-gold
+edges (52 - 42) are the rel-FN set above (entity-surface/typing splits + anchor
+misses + the ext-58 mis-predicate), not a bucket-kind failure.
+
+**The 6 RECOMMENDS / HAS_HABIT probes (per-probe).** All 6 now emit the new
+predicate (none defaults to RELATED_TO; KNOWS_PERSON anchor present on all
+recommendation probes). 4 of 6 are fully CLEAN (every gold rel extracted, no FP);
+the 2 imperfect ones emit the CORRECT predicate and differ only on an endpoint or
+an extra edge:
+
+| Probe | Utterance | Gold edges | Result |
+|---|---|---|---|
+| ext-08-third-party-person | "My mentor Priya suggested I try DuckDB" | user-[KNOWS_PERSON]->priya; priya-[RECOMMENDS]->duckdb | CLEAN (both edges TP) |
+| ext-31-third-party-recommends | "My architect Mateo recommended GraphQL for the new service" | user-[KNOWS_PERSON]->mateo; mateo-[RECOMMENDS]->graphql | RECOMMENDS + anchor BOTH correct; 1 FP = spurious graphql-[STRATEGY_FOR]->new-service |
+| ext-32-third-party-recommends | "A teammate named Lena pushed me toward trying Bun" | user-[KNOWS_PERSON]->lena; lena-[RECOMMENDS]->bun | CLEAN (both edges TP) |
+| ext-55-habit | "I journal every night before bed" | user-[HAS_HABIT]->journaling | CLEAN (TP) |
+| ext-56-habit | "I review PRs every Friday" | user-[HAS_HABIT]->pr-review | HAS_HABIT fires; target `pull-requests` (Topic) vs gold `pr-review` (Concept) -- 1 FP + 1 FN (entity-surface) |
+| ext-57-habit | "I do a long run every Sunday" | user-[HAS_HABIT]->long-run | CLEAN (TP) |
+
+The deliberate baseline FNs (RECOMMENDS ext-31/32, HAS_HABIT ext-55/56/57, plus
+ext-08 RECOMMENDS) are recovered at the predicate level: T10 + r3 turned all six
+from structural rel-FNs into extracted edges. The 2 residual gaps (ext-31 extra
+STRATEGY_FOR edge, ext-56 target-surface) are over-extraction / entity-surface
+classes, not predicate misses.
+
 ### Full-chat reference band (60-probe corpus, 2026-06-13) -- NON-DETERMINISTIC, SUPERSEDED
 
 Superseded by the extraction-only baseline above (the authoritative C3 floor).
