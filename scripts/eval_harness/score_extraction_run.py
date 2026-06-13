@@ -372,12 +372,26 @@ def score_run(probes: list[GoldProbe], produced_index: dict[str, Produced]) -> R
             if produced is not None and (produced.entities or produced.relationships):
                 report.negative_violations += 1
 
+        if produced is not None:
+            entity_fps = sorted([e.id, e.type] for e in prod_entities - gold_entities)
+            entity_fns = sorted([e.id, e.type] for e in gold_entities - prod_entities)
+            rel_fps = sorted(list(t) for t in prod_rel_keys - gold_rel_keys)
+            rel_fns = sorted(list(t) for t in gold_rel_keys - prod_rel_keys)
+        else:
+            entity_fps = []
+            entity_fns = sorted([e.id, e.type] for e in gold_entities)
+            rel_fps = []
+            rel_fns = sorted(list(t) for t in gold_rel_keys)
         report.per_probe.append(
             {
                 "tag": probe.tag,
                 "matched": produced is not None,
                 "gold_entities": len(gold_entities),
                 "gold_relationships": len(gold_rel_keys),
+                "entity_fps": entity_fps,
+                "entity_fns": entity_fns,
+                "rel_fps": rel_fps,
+                "rel_fns": rel_fns,
             }
         )
     return report

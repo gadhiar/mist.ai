@@ -357,3 +357,44 @@ class TestUtteranceJoinRoundTrip:
         m = V9_PATTERN.search(self._render(utterance))
         assert m is not None, "score_v9_predicate_run pattern no longer matches the template"
         assert m.group(1) == utterance
+
+
+def test_per_probe_reports_fp_fn_detail():
+    """per_probe entries must carry the exact FP/FN sets so failures are diagnosable."""
+    probes = [
+        GoldProbe(
+            tag="t1",
+            utterance="I use Rust",
+            entities=(GoldEntity(id="user", type="User"), GoldEntity(id="rust", type="Technology")),
+            relationships=(
+                GoldRel(
+                    source="user",
+                    source_type="User",
+                    predicate="USES",
+                    target="rust",
+                    target_type="Technology",
+                ),
+            ),
+        )
+    ]
+    produced = {
+        "I use Rust": Produced(
+            utterance="I use Rust",
+            parse_ok=True,
+            entities=(
+                GoldEntity(id="user", type="User"),
+                GoldEntity(id="cargo", type="Technology"),
+            ),
+            entity_type_by_id={"user": "User", "cargo": "Technology"},
+            relationships=(
+                {"source": "user", "target": "cargo", "predicate": "USES", "properties": {}},
+            ),
+        )
+    }
+    report = score_run(probes, produced)
+    row = report.per_probe[0]
+    assert row["matched"] is True
+    assert row["entity_fps"] == [["cargo", "Technology"]]
+    assert row["entity_fns"] == [["rust", "Technology"]]
+    assert row["rel_fps"] == [["user", "USES", "cargo"]]
+    assert row["rel_fns"] == [["user", "USES", "rust"]]
