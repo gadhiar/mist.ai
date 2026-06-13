@@ -27,6 +27,10 @@ Tier 3 subcommands (end-to-end):
                                              output via MIST_DEBUG_JSONL.
     replay <file> [--session-id X]          Replay utterances from a JSONL or
                                              plain-text file; aggregate results.
+        [--extraction-only]                  Drive each utterance through the
+                                             production extraction pipeline with
+                                             NO chat reply (deterministic F2
+                                             measurement path).
 
 Usage:
     python scripts/mist_admin.py <subcommand> [options]
@@ -583,6 +587,163 @@ async def run_replay(
     return results
 
 
+async def run_extraction_only(
+    handler: Any,
+    utterance: str,
+    session_id: str,
+    user_id: str = "User",
+) -> dict[str, Any]:
+    """Run the production extraction pipeline for one utterance, no chat reply.
+
+    Drives MIST's PRODUCTION extraction path (subject-scope classifier ->
+    ontology extraction -> validation -> curation/graph write) WITHOUT
+    generating a conversational reply and without injecting a same-turn
+    assistant reply into the extraction context. This is the deterministic F2
+    measurement path: the chat reply is conversational noise the gold corpus
+    does not encode and is the sole source of F2 nondeterminism (flash-attn FP
+    noise on long greedy generations); the extraction calls themselves are
+    deterministic at temperature 0.
+
+    Reuses the handler's extraction entry point directly rather than
+    reimplementing it. Mirrors the scaffolding `handle_message` sets up before
+    spawning background extraction, minus the chat generation:
+
+    1. Step 0 -- vault session-note path pre-allocation
+       (`_get_or_allocate_vault_path`), so the path threads through extraction
+       -> curation -> graph_writer for the DERIVED_FROM edge, exactly as in
+       production.
+    2. Event-store turn record (`_record_turn_event`) with an EMPTY
+       assistant_message, to obtain the `event_id` (fact provenance) and
+       `recorded_at` (bitemporal fact-time + extraction reference_date). The
+       reply slot is empty because no reply is generated.
+    3. The production extraction entry point (`_extract_knowledge_async`) with
+       `conversation_history=[]` and `assistant_message=""` -- so no prior turn
+       and no same-turn reply enters the extraction "Context:" block. This is
+       the same coroutine `handle_message` spawns as a background task; running
+       it inline here emits the identical `extraction.ontology` /
+       `extraction.scope_classifier` `llm_call` debug records (via the
+       instrumented provider) that `score_extraction_run.py` consumes.
+    4. Drain any in-flight background extraction the pipeline itself spawned
+       (`_drain_extraction_tasks`) so `asyncio.run` closing the loop cannot
+       cancel a graph write mid commit-protocol -- the same drain `run_chat`
+       performs.
+
+    The 60-probe gold corpus is single-utterance and self-contained (no prior
+    turns), so an empty `conversation_history` is the faithful extraction input.
+
+    Deliberate deviation from production: production runs extraction with the
+    just-generated assistant reply embedded in the extraction context. This
+    path omits it. Justified: that reply is conversational noise the gold does
+    not encode and is the source of nondeterminism. Documented in
+    `scripts/eval_harness/extraction_probe_set_design.md`.
+
+    Args:
+        handler: A ConversationHandler (or test double) exposing
+            `_get_or_allocate_vault_path`, `_record_turn_event`,
+            `_extract_knowledge_async`, and `_drain_extraction_tasks`.
+        utterance: The user message to extract from.
+        session_id: Conversation session identifier.
+        user_id: User identifier (default "User" matches the seeded anchor).
+
+    Returns:
+        Dict with keys: utterance, session_id, user_id, ok, error,
+        extraction_duration_ms (the extraction + drain wall time), and
+        event_id. On handler exception: ok=False, error="ExceptionType: msg".
+    """
+    start = time.time()
+    try:
+        # Step 0: vault session-note path pre-allocation (pure path compute).
+        vault_note_path = handler._get_or_allocate_vault_path(session_id, first_utterance=utterance)
+
+        # Event-store turn record. EMPTY assistant_message: no reply is
+        # generated on the extraction-only path. Yields the event_id used for
+        # fact provenance and the recorded_at that anchors both the bitemporal
+        # edge fact-time and the extraction prompt's reference_date.
+        event_id, recorded_at = handler._record_turn_event(
+            session_id=session_id,
+            user_message=utterance,
+            assistant_message="",
+        )
+
+        # Production extraction entry point, run inline. conversation_history
+        # is empty and assistant_message is empty so no reply enters the
+        # extraction context. The instrumented provider emits the
+        # extraction.* llm_call debug records the scorer consumes.
+        await handler._extract_knowledge_async(
+            utterance=utterance,
+            conversation_history=[],
+            event_id=event_id,
+            session_id=session_id,
+            assistant_message="",
+            turn_record=None,
+            vault_note_path=vault_note_path,
+            recorded_at=recorded_at,
+        )
+
+        # Drain any background extraction tasks the pipeline spawned so the
+        # surrounding asyncio.run does not cancel a graph write mid-flight.
+        await handler._drain_extraction_tasks(session_id=session_id)
+
+        extraction_duration_ms = (time.time() - start) * 1000
+        return {
+            "utterance": utterance,
+            "session_id": session_id,
+            "user_id": user_id,
+            "ok": True,
+            "error": None,
+            "extraction_duration_ms": extraction_duration_ms,
+            "event_id": event_id,
+        }
+    except Exception as e:
+        extraction_duration_ms = (time.time() - start) * 1000
+        return {
+            "utterance": utterance,
+            "session_id": session_id,
+            "user_id": user_id,
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "extraction_duration_ms": extraction_duration_ms,
+            "event_id": None,
+        }
+
+
+async def run_extraction_only_replay(
+    handler: Any,
+    inputs: list[dict[str, Any]],
+    default_session_id: str,
+    default_user_id: str = "User",
+) -> list[dict[str, Any]]:
+    """Replay inputs through `run_extraction_only`, preserving per-entry metadata.
+
+    The extraction-only sibling of `run_replay`. Each input is a dict with at
+    minimum an `utterance` key; optional `session_id`, `user_id`, `tag`, and
+    `expected_behavior` keys behave exactly as in `run_replay`. A single
+    probe's extraction failure is captured in that probe's record and does not
+    abort the batch.
+
+    Args:
+        handler: ConversationHandler or test double (see `run_extraction_only`).
+        inputs: Ordered list of input dicts.
+        default_session_id: Session used when an input lacks `session_id`.
+        default_user_id: User used when an input lacks `user_id`.
+
+    Returns:
+        List of per-probe result dicts in input order; each carries the keys
+        from `run_extraction_only` plus `tag`/`expected_behavior` if present.
+    """
+    results: list[dict[str, Any]] = []
+    for entry in inputs:
+        utterance = entry.get("utterance", "")
+        sid = entry.get("session_id", default_session_id)
+        uid = entry.get("user_id", default_user_id)
+        result = await run_extraction_only(handler, utterance, sid, uid)
+        for key in ("tag", "expected_behavior"):
+            if key in entry:
+                result[key] = entry[key]
+        results.append(result)
+    return results
+
+
 def _read_replay_inputs(path: Path) -> list[dict[str, Any]]:
     """Load replay inputs from a JSONL or plain-text file.
 
@@ -677,6 +838,15 @@ def cmd_replay(args: argparse.Namespace) -> int:
     integrated graph; conversation-side DERIVED_FROM->VaultNote emission
     is covered by the server-path unit tests
     (test_conversation_handler_vault_integration, test_factories_vault).
+
+    With `--extraction-only`, each utterance is driven through the production
+    extraction pipeline WITHOUT a chat reply (the deterministic F2 measurement
+    path). The chat reply is conversational noise the F2 gold does not encode
+    and is the sole source of F2 nondeterminism (flash-attn FP noise on long
+    greedy generations); the extraction calls are deterministic at temperature
+    0. The same `extraction.ontology` / `extraction.scope_classifier` debug
+    records are emitted, so `score_extraction_run.py` works unchanged. See
+    `scripts/eval_harness/extraction_probe_set_design.md`.
     """
     be = _load_backend()
     from backend.factories import build_conversation_handler
@@ -692,7 +862,12 @@ def cmd_replay(args: argparse.Namespace) -> int:
     config = be.get_config()
     session_id = args.session_id or f"replay-{uuid.uuid4().hex[:8]}"
     user_id = args.user_id or "User"
-    print(f"[replay] {len(inputs)} inputs, session_id={session_id}, user_id={user_id}")
+    extraction_only = getattr(args, "extraction_only", False)
+    mode = "extraction-only" if extraction_only else "chat"
+    print(
+        f"[replay] {len(inputs)} inputs, session_id={session_id}, "
+        f"user_id={user_id}, mode={mode}"
+    )
     print("[replay] Building conversation handler (may load embedding model)...")
 
     # ADR-010 Phase 9: wire the read-only vault sidecar so replay validates
@@ -701,12 +876,21 @@ def cmd_replay(args: argparse.Namespace) -> int:
     # build_conversation_handler). `_build_cli_sidecar` returns None when
     # config.sidecar_index.enabled is False, mirroring the server's
     # enablement guard, and is a reader (no writer) per the single-writer rule.
+    #
+    # The sidecar feeds the chat path's auto-RAG / "Relevant Documents"
+    # injection. The extraction-only path does NOT consult the sidecar (it
+    # skips chat generation entirely), but building it is harmless and keeps
+    # both modes on one wiring path.
     sidecar = _build_cli_sidecar(config)
     try:
         handler = build_conversation_handler(config, vault_sidecar=sidecar)
 
-        results = asyncio.run(run_replay(handler, inputs, session_id, user_id))
-        _print_replay_summary(results)
+        if extraction_only:
+            results = asyncio.run(run_extraction_only_replay(handler, inputs, session_id, user_id))
+            _print_extraction_only_summary(results)
+        else:
+            results = asyncio.run(run_replay(handler, inputs, session_id, user_id))
+            _print_replay_summary(results)
 
         if args.output:
             out_path = Path(args.output)
@@ -917,6 +1101,36 @@ def _print_replay_summary(results: list[dict]) -> None:
         body = r["response"] if r["ok"] else r.get("error", "")
         preview = (body or "").replace("\n", " ")[:60]
         print(f"  [{i:>2}] [{mark:<4}] {tag:<22} " f"{r['duration_ms']:>8.1f}ms  {preview!r}")
+
+
+def _print_extraction_only_summary(results: list[dict]) -> None:
+    """Render an extraction-only replay batch summary for CLI output.
+
+    Mirrors `_print_replay_summary` but reports `extraction_duration_ms`
+    (extraction + drain wall time) rather than chat-response latency, since the
+    extraction-only path never generates a reply.
+    """
+    if not results:
+        print("[replay] (no results)")
+        return
+    ok_count = sum(1 for r in results if r["ok"])
+    fail_count = len(results) - ok_count
+    durations = [r.get("extraction_duration_ms", 0.0) for r in results]
+    avg_ms = sum(durations) / len(results)
+    p50_ms = sorted(durations)[len(results) // 2]
+    print(
+        f"\n[replay] Extraction-only results: {ok_count}/{len(results)} ok, "
+        f"{fail_count} failed, avg {avg_ms:.1f}ms, p50 {p50_ms:.1f}ms"
+    )
+    for i, r in enumerate(results, start=1):
+        mark = "OK" if r["ok"] else "FAIL"
+        tag = r.get("tag", "")
+        detail = "" if r["ok"] else (r.get("error", "") or "")
+        preview = detail.replace("\n", " ")[:60]
+        print(
+            f"  [{i:>2}] [{mark:<4}] {tag:<22} "
+            f"{r.get('extraction_duration_ms', 0.0):>8.1f}ms  {preview!r}"
+        )
 
 
 def _print_status_line(status: dict) -> None:
@@ -1130,6 +1344,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--output",
         default=None,
         help="Write per-turn results as JSONL to this path.",
+    )
+    p_replay.add_argument(
+        "--extraction-only",
+        action="store_true",
+        dest="extraction_only",
+        help=(
+            "Drive each utterance through the production extraction pipeline "
+            "WITHOUT generating a chat reply (deterministic F2 measurement "
+            "path). Emits the same extraction.* debug records the F2 scorer "
+            "consumes. The chat reply is conversational noise the F2 gold does "
+            "not encode and is the sole source of F2 nondeterminism."
+        ),
     )
     p_replay.set_defaults(func=cmd_replay)
 
