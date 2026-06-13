@@ -2,7 +2,7 @@
 
 **Date authored:** 2026-06-10
 **Scope:** `data/ingest/extraction-gold-2026-06-10.jsonl`
-**Consumer:** `scripts/mist_admin.py replay` (emits `MIST_DEBUG_JSONL`) + `scripts/eval_harness/score_extraction_run.py`
+**Consumer:** `scripts/mist_admin.py replay --extraction-only` (authoritative; emits `MIST_DEBUG_JSONL`) + `scripts/eval_harness/score_extraction_run.py`
 **Purpose:** Ground-truth measurement of extraction accuracy for sub-project A (F2). Establishes the baseline the C1/C2/C3 gates improve on.
 
 ## Record schema
@@ -118,19 +118,47 @@ Tiered: core user-centric predicates gate; the v1.1.0 long-tail is tracked-not-g
 
 ## How to run (isolated via F1's throwaway-quad)
 
-### Determinism env (MANDATORY for reproducible F2 replays)
+### Authoritative path: extraction-only (`replay --extraction-only`)
 
-F2 replay drives the FULL `handle_message` path, not extraction in isolation.
-That path makes three LLM calls per turn at two different temperatures:
-`extraction.scope_classifier` and `extraction.ontology` at `LLM_TEMPERATURE`
-(0.0, greedy), and `chat.initial` at `LLM_CONVERSATION_TEMPERATURE` (production
-default 0.7, stochastic). The extraction prompt's `Context:` block embeds the
-assistant's chat reply, so a stochastic chat turn makes the extraction INPUT
-differ run-to-run -- which makes the (otherwise greedy) extraction OUTPUT differ
-too. Pinning only `LLM_TEMPERATURE=0.0` is therefore insufficient: the
-2026-06-12 C3 T3 determinism check caught two replays diverging on 20/60 probes
-for exactly this reason (root cause: conversational-temperature contamination of
-the extraction input, compounded by RAG over the per-turn-accumulating graph).
+F2 is measured EXTRACTION-ONLY. Pass `--extraction-only` to the `replay`
+subcommand: each probe runs the production extraction pipeline with NO chat-reply
+generation. This is byte-reproducible (two fresh-quad runs produce byte-identical
+score JSONs), so a single run is a valid gate. The commands in this section use
+`--extraction-only`; the `MIST_FIXED_CLOCK` pin keeps the extraction prompt's
+`reference_date` stable across runs (and is harmless even though no chat reply is
+generated). Use `--session-id ext-only-d1` / `ext-only-d2` for a determinism pair.
+
+The env pin is identical to the full-chat path below (`LLM_CONVERSATION_TEMPERATURE`
+is irrelevant on the extraction-only path -- no chat call -- but harmless to set):
+
+```
+-e LLM_TEMPERATURE=0.0 -e LLM_CONVERSATION_TEMPERATURE=0.0 -e PYTHONHASHSEED=0 \
+-e MIST_FIXED_CLOCK=2026-06-13T00:00:00+00:00
+```
+
+To confirm determinism: run the seed + `replay --extraction-only` + score TWICE on
+fresh quads (distinct `--session-id`, fresh `mist-neo4j-eval` instance each), and
+diff the two score JSONs -- they must be byte-identical on aggregate metrics AND
+`per_probe` FP/FN arrays. (Certified 2026-06-13; see "Baseline results
+(60-probe corpus, extraction-only, deterministic)".)
+
+### Determinism env for the SUPERSEDED full-chat path
+
+The full-chat `replay` path (without `--extraction-only`) drives the FULL
+`handle_message` path, not extraction in isolation. That path makes three LLM
+calls per turn at two different temperatures: `extraction.scope_classifier` and
+`extraction.ontology` at `LLM_TEMPERATURE` (0.0, greedy), and `chat.initial` at
+`LLM_CONVERSATION_TEMPERATURE` (production default 0.7, stochastic). The
+extraction prompt's `Context:` block embeds the assistant's chat reply, so a
+stochastic chat turn makes the extraction INPUT differ run-to-run -- which makes
+the (otherwise greedy) extraction OUTPUT differ too. Pinning only
+`LLM_TEMPERATURE=0.0` is therefore insufficient: the 2026-06-12 C3 T3 determinism
+check caught two replays diverging on 20/60 probes for exactly this reason (root
+cause: conversational-temperature contamination of the extraction input,
+compounded by RAG over the per-turn-accumulating graph). Even with the whole chain
+pinned greedy + fixed clock, the full-chat path still diverges on 18/60 probes due
+to flash-attn FP nondeterminism on the long chat generation -- which is why F2
+moved to extraction-only.
 
 To make F2 replays reproducible, pin the WHOLE chain greedy plus a stable hash
 seed AND a fixed clock on BOTH the seed and the replay exec:
@@ -180,7 +208,10 @@ MSYS_NO_PATHCONV=1 docker compose exec -T \
   -e MIST_FIXED_CLOCK=2026-06-13T00:00:00+00:00 \
   mist-backend python scripts/mist_admin.py seed
 
-# 2. Replay the gold corpus, emitting the extraction debug log
+# 2. Replay the gold corpus EXTRACTION-ONLY (authoritative path), emitting the
+#    extraction debug log. --extraction-only runs the production extraction
+#    pipeline with NO chat reply (deterministic). Drop the flag for the
+#    superseded full-chat path.
 MSYS_NO_PATHCONV=1 docker compose exec -T \
   -e MIST_EVAL_ISOLATION=1 -e NEO4J_URI=bolt://mist-neo4j-eval:7687 \
   -e MIST_SIDECAR_DB_PATH=/app/data/eval-run/vault_sidecar.db \
@@ -190,14 +221,18 @@ MSYS_NO_PATHCONV=1 docker compose exec -T \
   -e MIST_FIXED_CLOCK=2026-06-13T00:00:00+00:00 \
   -e MIST_DEBUG_JSONL=/app/data/runtime/extraction-baseline.jsonl -e MIST_DEBUG_LLM_JSONL=1 \
   mist-backend python scripts/mist_admin.py replay \
-  data/ingest/extraction-gold-2026-06-10.jsonl --session-id ext-baseline
+  data/ingest/extraction-gold-2026-06-10.jsonl --session-id ext-baseline --extraction-only
 
-# 3. Score (--strict: fail loudly on a broken probe join or any
-# negative-control violation instead of silently scoring a partial run)
+# 3. Score. The extraction-only run is byte-reproducible, so --strict is safe
+# (it fails loudly on a broken probe join or any negative-control violation
+# instead of silently scoring a partial run). Pass --session-id to filter the
+# debug log to this run.
 MSYS_NO_PATHCONV=1 docker compose exec -T mist-backend python scripts/eval_harness/score_extraction_run.py \
   --gold data/ingest/extraction-gold-2026-06-10.jsonl \
   --debug-jsonl data/runtime/extraction-baseline.jsonl \
+  --session-id ext-baseline \
   --output data/runtime/extraction-baseline-report.md \
+  --json-output data/runtime/extraction-baseline.json \
   --strict
 
 # 4. Teardown (F1)
@@ -205,9 +240,11 @@ docker compose -f docker-compose.yml -f docker-compose.eval-neo4j.yml --profile 
 ```
 
 To empirically confirm determinism (recommended after any procedure change),
-run steps 1-3 twice with the env above (distinct `--session-id` and
-`--json-output` paths, fresh quad each), and diff the two score JSON reports on
-the aggregate metrics AND the `per_probe` FP/FN arrays -- they must be identical.
+run steps 1-3 twice with `--extraction-only` and the env above (distinct
+`--session-id` and `--json-output` paths, fresh `mist-neo4j-eval` instance each),
+and diff the two score JSON reports on the aggregate metrics AND the `per_probe`
+FP/FN arrays -- on the extraction-only path they are byte-identical (certified
+2026-06-13). The full-chat path (no flag) instead diverges on 18/60 probes.
 
 ## Baseline results (2026-06-12, corrected corpus)
 
@@ -250,14 +287,130 @@ All gates pass at this corrected baseline -- C3's remaining tasks target
 further precision improvements, not gate recovery (12-record seed; expand
 toward 60-100 before treating gates as commitments).
 
-### Baseline results (60-probe corpus, 2026-06-13)
+### Baseline results (60-probe corpus, extraction-only, deterministic) -- AUTHORITATIVE C3 FLOOR
 
-Status: the MIST chain is now REPRODUCIBLE (the clock fix landed). Byte-identical
-extraction scores remain gated by ONE irreducible source outside MIST's code --
-llama-server flash-attention floating-point nondeterminism at greedy decoding.
-The baseline below is therefore a tight reference BAND (two runs, deltas <= 0.032
-on every metric), not a single byte-stable point. Read it as the C3 no-regression
-floor with that band as its measurement noise.
+**This is the authoritative C3 regression floor.** F2 is measured EXTRACTION-ONLY:
+the production extraction pipeline (subject-scope classifier -> ontology
+extraction -> validation -> curation/graph write) runs per probe utterance with
+NO chat-reply generation and NO same-turn assistant reply in the extraction
+context. The chat reply is conversational noise the gold does not encode and is
+the sole source of F2 nondeterminism (flash-attn FP noise on long greedy
+generations -- see the superseded full-chat band below for the localized
+evidence); the extraction calls themselves are deterministic at temperature 0.
+Two extraction-only replays on fresh isolated quads are byte-identical, so a
+single run is now a valid gate -- no band needed.
+
+**Methodology.** Per probe, `mist_admin.py replay --extraction-only` invokes the
+ConversationHandler's production extraction entry point (`_extract_knowledge_async`
+-> `ExtractionPipeline.extract_from_utterance`) directly, after the same Step 0
+vault-path pre-allocation and event-store turn record `handle_message` performs --
+but with `conversation_history=[]`, `assistant_message=""`, and NO `chat.initial`
+/ `chat.final` call. The same `extraction.ontology` / `extraction.scope_classifier`
+`llm_call` debug records are emitted (via the instrumented provider), so
+`score_extraction_run.py` consumes them unchanged. The 60 gold probes are
+single-utterance and self-contained, so an empty conversation history is the
+faithful extraction input.
+
+**Determinism certification.** Two full 60-probe extraction-only replays on FRESH
+isolated quads (sessions `ext-only-d1` / `ext-only-d2`, distinct throwaway
+trios + a fresh `mist-neo4j-eval` instance each; `LLM_TEMPERATURE=0.0
+LLM_CONVERSATION_TEMPERATURE=0.0 PYTHONHASHSEED=0
+MIST_FIXED_CLOCK=2026-06-13T00:00:00+00:00`), scored WITHOUT `--strict`. The two
+score JSONs are BYTE-IDENTICAL (SHA-256 `ee59d59e...` on both) on aggregate
+metrics AND on every `per_probe` FP/FN array (0 diffs across all 60 probes). The
+debug logs carry 60 `extraction.ontology` + 60 `extraction.scope_classifier`
+records and ZERO `chat.*` records, confirming no reply was generated. This is the
+determinism certification the full-chat path could not achieve (it diverged on
+18/60 probes). Artifacts: `data/runtime/extraction-ext-only-d{1,2}.{jsonl,json}`
++ `-report.md`.
+
+Gemma 4 E4B Q5_K_M, ontology v1.2.1, branch `feat/subproject-a-c3-extraction-accuracy`
+@ `f1b6bcb`, seed graph, isolated quad. All 60 probes matched in the debug log.
+
+| Metric | Value | k/n | Gate | Pass |
+|---|---|---|---|---|
+| Matched probes | 60/60 | 60/60 | == total | PASS |
+| Entity precision | 0.769 | 103/134 | >= 0.90 | FAIL |
+| Entity recall | 0.873 | 103/118 | >= 0.80 | PASS |
+| Relationship precision | 0.672 | 45/67 | >= 0.90 | FAIL |
+| Relationship recall | 0.714 | 45/63 | >= 0.80 | FAIL |
+| Typing accuracy | 0.761 | 51/67 | >= 0.90 | FAIL |
+| RELATED_TO rate | 0.000 | 0/67 | <= 0.10 | PASS |
+| Valid-time accuracy | 0.875 | 7/8 | (tracked) | - |
+| Negative-control violations | 0 | 0 | == 0 | PASS |
+
+Reconciliation-action accuracy: SKIPPED (requires C2 telemetry).
+
+(k/n: entity P denominator = produced entities, recall denominator = gold
+entities; rel analogous; typing = constraint-valid of produced rels; RELATED_TO
+= default-predicate edges of produced rels; valid-time = correct of date-bearing
+gold edges on matched probes.)
+
+Reading: below-gate on entity/rel precision, rel recall, and typing -- this is
+the FLOOR the remaining C3 tasks improve, not a gate-passing result (gates are
+provisional until C3 tuning; see "Metrics + provisional gates"). Because the run
+is byte-reproducible, every gap direction is exact -- there is no measurement-noise
+band to reason around. Negative-control violations are 0 here (vs 1 on the
+full-chat band): removing the chat reply removes the contamination that made
+Gemma mine entities from a directive/question/hypothetical control via the reply
+text, so the negative controls now pass cleanly.
+
+**Per-category FP/FN breakdown (byte-identical across d1/d2).** From the `per_probe`
+diagnostics; counts are absolute FP/FN tallies summed within the category.
+
+| Category | n | entity FP | entity FN | rel FP | rel FN |
+|---|---|---|---|---|---|
+| Core user facts | 10 | 2 | 0 | 1 | 2 |
+| Events + dates | 5 | 3 | 3 | 4 | 4 |
+| Quantified | 3 | 3 | 2 | 1 | 1 |
+| Skill state | 5 | 3 | 2 | 0 | 0 |
+| Third-party | 5 | 3 | 2 | 9 | 7 |
+| Valid-time | 5 | 4 | 0 | 0 | 0 |
+| Negative controls | 6 | 0 | 0 | 0 | 0 |
+| Structural | 3 | 3 | 3 | 0 | 0 |
+| Cessation | 5 | 1 | 0 | 0 | 0 |
+| Retraction | 5 | 0 | 0 | 0 | 0 |
+| Same-turn pair | 2 | 1 | 0 | 1 | 0 |
+| Habit / recurrence | 3 | 5 | 3 | 4 | 3 |
+| Date-discrimination | 3 | 3 | 0 | 2 | 1 |
+| TOTAL | 60 | 31 | 15 | 22 | 18 |
+
+The load-bearing categories are Third-party (rel FP 9 / rel FN 7), Habit/recurrence
+(entity FP 5, rel FP 4 / FN 3), Events+dates, and Structural (entity FP/FN 3 each).
+Because the run is deterministic, these integers are exact, not directional.
+
+Deliberate-FN note (RECOMMENDS / HAS_HABIT): the RECOMMENDS gold edges (ext-31,
+ext-32) and HAS_HABIT gold edges (ext-55, ext-56, ext-57) are EXPECTED relationship
+false-negatives until the ontology gains those predicates at T10. They sit inside
+the Third-party rel-FN and Habit/recurrence rows above. Measured on purpose; T10
+recovers them. Do NOT read those FNs as an extraction-quality regression.
+
+**Deliberate deviation from production (known measurement choice).** Production
+runs extraction with the just-generated assistant reply embedded in the extraction
+"Context:" block; the extraction-only harness omits it (empty
+`conversation_history` + empty `assistant_message`). This is intentional: the reply
+is conversational noise the gold does not encode AND is the sole source of
+nondeterminism. The trade-off is that the baseline measures extraction over a
+no-reply context rather than production's with-reply context. For the 60
+single-utterance gold probes this is faithful (the gold labels are authored from
+the utterance alone, never the reply), and it buys byte-reproducible single-run
+gating. The full-chat path remains available (`replay` without `--extraction-only`)
+for any future measurement that wants the with-reply context.
+
+### Full-chat reference band (60-probe corpus, 2026-06-13) -- NON-DETERMINISTIC, SUPERSEDED
+
+Superseded by the extraction-only baseline above (the authoritative C3 floor).
+Retained for provenance: this is the full-chat replay path (chat reply generated
+per turn, then extraction over a context containing that reply). It is NOT
+byte-reproducible -- two runs diverge on 18/60 probes -- and the localized evidence
+below is what motivated moving F2 to extraction-only.
+
+Status: the MIST chain is REPRODUCIBLE up to the LLM sampler (the clock fix
+landed). Byte-identical full-chat extraction scores remain gated by ONE
+irreducible source outside MIST's code -- llama-server flash-attention
+floating-point nondeterminism at greedy decoding. The band below is a tight
+reference (two runs, deltas <= 0.032 on every metric), not a single byte-stable
+point.
 
 **What the clock fix achieved (commit `3ca09e4`).** The 2026-06-12 determinism
 check diverged on 20/60 probes because a wall-clock `rendered_at` stamped into
@@ -394,8 +547,17 @@ engine property. To get det1 == det2 byte-for-byte, one of:
    and the gap directions are unambiguous, so this is defensible for a regression
    floor.
 None of these is a DI/code change, so they are deferred to an infra decision. The
-clock fix (this task) removed the only MIST-code nondeterminism source; the chain
-is reproducible up to the LLM sampler.
+clock fix removed the only MIST-code nondeterminism source; the full-chat chain is
+reproducible up to the LLM sampler.
+
+RESOLVED a different way (2026-06-13): the extraction-only path achieves
+byte-stable single-run scoring WITHOUT any of the three infra options above. It
+removes the long `chat.initial` generation entirely -- the only call long enough
+for the flash-attn FP noise to flip an argmax -- leaving only the short, robust
+`extraction.scope_classifier` + `extraction.ontology` calls (60/60 byte-identical
+historically, and the full score JSON is byte-identical here). flash-attn stays ON
+(production-faithful for the extraction calls). See "Baseline results (60-probe
+corpus, extraction-only, deterministic)".
 
 ### Superseded baseline (2026-06-10, pre-correction corpus -- NON-COMPARABLE)
 
@@ -405,17 +567,24 @@ history only; the entity-precision FAIL and typing FAIL were measured against
 anchor-less gold labels and the pre-C1 hardcoded constraint table.
 
 ## Known limitations
-- MIST-code replay reproducibility is DONE (commit `3ca09e4`): the full greedy
-  chain pin (`LLM_TEMPERATURE=0.0 LLM_CONVERSATION_TEMPERATURE=0.0
-  PYTHONHASHSEED=0`) plus the injected fixed clock (`MIST_FIXED_CLOCK`) make the
-  chat PROMPT byte-reproducible (verified: turn-1 `chat.initial` request identical
-  across runs; seeded `users/user.md` byte-identical). RESIDUAL (NOT a code/DI
-  source, deferred to an infra decision): llama-server flash-attention FP
-  nondeterminism makes greedy decoding non-bit-reproducible at temperature 0.0,
-  so two full replays still diverge on 18/60 probes -- a TIGHT band (deltas <=
-  0.032), not a divergent floor. The baseline is recorded as that band; a byte-
-  stable single run needs `LLAMA_ARG_FLASH_ATTN=off` or a deterministic-kernel
-  eval build (see "Baseline results -> Path to a byte-stable single-run baseline").
+- F2 replay reproducibility is DONE and byte-stable via the EXTRACTION-ONLY path
+  (`replay --extraction-only`, 2026-06-13): two full 60-probe runs on fresh
+  isolated quads produce BYTE-IDENTICAL score JSONs (aggregate + per_probe). F2 no
+  longer needs a band -- a single run gates. This is the authoritative C3 floor.
+  The extraction-only path removes the long `chat.initial` generation (the sole
+  flash-attn-sensitive call) and keeps flash-attn ON for the short extraction
+  calls. Deliberate deviation: the production with-reply extraction context is
+  omitted (the reply is noise the gold does not encode); documented as a known
+  measurement choice under the baseline section.
+- The SUPERSEDED full-chat path (`replay` without the flag) is NOT byte-stable:
+  the clock fix (commit `3ca09e4`) made the chat PROMPT byte-reproducible
+  (turn-1 `chat.initial` request identical; seeded `users/user.md` identical), but
+  llama-server flash-attention FP nondeterminism makes the long greedy chat
+  generation non-bit-reproducible, so two full-chat replays diverge on 18/60
+  probes -- a TIGHT band (deltas <= 0.032). Retained for provenance only; a
+  byte-stable full-chat run would need `LLAMA_ARG_FLASH_ATTN=off` or a
+  deterministic-kernel eval build (see "Path to a byte-stable single-run
+  baseline"). Extraction-only sidesteps this entirely.
 - 60-record corpus (C3 T3): per-category mass is now meaningful (5-10 probes in
   most categories), but several categories are still small (same-turn pair = 2,
   quantified/structural/habit/date-discrimination = 3). Treat per-category
