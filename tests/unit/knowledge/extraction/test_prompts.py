@@ -231,6 +231,25 @@ class TestAssertionKindSignal:
         assert "retract" in EXTRACTION_SYSTEM_PROMPT
 
 
+class TestRecommendsHabitDateRules:
+    """C3 prompt r3: RECOMMENDS / HAS_HABIT predicates (ontology v1.3.0) plus
+    date-entity discrimination.
+
+    RECOMMENDS captures third-party suggestions ("Sarah recommended Postgres")
+    with the recommender as source, not the user. HAS_HABIT captures recurring
+    activities ("I work out every morning") as stative facts, not Events. The
+    date-entity rule stops the model from minting a `Date` node every time a
+    date merely scopes a stative fact.
+    """
+
+    def test_prompt_lists_recommends_and_has_habit(self):
+        assert "RECOMMENDS" in EXTRACTION_SYSTEM_PROMPT
+        assert "HAS_HABIT" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_prompt_teaches_date_entity_discrimination(self):
+        assert "do NOT create a Date entity" in EXTRACTION_SYSTEM_PROMPT
+
+
 class TestUserTemplate:
     """Cluster 1: user template must surface subject_scope to the model."""
 
@@ -272,8 +291,8 @@ class TestExtractionVersionDriftGuard:
     """
 
     # sha256(EXTRACTION_SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE) pinned for
-    # extraction_version = "2026-06-12-r2".
-    PINNED_SHA256 = "834d81ac779cdb873b572b48b5018748007522dc7c2216d556719509b4e214d0"
+    # extraction_version = "2026-06-12-r3".
+    PINNED_SHA256 = "0bf29300616a489594420bc5290e857b04b1d9ddcd7624e86b3e61b3252cc3d6"
 
     def test_prompt_content_matches_pinned_extraction_version(self):
         import hashlib
@@ -294,5 +313,5 @@ class TestExtractionVersionDriftGuard:
         from backend.knowledge.config import KnowledgeConfig
         from backend.vault.writer import _EXTRACTION_VERSION
 
-        assert KnowledgeConfig.extraction_version == "2026-06-12-r2"
-        assert _EXTRACTION_VERSION == "2026-06-12-r2"
+        assert KnowledgeConfig.extraction_version == "2026-06-12-r3"
+        assert _EXTRACTION_VERSION == "2026-06-12-r3"

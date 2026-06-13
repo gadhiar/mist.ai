@@ -593,7 +593,7 @@ class KnowledgeConfig:
     enable_knowledge_integration: bool = True  # Master switch for knowledge system
 
     # System settings
-    ontology_version: str = "1.2.1"  # Current ontology version (semantics correction 2026-06-12)
+    ontology_version: str = "1.3.0"  # Current ontology version (RECOMMENDS + HAS_HABIT, 2026-06-13)
     enable_versioning: bool = True  # Track ontology versions
     enable_provenance: bool = True  # Track extraction provenance
 
@@ -611,7 +611,9 @@ class KnowledgeConfig:
     # USES/DEPENDS_ON/WORKS_WITH source sets, undirected WORKS_WITH).
     # 2026-06-12-r2: emit assertion_kind signal (assert|cease|retract) per
     # relationship (C3 spec 6.2 -- cessation/retraction reconciliation).
-    extraction_version: str = "2026-06-12-r2"
+    # 2026-06-12-r3: RECOMMENDS / HAS_HABIT predicates (ontology v1.3.0) plus
+    # date-entity discrimination (Rules 16-17, Examples 23-24).
+    extraction_version: str = "2026-06-12-r3"
     model_hash: str = "gemma-4-e4b-q5-k-m-carteakey-full-v1"
 
     # Auto-RAG configuration
@@ -667,10 +669,10 @@ class KnowledgeConfig:
             graph_regenerator=GraphRegeneratorConfig.from_env(),
             enable_knowledge_integration=os.getenv("ENABLE_KNOWLEDGE_INTEGRATION", "true").lower()
             == "true",
-            ontology_version=os.getenv("ONTOLOGY_VERSION", "1.2.1"),
+            ontology_version=os.getenv("ONTOLOGY_VERSION", "1.3.0"),
             enable_versioning=os.getenv("ENABLE_VERSIONING", "true").lower() == "true",
             enable_provenance=os.getenv("ENABLE_PROVENANCE", "true").lower() == "true",
-            extraction_version=os.getenv("EXTRACTION_VERSION", "2026-06-12-r2"),
+            extraction_version=os.getenv("EXTRACTION_VERSION", "2026-06-12-r3"),
             model_hash=os.getenv("MIST_MODEL_HASH", "gemma-4-e4b-q5-k-m-carteakey-full-v1"),
             auto_inject_docs=os.getenv("AUTO_INJECT_DOCS", "true").lower() == "true",
             auto_inject_limit=int(os.getenv("AUTO_INJECT_LIMIT", "3")),

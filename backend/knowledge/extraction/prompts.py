@@ -15,7 +15,7 @@ You MUST output ONLY valid JSON. No explanations. No markdown code fences. Just 
 User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location, Date, Milestone, Metric, Document, Pattern, Convention, Mechanism, Strategy, DataStructure, MistIdentity
 
 ### Allowed Relationship Types (use EXACTLY these strings):
-USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF, IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT, MIST_HAS_PREFERENCE, OCCURRED_ON, HAS_METRIC, REFERENCES_DOCUMENT, PRECEDED_BY, MECHANISM_OF, OPERATES_ON, INPUT_TO, IMPROVES, COMPRISES, APPLICABLE_TO, STRATEGY_FOR, NAMING_CONVENTION_OF
+USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF, IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT, MIST_HAS_PREFERENCE, OCCURRED_ON, HAS_METRIC, REFERENCES_DOCUMENT, PRECEDED_BY, MECHANISM_OF, OPERATES_ON, INPUT_TO, IMPROVES, COMPRISES, APPLICABLE_TO, STRATEGY_FOR, NAMING_CONVENTION_OF, RECOMMENDS, HAS_HABIT
 
 ### Subject Scope (passed in as SUBJECT SCOPE below)
 - `user-scope` utterances: the user is the subject. Use User-centric predicates (USES, LEARNING, WORKS_ON, etc.). source="user".
@@ -49,6 +49,8 @@ USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXP
 13. Temporal precedence -- when the user says "X happened after Y" / "X came after Y" / "X after Y" / "X following Y", emit a `PRECEDED_BY` edge from X to Y (X PRECEDED_BY Y means X happened after Y in time). X and Y are `Event` or `Milestone` entities; Y can also be a `Date`. Do NOT use `RELATED_TO` for explicit temporal ordering -- `RELATED_TO` drops the directional time signal. Do NOT use only `OCCURRED_ON` for "X after <date>" -- the precedence relationship is the load-bearing fact, not the date anchor.
 14. Mechanism / Pattern / Strategy entity selection -- when a noun phrase names a concrete operational component (a thing that performs a specific function inside a larger system: garbage collector, validator, retry-policy, exclusion-filter, rate-limiter, scheduler), classify it as `Mechanism`, NOT `Concept` and NOT `Technology`. When it names a reusable algorithmic shape (LRU, two-pointer, observer, hexagonal-architecture), classify it as `Pattern`. When it names a high-level approach to a goal (hybrid-retrieval, semantic-search, write-through-caching), classify it as `Strategy`. When it names a first-class data shape used by code (memoryfragment, hashmap, trie, preferencerecord), classify it as `DataStructure`. When it names a naming/formatting rule (camelCase, snake_case, PEP 8), classify it as `Convention`. These types absorb the most common RELATED_TO cases and unlock canonical predicates below; defaulting to `Concept` is a quality regression.
 15. Mechanism / Pattern / Strategy predicates -- prefer canonical predicates over `RELATED_TO` whenever a sentence expresses one of these shapes. (a) `MECHANISM_OF` -- "X is the mechanism by which Y works"; source is Mechanism or Pattern, target is Concept / Technology / Topic / Strategy. (b) `OPERATES_ON` -- "X acts on Y" / "X manages Y"; source is Mechanism / Technology / Strategy / Pattern, target is DataStructure / Concept / Topic. Direction is from the actor to the thing acted upon. (c) `INPUT_TO` -- "X feeds into Y" / "X is consumed by Y"; source is the data, target is the consumer. (d) `IMPROVES` -- "X optimises Y" / "X mitigates Y" / "X reduces Y" / "X speeds up Y"; merged optimization-or-mitigation predicate. (e) `COMPRISES` -- "X is made up of Y" / "X consists of Y"; source is the whole, target is the part. (f) `APPLICABLE_TO` -- "X applies to Y" / "X works for Y"; substrate-oriented. (g) `STRATEGY_FOR` -- "X is a strategy for Y"; goal-oriented. (h) `NAMING_CONVENTION_OF` -- "X is the naming convention used for Y"; source is Convention. Do NOT emit `RELATED_TO` when one of these canonical shapes fits.
+16. Date entities are anchors, not facts. Create a `Date` entity ONLY when an edge targets it: an Event or Milestone anchoring via OCCURRED_ON, or a PRECEDED_BY edge targeting the date (Rule 13). When a date merely scopes a stative fact ("since May 2026", "started using X in 2026"), put it in start_date/end_date and do NOT create a Date entity.
+17. Recommendations and habits. "X recommended/suggested Y" -> X RECOMMENDS Y (source is the recommender, NOT the user unless the user recommended it); when X is a person the user knows, ALSO emit user KNOWS_PERSON X. "I <do activity> every <interval>" -> user HAS_HABIT <activity> with temporal_expression carrying the interval; habitual statements are current stative facts, not Events.
 
 ## REFERENCE DATE
 Today's date: {reference_date}
@@ -186,6 +188,18 @@ Subject scope: user-scope
 Utterance: "Scratch that -- I never actually used MongoDB"
 Output:
 {{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "mongodb", "name": "MongoDB", "type": "Technology"}}], "relationships": [{{"source": "user", "target": "mongodb", "type": "USES", "properties": {{"confidence": 0.95, "temporal_status": "past", "start_date": null, "end_date": null, "temporal_expression": "never", "context": null, "negated": false, "assertion_kind": "retract"}}}}]}}
+
+### Example 23: Third-party recommendation -- RECOMMENDS plus KNOWS_PERSON, user stays anchored
+Subject scope: user-scope
+Utterance: "My coworker Sarah recommended Postgres"
+Output:
+{{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "sarah", "name": "Sarah", "type": "Person"}}, {{"id": "postgres", "name": "Postgres", "type": "Technology"}}], "relationships": [{{"source": "user", "target": "sarah", "type": "KNOWS_PERSON", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "coworker", "negated": false, "assertion_kind": "assert"}}}}, {{"source": "sarah", "target": "postgres", "type": "RECOMMENDS", "properties": {{"confidence": 0.9, "temporal_status": "past", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false, "assertion_kind": "assert"}}}}]}}
+
+### Example 24: Habit -- recurring activity via HAS_HABIT, no Date entity for the recurrence
+Subject scope: user-scope
+Utterance: "I work out every morning before standup"
+Output:
+{{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "working-out", "name": "Working out", "type": "Concept"}}], "relationships": [{{"source": "user", "target": "working-out", "type": "HAS_HABIT", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": "every morning", "context": "before standup", "negated": false, "assertion_kind": "assert"}}}}]}}
 """
 
 EXTRACTION_USER_TEMPLATE = """Context:
