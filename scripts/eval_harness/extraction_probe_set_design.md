@@ -678,6 +678,156 @@ from structural rel-FNs into extracted edges. The 2 residual gaps (ext-31 extra
 STRATEGY_FOR edge, ext-56 target-surface) are over-extraction / entity-surface
 classes, not predicate misses.
 
+### Phase C iteration (prompt r4) -- precision-rule re-measure
+
+Path-A disciplined iteration on the r3 gate miss. r4 adds two GENERALIZABLE
+precision rules (no probe names in the prompt): Edit A tightens the HAS_HABIT
+clause (Rule 17) so a continuous "since <date>" stative routes to the matching
+stative predicate (EXPERT_IN / LEARNING / INTERESTED_IN) with valid_from instead
+of over-firing HAS_HABIT; Edit B adds Rule 18 (extract the asserted fact, not
+incidental trailing-prepositional scope -- do NOT manufacture STRATEGY_FOR /
+APPLICABLE_TO / WORKS_ON / PART_OF / USED_FOR for a scoping phrase; the
+"Rust USED_FOR backend-work IS the fact" contrast protects legitimate USED_FOR
+recall). Committed on `feat/subproject-a-c3-extraction-accuracy` (r4 prompt commit
+`0b6d5b7`; extraction_version `2026-06-12-r4`, prompt sha256 re-pinned to
+`38f379f757f40f69e8da583cb6b5342fb8bf5015e512c98ddc38e50f853092a8`). Re-measured
+on the SAME deterministic extraction-only 60-probe F2 instrument.
+
+**Determinism still holds on r4.** Two replays on FRESH isolated quads (sessions
+`ext-c3-r4-d1` / `ext-c3-r4-d2`, distinct throwaway trios + a FRESH `mist-neo4j-eval`
+instance each -- eval Neo4j torn down and recreated between d1 and d2, both from
+an identical 138-write / 32-embedding seed; full pin `LLM_TEMPERATURE=0.0
+LLM_CONVERSATION_TEMPERATURE=0.0 PYTHONHASHSEED=0
+MIST_FIXED_CLOCK=2026-06-13T00:00:00+00:00` + `--extraction-only`). d1 scored
+WITHOUT `--strict`; d2 scored WITH `--strict` (exit 0 -- `--strict` enforces
+probe-join integrity + negative-control violations, both clean; it does NOT
+hard-fail on the headline precision gates, which remain reported FAIL). The two
+score JSONs are BYTE-IDENTICAL (SHA-256
+`e368a42076ad6576d96010f680ca2356a26acbe6638d127b7bc8e7e87e37bc4d` on both;
+`diff -q` empty) on aggregate metrics AND the full 60-entry `per_probe` FP/FN
+arrays AND `assertion_kind_buckets`. The debug logs carry 60 `extraction.ontology`
++ 60 `extraction.scope_classifier` records and ZERO `chat.*` records. Artifacts:
+`data/runtime/extraction-ext-c3-r4-d{1,2}.{jsonl,json}` + `-report.md`.
+
+Gemma 4 E4B Q5_K_M, ontology v1.3.0, seed graph, isolated quad. All 60 probes
+matched.
+
+| Metric | r4 | k/n (r4) | r3 | delta r3 | Gate | Pass |
+|---|---|---|---|---|---|---|
+| Matched probes | 60/60 | 60/60 | 60/60 | 0 | == total | PASS |
+| Entity precision | 0.831 | 103/124 | 0.855 | -0.024 | >= 0.90 | FAIL |
+| Entity recall | 0.873 | 103/118 | 0.898 | -0.025 | >= 0.80 | PASS |
+| Relationship precision | 0.812 | 52/64 | 0.831 | -0.019 | >= 0.90 | FAIL |
+| Relationship recall | 0.812 | 52/64 | 0.844 | -0.032 | >= 0.80 | PASS |
+| Typing accuracy | 0.875 | 56/64 | 0.892 | -0.017 | >= 0.90 | FAIL |
+| RELATED_TO rate | 0.000 | 0/64 | 0.000 | 0 | <= 0.10 | PASS |
+| Valid-time accuracy | 0.875 | 7/8 | 0.875 | 0 | (tracked) | - |
+| Negative-control violations | 0 | 0 | 0 | 0 | == 0 | PASS |
+
+Reconciliation-action accuracy: SKIPPED (requires C2 telemetry).
+
+(k/n: entity P denominator = produced entities, recall denominator = gold
+entities; rel analogous; typing = constraint-valid of produced rels; RELATED_TO
+= default-predicate edges of produced rels; valid-time = correct of date-bearing
+gold edges on matched probes.)
+
+Reading: ALL FOUR targeted genuine errors are eliminated at the structural-edge
+level -- ext-25 APPLICABLE_TO, ext-31 STRATEGY_FOR, ext-54 WORKS_ON (Rule 18) and
+ext-58 HAS_HABIT (Rule A, now correctly EXPERT_IN) are all gone from the FP set.
+But every aggregate metric REGRESSED slightly vs r3 (rel P -0.019, rel R -0.032,
+entity P -0.024). The regression does NOT come from the two new rules: it is
+prompt-hash-perturbation drift on THREE probes that were rel-CLEAN at r3 and are
+NOT logical cases for either rule -- ext-23 ("wedding on 2026-05-30": the model
+chose entity id `wedding-event` vs gold `wedding-2026-05-30`, splitting the
+EXPERIENCED + OCCURRED_ON pair into 2 FP + 2 FN, pure entity-surface), ext-30
+("had coffee with Devin": new over-extraction of a `coffee-meeting` Event +
+EXPERIENCED edge), and ext-35 ("learning Go until Dec 2025": new spurious
+`go OCCURRED_ON 2025-12-01` + Date entity, a Rule-16 date-discrimination miss).
+Changing the prompt text shifts the greedy argmax on these near-tie probes -- the
+same flash-attn-FP-near-tie sensitivity documented for the full-chat band, here
+triggered by the prompt-string delta rather than generation length. The net trade
+is 5 fixed FPs (4 targeted spurious edges + 1 ext-25 metric-surface variant) for
+4 new drift edges (ext-23 ×2, ext-30, ext-35) plus 2 dropped assert-found edges
+(ext-23 surface split), netting -2 rel TP / +1 rel FP / +2 rel FN.
+
+**RECALL-SAFETY (Rule 18): NO new structural-edge false-negative.** ext-01
+(`rust USED_FOR backend-work`) was ALREADY a rel-FN at r3 (the model emits only
+the `user USES rust` anchor and drops the 2nd USED_FOR edge); it remains FN at r4
+with byte-identical behavior -- Rule 18's protective contrast did not suppress it,
+and it was never extracted to begin with. ext-14 (`terraform USED_FOR
+cloud-infrastructure`) is FN in BOTH r3 and r4 (entity-typing split, target
+Concept vs gold Topic). No USED_FOR / PART_OF / structural gold edge that r3
+correctly extracted was dropped by r4. The only NEW rel-FNs are the ext-23
+entity-surface pair (drift, not a Rule-18 suppression).
+
+**Per-probe verification of the 4 targeted probes (r4):**
+
+| Probe | r3 error | r4 result | Verdict |
+|---|---|---|---|
+| ext-58 | `user HAS_HABIT mentoring-junior-engineers` (mis-predicate) | HAS_HABIT GONE; emits `user EXPERT_IN mentoring-junior-engineers`; gold `user EXPERT_IN mentoring` -> entity-surface split (`mentoring-junior-engineers` Concept vs `mentoring` Skill) | PARTIAL (predicate fixed; residual is canonicalization) |
+| ext-25 | spurious `coverage-87-percent APPLICABLE_TO codebase` | APPLICABLE_TO GONE; residual `test-suite HAS_METRIC 87-percent` vs gold `87-percent-coverage` is entity-surface only | RESOLVED (targeted spurious edge gone) |
+| ext-31 | spurious `graphql STRATEGY_FOR new-service` | STRATEGY_FOR GONE; ext-31 has NO rel FP (KNOWS_PERSON + RECOMMENDS both correct) -> fully CLEAN | RESOLVED |
+| ext-54 | spurious `user WORKS_ON project` | WORKS_ON GONE; ext-54 has NO rel FP (only a stray `project` entity FP remains) | RESOLVED (targeted structural edge gone) |
+
+**Assertion-kind buckets (r4).** Scored on the same certified run (`ext-c3-r4-d1`;
+byte-identical on `d2`).
+
+| Kind | correct/found (r4) | found/gold_total (r4) | correct/found (r3) | found/gold_total (r3) |
+|---|---|---|---|---|
+| assert | 39/40 | 40/52 | 42/42 | 42/52 |
+| cease | 7/7 | 7/7 | 7/7 | 7/7 |
+| retract | 5/5 | 5/5 | 5/5 | 5/5 |
+
+Reading: `cease` and `retract` hold perfect (7/7, 5/5) -- no regression below
+Phase B. `assert` correct/found dipped 42/42 -> 39/40: `found` dropped by 2 (the
+ext-23 surface-split pair is no longer rel-TP, so 2 assert-gold edges fell out of
+found), and 1 mis-derivation appeared (ext-35: r4 emitted `assertion_kind=cease`
++ `temporal_status=past` on the assert-gold "until Dec 2025" LEARNING edge, the
+same "until -> read as cease" class seen in the r2 buckets). Both are the drift
+probes above, not a Rule-A/18 consequence.
+
+**Per-category FP/FN breakdown (byte-identical across d1/d2).** r3 counts in
+parentheses for trajectory.
+
+| Category | n | entity FP | entity FN | rel FP | rel FN |
+|---|---|---|---|---|---|
+| Core user facts | 10 | 3 (3) | 2 (1) | 0 (0) | 2 (2) |
+| Events + dates | 5 | 4 (3) | 4 (3) | 5 (3) | 5 (3) |
+| Quantified | 3 | 3 (5) | 2 (4) | 2 (3) | 2 (2) |
+| Skill state | 5 | 0 (0) | 0 (0) | 0 (0) | 0 (0) |
+| Third-party | 5 | 2 (2) | 1 (1) | 2 (2) | 1 (1) |
+| Valid-time | 5 | 1 (1) | 0 (0) | 1 (0) | 0 (0) |
+| Negative controls | 6 | 0 (0) | 0 (0) | 0 (0) | 0 (0) |
+| Structural | 3 | 3 (1) | 3 (1) | 0 (0) | 0 (0) |
+| Cessation | 5 | 0 (0) | 0 (0) | 0 (0) | 0 (0) |
+| Retraction | 5 | 0 (0) | 0 (0) | 0 (0) | 0 (0) |
+| Same-turn pair | 2 | 1 (1) | 0 (0) | 0 (1) | 0 (0) |
+| Habit / recurrence | 3 | 1 (1) | 1 (1) | 1 (1) | 1 (1) |
+| Date-discrimination | 3 | 1 (1) | 1 (1) | 1 (1) | 1 (1) |
+| TOTAL | 60 | 19 (18) | 14 (12) | 12 (11) | 12 (10) |
+
+The two targeted categories MOVED in the intended direction at the predicate
+level: Same-turn pair rel FP 1 -> 0 (ext-54 WORKS_ON gone), and the ext-58
+date-discrimination + ext-25 quantified spurious edges are gone (Quantified rel FP
+3 -> 2, entity FP 5 -> 3). The regression is isolated to Events+dates (rel FP/FN
+3 -> 5 each: the ext-23 surface split + ext-30 over-extract + ext-35 spurious
+OCCURRED_ON all land here) and Structural entity FP/FN 1 -> 3 (ext-41/ext-42
+entity-typing drift). None of these is a Rule-A/18 case.
+
+**Remaining FP/FN classified (pure-canonicalization vs other).** Of the 12 rel FPs:
+8 are entity-surface paired splits (PURE canonicalization -- ext-21, ext-22
+closing-on-house, ext-23 ×2, ext-24, ext-25, ext-56, ext-58); 4 are genuine
+over-extractions (ext-22 EXPERIENCED on mis-typed Event, ext-29 WORKS_AT
+third-party scope creep, ext-30 EXPERIENCED incidental meeting, ext-35 OCCURRED_ON
+date-discrimination miss). Of the 4 over-extractions, 2 are NEW drift (ext-30,
+ext-35) and 2 are r3 carryovers (ext-22, ext-29). The 12 rel FNs are the paired
+splits of the 8 surface FPs plus the structural under-extractions (ext-01, ext-14
+USED_FOR drops; ext-20, ext-29 anchor misses) -- all either canonicalization
+(surface/typing) or pre-existing recall gaps. The ~70% canonicalization residual
+the controller scoped out of this iteration is confirmed: 8 of 12 rel FP and the
+bulk of rel FN are pure entity-surface/typing, unaddressable by precision rules
+alone.
+
 ### Full-chat reference band (60-probe corpus, 2026-06-13) -- NON-DETERMINISTIC, SUPERSEDED
 
 Superseded by the extraction-only baseline above (the authoritative C3 floor).
