@@ -250,7 +250,13 @@ class ExtractionValidator:
             for holder in (props, rel):
                 ak = holder.get("assertion_kind")
                 if ak is not None and str(ak).lower() not in _ASSERTION_KINDS:
-                    logger.debug("Stripping invalid assertion_kind %r on %s", ak, rel.get("type"))
+                    logger.debug(
+                        "Stripping invalid assertion_kind %r on %s -[%s]-> %s",
+                        ak,
+                        source,
+                        rel_type,
+                        target,
+                    )
                     holder.pop("assertion_kind", None)
 
             valid_relationships.append(rel)

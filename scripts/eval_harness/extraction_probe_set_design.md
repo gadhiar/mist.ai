@@ -632,3 +632,12 @@ anchor-less gold labels and the pre-C1 hardcoded constraint table.
   Assertion-kind bucket scoring is a later C3 task.
 - Reconciliation-action accuracy unmeasurable until C2 emits telemetry.
 - Valid-time accuracy only meaningful for absolute-date probes.
+- Pre-T7 rebuild baselines are NON-COMPARABLE for same-turn-pair turns (a cease
+  and an assert of the same predicate in one turn, e.g. "I left Zeta for Acme").
+  T7 changed the intra-turn processing order to retract/cease BEFORE assert
+  (`_sort_key` in `reconciliation.py`); pre-T7 runs processed those edges in
+  plain `(type, source, target)` order, so the close reason, valid_to, and
+  cease/supersession flags on the superseded edge differ. Final open-belief
+  state is unchanged across the two orderings -- only provenance/version-chain
+  on the closed copy differs -- but any per-probe diff against a pre-T7 rebuild
+  on a same-turn-pair probe is expected, not a regression.

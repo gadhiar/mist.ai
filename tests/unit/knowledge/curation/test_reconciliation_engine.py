@@ -532,6 +532,48 @@ class TestPastTenseMapping:
         assert params["valid_to"] is not None
 
 
+class TestSameTurnSingleArbitration:
+    """Same-turn SINGLE arbitration ordering (deep-review finding #2).
+
+    'I left Zeta for Acme': WORKS_AT cease(zeta) + assert(acme) in ONE turn.
+    The intra-turn sort must process retract/cease BEFORE assert so the cease
+    closes its prior with reason 'cease' instead of the assert racing it to a
+    single_supersession close + spurious cease_without_prior flag. The static
+    substring-keyed fake cannot model write-read feedback, so end-state lives
+    in the live-Cypher integration test; here we pin the processing ORDER via
+    the recorded same-fact fetches.
+    """
+
+    @pytest.mark.asyncio
+    async def test_same_turn_cease_processed_before_assert(self):
+        # The cease(zeta) edge must be PLANNED before the assert(acme) edge even
+        # though 'acme' < 'zeta' alphabetically, so the cease closes its prior
+        # with reason 'cease' rather than the assert racing it to a single
+        # supersession close + spurious cease_without_prior flag.
+        rels = [
+            _rel(predicate="WORKS_AT", target="acme", props={"assertion_kind": "assert"}),
+            _rel(
+                predicate="WORKS_AT",
+                target="zeta",
+                props={"assertion_kind": "cease", "temporal_status": "past"},
+            ),
+        ]
+        conn = FakeNeo4jConnection()
+
+        await _engine(conn).reconcile_turn(
+            rels, recorded_at=RECORDED_AT, event_id="e1", session_id="s1"
+        )
+
+        # The same-fact fetch is the latest-belief read keyed on the edge's own
+        # target ("t.id = $target"); the SINGLE-conflict read uses the
+        # complementary "t.id <> $target" clause. The FIRST same-fact fetch
+        # records the edge processed first -- it must carry the cease's
+        # target='zeta', not the alphabetically-earlier assert's 'acme'.
+        same_fact_fetches = [params for query, params in conn.queries if "t.id = $target" in query]
+        assert same_fact_fetches, "expected at least one same-fact fetch"
+        assert same_fact_fetches[0]["target"] == "zeta"
+
+
 class TestConfidenceForwarding:
     @pytest.mark.asyncio
     async def test_validator_shaped_confidence_reaches_edge(self):

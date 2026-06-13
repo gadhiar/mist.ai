@@ -19,6 +19,9 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from backend.knowledge.config import Neo4jConfig
+from backend.knowledge.curation.graph_writer import RebuildStamps
+from backend.knowledge.curation.reconciliation import ReconciliationEngine
+from backend.knowledge.storage.graph_executor import GraphExecutor
 from backend.knowledge.storage.graph_store import GraphStore
 from backend.knowledge.storage.neo4j_connection import Neo4jConnection
 from tests.mocks.embeddings import FakeEmbeddingGenerator
@@ -127,3 +130,116 @@ class TestClosedOpenReadBoundary:
         targets = {r["entity_id"] for r in rows}
 
         assert targets == {"currencytest-always", "currencytest-open"}
+
+
+_STAMPS = RebuildStamps(
+    ontology_version="1.2.1", extraction_version="v-int-test", model_hash="m-int-test"
+)
+_RECORDED_AT = "2026-06-10T12:00:00+00:00"
+
+
+class TestSameTurnSingleArbitrationLive:
+    """Same-turn SINGLE arbitration end-state on live Cypher (deep-review #2).
+
+    'I left Zeta for Acme' in ONE turn: WORKS_AT cease(zeta, stated stop) +
+    assert(acme). The unit layer can only witness the processing ORDER (the
+    static fake cannot model write-read feedback); only a real Neo4j run can
+    prove the end-state -- zeta's belief closed at the STATED stop (not
+    recorded_at), close reason 'cease', no cease_without_prior flag, acme open,
+    exactly one closed copy of zeta.
+    """
+
+    def _seed_open_zeta(self, store: GraphStore, zeta_from: str) -> None:
+        store.connection.execute_write(
+            """
+            MERGE (u:__Entity__ {id: $uid})
+              ON CREATE SET u.entity_type = 'User', u.status = 'active'
+            MERGE (z:__Entity__ {id: 'currencytest-zeta'})
+              ON CREATE SET z.entity_type = 'Organization', z.status = 'active'
+            MERGE (a:__Entity__ {id: 'currencytest-acme'})
+              ON CREATE SET a.entity_type = 'Organization', a.status = 'active'
+            CREATE (u)-[:WORKS_AT {
+                is_latest_belief: true, valid_from: $zeta_from, valid_to: NULL,
+                recorded_at: $zeta_from, source_utterance_id: 'seed-zeta',
+                version_key: 'seed-zeta|open|open', confidence: 0.9,
+                source_type: 'extracted', temporal_status: 'current'
+            }]->(z)
+            """,
+            {"uid": _UID, "zeta_from": zeta_from},
+        )
+
+    @pytest.mark.asyncio
+    async def test_same_turn_cease_then_assert_closes_zeta_at_stated_stop(self, store):
+        # Seed an open WORKS_AT(user, zeta) starting well before the stated stop.
+        self._seed_open_zeta(store, zeta_from="2024-01-01T00:00:00+00:00")
+        # Stated stop 'left in March 2026'. valid_to is a closed-open EXCLUSIVE
+        # upper bound (intervals design 4.5): a month-precision TO bound covers
+        # the whole stated period, so '2026-03' clamps to 2026-04-01 (valid
+        # THROUGH March). The point under test is that the close uses this
+        # STATED stop, not recorded_at (2026-06-10).
+        stated_stop = "2026-04-01T00:00:00+00:00"
+
+        engine = ReconciliationEngine(
+            executor=GraphExecutor(store.connection), rebuild_stamps=_STAMPS
+        )
+        # Same turn, listed assert-first so only the kind-ordering sort can put
+        # the cease before the assert ('acme' < 'zeta' alphabetically).
+        rels = [
+            {
+                "source": _UID,
+                "target": "currencytest-acme",
+                "type": "WORKS_AT",
+                "properties": {"assertion_kind": "assert", "confidence": 0.9},
+            },
+            {
+                "source": _UID,
+                "target": "currencytest-zeta",
+                "type": "WORKS_AT",
+                "properties": {
+                    "assertion_kind": "cease",
+                    "temporal_status": "past",
+                    "end_date": "2026-03",
+                },
+            },
+        ]
+
+        result = await engine.reconcile_turn(
+            rels, recorded_at=_RECORDED_AT, event_id="int-e1", session_id="int-s1"
+        )
+
+        # No spurious cease_without_prior (the cease found its open prior).
+        assert not any("cease_without_prior" in f for f in result.flags), result.flags
+
+        # acme is the sole currently-valid WORKS_AT for the user.
+        open_rows = store.connection.execute_query(
+            "MATCH (u:__Entity__ {id: $uid})-[r:WORKS_AT]->(t:__Entity__) "
+            "WHERE coalesce(r.is_latest_belief, true) AND r.valid_to IS NULL "
+            "RETURN t.id AS target, r.supersession_reason AS reason",
+            {"uid": _UID},
+        )
+        open_targets = {row["target"] for row in open_rows}
+        assert open_targets == {"currencytest-acme"}
+
+        # zeta: exactly one surviving (latest) version, closed at the STATED
+        # stop -- not recorded_at -- with close reason 'cease'.
+        zeta_latest = store.connection.execute_query(
+            "MATCH (u:__Entity__ {id: $uid})-[r:WORKS_AT]->(t:__Entity__ {id: 'currencytest-zeta'})"
+            " WHERE coalesce(r.is_latest_belief, true) "
+            "RETURN r.valid_to AS valid_to, r.supersession_reason AS reason, "
+            "r.temporal_status AS temporal_status",
+            {"uid": _UID},
+        )
+        assert len(zeta_latest) == 1
+        assert zeta_latest[0]["valid_to"] == stated_stop  # stated, not recorded_at
+        assert zeta_latest[0]["valid_to"] != _RECORDED_AT
+        assert zeta_latest[0]["reason"] == "cease"
+        assert zeta_latest[0]["temporal_status"] == "past"
+
+        # The original open prior was transaction-closed (no longer latest).
+        closed_prior = store.connection.execute_query(
+            "MATCH (u:__Entity__ {id: $uid})-[r:WORKS_AT]->(t:__Entity__ {id: 'currencytest-zeta'})"
+            " WHERE r.is_latest_belief = false AND r.source_utterance_id = 'seed-zeta' "
+            "RETURN count(r) AS n",
+            {"uid": _UID},
+        )
+        assert closed_prior[0]["n"] == 1

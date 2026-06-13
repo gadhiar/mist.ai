@@ -54,6 +54,15 @@ def derive_assertion_kind(rel: dict[str, Any]) -> tuple[AssertionKind, bool]:
     applies only when the payload carried no parseable explicit kind (pre-r2
     log events, parse drops). Consumed by EdgeAssertion.from_rel_dict, the
     intra-turn sort key, and the F2 scorer -- change it in one place only.
+
+    NOTE (raw-input order-sensitivity): a truthy-but-INVALID rel-level
+    assertion_kind shadows a valid props-level one -- the `or`-chain
+    short-circuits on the rel-level value, that invalid value then fails to
+    parse, and the props-level value is never consulted (control falls through
+    to the temporal_status path). Production-safe because the validator strips
+    OOV assertion_kind values from both levels first AND the model only emits
+    the field inside `properties`. This is a documented edge of raw dicts, not
+    an order-robust contract -- no order-robust variant is built here.
     """
     props = rel.get("properties") or {}
     raw = rel.get("assertion_kind") or props.get("assertion_kind")
@@ -199,6 +208,24 @@ class ReconcileTurnResult:
 
 def _iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt is not None else None
+
+
+# Intra-turn processing order: retract/cease BEFORE assert. A SINGLE assert
+# closes any open prior via single_supersession at recorded_at; if it raced an
+# in-turn cease of a different target it would steal the close (wrong reason,
+# wrong valid_to, spurious cease_without_prior). Lower sorts first.
+_KIND_ORDER = {AssertionKind.RETRACT: 0, AssertionKind.CEASE: 1, AssertionKind.ASSERT: 2}
+
+
+def _sort_key(rel: dict[str, Any]) -> tuple[int, str, str, str]:
+    """Total, content-only intra-turn sort key (rebuild-deterministic).
+
+    Shares `derive_assertion_kind` with the planner so the sort and the planner
+    cannot disagree on a rel's kind. No wall-clock, no edge_ref, no ontology
+    lookup -- a rebuild replays the identical order.
+    """
+    kind, _ = derive_assertion_kind(rel)
+    return (_KIND_ORDER[kind], rel.get("type", ""), rel.get("source", ""), rel.get("target", ""))
 
 
 def plan_edge(
@@ -472,10 +499,7 @@ class ReconciliationEngine:
         if recorded_dt is None:
             raise ValueError(f"unparsable recorded_at: {recorded_at!r}")
 
-        ordered = sorted(
-            relationships,
-            key=lambda r: (r.get("type", ""), r.get("source", ""), r.get("target", "")),
-        )
+        ordered = sorted(relationships, key=_sort_key)
         for rel in ordered:
             defn = self._edges.get(rel.get("type", ""))
             if defn is None:
