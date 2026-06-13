@@ -380,6 +380,95 @@ class TestScoreRun:
         assert row["entity_fns"] == [["rust", "Technology"], ["user", "User"]]
         assert row["rel_fns"] == [["user", "USES", "rust"]]
 
+    def test_assertion_kind_buckets_scored(self):
+        """Buckets = {gold_total, found, correct} per kind; derivation is the
+        engine's own derive_assertion_kind (explicit wins incl. explicit assert;
+        absent + past + no end_date -> cease).
+
+        `found` counts gold edges of that kind that were extracted at all (TP
+        membership); `correct` counts found edges whose engine-derived kind
+        matches gold. The retract probe's edge is NOT extracted, so found=0 --
+        the count that catches a model which silently never emits cessations.
+        """
+        probes = [
+            GoldProbe(
+                tag="t-c",
+                utterance="I stopped using X",
+                entities=(
+                    GoldEntity(id="user", type="User"),
+                    GoldEntity(id="x", type="Technology"),
+                ),
+                relationships=(
+                    GoldRel(
+                        source="user",
+                        source_type="User",
+                        predicate="USES",
+                        target="x",
+                        target_type="Technology",
+                        assertion_kind="cease",
+                    ),
+                ),
+            ),
+            GoldProbe(
+                tag="t-r",
+                utterance="I never used Z",
+                entities=(
+                    GoldEntity(id="user", type="User"),
+                    GoldEntity(id="z", type="Technology"),
+                ),
+                relationships=(
+                    GoldRel(
+                        source="user",
+                        source_type="User",
+                        predicate="USES",
+                        target="z",
+                        target_type="Technology",
+                        assertion_kind="retract",
+                    ),
+                ),
+            ),
+        ]
+        produced = {
+            # cease probe: edge found, no explicit kind, past + no end_date ->
+            # engine derives cease (correct).
+            "I stopped using X": _produced(
+                "I stopped using X",
+                [GoldEntity(id="user", type="User"), GoldEntity(id="x", type="Technology")],
+                [
+                    {
+                        "source": "user",
+                        "target": "x",
+                        "predicate": "USES",
+                        "properties": {"temporal_status": "past"},
+                    }
+                ],
+                {"user": "User", "x": "Technology"},
+            ),
+            # retract probe: edge NOT extracted at all -> found=0.
+            "I never used Z": _produced(
+                "I never used Z",
+                [GoldEntity(id="user", type="User")],
+                [],
+                {"user": "User"},
+            ),
+        }
+        report = score_run(probes, produced)
+        assert report.assertion_kind_buckets["cease"] == {
+            "gold_total": 1,
+            "found": 1,
+            "correct": 1,
+        }
+        assert report.assertion_kind_buckets["retract"] == {
+            "gold_total": 1,
+            "found": 0,
+            "correct": 0,
+        }
+        assert report.assertion_kind_buckets["assert"] == {
+            "gold_total": 0,
+            "found": 0,
+            "correct": 0,
+        }
+
 
 from eval_harness.score_extraction_run import main, render_json, render_markdown  # noqa: E402
 

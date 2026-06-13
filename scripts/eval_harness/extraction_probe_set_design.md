@@ -397,6 +397,41 @@ the utterance alone, never the reply), and it buys byte-reproducible single-run
 gating. The full-chat path remains available (`replay` without `--extraction-only`)
 for any future measurement that wants the with-reply context.
 
+**Assertion-kind buckets (T4 -- engine-shared derivation).** Scored on the SAME
+certified extraction-only run (`ext-only-d1`; byte-identical on `ext-only-d2` and
+across re-scores, so the bucket table inherits the floor's reproducibility). The
+kind is whatever the engine derives: the scorer imports
+`reconciliation.derive_assertion_kind` (anti-drift -- no parallel
+reimplementation, same pattern as `RELATIONSHIP_CONSTRAINTS`). Per kind:
+`gold_total` = gold edges of that kind; `found` = gold edges of that kind
+extracted at all (relationship-TP membership); `correct` = found edges whose
+engine-derived kind matches gold. `found` is tracked explicitly because the
+~12 cease+retract gold edges in 63 could be omitted wholesale and still clear the
+0.80 overall rel-recall gate -- accuracy-over-found alone would be blind to that.
+
+| Kind | correct/found | found/gold_total |
+|---|---|---|
+| assert | 28/33 | 33/51 |
+| cease | 6/7 | 7/7 |
+| retract | 0/5 | 5/5 |
+
+Reading (the gap T5 closes): this is the PRE-prompt-change baseline -- no produced
+edge carries an explicit `assertion_kind`, so every kind is whatever the engine
+INFERS from `temporal_status`. `cease` already lands 6/7: the model marks these
+"stopped using X" utterances `temporal_status=past`, and the engine's interim
+past + no-end_date -> CEASE mapping recovers them. `retract` is the headline gap:
+all 5 retraction edges are EXTRACTED (found 5/5 -- "I never used Z" produces the
+USES edge structurally, so it is a rel-TP), but NONE derives as retract
+(correct 0/5) -- without the prompt emitting `assertion_kind=retract` there is no
+past-tense signal and `derive_assertion_kind` returns ASSERT for all five. The
+edges are present; only the kind label is missing. `assert` is 28/33 correct: of
+33 found assert-gold edges, 5 are mis-derived as CEASE (the model tagged a
+present-tense fact `temporal_status=past`, tripping the interim coercion) -- a
+second class of label error T5's explicit-kind emission removes. The 33/51 found
+reflects the 18 assert-gold rel-FNs already in the floor's rel-recall, not a
+bucket-specific miss. T5 (prompt emits explicit `assertion_kind`) is measured
+against exactly these three rows.
+
 ### Full-chat reference band (60-probe corpus, 2026-06-13) -- NON-DETERMINISTIC, SUPERSEDED
 
 Superseded by the extraction-only baseline above (the authoritative C3 floor).

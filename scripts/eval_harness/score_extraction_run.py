@@ -30,6 +30,9 @@ if str(_REPO_ROOT) not in sys.path:
 
 # Intentionally NOT guarded: a missing backend must fail loudly, never silently
 # zero the typing metric.
+from backend.knowledge.curation.reconciliation import (  # noqa: E402
+    derive_assertion_kind,
+)
 from backend.knowledge.extraction.validator import (  # noqa: E402
     RELATIONSHIP_CONSTRAINTS,
 )
@@ -267,6 +270,12 @@ class Report:
     valid_time_ok: int = 0
     negative_probes: int = 0
     negative_violations: int = 0
+    # Per assertion-kind: {gold_total, found, correct}. found = gold edges of
+    # that kind that were extracted at all (TP membership); correct = found
+    # edges whose engine-derived kind matches gold. The explicit `found` count
+    # catches a model that simply never emits cessation/retraction edges --
+    # total omission would still clear the 0.80 overall-recall gate.
+    assertion_kind_buckets: dict[str, dict[str, int]] = field(default_factory=dict)
     per_probe: list[dict[str, Any]] = field(default_factory=list)
 
     @staticmethod
@@ -334,6 +343,10 @@ def _typing_ok(predicate: str, s_type: str | None, t_type: str | None) -> bool:
 
 def score_run(probes: list[GoldProbe], produced_index: dict[str, Produced]) -> Report:
     report = Report(total_probes=len(probes))
+    # Initialize all three kinds so an absent bucket reads zeros (not KeyError):
+    # a corpus with no retract gold must still surface retract: 0/0 0/0.
+    for kind in VALID_ASSERTION_KINDS:
+        report.assertion_kind_buckets[kind] = {"gold_total": 0, "found": 0, "correct": 0}
     for probe in probes:
         produced = produced_index.get(_norm_ws(probe.utterance))
         if produced is not None:
@@ -347,9 +360,15 @@ def score_run(probes: list[GoldProbe], produced_index: dict[str, Produced]) -> R
 
         gold_rel_keys = {(r.source, r.predicate, r.target) for r in probe.relationships}
         prod_rel_keys: set[tuple[str, str, str]] = set()
+        # Map each produced key tuple to its rel dict so a matched gold edge can
+        # be handed to the engine's derive_assertion_kind (anti-drift: the kind
+        # is whatever the engine will derive, not a parallel reimplementation).
+        prod_rel_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
         if produced:
             for r in produced.relationships:
-                prod_rel_keys.add((r["source"], r["predicate"], r["target"]))
+                key = (r["source"], r["predicate"], r["target"])
+                prod_rel_keys.add(key)
+                prod_rel_by_key[key] = r
                 report.produced_rel_total += 1
                 if r["predicate"] == "RELATED_TO":
                     report.related_to_count += 1
@@ -363,6 +382,16 @@ def score_run(probes: list[GoldProbe], produced_index: dict[str, Produced]) -> R
         report.rel_tp += len(gold_rel_keys & prod_rel_keys)
         report.rel_fp += len(prod_rel_keys - gold_rel_keys)
         report.rel_fn += len(gold_rel_keys - prod_rel_keys)
+
+        for gr in probe.relationships:
+            bucket = report.assertion_kind_buckets[gr.assertion_kind]
+            bucket["gold_total"] += 1
+            matched = prod_rel_by_key.get((gr.source, gr.predicate, gr.target))
+            if matched is None:
+                continue  # gold edge not extracted at all -> not in found
+            bucket["found"] += 1
+            if derive_assertion_kind(matched)[0].value == gr.assertion_kind:
+                bucket["correct"] += 1
 
         for gr in probe.relationships:
             if gr.valid_from is None and gr.valid_to is None:
@@ -458,6 +487,20 @@ def render_markdown(report: Report) -> str:
         f"| Negative-control violations | {report.negative_violations} | == 0 | "
         f"{'PASS' if report.negative_violations == 0 else 'FAIL'} |",
         "",
+        "## Assertion-kind buckets",
+        "",
+        "Derivation is the engine's own `derive_assertion_kind` (shared, not "
+        "reimplemented). `found` = gold edges of this kind extracted at all; "
+        "`correct` = found edges whose derived kind matches gold.",
+        "",
+        "| Kind | correct/found | found/gold_total |",
+        "|---|---|---|",
+    ]
+    for kind in VALID_ASSERTION_KINDS:
+        b = report.assertion_kind_buckets.get(kind, {"gold_total": 0, "found": 0, "correct": 0})
+        lines.append(f"| {kind} | {b['correct']}/{b['found']} | {b['found']}/{b['gold_total']} |")
+    lines += [
+        "",
         f"Matched probes: {report.matched_probes}/{report.total_probes}.",
         "Reconciliation-action accuracy: SKIPPED (requires C2 telemetry).",
     ]
@@ -476,6 +519,7 @@ def render_json(report: Report) -> str:
             "typing_accuracy": report.typing_accuracy,
             "related_to_rate": report.related_to_rate,
             "valid_time_accuracy": report.valid_time_accuracy,
+            "assertion_kind_buckets": report.assertion_kind_buckets,
             "per_probe": report.per_probe,
         },
         indent=2,
