@@ -609,7 +609,9 @@ class KnowledgeConfig:
     # serve stale extractions.
     # 2026-06-12-r1: deep-review prompt fix (direction rules for
     # USES/DEPENDS_ON/WORKS_WITH source sets, undirected WORKS_WITH).
-    extraction_version: str = "2026-06-12-r1"
+    # 2026-06-12-r2: emit assertion_kind signal (assert|cease|retract) per
+    # relationship (C3 spec 6.2 -- cessation/retraction reconciliation).
+    extraction_version: str = "2026-06-12-r2"
     model_hash: str = "gemma-4-e4b-q5-k-m-carteakey-full-v1"
 
     # Auto-RAG configuration
@@ -668,7 +670,7 @@ class KnowledgeConfig:
             ontology_version=os.getenv("ONTOLOGY_VERSION", "1.2.1"),
             enable_versioning=os.getenv("ENABLE_VERSIONING", "true").lower() == "true",
             enable_provenance=os.getenv("ENABLE_PROVENANCE", "true").lower() == "true",
-            extraction_version=os.getenv("EXTRACTION_VERSION", "2026-06-12-r1"),
+            extraction_version=os.getenv("EXTRACTION_VERSION", "2026-06-12-r2"),
             model_hash=os.getenv("MIST_MODEL_HASH", "gemma-4-e4b-q5-k-m-carteakey-full-v1"),
             auto_inject_docs=os.getenv("AUTO_INJECT_DOCS", "true").lower() == "true",
             auto_inject_limit=int(os.getenv("AUTO_INJECT_LIMIT", "3")),

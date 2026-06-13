@@ -379,9 +379,9 @@ class TestRebuildDeterminismStamps:
 
         # ADR-010 example string -- matches vault writer's _EXTRACTION_VERSION
         # constant. When extraction prompts or ontology change, bump this.
-        # Bumped 2026-05-06 with ontology v1.1.0 + prompt Rules 14-15 + few-shot
-        # examples 15-19 covering the new mechanism/pattern/strategy predicates.
-        assert config.extraction_version == "2026-06-12-r1"
+        # Bumped 2026-06-12-r2 with the assertion_kind signal (C3 spec 6.2):
+        # every relationship now carries assert|cease|retract.
+        assert config.extraction_version == "2026-06-12-r2"
 
     def test_default_model_hash_matches_active_llm(self):
         from backend.knowledge.config import (
@@ -416,5 +416,5 @@ class TestRebuildDeterminismStamps:
         with _env(EXTRACTION_VERSION=None, MIST_MODEL_HASH=None):
             config = KnowledgeConfig.from_env()
 
-        assert config.extraction_version == "2026-06-12-r1"
+        assert config.extraction_version == "2026-06-12-r2"
         assert config.model_hash == "gemma-4-e4b-q5-k-m-carteakey-full-v1"

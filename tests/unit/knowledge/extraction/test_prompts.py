@@ -214,6 +214,23 @@ class TestDocumentEngagementRule:
         ), "Expected active-engagement few-shot using 'working through' verb"
 
 
+class TestAssertionKindSignal:
+    """C3 spec 6.2: prompt must emit an assertion_kind signal per relationship.
+
+    The reconciliation engine consumes assertion_kind to distinguish a fact
+    that began (assert) from one that stopped being true (cease) from one that
+    was never true (retract). Without the prompt teaching the field, a 4B model
+    omits it and reconciliation loses the cessation/retraction signal.
+    """
+
+    def test_prompt_emits_assertion_kind_in_schema(self):
+        assert '"assertion_kind"' in EXTRACTION_SYSTEM_PROMPT
+
+    def test_prompt_rule6_teaches_assertion_kind(self):
+        assert "cease" in EXTRACTION_SYSTEM_PROMPT
+        assert "retract" in EXTRACTION_SYSTEM_PROMPT
+
+
 class TestUserTemplate:
     """Cluster 1: user template must surface subject_scope to the model."""
 
@@ -255,8 +272,8 @@ class TestExtractionVersionDriftGuard:
     """
 
     # sha256(EXTRACTION_SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE) pinned for
-    # extraction_version = "2026-06-12-r1".
-    PINNED_SHA256 = "06a6f0a7ced948aa578745b5fba67a84f504185725f1fc81b8cbc1f0116bfc5a"
+    # extraction_version = "2026-06-12-r2".
+    PINNED_SHA256 = "834d81ac779cdb873b572b48b5018748007522dc7c2216d556719509b4e214d0"
 
     def test_prompt_content_matches_pinned_extraction_version(self):
         import hashlib
@@ -277,5 +294,5 @@ class TestExtractionVersionDriftGuard:
         from backend.knowledge.config import KnowledgeConfig
         from backend.vault.writer import _EXTRACTION_VERSION
 
-        assert KnowledgeConfig.extraction_version == "2026-06-12-r1"
-        assert _EXTRACTION_VERSION == "2026-06-12-r1"
+        assert KnowledgeConfig.extraction_version == "2026-06-12-r2"
+        assert _EXTRACTION_VERSION == "2026-06-12-r2"
