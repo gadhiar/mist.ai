@@ -250,6 +250,24 @@ class TestRecommendsHabitDateRules:
         assert "do NOT create a Date entity" in EXTRACTION_SYSTEM_PROMPT
 
 
+class TestR4PrecisionRules:
+    """C3 prompt r4: two GENERALIZABLE precision rules closing genuine
+    extraction errors surfaced in the r3 Phase C per-probe diagnostics.
+
+    Edit A tightens the HAS_HABIT clause (Rule 17): a continuous "since
+    <date>" stative is NOT a recurrence, so it must route to the matching
+    stative predicate (EXPERT_IN / LEARNING / INTERESTED_IN) with valid_from,
+    not HAS_HABIT. Edit B adds Rule 18: a trailing prepositional phrase that
+    merely scopes another fact is context, not a separate structural edge.
+    """
+
+    def test_prompt_requires_recurrence_cadence_for_has_habit(self):
+        assert "requires an explicit recurrence cadence" in EXTRACTION_SYSTEM_PROMPT
+
+    def test_prompt_forbids_prepositional_over_extraction(self):
+        assert "Extract the asserted fact, not incidental scope" in EXTRACTION_SYSTEM_PROMPT
+
+
 class TestUserTemplate:
     """Cluster 1: user template must surface subject_scope to the model."""
 
@@ -291,8 +309,8 @@ class TestExtractionVersionDriftGuard:
     """
 
     # sha256(EXTRACTION_SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE) pinned for
-    # extraction_version = "2026-06-12-r3".
-    PINNED_SHA256 = "0bf29300616a489594420bc5290e857b04b1d9ddcd7624e86b3e61b3252cc3d6"
+    # extraction_version = "2026-06-12-r4".
+    PINNED_SHA256 = "38f379f757f40f69e8da583cb6b5342fb8bf5015e512c98ddc38e50f853092a8"
 
     def test_prompt_content_matches_pinned_extraction_version(self):
         import hashlib
@@ -313,5 +331,5 @@ class TestExtractionVersionDriftGuard:
         from backend.knowledge.config import KnowledgeConfig
         from backend.vault.writer import _EXTRACTION_VERSION
 
-        assert KnowledgeConfig.extraction_version == "2026-06-12-r3"
-        assert _EXTRACTION_VERSION == "2026-06-12-r3"
+        assert KnowledgeConfig.extraction_version == "2026-06-12-r4"
+        assert _EXTRACTION_VERSION == "2026-06-12-r4"

@@ -52,7 +52,7 @@ _PROVENANCE_HEADING_RE = re.compile(r"(?im)^##\s+Provenance\s*$")
 # VaultConfig only). Keep in lockstep with backend/knowledge/config.py --
 # TestExtractionVersionDriftGuard pins the prompt<->version pairing.
 _ONTOLOGY_VERSION = "1.3.0"
-_EXTRACTION_VERSION = "2026-06-12-r3"
+_EXTRACTION_VERSION = "2026-06-12-r4"
 
 
 def _session_id_from_path(path: Path) -> str:

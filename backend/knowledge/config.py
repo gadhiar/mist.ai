@@ -613,7 +613,9 @@ class KnowledgeConfig:
     # relationship (C3 spec 6.2 -- cessation/retraction reconciliation).
     # 2026-06-12-r3: RECOMMENDS / HAS_HABIT predicates (ontology v1.3.0) plus
     # date-entity discrimination (Rules 16-17, Examples 23-24).
-    extraction_version: str = "2026-06-12-r3"
+    # 2026-06-12-r4: precision rules -- HAS_HABIT recurrence-cadence tightening
+    # (Rule 17) + no prepositional over-extraction (Rule 18).
+    extraction_version: str = "2026-06-12-r4"
     model_hash: str = "gemma-4-e4b-q5-k-m-carteakey-full-v1"
 
     # Auto-RAG configuration
@@ -672,7 +674,7 @@ class KnowledgeConfig:
             ontology_version=os.getenv("ONTOLOGY_VERSION", "1.3.0"),
             enable_versioning=os.getenv("ENABLE_VERSIONING", "true").lower() == "true",
             enable_provenance=os.getenv("ENABLE_PROVENANCE", "true").lower() == "true",
-            extraction_version=os.getenv("EXTRACTION_VERSION", "2026-06-12-r3"),
+            extraction_version=os.getenv("EXTRACTION_VERSION", "2026-06-12-r4"),
             model_hash=os.getenv("MIST_MODEL_HASH", "gemma-4-e4b-q5-k-m-carteakey-full-v1"),
             auto_inject_docs=os.getenv("AUTO_INJECT_DOCS", "true").lower() == "true",
             auto_inject_limit=int(os.getenv("AUTO_INJECT_LIMIT", "3")),
