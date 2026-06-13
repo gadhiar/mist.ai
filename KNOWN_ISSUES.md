@@ -2,7 +2,7 @@
 
 **Created:** 2026-03-22
 **Source:** Comprehensive 8-agent backend audit (6 sectional + integration + fix rounds)
-**Last Updated:** 2026-06-12 (deep-review drift sweep: 3 items closed)
+**Last Updated:** 2026-06-13 (C3 close-out: 2 production-reproducibility findings added)
 
 > This file tracks unresolved issues found during the pre-Phase-2 audit.
 > Items here are P3 (maintenance risk) -- not blocking, but should be
@@ -45,6 +45,40 @@ from the active sweep because they sat in the Wave-2 forbidden zone
   `backend/knowledge/storage/vector_store.py`,
   `backend/knowledge/config.py`, and
   `backend/knowledge/extraction/prompts.py` few-shot examples.
+
+---
+
+## Production Reproducibility (2026-06-13, C3 determinism work)
+
+Surfaced while root-causing F2 eval non-reproducibility for the C3
+extraction-accuracy sub-project. NOT blocking: production extraction is
+deterministic for a fixed prompt, and these affect eval replays / prompt
+iteration rather than runtime behavior. Recorded so the F2 measurement
+constraints are not relearned later.
+
+- [ ] **Flash-attention non-determinism on long / high-entropy generations.**
+  With `LLAMA_ARG_FLASH_ATTN=on`, llama.cpp's flash-attention kernel uses a
+  non-associative floating-point reduction whose order is not fixed across
+  runs, so near-tie argmax can flip even at temperature 0. Short, structured
+  extraction calls are stable, so extraction QUALITY is unaffected; but
+  full-chat eval replays (long greedy conversational generations) are
+  non-reproducible -- this is why F2 is measured via the extraction-only
+  harness (`mist_admin replay --extraction-only`) rather than full chat. It
+  also introduces ~+/-0.02 of cross-prompt-version drift on near-tie
+  extraction probes, which caps how finely prompt iteration can move a
+  boundary gate (prompt-byte changes reshuffle the near-tie probes). Not a
+  MIST-code bug; an inference-stack property. Production extraction remains
+  deterministic for a fixed prompt. Fix would require deterministic-reduction
+  flash-attn or disabling flash-attn for eval at a throughput cost; deferred.
+
+- [ ] **Tool-schema enum set-ordering non-determinism (chat tool defs).** The
+  enum member set in the chat tool definitions is built from an unordered
+  collection, so its serialization order varies by process. The eval harness
+  masks this with `PYTHONHASHSEED=0`, but production does not pin the seed, so
+  the rendered tool schema (and thus the exact prompt bytes) is not
+  byte-reproducible across restarts. Latent prompt-reproducibility bug; no
+  behavioral impact observed. Real fix: sort the enum members at schema-build
+  time so ordering is deterministic without relying on `PYTHONHASHSEED`.
 
 ---
 

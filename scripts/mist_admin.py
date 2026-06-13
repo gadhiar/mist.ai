@@ -623,10 +623,12 @@ async def run_extraction_only(
        it inline here emits the identical `extraction.ontology` /
        `extraction.scope_classifier` `llm_call` debug records (via the
        instrumented provider) that `score_extraction_run.py` consumes.
-    4. Drain any in-flight background extraction the pipeline itself spawned
-       (`_drain_extraction_tasks`) so `asyncio.run` closing the loop cannot
-       cancel a graph write mid commit-protocol -- the same drain `run_chat`
-       performs.
+    4. Drain step (`_drain_extraction_tasks`) for defensive symmetry with
+       `run_chat`. The current production extraction pipeline does not spawn
+       registry-tracked background tasks -- the inline `_extract_knowledge_async`
+       await above does the work -- so on the real path this drain finds
+       nothing. It is kept as parity in case the pipeline later spawns
+       background tasks; it is not load-bearing here.
 
     The 60-probe gold corpus is single-utterance and self-contained (no prior
     turns), so an empty `conversation_history` is the faithful extraction input.
@@ -680,8 +682,12 @@ async def run_extraction_only(
             recorded_at=recorded_at,
         )
 
-        # Drain any background extraction tasks the pipeline spawned so the
-        # surrounding asyncio.run does not cancel a graph write mid-flight.
+        # Defensive symmetry with run_chat: drain any background extraction
+        # tasks the pipeline may have registered before asyncio.run closes the
+        # loop. The current production extraction pipeline does not spawn
+        # registry tasks -- the inline await above does the work -- so on the
+        # real path this drain finds nothing. Kept for parity in case the
+        # pipeline later spawns background tasks; not load-bearing here.
         await handler._drain_extraction_tasks(session_id=session_id)
 
         extraction_duration_ms = (time.time() - start) * 1000
@@ -694,7 +700,11 @@ async def run_extraction_only(
             "extraction_duration_ms": extraction_duration_ms,
             "event_id": event_id,
         }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
+        # Intentional batch-isolation boundary: one probe's failure is
+        # captured as ok=False so run_extraction_only_replay continues the
+        # batch rather than aborting. Consistent with the failure-isolation
+        # boundaries in run_replay / _extract_knowledge_async.
         extraction_duration_ms = (time.time() - start) * 1000
         return {
             "utterance": utterance,
