@@ -45,6 +45,29 @@ class AssertionKind(StrEnum):
     RETRACT = "retract"
 
 
+def derive_assertion_kind(rel: dict[str, Any]) -> tuple[AssertionKind, bool]:
+    """Single source of truth for assertion-kind derivation: (kind, past_mapped).
+
+    Explicit field wins -- rel-level first, then properties, case-insensitive --
+    INCLUDING explicit 'assert' (the past-tense mapping below must not coerce a
+    deliberately asserted past-tense EVENT). The interim past->CEASE mapping
+    applies only when the payload carried no parseable explicit kind (pre-r2
+    log events, parse drops). Consumed by EdgeAssertion.from_rel_dict, the
+    intra-turn sort key, and the F2 scorer -- change it in one place only.
+    """
+    props = rel.get("properties") or {}
+    raw = rel.get("assertion_kind") or props.get("assertion_kind")
+    if raw is not None:
+        try:
+            return AssertionKind(str(raw).lower()), False
+        except ValueError:
+            pass  # invalid explicit value: treat as absent
+    temporal_status = str(props.get("temporal_status") or rel.get("temporal_status") or "current")
+    if temporal_status == "past" and not props.get("end_date"):
+        return AssertionKind.CEASE, True
+    return AssertionKind.ASSERT, False
+
+
 class ActionKind(StrEnum):
     """Planner output vocabulary; the adapter maps each to Cypher."""
 
@@ -88,28 +111,15 @@ class EdgeAssertion:
         source, target = rel.get("source", ""), rel.get("target", "")
         if not defn.directional and target < source:
             source, target = target, source
-        raw_kind = str(rel.get("assertion_kind") or props.get("assertion_kind") or "assert")
-        try:
-            kind = AssertionKind(raw_kind.lower())
-        except ValueError:
-            kind = AssertionKind.ASSERT  # deterministic fallback, never destructive
+        # Derivation + interim past-tense mapping live in derive_assertion_kind
+        # (the single source of truth shared with the intra-turn sort and the
+        # F2 scorer). The past->CEASE coercion fires only for payloads with no
+        # explicit kind -- an explicit 'assert' on a past-tense EVENT must
+        # accumulate, not be coerced to CEASE and flagged away (C3 gate).
+        kind, past_mapped = derive_assertion_kind(rel)
         temporal_status = str(
             props.get("temporal_status") or rel.get("temporal_status") or "current"
         )
-        # Interim pre-C3 past-tense mapping: the extraction prompt routes
-        # cessation through temporal_status ('don't use anymore' -> past) and
-        # the temporal resolver fills end_date for only ~a dozen patterns, so
-        # a bare past-tense fact would otherwise mint an OPEN current belief
-        # (or REINFORCE the belief the user just said ended), and a same-turn
-        # SINGLE pair ('left Titan, joined Acme') would supersede backwards.
-        # CEASE closes overlapping open same-fact priors at recorded_at and
-        # never touches other targets, mirroring the backfill's past->closed
-        # semantics so live writes and migration agree. C3's assertion_kind
-        # signal supersedes this mapping.
-        past_mapped = False
-        if kind is AssertionKind.ASSERT and temporal_status == "past" and not props.get("end_date"):
-            kind = AssertionKind.CEASE
-            past_mapped = True
         return cls(
             source=source,
             predicate=rel.get("type", ""),

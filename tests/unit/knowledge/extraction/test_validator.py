@@ -1195,6 +1195,43 @@ class TestValidatorOntologyConsistency:
         assert drift == [], "Validator-ontology drift:\n  " + "\n  ".join(drift)
 
 
+class TestAssertionKindStrip:
+    """C3: a bad assertion_kind must not cost us the relationship -- strip it
+    (properties AND top level) so the reconciliation planner's absent-kind
+    derivation applies, and keep the edge. A valid kind passes through
+    untouched so the engine's explicit-kind gate can read it.
+    """
+
+    def test_invalid_assertion_kind_stripped_not_dropped(self):
+        # Arrange
+        validator = ExtractionValidator()
+        rel = _make_relationship()
+        rel["properties"]["assertion_kind"] = "negate"
+        rel["assertion_kind"] = "negate"
+        extraction = _make_extraction(relationships=[rel])
+
+        # Act
+        result = validator.validate(extraction)
+
+        # Assert -- relationship survives; bad kind stripped from both levels
+        assert len(result.relationships) == 1
+        assert "assertion_kind" not in result.relationships[0]["properties"]
+        assert "assertion_kind" not in result.relationships[0]
+
+    def test_valid_assertion_kind_passes_through(self):
+        # Arrange
+        validator = ExtractionValidator()
+        rel = _make_relationship()
+        rel["properties"]["assertion_kind"] = "cease"
+        extraction = _make_extraction(relationships=[rel])
+
+        # Act
+        result = validator.validate(extraction)
+
+        # Assert
+        assert result.relationships[0]["properties"]["assertion_kind"] == "cease"
+
+
 class TestConstraintsDerivedFromOntology:
     """Inv-A6: the validator's constraint table is derived, not hand-copied."""
 

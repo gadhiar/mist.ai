@@ -3,7 +3,13 @@
 import pytest
 
 from backend.knowledge.curation.graph_writer import RebuildStamps
-from backend.knowledge.curation.reconciliation import ReconciliationEngine
+from backend.knowledge.curation.reconciliation import (
+    AssertionKind,
+    EdgeAssertion,
+    ReconciliationEngine,
+    derive_assertion_kind,
+)
+from backend.knowledge.ontologies import EDGE_TYPES_BY_NAME
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
 
 STAMPS = RebuildStamps(ontology_version="1.2.0", extraction_version="v-test", model_hash="m-test")
@@ -577,3 +583,52 @@ class TestClampedCopyTemporalStatus:
         opens = [p for _, p in appends if p["valid_to"] is None]
         assert copies and copies[0]["temporal_status"] == "past"
         assert opens and opens[0]["temporal_status"] == "current"
+
+
+class TestExplicitKindGate:
+    """C3: the interim past->CEASE mapping must apply only when the payload
+    carried no explicit assertion_kind (pre-r2 events, parse drops). An
+    explicit 'assert' on a past-tense EVENT must stay ASSERT so the engine
+    accumulates it instead of coercing to CEASE and flagging it away.
+    """
+
+    USES = EDGE_TYPES_BY_NAME["USES"]
+
+    def test_explicit_assert_suppresses_past_mapping(self):
+        # Explicit assertion_kind='assert' + temporal_status='past' + no
+        # end_date must stay ASSERT (past-tense EVENTs accumulate; coercion to
+        # CEASE would FLAG_AMBIGUOUS and write nothing).
+        rel = _rel(props={"temporal_status": "past", "assertion_kind": "assert"})
+        a = EdgeAssertion.from_rel_dict(rel, self.USES)
+        assert a.assertion_kind is AssertionKind.ASSERT
+        assert a.past_mapped is False
+
+    def test_absent_kind_past_still_maps_to_cease(self):
+        # Pre-r2 payloads (no explicit kind) keep the interim past->CEASE map.
+        rel = _rel(props={"temporal_status": "past"})
+        a = EdgeAssertion.from_rel_dict(rel, self.USES)
+        assert a.assertion_kind is AssertionKind.CEASE
+        assert a.past_mapped is True
+
+    def test_derive_assertion_kind_is_engine_truth(self):
+        # The pure function and from_rel_dict agree on explicit/absent/case/
+        # fallback. derive_assertion_kind reads rel-level first, then
+        # properties, case-insensitive, including explicit 'assert'.
+        cases = [
+            ({"assertion_kind": "Cease", "properties": {}}, AssertionKind.CEASE, False),
+            ({"properties": {"assertion_kind": "retract"}}, AssertionKind.RETRACT, False),
+            ({"properties": {"temporal_status": "past"}}, AssertionKind.CEASE, True),
+            (
+                {"properties": {"temporal_status": "past", "end_date": "2026-01-01"}},
+                AssertionKind.ASSERT,
+                False,
+            ),
+            (
+                {"properties": {"assertion_kind": "bogus", "temporal_status": "past"}},
+                AssertionKind.CEASE,
+                True,
+            ),
+            ({"temporal_status": "past", "properties": {}}, AssertionKind.CEASE, True),
+        ]
+        for rel, kind, mapped in cases:
+            assert derive_assertion_kind(rel) == (kind, mapped)

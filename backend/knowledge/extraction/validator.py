@@ -66,6 +66,11 @@ RELATIONSHIP_CONSTRAINTS: dict[str, tuple[set[str] | None, set[str] | None]] = (
 
 VALID_TEMPORAL_STATUSES: set[str] = {"current", "past", "future", "recurring"}
 
+# C3 extraction signal: the only assertion-kind values the reconciliation
+# planner understands. An out-of-vocabulary value is stripped (not dropped)
+# so the planner's absent-kind derivation applies and the edge survives.
+_ASSERTION_KINDS: frozenset[str] = frozenset({"assert", "cease", "retract"})
+
 
 class ExtractionValidator:
     """Validates extraction results against ontology constraints.
@@ -237,6 +242,16 @@ class ExtractionValidator:
                     f"{source} -[{rel_type}]-> {target}, cleared to null"
                 )
                 props["temporal_status"] = None
+
+            # Strip an out-of-vocabulary assertion_kind from BOTH levels (the
+            # planner's derive_assertion_kind reads rel-level first, then
+            # properties): leaving a bad value would defeat the absent-kind
+            # past-tense mapping. Strip, never drop -- the edge is still valid.
+            for holder in (props, rel):
+                ak = holder.get("assertion_kind")
+                if ak is not None and str(ak).lower() not in _ASSERTION_KINDS:
+                    logger.debug("Stripping invalid assertion_kind %r on %s", ak, rel.get("type"))
+                    holder.pop("assertion_kind", None)
 
             valid_relationships.append(rel)
 
