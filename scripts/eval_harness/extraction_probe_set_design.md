@@ -133,10 +133,11 @@ for exactly this reason (root cause: conversational-temperature contamination of
 the extraction input, compounded by RAG over the per-turn-accumulating graph).
 
 To make F2 replays reproducible, pin the WHOLE chain greedy plus a stable hash
-seed on BOTH the seed and the replay exec:
+seed AND a fixed clock on BOTH the seed and the replay exec:
 
 ```
--e LLM_TEMPERATURE=0.0 -e LLM_CONVERSATION_TEMPERATURE=0.0 -e PYTHONHASHSEED=0
+-e LLM_TEMPERATURE=0.0 -e LLM_CONVERSATION_TEMPERATURE=0.0 -e PYTHONHASHSEED=0 \
+-e MIST_FIXED_CLOCK=2026-06-13T00:00:00+00:00
 ```
 
 `PYTHONHASHSEED=0` neutralizes a secondary set-ordering nondeterminism observed
@@ -145,6 +146,19 @@ between runs). NOTE: that enum-ordering flip is a latent PRODUCTION bug in the
 tool-schema serialization (non-deterministic iteration over a set/dict feeding
 the schema), tracked separately -- `PYTHONHASHSEED=0` masks it for reproducible
 evals but does not fix the underlying ordering instability.
+
+`MIST_FIXED_CLOCK` (added 2026-06-13, commit `3ca09e4`) pins the wall-clock
+`rendered_at` that the seed bootstrap stamps into `users/<id>.md`. That
+Provenance timestamp is read into the chat system prompt (always-inject curated
+profile); an unpinned wall-clock value made the turn-1 chat prompt differ
+between runs, perturbing the greedy reply and diverging the conversation history
+from turn 2 on. Set it to any single ISO-8601 instant -- the only requirement is
+that BOTH replays in a determinism pair use the SAME value. It MUST be passed on
+the `seed` exec (the seed writes the prompt-facing note) as well as the `replay`
+exec (the handler's C-pattern snapshot writeback and currency-filter `$now`).
+Unset in production -> live wall-clock (behavior unchanged). The clock is
+injected via DI (`ConversationHandler.now_fn`, wired in
+`backend.factories.build_now_fn`); it is not a monkeypatch.
 
 Caveat: production chat runs at conversation temp 0.7. This procedure measures
 extraction accuracy over a DETERMINISTIC (temperature-0 / mode) assistant
@@ -163,6 +177,7 @@ MSYS_NO_PATHCONV=1 docker compose exec -T \
   -e EVENT_STORE_DB_PATH=/app/data/eval-run/event_store.db \
   -e MIST_VAULT_ROOT=/app/data/eval-run/vault \
   -e LLM_TEMPERATURE=0.0 -e LLM_CONVERSATION_TEMPERATURE=0.0 -e PYTHONHASHSEED=0 \
+  -e MIST_FIXED_CLOCK=2026-06-13T00:00:00+00:00 \
   mist-backend python scripts/mist_admin.py seed
 
 # 2. Replay the gold corpus, emitting the extraction debug log
@@ -172,6 +187,7 @@ MSYS_NO_PATHCONV=1 docker compose exec -T \
   -e EVENT_STORE_DB_PATH=/app/data/eval-run/event_store.db \
   -e MIST_VAULT_ROOT=/app/data/eval-run/vault \
   -e LLM_TEMPERATURE=0.0 -e LLM_CONVERSATION_TEMPERATURE=0.0 -e PYTHONHASHSEED=0 \
+  -e MIST_FIXED_CLOCK=2026-06-13T00:00:00+00:00 \
   -e MIST_DEBUG_JSONL=/app/data/runtime/extraction-baseline.jsonl -e MIST_DEBUG_LLM_JSONL=1 \
   mist-backend python scripts/mist_admin.py replay \
   data/ingest/extraction-gold-2026-06-10.jsonl --session-id ext-baseline
@@ -234,110 +250,152 @@ All gates pass at this corrected baseline -- C3's remaining tasks target
 further precision improvements, not gate recovery (12-record seed; expand
 toward 60-100 before treating gates as commitments).
 
-### Baseline results (60-probe corpus) -- BLOCKED: residual replay nondeterminism
+### Baseline results (60-probe corpus, 2026-06-13)
 
-C3 T3 Step 6 ran the pre-any-prompt-change replay twice on the expanded
-60-probe corpus to pin replay determinism (the precondition that justifies
-every later single-run C3 gate). The determinism check ran in two rounds; it is
-NOT yet green.
+Status: the MIST chain is now REPRODUCIBLE (the clock fix landed). Byte-identical
+extraction scores remain gated by ONE irreducible source outside MIST's code --
+llama-server flash-attention floating-point nondeterminism at greedy decoding.
+The baseline below is therefore a tight reference BAND (two runs, deltas <= 0.032
+on every metric), not a single byte-stable point. Read it as the C3 no-regression
+floor with that band as its measurement noise.
 
-**Round 1 (LLM_TEMPERATURE=0.0 only):** two replays diverged on 20/60 probes.
-Root-causing by call_site (comparing request/response bytes) showed
-`extraction.scope_classifier` was already deterministic, but `chat.initial`
-(production conversation temperature 0.7, stochastic) varied, and since the
-extraction prompt's `Context:` block embeds the assistant reply, the (greedy)
-extraction input varied with it. Root cause: conversational-temperature
-contamination of the extraction input. Fix: pin the whole chain greedy --
-`LLM_TEMPERATURE=0.0 LLM_CONVERSATION_TEMPERATURE=0.0 PYTHONHASHSEED=0` on both
-seed and replay (now mandated in "How to run" above).
+**What the clock fix achieved (commit `3ca09e4`).** The 2026-06-12 determinism
+check diverged on 20/60 probes because a wall-clock `rendered_at` stamped into
+the seeded `users/<id>.md` Provenance block reached the chat system prompt (the
+always-inject curated profile), differing run-to-run and perturbing the turn-1
+greedy reply, which then propagated through conversation history. The fix injects
+a clock via DI (`ConversationHandler.now_fn` + `VaultWriter.upsert_user/
+upsert_identity/upsert_user_snapshot` accepting `rendered_at`, threaded from the
+seed bootstrap; env seam `MIST_FIXED_CLOCK`, see "How to run"). Verified:
+- Cheap seed check: two pinned seeds produce BYTE-IDENTICAL `users/user.md` and
+  `identity/mist.md`.
+- Turn-1 isolation: with the clock pinned, the turn-1 `chat.initial` REQUEST is
+  byte-identical across runs (the `rendered_at` line now reads the fixed
+  `2026-06-13T00:00:00+00:00` in both). The prompt-facing nondeterminism is gone.
 
-**Round 2 (full greedy chain pinned):** re-ran the two replays on fresh
-isolated quads each (sessions `ext-c3-det1` / `ext-c3-det2`, both
-`LLM_TEMPERATURE=0.0 LLM_CONVERSATION_TEMPERATURE=0.0 PYTHONHASHSEED=0`), scored
-WITHOUT `--strict`, and diffed the score JSONs on aggregate metrics AND
-`per_probe` FP/FN arrays. STILL NOT IDENTICAL -- 20/60 per-probe rows differ.
-Artifacts: `data/runtime/extraction-c3-det{1,2}.jsonl` + `-report.md` + `.json`.
-
-| Metric | det1 | det2 | identical? |
-|---|---|---|---|
-| Matched probes | 60/60 | 60/60 | yes |
-| Entity precision | 0.713 | 0.761 | NO |
-| Entity recall | 0.864 | 0.890 | NO |
-| Relationship precision | 0.605 | 0.696 | NO |
-| Relationship recall | 0.730 | 0.762 | NO |
-| Typing accuracy | 0.776 | 0.870 | NO |
-| RELATED_TO rate | 0.013 | 0.015 | NO |
-| Valid-time accuracy | 0.875 | 0.875 | yes |
-| Negative-control violations | 2 | 2 | yes |
-
-Reconciliation-action accuracy: SKIPPED (requires C2 telemetry).
-
-**Residual root cause (localized, NOT the LLM sampler).** Per-call_site
-request/response byte comparison across det1/det2:
+**Residual source (localized, IS the LLM sampler -- not MIST code).** Two full
+60-probe replays on fresh isolated quads (sessions `ext-c3-d1` / `ext-c3-d2`,
+`LLM_TEMPERATURE=0.0 LLM_CONVERSATION_TEMPERATURE=0.0 PYTHONHASHSEED=0
+MIST_FIXED_CLOCK=2026-06-13T00:00:00+00:00`), scored WITHOUT `--strict`. Still
+diverge on 18/60 per-probe rows. Per-call_site request/response byte comparison:
 
 | call_site | n | request identical | response identical |
 |---|---|---|---|
 | extraction.scope_classifier | 60 | 60/60 | 60/60 |
-| chat.initial | 60 | 0/60 | 3/60 |
-| extraction.ontology | 60 | 0/60 | 27/60 |
-| chat.final | 4 | 0/4 | 0/4 |
+| chat.initial | 60 | 1/60 | 0/60 |
+| extraction.ontology | 60 | 0/60 | 0/60 |
+| chat.final | 6 | 0/6 | 0/6 |
 
-`chat.initial` requests differ 0/60 -- the chat INPUT is non-reproducible, so
-greedy decoding cannot save it. Diffing the turn-1 `chat.initial` request (no
-graph accumulation yet) isolates the SOLE differing line to a wall-clock
-timestamp embedded in the chat system prompt's user-snapshot block:
+The turn-1 `chat.initial` REQUEST is now identical (the 1/60) -- the clock fix
+worked. But its RESPONSE differs even at temperature 0.0: identical 2738-token
+prompt, different greedy continuation (d1 "high-concurrency services / systems-
+level tooling", 203 tokens; d2 "API services / embedded systems / CLI tools",
+256 tokens). From turn 2 on, the diverged reply rides in conversation history, so
+later `chat.initial` requests differ too. Confirmed by diffing the turn-1
+`extraction.ontology` request: it differs in EXACTLY the two lines carrying the
+embedded `[assistant]:` reply -- every downstream divergence traces back to the
+LLM's non-deterministic greedy output, nothing else.
 
-```
-## Provenance
-- rendered_at: 2026-06-13T03:20:11.109426+00:00   (det1)
-- rendered_at: 2026-06-13T03:46:09.679254+00:00   (det2)
-```
+Direct confirmation it is the inference engine, not MIST: sending the byte-
+identical turn-1 prompt to `mist-llm` 3x at `temperature 0.0, seed 3407` produced
+2 distinct outputs of 3. The seed is irrelevant at greedy (argmax does not
+sample), so this is logit-level FP nondeterminism, not RNG. Root cause:
+`LLAMA_ARG_FLASH_ATTN=on` -- the CUDA flash-attention kernel uses non-
+deterministic floating-point reduction order, so logits vary at the bit level and
+a near-tie argmax occasionally flips, cascading into a different continuation. It
+is INTERMITTENT (most calls are stable; a 4x repeat may or may not catch it) and
+scales with sequence length, which is why the short `extraction.scope_classifier`
+calls are 60/60 stable while the long 2700+-token `chat.initial` calls are not.
 
-Source: `backend/chat/conversation_handler.py:2079-2080` supplies
-`rendered_at = datetime.now(UTC).isoformat()` to `query_user_snapshot`, which
-renders it into the prompt (`backend/vault/user_snapshot.py:115`). That one
-differing token perturbs turn-1's greedy chat reply (det1 emits an extra
-sentence; det2 truncates earlier); the differing reply enters turn-2's
-conversation history, so from turn 2 on the histories have permanently diverged
-(the turn-2+ "residual" differences are that turn-1 reply sentence propagating
-through history). Confirmed: stripping `rendered_at` from turn 1 makes it
-byte-identical; the 59 later-turn residuals are all downstream of the single
-turn-1 perturbation. Temperature was verified `0.0` on `chat.initial` in both
-runs, so the env fix worked -- it is necessary but not sufficient.
+**Reference band (the C3 regression floor).** Artifacts:
+`data/runtime/extraction-c3-d{1,2}.{jsonl,json}` + `-report.md`. The d1 column is
+the recorded reference; d2 shows the band. k/n shown for d1.
 
-`user_snapshot.py:41` even documents `rendered_at` as "caller-supplied for
-determinism in tests", but the production caller passes live wall-clock time.
+| Metric | d1 | d2 | delta | k/n (d1) | Gate | d1 Pass |
+|---|---|---|---|---|---|---|
+| Matched probes | 60/60 | 60/60 | - | 60/60 | == total | PASS |
+| Entity precision | 0.741 | 0.750 | 0.009 | 100/135 | >= 0.90 | FAIL |
+| Entity recall | 0.847 | 0.864 | 0.017 | 100/118 | >= 0.80 | PASS |
+| Relationship precision | 0.687 | 0.662 | 0.025 | 46/67 | >= 0.90 | FAIL |
+| Relationship recall | 0.730 | 0.714 | 0.016 | 46/63 | >= 0.80 | FAIL |
+| Typing accuracy | 0.806 | 0.838 | 0.032 | 54/67 | >= 0.90 | FAIL |
+| RELATED_TO rate | 0.000 | 0.000 | 0.000 | 0/67 | <= 0.10 | PASS |
+| Valid-time accuracy | 0.875 | 0.875 | 0.000 | 14/16 | (tracked) | - |
+| Negative-control violations | 1 | 1 | 0 | 1 | == 0 | FAIL |
 
-**Fix required before this baseline can be certified (NOT done in T3 -- out of
-scope, it touches the chat/vault production path):** make the chat-path
-`rendered_at` reproducible for replays -- e.g. derive it from a fixed
-replay reference_date / event timestamp rather than `datetime.now()`, or omit
-the provenance timestamp from the prompt-facing snapshot. Once that lands,
-re-run det1/det2 and confirm the score JSONs are byte-identical, THEN record the
-certified 60-probe baseline + per-category breakdown here.
+Reconciliation-action accuracy: SKIPPED (requires C2 telemetry).
 
-Secondary finding (tool-schema enum ordering): `PYTHONHASHSEED=0` was added to
-neutralize a set-ordering nondeterminism in the chat tool-schema enum
-serialization (a `display_hint` enum order flipped between unseeded runs). With
-the seed pinned, `extraction.scope_classifier` is now 60/60 byte-identical, so
-the seed did its job. The underlying unordered-iteration in the tool-schema
-serialization is a latent PRODUCTION reproducibility bug tracked separately --
-NOT fixed in T3.
+(k/n: entity P denominator = produced entities, recall denominator = gold
+entities; rel analogous; typing = correctly-typed of produced-and-matched rels;
+RELATED_TO = default-predicate edges of produced rels; valid-time = correct of
+date-bearing probes.)
 
-Deliberate-gap note (valid in both rounds): the RECOMMENDS gold edges (ext-31,
-ext-32) and HAS_HABIT gold edges (ext-55, ext-56, ext-57) are EXPECTED
-relationship false-negatives until the ontology gains those predicates at T10;
-both runs show them as FNs (model substitutes wrong predicates). Measured on
-purpose; T10 recovers it. Negative-control violations in the round-2 runs were
-ext-38 (question-form "What's the best way to learn a new language?" -- Gemma
-mined comprehensible-input / language-acquisition entities) and ext-39
-(hypothetical Berlin/German) -- real Rule-8/Rule-10 model misses the negative
-controls exist to catch, candidates for C3 prompt tuning.
+Reading: these are below-gate on entity/rel precision, rel recall, and typing --
+expected. This is the FLOOR the remaining C3 tasks improve, not a gate-passing
+result (the gates are provisional until C3 tuning + corpus expansion; see "Metrics
++ provisional gates"). The band (max delta 0.032) is small enough that the
+direction of each gap is unambiguous despite the LLM noise.
 
-Per-category FP/FN breakdown is omitted because det1/det2 disagree on the
-per-probe diagnostics; recording one run's table would imply a stability the
-data does not have. Add it once replay determinism is fixed and a single
-canonical run is reproducible.
+**Per-category FP/FN breakdown (d1).** From the `per_probe` diagnostics. Counts
+are absolute FP/FN tallies summed within the category.
+
+| Category | n | entity FP | entity FN | rel FP | rel FN |
+|---|---|---|---|---|---|
+| Core user facts | 10 | 2 | 0 | 2 | 2 |
+| Events + dates | 5 | 3 | 2 | 4 | 3 |
+| Quantified | 3 | 4 | 3 | 1 | 1 |
+| Skill state | 5 | 1 | 1 | 0 | 0 |
+| Third-party | 5 | 4 | 2 | 7 | 5 |
+| Valid-time | 5 | 4 | 0 | 0 | 0 |
+| Negative controls | 6 | 3 | 0 | 1 | 0 |
+| Structural | 3 | 4 | 4 | 1 | 1 |
+| Cessation | 5 | 1 | 0 | 0 | 0 |
+| Retraction | 5 | 0 | 2 | 0 | 1 |
+| Same-turn pair | 2 | 1 | 0 | 0 | 0 |
+| Habit / recurrence | 3 | 5 | 3 | 4 | 3 |
+| Date-discrimination | 3 | 3 | 1 | 1 | 1 |
+
+The category tallies sit ON the noise band -- a probe whose chat reply flipped
+between d1 and d2 can shift its own category's FP/FN by a count or two. Treat the
+shape (which categories carry the load: Third-party rel FP/FN, Habit/recurrence,
+Structural entity FN) as directional, not the exact integers.
+
+Deliberate-gap note: the RECOMMENDS gold edges (ext-31, ext-32) and HAS_HABIT
+gold edges (ext-55, ext-56, ext-57) are EXPECTED relationship false-negatives
+until the ontology gains those predicates at T10 (they sit inside the Third-party
+rel-FN and Habit/recurrence rows above). Measured on purpose; T10 recovers them.
+Do not read those FNs as an extraction-quality regression.
+
+Negative-control note: d1 shows 1 negative-control violation (a real Rule-8/
+Rule-10 model miss where Gemma mined entities from a directive/question/
+hypothetical control). This is a C3 PROMPT-TUNING target, not a determinism
+issue -- both runs are at 1, and the violation is the negative controls doing
+their job. (The prior 2026-06-12 pinned run showed 2; the candidates were ext-38
+question-form and ext-39 hypothetical.)
+
+Secondary finding (tool-schema enum ordering): `PYTHONHASHSEED=0` neutralizes a
+set-ordering nondeterminism in the chat tool-schema enum serialization (a
+`display_hint` enum order flipped between unseeded runs). With the seed pinned,
+`extraction.scope_classifier` is 60/60 byte-identical. The underlying unordered-
+iteration in the tool-schema serialization is a latent PRODUCTION reproducibility
+bug tracked separately -- masked here, not fixed.
+
+**Path to a byte-stable single-run baseline (infra, out of scope for the clock
+fix).** The clock fix is the complete CODE-side fix; the residual is an inference-
+engine property. To get det1 == det2 byte-for-byte, one of:
+1. Restart `mist-llm` with `LLAMA_ARG_FLASH_ATTN=off` for eval runs. Trade-off:
+   the baseline would then measure extraction over a flash-attn-OFF assistant
+   context, which is NOT production (production runs flash-attn ON), and CUDA non-
+   flash attention is itself not guaranteed bit-reproducible. Needs validation.
+2. Run extraction-eval LLM calls on a CPU/deterministic-kernel build for the
+   baseline (slow, but bit-stable).
+3. Accept the band: gate on the d1/d2 envelope (e.g. require both runs above the
+   floor) rather than a single byte-identical number. The band is tight (<= 0.032)
+   and the gap directions are unambiguous, so this is defensible for a regression
+   floor.
+None of these is a DI/code change, so they are deferred to an infra decision. The
+clock fix (this task) removed the only MIST-code nondeterminism source; the chain
+is reproducible up to the LLM sampler.
 
 ### Superseded baseline (2026-06-10, pre-correction corpus -- NON-COMPARABLE)
 
@@ -347,16 +405,17 @@ history only; the entity-precision FAIL and typing FAIL were measured against
 anchor-less gold labels and the pre-C1 hardcoded constraint table.
 
 ## Known limitations
-- BLOCKER (C3 T3): replay is not yet reproducible. Pinning the full greedy chain
-  (`LLM_TEMPERATURE=0.0 LLM_CONVERSATION_TEMPERATURE=0.0 PYTHONHASHSEED=0`) fixed
-  the conversational-temperature contamination, but a RESIDUAL blocker remains: a
-  wall-clock `rendered_at` timestamp injected into the chat system prompt
-  (`backend/chat/conversation_handler.py:2079`) perturbs the turn-1 greedy chat
-  reply, which propagates through conversation history into the extraction
-  inputs -- two replays still diverge on 20/60 probes (see "Baseline results").
-  No single run is a certified regression floor until the chat-path timestamp is
-  made replay-reproducible (out of T3 scope; touches the chat/vault production
-  path). Every later single-run C3 gate depends on fixing it first.
+- MIST-code replay reproducibility is DONE (commit `3ca09e4`): the full greedy
+  chain pin (`LLM_TEMPERATURE=0.0 LLM_CONVERSATION_TEMPERATURE=0.0
+  PYTHONHASHSEED=0`) plus the injected fixed clock (`MIST_FIXED_CLOCK`) make the
+  chat PROMPT byte-reproducible (verified: turn-1 `chat.initial` request identical
+  across runs; seeded `users/user.md` byte-identical). RESIDUAL (NOT a code/DI
+  source, deferred to an infra decision): llama-server flash-attention FP
+  nondeterminism makes greedy decoding non-bit-reproducible at temperature 0.0,
+  so two full replays still diverge on 18/60 probes -- a TIGHT band (deltas <=
+  0.032), not a divergent floor. The baseline is recorded as that band; a byte-
+  stable single run needs `LLAMA_ARG_FLASH_ATTN=off` or a deterministic-kernel
+  eval build (see "Baseline results -> Path to a byte-stable single-run baseline").
 - 60-record corpus (C3 T3): per-category mass is now meaningful (5-10 probes in
   most categories), but several categories are still small (same-turn pair = 2,
   quantified/structural/habit/date-discrimination = 3). Treat per-category
