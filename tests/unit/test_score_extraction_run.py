@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS = _REPO_ROOT / "scripts"
 if str(_SCRIPTS) not in sys.path:
@@ -64,6 +66,74 @@ class TestIterGoldProbes:
             target="rust",
             target_type="Technology",
         )
+
+    def test_gold_loader_accepts_assertion_kind(self, tmp_path):
+        line = (
+            '{"utterance": "I stopped using X", "tag": "t-cease", '
+            '"expected_entities": [{"id": "user", "type": "User"}], '
+            '"expected_relationships": [{"source": "user", "source_type": "User", '
+            '"predicate": "USES", "target": "x", "target_type": "Technology", '
+            '"assertion_kind": "cease", "valid_to": "2025-03"}]}'
+        )
+        path = tmp_path / "gold.jsonl"
+        path.write_text(line, encoding="utf-8")
+        probes = iter_gold_probes(path)
+        rel = probes[0].relationships[0]
+        assert rel.assertion_kind == "cease"
+        assert rel.valid_to == "2025-03"
+
+    def test_gold_loader_defaults_assertion_kind_to_assert(self, tmp_path):
+        # A relationship with no assertion_kind field defaults to "assert".
+        p = tmp_path / "gold.jsonl"
+        p.write_text(
+            json.dumps(
+                {
+                    "utterance": "I use Rust",
+                    "tag": "t-assert-default",
+                    "expected_entities": [{"id": "rust", "type": "Technology"}],
+                    "expected_relationships": [
+                        {
+                            "source": "user",
+                            "source_type": "User",
+                            "predicate": "USES",
+                            "target": "rust",
+                            "target_type": "Technology",
+                        }
+                    ],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        probes = iter_gold_probes(p)
+        assert probes[0].relationships[0].assertion_kind == "assert"
+
+    def test_gold_loader_rejects_unknown_assertion_kind(self, tmp_path):
+        # An invalid assertion_kind must fail loudly, naming the probe tag.
+        p = tmp_path / "gold.jsonl"
+        p.write_text(
+            json.dumps(
+                {
+                    "utterance": "I use Rust",
+                    "tag": "t-bad-kind",
+                    "expected_entities": [{"id": "rust", "type": "Technology"}],
+                    "expected_relationships": [
+                        {
+                            "source": "user",
+                            "source_type": "User",
+                            "predicate": "USES",
+                            "target": "rust",
+                            "target_type": "Technology",
+                            "assertion_kind": "bogus",
+                        }
+                    ],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="t-bad-kind"):
+            iter_gold_probes(p)
 
 
 class TestParseProduced:
@@ -276,6 +346,38 @@ class TestScoreRun:
         assert row["entity_fps"] == [["cargo", "Technology"]]
         assert row["entity_fns"] == [["rust", "Technology"]]
         assert row["rel_fps"] == [["user", "USES", "cargo"]]
+        assert row["rel_fns"] == [["user", "USES", "rust"]]
+
+    def test_per_probe_unmatched_reports_no_fps_full_gold_fns(self):
+        """An UNMATCHED probe must report empty FP lists and full-gold FN lists.
+
+        Pins the unmatched branch (T2): a probe with no produced extraction
+        cannot have false positives, and every gold entity/relationship is a
+        false negative.
+        """
+        probe = GoldProbe(
+            tag="t-unmatched",
+            utterance="never produced",
+            entities=(
+                GoldEntity(id="user", type="User"),
+                GoldEntity(id="rust", type="Technology"),
+            ),
+            relationships=(
+                GoldRel(
+                    source="user",
+                    source_type="User",
+                    predicate="USES",
+                    target="rust",
+                    target_type="Technology",
+                ),
+            ),
+        )
+        report = score_run([probe], {})
+        row = report.per_probe[0]
+        assert row["matched"] is False
+        assert row["entity_fps"] == []
+        assert row["rel_fps"] == []
+        assert row["entity_fns"] == [["rust", "Technology"], ["user", "User"]]
         assert row["rel_fns"] == [["user", "USES", "rust"]]
 
 

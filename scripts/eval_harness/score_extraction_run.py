@@ -65,9 +65,19 @@ class GoldEntity:
     type: str
 
 
+VALID_ASSERTION_KINDS = ("assert", "cease", "retract")
+
+
 @dataclass(frozen=True, slots=True)
 class GoldRel:
-    """A gold-labeled relationship with optional valid-time bounds."""
+    """A gold-labeled relationship with optional valid-time bounds.
+
+    `assertion_kind` records the temporal-assertion semantics of the gold edge:
+    `assert` (default) states the fact holds, `cease` states it stopped holding
+    (optionally bounded by `valid_to`), `retract` states it was never true.
+    Bucket scoring on this label lands in a later C3 task; the loader validates
+    it here so an unknown value fails loudly at corpus-author time.
+    """
 
     source: str
     source_type: str
@@ -76,6 +86,7 @@ class GoldRel:
     target_type: str
     valid_from: str | None = None
     valid_to: str | None = None
+    assertion_kind: str = "assert"
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +125,7 @@ def iter_gold_probes(path: Path) -> list[GoldProbe]:
                 GoldEntity(id=canonical_id(e["id"]), type=e["type"])
                 for e in obj.get("expected_entities", [])
             )
+            tag = obj.get("tag", f"probe-{line_no}")
             rels = tuple(
                 GoldRel(
                     source=canonical_id(r["source"]),
@@ -123,12 +135,19 @@ def iter_gold_probes(path: Path) -> list[GoldProbe]:
                     target_type=r["target_type"],
                     valid_from=r.get("valid_from"),
                     valid_to=r.get("valid_to"),
+                    assertion_kind=str(r.get("assertion_kind", "assert")),
                 )
                 for r in obj.get("expected_relationships", [])
             )
+            for rel in rels:
+                if rel.assertion_kind not in VALID_ASSERTION_KINDS:
+                    raise ValueError(
+                        f"{tag}: invalid assertion_kind {rel.assertion_kind!r} "
+                        f"(expected one of {VALID_ASSERTION_KINDS})"
+                    )
             probes.append(
                 GoldProbe(
-                    tag=obj.get("tag", f"probe-{line_no}"),
+                    tag=tag,
                     utterance=obj["utterance"],
                     entities=entities,
                     relationships=rels,
