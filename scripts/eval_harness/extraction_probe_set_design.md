@@ -86,39 +86,55 @@ MSYS_NO_PATHCONV=1 docker compose exec -T mist-backend python scripts/eval_harne
 docker compose -f docker-compose.yml -f docker-compose.eval-neo4j.yml --profile eval rm -sfv mist-neo4j-eval
 ```
 
-## Baseline results (2026-06-10)
+## Baseline results (2026-06-12, corrected corpus)
 
-**[2026-06-12 CORRECTION -- deep review foundation-f123-3] The numbers below
-are NON-COMPARABLE against the corrected corpus.** The original gold labels
-omitted the prompt-mandated `user` anchor entity (Extraction Rule 1) on the 8
-user-scope probes, so a contract-COMPLIANT extraction scored one guaranteed
-entity false positive per probe: entity precision 0.652 = 15/23 is exactly 15
-TP + 8 anchor FPs. The "extractor over-produces entities" diagnosis below is
-a harness artifact -- artifact-corrected entity precision on this run is
-~1.000, so TYPING (0.833) and relationship precision (0.750), not entity
-precision, are the real C3 targets. The corpus now lists the `user` anchor on
-ext-01/02/03/04/06/07/08/09; ext-04's `user EXPERIENCED team-offsite` anchor
-EDGE remains intentionally unlabeled (the probe scores the
-date-anchoring shape, not the anchor edge). Re-run this baseline procedure
-against the corrected corpus at C3 kickoff and replace the table below; the
-C1/C2 no-regression reference must also re-baseline.
+Re-baseline executed 2026-06-12 at C3 kickoff per the deep-review correction
+(foundation-f123-3): the original gold labels omitted the prompt-mandated
+`user` anchor entity (Extraction Rule 1) on the 8 user-scope probes
+(ext-01/02/03/04/06/07/08/09), so the 2026-06-10 run's entity precision 0.652
+was a harness artifact (15 TP + 8 guaranteed anchor FPs). ext-04's
+`user EXPERIENCED team-offsite` anchor EDGE remains intentionally unlabeled
+(the probe scores the date-anchoring shape, not the anchor edge). All
+pre-correction numbers are NON-COMPARABLE; this table is the C3
+no-regression reference.
 
-Gemma 4 E4B Q5_K_M, ontology v1.1.0, seed graph, isolated quad (eval Neo4j + throwaway trio). All 12 probes matched in the debug log; every probe produced an extraction record.
+Gemma 4 E4B Q5_K_M, ontology v1.2.1, main @ de5e566, seed graph, isolated
+quad (eval Neo4j + throwaway trio). All 12 probes matched in the debug log;
+every probe produced an extraction record. Run artifacts:
+`data/runtime/extraction-rebaseline-2026-06-12.jsonl` + `-report.md`.
 
 | Metric | Value | Gate | Pass |
 |---|---|---|---|
-| Entity precision | 0.652 | >= 0.90 | FAIL |
-| Entity recall | 1.000 | >= 0.80 | PASS |
-| Relationship precision | 0.750 | >= 0.90 | FAIL |
-| Relationship recall | 0.818 | >= 0.80 | PASS |
-| Typing accuracy | 0.833 | >= 0.90 | FAIL |
-| RELATED_TO rate | 0.000 | <= 0.10 | PASS |
+| Entity precision | 0.957 | >= 0.90 | PASS |
+| Entity recall | 0.957 | >= 0.80 | PASS |
+| Relationship precision | 0.833 | >= 0.90 | FAIL |
+| Relationship recall | 0.909 | >= 0.80 | PASS |
+| Typing accuracy | 1.000 | >= 0.90 | PASS |
+| RELATED_TO rate | 0.083 | <= 0.10 | PASS |
 | Valid-time accuracy | 1.000 | (tracked) | - |
 | Negative-control violations | 0 | == 0 | PASS |
 
 Reconciliation-action accuracy: SKIPPED (requires C2 telemetry).
 
-Reading: recall and negative-control discipline are already strong -- entity recall 1.000, relationship recall 0.818, 0/2 negative-control violations, and RELATED_TO rate 0.000 (the v1.1.0 ontology expansion eliminated the default-predicate problem). The open gap is precision: entity precision 0.652 and relationship precision 0.750 mean the extractor over-produces (correct facts plus extras), and typing accuracy 0.833 means roughly 1 in 6 produced relationships is constraint-invalid. Precision and typing are the targets for C1 (ontology / decomposition) and C3 (extraction accuracy). The provisional gates are intentionally unmet at baseline -- this is the regression-signal floor the canonical-graph work improves on, not a release gate (12-record seed; expand toward 60-100 before treating gates as commitments).
+Reading: 7 of 8 gates pass at baseline. The artifact correction confirmed
+entity precision was never the problem (0.957), and typing accuracy moved
+0.833 -> 1.000 between the 2026-06-10 run (ontology v1.1.0, hardcoded
+constraints) and this run (v1.2.1, ontology-derived RELATIONSHIP_CONSTRAINTS
+via C1). The single open gap -- and C3's primary lever -- is relationship
+precision 0.833 (the extractor produces correct facts plus extra
+relationships). RELATED_TO rate moved 0.000 -> 0.083 (one default-predicate
+edge on this run); below gate but worth watching at corpus expansion.
+Strict-mode exit is non-zero on the relationship-precision gate alone --
+expected at baseline; this is the regression-signal floor C3 improves on,
+not a release gate (12-record seed; expand toward 60-100 before treating
+gates as commitments).
+
+### Superseded baseline (2026-06-10, pre-correction corpus -- NON-COMPARABLE)
+
+Entity P 0.652 / R 1.000, rel P 0.750 / R 0.818, typing 0.833, RELATED_TO
+0.000, valid-time 1.000, 0 negative violations. Ontology v1.1.0. Retained for
+history only; the entity-precision FAIL and typing FAIL were measured against
+anchor-less gold labels and the pre-C1 hardcoded constraint table.
 
 ## Known limitations
 - ~12-record seed: regression signal, not statistical certification of 0.90. Expand toward 60-100 (per-category) before treating gates as commitments.
