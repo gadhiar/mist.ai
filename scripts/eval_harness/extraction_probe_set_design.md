@@ -432,6 +432,73 @@ reflects the 18 assert-gold rel-FNs already in the floor's rel-recall, not a
 bucket-specific miss. T5 (prompt emits explicit `assertion_kind`) is measured
 against exactly these three rows.
 
+### Phase B checkpoint (prompt r2) -- assertion_kind buckets on the r2 prompt
+
+Phase B (the `assertion_kind` signal: extraction prompt r2 emitting the field
+explicitly + engine gate + bucket scoring + same-turn arbitration) is committed
+(branch `feat/subproject-a-c3-extraction-accuracy` @ `3162927`, the r2 prompt
+commit region). Re-measurement of the SAME deterministic extraction-only 60-probe
+F2 instrument on the r2 prompt. Two replays on FRESH isolated quads (sessions
+`ext-c3-phb-d1` / `ext-c3-phb-d2`, distinct throwaway trios + a fresh
+`mist-neo4j-eval` instance each; full pin `LLM_TEMPERATURE=0.0
+LLM_CONVERSATION_TEMPERATURE=0.0 PYTHONHASHSEED=0
+MIST_FIXED_CLOCK=2026-06-13T00:00:00+00:00` + `--extraction-only`), scored
+WITHOUT `--strict`.
+
+**Determinism still holds on r2 (kernel property unchanged by the prompt edit).**
+The two score JSONs are BYTE-IDENTICAL (SHA-256
+`8b257442222bf16362eec82e75ab3a4e7b80b3d02c645fbdde9ef5d6d473eea2` on both) on
+aggregate metrics AND the full 60-entry `per_probe` FP/FN arrays AND
+`assertion_kind_buckets`. The debug logs carry 60 `extraction.ontology` + 60
+`extraction.scope_classifier` records and ZERO `chat.*` records. Artifacts:
+`data/runtime/extraction-ext-c3-phb-d{1,2}.{jsonl,json}` + `-report.md`.
+
+Gemma 4 E4B Q5_K_M, ontology v1.2.1, seed graph, isolated quad. All 60 probes
+matched.
+
+| Metric | r2 | k/n (r2) | baseline | delta |
+|---|---|---|---|---|
+| Matched probes | 60/60 | 60/60 | 60/60 | 0 |
+| Entity precision | 0.795 | 101/127 | 0.769 | +0.026 |
+| Entity recall | 0.856 | 101/118 | 0.873 | -0.017 |
+| Relationship precision | 0.734 | 47/64 | 0.672 | +0.062 |
+| Relationship recall | 0.746 | 47/63 | 0.714 | +0.032 |
+| Typing accuracy | 0.828 | 53/64 | 0.761 | +0.067 |
+| RELATED_TO rate | 0.000 | 0/64 | 0.000 | 0 |
+| Valid-time accuracy | 0.875 | 7/8 | 0.875 | 0 |
+| Negative-control violations | 0 | 0 | 0 | 0 |
+
+(k/n: entity P denominator = produced entities, recall denominator = gold
+entities; rel analogous; typing = constraint-valid of produced rels; RELATED_TO
+= default-predicate edges of produced rels; valid-time = correct of date-bearing
+gold edges on matched probes.) No regressions: relationship precision and recall
+both up, no neg-control increase, no new RELATED_TO.
+
+**Assertion-kind buckets (r2).** Scored on the same certified extraction-only run
+(`ext-c3-phb-d1`; byte-identical on `d2`). Kind is whatever the engine derives
+via the shared `derive_assertion_kind` (anti-drift). On r2 the model emits
+`assertion_kind` explicitly inside `properties` -- all 12 found cease/retract
+edges carry the correct explicit label, so the kind is driven by the r2 signal,
+not the interim `temporal_status=past -> CEASE` mapping.
+
+| Kind | correct/found (r2) | found/gold_total (r2) | correct/found (baseline) | found/gold_total (baseline) |
+|---|---|---|---|---|
+| assert | 34/35 | 35/51 | 28/33 | 33/51 |
+| cease | 7/7 | 7/7 | 6/7 | 7/7 |
+| retract | 5/5 | 5/5 | 0/5 | 5/5 |
+
+Reading: `retract` moved OFF 0 to perfect (0/5 -> 5/5 correct) -- the r2 prompt
+labels "never actually / misspoke / scratch that / was wrong about / correction:"
+as `retract`, which the explicit-field branch of `derive_assertion_kind` then
+honors. `cease` strengthened to perfect (6/7 -> 7/7). `assert` improved (28/33
+-> 34/35 correct): the 5 pre-r2 present-tense-fact-mis-coerced-to-CEASE errors
+are gone; the single remaining mis-derivation is ext-35-validtime-until
+(`user -LEARNING-> go`), where the model emitted `assertion_kind=cease` +
+`temporal_status=past` + `end_date=2025-12-01` on a bounded "until" probe (read
+the stated end as a cessation). Every cease/retract/same-turn-pair gold edge is
+both extracted (rel-TP) and correctly kinded -- 0 NOT-FOUND, 0 MIS-KIND in those
+buckets. Determinism confirmed: both runs byte-identical (sha256 above).
+
 ### Full-chat reference band (60-probe corpus, 2026-06-13) -- NON-DETERMINISTIC, SUPERSEDED
 
 Superseded by the extraction-only baseline above (the authoritative C3 floor).
