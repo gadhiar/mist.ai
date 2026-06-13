@@ -4,6 +4,7 @@ import pytest
 
 from backend.knowledge.curation.graph_writer import RebuildStamps
 from backend.knowledge.curation.reconciliation import (
+    ActionKind,
     AssertionKind,
     EdgeAssertion,
     ReconciliationEngine,
@@ -572,6 +573,47 @@ class TestSameTurnSingleArbitration:
         same_fact_fetches = [params for query, params in conn.queries if "t.id = $target" in query]
         assert same_fact_fetches, "expected at least one same-fact fetch"
         assert same_fact_fetches[0]["target"] == "zeta"
+
+
+class TestLearningAbandonment:
+    """LEARNING abandonment closure (deep-review finding #1).
+
+    'I gave up on Haskell' -> LEARNING assertion_kind=cease closes the open
+    LEARNING(user, haskell) belief without requiring EXPERT_IN progression.
+    No engine change: CEASE is predicate-generic and LEARNING is MULTI/STATIVE,
+    so the static fake's canned same-fact prior suffices.
+    """
+
+    @pytest.mark.asyncio
+    async def test_learning_cease_closes_open_learning_belief(self):
+        # Explicit cease => past_mapped False => no past_tense_cease flag; the
+        # open prior exists => no cease_without_prior. The planner emits a
+        # CLOSE_TRANSACTION + APPEND_CLOSED_COPY pair, no FLAG_AMBIGUOUS.
+        prior = _belief_row(edge_ref="ref-learning", target="haskell")
+        conn = FakeNeo4jConnection(query_responses={"t.id = $target": [prior]})
+
+        result = await _engine(conn).reconcile_turn(
+            [
+                _rel(
+                    predicate="LEARNING",
+                    target="haskell",
+                    props={"assertion_kind": "cease", "temporal_status": "past"},
+                )
+            ],
+            recorded_at=RECORDED_AT,
+            event_id="e1",
+            session_id="s1",
+        )
+
+        kinds = {act.kind for act in result.actions}
+        assert ActionKind.APPEND_CLOSED_COPY in kinds
+        assert ActionKind.CLOSE_TRANSACTION in kinds
+        assert ActionKind.FLAG_AMBIGUOUS not in kinds
+        assert result.closed == 1
+        assert result.appended == 1  # the clamped copy, no open version
+        reasons = {act.reason for act in result.actions if act.kind is ActionKind.CLOSE_TRANSACTION}
+        assert reasons == {"cease"}  # explicit cease, not cease_past_tense
+        assert not result.flags
 
 
 class TestConfidenceForwarding:
