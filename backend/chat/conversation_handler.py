@@ -622,8 +622,9 @@ the excerpts already injected below:
   and the injected excerpts do not contain the answer
 - User references a note, decision, or session by name or date that
   the excerpts below do not cover
-- Prefer query_vault for narrative/prose recall; prefer
-  query_knowledge_graph for typed-fact or multi-hop questions
+- Do NOT use query_vault for recall of specific facts you stated
+  (decisions, names, tools, employers, dates) -- those are typed facts;
+  use query_knowledge_graph. query_vault is for narrative/prose recall.
 
 === TOOL USAGE INVARIANTS ===
 
@@ -643,6 +644,13 @@ When unsure whether a tool is warranted, ASK YOURSELF: does the answer depend on
 cannot give? If yes, call the right tool (typed facts -> graph;
 prose/history -> vault). If no, answer from prose or general
 knowledge.
+  Examples: "which database did I choose" -> query_knowledge_graph;
+  "who recommended FastAPI" -> query_knowledge_graph; "what did we
+  write in yesterday's session note" -> query_vault. Hedged or
+  temporal phrasings of a fact ("have I decided X yet", "did I
+  decide anything recently", "what was that tool I wanted to try
+  again", "am I on track with my goals") are still typed-fact
+  lookups -> query_knowledge_graph, NOT query_vault.
 
 Knowledge from conversations is captured automatically -- you do not
 need to extract it manually.

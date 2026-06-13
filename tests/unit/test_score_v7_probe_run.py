@@ -58,12 +58,20 @@ def build_probe(
     utterance: str = "What languages do I use?",
     expected_tool: str | None = "query_knowledge_graph",
     rationale: str | None = "test rationale",
+    acceptable_tools: tuple[str, ...] | None = None,
 ) -> V7Probe:
+    # The loader resolves acceptable_tools from the JSONL, defaulting to
+    # [expected_tool] when the field is absent. Mirror that here so a probe
+    # built without an explicit acceptable_tools still has the canonical tool
+    # in its acceptance set.
+    if acceptable_tools is None:
+        acceptable_tools = (expected_tool,) if expected_tool else ()
     return V7Probe(
         tag=tag,
         utterance=utterance,
         expected_tool=expected_tool,
         rationale=rationale,
+        acceptable_tools=acceptable_tools,
     )
 
 
@@ -471,6 +479,155 @@ class TestVerdict:
         probe = build_probe()
 
         assert verdict_for(probe, None) == "missing"
+
+
+# ---------------------------------------------------------------------------
+# acceptable_tools (T14): a probe may declare a set of acceptable tools.
+# Firing ANY member is a TP; expected_tool remains the canonical/preferred
+# tool for the canonical-vs-acceptable audit split.
+# ---------------------------------------------------------------------------
+
+
+class TestAcceptableTools:
+    """A probe's acceptable_tools set extends what counts as a true positive."""
+
+    def test_acceptable_tools_extends_expected(self):
+        # Arrange -- a dual-substrate probe accepts both tools; canonical is graph.
+        probe = build_probe(
+            expected_tool="query_knowledge_graph",
+            acceptable_tools=("query_knowledge_graph", "query_vault"),
+        )
+        obs = build_observation(tool_calls=("query_vault",))
+
+        # Act -- score through the public path so matched_via is populated.
+        report = score_run([probe], {probe.utterance: obs})
+        outcome = report.outcomes[0]
+
+        # Assert -- firing an acceptable (non-canonical) tool is a TP tagged
+        # "acceptable"; expected_tool is still the canonical/preferred tool.
+        assert outcome.verdict == "tp"
+        assert outcome.matched_via == "acceptable"
+
+    def test_canonical_tool_match_tagged_canonical(self):
+        # Arrange
+        probe = build_probe(
+            expected_tool="query_knowledge_graph",
+            acceptable_tools=("query_knowledge_graph", "query_vault"),
+        )
+        obs = build_observation(tool_calls=("query_knowledge_graph",))
+
+        # Act
+        report = score_run([probe], {probe.utterance: obs})
+        outcome = report.outcomes[0]
+
+        # Assert -- the preferred tool fired; matched_via is "canonical".
+        assert outcome.verdict == "tp"
+        assert outcome.matched_via == "canonical"
+
+    def test_tool_outside_acceptable_set_is_fn(self):
+        # Arrange -- a graph-only probe (acceptable defaults to [expected_tool]).
+        probe = build_probe(expected_tool="query_knowledge_graph")
+        obs = build_observation(tool_calls=("query_vault",))
+
+        # Act
+        report = score_run([probe], {probe.utterance: obs})
+        outcome = report.outcomes[0]
+
+        # Assert -- query_vault is not acceptable for a graph-only probe.
+        assert outcome.verdict == "fn"
+        assert outcome.matched_via is None
+
+    def test_verdict_for_uses_acceptable_set(self):
+        # Arrange -- verdict_for alone treats any acceptable tool as a TP.
+        probe = build_probe(
+            expected_tool="query_knowledge_graph",
+            acceptable_tools=("query_knowledge_graph", "query_vault"),
+        )
+        obs = build_observation(tool_calls=("query_vault",))
+
+        # Act + Assert
+        assert verdict_for(probe, obs) == "tp"
+
+    def test_matched_via_none_on_non_tp_outcomes(self):
+        # Arrange -- a negative probe that stays silent (tn) carries no match tag.
+        probe = build_probe(tag="v7-21-neg-x", expected_tool=None)
+        obs = build_observation(tool_calls=())
+
+        # Act
+        report = score_run([probe], {probe.utterance: obs})
+        outcome = report.outcomes[0]
+
+        # Assert
+        assert outcome.verdict == "tn"
+        assert outcome.matched_via is None
+
+
+class TestAcceptableToolsLoading:
+    """The loader resolves acceptable_tools from the JSONL expected_behavior."""
+
+    def test_loads_explicit_acceptable_tools(self, tmp_path):
+        # Arrange -- a probe declaring both tools as acceptable.
+        path = tmp_path / "v7.jsonl"
+        write_jsonl(
+            path,
+            [
+                {
+                    "utterance": "What did I say about coffee?",
+                    "tag": "v7-16-habit-preference",
+                    "expected_behavior": {
+                        "tool_call": "query_knowledge_graph",
+                        "acceptable_tools": ["query_knowledge_graph", "query_vault"],
+                        "rationale": "dual-substrate",
+                    },
+                }
+            ],
+        )
+
+        # Act
+        probes = list(iter_probes(path))
+
+        # Assert
+        assert probes[0].acceptable_tools == ("query_knowledge_graph", "query_vault")
+
+    def test_defaults_acceptable_to_expected_tool_when_absent(self, tmp_path):
+        # Arrange -- no acceptable_tools field; default is [expected_tool].
+        path = tmp_path / "v7.jsonl"
+        write_jsonl(
+            path,
+            [
+                {
+                    "utterance": "Which database did I choose?",
+                    "tag": "v7-02-direct-decision-recall",
+                    "expected_behavior": {"tool_call": "query_knowledge_graph"},
+                }
+            ],
+        )
+
+        # Act
+        probes = list(iter_probes(path))
+
+        # Assert
+        assert probes[0].acceptable_tools == ("query_knowledge_graph",)
+
+    def test_defaults_acceptable_to_empty_for_negative_probe(self, tmp_path):
+        # Arrange -- a negative probe has tool_call null and no acceptable set.
+        path = tmp_path / "v7.jsonl"
+        write_jsonl(
+            path,
+            [
+                {
+                    "utterance": "What is the capital of Australia?",
+                    "tag": "v7-21-neg-general-knowledge",
+                    "expected_behavior": {"tool_call": None},
+                }
+            ],
+        )
+
+        # Act
+        probes = list(iter_probes(path))
+
+        # Assert
+        assert probes[0].acceptable_tools == ()
 
 
 # ---------------------------------------------------------------------------

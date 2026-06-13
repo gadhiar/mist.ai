@@ -240,6 +240,69 @@ def test_static_template_describes_query_vault():
 
 
 # ---------------------------------------------------------------------------
+# Task 14 (C3): typed-fact routing guidance -- the query_vault block must carry
+# a hard exclusion for specific-fact recall, and the closing decision rule must
+# carry concrete routing examples. This pins the fix for the V7 recall
+# regression where the soft "prefer query_vault for narrative/prose" line let
+# Gemma 4 E4B route typed-fact recall (DECIDED / KNOWS_PERSON coref / USES) to
+# query_vault instead of query_knowledge_graph.
+# ---------------------------------------------------------------------------
+
+
+def test_static_template_query_vault_block_excludes_specific_fact_recall():
+    """The query_vault block must hard-exclude specific-fact recall.
+
+    The old soft-preference line ("Prefer query_vault for narrative/prose
+    recall") competed with the typed-fact routing rule and confused the 4B
+    model. It is replaced by an explicit do-NOT directive that names the
+    typed-fact categories (decisions, names, tools, employers, dates).
+    """
+    body = _STATIC_SYSTEM_TEMPLATE_BODY
+    assert "Do NOT use query_vault for recall of specific facts you stated" in body
+    assert "decisions, names, tools, employers, dates" in body
+    assert "query_vault is for narrative/prose recall" in body
+    # The replaced soft-preference phrasing must be gone (two competing
+    # phrasings confuse the model -- one directive only).
+    assert "Prefer query_vault for narrative/prose recall" not in body
+
+
+def test_static_template_decision_rule_has_routing_examples():
+    """The closing decision rule must carry concrete routing examples.
+
+    Three worked examples anchor the typed-fact -> graph / prose -> vault
+    split for a small model that reasons better from instances than from the
+    abstract rule alone.
+    """
+    body = _STATIC_SYSTEM_TEMPLATE_BODY
+    assert '"which database did I choose" -> query_knowledge_graph' in body
+    assert '"who recommended FastAPI" -> query_knowledge_graph' in body
+    assert '"what did we' in body and "session note" in body
+    # The examples sit AFTER the abstract decision rule, not before it.
+    rule_idx = body.lower().index("typed facts -> graph")
+    example_idx = body.index('"which database did I choose"')
+    assert example_idx > rule_idx
+
+
+def test_static_template_routes_hedged_temporal_phrasings_to_graph():
+    """Hedged / temporal fact phrasings must be pinned to query_knowledge_graph.
+
+    V7 stable misses (v7-08 / v7-11 / v7-17) were hedged decision/learning
+    recalls ("have I decided X yet", "did I decide anything recently", "what
+    was that tool I wanted to try again") that Gemma 4 E4B mis-routed to
+    query_vault because the phrasing superficially reads as history recall.
+    The example line names these forms as typed-fact lookups explicitly.
+    """
+    body = _STATIC_SYSTEM_TEMPLATE_BODY
+    assert "Hedged or" in body and "temporal phrasings of a fact" in body
+    assert "have I decided X yet" in body
+    assert "did I\n  decide anything recently" in body or "did I decide anything recently" in body
+    # The hedged guidance must close by routing to graph, not vault.
+    hedge_idx = body.index("Hedged or")
+    tail = body[hedge_idx:]
+    assert "query_knowledge_graph, NOT query_vault" in tail
+
+
+# ---------------------------------------------------------------------------
 # Task 13: query_knowledge_graph tool description assertions
 # ---------------------------------------------------------------------------
 

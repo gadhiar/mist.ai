@@ -58,12 +58,22 @@ NEGATIVE_TAG_INFIX = "-neg-"
 
 @dataclass(frozen=True, slots=True)
 class V7Probe:
-    """One probe row from data/ingest/v7-tool-heavy-inputs.jsonl."""
+    """One probe row from data/ingest/v7-tool-heavy-inputs.jsonl.
+
+    `expected_tool` is the canonical/preferred tool. `acceptable_tools` is the
+    full set of tools that count as a true positive when fired -- it always
+    includes `expected_tool` and may add others for genuinely dual-substrate
+    probes (a query whose phrasing routes one way but whose content is typed).
+    A frozen slotted dataclass cannot reference another field in a default, so
+    `acceptable_tools` defaults to the empty tuple here and is resolved (to
+    `[expected_tool]` when the JSONL omits it) in `iter_probes`.
+    """
 
     tag: str
     utterance: str
     expected_tool: str | None
     rationale: str | None
+    acceptable_tools: tuple[str, ...] = ()
 
     @property
     def is_negative(self) -> bool:
@@ -98,11 +108,19 @@ class TurnObservation:
 
 @dataclass(frozen=True, slots=True)
 class ProbeOutcome:
-    """A probe joined to its observation and its verdict."""
+    """A probe joined to its observation and its verdict.
+
+    `matched_via` is set only on true-positive outcomes: "canonical" when the
+    fired tool is the probe's `expected_tool`, "acceptable" when it is a
+    non-canonical member of `acceptable_tools`. It is None for every non-TP
+    verdict. This audit field lets a PASS stay inspectable -- a reviewer can
+    see how many TPs came from the preferred tool vs. a dual-acceptance fallback.
+    """
 
     probe: V7Probe
     observation: TurnObservation | None
     verdict: str  # one of: "tp" | "fn" | "tn" | "fp" | "missing"
+    matched_via: str | None = None  # "canonical" | "acceptable" | None
 
 
 @dataclass(slots=True)
@@ -125,6 +143,16 @@ class V7Report:
     def true_positives(self) -> int:
         """Count of probes that fired the expected tool."""
         return sum(1 for o in self.outcomes if o.verdict == "tp")
+
+    @property
+    def canonical_true_positives(self) -> int:
+        """TPs where the fired tool was the canonical/preferred expected_tool."""
+        return sum(1 for o in self.outcomes if o.matched_via == "canonical")
+
+    @property
+    def acceptable_true_positives(self) -> int:
+        """TPs where a non-canonical acceptable_tools member fired (dual-accept)."""
+        return sum(1 for o in self.outcomes if o.matched_via == "acceptable")
 
     @property
     def false_negatives(self) -> int:
@@ -188,11 +216,21 @@ def iter_probes(input_path: Path) -> Iterator[V7Probe]:
             except json.JSONDecodeError as exc:
                 raise ValueError(f"{input_path}:{line_num}: invalid JSON: {exc}") from exc
             expected_behavior = rec.get("expected_behavior") or {}
+            expected_tool = expected_behavior.get("tool_call")
+            # Resolve acceptable_tools here (the frozen+slots dataclass cannot
+            # default one field from another). When the JSONL omits the field,
+            # the acceptance set is exactly the canonical tool; a negative probe
+            # (tool_call null) gets an empty set.
+            acceptable = tuple(
+                expected_behavior.get("acceptable_tools")
+                or ([expected_tool] if expected_tool else [])
+            )
             yield V7Probe(
                 tag=rec.get("tag", ""),
                 utterance=rec.get("utterance", ""),
-                expected_tool=expected_behavior.get("tool_call"),
+                expected_tool=expected_tool,
                 rationale=expected_behavior.get("rationale"),
+                acceptable_tools=acceptable,
             )
 
 
@@ -264,13 +302,32 @@ def index_observations_by_utterance(
 
 
 def verdict_for(probe: V7Probe, observation: TurnObservation | None) -> str:
-    """Compute the verdict per design-doc semantics."""
+    """Compute the verdict per design-doc semantics.
+
+    For positive probes a true positive is firing ANY tool in
+    `acceptable_tools` (which always contains the canonical `expected_tool`);
+    anything else is a false negative. Negatives never reach the acceptance
+    branch -- they are TN when silent, FP when any tool fires.
+    """
     if observation is None:
         return "missing"
     actual = observation.first_tool_call
     if probe.is_negative:
         return "tn" if actual is None else "fp"
-    return "tp" if actual == probe.expected_tool else "fn"
+    return "tp" if actual in probe.acceptable_tools else "fn"
+
+
+def matched_via_for(probe: V7Probe, observation: TurnObservation | None) -> str | None:
+    """Classify a true-positive match as canonical or acceptable.
+
+    Returns "canonical" when the fired tool is the probe's preferred
+    `expected_tool`, "acceptable" when it is a non-canonical member of
+    `acceptable_tools`, and None when the outcome is not a true positive.
+    """
+    if verdict_for(probe, observation) != "tp":
+        return None
+    actual = observation.first_tool_call if observation else None
+    return "canonical" if actual == probe.expected_tool else "acceptable"
 
 
 def score_run(
@@ -286,6 +343,7 @@ def score_run(
                 probe=probe,
                 observation=obs,
                 verdict=verdict_for(probe, obs),
+                matched_via=matched_via_for(probe, obs),
             )
         )
     return V7Report(outcomes=outcomes)
@@ -320,6 +378,10 @@ def render_markdown(report: V7Report) -> str:
     lines.append(
         f"- Recall:    {report.recall:.3f}  "
         f"({report.true_positives} TP / {expected_pos_total} expected positives)"
+    )
+    lines.append(
+        f"- TP split:  {report.canonical_true_positives} canonical / "
+        f"{report.acceptable_true_positives} acceptable (dual-accept fallback)"
     )
     lines.append(
         f"- False positives on negatives: " f"{report.false_positives} / {len(report.negatives)}"
@@ -404,6 +466,8 @@ def render_json(report: V7Report) -> str:
             "precision": report.precision,
             "recall": report.recall,
             "false_positives_on_negatives": report.false_positives,
+            "canonical_true_positives": report.canonical_true_positives,
+            "acceptable_true_positives": report.acceptable_true_positives,
         },
         "acceptance": {
             "precision_threshold": PRECISION_THRESHOLD,
@@ -417,8 +481,10 @@ def render_json(report: V7Report) -> str:
                 "bucket": o.probe.bucket,
                 "is_negative": o.probe.is_negative,
                 "expected_tool": o.probe.expected_tool,
+                "acceptable_tools": list(o.probe.acceptable_tools),
                 "actual_tool": (o.observation.first_tool_call if o.observation else None),
                 "verdict": o.verdict,
+                "matched_via": o.matched_via,
                 "utterance": o.probe.utterance,
                 "session_id": (o.observation.session_id if o.observation else None),
                 "event_id": (o.observation.event_id if o.observation else None),
