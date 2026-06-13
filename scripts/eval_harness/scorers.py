@@ -120,6 +120,9 @@ EXTRACTABLE_RELATIONSHIP_TYPES: frozenset[str] = frozenset(
         "APPLICABLE_TO",
         "STRATEGY_FOR",
         "NAMING_CONVENTION_OF",
+        # v1.3.0 additive recommendation / habit (2).
+        "RECOMMENDS",
+        "HAS_HABIT",
     }
 )
 
