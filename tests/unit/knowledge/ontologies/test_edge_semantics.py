@@ -71,7 +71,7 @@ EXPECTED_PROGRESSION = {
 
 class TestSemanticsTable:
     def test_version_bumped(self):
-        assert ONTOLOGY_V1_0_0.version == "1.3.0"
+        assert ONTOLOGY_V1_0_0.version == "1.4.0"
 
     def test_name_index_covers_all_edges(self):
         assert set(EDGE_TYPES_BY_NAME) == {e.type_name for e in ONTOLOGY_V1_0_0.edge_types}

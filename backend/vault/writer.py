@@ -51,7 +51,7 @@ _PROVENANCE_HEADING_RE = re.compile(r"(?im)^##\s+Provenance\s*$")
 # Stamp mirrors of KnowledgeConfig defaults (the writer is wired with
 # VaultConfig only). Keep in lockstep with backend/knowledge/config.py --
 # TestExtractionVersionDriftGuard pins the prompt<->version pairing.
-_ONTOLOGY_VERSION = "1.3.0"
+_ONTOLOGY_VERSION = "1.4.0"
 _EXTRACTION_VERSION = "2026-06-12-r4"
 
 

@@ -29,13 +29,15 @@ from backend.knowledge.ontologies.v1_0_0 import (
 class TestEntityTypes:
     """Verify the complete set of entity types in the ontology."""
 
-    def test_has_31_entity_types(self):
+    def test_has_30_entity_types(self):
         # Cluster 8 Phase 6 (ADR-010) added VaultNote as a bridging/provenance type.
-        # Post-MVP additive (2026-04-22) added Date, Milestone, Metric, Document
-        # as EXTERNAL extractable types.
+        # Post-MVP additive (2026-04-22) added Date, Metric, Document
+        # as EXTERNAL extractable types (Milestone retired in v1.4.0).
         # v1.1.0 additive (2026-05-06) added Pattern, Convention, Mechanism,
         # Strategy, DataStructure as EXTERNAL extractable types.
-        assert len(ALL_NODE_TYPES) == 31
+        # v1.4.0 (2026-06-14): Topic and Milestone retired; Abstraction supertype
+        # added. Net change: -2 retired, +1 Abstraction = -1 total (31 -> 30).
+        assert len(ALL_NODE_TYPES) == 30
 
     @pytest.mark.parametrize(
         "type_name",
@@ -67,14 +69,15 @@ class TestEntityTypes:
             pytest.param("Skill", id="Skill"),
             pytest.param("Project", id="Project"),
             pytest.param("Concept", id="Concept"),
-            pytest.param("Topic", id="Topic"),
+            # Topic retired in v1.4.0 (merged to Concept); removed from this list.
             pytest.param("Event", id="Event"),
             pytest.param("Goal", id="Goal"),
             pytest.param("Preference", id="Preference"),
             pytest.param("Location", id="Location"),
             # Post-MVP additive (2026-04-22):
             pytest.param("Date", id="Date"),
-            pytest.param("Milestone", id="Milestone"),
+            # Milestone retired in v1.4.0 (demoted to Event event_type=milestone);
+            # removed from this list.
             pytest.param("Metric", id="Metric"),
             pytest.param("Document", id="Document"),
             # v1.1.0 additive (2026-05-06):
@@ -83,16 +86,19 @@ class TestEntityTypes:
             pytest.param("Mechanism", id="Mechanism"),
             pytest.param("Strategy", id="Strategy"),
             pytest.param("DataStructure", id="DataStructure"),
+            # v1.4.0 additive (2026-06-14): Abstraction supertype.
+            pytest.param("Abstraction", id="Abstraction"),
         ],
     )
-    def test_external_domain_has_21_types(self, type_name: str):
+    def test_external_domain_has_20_types(self, type_name: str):
+        # v1.4.0: Topic + Milestone retired (-2), Abstraction added (+1) = 20.
         external_types = [
             nt for nt in ALL_NODE_TYPES if nt.knowledge_domain == KnowledgeDomain.EXTERNAL
         ]
 
         external_names = [nt.type_name for nt in external_types]
 
-        assert len(external_types) == 21
+        assert len(external_types) == 20
         assert type_name in external_names
 
     @pytest.mark.parametrize(
@@ -144,6 +150,8 @@ class TestEntityTypes:
         # types plus MistIdentity.
         # Post-MVP additive (2026-04-22): 12 -> 16 external, 13 -> 17 extractable.
         # v1.1.0 additive (2026-05-06): 16 -> 21 external, 17 -> 22 extractable.
+        # v1.4.0 (2026-06-14): Topic + Milestone retired (-2), Abstraction added
+        # (+1): 21 -> 20 external, 22 -> 21 extractable.
         external_names = {
             nt.type_name for nt in ALL_NODE_TYPES if nt.knowledge_domain == KnowledgeDomain.EXTERNAL
         }
@@ -151,7 +159,7 @@ class TestEntityTypes:
 
         extractable_set = set(EXTRACTABLE_NODE_TYPES)
 
-        assert len(EXTRACTABLE_NODE_TYPES) == 22
+        assert len(EXTRACTABLE_NODE_TYPES) == 21
         assert extractable_set == expected
 
 
@@ -211,9 +219,11 @@ class TestNewNodeTypeInvariants:
     set so the LLM extractor sees it as a valid target.
 
     `expected_allowed_values` pins the enum vocabulary for properties that
-    restrict inputs (Milestone.significance, Document.doc_type). Silent
-    widening of these enums would break downstream normalization and
-    retrieval filters, so this test catches it.
+    restrict inputs (Document.doc_type). Silent widening of these enums would
+    break downstream normalization and retrieval filters, so this test catches it.
+
+    v1.4.0 (2026-06-14): Milestone retired (demoted to Event event_type=milestone)
+    and replaced in this fixture with Abstraction, the new EXTERNAL supertype.
     """
 
     @pytest.mark.parametrize(
@@ -226,12 +236,13 @@ class TestNewNodeTypeInvariants:
                 {},
                 id="Date",
             ),
+            # Milestone retired in v1.4.0; replaced here by Abstraction.
             pytest.param(
-                "MILESTONE",
+                "ABSTRACTION",
                 [],
-                ["significance"],
-                {"significance": ("high", "medium", "low")},
-                id="Milestone",
+                [],
+                {},
+                id="Abstraction",
             ),
             pytest.param(
                 "METRIC",
@@ -373,11 +384,13 @@ class TestConfidencePolicies:
 class TestOntologyVersion:
     """Verify the top-level ontology version metadata."""
 
-    def test_version_is_1_3_0(self):
-        # v1.3.0 additive (2026-06-13): RECOMMENDS + HAS_HABIT predicates;
-        # retired started/ended/duration universal relationship props.
-        assert ONTOLOGY_V1_0_0.version == "1.3.0"
-        assert ONTOLOGY_V1_0_0.parent_version == "1.2.1"
+    def test_version_is_1_4_0(self):
+        # v1.4.0 (2026-06-14): MECE taxonomy redesign -- Topic and Milestone
+        # retired, Abstraction supertype added with parent_type on seven abstract
+        # leaves. Build-time edge allowed-set transform adds Abstraction wherever
+        # Concept is allowed.
+        assert ONTOLOGY_V1_0_0.version == "1.4.0"
+        assert ONTOLOGY_V1_0_0.parent_version == "1.3.0"
 
     def test_vault_writer_ontology_version_paired(self):
         # The vault writer stamps _ONTOLOGY_VERSION into session-note

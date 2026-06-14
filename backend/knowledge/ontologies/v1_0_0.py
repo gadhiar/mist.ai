@@ -1973,9 +1973,15 @@ EXTRACTION_RULES = ExtractionRules(
 # ===================================================================
 
 ONTOLOGY_V1_0_0 = OntologyVersion(
-    version="1.3.0",
+    version="1.4.0",
     created_at=datetime(2026, 6, 10, tzinfo=UTC),
     description=(
+        "v1.4.0 (2026-06-14): MECE taxonomy redesign -- retired Topic (merged "
+        "to Concept) and Milestone (demoted to Event, event_type=milestone), "
+        "added the Abstraction supertype with parent_type on the seven abstract "
+        "leaves (Concept, Skill, Pattern, Strategy, Mechanism, Convention, "
+        "DataStructure), and a build-time edge allowed-set transform (Abstraction "
+        "added wherever Concept is allowed). "
         "Stable ontology for the MIST.AI knowledge graph. v1.1.0 additive "
         "expansion (2026-05-06): Pattern, Convention, Mechanism, Strategy, "
         "DataStructure entity types and MECHANISM_OF, OPERATES_ON, INPUT_TO, "
@@ -2004,8 +2010,8 @@ ONTOLOGY_V1_0_0 = OntologyVersion(
     ),
     universal_entity_properties=UNIVERSAL_ENTITY_PROPERTIES,
     universal_relationship_properties=UNIVERSAL_RELATIONSHIP_PROPERTIES,
-    parent_version="1.2.1",
-    migration_script_path=None,
+    parent_version="1.3.0",
+    migration_script_path="scripts/migrations/ontology_v1_4_0.py",
     active=True,
     deprecated=False,
     deprecated_reason=None,
