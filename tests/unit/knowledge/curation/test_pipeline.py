@@ -244,6 +244,181 @@ class TestEngineStage:
         assert belief_change_writes, "the belief-change LearningEvent must be written"
 
 
+class TestThirdPartyPenalty:
+    """_apply_third_party_penalty reduces confidence on Person/Organization-sourced facts."""
+
+    def _make_pipeline(self):
+
+        pipeline, _conn, _eng = _build_pipeline()
+        return pipeline
+
+    def test_person_sourced_fact_gets_penalty(self):
+        # Arrange -- anjali (Person) WORKS_AT google; base confidence 0.9
+        # CONFIDENCE_EXTERNAL.third_party_penalty = 0.15 -> expected 0.75
+        from backend.knowledge.ontologies.v1_0_0 import CONFIDENCE_EXTERNAL
+
+        pipeline = self._make_pipeline()
+        entities = [
+            make_entity_dict(entity_id="user", entity_type="User"),
+            make_entity_dict(entity_id="anjali", entity_type="Person", display_name="Anjali"),
+            make_entity_dict(entity_id="google", entity_type="Organization", display_name="Google"),
+        ]
+        relationships = [
+            make_relationship_dict(
+                source="anjali",
+                target="google",
+                rel_type="WORKS_AT",
+                properties={"confidence": 0.9},
+            ),
+        ]
+
+        # Act
+        result = pipeline._apply_third_party_penalty(relationships, entities)
+
+        # Assert
+        expected = 0.9 - CONFIDENCE_EXTERNAL.third_party_penalty
+        actual = result[0]["properties"]["confidence"]
+        assert abs(actual - expected) < 1e-9
+
+    def test_organization_sourced_fact_gets_penalty(self):
+        # Arrange -- Organization as source (structural edge like WORKS_WITH)
+        from backend.knowledge.ontologies.v1_0_0 import CONFIDENCE_EXTERNAL
+
+        pipeline = self._make_pipeline()
+        entities = [
+            make_entity_dict(entity_id="acme", entity_type="Organization", display_name="Acme"),
+            make_entity_dict(entity_id="python", entity_type="Technology", display_name="Python"),
+        ]
+        relationships = [
+            make_relationship_dict(
+                source="acme",
+                target="python",
+                rel_type="USES",
+                properties={"confidence": 0.85},
+            ),
+        ]
+
+        # Act
+        result = pipeline._apply_third_party_penalty(relationships, entities)
+
+        # Assert
+        expected = 0.85 - CONFIDENCE_EXTERNAL.third_party_penalty
+        actual = result[0]["properties"]["confidence"]
+        assert abs(actual - expected) < 1e-9
+
+    def test_user_sourced_fact_no_penalty(self):
+        # Arrange -- User as source; must never be penalized
+        pipeline = self._make_pipeline()
+        entities = [
+            make_entity_dict(entity_id="user", entity_type="User"),
+            make_entity_dict(entity_id="python", entity_type="Technology"),
+        ]
+        relationships = [
+            make_relationship_dict(
+                source="user",
+                target="python",
+                rel_type="USES",
+                properties={"confidence": 0.9},
+            ),
+        ]
+
+        # Act
+        result = pipeline._apply_third_party_penalty(relationships, entities)
+
+        # Assert -- returned as-is, no penalty
+        assert result[0]["properties"]["confidence"] == 0.9
+
+    def test_mixed_turn_only_third_party_relationships_penalized(self):
+        # Arrange -- one user-scoped and one third-party relationship in the same turn
+        from backend.knowledge.ontologies.v1_0_0 import CONFIDENCE_EXTERNAL
+
+        pipeline = self._make_pipeline()
+        entities = [
+            make_entity_dict(entity_id="user", entity_type="User"),
+            make_entity_dict(entity_id="sarah", entity_type="Person", display_name="Sarah"),
+            make_entity_dict(entity_id="rust", entity_type="Technology", display_name="Rust"),
+        ]
+        user_rel = make_relationship_dict(
+            source="user",
+            target="rust",
+            rel_type="USES",
+            properties={"confidence": 0.9},
+        )
+        third_party_rel = make_relationship_dict(
+            source="sarah",
+            target="rust",
+            rel_type="USES",
+            properties={"confidence": 0.9},
+        )
+
+        # Act
+        result = pipeline._apply_third_party_penalty([user_rel, third_party_rel], entities)
+
+        # Assert -- user rel unchanged; person rel penalized
+        assert result[0]["properties"]["confidence"] == 0.9
+        expected_penalized = 0.9 - CONFIDENCE_EXTERNAL.third_party_penalty
+        assert abs(result[1]["properties"]["confidence"] - expected_penalized) < 1e-9
+
+    def test_penalty_does_not_go_below_zero(self):
+        # Arrange -- very low base confidence that would go negative without clamping
+        pipeline = self._make_pipeline()
+        entities = [
+            make_entity_dict(entity_id="anjali", entity_type="Person"),
+            make_entity_dict(entity_id="google", entity_type="Organization"),
+        ]
+        relationships = [
+            make_relationship_dict(
+                source="anjali",
+                target="google",
+                rel_type="WORKS_AT",
+                properties={"confidence": 0.05},
+            ),
+        ]
+
+        # Act
+        result = pipeline._apply_third_party_penalty(relationships, entities)
+
+        # Assert -- clamped to 0.0 (never negative)
+        assert result[0]["properties"]["confidence"] >= 0.0
+
+    def test_relationship_without_properties_dict_handled(self):
+        # Arrange -- relationship dict carries no 'properties' key; default
+        # confidence 0.8 should be used, then penalized
+        from backend.knowledge.ontologies.v1_0_0 import CONFIDENCE_EXTERNAL
+
+        pipeline = self._make_pipeline()
+        entities = [
+            make_entity_dict(entity_id="anjali", entity_type="Person"),
+            make_entity_dict(entity_id="google", entity_type="Organization"),
+        ]
+        # No 'properties' key in the relationship
+        relationships = [
+            {
+                "source": "anjali",
+                "target": "google",
+                "type": "WORKS_AT",
+            }
+        ]
+
+        # Act
+        result = pipeline._apply_third_party_penalty(relationships, entities)
+
+        # Assert -- default 0.8 minus penalty
+        expected = 0.8 - CONFIDENCE_EXTERNAL.third_party_penalty
+        actual = result[0]["properties"]["confidence"]
+        assert abs(actual - expected) < 1e-9
+
+    def test_empty_relationships_returns_empty(self):
+        # Arrange
+        pipeline = self._make_pipeline()
+
+        # Act
+        result = pipeline._apply_third_party_penalty([], [])
+
+        # Assert
+        assert result == []
+
+
 class TestErrorHandling:
     @pytest.mark.asyncio
     async def test_dedup_failure_logs_and_continues(self):

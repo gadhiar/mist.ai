@@ -226,6 +226,7 @@ def build_curation_pipeline(
         graph_writer=CurationGraphWriter(
             executor, embedding_provider, confidence_mgr, rebuild_stamps=rebuild_stamps
         ),
+        confidence_manager=confidence_mgr,
     )
 
 

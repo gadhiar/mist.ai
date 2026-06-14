@@ -64,3 +64,31 @@ class ConfidenceManager:
             The KnowledgeDomain for the entity type.
         """
         return self._type_to_domain.get(entity_type, KnowledgeDomain.EXTERNAL)
+
+    def penalized_confidence(
+        self, base: float, domain: KnowledgeDomain, *, third_party: bool
+    ) -> float:
+        """Return base confidence reduced by the domain's third_party_penalty.
+
+        Called when a relationship's source entity is a non-user Person or
+        Organization (i.e. the fact describes a third party, not the primary
+        user). The penalty is read from the ConfidencePolicy for `domain` so
+        the curation layer carries no hardcoded constants.
+
+        When `third_party` is False the base is returned unchanged. Result is
+        clamped to [0.0, 1.0].
+
+        Args:
+            base: Incoming confidence value from the extractor (0.0 to 1.0).
+            domain: Knowledge domain of the relationship's source entity.
+            third_party: True when the relationship source is a non-user
+                Person or Organization.
+
+        Returns:
+            Confidence after applying (or not) the third-party penalty.
+        """
+        if not third_party:
+            return base
+        policy = self._policies.get(domain)
+        penalty = policy.third_party_penalty if policy else 0.0
+        return max(0.0, base - penalty)
