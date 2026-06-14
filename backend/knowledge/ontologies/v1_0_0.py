@@ -548,6 +548,7 @@ SKILL = NodeTypeDefinition(
     type_name="Skill",
     description="A skill or competency (technical, soft, domain, or methodological).",
     knowledge_domain=KnowledgeDomain.EXTERNAL,
+    parent_type="Abstraction",
     optional_properties=(
         PropertyDefinition(
             name="skill_category",
@@ -603,6 +604,7 @@ CONCEPT = NodeTypeDefinition(
     type_name="Concept",
     description="An abstract concept such as a methodology, pattern, principle, domain, or theory.",
     knowledge_domain=KnowledgeDomain.EXTERNAL,
+    parent_type="Abstraction",
     optional_properties=(
         PropertyDefinition(
             name="concept_category",
@@ -612,12 +614,6 @@ CONCEPT = NodeTypeDefinition(
             allowed_values=("methodology", "pattern", "principle", "domain", "theory"),
         ),
     ),
-)
-
-TOPIC = NodeTypeDefinition(
-    type_name="Topic",
-    description="A general topic of discussion or interest.",
-    knowledge_domain=KnowledgeDomain.EXTERNAL,
 )
 
 EVENT = NodeTypeDefinition(
@@ -650,6 +646,13 @@ EVENT = NodeTypeDefinition(
             type="string",
             required=False,
             description="Outcome or result of the event.",
+        ),
+        PropertyDefinition(
+            name="significance",
+            type="string",
+            required=False,
+            description="User-assigned importance (migrated from the retired Milestone type).",
+            allowed_values=("high", "medium", "low"),
         ),
     ),
 )
@@ -741,25 +744,6 @@ DATE = NodeTypeDefinition(
     ),
 )
 
-MILESTONE = NodeTypeDefinition(
-    type_name="Milestone",
-    description=(
-        "A discrete significant event in a user or project timeline. "
-        "Distinct from Event: a Milestone carries explicit user-assigned "
-        "importance and typically anchors to a Date."
-    ),
-    knowledge_domain=KnowledgeDomain.EXTERNAL,
-    optional_properties=(
-        PropertyDefinition(
-            name="significance",
-            type="string",
-            required=False,
-            description="User-assigned importance level.",
-            allowed_values=("high", "medium", "low"),
-        ),
-    ),
-)
-
 METRIC = NodeTypeDefinition(
     type_name="Metric",
     description=(
@@ -830,15 +814,30 @@ DOCUMENT = NodeTypeDefinition(
 )
 
 # -------------------------------------------------------------------
-# Mechanism / Pattern / Strategy / Convention / DataStructure (v1.1.0
-# additive expansion, 2026-05-06). Surfaced from V6 deep-review where
-# 61 percent of relationships defaulted to RELATED_TO because there was
-# no canonical entity type for "the algorithm", "the convention", "the
-# implementation device", "the high-level approach", or "the first-class
-# data shape". Adding these unblocks predicate canonicalization for
-# MECHANISM_OF / OPERATES_ON / INPUT_TO / IMPROVES / COMPRISES /
-# APPLICABLE_TO / STRATEGY_FOR / NAMING_CONVENTION_OF.
+# Abstraction supertype + seven abstract leaves (v1.4.0, 2026-06-14).
+# Abstraction is the fallback supertype for abstract knowledge objects.
+# The seven leaves below declare parent_type="Abstraction" so the
+# hierarchy module can derive children_of("Abstraction") and
+# expand_allowed_with_parents can admit Abstraction wherever a child
+# type appears in an edge slot. Topic and Milestone are retired here;
+# their semantic roles are covered by Concept (Topic) and Event with
+# event_type="milestone" + significance property (Milestone).
+#
+# Originally added in v1.1.0 additive expansion (2026-05-06): Pattern,
+# Convention, Mechanism, Strategy, DataStructure surfaced from V6
+# deep-review where 61 percent of relationships defaulted to RELATED_TO.
 # -------------------------------------------------------------------
+
+ABSTRACTION = NodeTypeDefinition(
+    type_name="Abstraction",
+    description=(
+        "Abstract knowledge object. Fallback supertype for Concept / Skill / "
+        "Pattern / Strategy / Mechanism / Convention / DataStructure. Emit "
+        "Abstraction ONLY when no child type's definitional test clearly wins -- "
+        "never guess between sibling abstract types."
+    ),
+    knowledge_domain=KnowledgeDomain.EXTERNAL,
+)
 
 PATTERN = NodeTypeDefinition(
     type_name="Pattern",
@@ -850,6 +849,7 @@ PATTERN = NodeTypeDefinition(
         "necessarily prescriptive."
     ),
     knowledge_domain=KnowledgeDomain.EXTERNAL,
+    parent_type="Abstraction",
     optional_properties=(
         PropertyDefinition(
             name="pattern_family",
@@ -872,6 +872,7 @@ CONVENTION = NodeTypeDefinition(
         "or named; Concept is broader."
     ),
     knowledge_domain=KnowledgeDomain.EXTERNAL,
+    parent_type="Abstraction",
     optional_properties=(
         PropertyDefinition(
             name="convention_kind",
@@ -894,6 +895,7 @@ MECHANISM = NodeTypeDefinition(
         "finer-grained and typically lives inside a Technology."
     ),
     knowledge_domain=KnowledgeDomain.EXTERNAL,
+    parent_type="Abstraction",
 )
 
 STRATEGY = NodeTypeDefinition(
@@ -907,6 +909,7 @@ STRATEGY = NodeTypeDefinition(
         "is the device that realises part of it."
     ),
     knowledge_domain=KnowledgeDomain.EXTERNAL,
+    parent_type="Abstraction",
 )
 
 DATA_STRUCTURE = NodeTypeDefinition(
@@ -919,6 +922,7 @@ DATA_STRUCTURE = NodeTypeDefinition(
         "a structured runtime entity, not a referenced artifact."
     ),
     knowledge_domain=KnowledgeDomain.EXTERNAL,
+    parent_type="Abstraction",
 )
 
 # ===================================================================
@@ -1132,18 +1136,22 @@ _EXTERNAL_NODE_TYPES: tuple[NodeTypeDefinition, ...] = (
     SKILL,
     PROJECT,
     CONCEPT,
-    TOPIC,
     EVENT,
     GOAL,
     PREFERENCE,
     LOCATION,
     # Post-MVP additive expansion 2026-04-22: temporal + quantified + document.
+    # Note: Milestone retired in v1.4.0 (2026-06-14); Event with
+    # event_type="milestone" + significance property covers its semantics.
     DATE,
-    MILESTONE,
     METRIC,
     DOCUMENT,
     # v1.1.0 additive expansion 2026-05-06: Pattern / Convention / Mechanism /
     # Strategy / DataStructure. Surfaced from V6 deep-review RELATED_TO triage.
+    # v1.4.0 (2026-06-14): ABSTRACTION supertype added; seven abstract leaves
+    # (Concept, Skill, Pattern, Strategy, Mechanism, Convention, DataStructure)
+    # now declare parent_type="Abstraction". Topic retired; Concept covers it.
+    ABSTRACTION,
     PATTERN,
     CONVENTION,
     MECHANISM,
