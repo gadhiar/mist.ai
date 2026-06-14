@@ -29,3 +29,20 @@ def test_abstraction_added_where_concept_present():
 
     assert "Abstraction" in EDGE_TYPES_BY_NAME["KNOWS"].allowed_target_types
     assert "Abstraction" not in EDGE_TYPES_BY_NAME["MECHANISM_OF"].allowed_source_types
+
+
+# -------------------------------------------------------------------
+# Standing drift guard: parent accepted iff anchor child accepted.
+# Locks the expand_allowed_with_parents invariant (Abstraction appears
+# in a slot iff Concept is also in that slot) across ALL edges.
+# Adding a new edge that includes Abstraction without Concept, or
+# Concept without Abstraction, will be caught immediately here.
+# -------------------------------------------------------------------
+
+
+def test_parent_accepted_iff_anchor_child_accepted():
+    from backend.knowledge.ontologies.v1_0_0 import EDGE_TYPES_BY_NAME
+
+    for et in EDGE_TYPES_BY_NAME.values():
+        for slot in (et.allowed_source_types, et.allowed_target_types):
+            assert ("Abstraction" in slot) == ("Concept" in slot), et.type_name

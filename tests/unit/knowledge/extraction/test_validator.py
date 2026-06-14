@@ -1254,3 +1254,22 @@ class TestConstraintsDerivedFromOntology:
         from backend.knowledge.ontologies import EXTRACTABLE_RELATIONSHIP_TYPES
 
         assert set(RELATIONSHIP_CONSTRAINTS) == set(EXTRACTABLE_RELATIONSHIP_TYPES)
+
+
+# -------------------------------------------------------------------
+# Standing drift guard: retired types must not appear in validator
+# constraint sets (v1.4.0). Topic and Milestone were retired in Task 4;
+# this test permanently prevents either type from re-entering any
+# allowed_source_types or allowed_target_types slot.
+# -------------------------------------------------------------------
+
+
+def test_retired_types_absent_from_validator_constraints():
+    from backend.knowledge.extraction.validator import RELATIONSHIP_CONSTRAINTS
+
+    for name, (sources, targets) in RELATIONSHIP_CONSTRAINTS.items():
+        for slot in (sources, targets):
+            if slot is None:
+                continue  # None means "any type" -- no retired literal to check
+            assert "Topic" not in slot, name
+            assert "Milestone" not in slot, name
