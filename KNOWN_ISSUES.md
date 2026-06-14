@@ -2,7 +2,7 @@
 
 **Created:** 2026-03-22
 **Source:** Comprehensive 8-agent backend audit (6 sectional + integration + fix rounds)
-**Last Updated:** 2026-06-13 (C3 close-out: 2 production-reproducibility findings added)
+**Last Updated:** 2026-06-14 (MIS-124 / ontology v1.4.0 close-out: F2 typing gate CLEARED 0.909; rel-precision documented near-miss 0.833 -- residual bounded to model extraction quality (event-naming, metric structured-field emission, predicate choice) + small-model prompt sensitivity / flash-attn near-tie, deferred to a constrained-decoding / larger-model decision, NOT more canonicalization. Prior -- 2026-06-13 C3 close-out: 2 production-reproducibility findings added.)
 
 > This file tracks unresolved issues found during the pre-Phase-2 audit.
 > Items here are P3 (maintenance risk) -- not blocking, but should be
