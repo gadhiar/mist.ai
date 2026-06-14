@@ -114,6 +114,7 @@ class NodeTypeDefinition:
     required_properties: tuple[PropertyDefinition, ...] = ()
     optional_properties: tuple[PropertyDefinition, ...] = ()
     singleton: bool = False
+    parent_type: str | None = None
 
 
 @dataclass(frozen=True)
