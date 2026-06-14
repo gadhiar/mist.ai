@@ -2,6 +2,13 @@
 
 Idempotent. Near-noop on the current identity-only live graph.
 
+DEFERRED (2026-06-14, MIS-124 close-out): do NOT run this standalone against the
+live graph yet. R1 (the utterance->graph regenerator -- the next sub-project A
+deliverable) performs a FULL graph regeneration under ontology v1.4.0, which
+subsumes this retype; running it now would be throwaway work. Retained for
+completeness, eval use, and in case R1 slips. `ONTOLOGY_V1_0_0.migration_script_path`
+points here.
+
 Entity types in MIST.AI are stored ONLY as the `entity_type` property on
 :__Entity__ nodes -- there are no :Topic or :Milestone Neo4j labels (only
 :__Entity__ is the universal label, with :User and :MistIdentity as special
