@@ -11,7 +11,10 @@ import re
 
 from backend.errors import EmbeddingError, Neo4jQueryError
 from backend.interfaces import EmbeddingProvider
+from backend.knowledge.extraction.canonical_id import canonical_metric_id
 from backend.knowledge.extraction.ontology_extractor import ExtractionResult
+from backend.knowledge.ontologies.hierarchy import RETIRED_TYPE_MAP
+from backend.knowledge.ontologies.v1_0_0 import ALL_NODE_TYPE_NAMES
 from backend.knowledge.storage.graph_executor import GraphExecutor
 
 logger = logging.getLogger(__name__)
@@ -191,8 +194,14 @@ class EntityNormalizer:
                 if graph_id is not None:
                     canonical_id = graph_id
 
-            id_map[old_id] = canonical_id
+            # Set the pre-resolver canonical id first, then run resolver passes
+            # 3-5 (retired-type coercion, Metric compound-id, parent fallback).
+            # id_map captures entity["id"] AFTER the resolver so that the
+            # relationship source/target remap below points to the final id
+            # (e.g. the compound Metric id, not the pre-resolver canonical_id).
             entity["id"] = canonical_id
+            self._resolve_type_and_id(entity)
+            id_map[old_id] = entity["id"]
 
         # Update relationship source/target IDs
         for rel in extraction.relationships:
@@ -224,6 +233,44 @@ class EntityNormalizer:
         extraction.relationships = deduped_rels
 
         return extraction
+
+    def _resolve_type_and_id(self, entity: dict) -> None:
+        """Resolver passes 3-5: retired-type coercion, Metric compound-id, parent
+        fallback. (Pass 1 reserved-name and pass 2 registry are handled earlier in
+        normalize() because they short-circuit the loop.) Mutates entity in place;
+        the caller captures entity['id'] into id_map AFTER this runs.
+
+        Pass 3: Retired types (Topic -> Concept, Milestone -> Event). For Milestone,
+        also sets properties.event_type='milestone' via setdefault so an existing
+        value is never overwritten.
+
+        Pass 4: Metric compound-id from value + unit properties. Only fires when both
+        value and unit are present; skips silently otherwise.
+
+        Pass 5: Unknown type -> Abstraction fallback. Fires when the post-pass-3 type
+        is not in ALL_NODE_TYPE_NAMES.
+        """
+        etype = entity.get("type", "")
+
+        # Pass 3: retired-type coercion (Topic -> Concept, Milestone -> Event).
+        if etype in RETIRED_TYPE_MAP:
+            coerced = RETIRED_TYPE_MAP[etype]
+            if etype == "Milestone":
+                props = entity.setdefault("properties", {})
+                props.setdefault("event_type", "milestone")
+            entity["type"] = coerced
+            etype = coerced
+
+        # Pass 4: compound-id canonicalization for Metric (id from value + unit).
+        if etype == "Metric":
+            props = entity.get("properties") or {}
+            value, unit = props.get("value"), props.get("unit")
+            if value is not None and unit:
+                entity["id"] = canonical_metric_id(value, unit)
+
+        # Pass 5: parent fallback for unknown types not otherwise handled.
+        if entity.get("type", "") not in ALL_NODE_TYPE_NAMES:
+            entity["type"] = "Abstraction"
 
     def _canonicalize(self, name: str) -> str:
         """Convert a display name to a canonical entity ID.

@@ -8,6 +8,11 @@ from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
 
 
+def _result(entities, relationships=None):
+    """Build an ExtractionResult with the real constructor signature."""
+    return ExtractionResult(entities=entities, relationships=relationships or [])
+
+
 class TestNormalizerAsync:
     @pytest.mark.asyncio
     async def test_normalize_is_async(self):
@@ -284,3 +289,135 @@ class TestReservedNameTypeRemap:
         # Assert
         assert result.entities[0]["id"] == "mist-identity"
         assert result.entities[0]["type"] == "MistIdentity"
+
+
+class TestResolverPasses:
+    """Task 7: resolver passes 3-5 (retired-type coercion, Metric compound-id, parent
+    fallback). These run AFTER _canonicalize in the normal loop path (non-reserved, non-user
+    entities).
+    """
+
+    @pytest.fixture
+    def normalizer(self):
+        return EntityNormalizer(
+            embedding_generator=FakeEmbeddingGenerator(),
+            executor=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_retired_type_topic_coerced_to_concept(self, normalizer):
+        # Pass 3: Topic -> Concept coercion.
+        out = await normalizer.normalize(
+            _result([{"id": "backend-work", "name": "backend work", "type": "Topic"}])
+        )
+        assert out.entities[0]["type"] == "Concept"
+
+    @pytest.mark.asyncio
+    async def test_retired_type_milestone_coerced_to_event_with_event_type(self, normalizer):
+        # Pass 3: Milestone -> Event coercion + event_type sentinel.
+        out = await normalizer.normalize(
+            _result(
+                [
+                    {
+                        "id": "house-closing",
+                        "name": "house closing",
+                        "type": "Milestone",
+                        "properties": {},
+                    }
+                ]
+            )
+        )
+        assert out.entities[0]["type"] == "Event"
+        assert out.entities[0]["properties"]["event_type"] == "milestone"
+
+    @pytest.mark.asyncio
+    async def test_metric_id_canonicalized_from_props(self, normalizer):
+        # Pass 4: Metric compound-id from value + unit properties.
+        out = await normalizer.normalize(
+            _result(
+                [
+                    {
+                        "id": "requests-per-second-12000",
+                        "name": "12000 requests per second",
+                        "type": "Metric",
+                        "properties": {"value": "12000", "unit": "requests-per-second"},
+                    }
+                ]
+            )
+        )
+        assert out.entities[0]["id"] == "12000-requests-per-second"
+
+    @pytest.mark.asyncio
+    async def test_unknown_abstract_type_falls_back_to_abstraction(self, normalizer):
+        # Pass 5: unknown type -> Abstraction fallback.
+        out = await normalizer.normalize(
+            _result([{"id": "thing", "name": "thing", "type": "NotARealType"}])
+        )
+        assert out.entities[0]["type"] == "Abstraction"
+
+    @pytest.mark.asyncio
+    async def test_metric_relationship_target_remapped_to_post_resolver_id(self, normalizer):
+        # Verify id_map captures the POST-resolver Metric id so relationship
+        # source/target remapping uses the final compound id, not the pre-resolver
+        # canonical_id.
+        out = await normalizer.normalize(
+            _result(
+                entities=[
+                    {
+                        "id": "speed-metric",
+                        "name": "12000 requests per second",
+                        "type": "Metric",
+                        "properties": {"value": "12000", "unit": "requests-per-second"},
+                    },
+                    {"id": "myapp", "name": "MyApp", "type": "Project"},
+                ],
+                relationships=[{"source": "myapp", "target": "speed-metric", "type": "HAS_METRIC"}],
+            )
+        )
+        # The relationship target must point to the compound id, not the original.
+        assert out.relationships[0]["target"] == "12000-requests-per-second"
+
+    @pytest.mark.asyncio
+    async def test_milestone_coercion_does_not_overwrite_existing_event_type(self, normalizer):
+        # event_type already set -> setdefault must not overwrite it.
+        out = await normalizer.normalize(
+            _result(
+                [
+                    {
+                        "id": "sprint-end",
+                        "name": "sprint end",
+                        "type": "Milestone",
+                        "properties": {"event_type": "deadline"},
+                    }
+                ]
+            )
+        )
+        assert out.entities[0]["type"] == "Event"
+        assert out.entities[0]["properties"]["event_type"] == "deadline"
+
+    @pytest.mark.asyncio
+    async def test_metric_missing_unit_leaves_id_unchanged(self, normalizer):
+        # Pass 4 guard: no unit -> skip compound-id rewrite.
+        out = await normalizer.normalize(
+            _result(
+                [
+                    {
+                        "id": "raw-metric",
+                        "name": "raw metric",
+                        "type": "Metric",
+                        "properties": {"value": "42"},
+                    }
+                ]
+            )
+        )
+        # id should fall through to whatever _canonicalize produced, not compound id.
+        assert out.entities[0]["type"] == "Metric"
+        assert out.entities[0]["id"] != "42-"  # no blank-unit compound id
+
+    @pytest.mark.asyncio
+    async def test_valid_type_not_mutated_by_pass5(self, normalizer):
+        # Pass 5 guard: known type must NOT be changed to Abstraction.
+        out = await normalizer.normalize(
+            _result([{"id": "python", "name": "Python", "type": "Technology"}])
+        )
+        assert out.entities[0]["type"] == "Technology"
