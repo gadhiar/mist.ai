@@ -163,6 +163,85 @@ class TestParseProduced:
         ok, entities, type_by_id, rels = parse_produced("not json at all")
         assert ok is False and entities == () and rels == ()
 
+    def test_metric_entity_id_rebuilt_value_first_from_props(self):
+        # ext-24 shape: model emits unit-first id, gold is value-first canonical.
+        # The produced match id must collapse to canonical_metric_id(value, unit).
+        content = json.dumps(
+            {
+                "entities": [
+                    {
+                        "id": "requests-per-second-12000",
+                        "type": "Metric",
+                        "properties": {"value": "12000", "unit": "requests-per-second"},
+                    }
+                ],
+                "relationships": [],
+            }
+        )
+        ok, entities, type_by_id, rels = parse_produced(content)
+        assert ok is True
+        assert entities == (GoldEntity(id="12000-requests-per-second", type="Metric"),)
+        assert type_by_id == {"12000-requests-per-second": "Metric"}
+
+    def test_metric_rel_endpoint_remapped_to_canonical_metric_id(self):
+        # A relationship pointing at the Metric by its raw id must be rewritten to
+        # the value-first canonical id, so the edge does not split FP+FN.
+        content = json.dumps(
+            {
+                "entities": [
+                    {"id": "api", "type": "Technology"},
+                    {
+                        "id": "requests-per-second-12000",
+                        "type": "Metric",
+                        "properties": {"value": "12000", "unit": "requests-per-second"},
+                    },
+                ],
+                "relationships": [
+                    {
+                        "source": "api",
+                        "target": "requests-per-second-12000",
+                        "type": "HAS_METRIC",
+                        "properties": {},
+                    }
+                ],
+            }
+        )
+        ok, entities, type_by_id, rels = parse_produced(content)
+        assert ok is True
+        assert rels[0]["source"] == "api"
+        assert rels[0]["target"] == "12000-requests-per-second"
+
+    def test_metric_without_value_unit_falls_back_to_string_canonical(self):
+        # No value/unit props -> plain string canonical_id, id unchanged.
+        content = json.dumps(
+            {
+                "entities": [{"id": "some-metric", "type": "Metric"}],
+                "relationships": [],
+            }
+        )
+        ok, entities, type_by_id, rels = parse_produced(content)
+        assert ok is True
+        assert entities == (GoldEntity(id="some-metric", type="Metric"),)
+
+    def test_non_metric_entity_not_affected_by_value_unit_props(self):
+        # A non-Metric entity that happens to carry value/unit props keeps the
+        # plain string canonical id (Metric-id rebuild is type-gated).
+        content = json.dumps(
+            {
+                "entities": [
+                    {
+                        "id": "rust",
+                        "type": "Technology",
+                        "properties": {"value": "1", "unit": "thing"},
+                    }
+                ],
+                "relationships": [],
+            }
+        )
+        ok, entities, type_by_id, rels = parse_produced(content)
+        assert ok is True
+        assert entities == (GoldEntity(id="rust", type="Technology"),)
+
 
 class TestBuildProducedIndex:
     def test_indexes_extraction_ontology_records_by_utterance(self):
@@ -727,6 +806,72 @@ class TestTypesMatchInEntityPR:
         assert r.entity_tp == 1
         assert r.entity_fp == 0
         assert r.entity_fn == 0
+
+
+class TestMetricIdCanonicalizationInScoreRun:
+    """ext-24/ext-25: produced-side Metric id rebuild collapses surface splits so
+    the entity and its HAS_METRIC edge score as TP, not paired FP+FN.
+    """
+
+    def test_ext24_metric_surface_split_resolves_to_tp(self):
+        # Gold is the value-first canonical (matches data/ingest gold ext-24).
+        probe = GoldProbe(
+            tag="ext-24-metric",
+            utterance="Our API handles 12000 requests per second at peak",
+            entities=(
+                GoldEntity(id="api", type="Technology"),
+                GoldEntity(id="12000-requests-per-second", type="Metric"),
+            ),
+            relationships=(
+                GoldRel(
+                    source="api",
+                    source_type="Technology",
+                    predicate="HAS_METRIC",
+                    target="12000-requests-per-second",
+                    target_type="Metric",
+                ),
+            ),
+        )
+        # Produced raw LLM output emits the unit-first id; parse_produced rebuilds it.
+        raw = json.dumps(
+            {
+                "entities": [
+                    {"id": "api", "type": "Technology"},
+                    {
+                        "id": "requests-per-second-12000",
+                        "type": "Metric",
+                        "properties": {"value": "12000", "unit": "requests-per-second"},
+                    },
+                ],
+                "relationships": [
+                    {
+                        "source": "api",
+                        "target": "requests-per-second-12000",
+                        "type": "HAS_METRIC",
+                        "properties": {},
+                    }
+                ],
+            }
+        )
+        ok, entities, type_by_id, rels = parse_produced(raw)
+        produced = {
+            "Our API handles 12000 requests per second at peak": Produced(
+                utterance="Our API handles 12000 requests per second at peak",
+                parse_ok=ok,
+                entities=entities,
+                entity_type_by_id=type_by_id,
+                relationships=rels,
+            )
+        }
+        r = score_run([probe], produced)
+        # Both entities TP, no surface-split FP/FN.
+        assert r.entity_tp == 2
+        assert r.entity_fp == 0
+        assert r.entity_fn == 0
+        # HAS_METRIC edge resolves because both endpoints are canonical.
+        assert r.rel_tp == 1
+        assert r.rel_fp == 0
+        assert r.rel_fn == 0
 
 
 class TestRenderSpecificity:

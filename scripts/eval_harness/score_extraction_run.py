@@ -33,6 +33,9 @@ if str(_REPO_ROOT) not in sys.path:
 from backend.knowledge.curation.reconciliation import (  # noqa: E402
     derive_assertion_kind,
 )
+from backend.knowledge.extraction.canonical_id import (  # noqa: E402
+    canonical_metric_id,
+)
 from backend.knowledge.extraction.validator import (  # noqa: E402
     RELATIONSHIP_CONSTRAINTS,
 )
@@ -59,6 +62,28 @@ def canonical_id(name: str) -> str:
     s = re.sub(r"-{2,}", "-", s)
     s = s.strip("-")
     return s or name.lower().replace(" ", "-")
+
+
+def _produced_entity_match_id(raw_id: str, etype: str, properties: dict[str, Any]) -> str:
+    """Canonical match id for a PRODUCED entity, mirroring the normalizer.
+
+    For a Metric entity (after `canonical_type`) carrying non-null `value` and a
+    truthy `unit` in its properties, the id is rebuilt as `canonical_metric_id`
+    (value-first), so a model that emits `requests-per-second-12000` collapses to
+    the gold-canonical `12000-requests-per-second`. This is the SHARED helper the
+    production normalizer uses -- not a parallel reimplementation -- so the F2
+    score reflects the post-normalizer behavior on these surface splits.
+
+    Falls back to the plain string `canonical_id` when the type is not Metric or
+    when value/unit are absent. Gold is NOT passed through here: gold Metric
+    entities are authored with the canonical id and may not carry value/unit.
+    """
+    if canonical_type(etype) == "Metric":
+        value = properties.get("value")
+        unit = properties.get("unit")
+        if value is not None and unit:
+            return canonical_metric_id(value, str(unit))
+    return canonical_id(raw_id)
 
 
 def _norm_ws(text: str) -> str:
@@ -209,22 +234,37 @@ def parse_produced(
         return False, (), {}, ()
     entities: list[GoldEntity] = []
     type_by_id: dict[str, str] = {}
+    # Maps the plain-string-canonical id (what a relationship endpoint references)
+    # to the Metric-canonical id, so an edge pointing at a Metric entity by its
+    # raw id is rewritten to the rebuilt value-first id -- mirroring the normalizer
+    # rewriting edge endpoints when it canonicalizes a node.
+    metric_id_remap: dict[str, str] = {}
     for e in parsed.get("entities", []):
         if not isinstance(e, dict):
             continue
-        cid = canonical_id(str(e.get("id") or e.get("name") or ""))
         etype = str(e.get("type", ""))
+        raw_id = str(e.get("id") or e.get("name") or "")
+        props = e.get("properties") if isinstance(e.get("properties"), dict) else {}
+        # Metric entities get a value-first canonical id so word-order splits
+        # (requests-per-second-12000 vs 12000-requests-per-second) collapse before
+        # the match key is built. Non-Metric ids use the plain string canonical_id.
+        cid = _produced_entity_match_id(raw_id, etype, props)
         if cid:
             entities.append(GoldEntity(id=cid, type=etype))
             type_by_id[cid] = etype
+            plain = canonical_id(raw_id)
+            if plain != cid:
+                metric_id_remap[plain] = cid
     rels: list[dict[str, Any]] = []
     for r in parsed.get("relationships", []):
         if not isinstance(r, dict):
             continue
+        source = canonical_id(str(r.get("source", "")))
+        target = canonical_id(str(r.get("target", "")))
         rels.append(
             {
-                "source": canonical_id(str(r.get("source", ""))),
-                "target": canonical_id(str(r.get("target", ""))),
+                "source": metric_id_remap.get(source, source),
+                "target": metric_id_remap.get(target, target),
                 "predicate": str(r.get("type", "")),
                 "properties": r.get("properties") or {},
             }
