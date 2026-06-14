@@ -593,7 +593,7 @@ class KnowledgeConfig:
     enable_knowledge_integration: bool = True  # Master switch for knowledge system
 
     # System settings
-    ontology_version: str = "1.3.0"  # Current ontology version (RECOMMENDS + HAS_HABIT, 2026-06-13)
+    ontology_version: str = "1.4.0"  # Current ontology version (MECE taxonomy, 2026-06-14)
     enable_versioning: bool = True  # Track ontology versions
     enable_provenance: bool = True  # Track extraction provenance
 
@@ -675,7 +675,7 @@ class KnowledgeConfig:
             graph_regenerator=GraphRegeneratorConfig.from_env(),
             enable_knowledge_integration=os.getenv("ENABLE_KNOWLEDGE_INTEGRATION", "true").lower()
             == "true",
-            ontology_version=os.getenv("ONTOLOGY_VERSION", "1.3.0"),
+            ontology_version=os.getenv("ONTOLOGY_VERSION", "1.4.0"),
             enable_versioning=os.getenv("ENABLE_VERSIONING", "true").lower() == "true",
             enable_provenance=os.getenv("ENABLE_PROVENANCE", "true").lower() == "true",
             extraction_version=os.getenv("EXTRACTION_VERSION", "2026-06-14-r5"),

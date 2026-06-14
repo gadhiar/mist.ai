@@ -668,50 +668,6 @@ class TestTypesMatch:
         assert types_match(produced="Technology", gold="Project") is False
 
 
-class TestSpecificityRate:
-    """Specificity metric: fraction of abstract-cluster gold entities for which the
-    model emitted the precise leaf (not the Abstraction parent).
-    """
-
-    def test_all_precise_gives_one(self):
-        from eval_harness.score_extraction_run import specificity_rate
-
-        produced = [{"type": "Concept"}, {"type": "Skill"}]
-        gold = [{"type": "Concept"}, {"type": "Skill"}]
-        assert specificity_rate(produced, gold) == 1.0
-
-    def test_half_precise_gives_half(self):
-        from eval_harness.score_extraction_run import specificity_rate
-
-        # 2 cluster gold entities; one leaf match, one parent fallback -> 0.5
-        produced = [{"type": "Concept"}, {"type": "Abstraction"}]
-        gold = [{"type": "Concept"}, {"type": "Skill"}]
-        assert specificity_rate(produced, gold) == 0.5
-
-    def test_no_cluster_entities_returns_one(self):
-        from eval_harness.score_extraction_run import specificity_rate
-
-        # Non-cluster gold entities: metric is vacuously 1.0
-        produced = [{"type": "Technology"}]
-        gold = [{"type": "Technology"}]
-        assert specificity_rate(produced, gold) == 1.0
-
-    def test_parent_fallback_counts_as_imprecise(self):
-        from eval_harness.score_extraction_run import specificity_rate
-
-        produced = [{"type": "Abstraction"}]
-        gold = [{"type": "Pattern"}]
-        assert specificity_rate(produced, gold) == 0.0
-
-    def test_retired_gold_type_counted_as_cluster(self):
-        from eval_harness.score_extraction_run import specificity_rate
-
-        # gold "Topic" canonicalizes to "Concept" (cluster); produced "Concept" is precise
-        produced = [{"type": "Concept"}]
-        gold = [{"type": "Topic"}]
-        assert specificity_rate(produced, gold) == 1.0
-
-
 class TestScoreRunSpecificity:
     """Integration: specificity flows through score_run into Report."""
 
@@ -777,6 +733,77 @@ class TestScoreRunSpecificity:
         }
         r = score_run([probe], produced)
         assert r.specificity == 1.0
+
+
+class TestGatesPassSpecificity:
+    """_gates_pass enforces SPECIFICITY_FLOOR = 0.90."""
+
+    def _base_report(self):
+        """Return a Report that satisfies all gates except the ones under test.
+
+        All entity/rel/typing metrics are set to perfect values so the only
+        gate that can cause a failure is the one being exercised.
+        """
+        from eval_harness.score_extraction_run import Report
+
+        r = Report(
+            total_probes=1,
+            matched_probes=1,
+            entity_tp=1,
+            entity_fp=0,
+            entity_fn=0,
+            rel_tp=0,
+            rel_fp=0,
+            rel_fn=0,
+            typing_total=0,
+            typing_ok=0,
+            related_to_count=0,
+            produced_rel_total=0,
+            negative_probes=0,
+            negative_violations=0,
+        )
+        for kind in ("assert", "cease", "retract"):
+            r.assertion_kind_buckets[kind] = {"gold_total": 0, "found": 0, "correct": 0}
+        return r
+
+    def test_specificity_below_floor_fails_gate(self):
+        from eval_harness.score_extraction_run import _gates_pass
+
+        r = self._base_report()
+        # specificity = 0/1 = 0.0 (below 0.90 floor)
+        r.specificity_denominator = 1
+        r.specificity_numerator = 0
+        assert r.specificity == 0.0
+        assert _gates_pass(r) is False
+
+    def test_specificity_at_floor_passes_gate(self):
+        from eval_harness.score_extraction_run import _gates_pass
+
+        r = self._base_report()
+        # specificity = 9/10 = 0.90 (exactly at floor)
+        r.specificity_denominator = 10
+        r.specificity_numerator = 9
+        assert r.specificity == 0.90
+        assert _gates_pass(r) is True
+
+    def test_specificity_above_floor_passes_gate(self):
+        from eval_harness.score_extraction_run import _gates_pass
+
+        r = self._base_report()
+        # specificity = 1.0 (all precise leaves, as in real passing runs)
+        r.specificity_denominator = 5
+        r.specificity_numerator = 5
+        assert r.specificity == 1.0
+        assert _gates_pass(r) is True
+
+    def test_vacuous_specificity_passes_gate(self):
+        from eval_harness.score_extraction_run import _gates_pass
+
+        r = self._base_report()
+        # No abstract-cluster gold entities: specificity_denominator == 0 -> 1.0
+        assert r.specificity_denominator == 0
+        assert r.specificity == 1.0
+        assert _gates_pass(r) is True
 
 
 class TestTypesMatchInEntityPR:

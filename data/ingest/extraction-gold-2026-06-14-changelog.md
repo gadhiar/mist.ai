@@ -14,7 +14,7 @@
 | ext-14-uses-usedfor | 1 | entity `cloud-infrastructure` type "Topic" -> "Concept"; rel `USED_FOR` target_type "Topic" -> "Concept" | v1.4.0 RETIRED_TYPE_MAP: Topic is canonicalized to Concept; gold updated to read in v1.4.0 terms |
 | ext-21-milestone-on-date | 1 | entity `mobile-app-launch` type "Milestone" -> "Event"; rel source_type "Milestone" -> "Event" | v1.4.0 RETIRED_TYPE_MAP: Milestone is canonicalized to Event; gold updated to read in v1.4.0 terms |
 | ext-22-milestone-on-date | 1 | entity `house-closing` type "Milestone" -> "Event"; rel source_type "Milestone" -> "Event" | v1.4.0 RETIRED_TYPE_MAP: Milestone is canonicalized to Event; gold updated to read in v1.4.0 terms |
-| ext-29-third-party-knows | 2 | ADD entity `biotech` (Organization); REMOVE user anchor; ADD rel `anjali -[WORKS_AT]-> biotech` (Person -> Organization); REMOVE `user -[KNOWS_PERSON]-> anjali` | Policy: track durable third-party facts. Utterance "My sister Anjali works in biotech" states a durable employment fact about Anjali. anjali-[WORKS_AT]->biotech is the stated third-party fact; it belongs in gold alongside the user anchor. NOTE: the original gold was missing the user anchor entity and KNOWS_PERSON edge entirely (anchor-miss FN per diagnostics); this change restores the anchor AND adds the stated third-party fact. See anchor-miss note below. |
+| ext-29-third-party-knows | 2 | ADD entity `biotech` (Organization); KEEP `user` anchor + `user -[KNOWS_PERSON]-> anjali`; ADD rel `anjali -[WORKS_AT]-> biotech` (Person -> Organization) | Policy: track durable third-party facts. Utterance "My sister Anjali works in biotech" states a durable employment fact about Anjali. anjali-[WORKS_AT]->biotech is the stated third-party fact; it belongs in gold alongside the user anchor. The user anchor and KNOWS_PERSON edge were already present in the 2026-06-10 gold and are retained. See anchor note below. |
 | ext-08-third-party-person | 2 | No change | Audited: gold already has user-[KNOWS_PERSON]->priya AND priya-[RECOMMENDS]->duckdb. "My mentor Priya suggested I try DuckDB" states Priya's recommendation, a durable third-party fact; both edges already present and correct. |
 | ext-30-third-party-knows | 2 | No change | Audited: utterance "I had coffee with my old manager Devin last week" describes an incidental social meeting. "Had coffee" does not state a durable fact about Devin (no employer, no recommendation, no persistent attribute). The coffee meeting is an incidental event, not a third-party fact to track. Gold correctly has only user-[KNOWS_PERSON]->devin. |
 | ext-31-third-party-recommends | 2 | No change | Audited: gold has user-[KNOWS_PERSON]->mateo AND mateo-[RECOMMENDS]->graphql. "My architect Mateo recommended GraphQL for the new service" states a durable recommendation fact about Mateo. Both edges present and complete. No addition required. |
@@ -63,7 +63,7 @@ The change to ext-29 therefore:
 - [ ] File loads with 60 probes (run docker exec command below)
 - [ ] 6 negative-control probes (ext-10, ext-11, ext-37, ext-38, ext-39, ext-40) have empty expected_entities and expected_relationships
 - [ ] All 60 lines are valid JSON
-- [ ] NOT committed
+- [x] Committed (7cb2266)
 
 Validation command:
 ```

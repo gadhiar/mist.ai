@@ -420,33 +420,6 @@ def types_match(produced: str, gold: str) -> bool:
     return p == g or p == parent_of(g)
 
 
-def specificity_rate(
-    produced_entities: list[dict[str, str]], gold_entities: list[dict[str, str]]
-) -> float:
-    """Fraction of abstract-cluster gold entities where the model emitted the precise leaf.
-
-    Denominator: gold entities whose canonical type is in the Abstraction cluster.
-    Numerator: those whose produced canonical type exactly equals the gold canonical type
-    (not the parent fallback).
-
-    Vacuously 1.0 when no gold entity is in the cluster.
-    The pairing is positional: callers must pass matched (produced, gold) entity pairs,
-    not the full produced/gold sets.
-    """
-    cluster = children_of("Abstraction")
-    denominator = 0
-    numerator = 0
-    for p, g in zip(produced_entities, gold_entities):
-        g_type = canonical_type(g.get("type", ""))
-        if g_type not in cluster:
-            continue
-        denominator += 1
-        p_type = canonical_type(p.get("type", ""))
-        if p_type == g_type:
-            numerator += 1
-    return numerator / denominator if denominator else 1.0
-
-
 def score_run(probes: list[GoldProbe], produced_index: dict[str, Produced]) -> Report:
     report = Report(total_probes=len(probes))
     # Initialize all three kinds so an absent bucket reads zeros (not KeyError):
@@ -585,6 +558,11 @@ REL_PRECISION_GATE = 0.90
 REL_RECALL_GATE = 0.80
 TYPING_ACCURACY_GATE = 0.90
 RELATED_TO_RATE_LIMIT = 0.10
+# Specificity floor: fraction of abstract-cluster TP entity pairs where the
+# precise leaf (not the Abstraction parent fallback) was produced. Guards
+# against inflating the typing gate by over-using the parent type.
+# Vacuously 1.0 when no abstract-cluster gold entities are present (passes).
+SPECIFICITY_FLOOR = 0.90
 
 
 def score_reconciliation() -> None:
@@ -618,7 +596,7 @@ def render_markdown(report: Report) -> str:
         _row("Typing accuracy", report.typing_accuracy, TYPING_ACCURACY_GATE, ">="),
         _row("RELATED_TO rate", report.related_to_rate, RELATED_TO_RATE_LIMIT, "<="),
         _row("Valid-time accuracy", report.valid_time_accuracy, None, ""),
-        _row("Specificity (leaf vs parent)", report.specificity, None, ""),
+        _row("Specificity (leaf vs parent)", report.specificity, SPECIFICITY_FLOOR, ">="),
         f"| Negative-control violations | {report.negative_violations} | == 0 | "
         f"{'PASS' if report.negative_violations == 0 else 'FAIL'} |",
         "",
@@ -672,6 +650,7 @@ def _gates_pass(report: Report) -> bool:
         and report.rel_recall >= REL_RECALL_GATE
         and report.typing_accuracy >= TYPING_ACCURACY_GATE
         and report.related_to_rate <= RELATED_TO_RATE_LIMIT
+        and report.specificity >= SPECIFICITY_FLOOR
     )
 
 
