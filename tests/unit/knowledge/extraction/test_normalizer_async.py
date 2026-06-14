@@ -13,6 +13,15 @@ def _result(entities, relationships=None):
     return ExtractionResult(entities=entities, relationships=relationships or [])
 
 
+@pytest.fixture
+def normalizer_no_graph():
+    """EntityNormalizer with no graph executor (local-only mode)."""
+    return EntityNormalizer(
+        embedding_generator=FakeEmbeddingGenerator(),
+        executor=None,
+    )
+
+
 class TestNormalizerAsync:
     @pytest.mark.asyncio
     async def test_normalize_is_async(self):
@@ -421,3 +430,30 @@ class TestResolverPasses:
             _result([{"id": "python", "name": "Python", "type": "Technology"}])
         )
         assert out.entities[0]["type"] == "Technology"
+
+
+class TestCanonicalRegistry:
+    """Task 8: CANONICAL_REGISTRY pass overrides id and type, short-circuits graph dedup."""
+
+    @pytest.mark.asyncio
+    async def test_registry_overrides_id_and_type(self, normalizer_no_graph, monkeypatch):
+        # Key is the CANONICAL id: "the graph" canonicalizes to "the-graph".
+        monkeypatch.setitem(
+            EntityNormalizer.CANONICAL_REGISTRY, "the-graph", ("neo4j", "Technology")
+        )
+        out = await normalizer_no_graph.normalize(
+            _result([{"id": "x", "name": "the graph", "type": "Concept"}])
+        )
+        assert out.entities[0]["id"] == "neo4j"
+        assert out.entities[0]["type"] == "Technology"
+
+
+class TestTier3TypeFilter:
+    """Task 8: _dedup_type_filter widens to parent cluster for abstraction-cluster types."""
+
+    def test_tier3_type_filter_widens_to_cluster(self):
+        types = EntityNormalizer._dedup_type_filter("Concept")
+        assert "Abstraction" in types and "Concept" in types
+
+    def test_tier3_type_filter_non_cluster_exact(self):
+        assert EntityNormalizer._dedup_type_filter("Technology") == ["Technology"]

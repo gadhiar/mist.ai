@@ -87,6 +87,13 @@ class EntityNormalizer:
         r"(?:\s+v?|\bv)(\d+\.?\d*\.?\d*\.?\d*)([-.]?\w+)*$", re.IGNORECASE
     )
 
+    # Bounded curated (id, type) overrides for recurring high-value entities,
+    # keyed by CANONICAL id (post _canonicalize / static-alias). Seeded later
+    # from curated vocab (seed_data.yaml), NEVER from F2 probes. Authoritative:
+    # a registry hit overrides both id and type and short-circuits graph dedup
+    # and the resolver passes. Empty for now; populated in a later task.
+    CANONICAL_REGISTRY: dict[str, tuple[str, str]] = {}
+
     # Bug G guard: reserved names for the MIST system itself always resolve
     # to the canonical mist-identity node (seeded in scripts/seed_data.yaml).
     # Extraction that introduces new "mist" or "the-ai" entities pollutes
@@ -187,6 +194,18 @@ class EntityNormalizer:
 
                 # Check static aliases (post-canonicalization)
                 canonical_id = self.STATIC_ALIASES.get(canonical_id, canonical_id)
+
+            # Pass 2: canonical-entity registry (authoritative curated overrides).
+            # Keyed on the canonical id (post _canonicalize / static-alias) so one
+            # entry catches every surface variant that canonicalizes to the same id.
+            # A registry hit short-circuits graph dedup and the resolver passes.
+            registry = self.CANONICAL_REGISTRY.get(canonical_id)
+            if registry is not None:
+                reg_id, reg_type = registry
+                entity["type"] = reg_type
+                entity["id"] = reg_id
+                id_map[old_id] = reg_id
+                continue
 
             # Graph-based deduplication (if available)
             if self._graph_available and self._executor is not None:
@@ -309,6 +328,21 @@ class EntityNormalizer:
 
         return canonical or name.lower().replace(" ", "-")
 
+    @staticmethod
+    def _dedup_type_filter(entity_type: str) -> list[str]:
+        """Types that count as 'same kind' for embedding dedup.
+
+        For abstract-cluster types, widen to the parent + all siblings so a
+        Concept and a Skill of the same entity can still merge; non-cluster
+        types match exactly.
+        """
+        from backend.knowledge.ontologies.hierarchy import children_of, parent_of
+
+        parent = parent_of(entity_type) or (entity_type if entity_type == "Abstraction" else None)
+        if parent is None:
+            return [entity_type]
+        return sorted({parent, *children_of(parent), entity_type})
+
     async def _find_in_graph(self, canonical_id: str, entity_type: str) -> str | None:
         """Search the graph for an existing entity matching this canonical ID.
 
@@ -366,13 +400,13 @@ class EntityNormalizer:
             results = await self._executor.execute_query(
                 "CALL db.index.vector.queryNodes('entity_embeddings', 5, $candidate_embedding) "
                 "YIELD node, score "
-                "WHERE score >= $threshold AND node.entity_type = $entity_type "
+                "WHERE score >= $threshold AND node.entity_type IN $entity_types "
                 "RETURN node.id AS id, score "
                 "ORDER BY score DESC LIMIT 3",
                 {
                     "candidate_embedding": candidate_embedding,
                     "threshold": self.SIMILARITY_THRESHOLD,
-                    "entity_type": entity_type,
+                    "entity_types": self._dedup_type_filter(entity_type),
                 },
             )
             if results:
