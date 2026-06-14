@@ -18,6 +18,7 @@ EXTRACTABLE_NODE_TYPES / EXTRACTABLE_RELATIONSHIP_TYPES
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, datetime
 
 from backend.knowledge.ontologies.base import (
@@ -31,6 +32,7 @@ from backend.knowledge.ontologies.base import (
     PropertyDefinition,
     TemporalClass,
 )
+from backend.knowledge.ontologies.hierarchy import RETIRED_TYPE_MAP, expand_allowed_with_parents
 
 # ===================================================================
 # Confidence Policies
@@ -1819,12 +1821,41 @@ _MIST_SCOPE_EDGE_TYPES: tuple[EdgeTypeDefinition, ...] = (
     MIST_HAS_PREFERENCE,
 )
 
-ALL_EDGE_TYPES: list[EdgeTypeDefinition] = list(
+_RAW_EDGE_TYPES: tuple[EdgeTypeDefinition, ...] = (
     _INTERNAL_EDGE_TYPES
     + _EXTERNAL_USER_CENTRIC_EDGE_TYPES
     + _STRUCTURAL_EDGE_TYPES
     + _MIST_SCOPE_EDGE_TYPES
 )
+
+
+def _v1_4_0_allowed(types: tuple[str, ...]) -> tuple[str, ...]:
+    """Apply the v1.4.0 type-set rules to one allowed_* tuple, order-preserving.
+
+    1. Map retired types to canonical (Topic -> Concept, Milestone -> Event).
+    2. De-duplicate (a merge can collide an existing member).
+    3. Add a supertype where its anchor child is present (Abstraction wherever Concept is).
+
+    Milestone -> Event mapping: edges that listed BOTH Event and Milestone collapse to
+    a single Event (dedup); edges that listed ONLY Milestone now list Event. Intended.
+    """
+    mapped: list[str] = []
+    for t in types:
+        c = RETIRED_TYPE_MAP.get(t, t)
+        if c not in mapped:
+            mapped.append(c)
+    return expand_allowed_with_parents(tuple(mapped))
+
+
+def _apply_v1_4_0(edge: EdgeTypeDefinition) -> EdgeTypeDefinition:
+    return dataclasses.replace(
+        edge,
+        allowed_source_types=_v1_4_0_allowed(edge.allowed_source_types),
+        allowed_target_types=_v1_4_0_allowed(edge.allowed_target_types),
+    )
+
+
+ALL_EDGE_TYPES: list[EdgeTypeDefinition] = [_apply_v1_4_0(e) for e in _RAW_EDGE_TYPES]
 
 ALL_EDGE_TYPE_NAMES: list[str] = [et.type_name for et in ALL_EDGE_TYPES]
 
