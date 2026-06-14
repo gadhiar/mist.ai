@@ -36,6 +36,11 @@ from backend.knowledge.curation.reconciliation import (  # noqa: E402
 from backend.knowledge.extraction.validator import (  # noqa: E402
     RELATIONSHIP_CONSTRAINTS,
 )
+from backend.knowledge.ontologies.hierarchy import (  # noqa: E402
+    canonical_type,
+    children_of,
+    parent_of,
+)
 
 EXTRACTION_CALL_SITE = "extraction.ontology"
 EXTRACTION_UTTERANCE_PATTERN = re.compile(r'Utterance:\s*"(.+?)"\s*\n\s*Output:', re.DOTALL)
@@ -270,6 +275,12 @@ class Report:
     valid_time_ok: int = 0
     negative_probes: int = 0
     negative_violations: int = 0
+    # Specificity: among TP-aligned abstract-cluster entity pairs, count those
+    # where the model emitted the precise leaf rather than the Abstraction fallback.
+    # specificity_denominator counts cluster gold-TP pairs; specificity_numerator
+    # counts the precise-leaf subset. Derived from matched entity pairs only.
+    specificity_numerator: int = 0
+    specificity_denominator: int = 0
     # Per assertion-kind: {gold_total, found, correct}. found = gold edges of
     # that kind that were extracted at all (TP membership); correct = found
     # edges whose engine-derived kind matches gold. The explicit `found` count
@@ -319,6 +330,17 @@ class Report:
         """Fraction of valid-time gold relationships whose dates matched."""
         return self.valid_time_ok / self.valid_time_total if self.valid_time_total else 1.0
 
+    @property
+    def specificity(self) -> float:
+        """Fraction of abstract-cluster TP entity pairs where the precise leaf was used.
+
+        Vacuously 1.0 when no TP entity pair involves a cluster type -- guards against
+        reporting 0.0 on corpora with no abstract entities.
+        """
+        if self.specificity_denominator == 0:
+            return 1.0
+        return self.specificity_numerator / self.specificity_denominator
+
 
 def _date_matches(expected: str | None, produced: Any) -> bool:
     if expected is None:
@@ -341,6 +363,48 @@ def _typing_ok(predicate: str, s_type: str | None, t_type: str | None) -> bool:
     return True
 
 
+def types_match(produced: str, gold: str) -> bool:
+    """Hierarchy-aware entity type comparison.
+
+    A produced type matches gold if it equals the canonical form of gold, OR if
+    it equals gold's parent type (Abstraction is acceptable when gold is a concrete
+    abstract-cluster leaf such as Concept or Skill). Wrong-sibling is the only miss.
+
+    Both sides are canonicalized first so retired types (Topic -> Concept,
+    Milestone -> Event) on either the produced or gold side resolve correctly.
+    """
+    g = canonical_type(gold)
+    p = canonical_type(produced)
+    return p == g or p == parent_of(g)
+
+
+def specificity_rate(
+    produced_entities: list[dict[str, str]], gold_entities: list[dict[str, str]]
+) -> float:
+    """Fraction of abstract-cluster gold entities where the model emitted the precise leaf.
+
+    Denominator: gold entities whose canonical type is in the Abstraction cluster.
+    Numerator: those whose produced canonical type exactly equals the gold canonical type
+    (not the parent fallback).
+
+    Vacuously 1.0 when no gold entity is in the cluster.
+    The pairing is positional: callers must pass matched (produced, gold) entity pairs,
+    not the full produced/gold sets.
+    """
+    cluster = children_of("Abstraction")
+    denominator = 0
+    numerator = 0
+    for p, g in zip(produced_entities, gold_entities):
+        g_type = canonical_type(g.get("type", ""))
+        if g_type not in cluster:
+            continue
+        denominator += 1
+        p_type = canonical_type(p.get("type", ""))
+        if p_type == g_type:
+            numerator += 1
+    return numerator / denominator if denominator else 1.0
+
+
 def score_run(probes: list[GoldProbe], produced_index: dict[str, Produced]) -> Report:
     report = Report(total_probes=len(probes))
     # Initialize all three kinds so an absent bucket reads zeros (not KeyError):
@@ -353,10 +417,36 @@ def score_run(probes: list[GoldProbe], produced_index: dict[str, Produced]) -> R
             report.matched_probes += 1
 
         gold_entities = set(probe.entities)
-        prod_entities = set(produced.entities) if produced else set()
-        report.entity_tp += len(gold_entities & prod_entities)
-        report.entity_fp += len(prod_entities - gold_entities)
-        report.entity_fn += len(gold_entities - prod_entities)
+        gold_list = list(probe.entities)
+        prod_list = list(produced.entities) if produced else []
+
+        # Hierarchy-aware entity matching: a produced entity with id X and type
+        # Abstraction counts as TP for gold (X, Concept) because Abstraction is
+        # Concept's parent. Build matched sets by walking gold and finding a
+        # produced entity with the same id where types_match holds.
+        prod_by_id: dict[str, GoldEntity] = {}
+        for pe in prod_list:
+            prod_by_id.setdefault(pe.id, pe)
+
+        _cluster = children_of("Abstraction")
+        # hierarchy_tp: gold entity ids for which the produced output was TP.
+        hierarchy_tp: set[str] = set()
+        for ge in gold_list:
+            pe = prod_by_id.get(ge.id)
+            if pe is not None and types_match(pe.type, ge.type):
+                hierarchy_tp.add(ge.id)
+                # Accumulate specificity over TP abstract-cluster pairs.
+                g_canon = canonical_type(ge.type)
+                if g_canon in _cluster:
+                    report.specificity_denominator += 1
+                    if canonical_type(pe.type) == g_canon:
+                        report.specificity_numerator += 1
+
+        # Counts: TP = matched gold ids; FP = produced ids not in any gold match;
+        # FN = unmatched gold ids.
+        report.entity_tp += len(hierarchy_tp)
+        report.entity_fp += sum(1 for pe in prod_list if pe.id not in hierarchy_tp)
+        report.entity_fn += sum(1 for ge in gold_list if ge.id not in hierarchy_tp)
 
         gold_rel_keys = {(r.source, r.predicate, r.target) for r in probe.relationships}
         prod_rel_keys: set[tuple[str, str, str]] = set()
@@ -421,8 +511,10 @@ def score_run(probes: list[GoldProbe], produced_index: dict[str, Produced]) -> R
                 report.negative_violations += 1
 
         if produced is not None:
-            entity_fps = sorted([e.id, e.type] for e in prod_entities - gold_entities)
-            entity_fns = sorted([e.id, e.type] for e in gold_entities - prod_entities)
+            # FP: produced entities whose id was not matched by any gold entity.
+            entity_fps = sorted([pe.id, pe.type] for pe in prod_list if pe.id not in hierarchy_tp)
+            # FN: gold entities whose id had no hierarchy-compatible produced match.
+            entity_fns = sorted([ge.id, ge.type] for ge in gold_list if ge.id not in hierarchy_tp)
             rel_fps = sorted(list(t) for t in prod_rel_keys - gold_rel_keys)
             rel_fns = sorted(list(t) for t in gold_rel_keys - prod_rel_keys)
         else:
@@ -484,6 +576,7 @@ def render_markdown(report: Report) -> str:
         _row("Typing accuracy", report.typing_accuracy, TYPING_ACCURACY_GATE, ">="),
         _row("RELATED_TO rate", report.related_to_rate, RELATED_TO_RATE_LIMIT, "<="),
         _row("Valid-time accuracy", report.valid_time_accuracy, None, ""),
+        _row("Specificity (leaf vs parent)", report.specificity, None, ""),
         f"| Negative-control violations | {report.negative_violations} | == 0 | "
         f"{'PASS' if report.negative_violations == 0 else 'FAIL'} |",
         "",
@@ -519,6 +612,7 @@ def render_json(report: Report) -> str:
             "typing_accuracy": report.typing_accuracy,
             "related_to_rate": report.related_to_rate,
             "valid_time_accuracy": report.valid_time_accuracy,
+            "specificity": report.specificity,
             "assertion_kind_buckets": report.assertion_kind_buckets,
             "per_probe": report.per_probe,
         },

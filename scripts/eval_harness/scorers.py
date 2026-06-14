@@ -32,13 +32,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Ontology constants (mirror of backend/knowledge/ontologies/v1_0_0.py).
 #
-# RESYNCED 2026-04-22. These frozensets MUST stay aligned with
+# RESYNCED 2026-06-14 (v1.4.0). These frozensets MUST stay aligned with
 # EXTRACTABLE_NODE_TYPES and EXTRACTABLE_RELATIONSHIP_TYPES in
 # backend/knowledge/ontologies/v1_0_0.py. The harness is designed to
 # run standalone without a backend import at module load time, so the
 # mirror is intentional -- but drift here silently mis-scores extraction
 # quality (a type the model correctly produces gets counted as
 # "bad_entity_types" if missing from this list).
+#
+# v1.4.0 changes: Topic and Milestone retired (Topic -> Concept,
+# Milestone -> Event with event_type=milestone); Abstraction supertype added.
 #
 # Drift is caught by tests/unit/test_eval_harness_scorers.py which
 # cross-checks these frozensets against the ontology source of truth
@@ -47,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 EXTRACTABLE_ENTITY_TYPES: frozenset[str] = frozenset(
     {
-        # External domain -- original (12).
+        # External domain -- original (10; Topic/Milestone retired in v1.4.0).
         "User",
         "Person",
         "Organization",
@@ -55,14 +58,12 @@ EXTRACTABLE_ENTITY_TYPES: frozenset[str] = frozenset(
         "Skill",
         "Project",
         "Concept",
-        "Topic",
         "Event",
         "Goal",
         "Preference",
         "Location",
-        # External domain -- post-MVP additive 2026-04-22 (4).
+        # External domain -- post-MVP additive 2026-04-22 (3; Milestone retired).
         "Date",
-        "Milestone",
         "Metric",
         "Document",
         # External domain -- v1.1.0 additive 2026-05-06 (5).
@@ -71,6 +72,8 @@ EXTRACTABLE_ENTITY_TYPES: frozenset[str] = frozenset(
         "Mechanism",
         "Strategy",
         "DataStructure",
+        # External domain -- v1.4.0 Abstraction supertype (1).
+        "Abstraction",
         # MIST-scope identity -- Cluster 1 promoted from INTERNAL-only (1).
         "MistIdentity",
     }

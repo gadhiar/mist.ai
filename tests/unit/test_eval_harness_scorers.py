@@ -76,8 +76,16 @@ class TestScorerMembershipLandmarks:
         assert "MistIdentity" in EXTRACTABLE_ENTITY_TYPES
 
     def test_post_mvp_additive_entity_types_are_extractable(self):
-        for type_name in ("Date", "Milestone", "Metric", "Document"):
+        # Milestone retired in v1.4.0 (-> Event with event_type=milestone).
+        for type_name in ("Date", "Metric", "Document"):
             assert type_name in EXTRACTABLE_ENTITY_TYPES
+
+    def test_v1_4_0_abstraction_supertype_is_extractable(self):
+        assert "Abstraction" in EXTRACTABLE_ENTITY_TYPES
+
+    def test_v1_4_0_retired_types_not_extractable(self):
+        assert "Topic" not in EXTRACTABLE_ENTITY_TYPES
+        assert "Milestone" not in EXTRACTABLE_ENTITY_TYPES
 
     def test_v1_1_0_additive_entity_types_are_extractable(self):
         for type_name in (

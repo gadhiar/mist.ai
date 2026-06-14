@@ -548,6 +548,205 @@ class TestRenderAndCli:
         assert rc == 2
 
 
+class TestTypesMatch:
+    """Hierarchy-aware type matching (Task 9)."""
+
+    def test_exact_match_passes(self):
+        from eval_harness.score_extraction_run import types_match
+
+        assert types_match(produced="Concept", gold="Concept") is True
+
+    def test_parent_type_acceptable_for_child_gold(self):
+        from eval_harness.score_extraction_run import types_match
+
+        assert types_match(produced="Abstraction", gold="Concept") is True
+
+    def test_wrong_sibling_fails(self):
+        from eval_harness.score_extraction_run import types_match
+
+        assert types_match(produced="Pattern", gold="Concept") is False
+
+    def test_retired_gold_type_canonicalized_before_match(self):
+        from eval_harness.score_extraction_run import types_match
+
+        # gold "Topic" -> canonical "Concept"; produced "Concept" == canonical
+        assert types_match(produced="Concept", gold="Topic") is True
+
+    def test_retired_produced_type_canonicalized_before_match(self):
+        from eval_harness.score_extraction_run import types_match
+
+        # produced "Topic" -> canonical "Concept"; gold "Concept" == canonical
+        assert types_match(produced="Topic", gold="Concept") is True
+
+    def test_non_cluster_exact_pass(self):
+        from eval_harness.score_extraction_run import types_match
+
+        assert types_match(produced="Technology", gold="Technology") is True
+
+    def test_non_cluster_type_mismatch_fails(self):
+        from eval_harness.score_extraction_run import types_match
+
+        assert types_match(produced="Technology", gold="Project") is False
+
+
+class TestSpecificityRate:
+    """Specificity metric: fraction of abstract-cluster gold entities for which the
+    model emitted the precise leaf (not the Abstraction parent).
+    """
+
+    def test_all_precise_gives_one(self):
+        from eval_harness.score_extraction_run import specificity_rate
+
+        produced = [{"type": "Concept"}, {"type": "Skill"}]
+        gold = [{"type": "Concept"}, {"type": "Skill"}]
+        assert specificity_rate(produced, gold) == 1.0
+
+    def test_half_precise_gives_half(self):
+        from eval_harness.score_extraction_run import specificity_rate
+
+        # 2 cluster gold entities; one leaf match, one parent fallback -> 0.5
+        produced = [{"type": "Concept"}, {"type": "Abstraction"}]
+        gold = [{"type": "Concept"}, {"type": "Skill"}]
+        assert specificity_rate(produced, gold) == 0.5
+
+    def test_no_cluster_entities_returns_one(self):
+        from eval_harness.score_extraction_run import specificity_rate
+
+        # Non-cluster gold entities: metric is vacuously 1.0
+        produced = [{"type": "Technology"}]
+        gold = [{"type": "Technology"}]
+        assert specificity_rate(produced, gold) == 1.0
+
+    def test_parent_fallback_counts_as_imprecise(self):
+        from eval_harness.score_extraction_run import specificity_rate
+
+        produced = [{"type": "Abstraction"}]
+        gold = [{"type": "Pattern"}]
+        assert specificity_rate(produced, gold) == 0.0
+
+    def test_retired_gold_type_counted_as_cluster(self):
+        from eval_harness.score_extraction_run import specificity_rate
+
+        # gold "Topic" canonicalizes to "Concept" (cluster); produced "Concept" is precise
+        produced = [{"type": "Concept"}]
+        gold = [{"type": "Topic"}]
+        assert specificity_rate(produced, gold) == 1.0
+
+
+class TestScoreRunSpecificity:
+    """Integration: specificity flows through score_run into Report."""
+
+    def test_specificity_in_report_when_leaf_matched(self):
+        from eval_harness.score_extraction_run import GoldEntity, GoldProbe, Produced, score_run
+
+        probe = GoldProbe(
+            tag="t",
+            utterance="x",
+            entities=(GoldEntity(id="agile", type="Concept"),),
+            relationships=(),
+        )
+        produced = {
+            "x": Produced(
+                utterance="x",
+                parse_ok=True,
+                entities=(GoldEntity(id="agile", type="Concept"),),
+                entity_type_by_id={"agile": "Concept"},
+                relationships=(),
+            )
+        }
+        r = score_run([probe], produced)
+        assert r.specificity == 1.0
+
+    def test_specificity_in_report_when_parent_used(self):
+        from eval_harness.score_extraction_run import GoldEntity, GoldProbe, Produced, score_run
+
+        probe = GoldProbe(
+            tag="t",
+            utterance="x",
+            entities=(GoldEntity(id="agile", type="Concept"),),
+            relationships=(),
+        )
+        produced = {
+            "x": Produced(
+                utterance="x",
+                parse_ok=True,
+                entities=(GoldEntity(id="agile", type="Abstraction"),),
+                entity_type_by_id={"agile": "Abstraction"},
+                relationships=(),
+            )
+        }
+        r = score_run([probe], produced)
+        assert r.specificity == 0.0
+
+    def test_specificity_vacuously_one_when_no_cluster_gold(self):
+        from eval_harness.score_extraction_run import GoldEntity, GoldProbe, Produced, score_run
+
+        probe = GoldProbe(
+            tag="t",
+            utterance="x",
+            entities=(GoldEntity(id="rust", type="Technology"),),
+            relationships=(),
+        )
+        produced = {
+            "x": Produced(
+                utterance="x",
+                parse_ok=True,
+                entities=(GoldEntity(id="rust", type="Technology"),),
+                entity_type_by_id={"rust": "Technology"},
+                relationships=(),
+            )
+        }
+        r = score_run([probe], produced)
+        assert r.specificity == 1.0
+
+
+class TestTypesMatchInEntityPR:
+    """Hierarchy-aware entity P/R: parent type counts as TP, not FP+FN."""
+
+    def test_parent_type_counts_as_tp_not_fp_fn(self):
+        from eval_harness.score_extraction_run import GoldEntity, GoldProbe, Produced, score_run
+
+        # Gold: Concept; Produced: Abstraction (parent). Should match as TP under
+        # hierarchy-aware scoring rather than FP(Abstraction) + FN(Concept).
+        probe = GoldProbe(
+            tag="t",
+            utterance="x",
+            entities=(GoldEntity(id="agile", type="Concept"),),
+            relationships=(),
+        )
+        produced = {
+            "x": Produced(
+                utterance="x",
+                parse_ok=True,
+                entities=(GoldEntity(id="agile", type="Abstraction"),),
+                entity_type_by_id={"agile": "Abstraction"},
+                relationships=(),
+            )
+        }
+        r = score_run([probe], produced)
+        assert r.entity_tp == 1
+        assert r.entity_fp == 0
+        assert r.entity_fn == 0
+
+
+class TestRenderSpecificity:
+    """specificity appears in JSON and markdown output."""
+
+    def test_render_json_includes_specificity(self):
+        import json
+
+        from eval_harness.score_extraction_run import Report, render_json
+
+        payload = json.loads(render_json(Report(total_probes=1, matched_probes=1)))
+        assert "specificity" in payload
+
+    def test_render_markdown_includes_specificity(self):
+        from eval_harness.score_extraction_run import Report, render_markdown
+
+        md = render_markdown(Report(total_probes=1, matched_probes=1))
+        assert "Specificity" in md or "specificity" in md
+
+
 class TestUtteranceJoinRoundTrip:
     """tests-quality-10: the scorers join debug records to gold probes by
     regexing the utterance out of the rendered prompt. If the pattern drifts
