@@ -1873,7 +1873,7 @@ EDGE_TYPES_BY_NAME: dict[str, EdgeTypeDefinition] = {et.type_name: et for et in 
 # to extractable so that MIST-scope facts (e.g. "MIST uses LanceDB") can be
 # attributed at extraction time.
 # Post-MVP additive (2026-04-22): Date, Milestone, Metric, Document joined the
-# EXTERNAL set.
+# EXTERNAL set. (Milestone retired in v1.4.0)
 EXTRACTABLE_NODE_TYPES: list[str] = [nt.type_name for nt in _EXTERNAL_NODE_TYPES] + [
     MIST_IDENTITY.type_name,
 ]

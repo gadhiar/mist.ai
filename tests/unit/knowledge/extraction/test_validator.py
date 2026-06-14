@@ -706,13 +706,14 @@ class TestTemporalQuantifiedDocumentConstraints:
             "REFERENCES_DOCUMENT" in w and "Source type 'Person'" in w for w in result.warnings
         )
 
-    # --- PRECEDED_BY: (Event | Milestone) -> (Event | Milestone | Date) ---
+    # --- PRECEDED_BY: (Event) -> (Event | Date) ---
+    # Milestone retired in v1.4.0 (maps to Event), so Event is the sole source.
 
-    def test_preceded_by_milestone_to_date_accepted(self):
+    def test_preceded_by_event_to_date_accepted(self):
         validator = ExtractionValidator()
         extraction = _make_extraction(
             entities=[
-                _make_entity(entity_id="mvp-close", entity_type="Milestone"),
+                _make_entity(entity_id="mvp-close", entity_type="Event"),
                 _make_entity(entity_id="2026-04-17", entity_type="Date"),
             ],
             relationships=[
