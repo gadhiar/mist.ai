@@ -406,7 +406,8 @@ class TestResolverPasses:
 
     @pytest.mark.asyncio
     async def test_metric_missing_unit_leaves_id_unchanged(self, normalizer):
-        # Pass 4 guard: no unit -> skip compound-id rewrite.
+        # Pass 4 guard: no unit -> string fallback, not compound-id rewrite.
+        # "raw-metric" has no numeric token, so canonical_metric_id_from_id returns it unchanged.
         out = await normalizer.normalize(
             _result(
                 [
@@ -422,6 +423,25 @@ class TestResolverPasses:
         # id should fall through to whatever _canonicalize produced, not compound id.
         assert out.entities[0]["type"] == "Metric"
         assert out.entities[0]["id"] != "42-"  # no blank-unit compound id
+
+    @pytest.mark.asyncio
+    async def test_metric_no_props_string_fallback_moves_number_to_front(self, normalizer):
+        # Pass 4 string fallback: Metric with no value/unit props, bare id with numeric
+        # token at the end is reordered to value-first by canonical_metric_id_from_id.
+        # The entity carries NO name field so entity_name falls back to old_id, which
+        # means _canonicalize receives "requests-per-second-12000" (already-hyphenated,
+        # no version-strip match) and canonical_metric_id_from_id fires on the result.
+        out = await normalizer.normalize(
+            _result(
+                [
+                    {
+                        "id": "requests-per-second-12000",
+                        "type": "Metric",
+                    }
+                ]
+            )
+        )
+        assert out.entities[0]["id"] == "12000-requests-per-second"
 
     @pytest.mark.asyncio
     async def test_valid_type_not_mutated_by_pass5(self, normalizer):

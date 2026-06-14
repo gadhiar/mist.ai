@@ -813,6 +813,68 @@ class TestMetricIdCanonicalizationInScoreRun:
     the entity and its HAS_METRIC edge score as TP, not paired FP+FN.
     """
 
+    def test_ext25_metric_no_props_string_fallback_resolves_to_tp(self):
+        # Mirror of ext-24 but with NO value/unit props on the produced entity.
+        # The string-based fallback (canonical_metric_id_from_id) must collapse
+        # `requests-per-second-12000` -> `12000-requests-per-second` so both the
+        # entity and the HAS_METRIC edge score as TP (0 FP, 0 FN).
+        probe = GoldProbe(
+            tag="ext-25-metric-no-props",
+            utterance="Our API handles 12000 requests per second at peak",
+            entities=(
+                GoldEntity(id="api", type="Technology"),
+                GoldEntity(id="12000-requests-per-second", type="Metric"),
+            ),
+            relationships=(
+                GoldRel(
+                    source="api",
+                    source_type="Technology",
+                    predicate="HAS_METRIC",
+                    target="12000-requests-per-second",
+                    target_type="Metric",
+                ),
+            ),
+        )
+        # Produced: Metric entity has NO value/unit props, raw id is unit-first.
+        raw = json.dumps(
+            {
+                "entities": [
+                    {"id": "api", "type": "Technology"},
+                    {
+                        "id": "requests-per-second-12000",
+                        "type": "Metric",
+                    },
+                ],
+                "relationships": [
+                    {
+                        "source": "api",
+                        "target": "requests-per-second-12000",
+                        "type": "HAS_METRIC",
+                        "properties": {},
+                    }
+                ],
+            }
+        )
+        ok, entities, type_by_id, rels = parse_produced(raw)
+        produced = {
+            "Our API handles 12000 requests per second at peak": Produced(
+                utterance="Our API handles 12000 requests per second at peak",
+                parse_ok=ok,
+                entities=entities,
+                entity_type_by_id=type_by_id,
+                relationships=rels,
+            )
+        }
+        r = score_run([probe], produced)
+        # Both entities TP via string-fallback, no surface-split FP/FN.
+        assert r.entity_tp == 2
+        assert r.entity_fp == 0
+        assert r.entity_fn == 0
+        # HAS_METRIC edge resolves because the endpoint remap fired on the string path.
+        assert r.rel_tp == 1
+        assert r.rel_fp == 0
+        assert r.rel_fn == 0
+
     def test_ext24_metric_surface_split_resolves_to_tp(self):
         # Gold is the value-first canonical (matches data/ingest gold ext-24).
         probe = GoldProbe(

@@ -11,7 +11,10 @@ import re
 
 from backend.errors import EmbeddingError, Neo4jQueryError
 from backend.interfaces import EmbeddingProvider
-from backend.knowledge.extraction.canonical_id import canonical_metric_id
+from backend.knowledge.extraction.canonical_id import (
+    canonical_metric_id,
+    canonical_metric_id_from_id,
+)
 from backend.knowledge.extraction.ontology_extractor import ExtractionResult
 from backend.knowledge.ontologies.hierarchy import RETIRED_TYPE_MAP
 from backend.knowledge.ontologies.v1_0_0 import ALL_NODE_TYPE_NAMES
@@ -281,11 +284,17 @@ class EntityNormalizer:
             etype = coerced
 
         # Pass 4: compound-id canonicalization for Metric (id from value + unit).
+        # When structured props are present, rebuild as <value>-<unit> (canonical_metric_id).
+        # When props are absent, fall back to string-based value-position normalization
+        # (canonical_metric_id_from_id) so bare ids like `requests-per-second-12000`
+        # still collapse to the canonical `12000-requests-per-second`.
         if etype == "Metric":
             props = entity.get("properties") or {}
             value, unit = props.get("value"), props.get("unit")
             if value is not None and unit:
                 entity["id"] = canonical_metric_id(value, unit)
+            else:
+                entity["id"] = canonical_metric_id_from_id(entity["id"])
 
         # Pass 5: parent fallback for unknown types not otherwise handled.
         if entity.get("type", "") not in ALL_NODE_TYPE_NAMES:

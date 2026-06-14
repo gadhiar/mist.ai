@@ -35,6 +35,7 @@ from backend.knowledge.curation.reconciliation import (  # noqa: E402
 )
 from backend.knowledge.extraction.canonical_id import (  # noqa: E402
     canonical_metric_id,
+    canonical_metric_id_from_id,
 )
 from backend.knowledge.extraction.validator import (  # noqa: E402
     RELATIONSHIP_CONSTRAINTS,
@@ -83,6 +84,7 @@ def _produced_entity_match_id(raw_id: str, etype: str, properties: dict[str, Any
         unit = properties.get("unit")
         if value is not None and unit:
             return canonical_metric_id(value, str(unit))
+        return canonical_metric_id_from_id(raw_id)  # string fallback: no value/unit props
     return canonical_id(raw_id)
 
 
