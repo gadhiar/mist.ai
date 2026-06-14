@@ -379,9 +379,11 @@ class TestRebuildDeterminismStamps:
 
         # ADR-010 example string -- matches vault writer's _EXTRACTION_VERSION
         # constant. When extraction prompts or ontology change, bump this.
-        # Bumped 2026-06-12-r4 with precision rules -- HAS_HABIT recurrence-
-        # cadence tightening (Rule 17) + no prepositional over-extraction (Rule 18).
-        assert config.extraction_version == "2026-06-12-r4"
+        # Bumped 2026-06-14-r5: MECE taxonomy -- Abstraction fallback type,
+        # abstract-type tests block (Rules 19-20), third-party facts rule (Rule 19),
+        # retire Topic/Milestone from entity list (22 -> 21), retype Example 9
+        # Milestone -> Event, add Examples 25-26.
+        assert config.extraction_version == "2026-06-14-r5"
 
     def test_default_model_hash_matches_active_llm(self):
         from backend.knowledge.config import (
@@ -416,5 +418,5 @@ class TestRebuildDeterminismStamps:
         with _env(EXTRACTION_VERSION=None, MIST_MODEL_HASH=None):
             config = KnowledgeConfig.from_env()
 
-        assert config.extraction_version == "2026-06-12-r4"
+        assert config.extraction_version == "2026-06-14-r5"
         assert config.model_hash == "gemma-4-e4b-q5-k-m-carteakey-full-v1"

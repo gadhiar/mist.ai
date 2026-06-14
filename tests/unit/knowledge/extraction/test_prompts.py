@@ -137,12 +137,12 @@ class TestSystemPromptExampleBalance:
 
 
 class TestEventVsMilestoneDisambiguation:
-    """Post-MVP follow-up: prompt must disambiguate Event from Milestone.
+    """v1.4.0 follow-up: Milestone retired; prompt must route milestone-class facts to Event.
 
-    Both `Event` (with legacy `event_type=milestone` enum value) and the
-    dedicated `Milestone` type can represent the same fact. Without an
-    explicit boundary in the system prompt, the model picks at random,
-    which produces two graph nodes for the same conceptual entity.
+    In v1.4.0 the dedicated `Milestone` entity type is retired. The canonical
+    representation is `Event` with `event_type=milestone`. Rule 11 must route
+    "shipped / launched / completed / achieved / promoted" facts to Event, and
+    Example 9 must demonstrate the output shape.
     """
 
     def test_prompt_includes_event_vs_milestone_rule(self):
@@ -152,28 +152,35 @@ class TestEventVsMilestoneDisambiguation:
             "event vs milestone" in prompt_lower or "milestone vs event" in prompt_lower
         ), "Expected explicit Event-vs-Milestone disambiguation rule in EXTRACTION RULES"
 
-    def test_prompt_forbids_event_type_milestone_legacy_value(self):
-        """Rule 11 must explicitly retire the Event.event_type=milestone overlap."""
+    def test_prompt_covers_milestone_via_event_type(self):
+        """Rule 11 must call out event_type=milestone as the canonical representation.
+
+        v1.4.0: Milestone type retired; Event with event_type=milestone is the
+        canonical shape. The rule must name event_type=milestone so the model
+        knows the output shape.
+        """
         prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
         assert 'event_type="milestone"' in prompt_lower or "event_type=milestone" in prompt_lower, (
-            "Expected the rule to call out Event.event_type='milestone' and route it "
-            "to the dedicated Milestone type; without this, the model may emit "
-            "Event(event_type=milestone) instead of Milestone for shipped/launched/promoted facts."
+            "Expected 'event_type=milestone' to appear in Rule 11 so the model "
+            "knows the canonical output shape for milestone-class facts."
         )
 
-    def test_examples_include_both_event_and_milestone_extractions(self):
-        """At least one few-shot must extract Event, and at least one Milestone.
+    def test_examples_include_event_and_milestone_class_event_extractions(self):
+        """Few-shots must include an Event extraction and a milestone-class Event.
 
-        The contrast pair (Example 9 = Milestone, Example 12 = Event) anchors
-        the rule with concrete output; the rule alone is too easy to skim past.
+        Example 12 shows a plain Event (conference). Example 9 shows a
+        milestone-class Event (shipped Cluster 8 Phase 6) with event_type=milestone.
+        Both must be present so the model has anchors for each sub-case.
         """
         assert '"type": "Event"' in EXTRACTION_SYSTEM_PROMPT, (
             "Expected an Event extraction in the few-shot examples; without one "
-            "the model has no anchor for when to prefer Event over Milestone."
+            "the model has no anchor for non-milestone events."
         )
-        assert '"type": "Milestone"' in EXTRACTION_SYSTEM_PROMPT, (
-            "Expected a Milestone extraction in the few-shot examples (Example 9 "
-            "since the 2026-04-23 ontology expansion)."
+        assert (
+            "event_type" in EXTRACTION_SYSTEM_PROMPT and "milestone" in EXTRACTION_SYSTEM_PROMPT
+        ), (
+            "Expected a milestone-class Event extraction in the few-shot examples "
+            "(Example 9 since the v1.4.0 Milestone retirement)."
         )
 
 
@@ -309,8 +316,8 @@ class TestExtractionVersionDriftGuard:
     """
 
     # sha256(EXTRACTION_SYSTEM_PROMPT + EXTRACTION_USER_TEMPLATE) pinned for
-    # extraction_version = "2026-06-12-r4".
-    PINNED_SHA256 = "38f379f757f40f69e8da583cb6b5342fb8bf5015e512c98ddc38e50f853092a8"
+    # extraction_version = "2026-06-14-r5".
+    PINNED_SHA256 = "cb0f7788ba910b35c376a0ee4a172e92757aab5977c4d6330aa6e1584bc555be"
 
     def test_prompt_content_matches_pinned_extraction_version(self):
         import hashlib
@@ -331,5 +338,5 @@ class TestExtractionVersionDriftGuard:
         from backend.knowledge.config import KnowledgeConfig
         from backend.vault.writer import _EXTRACTION_VERSION
 
-        assert KnowledgeConfig.extraction_version == "2026-06-12-r4"
-        assert _EXTRACTION_VERSION == "2026-06-12-r4"
+        assert KnowledgeConfig.extraction_version == "2026-06-14-r5"
+        assert _EXTRACTION_VERSION == "2026-06-14-r5"

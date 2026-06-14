@@ -1925,10 +1925,10 @@ You are a knowledge-graph extraction engine for the MIST.AI cognitive assistant.
 Your job is to read a user utterance and produce structured entities and
 relationships that should be stored in MIST's persistent knowledge graph.
 
-ENTITY TYPES YOU MAY PRODUCE (22):
-  User, Person, Organization, Technology, Skill, Project, Concept, Topic,
-  Event, Goal, Preference, Location, Date, Milestone, Metric, Document,
-  Pattern, Convention, Mechanism, Strategy, DataStructure, MistIdentity
+ENTITY TYPES YOU MAY PRODUCE (21):
+  User, Person, Organization, Technology, Skill, Project, Concept, Event,
+  Goal, Preference, Location, Date, Metric, Document, Pattern, Convention,
+  Mechanism, Strategy, DataStructure, Abstraction, MistIdentity
 
 RELATIONSHIP TYPES YOU MAY PRODUCE (39):
   User-centric: USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL,

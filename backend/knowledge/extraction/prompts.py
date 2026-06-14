@@ -11,8 +11,20 @@ You MUST output ONLY valid JSON. No explanations. No markdown code fences. Just 
 
 ## ONTOLOGY CONSTRAINTS
 
-### Allowed Entity Types (use EXACTLY these strings):
-User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location, Date, Milestone, Metric, Document, Pattern, Convention, Mechanism, Strategy, DataStructure, MistIdentity
+### Allowed Entity Types (21 -- use EXACTLY these strings):
+User, Person, Organization, Technology, Skill, Project, Concept, Event,
+Goal, Preference, Location, Date, Metric, Document, Pattern, Convention,
+Mechanism, Strategy, DataStructure, Abstraction, MistIdentity
+
+### Abstract-Type Tests (pick the child whose test clearly fits; if none clearly
+### fits, emit Abstraction -- never guess between sibling abstract types):
+###   Concept       an idea/method/principle you understand but cannot "run"
+###   Skill         a competency you can be better or worse at
+###   Pattern       a named reusable solution shape
+###   Strategy      a goal-directed plan, may compose patterns
+###   Mechanism     a concrete component that performs a function
+###   Convention    a normative naming/format rule
+###   DataStructure an addressable runtime data shape
 
 ### Allowed Relationship Types (use EXACTLY these strings):
 USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF, IMPLEMENTED_WITH, MIST_HAS_CAPABILITY, MIST_HAS_TRAIT, MIST_HAS_PREFERENCE, OCCURRED_ON, HAS_METRIC, REFERENCES_DOCUMENT, PRECEDED_BY, MECHANISM_OF, OPERATES_ON, INPUT_TO, IMPROVES, COMPRISES, APPLICABLE_TO, STRATEGY_FOR, NAMING_CONVENTION_OF, RECOMMENDS, HAS_HABIT
@@ -52,6 +64,8 @@ USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXP
 16. Date entities are anchors, not facts. Create a `Date` entity ONLY when an edge targets it: an Event or Milestone anchoring via OCCURRED_ON, or a PRECEDED_BY edge targeting the date (Rule 13). When a date merely scopes a stative fact ("since May 2026", "started using X in 2026"), put it in start_date/end_date and do NOT create a Date entity.
 17. Recommendations and habits. "X recommended/suggested Y" -> X RECOMMENDS Y (source is the recommender, NOT the user unless the user recommended it); when X is a person the user knows, ALSO emit user KNOWS_PERSON X. "I <do activity> every <interval>" -> user HAS_HABIT <activity> with temporal_expression carrying the interval; habitual statements are current stative facts, not Events. HAS_HABIT requires an explicit recurrence cadence ("every morning", "each Friday", "nightly", "twice a week"). A continuous activity stated with only a start point ("mentoring since 2026", "I've been running for years") is NOT a habit -- use the matching stative predicate (EXPERT_IN, LEARNING, INTERESTED_IN) with valid_from instead.
 18. Extract the asserted fact, not incidental scope. A trailing prepositional phrase that merely scopes another fact ("recommended GraphQL FOR the new service", "switched to Memcached FOR the project", "covers 87 percent OF the codebase") is context, not a separate relationship -- do NOT manufacture a structural edge (STRATEGY_FOR / APPLICABLE_TO / WORKS_ON / PART_OF / USED_FOR) for it. Extract a structural edge ONLY when that relationship is itself the asserted fact: "I use Rust FOR backend work" -> rust USED_FOR backend-work IS the fact, so extract it.
+19. Third-party facts -- when the user states a fact about another person ("my sister Anjali works in biotech"), extract BOTH: user KNOWS_PERSON the person AND the third party's own fact with the third party as source (person WORKS_AT org, or equivalent predicate). Do not collapse the third-party fact onto the user.
+20. Abstract-type disambiguation -- when a noun phrase names an abstract knowledge object, apply the ABSTRACT-TYPE TESTS above. Emit the winning child type (Concept / Skill / Pattern / Strategy / Mechanism / Convention / DataStructure). Emit `Abstraction` ONLY when no child type's test clearly wins. Never guess between siblings: if the noun could be Concept OR Pattern, choose Abstraction rather than picking at random.
 
 ## REFERENCE DATE
 Today's date: {reference_date}
@@ -106,11 +120,11 @@ Utterance: "Hey, how's it going?"
 Output:
 {{"entities": [], "relationships": []}}
 
-### Example 9: Temporal -- Milestone anchored to a Date via OCCURRED_ON
+### Example 9: Temporal -- milestone-class Event anchored to a Date via OCCURRED_ON
 Subject scope: user-scope
 Utterance: "We shipped Cluster 8 Phase 6 on 2026-04-22"
 Output:
-{{"entities": [{{"id": "cluster-8-phase-6", "name": "Cluster 8 Phase 6", "type": "Milestone"}}, {{"id": "2026-04-22", "name": "2026-04-22", "type": "Date"}}], "relationships": [{{"source": "cluster-8-phase-6", "target": "2026-04-22", "type": "OCCURRED_ON", "properties": {{"confidence": 0.95, "temporal_status": "past", "start_date": "2026-04-22", "end_date": null, "temporal_expression": "on 2026-04-22", "context": null, "negated": false, "assertion_kind": "assert"}}}}]}}
+{{"entities": [{{"id": "cluster-8-phase-6", "name": "Cluster 8 Phase 6", "type": "Event", "properties": {{"event_type": "milestone"}}}}, {{"id": "2026-04-22", "name": "2026-04-22", "type": "Date"}}], "relationships": [{{"source": "cluster-8-phase-6", "target": "2026-04-22", "type": "OCCURRED_ON", "properties": {{"confidence": 0.95, "temporal_status": "past", "start_date": "2026-04-22", "end_date": null, "temporal_expression": "on 2026-04-22", "context": null, "negated": false, "assertion_kind": "assert"}}}}]}}
 
 ### Example 10: Quantified -- Technology with a numeric Metric via HAS_METRIC
 Subject scope: unknown
@@ -201,6 +215,18 @@ Subject scope: user-scope
 Utterance: "I work out every morning before standup"
 Output:
 {{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "working-out", "name": "Working out", "type": "Concept"}}], "relationships": [{{"source": "user", "target": "working-out", "type": "HAS_HABIT", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": "every morning", "context": "before standup", "negated": false, "assertion_kind": "assert"}}}}]}}
+
+### Example 25: Third-party facts -- KNOWS_PERSON plus the third party's own WORKS_AT fact
+Subject scope: user-scope
+Utterance: "My sister Anjali works at Google in biotech"
+Output:
+{{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "anjali", "name": "Anjali", "type": "Person"}}, {{"id": "google", "name": "Google", "type": "Organization"}}], "relationships": [{{"source": "user", "target": "anjali", "type": "KNOWS_PERSON", "properties": {{"confidence": 0.95, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "sister", "negated": false, "assertion_kind": "assert"}}}}, {{"source": "anjali", "target": "google", "type": "WORKS_AT", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": "biotech", "negated": false, "assertion_kind": "assert"}}}}]}}
+
+### Example 26: Abstraction fallback -- ambiguous abstract noun that fits no single child type
+Subject scope: user-scope
+Utterance: "I find the notion of semantic closure really interesting"
+Output:
+{{"entities": [{{"id": "user", "name": "User", "type": "User"}}, {{"id": "semantic-closure", "name": "Semantic closure", "type": "Abstraction"}}], "relationships": [{{"source": "user", "target": "semantic-closure", "type": "INTERESTED_IN", "properties": {{"confidence": 0.9, "temporal_status": "current", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false, "assertion_kind": "assert"}}}}]}}
 """
 
 EXTRACTION_USER_TEMPLATE = """Context:
