@@ -647,6 +647,49 @@ class TestGetMistIdentityContext:
         # capability renders naturally in the persona block.
         assert "Implemented with LanceDB" in cap["description"]
 
+    def test_identity_queries_anchor_on_typed_label_not_entity(self):
+        """After the partition move, the persona read must not depend on
+        mist-identity carrying :__Entity__.
+        """
+        conn = FakeNeo4jConnection(
+            query_responses={
+                "RETURN m.id AS id": [
+                    {
+                        "id": "mist-identity",
+                        "display_name": "MIST",
+                        "pronouns": "she/her",
+                        "self_concept": "A cognitive architecture.",
+                    }
+                ],
+            }
+        )
+        store = GraphStore(connection=conn, embedding_generator=FakeEmbeddingGenerator())
+
+        store.get_mist_identity_context()
+
+        identity_queries = [
+            q for q, _ in conn.queries if "mist-identity" in q and "RETURN m.id" in q
+        ]
+        assert identity_queries, "Expected the identity query to run"
+        assert all(
+            ":MistIdentity {id: 'mist-identity'}" in q for q in identity_queries
+        ), identity_queries
+        assert not any(
+            ":__Entity__ {id: 'mist-identity'}" in q for q in identity_queries
+        ), identity_queries
+
+    def test_seeded_trait_query_does_not_require_entity_target(self):
+        conn = FakeNeo4jConnection()
+        store = GraphStore(connection=conn, embedding_generator=FakeEmbeddingGenerator())
+
+        store.get_mist_identity_context()
+
+        seeded_trait = [
+            q for q, _ in conn.queries if "HAS_TRAIT" in q and "MIST_HAS_TRAIT" not in q
+        ]
+        assert seeded_trait, "Expected the seeded HAS_TRAIT query"
+        assert not any("(t:__Entity__)" in q for q in seeded_trait), seeded_trait
+
 
 class TestCurrentBeliefFilters:
     """C1: reads filter to current beliefs (coalesce-tolerant of legacy edges)."""

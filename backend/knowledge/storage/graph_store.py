@@ -1375,7 +1375,7 @@ class GraphStore:
         (pre-seed state).
         """
         identity_query = """
-            MATCH (m:__Entity__ {id: 'mist-identity'})
+            MATCH (m:MistIdentity {id: 'mist-identity'})
             RETURN m.id AS id, m.display_name AS display_name,
                    m.pronouns AS pronouns, m.self_concept AS self_concept
         """
@@ -1392,7 +1392,7 @@ class GraphStore:
               AND (r.valid_to IS NULL OR r.valid_to > $now)
               AND (r.valid_from IS NULL OR r.valid_from = '-inf' OR r.valid_from <= $now)"""
         seeded_traits_query = f"""
-            MATCH (m:__Entity__ {{id: 'mist-identity'}})-[r:HAS_TRAIT]->(t:__Entity__)
+            MATCH (m:MistIdentity {{id: 'mist-identity'}})-[r:HAS_TRAIT]->(t)
             {currency}
             RETURN t.id AS id, t.display_name AS display_name,
                    t.axis AS axis, t.description AS description,
@@ -1400,7 +1400,7 @@ class GraphStore:
             ORDER BY t.display_name
         """
         seeded_capabilities_query = f"""
-            MATCH (m:__Entity__ {{id: 'mist-identity'}})-[r:HAS_CAPABILITY]->(c:__Entity__)
+            MATCH (m:MistIdentity {{id: 'mist-identity'}})-[r:HAS_CAPABILITY]->(c)
             {currency}
             RETURN c.id AS id, c.display_name AS display_name,
                    c.description AS description,
@@ -1408,7 +1408,7 @@ class GraphStore:
             ORDER BY c.display_name
         """
         seeded_preferences_query = f"""
-            MATCH (m:__Entity__ {{id: 'mist-identity'}})-[r:HAS_PREFERENCE]->(p:__Entity__)
+            MATCH (m:MistIdentity {{id: 'mist-identity'}})-[r:HAS_PREFERENCE]->(p)
             {currency}
             RETURN p.id AS id, p.display_name AS display_name,
                    p.enforcement AS enforcement, p.context AS context,
@@ -1419,7 +1419,7 @@ class GraphStore:
         # MIST_HAS_PREFERENCE -> external-domain nodes. These have display_name
         # and description only; axis/enforcement/context are synthesized below.
         extracted_traits_query = f"""
-            MATCH (m:__Entity__ {{id: 'mist-identity'}})-[r:MIST_HAS_TRAIT]->(t:__Entity__)
+            MATCH (m:MistIdentity {{id: 'mist-identity'}})-[r:MIST_HAS_TRAIT]->(t:__Entity__)
             {currency}
             RETURN t.id AS id, t.display_name AS display_name,
                    t.description AS description,
@@ -1427,7 +1427,7 @@ class GraphStore:
             ORDER BY t.display_name
         """
         extracted_capabilities_query = f"""
-            MATCH (m:__Entity__ {{id: 'mist-identity'}})-[r:MIST_HAS_CAPABILITY]->(c:__Entity__)
+            MATCH (m:MistIdentity {{id: 'mist-identity'}})-[r:MIST_HAS_CAPABILITY]->(c:__Entity__)
             {currency}
             RETURN c.id AS id, c.display_name AS display_name,
                    c.description AS description,
@@ -1435,7 +1435,7 @@ class GraphStore:
             ORDER BY c.display_name
         """
         extracted_preferences_query = f"""
-            MATCH (m:__Entity__ {{id: 'mist-identity'}})-[r:MIST_HAS_PREFERENCE]->(p:__Entity__)
+            MATCH (m:MistIdentity {{id: 'mist-identity'}})-[r:MIST_HAS_PREFERENCE]->(p:__Entity__)
             {currency}
             RETURN p.id AS id, p.display_name AS display_name,
                    p.description AS description,
@@ -1447,7 +1447,7 @@ class GraphStore:
         # it into the capabilities list so the persona block covers
         # implementation-stack facts.
         implemented_with_query = f"""
-            MATCH (m:__Entity__ {{id: 'mist-identity'}})-[r:IMPLEMENTED_WITH]->(t:__Entity__)
+            MATCH (m:MistIdentity {{id: 'mist-identity'}})-[r:IMPLEMENTED_WITH]->(t:__Entity__)
             {currency}
             RETURN t.id AS id, t.display_name AS display_name,
                    t.description AS description,
