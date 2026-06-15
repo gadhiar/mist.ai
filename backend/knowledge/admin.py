@@ -90,12 +90,14 @@ def ensure_schema(connection: GraphConnection) -> dict[str, int]:
     for cypher in (
         "CREATE CONSTRAINT entity_id_unique IF NOT EXISTS FOR (e:__Entity__) REQUIRE e.id IS UNIQUE",
         "CREATE CONSTRAINT provenance_id_unique IF NOT EXISTS FOR (p:__Provenance__) REQUIRE p.id IS UNIQUE",
+        "CREATE CONSTRAINT selfmodel_id_unique IF NOT EXISTS FOR (s:__SelfModel__) REQUIRE s.id IS UNIQUE",
     ):
         connection.execute_write(cypher)
         counts["constraints"] += 1
     for cypher in (
         "CREATE INDEX entity_type_idx IF NOT EXISTS FOR (e:__Entity__) ON (e.entity_type)",
         "CREATE INDEX provenance_type_idx IF NOT EXISTS FOR (p:__Provenance__) ON (p.entity_type)",
+        "CREATE INDEX selfmodel_type_idx IF NOT EXISTS FOR (s:__SelfModel__) ON (s.entity_type)",
     ):
         connection.execute_write(cypher)
         counts["indexes"] += 1

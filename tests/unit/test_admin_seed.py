@@ -368,3 +368,19 @@ def test_ensure_schema_installs_provenance_type_index():
         "INDEX provenance_type_idx" in q and "__Provenance__" in q and "p.entity_type" in q
         for q in issued
     ), f"Expected provenance_type_idx, got: {issued}"
+
+
+def test_ensure_schema_installs_selfmodel_constraint_and_index():
+    from backend.knowledge import admin
+    from tests.mocks.neo4j import FakeNeo4jConnection
+
+    conn = FakeNeo4jConnection()
+    admin.ensure_schema(conn)
+
+    issued = [q for q, _ in conn.writes]
+    assert any(
+        "CONSTRAINT selfmodel_id_unique" in q and "__SelfModel__" in q for q in issued
+    ), f"Expected __SelfModel__ constraint in admin.ensure_schema, got: {issued}"
+    assert any(
+        "INDEX selfmodel_type_idx" in q and "__SelfModel__" in q for q in issued
+    ), f"Expected selfmodel_type_idx in admin.ensure_schema, got: {issued}"

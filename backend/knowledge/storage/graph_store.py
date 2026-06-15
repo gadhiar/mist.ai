@@ -179,6 +179,7 @@ class GraphStore:
             "CREATE CONSTRAINT external_source_uri_unique IF NOT EXISTS FOR (es:ExternalSource) REQUIRE es.source_uri IS UNIQUE",
             "CREATE CONSTRAINT vector_chunk_store_id_unique IF NOT EXISTS FOR (vc:VectorChunk) REQUIRE vc.vector_store_id IS UNIQUE",
             "CREATE CONSTRAINT provenance_id_unique IF NOT EXISTS FOR (p:__Provenance__) REQUIRE p.id IS UNIQUE",
+            "CREATE CONSTRAINT selfmodel_id_unique IF NOT EXISTS FOR (s:__SelfModel__) REQUIRE s.id IS UNIQUE",
         ]
 
         for constraint in constraints:
@@ -199,6 +200,7 @@ class GraphStore:
             "CREATE INDEX external_source_type_idx IF NOT EXISTS FOR (es:ExternalSource) ON (es.source_type)",
             "CREATE INDEX vector_chunk_source_id_idx IF NOT EXISTS FOR (vc:VectorChunk) ON (vc.source_id)",
             "CREATE INDEX provenance_type_idx IF NOT EXISTS FOR (p:__Provenance__) ON (p.entity_type)",
+            "CREATE INDEX selfmodel_type_idx IF NOT EXISTS FOR (s:__SelfModel__) ON (s.entity_type)",
         ]
 
         for index in indexes:

@@ -231,3 +231,29 @@ class TestGraphHopEntityFilter:
         assert params["allowed_rel_types"] == [
             "WORKS_ON"
         ], f"Expected caller-provided subset ['WORKS_ON'], got: {params}"
+
+
+class TestInitializeSchemaSelfModel:
+    def test_ensure_schema_installs_selfmodel_constraint(self) -> None:
+        conn = FakeNeo4jConnection()
+        store = GraphStore(connection=conn, embedding_generator=FakeEmbeddingGenerator())
+
+        store.initialize_schema()
+
+        issued = [q for q, _ in conn.writes]
+        assert any(
+            "CONSTRAINT selfmodel_id_unique" in q and "__SelfModel__" in q and "s.id" in q
+            for q in issued
+        ), f"Expected __SelfModel__ uniqueness constraint, got writes: {issued}"
+
+    def test_ensure_schema_installs_selfmodel_type_index(self) -> None:
+        conn = FakeNeo4jConnection()
+        store = GraphStore(connection=conn, embedding_generator=FakeEmbeddingGenerator())
+
+        store.initialize_schema()
+
+        issued = [q for q, _ in conn.writes]
+        assert any(
+            "INDEX selfmodel_type_idx" in q and "__SelfModel__" in q and "s.entity_type" in q
+            for q in issued
+        ), f"Expected selfmodel_type_idx, got writes: {issued}"
