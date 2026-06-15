@@ -492,4 +492,4 @@ class TestSelfModelPartition:
         q = create[0]
         assert "__SelfModel__" in q, f"Expected __SelfModel__ partition in query, got: {q}"
         assert "__Entity__" not in q, f"Unexpected __Entity__ label in capability create: {q}"
-        assert "MistCapability" in q, f"Expected MistCapability typed label in query, got: {q}"
+        assert "SET e:MistCapability" in q, f"typed label must be applied via SET, got: {q}"
