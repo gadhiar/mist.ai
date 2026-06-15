@@ -163,9 +163,52 @@ class TestUpdateOperation:
         assert len(result.operations) == 1
         assert result.operations[0]["op"] == "UPDATE"
         # entity_id is passed as a parameter, not in the query string
-        conn.assert_write_executed("__Entity__")
+        conn.assert_write_executed("__SelfModel__")
         _, params = conn.writes[0]
         assert params["entity_id"] == "trait-concise-communication"
+
+
+class TestSelfModelPartition:
+    @pytest.mark.asyncio
+    async def test_create_trait_writes_selfmodel_partition_and_typed_label(self):
+        llm = FakeLLM(
+            default_response=json.dumps(
+                {
+                    "operations": [
+                        {
+                            "op": "CREATE_TRAIT",
+                            "id": "trait-concise",
+                            "display_name": "Concise",
+                            "description": "Prefers concise responses",
+                            "confidence": 0.85,
+                        }
+                    ]
+                }
+            )
+        )
+        conn = FakeNeo4jConnection()
+        executor = FakeGraphExecutor(connection=conn)
+        deriver = InternalKnowledgeDeriver(llm=llm, executor=executor)
+        signals = SignalDetectionResult(
+            has_signals=True,
+            signal_types=frozenset({"feedback"}),
+            matched_patterns=("feedback:concise",),
+        )
+
+        await deriver.derive(
+            utterance="be concise",
+            assistant_response="ok",
+            signals=signals,
+            session_id="s1",
+            event_id="e1",
+        )
+
+        create_writes = [q for q, _ in conn.writes if "MERGE (e:" in q]
+        assert create_writes, "Expected a node-creating write"
+        q = create_writes[0]
+        assert "__SelfModel__" in q, f"Self-model node must use :__SelfModel__, got: {q}"
+        assert "__Entity__" not in q, f"Self-model node must NOT carry :__Entity__, got: {q}"
+        assert "MistTrait" in q, f"Self-model node must carry its typed label, got: {q}"
 
 
 class TestDeprecateOperation:

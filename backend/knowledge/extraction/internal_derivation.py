@@ -11,12 +11,14 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from backend.errors import ExtractionError
 from backend.knowledge.extraction.internal_prompts import (
     INTERNAL_DERIVATION_SYSTEM_PROMPT,
     INTERNAL_DERIVATION_USER_TEMPLATE,
 )
 from backend.knowledge.extraction.signal_detector import SignalDetectionResult, SignalDetector
 from backend.knowledge.storage.graph_executor import GraphExecutor
+from backend.knowledge.storage.partitions import SELF_MODEL_LABEL, SELF_MODEL_TYPES
 from backend.llm.models import LLMRequest
 
 logger = logging.getLogger(__name__)
@@ -169,7 +171,7 @@ class InternalKnowledgeDeriver:
         """Fetch existing internal entities for LLM context."""
         try:
             results = await self._executor.execute_query(
-                "MATCH (m:MistIdentity)-[r]->(e:__Entity__) "
+                f"MATCH (m:MistIdentity)-[r]->(e:{SELF_MODEL_LABEL}) "
                 "WHERE e.knowledge_domain = 'internal' AND e.status = 'active' "
                 "AND coalesce(r.is_latest_belief, true) "
                 "RETURN e.id AS id, e.entity_type AS type, "
@@ -240,11 +242,17 @@ class InternalKnowledgeDeriver:
             if prop_sets:
                 create_set += ", " + prop_sets
 
-            # MERGE entity + link to MistIdentity
+            # MERGE entity into the :__SelfModel__ partition + apply the typed
+            # label (entity_type is one of SELF_MODEL_TYPES from the op mapping,
+            # so it is safe to interpolate as a label).
+            typed_label = params["entity_type"]
+            if typed_label not in SELF_MODEL_TYPES:
+                raise ExtractionError(f"Unknown self-model type: {typed_label}")
             await self._executor.execute_write(
-                f"MERGE (e:__Entity__ {{id: $entity_id}}) "
+                f"MERGE (e:{SELF_MODEL_LABEL} {{id: $entity_id}}) "
                 f"ON CREATE SET {create_set} "
                 "ON MATCH SET e.updated_at = $now, e.confidence = $confidence "
+                f"SET e:{typed_label} "
                 "WITH e "
                 "MATCH (m:MistIdentity {id: 'mist-identity'}) "
                 f"MERGE (m)-[:{rel_type}]->(e)",
@@ -266,7 +274,7 @@ class InternalKnowledgeDeriver:
                     params[param_key] = value
 
             await self._executor.execute_write(
-                f"MATCH (e:__Entity__ {{id: $entity_id}}) " f"SET {', '.join(set_clauses)}",
+                f"MATCH (e:{SELF_MODEL_LABEL} {{id: $entity_id}}) " f"SET {', '.join(set_clauses)}",
                 params,
             )
 
@@ -277,7 +285,7 @@ class InternalKnowledgeDeriver:
                 return
 
             await self._executor.execute_write(
-                "MATCH (e:__Entity__ {id: $entity_id}) "
+                f"MATCH (e:{SELF_MODEL_LABEL} {{id: $entity_id}}) "
                 "SET e.status = 'deprecated', e.deprecated_reason = $reason, "
                 "e.updated_at = $now",
                 {"entity_id": entity_id, "reason": reason, "now": now},
