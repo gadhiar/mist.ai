@@ -527,7 +527,7 @@ class ReconciliationEngine:
             clauses.append("t.id <> $target")
             params["target"] = exclude_target
         rows = await self._executor.execute_query(
-            f"MATCH (s:__Entity__ {{id: $source}})-[r:{stype}]->(t:__Entity__) "
+            f"MATCH (s:__Entity__|__SelfModel__ {{id: $source}})-[r:{stype}]->(t:__Entity__) "
             f"WHERE {' AND '.join(clauses)} {_BELIEF_RETURN}",
             params,
         )
@@ -555,7 +555,7 @@ class ReconciliationEngine:
     ) -> ExistingBeliefs:
         stype = _sanitize(a.predicate)
         applied = await self._executor.execute_query(
-            f"MATCH (s:__Entity__ {{id: $source}})"
+            f"MATCH (s:__Entity__|__SelfModel__ {{id: $source}})"
             f"-[r:{stype} {{source_utterance_id: $eid}}]->"
             f"(t:__Entity__ {{id: $target}}) RETURN count(r) AS n",
             {"source": a.source, "target": a.target, "eid": event_id},
@@ -687,7 +687,7 @@ class ReconciliationEngine:
         src = copy_of or assertion
         vf = act.valid_from if copy_of is None else copy_of.valid_from
         rows = await self._executor.execute_write(
-            f"MATCH (s:__Entity__ {{id: $source}}) "
+            f"MATCH (s:__Entity__|__SelfModel__ {{id: $source}}) "
             f"MATCH (t:__Entity__ {{id: $target}}) "
             f"MERGE (s)-[r:{stype} {{version_key: $vk}}]->(t) "
             "ON CREATE SET r.source_utterance_id = $eid, "
@@ -740,7 +740,7 @@ class ReconciliationEngine:
     ) -> bool:
         stype = _sanitize(act.predicate)
         rows = await self._executor.execute_write(
-            f"MATCH (s:__Entity__ {{id: $source}}) "
+            f"MATCH (s:__Entity__|__SelfModel__ {{id: $source}}) "
             f"MATCH (t:__Entity__ {{id: $target}}) "
             f"MERGE (s)-[r:{stype}]->(t) "
             "ON CREATE SET r.source_utterance_id = $eid, r.recorded_at = $recorded_at, "

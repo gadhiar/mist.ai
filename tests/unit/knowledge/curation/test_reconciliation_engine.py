@@ -716,3 +716,40 @@ class TestExplicitKindGate:
         ]
         for rel, kind, mapped in cases:
             assert derive_assertion_kind(rel) == (kind, mapped)
+
+
+class TestSelfModelSourceMatching:
+    """Regression guard for R1.0: self-model partition source matching.
+
+    After mist-identity leaves :__Entity__ (it now lives in :__SelfModel__),
+    the source MATCH in the reconciliation engine must use a label disjunction
+    so MIST_HAS_* edges are not silently dropped.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mist_has_trait_edge_matches_selfmodel_source(self):
+        """A MIST_HAS_TRAIT edge sourced from the self-model partition must still be
+        applied after mist-identity leaves :__Entity__.
+        """
+        conn = FakeNeo4jConnection()
+        await _engine(conn).reconcile_turn(
+            relationships=[
+                {
+                    "source": "mist-identity",
+                    "type": "MIST_HAS_TRAIT",
+                    "target": "curiosity",
+                    "confidence": 0.9,
+                }
+            ],
+            recorded_at=RECORDED_AT,
+            event_id="e1",
+            session_id="s1",
+        )
+
+        append_writes = [q for q, _ in conn.writes if "MERGE (s)-[r:MIST_HAS_TRAIT" in q]
+        assert (
+            append_writes
+        ), "Expected a MIST_HAS_TRAIT append write; MIST_HAS_TRAIT edge was silently dropped"
+        assert all(
+            "(s:__Entity__|__SelfModel__ {id: $source})" in q for q in append_writes
+        ), f"Expected source disjunction in all append writes; got: {append_writes}"
