@@ -1,6 +1,6 @@
 """Canonical graph serializer (F3) -- deterministic, wall-clock-free form."""
 
-from backend.knowledge.canonical_serialize import canonical_graph_form
+from backend.knowledge.canonical_serialize import _canon_props, _node, _rel, canonical_graph_form
 from tests.mocks.neo4j import FakeNeo4jConnection
 
 
@@ -115,3 +115,42 @@ class TestCanonicalGraphForm:
         form2 = canonical_graph_form(_conn([], list(reversed(rels))))
         assert form1 == form2  # input order does not change canonical output
         assert form1.index('"e1"') < form1.index('"e2"')  # ordered by source_event_id
+
+
+class TestCanonPropsEpochAndConfidence:
+    def test_canon_props_drops_epoch_stamps_for_both_nodes_and_edges(self):
+        props = {
+            "display_name": "Python",
+            "ontology_version": "1.4.0",
+            "extraction_version": "2026-06-14-r5",
+            "model_hash": "gemma-x",
+        }
+        node_out = _canon_props(props, is_node=True)
+        edge_out = _canon_props(props, is_node=False)
+        for out in (node_out, edge_out):
+            assert "ontology_version" not in out
+            assert "extraction_version" not in out
+            assert "model_hash" not in out
+            assert out["display_name"] == "Python"
+
+    def test_canon_props_drops_confidence_for_nodes_keeps_for_edges(self):
+        props = {"display_name": "Python", "confidence": 0.73}
+        assert "confidence" not in _canon_props(props, is_node=True)
+        assert _canon_props(props, is_node=False)["confidence"] == 0.73
+
+    def test_node_and_rel_apply_the_right_kind(self):
+        n = {
+            "id": "python",
+            "labels": ["__Entity__"],
+            "properties": {"confidence": 0.9, "model_hash": "x"},
+        }
+        r = {
+            "source": "user",
+            "type": "USES",
+            "target": "python",
+            "properties": {"confidence": 0.9, "model_hash": "x"},
+        }
+        assert "confidence" not in _node(n)["properties"]  # node: dropped
+        assert "model_hash" not in _node(n)["properties"]
+        assert _rel(r)["properties"]["confidence"] == 0.9  # edge: kept
+        assert "model_hash" not in _rel(r)["properties"]

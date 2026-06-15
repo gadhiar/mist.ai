@@ -30,11 +30,21 @@ AUDIT_FIELDS = frozenset(
     }
 )
 
+# Epoch-derived metadata: deterministic for a fixed epoch but DRIFTS across the
+# historical stamps a live graph accumulates (seed 1.2.0 / config 1.4.0 / writer
+# fallback 1.2.1). Excluded from the content form so the proof is "same log +
+# same epoch => same facts", not "same stamps".
+EPOCH_STAMP_FIELDS = frozenset({"ontology_version", "extraction_version", "model_hash"})
 
-def _canon_props(props: dict[str, Any]) -> dict[str, Any]:
+
+def _canon_props(props: dict[str, Any], *, is_node: bool) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for k, v in props.items():
-        if k in AUDIT_FIELDS or k == "embedding":
+        if k in AUDIT_FIELDS or k in EPOCH_STAMP_FIELDS or k == "embedding":
+            continue
+        # Node `confidence` is wall-clock-decayed (confidence_decay.py); edge
+        # `confidence` is reinforce-only (log-deterministic) and is retained.
+        if is_node and k == "confidence":
             continue
         out[k] = sorted(v) if isinstance(v, list) else v
     return out
@@ -44,7 +54,7 @@ def _node(n: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": n["id"],
         "labels": sorted(n["labels"]),
-        "properties": _canon_props(n["properties"]),
+        "properties": _canon_props(n["properties"], is_node=True),
     }
 
 
@@ -53,7 +63,7 @@ def _rel(r: dict[str, Any]) -> dict[str, Any]:
         "source": r["source"],
         "type": r["type"],
         "target": r["target"],
-        "properties": _canon_props(r["properties"]),
+        "properties": _canon_props(r["properties"], is_node=False),
     }
 
 
