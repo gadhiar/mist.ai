@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from backend.knowledge.config import SkillDerivationConfig
 from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
 from backend.knowledge.storage.graph_executor import GraphExecutor
+from backend.knowledge.storage.partitions import SELF_MODEL_LABEL
 
 logger = logging.getLogger(__name__)
 
@@ -203,21 +204,21 @@ class SkillDerivationJob:
         capability_id = f"cap-{_slugify(display_name)}"
 
         existing = await self._executor.execute_query(
-            "MATCH (e:__Entity__ {id: $cap_id, entity_type: 'MistCapability'}) "
+            f"MATCH (e:{SELF_MODEL_LABEL} {{id: $cap_id, entity_type: 'MistCapability'}}) "
             "RETURN e.id AS id LIMIT 1",
             {"cap_id": capability_id},
         )
 
         if existing:
             await self._executor.execute_write(
-                "MATCH (e:__Entity__ {id: $cap_id, entity_type: 'MistCapability'}) "
+                f"MATCH (e:{SELF_MODEL_LABEL} {{id: $cap_id, entity_type: 'MistCapability'}}) "
                 "SET e.proficiency = $proficiency, e.updated_at = $now",
                 {"cap_id": capability_id, "proficiency": proficiency, "now": now},
             )
             return False
 
         await self._executor.execute_write(
-            "MERGE (e:__Entity__ {id: $cap_id}) "
+            f"MERGE (e:{SELF_MODEL_LABEL} {{id: $cap_id}}) "
             "ON CREATE SET "
             "  e.entity_type = 'MistCapability', "
             "  e.display_name = $display_name, "
@@ -229,6 +230,7 @@ class SkillDerivationJob:
             "  e.created_at = $now, "
             "  e.updated_at = $now, "
             "  e.ontology_version = '1.0.0' "
+            "SET e:MistCapability "
             "WITH e "
             "MATCH (m:MistIdentity {id: 'mist-identity'}) "
             "MERGE (m)-[:HAS_CAPABILITY]->(e)",

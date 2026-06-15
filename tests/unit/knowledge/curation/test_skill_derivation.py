@@ -462,3 +462,34 @@ class TestDeduplication:
         # Assert: a MATCH query was issued to check for the existing skill.
         conn.assert_query_executed("MATCH")
         conn.assert_query_executed("entity_type: 'Skill'")
+
+
+# ---------------------------------------------------------------------------
+# TestSelfModelPartition
+# ---------------------------------------------------------------------------
+
+
+class TestSelfModelPartition:
+    @pytest.mark.asyncio
+    async def test_ensure_capability_writes_selfmodel_partition_with_typed_label(self):
+        # Arrange: seed query_responses so the MistCapability lookup returns empty
+        # (forces the create path, not the update path).
+        config = _make_config(skill_threshold=3, capability_threshold=3)
+        conn = FakeNeo4jConnection(query_responses={"MistCapability": []})
+        executor = FakeGraphExecutor(connection=conn)
+        tracker = ToolUsageTracker(config=config)
+        job = SkillDerivationJob(tracker=tracker, executor=executor, config=config)
+
+        _record_identical(tracker, count=3, success=True)
+
+        # Act
+        await job.run()
+
+        # Assert: the capability create write uses :__SelfModel__, not :__Entity__,
+        # and applies the MistCapability typed label via SET.
+        create = [q for q, _ in conn.writes if "MERGE (e:" in q and "cap_id" in q]
+        assert create, "Expected a capability create write targeting MERGE (e:..."
+        q = create[0]
+        assert "__SelfModel__" in q, f"Expected __SelfModel__ partition in query, got: {q}"
+        assert "__Entity__" not in q, f"Unexpected __Entity__ label in capability create: {q}"
+        assert "MistCapability" in q, f"Expected MistCapability typed label in query, got: {q}"
