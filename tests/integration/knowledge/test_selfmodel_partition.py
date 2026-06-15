@@ -135,25 +135,48 @@ class TestSelfModelPartition:
         ), "mist-identity carries :__Entity__ label -- partition isolation violated"
 
     def test_persona_read_returns_graph_identity_not_fallback(self, store: GraphStore):
-        """get_mist_identity_context() returns the graph node, not the minimal-default fallback."""
-        # Arrange
+        """get_mist_identity_context() reads the graph (seeded HAS_TRAIT), not the fallback.
+
+        The fallback dict in get_mist_identity_context (graph_store.py ~1477)
+        returns the SAME id/display_name as a real node, so asserting only on
+        identity fields is tautological -- it passes even if the graph was never
+        matched. A seeded :__SelfModel__:MistTrait flowing through the persona
+        traits list can ONLY happen when the seeded HAS_TRAIT traversal actually
+        runs against the graph (the fallback returns EMPTY traits). This also
+        exercises T7's seeded self-model traversal end-to-end on real Neo4j.
+        """
+        # Arrange: identity node + one current HAS_TRAIT edge to a self-model
+        # trait. The edge properties satisfy every arm of the `currency` filter
+        # in get_mist_identity_context: status != 'orphaned',
+        # is_latest_belief=true, valid_to IS NULL, valid_from='-inf' sentinel.
         store.ensure_mist_identity()
+        store.connection.execute_write(
+            """
+            MERGE (t:__SelfModel__:MistTrait {id: 'trait-test-warm'})
+            ON CREATE SET t.display_name = 'Warm', t.entity_type = 'MistTrait',
+                          t.axis = 'Temperament', t.status = 'active'
+            WITH t
+            MATCH (m:MistIdentity {id: 'mist-identity'})
+            MERGE (m)-[r:HAS_TRAIT]->(t)
+            ON CREATE SET r.status = 'active', r.is_latest_belief = true,
+                          r.valid_from = '-inf'
+            """,
+            {},
+        )
 
         # Act
         context = store.get_mist_identity_context()
 
-        # Assert
+        # Assert: identity resolved AND the seeded trait flowed through.
         identity = context["identity"]
         assert (
             identity["id"] == "mist-identity"
         ), f"Expected graph node id='mist-identity', got: {identity!r}"
-        # The fallback has display_name='MIST' and no database-set fields.
-        # A node returned from the graph carries at least id and display_name
-        # as set in ensure_mist_identity(); verify it is not the hardcoded
-        # default by confirming the node was actually matched (not synthesised).
-        assert (
-            identity.get("display_name") == "MIST"
-        ), f"Unexpected display_name: {identity.get('display_name')!r}"
+        assert any(t.get("display_name") == "Warm" for t in context["traits"]), (
+            "Seeded HAS_TRAIT trait 'Warm' not in context['traits'] "
+            f"(empty traits => persona read fell back instead of reading the graph): "
+            f"{context['traits']!r}"
+        )
 
     def test_reset_preserves_selfmodel_partition(self, store: GraphStore):
         """reset_graph(include_derived=True) wipes :__Entity__ but leaves :__SelfModel__ intact."""
