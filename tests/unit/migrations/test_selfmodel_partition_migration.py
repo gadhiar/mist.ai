@@ -2,6 +2,7 @@
 
 import pytest
 
+from backend.knowledge.storage.partitions import SELF_MODEL_TYPES
 from scripts.migrations.selfmodel_partition import CYPHER, migrate
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
 
@@ -15,13 +16,7 @@ def test_cypher_relabels_entity_to_selfmodel_for_self_model_types():
 
 def test_cypher_backfills_each_typed_label():
     joined = "\n".join(CYPHER)
-    for typed in (
-        "MistIdentity",
-        "MistTrait",
-        "MistCapability",
-        "MistPreference",
-        "MistUncertainty",
-    ):
+    for typed in sorted(SELF_MODEL_TYPES):
         assert f"SET e:{typed}" in joined, f"missing typed-label backfill for {typed}"
 
 
