@@ -113,6 +113,26 @@ def test_graph_reset_without_include_derived_result_has_no_provenance_count():
 
 
 # ---------------------------------------------------------------------------
+# Task 9 -- self-model partition preserved across reset
+# ---------------------------------------------------------------------------
+
+
+def test_reset_graph_never_deletes_selfmodel_nodes():
+    """reset_graph must never issue a DETACH DELETE that targets :__SelfModel__,
+    in either mode -- the self-model is preserved across an :__Entity__ reset.
+    """
+    connection = _make_connection(non_seed_count=0)
+
+    admin.reset_graph(connection, include_derived=False)
+    admin.reset_graph(connection, include_derived=True)
+
+    issued_writes = [q for q, _ in connection.writes]
+    assert not any(
+        "__SelfModel__" in q and "DETACH DELETE" in q for q in issued_writes
+    ), f"reset_graph must never DETACH DELETE :__SelfModel__, got: {issued_writes}"
+
+
+# ---------------------------------------------------------------------------
 # Safety guard still enforced
 # ---------------------------------------------------------------------------
 
