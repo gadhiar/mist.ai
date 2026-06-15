@@ -140,7 +140,13 @@ class EntityNormalizer:
         self._graph_available = executor is not None
 
     async def normalize(self, extraction: ExtractionResult) -> ExtractionResult:
-        """Normalize all entity IDs and deduplicate against the graph.
+        """Normalize all entity IDs via string canonicalization + resolver passes.
+
+        Pure canonicalization: reserved-name/registry resolution + the ontology
+        resolver passes (retired-type coercion, Metric compound-id, parent
+        fallback). Graph-identity resolution (matching against existing graph
+        nodes) is the curation deduper's sole responsibility as of R1.1 -- this
+        method issues no graph queries.
 
         Modifies the ExtractionResult in place and returns it.
 
