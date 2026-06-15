@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 
 from backend.interfaces import EmbeddingProvider
 from backend.knowledge.curation.confidence import ConfidenceManager
+from backend.knowledge.ontologies.hierarchy import dedup_type_filter
 from backend.knowledge.storage.graph_executor import GraphExecutor
 
 logger = logging.getLogger(__name__)
@@ -78,8 +79,9 @@ class EntityDeduplicator:
         for entity in entities:
             entity_id = entity.get("id", "")
             entity_type = entity.get("type", "")
+            display_name = entity.get("name") or entity.get("display_name") or entity_id
 
-            existing = await self._find_existing(entity_id, entity_type)
+            existing = await self._find_existing(entity_id, entity_type, display_name)
 
             if existing is not None:
                 instructions = self._build_merge_instructions(existing, entity)
@@ -108,61 +110,64 @@ class EntityDeduplicator:
             id_renames=id_renames,
         )
 
-    async def _find_existing(self, entity_id: str, entity_type: str) -> dict | None:
-        """Search graph for existing entity via 3-tier matching."""
-        # Tier 1: Exact ID match
+    async def _find_existing(
+        self, entity_id: str, entity_type: str, display_name: str
+    ) -> dict | None:
+        """Deterministic 3-tier resolver: exact id -> alias -> exact cosine.
+
+        Every tier has a total order (ORDER BY id; the cosine tier breaks ties on
+        id) so live and a replay rebuild make identical merge decisions on the
+        same input -- no ANN, no insertion-order sensitivity.
+        """
+        _RET = (
+            "RETURN e.id AS id, e.entity_type AS entity_type, "
+            "e.display_name AS display_name, e.aliases AS aliases, "
+            "e.description AS description, e.confidence AS confidence, "
+            "e.source_type AS source_type"
+        )
+
+        # Tier 1: exact id (ORDER BY id makes case-fold collisions deterministic)
         results = await self._executor.execute_query(
             "MATCH (e:__Entity__) WHERE toLower(e.id) = $entity_id "
-            "AND e.entity_type = $entity_type "
-            "RETURN e.id AS id, e.entity_type AS entity_type, "
-            "e.display_name AS display_name, e.aliases AS aliases, "
-            "e.description AS description, e.confidence AS confidence, "
-            "e.source_type AS source_type LIMIT 1",
+            f"AND e.entity_type = $entity_type {_RET} ORDER BY e.id ASC LIMIT 1",
             {"entity_id": entity_id.lower(), "entity_type": entity_type},
         )
         if results:
             return results[0]
 
-        # Tier 2: Alias match
+        # Tier 2: alias (same total order)
         results = await self._executor.execute_query(
-            "MATCH (e:__Entity__) "
-            "WHERE $entity_id IN [a IN e.aliases | toLower(a)] "
-            "AND e.entity_type = $entity_type "
-            "RETURN e.id AS id, e.entity_type AS entity_type, "
-            "e.display_name AS display_name, e.aliases AS aliases, "
-            "e.description AS description, e.confidence AS confidence, "
-            "e.source_type AS source_type LIMIT 1",
+            "MATCH (e:__Entity__) WHERE $entity_id IN [a IN e.aliases | toLower(a)] "
+            f"AND e.entity_type = $entity_type {_RET} ORDER BY e.id ASC LIMIT 1",
             {"entity_id": entity_id.lower(), "entity_type": entity_type},
         )
         if results:
             return results[0]
 
-        # Tier 3: Embedding similarity
+        # Tier 3: exact cosine over the widened-type candidate set. No ANN: a full
+        # exact-cosine scan is a recall superset of HNSW top-k and is deterministic.
+        # Probe embeds the display_name (the text the node's embedding is built
+        # from), compared against stored node embeddings. Winner = argmax over
+        # (score, id) as a total order.
         try:
-            # Off-loop: model.encode blocks ~10ms warm (seconds cold) and
-            # this runs under the curation write lock on the event loop.
-            candidate_embedding = await asyncio.get_running_loop().run_in_executor(
-                None, self._embedding_provider.generate_embedding, entity_id
+            probe = await asyncio.get_running_loop().run_in_executor(
+                None, self._embedding_provider.generate_embedding, display_name
             )
             results = await self._executor.execute_query(
-                "CALL db.index.vector.queryNodes('entity_embeddings', 5, $embedding) "
-                "YIELD node, score "
-                "WHERE score >= $threshold AND node.entity_type = $entity_type "
-                "RETURN node.id AS id, node.entity_type AS entity_type, "
-                "node.display_name AS display_name, node.aliases AS aliases, "
-                "node.description AS description, node.confidence AS confidence, "
-                "node.source_type AS source_type, score "
-                "ORDER BY score DESC LIMIT 1",
+                "MATCH (e:__Entity__) WHERE e.entity_type IN $types AND e.embedding IS NOT NULL "
+                "WITH e, vector.similarity.cosine(e.embedding, $embedding) AS score "
+                f"WHERE score >= $threshold {_RET}, score "
+                "ORDER BY score DESC, e.id ASC LIMIT 1",
                 {
-                    "embedding": candidate_embedding,
+                    "embedding": probe,
                     "threshold": SIMILARITY_THRESHOLD,
-                    "entity_type": entity_type,
+                    "types": dedup_type_filter(entity_type),
                 },
             )
             if results:
                 return results[0]
         except Exception:
-            logger.debug("Embedding similarity search failed (expected if no vector index)")
+            logger.debug("Cosine similarity search failed (expected if no embeddings present)")
 
         return None
 

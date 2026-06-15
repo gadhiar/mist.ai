@@ -6,6 +6,66 @@ from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
 from tests.unit.knowledge.curation.conftest import make_entity_dict
 
+# ---------------------------------------------------------------------------
+# Helpers shared by the resolver shape tests
+# ---------------------------------------------------------------------------
+
+
+def _deduper(conn: FakeNeo4jConnection):
+    from backend.knowledge.curation.confidence import ConfidenceManager
+    from backend.knowledge.curation.deduplication import EntityDeduplicator
+
+    emb = FakeEmbeddingGenerator()
+    dd = EntityDeduplicator(
+        executor=FakeGraphExecutor(connection=conn),
+        embedding_provider=emb,
+        confidence_manager=ConfidenceManager(),
+    )
+    return dd, emb
+
+
+# ---------------------------------------------------------------------------
+# Resolver determinism: ORDER BY on all tiers, exact-cosine (no ANN), probe
+# ---------------------------------------------------------------------------
+
+
+class TestDeterministicResolver:
+    @pytest.mark.asyncio
+    async def test_exact_and_alias_tiers_order_by_id_for_total_order(self):
+        conn = FakeNeo4jConnection()
+        dd, _ = _deduper(conn)
+
+        await dd._find_existing("python", "Technology", "Python")
+
+        exact_alias = [
+            q for q, _ in conn.queries if "toLower(e.id)" in q or "IN [a IN e.aliases" in q
+        ]
+        assert exact_alias, "expected exact + alias tier queries"
+        assert all("ORDER BY e.id ASC" in q for q in exact_alias), exact_alias
+
+    @pytest.mark.asyncio
+    async def test_similarity_tier_uses_exact_cosine_not_ann(self):
+        conn = FakeNeo4jConnection()
+        dd, _ = _deduper(conn)
+
+        await dd._find_existing("python", "Technology", "Python")
+
+        cosine_q = [q for q, _ in conn.queries if "vector.similarity.cosine" in q]
+        assert cosine_q, "expected an exact-cosine query"
+        q = cosine_q[0]
+        assert "db.index.vector.queryNodes" not in q, "ANN must be gone from the resolver"
+        assert "ORDER BY score DESC, e.id ASC" in q, q
+
+    @pytest.mark.asyncio
+    async def test_probe_embeds_display_name_not_id(self):
+        conn = FakeNeo4jConnection()
+        dd, emb = _deduper(conn)
+
+        await dd._find_existing("py", "Technology", "Python")
+
+        assert "Python" in emb.calls, f"probe must embed display_name, got calls: {emb.calls}"
+        assert "py" not in emb.calls, "probe must NOT embed the id"
+
 
 class TestExactIdMatch:
     @pytest.mark.asyncio

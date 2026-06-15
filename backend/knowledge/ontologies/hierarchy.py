@@ -62,3 +62,16 @@ def expand_allowed_with_parents(allowed: tuple[str, ...]) -> tuple[str, ...]:
         if anchor in allowed and parent not in result:
             result.append(parent)
     return tuple(result)
+
+
+def dedup_type_filter(entity_type: str) -> list[str]:
+    """Types that count as 'same kind' for embedding dedup.
+
+    For abstract-cluster types, widen to the parent + all siblings so a Concept
+    and a Skill of the same entity can still merge; non-cluster types match
+    exactly. Result is sorted + deduped for deterministic candidate scoping.
+    """
+    parent = parent_of(entity_type) or (entity_type if entity_type == "Abstraction" else None)
+    if parent is None:
+        return [entity_type]
+    return sorted({parent, *children_of(parent), entity_type})
