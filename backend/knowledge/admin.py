@@ -580,7 +580,8 @@ def _merge_relationship(
     ontology_version: str,
     now_iso: str,
 ) -> int:
-    """MERGE a single relationship between two existing __Entity__ nodes.
+    """MERGE a single relationship between two existing nodes (each in the
+    :__Entity__ or :__SelfModel__ partition).
 
     Applies merge-params on both branches so seed metadata lands even if the
     relationship was pre-created by extraction. `first_seen_at` is create-only.
