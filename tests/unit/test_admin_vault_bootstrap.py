@@ -299,3 +299,29 @@ class TestEmitSeedVaultProvenance:
         # Assert -- same edge count returned both times
         assert first == second
         # Caller-side determinism: second run does not change the contract.
+
+    def test_entity_match_spans_entity_and_selfmodel_partitions(self) -> None:
+        # R1.0 Task 5: identity-anchored seed nodes (mist-identity, traits,
+        # capabilities, preferences) now live in :__SelfModel__, not :__Entity__.
+        # Every DERIVED_FROM entity MATCH must use the :__Entity__|__SelfModel__
+        # disjunction so the edge lands regardless of which partition holds the
+        # node; a bare :__Entity__ match would silently miss self-model nodes.
+        # Arrange
+        conn = FakeNeo4jConnection()
+
+        # Act
+        admin.emit_seed_vault_provenance(
+            conn,
+            SEED,
+            identity_path="/v/identity/mist.md",
+            user_path="/v/users/user.md",
+        )
+
+        # Assert -- every DERIVED_FROM write matches the entity via the
+        # dual-partition disjunction, and none restricts the entity to
+        # :__Entity__ alone.
+        derived_writes = [q for q, _ in conn.writes if "MERGE (e)-[r:DERIVED_FROM]->(vn)" in q]
+        assert derived_writes, "expected DERIVED_FROM writes"
+        for q in derived_writes:
+            assert "MATCH (e:__Entity__|__SelfModel__ {id: $entity_id})" in q, q
+            assert "MATCH (e:__Entity__ {id: $entity_id})" not in q, q

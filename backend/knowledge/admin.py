@@ -266,10 +266,15 @@ def emit_seed_vault_provenance(
     for entity in seed_data.get("entities", []):
         user_entities.append(entity["id"])
 
+    # Identity-anchored entities now live in the :__SelfModel__ partition
+    # (mist-identity + traits + capabilities + preferences); user-anchored
+    # entities stay in :__Entity__. The :__Entity__|__SelfModel__ disjunction
+    # matches a seed node in either partition so the DERIVED_FROM edge lands
+    # regardless of which side the node was seeded into.
     edges_written = 0
     for entity_id in identity_entities:
         connection.execute_write(
-            "MATCH (e:__Entity__ {id: $entity_id}) "
+            "MATCH (e:__Entity__|__SelfModel__ {id: $entity_id}) "
             "MATCH (vn:VaultNote {path: $path}) "
             "MERGE (e)-[r:DERIVED_FROM]->(vn) "
             "ON CREATE SET r.event_id = 'seed', r.created_at = $now "
@@ -280,7 +285,7 @@ def emit_seed_vault_provenance(
 
     for entity_id in user_entities:
         connection.execute_write(
-            "MATCH (e:__Entity__ {id: $entity_id}) "
+            "MATCH (e:__Entity__|__SelfModel__ {id: $entity_id}) "
             "MATCH (vn:VaultNote {path: $path}) "
             "MERGE (e)-[r:DERIVED_FROM]->(vn) "
             "ON CREATE SET r.event_id = 'seed', r.created_at = $now "
