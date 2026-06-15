@@ -25,6 +25,7 @@ import yaml
 from backend.errors import Neo4jConnectionError, Neo4jQueryError
 from backend.interfaces import GraphConnection
 from backend.knowledge.ontologies import EDGE_TYPES_BY_NAME, EXTRACTABLE_RELATIONSHIP_TYPES
+from backend.knowledge.storage.partitions import SELF_MODEL_LABEL, SELF_MODEL_TYPES
 
 SEED_METADATA_FIELDS = (
     "confidence",
@@ -414,7 +415,7 @@ def _seed_mist_identity(
         **merge_meta,
     }
     query = """
-    MERGE (m:__Entity__:MistIdentity {id: $id})
+    MERGE (m:__SelfModel__:MistIdentity {id: $id})
     ON CREATE SET m += $create_only, m += $merge_params
     ON MATCH SET m += $merge_params
     """
@@ -453,12 +454,13 @@ def _seed_internal_nodes(
         if immutable:
             merge_params["mutable"] = False
         _assert_known_entity_label(label, context=f"seed node {item.get('id', '?')!r}")
-        query = f"""
-        MERGE (n:__Entity__ {{id: $id}})
-        ON CREATE SET n += $create_only, n += $merge_params
-        ON MATCH SET n += $merge_params
-        SET n:{label}
-        """
+        partition = SELF_MODEL_LABEL if label in SELF_MODEL_TYPES else "__Entity__"
+        query = (
+            f"MERGE (n:{partition} {{id: $id}}) "
+            "ON CREATE SET n += $create_only, n += $merge_params "
+            "ON MATCH SET n += $merge_params "
+            f"SET n:{label}"
+        )
         connection.execute_write(
             query,
             {
@@ -597,7 +599,7 @@ def _merge_relationship(
     # edges per pair). Legacy seed edges get version_key='seed' via the
     # one-shot backfill, which the cutover runs BEFORE any re-seed.
     query = f"""
-    MATCH (s:__Entity__ {{id: $source_id}}), (t:__Entity__ {{id: $target_id}})
+    MATCH (s:__Entity__|__SelfModel__ {{id: $source_id}}), (t:__Entity__|__SelfModel__ {{id: $target_id}})
     MERGE (s)-[r:{rel_type} {{version_key: 'seed'}}]->(t)
     ON CREATE SET r += $create_only, r += $merge_params
     ON MATCH SET r += $merge_params
