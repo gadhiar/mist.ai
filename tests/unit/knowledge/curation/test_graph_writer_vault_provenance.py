@@ -543,7 +543,38 @@ class TestPhase8FactoryWiring:
         assert isinstance(stamps, RebuildStamps)
         assert stamps.ontology_version == "1.0.0"
         assert stamps.extraction_version == "factory-test-version"
-        assert stamps.model_hash == "factory-test-model"
+        assert stamps.model_hash == "factory-test-model|emb:test-model"
+
+    def test_rebuild_stamps_model_hash_includes_embedding_model_identity(self) -> None:
+        """model_hash must embed the embedding-model identity so an embedding-model
+        swap invalidates the extraction cache and re-baselines the epoch.
+
+        Task R1.1e: cosine comparisons in the deterministic resolver use the stored
+        embedding vectors; a different embedding model produces different vectors so
+        a near-0.92 merge can flip -> a different graph. Folding the embedding model
+        into model_hash makes the swap a new epoch, preventing a silent cross-epoch
+        determinism break.
+        """
+        from backend.factories import build_curation_pipeline
+        from backend.knowledge.curation.graph_writer import RebuildStamps
+        from tests.mocks.config import build_test_config
+        from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
+
+        # Arrange -- use distinct LLM hash and embedding model so the assertion
+        # cannot accidentally pass if only one of the two is included.
+        cfg = build_test_config(embedding_model="all-MiniLM-L6-v2-custom")
+        cfg.model_hash = "gemma-test-hash"
+
+        executor = FakeGraphExecutor(connection=FakeNeo4jConnection())
+
+        # Act
+        pipeline = build_curation_pipeline(cfg, executor)
+
+        # Assert -- model_hash must contain BOTH the LLM hash and the embedding model name.
+        stamps = pipeline._graph_writer._rebuild_stamps  # type: ignore[attr-defined]
+        assert isinstance(stamps, RebuildStamps)
+        assert cfg.model_hash in stamps.model_hash
+        assert cfg.embedding.model_name in stamps.model_hash
 
 
 # ---------------------------------------------------------------------------

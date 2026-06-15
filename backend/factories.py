@@ -214,7 +214,7 @@ def build_curation_pipeline(
     rebuild_stamps = RebuildStamps(
         ontology_version=config.ontology_version,
         extraction_version=config.extraction_version,
-        model_hash=config.model_hash,
+        model_hash=f"{config.model_hash}|emb:{config.embedding.model_name}",
     )
     return CurationPipeline(
         deduplicator=EntityDeduplicator(executor, embedding_provider, confidence_mgr),
