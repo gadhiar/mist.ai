@@ -678,7 +678,31 @@ class TestGetMistIdentityContext:
             ":__Entity__ {id: 'mist-identity'}" in q for q in identity_queries
         ), identity_queries
 
+    def test_all_persona_queries_anchor_on_mistidentity_not_entity(self):
+        """Every mist-identity-anchored query in get_mist_identity_context must
+        anchor on the preserved :MistIdentity typed label, never on :__Entity__
+        (which the self-model no longer carries). Regression guard for the persona
+        read path across all 8 queries.
+        """
+        conn = FakeNeo4jConnection()
+        store = GraphStore(connection=conn, embedding_generator=FakeEmbeddingGenerator())
+
+        store.get_mist_identity_context()
+
+        anchored = [q for q, _ in conn.queries if "mist-identity" in q]
+        assert (
+            len(anchored) >= 8
+        ), f"expected >=8 mist-identity-anchored queries, got {len(anchored)}: {anchored}"
+        for q in anchored:
+            assert ":MistIdentity {id: 'mist-identity'}" in q, q
+            assert (
+                ":__Entity__ {id: 'mist-identity'}" not in q
+            ), f"persona anchor must not use :__Entity__: {q}"
+
     def test_seeded_trait_query_does_not_require_entity_target(self):
+        """Seeded HAS_TRAIT target is unlabeled post-partition (node moved to
+        :__SelfModel__); the relationship type constrains it, no :__Entity__ needed.
+        """
         conn = FakeNeo4jConnection()
         store = GraphStore(connection=conn, embedding_generator=FakeEmbeddingGenerator())
 
