@@ -975,7 +975,7 @@ class GraphStore:
             match_sets = match_sets + ",\n            " + ",\n            ".join(property_sets)
 
         query = f"""
-        MATCH (source:__Entity__ {{id: $source_id}})
+        MATCH (source:__Entity__|__SelfModel__ {{id: $source_id}})
         MATCH (target:__Entity__ {{id: $target_id}})
         MERGE (source)-[r:{rel_type_safe}]->(target)
         ON CREATE SET
@@ -1325,7 +1325,7 @@ class GraphStore:
         to it via HAS_TRAIT, HAS_CAPABILITY, HAS_PREFERENCE, IS_UNCERTAIN_ABOUT.
         """
         query = """
-        MERGE (m:__Entity__:MistIdentity {id: 'mist-identity'})
+        MERGE (m:__SelfModel__:MistIdentity {id: 'mist-identity'})
         ON CREATE SET
             m.entity_type = 'MistIdentity',
             m.display_name = 'MIST',
@@ -1675,8 +1675,8 @@ class GraphStore:
         for slug in parsed_identity.traits:
             entity_id = f"mist-trait-{slug}"
             self.connection.execute_write(
-                "MERGE (m:__Entity__:MistIdentity {id: 'mist-identity'}) "
-                "MERGE (t:__Entity__:MistTrait {id: $entity_id}) "
+                "MERGE (m:__SelfModel__:MistIdentity {id: 'mist-identity'}) "
+                "MERGE (t:__SelfModel__:MistTrait {id: $entity_id}) "
                 "ON CREATE SET t.display_name = $slug, t.entity_type = 'MistTrait', "
                 "t.status = 'active', t.ontology_version = $ontology_version "
                 "MERGE (m)-[r:HAS_TRAIT]->(t) "
@@ -1696,7 +1696,7 @@ class GraphStore:
             # mark_orphaned_by_provenance_path queries this relationship-type,
             # so Bucket 1 edges must carry it to be findable on user-edit.
             self.connection.execute_write(
-                "MATCH (t:__Entity__:MistTrait {id: $entity_id}) "
+                "MATCH (t:__SelfModel__:MistTrait {id: $entity_id}) "
                 "MATCH (vn:__Provenance__:VaultNote {path: $path}) "
                 "MERGE (t)-[df:DERIVED_FROM]->(vn) "
                 "ON CREATE SET df.created_at = $now, "
@@ -1715,8 +1715,8 @@ class GraphStore:
         for slug in parsed_identity.capabilities:
             entity_id = f"mist-cap-{slug}"
             self.connection.execute_write(
-                "MERGE (m:__Entity__:MistIdentity {id: 'mist-identity'}) "
-                "MERGE (c:__Entity__:MistCapability {id: $entity_id}) "
+                "MERGE (m:__SelfModel__:MistIdentity {id: 'mist-identity'}) "
+                "MERGE (c:__SelfModel__:MistCapability {id: $entity_id}) "
                 "ON CREATE SET c.display_name = $slug, c.entity_type = 'MistCapability', "
                 "c.status = 'active', c.ontology_version = $ontology_version "
                 "MERGE (m)-[r:HAS_CAPABILITY]->(c) "
@@ -1734,7 +1734,7 @@ class GraphStore:
             )
             # DERIVED_FROM provenance edge: typed entity -> VaultNote.
             self.connection.execute_write(
-                "MATCH (c:__Entity__:MistCapability {id: $entity_id}) "
+                "MATCH (c:__SelfModel__:MistCapability {id: $entity_id}) "
                 "MATCH (vn:__Provenance__:VaultNote {path: $path}) "
                 "MERGE (c)-[df:DERIVED_FROM]->(vn) "
                 "ON CREATE SET df.created_at = $now, "
@@ -1753,8 +1753,8 @@ class GraphStore:
         for pref in parsed_identity.preferences:
             entity_id = f"mist-pref-{pref.slug}"
             self.connection.execute_write(
-                "MERGE (m:__Entity__:MistIdentity {id: 'mist-identity'}) "
-                "MERGE (p:__Entity__:MistPreference {id: $entity_id}) "
+                "MERGE (m:__SelfModel__:MistIdentity {id: 'mist-identity'}) "
+                "MERGE (p:__SelfModel__:MistPreference {id: $entity_id}) "
                 "ON CREATE SET p.display_name = $slug, p.entity_type = 'MistPreference', "
                 "p.enforcement = $enforcement, p.status = 'active', "
                 "p.ontology_version = $ontology_version "
@@ -1775,7 +1775,7 @@ class GraphStore:
             )
             # DERIVED_FROM provenance edge: typed entity -> VaultNote.
             self.connection.execute_write(
-                "MATCH (p:__Entity__:MistPreference {id: $entity_id}) "
+                "MATCH (p:__SelfModel__:MistPreference {id: $entity_id}) "
                 "MATCH (vn:__Provenance__:VaultNote {path: $path}) "
                 "MERGE (p)-[df:DERIVED_FROM]->(vn) "
                 "ON CREATE SET df.created_at = $now, "

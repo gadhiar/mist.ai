@@ -537,6 +537,19 @@ class TestUpsertIdentityWritesDerivedFromProvenance:
             "DERIVED_FROM write must reference VaultNote node; " f"got queries: {derived_writes}"
         )
 
+    @pytest.mark.asyncio
+    async def test_upsert_identity_writes_traits_into_selfmodel(self):
+        conn = FakeNeo4jConnection()
+        store = _store_with_conn(conn)
+        parsed = self._make_identity(traits=["warm"])
+
+        await store.upsert_identity(parsed, derived_from_path="/vault/identity/mist.md")
+
+        trait_writes = [q for q, _ in conn.writes if "MistTrait" in q]
+        assert trait_writes, "Expected a MistTrait write"
+        assert all("__SelfModel__:MistTrait" in q for q in trait_writes), trait_writes
+        assert not any("__Entity__:MistTrait" in q for q in trait_writes), trait_writes
+
 
 class TestUpsertUserWritesDerivedFromProvenance:
     """upsert_user must MERGE a DERIVED_FROM edge for each typed entity."""
@@ -615,6 +628,22 @@ class TestUpsertUserWritesDerivedFromProvenance:
             "DERIVED_FROM edge writes must use MERGE for idempotency; "
             f"non-MERGE queries found: {[q for q in derived_writes if 'MERGE' not in q]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# SelfModel partition tests (T6)
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_mist_identity_uses_selfmodel_partition():
+    conn = FakeNeo4jConnection()
+    store = _store_with_conn(conn)
+
+    store.ensure_mist_identity()
+
+    issued = [q for q, _ in conn.writes]
+    assert any("__SelfModel__:MistIdentity" in q for q in issued), issued
+    assert not any("__Entity__:MistIdentity" in q for q in issued), issued
 
 
 class TestMarkOrphanedAfterUpsert:
