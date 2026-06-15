@@ -1,15 +1,14 @@
-"""Entity normalization and deduplication stage.
+"""Entity normalization stage.
 
-Stage 5: Normalizes entity IDs to canonical forms and deduplicates
-against existing graph entities using static aliases, exact matches,
-alias matches, and embedding similarity. Target <50ms.
+Stage 5: Normalizes entity IDs to canonical forms via string canonicalization,
+static aliases, registry lookups, and resolver passes. Target <50ms.
+Graph-identity resolution (R1.1d) was removed; the curation deduper in Stage 7a
+is the sole authority for graph-identity decisions.
 """
 
-import asyncio
 import logging
 import re
 
-from backend.errors import EmbeddingError, Neo4jQueryError
 from backend.interfaces import EmbeddingProvider
 from backend.knowledge.extraction.canonical_id import (
     canonical_metric_id,
@@ -24,16 +23,18 @@ logger = logging.getLogger(__name__)
 
 
 class EntityNormalizer:
-    """Normalizes entity IDs and deduplicates against the graph.
+    """Normalizes entity IDs via string canonicalization, static aliases, registry, and
+    resolver passes (retired-type coercion, Metric compound-id, parent fallback).
+
+    Graph-identity resolution (R1.1d) was removed; the curation deduper in Stage 7a is
+    the sole authority for graph-identity decisions. This class is pure string/registry/
+    resolver canonicalization.
 
     Algorithm per entity:
     1. Canonicalize: lowercase, strip version numbers, replace spaces with hyphens.
     2. Check static alias map (e.g. "js" -> "javascript").
-    3. Check exact ID match in the graph.
-    4. Check alias match in the graph (entity.aliases array).
-    5. Check embedding similarity (>= threshold AND same entity_type).
-    6. If match found: rewrite entity ID to the existing one.
-       If no match: entity is new, keep the canonical ID.
+    3. Check canonical-entity registry (curated overrides).
+    4. Resolver passes: retired-type coercion, Metric compound-id, parent fallback.
     """
 
     # Static alias map: short name / alternate spelling -> canonical ID.
@@ -120,8 +121,6 @@ class EntityNormalizer:
         "the-assistant": ("mist-identity", "MistIdentity"),
     }
 
-    SIMILARITY_THRESHOLD: float = 0.92
-
     def __init__(
         self,
         embedding_generator: EmbeddingProvider,
@@ -130,10 +129,12 @@ class EntityNormalizer:
         """Initialize the normalizer.
 
         Args:
-            embedding_generator: For computing embedding similarity.
-            executor: Async graph executor for querying existing entities.
-                If None, graph-based deduplication is skipped (local-only mode).
+            embedding_generator: Retained for API compatibility; not used after R1.1d strip.
+            executor: Retained for API compatibility; not used after R1.1d strip.
+                Graph-identity resolution moved to the curation deduper (Stage 7a).
         """
+        # retained: constructor params kept for call-site compatibility (factories.py +
+        # ~16 test call sites). Graph-identity path (_find_in_graph) was removed in R1.1d.
         self._embedding_generator = embedding_generator
         self._executor = executor
         self._graph_available = executor is not None
@@ -158,7 +159,6 @@ class EntityNormalizer:
         for entity in extraction.entities:
             old_id = entity.get("id", "")
             entity_name = entity.get("name", old_id)
-            entity_type = entity.get("type", "")
 
             # Skip the "user" entity -- always canonical
             if old_id.lower() == "user":
@@ -209,12 +209,6 @@ class EntityNormalizer:
                 entity["id"] = reg_id
                 id_map[old_id] = reg_id
                 continue
-
-            # Graph-based deduplication (if available)
-            if self._graph_available and self._executor is not None:
-                graph_id = await self._find_in_graph(canonical_id, entity_type)
-                if graph_id is not None:
-                    canonical_id = graph_id
 
             # Set the pre-resolver canonical id first, then run resolver passes
             # 3-5 (retired-type coercion, Metric compound-id, parent fallback).
@@ -336,103 +330,3 @@ class EntityNormalizer:
         canonical = canonical.strip("-")
 
         return canonical or name.lower().replace(" ", "-")
-
-    @staticmethod
-    def _dedup_type_filter(entity_type: str) -> list[str]:
-        """Types that count as 'same kind' for embedding dedup.
-
-        For abstract-cluster types, widen to the parent + all siblings so a
-        Concept and a Skill of the same entity can still merge; non-cluster
-        types match exactly.
-        """
-        from backend.knowledge.ontologies.hierarchy import children_of, parent_of
-
-        parent = parent_of(entity_type) or (entity_type if entity_type == "Abstraction" else None)
-        if parent is None:
-            return [entity_type]
-        return sorted({parent, *children_of(parent), entity_type})
-
-    async def _find_in_graph(self, canonical_id: str, entity_type: str) -> str | None:
-        """Search the graph for an existing entity matching this canonical ID.
-
-        Tries three tiers:
-        1. Exact ID match.
-        2. Alias match (entity.aliases array).
-        3. Embedding similarity (>= threshold AND same entity_type).
-
-        Args:
-            canonical_id: The canonical entity ID to search for.
-            entity_type: The entity type (for type-constrained similarity).
-
-        Returns:
-            The existing entity's ID if found, None otherwise.
-        """
-        if self._executor is None:
-            return None
-
-        # Tier 1: Exact ID match
-        try:
-            results = await self._executor.execute_query(
-                "MATCH (e:__Entity__) WHERE toLower(e.id) = $canonical_id "
-                "RETURN e.id AS id, e.entity_type AS entity_type, e.aliases AS aliases LIMIT 1",
-                {"canonical_id": canonical_id},
-            )
-            if results:
-                logger.debug("Exact match for '%s' -> '%s'", canonical_id, results[0]["id"])
-                return results[0]["id"]
-        except (Neo4jQueryError, Exception) as e:
-            logger.warning("Exact ID query failed (%s): %s", type(e).__name__, e)
-            return None
-
-        # Tier 2: Alias match
-        try:
-            results = await self._executor.execute_query(
-                "MATCH (e:__Entity__) "
-                "WHERE $canonical_id IN [a IN e.aliases | toLower(a)] "
-                "RETURN e.id AS id, e.entity_type AS entity_type, e.aliases AS aliases LIMIT 1",
-                {"canonical_id": canonical_id},
-            )
-            if results:
-                logger.debug("Alias match for '%s' -> '%s'", canonical_id, results[0]["id"])
-                return results[0]["id"]
-        except (Neo4jQueryError, Exception) as e:
-            logger.warning("Alias query failed (%s): %s", type(e).__name__, e)
-            return None
-
-        # Tier 3: Embedding similarity
-        try:
-            # Off-loop: model.encode blocks the event loop for ~10ms per
-            # new entity (same pattern as curation-side call sites).
-            candidate_embedding = await asyncio.get_running_loop().run_in_executor(
-                None, self._embedding_generator.generate_embedding, canonical_id
-            )
-            results = await self._executor.execute_query(
-                "CALL db.index.vector.queryNodes('entity_embeddings', 5, $candidate_embedding) "
-                "YIELD node, score "
-                "WHERE score >= $threshold AND node.entity_type IN $entity_types "
-                "RETURN node.id AS id, score "
-                "ORDER BY score DESC LIMIT 3",
-                {
-                    "candidate_embedding": candidate_embedding,
-                    "threshold": self.SIMILARITY_THRESHOLD,
-                    "entity_types": self._dedup_type_filter(entity_type),
-                },
-            )
-            if results:
-                best = results[0]
-                logger.debug(
-                    "Embedding match for '%s' -> '%s' (score=%.3f)",
-                    canonical_id,
-                    best["id"],
-                    best["score"],
-                )
-                return best["id"]
-        except (Neo4jQueryError, EmbeddingError, Exception) as e:
-            # Vector index may not exist yet
-            logger.debug(
-                "Embedding similarity query failed (%s, expected if no vector index): %s",
-                type(e).__name__,
-                e,
-            )
-
-        return None

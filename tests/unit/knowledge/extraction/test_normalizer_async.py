@@ -37,12 +37,10 @@ class TestNormalizerAsync:
         assert result.entities[0]["id"] == "python"
 
     @pytest.mark.asyncio
-    async def test_graph_dedup_via_executor(self):
-        conn = FakeNeo4jConnection(
-            query_responses={
-                "toLower(e.id)": [{"id": "python", "entity_type": "Technology", "aliases": []}],
-            }
-        )
+    async def test_graph_executor_present_does_not_change_string_canonicalization(self):
+        # R1.1d: passing an executor no longer triggers graph-identity queries.
+        # String canonicalization result must be identical with or without executor.
+        conn = FakeNeo4jConnection()
         executor = FakeGraphExecutor(connection=conn)
         normalizer = EntityNormalizer(
             embedding_generator=FakeEmbeddingGenerator(),
@@ -54,7 +52,7 @@ class TestNormalizerAsync:
         )
         result = await normalizer.normalize(extraction)
         assert result.entities[0]["id"] == "python"
-        assert len(conn.queries) >= 1
+        assert len(conn.queries) == 0
 
     @pytest.mark.asyncio
     async def test_normalize_without_executor_skips_graph(self):
@@ -468,12 +466,25 @@ class TestCanonicalRegistry:
         assert out.entities[0]["type"] == "Technology"
 
 
-class TestTier3TypeFilter:
-    """Task 8: _dedup_type_filter widens to parent cluster for abstraction-cluster types."""
+class TestNoGraphIdentityQuery:
+    """R1.1d: After the strip, normalize() must not issue any graph identity queries."""
 
-    def test_tier3_type_filter_widens_to_cluster(self):
-        types = EntityNormalizer._dedup_type_filter("Concept")
-        assert "Abstraction" in types and "Concept" in types
+    @pytest.mark.asyncio
+    async def test_normalize_issues_no_graph_identity_query(self):
+        # After the strip, normalize() does pure string/registry/resolver canonicalization
+        # -- it must NOT query the graph for identity (no ANN, no entity MATCH).
+        conn = FakeNeo4jConnection()
+        executor = FakeGraphExecutor(connection=conn)
+        normalizer = EntityNormalizer(
+            embedding_generator=FakeEmbeddingGenerator(),
+            executor=executor,
+        )
+        extraction = ExtractionResult(
+            entities=[{"id": "Python", "name": "Python", "type": "Technology"}],
+            relationships=[],
+        )
 
-    def test_tier3_type_filter_non_cluster_exact(self):
-        assert EntityNormalizer._dedup_type_filter("Technology") == ["Technology"]
+        await normalizer.normalize(extraction)
+
+        assert not any("db.index.vector.queryNodes" in q for q, _ in conn.queries), conn.queries
+        assert not any("MATCH (e:__Entity__)" in q for q, _ in conn.queries), conn.queries
