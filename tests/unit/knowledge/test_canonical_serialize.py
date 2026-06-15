@@ -1,6 +1,12 @@
 """Canonical graph serializer (F3) -- deterministic, wall-clock-free form."""
 
-from backend.knowledge.canonical_serialize import _canon_props, _node, _rel, canonical_graph_form
+from backend.knowledge.canonical_serialize import (
+    _canon_props,
+    _node,
+    _rel,
+    _rel_key,
+    canonical_graph_form,
+)
 from tests.mocks.neo4j import FakeNeo4jConnection
 
 
@@ -154,3 +160,37 @@ class TestCanonPropsEpochAndConfidence:
         assert "model_hash" not in _node(n)["properties"]
         assert _rel(r)["properties"]["confidence"] == 0.9  # edge: kept
         assert "model_hash" not in _rel(r)["properties"]
+
+
+class TestRelKey:
+    def test_rel_key_distinguishes_same_turn_valid_time_versions(self):
+        # Two versions of the same (s,type,t,event_id), differing only in valid-time
+        # -- they MUST get distinct keys so the canonical sort is order-independent.
+        base = {"source": "user", "type": "WORKS_AT", "target": "acme"}
+        v1 = {
+            **base,
+            "properties": {
+                "source_utterance_id": "e1",
+                "version_key": "e1|2020|2022",
+                "valid_from": "2020",
+                "valid_to": "2022",
+            },
+        }
+        v2 = {
+            **base,
+            "properties": {
+                "source_utterance_id": "e1",
+                "version_key": "e1|2022|open",
+                "valid_from": "2022",
+                "valid_to": None,
+            },
+        }
+        assert _rel_key(v1) != _rel_key(v2)
+
+    def test_rel_key_stable_for_durable_null_version_key_edges(self):
+        # DURABLE edges carry no version_key; they are unique per (s,type,t), so the
+        # leading triple disambiguates and the key is still total.
+        a = {"source": "python", "type": "IS_A", "target": "language", "properties": {}}
+        b = {"source": "python", "type": "DEPENDS_ON", "target": "cpython", "properties": {}}
+        assert _rel_key(a) != _rel_key(b)
+        assert _rel_key(a) == _rel_key(dict(a))  # deterministic for identical input
