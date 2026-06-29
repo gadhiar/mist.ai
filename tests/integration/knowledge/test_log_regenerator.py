@@ -249,3 +249,99 @@ class TestLogRegeneratorReplay:
         job2 = event_store.get_reextraction_job(report2.job_id)
         assert job1 is not None and job1["status"] == "completed"
         assert job2 is not None and job2["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_rebuild_twice_byte_identical(self, staging_conn, tmp_path):
+        """Rebuild into a wiped staging twice; both canonical forms must be byte-identical.
+
+        This is the headline DoD gate for the proof-first deliverable. Two
+        independent rebuilds of the same epoch produce the same entity graph
+        when the extraction cache is the sole fact source and the curation
+        pipeline is deterministic.
+        """
+        from backend.knowledge.canonical_serialize import canonical_graph_form
+
+        # Arrange: event store + cache with 2 turns.
+        event_store = EventStore(str(tmp_path / "events.db"))
+        event_store.initialize()
+        session_id = event_store.start_session("text")
+
+        ts_a = "2026-06-29T10:00:00+00:00"
+        ts_b = "2026-06-29T10:01:00+00:00"
+        epoch = {
+            "epoch_id": 1,
+            "ontology_version": "1.4.0",
+            "extraction_version": "r5-inttest",
+            "model_hash": "test-model-hash-inttest",
+            "activated_at": ts_a,
+            "prev_epoch_id": None,
+        }
+
+        event_id_a = event_store.append_turn(
+            ConversationTurnEvent(
+                session_id=session_id,
+                turn_index=0,
+                timestamp=datetime.fromisoformat(ts_a),
+                user_utterance="I love Python.",
+                system_response="Python is great.",
+            )
+        )
+        event_id_b = event_store.append_turn(
+            ConversationTurnEvent(
+                session_id=session_id,
+                turn_index=1,
+                timestamp=datetime.fromisoformat(ts_b),
+                user_utterance="I also use FastAPI.",
+                system_response="FastAPI is a good choice.",
+            )
+        )
+
+        cache = ExtractionCache(str(tmp_path / "cache.db"))
+        cache.initialize()
+        cache.put(
+            event_id_a,
+            epoch["ontology_version"],
+            epoch["extraction_version"],
+            epoch["model_hash"],
+            entities=[{"id": "python", "type": "Technology", "display_name": "Python"}],
+            relationships=[],
+            created_at=ts_a,
+        )
+        cache.put(
+            event_id_b,
+            epoch["ontology_version"],
+            epoch["extraction_version"],
+            epoch["model_hash"],
+            entities=[{"id": "fastapi", "type": "Technology", "display_name": "FastAPI"}],
+            relationships=[],
+            created_at=ts_b,
+        )
+
+        pipeline = _build_staging_pipeline(staging_conn)
+        regen = LogRegenerator(
+            event_store=event_store,
+            extraction_cache=cache,
+            staging_curation_pipeline=pipeline,
+        )
+
+        # Act: first rebuild into staging.
+        await regen.rebuild(
+            staging_uri=_staging_uri(),
+            live_uri=_LIVE_URI,
+            epoch=epoch,
+        )
+        form_a = canonical_graph_form(staging_conn, include_provenance=False)
+
+        # Wipe staging between runs (schema constraints/indexes survive DETACH DELETE).
+        staging_conn.execute_write("MATCH (n) DETACH DELETE n", {})
+
+        # Act: second rebuild from scratch.
+        await regen.rebuild(
+            staging_uri=_staging_uri(),
+            live_uri=_LIVE_URI,
+            epoch=epoch,
+        )
+        form_b = canonical_graph_form(staging_conn, include_provenance=False)
+
+        # Assert: byte-identical proves deterministic log-driven rebuild.
+        assert form_a == form_b

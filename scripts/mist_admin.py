@@ -412,6 +412,7 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
 
     from backend.knowledge.canonical_serialize import canonical_graph_form
     from backend.knowledge.config import Neo4jConfig
+    from backend.knowledge.eval_isolation import RebuildTargetError, assert_rebuild_target_not_live
     from backend.knowledge.regeneration.log_regenerator import ColdCacheError
     from backend.knowledge.regeneration.rebuild_gate import (
         RebuildDeterminismError,
@@ -420,8 +421,13 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
     )
 
     be = _load_backend()
-    live_conn = _connect(be)  # reads NEO4J_URI (live) from env
+    # Resolve live_uri early (no connection needed) so the isolation guard
+    # fires before ANY connect() or execute_write() call.
     live_uri = be.get_config().neo4j.uri
+    # Guard FIRST: refuse if --staging-uri resolves to the same host:port as live.
+    assert_rebuild_target_not_live(args.staging_uri, live_uri)
+
+    live_conn = _connect(be)  # reads NEO4J_URI (live) from env
 
     # Build staging connection from args.staging_uri with live credentials.
     config = be.get_config()
@@ -445,7 +451,6 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
                 epoch=epoch,
                 source_conn=live_conn,
                 staging_conn=staging_conn,
-                resume_from=args.resume_from,
             )
         )
         return canonical_graph_form(staging_conn, include_provenance=False)
@@ -459,6 +464,9 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
         print(live_vs_rebuilt_report(live_form, build_b))
         return 0
     except ColdCacheError as exc:
+        print(f"[rebuild] REFUSED: {exc}")
+        return 2
+    except RebuildTargetError as exc:
         print(f"[rebuild] REFUSED: {exc}")
         return 2
     except RebuildDeterminismError as exc:
@@ -1608,12 +1616,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Epoch id (default: current).",
-    )
-    p_rebuild.add_argument(
-        "--resume-from",
-        default=None,
-        dest="resume_from",
-        help="Resume from this event_id.",
     )
     p_rebuild.set_defaults(func=cmd_graph_rebuild_from_log)
 

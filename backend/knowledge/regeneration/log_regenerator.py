@@ -22,7 +22,7 @@ from backend.errors import MistError
 from backend.knowledge.curation.pipeline import CurationResult
 from backend.knowledge.eval_isolation import assert_rebuild_target_not_live
 from backend.knowledge.extraction.validator import ValidationResult
-from backend.knowledge.storage.partitions import SELF_MODEL_LABEL
+from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
 
 class ColdCacheError(MistError):
@@ -136,14 +136,14 @@ class LogRegenerator:
         created, skipped = 0, 0
         for edge_type in self._CROSS_LAYER_EDGES:
             edges = source_conn.execute_query(
-                f"MATCH (s:{SELF_MODEL_LABEL})-[r:{edge_type}]->(t:__Entity__) "
+                f"MATCH (s:{SELF_MODEL_LABEL})-[r:{edge_type}]->(t:{ENTITY_LABEL}) "
                 "RETURN s.id AS s, t.id AS t, properties(r) AS props",
                 {},
             )
             for e in edges:
                 result = staging_conn.execute_write(
                     f"MATCH (s:{SELF_MODEL_LABEL} {{id: $s}}) "
-                    f"MATCH (t:__Entity__ {{id: $t}}) "
+                    f"MATCH (t:{ENTITY_LABEL} {{id: $t}}) "
                     f"MERGE (s)-[r:{edge_type}]->(t) SET r = $props "
                     "RETURN count(r) AS n",
                     {"s": e["s"], "t": e["t"], "props": e["props"]},
@@ -192,6 +192,14 @@ class LogRegenerator:
         """
         assert_rebuild_target_not_live(staging_uri, live_uri)
 
+        # Fail-fast resume guard: job_id is required when resuming. Checked here
+        # so callers get an immediate error before any event-store reads occur.
+        if resume_from is not None and job_id is None:
+            raise RebuildError(
+                "job_id is required when resuming a rebuild (resume_from is set). "
+                "Pass the original job_id returned by the initial rebuild call."
+            )
+
         turns = self._events.get_all_turns_for_reextraction(after_event_id=resume_from)
         self._assert_cache_coverage(turns, epoch)
 
@@ -208,14 +216,8 @@ class LogRegenerator:
                 total_events=len(turns),
                 started_at=started_at,
             )
-        else:
-            # Resume: the job row already exists from the initial run.
-            # job_id MUST be provided by the caller -- we have no way to recover it.
-            if job_id is None:
-                raise RebuildError(
-                    "job_id is required when resuming a rebuild (resume_from is set). "
-                    "Pass the original job_id returned by the initial rebuild call."
-                )
+        # Resume path: job_id was validated above (non-None), so the row
+        # already exists in the event store from the initial run.
 
         processed = 0
         turns_failed = 0
