@@ -375,6 +375,50 @@ class EventStore:
         rows = conn.execute("SELECT * FROM epoch_ledger ORDER BY epoch_id ASC").fetchall()
         return [dict(r) for r in rows]
 
+    def create_reextraction_job(
+        self,
+        job_id: str,
+        target_ontology_version: str,
+        source_ontology_version: str | None,
+        total_events: int,
+        started_at: str,
+    ) -> None:
+        """Insert a new re-extraction job row in status 'running'."""
+        conn = self._get_connection()
+        conn.execute(
+            "INSERT INTO re_extraction_jobs "
+            "(job_id, target_ontology_version, source_ontology_version, status, "
+            " total_events, processed, failed, last_event_id, started_at, updated_at) "
+            "VALUES (?, ?, ?, 'running', ?, 0, 0, NULL, ?, ?)",
+            (
+                job_id,
+                target_ontology_version,
+                source_ontology_version,
+                total_events,
+                started_at,
+                started_at,
+            ),
+        )
+
+    def checkpoint_reextraction_job(
+        self, job_id: str, last_event_id: str, processed: int, updated_at: str
+    ) -> None:
+        """Advance a job's checkpoint cursor + processed count."""
+        conn = self._get_connection()
+        conn.execute(
+            "UPDATE re_extraction_jobs SET last_event_id = ?, processed = ?, updated_at = ? "
+            "WHERE job_id = ?",
+            (last_event_id, processed, updated_at, job_id),
+        )
+
+    def get_reextraction_job(self, job_id: str) -> dict[str, Any] | None:
+        """Return the job row as a dict, or None if absent."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM re_extraction_jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
     def close(self) -> None:
         """Close the database connection."""
         if self._conn is not None:
