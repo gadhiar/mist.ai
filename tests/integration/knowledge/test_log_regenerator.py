@@ -1,0 +1,197 @@
+"""Integration coverage for LogRegenerator.rebuild (R1.2), staging-isolated."""
+
+from __future__ import annotations
+
+import socket
+from datetime import datetime
+from pathlib import Path
+
+import pytest
+
+from backend.event_store.models import ConversationTurnEvent
+from backend.event_store.store import EventStore
+from backend.knowledge.config import Neo4jConfig
+from backend.knowledge.extraction_cache import ExtractionCache
+from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
+from backend.knowledge.storage.neo4j_connection import Neo4jConnection
+
+# Staging endpoint (NEVER live). In-network service name, then host-published port.
+_CANDIDATES = [("mist-neo4j-staging", 7687), ("localhost", 7689), ("127.0.0.1", 7689)]
+
+
+def _staging_endpoint() -> tuple[str, int] | None:
+    for host, port in _CANDIDATES:
+        try:
+            sock = socket.create_connection((host, port), timeout=2)
+            sock.close()
+            return host, port
+        except OSError:
+            continue
+    return None
+
+
+_ENDPOINT = _staging_endpoint()
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        _ENDPOINT is None,
+        reason=(
+            "staging Neo4j not running (docker compose -f docker-compose.yml "
+            "-f docker-compose.staging-neo4j.yml --profile staging up -d mist-neo4j-staging)"
+        ),
+    ),
+]
+_LIVE_URI = "bolt://mist-neo4j:7687"  # used only for the target!=live guard check
+
+
+@pytest.fixture
+def staging_conn():
+    host, port = _ENDPOINT  # type: ignore[misc]
+    conn = Neo4jConnection(
+        Neo4jConfig(uri=f"bolt://{host}:{port}", username="neo4j", password="password")
+    )
+    conn.connect()
+    conn.execute_write("MATCH (n) DETACH DELETE n", {})  # staging starts empty
+    yield conn
+    conn.execute_write("MATCH (n) DETACH DELETE n", {})
+    conn.disconnect()
+
+
+def _staging_uri() -> str:
+    host, port = _ENDPOINT  # type: ignore[misc]
+    return f"bolt://{host}:{port}"
+
+
+# ---------------------------------------------------------------------------
+# Test epoch and timestamp constants -- shared across both helpers
+# ---------------------------------------------------------------------------
+
+_TURN_TS = "2026-06-29T10:00:00+00:00"
+_TEST_EPOCH = {
+    "epoch_id": 1,
+    "ontology_version": "1.4.0",
+    "extraction_version": "r5-inttest",
+    "model_hash": "test-model-hash-inttest",
+    "activated_at": _TURN_TS,
+    "prev_epoch_id": None,
+}
+
+
+def _make_event_store_with_turn(tmp_path: Path) -> tuple[EventStore, str, str]:
+    """Create an EventStore with one seeded turn. Returns (store, session_id, event_id)."""
+    event_store = EventStore(str(tmp_path / "events.db"))
+    event_store.initialize()
+    session_id = event_store.start_session("text")
+    event = ConversationTurnEvent(
+        session_id=session_id,
+        turn_index=0,
+        timestamp=datetime.fromisoformat(_TURN_TS),
+        user_utterance="I love Python.",
+        system_response="Python is great.",
+    )
+    event_id = event_store.append_turn(event)
+    return event_store, session_id, event_id
+
+
+def _build_staging_pipeline(staging_conn: Neo4jConnection):
+    """Build a CurationPipeline wired to staging via the production factory.
+
+    Uses build_curation_pipeline(config, executor) exactly as documented in
+    factories.py build_curation_pipeline (~line 191). The staging GraphExecutor
+    is constructed from the staging Neo4jConnection passed in. Schema is
+    initialised (idempotent) before returning.
+    """
+    from backend.factories import build_curation_pipeline
+    from backend.knowledge.storage.graph_executor import GraphExecutor
+    from backend.knowledge.storage.graph_store import GraphStore
+    from tests.mocks.config import build_test_config
+    from tests.mocks.embeddings import FakeEmbeddingGenerator
+
+    # Initialize staging schema (idempotent: safe to call on a pre-existing instance).
+    staging_store = GraphStore(
+        connection=staging_conn, embedding_generator=FakeEmbeddingGenerator()
+    )
+    staging_store.initialize_schema()
+
+    executor = GraphExecutor(staging_conn)
+    # build_test_config neo4j uri is irrelevant here: executor owns the connection.
+    # ontology_version/extraction_version/model_hash come from KnowledgeConfig defaults
+    # and are written as rebuild-stamp metadata on edges; they do not gate entity writes.
+    config = build_test_config()
+    return build_curation_pipeline(config, executor, embedding_provider=FakeEmbeddingGenerator())
+
+
+def _build_regenerator_with_one_turn(
+    tmp_path: Path, staging_conn: Neo4jConnection
+) -> tuple[LogRegenerator, EventStore, ExtractionCache, dict]:
+    """Build a LogRegenerator seeded with one turn that HAS a cache hit."""
+    event_store, _session_id, event_id = _make_event_store_with_turn(tmp_path)
+
+    cache = ExtractionCache(str(tmp_path / "cache.db"))
+    cache.initialize()
+    cache.put(
+        event_id,
+        _TEST_EPOCH["ontology_version"],
+        _TEST_EPOCH["extraction_version"],
+        _TEST_EPOCH["model_hash"],
+        entities=[{"id": "python", "type": "Technology", "display_name": "Python"}],
+        relationships=[],
+        created_at=_TURN_TS,
+    )
+
+    pipeline = _build_staging_pipeline(staging_conn)
+    regen = LogRegenerator(
+        event_store=event_store,
+        extraction_cache=cache,
+        staging_curation_pipeline=pipeline,
+    )
+    return regen, event_store, cache, _TEST_EPOCH
+
+
+def _build_regenerator_with_uncached_turn(
+    tmp_path: Path, staging_conn: Neo4jConnection
+) -> tuple[LogRegenerator, EventStore, ExtractionCache, dict]:
+    """Build a LogRegenerator seeded with one turn that has NO cache entry."""
+    event_store, _session_id, _event_id = _make_event_store_with_turn(tmp_path)
+
+    cache = ExtractionCache(str(tmp_path / "cache.db"))
+    cache.initialize()
+    # Intentionally no cache.put -- this turn is cold.
+
+    pipeline = _build_staging_pipeline(staging_conn)
+    regen = LogRegenerator(
+        event_store=event_store,
+        extraction_cache=cache,
+        staging_curation_pipeline=pipeline,
+    )
+    return regen, event_store, cache, _TEST_EPOCH
+
+
+class TestLogRegeneratorReplay:
+    @pytest.mark.asyncio
+    async def test_cache_driven_rebuild_builds_entity_graph(self, staging_conn, tmp_path):
+        # Arrange: an event store with one turn + a cache hit for it.
+        # (Build via the real EventStore + ExtractionCache against tmp sqlite files;
+        #  the implementer wires these per the constructors -- see Step 3 notes.)
+        regen, event_store, cache, epoch = _build_regenerator_with_one_turn(tmp_path, staging_conn)
+
+        # Act
+        report = await regen.rebuild(
+            staging_uri=_staging_uri(),
+            live_uri=_LIVE_URI,
+            epoch=epoch,
+        )
+
+        # Assert: the turn's cached entity was written to staging.
+        assert report.turns_processed == 1
+        rows = staging_conn.execute_query(
+            "MATCH (n:__Entity__ {id: $id}) RETURN count(n) AS n", {"id": "python"}
+        )
+        assert rows[0]["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_cold_cache_refuses(self, staging_conn, tmp_path):
+        # Arrange: a turn with NO cache entry -> coverage check must refuse.
+        regen, _, _, epoch = _build_regenerator_with_uncached_turn(tmp_path, staging_conn)
+        with pytest.raises(ColdCacheError, match="uncached"):
+            await regen.rebuild(staging_uri=_staging_uri(), live_uri=_LIVE_URI, epoch=epoch)
