@@ -411,6 +411,34 @@ class EventStore:
             (last_event_id, processed, updated_at, job_id),
         )
 
+    def finalize_reextraction_job(
+        self,
+        job_id: str,
+        status: str,
+        failed: int,
+        errors: str | None,
+        updated_at: str,
+    ) -> None:
+        """Transition a job to a terminal status.
+
+        Sets status, failed count, errors JSON, and updated_at timestamp.
+        Status must be one of the terminal values ('completed', 'failed').
+
+        Args:
+            job_id: The job to finalize.
+            status: Terminal status string ('completed' or 'failed').
+            failed: Count of turns that had curation stage errors.
+            errors: JSON-encoded list of error strings, or None if no errors.
+            updated_at: ISO-8601 timestamp of the last processed turn (or
+                epoch activated_at when no turns were processed).
+        """
+        conn = self._get_connection()
+        conn.execute(
+            "UPDATE re_extraction_jobs SET status=?, failed=?, errors=?, updated_at=? "
+            "WHERE job_id=?",
+            (status, failed, errors, updated_at, job_id),
+        )
+
     def get_reextraction_job(self, job_id: str) -> dict[str, Any] | None:
         """Return the job row as a dict, or None if absent."""
         conn = self._get_connection()

@@ -195,3 +195,57 @@ class TestLogRegeneratorReplay:
         regen, _, _, epoch = _build_regenerator_with_uncached_turn(tmp_path, staging_conn)
         with pytest.raises(ColdCacheError, match="uncached"):
             await regen.rebuild(staging_uri=_staging_uri(), live_uri=_LIVE_URI, epoch=epoch)
+
+    @pytest.mark.asyncio
+    async def test_rebuild_finalizes_job_completed(self, staging_conn, tmp_path):
+        # Arrange: one cached turn.
+        regen, event_store, _cache, epoch = _build_regenerator_with_one_turn(tmp_path, staging_conn)
+
+        # Act
+        report = await regen.rebuild(
+            staging_uri=_staging_uri(),
+            live_uri=_LIVE_URI,
+            epoch=epoch,
+        )
+
+        # Assert report fields
+        assert report.turns_processed == 1
+        assert report.turns_failed == 0
+
+        # Assert the job ledger row is in a terminal state
+        job = event_store.get_reextraction_job(report.job_id)
+        assert job is not None
+        assert job["status"] == "completed"
+        assert job["failed"] == 0
+        assert job["errors"] is None
+
+    @pytest.mark.asyncio
+    async def test_rebuild_twice_same_epoch_no_collision(self, staging_conn, tmp_path):
+        # Arrange: one cached turn. The fixture wipes + re-seeds staging between
+        # each test, so both rebuilds share one event-store + cache db but write
+        # to a clean staging graph. The PK collision risk is in the sqlite event
+        # store job ledger, not in Neo4j.
+        regen, event_store, _cache, epoch = _build_regenerator_with_one_turn(tmp_path, staging_conn)
+
+        # Act: two independent rebuilds of the same epoch
+        report1 = await regen.rebuild(
+            staging_uri=_staging_uri(),
+            live_uri=_LIVE_URI,
+            epoch=epoch,
+        )
+        report2 = await regen.rebuild(
+            staging_uri=_staging_uri(),
+            live_uri=_LIVE_URI,
+            epoch=epoch,
+        )
+
+        # Both runs must complete without IntegrityError and produce distinct ids
+        assert report1.job_id != report2.job_id
+        assert report1.job_id.startswith(f"rebuild-{epoch['epoch_id']}-")
+        assert report2.job_id.startswith(f"rebuild-{epoch['epoch_id']}-")
+
+        # Both job rows must exist and be finalized
+        job1 = event_store.get_reextraction_job(report1.job_id)
+        job2 = event_store.get_reextraction_job(report2.job_id)
+        assert job1 is not None and job1["status"] == "completed"
+        assert job2 is not None and job2["status"] == "completed"

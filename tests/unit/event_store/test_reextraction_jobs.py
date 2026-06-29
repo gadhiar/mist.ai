@@ -40,3 +40,36 @@ class TestReextractionJobs:
     def test_get_missing_job_returns_none(self):
         store = _store()
         assert store.get_reextraction_job("nope") is None
+
+    def test_finalize_sets_completed_status(self):
+        store = _store()
+        store.create_reextraction_job("job-1", "1.4.0", None, 5, "2026-06-29T12:00:00+00:00")
+        store.finalize_reextraction_job(
+            job_id="job-1",
+            status="completed",
+            failed=0,
+            errors=None,
+            updated_at="2026-06-29T12:01:00+00:00",
+        )
+        job = store.get_reextraction_job("job-1")
+        assert job["status"] == "completed"
+        assert job["failed"] == 0
+        assert job["errors"] is None
+        assert job["updated_at"] == "2026-06-29T12:01:00+00:00"
+
+    def test_finalize_sets_failed_status_with_errors(self):
+        store = _store()
+        store.create_reextraction_job("job-1", "1.4.0", None, 5, "2026-06-29T12:00:00+00:00")
+        errors_json = '["Dedup failed: connection error", "Graph write failed: timeout"]'
+        store.finalize_reextraction_job(
+            job_id="job-1",
+            status="failed",
+            failed=2,
+            errors=errors_json,
+            updated_at="2026-06-29T12:01:30+00:00",
+        )
+        job = store.get_reextraction_job("job-1")
+        assert job["status"] == "failed"
+        assert job["failed"] == 2
+        assert job["errors"] == errors_json
+        assert job["updated_at"] == "2026-06-29T12:01:30+00:00"
