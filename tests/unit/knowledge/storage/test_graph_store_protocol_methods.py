@@ -4,7 +4,6 @@ Tests for:
 - mark_orphaned_by_provenance_path
 - current_ontology_version
 - get_orphaned_provenance_paths
-- upsert_identity
 - upsert_user
 
 All tests use FakeNeo4jConnection — no real Neo4j. Async methods are tested
@@ -16,8 +15,6 @@ from __future__ import annotations
 import pytest
 
 from backend.knowledge.curation.bucket1_reader import (
-    IdentityPreference,
-    ParsedIdentity,
     ParsedUser,
 )
 from backend.knowledge.storage.graph_store import GraphStore
@@ -206,114 +203,6 @@ class TestGetOrphanedProvenancePaths:
 
 
 # ---------------------------------------------------------------------------
-# TestUpsertIdentity
-# ---------------------------------------------------------------------------
-
-
-class TestUpsertIdentity:
-    """upsert_identity writes HAS_TRAIT/HAS_CAPABILITY/HAS_PREFERENCE edges idempotently."""
-
-    def _make_identity(
-        self,
-        traits: list[str] | None = None,
-        capabilities: list[str] | None = None,
-        preferences: list[IdentityPreference] | None = None,
-    ) -> ParsedIdentity:
-        return ParsedIdentity(
-            traits=traits or [],
-            capabilities=capabilities or [],
-            preferences=preferences or [],
-        )
-
-    @pytest.mark.asyncio
-    async def test_returns_integer(self):
-        conn = FakeNeo4jConnection()
-        store = _store_with_conn(conn)
-        parsed = self._make_identity(traits=["warm"])
-
-        result = await store.upsert_identity(parsed, derived_from_path="/vault/identity/mist.md")
-
-        assert isinstance(result, int)
-
-    @pytest.mark.asyncio
-    async def test_issues_write_for_each_trait(self):
-        conn = FakeNeo4jConnection()
-        store = _store_with_conn(conn)
-        parsed = self._make_identity(traits=["warm", "curious"])
-
-        await store.upsert_identity(parsed, derived_from_path="/vault/identity/mist.md")
-
-        has_trait_writes = [
-            (q, p)
-            for q, p in conn.writes
-            if "HAS_TRAIT" in q or ("MistTrait" in q and "warm" in str(p))
-        ]
-        assert has_trait_writes, "Expected writes for HAS_TRAIT edges"
-
-    @pytest.mark.asyncio
-    async def test_issues_write_for_each_capability(self):
-        conn = FakeNeo4jConnection()
-        store = _store_with_conn(conn)
-        parsed = self._make_identity(capabilities=["tool-use", "code-generation"])
-
-        await store.upsert_identity(parsed, derived_from_path="/vault/identity/mist.md")
-
-        cap_writes = [q for q, _ in conn.writes if "HAS_CAPABILITY" in q]
-        assert cap_writes, "Expected writes for HAS_CAPABILITY edges"
-
-    @pytest.mark.asyncio
-    async def test_issues_write_for_each_preference(self):
-        conn = FakeNeo4jConnection()
-        store = _store_with_conn(conn)
-        prefs = [
-            IdentityPreference(slug="no-emoji", enforcement="absolute"),
-            IdentityPreference(slug="no-slop", enforcement="absolute"),
-        ]
-        parsed = self._make_identity(preferences=prefs)
-
-        await store.upsert_identity(parsed, derived_from_path="/vault/identity/mist.md")
-
-        pref_writes = [q for q, _ in conn.writes if "HAS_PREFERENCE" in q]
-        assert pref_writes, "Expected writes for HAS_PREFERENCE edges"
-
-    @pytest.mark.asyncio
-    async def test_uses_merge_not_create_for_idempotency(self):
-        """Cypher must use MERGE, not CREATE, to avoid duplicates."""
-        conn = FakeNeo4jConnection()
-        store = _store_with_conn(conn)
-        parsed = self._make_identity(traits=["warm"])
-
-        await store.upsert_identity(parsed, derived_from_path="/vault/identity/mist.md")
-
-        merge_writes = [q for q, _ in conn.writes if "MERGE" in q.upper()]
-        assert merge_writes, "Expected MERGE writes for idempotency"
-
-    @pytest.mark.asyncio
-    async def test_passes_derived_from_path_in_params(self):
-        conn = FakeNeo4jConnection()
-        store = _store_with_conn(conn)
-        path = "/vault/identity/mist.md"
-        parsed = self._make_identity(traits=["warm"])
-
-        await store.upsert_identity(parsed, derived_from_path=path)
-
-        path_in_params = any(
-            params is not None and path in str(params.values()) for _, params in conn.writes
-        )
-        assert path_in_params, "Expected derived_from_path to appear in write params"
-
-    @pytest.mark.asyncio
-    async def test_empty_parsed_identity_returns_zero(self):
-        conn = FakeNeo4jConnection()
-        store = _store_with_conn(conn)
-        parsed = self._make_identity()
-
-        result = await store.upsert_identity(parsed, derived_from_path="/vault/identity/mist.md")
-
-        assert result == 0
-
-
-# ---------------------------------------------------------------------------
 # TestUpsertUser
 # ---------------------------------------------------------------------------
 
@@ -448,109 +337,6 @@ class TestUpsertUser:
         assert knows_writes, "Expected KNOWS_PERSON edge writes"
 
 
-# ---------------------------------------------------------------------------
-# TestDerivedFromProvenanceEdges
-# Phase 5.5 Bucket 1 fix: upsert_identity and upsert_user must write
-# DERIVED_FROM edges from each typed entity to the VaultNote so that
-# mark_orphaned_by_provenance_path finds them.
-# ---------------------------------------------------------------------------
-
-
-class TestUpsertIdentityWritesDerivedFromProvenance:
-    """upsert_identity must MERGE a DERIVED_FROM edge for each typed entity."""
-
-    def _make_identity(
-        self,
-        traits: list[str] | None = None,
-        capabilities: list[str] | None = None,
-        preferences: list[IdentityPreference] | None = None,
-    ) -> ParsedIdentity:
-        return ParsedIdentity(
-            traits=traits or [],
-            capabilities=capabilities or [],
-            preferences=preferences or [],
-        )
-
-    @pytest.mark.asyncio
-    async def test_upsert_identity_writes_derived_from_edge_for_each_trait(self):
-        """Each HAS_TRAIT write must be accompanied by a DERIVED_FROM edge write."""
-        conn = FakeNeo4jConnection()
-        store = _store_with_conn(conn)
-        parsed = self._make_identity(traits=["warm", "curious"])
-
-        await store.upsert_identity(parsed, derived_from_path="/vault/identity/mist.md")
-
-        derived_from_writes = [q for q, _ in conn.writes if "DERIVED_FROM" in q]
-        assert len(derived_from_writes) >= 2, (
-            f"Expected at least 2 DERIVED_FROM writes (one per trait); "
-            f"got {len(derived_from_writes)}: {derived_from_writes}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_upsert_identity_writes_derived_from_edge_for_each_capability(self):
-        """Each HAS_CAPABILITY write must be accompanied by a DERIVED_FROM edge write."""
-        conn = FakeNeo4jConnection()
-        store = _store_with_conn(conn)
-        parsed = self._make_identity(capabilities=["tool-use", "code-generation"])
-
-        await store.upsert_identity(parsed, derived_from_path="/vault/identity/mist.md")
-
-        derived_from_writes = [q for q, _ in conn.writes if "DERIVED_FROM" in q]
-        assert len(derived_from_writes) >= 2, (
-            f"Expected at least 2 DERIVED_FROM writes (one per capability); "
-            f"got {len(derived_from_writes)}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_upsert_identity_writes_derived_from_edge_for_each_preference(self):
-        """Each HAS_PREFERENCE write must be accompanied by a DERIVED_FROM edge write."""
-        conn = FakeNeo4jConnection()
-        store = _store_with_conn(conn)
-        prefs = [
-            IdentityPreference(slug="no-emoji", enforcement="absolute"),
-            IdentityPreference(slug="no-slop", enforcement="absolute"),
-        ]
-        parsed = self._make_identity(preferences=prefs)
-
-        await store.upsert_identity(parsed, derived_from_path="/vault/identity/mist.md")
-
-        derived_from_writes = [q for q, _ in conn.writes if "DERIVED_FROM" in q]
-        assert len(derived_from_writes) >= 2, (
-            f"Expected at least 2 DERIVED_FROM writes (one per preference); "
-            f"got {len(derived_from_writes)}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_upsert_identity_derived_from_targets_vault_note(self):
-        """DERIVED_FROM edges must target the VaultNote node, not an entity."""
-        conn = FakeNeo4jConnection()
-        store = _store_with_conn(conn)
-        parsed = self._make_identity(traits=["warm"])
-
-        await store.upsert_identity(parsed, derived_from_path="/vault/identity/mist.md")
-
-        derived_writes = [q for q, _ in conn.writes if "DERIVED_FROM" in q]
-        assert derived_writes, "Expected at least one DERIVED_FROM write"
-        # The write must reference VaultNote (the provenance node type)
-        vault_note_in_query = any("VaultNote" in q for q in derived_writes)
-        assert vault_note_in_query, (
-            "DERIVED_FROM write must reference VaultNote node; " f"got queries: {derived_writes}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_upsert_identity_writes_traits_into_selfmodel(self):
-        conn = FakeNeo4jConnection()
-        store = _store_with_conn(conn)
-        parsed = self._make_identity(traits=["warm"])
-
-        await store.upsert_identity(parsed, derived_from_path="/vault/identity/mist.md")
-
-        trait_writes = [q for q, _ in conn.writes if "MistTrait" in q]
-        assert trait_writes, "Expected a MistTrait write"
-        assert all("__SelfModel__:MistTrait" in q for q in trait_writes), trait_writes
-        assert not any("__Entity__:MistTrait" in q for q in trait_writes), trait_writes
-
-
 class TestUpsertUserWritesDerivedFromProvenance:
     """upsert_user must MERGE a DERIVED_FROM edge for each typed entity."""
 
@@ -649,9 +435,6 @@ def test_ensure_mist_identity_uses_selfmodel_partition():
 class TestMarkOrphanedAfterUpsert:
     """mark_orphaned_by_provenance_path finds Bucket 1 triples after the upsert fix."""
 
-    def _make_identity(self, traits: list[str]) -> ParsedIdentity:
-        return ParsedIdentity(traits=traits, capabilities=[], preferences=[])
-
     def _make_user(self, tools: list[str]) -> ParsedUser:
         return ParsedUser(
             user_id="user-raj",
@@ -664,28 +447,6 @@ class TestMarkOrphanedAfterUpsert:
             goals=[],
             preferences=[],
             people=[],
-        )
-
-    @pytest.mark.asyncio
-    async def test_mark_orphaned_after_upsert_identity_finds_the_triples(self):
-        """After upsert_identity, mark_orphaned_by_provenance_path marks >0 triples.
-
-        Uses FakeGraphStore (not real GraphStore) so the test runs on the host
-        without Neo4j. Exercises the FakeGraphStore's own DERIVED_FROM tracking.
-        """
-        from tests.fakes.graph_store import FakeGraphStore
-
-        store = FakeGraphStore()
-        path = "/vault/identity/mist.md"
-        parsed = self._make_identity(traits=["warm", "curious"])
-
-        await store.upsert_identity(parsed, derived_from_path=path)
-        marked = await store.mark_orphaned_by_provenance_path(path)
-
-        assert marked > 0, (
-            f"mark_orphaned_by_provenance_path must find >0 triples after "
-            f"upsert_identity; got {marked}. "
-            f"FakeGraphStore likely does not track DERIVED_FROM provenance."
         )
 
     @pytest.mark.asyncio
@@ -709,21 +470,6 @@ class TestMarkOrphanedAfterUpsert:
             f"upsert_user; got {marked}. "
             f"FakeGraphStore likely does not track DERIVED_FROM provenance."
         )
-
-    @pytest.mark.asyncio
-    async def test_mark_orphaned_after_upsert_identity_marks_correct_count(self):
-        """mark_orphaned returns count equal to number of typed entities upserted."""
-        from tests.fakes.graph_store import FakeGraphStore
-
-        store = FakeGraphStore()
-        path = "/vault/identity/mist.md"
-        parsed = self._make_identity(traits=["warm", "curious", "direct"])
-
-        await store.upsert_identity(parsed, derived_from_path=path)
-        marked = await store.mark_orphaned_by_provenance_path(path)
-
-        # 3 traits -> 3 DERIVED_FROM edges -> 3 marked
-        assert marked == 3, f"Expected 3 triples marked (one per trait); got {marked}"
 
     @pytest.mark.asyncio
     async def test_mark_orphaned_does_not_affect_different_path(self):

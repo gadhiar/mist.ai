@@ -4,9 +4,9 @@ Idempotent. MIST's self-model exists twice in the :__SelfModel__ partition: the
 canonical kebab set (`trait-warm`, `cap-*`, `pref-*`) seeded once by the ADR-008
 bootstrap (`apply_seed`), carrying full content (`axis`/`description`/`embedding`)
 and currency-stamped `HAS_*` edges; and a sparse mist-prefixed shadow set
-(`mist-trait-Warm`, ...) written by the vault->graph regenerator's
-`graph_store.upsert_identity` on `identity/mist.md` edits, carrying no content
-and no currency stamps. The shadows double MIST's persona injection.
+(`mist-trait-Warm`, ...) written by the vault->graph regenerator on
+`identity/mist.md` edits, carrying no content and no currency stamps.
+The shadows double MIST's persona injection.
 
 The :__SelfModel__ partition is canonical and preserved (R1 truth model: the
 self-model is not vault-derived). This migration deletes the mist-prefixed
@@ -15,7 +15,7 @@ shadow traits/capabilities/preferences. The singleton identity root
 MERGE onto the same root node, so there is no identity shadow, and the
 selfmodel_partition migration already reconciled its gap-window duplicate.
 
-Run inside the container after `graph_store.upsert_identity` is retired:
+Run inside the container after the vault->graph re-derivation path is retired:
     python -c "
     import asyncio, sys
     sys.path.insert(0, '.')

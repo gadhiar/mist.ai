@@ -1,22 +1,17 @@
-"""Bucket 1 file parser (inverse of backend.vault.writer / user_snapshot).
+"""Bucket 1 file parser (inverse of backend.vault.user_snapshot).
 
-Per ADR-011 Bucket 1: identity/mist.md and users/<user>.md are mechanical
-state mirrors of graph 1-hop snapshots. The forward direction (graph -> file)
-is handled by:
-  - VaultWriter._upsert_identity_sync  (identity/mist.md)
-  - render_user_snapshot_body          (body for users/<user>.md)
+Per ADR-011 Bucket 1: users/<user>.md is a mechanical state mirror of the
+User node's 1-hop graph snapshot. The forward direction (graph -> file) is
+handled by render_user_snapshot_body (body for users/<user>.md).
 
-This module is the reverse direction (file -> graph attributes/edges) for use
-by GraphRegenerator on user-edit detection. No LLM calls -- the file structure
+This module is the reverse direction (file -> graph edges) for use by
+GraphRegenerator on user-edit detection. No LLM calls -- the file structure
 is deterministic.
 
 Bullet format emitted by the forward direction:
-  identity traits/caps: - **{display_name}** [{(axis)}] -- {description}
-  identity prefs:       - **{display_name}** [{(enforcement)}] -- {context}
-  user neighbors:       - **{display_name}** ({entity_type}) [-- {description}]
+  user neighbors: - **{display_name}** ({entity_type}) [-- {description}]
 
-The parser extracts the display_name (slug) from each bullet. For identity
-preferences it also extracts the enforcement parenthetical.
+The parser extracts the display_name (slug) from each bullet.
 """
 
 from __future__ import annotations
@@ -39,23 +34,6 @@ class Bucket1ParseError(Exception):
 # ---------------------------------------------------------------------------
 # Result dataclasses
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class IdentityPreference:
-    """One parsed identity preference."""
-
-    slug: str
-    enforcement: str  # "absolute" | "soft" | ""
-
-
-@dataclass(frozen=True)
-class ParsedIdentity:
-    """Graph-equivalent attributes extracted from identity/mist.md."""
-
-    traits: list[str] = field(default_factory=list)
-    capabilities: list[str] = field(default_factory=list)
-    preferences: list[IdentityPreference] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -153,49 +131,6 @@ def _bold_display_names(section_text: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-
-
-def parse_identity_file(path: Path) -> ParsedIdentity:
-    """Parse identity/mist.md into graph-equivalent attributes.
-
-    The file must have been produced by VaultWriter._upsert_identity_sync.
-    The parser is the exact inverse: it reads the same ## Traits,
-    ## Capabilities, and ## Preferences sections and recovers the slug
-    (display_name) and enforcement for each item.
-
-    Args:
-        path: Absolute path to identity/mist.md.
-
-    Returns:
-        ParsedIdentity with traits, capabilities, and preferences.
-
-    Raises:
-        Bucket1ParseError: If frontmatter is missing, YAML is malformed,
-            or the `type` field is not `mist-identity`.
-    """
-    text = path.read_text(encoding="utf-8")
-    fm, body = _split_frontmatter(text)
-
-    if fm.get("type") != "mist-identity":
-        raise Bucket1ParseError(
-            f"Expected type=mist-identity, got type={fm.get('type')!r}. "
-            "Is this an identity/mist.md file?"
-        )
-
-    sections = _extract_sections(body)
-
-    # Parse preferences: extract both display_name (slug) and enforcement
-    preferences: list[IdentityPreference] = []
-    for m in _BOLD_BULLET_RE.finditer(sections.get("Preferences", "")):
-        slug = m.group(1).strip()
-        enforcement = (m.group(2) or "").strip().lower()
-        preferences.append(IdentityPreference(slug=slug, enforcement=enforcement))
-
-    return ParsedIdentity(
-        traits=_bold_display_names(sections.get("Traits", "")),
-        capabilities=_bold_display_names(sections.get("Capabilities", "")),
-        preferences=preferences,
-    )
 
 
 def parse_user_file(path: Path) -> ParsedUser:

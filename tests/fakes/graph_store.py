@@ -3,7 +3,6 @@
 Satisfies the GraphStoreProtocol surface required by GraphRegenerator:
   - mark_orphaned_by_provenance_path
   - current_ontology_version
-  - upsert_identity
   - upsert_user
 
 Also exposes assertion helpers for test readability:
@@ -12,10 +11,10 @@ Also exposes assertion helpers for test readability:
 Schema alignment (Phase 5.5 Bucket 1 fix):
   The real mark_orphaned_by_provenance_path queries DERIVED_FROM relationship-
   type edges pointing at :__Provenance__:VaultNote nodes. This fake mirrors
-  that schema: upsert_identity and upsert_user write FakeDerivedFromEdge
-  records, and mark_orphaned_by_provenance_path marks those edges by path.
-  This ensures the fake catches the same class of bug as the real Neo4j
-  implementation rather than masking it via property-based triple matching.
+  that schema: upsert_user writes FakeDerivedFromEdge records, and
+  mark_orphaned_by_provenance_path marks those edges by path. This ensures
+  the fake catches the same class of bug as the real Neo4j implementation
+  rather than masking it via property-based triple matching.
 """
 
 from __future__ import annotations
@@ -51,8 +50,8 @@ class FakeGraphStore:
     """In-memory test double for GraphStoreProtocol.
 
     Tracks typed triples and DERIVED_FROM provenance edges separately.
-    Idempotent upsert: calling upsert_identity / upsert_user with the same
-    display_name twice writes only one triple and one provenance edge (dedup).
+    Idempotent upsert: calling upsert_user with the same display_name twice
+    writes only one triple and one provenance edge (dedup).
 
     mark_orphaned_by_provenance_path mirrors the real Neo4j implementation:
     it finds DERIVED_FROM edges by path and marks their status='orphaned'.
@@ -70,7 +69,6 @@ class FakeGraphStore:
         # DERIVED_FROM provenance edges (entity_id, path) -> FakeDerivedFromEdge
         self._provenance_edges: dict[tuple[str, str], FakeDerivedFromEdge] = {}
         self.mark_orphaned_calls: list[str] = []
-        self.upsert_identity_calls: list[dict] = []
         self.upsert_user_calls: list[dict] = []
 
     # ------------------------------------------------------------------
@@ -117,46 +115,6 @@ class FakeGraphStore:
                 seen.add(edge.path)
                 result.append(edge.path)
         return result
-
-    async def upsert_identity(self, parsed_identity, derived_from_path: str) -> int:
-        """Write ParsedIdentity attributes as graph triples (idempotent).
-
-        Mirrors the real upsert_identity: for each typed entity, writes a typed
-        triple AND a DERIVED_FROM provenance edge to the VaultNote at
-        derived_from_path. mark_orphaned_by_provenance_path finds edges by path.
-        """
-        self.upsert_identity_calls.append(
-            {"parsed_identity": parsed_identity, "derived_from_path": derived_from_path}
-        )
-        written = 0
-        for trait_slug in parsed_identity.traits:
-            entity_id = f"mist-trait-{trait_slug}"
-            written += self._upsert_triple(
-                subject="mist-identity",
-                predicate="HAS_TRAIT",
-                object=trait_slug,
-                derived_from_path=derived_from_path,
-            )
-            self._upsert_provenance_edge(entity_id, derived_from_path)
-        for cap_slug in parsed_identity.capabilities:
-            entity_id = f"mist-cap-{cap_slug}"
-            written += self._upsert_triple(
-                subject="mist-identity",
-                predicate="HAS_CAPABILITY",
-                object=cap_slug,
-                derived_from_path=derived_from_path,
-            )
-            self._upsert_provenance_edge(entity_id, derived_from_path)
-        for pref in parsed_identity.preferences:
-            entity_id = f"mist-pref-{pref.slug}"
-            written += self._upsert_triple(
-                subject="mist-identity",
-                predicate="HAS_PREFERENCE",
-                object=pref.slug,
-                derived_from_path=derived_from_path,
-            )
-            self._upsert_provenance_edge(entity_id, derived_from_path)
-        return written
 
     async def upsert_user(self, parsed_user, derived_from_path: str) -> int:
         """Write ParsedUser edge targets as graph triples (idempotent).

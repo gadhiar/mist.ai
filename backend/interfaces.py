@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
-    from backend.knowledge.curation.bucket1_reader import ParsedIdentity, ParsedUser
+    from backend.knowledge.curation.bucket1_reader import ParsedUser
     from backend.knowledge.models import DocumentChunk, VectorSearchResult
     from backend.llm.models import LLMRequest, LLMResponse
 
@@ -183,20 +183,6 @@ class GraphStoreProtocol(Protocol):
 
         Returns:
             List of absolute path strings for which orphaned triples exist.
-        """
-        ...
-
-    async def upsert_identity(
-        self,
-        parsed_identity: ParsedIdentity,
-        derived_from_path: str,
-    ) -> int:
-        """Upsert MistIdentity attributes from a ParsedIdentity.
-
-        Writes traits, capabilities, and preferences to the graph as typed
-        edges from the MistIdentity node. Sets DERIVED_FROM.path on each
-        written triple to `derived_from_path`. Returns count of triples
-        written.
         """
         ...
 
