@@ -29,10 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from backend.interfaces import ExtractionPipelineProtocol, GraphStoreProtocol
-from backend.knowledge.curation.bucket1_reader import (
-    parse_identity_file,
-    parse_user_file,
-)
+from backend.knowledge.curation.bucket1_reader import parse_user_file
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +39,7 @@ class RebuildResult:
     """Result of a single GraphRegenerator.rebuild_from_path call."""
 
     path: Path
-    bucket: str  # "1" | "2" | "3"
+    bucket: str  # "1" | "2" | "3" | "ignored"
     orphaned_triple_count: int
     new_triple_count: int  # 0 if async-deferred
     ontology_version: str
@@ -119,6 +116,23 @@ class GraphRegenerator:
         Returns:
             RebuildResult with counts and metadata.
         """
+        # Self-model is graph-canonical and preserved, not vault-derived (R1
+        # truth model). identity/mist.md edits no longer touch the graph: skip
+        # the orphan-mark + re-derivation entirely so a doc edit is inert.
+        if path.name == "mist.md":
+            logger.info(
+                "GraphRegenerator: identity/mist.md is graph-canonical; "
+                "treating edit as a graph no-op (self-model not vault-derived)"
+            )
+            return RebuildResult(
+                path=path,
+                bucket="ignored",
+                orphaned_triple_count=0,
+                new_triple_count=0,
+                ontology_version=self._graph_store.current_ontology_version(),
+                deferred=False,
+            )
+
         bucket = self._classify_bucket(path)
 
         # Step 1: orphan-mark existing DERIVED_FROM-scoped triples
@@ -155,27 +169,22 @@ class GraphRegenerator:
         )
 
     async def _rebuild_bucket1(self, path: Path) -> int:
-        """Deterministic Bucket 1 re-derivation.
+        """Deterministic Bucket 1 re-derivation for users/<user>.md.
 
-        Parses identity/mist.md or users/<user>.md and upserts the
-        resulting attributes/edges into the graph store. No LLM calls.
+        Parses users/<user>.md and upserts the resulting edges into the graph
+        store. No LLM calls. (identity/mist.md is handled as a graph no-op in
+        rebuild_from_path; the self-model is graph-canonical, not vault-derived.)
 
         Returns:
             Count of new triples written.
         """
-        if path.name == "mist.md":
-            parsed_identity = parse_identity_file(path)
-            return await self._graph_store.upsert_identity(
-                parsed_identity, derived_from_path=str(path)
-            )
-
         # Check parent directory name for users/ classification
         if len(path.parts) >= 2 and path.parts[-2] == "users":
             parsed_user = parse_user_file(path)
             return await self._graph_store.upsert_user(parsed_user, derived_from_path=str(path))
 
         logger.warning(
-            "GraphRegenerator: bucket-1 path not recognised as identity or user file: %s",
+            "GraphRegenerator: bucket-1 path not recognised as a user file: %s",
             path,
         )
         return 0

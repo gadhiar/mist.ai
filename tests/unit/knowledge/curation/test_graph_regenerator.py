@@ -108,22 +108,29 @@ def test_rebuild_marks_old_triples_orphaned(
     assert triple.status == "orphaned"
 
 
-def test_rebuild_bucket1_identity_deterministic(
+def test_rebuild_mist_md_is_graph_noop(
     regenerator: GraphRegenerator,
     fake_graph_store: FakeGraphStore,
     tmp_path: Path,
 ) -> None:
-    """identity/mist.md triggers Bucket 1 deterministic re-derivation, no LLM."""
+    """identity/mist.md is graph-canonical: an edit is a no-op.
+
+    The self-model is not vault-derived (R1 truth model), so a mist.md edit
+    must not orphan-mark or re-derive any graph state.
+    """
     p = tmp_path / "identity" / "mist.md"
     p.parent.mkdir()
     p.write_text(_IDENTITY_BODY, encoding="utf-8")
 
     result: RebuildResult = asyncio.run(regenerator.rebuild_from_path(p))
 
-    assert result.bucket == "1"
+    assert result.bucket == "ignored"
     assert result.deferred is False
-    # Trait was written to graph without an LLM call
-    assert fake_graph_store.has_trait("precise")
+    assert result.orphaned_triple_count == 0
+    assert result.new_triple_count == 0
+    # No graph write and no orphan-mark happened.
+    assert not fake_graph_store.has_trait("precise")
+    assert fake_graph_store.mark_orphaned_calls == []
 
 
 def test_rebuild_bucket1_user_deterministic(
@@ -174,16 +181,19 @@ def test_rebuild_idempotent_no_proliferation(
     fake_graph_store: FakeGraphStore,
     tmp_path: Path,
 ) -> None:
-    """Repeat rebuild from same content does not create duplicate triples."""
-    p = tmp_path / "identity" / "mist.md"
+    """Repeat Bucket-1 (user) rebuild from identical content writes no new
+    triples the second time.
+    """
+    p = tmp_path / "users" / "raj.md"
     p.parent.mkdir()
-    p.write_text(_IDENTITY_BODY, encoding="utf-8")
+    p.write_text(_USER_BODY, encoding="utf-8")
 
-    asyncio.run(regenerator.rebuild_from_path(p))
-    asyncio.run(regenerator.rebuild_from_path(p))
+    first: RebuildResult = asyncio.run(regenerator.rebuild_from_path(p))
+    second: RebuildResult = asyncio.run(regenerator.rebuild_from_path(p))
 
-    # Exactly one HAS_TRAIT triple for "precise", regardless of rebuild count
-    assert fake_graph_store.count_traits() == 1
+    assert first.new_triple_count >= 1
+    assert second.new_triple_count == 0
+    assert fake_graph_store.get_triple("raj", "USES", "Python") is not None
 
 
 # ---------------------------------------------------------------------------
