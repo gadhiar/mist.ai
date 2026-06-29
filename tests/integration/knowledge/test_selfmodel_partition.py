@@ -358,3 +358,71 @@ class TestSelfModelPartition:
             {"types": sorted(SELF_MODEL_TYPES)},
         )
         assert leftover[0]["n"] == 0, "self-model nodes must not remain in :__Entity__"
+
+    @pytest.mark.asyncio
+    async def test_dedup_removes_mist_prefixed_shadows_keeps_kebab(self, store: GraphStore):
+        """Dual-seeded self-model -> only the canonical kebab set survives.
+
+        Reproduces the live dual-seed: the canonical kebab trait (`trait-warm`,
+        rich props, currency-stamped HAS_TRAIT from the ADR-008 bootstrap) plus
+        the sparse mist-prefixed shadow (`mist-trait-Warm` from the vault->graph
+        regenerator). The dedup migration must delete the shadow and leave the
+        kebab node + its HAS_TRAIT edge from the identity root intact, so the
+        persona reads the trait exactly once.
+        """
+        from scripts.migrations.selfmodel_dedup import migrate as dedup_migrate
+
+        # Arrange: identity root + canonical kebab trait (rich, HAS_TRAIT) ...
+        store.connection.execute_write(
+            """
+            CREATE (m:__SelfModel__:MistIdentity {
+                id: 'mist-identity', entity_type: 'MistIdentity', display_name: 'MIST'
+            })
+            CREATE (k:__SelfModel__:MistTrait {
+                id: 'trait-warm', entity_type: 'MistTrait', display_name: 'Warm',
+                axis: 'tone', description: 'warm and kind', status: 'active'
+            })
+            MERGE (m)-[:HAS_TRAIT {is_latest_belief: true, valid_from: '-inf'}]->(k)
+            """,
+            {},
+        )
+        # ... and the sparse mist-prefixed shadow trait (no content, HAS_TRAIT).
+        store.connection.execute_write(
+            """
+            MATCH (m:__SelfModel__:MistIdentity {id: 'mist-identity'})
+            CREATE (s:__SelfModel__:MistTrait {
+                id: 'mist-trait-Warm', entity_type: 'MistTrait',
+                display_name: 'Warm', status: 'active'
+            })
+            MERGE (m)-[:HAS_TRAIT]->(s)
+            """,
+            {},
+        )
+
+        # Act
+        await dedup_migrate(GraphExecutor(store.connection))
+
+        # Assert: the shadow is gone; the kebab survives with its content.
+        traits = store.connection.execute_query(
+            "MATCH (t:__SelfModel__:MistTrait) RETURN t.id AS id, t.axis AS axis ORDER BY id",
+            {},
+        )
+        assert [t["id"] for t in traits] == [
+            "trait-warm"
+        ], "only the canonical kebab trait must survive the dedup"
+        assert traits[0]["axis"] == "tone", "the surviving trait must keep its kebab content"
+
+        # Assert: the persona reads the trait exactly once.
+        persona = store.connection.execute_query(
+            "MATCH (m:MistIdentity {id: 'mist-identity'})-[:HAS_TRAIT]->(t) "
+            "RETURN count(t) AS trait_edges",
+            {},
+        )
+        assert persona[0]["trait_edges"] == 1, "persona must list the trait once after dedup"
+
+        # Assert: idempotent -- a second run deletes nothing more.
+        await dedup_migrate(GraphExecutor(store.connection))
+        recount = store.connection.execute_query(
+            "MATCH (t:__SelfModel__:MistTrait) RETURN count(t) AS n", {}
+        )
+        assert recount[0]["n"] == 1, "second dedup run must be a no-op"
