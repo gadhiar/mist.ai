@@ -23,6 +23,8 @@ from backend.knowledge.curation.reconciliation import ReconciliationEngine
 from backend.knowledge.storage.graph_executor import GraphExecutor
 from backend.knowledge.storage.graph_store import GraphStore
 from backend.knowledge.storage.neo4j_connection import Neo4jConnection
+from backend.knowledge.storage.partitions import SELF_MODEL_TYPES
+from scripts.migrations.selfmodel_partition import migrate
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 
 # ---------------------------------------------------------------------------
@@ -101,6 +103,11 @@ def store():
         "MATCH (n:__Entity__) WHERE n.id STARTS WITH $prefix DETACH DELETE n",
         {"prefix": _TEST_ENTITY_PREFIX},
     )
+    # The migration round-trip test creates an :__Entity__:MistIdentity with the
+    # canonical (un-prefixed) id 'mist-identity'. If that test fails before the
+    # relabel, the node stays in :__Entity__ and escapes both sweeps above, so
+    # sweep it by id to keep reruns deterministic.
+    conn.execute_write("MATCH (n {id: 'mist-identity'}) DETACH DELETE n", {})
     conn.disconnect()
 
 
@@ -276,3 +283,78 @@ class TestSelfModelPartition:
             "MIST_HAS_TRAIT edge from :__SelfModel__ source not found in graph -- "
             "T8 source-disjunction fix may not have applied to the reconciliation writer"
         )
+
+    @pytest.mark.asyncio
+    async def test_migrate_reconciles_gap_window_orphan_to_single_root(self, store: GraphStore):
+        """Gap-window orphan + real :__Entity__ root -> one clean :__SelfModel__ root.
+
+        Reproduces the live R1.0 pre-migration state: a backend boot in the gap
+        window between the R1.0 writers shipping and this migration running calls
+        ensure_mist_identity(), which MERGEs a :__SelfModel__:MistIdentity stub
+        because the real, edge-bearing root still carries :__Entity__. Relabeling
+        naively would move the real root into :__SelfModel__ and collide with the
+        stub on selfmodel_id_unique (constraint present via initialize_schema in
+        the fixture). The migration must delete the stub (the :__Entity__
+        original wins) before relabeling.
+        """
+        # Arrange: the real, edge-bearing root in :__Entity__ with a HAS_TRAIT
+        # edge to a self-model trait...
+        store.connection.execute_write(
+            """
+            CREATE (m:__Entity__:MistIdentity {
+                id: 'mist-identity', entity_type: 'MistIdentity',
+                display_name: 'MIST', self_concept: 'real-root', pronouns: 'she/her'
+            })
+            CREATE (t:__SelfModel__:MistTrait {
+                id: $trait_id, entity_type: 'MistTrait',
+                display_name: 'Curious', status: 'active'
+            })
+            MERGE (m)-[r:HAS_TRAIT]->(t)
+            ON CREATE SET r.status = 'active', r.is_latest_belief = true,
+                          r.valid_from = '-inf'
+            """,
+            {"trait_id": _TRAIT_TARGET_ID},
+        )
+        # ...and the gap-window orphan stub in :__SelfModel__ (no edges), exactly
+        # what ensure_mist_identity() MERGEs on a boot in the gap window.
+        store.connection.execute_write(
+            """
+            CREATE (s:__SelfModel__:MistIdentity {
+                id: 'mist-identity', entity_type: 'MistIdentity', display_name: 'MIST'
+            })
+            """,
+            {},
+        )
+
+        # Act
+        await migrate(GraphExecutor(store.connection))
+
+        # Assert: exactly one mist-identity node survives.
+        roots = store.connection.execute_query(
+            "MATCH (m {id: 'mist-identity'}) RETURN count(m) AS roots", {}
+        )
+        assert roots[0]["roots"] == 1, "expected a single mist-identity root after migration"
+
+        # Assert: the survivor is the real edge-bearing root, now relabeled into
+        # :__SelfModel__ and out of :__Entity__ -- NOT the empty stub.
+        detail = store.connection.execute_query(
+            "MATCH (m {id: 'mist-identity'}) "
+            "OPTIONAL MATCH (m)-[:HAS_TRAIT]->(t) "
+            "RETURN m:__SelfModel__ AS in_selfmodel, m:__Entity__ AS in_entity, "
+            "m.self_concept AS self_concept, count(t) AS trait_edges",
+            {},
+        )
+        row = detail[0]
+        assert row["in_selfmodel"] is True, "survivor must carry :__SelfModel__"
+        assert row["in_entity"] is False, "survivor must no longer carry :__Entity__"
+        assert (
+            row["self_concept"] == "real-root"
+        ), "the edge-bearing :__Entity__ root must survive, not the empty stub"
+        assert row["trait_edges"] == 1, "the real root's HAS_TRAIT edge must be preserved"
+
+        # Assert: no self-model node remains in :__Entity__.
+        leftover = store.connection.execute_query(
+            "MATCH (e:__Entity__) WHERE e.entity_type IN $types RETURN count(e) AS n",
+            {"types": sorted(SELF_MODEL_TYPES)},
+        )
+        assert leftover[0]["n"] == 0, "self-model nodes must not remain in :__Entity__"

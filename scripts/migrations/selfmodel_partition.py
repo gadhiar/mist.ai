@@ -38,6 +38,23 @@ if TYPE_CHECKING:
 
 _TYPES_LIST = "[" + ", ".join(f"'{t}'" for t in sorted(SELF_MODEL_TYPES)) + "]"
 
+# 0) Reconcile gap-window orphans. A backend boot between the R1.0 writers
+#    shipping and this migration running calls ensure_mist_identity(), whose
+#    `MERGE (m:__SelfModel__:MistIdentity {id: 'mist-identity'})` cannot match
+#    the real root (still :__Entity__) and so MERGEs a fresh :__SelfModel__
+#    stub. Relabeling the real root (step 1) would then collide with that stub
+#    on the same id -- a selfmodel_id_unique violation, or two roots where the
+#    constraint is absent. The :__Entity__ original is the pre-migration source
+#    of truth (seeded props + HAS_* edges), so it wins: delete any :__SelfModel__
+#    self-model node whose id still has a same-type :__Entity__ counterpart.
+#    Idempotent -- after step 1 relabels the original, no :__Entity__ counterpart
+#    remains, so re-runs match nothing.
+_RECONCILE = (
+    f"MATCH (stub:__SelfModel__) WHERE stub.entity_type IN {_TYPES_LIST} "
+    "MATCH (orig:__Entity__ {id: stub.id}) WHERE orig.entity_type = stub.entity_type "
+    "DETACH DELETE stub"
+)
+
 # 1) Move every self-model node out of :__Entity__ into :__SelfModel__.
 #    After the first run, no :__Entity__ node carries a self-model entity_type,
 #    so the MATCH is empty and the statement is a structural no-op.
@@ -54,7 +71,7 @@ _BACKFILL = [
     for typed in sorted(SELF_MODEL_TYPES)
 ]
 
-CYPHER: list[str] = [_RELABEL, *_BACKFILL]
+CYPHER: list[str] = [_RECONCILE, _RELABEL, *_BACKFILL]
 
 
 async def migrate(executor: GraphExecutor) -> None:
