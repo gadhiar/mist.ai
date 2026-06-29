@@ -1182,21 +1182,11 @@ class ConversationHandler:
         completes, so the next mist_context fetch reads correct re-derived state.
 
         Eviction rules:
-        - identity/mist.md -> clear ALL active sessions (persona changed)
         - users/<user>.md  -> clear sessions whose user_id matches the stem
-        - other paths      -> no-op (sessions/*, decisions/*, etc.)
+        - other paths      -> no-op (identity/* is graph-canonical; sessions/*,
+          decisions/*, etc. do not affect the persona cache)
         """
         parts = event.path.parts
-
-        if "identity" in parts and event.path.name == "mist.md":
-            # Persona definition changed -- all cached contexts are stale.
-            cleared_count = len(self._mist_context_cache)
-            self._mist_context_cache.clear()
-            logger.info(
-                "_on_vault_rebuild: identity/mist.md rebuilt; cleared all %d session caches",
-                cleared_count,
-            )
-            return
 
         if "users" in parts:
             user_id = event.path.stem

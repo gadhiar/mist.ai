@@ -380,24 +380,30 @@ class TestInvalidationBusSubscription:
         handler.get_or_create_session(session_id, user_id)
         asyncio.run(handler._get_or_fetch_mist_context(session_id))
 
-    def test_identity_edit_invalidates_all_session_caches(
+    def test_identity_edit_does_not_invalidate_caches(
         self, invalidation_handler: ConversationHandler
     ) -> None:
-        """identity/mist.md rebuild clears ALL active session caches."""
+        """identity/mist.md is graph-canonical: an edit does NOT clear persona
+        caches. The self-model is not vault-derived, so the persona is unchanged
+        and the cached MistContext is still valid.
+        """
         self._pre_populate(invalidation_handler, "s1", "raj")
         self._pre_populate(invalidation_handler, "s2", "alice")
         assert len(invalidation_handler._mist_context_cache) == 2
 
         event = RebuildResult(
             path=Path("/app/mist-memory/identity/mist.md"),
-            bucket="1",
-            orphaned_triple_count=1,
-            new_triple_count=1,
+            bucket="ignored",
+            orphaned_triple_count=0,
+            new_triple_count=0,
             ontology_version="1.1.0",
             deferred=False,
         )
         asyncio.run(invalidation_handler._on_vault_rebuild(event))
-        assert invalidation_handler._mist_context_cache == {}
+
+        # Both session caches survive: a mist.md edit no longer changes the persona.
+        assert "s1" in invalidation_handler._mist_context_cache
+        assert "s2" in invalidation_handler._mist_context_cache
 
     def test_user_edit_invalidates_only_matching_user_caches(
         self, invalidation_handler: ConversationHandler
