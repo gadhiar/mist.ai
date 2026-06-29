@@ -424,38 +424,41 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
     # Resolve live_uri early (no connection needed) so the isolation guard
     # fires before ANY connect() or execute_write() call.
     live_uri = be.get_config().neo4j.uri
-    # Guard FIRST: refuse if --staging-uri resolves to the same host:port as live.
-    assert_rebuild_target_not_live(args.staging_uri, live_uri)
-
-    live_conn = _connect(be)  # reads NEO4J_URI (live) from env
-
-    # Build staging connection from args.staging_uri with live credentials.
-    config = be.get_config()
-    staging_config = Neo4jConfig(
-        uri=args.staging_uri,
-        username=config.neo4j.username,
-        password=config.neo4j.password,
-    )
-    staging_conn = be.Neo4jConnection(staging_config)
-    staging_conn.connect()
-
-    def _build_once() -> str:
-        # Wipe staging so each build starts from a clean slate.
-        staging_conn.execute_write("MATCH (n) DETACH DELETE n", {})
-        regen, epoch = _build_log_regenerator(be, staging_conn, args.epoch)
-        # Each call gets a unique job_id automatically (job_id left unset).
-        _asyncio.run(
-            regen.rebuild(
-                staging_uri=args.staging_uri,
-                live_uri=live_uri,
-                epoch=epoch,
-                source_conn=live_conn,
-                staging_conn=staging_conn,
-            )
-        )
-        return canonical_graph_form(staging_conn, include_provenance=False)
-
+    live_conn = None
+    staging_conn = None
     try:
+        # Guard FIRST: refuse if --staging-uri resolves to the same host:port as live.
+        # Must be the first statement in the try so RebuildTargetError is caught below.
+        assert_rebuild_target_not_live(args.staging_uri, live_uri)
+
+        live_conn = _connect(be)  # reads NEO4J_URI (live) from env
+
+        # Build staging connection from args.staging_uri with live credentials.
+        config = be.get_config()
+        staging_config = Neo4jConfig(
+            uri=args.staging_uri,
+            username=config.neo4j.username,
+            password=config.neo4j.password,
+        )
+        staging_conn = be.Neo4jConnection(staging_config)
+        staging_conn.connect()
+
+        def _build_once() -> str:
+            # Wipe staging so each build starts from a clean slate.
+            staging_conn.execute_write("MATCH (n) DETACH DELETE n", {})
+            regen, epoch = _build_log_regenerator(be, staging_conn, args.epoch)
+            # Each call gets a unique job_id automatically (job_id left unset).
+            _asyncio.run(
+                regen.rebuild(
+                    staging_uri=args.staging_uri,
+                    live_uri=live_uri,
+                    epoch=epoch,
+                    source_conn=live_conn,
+                    staging_conn=staging_conn,
+                )
+            )
+            return canonical_graph_form(staging_conn, include_provenance=False)
+
         build_a = _build_once()
         build_b = _build_once()
         assert_rebuild_twice_identical(build_a, build_b)
@@ -463,18 +466,20 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
         live_form = canonical_graph_form(live_conn, include_provenance=False)
         print(live_vs_rebuilt_report(live_form, build_b))
         return 0
-    except ColdCacheError as exc:
+    except RebuildTargetError as exc:
         print(f"[rebuild] REFUSED: {exc}")
         return 2
-    except RebuildTargetError as exc:
+    except ColdCacheError as exc:
         print(f"[rebuild] REFUSED: {exc}")
         return 2
     except RebuildDeterminismError as exc:
         print(f"[rebuild] {exc}")
         return 1
     finally:
-        live_conn.disconnect()
-        staging_conn.disconnect()
+        if live_conn is not None:
+            live_conn.disconnect()
+        if staging_conn is not None:
+            staging_conn.disconnect()
 
 
 def cmd_graph_reset(args: argparse.Namespace) -> int:
