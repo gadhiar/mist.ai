@@ -1,0 +1,32 @@
+# docker-compose.staging-neo4j.yml
+# Disposable Neo4j for R1.2 rebuild staging (build-then-swap proof). Separate
+# INSTANCE (Neo4j Community is single-DB) on the main compose network so
+# mist-backend resolves it by service name. Gated behind the `staging` profile
+# so a normal `docker compose up` never starts it. State on tmpfs -> wiped on
+# container removal. Kept distinct from mist-neo4j-eval so a rebuild dry-run
+# never clobbers the test DB.
+#
+# Usage (from repo root):
+#   docker compose -f docker-compose.yml -f docker-compose.staging-neo4j.yml \
+#     --profile staging up -d mist-neo4j-staging
+#   docker compose -f docker-compose.yml -f docker-compose.staging-neo4j.yml \
+#     --profile staging rm -sfv mist-neo4j-staging      # teardown
+services:
+  mist-neo4j-staging:
+    image: neo4j:5
+    container_name: mist-neo4j-staging
+    profiles: ["staging"]
+    ports:
+      - "7476:7474"   # HTTP (host 7476; live 7474, eval 7475)
+      - "7689:7687"   # Bolt (host 7689; live 7687, eval 7688)
+    environment:
+      - NEO4J_AUTH=${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-password}
+      - NEO4J_PLUGINS=["apoc"]
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s

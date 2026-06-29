@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 from urllib.parse import urlparse
 
+from backend.errors import MistError
 from backend.knowledge.config import Neo4jConfig
 
 # Disposable eval endpoints: in-network service name + the host-published
@@ -115,4 +116,36 @@ def assert_neo4j_isolated(neo4j_config: Neo4jConfig) -> None:
             f"{sorted(_allowed_endpoints())} (override via MIST_EVAL_NEO4J_HOSTS). "
             "The live bolt port is host-published, so only explicit eval "
             "endpoints pass. Refusing to avoid polluting the canonical graph."
+        )
+
+
+class RebuildTargetError(MistError):
+    """Raised when a graph rebuild's WRITE target resolves to the live graph."""
+
+
+def assert_rebuild_target_not_live(target_uri: str, live_uri: str) -> None:
+    """Fail-closed: refuse a rebuild whose write target is the live graph.
+
+    The rebuild opens a read-only connection to the live `source` and a
+    read-write connection to `staging`. The process-global eval guard cannot
+    express "read live, write staging", so this dedicated check protects the
+    write target by host:port. Raises `RebuildTargetError` if `target_uri`
+    resolves to the same host:port as `live_uri`, or if either is unparsable.
+    """
+    target = urlparse(target_uri)
+    live = urlparse(live_uri)
+    if target.hostname is None or live.hostname is None:
+        raise RebuildTargetError(
+            f"Cannot parse host from target {target_uri!r} or live {live_uri!r}; "
+            "refusing the rebuild for a fail-closed guard."
+        )
+    try:
+        same_port = target.port == live.port
+    except ValueError as exc:
+        raise RebuildTargetError(f"Unparsable port in {target_uri!r}/{live_uri!r}") from exc
+    if target.hostname.lower() == live.hostname.lower() and same_port:
+        raise RebuildTargetError(
+            f"Rebuild write target {target_uri!r} resolves to the live graph "
+            f"({live_uri!r}). The rebuild must write only to a disposable staging "
+            "instance. Refusing to avoid corrupting the canonical graph."
         )
