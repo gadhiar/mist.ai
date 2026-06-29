@@ -22,6 +22,8 @@ def test_cypher_is_double_guarded_by_type_and_prefix():
     joined = "\n".join(CYPHER)
     assert "s.entity_type IN ['MistTrait', 'MistCapability', 'MistPreference']" in joined
     assert "STARTS WITH 'mist-trait-'" in joined
+    assert "STARTS WITH 'mist-cap-'" in joined
+    assert "STARTS WITH 'mist-pref-'" in joined
 
 
 def test_cypher_excludes_identity_root():

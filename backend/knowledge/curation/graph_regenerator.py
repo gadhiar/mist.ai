@@ -7,7 +7,8 @@ WHERE DERIVED_FROM.path == edited_path are marked status='orphaned'
 updated file content.
 
 Bucket dispatch (per ADR-011):
-- Bucket 1 (identity/, users/): deterministic parse + write (no LLM call)
+- Bucket 1 (users/): deterministic parse + write (no LLM call). identity/mist.md
+  is a graph no-op (self-model is graph-canonical, not vault-derived).
 - Bucket 2/3 (sessions/, decisions/): queue async LLM re-extraction via
   asyncio.create_task; caller receives deferred=True.
 
@@ -94,6 +95,8 @@ class GraphRegenerator:
             "2" as conservative default for unrecognised paths.
         """
         parts = path.parts
+        # identity/mist.md is short-circuited as a no-op in rebuild_from_path before
+        # this runs; "identity" stays here only for any non-mist.md identity/ path.
         if "identity" in parts or "users" in parts:
             return "1"
         if "sessions" in parts:

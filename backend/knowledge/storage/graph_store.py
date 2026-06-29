@@ -1578,7 +1578,7 @@ class GraphStore:
         Two Cypher writes are issued:
         1. Mark DERIVED_FROM edges pointing at the VaultNote for path.
         2. Mark any typed edge whose r.derived_from_path == path (the
-           property stamped by upsert_identity / upsert_user at write time).
+           property stamped by upsert_user at write time).
 
         Both writes are idempotent: the WHERE predicate excludes already-
         orphaned edges so re-running with the same path returns 0 on the
