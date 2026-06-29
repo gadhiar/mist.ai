@@ -319,6 +319,142 @@ def cmd_graph_backfill_bitemporal(args: argparse.Namespace) -> int:
         connection.disconnect()
 
 
+def _build_log_regenerator(be: Any, staging_conn: Any, epoch_id: int | None) -> tuple:
+    """Build a LogRegenerator wired to the staging graph, resolving the epoch.
+
+    Wires the staging curation pipeline exactly as Task 3 integration tests do:
+    GraphStore.initialize_schema() on staging, then GraphExecutor(staging_conn),
+    then build_curation_pipeline(config, executor, FakeEmbeddingGenerator()).
+    EventStore and ExtractionCache are constructed from config paths (defaulting
+    to ~/.mist/ siblings when the config carries no explicit override).
+
+    Returns (LogRegenerator, epoch_dict).
+    """
+    from pathlib import Path as _Path
+
+    from backend.event_store.store import EventStore
+    from backend.factories import build_curation_pipeline
+    from backend.knowledge.extraction_cache import ExtractionCache
+    from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
+    from backend.knowledge.storage.graph_executor import GraphExecutor
+    from backend.knowledge.storage.graph_store import GraphStore
+    from tests.mocks.embeddings import FakeEmbeddingGenerator
+
+    config = be.get_config()
+
+    # EventStore: use config path or fall back to the default ~/.mist/event_store.db.
+    event_store_path = config.event_store.db_path or str(_Path.home() / ".mist" / "event_store.db")
+    event_store = EventStore(event_store_path)
+    # initialize() is idempotent: safe against a pre-existing store.
+    event_store.initialize()
+
+    # ExtractionCache: lives alongside the event store db.
+    cache_path = str(_Path(event_store_path).parent / "extraction_cache.db")
+    extraction_cache = ExtractionCache(cache_path)
+    extraction_cache.initialize()
+
+    # Initialize staging schema (idempotent) via a transient GraphStore.
+    staging_store = GraphStore(
+        connection=staging_conn, embedding_generator=FakeEmbeddingGenerator()
+    )
+    staging_store.initialize_schema()
+
+    # Curation pipeline wired to staging: deterministic via FakeEmbeddingGenerator
+    # so both rebuild-twice runs produce byte-identical embeddings.
+    executor = GraphExecutor(staging_conn)
+    pipeline = build_curation_pipeline(
+        config, executor, embedding_provider=FakeEmbeddingGenerator()
+    )
+
+    regen = LogRegenerator(
+        event_store=event_store,
+        extraction_cache=extraction_cache,
+        staging_curation_pipeline=pipeline,
+    )
+
+    # Resolve epoch -- raise ColdCacheError so the handler's REFUSED branch fires.
+    if epoch_id is None:
+        epoch = event_store.get_current_epoch()
+        if epoch is None:
+            raise ColdCacheError(
+                "No epochs found in the event store. "
+                "Run at least one conversation turn to register an epoch before rebuilding."
+            )
+    else:
+        epochs = event_store.list_epochs()
+        epoch = next((e for e in epochs if e["epoch_id"] == epoch_id), None)
+        if epoch is None:
+            raise ColdCacheError(
+                f"Epoch {epoch_id} not found in the event store. "
+                f"Available epoch IDs: {[e['epoch_id'] for e in epochs]}"
+            )
+
+    return regen, epoch
+
+
+def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
+    """Build a staging graph from the log twice; assert determinism; report live divergence."""
+    import asyncio as _asyncio
+
+    from backend.knowledge.canonical_serialize import canonical_graph_form
+    from backend.knowledge.config import Neo4jConfig
+    from backend.knowledge.regeneration.log_regenerator import ColdCacheError
+    from backend.knowledge.regeneration.rebuild_gate import (
+        RebuildDeterminismError,
+        assert_rebuild_twice_identical,
+        live_vs_rebuilt_report,
+    )
+
+    be = _load_backend()
+    live_conn = _connect(be)  # reads NEO4J_URI (live) from env
+    live_uri = be.get_config().neo4j.uri
+
+    # Build staging connection from args.staging_uri with live credentials.
+    config = be.get_config()
+    staging_config = Neo4jConfig(
+        uri=args.staging_uri,
+        username=config.neo4j.username,
+        password=config.neo4j.password,
+    )
+    staging_conn = be.Neo4jConnection(staging_config)
+    staging_conn.connect()
+
+    def _build_once() -> str:
+        # Wipe staging so each build starts from a clean slate.
+        staging_conn.execute_write("MATCH (n) DETACH DELETE n", {})
+        regen, epoch = _build_log_regenerator(be, staging_conn, args.epoch)
+        # Each call gets a unique job_id automatically (job_id left unset).
+        _asyncio.run(
+            regen.rebuild(
+                staging_uri=args.staging_uri,
+                live_uri=live_uri,
+                epoch=epoch,
+                source_conn=live_conn,
+                staging_conn=staging_conn,
+                resume_from=args.resume_from,
+            )
+        )
+        return canonical_graph_form(staging_conn, include_provenance=False)
+
+    try:
+        build_a = _build_once()
+        build_b = _build_once()
+        assert_rebuild_twice_identical(build_a, build_b)
+        print("[rebuild] determinism gate PASSED (rebuild-twice byte-identical)")
+        live_form = canonical_graph_form(live_conn, include_provenance=False)
+        print(live_vs_rebuilt_report(live_form, build_b))
+        return 0
+    except ColdCacheError as exc:
+        print(f"[rebuild] REFUSED: {exc}")
+        return 2
+    except RebuildDeterminismError as exc:
+        print(f"[rebuild] {exc}")
+        return 1
+    finally:
+        live_conn.disconnect()
+        staging_conn.disconnect()
+
+
 def cmd_graph_reset(args: argparse.Namespace) -> int:
     be = _load_backend()
     connection = _connect(be)
@@ -1433,6 +1569,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="Target ontology version. Defaults to current config.ontology_version.",
     )
     p_vmigrate.set_defaults(func=cmd_vault_migrate)
+
+    # ---- R1.2: graph rebuild from log (proof-first, dry-run only) ----------
+    p_rebuild = sub.add_parser(
+        "graph-rebuild-from-log",
+        help=(
+            "Proof-first: rebuild a staging graph from the event log; "
+            "prove determinism (dry-run)."
+        ),
+    )
+    p_rebuild.add_argument(
+        "--dry-run",
+        action="store_true",
+        required=True,
+        help="Build staging + run gates; NO cutover (the only R1.2 mode).",
+    )
+    p_rebuild.add_argument(
+        "--staging-uri",
+        default="bolt://mist-neo4j-staging:7687",
+        help="Staging Neo4j bolt URI (must NOT be live).",
+    )
+    p_rebuild.add_argument(
+        "--epoch",
+        type=int,
+        default=None,
+        help="Epoch id (default: current).",
+    )
+    p_rebuild.add_argument(
+        "--resume-from",
+        default=None,
+        dest="resume_from",
+        help="Resume from this event_id.",
+    )
+    p_rebuild.set_defaults(func=cmd_graph_rebuild_from_log)
 
     return parser
 
