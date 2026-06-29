@@ -22,6 +22,7 @@ from backend.errors import MistError
 from backend.knowledge.curation.pipeline import CurationResult
 from backend.knowledge.eval_isolation import assert_rebuild_target_not_live
 from backend.knowledge.extraction.validator import ValidationResult
+from backend.knowledge.storage.partitions import SELF_MODEL_LABEL
 
 
 class ColdCacheError(MistError):
@@ -50,6 +51,21 @@ class LogRegenerator:
     and a curation pipeline already wired to the STAGING graph store.
     """
 
+    # Intra-self-model edges (both endpoints in :__SelfModel__) -- copied verbatim.
+    _INTRA_SELF_MODEL_EDGES = (
+        "HAS_TRAIT",
+        "HAS_CAPABILITY",
+        "HAS_PREFERENCE",
+        "IS_UNCERTAIN_ABOUT",
+    )
+    # Cross-layer edges (self-model -> :__Entity__) -- re-derived by canonical id.
+    _CROSS_LAYER_EDGES = (
+        "MIST_HAS_TRAIT",
+        "MIST_HAS_CAPABILITY",
+        "MIST_HAS_PREFERENCE",
+        "IMPLEMENTED_WITH",
+    )
+
     def __init__(self, *, event_store, extraction_cache, staging_curation_pipeline) -> None:
         self._events = event_store
         self._cache = extraction_cache
@@ -75,6 +91,69 @@ class LogRegenerator:
                 f"warm the cache before rebuilding. First uncached: {uncached[:3]}"
             )
 
+    def copy_self_model_partition(self, source_conn, staging_conn) -> int:
+        """Copy :__SelfModel__ nodes + intra-self-model edges from source to staging.
+
+        Preserve (option A): nodes + their HAS_*/IS_UNCERTAIN_ABOUT edges are
+        copied verbatim (by id + labels + properties). Cross-layer MIST_HAS_*
+        edges are NOT copied here (re-derived separately -- their targets are
+        fresh :__Entity__ nodes from the replay). Returns the node count copied.
+        """
+        nodes = source_conn.execute_query(
+            f"MATCH (n:{SELF_MODEL_LABEL}) "
+            "RETURN n.id AS id, labels(n) AS labels, properties(n) AS props",
+            {},
+        )
+        for n in nodes:
+            labels = ":".join(lbl for lbl in n["labels"])  # includes __SelfModel__ + typed label
+            staging_conn.execute_write(
+                f"MERGE (x:{labels} {{id: $id}}) SET x = $props",
+                {"id": n["id"], "props": n["props"]},
+            )
+        for edge_type in self._INTRA_SELF_MODEL_EDGES:
+            edges = source_conn.execute_query(
+                f"MATCH (s:{SELF_MODEL_LABEL})-[r:{edge_type}]->(t:{SELF_MODEL_LABEL}) "
+                "RETURN s.id AS s, t.id AS t, properties(r) AS props",
+                {},
+            )
+            for e in edges:
+                staging_conn.execute_write(
+                    f"MATCH (s:{SELF_MODEL_LABEL} {{id: $s}}) "
+                    f"MATCH (t:{SELF_MODEL_LABEL} {{id: $t}}) "
+                    f"MERGE (s)-[r:{edge_type}]->(t) SET r = $props",
+                    {"s": e["s"], "t": e["t"], "props": e["props"]},
+                )
+        return len(nodes)
+
+    def rederive_self_model_cross_layer_edges(self, source_conn, staging_conn) -> dict[str, int]:
+        """Re-create cross-layer self-model -> :__Entity__ edges in staging by id.
+
+        Reads each cross-layer edge from source and MERGEs it in staging keyed on
+        canonical (id) at both ends. Skips (and counts) edges whose target entity
+        id is absent from staging (a target that the log-replay did not produce,
+        e.g. a formerly vault-derived-only entity). Returns {edges, skipped}.
+        """
+        created, skipped = 0, 0
+        for edge_type in self._CROSS_LAYER_EDGES:
+            edges = source_conn.execute_query(
+                f"MATCH (s:{SELF_MODEL_LABEL})-[r:{edge_type}]->(t:__Entity__) "
+                "RETURN s.id AS s, t.id AS t, properties(r) AS props",
+                {},
+            )
+            for e in edges:
+                result = staging_conn.execute_write(
+                    f"MATCH (s:{SELF_MODEL_LABEL} {{id: $s}}) "
+                    f"MATCH (t:__Entity__ {{id: $t}}) "
+                    f"MERGE (s)-[r:{edge_type}]->(t) SET r = $props "
+                    "RETURN count(r) AS n",
+                    {"s": e["s"], "t": e["t"], "props": e["props"]},
+                )
+                if result and result[0]["n"] > 0:
+                    created += 1
+                else:
+                    skipped += 1
+        return {"edges": created, "skipped": skipped}
+
     async def rebuild(
         self,
         *,
@@ -83,6 +162,8 @@ class LogRegenerator:
         epoch: dict,
         job_id: str | None = None,
         resume_from: str | None = None,
+        source_conn=None,
+        staging_conn=None,
     ) -> RebuildReport:
         """Replay the log into staging from the cache. Never writes to live.
 
@@ -95,6 +176,11 @@ class LogRegenerator:
                 optional (a unique id is generated). For resume runs this is REQUIRED
                 (it must match the row created during the initial run).
             resume_from: Event ID to resume after (cursor-based); None for a full run.
+            source_conn: Optional Neo4jConnection to the live source graph (read-only).
+                When provided alongside staging_conn, the self-model partition is
+                copied forward from source into staging after the replay loop.
+            staging_conn: Optional Neo4jConnection to the staging graph (write). Must
+                be provided together with source_conn to enable self-model copy-forward.
 
         Returns:
             RebuildReport with job_id, turns_processed, turns_failed, staging_uri,
@@ -170,6 +256,13 @@ class LogRegenerator:
             errors=json.dumps(collected_errors) if collected_errors else None,
             updated_at=last_ts,
         )
+
+        # Self-model copy-forward (R1.2 Task 4): optional -- only runs when both
+        # source_conn and staging_conn are provided. Task 3 callers omit both and
+        # are unaffected.
+        if source_conn is not None and staging_conn is not None:
+            self.copy_self_model_partition(source_conn, staging_conn)
+            self.rederive_self_model_cross_layer_edges(source_conn, staging_conn)
 
         return RebuildReport(
             job_id=job_id,
