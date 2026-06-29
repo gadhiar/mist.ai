@@ -49,7 +49,10 @@ import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from backend.knowledge.regeneration.log_regenerator import LogRegenerator
 
 # Make `backend` importable when running from the host (mist-ai is not pip-installed).
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -319,14 +322,22 @@ def cmd_graph_backfill_bitemporal(args: argparse.Namespace) -> int:
         connection.disconnect()
 
 
-def _build_log_regenerator(be: Any, staging_conn: Any, epoch_id: int | None) -> tuple:
+def _build_log_regenerator(
+    be: Any, staging_conn: Any, epoch_id: int | None
+) -> tuple[LogRegenerator, dict[str, Any]]:
     """Build a LogRegenerator wired to the staging graph, resolving the epoch.
 
-    Wires the staging curation pipeline exactly as Task 3 integration tests do:
-    GraphStore.initialize_schema() on staging, then GraphExecutor(staging_conn),
-    then build_curation_pipeline(config, executor, FakeEmbeddingGenerator()).
-    EventStore and ExtractionCache are constructed from config paths (defaulting
-    to ~/.mist/ siblings when the config carries no explicit override).
+    Wires the staging curation pipeline with the real all-MiniLM-L6-v2
+    embedding provider: GraphStore.initialize_schema() on staging, then
+    GraphExecutor(staging_conn), then build_curation_pipeline(config, executor,
+    EmbeddingGenerator(model_name)). Using real embeddings ensures the merge
+    decisions made by the deterministic deduper match production topology (fake
+    embeddings produce different cosine distances and a different graph topology,
+    which would block the R1.6 live==rebuilt closure gate). all-MiniLM-L6-v2
+    embeddings are deterministic for identical input text, so rebuild-twice
+    determinism still holds. EventStore and ExtractionCache are constructed from
+    config paths (defaulting to ~/.mist/ siblings when the config carries no
+    explicit override).
 
     Returns (LogRegenerator, epoch_dict).
     """
@@ -334,11 +345,11 @@ def _build_log_regenerator(be: Any, staging_conn: Any, epoch_id: int | None) -> 
 
     from backend.event_store.store import EventStore
     from backend.factories import build_curation_pipeline
+    from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
     from backend.knowledge.extraction_cache import ExtractionCache
     from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
     from backend.knowledge.storage.graph_executor import GraphExecutor
     from backend.knowledge.storage.graph_store import GraphStore
-    from tests.mocks.embeddings import FakeEmbeddingGenerator
 
     config = be.get_config()
 
@@ -353,18 +364,21 @@ def _build_log_regenerator(be: Any, staging_conn: Any, epoch_id: int | None) -> 
     extraction_cache = ExtractionCache(cache_path)
     extraction_cache.initialize()
 
+    # Real embedding provider (all-MiniLM-L6-v2). Eager load is acceptable here:
+    # this is an admin CLI (sync batch), NOT the async server event loop, so there
+    # is no event-loop lazy-loading hazard. A single instance is shared across
+    # GraphStore and the curation pipeline to avoid loading two copies.
+    embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+
     # Initialize staging schema (idempotent) via a transient GraphStore.
-    staging_store = GraphStore(
-        connection=staging_conn, embedding_generator=FakeEmbeddingGenerator()
-    )
+    staging_store = GraphStore(connection=staging_conn, embedding_generator=embedding_provider)
     staging_store.initialize_schema()
 
-    # Curation pipeline wired to staging: deterministic via FakeEmbeddingGenerator
-    # so both rebuild-twice runs produce byte-identical embeddings.
+    # Curation pipeline wired to staging. Real embeddings ensure dedup merge
+    # decisions match production topology; determinism holds because
+    # all-MiniLM-L6-v2 is deterministic for identical input text.
     executor = GraphExecutor(staging_conn)
-    pipeline = build_curation_pipeline(
-        config, executor, embedding_provider=FakeEmbeddingGenerator()
-    )
+    pipeline = build_curation_pipeline(config, executor, embedding_provider=embedding_provider)
 
     regen = LogRegenerator(
         event_store=event_store,
