@@ -7,39 +7,48 @@ tests/unit/knowledge/curation/test_graph_regenerator.py collectively proved
 the guarantee this file now carries forward onto its new subject,
 `VaultFilewatcher._do_reindex`: a vault edit performs no graph write.
 
-Fix round 1 (team-lead review): the first version of this file used a
-pre-seeded FakeGraphStore that was constructed but never wired into the
-watcher, and a signature check that only pinned the name "regenerator". Both
-were proven vacuous by mutation. Replaced with an exhaustive constructor
+Fix round 1: replaced a vacuous FakeGraphStore-never-wired-in test and a
+single-name ("regenerator") signature check with an exhaustive constructor
 parameter whitelist plus a source-text layering check.
 
-Fix round 2 (team-lead review): the source-text layering check was itself
-proven permeable by mutation -- `from backend.knowledge import storage`
-contains no contiguous "knowledge.storage" substring, so it passed silently,
-and a write reached through `backend.factories.build_graph_store` (this
-codebase's own DI entry point, and exactly how `build_filewatcher` used to
-reach GraphRegenerator) was invisible to any check that never executes
-`_do_reindex` at all. Three checks now:
+Fix round 2: the substring layering check missed `from backend.knowledge
+import storage` (no contiguous "knowledge.storage" substring) and, because
+round 1 deleted the only tests that ran `_do_reindex` at all, missed a write
+reached through `backend.factories.build_graph_store`. Replaced the
+substring check with an AST-based dotted-import-name walk and added a
+parametrized behavioral trap that runs the real `_do_reindex`.
 
-1. The exhaustive parameter whitelist (unchanged from round 1) -- catches a
-   graph-store dependency added directly to the constructor.
-2. An AST-based import check (replaces the substring check) -- walks the
-   parsed module for Import/ImportFrom nodes and asserts no resulting dotted
-   name starts with the two packages that own graph-write machinery. Immune
-   to the substring check's false positive (a comment mentioning
-   "knowledge.storage" would have failed it) and its false negative (`from
-   backend.knowledge import storage` evades a substring match).
-3. A parametrized behavioral trap that actually runs `_do_reindex` for a
-   users/, sessions/, identity/, and decisions/ path, with
-   `backend.knowledge.storage.graph_store.GraphStore` and
-   `backend.factories.build_graph_store` monkeypatched to a RECORDING
-   double. Recording, not raising: `_do_reindex` wraps its vault-edit
-   sequence in `except Exception` (filewatcher.py, watcher-must-survive
-   guard), which silently swallows a raising double's exception -- proven by
-   the reviewer's fifth mutation, which placed a factories-based write after
-   the publish() call and got a fully green suite from a raising trap. A
-   recording double's `.append()` never raises, so its effect survives that
-   swallow and is observable in the assertion afterward.
+Fix round 3 (team-lead review, 10 mutation forms, 2 still open): two more
+holes.
+
+- C6: `from backend.factories import GraphStore` -- `factories.py` re-exports
+  the class at import time. Neither the AST check (the dotted name
+  `backend.factories.GraphStore` matches no forbidden prefix) nor the round-2
+  trap (which patched a *module attribute binding*, not the class itself)
+  caught it, because `backend.factories.GraphStore` was bound to the real
+  class object before any patch ran. Fix: patch `GraphStore.__init__` on the
+  class OBJECT rather than replacing a name in one module's namespace. Since
+  `from X import Y` binds the SAME object `Y` is (`backend.factories.GraphStore
+  is backend.knowledge.storage.graph_store.GraphStore` is True -- confirmed
+  directly, not assumed), patching the object is import-route-independent:
+  static import, `from backend.knowledge import storage`, the factories
+  re-export, `importlib.import_module`, and a relative import all resolve to
+  the identical class, so patching its `__init__` requires enumerating no
+  import spellings at all. It also removes the round-2 import-order hazard as
+  a side effect: patching `__init__` leaves the class itself intact, so
+  `GraphStore | None` type annotations elsewhere keep evaluating regardless
+  of when `backend.factories` gets imported relative to the patch.
+- C4: `_do_reindex` wraps its vault-edit sequence in `except Exception` (the
+  "watcher must survive" guard) -- every prior case only drove the try
+  block's happy path, so a write reachable only via the except handler had no
+  coverage. Fix: a new case with a raising writer, asserting the graph store
+  is untouched on the failure path too.
+
+The AST check also now resolves relative imports (`node.level`) against the
+importing module's own package, so `from ..knowledge.storage import x` (from
+`backend.vault.filewatcher`, package `backend.vault`, resolves to
+`backend.knowledge.storage.x`) is caught structurally rather than relying on
+the behavioral trap alone.
 """
 
 from __future__ import annotations
@@ -51,6 +60,7 @@ from pathlib import Path
 
 import pytest
 
+import backend.knowledge.storage.graph_store as gs_mod
 import backend.vault.filewatcher as filewatcher_module
 from backend.knowledge.config import FilewatcherConfig
 from backend.vault.filewatcher import VaultFilewatcher
@@ -59,10 +69,23 @@ from backend.vault.filewatcher import VaultFilewatcher
 # Platform-availability marker (mirrors tests/unit/test_factories_phase3.py)
 # ---------------------------------------------------------------------------
 #
-# Only the behavioral trap below needs this: monkeypatching
+# Only the behavioral trap tests below need this: patching
 # backend.factories.build_graph_store requires importing backend.factories,
 # which eagerly imports EmbeddingGenerator (sentence_transformers,
 # Linux/container only).
+#
+# Deliberate trade-off, not an oversight: on a platform without
+# sentence_transformers, all five behavioral cases below skip (4 parametrized
+# + 1 error-path) and this file degrades to the whitelist + AST check --
+# round-2 strength, which fix round 2 itself proved permeable to two mutation
+# forms. This does not bite in
+# MIST.AI's actual verification environment (tests run in-container only,
+# per tests/CLAUDE.md and every task brief in this plan; sentence_transformers
+# is always present there). The alternative -- restructuring to avoid the
+# backend.factories dependency -- would mean not exercising the real
+# build_graph_store/GraphStore integration points this guard exists to watch,
+# which defeats its purpose. Kept as a conscious choice, documented here
+# rather than left implicit.
 
 _SENTENCE_TRANSFORMERS_AVAILABLE = False
 try:
@@ -136,6 +159,13 @@ class _FakeVaultWriter:
         self.authored_by_calls.append(path)
 
 
+class _RaisingVaultWriter:
+    """Fails the first vault-edit step, driving _do_reindex's except path."""
+
+    async def mark_authored_by_user_edit(self, path: Path) -> None:
+        raise RuntimeError("disk hiccup")
+
+
 class _FakeInvalidationBus:
     """Records publish calls -- the second and final vault-edit step."""
 
@@ -146,30 +176,7 @@ class _FakeInvalidationBus:
         self.published.append(event)
 
 
-class _RecordingGraphStore:
-    """Records any attribute access instead of performing a real graph write.
-
-    Any attribute is a bound no-op that appends its own name to `uses` when
-    called. Used as the monkeypatched stand-in for both `GraphStore` (the
-    class) and `build_graph_store`'s return value, so that however a
-    regression reaches a graph store, calling any method on it leaves a
-    trace in `uses` -- without ever raising, which is the property that
-    matters (see module docstring, fix round 2).
-    """
-
-    def __init__(self, uses: list[str]) -> None:
-        self._uses = uses
-
-    def __getattr__(self, name: str):
-        def _record(*_args: object, **_kwargs: object) -> None:
-            self._uses.append(name)
-
-        return _record
-
-
-def _make_watcher(
-    vault_root: Path, writer: _FakeVaultWriter, bus: _FakeInvalidationBus
-) -> VaultFilewatcher:
+def _make_watcher(vault_root: Path, writer: object, bus: _FakeInvalidationBus) -> VaultFilewatcher:
     config = FilewatcherConfig(
         enabled=True,
         observer_type="polling",
@@ -184,6 +191,49 @@ def _make_watcher(
         invalidation_bus=bus,
         writer=writer,
     )
+
+
+def _patch_graph_store_construction(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Patch GraphStore construction, route-independently, and return the trace.
+
+    Patches `GraphStore.__init__` on the class OBJECT (not a name binding in
+    any one module's namespace), so however a regression obtains "the
+    GraphStore class" -- direct import, `from backend.knowledge import
+    storage`, the `backend.factories` re-export, `importlib.import_module`,
+    a relative import -- it is the same object, and constructing it here is
+    recorded regardless of route (fix round 3, closing C6).
+
+    Also patches `backend.factories.build_graph_store` so a write reached
+    through it does not first crash inside the REAL `build_neo4j_connection`
+    (which `build_graph_store` calls before ever touching `GraphStore`, and
+    which cannot succeed against this test's fake config) -- without this,
+    that mutation form would be masked by an unrelated crash rather than
+    caught by a clean trap record. The patched version still routes through
+    the (already-patched) real `GraphStore`, so a single `uses` list captures
+    every path.
+
+    `backend.factories` is imported before either patch is applied. This is
+    no longer strictly required for correctness -- patching `__init__`
+    leaves `GraphStore` itself a class, so `GraphStore | None` annotations
+    elsewhere keep evaluating regardless of import order -- but it is kept
+    for clarity and as a safety margin around the `build_graph_store` name
+    patch, which IS a module-attribute rebinding.
+    """
+    import backend.factories  # noqa: F401
+
+    uses: list[str] = []
+
+    def _record_init(self: object, *args: object, **kwargs: object) -> None:
+        uses.append("GraphStore.__init__")
+
+    monkeypatch.setattr(gs_mod.GraphStore, "__init__", _record_init)
+
+    def _fake_build_graph_store(*args: object, **kwargs: object) -> object:
+        uses.append("build_graph_store")
+        return gs_mod.GraphStore(None, None)  # still routes through the patched __init__
+
+    monkeypatch.setattr("backend.factories.build_graph_store", _fake_build_graph_store)
+    return uses
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +268,7 @@ def test_filewatcher_constructor_accepts_exactly_the_known_dependencies() -> Non
 _FORBIDDEN_IMPORT_PREFIXES = ("backend.knowledge.storage", "backend.knowledge.curation")
 
 
-def _imported_dotted_names(source: str) -> list[str]:
+def _imported_dotted_names(source: str, package: str) -> list[str]:
     """Return every dotted name an import statement in `source` binds to.
 
     `import X.Y.Z` contributes `"X.Y.Z"`. `from X.Y import Z` contributes
@@ -227,14 +277,29 @@ def _imported_dotted_names(source: str) -> list[str]:
     what it imports. Walks the full AST, including inside function and
     method bodies, so a lazily-constructed import inside `_do_reindex`
     itself is caught, not just module-level imports.
+
+    `package` is the importing module's own `__package__` (e.g.
+    "backend.vault" for backend/vault/filewatcher.py), used to resolve
+    relative imports to the same absolute dotted form absolute imports
+    produce: `from ..knowledge.storage import x` reaches
+    `backend.knowledge.storage.x` exactly as directly as `from
+    backend.knowledge.storage import x` does, and must not evade detection
+    just by spelling the path with dots.
     """
     tree = ast.parse(source)
+    package_parts = package.split(".") if package else []
     names: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.extend(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module is not None:
-            names.extend(f"{node.module}.{alias.name}" for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                base = node.module
+            else:
+                base_parts = package_parts[: len(package_parts) - node.level + 1]
+                base = ".".join(base_parts + ([node.module] if node.module else []))
+            if base:
+                names.extend(f"{base}.{alias.name}" for alias in node.names)
     return names
 
 
@@ -249,10 +314,13 @@ def test_filewatcher_module_does_not_import_graph_write_layers() -> None:
     import storage` reaches knowledge.storage just as directly as `import
     backend.knowledge.storage`, but contains no contiguous "knowledge.storage"
     substring, so a text search would miss it (proven by mutation in fix
-    round 2) while this dotted-name comparison does not.
+    round 2) while this dotted-name comparison does not. Also resolves
+    relative imports (fix round 3) via `_imported_dotted_names`'s `package`
+    argument.
     """
     source = inspect.getsource(filewatcher_module)
-    for dotted in _imported_dotted_names(source):
+    package = filewatcher_module.__package__
+    for dotted in _imported_dotted_names(source, package):
         assert not dotted.startswith(_FORBIDDEN_IMPORT_PREFIXES), (
             f"filewatcher.py imports {dotted!r}, which reaches graph-write "
             "machinery; VaultFilewatcher must have no path to a graph write"
@@ -279,37 +347,17 @@ def test_do_reindex_never_reaches_a_graph_store(
 ) -> None:
     """A full _do_reindex run never touches a graph store, however it might be reached.
 
-    Monkeypatches the two entry points a regression could use to reach a
-    real graph write -- direct construction
-    (`backend.knowledge.storage.graph_store.GraphStore`) and the DI factory
-    (`backend.factories.build_graph_store`, exactly how `build_filewatcher`
+    Patches GraphStore.__init__ on the class object (route-independent --
+    see `_patch_graph_store_construction`) plus `backend.factories.build_graph_store`
+    (this codebase's own DI entry point, and exactly how `build_filewatcher`
     used to reach `GraphRegenerator` before Task 6: `CurationGraphRegenerator
-    (graph_store=build_graph_store(config))`) -- with a recording double,
-    then runs the real `_do_reindex` for a user-edit path under each of the
-    four vault subdirectories the retired GraphRegenerator once dispatched
-    on differently.
+    (graph_store=build_graph_store(config))`), then runs the real
+    `_do_reindex` for a user-edit path under each of the four vault
+    subdirectories the retired GraphRegenerator once dispatched on
+    differently.
     """
     # Arrange
-    # Import backend.factories BEFORE patching GraphStore: factories.py does
-    # `from backend.knowledge.storage.graph_store import GraphStore` and uses
-    # `GraphStore | None` as a live type annotation on several factory
-    # functions, evaluated once at module-import time. Patching GraphStore
-    # to a plain callable first (this test's first import of backend.factories
-    # in the process, since it is otherwise unrelated to filewatcher tests)
-    # would corrupt that evaluation with a TypeError, breaking every other
-    # factory function in the module, not just the one this test cares about.
-    import backend.factories  # noqa: F401
-
-    uses: list[str] = []
-    recording_store = _RecordingGraphStore(uses)
-    monkeypatch.setattr(
-        "backend.knowledge.storage.graph_store.GraphStore",
-        lambda *args, **kwargs: recording_store,
-    )
-    monkeypatch.setattr(
-        "backend.factories.build_graph_store",
-        lambda *args, **kwargs: recording_store,
-    )
+    uses = _patch_graph_store_construction(monkeypatch)
 
     vault_root = tmp_path / "vault"
     target_dir = vault_root / subdir
@@ -327,4 +375,41 @@ def test_do_reindex_never_reaches_a_graph_store(
     # Assert
     assert writer.authored_by_calls == [p]
     assert len(bus.published) == 1
+    assert uses == []
+
+
+@requires_sentence_transformers
+def test_do_reindex_error_path_never_reaches_a_graph_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The except-Exception failure path is Inv-A1-safe too (fix round 3, C4).
+
+    All four happy-path cases above only exercise `_do_reindex`'s try block;
+    none drives the `except Exception` recovery handler ("watcher must
+    survive" guard), so a graph write reachable only from inside that handler
+    had no coverage. A writer whose `mark_authored_by_user_edit` raises
+    forces that path. Also pins the handler's documented recovery behavior:
+    the mtime is dropped so the next audit pass retries the edit, and no
+    cache-invalidation event is published for a sequence that never
+    completed.
+    """
+    # Arrange
+    uses = _patch_graph_store_construction(monkeypatch)
+
+    vault_root = tmp_path / "vault"
+    sessions_dir = vault_root / "sessions"
+    sessions_dir.mkdir(parents=True)
+    p = sessions_dir / "2026-07-30-test.md"
+    p.write_text("---\ntype: mist-session\n---\n\nbody\n", encoding="utf-8")
+
+    writer = _RaisingVaultWriter()
+    bus = _FakeInvalidationBus()
+    fw = _make_watcher(vault_root, writer, bus)
+
+    # Act
+    asyncio.run(fw._do_reindex(str(p), is_mist_write=False))
+
+    # Assert
+    assert bus.published == []
+    assert str(p) not in fw._known_mtimes
     assert uses == []
