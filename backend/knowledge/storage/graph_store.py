@@ -1379,10 +1379,14 @@ class GraphStore:
         # MistTrait / MistCapability / MistPreference nodes with canonical shape.
         # C1 currency filter on every persona edge: latest belief AND valid
         # now ('-inf' = ALWAYS sentinel; legacy unstamped edges coalesce true).
-        # Orphan arm is the ONLY retirement channel for persona edges: HAS_*
-        # is not extractable, so vault user-edits retire them via
-        # status='orphaned' (rebuild_from_path) and nothing interval-closes
-        # them.
+        # Orphan arm: HAS_* is not extractable, so the engine never interval-
+        # closes persona edges, and R1.3 retired the only writer that ever
+        # set status='orphaned' (GraphStore.mark_orphaned_by_provenance_path,
+        # driven by vault user-edits). Persona edges now have no retirement
+        # channel at all -- intended under R1's truth model, where the self-
+        # model is a preserved layer, not an evolved one. This arm is legacy-
+        # data-only: it still excludes any status='orphaned' edge written
+        # before R1.3, but nothing produces a new one going forward.
         currency = """WHERE (r.status IS NULL OR r.status <> 'orphaned')
               AND coalesce(r.is_latest_belief, true)
               AND (r.valid_to IS NULL OR r.valid_to > $now)

@@ -19,11 +19,18 @@ What remains and why:
   marks new edges orphaned going forward.
 - test_graph_store_has_no_upsert_user: relocated here in Task 3 specifically
   to escape Task 6's deletion of the curation test file it used to live in.
+- test_orphan_marking_surface_is_retired / test_regenerator_protocols_are_retired:
+  relocated here in Task 5's fix round for the same reason -- both were
+  originally appended to tests/unit/knowledge/curation/test_graph_regenerator.py,
+  which Task 6 deletes wholesale along with GraphRegenerator. They are R1.3's
+  only guards that GraphStore has no mark_orphaned_by_provenance_path /
+  get_orphaned_provenance_paths and that backend.interfaces exports no
+  GraphStoreProtocol / ExtractionPipelineProtocol; losing that home would
+  have silently dropped both contracts in Task 6.
 - test_ensure_mist_identity_uses_selfmodel_partition: guards the 2026-06-29
   `:__SelfModel__` partition migration, unrelated to R1.3.
 
-All tests use FakeNeo4jConnection -- no real Neo4j. Async methods are tested
-with pytest.mark.asyncio.
+All tests use FakeNeo4jConnection -- no real Neo4j.
 """
 
 from __future__ import annotations
@@ -37,19 +44,9 @@ from tests.mocks.neo4j import FakeNeo4jConnection
 # ---------------------------------------------------------------------------
 
 
-def _make_store(
-    *,
-    query_results=None,
-    query_responses=None,
-    write_results=None,
-    ontology_version: str | None = None,
-) -> GraphStore:
+def _make_store(*, ontology_version: str | None = None) -> GraphStore:
     """Build a GraphStore with a FakeNeo4jConnection."""
-    conn = FakeNeo4jConnection(
-        query_results=query_results or [],
-        query_responses=query_responses or {},
-        write_results=write_results or [],
-    )
+    conn = FakeNeo4jConnection()
     store = GraphStore(connection=conn, embedding_generator=FakeEmbeddingGenerator())
     if ontology_version is not None:
         store._ontology_version = ontology_version
@@ -111,6 +108,32 @@ def test_graph_store_has_no_upsert_user() -> None:
     assert not hasattr(
         GraphStore, "upsert_user"
     ), "R1.3: GraphStore.upsert_user is the Bucket-1 fact sink and retires with it"
+
+
+def test_orphan_marking_surface_is_retired() -> None:
+    """R1.3: with no re-derivation, orphan-marking has no consumer.
+
+    The methods existed to preserve triples for a rebuild that no longer
+    happens. Leaving them would leave a status field nothing ever clears.
+
+    Relocated here from test_graph_regenerator.py in Task 5's fix round --
+    that file is deleted wholesale in Task 6 along with GraphRegenerator,
+    which would have taken this guard down with it.
+    """
+    assert not hasattr(GraphStore, "mark_orphaned_by_provenance_path")
+    assert not hasattr(GraphStore, "get_orphaned_provenance_paths")
+
+
+def test_regenerator_protocols_are_retired() -> None:
+    """The protocols typed only the regenerator's dependencies.
+
+    Relocated here from test_graph_regenerator.py in Task 5's fix round,
+    same reason as test_orphan_marking_surface_is_retired above.
+    """
+    import backend.interfaces as interfaces
+
+    assert not hasattr(interfaces, "GraphStoreProtocol")
+    assert not hasattr(interfaces, "ExtractionPipelineProtocol")
 
 
 # ---------------------------------------------------------------------------

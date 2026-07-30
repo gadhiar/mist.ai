@@ -1,4 +1,4 @@
-"""FakeGraphStore — in-memory test double for GraphStore.
+"""FakeGraphStore -- in-memory test double for GraphStore.
 
 `current_ontology_version` is the only surface GraphRegenerator still needs
 (typed structurally via `_OntologyVersionSource` in

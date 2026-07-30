@@ -764,9 +764,11 @@ class TestCurrentBeliefFilters:
         assert identity_queries, "identity queries must name the rel variable r"
         assert len(identity_queries) == 7
         for query in identity_queries:
-            # Orphan arm: vault user-edits retire persona edges via
-            # status='orphaned' (their only retirement channel -- HAS_* is
-            # not extractable so the engine never interval-closes them).
+            # Orphan arm: HAS_* is not extractable, so the engine never
+            # interval-closes persona edges, and R1.3 retired the only writer
+            # that ever set status='orphaned'. Persona edges now have no
+            # retirement channel at all; this arm only still excludes legacy
+            # status='orphaned' edges written before R1.3.
             assert "r.status IS NULL OR r.status <> 'orphaned'" in query
             assert "coalesce(r.is_latest_belief, true)" in query
             assert "r.valid_from IS NULL OR r.valid_from = '-inf' OR r.valid_from <= $now" in query
