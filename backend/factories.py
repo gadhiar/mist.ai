@@ -349,7 +349,7 @@ def build_conversation_handler(
             None those branches degrade to graph + vector only.
         invalidation_bus: Optional InvalidationBus shared with the filewatcher.
             When provided the handler registers `_on_vault_rebuild` to receive
-            rebuild-completion events and evict stale mist_context caches. The
+            vault-change events and evict stale mist_context caches. The
             bus must be the same instance returned by `build_phase3_components`.
     """
     from pathlib import Path
