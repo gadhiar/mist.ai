@@ -1908,7 +1908,9 @@ class ConversationHandler:
         Mirrors GraphRegenerator.aclose (Phase 5.5 Fix A): without the drain,
         loop teardown cancels extraction mid commit-protocol -- which can
         permanently retire a belief without writing its successor -- and
-        silently drops the turn's vault append and DERIVED_FROM anchoring.
+        silently drops the turn's vault append (R1.3: the append is prose
+        for the read path now, not a fact anchor, but losing it mid-drain is
+        still a silent write loss worth avoiding).
         """
         await self._drain_extraction_tasks(session_id=None)
 
@@ -2361,16 +2363,20 @@ class ConversationHandler:
         """Return the pre-allocated vault session-note path for `session_id`.
 
         ADR-010 Cluster 8 Phase 6 Step 0: pure path computation done once per
-        session lifetime, returned synchronously so the path can be threaded
-        through downstream writes (event store, vault append, extraction
-        pipeline -> curation -> graph writer DERIVED_FROM emission) before
-        any of them dispatch.
+        session lifetime, returned synchronously so the same path is reused
+        by every later vault append within the session (`_write_to_vault` ->
+        `VaultWriter.append_turn_to_session`). R1.3 retired the extraction
+        pipeline -> curation -> graph writer forwarding this docstring used
+        to describe: the returned path feeds the vault session note only,
+        never a fact write. Callers that only need the caching side effect
+        (priming the slug for later `session_id`-only lookups) may discard
+        the return value.
 
         Returns None when the vault layer is disabled (`vault_writer is None`),
-        which causes downstream callers to skip vault-note provenance and
-        retain legacy pre-Phase-6 behavior. Path computation never raises;
-        on slug-derivation edge cases it falls back to the kebab-case
-        sanitizer with `"session"` as the ultimate fallback.
+        which causes downstream callers to skip the vault append entirely.
+        Path computation never raises; on slug-derivation edge cases it falls
+        back to the kebab-case sanitizer with `"session"` as the ultimate
+        fallback.
 
         Phase 9 slug improvement: when `first_utterance` is supplied on the
         first call for this session, the slug is derived from significant

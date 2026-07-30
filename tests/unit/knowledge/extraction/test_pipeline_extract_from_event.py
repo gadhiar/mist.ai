@@ -148,3 +148,9 @@ class TestExtractFromEventFactTime:
         # relative dates identically to the original live turn.
         assert len(recorder.calls) == 1
         assert recorder.calls[0]["recorded_at"] == event.timestamp.isoformat()
+        # extract_from_event -> curate_and_store is the one hop in the
+        # extraction/curation chain with no other test asserting event_id and
+        # session_id arrive intact. A mis-forward here would attach
+        # EXTRACTED_FROM edges to the wrong utterance with nothing failing.
+        assert recorder.calls[0]["event_id"] == event.event_id
+        assert recorder.calls[0]["session_id"] == event.session_id

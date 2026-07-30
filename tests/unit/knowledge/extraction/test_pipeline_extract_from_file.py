@@ -118,6 +118,14 @@ class TestExtractFromFileDoesNotForwardPath:
     curate_and_store for the (now-retired) VaultNote provenance anchor. This
     pins the retirement: curate_and_store must never see the kwarg, even
     though extract_from_file itself still accepts the parameter.
+
+    Enforcement below is implicit, not an assertion: `_RecordingCuration.
+    curate_and_store`'s signature was narrowed to match the real
+    `CurationPipeline.curate_and_store` (no `vault_note_path` parameter), so
+    a regression that starts forwarding the kwarg again raises `TypeError`
+    on the call rather than failing an `assert`. Do not "helpfully" widen
+    the double's signature with `**kwargs` -- that would silently void this
+    test's entire purpose.
     """
 
     @pytest.mark.asyncio

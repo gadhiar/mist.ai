@@ -415,9 +415,9 @@ class TestConditionalPerTurnAppend:
     Under the 2026-05-06 canonical pattern, the per-turn session-note append
     is gated on extraction yielding at least one entity OR one relationship.
     Turns that produce no graph state (purely conversational utterances like
-    "Hi", "Thanks") are not anchored in the vault because they have no
-    DERIVED_FROM edges to back. Substantive turns still write; the rebuild
-    contract is preserved.
+    "Hi", "Thanks") get no session-note append -- R1.3: the note is prose
+    for the read path, not a fact anchor, so this guard exists purely to
+    keep the note free of empty-turn clutter. Substantive turns still write.
     """
 
     @pytest.mark.asyncio
@@ -973,9 +973,10 @@ class TestPhase6PathPreAllocation:
         # Arrange -- short messages skip extraction dispatch. Under ADR-011
         # bucket 2, vault append is gated on extraction firing; for short
         # messages, no extraction means no vault append (zero graph state to
-        # anchor). Path pre-allocation still runs in handle_message (Phase 6
-        # invariant -- the path is needed by extraction's DERIVED_FROM emission
-        # IF extraction were to fire later in the session).
+        # write a session-note block for). Path pre-allocation still runs in
+        # handle_message (Phase 6 invariant -- R1.3: the path only feeds the
+        # vault session note, so priming it here just keeps the slug stable
+        # for whenever the session's first real vault write happens).
         fake_vault = FakeVaultWriter()
         handler = make_handler(vault_writer=fake_vault, event_store_enabled=True)
         recorder = FakeExtractionPipeline()

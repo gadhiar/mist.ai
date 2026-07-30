@@ -116,16 +116,18 @@ class TestUtteranceAnchor:
             assert "r.ontology_version = $ontology_version" in clause
             assert "r.extraction_version = $extraction_version" in clause
             assert "r.model_hash = $model_hash" in clause
+            # Guards a lost leading comma on stamp_clause: without it this
+            # branch emits `r.status = 'active' r.ontology_version = ...`,
+            # which is runtime-fatal Cypher, but every assertion above still
+            # passes. Checked per-branch (not just `in query`) so a comma
+            # loss on only one of CREATE/MATCH is still caught.
+            assert "r.status = 'active', r.ontology_version = $ontology_version" in clause
         assert params["ontology_version"] == "1.4.0"
         assert params["extraction_version"] == "2026-06-14-r5"
         assert params["model_hash"] == "abc123"
         # Guards the SET-clause concatenation: same rationale as the
         # unstamped case above, pinned to the stamped clause's own tail.
         assert "r.derived_at = $now ON MATCH SET" in query
-        # Guards a lost leading comma on stamp_clause: without it the CREATE
-        # branch emits `r.status = 'active' r.ontology_version = ...`, which
-        # is runtime-fatal Cypher, but every assertion above still passes.
-        assert "r.status = 'active', r.ontology_version = $ontology_version" in query
 
     @pytest.mark.asyncio
     async def test_provenance_edge_counter_still_increments(self) -> None:
