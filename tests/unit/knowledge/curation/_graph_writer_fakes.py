@@ -1,58 +1,36 @@
 """Shared fakes for curation graph-writer unit tests.
 
-Extracted so the utterance-provenance tests and the existing graph-writer
-tests share one recording executor instead of two drifting copies.
+Built on the canonical test doubles in `tests/mocks/` rather than a private
+copy -- `tests/CLAUDE.md`'s Mocking Rules require mocking only at I/O
+boundaries and reusing the doubles in `tests/mocks/`. `FakeNeo4jConnection`
+already records every write as `(query, params)`, so `make_writer` returns
+the connection (not the `FakeGraphExecutor` wrapper) for assertions.
+`ConfidenceManager` is pure computation, not an I/O boundary, so tests use
+the real one rather than faking it.
 """
 
 from typing import Any
 
+from backend.knowledge.curation.confidence import ConfidenceManager
 from backend.knowledge.curation.graph_writer import CurationGraphWriter, RebuildStamps
-
-
-class FakeExecutor:
-    """Records every execute_write call as (query, params)."""
-
-    def __init__(self) -> None:
-        self.writes: list[tuple[str, dict[str, Any]]] = []
-
-    async def execute_write(self, query: str, params: dict[str, Any] | None = None) -> list:
-        self.writes.append((query, params or {}))
-        return []
-
-    async def execute_query(self, query: str, params: dict[str, Any] | None = None) -> list:
-        return []
-
-
-class FakeEmbeddingProvider:
-    def generate_embedding(self, text: str) -> list[float]:
-        return [0.0] * 384
-
-
-class FakeConfidenceManager:
-    def determine_domain(self, entity_type: str) -> Any:
-        class _Domain:
-            value = "technical"
-
-        return _Domain()
-
-    def reinforced_confidence(self, confidence: float, domain: Any) -> float:
-        return confidence
+from tests.mocks.embeddings import FakeEmbeddingGenerator
+from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
 
 
 def make_writer(
     rebuild_stamps: RebuildStamps | None = None,
-) -> tuple[CurationGraphWriter, FakeExecutor]:
-    """Build a CurationGraphWriter over a recording fake executor."""
-    executor = FakeExecutor()
+) -> tuple[CurationGraphWriter, FakeNeo4jConnection]:
+    """Build a CurationGraphWriter over the canonical recording connection."""
+    conn = FakeNeo4jConnection()
     writer = CurationGraphWriter(
-        executor=executor,
-        embedding_provider=FakeEmbeddingProvider(),
-        confidence_manager=FakeConfidenceManager(),
+        executor=FakeGraphExecutor(connection=conn),
+        embedding_provider=FakeEmbeddingGenerator(),
+        confidence_manager=ConfidenceManager(),
         rebuild_stamps=rebuild_stamps,
     )
-    return writer, executor
+    return writer, conn
 
 
-def writes_matching(executor: FakeExecutor, needle: str) -> list[tuple[str, dict[str, Any]]]:
+def writes_matching(conn: FakeNeo4jConnection, needle: str) -> list[tuple[str, dict[str, Any]]]:
     """Return recorded writes whose query contains `needle`."""
-    return [(q, p) for q, p in executor.writes if needle in q]
+    return [(q, p or {}) for q, p in conn.writes if needle in q]

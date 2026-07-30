@@ -269,11 +269,19 @@ class CurationGraphWriter:
         """Anchor an entity to the utterance it was extracted from.
 
         R1.3: this is the sole entity-level provenance anchor on the
-        conversational path. `source_utterance_id` names the utterance the
-        fact came from -- the same property C2 stamps on reconciled
-        relationship edges (`reconciliation.py`), so entity and relationship
-        provenance share one vocabulary and a rebuild can trace either back to
-        the same log row. The vault is not a fact source under Inv-A1, so no
+        conversational path. `source_utterance_id` names the MOST RECENT
+        utterance in this session that produced (or re-produced, via
+        re-extraction) the entity: the edge MERGEs on (entity,
+        ConversationContext) and the property is set on both ON CREATE and
+        ON MATCH, so a later turn's re-extraction overwrites it --
+        last-writer-wins, not append-only.
+
+        This is NOT the same guarantee as the identically-named property C2
+        stamps on reconciled relationship edges (`reconciliation.py`), which
+        MERGEs on `{version_key: $vk}` and sets the property ON CREATE only,
+        pinning it permanently to the originating utterance. Do not assume
+        the two are interchangeable for provenance tracing back to a single
+        log row. The vault is not a fact source under Inv-A1, so no
         `DERIVED_FROM -> VaultNote` edge is written.
 
         Epoch stamps ride this edge when `rebuild_stamps` was injected at
@@ -287,8 +295,14 @@ class CurationGraphWriter:
             "event_id": event_id,
             "now": now,
         }
-        stamp_clause = ""
-        if self._rebuild_stamps is not None:
+        if self._rebuild_stamps is None:
+            create_set = (
+                "r.source_utterance_id = $event_id, r.created_at = $now, r.status = 'active'"
+            )
+            match_set = (
+                "r.source_utterance_id = $event_id, r.updated_at = $now, r.status = 'active'"
+            )
+        else:
             params["ontology_version"] = self._rebuild_stamps.ontology_version
             params["extraction_version"] = self._rebuild_stamps.extraction_version
             params["model_hash"] = self._rebuild_stamps.model_hash
@@ -298,15 +312,21 @@ class CurationGraphWriter:
                 ", r.model_hash = $model_hash"
                 ", r.derived_at = $now"
             )
+            create_set = (
+                "r.source_utterance_id = $event_id, r.created_at = $now, "
+                "r.status = 'active'" + stamp_clause
+            )
+            match_set = (
+                "r.source_utterance_id = $event_id, r.updated_at = $now, "
+                "r.status = 'active'" + stamp_clause
+            )
 
         await self._executor.execute_write(
             "MATCH (e:__Entity__ {id: $entity_id}) "
             "MATCH (ctx:ConversationContext {conversation_id: $session_id}) "
             "MERGE (e)-[r:EXTRACTED_FROM]->(ctx) "
-            "ON CREATE SET r.source_utterance_id = $event_id, r.created_at = $now, "
-            "r.status = 'active'" + stamp_clause + " "
-            "ON MATCH SET r.source_utterance_id = $event_id, r.updated_at = $now, "
-            "r.status = 'active'" + stamp_clause,
+            f"ON CREATE SET {create_set} "
+            f"ON MATCH SET {match_set}",
             params,
         )
 
