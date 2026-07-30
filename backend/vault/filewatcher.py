@@ -498,7 +498,7 @@ class VaultFilewatcher:
         cache signal.
 
         MIST-write origin (is_mist_write=True) skips the invariant-5 steps to
-        avoid recursive rebuild triggered by internal vault writes.
+        avoid a reindex/writeback loop triggered by internal vault writes.
 
         Args:
             path: Absolute path to the vault markdown file.
@@ -578,7 +578,7 @@ class VaultFilewatcher:
 
         if is_mist_write:
             # MIST internal write: sidecar reindex done; skip invariant-5 steps
-            # to avoid recursive rebuild on internal vault writes.
+            # to avoid a reindex/writeback loop on internal vault writes.
             return
 
         if self._writer is None:
@@ -606,7 +606,7 @@ class VaultFilewatcher:
             # this path and the sequence is retried.
             self._known_mtimes.pop(path, None)
             logger.exception(
-                "VaultFilewatcher: vault-edit sequence failed for %s " "(will retry via audit): %s",
+                "VaultFilewatcher: vault-edit sequence failed for %s (will retry via audit): %s",
                 path,
                 exc,
             )

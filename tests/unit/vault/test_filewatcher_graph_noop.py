@@ -7,170 +7,60 @@ tests/unit/knowledge/curation/test_graph_regenerator.py collectively proved
 the guarantee this file now carries forward onto its new subject,
 `VaultFilewatcher._do_reindex`: a vault edit performs no graph write.
 
-VaultFilewatcher no longer accepts any graph-store-shaped dependency at all,
-so there is no injection point left for a write to occur through. The guard
-below combines a structural check (no such constructor parameter exists) with
-a behavioral one, mirroring the deleted suite's
-test_rebuild_does_not_orphan_existing_triples: a triple pre-seeded on a
-FakeGraphStore and scoped to the exact path under edit survives a full
-_do_reindex run untouched, for both a users/ path and a sessions/ path,
-because nothing in the reindex sequence ever references the store.
+Fix round 1 (team-lead review): the first version of this file used a
+pre-seeded FakeGraphStore that was constructed but never wired into the
+watcher, and a signature check that only pinned the name "regenerator". Both
+were proven vacuous by mutation -- a reviewer patched an optional
+`graph_store` constructor param plus a live `add_triple` call into
+`_do_reindex` and all tests still passed, because nothing in this file gave
+the mutation a channel to be observed through. The guard below is two
+structural checks instead: an exhaustive parameter whitelist (no dependency
+of ANY name can be added without failing this test, not just one named
+"regenerator") and a source-text layering check (the filewatcher module
+cannot import from knowledge.curation or knowledge.storage, the two packages
+that own graph-write machinery). Together these prove no channel exists,
+which is strictly stronger than proving one specific object was untouched.
 """
 
 from __future__ import annotations
 
-import asyncio
 import inspect
-from pathlib import Path
 
-from backend.knowledge.config import FilewatcherConfig
+import backend.vault.filewatcher as filewatcher_module
 from backend.vault.filewatcher import VaultFilewatcher
-from tests.fakes.graph_store import FakeGraphStore
 
 
-class _FakeSidecarIndex:
-    """Minimal SidecarIndexProtocol double; only upsert_file is exercised here."""
+def test_filewatcher_constructor_accepts_exactly_the_known_dependencies() -> None:
+    """No graph-store dependency, of any name, can be added silently.
 
-    def initialize(self) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
-
-    def upsert_file(
-        self,
-        path: str,
-        content: str,
-        mtime: int,
-        frontmatter: dict | None = None,
-    ) -> int:
-        return 1
-
-    def delete_path(self, path: str) -> int:
-        return 1
-
-    def query_vector(self, embedding: list[float], k: int = 10) -> list[dict]:
-        return []
-
-    def query_fts(self, text: str, k: int = 10) -> list[dict]:
-        return []
-
-    def query_hybrid(
-        self,
-        embedding: list[float],
-        text: str,
-        k: int = 10,
-        rrf_k: int = 60,
-    ) -> list[dict]:
-        return []
-
-    def chunk_count(self) -> int:
-        return 0
-
-    def health_check(self) -> bool:
-        return True
-
-
-class _FakeVaultWriter:
-    """Records authored_by writeback calls -- the first vault-edit step."""
-
-    def __init__(self) -> None:
-        self.authored_by_calls: list[Path] = []
-
-    async def mark_authored_by_user_edit(self, path: Path) -> None:
-        self.authored_by_calls.append(path)
-
-
-class _FakeInvalidationBus:
-    """Records publish calls -- the second and final vault-edit step."""
-
-    def __init__(self) -> None:
-        self.published: list[object] = []
-
-    async def publish(self, event: object) -> None:
-        self.published.append(event)
-
-
-def _make_watcher(
-    vault_root: Path, writer: _FakeVaultWriter, bus: _FakeInvalidationBus
-) -> VaultFilewatcher:
-    config = FilewatcherConfig(
-        enabled=True,
-        observer_type="polling",
-        debounce_ms=100,
-        staleness_slo_seconds=5,
-        audit_interval_seconds=3600,
-    )
-    return VaultFilewatcher(
-        config,
-        vault_root,
-        _FakeSidecarIndex(),
-        invalidation_bus=bus,
-        writer=writer,
-    )
-
-
-def test_filewatcher_has_no_graph_store_injection_point() -> None:
-    """No constructor parameter can wire a graph store into the filewatcher.
-
-    GraphRegenerator's retirement removed the only path from a vault edit to
-    a graph write. This pins the removal at the signature level so a future
-    regression -- re-adding a `regenerator` or other graph-store parameter --
-    fails loudly here instead of surfacing as a silent Inv-A1 violation.
+    An exhaustive whitelist (not a single-name exclusion) so that adding ANY
+    new constructor parameter -- `graph_store`, `graph_executor`, `curator`,
+    `rebuilder`, or anything else -- fails this test and forces a deliberate
+    review, rather than only catching a regression that happens to reuse the
+    name `regenerator`.
     """
-    params = inspect.signature(VaultFilewatcher.__init__).parameters
-    assert "regenerator" not in params
+    params = list(inspect.signature(VaultFilewatcher.__init__).parameters)
+    assert params == [
+        "self",
+        "config",
+        "vault_root",
+        "sidecar_index",
+        "invalidation_bus",
+        "writer",
+    ]
 
 
-def test_user_file_edit_leaves_pre_existing_triple_untouched(tmp_path: Path) -> None:
-    """A users/ path edit does not orphan or otherwise touch a scoped triple."""
-    vault_root = tmp_path / "vault"
-    users_dir = vault_root / "users"
-    users_dir.mkdir(parents=True)
-    p = users_dir / "raj.md"
-    p.write_text(
-        "---\nuser_id: raj\n---\n\n## Tools and Technologies\n- Python\n", encoding="utf-8"
-    )
+def test_filewatcher_module_does_not_import_graph_write_layers() -> None:
+    """The filewatcher module cannot reach graph-write machinery even indirectly.
 
-    fake_graph_store = FakeGraphStore()  # deliberately never wired into the watcher
-    fake_graph_store.add_triple(
-        subject="user", predicate="USES", object="python", derived_from_path=str(p)
-    )
-
-    writer = _FakeVaultWriter()
-    bus = _FakeInvalidationBus()
-    fw = _make_watcher(vault_root, writer, bus)
-
-    asyncio.run(fw._do_reindex(str(p), is_mist_write=False))
-
-    assert writer.authored_by_calls == [p]
-    assert len(bus.published) == 1
-    triple = fake_graph_store.get_triple("user", "USES", "python")
-    assert triple is not None
-    assert triple.status == "active"
-
-
-def test_session_file_edit_leaves_pre_existing_triple_untouched(tmp_path: Path) -> None:
-    """A sessions/ path edit does not orphan or otherwise touch a scoped triple."""
-    vault_root = tmp_path / "vault"
-    sessions_dir = vault_root / "sessions"
-    sessions_dir.mkdir(parents=True)
-    p = sessions_dir / "2026-07-30-test.md"
-    p.write_text("# Turn 1\n\nI use Python at work.\n", encoding="utf-8")
-
-    fake_graph_store = FakeGraphStore()  # deliberately never wired into the watcher
-    fake_graph_store.add_triple(
-        subject="user", predicate="USES", object="python", derived_from_path=str(p)
-    )
-
-    writer = _FakeVaultWriter()
-    bus = _FakeInvalidationBus()
-    fw = _make_watcher(vault_root, writer, bus)
-
-    asyncio.run(fw._do_reindex(str(p), is_mist_write=False))
-
-    assert writer.authored_by_calls == [p]
-    assert len(bus.published) == 1
-    triple = fake_graph_store.get_triple("user", "USES", "python")
-    assert triple is not None
-    assert triple.status == "active"
+    A regression need not go through the constructor: a lazily-constructed
+    store inside `_do_reindex` (mirroring how backend/factories.py used to
+    lazily construct GraphRegenerator) would pass the exhaustive-parameter
+    check above while still writing to the graph. This closes that gap by
+    asserting the module source never references the two packages that own
+    graph-write surfaces: knowledge.curation (CurationGraphWriter,
+    CurationPipeline) and knowledge.storage (GraphStore itself).
+    """
+    source = inspect.getsource(filewatcher_module)
+    assert "knowledge.curation" not in source
+    assert "knowledge.storage" not in source

@@ -180,7 +180,7 @@ class TestVaultNotePathParameterRetired:
         """The vault-file fact writer is deleted, not left dormant.
 
         Relocated from test_graph_regenerator.py (R1.3 Task 4): that file's
-        subject is GraphRegenerator, which Task 6 deletes wholesale, but this
+        subject was GraphRegenerator, which Task 6 deleted wholesale, but this
         guard's subject is ExtractionPipeline, which survives the whole plan.
         It is the sole structural guard that extract_from_file -- a tested,
         callable vault-file-to-graph fact writer -- stays deleted rather than

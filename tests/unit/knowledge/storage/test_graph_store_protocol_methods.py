@@ -26,11 +26,11 @@ What remains and why:
 - test_orphan_marking_surface_is_retired / test_regenerator_protocols_are_retired:
   relocated here in Task 5's fix round for the same reason -- both were
   originally appended to tests/unit/knowledge/curation/test_graph_regenerator.py,
-  which Task 6 deletes wholesale along with GraphRegenerator. They are R1.3's
+  which Task 6 deleted wholesale along with GraphRegenerator. They are R1.3's
   only guards that GraphStore has no mark_orphaned_by_provenance_path /
   get_orphaned_provenance_paths and that backend.interfaces exports no
   GraphStoreProtocol / ExtractionPipelineProtocol; losing that home would
-  have silently dropped both contracts in Task 6.
+  have silently dropped both contracts when Task 6 landed.
 - test_ensure_mist_identity_uses_selfmodel_partition: guards the 2026-06-29
   `:__SelfModel__` partition migration, unrelated to R1.3.
 

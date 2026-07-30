@@ -4,9 +4,9 @@ Per ADR-011 Bucket 1: users/<user>.md is a mechanical state mirror of the
 User node's 1-hop graph snapshot. The forward direction (graph -> file) is
 handled by render_user_snapshot_body (body for users/<user>.md).
 
-This module is the reverse direction (file -> graph edges) for use by
-GraphRegenerator on user-edit detection. No LLM calls -- the file structure
-is deterministic.
+This module is the reverse direction (file -> graph edges), originally for
+use by the now-deleted GraphRegenerator on user-edit detection (R1.3 Task 6).
+No LLM calls -- the file structure is deterministic.
 
 Bullet format emitted by the forward direction:
   user neighbors: - **{display_name}** ({entity_type}) [-- {description}]

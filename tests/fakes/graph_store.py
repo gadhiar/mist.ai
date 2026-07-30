@@ -4,18 +4,16 @@
 tests/unit/knowledge/storage/test_graph_store_protocol_methods.py for its
 coverage.
 
-R1.3 deleted the real `GraphStore.upsert_user` (Task 3) and
+R1.3 deleted the real `GraphStore.upsert_user` (Task 3),
 `GraphStore.mark_orphaned_by_provenance_path` / `get_orphaned_provenance_paths`
-(Task 5). This fake's mirrors of those three methods were trimmed alongside
-them: a fake mirroring methods that exist on no real class is a trap for the
-next reader.
+(Task 5), and `GraphRegenerator` itself (Task 6) -- this fake's mirrors of
+those methods, and the `mark_orphaned_calls` / `upsert_user_calls` call-trap
+attributes that existed only to assert against GraphRegenerator's no-op
+behavior, were trimmed alongside them. A fake mirroring methods that exist on
+no real class, or attributes with no reader, is a trap for the next reader.
 
-`mark_orphaned_calls` and `upsert_user_calls` were plain instance attributes
--- always `[]`, since nothing populated them -- kept only as a call-trap for
-tests/unit/knowledge/curation/test_graph_regenerator.py, which asserted
-`== []` on both to prove GraphRegenerator's no-op `rebuild_from_path` never
-reached the graph store. That file (GraphRegenerator's last consumer) is
-deleted in Task 6, so these two attributes retire with it.
+As of Task 6 this fake has zero consumers in tests/unit/ -- its sole reader
+is tests/integration/test_adr010_invariant5.py (Task 9 rewrites that file).
 
 Also exposes assertion helpers for test readability:
   - add_triple / get_triple / has_trait

@@ -363,10 +363,11 @@ def test_static_template_contains_fabrication_risk_replacement():
 
 
 class TestInvalidationBusSubscription:
-    """Task 21: _on_vault_rebuild evicts _mist_context_cache on rebuild events.
+    """Task 21: _on_vault_rebuild evicts _mist_context_cache on vault-change events.
 
-    Coordination guarantee: filewatcher publishes AFTER graph rebuild completes,
-    so the next mist_context fetch reads correct re-derived state.
+    Coordination guarantee: the filewatcher publishes AFTER the sidecar
+    reindex and authored_by writeback complete, so the next mist_context
+    fetch reads the edited file's current content.
     """
 
     def _pre_populate(self, handler: ConversationHandler, session_id: str, user_id: str) -> None:
@@ -400,7 +401,7 @@ class TestInvalidationBusSubscription:
     def test_user_edit_invalidates_only_matching_user_caches(
         self, invalidation_handler: ConversationHandler
     ) -> None:
-        """users/raj.md rebuild evicts only sessions belonging to user 'raj'."""
+        """users/raj.md edit evicts only sessions belonging to user 'raj'."""
         self._pre_populate(invalidation_handler, "s1", "raj")
         self._pre_populate(invalidation_handler, "s2", "alice")
 
@@ -414,7 +415,7 @@ class TestInvalidationBusSubscription:
     def test_unrelated_path_edit_does_not_invalidate_cache(
         self, invalidation_handler: ConversationHandler
     ) -> None:
-        """sessions/* rebuild events are a no-op for the mist_context cache."""
+        """sessions/* vault-change events are a no-op for the mist_context cache."""
         self._pre_populate(invalidation_handler, "s1", "raj")
 
         event = VaultChangeEvent(path=Path("/app/mist-memory/sessions/2026-05-10-test.md"))

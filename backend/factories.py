@@ -691,7 +691,7 @@ def build_sidecar_index(
 def build_filewatcher(
     config: KnowledgeConfig,
     sidecar_index: "VaultSidecarIndex | None" = None,
-    regenerator: "GraphRegenerator | None" = None,  # noqa: F821
+    regenerator: object | None = None,
     writer: "VaultWriter | None" = None,
 ) -> "VaultFilewatcher | None":
     """Create a VaultFilewatcher.
@@ -759,8 +759,8 @@ class Phase3Components:
     """Holds a VaultFilewatcher and the InvalidationBus it publishes to.
 
     Both share the SAME bus instance. ConversationHandler (Task 21) calls
-    `components.invalidation_bus.subscribe(listener)` to receive rebuild
-    completion events emitted by the filewatcher after vault-edit processing.
+    `components.invalidation_bus.subscribe(listener)` to receive vault-change
+    events emitted by the filewatcher after vault-edit processing.
 
     Produced by `build_phase3_components`. Consumed by the server lifespan
     (Session A's scope) to wire the handler and start the filewatcher.
@@ -773,7 +773,7 @@ class Phase3Components:
 def build_phase3_components(
     config: KnowledgeConfig,
     sidecar_index: "VaultSidecarIndex | None",
-    regenerator: "GraphRegenerator | None" = None,  # noqa: F821
+    regenerator: object | None = None,
     writer: "VaultWriter | None" = None,
 ) -> "Phase3Components | None":
     """Create a Phase3Components: VaultFilewatcher + InvalidationBus (shared).
@@ -784,7 +784,7 @@ def build_phase3_components(
 
     The InvalidationBus on the returned dataclass is the SAME instance wired
     into the filewatcher, so any listener subscribed to `components.invalidation_bus`
-    will receive every rebuild-completion event published by the filewatcher.
+    will receive every vault-change event published by the filewatcher.
 
     Args:
         config: Knowledge subsystem configuration.
@@ -795,8 +795,8 @@ def build_phase3_components(
             break at the call site; Task 7 removes it.
         writer: Pre-built VaultWriter. REQUIRED whenever the vault is
             enabled: without it the filewatcher cannot run the ADR-010
-            invariant-5 chain (authored_by writeback -> graph rebuild ->
-            cache invalidation) and user edits silently stop propagating.
+            invariant-5 chain (authored_by writeback -> cache invalidation)
+            and user edits silently stop propagating.
 
     Returns:
         Phase3Components(filewatcher, invalidation_bus), or None when any
@@ -826,7 +826,7 @@ def build_phase3_components(
             "build_phase3_components requires writer= when the vault is "
             "enabled: a writer-less filewatcher cannot run the ADR-010 "
             "invariant-5 chain, so user edits would index but never flip "
-            "authored_by, rebuild the graph, or evict caches."
+            "authored_by or evict caches."
         )
 
     bus = InvalidationBus()

@@ -742,7 +742,7 @@ class ConversationHandler:
                 note. None preserves legacy pre-Cluster-8 behavior.
             invalidation_bus: Optional InvalidationBus (Phase 3 Task 21). When
                 set, the handler subscribes `_on_vault_rebuild` to receive
-                rebuild-completion events from the filewatcher and evict stale
+                vault-change events from the filewatcher and evict stale
                 `_mist_context_cache` entries. When None, no subscription is
                 registered and the cache is not driven by vault edits.
             now_fn: Injectable clock returning a tz-aware datetime. Used at the
@@ -1208,7 +1208,7 @@ class ConversationHandler:
                 del self._mist_context_cache[sid]
             if stale_sids:
                 logger.info(
-                    "_on_vault_rebuild: users/%s.md rebuilt; evicted %d session cache(s): %s",
+                    "_on_vault_rebuild: users/%s.md edited; evicted %d session cache(s): %s",
                     user_id,
                     len(stale_sids),
                     sorted(stale_sids),
