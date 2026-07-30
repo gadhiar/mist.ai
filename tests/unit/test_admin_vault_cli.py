@@ -251,8 +251,8 @@ class TestVaultRebuild:
         sidecar_path = tmp_path / "sidecar.db"
         sidecar_path.write_text("placeholder", encoding="utf-8")
 
-        # _cmd_vault_rebuild_sidecar is the argparse-facing sidecar-only handler;
-        # the public async cmd_vault_rebuild is the graph-aware version (Task 22).
+        # _cmd_vault_rebuild_sidecar is the sole vault-rebuild handler (R1.3
+        # Task 8 retired the graph-aware --scope / --retry-orphaned modes).
         rc = mist_admin._cmd_vault_rebuild_sidecar(argparse.Namespace(confirm=False))
 
         assert rc == 0

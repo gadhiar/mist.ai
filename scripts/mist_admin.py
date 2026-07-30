@@ -1563,29 +1563,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm",
         action="store_true",
         help="Required to actually drop + rebuild the sidecar. Without --confirm "
-        "the legacy sidecar-only path previews the work and exits without writing.",
+        "the rebuild previews the work and exits without writing.",
     )
-    p_vrebuild.add_argument(
-        "--scope",
-        default=None,
-        help=(
-            "Graph rebuild scope: '<path>' to rebuild one vault file's subgraph, "
-            "'all' to rebuild every non-excluded .md. Requires --confirm to be "
-            "omitted (scope enables graph-aware mode; sidecar-only mode uses "
-            "--confirm). When omitted together with --retry-orphaned the legacy "
-            "sidecar-only rebuild is used."
-        ),
-    )
-    p_vrebuild.add_argument(
-        "--retry-orphaned",
-        action="store_true",
-        help=(
-            "Retry async re-extraction for Bucket 2/3 paths whose previous "
-            "re-extraction failed (orphaned triples remain marked until retry "
-            "succeeds). Takes priority over --scope when both are provided."
-        ),
-    )
-    p_vrebuild.set_defaults(func=_dispatch_vault_rebuild)
+    p_vrebuild.set_defaults(func=_cmd_vault_rebuild_sidecar)
 
     p_vmigrate = sub.add_parser(
         "vault-migrate",
@@ -1631,73 +1611,6 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 # Cluster 8 Phase 11 -- vault CLI subcommands
 # ---------------------------------------------------------------------------
-
-
-def _dispatch_vault_rebuild(args: argparse.Namespace) -> int:
-    """Route vault-rebuild to the appropriate handler based on flags.
-
-    When --scope or --retry-orphaned is set, delegates to the new async
-    cmd_vault_rebuild which handles graph-aware rebuild modes. Without
-    either flag, falls through to the legacy sidecar-only rebuild handler
-    so bare `vault-rebuild --confirm` continues to work unchanged.
-
-    This is a module-level function (not a closure) so it is patchable in
-    tests via ``monkeypatch.setattr(mist_admin, '_dispatch_vault_rebuild',
-    ...)``.  The lazy heavy imports are deferred into the branch body so that
-    the argparse help path and the legacy sidecar path do not pay the
-    sentence_transformers / Neo4j driver import cost.
-    """
-    if args.scope or args.retry_orphaned:
-        import asyncio
-
-        ctx = _build_vault_rebuild_ctx()
-        return asyncio.run(
-            cmd_vault_rebuild(
-                scope=args.scope,
-                retry_orphaned=args.retry_orphaned,
-                ctx=ctx,
-            )
-        )
-    return _cmd_vault_rebuild_sidecar(args)
-
-
-def _build_vault_rebuild_ctx():
-    """Construct the admin context object required by cmd_vault_rebuild.
-
-    Lazily imports all heavy backend dependencies (Neo4j driver,
-    sentence_transformers, sidecar) so the legacy sidecar-only path and the
-    ``--help`` path remain unaffected.
-    """
-    be = _load_backend()
-    config = be.get_config()
-
-    from backend.factories import build_extraction_pipeline, build_graph_store
-    from backend.knowledge.curation.graph_regenerator import (
-        GraphRegenerator as CurationGraphRegenerator,
-    )
-    from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
-    from backend.vault.sidecar_index import VaultSidecarIndex
-
-    class _RebuildCtx:
-        pass
-
-    ctx = _RebuildCtx()
-    ctx.vault_root = Path(config.vault.root)
-    gs = build_graph_store(config)
-    pipeline = build_extraction_pipeline(config, graph_store=gs)
-    # The curation GraphRegenerator (Bucket-aware, post-Phase 3) does not
-    # accept a config kwarg; rebuild_timeout_s falls back to the class default
-    # (300 s), identical to GraphRegeneratorConfig's default. Env-var override
-    # via MIST_GRAPH_REGENERATOR_REBUILD_TIMEOUT_S not honored on this code
-    # path -- acceptable because vault-rebuild is an admin tool, not a hot
-    # path. Production wiring uses build_phase3_components which is unaffected.
-    ctx.regenerator = CurationGraphRegenerator(
-        extraction_pipeline=pipeline,
-        graph_store=gs,
-    )
-    embedder = EmbeddingGenerator(config.embedding.model_name)
-    ctx.sidecar = VaultSidecarIndex(config.sidecar_index, embedder)
-    return ctx
 
 
 def _walk_vault_md_files(vault_root: Path) -> list[Path]:
@@ -1852,63 +1765,6 @@ def cmd_vault_reindex(args: argparse.Namespace) -> int:
     return 0 if not failures else 1
 
 
-async def cmd_vault_rebuild(
-    scope: str | None,
-    retry_orphaned: bool,
-    ctx: Any,
-) -> int:
-    """Rebuild sidecar and/or graph from vault content.
-
-    New async entry-point for graph-aware vault rebuild modes added in Phase 3
-    Task 22. Three distinct modes:
-
-    - ``retry_orphaned=True``: retry async re-extraction for Bucket 2/3 paths
-      whose previous re-extraction failed (orphaned triples remain marked until
-      retry succeeds).
-    - ``scope='all'``: iterate every .md under vault_root (skipping excluded
-      conventions docs and meta/) and call regenerator.rebuild_from_path on
-      each file.
-    - ``scope='<path>'``: rebuild the graph subgraph for a single vault file.
-
-    The legacy sidecar-only rebuild (``scope=None, retry_orphaned=False``) is not
-    handled here: _dispatch_vault_rebuild routes that case to
-    _cmd_vault_rebuild_sidecar before this function is ever called, so this
-    coroutine is only reached with a truthy scope or retry_orphaned.
-
-    Args:
-        scope: None, 'all', or an absolute/relative path string.
-        retry_orphaned: When True, retry orphaned triples; all other args
-            are ignored.
-        ctx: Admin context exposing .regenerator, .sidecar, and .vault_root.
-
-    Returns:
-        0 on success.
-    """
-    if retry_orphaned:
-        await ctx.regenerator.retry_orphaned()
-        return 0
-
-    # No `scope is None` branch here: _dispatch_vault_rebuild only routes to this
-    # function when args.scope or args.retry_orphaned is truthy, so the no-scope /
-    # no-retry case is handled upstream by _cmd_vault_rebuild_sidecar (the working
-    # sidecar drop+reindex). Reaching this point with scope=None is unreachable.
-    if scope == "all":
-        from backend.vault.sidecar_index import _is_excluded_from_indexing
-
-        for vault_file in ctx.vault_root.rglob("*.md"):
-            if _is_excluded_from_indexing(vault_file):
-                continue
-            await ctx.regenerator.rebuild_from_path(vault_file)
-        return 0
-
-    # scope == '<path>': single-file rebuild
-    path = Path(scope)
-    if not path.is_absolute():
-        path = ctx.vault_root / path
-    await ctx.regenerator.rebuild_from_path(path)
-    return 0
-
-
 def _cmd_vault_rebuild_sidecar(args: argparse.Namespace) -> int:
     """Drop the sidecar tables and re-index every vault note from disk.
 
@@ -1920,9 +1776,10 @@ def _cmd_vault_rebuild_sidecar(args: argparse.Namespace) -> int:
     Requires `--confirm` because this drops the sidecar's contents
     (re-buildable from disk, but still destructive on the SQLite file).
 
-    This is the legacy argparse handler invoked by the `vault-rebuild`
-    subcommand when neither --scope nor --retry-orphaned is passed. The new
-    async `cmd_vault_rebuild` function handles graph-aware modes.
+    This is the sole `vault-rebuild` handler. The graph-aware --scope and
+    --retry-orphaned modes retired with R1.3: a vault edit no longer produces
+    graph facts, so there is no graph subgraph to rebuild from a vault file.
+    Graph rebuilds now run from the utterance log via `graph-rebuild-from-log`.
     """
     be = _load_backend()
     config = be.get_config()
