@@ -6,9 +6,10 @@ WHERE DERIVED_FROM.path == edited_path are marked status='orphaned'
 (preserved per ADR-010, not hard-deleted) and re-derived from the
 updated file content.
 
-Bucket dispatch (per ADR-011):
-- Bucket 1 (users/): deterministic parse + write (no LLM call). identity/mist.md
-  is a graph no-op (self-model is graph-canonical, not vault-derived).
+Bucket dispatch (per ADR-011, narrowed by R1.3 Inv-A1):
+- identity/mist.md, users/<id>.md: graph no-op. The vault is not a fact
+  source for these paths -- they are prose the read path injects, and an
+  edit never touches the graph.
 - Bucket 2/3 (sessions/, decisions/): queue async LLM re-extraction via
   asyncio.create_task; caller receives deferred=True.
 
@@ -30,7 +31,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from backend.interfaces import ExtractionPipelineProtocol, GraphStoreProtocol
-from backend.knowledge.curation.bucket1_reader import parse_user_file
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ class RebuildResult:
     """Result of a single GraphRegenerator.rebuild_from_path call."""
 
     path: Path
-    bucket: str  # "1" | "2" | "3" | "ignored"
+    bucket: str  # "2" | "3" | "ignored"
     orphaned_triple_count: int
     new_triple_count: int  # 0 if async-deferred
     ontology_version: str
@@ -56,10 +56,11 @@ class GraphRegenerator:
     Wired into VaultFilewatcher._do_reindex after sidecar indexing
     completes (Task 19). On each call:
 
-    1. Orphan-marks existing DERIVED_FROM-scoped triples for the edited
-       path (atomic, sync via graph store).
-    2. Dispatches bucket-specific re-derivation:
-       - Bucket 1 (identity/, users/): deterministic parse, no LLM.
+    1. Short-circuits identity/mist.md and users/<id>.md as graph no-ops
+       (R1.3): the vault is not a fact source for read-path prose.
+    2. Otherwise orphan-marks existing DERIVED_FROM-scoped triples for the
+       edited path (atomic, sync via graph store), then dispatches
+       bucket-specific re-derivation:
        - Bucket 2/3 (sessions/, decisions/): async LLM extraction queued
          via asyncio.create_task; caller receives deferred=True.
 
@@ -89,18 +90,14 @@ class GraphRegenerator:
         """Return bucket string based on vault path segments.
 
         Returns:
-            "1" for identity/ or users/ paths (deterministic parse).
             "2" for sessions/ paths (async LLM extraction).
             "3" for decisions/ paths (async LLM extraction).
             "2" as conservative default for unrecognised paths.
+
+        identity/ and users/ paths never reach here -- rebuild_from_path
+        short-circuits them as graph no-ops (R1.3).
         """
         parts = path.parts
-        # identity/mist.md is short-circuited as a no-op in rebuild_from_path before
-        # this runs; "identity" stays here only for any non-mist.md identity/ path.
-        if "identity" in parts or "users" in parts:
-            return "1"
-        if "sessions" in parts:
-            return "2"
         if "decisions" in parts:
             return "3"
         return "2"
@@ -119,13 +116,15 @@ class GraphRegenerator:
         Returns:
             RebuildResult with counts and metadata.
         """
-        # Self-model is graph-canonical and preserved, not vault-derived (R1
-        # truth model). identity/mist.md edits no longer touch the graph: skip
-        # the orphan-mark + re-derivation entirely so a doc edit is inert.
-        if path.name == "mist.md":
+        # R1.3 (Inv-A1): the vault is not a fact source. Identity and user
+        # files are prose the read path injects; their edits change what MIST
+        # reads, never what the graph asserts. Both short-circuit before any
+        # orphan-mark or re-derivation so the edit is inert graph-side.
+        if path.name == "mist.md" or (len(path.parts) >= 2 and path.parts[-2] == "users"):
             logger.info(
-                "GraphRegenerator: identity/mist.md is graph-canonical; "
-                "treating edit as a graph no-op (self-model not vault-derived)"
+                "GraphRegenerator: %s is read-path prose under R1.3; "
+                "treating edit as a graph no-op",
+                path,
             )
             return RebuildResult(
                 path=path,
@@ -141,18 +140,6 @@ class GraphRegenerator:
         # Step 1: orphan-mark existing DERIVED_FROM-scoped triples
         orphaned = await self._graph_store.mark_orphaned_by_provenance_path(str(path))
         ontology_version = self._graph_store.current_ontology_version()
-
-        if bucket == "1":
-            # Deterministic re-derivation; no LLM call
-            new_count = await self._rebuild_bucket1(path)
-            return RebuildResult(
-                path=path,
-                bucket=bucket,
-                orphaned_triple_count=orphaned,
-                new_triple_count=new_count,
-                ontology_version=ontology_version,
-                deferred=False,
-            )
 
         # Bucket 2/3: queue async LLM re-extraction with task tracking + timeout.
         # _in_flight holds a strong reference so the task cannot be garbage-collected
@@ -170,27 +157,6 @@ class GraphRegenerator:
             ontology_version=ontology_version,
             deferred=True,
         )
-
-    async def _rebuild_bucket1(self, path: Path) -> int:
-        """Deterministic Bucket 1 re-derivation for users/<user>.md.
-
-        Parses users/<user>.md and upserts the resulting edges into the graph
-        store. No LLM calls. (identity/mist.md is handled as a graph no-op in
-        rebuild_from_path; the self-model is graph-canonical, not vault-derived.)
-
-        Returns:
-            Count of new triples written.
-        """
-        # Check parent directory name for users/ classification
-        if len(path.parts) >= 2 and path.parts[-2] == "users":
-            parsed_user = parse_user_file(path)
-            return await self._graph_store.upsert_user(parsed_user, derived_from_path=str(path))
-
-        logger.warning(
-            "GraphRegenerator: bucket-1 path not recognised as a user file: %s",
-            path,
-        )
-        return 0
 
     async def aclose(self) -> None:
         """Drain all in-flight Bucket 2/3 rebuild tasks before returning.

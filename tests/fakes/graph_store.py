@@ -3,7 +3,11 @@
 Satisfies the GraphStoreProtocol surface required by GraphRegenerator:
   - mark_orphaned_by_provenance_path
   - current_ontology_version
-  - upsert_user
+
+`upsert_user` is retained as a transitional call-trap after R1.3 deleted
+the real `GraphStore.upsert_user` and its `GraphStoreProtocol` declaration:
+tests assert `upsert_user_calls == []` to prove the retired Bucket-1 write
+path never fires. R1.3 Task 6 removes it once the last consumer is gone.
 
 Also exposes assertion helpers for test readability:
   - add_triple / get_triple / count_traits / has_trait

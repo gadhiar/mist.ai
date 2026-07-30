@@ -11,7 +11,6 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
-    from backend.knowledge.curation.bucket1_reader import ParsedUser
     from backend.knowledge.models import DocumentChunk, VectorSearchResult
     from backend.llm.models import LLMRequest, LLMResponse
 
@@ -183,19 +182,6 @@ class GraphStoreProtocol(Protocol):
 
         Returns:
             List of absolute path strings for which orphaned triples exist.
-        """
-        ...
-
-    async def upsert_user(
-        self,
-        parsed_user: ParsedUser,
-        derived_from_path: str,
-    ) -> int:
-        """Upsert User neighbor edges from a ParsedUser.
-
-        Writes per-section display_name lists as typed edges from the User
-        node. Sets DERIVED_FROM.path on each triple. Returns count of
-        triples written.
         """
         ...
 

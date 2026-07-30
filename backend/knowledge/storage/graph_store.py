@@ -7,13 +7,10 @@ import asyncio
 import logging
 import re
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from backend.errors import Neo4jQueryError
 from backend.interfaces import EmbeddingProvider, GraphConnection
-
-if TYPE_CHECKING:
-    from backend.knowledge.curation.bucket1_reader import ParsedUser
 
 logger = logging.getLogger(__name__)
 
@@ -1641,113 +1638,6 @@ class GraphStore:
         loop = asyncio.get_event_loop()
         rows = await loop.run_in_executor(None, self.connection.execute_query, query, None)
         return [r.get("path") for r in rows if r.get("path") is not None]
-
-    async def upsert_user(
-        self,
-        parsed_user: "ParsedUser",
-        derived_from_path: str,
-    ) -> int:
-        """Upsert User neighbor edges from a ParsedUser (idempotent).
-
-        Writes per-section display_name lists as typed edges from the User
-        node identified by `parsed_user.user_id`. Each edge gets a fresh
-        DERIVED_FROM provenance stamp to the VaultNote at `derived_from_path`.
-        Uses MERGE so re-running with the same input produces no duplicates.
-
-        Edge types map to bucket1_reader section labels:
-            tools_and_technologies -> USES
-            expertise              -> EXPERT_IN
-            currently_learning     -> LEARNING
-            projects               -> WORKS_ON
-            affiliations           -> WORKS_AT
-            interests              -> INTERESTED_IN
-            goals                  -> HAS_GOAL
-            preferences            -> PREFERS
-            people                 -> KNOWS_PERSON
-
-        Returns:
-            Count of new triples written (0 when all already exist).
-        """
-        now = datetime.utcnow().isoformat()
-        path = derived_from_path
-        ontology_version = self._ontology_version
-        user_id = parsed_user.user_id
-
-        # Ensure the provenance VaultNote node exists
-        self.connection.execute_write(
-            "MERGE (vn:__Provenance__:VaultNote {path: $path}) "
-            "ON CREATE SET vn.created_at = $now, vn.status = 'active' "
-            "ON MATCH SET vn.updated_at = $now",
-            {"path": path, "now": now},
-        )
-
-        section_map: list[tuple[str, list[str]]] = [
-            ("USES", parsed_user.tools_and_technologies),
-            ("EXPERT_IN", parsed_user.expertise),
-            ("LEARNING", parsed_user.currently_learning),
-            ("WORKS_ON", parsed_user.projects),
-            ("WORKS_AT", parsed_user.affiliations),
-            ("INTERESTED_IN", parsed_user.interests),
-            ("HAS_GOAL", parsed_user.goals),
-            ("PREFERS", parsed_user.preferences),
-            ("KNOWS_PERSON", parsed_user.people),
-        ]
-
-        written = 0
-        for predicate, targets in section_map:
-            for display_name in targets:
-                target_id = f"entity-{display_name.lower().replace(' ', '-')}"
-                self.connection.execute_write(
-                    # Label-safe user MERGE: match on :__Entity__ {id} and SET
-                    # the :User label, so a label-less extraction-created user
-                    # node is healed instead of tripping entity_id_unique
-                    # (deep review cypher-data-integrity-2b).
-                    f"MERGE (u:__Entity__ {{id: $user_id}}) "
-                    f"SET u:User "
-                    f"MERGE (t:__Entity__ {{id: $target_id}}) "
-                    f"ON CREATE SET t.display_name = $display_name, "
-                    f"t.status = 'active', t.ontology_version = $ontology_version "
-                    f"MERGE (u)-[r:{predicate}]->(t) "
-                    f"ON CREATE SET r.derived_from_path = $path, r.created_at = $now, "
-                    f"r.status = 'active', r.ontology_version = $ontology_version "
-                    f"ON MATCH SET r.derived_from_path = $path, r.updated_at = $now, "
-                    f"r.status = 'active', r.ontology_version = $ontology_version",
-                    {
-                        "user_id": user_id,
-                        "target_id": target_id,
-                        "display_name": display_name,
-                        "path": path,
-                        "now": now,
-                        "ontology_version": ontology_version,
-                    },
-                )
-                # DERIVED_FROM provenance edge: target entity -> VaultNote.
-                # mark_orphaned_by_provenance_path queries this relationship-type,
-                # so Bucket 1 edges must carry it to be findable on user-edit.
-                self.connection.execute_write(
-                    "MATCH (t:__Entity__ {id: $target_id}) "
-                    "MATCH (vn:__Provenance__:VaultNote {path: $path}) "
-                    "MERGE (t)-[df:DERIVED_FROM]->(vn) "
-                    "ON CREATE SET df.created_at = $now, "
-                    "df.ontology_version = $ontology_version, df.status = 'active' "
-                    "ON MATCH SET df.status = 'active'",
-                    {
-                        "target_id": target_id,
-                        "path": path,
-                        "now": now,
-                        "ontology_version": ontology_version,
-                    },
-                )
-                written += 1
-
-        logger.debug(
-            "upsert_user: wrote %d triples for user %s from %s (ontology %s)",
-            written,
-            user_id,
-            path,
-            ontology_version,
-        )
-        return written
 
     def close(self):
         """Close Neo4j connection."""

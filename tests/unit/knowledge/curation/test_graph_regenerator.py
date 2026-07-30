@@ -4,8 +4,8 @@ Tests cover the ADR-010 invariant 5 closure: on user-edit detection,
 DERIVED_FROM-scoped triples are orphan-marked and re-derived per bucket.
 
 Bucket dispatch:
-- Bucket 1 (identity/, users/): deterministic parse via bucket1_reader,
-  no LLM call.
+- identity/mist.md, users/<id>.md: graph no-op (R1.3). The vault is not a
+  fact source for these paths; an edit changes read-path prose only.
 - Bucket 2/3 (sessions/, decisions/): async LLM re-extraction queued;
   result is deferred=True.
 
@@ -59,19 +59,6 @@ _IDENTITY_BODY = (
     "## Traits\n- **precise** [(sharp)] -- always accurate\n"
     "## Capabilities\n"
     "## Preferences\n"
-)
-
-_USER_BODY = (
-    "---\ntype: mist-user\nuser_id: raj\n---\n"
-    "## Tools and Technologies\n- **Python** (Technology)\n"
-    "## Expertise\n"
-    "## Currently Learning\n"
-    "## Projects\n"
-    "## Affiliations\n"
-    "## Interests\n"
-    "## Goals\n"
-    "## Preferences\n"
-    "## People\n"
 )
 
 _SESSION_BODY = "---\ntype: mist-session\n---\n" "## Turn 1\n**User:** hi\n**MIST:** hello\n"
@@ -133,23 +120,41 @@ def test_rebuild_mist_md_is_graph_noop(
     assert fake_graph_store.mark_orphaned_calls == []
 
 
-def test_rebuild_bucket1_user_deterministic(
+def test_rebuild_user_file_is_graph_noop(
     regenerator: GraphRegenerator,
     fake_graph_store: FakeGraphStore,
     tmp_path: Path,
 ) -> None:
-    """users/<user>.md triggers Bucket 1 deterministic re-derivation."""
-    p = tmp_path / "users" / "raj.md"
-    p.parent.mkdir()
-    p.write_text(_USER_BODY, encoding="utf-8")
+    """R1.3 spec 5.1: user-file edits write no graph facts.
 
-    result: RebuildResult = asyncio.run(regenerator.rebuild_from_path(p))
+    The user file is prose the read path injects, not a fact source. A rebuild
+    must not orphan-mark, must not parse, and must not upsert.
+    """
+    users_dir = tmp_path / "users"
+    users_dir.mkdir()
+    user_file = users_dir / "raj.md"
+    user_file.write_text(
+        "---\nuser_id: raj\n---\n\n## Tools and Technologies\n- Python\n- Neo4j\n",
+        encoding="utf-8",
+    )
 
-    assert result.bucket == "1"
+    result = asyncio.run(regenerator.rebuild_from_path(user_file))
+
+    assert result.bucket == "ignored"
+    assert result.new_triple_count == 0
+    assert result.orphaned_triple_count == 0
     assert result.deferred is False
-    # Verify a USES triple was written for the user
-    triple = fake_graph_store.get_triple("raj", "USES", "Python")
-    assert triple is not None
+    assert fake_graph_store.upsert_user_calls == [], "no user facts may be written"
+    assert fake_graph_store.mark_orphaned_calls == [], "no orphan-marking on a no-op"
+
+
+def test_graph_store_has_no_upsert_user() -> None:
+    """The Bucket-1 fact sink is deleted, not merely unreferenced."""
+    from backend.knowledge.storage.graph_store import GraphStore
+
+    assert not hasattr(
+        GraphStore, "upsert_user"
+    ), "R1.3: GraphStore.upsert_user is the Bucket-1 fact sink and retires with it"
 
 
 def test_rebuild_bucket2_session_defers_extraction(
@@ -174,26 +179,6 @@ def test_rebuild_bucket2_session_defers_extraction(
     assert result.deferred is True
     # Extraction completed (create_task + aclose drain ensures pipeline ran)
     assert fake_extraction.scheduled_jobs >= 1
-
-
-def test_rebuild_idempotent_no_proliferation(
-    regenerator: GraphRegenerator,
-    fake_graph_store: FakeGraphStore,
-    tmp_path: Path,
-) -> None:
-    """Repeat Bucket-1 (user) rebuild from identical content writes no new
-    triples the second time.
-    """
-    p = tmp_path / "users" / "raj.md"
-    p.parent.mkdir()
-    p.write_text(_USER_BODY, encoding="utf-8")
-
-    first: RebuildResult = asyncio.run(regenerator.rebuild_from_path(p))
-    second: RebuildResult = asyncio.run(regenerator.rebuild_from_path(p))
-
-    assert first.new_triple_count >= 1
-    assert second.new_triple_count == 0
-    assert fake_graph_store.get_triple("raj", "USES", "Python") is not None
 
 
 # ---------------------------------------------------------------------------
