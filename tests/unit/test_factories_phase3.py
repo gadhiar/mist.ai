@@ -92,13 +92,6 @@ class _FakeVaultWriter:
         self.mist_write_marker = marker
 
 
-class _FakeGraphRegenerator:
-    """Minimal curation.GraphRegenerator double."""
-
-    async def rebuild_from_path(self, path: Path):
-        return None
-
-
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
@@ -122,6 +115,47 @@ def _make_config(tmp_path: Path, *, filewatcher_enabled: bool = True) -> Knowled
         debounce_ms=500,
     )
     return base
+
+
+# ---------------------------------------------------------------------------
+# TestRegeneratorFullyRetired
+# ---------------------------------------------------------------------------
+
+
+class TestRegeneratorFullyRetired:
+    """R1.3 Task 7: no factory wiring path constructs a graph regenerator."""
+
+    @requires_sentence_transformers
+    def test_build_phase3_components_takes_no_regenerator(self, tmp_path):
+        """R1.3: there is no graph regenerator left to wire."""
+        import inspect
+
+        from backend.factories import build_filewatcher, build_phase3_components
+
+        assert "regenerator" not in inspect.signature(build_phase3_components).parameters
+        assert "regenerator" not in inspect.signature(build_filewatcher).parameters
+
+    @requires_sentence_transformers
+    def test_filewatcher_has_no_regenerator_attribute(self, tmp_path):
+        """The lifespan drain hung off this attribute; both retire together."""
+        from backend.factories import build_phase3_components
+
+        config = _make_config(tmp_path)
+        components = build_phase3_components(
+            config=config,
+            sidecar_index=_FakeSidecarIndex(),
+            writer=_FakeVaultWriter(),
+        )
+        assert not hasattr(components.filewatcher, "_regenerator")
+
+    @requires_sentence_transformers
+    def test_build_graph_regenerator_tombstone_is_gone(self):
+        """The tombstone pointed at 'the regenerator ships with R1'. It shipped
+        as R1.2's log_regenerator; this stale sign-post retires with R1.3.
+        """
+        import backend.factories as factories
+
+        assert not hasattr(factories, "build_graph_regenerator")
 
 
 # ---------------------------------------------------------------------------
@@ -159,13 +193,11 @@ class TestPhase3Components:
 
         config = _make_config(tmp_path)
         sidecar = _FakeSidecarIndex()
-        regenerator = _FakeGraphRegenerator()
         writer = _FakeVaultWriter()
 
         result = build_phase3_components(
             config=config,
             sidecar_index=sidecar,
-            regenerator=regenerator,
             writer=writer,
         )
 
@@ -178,13 +210,11 @@ class TestPhase3Components:
 
         config = _make_config(tmp_path)
         sidecar = _FakeSidecarIndex()
-        regenerator = _FakeGraphRegenerator()
         writer = _FakeVaultWriter()
 
         result = build_phase3_components(
             config=config,
             sidecar_index=sidecar,
-            regenerator=regenerator,
             writer=writer,
         )
 
@@ -199,13 +229,11 @@ class TestPhase3Components:
 
         config = _make_config(tmp_path)
         sidecar = _FakeSidecarIndex()
-        regenerator = _FakeGraphRegenerator()
         writer = _FakeVaultWriter()
 
         result = build_phase3_components(
             config=config,
             sidecar_index=sidecar,
-            regenerator=regenerator,
             writer=writer,
         )
 
@@ -220,13 +248,11 @@ class TestPhase3Components:
 
         config = _make_config(tmp_path)
         sidecar = _FakeSidecarIndex()
-        regenerator = _FakeGraphRegenerator()
         writer = _FakeVaultWriter()
 
         result = build_phase3_components(
             config=config,
             sidecar_index=sidecar,
-            regenerator=regenerator,
             writer=writer,
         )
 
@@ -241,13 +267,11 @@ class TestPhase3Components:
 
         config = _make_config(tmp_path)
         sidecar = _FakeSidecarIndex()
-        regenerator = _FakeGraphRegenerator()
 
-        with pytest.raises(ValueError, match="invariant-5"):
+        with pytest.raises(ValueError, match="writer-less filewatcher"):
             build_phase3_components(
                 config=config,
                 sidecar_index=sidecar,
-                regenerator=regenerator,
             )
 
     @requires_sentence_transformers
@@ -258,13 +282,11 @@ class TestPhase3Components:
 
         config = _make_config(tmp_path)
         sidecar = _FakeSidecarIndex()
-        regenerator = _FakeGraphRegenerator()
         writer = _FakeVaultWriter()
 
         result = build_phase3_components(
             config=config,
             sidecar_index=sidecar,
-            regenerator=regenerator,
             writer=writer,
         )
 
@@ -316,13 +338,11 @@ class TestPhase3Components:
 
         config = _make_config(tmp_path)
         sidecar = _FakeSidecarIndex()
-        regenerator = _FakeGraphRegenerator()
         writer = _FakeVaultWriter()
 
         result = build_phase3_components(
             config=config,
             sidecar_index=sidecar,
-            regenerator=regenerator,
             writer=writer,
         )
 

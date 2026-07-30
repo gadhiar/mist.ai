@@ -431,23 +431,6 @@ def build_conversation_handler(
     )
 
 
-def build_graph_regenerator(config: KnowledgeConfig):
-    """Quarantined: the legacy utterance->graph regenerator is superseded.
-
-    Raises immediately instead of constructing graph/LLM wiring for a
-    component ADR-010 retired (the utterance->graph rebuild is being
-    redesigned under sub-project A R1). Kept as a tombstone so stale
-    callers fail with direction instead of resurrecting the legacy path
-    (deep review vault-layer-adr010-7).
-    """
-    raise RuntimeError(
-        "build_graph_regenerator is quarantined (ADR-010): the legacy "
-        "regeneration path is superseded. Use 'mist_admin vault-rebuild' for "
-        "vault-derived rebuilds; the utterance->graph regenerator ships with "
-        "sub-project A R1."
-    )
-
-
 def build_curation_scheduler(
     config: KnowledgeConfig,
     event_store: EventStoreProvider | None = None,
@@ -691,7 +674,6 @@ def build_sidecar_index(
 def build_filewatcher(
     config: KnowledgeConfig,
     sidecar_index: "VaultSidecarIndex | None" = None,
-    regenerator: object | None = None,
     writer: "VaultWriter | None" = None,
 ) -> "VaultFilewatcher | None":
     """Create a VaultFilewatcher.
@@ -709,10 +691,6 @@ def build_filewatcher(
     Args:
         config: Knowledge subsystem configuration.
         sidecar_index: The sidecar to reindex into on file events.
-        regenerator: Unused (R1.3 Task 6 deleted GraphRegenerator; the
-            filewatcher no longer accepts a graph-store dependency). Kept as
-            an accepted-but-ignored parameter so existing callers do not
-            break at the call site; Task 7 removes it.
         writer: VaultWriter for session note writes. May be None.
 
     Returns:
@@ -773,7 +751,6 @@ class Phase3Components:
 def build_phase3_components(
     config: KnowledgeConfig,
     sidecar_index: "VaultSidecarIndex | None",
-    regenerator: object | None = None,
     writer: "VaultWriter | None" = None,
 ) -> "Phase3Components | None":
     """Create a Phase3Components: VaultFilewatcher + InvalidationBus (shared).
@@ -789,14 +766,10 @@ def build_phase3_components(
     Args:
         config: Knowledge subsystem configuration.
         sidecar_index: Initialized VaultSidecarIndex. None returns None.
-        regenerator: Unused (R1.3 Task 6 deleted GraphRegenerator; the
-            filewatcher no longer accepts a graph-store dependency). Kept as
-            an accepted-but-ignored parameter so existing callers do not
-            break at the call site; Task 7 removes it.
         writer: Pre-built VaultWriter. REQUIRED whenever the vault is
-            enabled: without it the filewatcher cannot run the ADR-010
-            invariant-5 chain (authored_by writeback -> cache invalidation)
-            and user edits silently stop propagating.
+            enabled: without it the filewatcher cannot flip authored_by or
+            publish cache-invalidation events, so user edits would index but
+            never propagate to the read path.
 
     Returns:
         Phase3Components(filewatcher, invalidation_bus), or None when any
@@ -804,8 +777,8 @@ def build_phase3_components(
 
     Raises:
         ValueError: When the vault is enabled but `writer` is None -- the
-            composition would silently disable invariant 5 (the exact
-            production wiring bug the deep review surfaced).
+            composition would silently break the vault-edit read-path (the
+            exact production wiring bug the deep review surfaced).
     """
     from backend.vault import VaultFilewatcher
     from backend.vault.invalidation_bus import InvalidationBus
@@ -824,9 +797,9 @@ def build_phase3_components(
     if writer is None:
         raise ValueError(
             "build_phase3_components requires writer= when the vault is "
-            "enabled: a writer-less filewatcher cannot run the ADR-010 "
-            "invariant-5 chain, so user edits would index but never flip "
-            "authored_by or evict caches."
+            "enabled: a writer-less filewatcher cannot flip authored_by or "
+            "publish cache-invalidation events, so user edits would index but "
+            "never propagate to the read path."
         )
 
     bus = InvalidationBus()

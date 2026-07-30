@@ -264,7 +264,7 @@ async def lifespan(app: FastAPI):
         # build_phase3_components so the shared InvalidationBus instance can
         # be forwarded to VoiceProcessor -> ModelManager -> KnowledgeIntegration
         # -> build_conversation_handler, wiring ConversationHandler._on_vault_rebuild
-        # for ADR-010 invariant-5 cache invalidation on vault edits.
+        # for ADR-010 read-path cache invalidation on vault edits.
         phase3 = build_phase3_components(
             config=knowledge_config,
             sidecar_index=vault_sidecar,
@@ -286,7 +286,7 @@ async def lifespan(app: FastAPI):
     # and invalidation_bus so that the voice-path ConversationHandler shares a
     # single started writer, the retriever routes to the same initialized sidecar
     # (Phase 9), and _on_vault_rebuild is subscribed to the shared bus for
-    # ADR-010 invariant-5 cache invalidation (Phase 5.5).
+    # ADR-010 read-path cache invalidation (Phase 5.5).
     voice_processor = VoiceProcessor(
         config,
         message_queue,

@@ -69,7 +69,7 @@ class VoiceProcessor:
             invalidation_bus: Optional InvalidationBus shared with the filewatcher
                 (Phase 5.5). Threaded through ModelManager -> KnowledgeIntegration
                 -> ConversationHandler so _on_vault_rebuild is subscribed for
-                ADR-010 invariant-5 cache invalidation. Must be the same
+                ADR-010 read-path cache invalidation. Must be the same
                 instance returned by build_phase3_components. Server lifespan
                 owns the lifecycle. None preserves pre-Phase-5.5 behavior.
         """

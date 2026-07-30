@@ -63,7 +63,7 @@ class ModelManager:
             invalidation_bus: Optional InvalidationBus shared with the filewatcher
                 (Phase 5.5). Passed through to KnowledgeIntegration so
                 ConversationHandler subscribes `_on_vault_rebuild` for
-                ADR-010 invariant-5 cache invalidation. Must be the same
+                ADR-010 read-path cache invalidation. Must be the same
                 instance returned by build_phase3_components. None preserves
                 pre-Phase-5.5 behavior.
         """
