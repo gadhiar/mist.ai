@@ -422,7 +422,6 @@ class ExtractionPipeline:
         reference_date: datetime | None = None,
         source_metadata: SourceMetadata | None = None,
         extraction_source: str = "conversation",
-        vault_note_path: str | None = None,
         recorded_at: str | None = None,
     ) -> ValidationResult | CurationResult:
         """Main entry point for live extraction.
@@ -444,11 +443,6 @@ class ExtractionPipeline:
             extraction_source: Source type for threshold lookup. One of
                 "conversation" (default), "orchestrator_summary", or
                 "agent_tool_output".
-            vault_note_path: Optional vault session-note path (ADR-010
-                Cluster 8 Phase 6). Forwarded through the curation pipeline
-                so every upserted entity gets a DERIVED_FROM edge to its
-                source vault note. None for non-conversation paths
-                (document ingest) or when the vault layer is disabled.
             recorded_at: Fact-time ISO-8601 timestamp of the source event
                 (C1). Defaults to now(UTC). Anchors `reference_date` so a
                 rebuild resolves relative dates identically to the live turn,
@@ -599,7 +593,6 @@ class ExtractionPipeline:
                 event_id=event_id,
                 session_id=session_id,
                 source_metadata=source_metadata,
-                vault_note_path=vault_note_path,
                 recorded_at=recorded_at,
             )
             stage_78_ms = (time.perf_counter() - stage_start) * 1000
@@ -719,10 +712,10 @@ class ExtractionPipeline:
         GraphRegenerator._rebuild_async_extraction for Bucket 2/3
         (sessions/, decisions/) re-extraction on user-edit.
 
-        Treats the full file body as a single extraction utterance, passing
-        `vault_note_path` through to the curation pipeline so every upserted
-        entity gets a DERIVED_FROM edge stamped to its source vault note.
-        `extraction_source` is hardcoded to "orchestrator_summary", which
+        Treats the full file body as a single extraction utterance.
+        `vault_note_path` is used only for logging here (R1.3 retired the
+        vault->graph fact anchor `extract_from_utterance` used to forward it
+        to). `extraction_source` is hardcoded to "orchestrator_summary", which
         selects the 0.2 significance threshold from `_SOURCE_THRESHOLDS`;
         there is no vault-specific source tag. `ontology_version` is used
         only in the re-extraction log line below.
@@ -758,6 +751,5 @@ class ExtractionPipeline:
             conversation_history=[],
             event_id=event_id,
             session_id=session_id,
-            vault_note_path=vault_note_path,
             extraction_source="orchestrator_summary",
         )

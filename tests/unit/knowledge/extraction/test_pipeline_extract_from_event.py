@@ -1,9 +1,11 @@
-"""ADR-010 Cluster 8 Phase 6: vault_note_path forwarding through ExtractionPipeline.
+"""ExtractionPipeline.extract_from_event: fact-time anchoring for event replay.
 
-`ExtractionPipeline.extract_from_utterance` accepts an optional
-`vault_note_path` and forwards it to `CurationPipeline.curate_and_store`
-when curation is enabled. Verifies forwarding semantics and the
-None-default backward-compatibility path.
+extract_from_event is the event-store re-extraction path used by
+GraphRegenerator and the R1 rebuild machinery. This file used to also cover
+vault_note_path forwarding (ADR-010 Cluster 8 Phase 6); R1.3 retired that
+parameter from the whole curation/extraction path, so only the recorded_at
+anchoring behavior remains -- it is real production behavior with no other
+test coverage.
 """
 
 from __future__ import annotations
@@ -25,7 +27,6 @@ from backend.knowledge.extraction.preprocessor import PreProcessor
 from backend.knowledge.extraction.temporal import TemporalResolver
 from backend.knowledge.extraction.validator import ExtractionValidator
 from backend.knowledge.storage.graph_store import GraphStore
-from tests.mocks.config import TEST_EVENT_ID, TEST_SESSION_ID
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeNeo4jConnection
 
@@ -42,7 +43,6 @@ class _RecordingCurationPipeline:
         event_id: str,
         session_id: str,
         source_metadata=None,
-        vault_note_path: str | None = None,
         recorded_at: str | None = None,
     ):
         self.calls.append(
@@ -51,7 +51,6 @@ class _RecordingCurationPipeline:
                 "event_id": event_id,
                 "session_id": session_id,
                 "source_metadata": source_metadata,
-                "vault_note_path": vault_note_path,
                 "recorded_at": recorded_at,
             }
         )
@@ -121,56 +120,11 @@ def _build_pipeline(curation_pipeline: _RecordingCurationPipeline) -> Extraction
     )
 
 
-class TestVaultNotePathForwarding:
+class TestExtractFromEventFactTime:
     @pytest.mark.asyncio
-    async def test_forwards_vault_note_path_to_curation(self) -> None:
-        # Arrange
-        recorder = _RecordingCurationPipeline()
-        pipeline = _build_pipeline(recorder)
-
-        # Act
-        await pipeline.extract_from_utterance(
-            utterance="I love working with Python and Neo4j on a daily basis.",
-            conversation_history=[],
-            event_id=TEST_EVENT_ID,
-            session_id=TEST_SESSION_ID,
-            vault_note_path="/vault/sessions/2026-04-22-foo.md",
-            recorded_at="2026-06-12T09:00:00+00:00",
-        )
-
-        # Assert
-        assert len(recorder.calls) == 1
-        assert recorder.calls[0]["vault_note_path"] == "/vault/sessions/2026-04-22-foo.md"
-        assert recorder.calls[0]["event_id"] == TEST_EVENT_ID
-        assert recorder.calls[0]["session_id"] == TEST_SESSION_ID
-        # C1 fact-time threading (tests-quality-1): the engine's bitemporal
-        # recorded_at must be the event's fact-time, never wall-clock.
-        assert recorder.calls[0]["recorded_at"] == "2026-06-12T09:00:00+00:00"
-
-    @pytest.mark.asyncio
-    async def test_defaults_vault_note_path_to_none(self) -> None:
-        # Arrange
-        recorder = _RecordingCurationPipeline()
-        pipeline = _build_pipeline(recorder)
-
-        # Act -- omit vault_note_path
-        await pipeline.extract_from_utterance(
-            utterance="Working with TypeScript and React lately for the frontend.",
-            conversation_history=[],
-            event_id=TEST_EVENT_ID,
-            session_id=TEST_SESSION_ID,
-        )
-
-        # Assert
-        assert len(recorder.calls) == 1
-        assert recorder.calls[0]["vault_note_path"] is None
-
-    @pytest.mark.asyncio
-    async def test_extract_from_event_does_not_carry_vault_note_path(self) -> None:
-        # Arrange -- the event-store re-extraction path (used by graph_regenerator
-        # and Phase 11 vault-rebuild). For now extract_from_event has no vault
-        # awareness; it always passes None through to the curation pipeline.
-        # Phase 11 may extend this.
+    async def test_anchors_recorded_at_to_event_timestamp(self) -> None:
+        # Arrange -- the event-store re-extraction path (used by
+        # graph_regenerator and the R1 rebuild machinery).
         from datetime import datetime
 
         from backend.event_store.models import ConversationTurnEvent
@@ -189,10 +143,8 @@ class TestVaultNotePathForwarding:
         # Act
         await pipeline.extract_from_event(event=event, conversation_context=[])
 
-        # Assert -- curation called, vault_note_path defaulted to None
+        # Assert -- R1 rebuild fact-time contract: replaying a stored event
+        # anchors recorded_at to the EVENT's timestamp so the rebuild resolves
+        # relative dates identically to the original live turn.
         assert len(recorder.calls) == 1
-        assert recorder.calls[0]["vault_note_path"] is None
-        # R1 rebuild fact-time contract (tests-quality-1): replaying a stored
-        # event anchors recorded_at to the EVENT's timestamp so the rebuild
-        # resolves relative dates identically to the original live turn.
         assert recorder.calls[0]["recorded_at"] == event.timestamp.isoformat()

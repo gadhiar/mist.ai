@@ -860,8 +860,11 @@ class TestSlugDerivation:
 
 class TestPhase6PathPreAllocation:
     """ADR-010 Cluster 8 Phase 6: vault_note_path is allocated synchronously
-    at Step 0 of handle_message and threaded through to the extraction
-    pipeline so curation can emit DERIVED_FROM->VaultNote edges.
+    at Step 0 of handle_message. R1.3 retired the extraction-pipeline
+    forwarding this class used to also cover (curation no longer anchors
+    facts to a VaultNote); the path allocation itself -- caching, idempotency
+    within a session, and distinctness across sessions -- is still real
+    production behavior and is what remains under test here.
     """
 
     def test_get_or_allocate_returns_none_when_vault_disabled(self) -> None:
@@ -938,10 +941,11 @@ class TestPhase6PathPreAllocation:
         assert handler._vault_turn_counts["counter-test"] == 0
 
     @pytest.mark.asyncio
-    async def test_handle_message_passes_vault_note_path_to_extraction(self) -> None:
+    async def test_handle_message_does_not_pass_vault_note_path_to_extraction(self) -> None:
         # Arrange -- a handler with a real fake vault writer + a fake extraction
-        # pipeline that records every kwargs dict. handle_message must dispatch
-        # background extraction with vault_note_path matching the pre-allocated path.
+        # pipeline that records every kwargs dict. R1.3: handle_message still
+        # primes the vault path cache at Step 0, but no longer dispatches the
+        # allocated path to the extraction pipeline.
         fake_vault = FakeVaultWriter()
         handler = make_handler(
             vault_writer=fake_vault,
@@ -958,61 +962,11 @@ class TestPhase6PathPreAllocation:
         )
         await asyncio.sleep(0.05)  # let fire-and-forget extraction settle
 
-        # Assert -- the extraction pipeline received vault_note_path matching
-        # the path the vault writer wrote to.
+        # Assert -- the extraction pipeline never receives vault_note_path,
+        # even though the vault writer still received a real append.
         assert len(recorder.calls) == 1
-        kwargs = recorder.calls[0]
-        assert "vault_note_path" in kwargs
-        assert kwargs["vault_note_path"] is not None
-        # Vault writer recorded the same path
+        assert "vault_note_path" not in recorder.calls[0]
         assert len(fake_vault.append_calls) == 1
-        assert kwargs["vault_note_path"] == fake_vault.append_calls[0]["vault_note_path"]
-
-    @pytest.mark.asyncio
-    async def test_handle_message_passes_none_when_vault_disabled(self) -> None:
-        # Arrange
-        handler = make_handler(vault_writer=None, event_store_enabled=True)
-        recorder = FakeExtractionPipeline()
-        handler._extraction_pipeline = recorder
-
-        # Act
-        await handler.handle_message(
-            user_message="A long enough utterance to trigger extraction dispatch.",
-            session_id="no-vault-phase6",
-        )
-        await asyncio.sleep(0.05)
-
-        # Assert -- vault_note_path is None when the vault layer is disabled
-        assert len(recorder.calls) == 1
-        assert recorder.calls[0]["vault_note_path"] is None
-
-    @pytest.mark.asyncio
-    async def test_handle_message_two_turns_pass_same_vault_path_to_extraction(self) -> None:
-        # Arrange
-        fake_vault = FakeVaultWriter()
-        handler = make_handler(vault_writer=fake_vault, event_store_enabled=True)
-        recorder = FakeExtractionPipeline()
-        handler._extraction_pipeline = recorder
-
-        # Act -- two turns of the same session
-        session_id = "multi-turn-phase6"
-        await handler.handle_message(
-            user_message="First long utterance about Python and async.",
-            session_id=session_id,
-        )
-        await handler.handle_message(
-            user_message="Second long utterance about Neo4j and Cypher.",
-            session_id=session_id,
-        )
-        await asyncio.sleep(0.05)
-
-        # Assert -- both extraction dispatches receive the same vault_note_path,
-        # matching ADR-010 "Pre-allocated vault path" stability invariant.
-        assert len(recorder.calls) == 2
-        path_1 = recorder.calls[0]["vault_note_path"]
-        path_2 = recorder.calls[1]["vault_note_path"]
-        assert path_1 is not None
-        assert path_1 == path_2
 
     @pytest.mark.asyncio
     async def test_step_0_runs_even_when_extraction_skipped_for_short_message(self) -> None:

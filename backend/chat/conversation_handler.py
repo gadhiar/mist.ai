@@ -1531,20 +1531,19 @@ class ConversationHandler:
                 tool_results=tool_results if tool_results else None,
             )
 
-            # --- Step 0: Vault path pre-allocation (ADR-010 Cluster 8 Phase 6) ---
-            # Compute the vault session note path BEFORE any downstream write
-            # so the path can be threaded through extraction -> curation ->
-            # graph_writer for the load-bearing DERIVED_FROM edge. Pure
-            # path computation, no I/O. Returns None when vault layer is
-            # disabled, in which case extraction proceeds without vault-note
-            # provenance (legacy pre-Phase-6 behavior).
+            # --- Step 0: Vault path cache priming ---
+            # Pure path computation, no I/O. The path is no longer threaded
+            # into extraction (R1.3: the vault is not a fact source), but the
+            # allocation must still happen here so the slug is derived from the
+            # first utterance rather than the opaque session_id.
             #
-            # Phase 9: pass the user message so the slug can be derived from
-            # the first utterance content rather than the opaque session_id.
-            # On subsequent turns the cached path is reused regardless.
-            vault_note_path = self._get_or_allocate_vault_path(
-                session_id, first_utterance=user_message
-            )
+            # Prime the per-session vault path cache while the first utterance
+            # is still in hand: the slug is derived from it and later callers
+            # (the conditional session-note append inside _extract_knowledge_async)
+            # only pass session_id. R1.3 retired the fact-path consumer of the
+            # returned path, so the return value is deliberately discarded --
+            # the call is kept for its caching side effect, not its result.
+            self._get_or_allocate_vault_path(session_id, first_utterance=user_message)
 
             # --- Event Store Write (Layer 1) ---
             # Synchronous, <5ms target. Happens BEFORE any async extraction.
@@ -1563,9 +1562,9 @@ class ConversationHandler:
             # at least one entity OR one relationship. This implements the
             # 2026-05-06 canonical-vault-pattern decision to skip per-turn
             # appends for zero-extraction turns ("Hi"/"Thanks") - those
-            # produce no graph state to anchor via DERIVED_FROM, so a vault
-            # note for them is pure noise. Substantive turns still anchor
-            # cleanly; the rebuild contract is preserved.
+            # produce no graph state worth a note, so a vault note for them
+            # is pure noise. Substantive turns still anchor cleanly; the
+            # rebuild contract is preserved.
 
             # Debug JSONL: record this turn and attach the TurnRecord to the
             # background extraction task so the extraction phase flushes a
@@ -1599,7 +1598,6 @@ class ConversationHandler:
                         event_id=event_id,
                         session_id=session_id,
                         turn_record=turn_record,
-                        vault_note_path=vault_note_path,
                         recorded_at=recorded_at,
                     )
                 )
@@ -1704,7 +1702,6 @@ class ConversationHandler:
         session_id: str,
         assistant_message: str = "",
         turn_record: TurnRecord | None = None,
-        vault_note_path: str | None = None,
         recorded_at: str | None = None,
     ) -> None:
         """Fire-and-forget background extraction.
@@ -1714,12 +1711,6 @@ class ConversationHandler:
 
         If `turn_record` is supplied, records extraction outcome + graph writes
         to the per-turn JSONL debug log (phase: "extraction", keyed by event_id).
-
-        `vault_note_path` (ADR-010 Cluster 8 Phase 6): pre-allocated vault session
-        note path for the current turn. Forwarded to `extract_from_utterance` so
-        every entity written by the curation graph writer carries a DERIVED_FROM
-        edge to its source vault note. None preserves legacy pre-Phase-6 behavior
-        (no vault-note provenance edges).
 
         `assistant_message` (ADR-011 bucket 2 - 2026-05-06): the assistant's
         finalized response for this turn. After extraction completes, if the
@@ -1745,7 +1736,6 @@ class ConversationHandler:
                     conversation_history=conversation_history,
                     event_id=event_id,
                     session_id=session_id,
-                    vault_note_path=vault_note_path,
                     recorded_at=recorded_at,
                 )
             # Log results at debug level. Result may be ValidationResult
@@ -1784,11 +1774,10 @@ class ConversationHandler:
 
             # ADR-011 bucket 2: conditional per-turn vault append. Skip the
             # session-note write when extraction yielded zero entities AND
-            # zero relationships - those turns produce no graph state to
-            # anchor via DERIVED_FROM, so a vault note for them is pure noise.
-            # Substantive turns still write; the rebuild contract is preserved
-            # because every entity that gets a DERIVED_FROM edge has its
-            # vault note created here.
+            # zero relationships -- those turns produce no graph state, so a
+            # vault note for them is pure noise. R1.3: the note is prose for
+            # the read path, not a fact anchor; the rebuild contract is
+            # carried by the utterance log, not by this file.
             await self._maybe_append_session_turn(
                 session_id=session_id,
                 user_message=utterance,
@@ -1997,9 +1986,10 @@ class ConversationHandler:
 
         Skipped when extraction yielded zero entities AND zero relationships.
         Such turns ("Hi", "Thanks") produce no graph state, so a session-note
-        block for them is pure noise. The rebuild contract is preserved
-        because every extracted entity's DERIVED_FROM edge points to a vault
-        note that DOES exist (lazily created on first append).
+        block for them is pure noise. R1.3: the note is prose for the read
+        path, not a fact anchor, so this guard exists purely to keep the
+        session note free of empty-turn clutter -- it carries no rebuild
+        obligation.
 
         Failure-isolated per Invariant 6: vault write errors are logged but
         never propagate.

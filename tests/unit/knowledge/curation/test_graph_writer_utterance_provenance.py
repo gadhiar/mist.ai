@@ -35,7 +35,6 @@ class TestNoVaultNoteWrites:
             merge_actions=[],
             event_id="evt-1",
             session_id="sess-1",
-            vault_note_path="/vault/sessions/2026-07-30.md",
         )
         assert (
             writes_matching(conn, "VaultNote") == []
@@ -49,7 +48,6 @@ class TestNoVaultNoteWrites:
             merge_actions=[],
             event_id="evt-1",
             session_id="sess-1",
-            vault_note_path="/vault/sessions/2026-07-30.md",
         )
         assert (
             writes_matching(conn, "DERIVED_FROM") == []
@@ -124,6 +122,10 @@ class TestUtteranceAnchor:
         # Guards the SET-clause concatenation: same rationale as the
         # unstamped case above, pinned to the stamped clause's own tail.
         assert "r.derived_at = $now ON MATCH SET" in query
+        # Guards a lost leading comma on stamp_clause: without it the CREATE
+        # branch emits `r.status = 'active' r.ontology_version = ...`, which
+        # is runtime-fatal Cypher, but every assertion above still passes.
+        assert "r.status = 'active', r.ontology_version = $ontology_version" in query
 
     @pytest.mark.asyncio
     async def test_provenance_edge_counter_still_increments(self) -> None:
@@ -138,3 +140,36 @@ class TestUtteranceAnchor:
             session_id="sess-1",
         )
         assert result.provenance_edges_created == 2
+
+
+class TestVaultNotePathParameterRetired:
+    """R1.3: the parameter is gone from every curation-path signature.
+
+    A signature check, not a behavior check: the risk this guards is a future
+    change re-threading a vault path into the fact writer and silently
+    restoring a vault->graph anchor.
+    """
+
+    def test_graph_writer_write_has_no_vault_note_path_param(self) -> None:
+        import inspect
+
+        from backend.knowledge.curation.graph_writer import CurationGraphWriter
+
+        params = inspect.signature(CurationGraphWriter.write).parameters
+        assert "vault_note_path" not in params
+
+    def test_curation_pipeline_has_no_vault_note_path_param(self) -> None:
+        import inspect
+
+        from backend.knowledge.curation.pipeline import CurationPipeline
+
+        params = inspect.signature(CurationPipeline.curate_and_store).parameters
+        assert "vault_note_path" not in params
+
+    def test_extraction_pipeline_has_no_vault_note_path_param(self) -> None:
+        import inspect
+
+        from backend.knowledge.extraction.pipeline import ExtractionPipeline
+
+        params = inspect.signature(ExtractionPipeline.extract_from_utterance).parameters
+        assert "vault_note_path" not in params

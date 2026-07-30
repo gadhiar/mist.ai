@@ -772,9 +772,9 @@ async def run_extraction_only(
     spawning background extraction, minus the chat generation:
 
     1. Step 0 -- vault session-note path pre-allocation
-       (`_get_or_allocate_vault_path`), so the path threads through extraction
-       -> curation -> graph_writer for the DERIVED_FROM edge, exactly as in
-       production.
+       (`_get_or_allocate_vault_path`), mirroring `handle_message`'s cache
+       priming exactly. R1.3 retired the fact-path consumer of the returned
+       path, so the value itself is not threaded any further here.
     2. Event-store turn record (`_record_turn_event`) with an EMPTY
        assistant_message, to obtain the `event_id` (fact provenance) and
        `recorded_at` (bitemporal fact-time + extraction reference_date). The
@@ -818,7 +818,9 @@ async def run_extraction_only(
     start = time.time()
     try:
         # Step 0: vault session-note path pre-allocation (pure path compute).
-        vault_note_path = handler._get_or_allocate_vault_path(session_id, first_utterance=utterance)
+        # R1.3: the return value is no longer forwarded to extraction; the
+        # call is kept for its per-session slug-cache priming side effect.
+        handler._get_or_allocate_vault_path(session_id, first_utterance=utterance)
 
         # Event-store turn record. EMPTY assistant_message: no reply is
         # generated on the extraction-only path. Yields the event_id used for
@@ -841,7 +843,6 @@ async def run_extraction_only(
             session_id=session_id,
             assistant_message="",
             turn_record=None,
-            vault_note_path=vault_note_path,
             recorded_at=recorded_at,
         )
 

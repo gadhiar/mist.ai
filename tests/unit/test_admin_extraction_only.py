@@ -10,9 +10,9 @@ The extraction calls themselves are deterministic at temperature 0.
 Covered:
 - `run_extraction_only` invokes the handler's extraction path directly
   (`_extract_knowledge_async`) and NEVER calls `handle_message` (no chat reply)
-- It pre-allocates the vault path (Step 0) and records the turn event so the
-  same scaffolding production extraction needs (event_id, vault_note_path,
-  recorded_at) is present
+- It pre-allocates the vault path (Step 0, cache-priming side effect only
+  since R1.3) and records the turn event so the same scaffolding production
+  extraction needs (event_id, recorded_at) is present
 - It forwards an empty conversation_history and empty assistant_message so no
   same-turn assistant reply enters the extraction context
 - It drains the in-flight background extraction task before returning (without
@@ -100,7 +100,6 @@ class FakeExtractionHandler:
         session_id: str,
         assistant_message: str = "",
         turn_record=None,
-        vault_note_path: str | None = None,
         recorded_at: str | None = None,
     ) -> None:
         self.extract_calls.append(
@@ -110,7 +109,6 @@ class FakeExtractionHandler:
                 "event_id": event_id,
                 "session_id": session_id,
                 "assistant_message": assistant_message,
-                "vault_note_path": vault_note_path,
                 "recorded_at": recorded_at,
             }
         )
@@ -171,12 +169,12 @@ class TestRunExtractionOnly:
         # Act
         asyncio.run(run_extraction_only(handler, "I use Rust", "s1"))
 
-        # Assert: Step 0 vault path pre-allocation mirrors handle_message
+        # Assert: Step 0 vault path pre-allocation mirrors handle_message.
+        # R1.3: the path is no longer forwarded into extraction -- the call
+        # is kept only for its per-session slug-cache priming side effect.
         assert len(handler.vault_path_calls) == 1
         assert handler.vault_path_calls[0]["session_id"] == "s1"
         assert handler.vault_path_calls[0]["first_utterance"] == "I use Rust"
-        # The allocated path is threaded into extraction for DERIVED_FROM.
-        assert handler.extract_calls[0]["vault_note_path"] == "/vault/s1.md"
 
     def test_records_turn_event_with_empty_assistant_message(self):
         # Arrange

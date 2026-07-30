@@ -110,7 +110,6 @@ class CurationGraphWriter:
         event_id: str,
         session_id: str,
         source_metadata: SourceMetadata | None = None,
-        vault_note_path: str | None = None,
     ) -> WriteResult:
         """Write curated entities to the graph with provenance.
 
@@ -125,9 +124,6 @@ class CurationGraphWriter:
             source_metadata: Optional external source metadata. When provided,
                 provenance targets an ExternalSource node instead of
                 ConversationContext.
-            vault_note_path: Retained for signature compatibility during the
-                R1.3 retirement and ignored. Removed in the next task once
-                every caller stops passing it.
 
         Returns:
             WriteResult with operation counts.

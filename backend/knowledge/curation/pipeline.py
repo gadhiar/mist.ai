@@ -78,7 +78,6 @@ class CurationPipeline:
         event_id: str,
         session_id: str,
         source_metadata: SourceMetadata | None = None,
-        vault_note_path: str | None = None,
         recorded_at: str | None = None,
     ) -> CurationResult:
         """Run curation stages and write to graph, serialized per turn.
@@ -126,7 +125,6 @@ class CurationPipeline:
                     event_id=event_id,
                     session_id=session_id,
                     source_metadata=source_metadata,
-                    vault_note_path=vault_note_path,
                 )
             except Exception as e:
                 logger.error("Stage 8 (entity write) failed: %s", e)
