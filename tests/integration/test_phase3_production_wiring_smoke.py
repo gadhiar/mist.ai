@@ -5,20 +5,15 @@ host_path typo, missing GraphStoreProtocol methods, missing extract_from_file,
 orphan InvalidationBus, broken mist_admin argparse -- was caused by the absence
 of any test exercising the REAL production wiring chain. factories.py was
 un-importable on the Windows host (sentence_transformers unavailable), so every
-factory-composition test on the host silently skipped. The existing ADR-010
-invariant-5 contract test was green only because it used FakeGraphStore +
-FakeExtractionPipeline that DO implement the protocols.
+factory-composition test on the host silently skipped.
 
 This test adds the protective regression: build_phase3_components +
-build_conversation_handler + the chain through real GraphStore + real
-ExtractionPipeline. The headline test simulates one vault user-edit (Bucket 1,
-users/<user>.md -- no LLM call) and asserts the four-step invariant-5
-coordination fires correctly:
-
-  Step 1 -- authored_by transitions to user-edit on the edited file
-  Step 2 -- old triples (DERIVED_FROM.path == edited_path) marked orphaned
-  Step 3 -- new triples written from the updated content
-  Step 4 -- _mist_context_cache evicted for the affected session
+build_conversation_handler + the chain through a real GraphStore. R1.3
+retired the graph-write half of the old invariant-5 chain (Inv-A1: the vault
+is prose MIST reads, not a fact source) -- the headline test now asserts the
+INVERSE of what it used to: a vault user-edit (Bucket 1, users/<user>.md)
+produces zero graph edges and zero VaultNote provenance nodes, while the
+read-path cache-invalidation signal still fires.
 
 Skip gating: tests skip on any host where sentence_transformers is not
 importable (Windows dev host) OR where Neo4j is not reachable at the URI
@@ -35,6 +30,8 @@ from __future__ import annotations
 import importlib.util
 import os
 import socket
+from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
@@ -84,35 +81,6 @@ requires_container = pytest.mark.skipif(
 )
 
 # ---------------------------------------------------------------------------
-# Vault file content fixtures (mirror test_adr010_invariant5.py)
-# ---------------------------------------------------------------------------
-
-_USER_FILE_INITIAL = (
-    "---\n"
-    "type: mist-user\n"
-    "user_id: smoke-test-user\n"
-    "authored_by: mist\n"
-    "last_updated: 2026-05-11\n"
-    "---\n"
-    "\n"
-    "## Tools and Technologies\n"
-    "- **python** (Technology)\n"
-)
-
-_USER_FILE_EDITED = (
-    "---\n"
-    "type: mist-user\n"
-    "user_id: smoke-test-user\n"
-    "authored_by: mist\n"
-    "last_updated: 2026-05-11\n"
-    "---\n"
-    "\n"
-    "## Tools and Technologies\n"
-    "- **rust** (Technology)\n"
-)
-
-
-# ---------------------------------------------------------------------------
 # Minimal sidecar stub (no SQLite required; filewatcher just calls upsert_file)
 # ---------------------------------------------------------------------------
 
@@ -146,6 +114,31 @@ class _NoopSidecarIndex:
 
     def health_check(self) -> bool:
         return True
+
+
+# ---------------------------------------------------------------------------
+# Minimal writer stub -- build_phase3_components raises ValueError when the
+# vault is enabled and writer= is None, so every call in this file needs one.
+# ---------------------------------------------------------------------------
+
+
+class _FakeVaultWriter:
+    """Minimal VaultWriterProtocol double for the invariant-5 writeback surface.
+
+    Records mark_authored_by_user_edit calls without driving VaultWriter's
+    real queue-consumer lifecycle. set_mist_write_marker is a no-op: no test
+    in this file drives the watchdog observer, so there is nothing for a
+    self-marked write to suppress.
+    """
+
+    def __init__(self) -> None:
+        self.authored_by_calls: list[Path] = []
+
+    async def mark_authored_by_user_edit(self, path: Path) -> None:
+        self.authored_by_calls.append(path)
+
+    def set_mist_write_marker(self, marker: Callable[[str], None]) -> None:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +211,7 @@ class TestPhase3ComponentsComposition:
         components = build_phase3_components(
             config=config,
             sidecar_index=sidecar_stub,
+            writer=_FakeVaultWriter(),
         )
 
         assert components is not None, (
@@ -285,6 +279,7 @@ class TestConversationHandlerBusSubscription:
         components = build_phase3_components(
             config=config,
             sidecar_index=sidecar_stub,
+            writer=_FakeVaultWriter(),
         )
         assert components is not None
 
@@ -317,240 +312,101 @@ class TestConversationHandlerBusSubscription:
 
 
 # ---------------------------------------------------------------------------
-# Test 3: Full invariant-5 cycle against real GraphStore + real ExtractionPipeline
+# Shared config builder (Test 3 only -- Tests 1/2 keep their pre-existing
+# inline config construction, which is deliberately left untouched)
 # ---------------------------------------------------------------------------
 
 
-@requires_container
-class TestVaultUserEditInvariant5ProductionWiring:
-    """Headline regression: the four-step invariant-5 coordination fires correctly
-    against real GraphStore (Neo4j) + real ExtractionPipeline.
+def _smoke_config(tmp_path: Path):
+    """Vault + filewatcher enabled over a temp vault root, real Neo4j from env."""
+    from backend.knowledge.config import FilewatcherConfig, KnowledgeConfig, VaultConfig
 
-    Exercises Bucket 1 (users/<user>.md) -- deterministic, no LLM call.
+    vault_root = tmp_path / "vault"
+    vault_root.mkdir(exist_ok=True)
+    config = KnowledgeConfig.from_env()
+    config.vault = VaultConfig(enabled=True, root=str(vault_root), git_auto_init=False)
+    config.filewatcher = FilewatcherConfig(enabled=True, observer_type="polling")
+    return config
 
-    This is the test that would have caught every Phase 3 P0:
-    - host_path typo -> build_phase3_components would have failed at import
-    - missing GraphStoreProtocol methods -> mark_orphaned_by_provenance_path call
-    - missing extract_from_file -> Bucket 1 rebuild dispatches to pipeline
-    - orphan InvalidationBus -> bus.publish would have raised
-    - broken mist_admin argparse -> unrelated, but factory import itself
+
+async def _append_and_return(sink: list, event) -> None:
+    """Async listener adapter: record the event, return None."""
+    sink.append(event)
+
+
+# ---------------------------------------------------------------------------
+# Test 3: a real user-file edit produces no graph write, against real Neo4j
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _neo4j_reachable(), reason="requires a reachable Neo4j")
+class TestVaultUserEditWritesNoGraphFactsProduction:
+    """R1.3 against a real Neo4j: a user-file edit leaves the graph untouched.
+
+    The predecessor asserted the opposite -- that the edit produced USES /
+    EXPERT_IN edges via upsert_user. That was the vault->graph fact path
+    Inv-A1 retires.
     """
 
     @pytest.mark.asyncio
-    async def test_vault_user_edit_drives_full_invariant5_cycle(self, tmp_path):
-        """Four-step invariant-5 coordination against real Neo4j.
+    async def test_vault_user_edit_produces_no_graph_edges(self, tmp_path):
+        from backend.factories import build_graph_store, build_phase3_components
 
-        Arrange:
-          - Build real GraphStore + real ExtractionPipeline via factories
-          - Pre-seed a USES/python triple derived from a tmp users/ file
-          - Build Phase3Components (real filewatcher + real InvalidationBus)
-          - Build ConversationHandler and subscribe to bus
-          - Pre-populate _mist_context_cache for the session
-
-        Act:
-          - Write new content to the user file (python -> rust)
-          - Call filewatcher._do_reindex(path, is_mist_write=False) directly
-
-        Assert:
-          - Step 1: authored_by == user-edit in the file
-          - Step 2: get_orphaned_provenance_paths includes the edited path
-          - Step 3: USES/rust triple written to Neo4j
-          - Step 4: _mist_context_cache cleared for the affected session
-        """
-        from backend.chat.mist_context import MistContext
-        from backend.factories import (
-            build_conversation_handler,
-            build_extraction_pipeline,
-            build_graph_store,
-            build_phase3_components,
+        graph_store = build_graph_store(_smoke_config(tmp_path))
+        user_id = "smoke-r13-user"
+        target = tmp_path / "users" / f"{user_id}.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            "---\n"
+            f"user_id: {user_id}\n"
+            "---\n\n"
+            "## Tools and Technologies\n"
+            "- SmokeTestTechnology\n",
+            encoding="utf-8",
         )
-        from backend.knowledge.config import (
-            EventStoreConfig,
-            FilewatcherConfig,
-            KnowledgeConfig,
-            SidecarIndexConfig,
-            VaultConfig,
-        )
-        from backend.knowledge.curation.graph_regenerator import GraphRegenerator
-        from backend.vault.writer import VaultWriter
+        _cleanup_smoke_nodes(graph_store, user_id, str(target))
+        try:
+            components = build_phase3_components(
+                config=_smoke_config(tmp_path),
+                sidecar_index=_NoopSidecarIndex(),
+                writer=_FakeVaultWriter(),
+            )
+            await components.filewatcher._do_reindex(str(target), is_mist_write=False)
 
-        # ------------------------------------------------------------------
-        # Arrange: vault directory structure
-        # ------------------------------------------------------------------
-        vault_root = tmp_path / "vault"
-        vault_root.mkdir()
-        (vault_root / "users").mkdir()
+            rows = graph_store.connection.execute_query(
+                "MATCH (u:__Entity__ {id: $user_id})-[r]->(t) RETURN type(r) AS rel_type",
+                {"user_id": user_id},
+            )
+            assert rows == [], (
+                "R1.3: a user-file edit must write no graph edges; "
+                f"found {[r['rel_type'] for r in rows]}"
+            )
 
-        user_file = vault_root / "users" / "smoke-test-user.md"
-        user_file.write_text(_USER_FILE_INITIAL, encoding="utf-8")
+            vault_notes = graph_store.connection.execute_query(
+                "MATCH (vn:__Provenance__:VaultNote {path: $path}) RETURN vn.path AS path",
+                {"path": str(target)},
+            )
+            assert vault_notes == [], "R1.3: no VaultNote provenance node for an edited file"
+        finally:
+            _cleanup_smoke_nodes(graph_store, user_id, str(target))
+            graph_store.close()
 
-        # ------------------------------------------------------------------
-        # Arrange: config (read from env so NEO4J_URI is honoured in container)
-        # ------------------------------------------------------------------
-        config = KnowledgeConfig.from_env()
-        config.vault = VaultConfig(
-            enabled=True,
-            root=str(vault_root),
-            default_user_id="smoke-test-user",
-            git_auto_init=False,
-        )
-        config.filewatcher = FilewatcherConfig(enabled=True, observer_type="polling")
-        config.sidecar_index = SidecarIndexConfig(enabled=False)
-        config.event_store = EventStoreConfig(enabled=False)
-
-        # ------------------------------------------------------------------
-        # Arrange: real GraphStore + real ExtractionPipeline
-        # ------------------------------------------------------------------
-        graph_store = build_graph_store(config)
-        extraction_pipeline = build_extraction_pipeline(
-            config,
-            graph_store=graph_store,
-            include_curation=False,
-            include_internal_derivation=False,
-        )
-
-        # ------------------------------------------------------------------
-        # Arrange: pre-seed via natural upsert_user path.
-        #
-        # upsert_user now writes DERIVED_FROM edges from each typed entity to
-        # the VaultNote (Phase 5.5 Bucket 1 fix). mark_orphaned_by_provenance_path
-        # queries that relationship-type, so the natural upsert path is all that
-        # is needed. No manual Cypher seeding required.
-        # ------------------------------------------------------------------
-        from backend.knowledge.curation.bucket1_reader import ParsedUser
-
-        _path_str = str(user_file)
-        initial_parsed = ParsedUser(
-            user_id="smoke-test-user",
-            tools_and_technologies=["python"],
-            expertise=[],
-            currently_learning=[],
-            projects=[],
-            affiliations=[],
-            interests=[],
-            goals=[],
-            preferences=[],
-            people=[],
-        )
-        await graph_store.upsert_user(initial_parsed, derived_from_path=_path_str)
-
-        # Confirm the provenance edge landed and is not already orphaned
-        orphaned_before = await graph_store.get_orphaned_provenance_paths()
-        assert _path_str not in orphaned_before, (
-            f"Pre-condition: {_path_str} must not be orphaned before the edit; "
-            f"orphaned_before={orphaned_before!r}"
-        )
-
-        # ------------------------------------------------------------------
-        # Arrange: Phase3Components (shared bus) + VaultWriter
-        # ------------------------------------------------------------------
-        vault_writer = VaultWriter(
-            config.vault,
-            debug_logger=None,
-            model_hash=config.model_hash,
-        )
-
-        regenerator = GraphRegenerator(
-            graph_store=graph_store,
-            extraction_pipeline=extraction_pipeline,
-        )
-
-        sidecar_stub = _NoopSidecarIndex()
+    @pytest.mark.asyncio
+    async def test_vault_user_edit_still_evicts_the_read_path_cache(self, tmp_path):
+        """The kept half of the chain: prose changes must reach the read path."""
+        from backend.factories import build_phase3_components
 
         components = build_phase3_components(
-            config=config,
-            sidecar_index=sidecar_stub,
-            regenerator=regenerator,
-            writer=vault_writer,
+            config=_smoke_config(tmp_path),
+            sidecar_index=_NoopSidecarIndex(),
+            writer=_FakeVaultWriter(),
         )
-        assert (
-            components is not None
-        ), "build_phase3_components must return non-None when filewatcher + vault are enabled"
+        received = []
+        components.invalidation_bus.subscribe(lambda event: _append_and_return(received, event))
+        target = tmp_path / "users" / "smoke-r13-user.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("---\nuser_id: smoke-r13-user\n---\n\nEdited.\n", encoding="utf-8")
 
-        # ------------------------------------------------------------------
-        # Arrange: ConversationHandler subscribes to bus
-        # ------------------------------------------------------------------
-        handler = build_conversation_handler(
-            config=config,
-            invalidation_bus=components.invalidation_bus,
-            vault_writer=vault_writer,
-            vault_sidecar=None,
-        )
+        await components.filewatcher._do_reindex(str(target), is_mist_write=False)
 
-        # ------------------------------------------------------------------
-        # Arrange: pre-populate _mist_context_cache for the session
-        # ------------------------------------------------------------------
-        session_id = "smoke-session-001"
-        handler.get_or_create_session(session_id, user_id="smoke-test-user")
-        stub_ctx = MistContext(
-            display_name="MIST",
-            pronouns="she/her",
-            self_concept="test stub",
-            traits=[],
-            capabilities=[],
-            preferences=[],
-        )
-        handler._mist_context_cache[session_id] = stub_ctx
-        assert (
-            session_id in handler._mist_context_cache
-        ), "Pre-condition: cache must be populated before the edit"
-
-        # ------------------------------------------------------------------
-        # Act: simulate user edit (python -> rust) and drive filewatcher
-        # ------------------------------------------------------------------
-        user_file.write_text(_USER_FILE_EDITED, encoding="utf-8")
-
-        await components.filewatcher._do_reindex(str(user_file), is_mist_write=False)
-
-        # ------------------------------------------------------------------
-        # Assert Step 1: authored_by rewritten to user-edit
-        # ------------------------------------------------------------------
-        file_text = user_file.read_text(encoding="utf-8")
-        assert "authored_by: user-edit" in file_text, (
-            "Step 1 FAILED: authored_by must be rewritten to 'user-edit' after "
-            f"user-edit detection; got file content:\n{file_text}"
-        )
-
-        # ------------------------------------------------------------------
-        # Assert Step 2: old provenance path marked orphaned in Neo4j
-        # ------------------------------------------------------------------
-        orphaned_paths = await graph_store.get_orphaned_provenance_paths()
-        assert str(user_file) in orphaned_paths, (
-            f"Step 2 FAILED: get_orphaned_provenance_paths must include the edited path; "
-            f"got orphaned_paths={orphaned_paths!r}"
-        )
-
-        # ------------------------------------------------------------------
-        # Assert Step 3: new USES/rust triple written to Neo4j.
-        #
-        # upsert_user (Bucket 1) writes:
-        #   (:__Entity__:User {id: "smoke-test-user"}) -[:USES]->
-        #   (:__Entity__ {id: "entity-rust", display_name: "rust"})
-        # The User node key is `id` (not `user_id`). Match on that schema.
-        # ------------------------------------------------------------------
-        conn = graph_store.connection
-        rows = conn.execute_query(
-            "MATCH (u:__Entity__:User {id: $uid})-[r:USES]->(t) "
-            "WHERE toLower(t.display_name) = 'rust' "
-            "RETURN count(r) AS cnt",
-            {"uid": "smoke-test-user"},
-        )
-        rust_count = rows[0].get("cnt", 0) if rows else 0
-        assert rust_count >= 1, (
-            f"Step 3 FAILED: a USES->rust edge must exist for smoke-test-user after rebuild; "
-            f"got cnt={rust_count}. Bucket 1 re-derivation via upsert_user may not have run."
-        )
-
-        # ------------------------------------------------------------------
-        # Assert Step 4: _mist_context_cache evicted for the affected session
-        # ------------------------------------------------------------------
-        assert session_id not in handler._mist_context_cache, (
-            f"Step 4 FAILED: _mist_context_cache must be evicted for session "
-            f"'{session_id}' after users/smoke-test-user.md rebuild; "
-            f"cache keys still present: {list(handler._mist_context_cache.keys())!r}"
-        )
-
-        # ------------------------------------------------------------------
-        # Cleanup: remove smoke-test nodes from Neo4j
-        # ------------------------------------------------------------------
-        _cleanup_smoke_nodes(graph_store, "smoke-test-user", str(user_file))
+        assert [e.path for e in received] == [target]
