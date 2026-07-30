@@ -576,7 +576,8 @@ class KnowledgeConfig:
     # DERIVED_FROM->VaultNote) so a future consumer can detect version drift
     # and migrate forward when ontology / extraction prompt / model changes.
     # `mist_admin vault-rebuild` no longer reads these -- R1.3 made it a
-    # sidecar-only reindex with no graph-side comparison.
+    # sidecar-only reindex with no graph-side comparison; no command consumes
+    # the drift signal today.
     # `extraction_version` should bump when EXTRACTION_SYSTEM_PROMPT or the
     # ontology contract changes. `model_hash` is an immutable identifier for
     # the LLM binary actually running extraction (recipe + quantization +
