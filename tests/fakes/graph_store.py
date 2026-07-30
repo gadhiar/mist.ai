@@ -21,7 +21,7 @@ itself and is deleted wholesale in Task 6, which is where these two
 attributes should go too.
 
 Also exposes assertion helpers for test readability:
-  - add_triple / get_triple / count_traits / has_trait
+  - add_triple / get_triple / has_trait
 """
 
 from __future__ import annotations
@@ -95,9 +95,3 @@ class FakeGraphStore:
     def has_trait(self, trait_slug: str) -> bool:
         """Return True if a HAS_TRAIT triple exists for the given slug."""
         return self.get_triple("mist-identity", "HAS_TRAIT", trait_slug) is not None
-
-    def count_traits(self) -> int:
-        """Return the number of HAS_TRAIT triples (deduped)."""
-        return sum(
-            1 for t in self._triples if t.predicate == "HAS_TRAIT" and t.subject == "mist-identity"
-        )
