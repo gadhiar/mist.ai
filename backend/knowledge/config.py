@@ -503,30 +503,6 @@ class FilewatcherConfig:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class GraphRegeneratorConfig:
-    """Configuration for the vault GraphRegenerator (curation/graph_regenerator.py).
-
-    `rebuild_timeout_s` caps each async LLM re-extraction call dispatched on
-    Bucket 2/3 vault edits. Without a timeout a hung llama-server call would
-    hold the asyncio Task open indefinitely, preventing clean shutdown and
-    potentially leaking resources across deploys.
-
-    Default 300 s (5 minutes) gives extraction ample room for large session
-    notes while bounding the worst-case hang. Operators with faster or slower
-    inference infrastructure can tune via the env var.
-    """
-
-    rebuild_timeout_s: int = 300
-
-    @classmethod
-    def from_env(cls) -> "GraphRegeneratorConfig":
-        """Load graph-regenerator configuration from environment variables."""
-        return cls(
-            rebuild_timeout_s=int(os.getenv("MIST_GRAPH_REGENERATOR_REBUILD_TIMEOUT_S", "300")),
-        )
-
-
 @dataclass
 class SkillDerivationConfig:
     """Configuration for skill derivation from tool usage patterns."""
@@ -585,9 +561,6 @@ class KnowledgeConfig:
     vault: VaultConfig = None  # type: ignore[assignment]
     sidecar_index: SidecarIndexConfig = None  # type: ignore[assignment]
     filewatcher: FilewatcherConfig = None  # type: ignore[assignment]
-
-    # Phase 5.5 Fix A: graph regenerator async lifecycle config
-    graph_regenerator: GraphRegeneratorConfig = None  # type: ignore[assignment]
 
     # Feature flags
     enable_knowledge_integration: bool = True  # Master switch for knowledge system
@@ -651,8 +624,6 @@ class KnowledgeConfig:
             self.sidecar_index = SidecarIndexConfig()
         if self.filewatcher is None:
             self.filewatcher = FilewatcherConfig()
-        if self.graph_regenerator is None:
-            self.graph_regenerator = GraphRegeneratorConfig()
 
     @classmethod
     def from_env(cls) -> "KnowledgeConfig":
@@ -672,7 +643,6 @@ class KnowledgeConfig:
             vault=VaultConfig.from_env(),
             sidecar_index=SidecarIndexConfig.from_env(),
             filewatcher=FilewatcherConfig.from_env(),
-            graph_regenerator=GraphRegeneratorConfig.from_env(),
             enable_knowledge_integration=os.getenv("ENABLE_KNOWLEDGE_INTEGRATION", "true").lower()
             == "true",
             ontology_version=os.getenv("ONTOLOGY_VERSION", "1.4.0"),

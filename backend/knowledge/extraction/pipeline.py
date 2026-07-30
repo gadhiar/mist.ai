@@ -19,7 +19,7 @@ import logging
 import time
 from collections import OrderedDict
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -698,58 +698,4 @@ class ExtractionPipeline:
             session_id=event.session_id,
             reference_date=reference_date,
             recorded_at=recorded_at,
-        )
-
-    async def extract_from_file(
-        self,
-        content: str,
-        vault_note_path: str,
-        ontology_version: str,
-    ) -> Any:
-        """Extract entities and relationships from vault file content.
-
-        ExtractionPipelineProtocol entry point used by
-        GraphRegenerator._rebuild_async_extraction for Bucket 2/3
-        (sessions/, decisions/) re-extraction on user-edit.
-
-        Treats the full file body as a single extraction utterance.
-        `vault_note_path` is used only for logging here (R1.3 retired the
-        vault->graph fact anchor `extract_from_utterance` used to forward it
-        to). `extraction_source` is hardcoded to "orchestrator_summary", which
-        selects the 0.2 significance threshold from `_SOURCE_THRESHOLDS`;
-        there is no vault-specific source tag. `ontology_version` is used
-        only in the re-extraction log line below.
-
-        Returns None when `content` is empty. Otherwise delegates to
-        `extract_from_utterance` and returns its result.
-
-        Args:
-            content: Full text body of the vault file.
-            vault_note_path: Absolute path string for provenance tracking.
-            ontology_version: Ontology version string for the log line.
-        """
-        if not content.strip():
-            logger.debug(
-                "extract_from_file: empty content for %s, skipping extraction",
-                vault_note_path,
-            )
-            return None
-
-        import uuid
-
-        event_id = str(uuid.uuid4())
-        session_id = "vault-regen"
-
-        logger.info(
-            "extract_from_file: re-extracting %s (ontology %s)",
-            vault_note_path,
-            ontology_version,
-        )
-
-        return await self.extract_from_utterance(
-            utterance=content,
-            conversation_history=[],
-            event_id=event_id,
-            session_id=session_id,
-            extraction_source="orchestrator_summary",
         )

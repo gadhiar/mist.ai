@@ -742,9 +742,6 @@ def build_filewatcher(
     # subscribe to it. Task 21 migrates server.py to use build_phase3_components.
     regen = regenerator or CurationGraphRegenerator(
         graph_store=build_graph_store(config),
-        extraction_pipeline=build_extraction_pipeline(
-            config, include_curation=False, include_internal_derivation=False
-        ),
     )
     bus = InvalidationBus()
     return VaultFilewatcher(
@@ -798,7 +795,7 @@ def build_phase3_components(
         config: Knowledge subsystem configuration.
         sidecar_index: Initialized VaultSidecarIndex. None returns None.
         regenerator: Optional pre-built curation GraphRegenerator. When None,
-            one is constructed from `config` (requires graph + LLM access).
+            one is constructed from `config` (requires graph access).
         writer: Pre-built VaultWriter. REQUIRED whenever the vault is
             enabled: without it the filewatcher cannot run the ADR-010
             invariant-5 chain (authored_by writeback -> graph rebuild ->
@@ -840,9 +837,6 @@ def build_phase3_components(
 
     regen = regenerator or CurationGraphRegenerator(
         graph_store=build_graph_store(config),
-        extraction_pipeline=build_extraction_pipeline(
-            config, include_curation=False, include_internal_derivation=False
-        ),
     )
     bus = InvalidationBus()
     filewatcher = VaultFilewatcher(

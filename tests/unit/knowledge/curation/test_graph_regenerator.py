@@ -1,13 +1,10 @@
 """Unit tests for GraphRegenerator.
 
-Tests cover the ADR-010 invariant 5 closure: on user-edit detection,
-DERIVED_FROM-scoped triples are orphan-marked and re-derived per bucket.
-
-Bucket dispatch:
-- identity/mist.md, users/<id>.md: graph no-op (R1.3). The vault is not a
-  fact source for these paths; an edit changes read-path prose only.
-- Bucket 2/3 (sessions/, decisions/): async LLM re-extraction queued;
-  result is deferred=True.
+R1.3 retires both re-derivation buckets: Bucket 1 (deterministic user/
+identity parse, Task 3) and Bucket 2/3 (LLM re-extraction of session and
+decision notes, this task). `rebuild_from_path` is now an unconditional
+graph no-op for every vault path -- Inv-A1: the vault is not a fact source;
+facts enter the graph only through the utterance log.
 
 Fakes live in tests/fakes/ so they can be shared across test modules.
 """
@@ -21,7 +18,6 @@ from backend.knowledge.curation.graph_regenerator import (
     GraphRegenerator,
     RebuildResult,
 )
-from tests.fakes.extraction_pipeline import FakeExtractionPipeline
 from tests.fakes.graph_store import FakeGraphStore
 
 # ---------------------------------------------------------------------------
@@ -34,20 +30,21 @@ def fake_graph_store() -> FakeGraphStore:
     return FakeGraphStore()
 
 
-@pytest.fixture()
-def fake_extraction() -> FakeExtractionPipeline:
-    return FakeExtractionPipeline()
+class _NeverCalledExtractionPipeline:
+    """Stub that fails loudly if the retired re-extraction path fires."""
+
+    def __init__(self) -> None:
+        self.extract_from_file_calls: list[dict] = []
 
 
 @pytest.fixture()
-def regenerator(
-    fake_graph_store: FakeGraphStore,
-    fake_extraction: FakeExtractionPipeline,
-) -> GraphRegenerator:
-    return GraphRegenerator(
-        graph_store=fake_graph_store,
-        extraction_pipeline=fake_extraction,
-    )
+def fake_extraction() -> _NeverCalledExtractionPipeline:
+    return _NeverCalledExtractionPipeline()
+
+
+@pytest.fixture()
+def regenerator(fake_graph_store: FakeGraphStore) -> GraphRegenerator:
+    return GraphRegenerator(graph_store=fake_graph_store)
 
 
 # ---------------------------------------------------------------------------
@@ -69,12 +66,19 @@ _SESSION_BODY = "---\ntype: mist-session\n---\n" "## Turn 1\n**User:** hi\n**MIS
 # ---------------------------------------------------------------------------
 
 
-def test_rebuild_marks_old_triples_orphaned(
+def test_rebuild_does_not_orphan_existing_triples(
     regenerator: GraphRegenerator,
     fake_graph_store: FakeGraphStore,
     tmp_path: Path,
 ) -> None:
-    """Triples with DERIVED_FROM.path == edited_path are orphan-marked."""
+    """R1.3: a vault edit leaves pre-existing DERIVED_FROM-scoped triples untouched.
+
+    Before R1.3 this same fixture (a triple scoped to the edited path) proved
+    orphan-marking fired on rebuild. Bucket 2/3's retirement (this task)
+    collapses rebuild_from_path to an unconditional no-op that never reaches
+    the graph store, so the same fixture now proves the inverse: the triple
+    survives the edit untouched.
+    """
     p = tmp_path / "sessions" / "2026-05-10-test.md"
     p.parent.mkdir()
     p.write_text(_SESSION_BODY, encoding="utf-8")
@@ -89,10 +93,11 @@ def test_rebuild_marks_old_triples_orphaned(
 
     result: RebuildResult = asyncio.run(regenerator.rebuild_from_path(p))
 
-    assert result.orphaned_triple_count == 1
+    assert result.orphaned_triple_count == 0
+    assert fake_graph_store.mark_orphaned_calls == []
     triple = fake_graph_store.get_triple("user", "USES", "python")
     assert triple is not None
-    assert triple.status == "orphaned"
+    assert triple.status == "active"
 
 
 def test_rebuild_mist_md_is_graph_noop(
@@ -153,12 +158,13 @@ def test_rebuild_identity_non_mist_file_is_graph_noop(
     fake_graph_store: FakeGraphStore,
     tmp_path: Path,
 ) -> None:
-    """Any identity/ file is a graph no-op, not just identity/mist.md.
+    """Any identity/ file remains a graph no-op under the unconditional no-op.
 
-    The guard must match on the "identity" path segment, not only on the
-    literal filename "mist.md" -- an identity/ file with a different name
-    (e.g. a future identity/persona.md) is still read-path prose and must
-    not fall through to Bucket 2/3 LLM re-extraction.
+    Originally pinned a narrow-guard bug (Task 3 review: only literal
+    "identity/mist.md" was inert; a differently-named identity/ file fell
+    through to Bucket 2/3 LLM re-extraction). R1.3 retired the guard's
+    path-segment matching entirely -- every path is now inert -- so this is
+    retained as a regression check on that now-broader behavior.
     """
     p = tmp_path / "identity" / "persona.md"
     p.parent.mkdir()
@@ -178,12 +184,12 @@ def test_rebuild_nested_user_file_is_graph_noop(
     fake_graph_store: FakeGraphStore,
     tmp_path: Path,
 ) -> None:
-    """A users/ file nested below a subdirectory is still a graph no-op.
+    """A users/ file nested below a subdirectory remains a graph no-op.
 
-    The guard must match on the "users" path segment anywhere in the path,
-    not only when "users" is the immediate parent directory -- a nested
-    users/<subdir>/<file>.md edit must not fall through to Bucket 2/3 LLM
-    re-extraction.
+    Originally pinned a narrow-guard bug (Task 3 review: "users" had to be
+    the immediate parent directory). R1.3 retired the guard's path-segment
+    matching entirely -- every path is now inert -- so this is retained as a
+    regression check on that now-broader behavior.
     """
     p = tmp_path / "users" / "archive" / "raj.md"
     p.parent.mkdir(parents=True)
@@ -202,123 +208,55 @@ def test_rebuild_nested_user_file_is_graph_noop(
     assert fake_graph_store.mark_orphaned_calls == []
 
 
-def test_rebuild_bucket2_session_defers_extraction(
+def test_rebuild_session_file_is_graph_noop(
     regenerator: GraphRegenerator,
-    fake_extraction: FakeExtractionPipeline,
+    fake_graph_store: FakeGraphStore,
+    fake_extraction: "_NeverCalledExtractionPipeline",
     tmp_path: Path,
 ) -> None:
-    """sessions/* edit returns deferred=True and queues async extraction."""
-    p = tmp_path / "sessions" / "2026-05-10-test.md"
-    p.parent.mkdir()
-    p.write_text(_SESSION_BODY, encoding="utf-8")
+    """R1.3 spec 5.1: session-note edits trigger no LLM re-extraction."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    note = sessions_dir / "2026-07-30.md"
+    note.write_text("# Turn 1\n\nI use Python at work.\n", encoding="utf-8")
 
-    async def _run():
-        result = await regenerator.rebuild_from_path(p)
-        # Drain in-flight tasks so the inner wait_for pipeline call completes.
-        await regenerator.aclose()
-        return result
+    result = asyncio.run(regenerator.rebuild_from_path(note))
 
-    result: RebuildResult = asyncio.run(_run())
-
-    assert result.bucket == "2"
-    assert result.deferred is True
-    # Extraction completed (create_task + aclose drain ensures pipeline ran)
-    assert fake_extraction.scheduled_jobs >= 1
+    assert result.bucket == "ignored"
+    assert result.deferred is False
+    assert result.new_triple_count == 0
+    assert result.orphaned_triple_count == 0
+    assert fake_extraction.extract_from_file_calls == [], "no LLM re-extraction may fire"
 
 
-# ---------------------------------------------------------------------------
-# Tests: retry_orphaned (Task 22)
-# ---------------------------------------------------------------------------
-
-
-def test_retry_orphaned_reruns_extraction_for_orphaned_paths(
+def test_rebuild_decision_file_is_graph_noop(
     regenerator: GraphRegenerator,
-    fake_graph_store: FakeGraphStore,
-    fake_extraction: FakeExtractionPipeline,
+    fake_extraction: "_NeverCalledExtractionPipeline",
     tmp_path: Path,
 ) -> None:
-    """retry_orphaned re-runs extraction for each orphaned provenance path."""
-    p = tmp_path / "sessions" / "2026-05-10-test.md"
-    p.parent.mkdir()
-    p.write_text(_SESSION_BODY, encoding="utf-8")
+    """decisions/ retires with sessions/ -- both were Bucket 2/3."""
+    decisions_dir = tmp_path / "decisions"
+    decisions_dir.mkdir()
+    note = decisions_dir / "ADR-001.md"
+    note.write_text("# ADR-001\n\nWe chose Neo4j.\n", encoding="utf-8")
 
-    # Pre-seed a triple with 'orphaned' status for this path
-    fake_graph_store.add_triple(
-        subject="user",
-        predicate="USES",
-        object="python",
-        derived_from_path=str(p),
-        status="orphaned",
+    result = asyncio.run(regenerator.rebuild_from_path(note))
+
+    assert result.bucket == "ignored"
+    assert fake_extraction.extract_from_file_calls == []
+
+
+def test_regenerator_has_no_async_lifecycle() -> None:
+    """No in-flight tasks means no drain: aclose and retry_orphaned retire."""
+    assert not hasattr(GraphRegenerator, "aclose")
+    assert not hasattr(GraphRegenerator, "retry_orphaned")
+
+
+def test_extraction_pipeline_has_no_extract_from_file() -> None:
+    """The vault-file fact writer is deleted, not left dormant."""
+    from backend.knowledge.extraction.pipeline import ExtractionPipeline
+
+    assert not hasattr(ExtractionPipeline, "extract_from_file"), (
+        "R1.3: extract_from_file is a vault-file->graph fact path and retires "
+        "with its sole caller"
     )
-
-    jobs_before = fake_extraction.scheduled_jobs
-    asyncio.run(regenerator.retry_orphaned())
-
-    # extraction should have been called once for the orphaned path
-    assert fake_extraction.scheduled_jobs == jobs_before + 1
-    assert fake_extraction.extract_from_file_calls[-1]["vault_note_path"] == str(p)
-
-
-def test_retry_orphaned_skips_nonexistent_paths(
-    regenerator: GraphRegenerator,
-    fake_graph_store: FakeGraphStore,
-    fake_extraction: FakeExtractionPipeline,
-) -> None:
-    """retry_orphaned skips paths that no longer exist on disk."""
-    fake_graph_store.add_triple(
-        subject="user",
-        predicate="USES",
-        object="python",
-        derived_from_path="/nonexistent/path/file.md",
-        status="orphaned",
-    )
-
-    asyncio.run(regenerator.retry_orphaned())
-
-    # No extraction should have been attempted for the missing path
-    assert fake_extraction.scheduled_jobs == 0
-
-
-def test_retry_orphaned_noop_when_no_orphans(
-    regenerator: GraphRegenerator,
-    fake_graph_store: FakeGraphStore,
-    fake_extraction: FakeExtractionPipeline,
-) -> None:
-    """retry_orphaned is a no-op when there are no orphaned triples."""
-    # All triples active
-    fake_graph_store.add_triple(
-        subject="user",
-        predicate="USES",
-        object="python",
-        derived_from_path="/some/path.md",
-        status="active",
-    )
-
-    asyncio.run(regenerator.retry_orphaned())
-
-    assert fake_extraction.scheduled_jobs == 0
-
-
-def test_retry_orphaned_deduplicates_paths(
-    regenerator: GraphRegenerator,
-    fake_graph_store: FakeGraphStore,
-    fake_extraction: FakeExtractionPipeline,
-    tmp_path: Path,
-) -> None:
-    """retry_orphaned calls extraction once per unique path even with multiple orphaned triples."""
-    p = tmp_path / "sessions" / "2026-05-10-test.md"
-    p.parent.mkdir()
-    p.write_text(_SESSION_BODY, encoding="utf-8")
-
-    # Two orphaned triples for the same path
-    fake_graph_store.add_triple(
-        "user", "USES", "python", derived_from_path=str(p), status="orphaned"
-    )
-    fake_graph_store.add_triple(
-        "user", "KNOWS", "django", derived_from_path=str(p), status="orphaned"
-    )
-
-    asyncio.run(regenerator.retry_orphaned())
-
-    # FakeGraphStore.get_orphaned_provenance_paths deduplicates; extraction called once
-    assert fake_extraction.scheduled_jobs == 1
