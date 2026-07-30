@@ -1,69 +1,91 @@
-"""Unit tests for InvalidationBus."""
+"""InvalidationBus pub/sub transport tests.
+
+R1.3: the bus event is owned by the vault layer (VaultChangeEvent) rather than
+imported from the retired curation GraphRegenerator. The bus carries read-path
+cache invalidation only -- it never signalled a graph write, and after R1.3 no
+graph write exists for it to signal.
+"""
 
 import asyncio
+import dataclasses
 from pathlib import Path
 
-from backend.knowledge.curation.graph_regenerator import RebuildResult
-from backend.vault.invalidation_bus import InvalidationBus
+import pytest
+
+from backend.vault.invalidation_bus import InvalidationBus, VaultChangeEvent
 
 
-def make_event(path_str: str) -> RebuildResult:
-    return RebuildResult(
-        path=Path(path_str),
-        bucket="1",
-        orphaned_triple_count=0,
-        new_triple_count=0,
-        ontology_version="1.1.0",
-        deferred=False,
-    )
+def make_event(path_str: str) -> VaultChangeEvent:
+    return VaultChangeEvent(path=Path(path_str))
 
 
-def test_publish_calls_all_listeners():
+def test_vault_change_event_is_frozen() -> None:
+    event = make_event("/vault/users/raj.md")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        event.path = Path("/vault/other.md")  # type: ignore[misc]
+
+
+def test_vault_change_event_carries_path() -> None:
+    event = make_event("/vault/users/raj.md")
+    assert event.path == Path("/vault/users/raj.md")
+
+
+def test_bus_does_not_import_from_curation() -> None:
+    """Guards the layering fix: vault must not depend on knowledge.curation."""
+    import inspect
+
+    import backend.vault.invalidation_bus as bus_module
+
+    source = inspect.getsource(bus_module)
+    assert "knowledge.curation" not in source
+    assert "RebuildResult" not in source
+
+
+def test_publish_calls_all_listeners() -> None:
     bus = InvalidationBus()
-    seen: list[RebuildResult] = []
+    seen: list[Path] = []
 
-    async def listener(event):
-        seen.append(event)
+    async def listener(event: VaultChangeEvent) -> None:
+        seen.append(event.path)
 
     bus.subscribe(listener)
-    asyncio.run(bus.publish(make_event("/x.md")))
-    assert len(seen) == 1
+    bus.subscribe(listener)
+    asyncio.run(bus.publish(make_event("/vault/users/raj.md")))
+    assert seen == [Path("/vault/users/raj.md")] * 2
 
 
-def test_publish_isolates_listener_exceptions():
+def test_publish_isolates_listener_exceptions() -> None:
     bus = InvalidationBus()
     seen: list[str] = []
 
-    async def bad_listener(event):
-        raise RuntimeError("boom")
+    async def bad(event: VaultChangeEvent) -> None:
+        raise RuntimeError("listener exploded")
 
-    async def good_listener(event):
-        seen.append("ok")
+    async def good(event: VaultChangeEvent) -> None:
+        seen.append("good")
 
-    bus.subscribe(bad_listener)
-    bus.subscribe(good_listener)
-    # Bad listener does not prevent good listener from being called
-    asyncio.run(bus.publish(make_event("/x.md")))
-    assert seen == ["ok"]
+    bus.subscribe(bad)
+    bus.subscribe(good)
+    asyncio.run(bus.publish(make_event("/vault/users/raj.md")))
+    assert seen == ["good"], "a failing listener must not block the next one"
 
 
-def test_publish_with_no_listeners_is_noop():
+def test_publish_with_no_listeners_is_noop() -> None:
     bus = InvalidationBus()
-    asyncio.run(bus.publish(make_event("/x.md")))
+    asyncio.run(bus.publish(make_event("/vault/users/raj.md")))
 
 
-def test_subscribe_multiple_listeners():
+def test_subscribe_multiple_listeners() -> None:
     bus = InvalidationBus()
-    counts = [0, 0, 0]
+    calls: list[str] = []
 
-    async def make_listener(idx):
-        async def fn(event):
-            counts[idx] += 1
+    async def first(event: VaultChangeEvent) -> None:
+        calls.append("first")
 
-        return fn
+    async def second(event: VaultChangeEvent) -> None:
+        calls.append("second")
 
-    bus.subscribe(asyncio.run(make_listener(0)))
-    bus.subscribe(asyncio.run(make_listener(1)))
-    bus.subscribe(asyncio.run(make_listener(2)))
-    asyncio.run(bus.publish(make_event("/x.md")))
-    assert counts == [1, 1, 1]
+    bus.subscribe(first)
+    bus.subscribe(second)
+    asyncio.run(bus.publish(make_event("/vault/sessions/x.md")))
+    assert calls == ["first", "second"], "listeners fire in registration order"

@@ -3,9 +3,14 @@
 Task 11: Tests the exclusion of MIST.md, CLAUDE.md, and meta/ from the sidecar
 reindex path.
 
-Task 19: Tests the invariant-5 wiring: user-edit detection sequences
-mark_authored_by_user_edit -> regenerator.rebuild_from_path ->
-invalidation_bus.publish. MIST-write origin must bypass all three steps.
+Task 19: Tests the vault-edit sequencing: user-edit detection sequences
+mark_authored_by_user_edit -> invalidation_bus.publish. MIST-write origin
+must bypass both steps.
+
+R1.3 Task 6: this sequence used to have a middle step,
+regenerator.rebuild_from_path, retired along with GraphRegenerator -- a vault
+edit produces no graph write (Inv-A1), so nothing sits between the authored_by
+writeback and the cache-invalidation publish anymore.
 
 All async tests are decorated with @pytest.mark.asyncio (asyncio_mode=strict).
 """
@@ -21,17 +26,6 @@ import pytest_asyncio
 
 from backend.knowledge.config import FilewatcherConfig
 from backend.vault.filewatcher import VaultFilewatcher
-
-# ---------------------------------------------------------------------------
-# Stub types
-# ---------------------------------------------------------------------------
-
-
-class RebuildResultStub:
-    """Minimal stand-in for RebuildResult — satisfies bus.publish type."""
-
-    pass
-
 
 # ---------------------------------------------------------------------------
 # Fake sidecar index (minimal surface for Task 11)
@@ -105,17 +99,6 @@ class FakeVaultWriter:
         self.calls.append("authored_by")
 
 
-class FakeGraphRegenerator:
-    """Minimal test double for GraphRegenerator."""
-
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-
-    async def rebuild_from_path(self, path: Path) -> RebuildResultStub:
-        self.calls.append("rebuild")
-        return RebuildResultStub()
-
-
 class FakeInvalidationBus:
     """Minimal test double for InvalidationBus."""
 
@@ -171,7 +154,6 @@ async def watcher(vault_root: Path, fake_sidecar: FakeSidecarIndex):
         config,
         vault_root,
         fake_sidecar,
-        regenerator=FakeGraphRegenerator(),
         invalidation_bus=FakeInvalidationBus(),
         writer=FakeVaultWriter(),
     )
@@ -182,26 +164,24 @@ async def watcher(vault_root: Path, fake_sidecar: FakeSidecarIndex):
 
 @pytest.fixture
 def filewatcher_setup(tmp_path: Path):
-    """Compose a VaultFilewatcher with all Phase 3 fakes for invariant-5 tests.
+    """Compose a VaultFilewatcher with all Phase 3 fakes for vault-edit-sequencing tests.
 
-    Returns: (fw, sidecar, regenerator, bus, vault_root, writer)
+    Returns: (fw, sidecar, bus, vault_root, writer)
     """
     vault_root = tmp_path / "vault"
     vault_root.mkdir(parents=True)
     config = _make_config()
     sidecar = FakeSidecarIndex()
-    regenerator = FakeGraphRegenerator()
     bus = FakeInvalidationBus()
     writer = FakeVaultWriter()
     fw = VaultFilewatcher(
         config,
         vault_root,
         sidecar,
-        regenerator=regenerator,
         invalidation_bus=bus,
         writer=writer,
     )
-    return fw, sidecar, regenerator, bus, vault_root, writer
+    return fw, sidecar, bus, vault_root, writer
 
 
 # ---------------------------------------------------------------------------
@@ -270,25 +250,23 @@ class TestFilewatcherExclusions:
 # ---------------------------------------------------------------------------
 # TestInvariant5Wiring (Task 19)
 #
-# Tests that _do_reindex sequences mark_authored_by_user_edit ->
-# rebuild_from_path -> publish on user-edit, and skips all three steps
-# when is_mist_write=True.
+# Tests that _do_reindex sequences mark_authored_by_user_edit -> publish on
+# user-edit, and skips both steps when is_mist_write=True. R1.3 Task 6
+# retired the regenerator.rebuild_from_path step that used to sit between
+# them.
 # ---------------------------------------------------------------------------
 
 
 class TestInvariant5Wiring:
-    def test_user_edit_triggers_authored_by_then_rebuild_then_publish(
+    def test_user_edit_triggers_authored_by_then_publish(
         self,
         filewatcher_setup,
     ):
-        """User-edit path must call authored_by, rebuild, publish in order."""
-        fw, sidecar, regenerator, bus, vault_root, writer = filewatcher_setup
+        """User-edit path must call authored_by, then publish, in order."""
+        fw, sidecar, bus, vault_root, writer = filewatcher_setup
         order: list[str] = []
         writer.mark_authored_by_user_edit = AsyncMock(
             side_effect=lambda p: order.append("authored_by")
-        )
-        regenerator.rebuild_from_path = AsyncMock(
-            side_effect=lambda p: order.append("rebuild") or RebuildResultStub()
         )
         bus.publish = AsyncMock(side_effect=lambda e: order.append("publish"))
 
@@ -297,16 +275,15 @@ class TestInvariant5Wiring:
         p.write_text("body", encoding="utf-8")
         asyncio.run(fw._do_reindex(str(p), is_mist_write=False))
 
-        assert order == ["authored_by", "rebuild", "publish"]
+        assert order == ["authored_by", "publish"]
 
     def test_mist_write_does_not_trigger_invariant5_steps(
         self,
         filewatcher_setup,
     ):
-        """MIST-write origin must not call authored_by, rebuild, or publish."""
-        fw, sidecar, regenerator, bus, vault_root, writer = filewatcher_setup
+        """MIST-write origin must not call authored_by or publish."""
+        fw, sidecar, bus, vault_root, writer = filewatcher_setup
         writer.mark_authored_by_user_edit = AsyncMock()
-        regenerator.rebuild_from_path = AsyncMock()
         bus.publish = AsyncMock()
 
         p = vault_root / "sessions" / "2026-05-10-test.md"
@@ -315,5 +292,4 @@ class TestInvariant5Wiring:
         asyncio.run(fw._do_reindex(str(p), is_mist_write=True))
 
         writer.mark_authored_by_user_edit.assert_not_called()
-        regenerator.rebuild_from_path.assert_not_called()
         bus.publish.assert_not_called()

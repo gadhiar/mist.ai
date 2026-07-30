@@ -53,15 +53,6 @@ class _RecordingWriter:
         self.mark_calls.append(path)
 
 
-class _RecordingRegenerator:
-    def __init__(self) -> None:
-        self.rebuild_calls: list[Path] = []
-
-    async def rebuild_from_path(self, path: Path):
-        self.rebuild_calls.append(path)
-        return None
-
-
 class _RecordingBus:
     def __init__(self) -> None:
         self.published: list[object] = []
@@ -82,12 +73,11 @@ def _config(**kwargs) -> FilewatcherConfig:
     return FilewatcherConfig(**defaults)
 
 
-def _watcher(vault_root: Path, sidecar=None, writer=None, regenerator=None, bus=None):
+def _watcher(vault_root: Path, sidecar=None, writer=None, bus=None):
     return VaultFilewatcher(
         _config(),
         vault_root,
         sidecar or _RecordingSidecar(),
-        regenerator=regenerator or _RecordingRegenerator(),
         invalidation_bus=bus or _RecordingBus(),
         writer=writer,
     )
@@ -171,22 +161,21 @@ class TestInvariant5GuardRails:
         with caplog.at_level("ERROR"):
             await w._do_reindex(str(note), is_mist_write=False)  # must not raise
 
-        assert any("invariant-5 sequence failed" in r.message for r in caplog.records)
+        assert any("vault-edit sequence failed" in r.message for r in caplog.records)
         # mtime dropped so the audit job re-schedules and retries the path
         assert str(note) not in w._known_mtimes
 
     @pytest.mark.asyncio
-    async def test_invariant5_success_runs_all_three_steps(self, tmp_path: Path):
+    async def test_invariant5_success_runs_both_steps(self, tmp_path: Path):
+        """R1.3 retired the graph-rebuild step; two steps remain: authored_by then publish."""
         writer = _RecordingWriter()
-        regen = _RecordingRegenerator()
         bus = _RecordingBus()
-        w = _watcher(tmp_path / "vault", writer=writer, regenerator=regen, bus=bus)
+        w = _watcher(tmp_path / "vault", writer=writer, bus=bus)
         note = _session_note(tmp_path / "vault")
 
         await w._do_reindex(str(note), is_mist_write=False)
 
         assert writer.mark_calls == [Path(str(note))]
-        assert regen.rebuild_calls == [Path(str(note))]
         assert len(bus.published) == 1
 
 

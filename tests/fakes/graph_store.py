@@ -1,24 +1,21 @@
 """FakeGraphStore -- in-memory test double for GraphStore.
 
-`current_ontology_version` is the only surface GraphRegenerator still needs
-(typed structurally via `_OntologyVersionSource` in
-backend/knowledge/curation/graph_regenerator.py).
+`current_ontology_version` is GraphStore's ontology-version accessor; see
+tests/unit/knowledge/storage/test_graph_store_protocol_methods.py for its
+coverage.
 
 R1.3 deleted the real `GraphStore.upsert_user` (Task 3) and
 `GraphStore.mark_orphaned_by_provenance_path` / `get_orphaned_provenance_paths`
-(Task 5). This fake's mirrors of those three methods are trimmed too, in
-this task: a fake mirroring methods that exist on no real class is a trap
-for the next reader, and their last method-level consumers (this file's own
-prior test coverage, plus test_knowledge_retriever_orphan_filter.py's
-FakeGraphStore-only lifecycle simulation) were deleted alongside them.
+(Task 5). This fake's mirrors of those three methods were trimmed alongside
+them: a fake mirroring methods that exist on no real class is a trap for the
+next reader.
 
-`mark_orphaned_calls` and `upsert_user_calls` stay as plain instance
-attributes -- always `[]`, since nothing populates them anymore --
-because test_graph_regenerator.py still asserts `== []` on both as a
-call-trap proving GraphRegenerator's no-op `rebuild_from_path` never
-reaches the graph store. That file is the last consumer of GraphRegenerator
-itself and is deleted wholesale in Task 6, which is where these two
-attributes should go too.
+`mark_orphaned_calls` and `upsert_user_calls` were plain instance attributes
+-- always `[]`, since nothing populated them -- kept only as a call-trap for
+tests/unit/knowledge/curation/test_graph_regenerator.py, which asserted
+`== []` on both to prove GraphRegenerator's no-op `rebuild_from_path` never
+reached the graph store. That file (GraphRegenerator's last consumer) is
+deleted in Task 6, so these two attributes retire with it.
 
 Also exposes assertion helpers for test readability:
   - add_triple / get_triple / has_trait
@@ -52,8 +49,6 @@ class FakeGraphStore:
 
     def __init__(self) -> None:
         self._triples: list[FakeTriple] = []
-        self.mark_orphaned_calls: list[str] = []
-        self.upsert_user_calls: list[dict] = []
 
     def current_ontology_version(self) -> str:
         return self._ONTOLOGY_VERSION

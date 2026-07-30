@@ -34,8 +34,7 @@ from watchdog.events import (
 from backend.errors import FilewatcherError, SidecarIndexError
 from backend.interfaces import SidecarIndexProtocol
 from backend.knowledge.config import FilewatcherConfig
-from backend.knowledge.curation.graph_regenerator import GraphRegenerator
-from backend.vault.invalidation_bus import InvalidationBus
+from backend.vault.invalidation_bus import InvalidationBus, VaultChangeEvent
 from backend.vault.models import parse_frontmatter
 from backend.vault.sidecar_index import _is_excluded_from_indexing
 from backend.vault.writer import VaultWriter
@@ -147,14 +146,12 @@ class VaultFilewatcher:
         config: FilewatcherConfig,
         vault_root: str | Path,
         sidecar_index: SidecarIndexProtocol,
-        regenerator: GraphRegenerator,
         invalidation_bus: InvalidationBus,
         writer: VaultWriter | None,
     ) -> None:
         self.config = config
         self.vault_root = Path(vault_root)
         self._sidecar = sidecar_index
-        self._regenerator = regenerator
         self._invalidation_bus = invalidation_bus
         self._writer = writer
 
@@ -450,7 +447,7 @@ class VaultFilewatcher:
             # the file mutation) must still classify as MIST-origin.
             # Bias is deliberate: a false MIST skips one authored_by flip
             # (self-heals on the next real edit); a false user-edit corrupts
-            # authorship and orphans provenance.
+            # authorship.
             now = time.monotonic()
             marker_active = (
                 path in self._mist_writes_in_flight and self._mist_writes_in_flight[path] > now
@@ -491,14 +488,14 @@ class VaultFilewatcher:
         load path via ConventionsLoader and would surface as noise if
         auto-injected.
 
-        On user-edit (is_mist_write=False), sequences three post-sidecar steps
-        per ADR-010 invariant 5:
-        1. mark_authored_by_user_edit — flip authored_by frontmatter field
-        2. regenerator.rebuild_from_path — graph no-op for every path (R1.3:
-           the vault is not a fact source; facts enter the graph only through
-           the utterance log). Retained so a RebuildResult event exists for
-           step 3 to publish.
-        3. invalidation_bus.publish — notify consumers to evict stale caches
+        On user-edit (is_mist_write=False), sequences two post-sidecar steps:
+        1. mark_authored_by_user_edit -- flip the authored_by frontmatter field
+        2. invalidation_bus.publish -- notify consumers to evict stale caches
+
+        R1.3 retired the graph-rebuild step that used to sit between them: a
+        vault edit changes the prose MIST reads, never what the graph asserts
+        (Inv-A1). What survives is the vault-side writeback plus the read-path
+        cache signal.
 
         MIST-write origin (is_mist_write=True) skips the invariant-5 steps to
         avoid recursive rebuild triggered by internal vault writes.
@@ -586,9 +583,9 @@ class VaultFilewatcher:
 
         if self._writer is None:
             # Wiring regression guard: without a writer the invariant-5 chain
-            # cannot run -- user edits would index but never flip authored_by,
-            # rebuild the graph, or evict caches. Fail loudly, not with an
-            # AttributeError inside a fire-and-forget task.
+            # cannot run -- user edits would index but never flip authored_by
+            # or evict caches. Fail loudly, not with an AttributeError inside
+            # a fire-and-forget task.
             logger.error(
                 "VaultFilewatcher has no VaultWriter wired -- ADR-010 "
                 "invariant-5 chain DISABLED for user edit at %s",
@@ -596,23 +593,20 @@ class VaultFilewatcher:
             )
             return
 
-        # ADR-010 Invariant 5: user-edit sequencing. The authored_by
-        # writeback runs through the writer queue, whose handler self-marks
-        # the path as a MIST write, so no local suppression wrap is needed.
+        # Vault-edit sequencing. The authored_by writeback runs through the
+        # writer queue, whose handler self-marks the path as a MIST write, so
+        # no local suppression wrap is needed.
         try:
-            # Step 1 — authored_by writeback
+            # Step 1 -- authored_by writeback
             await self._writer.mark_authored_by_user_edit(Path(path))
-            # Step 2 — graph subgraph rebuild
-            rebuild_result = await self._regenerator.rebuild_from_path(Path(path))
-            # Step 3 — coordinated cache invalidation
-            await self._invalidation_bus.publish(rebuild_result)
+            # Step 2 -- coordinated read-path cache invalidation
+            await self._invalidation_bus.publish(VaultChangeEvent(path=Path(path)))
         except Exception as exc:  # noqa: BLE001 -- watcher must survive
             # Drop the recorded mtime so the next audit pass re-schedules
-            # this path and the invariant-5 sequence is retried.
+            # this path and the sequence is retried.
             self._known_mtimes.pop(path, None)
             logger.exception(
-                "VaultFilewatcher: invariant-5 sequence failed for %s "
-                "(will retry via audit): %s",
+                "VaultFilewatcher: vault-edit sequence failed for %s " "(will retry via audit): %s",
                 path,
                 exc,
             )

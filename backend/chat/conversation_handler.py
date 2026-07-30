@@ -43,10 +43,9 @@ from backend.vault.conventions import ConventionsLoader
 if TYPE_CHECKING:
     from backend.debug_jsonl_logger import DebugJSONLLogger, TurnRecord
     from backend.interfaces import VaultWriterProtocol
-    from backend.knowledge.curation.graph_regenerator import RebuildResult
     from backend.knowledge.extraction.pipeline import ExtractionPipeline
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
-    from backend.vault.invalidation_bus import InvalidationBus
+    from backend.vault.invalidation_bus import InvalidationBus, VaultChangeEvent
 
 logger = logging.getLogger(__name__)
 
@@ -829,8 +828,8 @@ class ConversationHandler:
         self._mist_context_cache: dict[str, MistContext] = {}
 
         # Phase 3 Task 21: optional InvalidationBus subscription.
-        # When set, _on_vault_rebuild is called after each vault-file rebuild
-        # (filewatcher -> GraphRegenerator -> bus) to evict stale cache entries.
+        # When set, _on_vault_rebuild is called after each vault-file edit
+        # (filewatcher -> bus) to evict stale cache entries.
         self._invalidation_bus: InvalidationBus | None = invalidation_bus
         if invalidation_bus is not None:
             invalidation_bus.subscribe(self._on_vault_rebuild)
@@ -1174,12 +1173,17 @@ class ConversationHandler:
         self._mist_context_cache[session_id] = ctx
         return ctx
 
-    async def _on_vault_rebuild(self, event: RebuildResult) -> None:
-        """Evict mist_context cache entries affected by a vault rebuild.
+    async def _on_vault_rebuild(self, event: VaultChangeEvent) -> None:
+        """Evict mist_context cache entries affected by a vault edit.
 
         Subscribed to InvalidationBus on __init__ (when bus is provided).
-        Coordination guarantee: filewatcher publishes AFTER graph rebuild
-        completes, so the next mist_context fetch reads correct re-derived state.
+        Coordination guarantee: the filewatcher publishes AFTER the sidecar
+        reindex and authored_by writeback complete, so the next mist_context
+        fetch reads the edited file's current content.
+
+        R1.3: a vault edit writes no graph facts, so this is purely a
+        read-path concern -- the cached persona/profile prose is what goes
+        stale, not any graph state.
 
         Eviction rules:
         - users/<user>.md  -> clear sessions whose user_id matches the stem

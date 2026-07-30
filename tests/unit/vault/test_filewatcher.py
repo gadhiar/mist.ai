@@ -117,13 +117,6 @@ class _StubWriter:
         pass
 
 
-class _StubGraphRegenerator:
-    """Minimal stub for GraphRegenerator (Task 19 required param)."""
-
-    async def rebuild_from_path(self, path: Path):  # noqa: ARG002
-        return None
-
-
 class _StubInvalidationBus:
     """Minimal stub for InvalidationBus (Task 19 required param)."""
 
@@ -141,7 +134,6 @@ def _make_filewatcher(
     vault_root: Path,
     sidecar: FakeSidecarIndex,
     *,
-    regenerator=None,
     invalidation_bus=None,
     writer=None,
 ) -> VaultFilewatcher:
@@ -150,7 +142,6 @@ def _make_filewatcher(
         config,
         vault_root,
         sidecar,
-        regenerator=regenerator or _StubGraphRegenerator(),
         invalidation_bus=invalidation_bus or _StubInvalidationBus(),
         writer=writer or _StubWriter(),
     )

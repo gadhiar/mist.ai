@@ -97,7 +97,6 @@ class TestFilewatcherUsesWorker:
             FilewatcherConfig(enabled=True, observer_type="polling", debounce_ms=100),
             root,
             sidecar,
-            regenerator=None,
             invalidation_bus=None,
             writer=None,
         )
@@ -117,7 +116,6 @@ class TestFilewatcherUsesWorker:
             FilewatcherConfig(enabled=True, observer_type="polling", debounce_ms=100),
             tmp_path / "vault",
             sidecar,
-            regenerator=None,
             invalidation_bus=None,
             writer=None,
         )

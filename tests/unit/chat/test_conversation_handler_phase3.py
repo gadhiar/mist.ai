@@ -10,12 +10,11 @@ from pathlib import Path
 import pytest
 
 from backend.chat.conversation_handler import ConversationHandler
-from backend.knowledge.curation.graph_regenerator import RebuildResult
 from backend.knowledge.models import ConversationSession
 from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from backend.knowledge.storage.graph_store import GraphStore
 from backend.vault.conventions import ConventionsLoader
-from backend.vault.invalidation_bus import InvalidationBus
+from backend.vault.invalidation_bus import InvalidationBus, VaultChangeEvent
 from tests.mocks.config import build_test_config
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeNeo4jConnection
@@ -391,14 +390,7 @@ class TestInvalidationBusSubscription:
         self._pre_populate(invalidation_handler, "s2", "alice")
         assert len(invalidation_handler._mist_context_cache) == 2
 
-        event = RebuildResult(
-            path=Path("/app/mist-memory/identity/mist.md"),
-            bucket="ignored",
-            orphaned_triple_count=0,
-            new_triple_count=0,
-            ontology_version="1.1.0",
-            deferred=False,
-        )
+        event = VaultChangeEvent(path=Path("/app/mist-memory/identity/mist.md"))
         asyncio.run(invalidation_handler._on_vault_rebuild(event))
 
         # Both session caches survive: a mist.md edit no longer changes the persona.
@@ -412,14 +404,7 @@ class TestInvalidationBusSubscription:
         self._pre_populate(invalidation_handler, "s1", "raj")
         self._pre_populate(invalidation_handler, "s2", "alice")
 
-        event = RebuildResult(
-            path=Path("/app/mist-memory/users/raj.md"),
-            bucket="1",
-            orphaned_triple_count=0,
-            new_triple_count=0,
-            ontology_version="1.1.0",
-            deferred=False,
-        )
+        event = VaultChangeEvent(path=Path("/app/mist-memory/users/raj.md"))
         asyncio.run(invalidation_handler._on_vault_rebuild(event))
 
         # raj's session cache is evicted; alice's survives.
@@ -432,14 +417,7 @@ class TestInvalidationBusSubscription:
         """sessions/* rebuild events are a no-op for the mist_context cache."""
         self._pre_populate(invalidation_handler, "s1", "raj")
 
-        event = RebuildResult(
-            path=Path("/app/mist-memory/sessions/2026-05-10-test.md"),
-            bucket="2",
-            orphaned_triple_count=1,
-            new_triple_count=0,
-            ontology_version="1.1.0",
-            deferred=True,
-        )
+        event = VaultChangeEvent(path=Path("/app/mist-memory/sessions/2026-05-10-test.md"))
         asyncio.run(invalidation_handler._on_vault_rebuild(event))
 
         # Cache untouched.

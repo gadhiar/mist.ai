@@ -709,17 +709,16 @@ def build_filewatcher(
     Args:
         config: Knowledge subsystem configuration.
         sidecar_index: The sidecar to reindex into on file events.
-        regenerator: GraphRegenerator (curation) for vault-edit graph rebuild.
-            When None, a minimal no-op double is used (bus still fires).
+        regenerator: Unused (R1.3 Task 6 deleted GraphRegenerator; the
+            filewatcher no longer accepts a graph-store dependency). Kept as
+            an accepted-but-ignored parameter so existing callers do not
+            break at the call site; Task 7 removes it.
         writer: VaultWriter for session note writes. May be None.
 
     Returns:
         Unstarted VaultFilewatcher, or None if filewatcher/vault/sidecar
         is disabled.
     """
-    from backend.knowledge.curation.graph_regenerator import (
-        GraphRegenerator as CurationGraphRegenerator,
-    )
     from backend.vault.invalidation_bus import InvalidationBus
 
     if not config.filewatcher.enabled:
@@ -740,15 +739,11 @@ def build_filewatcher(
     # and carry the bus themselves. This wrapper builds a throwaway bus so the
     # constructor signature is satisfied; it will receive events but nobody can
     # subscribe to it. Task 21 migrates server.py to use build_phase3_components.
-    regen = regenerator or CurationGraphRegenerator(
-        graph_store=build_graph_store(config),
-    )
     bus = InvalidationBus()
     return VaultFilewatcher(
         config.filewatcher,
         config.vault.root,
         sidecar_index,
-        regenerator=regen,
         invalidation_bus=bus,
         writer=writer,
     )
@@ -794,8 +789,10 @@ def build_phase3_components(
     Args:
         config: Knowledge subsystem configuration.
         sidecar_index: Initialized VaultSidecarIndex. None returns None.
-        regenerator: Optional pre-built curation GraphRegenerator. When None,
-            one is constructed from `config` (requires graph access).
+        regenerator: Unused (R1.3 Task 6 deleted GraphRegenerator; the
+            filewatcher no longer accepts a graph-store dependency). Kept as
+            an accepted-but-ignored parameter so existing callers do not
+            break at the call site; Task 7 removes it.
         writer: Pre-built VaultWriter. REQUIRED whenever the vault is
             enabled: without it the filewatcher cannot run the ADR-010
             invariant-5 chain (authored_by writeback -> graph rebuild ->
@@ -810,9 +807,6 @@ def build_phase3_components(
             composition would silently disable invariant 5 (the exact
             production wiring bug the deep review surfaced).
     """
-    from backend.knowledge.curation.graph_regenerator import (
-        GraphRegenerator as CurationGraphRegenerator,
-    )
     from backend.vault import VaultFilewatcher
     from backend.vault.invalidation_bus import InvalidationBus
 
@@ -835,15 +829,11 @@ def build_phase3_components(
             "authored_by, rebuild the graph, or evict caches."
         )
 
-    regen = regenerator or CurationGraphRegenerator(
-        graph_store=build_graph_store(config),
-    )
     bus = InvalidationBus()
     filewatcher = VaultFilewatcher(
         config.filewatcher,
         config.vault.root,
         sidecar_index,
-        regenerator=regen,
         invalidation_bus=bus,
         writer=writer,
     )

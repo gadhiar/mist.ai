@@ -111,11 +111,6 @@ class _StubWriter:
         pass
 
 
-class _StubGraphRegenerator:
-    async def rebuild_from_path(self, path: Path):  # noqa: ARG002
-        return None
-
-
 class _StubInvalidationBus:
     async def publish(self, event: object) -> None:  # noqa: ARG002
         pass
@@ -152,7 +147,6 @@ def _make_filewatcher(
         config=config,
         vault_root=vault_root,
         sidecar_index=sidecar,
-        regenerator=_StubGraphRegenerator(),
         invalidation_bus=_StubInvalidationBus(),
         writer=_StubWriter(),
     )

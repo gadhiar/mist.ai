@@ -215,24 +215,6 @@ class TestPhase3Components:
         assert result.filewatcher._invalidation_bus is result.invalidation_bus
 
     @requires_sentence_transformers
-    def test_build_phase3_components_regenerator_wired(self, tmp_path):
-        from backend.factories import build_phase3_components
-
-        config = _make_config(tmp_path)
-        sidecar = _FakeSidecarIndex()
-        regenerator = _FakeGraphRegenerator()
-        writer = _FakeVaultWriter()
-
-        result = build_phase3_components(
-            config=config,
-            sidecar_index=sidecar,
-            regenerator=regenerator,
-            writer=writer,
-        )
-
-        assert result.filewatcher._regenerator is regenerator
-
-    @requires_sentence_transformers
     def test_build_phase3_components_writer_wired(self, tmp_path):
         from backend.factories import build_phase3_components
 
@@ -330,7 +312,7 @@ class TestPhase3Components:
         import asyncio
 
         from backend.factories import build_phase3_components
-        from backend.knowledge.curation.graph_regenerator import RebuildResult
+        from backend.vault.invalidation_bus import VaultChangeEvent
 
         config = _make_config(tmp_path)
         sidecar = _FakeSidecarIndex()
@@ -344,21 +326,14 @@ class TestPhase3Components:
             writer=writer,
         )
 
-        received: list[RebuildResult] = []
+        received: list[VaultChangeEvent] = []
 
-        async def listener(event: RebuildResult) -> None:
+        async def listener(event: VaultChangeEvent) -> None:
             received.append(event)
 
         result.invalidation_bus.subscribe(listener)
 
-        event = RebuildResult(
-            path=Path(tmp_path / "vault" / "test.md"),
-            bucket="2",
-            orphaned_triple_count=0,
-            new_triple_count=1,
-            ontology_version="v1.1.0",
-            deferred=False,
-        )
+        event = VaultChangeEvent(path=Path(tmp_path / "vault" / "test.md"))
 
         asyncio.get_event_loop().run_until_complete(
             result.filewatcher._invalidation_bus.publish(event)

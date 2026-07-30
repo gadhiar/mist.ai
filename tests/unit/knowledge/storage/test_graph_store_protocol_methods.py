@@ -8,10 +8,14 @@ two methods (directly or via FakeGraphStore's mirror of them) are deleted
 with them; see git history (pre-Task-5) for the removed coverage.
 
 What remains and why:
-- TestCurrentOntologyVersion: `current_ontology_version` was NOT deleted --
-  it still has a live caller (GraphRegenerator, via the structural
-  `_OntologyVersionSource` protocol) until Task 6 deletes GraphRegenerator
-  itself. Task 6 decides this class's fate once that caller is gone.
+- TestCurrentOntologyVersion: `current_ontology_version` was NOT deleted.
+  R1.3 Task 6 deleted its last caller (GraphRegenerator, via the structural
+  `_OntologyVersionSource` protocol it defined), leaving the accessor with
+  zero callers in backend/ or scripts/ today. Task 6 chose to retain it as a
+  public GraphStore accessor anyway: it is a trivial `return
+  self._ontology_version`, and later R1.3 work (the seed-utterance migration,
+  the rebuild-closure task) will plausibly want it. This class stays as its
+  coverage.
 - TestRetrievalQueryOrphanFilter: the read-side orphan filter in
   get_user_relationships_to_entities / get_entity_neighborhood /
   get_all_user_relationships is untouched by Task 5. It stays load-bearing
