@@ -1905,12 +1905,11 @@ class ConversationHandler:
     async def aclose(self) -> None:
         """Drain all in-flight extraction tasks (server shutdown hook).
 
-        Mirrors GraphRegenerator.aclose (Phase 5.5 Fix A): without the drain,
-        loop teardown cancels extraction mid commit-protocol -- which can
-        permanently retire a belief without writing its successor -- and
-        silently drops the turn's vault append (R1.3: the append is prose
-        for the read path now, not a fact anchor, but losing it mid-drain is
-        still a silent write loss worth avoiding).
+        Without the drain, loop teardown cancels extraction mid
+        commit-protocol -- which can permanently retire a belief without
+        writing its successor -- and silently drops the turn's vault append
+        (R1.3: the append is prose for the read path now, not a fact anchor,
+        but losing it mid-drain is still a silent write loss worth avoiding).
         """
         await self._drain_extraction_tasks(session_id=None)
 

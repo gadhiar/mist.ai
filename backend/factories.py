@@ -850,7 +850,8 @@ def build_phase3_components(
     # MIST-write self-marking: consumer handlers mark each path right before
     # mutating it so the filewatcher classifies the resulting event as
     # MIST-origin. Without this every per-turn session append runs the
-    # user-edit invariant-5 sequence (authored_by corruption + provenance
-    # orphaning + a wasted full-note re-extraction per turn).
+    # user-edit invariant-5 sequence (spurious authored_by corruption; the
+    # graph-side steps that sequence used to also trigger -- provenance
+    # orphaning and a full-note re-extraction -- retired under R1.3).
     writer.set_mist_write_marker(filewatcher.mark_mist_write)
     return Phase3Components(filewatcher=filewatcher, invalidation_bus=bus)

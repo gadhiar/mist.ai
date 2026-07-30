@@ -250,13 +250,3 @@ def test_regenerator_has_no_async_lifecycle() -> None:
     """No in-flight tasks means no drain: aclose and retry_orphaned retire."""
     assert not hasattr(GraphRegenerator, "aclose")
     assert not hasattr(GraphRegenerator, "retry_orphaned")
-
-
-def test_extraction_pipeline_has_no_extract_from_file() -> None:
-    """The vault-file fact writer is deleted, not left dormant."""
-    from backend.knowledge.extraction.pipeline import ExtractionPipeline
-
-    assert not hasattr(ExtractionPipeline, "extract_from_file"), (
-        "R1.3: extract_from_file is a vault-file->graph fact path and retires "
-        "with its sole caller"
-    )

@@ -175,3 +175,20 @@ class TestVaultNotePathParameterRetired:
 
         params = inspect.signature(ExtractionPipeline.extract_from_utterance).parameters
         assert "vault_note_path" not in params
+
+    def test_extraction_pipeline_has_no_extract_from_file(self) -> None:
+        """The vault-file fact writer is deleted, not left dormant.
+
+        Relocated from test_graph_regenerator.py (R1.3 Task 4): that file's
+        subject is GraphRegenerator, which Task 6 deletes wholesale, but this
+        guard's subject is ExtractionPipeline, which survives the whole plan.
+        It is the sole structural guard that extract_from_file -- a tested,
+        callable vault-file-to-graph fact writer -- stays deleted rather than
+        one wiring change away from violating Inv-A1.
+        """
+        from backend.knowledge.extraction.pipeline import ExtractionPipeline
+
+        assert not hasattr(ExtractionPipeline, "extract_from_file"), (
+            "R1.3: extract_from_file is a vault-file->graph fact path and retires "
+            "with its sole caller"
+        )

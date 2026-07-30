@@ -494,9 +494,10 @@ class VaultFilewatcher:
         On user-edit (is_mist_write=False), sequences three post-sidecar steps
         per ADR-010 invariant 5:
         1. mark_authored_by_user_edit — flip authored_by frontmatter field
-        2. regenerator.rebuild_from_path — orphan + re-derive graph subgraph
-           for sessions/ and decisions/ paths; a graph no-op for identity/
-           and users/ paths, which are read-path prose, not facts (R1.3)
+        2. regenerator.rebuild_from_path — graph no-op for every path (R1.3:
+           the vault is not a fact source; facts enter the graph only through
+           the utterance log). Retained so a RebuildResult event exists for
+           step 3 to publish.
         3. invalidation_bus.publish — notify consumers to evict stale caches
 
         MIST-write origin (is_mist_write=True) skips the invariant-5 steps to
