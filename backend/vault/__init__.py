@@ -2,8 +2,11 @@
 
 Markdown-corpus persistent memory. The vault is canonical, user-approved
 history rendered to disk as markdown notes. MIST writes session-note
-turns; the user can edit prose via Obsidian or any text editor and the
-graph rebuilds from the updated vault content.
+turns; the user can edit prose via Obsidian or any text editor. R1.3
+retired the graph-rebuild that edit used to trigger -- a vault edit
+changes the prose MIST reads, never what the graph asserts -- so what
+survives is the sidecar reindex plus a read-path cache-invalidation
+signal (see `VaultFilewatcher`).
 
 Public surface:
 

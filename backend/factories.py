@@ -335,7 +335,7 @@ def build_conversation_handler(
     Phase 3 Task 21 (invalidation bus):
     - `invalidation_bus` must be the SAME instance wired into the filewatcher
       (from `build_phase3_components`). The handler subscribes its
-      `_on_vault_rebuild` listener so vault-edit rebuilds evict stale
+      `_on_vault_rebuild` listener so vault-change events evict stale
       `_mist_context_cache` entries. When None, no subscription is registered.
 
     Args:

@@ -454,7 +454,8 @@ class FilewatcherConfig:
     to async via `loop.call_soon_threadsafe`. On vault file changes, schedules
     a debounced sidecar reindex; on vault-note edits made outside MIST, marks
     the corresponding `mist-session` / `mist-user` note as `authored_by:
-    user-edit` and queues affected graph subgraph rebuild.
+    user-edit` and publishes a read-path cache-invalidation event. R1.3
+    retired the graph subgraph rebuild this used to also queue.
 
     `observer_type` selects the watchdog observer backend:
       - `auto`: PollingObserver on Windows/WSL2 bind mounts; Inotify on
@@ -571,8 +572,11 @@ class KnowledgeConfig:
     enable_provenance: bool = True  # Track extraction provenance
 
     # ADR-010 Cluster 8 Phase 8: rebuild determinism stamps. Stamped on every
-    # DERIVED_FROM->VaultNote edge so vault-rebuild can detect version drift
+    # EXTRACTED_FROM->ConversationContext edge (R1.3 moved this anchor from
+    # DERIVED_FROM->VaultNote) so a future consumer can detect version drift
     # and migrate forward when ontology / extraction prompt / model changes.
+    # `mist_admin vault-rebuild` no longer reads these -- R1.3 made it a
+    # sidecar-only reindex with no graph-side comparison.
     # `extraction_version` should bump when EXTRACTION_SYSTEM_PROMPT or the
     # ontology contract changes. `model_hash` is an immutable identifier for
     # the LLM binary actually running extraction (recipe + quantization +

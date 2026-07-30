@@ -90,9 +90,11 @@ def _is_excluded_from_indexing(path: str | Path) -> bool:
     (users/<user_id>-graph-snapshot.md) is a machine-owned derived cache and
     is excluded so it never competes with the curated users/<user_id>.md.
 
-    This function is shared by `upsert_file` (initial index), the filewatcher
-    live re-index, and the `vault-rebuild` graph-regeneration scope; excluding
-    the snapshot here covers all three paths.
+    This function is shared by `upsert_file` (called for both the initial
+    index and `mist_admin vault-rebuild`'s bulk sidecar reindex -- R1.3
+    retired the separate graph-regeneration scope that used to call it too)
+    and the filewatcher's live re-index; excluding the snapshot here covers
+    both paths.
 
     Args:
         path: Vault-relative or absolute path to the note file.

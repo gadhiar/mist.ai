@@ -29,10 +29,11 @@ class RebuildStamps:
     ADR-010 "Rebuild Determinism Model" requires every entity-provenance edge
     to carry the ontology, extraction-prompt, and model identifiers that were
     active when the entity was extracted. R1.3 moved this anchor from
-    DERIVED_FROM->VaultNote onto EXTRACTED_FROM->ConversationContext, but the
-    stamps themselves are unchanged: `mist_admin vault-rebuild` compares these
-    against current values and migrates entities forward (marking old edges
-    `status=superseded`) when any stamp drifts.
+    DERIVED_FROM->VaultNote onto EXTRACTED_FROM->ConversationContext, and the
+    stamps' purpose is unchanged: they let a future consumer detect drift
+    against current config values. `mist_admin vault-rebuild` no longer reads
+    them -- R1.3 (Task 8) made it a sidecar-only reindex with no graph-side
+    comparison; drift consumption is not wired to any command today.
 
     Stable for the lifetime of the writer -- the LLM binary and ontology
     version do not change mid-process. Constructed from `KnowledgeConfig`

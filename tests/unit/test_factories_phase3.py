@@ -126,7 +126,7 @@ class TestRegeneratorFullyRetired:
     """R1.3 Task 7: no factory wiring path constructs a graph regenerator."""
 
     @requires_sentence_transformers
-    def test_build_phase3_components_takes_no_regenerator(self, tmp_path):
+    def test_build_phase3_components_takes_no_regenerator(self):
         """R1.3: there is no graph regenerator left to wire."""
         import inspect
 
