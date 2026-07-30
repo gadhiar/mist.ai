@@ -49,6 +49,34 @@ importing module's own package, so `from ..knowledge.storage import x` (from
 `backend.vault.filewatcher`, package `backend.vault`, resolves to
 `backend.knowledge.storage.x`) is caught structurally rather than relying on
 the behavioral trap alone.
+
+Fix round 4 (team-lead review, five more forms, one line): `backend/factories.py`
+re-exports five graph-layer classes at module level, not just `GraphStore` --
+`CurationGraphWriter`, `CurationPipeline`, `GraphExecutor`, `Neo4jConnection`,
+plus `GraphStore` itself. `from backend.factories import CurationGraphWriter`
+(the actual triple-writing class, and the module a future implementer wiring
+graph access into the filewatcher is most likely to open) produced a dotted
+name of `backend.factories.CurationGraphWriter`, matching no forbidden
+prefix -- only `GraphStore` construction was separately trapped, and even
+that is bypassable via `object.__new__(GraphStore)`, which never calls
+`__init__`. Added `"backend.factories"` to `_FORBIDDEN_IMPORT_PREFIXES`.
+Correct independent of this guard, not just a patch: `backend/vault/filewatcher.py`
+is a leaf module and `backend.factories` is the composition root, so a leaf
+importing the composition root is a layering inversion that should fail a
+test regardless of what it imports from there. Nothing legitimate breaks --
+`filewatcher.py` does not import `backend.factories` today. Strengthens C6
+and B2a from trap-only coverage to AST-plus-trap.
+
+Irreducible residual, stated for the record rather than chased: a dynamic
+`importlib.import_module("backend.factories")` followed by
+`getattr(module, "CurationGraphWriter")` (or any of the other four classes)
+produces no `Import`/`ImportFrom` AST node, so it would evade the AST check
+exactly as form C2 evaded it for `GraphStore` -- but unlike `GraphStore`,
+none of the other four classes has a construction-time trap in this file, so
+that specific form would currently pass. Closing it requires deliberately
+obscure code (a dynamically-resolved attribute name on a dynamically-imported
+module), and Task 9's integration-test rewrite covers the same guarantee at
+the wiring level. Explicitly not worth chasing here.
 """
 
 from __future__ import annotations
@@ -265,7 +293,11 @@ def test_filewatcher_constructor_accepts_exactly_the_known_dependencies() -> Non
 # Check 2: AST-based import layering guard
 # ---------------------------------------------------------------------------
 
-_FORBIDDEN_IMPORT_PREFIXES = ("backend.knowledge.storage", "backend.knowledge.curation")
+_FORBIDDEN_IMPORT_PREFIXES = (
+    "backend.knowledge.storage",
+    "backend.knowledge.curation",
+    "backend.factories",
+)
 
 
 def _imported_dotted_names(source: str, package: str) -> list[str]:
