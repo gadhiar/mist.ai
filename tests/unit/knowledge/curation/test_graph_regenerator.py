@@ -148,13 +148,58 @@ def test_rebuild_user_file_is_graph_noop(
     assert fake_graph_store.mark_orphaned_calls == [], "no orphan-marking on a no-op"
 
 
-def test_graph_store_has_no_upsert_user() -> None:
-    """The Bucket-1 fact sink is deleted, not merely unreferenced."""
-    from backend.knowledge.storage.graph_store import GraphStore
+def test_rebuild_identity_non_mist_file_is_graph_noop(
+    regenerator: GraphRegenerator,
+    fake_graph_store: FakeGraphStore,
+    tmp_path: Path,
+) -> None:
+    """Any identity/ file is a graph no-op, not just identity/mist.md.
 
-    assert not hasattr(
-        GraphStore, "upsert_user"
-    ), "R1.3: GraphStore.upsert_user is the Bucket-1 fact sink and retires with it"
+    The guard must match on the "identity" path segment, not only on the
+    literal filename "mist.md" -- an identity/ file with a different name
+    (e.g. a future identity/persona.md) is still read-path prose and must
+    not fall through to Bucket 2/3 LLM re-extraction.
+    """
+    p = tmp_path / "identity" / "persona.md"
+    p.parent.mkdir()
+    p.write_text(_IDENTITY_BODY, encoding="utf-8")
+
+    result: RebuildResult = asyncio.run(regenerator.rebuild_from_path(p))
+
+    assert result.bucket == "ignored"
+    assert result.deferred is False
+    assert result.orphaned_triple_count == 0
+    assert result.new_triple_count == 0
+    assert fake_graph_store.mark_orphaned_calls == []
+
+
+def test_rebuild_nested_user_file_is_graph_noop(
+    regenerator: GraphRegenerator,
+    fake_graph_store: FakeGraphStore,
+    tmp_path: Path,
+) -> None:
+    """A users/ file nested below a subdirectory is still a graph no-op.
+
+    The guard must match on the "users" path segment anywhere in the path,
+    not only when "users" is the immediate parent directory -- a nested
+    users/<subdir>/<file>.md edit must not fall through to Bucket 2/3 LLM
+    re-extraction.
+    """
+    p = tmp_path / "users" / "archive" / "raj.md"
+    p.parent.mkdir(parents=True)
+    p.write_text(
+        "---\nuser_id: raj\n---\n\n## Tools and Technologies\n- Python\n",
+        encoding="utf-8",
+    )
+
+    result: RebuildResult = asyncio.run(regenerator.rebuild_from_path(p))
+
+    assert result.bucket == "ignored"
+    assert result.deferred is False
+    assert result.orphaned_triple_count == 0
+    assert result.new_triple_count == 0
+    assert fake_graph_store.upsert_user_calls == []
+    assert fake_graph_store.mark_orphaned_calls == []
 
 
 def test_rebuild_bucket2_session_defers_extraction(

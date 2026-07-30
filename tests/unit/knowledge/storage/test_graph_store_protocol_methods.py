@@ -206,6 +206,19 @@ class TestGetOrphanedProvenancePaths:
         assert any_orphaned_query, "Expected a query filtering on 'orphaned' status"
 
 
+def test_graph_store_has_no_upsert_user() -> None:
+    """The Bucket-1 fact sink is deleted, not merely unreferenced (R1.3).
+
+    Lives in this storage-layer test file, not the curation test file that
+    exercises GraphRegenerator dispatch: this is a storage-layer contract
+    (GraphStore's own surface), and the curation test file (Task 6, R1.3)
+    is deleted wholesale when GraphRegenerator itself retires.
+    """
+    assert not hasattr(
+        GraphStore, "upsert_user"
+    ), "R1.3: GraphStore.upsert_user is the Bucket-1 fact sink and retires with it"
+
+
 # ---------------------------------------------------------------------------
 # SelfModel partition tests (T6)
 # ---------------------------------------------------------------------------

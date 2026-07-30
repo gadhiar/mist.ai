@@ -495,6 +495,8 @@ class VaultFilewatcher:
         per ADR-010 invariant 5:
         1. mark_authored_by_user_edit — flip authored_by frontmatter field
         2. regenerator.rebuild_from_path — orphan + re-derive graph subgraph
+           for sessions/ and decisions/ paths; a graph no-op for identity/
+           and users/ paths, which are read-path prose, not facts (R1.3)
         3. invalidation_bus.publish — notify consumers to evict stale caches
 
         MIST-write origin (is_mist_write=True) skips the invariant-5 steps to

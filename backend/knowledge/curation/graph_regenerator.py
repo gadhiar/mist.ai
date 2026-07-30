@@ -106,9 +106,11 @@ class GraphRegenerator:
         """Rebuild the graph subgraph derived from the given vault file.
 
         Steps:
-        1. Orphan-mark all triples with DERIVED_FROM.path == path.
-        2. Re-derive based on bucket classification.
-        3. Return RebuildResult (deferred=True for Bucket 2/3).
+        1. Short-circuit identity/ and users/ paths as graph no-ops (R1.3):
+           return immediately, before any orphan-mark or re-derivation.
+        2. Otherwise, orphan-mark all triples with DERIVED_FROM.path == path.
+        3. Re-derive based on bucket classification.
+        4. Return RebuildResult (deferred=True for Bucket 2/3).
 
         Args:
             path: Absolute Path to the vault file that was user-edited.
@@ -120,7 +122,7 @@ class GraphRegenerator:
         # files are prose the read path injects; their edits change what MIST
         # reads, never what the graph asserts. Both short-circuit before any
         # orphan-mark or re-derivation so the edit is inert graph-side.
-        if path.name == "mist.md" or (len(path.parts) >= 2 and path.parts[-2] == "users"):
+        if path.name == "mist.md" or "users" in path.parts or "identity" in path.parts:
             logger.info(
                 "GraphRegenerator: %s is read-path prose under R1.3; "
                 "treating edit as a graph no-op",
