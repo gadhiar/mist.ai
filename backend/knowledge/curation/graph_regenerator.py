@@ -15,10 +15,15 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-
-from backend.interfaces import GraphStoreProtocol
+from typing import Protocol
 
 logger = logging.getLogger(__name__)
+
+
+class _OntologyVersionSource(Protocol):
+    """The only graph-store surface this transitional shim still needs."""
+
+    def current_ontology_version(self) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -45,7 +50,7 @@ class GraphRegenerator:
 
     def __init__(
         self,
-        graph_store: GraphStoreProtocol,
+        graph_store: _OntologyVersionSource,
     ) -> None:
         self._graph_store = graph_store
 

@@ -1,11 +1,16 @@
 """Phase 5.5 tie-up (P3 #1): Retrieval orphan filter tests.
 
-Asserts that:
-1. GraphStore.get_user_relationships_to_entities excludes orphaned edges.
-2. GraphStore.get_entity_neighborhood excludes orphaned edges.
-3. Orphaned triples written via FakeGraphStore do not surface through the
-   KnowledgeRetriever._gather_facts pipeline.
-4. Non-orphaned triples on a different path still surface correctly.
+Asserts that the retrieval-path orphan filter is respected end to end:
+GraphStore.get_user_relationships_to_entities and get_entity_neighborhood
+are expected to filter on edge status, and KnowledgeRetriever._gather_facts
+must propagate whatever they return rather than re-filtering itself.
+
+R1.3 retired the write side of this contract (GraphStore.mark_orphaned_by_
+provenance_path, Task 5): nothing marks new edges orphaned going forward.
+The filter on the read side stays load-bearing for pre-R1.3 data already in
+the graph, so these tests stay; the former FakeGraphStore lifecycle
+simulation (upsert -> mark_orphaned -> verify) tested only the fake's own
+bookkeeping for methods with no real counterpart left and was removed.
 """
 
 from __future__ import annotations
@@ -170,110 +175,3 @@ class TestGatherFactsOrphanFiltering:
         assert any(
             f.predicate == "USES" and f.object == "rust" for f in facts
         ), "Active edge from non-orphaned path must surface in facts"
-
-
-# ---------------------------------------------------------------------------
-# TestFakeGraphStoreOrphanFiltering
-# End-to-end simulation via FakeGraphStore: upsert, orphan-mark, and check
-# that the orphaned triples have status='orphaned' and active ones do not.
-# ---------------------------------------------------------------------------
-
-
-class TestFakeGraphStoreOrphanFiltering:
-    """FakeGraphStore end-to-end: upsert -> mark_orphaned -> verify status propagation.
-
-    These tests use FakeGraphStore to simulate the full lifecycle without Neo4j.
-    They assert that:
-    1. Orphaned triples carry status='orphaned' after mark_orphaned.
-    2. Active triples from a different path retain status='active'.
-    3. The FakeGraphStore.get_active_triples() helper (or direct inspection)
-       shows only active triples.
-    """
-
-    def _build_parsed_user(self, user_id: str = "User", tools: list[str] | None = None):
-        """Build a minimal ParsedUser via the real bucket1_reader dataclass."""
-        from backend.knowledge.curation.bucket1_reader import ParsedUser
-
-        return ParsedUser(
-            user_id=user_id,
-            tools_and_technologies=tools or [],
-            expertise=[],
-            currently_learning=[],
-            projects=[],
-            affiliations=[],
-            interests=[],
-            goals=[],
-            preferences=[],
-            people=[],
-        )
-
-    @pytest.mark.asyncio
-    async def test_upsert_then_mark_orphaned_marks_all_triples_for_path(self):
-        """After upsert_user + mark_orphaned, all triples for that path are orphaned."""
-        from tests.fakes.graph_store import FakeGraphStore
-
-        store = FakeGraphStore()
-        path = "/app/mist-memory/users/raj.md"
-        parsed = self._build_parsed_user(tools=["Python", "Neo4j"])
-
-        await store.upsert_user(parsed, derived_from_path=path)
-        marked = await store.mark_orphaned_by_provenance_path(path)
-
-        assert marked == 2, f"Expected 2 triples marked; got {marked}"
-        for tool in ["Python", "Neo4j"]:
-            triple = store.get_triple("User", "USES", tool)
-            assert triple is not None
-            assert (
-                triple.status == "orphaned"
-            ), f"Triple for tool={tool!r} must be orphaned; got {triple.status!r}"
-
-    @pytest.mark.asyncio
-    async def test_upsert_two_paths_mark_one_other_remains_active(self):
-        """Orphan-marking path A must not affect triples upserted under path B."""
-        from tests.fakes.graph_store import FakeGraphStore
-
-        store = FakeGraphStore()
-        path_a = "/app/mist-memory/users/raj.md"
-        path_b = "/app/mist-memory/users/alice.md"
-        parsed_a = self._build_parsed_user(tools=["Python"])
-        parsed_b = self._build_parsed_user(tools=["Rust"])
-
-        await store.upsert_user(parsed_a, derived_from_path=path_a)
-        await store.upsert_user(parsed_b, derived_from_path=path_b)
-
-        await store.mark_orphaned_by_provenance_path(path_a)
-
-        triple_a = store.get_triple("User", "USES", "Python")
-        triple_b = store.get_triple("User", "USES", "Rust")
-
-        assert (
-            triple_a is not None and triple_a.status == "orphaned"
-        ), f"Triple from path_a must be orphaned; got {triple_a}"
-        assert (
-            triple_b is not None and triple_b.status == "active"
-        ), f"Triple from path_b must remain active; got {triple_b}"
-
-    @pytest.mark.asyncio
-    async def test_mark_orphaned_then_upsert_new_path_restores_active(self):
-        """Re-upsert with a new path after orphan-marking restores status='active'.
-
-        This simulates the full lifecycle: old path orphaned -> new extraction
-        writes fresh triples -> those triples are active -> retrieval sees them.
-        """
-        from tests.fakes.graph_store import FakeGraphStore
-
-        store = FakeGraphStore()
-        old_path = "/app/mist-memory/users/raj-v1.md"
-        new_path = "/app/mist-memory/users/raj-v2.md"
-        parsed_old = self._build_parsed_user(tools=["Python"])
-        parsed_new = self._build_parsed_user(tools=["Python"])
-
-        await store.upsert_user(parsed_old, derived_from_path=old_path)
-        await store.mark_orphaned_by_provenance_path(old_path)
-        # Re-upsert with new path re-activates the triple
-        await store.upsert_user(parsed_new, derived_from_path=new_path)
-
-        triple = store.get_triple("User", "USES", "Python")
-        assert (
-            triple is not None and triple.status == "active"
-        ), f"Triple must be restored to active after re-upsert; got {triple.status!r}"

@@ -1,24 +1,25 @@
-"""FakeGraphStore — in-memory test double for GraphStoreProtocol.
+"""FakeGraphStore — in-memory test double for GraphStore.
 
-Satisfies the GraphStoreProtocol surface required by GraphRegenerator:
-  - mark_orphaned_by_provenance_path
-  - current_ontology_version
+`current_ontology_version` is the only surface GraphRegenerator still needs
+(typed structurally via `_OntologyVersionSource` in
+backend/knowledge/curation/graph_regenerator.py).
 
-`upsert_user` is retained as a transitional call-trap after R1.3 deleted
-the real `GraphStore.upsert_user` and its `GraphStoreProtocol` declaration:
-tests assert `upsert_user_calls == []` to prove the retired Bucket-1 write
-path never fires. R1.3 Task 6 removes it once the last consumer is gone.
+`upsert_user` and `mark_orphaned_by_provenance_path` are retained as
+transitional call-traps after R1.3 deleted their real `GraphStore`
+counterparts (Task 3 and Task 5 respectively): tests assert
+`upsert_user_calls == []` and `mark_orphaned_calls == []` to prove the
+retired write paths never fire. R1.3 Task 6 trims them once their last
+consumer (test_graph_regenerator.py) is gone.
 
 Also exposes assertion helpers for test readability:
   - add_triple / get_triple / count_traits / has_trait
 
-Schema alignment (Phase 5.5 Bucket 1 fix):
-  The real mark_orphaned_by_provenance_path queries DERIVED_FROM relationship-
-  type edges pointing at :__Provenance__:VaultNote nodes. This fake mirrors
-  that schema: upsert_user writes FakeDerivedFromEdge records, and
-  mark_orphaned_by_provenance_path marks those edges by path. This ensures
-  the fake catches the same class of bug as the real Neo4j implementation
-  rather than masking it via property-based triple matching.
+Schema alignment (Phase 5.5 Bucket 1 fix, pre-R1.3):
+  The retired GraphStore.mark_orphaned_by_provenance_path queried DERIVED_FROM
+  relationship-type edges pointing at :__Provenance__:VaultNote nodes. This
+  fake still mirrors that schema for its remaining call-trap tests: upsert_user
+  writes FakeDerivedFromEdge records, and mark_orphaned_by_provenance_path
+  marks those edges by path.
 """
 
 from __future__ import annotations
@@ -51,19 +52,19 @@ class FakeDerivedFromEdge:
 
 
 class FakeGraphStore:
-    """In-memory test double for GraphStoreProtocol.
+    """In-memory test double for GraphStore.
 
     Tracks typed triples and DERIVED_FROM provenance edges separately.
     Idempotent upsert: calling upsert_user with the same display_name twice
     writes only one triple and one provenance edge (dedup).
 
-    mark_orphaned_by_provenance_path mirrors the real Neo4j implementation:
-    it finds DERIVED_FROM edges by path and marks their status='orphaned'.
-    This catches the bug class where upsert writes typed edges but omits the
-    DERIVED_FROM provenance edge, leaving mark_orphaned with nothing to find.
+    mark_orphaned_by_provenance_path mirrors what the real Neo4j
+    implementation did before R1.3 retired it: it finds DERIVED_FROM edges
+    by path and marks their status='orphaned'. Retained here only as a
+    call-trap (see module docstring) -- no production code calls it anymore.
 
-    Supports `get_orphaned_provenance_paths` for retry_orphaned tests:
-    returns the distinct set of paths for which DERIVED_FROM edges are orphaned.
+    get_orphaned_provenance_paths is likewise retained as a call-trap;
+    its former consumer, GraphRegenerator.retry_orphaned, was deleted in R1.3.
     """
 
     _ONTOLOGY_VERSION = "1.1.0"
@@ -76,13 +77,14 @@ class FakeGraphStore:
         self.upsert_user_calls: list[dict] = []
 
     # ------------------------------------------------------------------
-    # GraphStoreProtocol methods
+    # Transitional call-trap methods (R1.3) -- see module docstring
     # ------------------------------------------------------------------
 
     async def mark_orphaned_by_provenance_path(self, path: str) -> int:
         """Mark all DERIVED_FROM edges pointing at path as 'orphaned'.
 
-        Mirrors the real Cypher: MATCH ()-[d:DERIVED_FROM]->(vn:VaultNote {path})
+        Mirrors the Cypher the retired real method used to issue:
+        MATCH ()-[d:DERIVED_FROM]->(vn:VaultNote {path})
         WHERE d.status <> 'orphaned' SET d.status = 'orphaned'.
         Returns count of edges marked.
 
@@ -123,9 +125,10 @@ class FakeGraphStore:
     async def upsert_user(self, parsed_user, derived_from_path: str) -> int:
         """Write ParsedUser edge targets as graph triples (idempotent).
 
-        Mirrors the real upsert_user: for each typed entity, writes a typed
-        triple AND a DERIVED_FROM provenance edge to the VaultNote at
-        derived_from_path. mark_orphaned_by_provenance_path finds edges by path.
+        Mirrors what the retired real upsert_user did: for each typed entity,
+        write a typed triple AND a DERIVED_FROM provenance edge to the
+        VaultNote at derived_from_path. mark_orphaned_by_provenance_path
+        finds edges by path.
         """
         self.upsert_user_calls.append(
             {"parsed_user": parsed_user, "derived_from_path": derived_from_path}

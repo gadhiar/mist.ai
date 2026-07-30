@@ -250,3 +250,23 @@ def test_regenerator_has_no_async_lifecycle() -> None:
     """No in-flight tasks means no drain: aclose and retry_orphaned retire."""
     assert not hasattr(GraphRegenerator, "aclose")
     assert not hasattr(GraphRegenerator, "retry_orphaned")
+
+
+def test_orphan_marking_surface_is_retired() -> None:
+    """R1.3: with no re-derivation, orphan-marking has no consumer.
+
+    The methods existed to preserve triples for a rebuild that no longer
+    happens. Leaving them would leave a status field nothing ever clears.
+    """
+    from backend.knowledge.storage.graph_store import GraphStore
+
+    assert not hasattr(GraphStore, "mark_orphaned_by_provenance_path")
+    assert not hasattr(GraphStore, "get_orphaned_provenance_paths")
+
+
+def test_regenerator_protocols_are_retired() -> None:
+    """The protocols typed only the regenerator's dependencies."""
+    import backend.interfaces as interfaces
+
+    assert not hasattr(interfaces, "GraphStoreProtocol")
+    assert not hasattr(interfaces, "ExtractionPipelineProtocol")

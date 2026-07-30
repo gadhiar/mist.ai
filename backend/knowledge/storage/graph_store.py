@@ -3,7 +3,6 @@
 Stores extracted entities and relationships in Neo4j with provenance tracking.
 """
 
-import asyncio
 import logging
 import re
 from datetime import UTC, datetime
@@ -120,10 +119,10 @@ class GraphStore:
             connection: Graph database connection (satisfies GraphConnection protocol).
             embedding_generator: Embedding provider (satisfies EmbeddingProvider protocol).
             ontology_version: Current ontology version string. Exposed via
-                `current_ontology_version()` for GraphStoreProtocol callers.
-                Defaults to the module constant which tracks KnowledgeConfig.
-                The factory injects the live value from config so rebuilds
-                always stamp the correct version on DERIVED_FROM edges.
+                `current_ontology_version()`. Defaults to the module constant
+                which tracks KnowledgeConfig. The factory injects the live
+                value from config so rebuilds always stamp the correct
+                version on DERIVED_FROM edges.
         """
         self.connection = connection
         self.embedding_generator = embedding_generator
@@ -1550,96 +1549,18 @@ class GraphStore:
         }
 
     # ------------------------------------------------------------------
-    # GraphStoreProtocol methods (ADR-010 / Phase 5 reviewer P0)
+    # Ontology version accessor
     # ------------------------------------------------------------------
 
     def current_ontology_version(self) -> str:
         """Return the current ontology version string (e.g. '1.1.0').
 
-        Synchronous accessor used by GraphRegenerator to stamp re-derived
-        triples with the version active at rebuild time. The value is set
-        at construction by the factory (injected from KnowledgeConfig) and
-        never changes during the lifetime of this store instance.
+        Synchronous accessor for the ontology version active on this store
+        instance. The value is set at construction by the factory (injected
+        from KnowledgeConfig) and never changes during the lifetime of this
+        store instance.
         """
         return self._ontology_version
-
-    async def mark_orphaned_by_provenance_path(self, path: str) -> int:
-        """Mark all triples with DERIVED_FROM.path == path as status='orphaned'.
-
-        Per ADR-010 invariant 5: preserves the triples (no hard-delete) so
-        they can be re-derived on retry. Marks both the DERIVED_FROM edge
-        itself and the typed edges whose `derived_from_path` property matches
-        the path, so retrieval queries can filter on the typed edge's own
-        status field without a JOIN through DERIVED_FROM per query.
-
-        Two Cypher writes are issued:
-        1. Mark DERIVED_FROM edges pointing at the VaultNote for path.
-        2. Mark any typed edge whose r.derived_from_path == path. As of
-           R1.3, nothing writes this property going forward (the Bucket-1
-           sink that stamped it, `GraphStore.upsert_user`, is retired); this
-           write only still matches pre-R1.3 edges already in the graph.
-
-        Both writes are idempotent: the WHERE predicate excludes already-
-        orphaned edges so re-running with the same path returns 0 on the
-        second call.
-
-        Returns:
-            Total count of edges marked (DERIVED_FROM edges + typed edges).
-        """
-        params: dict[str, Any] = {"path": path}
-        loop = asyncio.get_event_loop()
-
-        # --- Write 1: mark DERIVED_FROM provenance edges ---
-        # coalesce: legacy DERIVED_FROM edges predate the status property;
-        # under three-valued logic a bare `d.status <> 'orphaned'` filters
-        # null-status edges OUT and the orphan-marking silently no-ops.
-        derived_from_query = (
-            "MATCH ()-[d:DERIVED_FROM]->(p:__Provenance__:VaultNote {path: $path}) "
-            "WHERE coalesce(d.status, 'active') <> 'orphaned' "
-            "SET d.status = 'orphaned', d.orphaned_at = toString(datetime()) "
-            "RETURN count(d) AS marked_count"
-        )
-        rows_df = await loop.run_in_executor(
-            None, self.connection.execute_write, derived_from_query, params
-        )
-        d_count = int(rows_df[0].get("marked_count", 0)) if rows_df else 0
-
-        # --- Write 2: mark typed edges by derived_from_path property ---
-        # Scoped to the known user-facing relationship types (the allowlist
-        # mirrors _USER_FACING_REL_TYPES) so the MATCH is not a full graph
-        # scan. The WHERE clause is defensive against already-orphaned edges
-        # to preserve idempotency on repeat calls.
-        typed_edge_query = (
-            "MATCH ()-[r]->() "
-            "WHERE r.derived_from_path = $path "
-            "  AND (r.status IS NULL OR r.status <> 'orphaned') "
-            "SET r.status = 'orphaned', r.orphaned_at = toString(datetime()) "
-            "RETURN count(r) AS marked_count"
-        )
-        rows_te = await loop.run_in_executor(
-            None, self.connection.execute_write, typed_edge_query, params
-        )
-        r_count = int(rows_te[0].get("marked_count", 0)) if rows_te else 0
-
-        return d_count + r_count
-
-    async def get_orphaned_provenance_paths(self) -> list[str]:
-        """Return the list of distinct DERIVED_FROM.path values for orphaned triples.
-
-        Used by GraphRegenerator.retry_orphaned to enumerate provenance paths
-        whose async re-extraction previously failed.
-
-        Returns:
-            List of absolute path strings for which orphaned triples exist.
-        """
-        query = (
-            "MATCH ()-[d:DERIVED_FROM]->(p:__Provenance__:VaultNote) "
-            "WHERE d.status = 'orphaned' "
-            "RETURN DISTINCT p.path AS path"
-        )
-        loop = asyncio.get_event_loop()
-        rows = await loop.run_in_executor(None, self.connection.execute_query, query, None)
-        return [r.get("path") for r in rows if r.get("path") is not None]
 
     def close(self):
         """Close Neo4j connection."""
