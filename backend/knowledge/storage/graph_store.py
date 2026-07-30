@@ -118,11 +118,14 @@ class GraphStore:
         Args:
             connection: Graph database connection (satisfies GraphConnection protocol).
             embedding_generator: Embedding provider (satisfies EmbeddingProvider protocol).
-            ontology_version: Current ontology version string. Exposed via
-                `current_ontology_version()`. Defaults to the module constant
-                which tracks KnowledgeConfig. The factory injects the live
-                value from config so rebuilds always stamp the correct
-                version on DERIVED_FROM edges.
+            ontology_version: Current ontology version string, read only by
+                `current_ontology_version()`. It is not stamped onto any node
+                or edge -- per-write versions come from each write method's
+                own `ontology_version` argument, and the curation path stamps
+                from `RebuildStamps`. Retained without a production caller for
+                R1.4's seed-utterance migration and R1.6's rebuild closure.
+                Defaults to the module constant, which tracks
+                `KnowledgeConfig.ontology_version`.
         """
         self.connection = connection
         self.embedding_generator = embedding_generator

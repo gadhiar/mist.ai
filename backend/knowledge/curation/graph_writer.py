@@ -24,7 +24,8 @@ PROPERTY_KEY_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 @dataclass(frozen=True, slots=True)
 class RebuildStamps:
-    """Per-deployment rebuild-determinism stamps for EXTRACTED_FROM edges.
+    """Per-deployment rebuild-determinism stamps for EXTRACTED_FROM edges and
+    reconciled fact edges (reconciliation.py stamps both from this object).
 
     ADR-010 "Rebuild Determinism Model" requires every entity-provenance edge
     to carry the ontology, extraction-prompt, and model identifiers that were

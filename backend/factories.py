@@ -208,9 +208,11 @@ def build_curation_pipeline(
         embedding_provider = EmbeddingGenerator(config.embedding.model_name)
     confidence_mgr = ConfidenceManager()
     # ADR-010 Phase 8 rebuild-determinism stamps. Written to every fact edge
-    # (C1 4.7) and every DERIVED_FROM->VaultNote edge so rebuilds can detect
-    # when the ontology, extraction prompt, or model binary has drifted from
-    # the values active at extraction time.
+    # (C1 4.7, reconciliation.py) and every EXTRACTED_FROM->ConversationContext
+    # edge (R1.3 moved this anchor off DERIVED_FROM->VaultNote) so a future
+    # consumer can detect when the ontology, extraction prompt, or model
+    # binary has drifted from the values active at extraction time -- no
+    # command reads them for that purpose today.
     rebuild_stamps = RebuildStamps(
         ontology_version=config.ontology_version,
         extraction_version=config.extraction_version,
@@ -632,10 +634,11 @@ def build_vault_writer(
         return None
     from backend.vault import VaultWriter
 
-    # Phase 8 stamp: same model_hash that flows into RebuildStamps for graph
-    # DERIVED_FROM->VaultNote edges (line 151 above). Populates the
-    # `model_hash` frontmatter field on every newly created session note so
-    # vault rebuild can reconcile session-note vintage against current config.
+    # Phase 8 stamp: same model_hash that flows into RebuildStamps for the
+    # EXTRACTED_FROM->ConversationContext and reconciled fact edges (see
+    # build_curation_pipeline's RebuildStamps construction above). Populates
+    # the `model_hash` frontmatter field on every newly created session note;
+    # no command reconciles it against current config today.
     return VaultWriter(config.vault, debug_logger=debug_logger, model_hash=config.model_hash)
 
 

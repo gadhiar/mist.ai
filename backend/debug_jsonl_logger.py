@@ -281,9 +281,11 @@ class DebugJSONLLogger:
         """Emit a `phase: "vault"` JSONL line (ADR-010 Phase 12).
 
         Captures every successful (and failed-but-isolated-per-Invariant-6)
-        vault write op so operators can correlate filewatcher events,
-        sidecar reindex latency, and graph-side DERIVED_FROM emission with
-        the wall-clock cost of the underlying file mutation.
+        vault write op so operators can correlate filewatcher events and
+        sidecar reindex latency with the wall-clock cost of the underlying
+        file mutation. R1.3 retired the graph-side DERIVED_FROM emission
+        these writes used to also trigger; none of the four operations below
+        touch the graph.
 
         `operation` is one of:
           - `append_turn_to_session` (per-turn append)

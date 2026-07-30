@@ -142,12 +142,14 @@ class VaultWriter:
                 op emits a `phase: "vault"` JSONL record with operation,
                 path, duration_ms, ok, and any error_message. None preserves
                 pre-Phase-12 silent operation.
-            model_hash: Optional Phase 8 rebuild-determinism stamp. Mirrors the
-                same value used for graph DERIVED_FROM->VaultNote edges
-                (via `RebuildStamps` on `CurationGraphWriter`). When provided,
-                populates the `model_hash` frontmatter field on every newly
-                created session note. None preserves pre-fix behavior
-                (frontmatter `model_hash: null`).
+            model_hash: Optional Phase 8 rebuild-determinism stamp. Mirrors
+                the same value used for the EXTRACTED_FROM->ConversationContext
+                and reconciled fact edges (via `RebuildStamps` on
+                `CurationGraphWriter` -- R1.3 moved this anchor off
+                DERIVED_FROM->VaultNote). When provided, populates the
+                `model_hash` frontmatter field on every newly created session
+                note. None preserves pre-fix behavior (frontmatter
+                `model_hash: null`).
         """
         self.config = config
         self._root = Path(config.root)
