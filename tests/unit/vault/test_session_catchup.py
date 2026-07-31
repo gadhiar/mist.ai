@@ -327,6 +327,27 @@ async def test_yields_mid_pass_when_a_conversation_starts_during_the_pass(catchu
 
 
 @pytest.mark.asyncio
+async def test_does_not_probe_llm_readiness_when_there_is_nothing_to_do(catchup_harness):
+    """N2 (fix round 2): an empty backlog must not make an LLM health-check
+    HTTP call every tick forever just to decide it has nothing to attempt.
+    The candidate check must run BEFORE the readiness probe, not after.
+    """
+    h = catchup_harness
+    h.event_store.sessions = []  # nothing to do
+    probe_calls = {"n": 0}
+
+    async def _counting_ready() -> bool:
+        probe_calls["n"] += 1
+        return True
+
+    h.is_llm_ready = _counting_ready
+
+    await SessionNoteCatchup(**h.kwargs).run()
+
+    assert probe_calls["n"] == 0, "no LLM readiness probe may fire when there is nothing to do"
+
+
+@pytest.mark.asyncio
 async def test_defers_the_whole_pass_when_llm_is_not_ready(catchup_harness):
     """I4: a cold LLM at boot must be indistinguishable from "come back
     later," never from "synthesis genuinely failed." Distinct from the

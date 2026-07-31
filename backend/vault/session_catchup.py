@@ -111,21 +111,25 @@ class SessionNoteCatchup:
             return
 
         try:
-            ready = await self._is_llm_ready()
-        except Exception as exc:  # noqa: BLE001 -- readiness check is best-effort
-            logger.warning("Catch-up could not check LLM readiness (non-fatal): %s", exc)
-            return
-        if not ready:
-            logger.debug("Catch-up deferred: LLM backend not ready")
-            return
-
-        try:
             candidates = self._event_store.list_sessions_with_turns()
         except Exception as exc:  # noqa: BLE001 -- catch-up is best-effort
             logger.warning("Catch-up could not list sessions (non-fatal): %s", exc)
             return
 
         if not candidates:
+            # Nothing to do -- checked BEFORE the LLM readiness probe below
+            # deliberately (R1.3.1 fix round 2, N2). The probe is an HTTP
+            # call to llama-server; an idle backlog must not pay that cost
+            # every tick forever just to decide it has nothing to attempt.
+            return
+
+        try:
+            ready = await self._is_llm_ready()
+        except Exception as exc:  # noqa: BLE001 -- readiness check is best-effort
+            logger.warning("Catch-up could not check LLM readiness (non-fatal): %s", exc)
+            return
+        if not ready:
+            logger.debug("Catch-up deferred: LLM backend not ready")
             return
 
         # Off the event loop: a Neo4j query. A large backlog must not stall

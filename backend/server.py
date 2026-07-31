@@ -226,6 +226,44 @@ def _log_catchup_task_exception(task: "asyncio.Task") -> None:
         logger.error("Session-note catch-up task failed: %s", exc, exc_info=exc)
 
 
+def _schedule_session_note_catchup(catchup) -> "asyncio.Task":
+    """Schedule catch-up as a periodic background task with exception visibility.
+
+    Extracted from `lifespan()` (R1.3.1 fix round 2, N1) so the exact
+    coroutine that gets scheduled -- `run_forever`, not a one-shot `run` --
+    and the done-callback attachment are both independently testable
+    without booting the full ASGI lifespan, which would otherwise require
+    faking `VoiceProcessor.initialize` and the entire model stack. See
+    `tests/unit/test_server_catchup_lifecycle.py`.
+    """
+    task = asyncio.create_task(catchup.run_forever(), name="session-note-catchup")
+    # The task is never awaited on the happy path, so an exception escaping
+    # run_forever's own internal try/except (a genuine bug, not a modeled
+    # failure mode) would otherwise surface only as "Task exception was
+    # never retrieved" at garbage collection.
+    task.add_done_callback(_log_catchup_task_exception)
+    return task
+
+
+async def _shutdown_session_note_catchup(catchup_task: "asyncio.Task | None") -> None:
+    """Cancel and await the catch-up background task.
+
+    Extracted from `lifespan()` (R1.3.1 fix round 2, N1) for the same
+    testability reason as `_schedule_session_note_catchup`. Must run before
+    anything else in shutdown that awaits (`curation_scheduler.stop()`,
+    `ConversationHandler.aclose()`, `vault_writer.stop()`) -- those awaits
+    yield the event loop, and a still-resuming catch-up pass could
+    otherwise reach a write against an already-stopped `vault_writer`.
+    `lifespan()` calls this as its first shutdown action for that reason;
+    a no-op when no task was scheduled (vault layer disabled).
+    """
+    if catchup_task is None:
+        return
+    catchup_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await catchup_task
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
@@ -394,12 +432,7 @@ async def lifespan(app: FastAPI):
                 is_conversation_active=lambda: bool(catchup_handler.sessions),
                 is_llm_ready=catchup_handler.session_synthesizer.is_ready,
             )
-            catchup_task = asyncio.create_task(catchup.run_forever(), name="session-note-catchup")
-            # The task is never awaited on the happy path, so an exception
-            # escaping run_forever's own internal try/except (a genuine bug,
-            # not a modeled failure mode) would otherwise surface only as
-            # "Task exception was never retrieved" at garbage collection.
-            catchup_task.add_done_callback(_log_catchup_task_exception)
+            catchup_task = _schedule_session_note_catchup(catchup)
             logger.info("Session-note catch-up scheduled as a periodic background task")
     except Exception as e:  # noqa: BLE001 -- catch-up must never block startup
         logger.warning("Session-note catch-up scheduling failed (non-fatal): %s", e)
@@ -418,10 +451,7 @@ async def lifespan(app: FastAPI):
     # the event loop -- a still-running catch-up pass could resume in that
     # window and reach a write against an already-stopped vault_writer if
     # cancellation happened later (or not at all).
-    if catchup_task is not None:
-        catchup_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await catchup_task
+    await _shutdown_session_note_catchup(catchup_task)
 
     if curation_scheduler is not None:
         await curation_scheduler.stop()

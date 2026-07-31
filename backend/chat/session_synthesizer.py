@@ -83,6 +83,11 @@ class SessionSynthesizer:
         directly.
         """
         try:
+            # Fail-open by default: StreamingLLMProvider.health_check's base
+            # implementation returns True unconditionally. Correct today
+            # because every real provider (LlamaServerProvider, OllamaProvider)
+            # overrides it with a genuine probe -- a future provider that
+            # forgets to would silently degrade this readiness gate.
             return await self._llm.health_check()
         except Exception as exc:  # noqa: BLE001 -- readiness check is best-effort
             logger.warning("LLM readiness check failed (non-fatal): %s", exc)
