@@ -160,6 +160,53 @@ def _make_config(**kwargs) -> FilewatcherConfig:
     return FilewatcherConfig(**defaults)
 
 
+# How long a debounce test will wait for the watcher to do its work before
+# giving up. Generous on purpose -- it is an upper bound on patience, not an
+# expected duration, and a passing test returns as soon as the condition
+# holds. Measured fire latency for a 100ms debounce is ~102ms.
+_DEBOUNCE_TIMEOUT_S = 5.0
+
+# Gap between polls. Small enough that a fast machine is not penalised.
+_POLL_INTERVAL_S = 0.005
+
+
+async def _wait_for(predicate, *, settle: float = 0.0, timeout: float = _DEBOUNCE_TIMEOUT_S):
+    """Poll `predicate` until it holds or `timeout` elapses.
+
+    Replaces `await asyncio.sleep(debounce_ms / 1000 + margin)`. A fixed sleep
+    bakes a wall-clock assumption into every debounce test: it passes only
+    while the event loop happens to schedule the debounce callback inside the
+    margin, so an unrelated stall -- a GC pause, host contention, a heavy
+    neighbouring test -- turns a correct watcher into a red test. That is
+    exactly the flake this replaced: the 250ms budget was never marginal
+    (measured fire latency ~102ms, ~147ms of headroom), so failures were
+    always large stalls rather than near-misses, which a fixed sleep can never
+    absorb but a poll can. See `tests/CLAUDE.md`: "no time-dependent
+    assertions".
+
+    Deliberately returns None rather than asserting. The caller's existing
+    assertions stay the sole source of failure messages, so a genuine
+    regression still fails with the diagnostic it always had -- just after a
+    generous timeout instead of a fixed one.
+
+    Args:
+        predicate: Zero-arg callable returning truthy when the awaited
+            behaviour has happened.
+        settle: Extra wait AFTER `predicate` first holds. Required for
+            exactly-N assertions, where a late DUPLICATE is the regression
+            under guard: polling for `>= 1` would otherwise return before a
+            spurious second call arrived and the test would pass vacuously.
+        timeout: Upper bound on total waiting, excluding `settle`.
+    """
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return
+        await asyncio.sleep(_POLL_INTERVAL_S)
+    if settle:
+        await asyncio.sleep(settle)
+
+
 def _make_md_file(directory: Path, name: str = "note.md", content: str = "") -> Path:
     """Create a markdown file in `directory` with the given content."""
     p = directory / name
@@ -397,7 +444,7 @@ class TestEventHandling:
 
         # Act
         watcher._handler.on_modified(FileModifiedEvent(str(md_file)))
-        await asyncio.sleep(watcher.config.debounce_ms / 1000.0 + 0.1)
+        await _wait_for(lambda: fake_sidecar.upsert_file_calls)
 
         # Assert
         fake_sidecar.assert_upsert_called_for(str(md_file))
@@ -413,7 +460,7 @@ class TestEventHandling:
 
         # Act
         watcher._handler.on_created(FileCreatedEvent(str(md_file)))
-        await asyncio.sleep(watcher.config.debounce_ms / 1000.0 + 0.1)
+        await _wait_for(lambda: fake_sidecar.upsert_file_calls)
 
         # Assert
         fake_sidecar.assert_upsert_called_for(str(md_file))
@@ -428,8 +475,14 @@ class TestEventHandling:
         path = str(vault_root / "sessions" / "gone.md")
 
         # Act: dispatch deleted event and wait for debounce to fire
+        # settle: the no-upsert half is a negative assertion -- wait past the
+        # debounce window after the delete lands so a stray upsert would have
+        # had time to arrive and fail the test.
         watcher._handler.on_deleted(FileDeletedEvent(path))
-        await asyncio.sleep(watcher.config.debounce_ms / 1000.0 + 0.15)
+        await _wait_for(
+            lambda: fake_sidecar.delete_path_calls,
+            settle=watcher.config.debounce_ms / 1000.0,
+        )
 
         # Assert: delete called, no upsert
         fake_sidecar.assert_delete_called_for(path)
@@ -452,7 +505,7 @@ class TestEventHandling:
 
         # Act
         watcher._handler.on_moved(FileMovedEvent(src, dest))
-        await asyncio.sleep(watcher.config.debounce_ms / 1000.0 + 0.15)
+        await _wait_for(lambda: fake_sidecar.delete_path_calls and fake_sidecar.upsert_file_calls)
 
         # Assert: delete for src, upsert for dest
         fake_sidecar.assert_delete_called_for(src)
@@ -535,7 +588,13 @@ class TestDebounce:
         for _ in range(5):
             watcher._handler.on_modified(event)
 
-        await asyncio.sleep(watcher.config.debounce_ms / 1000.0 + 0.15)
+        # settle: collapsing 5 events into 1 is the behaviour under test, so a
+        # late SECOND upsert is the regression. Waiting only for >= 1 would
+        # return before it arrived and pass vacuously.
+        await _wait_for(
+            lambda: fake_sidecar.upsert_file_calls,
+            settle=watcher.config.debounce_ms / 1000.0,
+        )
 
         # Assert: exactly one upsert
         assert len(fake_sidecar.upsert_file_calls) == 1
@@ -557,7 +616,11 @@ class TestDebounce:
         watcher._handler.on_modified(FileModifiedEvent(str(file_a)))
         watcher._handler.on_modified(FileModifiedEvent(str(file_b)))
 
-        await asyncio.sleep(watcher.config.debounce_ms / 1000.0 + 0.15)
+        # settle: the count assertion is exactly-2, so guard against a third.
+        await _wait_for(
+            lambda: len(fake_sidecar.upsert_file_calls) >= 2,
+            settle=watcher.config.debounce_ms / 1000.0,
+        )
 
         # Assert: one upsert per path
         upserted_paths = {c[0] for c in fake_sidecar.upsert_file_calls}
@@ -585,7 +648,14 @@ class TestDebounce:
         md_file.write_text("---\ntype: mist-session\n---\n\n# Recreated\n", encoding="utf-8")
         watcher._handler.on_created(FileCreatedEvent(path))
 
-        await asyncio.sleep(watcher.config.debounce_ms / 1000.0 + 0.15)
+        # settle: both assertions are exact (1 upsert, 0 deletes). The delete
+        # arriving late is precisely the collapse failure under guard, so wait
+        # past the debounce window after the upsert lands rather than
+        # returning the moment it appears.
+        await _wait_for(
+            lambda: fake_sidecar.upsert_file_calls,
+            settle=watcher.config.debounce_ms / 1000.0,
+        )
 
         # Assert: zero deletes (create cancelled the delete's side-effect on pending,
         # and the created event scheduled a reindex). One upsert.
@@ -610,8 +680,12 @@ class TestDebounce:
         t_start = time.monotonic()
         watcher._handler.on_modified(FileModifiedEvent(str(md_file)))
 
-        # Wait just past the debounce window
-        await asyncio.sleep(watcher.config.debounce_ms / 1000.0 + 0.1)
+        # Poll rather than sleep, then measure. This test asserts a LOWER
+        # bound (reindex must not fire EARLY), which polling preserves
+        # exactly -- `elapsed` is now the real fire latency instead of
+        # whatever fixed sleep was chosen, making the assertion strictly
+        # sharper than it was.
+        await _wait_for(lambda: fake_sidecar.upsert_file_calls)
 
         elapsed = time.monotonic() - t_start
 
@@ -871,7 +945,12 @@ class TestReindexResilience:
         md_file.unlink()
 
         with caplog.at_level(logging.WARNING, logger="backend.vault.filewatcher"):
-            await asyncio.sleep(watcher.config.debounce_ms / 1000.0 + 0.15)
+            # settle: `assert_no_upsert` below is a negative assertion, so
+            # give a stray upsert time to arrive after the warning lands.
+            await _wait_for(
+                lambda: any("deleted between event" in r.message for r in caplog.records),
+                settle=watcher.config.debounce_ms / 1000.0,
+            )
 
         # Assert: watcher still alive, warning logged, no upsert
         assert watcher.is_running
@@ -897,7 +976,7 @@ class TestReindexResilience:
 
         with caplog.at_level(logging.ERROR, logger="backend.vault.filewatcher"):
             watcher._handler.on_modified(FileModifiedEvent(str(md_file)))
-            await asyncio.sleep(watcher.config.debounce_ms / 1000.0 + 0.15)
+            await _wait_for(lambda: any("upsert_file failed" in r.message for r in caplog.records))
 
         # Assert: watcher still running
         assert watcher.is_running
@@ -920,7 +999,7 @@ class TestReindexResilience:
 
         with caplog.at_level(logging.WARNING, logger="backend.vault.filewatcher"):
             watcher._handler.on_modified(FileModifiedEvent(str(bad_file)))
-            await asyncio.sleep(watcher.config.debounce_ms / 1000.0 + 0.15)
+            await _wait_for(lambda: any("UTF-8 decode error" in r.message for r in caplog.records))
 
         # Assert: watcher alive, warning logged
         assert watcher.is_running
@@ -942,8 +1021,12 @@ class TestReindexResilience:
         bad_fm.write_text("---\ntype: [unclosed\n\n# body\n", encoding="utf-8")
 
         # Act
+        # settle: the assertion is exactly-1, so guard against a duplicate.
         watcher._handler.on_modified(FileModifiedEvent(str(bad_fm)))
-        await asyncio.sleep(watcher.config.debounce_ms / 1000.0 + 0.15)
+        await _wait_for(
+            lambda: fake_sidecar.upsert_file_calls,
+            settle=watcher.config.debounce_ms / 1000.0,
+        )
 
         # Assert: upsert was called (watcher recovered gracefully)
         assert len(fake_sidecar.upsert_file_calls) == 1
@@ -997,7 +1080,7 @@ class TestPendingPaths:
         watcher._handler.on_modified(FileModifiedEvent(str(md_file)))
 
         # Wait for debounce to fire and reindex to complete
-        await asyncio.sleep(watcher.config.debounce_ms / 1000.0 + 0.2)
+        await _wait_for(lambda: str(md_file) not in watcher.pending_paths)
 
         # Assert: path no longer pending
         assert str(md_file) not in watcher.pending_paths
