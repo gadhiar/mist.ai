@@ -9,13 +9,20 @@ store. One path, no drift.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 
-from backend.llm import LLMRequest
+from backend.llm import LLMRequest, StreamingLLMProvider
 
 logger = logging.getLogger(__name__)
 
-_MIN_TURNS_FOR_SYNTHESIS = 2
+_MIN_TURNS_FOR_SYNTHESIS = 1
+
+# Tolerates the small model drifting from the exact `TITLE: ...` convention --
+# markdown emphasis around the marker (`**TITLE:**`) and stray whitespace
+# before the colon (`TITLE : ...`) are both still recognized as a title
+# attempt, so the line is consumed and never leaks into the body.
+_TITLE_LINE_RE = re.compile(r"^[*_]{0,2}\s*TITLE\s*:\s*[*_]{0,2}\s*(.*)$", re.IGNORECASE)
 
 _PROMPT_TEMPLATE = (
     "You are MIST writing a session-end summary for the user's persistent "
@@ -57,7 +64,9 @@ class SessionSynthesizer:
     the startup catch-up path can share it without either owning the other.
     """
 
-    def __init__(self, llm_provider, temperature: float, max_tokens: int) -> None:
+    def __init__(
+        self, llm_provider: StreamingLLMProvider, temperature: float, max_tokens: int
+    ) -> None:
         self._llm = llm_provider
         self._temperature = temperature
         self._max_tokens = max_tokens
@@ -65,10 +74,12 @@ class SessionSynthesizer:
     async def synthesize(self, turns: list[dict]) -> SessionSynthesis | None:
         """Synthesize a session note body from its turns.
 
-        Returns None when the session is below the substance threshold or the
-        model call fails. A None result means "write no note", which is the
-        correct outcome for a throwaway session -- see the catch-up gating in
-        `backend/vault/session_catchup.py`.
+        Returns None when there are no turns at all, or the model call fails.
+        A None result means "write no note", which is the correct outcome for
+        an empty session -- see the catch-up gating in
+        `backend/vault/session_catchup.py` for the separate "was anything
+        worth remembering" filter, which composes with this one rather than
+        duplicating it.
         """
         if len(turns) < _MIN_TURNS_FOR_SYNTHESIS:
             return None
@@ -87,7 +98,7 @@ class SessionSynthesizer:
         )
 
         try:
-            response = await self._llm.complete(request)
+            response = await self._llm.invoke(request)
         except Exception as exc:  # noqa: BLE001 -- synthesis is best-effort
             logger.warning("Session synthesis LLM call failed (non-fatal): %s", exc)
             return None
@@ -98,8 +109,11 @@ class SessionSynthesizer:
     def _parse(completion: str) -> SessionSynthesis | None:
         """Split `TITLE: ...` off the front of the completion.
 
-        The model is small and will sometimes ignore the convention, so a
-        missing title falls back rather than discarding a good body.
+        The model is small and will sometimes drift from the exact convention
+        (markdown emphasis around the marker, stray whitespace before the
+        colon, or omitting the line entirely) -- a near-miss still counts as
+        a title attempt and must never leak into the body, and a missing
+        title falls back rather than discarding a good body.
         """
         text = completion.strip()
         if not text:
@@ -109,8 +123,9 @@ class SessionSynthesizer:
         body = text
 
         first, _, rest = text.partition("\n")
-        if first.strip().upper().startswith("TITLE:"):
-            candidate = first.split(":", 1)[1].strip()
+        match = _TITLE_LINE_RE.match(first.strip())
+        if match:
+            candidate = match.group(1).strip()
             if candidate:
                 title = candidate
             body = rest.strip()
