@@ -6,6 +6,9 @@ as the running backend.
 
 Tier 1 subcommands (graph operations):
     seed                                    Apply seed_data.yaml idempotently.
+    seed-verify [--seed-dir DIR]            Run facts-present, containment and
+                                             negation-proximity gates against the
+                                             versioned seed source (R1.4 spec 5).
     graph-dump [--format json|cypher]       Dump full __Entity__ subgraph.
     graph-stats                             Node/rel counts, confidence, orphans.
     graph-reset [--confirm] [--dry-run]     Wipe graph with safety guards.
@@ -184,6 +187,59 @@ def _do_vault_bootstrap(be: Any, config: Any, seed_data: dict[str, Any]) -> None
 
     print(f"[seed]   identity_path: {paths['identity_path']}")
     print(f"[seed]   user_path:     {paths['user_path']}")
+
+
+def cmd_seed_verify(args: argparse.Namespace) -> int:
+    """Run the three seed-verification gates against the versioned seed source.
+
+    `facts-present` is the only gate that touches the graph, and only to
+    read -- it never writes (Gate 2, `backend.knowledge.seed.gates`).
+    `containment` and `negation-proximity` check the source against
+    itself and need no connection at all. Exits non-zero if any gate
+    fails, so this is safe to wire into a pre-rebuild check.
+    """
+    be = _load_backend()
+    from backend.knowledge.seed.gates import (
+        check_containment,
+        check_facts_present,
+        check_negation_proximity,
+    )
+    from backend.knowledge.seed.loader import load_seed_documents
+
+    config = be.get_config()
+    seed_dir = Path(args.seed_dir) if args.seed_dir else Path(config.vault.root) / "seed"
+    print(f"[seed-verify] Loading seed documents from {seed_dir}")
+    documents = load_seed_documents(seed_dir)
+    seed_version = documents[0].seed_version  # loader enforces exactly one shared version
+    print(f"[seed-verify] {len(documents)} document(s) at seed_version={seed_version!r}")
+
+    connection = _connect(be)
+    try:
+        gate_results = [
+            (
+                "facts-present",
+                check_facts_present(connection, documents, seed_version=seed_version),
+            ),
+            ("containment", check_containment(documents)),
+            ("negation-proximity", check_negation_proximity(documents)),
+        ]
+    finally:
+        connection.disconnect()
+
+    all_passed = True
+    for name, result in gate_results:
+        status = "PASS" if result.passed else "FAIL"
+        print(f"[seed-verify] {name}: {status}")
+        for failure in result.failures:
+            print(f"  - {failure}")
+        if not result.passed:
+            all_passed = False
+
+    if all_passed:
+        print("[seed-verify] all gates passed")
+    else:
+        print("[seed-verify] one or more gates failed")
+    return 0 if all_passed else 1
 
 
 def cmd_graph_dump(args: argparse.Namespace) -> int:
@@ -1345,6 +1401,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_seed.set_defaults(func=cmd_seed)
+
+    p_seed_verify = sub.add_parser(
+        "seed-verify",
+        help="Run facts-present, containment and negation-proximity gates on the seed source.",
+    )
+    p_seed_verify.add_argument(
+        "--seed-dir",
+        default=None,
+        help="Path to the seed source directory (default: <vault.root>/seed).",
+    )
+    p_seed_verify.set_defaults(func=cmd_seed_verify)
 
     p_dump = sub.add_parser("graph-dump", help="Dump the __Entity__ subgraph.")
     p_dump.add_argument(
