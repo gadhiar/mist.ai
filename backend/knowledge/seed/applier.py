@@ -13,21 +13,40 @@ import logging
 from backend.errors import SeedSourceError
 from backend.interfaces import GraphConnection
 from backend.knowledge.ontologies.v1_0_0 import ALL_EDGE_TYPE_NAMES
+from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
 from .models import SeedDocument
 
 logger = logging.getLogger(__name__)
 
+# Node label is interpolated per document's partition (`%s`), never a fixed
+# constant -- the graph has two id-scoped, constraint-isolated partitions
+# (`entity_id_unique` on :__Entity__, `selfmodel_id_unique` on
+# :__SelfModel__) and a hardcoded label here would create a duplicate
+# :__Entity__ copy of every live :__SelfModel__ node the self-model seed
+# content (`seed/mist.md`) references, silently orphaning the real
+# self-model (R1.4 Task 4 rework, found during Task 8). No runtime
+# allowlist check guards this interpolation the way `_validate_predicates`
+# guards the edge type below: `SeedDocument.partition` is `Literal`-typed
+# against exactly `ENTITY_LABEL`/`SELF_MODEL_LABEL`, which makes
+# constructing a document with any other value impossible, so the
+# type-level closure IS the guard.
 _MERGE_NODE = (
-    "MERGE (n:__Entity__ {id: $id}) "
+    "MERGE (n:%s {id: $id}) "
     "ON CREATE SET n.created_at = $now "
     "SET n.seed_version = $seed_version, n.updated_at = $now "
     "RETURN n.id AS id"
 )
 
+# The label union (`:A|B`) matches a node in EITHER partition -- this MATCH
+# must find self-model nodes as readily as entity nodes, since a fact's
+# subject/object may resolve to either. Mirrors the existing production
+# precedent at backend/knowledge/admin.py's edge-merge helper, which solves
+# the identical two-partition matching problem for the older seed_data.yaml
+# path.
 _MERGE_EDGE = (
-    "MATCH (s:__Entity__ {id: $subject}) "
-    "MATCH (o:__Entity__ {id: $object}) "
+    f"MATCH (s:{ENTITY_LABEL}|{SELF_MODEL_LABEL} {{id: $subject}}) "
+    f"MATCH (o:{ENTITY_LABEL}|{SELF_MODEL_LABEL} {{id: $object}}) "
     "MERGE (s)-[r:%s]->(o) "
     "SET r.seed_version = $seed_version, r.valid_from = $valid_from, "
     "    r.valid_to = $valid_to, r.updated_at = $now "
@@ -73,19 +92,16 @@ def apply_seed_documents(
 
     Raises:
         SeedSourceError: A fact's predicate is not a recognized ontology
-            relationship type.
+            relationship type, or the same node id is assigned to two
+            different partitions by different documents.
     """
     _validate_predicates(documents)
+    node_partitions = _assign_node_partitions(documents)
 
-    subjects_and_objects: set[str] = set()
-    for doc in documents:
-        for fact in doc.facts:
-            subjects_and_objects.add(fact.subject)
-            subjects_and_objects.add(fact.object)
-
-    for node_id in sorted(subjects_and_objects):
+    for node_id in sorted(node_partitions):
         connection.execute_write(
-            _MERGE_NODE, {"id": node_id, "seed_version": seed_version, "now": now_iso}
+            _MERGE_NODE % node_partitions[node_id],
+            {"id": node_id, "seed_version": seed_version, "now": now_iso},
         )
 
     fact_count = 0
@@ -107,11 +123,11 @@ def apply_seed_documents(
 
     logger.info(
         "Seed applied: %d nodes, %d facts at version %s",
-        len(subjects_and_objects),
+        len(node_partitions),
         fact_count,
         seed_version,
     )
-    return {"nodes": len(subjects_and_objects), "facts": fact_count}
+    return {"nodes": len(node_partitions), "facts": fact_count}
 
 
 def wipe_seed_version(connection: GraphConnection, seed_version: str) -> dict[str, int]:
@@ -170,11 +186,14 @@ def reseed(
     unauthored ones are absent. Wiping first is what makes the graph
     actually track the source rather than only ever accumulate it.
 
-    Predicates are validated before the wipe runs, not just before the
-    re-apply's writes (`apply_seed_documents` already guards that point).
-    Without this, a typo introduced in a source edit would empty a
-    previously-good graph via the wipe and then abort the re-apply,
-    leaving a real data-loss window open until the typo is fixed.
+    Predicates and node-partition assignment are validated before the wipe
+    runs, not just before the re-apply's writes (`apply_seed_documents`
+    already guards both points; this call is deliberately redundant --
+    see the identical redundancy for `_validate_predicates`, established
+    before this function existed). Without this, a typo or partition
+    conflict introduced in a source edit would empty a previously-good
+    graph via the wipe and then abort the re-apply, leaving a real
+    data-loss window open until the source is fixed.
 
     Args:
         connection: Sync graph connection.
@@ -189,9 +208,12 @@ def reseed(
 
     Raises:
         SeedSourceError: A fact's predicate is not a recognized ontology
-            relationship type. Raised before the wipe runs.
+            relationship type, or the same node id is assigned to two
+            different partitions by different documents. Raised before
+            the wipe runs.
     """
     _validate_predicates(documents)
+    _assign_node_partitions(documents)
     wipe_seed_version(connection, seed_version)
     return apply_seed_documents(connection, documents, seed_version=seed_version, now_iso=now_iso)
 
@@ -208,6 +230,45 @@ def _count(results: list[dict]) -> int:
     if not results:
         return 0
     return int(results[0]["n"])
+
+
+def _assign_node_partitions(documents: list[SeedDocument]) -> dict[str, str]:
+    """Map every subject/object id referenced in `documents` to its partition.
+
+    A document's `partition` applies to every subject and object its facts
+    reference. `SeedDocument.partition` is `Literal`-typed against the
+    graph's two valid partition labels, so a single document can never
+    carry an invalid one -- what this function additionally catches is a
+    node id claimed by two DIFFERENT documents under different partitions,
+    which no single document's type validation can see. That case is a
+    genuine authoring conflict (the same id cannot mean two different
+    partitioned things), not a typo class covered elsewhere.
+
+    Args:
+        documents: Parsed seed documents to map.
+
+    Returns:
+        Every referenced node id mapped to the partition label
+        (`ENTITY_LABEL` or `SELF_MODEL_LABEL`) it belongs to.
+
+    Raises:
+        SeedSourceError: The same node id is assigned different partitions
+            by different documents.
+    """
+    partitions: dict[str, str] = {}
+    for doc in documents:
+        for fact in doc.facts:
+            for node_id in (fact.subject, fact.object):
+                claimed = partitions.get(node_id)
+                if claimed is not None and claimed != doc.partition:
+                    raise SeedSourceError(
+                        f"{doc.source_path}: {node_id!r} is claimed by partition "
+                        f"{claimed!r} elsewhere in the seed source and "
+                        f"{doc.partition!r} here -- a node cannot live in two "
+                        "graph partitions"
+                    )
+                partitions[node_id] = doc.partition
+    return partitions
 
 
 def _validate_predicates(documents: list[SeedDocument]) -> None:

@@ -6,6 +6,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from backend.errors import SeedSourceError
+from backend.knowledge.storage.partitions import ENTITY_LABEL
 from backend.vault.models import parse_frontmatter
 
 from .models import SeedDocument, SeedFact
@@ -26,9 +27,11 @@ def load_seed_documents(seed_dir: Path) -> list[SeedDocument]:
 
     Raises:
         SeedSourceError: The directory is missing or empty, a document is
-            malformed, or the documents disagree on `seed_version`. One global
-            version is the contract (spec O10); disagreement is a bug rather
-            than something to reconcile silently.
+            malformed (including an unrecognized `partition` value -- see
+            `SeedDocument.partition`), or the documents disagree on
+            `seed_version`. One global version is the contract (spec O10);
+            disagreement is a bug rather than something to reconcile
+            silently.
     """
     if not seed_dir.is_dir():
         raise SeedSourceError(f"Seed directory does not exist: {seed_dir}")
@@ -76,9 +79,19 @@ def load_seed_documents(seed_dir: Path) -> list[SeedDocument]:
             # still visible at load time.
             logger.info("Seed document %s has no facts (prose-only)", path)
 
-        docs.append(
-            SeedDocument(seed_version=str(version), facts=facts, body=body, source_path=path)
-        )
+        partition = fm.get("partition", ENTITY_LABEL)
+
+        try:
+            doc = SeedDocument(
+                seed_version=str(version),
+                facts=facts,
+                body=body,
+                source_path=path,
+                partition=partition,
+            )
+        except ValidationError as exc:
+            raise SeedSourceError(f"{path}: invalid `partition` {partition!r}: {exc}") from exc
+        docs.append(doc)
 
     if not docs:
         raise SeedSourceError(f"Found no seed documents in {seed_dir}")

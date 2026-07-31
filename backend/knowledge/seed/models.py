@@ -7,8 +7,11 @@ are never split into synchronized files because that invites silent drift.
 """
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
+
+from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
 
 class SeedFact(BaseModel):
@@ -54,6 +57,25 @@ class SeedDocument(BaseModel):
     arguments internally by the loader, not from a raw dict: it costs
     nothing and turns a future typo'd kwarg into a loud `ValidationError`
     instead of a silently dropped field.
+
+    `partition`: which of the graph's two id-scoped structural partitions
+    (`backend.knowledge.storage.partitions`) every subject/object this
+    document's facts reference belongs to. Declared per-document rather than
+    per-fact because the seed source is authored one file per topic and each
+    file is homogeneous by partition in practice (`seed/mist.md` is entirely
+    the self-model, `seed/user.md` is entirely user/world facts) -- added in
+    R1.4 Task 4's rework after `apply_seed_documents` was found to hardcode
+    every node to `__Entity__`, which would have duplicated the live
+    `:__SelfModel__` partition rather than matching it at seed-apply time.
+    `Literal` against the graph's exact two partition labels is the sole
+    validation boundary for this field: it makes constructing a
+    `SeedDocument` with any other value impossible, so the Cypher
+    interpolation site in `applier.py` never needs (and does not have) a
+    redundant runtime check for partition validity -- unlike `predicate`,
+    which has no equivalent type-level closure (see `applier.py`'s
+    `_validate_predicates` docstring) because the ontology's relationship
+    types are too large and version-dependent to enumerate as a `Literal`.
+    Defaults to the entity partition, the common case.
     """
 
     model_config = {"extra": "forbid"}
@@ -62,3 +84,4 @@ class SeedDocument(BaseModel):
     facts: list[SeedFact] = Field(default_factory=list)
     body: str
     source_path: Path
+    partition: Literal[ENTITY_LABEL, SELF_MODEL_LABEL] = ENTITY_LABEL

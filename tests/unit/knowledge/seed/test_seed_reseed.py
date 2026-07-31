@@ -18,6 +18,7 @@ import pytest
 from backend.errors import SeedSourceError
 from backend.knowledge.seed.applier import reseed, wipe_seed_version
 from backend.knowledge.seed.models import SeedDocument, SeedFact
+from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
 _NOW = "2026-07-31T00:00:00+00:00"
 
@@ -28,10 +29,17 @@ def _doc(
     facts: list[tuple[str, str, str]] | None = None,
     body: str = "test body",
     source_path: Path = Path("test.md"),
+    partition: str = ENTITY_LABEL,
 ) -> SeedDocument:
     """Build a valid SeedDocument. `facts` is a list of (subject, predicate, object)."""
     fact_objs = [SeedFact(subject=s, predicate=p, object=o) for s, p, o in (facts or [])]
-    return SeedDocument(seed_version=version, facts=fact_objs, body=body, source_path=source_path)
+    return SeedDocument(
+        seed_version=version,
+        facts=fact_objs,
+        body=body,
+        source_path=source_path,
+        partition=partition,
+    )
 
 
 class TestWipeScoping:
@@ -188,6 +196,29 @@ class TestReseed:
         docs = [_doc(facts=[("user", "NOT_A_REAL_PREDICATE", "thing")])]
 
         with pytest.raises(SeedSourceError):
+            reseed(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        fake_connection.assert_no_writes()
+
+    def test_reseed_validates_partition_conflicts_before_wiping(self, fake_connection):
+        """The same data-loss shape as the predicate case above, for the newer
+        partition-conflict guard: a node id claimed by two different partitions
+        must abort before the wipe runs, not after (R1.4 Task 4 rework).
+        """
+        docs = [
+            _doc(
+                facts=[("shared-id", "USES", "python")],
+                partition=ENTITY_LABEL,
+                source_path=Path("a.md"),
+            ),
+            _doc(
+                facts=[("shared-id", "HAS_TRAIT", "trait-warm")],
+                partition=SELF_MODEL_LABEL,
+                source_path=Path("b.md"),
+            ),
+        ]
+
+        with pytest.raises(SeedSourceError, match="shared-id"):
             reseed(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
 
         fake_connection.assert_no_writes()

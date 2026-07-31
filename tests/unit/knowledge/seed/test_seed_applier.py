@@ -14,6 +14,7 @@ import pytest
 from backend.errors import SeedSourceError
 from backend.knowledge.seed.applier import apply_seed_documents
 from backend.knowledge.seed.models import SeedDocument, SeedFact
+from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
 _NOW = "2026-07-31T00:00:00+00:00"
 
@@ -24,10 +25,17 @@ def _doc(
     facts: list[tuple[str, str, str]] | None = None,
     body: str = "test body",
     source_path: Path = Path("test.md"),
+    partition: str = ENTITY_LABEL,
 ) -> SeedDocument:
     """Build a valid SeedDocument. `facts` is a list of (subject, predicate, object)."""
     fact_objs = [SeedFact(subject=s, predicate=p, object=o) for s, p, o in (facts or [])]
-    return SeedDocument(seed_version=version, facts=fact_objs, body=body, source_path=source_path)
+    return SeedDocument(
+        seed_version=version,
+        facts=fact_objs,
+        body=body,
+        source_path=source_path,
+        partition=partition,
+    )
 
 
 class TestSeedVersionStamping:
@@ -242,3 +250,112 @@ class TestPredicateValidation:
         apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
 
         assert fake_connection.writes
+
+
+class TestPartitionRouting:
+    """The graph has two id-scoped, constraint-isolated partitions: `__Entity__`
+    (user/world facts) and `__SelfModel__` (MIST's identity/traits/capabilities/
+    preferences). A node write that hardcodes `__Entity__` for self-model content
+    would create a duplicate copy in the wrong partition rather than matching the
+    21 live `:__SelfModel__` nodes -- this was the defect found during Task 8 that
+    reopened this module. Every assertion here pins the exact routing clause
+    (which label a specific node id's MERGE uses), not merely that a label
+    *appears somewhere* in the query text -- Task 4's own retrospective on the
+    seed_version stamping test showed that a looser substring check on the wrong
+    thing proves nothing.
+    """
+
+    def test_routes_self_model_nodes_to_the_selfmodel_partition(self, fake_connection):
+        docs = [
+            _doc(
+                facts=[("mist-identity", "HAS_TRAIT", "trait-warm")],
+                partition=SELF_MODEL_LABEL,
+            )
+        ]
+
+        apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        node_writes = [(q, p) for q, p in fake_connection.writes if not p.get("predicate")]
+        assert len(node_writes) == 2  # mist-identity, trait-warm
+        for query, params in node_writes:
+            assert (
+                f"MERGE (n:{SELF_MODEL_LABEL} {{id: $id}})" in query
+            ), f"node {params['id']!r} was not routed to {SELF_MODEL_LABEL}: {query!r}"
+
+    def test_routes_entity_nodes_to_the_entity_partition_by_default(self, fake_connection):
+        docs = [_doc(facts=[("user", "WORKS_AT", "slalom")])]  # default partition
+
+        apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        node_writes = [(q, p) for q, p in fake_connection.writes if not p.get("predicate")]
+        assert len(node_writes) == 2  # user, slalom
+        for query, params in node_writes:
+            assert (
+                f"MERGE (n:{ENTITY_LABEL} {{id: $id}})" in query
+            ), f"node {params['id']!r} was not routed to {ENTITY_LABEL}: {query!r}"
+
+    def test_two_documents_route_their_nodes_to_different_partitions_independently(
+        self, fake_connection
+    ):
+        """The realistic shape: one document is entirely self-model (seed/mist.md),
+        another is entirely user-facing (seed/user.md), applied together in one call.
+        """
+        docs = [
+            _doc(
+                facts=[("mist-identity", "HAS_TRAIT", "trait-warm")],
+                partition=SELF_MODEL_LABEL,
+                source_path=Path("mist.md"),
+            ),
+            _doc(facts=[("user", "WORKS_AT", "slalom")], source_path=Path("user.md")),
+        ]
+
+        apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        node_writes = [(q, p) for q, p in fake_connection.writes if not p.get("predicate")]
+        by_id = {p["id"]: q for q, p in node_writes}
+        assert f"MERGE (n:{SELF_MODEL_LABEL} {{id: $id}})" in by_id["mist-identity"]
+        assert f"MERGE (n:{SELF_MODEL_LABEL} {{id: $id}})" in by_id["trait-warm"]
+        assert f"MERGE (n:{ENTITY_LABEL} {{id: $id}})" in by_id["user"]
+        assert f"MERGE (n:{ENTITY_LABEL} {{id: $id}})" in by_id["slalom"]
+
+    def test_edge_match_accepts_either_partition_for_subject_and_object(self, fake_connection):
+        """A fact's subject/object may resolve to either partition (e.g. the
+        self-model's HAS_TRAIT edges, or a future cross-layer edge), so the edge
+        MATCH must not assume `__Entity__` the way the pre-fix version did.
+        """
+        docs = [
+            _doc(facts=[("mist-identity", "HAS_TRAIT", "trait-warm")], partition=SELF_MODEL_LABEL)
+        ]
+
+        apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        edge_writes = [(q, p) for q, p in fake_connection.writes if p.get("predicate")]
+        assert edge_writes
+        query, _params = edge_writes[0]
+        assert f"MATCH (s:{ENTITY_LABEL}|{SELF_MODEL_LABEL} {{id: $subject}})" in query
+        assert f"MATCH (o:{ENTITY_LABEL}|{SELF_MODEL_LABEL} {{id: $object}})" in query
+
+    def test_rejects_a_node_id_claimed_by_two_different_partitions(self, fake_connection):
+        """A genuine authoring conflict: two documents disagree about which
+        partition the same node id belongs to. Neither document's own `partition`
+        value is individually invalid, so `SeedDocument`'s `Literal` typing cannot
+        catch this -- it is a cross-document consistency error, not a per-document
+        one.
+        """
+        docs = [
+            _doc(
+                facts=[("shared-id", "USES", "python")],
+                partition=ENTITY_LABEL,
+                source_path=Path("a.md"),
+            ),
+            _doc(
+                facts=[("shared-id", "HAS_TRAIT", "trait-warm")],
+                partition=SELF_MODEL_LABEL,
+                source_path=Path("b.md"),
+            ),
+        ]
+
+        with pytest.raises(SeedSourceError, match="shared-id"):
+            apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        fake_connection.assert_no_writes()

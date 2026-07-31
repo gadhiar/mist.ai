@@ -5,6 +5,7 @@ import pytest
 
 from backend.errors import SeedSourceError
 from backend.knowledge.seed.loader import load_seed_documents
+from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
 _DOC = """---
 type: mist-seed
@@ -172,3 +173,45 @@ def test_logs_info_for_fact_less_seed_document(tmp_path: Path, caplog: pytest.Lo
         "identity.md" in record.getMessage() and "no facts" in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_defaults_partition_to_the_entity_label_when_absent(tmp_path: Path):
+    """`_DOC` carries no `partition:` key -- most seed documents are ordinary
+    user/world facts, so the entity partition is the correct default rather than
+    requiring every document to declare it.
+    """
+    d = _write(tmp_path, "user.md", _DOC)
+
+    docs = load_seed_documents(d)
+
+    assert docs[0].partition == ENTITY_LABEL
+
+
+def test_loads_partition_field_from_frontmatter(tmp_path: Path):
+    """A document whose content belongs in the self-model partition (e.g.
+    seed/mist.md) must declare it, and the loader must read it through rather
+    than silently defaulting -- this is R1.4 Task 4's rework: apply_seed_documents
+    previously hardcoded every node to the entity partition regardless of what
+    the document declared.
+    """
+    self_model_doc = _DOC.replace(
+        "seed_version: profile-v1\n", f"seed_version: profile-v1\npartition: {SELF_MODEL_LABEL}\n"
+    )
+    d = _write(tmp_path, "mist.md", self_model_doc)
+
+    docs = load_seed_documents(d)
+
+    assert docs[0].partition == SELF_MODEL_LABEL
+
+
+def test_rejects_unknown_partition_value(tmp_path: Path):
+    """A typo'd partition (e.g. `__SelfModle__`) must fail loudly at load time as
+    a `SeedSourceError`, not surface as a raw pydantic `ValidationError` -- and
+    must never silently fall through to the entity-partition default, which
+    would reproduce the exact bug this field exists to prevent.
+    """
+    bad = _DOC.replace("seed_version: profile-v1\n", "seed_version: profile-v1\npartition: bogus\n")
+    d = _write(tmp_path, "user.md", bad)
+
+    with pytest.raises(SeedSourceError, match="partition"):
+        load_seed_documents(d)
