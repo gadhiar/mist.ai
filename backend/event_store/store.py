@@ -79,9 +79,22 @@ class EventStore:
         conn = self._get_connection()
         conn.executescript(schema_sql)
 
+        # `CREATE TABLE IF NOT EXISTS` leaves a pre-existing table untouched,
+        # so a database created before `origin` existed needs the column added
+        # explicitly. Guarded on PRAGMA rather than caught-and-ignored so a
+        # genuine failure still surfaces.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(conversation_sessions)")}
+        if "origin" not in columns:
+            conn.execute(
+                "ALTER TABLE conversation_sessions ADD COLUMN origin TEXT NOT NULL DEFAULT 'real'"
+            )
+            logger.info("Event store: added `origin` column to conversation_sessions")
+
         logger.info("Event store initialized at %s", self.db_path)
 
-    def start_session(self, session_id: str, input_modality: str = "voice") -> str:
+    def start_session(
+        self, session_id: str, input_modality: str = "voice", origin: str = "real"
+    ) -> str:
         """Start a new conversation session.
 
         R1.3.1 fix round 1: `session_id` is now supplied by the caller
@@ -102,6 +115,11 @@ class EventStore:
                 single identifier used across SQLite, the Neo4j
                 `ConversationContext` anchor, and vault note paths.
             input_modality: How the user is interacting. One of "voice", "text", "api".
+            origin: Provenance of this session. "real" is genuine usage and is
+                what R1.6's cutover rebuilds from; "test" marks harness and
+                probe traffic; "seed" is reserved. Defaults to "real" so a
+                caller that forgets is counted as real rather than silently
+                excluded from a rebuild.
 
         Returns:
             The `session_id` that was passed in, for call-site symmetry
@@ -113,13 +131,15 @@ class EventStore:
         conn = self._get_connection()
         conn.execute(
             """
-            INSERT INTO conversation_sessions (session_id, started_at, input_modality)
-            VALUES (?, ?, ?)
+            INSERT INTO conversation_sessions (session_id, started_at, input_modality, origin)
+            VALUES (?, ?, ?, ?)
             """,
-            (session_id, started_at, input_modality),
+            (session_id, started_at, input_modality, origin),
         )
 
-        logger.info("Started session %s (modality=%s)", session_id, input_modality)
+        logger.info(
+            "Started session %s (modality=%s, origin=%s)", session_id, input_modality, origin
+        )
         return session_id
 
     def end_session(self, session_id: str) -> None:

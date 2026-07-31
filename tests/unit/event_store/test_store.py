@@ -4,6 +4,7 @@ Uses real in-memory SQLite (:memory:) -- fast enough and avoids
 fake/real divergence.
 """
 
+import sqlite3
 from datetime import UTC, datetime
 
 import pytest
@@ -163,3 +164,78 @@ class TestListSessionsWithTurns:
         result = store.list_sessions_with_turns()
 
         assert result.index(first) < result.index(second)
+
+
+class TestOrigin:
+    """Provenance discriminator on conversation_sessions -- see R1.4 Task 3.
+
+    Uses `tmp_path` rather than the `:memory:` `store` fixture: the
+    pre-existing-database test needs a file it can reopen with a second
+    connection, which an in-memory database does not support.
+    """
+
+    def test_start_session_defaults_origin_to_real(self, tmp_path):
+        """A caller that forgets to pass origin is counted as real usage,
+        not silently excluded from a future rebuild.
+        """
+        store = EventStore(db_path=str(tmp_path / "es.db"))
+        store.initialize()
+
+        store.start_session("s-1", input_modality="text")
+
+        conn = store._get_connection()
+        row = conn.execute(
+            "SELECT origin FROM conversation_sessions WHERE session_id = ?", ("s-1",)
+        ).fetchone()
+        assert row[0] == "real"
+
+    def test_start_session_records_test_origin(self, tmp_path):
+        store = EventStore(db_path=str(tmp_path / "es.db"))
+        store.initialize()
+
+        store.start_session("s-2", input_modality="text", origin="test")
+
+        conn = store._get_connection()
+        row = conn.execute(
+            "SELECT origin FROM conversation_sessions WHERE session_id = ?", ("s-2",)
+        ).fetchone()
+        assert row[0] == "test"
+
+    def test_origin_column_added_to_preexisting_db(self, tmp_path):
+        """A database created before the column existed gains it on open."""
+        db = tmp_path / "legacy.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE conversation_sessions ("
+            "session_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT, "
+            "turn_count INTEGER DEFAULT 0, input_modality TEXT DEFAULT 'voice')"
+        )
+        conn.commit()
+        conn.close()
+
+        store = EventStore(db_path=str(db))
+        store.initialize()
+
+        cols = {
+            row[1]
+            for row in store._get_connection().execute("PRAGMA table_info(conversation_sessions)")
+        }
+        assert "origin" in cols
+
+    def test_migration_guard_is_idempotent_across_reopens(self, tmp_path):
+        """The guarded ALTER must not raise `duplicate column name` the
+        second time a database that already has `origin` is opened.
+        """
+        db_path = str(tmp_path / "es.db")
+        first = EventStore(db_path=db_path)
+        first.initialize()
+        first.close()
+
+        second = EventStore(db_path=db_path)
+        second.initialize()  # must not raise
+
+        cols = {
+            row[1]
+            for row in second._get_connection().execute("PRAGMA table_info(conversation_sessions)")
+        }
+        assert "origin" in cols

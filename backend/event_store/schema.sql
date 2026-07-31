@@ -11,7 +11,8 @@ CREATE TABLE IF NOT EXISTS conversation_sessions (
     started_at TEXT NOT NULL,                -- ISO-8601
     ended_at TEXT,                           -- ISO-8601, NULL if still active
     turn_count INTEGER DEFAULT 0,
-    input_modality TEXT DEFAULT 'voice'      -- 'voice', 'text', 'api'
+    input_modality TEXT DEFAULT 'voice',     -- 'voice', 'text', 'api'
+    origin TEXT NOT NULL DEFAULT 'real'      -- 'real', 'test', 'seed'
 );
 
 -- Individual conversation turns (immutable after creation)
