@@ -40,14 +40,18 @@ def load_seed_documents(seed_dir: Path) -> list[SeedDocument]:
 
         # `parse_frontmatter` swallows yaml.YAMLError and returns `{}`, which
         # is indistinguishable from "this file never had frontmatter" -- see
-        # backend/vault/models.py:151-155. For a dedicated seed directory
-        # every `.md` file is expected to carry frontmatter, so a file that
-        # opens with the `---` delimiter but comes back with an empty dict
-        # did not silently opt out of being a seed doc; its YAML is broken.
-        # Fail loudly here rather than let it fall through to the type check
-        # below and vanish as a silently-skipped "non-seed" file.
+        # backend/vault/models.py:151-155. It is also indistinguishable from
+        # well-formed YAML that legitimately resolves to no keys (e.g. a
+        # frontmatter block containing only comments), so this message does
+        # not claim a syntax error -- it may have parsed fine and simply had
+        # nothing in it. For a dedicated seed directory every `.md` file is
+        # expected to carry frontmatter, so a file that opens with the `---`
+        # delimiter but comes back with an empty dict did not silently opt
+        # out of being a seed doc. Fail loudly here rather than let it fall
+        # through to the type check below and vanish as a silently-skipped
+        # "non-seed" file.
         if text.startswith("---") and not fm:
-            raise SeedSourceError(f"{path}: frontmatter present but failed to parse as YAML")
+            raise SeedSourceError(f"{path}: frontmatter is present but resolved to no keys")
 
         if fm.get("type") != _SEED_TYPE:
             logger.debug("Skipping non-seed document %s (type=%r)", path, fm.get("type"))
@@ -61,6 +65,16 @@ def load_seed_documents(seed_dir: Path) -> list[SeedDocument]:
             facts = [SeedFact(**f) for f in fm.get("facts", [])]
         except (ValidationError, TypeError) as exc:
             raise SeedSourceError(f"{path}: invalid `facts` entry: {exc}") from exc
+
+        if not facts:
+            # Legitimate case (prose-only seed content, e.g. an identity
+            # narrative with no typed assertions) -- Gate 3's containment
+            # check passes vacuously with nothing to contain. Logged rather
+            # than silent so a doc that *should* have facts and lost them to
+            # a typo in the `facts:` key itself (which `extra="forbid"` on
+            # SeedFact cannot catch -- that typo never reaches SeedFact) is
+            # still visible at load time.
+            logger.info("Seed document %s has no facts (prose-only)", path)
 
         docs.append(
             SeedDocument(seed_version=str(version), facts=facts, body=body, source_path=path)
