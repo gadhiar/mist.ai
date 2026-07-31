@@ -143,11 +143,19 @@ class TestListSessionsWithTurns:
         assert empty not in result
 
     def test_is_oldest_first(self, store: EventStore):
-        """Catch-up drains oldest first so a long backlog makes visible progress."""
+        """Catch-up drains oldest first so a long backlog makes visible progress.
+
+        `first` gets a second turn after `second` starts, so its earliest
+        turn (rowid 1) and latest turn (rowid 3) land on opposite sides of
+        `second`'s only turn (rowid 2). Ordering by MIN(rowid) keeps
+        [first, second]; a MIN -> MAX typo would flip it to [second, first],
+        so this discriminates the two instead of passing under either.
+        """
         first = store.start_session()
-        store.append_turn(_build_turn_event(session_id=first))
+        store.append_turn(_build_turn_event(session_id=first, turn_index=0))
         second = store.start_session()
-        store.append_turn(_build_turn_event(session_id=second))
+        store.append_turn(_build_turn_event(session_id=second, turn_index=0))
+        store.append_turn(_build_turn_event(session_id=first, turn_index=1))
 
         result = store.list_sessions_with_turns()
 

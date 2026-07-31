@@ -326,9 +326,10 @@ class EventStore:
         Used by the startup catch-up to find sessions that may need a vault
         note. These are the event store's internal session ids -- the same
         ids `get_turns` keys on -- not the external ids `ConversationHandler`
-        exposes to the chat layer. Callers resolving a catch-up candidate
-        back to a live conversation must go through
-        `ConversationHandler._es_session_ids` first.
+        exposes to the chat layer. `ConversationHandler._es_session_ids` maps
+        external id -> internal id, so resolving one of these results back
+        to a live conversation is a reverse lookup (scan `.items()` for a
+        matching value), not a direct `_es_session_ids[candidate]` index.
 
         Ordering is by the session's earliest turn rowid so a backlog
         drains in conversation order.
