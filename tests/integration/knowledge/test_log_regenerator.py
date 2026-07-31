@@ -81,7 +81,8 @@ def _make_event_store_with_turn(tmp_path: Path) -> tuple[EventStore, str, str]:
     """Create an EventStore with one seeded turn. Returns (store, session_id, event_id)."""
     event_store = EventStore(str(tmp_path / "events.db"))
     event_store.initialize()
-    session_id = event_store.start_session("text")
+    session_id = "log-regen-turn-session"
+    event_store.start_session(session_id, input_modality="text")
     event = ConversationTurnEvent(
         session_id=session_id,
         turn_index=0,
@@ -264,7 +265,8 @@ class TestLogRegeneratorReplay:
         # Arrange: event store + cache with 2 turns.
         event_store = EventStore(str(tmp_path / "events.db"))
         event_store.initialize()
-        session_id = event_store.start_session("text")
+        session_id = "log-regen-rebuild-twice-session"
+        event_store.start_session(session_id, input_modality="text")
 
         ts_a = "2026-06-29T10:00:00+00:00"
         ts_b = "2026-06-29T10:01:00+00:00"

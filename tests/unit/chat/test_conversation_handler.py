@@ -2130,3 +2130,124 @@ class TestRecordTurnEventRecordedAt:
         assert handler._record_turn_event(
             session_id="s1", user_message="x", assistant_message="y"
         ) == (None, None)
+
+
+class TestEventStoreIdNamespaceCollapse:
+    """R1.3.1 fix round 1: the event store's session_id IS the chat-layer
+    session_id -- `start_session` no longer mints its own `uuid4`, and
+    `ConversationHandler` no longer bridges the two through `_es_session_ids`.
+
+    Regression these tests catch: reintroducing a separately-minted internal
+    id (e.g. `_es_session_ids` or a fresh `uuid4` in `start_session`) would
+    make `get_turns`/`list_sessions_with_turns` return a DIFFERENT id than
+    the one the caller passed to `_record_turn_event`, failing the exact-id
+    assertions below.
+    """
+
+    def _handler(self, config):
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        return ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=FakeExtractionPipeline(),
+            retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
+        )
+
+    def test_get_turns_is_keyed_on_the_external_session_id_directly(self):
+        handler = self._handler(
+            build_test_config(event_store_enabled=True, event_store_db_path=":memory:")
+        )
+
+        handler._record_turn_event(
+            session_id="external-abc", user_message="hello", assistant_message="hi"
+        )
+
+        # No translation: querying with the EXACT id the caller passed in
+        # returns the turn. A resurrected `_es_session_ids` bridge would
+        # store the turn under a different, internally-minted id instead.
+        turns = handler.event_store.get_turns("external-abc")
+        assert len(turns) == 1
+        assert turns[0]["user_utterance"] == "hello"
+
+    def test_list_sessions_with_turns_returns_the_external_id(self):
+        handler = self._handler(
+            build_test_config(event_store_enabled=True, event_store_db_path=":memory:")
+        )
+
+        handler._record_turn_event(
+            session_id="external-xyz", user_message="hello", assistant_message="hi"
+        )
+
+        assert handler.event_store.list_sessions_with_turns() == ["external-xyz"]
+
+    def test_repeated_turns_for_one_session_increment_turn_index_without_a_new_row(self):
+        handler = self._handler(
+            build_test_config(event_store_enabled=True, event_store_db_path=":memory:")
+        )
+
+        handler._record_turn_event(
+            session_id="repeat-1", user_message="first", assistant_message="ack"
+        )
+        handler._record_turn_event(
+            session_id="repeat-1", user_message="second", assistant_message="ack"
+        )
+
+        # A single session row accumulates both turns -- if get_session/
+        # start_session's existence check regressed, this would either
+        # raise (duplicate INSERT) or silently drop the second turn.
+        turns = handler.event_store.get_turns("repeat-1")
+        assert [t["turn_index"] for t in turns] == [0, 1]
+        assert handler.event_store.list_sessions_with_turns() == ["repeat-1"]
+
+
+class TestClearSession:
+    """R1.3.1 fix round 1: clear_session ends the event-store session
+    directly by session_id, with no `_es_session_ids` lookup gating it.
+    """
+
+    def _handler(self, config):
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        return ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=FakeExtractionPipeline(),
+            retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
+        )
+
+    def test_ends_the_event_store_session_by_the_same_id(self):
+        handler = self._handler(
+            build_test_config(event_store_enabled=True, event_store_db_path=":memory:")
+        )
+        handler.sessions["s-clear"] = object()  # minimal stand-in; only membership is checked
+        handler._record_turn_event(
+            session_id="s-clear", user_message="hello", assistant_message="hi"
+        )
+
+        handler.clear_session("s-clear")
+
+        session = handler.event_store.get_session("s-clear")
+        assert session is not None
+        assert session.ended_at is not None
+
+    def test_is_a_safe_no_op_when_the_session_never_recorded_a_turn(self):
+        """A chat-layer session_id that never got a turn recorded (e.g.
+        cleared immediately after connect) has no event-store row at all.
+        Previously this was silently skipped via the `_es_session_ids`
+        membership check; now `EventStore.end_session` itself no-ops
+        (with its own internal warning log) on an unknown session_id, so
+        this must not raise.
+        """
+        handler = self._handler(
+            build_test_config(event_store_enabled=True, event_store_db_path=":memory:")
+        )
+        handler.sessions["never-touched"] = object()
+
+        handler.clear_session("never-touched")  # must not raise
+
+        assert "never-touched" not in handler.sessions

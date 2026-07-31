@@ -52,14 +52,17 @@ class TestInitialize:
 
 
 class TestSessionLifecycle:
-    def test_start_session_returns_session_id(self, store: EventStore):
-        session_id = store.start_session()
+    def test_start_session_returns_the_id_passed_in(self, store: EventStore):
+        """R1.3.1 fix round 1: the caller supplies the session id (the
+        chat-layer id) rather than the store minting its own uuid4 -- the
+        namespace collapse the id-mismatch bugs in catch-up motivated.
+        """
+        session_id = store.start_session("caller-supplied-id")
 
-        assert isinstance(session_id, str)
-        assert len(session_id) == 36  # UUID format
+        assert session_id == "caller-supplied-id"
 
     def test_end_session_updates_ended_at(self, store: EventStore):
-        session_id = store.start_session()
+        session_id = store.start_session("s-end")
 
         store.end_session(session_id)
 
@@ -68,7 +71,7 @@ class TestSessionLifecycle:
         assert session.ended_at is not None
 
     def test_get_session_returns_session_data(self, store: EventStore):
-        session_id = store.start_session(input_modality="text")
+        session_id = store.start_session("s-info", input_modality="text")
 
         session = store.get_session(session_id)
 
@@ -82,7 +85,7 @@ class TestSessionLifecycle:
 
 class TestTurnEvents:
     def test_append_turn_stores_event(self, store: EventStore):
-        session_id = store.start_session()
+        session_id = store.start_session("s-append")
         event = _build_turn_event(
             session_id=session_id,
             user_utterance="what is the weather",
@@ -98,7 +101,7 @@ class TestTurnEvents:
         assert turns[0]["system_response"] == "I cannot check the weather yet"
 
     def test_append_turn_increments_turn_index(self, store: EventStore):
-        session_id = store.start_session()
+        session_id = store.start_session("s-increment")
 
         for i in range(3):
             event = _build_turn_event(session_id=session_id, turn_index=i)
@@ -112,7 +115,7 @@ class TestTurnEvents:
         assert turns[2]["turn_index"] == 2
 
     def test_get_turns_returns_all_turns_for_session(self, store: EventStore):
-        session_id = store.start_session()
+        session_id = store.start_session("s-get-turns")
         event_ids = []
         for i in range(3):
             event = _build_turn_event(session_id=session_id, turn_index=i)
@@ -133,8 +136,8 @@ class TestTurnEvents:
 class TestListSessionsWithTurns:
     def test_excludes_empty_sessions(self, store: EventStore):
         """A session row with no turns has nothing to synthesize."""
-        empty = store.start_session()
-        populated = store.start_session()
+        empty = store.start_session("s-empty")
+        populated = store.start_session("s-populated")
         store.append_turn(_build_turn_event(session_id=populated))
 
         result = store.list_sessions_with_turns()
@@ -151,9 +154,9 @@ class TestListSessionsWithTurns:
         [first, second]; a MIN -> MAX typo would flip it to [second, first],
         so this discriminates the two instead of passing under either.
         """
-        first = store.start_session()
+        first = store.start_session("s-first")
         store.append_turn(_build_turn_event(session_id=first, turn_index=0))
-        second = store.start_session()
+        second = store.start_session("s-second")
         store.append_turn(_build_turn_event(session_id=second, turn_index=0))
         store.append_turn(_build_turn_event(session_id=first, turn_index=1))
 

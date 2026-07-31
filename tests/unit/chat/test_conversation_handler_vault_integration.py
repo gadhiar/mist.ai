@@ -323,8 +323,8 @@ class TestSessionEnd:
         assert fake_vault.write_session_note_calls == []
         warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert any(
-            "no event-store turns available" in msg for msg in warning_messages
-        ), f"Expected a no-turns-available warning. Got: {warning_messages}"
+            "no event-store turns were recorded" in msg for msg in warning_messages
+        ), f"Expected a no-turns-recorded warning. Got: {warning_messages}"
 
     @pytest.mark.asyncio
     async def test_end_session_no_op_when_vault_writer_none(self):
@@ -738,24 +738,49 @@ class TestDeriveSessionNotePath:
         assert "s-crashed" not in handler._vault_paths
 
     def test_matches_the_live_allocation_path_for_the_same_inputs(self) -> None:
-        # Arrange -- the load-bearing property: a catch-up note and a live
-        # note for the same session_id + first utterance must derive the
-        # same SLUG (dates naturally differ -- catch-up runs later than the
-        # session did -- so the slug, not the full path, is what must
-        # match, or the two note-writing paths silently diverge).
+        """Exercises the two REAL call paths rather than asserting a pure
+        function is deterministic against a hand-picked matching string (a
+        prior version of this test passed the same literal to both sides,
+        which cannot fail and would not catch a real regression).
+
+        A turn is recorded through `_record_turn_event` -- the same method
+        `handle_message` calls -- so the event-store session id it produces
+        is whatever the REAL id-collapse wiring produces, not an assumption.
+        `derive_session_note_path` is then fed exactly the id
+        `list_sessions_with_turns()` (what startup catch-up actually calls)
+        returns for that conversation. Regression this catches: if a future
+        change reintroduces a separate internal event-store id (e.g. a
+        fresh `uuid4` back in `start_session`), `list_sessions_with_turns()`
+        would return a DIFFERENT id than the external one
+        `_get_or_allocate_vault_path` used, and the second assertion below
+        would fail because the two derived slugs would then differ.
+        """
         fake_vault = FakeVaultWriter()
-        handler = make_handler(vault_writer=fake_vault)
+        handler = make_handler(vault_writer=fake_vault, event_store_enabled=True)
         utterance = "walk me through the extraction pipeline"
 
-        # Act
+        # Act -- the live allocation path (called at Step 0 of handle_message)
         live_path = handler._get_or_allocate_vault_path("s-live", first_utterance=utterance)
-        # A second handler models catch-up running in a fresh process, with
-        # no `_vault_paths` cache primed for "s-live".
-        catchup_handler = make_handler(vault_writer=FakeVaultWriter())
-        catchup_path = catchup_handler.derive_session_note_path("s-live", utterance, "2026-07-29")
+        # ... and a real turn actually recorded to the event store, exactly
+        # as handle_message would do it.
+        event_id, _recorded_at = handler._record_turn_event(
+            session_id="s-live",
+            user_message=utterance,
+            assistant_message="Sure -- stage one is preprocessing.",
+        )
+        assert event_id is not None, "turn must actually record for this test to be meaningful"
+
+        candidates = handler.event_store.list_sessions_with_turns()
+        assert candidates == ["s-live"], (
+            "post-collapse, the event store's session id IS the chat-layer "
+            "session id -- this is the property the rest of the test relies on"
+        )
+
+        catchup_path = handler.derive_session_note_path(candidates[0], utterance, "2026-07-29")
         expected_slug = handler._derive_session_slug_from_utterance(utterance, "s-live")
 
-        # Assert
+        # Assert -- dates naturally differ (catch-up runs later than the
+        # session did), so the slug, not the full path, is what must match.
         assert live_path.endswith(f"-{expected_slug}.md")
         assert catchup_path.endswith(f"-{expected_slug}.md")
 

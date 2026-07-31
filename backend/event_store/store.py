@@ -81,16 +81,33 @@ class EventStore:
 
         logger.info("Event store initialized at %s", self.db_path)
 
-    def start_session(self, input_modality: str = "voice") -> str:
+    def start_session(self, session_id: str, input_modality: str = "voice") -> str:
         """Start a new conversation session.
 
+        R1.3.1 fix round 1: `session_id` is now supplied by the caller
+        rather than minted here. Previously this method generated its own
+        `uuid4`, giving the event store a session-id namespace independent
+        of the chat layer's -- `ConversationHandler` bridged the two via an
+        `_es_session_ids` dict, and every downstream consumer that assumed
+        a single namespace (the vault path allocator, the Neo4j
+        `ConversationContext` anchor, startup catch-up) silently broke on
+        that assumption. Collapsing the namespaces -- the event store's
+        `session_id` now IS the chat layer's `session_id` -- removes the
+        bridge and the class of bug it enabled, rather than patching each
+        consumer to translate correctly.
+
         Args:
+            session_id: The session identifier to record under. Callers
+                pass the chat-layer session id directly; this is now the
+                single identifier used across SQLite, the Neo4j
+                `ConversationContext` anchor, and vault note paths.
             input_modality: How the user is interacting. One of "voice", "text", "api".
 
         Returns:
-            session_id as a UUID string.
+            The `session_id` that was passed in, for call-site symmetry
+            with the pre-collapse signature (callers that used the return
+            value continue to work unchanged).
         """
-        session_id = str(uuid.uuid4())
         started_at = datetime.now(UTC).isoformat()
 
         conn = self._get_connection()
@@ -324,12 +341,14 @@ class EventStore:
         """Session ids having at least one recorded turn, oldest first.
 
         Used by the startup catch-up to find sessions that may need a vault
-        note. These are the event store's internal session ids -- the same
-        ids `get_turns` keys on -- not the external ids `ConversationHandler`
-        exposes to the chat layer. `ConversationHandler._es_session_ids` maps
-        external id -> internal id, so resolving one of these results back
-        to a live conversation is a reverse lookup (scan `.items()` for a
-        matching value), not a direct `_es_session_ids[candidate]` index.
+        note. R1.3.1 fix round 1 collapsed the event store's session-id
+        namespace into the chat layer's: `start_session` now takes the
+        session id as a parameter rather than minting its own `uuid4`, so
+        there is exactly one namespace. A result from this method IS the
+        chat-layer session id -- the same id `ConversationHandler` uses for
+        `_vault_paths`, and the same id the Neo4j `ConversationContext`
+        anchor is keyed on. No translation or lookup is needed to resolve
+        one of these back to anything else.
 
         Ordering is by the session's earliest turn rowid so a backlog
         drains in conversation order.

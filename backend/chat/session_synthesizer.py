@@ -71,6 +71,23 @@ class SessionSynthesizer:
         self._temperature = temperature
         self._max_tokens = max_tokens
 
+    async def is_ready(self) -> bool:
+        """Report whether the backing LLM is currently reachable.
+
+        Delegates to `StreamingLLMProvider.health_check` (an existing
+        interface method -- `LlamaServerProvider` genuinely probes the
+        `/health` endpoint; the base class and `OllamaProvider` have their
+        own implementations). Exists so a caller that must not commit to a
+        synthesis failure while the backend is merely cold at boot (startup
+        catch-up) can check readiness first, without depending on `_llm`
+        directly.
+        """
+        try:
+            return await self._llm.health_check()
+        except Exception as exc:  # noqa: BLE001 -- readiness check is best-effort
+            logger.warning("LLM readiness check failed (non-fatal): %s", exc)
+            return False
+
     async def synthesize(self, turns: list[dict]) -> SessionSynthesis | None:
         """Synthesize a session note body from its turns.
 

@@ -151,3 +151,42 @@ async def test_llm_failure_returns_none_rather_than_raising():
     synth = SessionSynthesizer(llm_provider=_Boom(), temperature=0.3, max_tokens=512)
 
     assert await synth.synthesize(_turns(2)) is None
+
+
+class TestIsReady:
+    """R1.3.1 fix round 1 (I4): is_ready must forward health_check faithfully.
+
+    `SessionNoteCatchup`'s readiness gate depends on this: a cold LLM at
+    boot must be indistinguishable from "not ready yet," never silently
+    treated as "ready."
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_true_when_the_provider_reports_healthy(self):
+        class _Healthy:
+            async def health_check(self) -> bool:
+                return True
+
+        synth = SessionSynthesizer(llm_provider=_Healthy(), temperature=0.3, max_tokens=512)
+
+        assert await synth.is_ready() is True
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_the_provider_reports_unhealthy(self):
+        class _Cold:
+            async def health_check(self) -> bool:
+                return False
+
+        synth = SessionSynthesizer(llm_provider=_Cold(), temperature=0.3, max_tokens=512)
+
+        assert await synth.is_ready() is False
+
+    @pytest.mark.asyncio
+    async def test_returns_false_rather_than_raising_when_the_check_itself_fails(self):
+        class _Broken:
+            async def health_check(self) -> bool:
+                raise RuntimeError("connection refused")
+
+        synth = SessionSynthesizer(llm_provider=_Broken(), temperature=0.3, max_tokens=512)
+
+        assert await synth.is_ready() is False

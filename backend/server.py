@@ -4,6 +4,7 @@ Based on CSM demo architecture - production-ready for web frontend
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -208,6 +209,23 @@ async def health_status_loop(interval_seconds: float = 30.0) -> None:
             logger.error("Health status emit failed: %s", e)
 
 
+def _log_catchup_task_exception(task: "asyncio.Task") -> None:
+    """Done-callback for the session-note catch-up background task.
+
+    `run_forever` already swallows exceptions from individual `run()`
+    passes internally (logged, loop continues) -- anything that reaches
+    here is a bug in that internal handling itself, not a modeled failure
+    mode. Without this callback such an exception would surface only as
+    "Task exception was never retrieved" when the task object is garbage
+    collected, which is easy to miss in production logs.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Session-note catch-up task failed: %s", exc, exc_info=exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
@@ -342,6 +360,10 @@ async def lifespan(app: FastAPI):
     # would hold the GPU and delay their first token. Reached through the
     # same voice_processor -> models -> knowledge -> conversation_handler
     # chain the shutdown path below already uses to reach the handler.
+    # Runs as `run_forever` (periodic, not one-shot): a single pass can come
+    # back empty because the LLM backend is still cold at boot or a
+    # conversation is live throughout, and a one-shot task would strand the
+    # backlog for the rest of the process's life in either case.
     catchup_task: asyncio.Task | None = None
     try:
         catchup_handler = (
@@ -367,13 +389,18 @@ async def lifespan(app: FastAPI):
                 event_store=catchup_event_store,
                 synthesizer=catchup_handler.session_synthesizer,
                 vault_writer=vault_writer,
-                vault_sessions_dir=Path(knowledge_config.vault.root) / "sessions",
                 sessions_with_graph_state=catchup_handler.graph_store.sessions_with_graph_state,
                 session_path_for=catchup_handler.derive_session_note_path,
                 is_conversation_active=lambda: bool(catchup_handler.sessions),
+                is_llm_ready=catchup_handler.session_synthesizer.is_ready,
             )
-            catchup_task = asyncio.create_task(catchup.run(), name="session-note-catchup")
-            logger.info("Session-note catch-up scheduled as a background task")
+            catchup_task = asyncio.create_task(catchup.run_forever(), name="session-note-catchup")
+            # The task is never awaited on the happy path, so an exception
+            # escaping run_forever's own internal try/except (a genuine bug,
+            # not a modeled failure mode) would otherwise surface only as
+            # "Task exception was never retrieved" at garbage collection.
+            catchup_task.add_done_callback(_log_catchup_task_exception)
+            logger.info("Session-note catch-up scheduled as a periodic background task")
     except Exception as e:  # noqa: BLE001 -- catch-up must never block startup
         logger.warning("Session-note catch-up scheduling failed (non-fatal): %s", e)
 
@@ -384,6 +411,18 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Server shutting down...")
+
+    # Cancel the catch-up background task FIRST, before anything else below
+    # touches vault_writer or the ConversationHandler it holds a reference
+    # to. curation_scheduler.stop() and ch.aclose() both await, which yields
+    # the event loop -- a still-running catch-up pass could resume in that
+    # window and reach a write against an already-stopped vault_writer if
+    # cancellation happened later (or not at all).
+    if catchup_task is not None:
+        catchup_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await catchup_task
+
     if curation_scheduler is not None:
         await curation_scheduler.stop()
 
@@ -428,10 +467,6 @@ async def lifespan(app: FastAPI):
     health_status_task.cancel()
     heartbeat_task.cancel()
     broadcaster_task.cancel()
-    if catchup_task is not None:
-        # Best-effort background pass -- an in-flight session simply gets
-        # picked up again by the next boot's catch-up (bounded-retry gate).
-        catchup_task.cancel()
     if voice_processor and voice_processor.models:
         voice_processor.models.shutdown()
 

@@ -829,9 +829,6 @@ class ConversationHandler:
                 logger.error("Failed to initialize event store: %s", e, exc_info=True)
                 self.event_store = None
 
-        # Maps external session_id -> event store session_id
-        self._es_session_ids: dict[str, str] = {}
-
         # Cluster 3: MistContext cached per session for persona injection.
         # Populated on first handle_message for a given session; stable until
         # clear_session or process restart.
@@ -1844,27 +1841,34 @@ class ConversationHandler:
             # it instead of allocating fresh.
             self._vault_paths.pop(sid, None)
 
-            es_session_id = self._es_session_ids.get(sid)
-            if self.event_store is None or es_session_id is None:
-                # A session with a vault path (i.e. it was live) but no
-                # event-store turns available -- either the event store is
-                # disabled (EVENT_STORE_ENABLED=false) or failed to
-                # initialize (see __init__'s except clause), or this
-                # specific session never got a turn recorded. Distinct from
-                # a genuinely quiet session: this is a structural gap that
-                # silently drops every note for its duration, so it gets a
-                # warning rather than the below-threshold debug line below.
+            if self.event_store is None:
+                # A session with a vault path (i.e. it was live) but the
+                # event store is disabled (EVENT_STORE_ENABLED=false) or
+                # failed to initialize (see __init__'s except clause).
+                # Distinct from a genuinely quiet session: this is a
+                # structural gap that silently drops every note for its
+                # duration, so it gets a warning rather than the
+                # below-threshold debug line below.
                 logger.warning(
-                    "Session %s has a vault path but no event-store turns "
-                    "available (event_store=%s, es_session_id=%s); no "
-                    "session note will be written",
+                    "Session %s has a vault path but the event store is "
+                    "disabled; no session note will be written",
                     sid,
-                    "disabled" if self.event_store is None else "enabled",
-                    es_session_id,
                 )
                 turns = []
             else:
-                turns = self.event_store.get_turns(es_session_id)
+                # Since the R1.3.1 fix-round id-namespace collapse, `sid`
+                # IS the event store's session_id -- no local mapping to
+                # resolve. A session that never got a turn recorded simply
+                # returns an empty list here (get_turns on an unknown
+                # session_id is not an error).
+                turns = self.event_store.get_turns(sid)
+                if not turns:
+                    logger.warning(
+                        "Session %s has a vault path but no event-store "
+                        "turns were recorded; no session note will be "
+                        "written",
+                        sid,
+                    )
 
             synthesis = await self.session_synthesizer.synthesize(turns)
             if synthesis is None:
@@ -2192,16 +2196,17 @@ class ConversationHandler:
             return None, None
 
         try:
-            # Ensure an event store session exists for this session_id
-            if session_id not in self._es_session_ids:
-                es_session_id = self.event_store.start_session(input_modality="text")
-                self._es_session_ids[session_id] = es_session_id
-
-            es_session_id = self._es_session_ids[session_id]
-
-            # Determine turn_index from session turn_count
-            es_session = self.event_store.get_session(es_session_id)
-            turn_index = es_session.turn_count if es_session else 0
+            # Ensure an event store session exists for this session_id. Since
+            # the R1.3.1 fix-round id-namespace collapse, the event store's
+            # session_id IS this session_id -- no separate uuid4 minted, no
+            # local id-mapping cache to maintain. A cheap `get_session` read
+            # doubles as both the existence check and the turn_index source.
+            es_session = self.event_store.get_session(session_id)
+            if es_session is None:
+                self.event_store.start_session(session_id, input_modality="text")
+                turn_index = 0
+            else:
+                turn_index = es_session.turn_count
 
             # Build retrieval_context from RetrievalResult if present
             retrieval_context = None
@@ -2218,7 +2223,7 @@ class ConversationHandler:
             # write time, design 4.2).
             recorded_at = datetime.now(UTC)
             event = ConversationTurnEvent(
-                session_id=es_session_id,
+                session_id=session_id,
                 turn_index=turn_index,
                 timestamp=recorded_at,
                 user_utterance=user_message,
@@ -2728,13 +2733,16 @@ class ConversationHandler:
         """Clear a conversation session."""
         if session_id in self.sessions:
             del self.sessions[session_id]
-            # End event store session
-            if self.event_store and session_id in self._es_session_ids:
+            # End event store session. Since the R1.3.1 fix-round
+            # id-namespace collapse, session_id IS the event store's
+            # session_id, so there is no local mapping to check first --
+            # `end_session` is itself a safe no-op (with a logged warning)
+            # if this session_id never got a turn recorded.
+            if self.event_store:
                 try:
-                    self.event_store.end_session(self._es_session_ids[session_id])
+                    self.event_store.end_session(session_id)
                 except Exception as e:
                     logger.error("Failed to end event store session: %s", e)
-                del self._es_session_ids[session_id]
             # Evict cached MistContext so the next session gets a fresh fetch.
             self._mist_context_cache.pop(session_id, None)
             logger.info(f"Cleared session: {session_id}")

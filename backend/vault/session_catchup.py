@@ -2,16 +2,30 @@
 
 Cost control is the whole design here. The expensive operation is an LLM
 synthesis call, so every gate exists to avoid making one: sessions that
-produced no graph state are skipped outright, sessions already recorded are
-skipped, repeated failures are marked so they stop being retried, and the
-whole pass yields while a conversation is active.
+produced no graph state are skipped outright, a session that already has a
+note at its canonical path is skipped, repeated synthesis failure is marked
+so it stops being retried, the LLM backend must report itself ready before a
+pass attempts any synthesis at all, and the whole pass yields while a
+conversation is active. `run_forever` repeats the pass on an interval rather
+than firing once at boot, so a cold LLM or a live conversation at startup
+does not permanently strand the backlog for the life of the process.
+
+R1.3.1 fix round 1: dedup is keyed on the note's own canonical path
+(`session_path_for`), not on a frontmatter `session_id` field. The vault
+writer's frontmatter `session_id` is always the path-derived slug
+(`_session_id_from_path` in `backend/vault/writer.py`), never any external
+or internal session identifier -- matching against it could never actually
+correlate to a catch-up candidate. Checking "does my own canonical path
+already have a note" needs no id at all: the live path and catch-up already
+agree on where a session's note belongs via the shared slug algorithm, so
+that agreement alone is the dedup key.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -24,7 +38,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_MAX_ATTEMPTS_PER_BOOT = 2
+_MAX_ATTEMPTS_PER_PASS = 2
+_DEFAULT_RETRY_INTERVAL_SECONDS = 300.0
 
 
 class SessionNoteCatchup:
@@ -35,10 +50,10 @@ class SessionNoteCatchup:
         event_store: EventStore,
         synthesizer: SessionSynthesizer,
         vault_writer: VaultWriter,
-        vault_sessions_dir: Path,
         sessions_with_graph_state: Callable[[], set[str]],
         session_path_for: Callable[[str, str, str], str | None],
         is_conversation_active: Callable[[], bool],
+        is_llm_ready: Callable[[], Awaitable[bool]],
     ) -> None:
         """Wire the collaborators. See module docstring for the cost model.
 
@@ -52,8 +67,6 @@ class SessionNoteCatchup:
                 shape).
             vault_writer: `VaultWriter` (or a test double with the same
                 `async write_session_note(...)` shape).
-            vault_sessions_dir: `<vault_root>/sessions` -- scanned for
-                existing note status.
             sessions_with_graph_state: Sync callable returning the set of
                 session ids that produced at least one graph entity (the
                 efficiency gate). Wired to a `GraphStore` method, which
@@ -63,23 +76,47 @@ class SessionNoteCatchup:
                 loop.
             session_path_for: Derives a session's note path from its first
                 turn, reusing the live path's slug algorithm. Returns None
-                when the vault layer is disabled.
+                when the vault layer is disabled. May raise (e.g. a
+                pathological utterance producing an invalid slug); `run()`
+                treats that as "skip this one session," never as a reason
+                to abort the rest of the backlog.
             is_conversation_active: Cheap sync check (a live-session map
                 being non-empty) -- read once per candidate so catch-up
                 yields mid-pass, not just at the start.
+            is_llm_ready: Async readiness probe (`SessionSynthesizer
+                .is_ready`, which delegates to the LLM provider's
+                `health_check`). A whole pass is deferred, not attempted,
+                while this reports False -- a cold backend at boot must not
+                be indistinguishable from a genuine synthesis failure, or
+                every pending session gets permanently marked `skipped`
+                before the model has even finished loading.
         """
         self._event_store = event_store
         self._synthesizer = synthesizer
         self._writer = vault_writer
-        self._sessions_dir = vault_sessions_dir
         self._sessions_with_graph_state = sessions_with_graph_state
         self._session_path_for = session_path_for
         self._is_conversation_active = is_conversation_active
+        self._is_llm_ready = is_llm_ready
 
     async def run(self) -> None:
-        """One catch-up pass. Idempotent: a completed session is never redone."""
+        """One catch-up pass.
+
+        Idempotent: a session with a completed or skipped note already at
+        its canonical path is never redone. Safe to call repeatedly --
+        `run_forever` does exactly that.
+        """
         if self._is_conversation_active():
             logger.debug("Catch-up deferred: a conversation is active")
+            return
+
+        try:
+            ready = await self._is_llm_ready()
+        except Exception as exc:  # noqa: BLE001 -- readiness check is best-effort
+            logger.warning("Catch-up could not check LLM readiness (non-fatal): %s", exc)
+            return
+        if not ready:
+            logger.debug("Catch-up deferred: LLM backend not ready")
             return
 
         try:
@@ -91,19 +128,10 @@ class SessionNoteCatchup:
         if not candidates:
             return
 
+        # Off the event loop: a Neo4j query. A large backlog must not stall
+        # the WebSocket handler that boot is racing against (efficiency
+        # gate: yield to live traffic).
         loop = asyncio.get_running_loop()
-
-        # Both scans are potentially non-trivial I/O -- a vault directory
-        # listing and frontmatter parse per note, a Neo4j query -- so both
-        # run off the event loop. A large backlog must not stall the
-        # WebSocket handler that boot is racing against (efficiency gate:
-        # yield to live traffic).
-        try:
-            recorded = await loop.run_in_executor(None, self._recorded_statuses)
-        except Exception as exc:  # noqa: BLE001 -- catch-up is best-effort
-            logger.warning("Catch-up could not scan existing notes (non-fatal): %s", exc)
-            return
-
         try:
             with_facts = await loop.run_in_executor(None, self._sessions_with_graph_state)
         except Exception as exc:  # noqa: BLE001 -- catch-up is best-effort
@@ -115,14 +143,29 @@ class SessionNoteCatchup:
                 logger.debug("Catch-up yielding mid-pass: a conversation started")
                 return
 
-            status = recorded.get(session_id)
-            if status in ("completed", "skipped"):
-                continue
             if session_id not in with_facts:
                 logger.debug("Catch-up skipping %s: produced no graph state", session_id)
                 continue
 
             await self._synthesize_one(session_id)
+
+    async def run_forever(self, interval_seconds: float = _DEFAULT_RETRY_INTERVAL_SECONDS) -> None:
+        """Run catch-up passes periodically for the life of the process.
+
+        A single `run()` pass can come back empty-handed for reasons that
+        are transient, not permanent: the LLM backend is still cold at
+        boot, or a conversation was live for the whole pass. A one-shot
+        catch-up would let either of those permanently strand the backlog
+        until the next restart. Looping means the next tick picks up
+        wherever this one left off -- every gate in `run()` is already
+        idempotent, so repeated invocation is safe by construction.
+        """
+        while True:
+            try:
+                await self.run()
+            except Exception as exc:  # noqa: BLE001 -- must survive to the next tick
+                logger.warning("Session-note catch-up pass raised (non-fatal): %s", exc)
+            await asyncio.sleep(interval_seconds)
 
     async def _synthesize_one(self, session_id: str) -> None:
         """Synthesize and write one session's note, bounded-retry on failure."""
@@ -140,11 +183,32 @@ class SessionNoteCatchup:
         # than today's date, since this may run long after the session.
         first = turns[0]
         date = str(first.get("timestamp", ""))[:10]
-        path = self._session_path_for(session_id, str(first.get("user_utterance", "")), date)
+        try:
+            path = self._session_path_for(session_id, str(first.get("user_utterance", "")), date)
+        except Exception as exc:  # noqa: BLE001 -- one bad session must not abort the backlog
+            logger.warning(
+                "Catch-up could not derive a note path for %s (non-fatal, skipping): %s",
+                session_id,
+                exc,
+            )
+            return
         if path is None:
             return
 
-        for attempt in range(1, _MAX_ATTEMPTS_PER_BOOT + 1):
+        loop = asyncio.get_running_loop()
+        try:
+            status = await loop.run_in_executor(None, self._existing_note_status, path)
+        except Exception as exc:  # noqa: BLE001 -- best-effort
+            logger.warning(
+                "Catch-up could not read existing note status for %s (non-fatal): %s",
+                session_id,
+                exc,
+            )
+            status = None
+        if status in ("completed", "skipped"):
+            return
+
+        for attempt in range(1, _MAX_ATTEMPTS_PER_PASS + 1):
             try:
                 synthesis = await self._synthesizer.synthesize(turns)
             except Exception as exc:  # noqa: BLE001 -- best-effort
@@ -167,8 +231,10 @@ class SessionNoteCatchup:
                     )
                 return
 
-        # Exhausted attempts. Persist the skip in the vault so it survives a
-        # restart -- an in-memory counter would make this a per-boot tax.
+        # Exhausted attempts with the LLM reporting itself ready throughout
+        # this pass. Persist the skip in the vault so it survives a restart
+        # -- an in-memory counter would make this a per-boot tax, and would
+        # not survive `run_forever`'s later ticks either.
         try:
             await self._writer.write_session_note(
                 vault_note_path=path, synthesis=None, status="skipped"
@@ -176,24 +242,18 @@ class SessionNoteCatchup:
         except Exception as exc:  # noqa: BLE001 -- Invariant 6
             logger.warning("Catch-up skip-marker write failed for %s: %s", session_id, exc)
 
-    def _recorded_statuses(self) -> dict[str, str]:
-        """Map session_id -> frontmatter status for existing notes.
+    def _existing_note_status(self, path: str) -> str | None:
+        """Read the frontmatter status of the note at `path`, if it exists.
 
-        One directory listing plus a frontmatter read per note. A note that
-        cannot be parsed is treated as absent and re-rendered, rather than
-        parsed defensively.
+        A single targeted file read, not a directory scan -- the caller
+        already knows exactly where this session's note would live.
         """
-        statuses: dict[str, str] = {}
-        if not self._sessions_dir.exists():
-            return statuses
-
-        for note in self._sessions_dir.glob("*.md"):
-            try:
-                fm, _ = parse_frontmatter(note.read_text(encoding="utf-8"))
-            except Exception:  # noqa: BLE001 -- unreadable note = not recorded
-                continue  # nosec B112 -- skipping one bad note is not a security decision
-            sid = fm.get("session_id")
-            status = fm.get("status")
-            if sid and status:
-                statuses[str(sid)] = str(status)
-        return statuses
+        note = Path(path)
+        if not note.exists():
+            return None
+        try:
+            fm, _ = parse_frontmatter(note.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 -- unreadable note is treated as absent
+            return None
+        status = fm.get("status")
+        return str(status) if status else None
