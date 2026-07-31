@@ -130,3 +130,10 @@ class FilewatcherError(MistError):
     a missing filewatcher degrades to "no live reindex" (audit job +
     explicit reindex CLI cover the gap).
     """
+
+
+# -- Seed source (R1.4) -------------------------------------------------------
+
+
+class SeedSourceError(MistError):
+    """The seed source is missing, malformed, or internally inconsistent."""
