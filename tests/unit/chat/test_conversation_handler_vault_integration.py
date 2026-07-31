@@ -298,6 +298,35 @@ class TestSessionEnd:
         assert fake_vault.write_session_note_calls == []
 
     @pytest.mark.asyncio
+    async def test_end_session_pops_path_and_warns_when_no_turns_available(self, caplog):
+        """A session with an allocated vault path but zero event-store turns
+        (no `handle_message` ever ran for it -- e.g. a stale or manually
+        seeded path) still gets its path evicted. end_session means the
+        session is over regardless of whether a note gets written; leaving
+        the entry behind would both grow `_vault_paths` unboundedly and let
+        a later reconnect under the same session_id silently reuse a path
+        whose note was never written. The gap is logged at warning, not
+        silently swallowed at the below-threshold debug level, because it
+        signals a structural problem (no event-store turns reachable) rather
+        than a quiet session.
+        """
+        import logging
+
+        fake_vault = FakeVaultWriter()
+        handler = make_handler(vault_writer=fake_vault)
+        handler._vault_paths["ghost-session"] = "/tmp/vault/sessions/2026-07-31-ghost.md"
+
+        with caplog.at_level(logging.WARNING, logger="backend.chat.conversation_handler"):
+            await handler.end_session("ghost-session")
+
+        assert "ghost-session" not in handler._vault_paths
+        assert fake_vault.write_session_note_calls == []
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "no event-store turns available" in msg for msg in warning_messages
+        ), f"Expected a no-turns-available warning. Got: {warning_messages}"
+
+    @pytest.mark.asyncio
     async def test_end_session_no_op_when_vault_writer_none(self):
         handler = make_handler(vault_writer=None)
         # Should not raise

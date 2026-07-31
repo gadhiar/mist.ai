@@ -1834,13 +1834,38 @@ class ConversationHandler:
             # background task cannot race the note write below (FE
             # heartbeat-loss reconnects routinely hit this window).
             await self._drain_extraction_tasks(session_id=sid)
+            # A resumed conversation must allocate a FRESH note: end_session
+            # means the session is over regardless of whether this call
+            # manages to write a note, so the path is evicted unconditionally
+            # here rather than only on the success path -- otherwise a
+            # session that never clears the synthesis threshold leaves a
+            # stale entry in `_vault_paths` forever (unbounded growth) and a
+            # later reconnect under the same session_id would silently reuse
+            # it instead of allocating fresh.
+            self._vault_paths.pop(sid, None)
 
             es_session_id = self._es_session_ids.get(sid)
-            turns = (
-                self.event_store.get_turns(es_session_id)
-                if self.event_store is not None and es_session_id is not None
-                else []
-            )
+            if self.event_store is None or es_session_id is None:
+                # A session with a vault path (i.e. it was live) but no
+                # event-store turns available -- either the event store is
+                # disabled (EVENT_STORE_ENABLED=false) or failed to
+                # initialize (see __init__'s except clause), or this
+                # specific session never got a turn recorded. Distinct from
+                # a genuinely quiet session: this is a structural gap that
+                # silently drops every note for its duration, so it gets a
+                # warning rather than the below-threshold debug line below.
+                logger.warning(
+                    "Session %s has a vault path but no event-store turns "
+                    "available (event_store=%s, es_session_id=%s); no "
+                    "session note will be written",
+                    sid,
+                    "disabled" if self.event_store is None else "enabled",
+                    es_session_id,
+                )
+                turns = []
+            else:
+                turns = self.event_store.get_turns(es_session_id)
+
             synthesis = await self.session_synthesizer.synthesize(turns)
             if synthesis is None:
                 logger.debug("Session %s below synthesis threshold; writing no vault note", sid)
@@ -1859,9 +1884,6 @@ class ConversationHandler:
                     sid,
                     exc,
                 )
-            # A resumed conversation must allocate a FRESH note: writing a
-            # second note over an already-written one corrupts the record.
-            self._vault_paths.pop(sid, None)
 
     async def _drain_extraction_tasks(
         self, session_id: str | None = None, timeout: float = 60.0

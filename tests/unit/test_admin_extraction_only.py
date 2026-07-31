@@ -13,8 +13,10 @@ Covered:
 - It pre-allocates the vault path (Step 0, cache-priming side effect only
   since R1.3) and records the turn event so the same scaffolding production
   extraction needs (event_id, recorded_at) is present
-- It forwards an empty conversation_history and empty assistant_message so no
-  same-turn assistant reply enters the extraction context
+- It forwards an empty conversation_history so no prior turn enters the
+  extraction context (R1.3.1 dropped `assistant_message` from
+  `_extract_knowledge_async` entirely -- it only ever fed the retired
+  per-turn vault append, never the extraction call itself)
 - It drains the in-flight background extraction task before returning (without
   the drain, `asyncio.run` would cancel the fire-and-forget task)
 - It returns a structured record with timing + ok flag
@@ -98,7 +100,6 @@ class FakeExtractionHandler:
         conversation_history,
         event_id: str,
         session_id: str,
-        assistant_message: str = "",
         turn_record=None,
         recorded_at: str | None = None,
     ) -> None:
@@ -108,7 +109,6 @@ class FakeExtractionHandler:
                 "conversation_history": conversation_history,
                 "event_id": event_id,
                 "session_id": session_id,
-                "assistant_message": assistant_message,
                 "recorded_at": recorded_at,
             }
         )
@@ -150,17 +150,16 @@ class TestRunExtractionOnly:
         assert handler.extract_calls[0]["utterance"] == "I use Rust"
         assert not hasattr(handler, "handle_message")
 
-    def test_omits_same_turn_assistant_reply_from_extraction_context(self):
+    def test_omits_conversation_history_from_extraction_context(self):
         # Arrange
         handler = FakeExtractionHandler()
 
         # Act
         asyncio.run(run_extraction_only(handler, "I use Rust", "s1"))
 
-        # Assert: empty history + empty assistant_message -> no reply contamination
+        # Assert: empty history -> no prior turn contaminates the extraction context
         call = handler.extract_calls[0]
         assert call["conversation_history"] == []
-        assert call["assistant_message"] == ""
 
     def test_pre_allocates_vault_path_with_first_utterance(self):
         # Arrange

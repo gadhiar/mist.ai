@@ -780,8 +780,10 @@ async def run_extraction_only(
        `recorded_at` (bitemporal fact-time + extraction reference_date). The
        reply slot is empty because no reply is generated.
     3. The production extraction entry point (`_extract_knowledge_async`) with
-       `conversation_history=[]` and `assistant_message=""` -- so no prior turn
-       and no same-turn reply enters the extraction "Context:" block. This is
+       `conversation_history=[]` -- so no prior turn enters the extraction
+       "Context:" block. R1.3.1 dropped the `assistant_message` parameter
+       from `_extract_knowledge_async` entirely (it only fed the retired
+       per-turn vault append), so there is nothing left to pass here. This is
        the same coroutine `handle_message` spawns as a background task; running
        it inline here emits the identical `extraction.ontology` /
        `extraction.scope_classifier` `llm_call` debug records (via the
@@ -795,12 +797,7 @@ async def run_extraction_only(
 
     The 60-probe gold corpus is single-utterance and self-contained (no prior
     turns), so an empty `conversation_history` is the faithful extraction input.
-
-    Deliberate deviation from production: production runs extraction with the
-    just-generated assistant reply embedded in the extraction context. This
-    path omits it. Justified: that reply is conversational noise the gold does
-    not encode and is the source of nondeterminism. Documented in
-    `scripts/eval_harness/extraction_probe_set_design.md`.
+    Documented in `scripts/eval_harness/extraction_probe_set_design.md`.
 
     Args:
         handler: A ConversationHandler (or test double) exposing
@@ -833,15 +830,14 @@ async def run_extraction_only(
         )
 
         # Production extraction entry point, run inline. conversation_history
-        # is empty and assistant_message is empty so no reply enters the
-        # extraction context. The instrumented provider emits the
-        # extraction.* llm_call debug records the scorer consumes.
+        # is empty so no prior turn enters the extraction context. The
+        # instrumented provider emits the extraction.* llm_call debug records
+        # the scorer consumes.
         await handler._extract_knowledge_async(
             utterance=utterance,
             conversation_history=[],
             event_id=event_id,
             session_id=session_id,
-            assistant_message="",
             turn_record=None,
             recorded_at=recorded_at,
         )

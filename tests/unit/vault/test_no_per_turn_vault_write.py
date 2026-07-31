@@ -56,9 +56,20 @@ class _RecordingVaultWriter:
 class _FakeExtractionPipeline:
     """Minimal extraction pipeline double, shaped like the real
     `ValidationResult` (L20: built from the real collaborator's fields, not
-    invented ones). Empty entities/relationships by default so the C-pattern
-    user-snapshot trigger (`_maybe_refresh_user_vault`) never fires and
-    cannot contaminate the write-count assertions below.
+    invented ones).
+
+    Yields one non-User-scope entity by default (matching the
+    `FakeExtractionPipeline` default in
+    tests/unit/chat/test_conversation_handler_vault_integration.py). Empty
+    entities/relationships would make the guard vacuous: the deleted
+    `_maybe_append_session_turn` gate was itself a no-op on exactly that
+    input (zero entities AND zero relationships), so a mutation that
+    resurrects the retired per-turn append under its original gate would
+    never fire and the guard would pass for the wrong reason. A `Technology`
+    entity (not `entity_id="user"`) still keeps the C-pattern user-snapshot
+    trigger (`_maybe_refresh_user_vault`) from firing, so it cannot
+    contaminate the write-count assertions below -- confirmed empirically,
+    not assumed.
     """
 
     def __init__(self) -> None:
@@ -66,7 +77,13 @@ class _FakeExtractionPipeline:
 
     async def extract_from_utterance(self, **kwargs):
         self.calls.append(kwargs)
-        return ValidationResult(valid=True, entities=[], relationships=[])
+        return ValidationResult(
+            valid=True,
+            entities=[
+                {"entity_id": "python", "entity_type": "Technology", "display_name": "Python"}
+            ],
+            relationships=[],
+        )
 
 
 # ---------------------------------------------------------------------------
