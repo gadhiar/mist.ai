@@ -34,6 +34,13 @@ _MERGE_EDGE = (
     "RETURN type(r) AS t"
 )
 
+_WIPE_EDGES = "MATCH ()-[r]->() WHERE r.seed_version = $seed_version DELETE r RETURN count(r) AS n"
+_WIPE_NODES = (
+    "MATCH (n) WHERE n.seed_version = $seed_version "
+    "AND NOT (n)--() "
+    "DELETE n RETURN count(n) AS n"
+)
+
 
 def apply_seed_documents(
     connection: GraphConnection,
@@ -105,6 +112,102 @@ def apply_seed_documents(
         seed_version,
     )
     return {"nodes": len(subjects_and_objects), "facts": fact_count}
+
+
+def wipe_seed_version(connection: GraphConnection, seed_version: str) -> dict[str, int]:
+    """Remove everything stamped with `seed_version`.
+
+    Scoped entirely on the `seed_version` property -- never on label or id
+    patterns. Real conversation-derived facts share `__Entity__` and the
+    ontology's relationship types with seeded ones, so an unscoped delete,
+    or one scoped on anything broader than the stamp, would destroy the
+    user's actual memory alongside the seed content.
+
+    Edges are deleted first, then nodes left with no remaining
+    relationship. Order matters: reversed, `NOT (n)--()` would find nothing
+    orphaned (the seeded edges are still attached) and the node delete
+    would silently no-op.
+
+    A seeded node that has since acquired a conversation-derived edge is
+    deliberately kept -- `NOT (n)--()` excludes any node still holding a
+    relationship, seeded or not. Dropping it would delete a
+    conversation-derived fact, which the seed layer has no authority to do.
+
+    Args:
+        connection: Sync graph connection.
+        seed_version: The exact stamp to remove.
+
+    Returns:
+        Counts keyed `edges` and `nodes`.
+    """
+    edge_result = connection.execute_write(_WIPE_EDGES, {"seed_version": seed_version})
+    node_result = connection.execute_write(_WIPE_NODES, {"seed_version": seed_version})
+    edges_removed = _count(edge_result)
+    nodes_removed = _count(node_result)
+
+    logger.info(
+        "Seed wiped: %d edges, %d nodes at version %s",
+        edges_removed,
+        nodes_removed,
+        seed_version,
+    )
+    return {"edges": edges_removed, "nodes": nodes_removed}
+
+
+def reseed(
+    connection: GraphConnection,
+    documents: list[SeedDocument],
+    *,
+    seed_version: str,
+    now_iso: str,
+) -> dict[str, int]:
+    """Wipe `seed_version` and re-apply `documents` under the same version.
+
+    MERGE alone cannot remove a fact that was deleted from the source: a
+    fact written by a prior application but absent from `documents` would
+    otherwise persist in the graph forever, silently, and no gate catches
+    it -- Gate 2 checks that authored facts are present, never that
+    unauthored ones are absent. Wiping first is what makes the graph
+    actually track the source rather than only ever accumulate it.
+
+    Predicates are validated before the wipe runs, not just before the
+    re-apply's writes (`apply_seed_documents` already guards that point).
+    Without this, a typo introduced in a source edit would empty a
+    previously-good graph via the wipe and then abort the re-apply,
+    leaving a real data-loss window open until the typo is fixed.
+
+    Args:
+        connection: Sync graph connection.
+        documents: Parsed seed documents to apply after the wipe.
+        seed_version: The one global version wiped and re-applied together
+            -- a caller cannot wipe one version and apply another.
+        now_iso: Timestamp forwarded to `apply_seed_documents`. Required,
+            not read from the clock, so re-seeding is byte-reproducible.
+
+    Returns:
+        Counts keyed `nodes` and `facts`, from the re-apply.
+
+    Raises:
+        SeedSourceError: A fact's predicate is not a recognized ontology
+            relationship type. Raised before the wipe runs.
+    """
+    _validate_predicates(documents)
+    wipe_seed_version(connection, seed_version)
+    return apply_seed_documents(connection, documents, seed_version=seed_version, now_iso=now_iso)
+
+
+def _count(results: list[dict]) -> int:
+    """Extract the `n` count from a `RETURN count(...) AS n` result.
+
+    `FakeNeo4jConnection.execute_write` returns an empty list unless a test
+    pre-configures `write_results`, which real Neo4j never does for an
+    aggregation query -- `count()` always yields exactly one row, even over
+    zero matches. Guarding the empty case keeps unit tests that are not
+    exercising this return value from raising `IndexError`.
+    """
+    if not results:
+        return 0
+    return int(results[0]["n"])
 
 
 def _validate_predicates(documents: list[SeedDocument]) -> None:
