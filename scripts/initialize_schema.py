@@ -53,8 +53,10 @@ def main():
         print("\nNext steps:")
         print("  1. Run: python -m scripts.mist_admin seed")
         print("     (Restore the seed baseline: entities + relationships + embeddings)")
-        print("  2. Optional: python -m scripts.mist_admin vault-rebuild --scope all")
-        print("     (Re-derive graph content from the vault corpus)")
+        print("  2. Optional: python -m scripts.mist_admin vault-rebuild --confirm")
+        print("     (Drop and re-index the vault sidecar from the vault corpus on disk --")
+        print("     read-path only; this writes no graph content. For a graph rebuild,")
+        print("     see: python -m scripts.mist_admin graph-rebuild-from-log --dry-run)")
         print()
 
     except Exception as e:
