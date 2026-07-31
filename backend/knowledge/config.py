@@ -374,8 +374,7 @@ class VaultConfig:
 
     Defaults match ADR-010 implementation defaults section: container-relative
     `mist-memory/` root with host-side bind mount controlled by docker-compose
-    `VAULT_HOST_PATH`. Append sentinel is the canonical literal documented in
-    the ADR. Session soft caps drive auto-split behavior.
+    `VAULT_HOST_PATH`. Session soft caps drive auto-split behavior.
 
     The default user id (`raj`) is used to bootstrap `users/<id>.md` from
     `scripts/seed_data.yaml` on first run; MIST currently only models a single
@@ -388,7 +387,6 @@ class VaultConfig:
     git_auto_init: bool = True
     session_soft_cap_turns: int = 20
     session_soft_cap_tokens: int = 6000
-    append_sentinel: str = "<!-- MIST_APPEND_HERE -->"
     writer_queue_max_depth: int = 100
 
     @classmethod
@@ -401,7 +399,6 @@ class VaultConfig:
             git_auto_init=os.getenv("MIST_VAULT_GIT_AUTO_INIT", "true").lower() == "true",
             session_soft_cap_turns=int(os.getenv("MIST_VAULT_SESSION_SOFT_CAP_TURNS", "20")),
             session_soft_cap_tokens=int(os.getenv("MIST_VAULT_SESSION_SOFT_CAP_TOKENS", "6000")),
-            append_sentinel=os.getenv("MIST_VAULT_APPEND_SENTINEL", "<!-- MIST_APPEND_HERE -->"),
             writer_queue_max_depth=int(os.getenv("MIST_VAULT_WRITER_QUEUE_MAX_DEPTH", "100")),
         )
 

@@ -31,7 +31,6 @@ def _make_config(tmp_path: Path, **kwargs) -> VaultConfig:
         "git_auto_init": False,
         "session_soft_cap_turns": 20,
         "session_soft_cap_tokens": 6000,
-        "append_sentinel": "<!-- MIST_APPEND_HERE -->",
         "writer_queue_max_depth": 100,
     }
     defaults.update(kwargs)

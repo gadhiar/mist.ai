@@ -67,7 +67,6 @@ _VAULT_ENV_KEYS = (
     "MIST_VAULT_GIT_AUTO_INIT",
     "MIST_VAULT_SESSION_SOFT_CAP_TURNS",
     "MIST_VAULT_SESSION_SOFT_CAP_TOKENS",
-    "MIST_VAULT_APPEND_SENTINEL",
     "MIST_VAULT_WRITER_QUEUE_MAX_DEPTH",
 )
 
@@ -107,7 +106,6 @@ class TestVaultConfigDefaults:
         assert config.git_auto_init is True
         assert config.session_soft_cap_turns == 20
         assert config.session_soft_cap_tokens == 6000
-        assert config.append_sentinel == "<!-- MIST_APPEND_HERE -->"
         assert config.writer_queue_max_depth == 100
 
     def test_is_frozen(self):

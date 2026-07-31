@@ -25,8 +25,6 @@ logger = logging.getLogger(__name__)
 # Enum
 # ---------------------------------------------------------------------------
 
-SENTINEL = "<!-- MIST_APPEND_HERE -->"
-
 
 class AuthoredBy(str, Enum):
     """5-state `authored_by` enum from ADR-010 "The `authored_by` State Machine".
