@@ -364,9 +364,14 @@ class TestVaultUserEditWritesNoGraphFactsProduction:
 
     @pytest.mark.asyncio
     async def test_vault_user_edit_produces_no_graph_edges(self, tmp_path):
-        from backend.factories import build_graph_store, build_phase3_components
+        from backend.factories import (
+            build_conversation_handler,
+            build_graph_store,
+            build_phase3_components,
+        )
 
-        graph_store = build_graph_store(_smoke_config(tmp_path))
+        config = _smoke_config(tmp_path)
+        graph_store = build_graph_store(config)
         user_id = "smoke-r13-user"
         target = tmp_path / "vault" / "users" / f"{user_id}.md"
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -381,9 +386,23 @@ class TestVaultUserEditWritesNoGraphFactsProduction:
         _cleanup_smoke_nodes(graph_store, user_id, str(target))
         try:
             components = build_phase3_components(
-                config=_smoke_config(tmp_path),
+                config=config,
                 sidecar_index=_NoopSidecarIndex(),
                 writer=_FakeVaultWriter(),
+            )
+            # Build the real ConversationHandler on the SAME bus the
+            # filewatcher publishes to, and do it before the `before` snapshot.
+            # _do_reindex does not end at the publish call -- the sole
+            # production subscriber is ConversationHandler._on_vault_rebuild,
+            # and without a listener registered here this test's measured
+            # window stops one hop short of the actual production signal
+            # chain (see the sibling test below, which drives the listener
+            # but never measures the graph). Mirrors that test's construction.
+            build_conversation_handler(
+                config=config,
+                invalidation_bus=components.invalidation_bus,
+                vault_writer=None,
+                vault_sidecar=None,
             )
             before = _graph_counts(graph_store)
 

@@ -445,3 +445,73 @@ def test_do_reindex_error_path_never_reaches_a_graph_store(
     assert bus.published == []
     assert str(p) not in fw._known_mtimes
     assert uses == []
+
+
+# ---------------------------------------------------------------------------
+# Check 4: production bus subscriber governance
+# ---------------------------------------------------------------------------
+#
+# Checks 1-3 close every route BY WHICH _do_reindex itself could reach a
+# graph write. They say nothing about the OTHER end of the chain it feeds:
+# _do_reindex awaits bus.publish(...), and InvalidationBus.subscribe()
+# imposes no allowlist of its own (backend/vault/invalidation_bus.py:50-52)
+# -- any listener, including a reintroduced graph-write listener, could
+# register and receive every vault-edit event. `ConversationHandler.
+# _on_vault_rebuild` is the sole production subscriber today (the only
+# `.subscribe(` call site anywhere under backend/, confirmed by a repo-wide
+# grep), and it is a pure cache-eviction listener (R1.3: it evicts
+# `_mist_context_cache` entries, it writes nothing). This section pins that
+# fact so a second, ungoverned subscriber is caught here rather than
+# discovered by mutation in an integration test.
+
+
+def test_production_bus_has_exactly_the_cache_eviction_listener(tmp_path: Path) -> None:
+    """ConversationHandler.__init__ is the only sanctioned InvalidationBus subscriber.
+
+    Builds the real `ConversationHandler.__init__` -- the sole `.subscribe(`
+    call site in backend/ -- against a real `InvalidationBus`, with fakes at
+    every I/O boundary (Neo4j, embeddings, LLM) per tests/CLAUDE.md, so no
+    sentence_transformers or live Neo4j is required. Pins the resulting
+    subscriber set to exactly one listener: the handler's own
+    `_on_vault_rebuild` cache-eviction method. A second subscriber added
+    anywhere in `ConversationHandler.__init__` -- the composition point a
+    reintroduced graph-write listener would most plausibly be wired from --
+    fails this test.
+    """
+    from backend.chat.conversation_handler import ConversationHandler
+    from backend.knowledge.extraction.validator import ValidationResult
+    from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
+    from backend.knowledge.storage.graph_store import GraphStore
+    from backend.vault.conventions import ConventionsLoader
+    from backend.vault.invalidation_bus import InvalidationBus
+    from tests.mocks.config import build_test_config
+    from tests.mocks.embeddings import FakeEmbeddingGenerator
+    from tests.mocks.neo4j import FakeNeo4jConnection
+    from tests.mocks.ollama import FakeLLM
+
+    class _FakeExtractionPipeline:
+        async def extract_from_utterance(self, **kwargs: object) -> ValidationResult:
+            return ValidationResult(valid=True, entities=[], relationships=[])
+
+    bus = InvalidationBus()
+    gs = GraphStore(FakeNeo4jConnection(), FakeEmbeddingGenerator())
+    config = build_test_config()
+
+    handler = ConversationHandler(
+        config=config,
+        graph_store=gs,
+        extraction_pipeline=_FakeExtractionPipeline(),
+        retriever=KnowledgeRetriever(config=config, graph_store=gs),
+        llm_provider=FakeLLM(),
+        conventions_loader=ConventionsLoader(tmp_path),
+        invalidation_bus=bus,
+    )
+
+    assert len(bus._listeners) == 1, (
+        "production InvalidationBus must have exactly one subscriber (the "
+        f"cache-eviction listener); got {len(bus._listeners)} -- an "
+        "ungoverned second subscriber was added"
+    )
+    assert bus._listeners[0] == handler._on_vault_rebuild, (
+        "the sole InvalidationBus subscriber must be " "ConversationHandler._on_vault_rebuild"
+    )
