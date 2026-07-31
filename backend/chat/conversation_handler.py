@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from backend.chat.context_budget import ContextBudgetPlanner
 from backend.chat.mist_context import MistContext
+from backend.chat.session_synthesizer import SessionSynthesizer
 from backend.chat.slop_detector import SlopDetector
 from backend.chat.stream_events import Complete, StreamEvent, Token, WSEvent
 from backend.event_store.models import ConversationTurnEvent
@@ -738,8 +739,8 @@ class ConversationHandler:
                 constructed from `config.context_budget`. When disabled, the
                 handler falls back to legacy pre-Cluster-6 message assembly.
             vault_writer: Optional VaultWriterProtocol (Cluster 8 Phase 5).
-                When set, every successful turn appends to the vault session
-                note. None preserves legacy pre-Cluster-8 behavior.
+                When set, `end_session` renders one synthesis-only session
+                note (R1.3.1). None disables the vault layer entirely.
             invalidation_bus: Optional InvalidationBus (Phase 3 Task 21). When
                 set, the handler subscribes `_on_vault_rebuild` to receive
                 vault-change events from the filewatcher and evict stale
@@ -765,19 +766,17 @@ class ConversationHandler:
         self._debug_logger = debug_logger
 
         # Cluster 8 Phase 5: optional vault layer write integration. When set,
-        # every successful turn appends to the vault session note via
-        # VaultWriter.append_turn_to_session. None means vault layer disabled
-        # (legacy pre-Cluster-8 behavior preserved).
+        # end_session renders one synthesis-only session note via
+        # VaultWriter.write_session_note. None means vault layer disabled.
+        # R1.3.1: the per-turn append retired with the DERIVED_FROM->VaultNote
+        # contract (ADR-011 amended) -- the vault is written once, at session
+        # end, not on every turn.
         self._vault_writer = vault_writer
 
         # Maps external session_id -> pre-allocated vault note path. Filled
         # lazily on first turn via vault_writer.session_path(...). Stable
         # for the session lifetime.
         self._vault_paths: dict[str, str] = {}
-
-        # Tracks turn count per session for vault writes (independent of
-        # event_store turn numbering -- vault numbering starts at 1 per session).
-        self._vault_turn_counts: dict[str, int] = {}
 
         # In-flight background extraction tasks (task -> session_id). Strong
         # references keep them GC-safe; end_session drains a session's tasks
@@ -800,6 +799,17 @@ class ConversationHandler:
 
         # LLM provider (replaces ChatOllama)
         self._provider = llm_provider
+
+        # R1.3.1: session-end synthesis, sourced from event-store turns rather
+        # than live session state, so the same synthesizer instance also
+        # serves Task 6's startup catch-up (no in-memory session to read from
+        # there). Public attribute -- catch-up reaches this instance instead
+        # of constructing a second one.
+        self.session_synthesizer = SessionSynthesizer(
+            llm_provider,
+            temperature=self.config.llm.conversation_temperature,
+            max_tokens=self.config.llm.conversation_max_tokens,
+        )
 
         # Tool configuration
         self._tool_schemas = KNOWLEDGE_TOOL_SCHEMAS
@@ -1536,21 +1546,23 @@ class ConversationHandler:
             )
 
             # --- Step 0: Vault path cache priming ---
-            # Pure path computation, no I/O. The path is no longer threaded
-            # into extraction (R1.3: the vault is not a fact source), but the
-            # allocation must still happen here so the slug is derived from the
-            # first utterance rather than the opaque session_id.
+            # Pure path computation, no I/O. The path is not threaded into
+            # extraction (R1.3: the vault is not a fact source); allocation
+            # happens here so the slug is derived from the first utterance
+            # rather than the opaque session_id, and stays stable for the
+            # session's lifetime (read later by `end_session`).
             #
-            # Prime the per-session vault path cache while the first utterance
-            # is still in hand: the slug is derived from it and later callers
-            # (the conditional session-note append inside _extract_knowledge_async)
-            # only pass session_id. R1.3 retired the fact-path consumer of the
-            # returned path, so the return value is deliberately discarded --
-            # the call is kept for its caching side effect, not its result.
+            # R1.3.1: there is no more per-turn vault write to prime a cache
+            # for -- the vault is written once, at session end. The call is
+            # kept purely so `end_session` has a path to write to; the
+            # return value is deliberately discarded here.
             self._get_or_allocate_vault_path(session_id, first_utterance=user_message)
 
             # --- Event Store Write (Layer 1) ---
             # Synchronous, <5ms target. Happens BEFORE any async extraction.
+            # R1.3.1: this is also the sole source `end_session` reads from
+            # to synthesize the session-end vault note -- there is no
+            # separate per-turn vault write to keep in sync with it.
             event_id, recorded_at = self._record_turn_event(
                 session_id=session_id,
                 user_message=user_message,
@@ -1559,17 +1571,6 @@ class ConversationHandler:
                 retrieval_result=retrieval_result,
                 tool_calls=tool_calls if tool_calls else None,
             )
-
-            # --- Vault Write deferred to extraction completion ---
-            # ADR-011 bucket 2 (rebuild substrate): the vault append happens
-            # inside `_extract_knowledge_async`, gated on extraction yielding
-            # at least one entity OR one relationship. This implements the
-            # 2026-05-06 canonical-vault-pattern decision to skip per-turn
-            # appends for zero-extraction turns ("Hi"/"Thanks") - those
-            # produce no graph state worth a note, so a vault note for them
-            # is pure noise. Substantive turns still anchor cleanly; R1.3:
-            # the rebuild contract is carried by the utterance log, not by
-            # this vault note.
 
             # Debug JSONL: record this turn and attach the TurnRecord to the
             # background extraction task so the extraction phase flushes a
@@ -1591,14 +1592,12 @@ class ConversationHandler:
                     )
                 turn_record.flush_turn()
 
-            # Fire-and-forget background extraction (also performs the
-            # conditional vault append per ADR-011 bucket 2). Tracked so
-            # end_session/aclose can drain instead of abandoning to GC.
+            # Fire-and-forget background extraction. Tracked so end_session/
+            # aclose can drain instead of abandoning to GC.
             if event_id and len(user_message.split()) >= 3:
                 task = asyncio.create_task(
                     self._extract_knowledge_async(
                         utterance=user_message,
-                        assistant_message=assistant_message,
                         conversation_history=session.get_history(max_history),
                         event_id=event_id,
                         session_id=session_id,
@@ -1705,7 +1704,6 @@ class ConversationHandler:
         conversation_history: list[dict[str, str]],
         event_id: str,
         session_id: str,
-        assistant_message: str = "",
         turn_record: TurnRecord | None = None,
         recorded_at: str | None = None,
     ) -> None:
@@ -1716,13 +1714,6 @@ class ConversationHandler:
 
         If `turn_record` is supplied, records extraction outcome + graph writes
         to the per-turn JSONL debug log (phase: "extraction", keyed by event_id).
-
-        `assistant_message` (ADR-011 bucket 2 - 2026-05-06): the assistant's
-        finalized response for this turn. After extraction completes, if the
-        result yielded at least one entity OR one relationship, the vault
-        append fires here (replacing the unconditional handle_message append).
-        Empty default keeps backwards compat for callers that don't yet thread
-        the response through.
         """
         _ex_start = time.time()
         try:
@@ -1777,19 +1768,6 @@ class ConversationHandler:
                 )
                 turn_record.flush_extraction()
 
-            # ADR-011 bucket 2: conditional per-turn vault append. Skip the
-            # session-note write when extraction yielded zero entities AND
-            # zero relationships -- those turns produce no graph state, so a
-            # vault note for them is pure noise. R1.3: the note is prose for
-            # the read path, not a fact anchor; the rebuild contract is
-            # carried by the utterance log, not by this file.
-            await self._maybe_append_session_turn(
-                session_id=session_id,
-                user_message=utterance,
-                assistant_message=assistant_message,
-                extraction_result=result,
-            )
-
             # ADR-011 bucket 1 / C-pattern: re-render users/<user_id>.md when
             # extraction touched user-scope (User entity or User-source/target
             # edge). Fire-and-forget; failures are logged but never propagate.
@@ -1821,19 +1799,19 @@ class ConversationHandler:
                 turn_record.flush_extraction()
 
     async def end_session(self, session_id: str | None = None) -> None:
-        """Mark one (or all) active session(s) as completed.
+        """Render the session-end vault note for one (or all) active session(s).
 
-        Gap #1 / ADR-011 bucket 2: invoked on session-end signal (WebSocket
-        disconnect, idle timeout, explicit end). For each target session:
+        R1.3.1: replaces the old append/synthesize/flip sequence with a
+        single full-render write. For each target session:
 
-        1. Generate a MIST-authored end-of-session synthesis (gap #1b)
-        2. Append the synthesis as `## Summary` above the sentinel
-        3. Flip frontmatter `status: in-progress` -> `status: completed`
+        1. Drain in-flight background extraction tasks so nothing can land
+           after the note is written.
+        2. Synthesize the session from its event-store turns.
+        3. Render the note via `VaultWriter.write_session_note` -- one write,
+           idempotent, safe to retry on the next boot's catch-up.
 
-        Failure-isolated per Invariant 6: failures in synthesis or write are
-        logged but never propagated to the caller. Synthesis errors do not
-        block the status flip — a session note is closed even if MIST
-        couldn't summarize it.
+        Failure-isolated per Invariant 6: a write failure is logged but never
+        propagated to the caller.
 
         Args:
             session_id: Specific session to end. When None, ends every
@@ -1852,34 +1830,38 @@ class ConversationHandler:
             path = self._vault_paths.get(sid)
             if not path:
                 continue
-            # Step 0: drain the session's in-flight extraction tasks so a
-            # background _maybe_append_session_turn cannot land turn blocks
-            # AFTER the Summary/status flip (FE heartbeat-loss reconnects
-            # routinely hit this window).
+            # Drain the session's in-flight extraction tasks first so a
+            # background task cannot race the note write below (FE
+            # heartbeat-loss reconnects routinely hit this window).
             await self._drain_extraction_tasks(session_id=sid)
-            # Step 1+2: synthesis (gap #1b). Failure must not block status flip.
+
+            es_session_id = self._es_session_ids.get(sid)
+            turns = (
+                self.event_store.get_turns(es_session_id)
+                if self.event_store is not None and es_session_id is not None
+                else []
+            )
+            synthesis = await self.session_synthesizer.synthesize(turns)
+            if synthesis is None:
+                logger.debug("Session %s below synthesis threshold; writing no vault note", sid)
+                continue
             try:
-                synthesis = await self._generate_session_synthesis(sid)
-                if synthesis:
-                    await self._vault_writer.append_session_synthesis(path, synthesis)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Session synthesis failed for %s (non-fatal): %s", sid, exc)
-            # Step 3: status flip (gap #1a). Always attempts.
-            try:
-                await self._vault_writer.mark_session_completed(path)
-                logger.debug("Session %s marked completed at %s", sid, path)
-            except Exception as exc:  # noqa: BLE001
+                await self._vault_writer.write_session_note(
+                    vault_note_path=path,
+                    synthesis=synthesis,
+                    related_entities=[],
+                )
+                logger.debug("Session note written for %s at %s", sid, path)
+            except Exception as exc:  # noqa: BLE001 -- Invariant 6
                 logger.warning(
-                    "end_session status flip failed for %s "
-                    "(non-fatal, swallowed per Invariant 6): %s",
+                    "Session note write failed for %s (non-fatal, swallowed "
+                    "per Invariant 6): %s",
                     sid,
                     exc,
                 )
-            # A resumed conversation must allocate a FRESH note: appending
-            # turns (and a second Summary on the next disconnect) to a
-            # completed note corrupts the session record.
+            # A resumed conversation must allocate a FRESH note: writing a
+            # second note over an already-written one corrupts the record.
             self._vault_paths.pop(sid, None)
-            self._vault_turn_counts.pop(sid, None)
 
     async def _drain_extraction_tasks(
         self, session_id: str | None = None, timeout: float = 60.0
@@ -1912,126 +1894,9 @@ class ConversationHandler:
 
         Without the drain, loop teardown cancels extraction mid
         commit-protocol -- which can permanently retire a belief without
-        writing its successor -- and silently drops the turn's vault append
-        (R1.3: the append is prose for the read path now, not a fact anchor,
-        but losing it mid-drain is still a silent write loss worth avoiding).
+        writing its successor.
         """
         await self._drain_extraction_tasks(session_id=None)
-
-    async def _generate_session_synthesis(self, session_id: str) -> str | None:
-        """Build a session-end synthesis via one LLM call.
-
-        Reads the session's accumulated turn history and asks the LLM to
-        produce a markdown body with subsections: What Was Accomplished,
-        Decisions Made, Next Actions, Context for Next Session. Mirrors the
-        end-of-session protocol the user (Raj) follows in his own
-        Claude+Obsidian workflow.
-
-        Returns the markdown body (without a leading `## Summary` header --
-        the writer adds that). Returns None when the session has no turns
-        worth synthesizing (one-turn sessions, empty content).
-        """
-        session = self.sessions.get(session_id)
-        if session is None or len(session.messages) < 2:
-            return None  # no substantive content to summarize
-
-        transcript_parts: list[str] = []
-        for msg in session.messages:
-            role = msg.role.upper()
-            transcript_parts.append(f"**{role}:** {msg.content}\n")
-        transcript = "".join(transcript_parts)
-
-        prompt = (
-            "You are MIST writing a session-end summary for the user's "
-            "persistent memory vault. The conversation just ended. Read the "
-            "transcript and produce a concise markdown body with the four "
-            "subsections below. If a subsection has no content, write "
-            "`(none)`. Do NOT include a leading `## Summary` header -- only "
-            "the subsection content.\n\n"
-            "### What Was Accomplished\n"
-            "<bullet list of substantive accomplishments, each one line>\n\n"
-            "### Decisions Made\n"
-            "<bullet list of explicit decisions, each one line, or (none)>\n\n"
-            "### Next Actions\n"
-            "<bullet list of action items the user or MIST committed to, each "
-            "one line, or (none)>\n\n"
-            "### Context for Next Session\n"
-            "<one to three sentences of prose summarizing what would be "
-            "useful to remember when picking this conversation back up>\n\n"
-            "---\n\n"
-            "TRANSCRIPT:\n\n" + transcript
-        )
-
-        try:
-            request = LLMRequest(
-                messages=[{"role": "user", "content": prompt}],
-                temperature=self.config.llm.conversation_temperature,
-                max_tokens=self.config.llm.conversation_max_tokens,
-                top_p=0.9,
-            )
-            with llm_call_context(
-                session_id=session_id,
-                call_site="session.synthesis",
-                pass_num=1,
-            ):
-                response = await self._provider.invoke(request)
-            content = (response.content or "").strip()
-            return content or None
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Session synthesis LLM call failed for %s: %s", session_id, exc)
-            return None
-
-    async def _maybe_append_session_turn(
-        self,
-        session_id: str,
-        user_message: str,
-        assistant_message: str,
-        extraction_result: Any,
-    ) -> None:
-        """ADR-011 bucket 2: conditional per-turn vault session-note append.
-
-        Skipped when extraction yielded zero entities AND zero relationships.
-        Such turns ("Hi", "Thanks") produce no graph state, so a session-note
-        block for them is pure noise. R1.3: the note is prose for the read
-        path, not a fact anchor, so this guard exists purely to keep the
-        session note free of empty-turn clutter -- it carries no rebuild
-        obligation.
-
-        Failure-isolated per Invariant 6: vault write errors are logged but
-        never propagate.
-        """
-        if self._vault_writer is None:
-            return
-        if not assistant_message:
-            return  # nothing to write
-        entities = getattr(extraction_result, "validated_entities", None)
-        relationships = getattr(extraction_result, "validated_relationships", None)
-        if entities is None and hasattr(extraction_result, "entities"):
-            entities = extraction_result.entities
-        if relationships is None and hasattr(extraction_result, "relationships"):
-            relationships = extraction_result.relationships
-        entities = entities or []
-        relationships = relationships or []
-        if not entities and not relationships:
-            logger.debug(
-                "Skipping vault append for session %s: extraction yielded "
-                "zero entities and zero relationships (ADR-011 bucket 2)",
-                session_id,
-            )
-            return
-        try:
-            await self._write_to_vault(
-                session_id=session_id,
-                user_message=user_message,
-                assistant_message=assistant_message,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Conditional vault append failed for session %s "
-                "(non-fatal, swallowed per Invariant 6): %s",
-                session_id,
-                exc,
-            )
 
     async def _maybe_refresh_user_vault(self, extraction_result: Any) -> None:
         """C-pattern user.md auto-render trigger (ADR-011 bucket 1).
@@ -2368,16 +2233,13 @@ class ConversationHandler:
 
         ADR-010 Cluster 8 Phase 6 Step 0: pure path computation done once per
         session lifetime, returned synchronously so the same path is reused
-        by every later vault append within the session (`_write_to_vault` ->
-        `VaultWriter.append_turn_to_session`). R1.3 retired the extraction
-        pipeline -> curation -> graph writer forwarding this docstring used
-        to describe: the returned path feeds the vault session note only,
-        never a fact write. Callers that only need the caching side effect
-        (priming the slug for later `session_id`-only lookups) may discard
-        the return value.
+        when `end_session` renders the session note (R1.3.1: the note is
+        written once, at session end, not per turn). Callers that only need
+        the caching side effect (priming the slug for later `session_id`-only
+        lookups) may discard the return value.
 
         Returns None when the vault layer is disabled (`vault_writer is None`),
-        which causes downstream callers to skip the vault append entirely.
+        which causes downstream callers to skip the vault write entirely.
         Path computation never raises; on slug-derivation edge cases it falls
         back to the kebab-case sanitizer with `"session"` as the ultimate
         fallback.
@@ -2416,68 +2278,7 @@ class ConversationHandler:
             slug = self._derive_session_slug(session_id)
         path = self._vault_writer.session_path(today, slug)
         self._vault_paths[session_id] = path
-        # Initialize the per-session vault turn counter only on first allocation.
-        # Seed from disk if a session note already exists at `path` so backend
-        # restart does not reset turn numbering for an ongoing session (e.g.,
-        # session_id="default" reused across restarts -- the V6 unified-path
-        # validation 2026-05-06 surfaced this as gap #4). When peek is not
-        # available on the writer (e.g., legacy fakes), default to 0.
-        if session_id not in self._vault_turn_counts:
-            peek = getattr(self._vault_writer, "peek_turn_count", None)
-            self._vault_turn_counts[session_id] = peek(path) if callable(peek) else 0
         return path
-
-    async def _write_to_vault(
-        self,
-        session_id: str,
-        user_message: str,
-        assistant_message: str,
-    ) -> str | None:
-        """Append the current turn to the vault session note.
-
-        Failure-isolated per ADR-010 Invariant 6: vault write errors are
-        logged but never propagate. Returns the vault note path on success,
-        None on failure or when vault layer is disabled.
-
-        Path allocation is delegated to `_get_or_allocate_vault_path` so the
-        same path can be reused by Phase 6's extraction-pipeline plumbing
-        without recomputation.
-
-        Args:
-            session_id: External session identifier.
-            user_message: Raw user utterance.
-            assistant_message: Final assistant response.
-
-        Returns:
-            Absolute vault note path on success, None on failure / disabled.
-        """
-        if self._vault_writer is None:
-            return None
-
-        try:
-            vault_path = self._get_or_allocate_vault_path(session_id)
-            if vault_path is None:
-                return None
-
-            self._vault_turn_counts[session_id] += 1
-            turn_index = self._vault_turn_counts[session_id]
-
-            return await self._vault_writer.append_turn_to_session(
-                session_id=session_id,
-                turn_index=turn_index,
-                user_text=user_message,
-                mist_text=assistant_message,
-                vault_note_path=vault_path,
-            )
-        except Exception as exc:  # noqa: BLE001
-            # ADR-010 Invariant 6: vault write failure is recoverable from
-            # event store. Log and continue.
-            logger.warning(
-                "Vault write failed for session %s (turn write swallowed per Invariant 6): %s",
-                session_id,
-                exc,
-            )
-            return None
 
     def _derive_session_slug(self, session_id: str) -> str:
         """Sanitize a session_id into a vault-compatible kebab-case slug.

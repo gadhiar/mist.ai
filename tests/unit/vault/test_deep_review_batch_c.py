@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from backend.chat.session_synthesizer import SessionSynthesis
 from backend.knowledge.config import FilewatcherConfig, VaultConfig
 from backend.vault.filewatcher import VaultFilewatcher, _is_tracked_path
 from backend.vault.writer import VaultWriter
@@ -261,7 +262,11 @@ class TestWriterSelfMarking:
         writer.set_mist_write_marker(lambda p: calls.append((p, Path(p).exists())))
         await writer.start()
         try:
-            path = await writer.append_turn_to_session("sess-mark", 1, "hi", "hello")
+            path_str = writer.session_path("2026-07-30", "sess-mark")
+            path = await writer.write_session_note(
+                vault_note_path=path_str,
+                synthesis=SessionSynthesis(title="Marked", body="Body."),
+            )
         finally:
             await writer.stop()
 

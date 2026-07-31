@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+from backend.chat.session_synthesizer import SessionSynthesis
 from backend.knowledge.config import VaultConfig
 from backend.vault.models import parse_frontmatter
 from backend.vault.writer import VaultWriter
@@ -48,6 +49,10 @@ async def vault_writer(tmp_path: Path):
     await writer.stop()
 
 
+def _synthesis(title: str = "Test Session") -> SessionSynthesis:
+    return SessionSynthesis(title=title, body="### What Was Accomplished\n- Did a thing\n")
+
+
 # ---------------------------------------------------------------------------
 # TestStartStop
 # ---------------------------------------------------------------------------
@@ -73,12 +78,9 @@ class TestStartStop:
         await vault_writer.start()
         # If we reach here without error and can still write, consumer is fine
         today = "2026-04-21"
-        path = await vault_writer.append_turn_to_session(
-            "idempotent-start",
-            1,
-            "hi",
-            "hello",
-            vault_writer.session_path(today, "idempotent-start"),
+        path = await vault_writer.write_session_note(
+            vault_note_path=vault_writer.session_path(today, "idempotent-start"),
+            synthesis=_synthesis(),
         )
         assert Path(path).exists()
 
@@ -88,21 +90,18 @@ class TestStartStop:
         writer = VaultWriter(config)
         await writer.start()
 
-        # Enqueue several jobs, then stop -- all should complete.
-        # Use sequential appends (not concurrent) to avoid file contention,
-        # then verify stop() is safe.
-        path_str = writer.session_path("2026-04-21", "drain-test")
-        for i in range(1, 4):
-            await writer.append_turn_to_session("drain-test", i, f"u{i}", f"m{i}", path_str)
+        # Enqueue several jobs for distinct sessions, then stop -- all should
+        # complete before stop() returns.
+        paths = [writer.session_path("2026-04-21", f"drain-test-{i}") for i in range(1, 4)]
+        for path_str in paths:
+            await writer.write_session_note(
+                vault_note_path=path_str, synthesis=_synthesis(f"Drain {path_str}")
+            )
 
         await writer.stop()
 
-        note = tmp_path / "vault" / "sessions" / "2026-04-21-drain-test.md"
-        assert note.exists()
-        from backend.vault.models import parse_frontmatter
-
-        fm_dict, _ = parse_frontmatter(note.read_text(encoding="utf-8"))
-        assert fm_dict["turn_count"] == 3
+        for path_str in paths:
+            assert Path(path_str).exists()
 
     @pytest.mark.asyncio
     async def test_double_stop_is_safe(self, tmp_path: Path):
@@ -163,308 +162,6 @@ class TestSessionPath:
 
         with pytest.raises(ValueError):
             writer.session_path("not-a-date", "slug")
-
-
-# ---------------------------------------------------------------------------
-# TestAppendTurnToSession
-# ---------------------------------------------------------------------------
-
-
-class TestAppendTurnToSession:
-    @pytest.mark.asyncio
-    async def test_creates_new_file_with_frontmatter_and_sentinel(
-        self, vault_writer: VaultWriter, tmp_path: Path
-    ):
-        path_str = vault_writer.session_path("2026-04-21", "new-session")
-
-        result = await vault_writer.append_turn_to_session(
-            "new-session", 1, "hello", "hi there", path_str
-        )
-
-        path = Path(result)
-        assert path.exists()
-        content = path.read_text(encoding="utf-8")
-        fm_dict, body = parse_frontmatter(content)
-
-        assert fm_dict["type"] == "mist-session"
-        assert fm_dict["session_id"] == "new-session"
-        assert "<!-- MIST_APPEND_HERE -->" in body
-
-    @pytest.mark.asyncio
-    async def test_new_file_frontmatter_carries_model_hash_when_provided(self, tmp_path: Path):
-        """Phase 8 stamps: when VaultWriter is constructed with a model_hash,
-        new session-note frontmatter must carry it.
-
-        Pre-fix (2026-05-06): model_hash was only populated on graph
-        DERIVED_FROM->VaultNote edges (via RebuildStamps in CurationGraphWriter).
-        Session-note frontmatter wrote None unconditionally because the writer
-        had no path to the config-driven model identifier.
-        """
-        config = _make_config(tmp_path)
-        writer = VaultWriter(config, model_hash="gemma-4-e4b-q5-k-m-test-v1")
-        await writer.start()
-        try:
-            path_str = writer.session_path("2026-04-21", "stamp-test")
-            await writer.append_turn_to_session("stamp-test", 1, "hi", "hello", path_str)
-            fm_dict, _ = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
-            assert fm_dict["model_hash"] == "gemma-4-e4b-q5-k-m-test-v1"
-        finally:
-            await writer.stop()
-
-    @pytest.mark.asyncio
-    async def test_new_file_frontmatter_model_hash_null_when_unset(
-        self, vault_writer: VaultWriter, tmp_path: Path
-    ):
-        """Default fixture omits model_hash; frontmatter should serialize null.
-
-        Confirms backwards-compat: existing callers that don't pass model_hash
-        get the same null behavior as before.
-        """
-        path_str = vault_writer.session_path("2026-04-21", "no-stamp-test")
-        await vault_writer.append_turn_to_session("no-stamp-test", 1, "hi", "hello", path_str)
-        fm_dict, _ = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
-        assert fm_dict["model_hash"] is None
-
-    @pytest.mark.asyncio
-    async def test_mark_session_completed_flips_status_in_frontmatter(
-        self, vault_writer: VaultWriter, tmp_path: Path
-    ):
-        """Gap #1a / ADR-011: WebSocket disconnect triggers session-end status flip."""
-        path_str = vault_writer.session_path("2026-04-21", "to-complete")
-        await vault_writer.append_turn_to_session("to-complete", 1, "u1", "m1", path_str)
-        # Pre-condition: status is in-progress
-        fm_dict, _ = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
-        assert fm_dict["status"] == "in-progress"
-
-        await vault_writer.mark_session_completed(path_str)
-
-        fm_dict, _ = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
-        assert fm_dict["status"] == "completed"
-
-    @pytest.mark.asyncio
-    async def test_mark_session_completed_is_idempotent(
-        self, vault_writer: VaultWriter, tmp_path: Path
-    ):
-        path_str = vault_writer.session_path("2026-04-21", "idempotent-complete")
-        await vault_writer.append_turn_to_session("idempotent-complete", 1, "u1", "m1", path_str)
-        await vault_writer.mark_session_completed(path_str)
-        await vault_writer.mark_session_completed(path_str)  # second call: no-op
-        fm_dict, _ = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
-        assert fm_dict["status"] == "completed"
-
-    @pytest.mark.asyncio
-    async def test_mark_session_completed_graceful_when_file_missing(
-        self, vault_writer: VaultWriter, tmp_path: Path
-    ):
-        """Missing file = no-op. Caller may invoke for never-appended sessions."""
-        path_str = vault_writer.session_path("2026-04-21", "never-existed")
-        # Should not raise even when path does not exist
-        await vault_writer.mark_session_completed(path_str)
-
-    @pytest.mark.asyncio
-    async def test_peek_turn_count_returns_zero_for_nonexistent_file(
-        self, vault_writer: VaultWriter, tmp_path: Path
-    ):
-        path = vault_writer.session_path("2026-04-21", "nonexistent")
-        assert vault_writer.peek_turn_count(path) == 0
-
-    @pytest.mark.asyncio
-    async def test_peek_turn_count_reflects_existing_frontmatter(
-        self, vault_writer: VaultWriter, tmp_path: Path
-    ):
-        """Seeds the durable-counter fix: ConversationHandler reads the current
-        turn_count from disk so backend restart doesn't reset turn numbering
-        for an ongoing session.
-        """
-        path = vault_writer.session_path("2026-04-21", "peek-existing")
-        await vault_writer.append_turn_to_session("peek-existing", 1, "u1", "m1", path)
-        assert vault_writer.peek_turn_count(path) == 1
-        await vault_writer.append_turn_to_session("peek-existing", 2, "u2", "m2", path)
-        await vault_writer.append_turn_to_session("peek-existing", 3, "u3", "m3", path)
-        assert vault_writer.peek_turn_count(path) == 3
-
-    @pytest.mark.asyncio
-    async def test_appends_turn_block_above_sentinel(
-        self, vault_writer: VaultWriter, tmp_path: Path
-    ):
-        path_str = vault_writer.session_path("2026-04-21", "turn-test")
-
-        await vault_writer.append_turn_to_session(
-            "turn-test", 1, "user turn 1", "mist turn 1", path_str
-        )
-        content = Path(path_str).read_text(encoding="utf-8")
-
-        assert "## Turn 1" in content
-        assert "**User:** user turn 1" in content
-        assert "**MIST:** mist turn 1" in content
-        assert "**Entities extracted:** _[pending]_" in content
-
-    @pytest.mark.asyncio
-    async def test_two_sequential_turns_both_present(
-        self, vault_writer: VaultWriter, tmp_path: Path
-    ):
-        path_str = vault_writer.session_path("2026-04-21", "two-turns")
-
-        await vault_writer.append_turn_to_session(
-            "two-turns", 1, "first user", "first mist", path_str
-        )
-        await vault_writer.append_turn_to_session(
-            "two-turns", 2, "second user", "second mist", path_str
-        )
-
-        content = Path(path_str).read_text(encoding="utf-8")
-        assert "## Turn 1" in content
-        assert "## Turn 2" in content
-        assert "first user" in content
-        assert "second user" in content
-        # Sentinel appears exactly once
-        assert content.count("<!-- MIST_APPEND_HERE -->") == 1
-
-    @pytest.mark.asyncio
-    async def test_turn_count_increments(self, vault_writer: VaultWriter, tmp_path: Path):
-        path_str = vault_writer.session_path("2026-04-21", "count-test")
-
-        await vault_writer.append_turn_to_session("count-test", 1, "u1", "m1", path_str)
-        await vault_writer.append_turn_to_session("count-test", 2, "u2", "m2", path_str)
-        await vault_writer.append_turn_to_session("count-test", 3, "u3", "m3", path_str)
-
-        fm_dict, _ = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
-        assert fm_dict["turn_count"] == 3
-
-    @pytest.mark.asyncio
-    async def test_append_sentinel_offset_is_set(self, vault_writer: VaultWriter, tmp_path: Path):
-        path_str = vault_writer.session_path("2026-04-21", "offset-test")
-
-        await vault_writer.append_turn_to_session("offset-test", 1, "u", "m", path_str)
-
-        fm_dict, _ = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
-        assert fm_dict["append_sentinel_offset"] is not None
-        assert isinstance(fm_dict["append_sentinel_offset"], int)
-        assert fm_dict["append_sentinel_offset"] > 0
-
-    @pytest.mark.asyncio
-    async def test_sentinel_missing_falls_back_to_eof_append(
-        self, vault_writer: VaultWriter, tmp_path: Path, caplog
-    ):
-        path_str = vault_writer.session_path("2026-04-21", "no-sentinel")
-        path = Path(path_str)
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Write file without a sentinel
-        path.write_text(
-            "---\ntype: mist-session\nsession_id: no-sentinel\n"
-            "date: 2026-04-21\nontology_version: 1.0.0\n"
-            "extraction_version: 2026-04-17-r1\nturn_count: 0\n"
-            "participants:\n- user\n- mist\n"
-            "authored_by: mist\nstatus: in-progress\n"
-            "append_sentinel_offset: null\nrelated_entities: []\n"
-            "model_hash: null\ntags: []\n---\n\nExisting body with no sentinel.\n",
-            encoding="utf-8",
-        )
-
-        with caplog.at_level(logging.WARNING, logger="backend.vault.writer"):
-            await vault_writer.append_turn_to_session(
-                "no-sentinel", 1, "user text", "mist text", path_str
-            )
-
-        content = path.read_text(encoding="utf-8")
-        assert "## Turn 1" in content
-        assert "<!-- MIST_APPEND_HERE -->" in content
-        assert any("sentinel" in r.message.lower() for r in caplog.records)
-
-    @pytest.mark.asyncio
-    async def test_returns_absolute_vault_note_path(
-        self, vault_writer: VaultWriter, tmp_path: Path
-    ):
-        path_str = vault_writer.session_path("2026-04-21", "ret-path")
-
-        result = await vault_writer.append_turn_to_session("ret-path", 1, "u", "m", path_str)
-
-        assert result == path_str
-        assert Path(result).is_absolute()
-
-    @pytest.mark.asyncio
-    async def test_derives_path_from_session_id_when_none(
-        self, vault_writer: VaultWriter, tmp_path: Path
-    ):
-        # vault_note_path=None should derive the path using today's date
-        result = await vault_writer.append_turn_to_session("auto-derived", 1, "u", "m", None)
-
-        assert "auto-derived.md" in result
-        assert Path(result).exists()
-
-
-# ---------------------------------------------------------------------------
-# TestUpdateEntitiesExtracted
-# ---------------------------------------------------------------------------
-
-
-class TestUpdateEntitiesExtracted:
-    async def _create_session_with_turn(
-        self, vault_writer: VaultWriter, session_id: str, path_str: str
-    ) -> None:
-        await vault_writer.append_turn_to_session(session_id, 1, "user text", "mist text", path_str)
-
-    @pytest.mark.asyncio
-    async def test_replaces_pending_with_wikilinks(self, vault_writer: VaultWriter, tmp_path: Path):
-        path_str = vault_writer.session_path("2026-04-21", "ent-test")
-        await self._create_session_with_turn(vault_writer, "ent-test", path_str)
-
-        await vault_writer.update_entities_extracted(path_str, 1, ["python", "neo4j"])
-
-        content = Path(path_str).read_text(encoding="utf-8")
-        assert "[[python]]" in content
-        assert "[[neo4j]]" in content
-        assert "_[pending]_" not in content
-
-    @pytest.mark.asyncio
-    async def test_empty_slug_list_renders_none(self, vault_writer: VaultWriter, tmp_path: Path):
-        path_str = vault_writer.session_path("2026-04-21", "empty-ent")
-        await self._create_session_with_turn(vault_writer, "empty-ent", path_str)
-
-        await vault_writer.update_entities_extracted(path_str, 1, [])
-
-        content = Path(path_str).read_text(encoding="utf-8")
-        assert "_(none)_" in content
-
-    @pytest.mark.asyncio
-    async def test_idempotent_rerun(self, vault_writer: VaultWriter, tmp_path: Path):
-        path_str = vault_writer.session_path("2026-04-21", "idem-ent")
-        await self._create_session_with_turn(vault_writer, "idem-ent", path_str)
-
-        await vault_writer.update_entities_extracted(path_str, 1, ["python"])
-        content_after_first = Path(path_str).read_text(encoding="utf-8")
-
-        # Second call with same slugs
-        await vault_writer.update_entities_extracted(path_str, 1, ["python"])
-        content_after_second = Path(path_str).read_text(encoding="utf-8")
-
-        assert content_after_first == content_after_second
-
-    @pytest.mark.asyncio
-    async def test_updates_frontmatter_related_entities(
-        self, vault_writer: VaultWriter, tmp_path: Path
-    ):
-        path_str = vault_writer.session_path("2026-04-21", "fm-ent")
-        await self._create_session_with_turn(vault_writer, "fm-ent", path_str)
-
-        await vault_writer.update_entities_extracted(path_str, 1, ["python", "neo4j"])
-
-        fm_dict, _ = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
-        related = fm_dict.get("related_entities", [])
-        assert "[[python]]" in related
-        assert "[[neo4j]]" in related
-
-    @pytest.mark.asyncio
-    async def test_related_entities_are_deduped(self, vault_writer: VaultWriter, tmp_path: Path):
-        path_str = vault_writer.session_path("2026-04-21", "dedup-ent")
-        await self._create_session_with_turn(vault_writer, "dedup-ent", path_str)
-
-        await vault_writer.update_entities_extracted(path_str, 1, ["python", "python", "neo4j"])
-
-        fm_dict, _ = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
-        related = fm_dict.get("related_entities", [])
-        assert related.count("[[python]]") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -750,17 +447,21 @@ class TestUpsertUser:
 
 class TestQueueSerialization:
     @pytest.mark.asyncio
-    async def test_concurrent_appends_land_in_sequence(
+    async def test_concurrent_writes_to_same_note_serialize_without_corruption(
         self, vault_writer: VaultWriter, tmp_path: Path
     ):
-        session_id = "concurrent-test"
-        path_str = vault_writer.session_path("2026-04-21", session_id)
+        # write_session_note is a full-render overwrite, not an accumulating
+        # append -- so the property worth proving under concurrency is that
+        # the queue serializes writes to one file rather than interleaving
+        # them into a corrupted file. Five concurrent writes with distinct
+        # titles must land as exactly one clean, parseable file.
+        path_str = vault_writer.session_path("2026-04-21", "concurrent-test")
 
-        # Fire 5 appends concurrently for the same session note
         tasks = [
             asyncio.create_task(
-                vault_writer.append_turn_to_session(
-                    session_id, i, f"user {i}", f"mist {i}", path_str
+                vault_writer.write_session_note(
+                    vault_note_path=path_str,
+                    synthesis=SessionSynthesis(title=f"Session {i}", body=f"Body {i}\n"),
                 )
             )
             for i in range(1, 6)
@@ -770,32 +471,29 @@ class TestQueueSerialization:
         content = Path(path_str).read_text(encoding="utf-8")
         fm_dict, _ = parse_frontmatter(content)
 
-        # All 5 turns must be present
-        assert fm_dict["turn_count"] == 5
-        for i in range(1, 6):
-            assert f"## Turn {i}" in content
+        assert fm_dict["title"] in [f"Session {i}" for i in range(1, 6)]
+        assert content.count("---\n") == 2, "frontmatter block must not be interleaved/duplicated"
 
     @pytest.mark.asyncio
     async def test_failure_in_one_job_does_not_break_consumer(
         self, vault_writer: VaultWriter, tmp_path: Path
     ):
-        # First job: valid path
         good_path = vault_writer.session_path("2026-04-21", "good-job")
+        await vault_writer.write_session_note(vault_note_path=good_path, synthesis=_synthesis())
 
-        # Second job: update_entities on non-existent path -- will raise VaultWriteError
-        bad_path = str(tmp_path / "vault" / "sessions" / "nonexistent.md")
+        # Non-canonical stem (no YYYY-MM-DD- prefix) -- raises VaultWriteError
+        bad_path = str(tmp_path / "vault" / "sessions" / "not-canonical.md")
 
-        await vault_writer.append_turn_to_session("good-job", 1, "user", "mist", good_path)
-
-        # This should raise (path doesn't exist)
         from backend.errors import VaultWriteError
 
         with pytest.raises(VaultWriteError):
-            await vault_writer.update_entities_extracted(bad_path, 1, ["python"])
+            await vault_writer.write_session_note(vault_note_path=bad_path, synthesis=_synthesis())
 
         # Consumer must still be alive -- subsequent write works
         second_good = vault_writer.session_path("2026-04-21", "recovery-job")
-        result = await vault_writer.append_turn_to_session("recovery-job", 1, "u", "m", second_good)
+        result = await vault_writer.write_session_note(
+            vault_note_path=second_good, synthesis=_synthesis()
+        )
         assert Path(result).exists()
 
 
@@ -825,10 +523,10 @@ class TestBackpressure:
                 # Simplest: enqueue two writes rapidly for the same session so
                 # the second enqueue sees qsize >= 1 > 0.
                 t1 = asyncio.create_task(
-                    writer.append_turn_to_session("backpressure-test", 1, "u1", "m1", path_str)
+                    writer.write_session_note(vault_note_path=path_str, synthesis=_synthesis())
                 )
                 t2 = asyncio.create_task(
-                    writer.append_turn_to_session("backpressure-test", 2, "u2", "m2", path_str)
+                    writer.write_session_note(vault_note_path=path_str, synthesis=_synthesis())
                 )
                 await asyncio.gather(t1, t2)
         finally:
@@ -849,7 +547,7 @@ class TestBackpressure:
             path_str = writer.session_path("2026-04-21", "bp-noblock")
             # Even with limit exceeded, caller must not block indefinitely
             result = await asyncio.wait_for(
-                writer.append_turn_to_session("bp-noblock", 1, "u", "m", path_str),
+                writer.write_session_note(vault_note_path=path_str, synthesis=_synthesis()),
                 timeout=5.0,
             )
             assert result == path_str
@@ -979,16 +677,16 @@ class TestSessionIdUniqueness:
     async def test_frontmatter_session_id_never_equals_default(
         self, vault_writer: VaultWriter, tmp_path: Path
     ):
-        """Regression: passing external session_id='default' must NOT write
-        session_id: default into frontmatter.
+        """Regression: an external session_id='default' path allocation must
+        NOT produce session_id: default in frontmatter.
 
-        Pre-fix: _append_turn_sync set session_id = <external session_id arg>
-        on file creation, so session_id='default' produced session_id: default.
-        Post-fix: session_id is derived from path.stem, which carries the slug
-        allocated by ConversationHandler._get_or_allocate_vault_path.
+        `_session_id_from_path` (shared by `write_session_note`) derives the
+        frontmatter session_id from the path stem's slug rather than the raw
+        external session_id allocated by
+        `ConversationHandler._get_or_allocate_vault_path`.
         """
         path_str = vault_writer.session_path("2026-05-10", "plan-new-feature-37a8")
-        await vault_writer.append_turn_to_session("default", 1, "hi there", "hello", path_str)
+        await vault_writer.write_session_note(vault_note_path=path_str, synthesis=_synthesis())
         fm_dict, _ = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
         assert fm_dict["session_id"] != "default", (
             "session_id in frontmatter must never be 'default'; " f"got {fm_dict['session_id']!r}"
@@ -1005,9 +703,7 @@ class TestSessionIdUniqueness:
         making programmatic lookup via session_id reliable.
         """
         path_str = vault_writer.session_path("2026-05-10", "vault-architecture-3a7f")
-        await vault_writer.append_turn_to_session(
-            "some-opaque-uuid-1234", 1, "tell me about the vault", "sure", path_str
-        )
+        await vault_writer.write_session_note(vault_note_path=path_str, synthesis=_synthesis())
         path = Path(path_str)
         fm_dict, _ = parse_frontmatter(path.read_text(encoding="utf-8"))
         # path.stem is "2026-05-10-vault-architecture-3a7f"
@@ -1018,22 +714,21 @@ class TestSessionIdUniqueness:
         )
 
     @pytest.mark.asyncio
-    async def test_frontmatter_session_id_stable_across_subsequent_turns(
+    async def test_frontmatter_session_id_stable_across_rerenders(
         self, vault_writer: VaultWriter, tmp_path: Path
     ):
-        """session_id must not change between turns of the same session.
+        """session_id must not change across repeated renders of the same note.
 
-        The path stem is fixed; all appends should preserve the same
-        frontmatter session_id.
+        The path stem is fixed, so re-rendering (e.g. a catch-up retry)
+        preserves the same frontmatter session_id.
         """
         path_str = vault_writer.session_path("2026-05-10", "stable-session-ab12")
         for i in range(1, 4):
-            await vault_writer.append_turn_to_session(
-                "default", i, f"user {i}", f"mist {i}", path_str
+            await vault_writer.write_session_note(
+                vault_note_path=path_str, synthesis=_synthesis(f"Render {i}")
             )
         fm_dict, _ = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
         assert fm_dict["session_id"] == "stable-session-ab12"
-        assert fm_dict["turn_count"] == 3
 
     @pytest.mark.asyncio
     async def test_two_sessions_with_same_slug_get_distinct_ids_via_hash(
@@ -1045,8 +740,8 @@ class TestSessionIdUniqueness:
         """
         path1 = vault_writer.session_path("2026-05-10", "topic-abc1")
         path2 = vault_writer.session_path("2026-05-10", "topic-abc2")
-        await vault_writer.append_turn_to_session("default", 1, "u", "m", path1)
-        await vault_writer.append_turn_to_session("default", 1, "u", "m", path2)
+        await vault_writer.write_session_note(vault_note_path=path1, synthesis=_synthesis())
+        await vault_writer.write_session_note(vault_note_path=path2, synthesis=_synthesis())
         fm1, _ = parse_frontmatter(Path(path1).read_text(encoding="utf-8"))
         fm2, _ = parse_frontmatter(Path(path2).read_text(encoding="utf-8"))
         assert fm1["session_id"] != fm2["session_id"], (

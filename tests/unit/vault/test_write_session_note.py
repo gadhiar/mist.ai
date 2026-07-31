@@ -145,3 +145,34 @@ async def test_related_entities_are_deduped_and_sorted(vault_writer, tmp_path):
 
     fm_dict, _body = parse_frontmatter(path.read_text(encoding="utf-8"))
     assert fm_dict["related_entities"] == ["alpha", "zeta"]
+
+
+@pytest.mark.asyncio
+async def test_frontmatter_carries_model_hash_when_provided(tmp_path):
+    """Phase 8 stamps: when VaultWriter is constructed with a model_hash,
+    new session-note frontmatter must carry it.
+
+    Migrated from `test_writer.py::TestAppendTurnToSession` (R1.3.1): the
+    property is unchanged, only the write path moved.
+    """
+    config = _make_config(tmp_path)
+    writer = VaultWriter(config, model_hash="gemma-4-e4b-q5-k-m-test-v1")
+    await writer.start()
+    try:
+        path = tmp_path / "sessions" / "2026-07-30-stamp-test.md"
+        await writer.write_session_note(vault_note_path=str(path), synthesis=_synthesis())
+        fm_dict, _body = parse_frontmatter(path.read_text(encoding="utf-8"))
+        assert fm_dict["model_hash"] == "gemma-4-e4b-q5-k-m-test-v1"
+    finally:
+        await writer.stop()
+
+
+@pytest.mark.asyncio
+async def test_frontmatter_model_hash_null_when_unset(vault_writer, tmp_path):
+    """Default fixture omits model_hash; frontmatter should serialize null."""
+    path = tmp_path / "sessions" / "2026-07-30-no-stamp-test.md"
+
+    await vault_writer.write_session_note(vault_note_path=str(path), synthesis=_synthesis())
+
+    fm_dict, _body = parse_frontmatter(path.read_text(encoding="utf-8"))
+    assert fm_dict["model_hash"] is None

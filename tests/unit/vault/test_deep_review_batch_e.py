@@ -1,9 +1,12 @@
 """Deep-review Batch E regressions: event-loop offloading and lifecycle.
 
-Covers concurrency-async-2 (shared warmed embedder for curation),
-concurrency-async-3 (sidecar work confined to a dedicated worker thread),
-and concurrency-async-8 (synthesis idempotency on reconnect-driven
-end_session).
+Covers concurrency-async-2 (shared warmed embedder for curation) and
+concurrency-async-3 (sidecar work confined to a dedicated worker thread).
+
+R1.3.1 removed concurrency-async-8's subject (the partial-append synthesis
+idempotency guard in `append_session_synthesis`) along with the method
+itself; `write_session_note`'s full-render idempotency is covered by
+`tests/unit/vault/test_write_session_note.py::test_render_is_idempotent_byte_for_byte`.
 """
 
 from __future__ import annotations
@@ -13,9 +16,8 @@ from pathlib import Path
 
 import pytest
 
-from backend.knowledge.config import SidecarIndexConfig, VaultConfig
+from backend.knowledge.config import SidecarIndexConfig
 from backend.vault.sidecar_index import VaultSidecarIndex
-from backend.vault.writer import VaultWriter
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
 
@@ -148,59 +150,3 @@ class TestCurationEmbeddingSharing:
         # SentenceTransformer on the event loop UNDER the curation lock.
         assert pipeline._deduplicator._embedding_provider is sentinel
         assert pipeline._graph_writer._embedding_provider is sentinel
-
-
-# ---------------------------------------------------------------------------
-# concurrency-async-8: synthesis idempotency
-# ---------------------------------------------------------------------------
-
-_NOTE = (
-    "---\n"
-    "type: mist-session\n"
-    "session_id: s1\n"
-    "status: active\n"
-    "authored_by: mist\n"
-    "---\n\n"
-    "## Turn 1\n\nhello\n\n"
-    "<!-- MIST_APPEND_HERE -->\n"
-)
-
-
-class TestSynthesisIdempotency:
-    @pytest.mark.asyncio
-    async def test_second_synthesis_append_is_skipped(self, tmp_path: Path):
-        writer = VaultWriter(
-            VaultConfig(enabled=True, root=str(tmp_path / "vault"), git_auto_init=False)
-        )
-        await writer.start()
-        try:
-            note = Path(writer.config.root) / "sessions" / "s1.md"
-            note.parent.mkdir(parents=True, exist_ok=True)
-            note.write_text(_NOTE, encoding="utf-8")
-
-            await writer.append_session_synthesis(str(note), "First synthesis.")
-            await writer.append_session_synthesis(str(note), "Second synthesis.")
-        finally:
-            await writer.stop()
-
-        content = note.read_text(encoding="utf-8")
-        assert content.count("## Summary") == 1
-        assert "Second synthesis." not in content
-
-    @pytest.mark.asyncio
-    async def test_completed_note_is_never_synthesized_again(self, tmp_path: Path):
-        writer = VaultWriter(
-            VaultConfig(enabled=True, root=str(tmp_path / "vault"), git_auto_init=False)
-        )
-        await writer.start()
-        try:
-            note = Path(writer.config.root) / "sessions" / "s2.md"
-            note.parent.mkdir(parents=True, exist_ok=True)
-            note.write_text(_NOTE.replace("status: active", "status: completed"), encoding="utf-8")
-
-            await writer.append_session_synthesis(str(note), "Late synthesis.")
-        finally:
-            await writer.stop()
-
-        content = note.read_text(encoding="utf-8")
-        assert "## Summary" not in content

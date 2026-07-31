@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
+    from backend.chat.session_synthesizer import SessionSynthesis
     from backend.knowledge.models import DocumentChunk, VectorSearchResult
     from backend.llm.models import LLMRequest, LLMResponse
 
@@ -81,20 +82,13 @@ class VaultWriterProtocol(Protocol):
 
     async def start(self) -> None: ...
     async def stop(self) -> None: ...
-    async def append_turn_to_session(
-        self,
-        session_id: str,
-        turn_index: int,
-        user_text: str,
-        mist_text: str,
-        vault_note_path: str | None = None,
-    ) -> str: ...
-    async def update_entities_extracted(
+    async def write_session_note(
         self,
         vault_note_path: str,
-        turn_index: int,
-        entity_slugs: list[str],
-    ) -> None: ...
+        synthesis: SessionSynthesis | None,
+        related_entities: list[str] | None = None,
+        status: str = "completed",
+    ) -> str | None: ...
     async def upsert_identity(
         self,
         traits: list[dict],

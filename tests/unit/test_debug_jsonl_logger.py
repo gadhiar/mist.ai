@@ -786,7 +786,8 @@ class TestVaultWriterDebugRecording:
     """
 
     @pytest.mark.asyncio
-    async def test_successful_append_records_one_line(self, tmp_path, monkeypatch):
+    async def test_successful_write_records_one_line(self, tmp_path, monkeypatch):
+        from backend.chat.session_synthesizer import SessionSynthesis
         from backend.knowledge.config import VaultConfig
         from backend.vault.writer import VaultWriter
 
@@ -801,11 +802,10 @@ class TestVaultWriterDebugRecording:
         await writer.start()
 
         try:
-            await writer.append_turn_to_session(
-                session_id="sess-test",
-                turn_index=1,
-                user_text="hello",
-                mist_text="hi",
+            path_str = writer.session_path("2026-07-30", "sess-test")
+            await writer.write_session_note(
+                vault_note_path=path_str,
+                synthesis=SessionSynthesis(title="Test Session", body="Body text."),
             )
         finally:
             await writer.stop()
@@ -813,15 +813,14 @@ class TestVaultWriterDebugRecording:
         records = [r for r in _read_jsonl(debug_path) if r.get("phase") == "vault"]
         assert len(records) == 1
         rec = records[0]
-        assert rec["operation"] == "append_turn"
+        assert rec["operation"] == "write_session_note"
         assert rec["ok"] is True
         assert rec["path"].endswith(".md")
         assert rec["duration_ms"] >= 0
-        assert rec["extra"]["turn_index"] == 1
-        assert rec["extra"]["session_id"] == "sess-test"
 
     @pytest.mark.asyncio
     async def test_no_recording_when_logger_is_none(self, tmp_path, monkeypatch):
+        from backend.chat.session_synthesizer import SessionSynthesis
         from backend.knowledge.config import VaultConfig
         from backend.vault.writer import VaultWriter
 
@@ -835,11 +834,10 @@ class TestVaultWriterDebugRecording:
         await writer.start()
 
         try:
-            await writer.append_turn_to_session(
-                session_id="sess-test",
-                turn_index=1,
-                user_text="hello",
-                mist_text="hi",
+            path_str = writer.session_path("2026-07-30", "sess-test")
+            await writer.write_session_note(
+                vault_note_path=path_str,
+                synthesis=SessionSynthesis(title="Test Session", body="Body text."),
             )
         finally:
             await writer.stop()
@@ -850,6 +848,7 @@ class TestVaultWriterDebugRecording:
 
     @pytest.mark.asyncio
     async def test_no_recording_when_gate_closed(self, tmp_path, monkeypatch):
+        from backend.chat.session_synthesizer import SessionSynthesis
         from backend.knowledge.config import VaultConfig
         from backend.vault.writer import VaultWriter
 
@@ -864,11 +863,10 @@ class TestVaultWriterDebugRecording:
         await writer.start()
 
         try:
-            await writer.append_turn_to_session(
-                session_id="sess-test",
-                turn_index=1,
-                user_text="hi",
-                mist_text="hi",
+            path_str = writer.session_path("2026-07-30", "sess-test")
+            await writer.write_session_note(
+                vault_note_path=path_str,
+                synthesis=SessionSynthesis(title="Test Session", body="Body text."),
             )
         finally:
             await writer.stop()

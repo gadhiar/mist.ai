@@ -288,10 +288,10 @@ class DebugJSONLLogger:
         touch the graph.
 
         `operation` is one of:
-          - `append_turn_to_session` (per-turn append)
-          - `update_entities_extracted` (post-extraction wikilink backfill)
+          - `write_session_note` (session-end synthesis render, R1.3.1)
           - `upsert_identity` (identity/mist.md write)
           - `upsert_user` (users/<id>.md write)
+          - `upsert_user_snapshot` (users/<id>-graph-snapshot.md write)
 
         `path` is the absolute vault note path on success, None on failure
         before the path was known. `duration_ms` covers the consumer-side
