@@ -57,6 +57,24 @@ This includes:
 
 ---
 
+## CODEBASE.md Maintenance Protocol
+
+`CODEBASE.md` is the authoritative in-repo snapshot of current project state -- branch, HEAD, active phase, per-subsystem status, test count, next actions. It is the first thing a fresh session reads (via `/mist-status`), so a stale CODEBASE.md silently misleads every future session. This is not hypothetical: on 2026-07-29 it still named a long-merged feature branch and a HEAD five phases behind reality.
+
+Keep it current as a side effect of routine work -- do NOT treat updating it as a separate task to be deferred:
+
+- **On any status / scan / context-loading pass** (`/mist-status`, session start, "where are we"): if the header (Last Updated / Branch / Status), Current Focus, test count, or any subsystem bullet diverges from `git` or the vault workstream note, reconcile it in the same turn before reporting status.
+- **On landing a milestone / merging to `main` / changing the active branch or HEAD:** update the header block and Current Focus before the work is considered done.
+- **On adding, removing, or materially changing a subsystem:** update its bullet under Current Status.
+
+Rules:
+- **Ground every claim in real state.** Read `git -C "D:\Users\rajga\mist.ai" status` / `log` and the vault workstream note; never copy a hash, count, or version forward without verifying it against the source. If a number cannot be verified (e.g. an ontology rel-type count), flag it rather than guessing.
+- **Preserve history.** Demote the prior header entry to a nested `PRIOR ENTRY --` rather than deleting it (the running-history style this file already uses).
+- **Docs are local-only.** CODEBASE.md and CLAUDE.md are never pushed to origin (no-push-docs convention + repo push-gating).
+- **Schema / convention / structure changes** belong in this CLAUDE.md, not only in CODEBASE.md.
+
+---
+
 ## Project Context
 
 ### Current Architecture (Updated: 2026-05-11)
