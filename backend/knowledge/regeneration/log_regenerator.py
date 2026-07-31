@@ -98,6 +98,19 @@ class LogRegenerator:
         copied verbatim (by id + labels + properties). Cross-layer MIST_HAS_*
         edges are NOT copied here (re-derived separately -- their targets are
         fresh :__Entity__ nodes from the replay). Returns the node count copied.
+
+        As of R1.4 the self-model is also authored as ordinary seed content
+        (`mist-memory/seed/mist.md`, verified to cover all 21 :__SelfModel__
+        nodes), so this copy is redundant belt-and-braces rather than the sole
+        durable source. Retiring it requires `rebuild()` to gain a seed-apply
+        step -- R1.6's composition work, not this method's contract. That step
+        cannot simply call `apply_seed_documents` unmodified: that function
+        hardcodes the `:__Entity__` label for every node it writes
+        (`backend/knowledge/seed/applier.py`), with no routing to
+        `:__SelfModel__` for self-model types the way `admin.py`'s older seed
+        path does. Applied as-is against self-model content, it would create
+        `:__Entity__` nodes colliding on id with the existing `:__SelfModel__`
+        nodes (e.g. `mist-identity`) rather than replacing them.
         """
         nodes = source_conn.execute_query(
             f"MATCH (n:{SELF_MODEL_LABEL}) "
@@ -262,6 +275,10 @@ class LogRegenerator:
         # Self-model copy-forward (R1.2 Task 4): optional -- only runs when both
         # source_conn and staging_conn are provided. Task 3 callers omit both and
         # are unaffected.
+        # R1.4: the self-model is now also authored in mist-memory/seed/, but this
+        # copy stays -- rebuild() has no seed-apply step, and apply_seed_documents
+        # cannot stand in for it unmodified (see copy_self_model_partition
+        # docstring). Retirement is R1.6's composition work.
         if source_conn is not None and staging_conn is not None:
             self.copy_self_model_partition(source_conn, staging_conn)
             self.rederive_self_model_cross_layer_edges(source_conn, staging_conn)
