@@ -135,28 +135,44 @@ class TestShutdownOrdering:
     function would still behave correctly wherever it is called from.
     """
 
-    def test_catchup_shutdown_precedes_curation_and_conversation_handler(self):
+    def test_catchup_shutdown_is_the_first_awaiting_action_in_shutdown(self):
+        """Catch-up's shutdown must be the FIRST awaiting action, not merely
+        earlier than two named calls.
+
+        Fix round 2's version of this test asserted only "before
+        curation_scheduler.stop() and before ch.aclose()" -- which two
+        round-3 reorderings satisfy while still breaking the property that
+        matters:
+
+        - Position kept, `await` dropped (replace `await
+          _shutdown_session_note_catchup(...)` with
+          `asyncio.create_task(_shutdown_session_note_catchup(...))`):
+          textually still first, so the old assertions held, but shutdown
+          no longer waits for cancellation -- the exact race I3 exists to
+          prevent.
+        - A new awaiting step inserted ABOVE the catch-up call: both old
+          relations still held (catch-up was still before curation and
+          aclose), but catch-up was no longer the FIRST shutdown action,
+          reopening the yield window. Only two named calls were checked,
+          so any future awaiting step added above catch-up would slip
+          through silently -- the same shape as the original N1 gap, one
+          level down.
+
+        Asserting catch-up's `await` is the first `await ` in the shutdown
+        block subsumes both former assertions (the first `await` position
+        is necessarily <= the position of any other `await`, including the
+        ones embedded in `await curation_scheduler.stop()` and `await
+        ch.aclose()`) while also catching both reorderings above, which
+        neither former assertion did.
+        """
         source = inspect.getsource(server.lifespan)
         # Split at the shutdown block's `yield`, not the "# Shutdown"
         # comment -- the explanatory comment above the catch-up shutdown
         # call itself mentions "curation_scheduler.stop()" and "ch.aclose()"
-        # in prose, and an `await `-prefixed search alone still finds that
-        # comment text if it happens to precede the yield (it does not
-        # here, but searching only the post-yield slice is the more
-        # robust anchor).
+        # in prose ("...both await, which yields...", comma not space, so
+        # it does not collide with the `"await "` search below either).
         shutdown_source = source.split("\n    yield\n", 1)[1]
 
-        catchup_pos = shutdown_source.index("_shutdown_session_note_catchup")
-        # `await `-prefixed, not the bare method call: the explanatory
-        # comment directly above the catch-up shutdown call also contains
-        # the bare "curation_scheduler.stop()" and "ch.aclose()" strings in
-        # prose form, which would otherwise match first.
-        curation_pos = shutdown_source.index("await curation_scheduler.stop()")
-        aclose_pos = shutdown_source.index("await ch.aclose()")
-
-        assert catchup_pos < curation_pos, (
-            "catch-up must be cancelled and awaited before the curation " "scheduler stops"
-        )
-        assert catchup_pos < aclose_pos, (
-            "catch-up must be cancelled and awaited before " "ConversationHandler.aclose()"
-        )
+        assert shutdown_source.index("await ") == shutdown_source.index(
+            "await _shutdown_session_note_catchup"
+        ), "catch-up shutdown must be the first awaiting action in shutdown"
