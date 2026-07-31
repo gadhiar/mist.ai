@@ -24,6 +24,16 @@ shutdown action, before anything that could race it -- is checked via
 source inspection, the same technique already used for import-boundary
 guards in tests/unit/vault/test_invalidation_bus.py and
 test_filewatcher_graph_noop.py.
+
+Final-review fix (C1, CRITICAL): production wired `is_conversation_active`
+to `bool(catchup_handler.sessions)`. `ConversationHandler.sessions` only
+ever grows in the production call graph (nothing removes from it on a
+normal WebSocket disconnect), so after the FIRST conversation this
+predicate is True forever -- `run()` returns at its first line for the
+life of the process, nullifying `run_forever`'s entire retry purpose (I5).
+The construction logic (which collaborator each callable is wired to) is
+now also extracted, into `_build_session_note_catchup`, so this wiring is
+directly testable the same way the scheduling/shutdown mechanics are.
 """
 
 from __future__ import annotations
@@ -32,6 +42,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+from types import SimpleNamespace
 
 import pytest
 
@@ -176,3 +187,172 @@ class TestShutdownOrdering:
         assert shutdown_source.index("await ") == shutdown_source.index(
             "await _shutdown_session_note_catchup"
         ), "catch-up shutdown must be the first awaiting action in shutdown"
+
+
+class _RecordingEventStore:
+    """Records whether `list_sessions_with_turns` was ever reached.
+
+    `SessionNoteCatchup.run()` checks `is_conversation_active()` before
+    anything else and returns immediately if it is True -- `list_sessions_
+    with_turns` is the very next thing `run()` calls if it is NOT deferred.
+    So whether this was reached is a direct, public-API-level probe of
+    what `is_conversation_active` actually evaluated to, without reaching
+    into `SessionNoteCatchup`'s private attributes.
+    """
+
+    def __init__(self) -> None:
+        self.list_sessions_with_turns_called = False
+
+    def list_sessions_with_turns(self) -> list[str]:
+        self.list_sessions_with_turns_called = True
+        return []
+
+
+class _FakeSynthesizer:
+    async def is_ready(self) -> bool:
+        return True
+
+
+def _fake_voice_processor(handler) -> SimpleNamespace:
+    return SimpleNamespace(
+        models=SimpleNamespace(knowledge=SimpleNamespace(conversation_handler=handler))
+    )
+
+
+def _fake_handler() -> SimpleNamespace:
+    """Minimal ConversationHandler-shaped double for `_build_session_note_catchup`.
+
+    `sessions` is seeded non-empty by default -- exactly the regression
+    shape: a conversation that ended but whose entry production never
+    evicts from `ConversationHandler.sessions`. A correct wiring must
+    ignore this entirely; the buggy wiring this replaces would defer
+    forever because of it.
+    """
+    return SimpleNamespace(
+        sessions={"leftover-from-an-ended-conversation": object()},
+        event_store=_RecordingEventStore(),
+        session_synthesizer=_FakeSynthesizer(),
+        graph_store=SimpleNamespace(sessions_with_graph_state=lambda: set()),
+        derive_session_note_path=lambda session_id, first_utterance, date: None,
+    )
+
+
+class TestBuildSessionNoteCatchup:
+    """C1 (CRITICAL, final review): proves the WIRING, not just that some
+    constructed `SessionNoteCatchup` behaves correctly when told to defer.
+    """
+
+    def test_returns_none_when_vault_writer_is_none(self):
+        handler = _fake_handler()
+        voice_processor = _fake_voice_processor(handler)
+
+        assert server._build_session_note_catchup(voice_processor, None) is None
+
+    def test_returns_none_when_no_conversation_handler_is_available(self):
+        voice_processor = SimpleNamespace(models=None)
+
+        assert server._build_session_note_catchup(voice_processor, vault_writer=object()) is None
+
+    def test_returns_none_when_event_store_is_unavailable(self):
+        handler = _fake_handler()
+        handler.event_store = None
+        voice_processor = _fake_voice_processor(handler)
+
+        assert server._build_session_note_catchup(voice_processor, vault_writer=object()) is None
+
+    @pytest.mark.asyncio
+    async def test_is_conversation_active_reflects_websocket_connections_not_handler_sessions(
+        self, monkeypatch
+    ):
+        """The core C1 regression guard. `handler.sessions` is non-empty
+        (simulating the leftover-entry bug this wiring must NOT depend on)
+        while there is no live WebSocket connection -- catch-up must still
+        proceed past the conversation-active gate.
+        """
+        handler = _fake_handler()
+        voice_processor = _fake_voice_processor(handler)
+        monkeypatch.setattr(server, "active_connections", set())
+
+        catchup = server._build_session_note_catchup(voice_processor, vault_writer=object())
+        assert catchup is not None
+        await catchup.run()
+
+        assert handler.event_store.list_sessions_with_turns_called, (
+            "is_conversation_active must reflect active_connections, not "
+            "ConversationHandler.sessions (which only ever grows in production)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_defers_when_there_is_an_active_websocket_connection(self, monkeypatch):
+        """Positive counterpart: a genuinely live connection must still defer."""
+        handler = _fake_handler()
+        handler.sessions = {}  # empty -- proves this is NOT what gates it either
+        voice_processor = _fake_voice_processor(handler)
+        monkeypatch.setattr(server, "active_connections", {object()})
+
+        catchup = server._build_session_note_catchup(voice_processor, vault_writer=object())
+        assert catchup is not None
+        await catchup.run()
+
+        assert not handler.event_store.list_sessions_with_turns_called
+
+    @pytest.mark.asyncio
+    async def test_full_wiring_reaches_synthesis_and_write_for_a_real_candidate(self, monkeypatch):
+        """Closes the broader review concern ("no test asserts anything
+        about what production passes as any of the four injected
+        callables") for the other three: drives a full successful pass and
+        checks the exact path and write that result, proving
+        `session_path_for`, `sessions_with_graph_state`, and `is_llm_ready`
+        are wired to the real collaborators, not just SOME collaborators.
+        """
+
+        class _EventStoreWithOneCandidate(_RecordingEventStore):
+            def list_sessions_with_turns(self):
+                super().list_sessions_with_turns()
+                return ["s-1"]
+
+            def get_turns(self, session_id):
+                return [
+                    {
+                        "user_utterance": "hello",
+                        "system_response": "hi",
+                        "timestamp": "2026-07-30T10:00:00+00:00",
+                    }
+                ]
+
+        class _RecordingVaultWriter:
+            def __init__(self) -> None:
+                self.writes: list[tuple[str, dict]] = []
+
+            async def write_session_note(self, vault_note_path, synthesis, **kwargs):
+                self.writes.append((vault_note_path, kwargs))
+                return vault_note_path
+
+        class _SucceedingSynthesizer:
+            async def is_ready(self) -> bool:
+                return True
+
+            async def synthesize(self, turns):
+                from backend.chat.session_synthesizer import SessionSynthesis
+
+                return SessionSynthesis(title="T", body="### What Was Accomplished\n- x\n")
+
+        handler = _fake_handler()
+        handler.sessions = {}
+        handler.event_store = _EventStoreWithOneCandidate()
+        handler.session_synthesizer = _SucceedingSynthesizer()
+        handler.graph_store = SimpleNamespace(sessions_with_graph_state=lambda: {"s-1"})
+        handler.derive_session_note_path = (
+            lambda session_id, first_utterance, date: f"/vault/sessions/{date}-{session_id}.md"
+        )
+        voice_processor = _fake_voice_processor(handler)
+        vault_writer = _RecordingVaultWriter()
+        monkeypatch.setattr(server, "active_connections", set())
+
+        catchup = server._build_session_note_catchup(voice_processor, vault_writer)
+        assert catchup is not None
+        await catchup.run()
+
+        assert vault_writer.writes == [
+            ("/vault/sessions/2026-07-30-s-1.md", {"related_entities": []})
+        ]

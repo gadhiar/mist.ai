@@ -325,11 +325,15 @@ class VaultWriter:
         no accumulated content to preserve, so this renders the whole file --
         which makes it idempotent, and therefore safe to re-run after a partial
         failure. The rendered bytes are a pure function of `synthesis`,
-        `related_entities`, `status`, `vault_note_path`, and `self._model_hash`
-        (fixed for the writer's lifetime) -- nothing else, including no
-        wall-clock read. That last one matters for Task 6's catch-up: the
-        idempotency guarantee spans a backend restart only because
-        `model_hash` is the same value across restarts in practice.
+        `related_entities`, `status`, `vault_note_path`, `self._model_hash`
+        (fixed for the writer's lifetime), and the on-disk `authored_by` at
+        the target path -- nothing else, including no wall-clock read. The
+        on-disk `authored_by` is read back and carried forward (final-review
+        fix, I1); when it is `user` or `user-edit` the write is refused
+        entirely, per ADR-010 Invariant 5. The idempotency guarantee spans a
+        backend restart because `model_hash` is stable across restarts in
+        practice and a partial failure never changes `authored_by` on disk
+        between retry attempts.
 
         Args:
             vault_note_path: Absolute path to the session note. Must be a
@@ -661,15 +665,31 @@ class VaultWriter:
         related_entities: list[str],
         status: str,
     ) -> None:
-        """Synchronous full render. Overwrites any existing file by design.
+        """Synchronous full render, given the on-disk `authored_by`.
 
-        Every field is recomputed from the arguments, the path, and
-        `self._model_hash` -- nothing is read back from an existing file
-        first. That absence of a read-modify-write step is what makes the
-        render idempotent: calling this twice with the same arguments
-        against the same path produces byte-identical output, which is the
-        property `Task 6`'s catch-up relies on to safely re-render after a
-        partial failure.
+        Final-review fix (I1): every field EXCEPT `authored_by` is
+        recomputed from the arguments, the path, and `self._model_hash` --
+        `authored_by` is read back from the existing file (if any) and
+        carried forward, mirroring `_upsert_user_sync` and
+        `_upsert_identity_sync`. The prior version never read the existing
+        file at all, so `authored_by` silently fell back to
+        `MistSessionFrontmatter`'s default (`mist`) on every render --
+        including over a note a user had hand-edited in Obsidian, which
+        both flipped `authored_by` back to `mist` and discarded their prose
+        (ADR-010 Invariant 5 violation). When the existing file's
+        `authored_by` is `user` or `user-edit`, the write is refused
+        entirely and logged -- there is no per-field update path for
+        session notes the way `_upsert_user_sync` has (session notes carry
+        no incrementally-touched field like `last_updated`), so "refuse"
+        here means the file is not touched at all, closer to
+        `_upsert_identity_sync`'s guard shape than `_upsert_user_sync`'s.
+
+        This trades away being a pure function of only the passed-in
+        arguments: calling this twice against the same path is idempotent
+        given an unchanged on-disk `authored_by`, not unconditionally --
+        the property Task 6's catch-up actually relies on (re-rendering
+        after a partial failure) still holds, since a partial failure never
+        changes `authored_by` on disk between attempts.
 
         Raises:
             VaultWriteError: Propagated from `_date_from_path` when `path`'s
@@ -679,11 +699,30 @@ class VaultWriter:
         canonical_session_id = _session_id_from_path(path)
         note_date = _date_from_path(path)
 
+        authored_by = AuthoredBy.MIST
+        if path.exists():
+            existing_fm, _existing_body = parse_frontmatter(path.read_text(encoding="utf-8"))
+            existing_authored_by = existing_fm.get("authored_by")
+            if existing_authored_by in ("user", "user-edit"):
+                logger.warning(
+                    "Session note %s has authored_by=%r -- write refused to "
+                    "preserve the user's edits (ADR-010 invariant 5)",
+                    path,
+                    existing_authored_by,
+                )
+                return
+            if existing_authored_by is not None:
+                try:
+                    authored_by = AuthoredBy(existing_authored_by)
+                except ValueError:
+                    authored_by = AuthoredBy.MIST
+
         fm = MistSessionFrontmatter(
             session_id=canonical_session_id,
             title=synthesis.title if synthesis else canonical_session_id,
             date=note_date,
             status=status,
+            authored_by=authored_by,
             related_entities=sorted(set(related_entities)),
             ontology_version=_ONTOLOGY_VERSION,
             extraction_version=_EXTRACTION_VERSION,

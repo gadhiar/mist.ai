@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -175,3 +176,109 @@ async def test_frontmatter_model_hash_null_when_unset(vault_writer, tmp_path):
 
     fm_dict, _body = parse_frontmatter(path.read_text(encoding="utf-8"))
     assert fm_dict["model_hash"] is None
+
+
+# ---------------------------------------------------------------------------
+# ADR-010 Invariant 5 (final-review fix, I1): a note's on-disk authored_by
+# must be read back and either carried forward or, for user/user-edit,
+# refused entirely. The prior implementation never read the existing file,
+# so authored_by silently reset to the MistSessionFrontmatter default
+# (`mist`) on every re-render -- including over a user's hand-edited notes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_new_note_defaults_to_mist_authored_by(vault_writer, tmp_path):
+    """No existing file -- the common case for a fresh session note."""
+    path = tmp_path / "sessions" / "2026-07-30-brand-new.md"
+
+    await vault_writer.write_session_note(vault_note_path=str(path), synthesis=_synthesis())
+
+    fm_dict, _body = parse_frontmatter(path.read_text(encoding="utf-8"))
+    assert fm_dict["authored_by"] == "mist"
+
+
+@pytest.mark.asyncio
+async def test_overwrites_a_mist_authored_note_normally(vault_writer, tmp_path):
+    """Regression guard: the new authored_by check must not accidentally
+    block the ordinary re-render case (e.g. catch-up completing a note
+    still at `in-progress`).
+    """
+    path = tmp_path / "sessions" / "2026-07-30-mist-authored.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "---\nauthored_by: mist\nstatus: in-progress\n---\n\nstale body\n",
+        encoding="utf-8",
+    )
+
+    await vault_writer.write_session_note(vault_note_path=str(path), synthesis=_synthesis())
+
+    text = path.read_text(encoding="utf-8")
+    assert "stale body" not in text
+    fm_dict, _body = parse_frontmatter(text)
+    assert fm_dict["authored_by"] == "mist"
+    assert fm_dict["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_carries_forward_a_non_default_authored_by(vault_writer, tmp_path):
+    """Not just `mist` -- any non-user, non-user-edit value already on disk
+    (e.g. `mist-pending-review`) must be preserved, not silently reset to
+    the model default on every re-render.
+    """
+    path = tmp_path / "sessions" / "2026-07-30-pending-review.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "---\nauthored_by: mist-pending-review\nstatus: in-progress\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+
+    await vault_writer.write_session_note(vault_note_path=str(path), synthesis=_synthesis())
+
+    fm_dict, _body = parse_frontmatter(path.read_text(encoding="utf-8"))
+    assert fm_dict["authored_by"] == "mist-pending-review"
+
+
+@pytest.mark.asyncio
+async def test_refuses_to_overwrite_a_user_edited_note(vault_writer, tmp_path, caplog):
+    """The load-bearing regression case: a note the user edited in Obsidian
+    (authored_by flipped to user-edit by the filewatcher's invariant-5
+    writeback) must survive a catch-up or session-end re-render untouched.
+    """
+    path = tmp_path / "sessions" / "2026-07-30-user-edited.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "---\nauthored_by: user-edit\nstatus: in-progress\n---\n\n"
+        "# My hand-written notes\n\nThis is the user's own prose.\n",
+        encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="backend.vault.writer"):
+        await vault_writer.write_session_note(vault_note_path=str(path), synthesis=_synthesis())
+
+    text = path.read_text(encoding="utf-8")
+    assert "This is the user's own prose." in text, "user body must survive the write"
+    fm_dict, _body = parse_frontmatter(text)
+    assert fm_dict["authored_by"] == "user-edit", "authored_by must not be reset"
+    warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        "write refused" in msg for msg in warning_messages
+    ), f"Expected a refusal warning. Got: {warning_messages}"
+
+
+@pytest.mark.asyncio
+async def test_refuses_to_overwrite_a_user_authored_note(vault_writer, tmp_path):
+    """`user` (a note the user created directly, not a MIST edit later
+    flipped) must be protected the same as `user-edit`.
+    """
+    path = tmp_path / "sessions" / "2026-07-30-user-authored.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "---\nauthored_by: user\nstatus: in-progress\n---\n\nOriginal user content.\n",
+        encoding="utf-8",
+    )
+
+    await vault_writer.write_session_note(vault_note_path=str(path), synthesis=_synthesis())
+
+    text = path.read_text(encoding="utf-8")
+    assert "Original user content." in text

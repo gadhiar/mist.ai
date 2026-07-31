@@ -226,6 +226,62 @@ def _log_catchup_task_exception(task: "asyncio.Task") -> None:
         logger.error("Session-note catch-up task failed: %s", exc, exc_info=exc)
 
 
+def _build_session_note_catchup(voice_processor, vault_writer):
+    """Construct the catch-up instance from live server state, or None if ineligible.
+
+    Extracted from `lifespan()` (final-review fix, C1) so the WIRING --
+    which collaborator each injected callable actually points at -- is
+    testable without booting the full ASGI lifespan, the same testability
+    reason `_schedule_session_note_catchup` and
+    `_shutdown_session_note_catchup` were extracted in fix round 2.
+
+    `is_conversation_active` is wired to the module-level `active_connections`
+    set, NOT `ConversationHandler.sessions`. `sessions` is populated on
+    every turn and, in production, is removed from in exactly one place --
+    `clear_session` -- whose only caller (`KnowledgeIntegration.clear_session`)
+    has zero production callers itself. The WebSocket disconnect path calls
+    `end_session`, which pops `_vault_paths` but never touches `self.sessions`.
+    Wiring the gate to `sessions` therefore means "this process has ever had
+    a conversation," not "a conversation is active right now" -- true
+    forever after the first turn, which silently disables `run_forever`'s
+    retry (R1.3.1 fix round 1, I5) for the rest of the process's life.
+    `active_connections` IS discarded on disconnect (see the `finally`
+    block in `websocket_endpoint`), so it reflects live connections
+    correctly.
+
+    Returns:
+        A `SessionNoteCatchup` ready to schedule, or None when the vault
+        layer is disabled, no `ConversationHandler` is reachable yet, or
+        the event store is unavailable.
+    """
+    catchup_handler = (
+        voice_processor.models.knowledge.conversation_handler
+        if voice_processor and voice_processor.models and voice_processor.models.knowledge
+        else None
+    )
+    catchup_event_store = catchup_handler.event_store if catchup_handler is not None else None
+    if vault_writer is None or catchup_handler is None or catchup_event_store is None:
+        return None
+
+    # Scoped to the production event store only: `catchup_event_store` is
+    # whatever ConversationHandler.__init__ built from EVENT_STORE_DB_PATH
+    # (the same store live traffic writes to), never a separate path such
+    # as data/eval-run/event_store.db. If this wiring is ever parameterized
+    # to accept an alternate event store, that path must NOT be routed
+    # through catch-up.
+    from backend.vault.session_catchup import SessionNoteCatchup
+
+    return SessionNoteCatchup(
+        event_store=catchup_event_store,
+        synthesizer=catchup_handler.session_synthesizer,
+        vault_writer=vault_writer,
+        sessions_with_graph_state=catchup_handler.graph_store.sessions_with_graph_state,
+        session_path_for=catchup_handler.derive_session_note_path,
+        is_conversation_active=lambda: bool(active_connections),
+        is_llm_ready=catchup_handler.session_synthesizer.is_ready,
+    )
+
+
 def _schedule_session_note_catchup(catchup) -> "asyncio.Task":
     """Schedule catch-up as a periodic background task with exception visibility.
 
@@ -404,34 +460,8 @@ async def lifespan(app: FastAPI):
     # backlog for the rest of the process's life in either case.
     catchup_task: asyncio.Task | None = None
     try:
-        catchup_handler = (
-            voice_processor.models.knowledge.conversation_handler
-            if voice_processor and voice_processor.models and voice_processor.models.knowledge
-            else None
-        )
-        catchup_event_store = catchup_handler.event_store if catchup_handler is not None else None
-        # Scoped to the production event store only: `catchup_event_store`
-        # is whatever ConversationHandler.__init__ built from
-        # EVENT_STORE_DB_PATH (the same store live traffic writes to), never
-        # a separate path such as data/eval-run/event_store.db. If this
-        # wiring is ever parameterized to accept an alternate event store,
-        # that path must NOT be routed through catch-up.
-        if (
-            vault_writer is not None
-            and catchup_handler is not None
-            and catchup_event_store is not None
-        ):
-            from backend.vault.session_catchup import SessionNoteCatchup
-
-            catchup = SessionNoteCatchup(
-                event_store=catchup_event_store,
-                synthesizer=catchup_handler.session_synthesizer,
-                vault_writer=vault_writer,
-                sessions_with_graph_state=catchup_handler.graph_store.sessions_with_graph_state,
-                session_path_for=catchup_handler.derive_session_note_path,
-                is_conversation_active=lambda: bool(catchup_handler.sessions),
-                is_llm_ready=catchup_handler.session_synthesizer.is_ready,
-            )
+        catchup = _build_session_note_catchup(voice_processor, vault_writer)
+        if catchup is not None:
             catchup_task = _schedule_session_note_catchup(catchup)
             logger.info("Session-note catch-up scheduled as a periodic background task")
     except Exception as e:  # noqa: BLE001 -- catch-up must never block startup
