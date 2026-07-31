@@ -8,7 +8,9 @@ import pytest
 import pytest_asyncio
 
 from backend.chat.session_synthesizer import SessionSynthesis
+from backend.errors import VaultWriteError
 from backend.knowledge.config import VaultConfig
+from backend.vault.models import parse_frontmatter
 from backend.vault.writer import VaultWriter
 
 # ---------------------------------------------------------------------------
@@ -114,3 +116,32 @@ async def test_overwrites_a_pre_existing_note_rather_than_appending(vault_writer
 
     text = path.read_text(encoding="utf-8")
     assert "stale content" not in text
+
+
+@pytest.mark.asyncio
+async def test_raises_on_a_path_without_a_canonical_date_prefix(vault_writer, tmp_path):
+    """A non-`session_path()`-shaped path has no date to derive.
+
+    Falling back to the wall clock here would make the render's date depend
+    on when it happens to run -- silently reintroducing the exact
+    non-determinism `write_session_note` exists to eliminate. Fail loudly
+    instead of guessing.
+    """
+    path = tmp_path / "sessions" / "not-a-canonical-session-filename.md"
+
+    with pytest.raises(VaultWriteError):
+        await vault_writer.write_session_note(vault_note_path=str(path), synthesis=_synthesis())
+
+
+@pytest.mark.asyncio
+async def test_related_entities_are_deduped_and_sorted(vault_writer, tmp_path):
+    path = tmp_path / "sessions" / "2026-07-30-entities.md"
+
+    await vault_writer.write_session_note(
+        vault_note_path=str(path),
+        synthesis=_synthesis(),
+        related_entities=["zeta", "alpha", "alpha"],
+    )
+
+    fm_dict, _body = parse_frontmatter(path.read_text(encoding="utf-8"))
+    assert fm_dict["related_entities"] == ["alpha", "zeta"]

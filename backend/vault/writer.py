@@ -95,25 +95,36 @@ def _date_from_path(path: Path) -> str:
 
     Uses the same `YYYY-MM-DD-` stem prefix as `_session_id_from_path` --
     one rule rather than two -- so a full render of `write_session_note` is a
-    pure function of its arguments, with no wall-clock read in the common
-    case. This also makes the date *correct* rather than merely stable: a
-    session that happened yesterday and is synthesized today (startup
-    catch-up) gets the date it actually occurred on, not the render date.
+    pure function of its arguments, with no wall-clock read. This also makes
+    the date *correct* rather than merely stable: a session that happened
+    yesterday and is synthesized today (startup catch-up) gets the date it
+    actually occurred on, not the render date.
+
+    There is deliberately NO wall-clock fallback for a non-conforming stem.
+    A fallback would make `write_session_note` idempotent for every path
+    `session_path()` produces but silently non-deterministic for any other
+    path -- a trap for a future caller (e.g. catch-up) that does not route
+    through `session_path()`. Raising instead makes "this method requires a
+    canonical path" an enforced precondition rather than a hoped-for one.
 
     Args:
         path: Absolute path to the session note file.
 
     Returns:
-        The `YYYY-MM-DD` prefix from the filename stem. Falls back to
-        today's UTC date when the stem does not start with a parseable date
-        (defensive -- the caller should always pass a well-formed path from
-        `session_path`).
+        The `YYYY-MM-DD` prefix from the filename stem.
+
+    Raises:
+        VaultWriteError: If the stem does not start with a `YYYY-MM-DD-`
+            prefix, i.e. the path was not produced by `session_path()`.
     """
     stem = path.stem
     m = _STEM_DATE_PREFIX_RE.match(stem)
     if m:
         return m.group(0)[:-1]  # drop the trailing "-" the regex captures
-    return datetime.now(UTC).date().isoformat()
+    raise VaultWriteError(
+        f"write_session_note requires a canonical session_path() output "
+        f"(stem 'YYYY-MM-DD-<slug>'); got stem {stem!r} from {path}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -437,20 +448,30 @@ class VaultWriter:
         + `mark_session_completed`. Because the note is synthesis-only there is
         no accumulated content to preserve, so this renders the whole file --
         which makes it idempotent, and therefore safe to re-run after a partial
-        failure. The note is a pure function of (synthesis, related_entities,
-        status, path).
+        failure. The rendered bytes are a pure function of `synthesis`,
+        `related_entities`, `status`, `vault_note_path`, and `self._model_hash`
+        (fixed for the writer's lifetime) -- nothing else, including no
+        wall-clock read. That last one matters for Task 6's catch-up: the
+        idempotency guarantee spans a backend restart only because
+        `model_hash` is the same value across restarts in practice.
 
         Args:
-            vault_note_path: Absolute path to the session note.
+            vault_note_path: Absolute path to the session note. Must be a
+                `session_path()`-shaped path (stem `YYYY-MM-DD-<slug>`) --
+                the date is derived from it, not read from the wall clock.
             synthesis: Prose from `SessionSynthesizer`. None renders a stub,
                 which is how a `skipped` session is recorded.
             related_entities: Entity ids this session touched, for the
-                prose-to-graph link.
+                prose-to-graph link. Deduped and sorted before rendering.
             status: `completed` normally; `skipped` when catch-up has given up
                 on the session (bounded retry).
 
         Returns:
             The path written.
+
+        Raises:
+            VaultWriteError: If `vault_note_path`'s filename stem does not
+                start with a `YYYY-MM-DD-` date prefix.
         """
         return await self._enqueue(
             "write_session_note",
@@ -805,12 +826,18 @@ class VaultWriter:
     ) -> None:
         """Synchronous full render. Overwrites any existing file by design.
 
-        Every field is recomputed from the arguments and the path -- nothing
-        is read back from an existing file first. That absence of a
-        read-modify-write step is what makes the render idempotent: calling
-        this twice with the same arguments against the same path produces
-        byte-identical output, which is the property `Task 6`'s catch-up
-        relies on to safely re-render after a partial failure.
+        Every field is recomputed from the arguments, the path, and
+        `self._model_hash` -- nothing is read back from an existing file
+        first. That absence of a read-modify-write step is what makes the
+        render idempotent: calling this twice with the same arguments
+        against the same path produces byte-identical output, which is the
+        property `Task 6`'s catch-up relies on to safely re-render after a
+        partial failure.
+
+        Raises:
+            VaultWriteError: Propagated from `_date_from_path` when `path`'s
+                stem is not `session_path()`-shaped. Deliberately not
+                caught here -- see that function's docstring.
         """
         canonical_session_id = _session_id_from_path(path)
         note_date = _date_from_path(path)
@@ -820,7 +847,7 @@ class VaultWriter:
             title=synthesis.title if synthesis else canonical_session_id,
             date=note_date,
             status=status,
-            related_entities=related_entities,
+            related_entities=sorted(set(related_entities)),
             ontology_version=_ONTOLOGY_VERSION,
             extraction_version=_EXTRACTION_VERSION,
             model_hash=self._model_hash,
