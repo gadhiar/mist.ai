@@ -58,6 +58,7 @@ class TestMistSessionFrontmatter:
     def _make(self, **kwargs) -> MistSessionFrontmatter:
         defaults = {
             "session_id": "test-session",
+            "title": "Test session",
             "date": "2026-04-21",
             "ontology_version": "1.0.0",
             "extraction_version": "2026-04-17-r1",
@@ -70,12 +71,12 @@ class TestMistSessionFrontmatter:
         assert fm.type == "mist-session"
 
     def test_defaults_applied(self):
+        """R1.3.1: status defaults to `completed` -- a note is now only ever
+        written at session end or catch-up, both terminal moments.
+        """
         fm = self._make()
-        assert fm.turn_count == 0
-        assert fm.participants == ["user", "mist"]
         assert fm.authored_by == AuthoredBy.MIST
-        assert fm.status == "in-progress"
-        assert fm.append_sentinel_offset is None
+        assert fm.status == "completed"
         assert fm.related_entities == []
         assert fm.model_hash is None
         assert fm.tags == []
@@ -83,6 +84,17 @@ class TestMistSessionFrontmatter:
     def test_required_fields_raise_without_session_id(self):
         with pytest.raises(ValidationError):
             MistSessionFrontmatter(
+                title="t",
+                date="2026-04-21",
+                ontology_version="1.0.0",
+                extraction_version="2026-04-17-r1",
+            )
+
+    def test_required_fields_raise_without_title(self):
+        """R1.3.1: title is now required -- notes were unbrowsable by opaque slug."""
+        with pytest.raises(ValidationError):
+            MistSessionFrontmatter(
+                session_id="test",
                 date="2026-04-21",
                 ontology_version="1.0.0",
                 extraction_version="2026-04-17-r1",
@@ -92,6 +104,7 @@ class TestMistSessionFrontmatter:
         with pytest.raises(ValidationError):
             MistSessionFrontmatter(
                 session_id="test",
+                title="t",
                 date="2026-04-21",
                 extraction_version="2026-04-17-r1",
             )
@@ -101,6 +114,7 @@ class TestMistSessionFrontmatter:
             MistSessionFrontmatter(
                 type="mist-identity",  # type: ignore[arg-type]
                 session_id="x",
+                title="t",
                 date="2026-04-21",
                 ontology_version="1.0.0",
                 extraction_version="2026-04-17-r1",
@@ -113,19 +127,63 @@ class TestMistSessionFrontmatter:
         # All values should be JSON primitives (no Enum instances)
         assert data["authored_by"] == "mist-pending-review"
         assert data["type"] == "mist-session"
-        assert isinstance(data["turn_count"], int)
-        assert isinstance(data["participants"], list)
+        assert isinstance(data["title"], str)
 
     def test_status_enum_values(self):
-        for status in ("in-progress", "completed", "archived"):
+        for status in ("in-progress", "completed", "skipped", "archived"):
             fm = self._make(status=status)
             assert fm.status == status
 
     def test_model_copy_update(self):
         fm = self._make()
-        updated = fm.model_copy(update={"turn_count": 5})
-        assert updated.turn_count == 5
-        assert fm.turn_count == 0  # original unchanged
+        updated = fm.model_copy(update={"status": "skipped"})
+        assert updated.status == "skipped"
+        assert fm.status == "completed"  # original unchanged
+
+
+# ---------------------------------------------------------------------------
+# R1.3.1: MistSessionFrontmatter is synthesis-only -- append bookkeeping dead
+# ---------------------------------------------------------------------------
+
+
+def test_session_frontmatter_drops_vestigial_append_fields():
+    """R1.3.1: with per-turn appends gone, the append bookkeeping is dead.
+
+    append_sentinel_offset existed solely to position an append; turn_count
+    and participants described a transcript the note no longer contains.
+    """
+    fields = MistSessionFrontmatter.model_fields
+
+    assert "append_sentinel_offset" not in fields
+    assert "turn_count" not in fields
+    assert "participants" not in fields
+
+
+def test_session_frontmatter_requires_a_title():
+    """Notes were identified only by opaque slug, which made them unbrowsable."""
+    fm = MistSessionFrontmatter(
+        session_id="2026-07-30-some-slug",
+        title="A readable session title",
+        date="2026-07-30",
+        ontology_version="1.4.0",
+        extraction_version="2026-06-14-r5",
+    )
+    assert fm.title == "A readable session title"
+
+
+def test_session_frontmatter_status_allows_skipped():
+    """Catch-up marks unsynthesizable sessions `skipped` so the skip survives
+    a restart -- see the bounded-retry design.
+    """
+    fm = MistSessionFrontmatter(
+        session_id="2026-07-30-some-slug",
+        title="t",
+        date="2026-07-30",
+        status="skipped",
+        ontology_version="1.4.0",
+        extraction_version="2026-06-14-r5",
+    )
+    assert fm.status == "skipped"
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +352,7 @@ class TestRenderFrontmatter:
     def _make_session(self) -> MistSessionFrontmatter:
         return MistSessionFrontmatter(
             session_id="render-test",
+            title="Render test session",
             date="2026-04-21",
             ontology_version="1.0.0",
             extraction_version="2026-04-17-r1",

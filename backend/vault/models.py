@@ -51,16 +51,21 @@ class AuthoredBy(str, Enum):
 
 
 class MistSessionFrontmatter(BaseModel):
-    """Frontmatter for `mist-session` notes (one file per conversation session)."""
+    """Frontmatter for `mist-session` notes (one file per conversation session).
+
+    R1.3.1: session notes are synthesis-only. `turn_count`, `participants` and
+    `append_sentinel_offset` described per-turn transcript appends, which
+    retired with the `DERIVED_FROM -> VaultNote` contract (ADR-011 amended).
+    `title` is produced by `SessionSynthesizer`; `status: skipped` marks a
+    session whose synthesis failed repeatedly, so catch-up stops retrying it.
+    """
 
     type: Literal["mist-session"] = "mist-session"
     session_id: str
+    title: str
     date: str
-    turn_count: int = 0
-    participants: list[str] = Field(default_factory=lambda: ["user", "mist"])
     authored_by: AuthoredBy = AuthoredBy.MIST
-    status: Literal["in-progress", "completed", "archived"] = "in-progress"
-    append_sentinel_offset: int | None = None
+    status: Literal["in-progress", "completed", "skipped", "archived"] = "completed"
     related_entities: list[str] = Field(default_factory=list)
     ontology_version: str
     extraction_version: str
