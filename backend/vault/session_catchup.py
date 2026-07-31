@@ -2,13 +2,14 @@
 
 Cost control is the whole design here. The expensive operation is an LLM
 synthesis call, so every gate exists to avoid making one: sessions that
-produced no graph state are skipped outright, a session that already has a
-note at its canonical path is skipped, repeated synthesis failure is marked
-so it stops being retried, the LLM backend must report itself ready before a
-pass attempts any synthesis at all, and the whole pass yields while a
-conversation is active. `run_forever` repeats the pass on an interval rather
-than firing once at boot, so a cold LLM or a live conversation at startup
-does not permanently strand the backlog for the life of the process.
+produced no graph state are skipped outright, a session whose note at its
+canonical path is already done (recorded, or user-authoritative and
+therefore not ours to touch) is skipped, repeated synthesis failure is
+marked so it stops being retried, the LLM backend must report itself ready
+before a pass attempts any synthesis at all, and the whole pass yields while
+a conversation is active. `run_forever` repeats the pass on an interval
+rather than firing once at boot, so a cold LLM or a live conversation at
+startup does not permanently strand the backlog for the life of the process.
 
 R1.3.1 fix round 1: dedup is keyed on the note's own canonical path
 (`session_path_for`), not on a frontmatter `session_id` field. The vault
@@ -19,6 +20,16 @@ correlate to a catch-up candidate. Checking "does my own canonical path
 already have a note" needs no id at all: the live path and catch-up already
 agree on where a session's note belongs via the shared slug algorithm, so
 that agreement alone is the dedup key.
+
+Final review, second round: "already done" is one decision, not two.
+`_note_is_not_ours_to_write` treats a `completed`/`skipped` status and a
+`user`/`user-edit` `authored_by` as the same underlying condition -- both
+mean synthesizing again is pure waste. Splitting them into separate checks
+was tried and rejected: `VaultWriter.write_session_note` refuses a
+`user`/`user-edit` note silently (no exception, no status written), so a
+status-only dedup check would never see that refusal reflected on disk and
+would re-attempt synthesis -- a real LLM call -- on every `run_forever`
+tick, forever.
 """
 
 from __future__ import annotations
@@ -102,9 +113,10 @@ class SessionNoteCatchup:
     async def run(self) -> None:
         """One catch-up pass.
 
-        Idempotent: a session with a completed or skipped note already at
-        its canonical path is never redone. Safe to call repeatedly --
-        `run_forever` does exactly that.
+        Idempotent: a session whose canonical-path note is already done --
+        recorded (`completed`/`skipped`) or user-authoritative
+        (`authored_by` `user`/`user-edit`) -- is never redone. Safe to call
+        repeatedly -- `run_forever` does exactly that.
         """
         if self._is_conversation_active():
             logger.debug("Catch-up deferred: a conversation is active")
@@ -201,15 +213,17 @@ class SessionNoteCatchup:
 
         loop = asyncio.get_running_loop()
         try:
-            status = await loop.run_in_executor(None, self._existing_note_status, path)
+            not_ours_to_write = await loop.run_in_executor(
+                None, self._note_is_not_ours_to_write, path
+            )
         except Exception as exc:  # noqa: BLE001 -- best-effort
             logger.warning(
                 "Catch-up could not read existing note status for %s (non-fatal): %s",
                 session_id,
                 exc,
             )
-            status = None
-        if status in ("completed", "skipped"):
+            not_ours_to_write = False
+        if not_ours_to_write:
             return
 
         for attempt in range(1, _MAX_ATTEMPTS_PER_PASS + 1):
@@ -246,18 +260,35 @@ class SessionNoteCatchup:
         except Exception as exc:  # noqa: BLE001 -- Invariant 6
             logger.warning("Catch-up skip-marker write failed for %s: %s", session_id, exc)
 
-    def _existing_note_status(self, path: str) -> str | None:
-        """Read the frontmatter status of the note at `path`, if it exists.
+    def _note_is_not_ours_to_write(self, path: str) -> bool:
+        """Whether an existing note at `path` means this session is done.
+
+        True when the note is already recorded (`status` is `completed` or
+        `skipped`) OR is user-authoritative (`authored_by` is `user` or
+        `user-edit`). Both are the same underlying decision -- "catch-up
+        has nothing left to do here" -- expressed as one check rather than
+        as two sibling special cases. That unification is load-bearing:
+        `VaultWriter.write_session_note` refuses to touch a `user`/
+        `user-edit` note (ADR-010 Invariant 5), and that refusal is silent
+        to this caller (no exception, no status written). Treating
+        `authored_by` as a SEPARATE condition from `status` would leave a
+        user-protected note sitting at whatever non-terminal `status` it
+        already has (typically `in-progress`, the legacy default for a
+        session that crashed before completion) -- so this gate would
+        never trip, and every `run_forever` tick would re-synthesize (a
+        real LLM call) only to have the write refused, forever.
 
         A single targeted file read, not a directory scan -- the caller
         already knows exactly where this session's note would live.
         """
         note = Path(path)
         if not note.exists():
-            return None
+            return False
         try:
             fm, _ = parse_frontmatter(note.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001 -- unreadable note is treated as absent
-            return None
-        status = fm.get("status")
-        return str(status) if status else None
+            return False
+        return fm.get("status") in ("completed", "skipped") or fm.get("authored_by") in (
+            "user",
+            "user-edit",
+        )

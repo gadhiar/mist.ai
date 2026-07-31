@@ -124,7 +124,11 @@ def _make_session_path_for(sessions_dir: Path):
 
 
 def _seed_existing_note(
-    sessions_dir: Path, session_id: str, status: str, date: str = _DEFAULT_TURN_DATE
+    sessions_dir: Path,
+    session_id: str,
+    status: str,
+    date: str = _DEFAULT_TURN_DATE,
+    authored_by: str | None = None,
 ) -> None:
     """Write a minimal real note at the exact path `session_path_for` would
     compute for `session_id`. Deliberately carries no `session_id`
@@ -132,10 +136,15 @@ def _seed_existing_note(
     (R1.3.1 fix round 1, C1); writing one here would risk a test that
     passes for the wrong reason, matching a shape the real writer never
     emits either.
+
+    `authored_by` is omitted entirely when None rather than defaulting to
+    `mist`, so the user-authoritative tests exercise a note shape that
+    differs from the default in exactly one field.
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
     note_path = sessions_dir / f"{date}-{session_id}.md"
-    note_path.write_text(f"---\nstatus: {status}\n---\n\nbody\n", encoding="utf-8")
+    authored_line = f"authored_by: {authored_by}\n" if authored_by else ""
+    note_path.write_text(f"---\nstatus: {status}\n{authored_line}---\n\nbody\n", encoding="utf-8")
 
 
 async def _always_ready() -> bool:
@@ -175,8 +184,8 @@ def catchup_harness(tmp_path: Path) -> SimpleNamespace:
         is_conversation_active=(lambda: False),
         is_llm_ready=_always_ready,
     )
-    h.seed_existing_note = lambda session_id, status: _seed_existing_note(
-        sessions_dir, session_id, status
+    h.seed_existing_note = lambda session_id, status, authored_by=None: _seed_existing_note(
+        sessions_dir, session_id, status, authored_by=authored_by
     )
     h.kwargs = {
         "event_store": h.event_store,
@@ -245,6 +254,36 @@ async def test_skips_sessions_already_marked_skipped(catchup_harness):
     await SessionNoteCatchup(**h.kwargs).run()
 
     assert h.synthesizer.calls == []
+
+
+@pytest.mark.parametrize("authored_by", ["user", "user-edit"])
+@pytest.mark.asyncio
+async def test_never_resynthesizes_a_user_authoritative_note(catchup_harness, authored_by):
+    """A user-authoritative note is skipped on EVERY pass, not just the first.
+
+    `VaultWriter.write_session_note` refuses to overwrite a `user` /
+    `user-edit` note (ADR-010 Invariant 5), and that refusal is silent to
+    catch-up -- no exception, no status written back. So a user-edited note
+    left at a non-terminal `status` (`in-progress` here, the legacy default
+    for a session that crashed before completion) would be re-synthesized on
+    every `run_forever` tick forever if the gate only consulted `status`:
+    a real LLM call each time, with the write refused each time.
+
+    Asserting across THREE passes rather than one is the point. A gate that
+    regressed to firing only once -- or one that consulted `status` alone --
+    would still leave a single-pass assertion green.
+    """
+    h = catchup_harness
+    h.event_store.sessions = ["s-user"]
+    h.sessions_with_graph_state = {"s-user"}
+    h.seed_existing_note("s-user", status="in-progress", authored_by=authored_by)
+
+    catchup = SessionNoteCatchup(**h.kwargs)
+    for _ in range(3):
+        await catchup.run()
+
+    assert h.synthesizer.calls == []
+    assert h.writer.writes == []
 
 
 @pytest.mark.asyncio
