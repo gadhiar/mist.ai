@@ -1567,8 +1567,9 @@ class ConversationHandler:
             # 2026-05-06 canonical-vault-pattern decision to skip per-turn
             # appends for zero-extraction turns ("Hi"/"Thanks") - those
             # produce no graph state worth a note, so a vault note for them
-            # is pure noise. Substantive turns still anchor cleanly; the
-            # rebuild contract is preserved.
+            # is pure noise. Substantive turns still anchor cleanly; R1.3:
+            # the rebuild contract is carried by the utterance log, not by
+            # this vault note.
 
             # Debug JSONL: record this turn and attach the TurnRecord to the
             # background extraction task so the extraction phase flushes a

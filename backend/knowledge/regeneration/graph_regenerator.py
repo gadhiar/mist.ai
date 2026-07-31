@@ -1,20 +1,26 @@
-"""Graph Regeneration Module -- QUARANTINED (ADR-010).
+"""Graph Regeneration Module -- QUARANTINED (ADR-010, retired further by R1.3).
 
 The legacy utterance-based regeneration path is DISABLED. This module
 used to rebuild the knowledge graph by replaying immutable event-store
-utterances; ADR-010 supersedes that model -- vault markdown is the source
-of truth and the graph is re-derived from the curated vault (see
-backend/knowledge/curation/graph_regenerator.py). Replaying raw utterances
-would re-introduce synthetic eval pollution, so both public entry points
-(`regenerate_all`, `regenerate_conversation`) raise NotImplementedError
-immediately.
+utterances. ADR-010 first superseded that model with a vault-derived
+rebuild; R1.3 (Inv-A1) retired that path in turn -- vault markdown is
+prose MIST reads, not a fact source, and a vault edit writes nothing to
+the graph. `backend/knowledge/curation/graph_regenerator.py`, the module
+this docstring used to point to, no longer exists (deleted by R1.3 Task
+6). The graph is rebuilt from the append-only utterance log instead, via
+`mist_admin graph-rebuild-from-log` (R1.2). Replaying raw utterances
+through THIS module would still re-introduce synthetic eval pollution, so
+both public entry points (`regenerate_all`, `regenerate_conversation`)
+raise NotImplementedError immediately.
 
 The class is NOT deleted: it remains importable only to preserve the
 dependency-injection construction contract and the ADR-009
 provenance-deletion invariant exercised by `_delete_graph_entities`. A
 future maintainer must NOT "fix" this by removing the guard raises.
 
-Replacement: `mist_admin vault-rebuild --scope all`.
+Replacement: `mist_admin graph-rebuild-from-log` for graph rebuilds;
+`mist_admin vault-rebuild --confirm` for the (graph-independent) vault
+sidecar reindex.
 """
 
 import logging
@@ -33,8 +39,10 @@ class GraphRegenerator:
 
     Both public entry points (`regenerate_all`, `regenerate_conversation`)
     raise NotImplementedError immediately: re-deriving the graph from
-    event-store utterances is superseded by ADR-010 vault-rebuild and would
-    re-introduce eval pollution. Use `mist_admin vault-rebuild --scope all`.
+    event-store utterances by replay is superseded -- first by ADR-010's
+    vault-derived rebuild, itself retired by R1.3 (Inv-A1) -- and either
+    path through THIS module would still re-introduce eval pollution. See
+    the module docstring for the current replacement commands.
 
     The class is retained (not deleted) only to preserve the
     dependency-injection construction contract and the ADR-009
@@ -71,20 +79,22 @@ class GraphRegenerator:
         from all event-store utterances (fetch utterances, delete the entity
         graph, re-extract, store). That path is disabled because re-deriving
         from raw utterances re-introduces eval pollution; the graph is now
-        rebuilt from the curated vault. Use `mist_admin vault-rebuild
-        --scope all`. The legacy body below is retained for reference but is
-        unreachable.
+        rebuilt from the append-only utterance log via `mist_admin
+        graph-rebuild-from-log` (R1.2). The legacy body below is retained
+        for reference but is unreachable.
 
         Raises:
             NotImplementedError: Always -- the legacy regeneration path is
-                superseded by ADR-010 vault-rebuild.
+                superseded (see the module docstring for the current
+                replacement commands).
         """
         # QUARANTINED per ADR-010 -- do not remove this raise; see module docstring
         raise NotImplementedError(
-            "Legacy utterance-based regeneration is superseded by ADR-010 "
-            "vault-rebuild. Re-deriving the graph from event-store utterances "
-            "would re-introduce eval pollution. Use `mist_admin vault-rebuild "
-            "--scope all` instead."
+            "Legacy utterance-based regeneration is superseded by ADR-010's "
+            "vault-derived rebuild, itself retired by R1.3 (Inv-A1). "
+            "Re-deriving the graph from event-store utterances would "
+            "re-introduce eval pollution. Use `mist_admin "
+            "graph-rebuild-from-log --dry-run` instead."
         )
 
         start_time = datetime.now()
@@ -180,9 +190,9 @@ class GraphRegenerator:
         This entry point previously regenerated the graph for a single
         conversation by replaying its event-store utterances. That path is
         disabled (re-deriving from raw utterances re-introduces eval
-        pollution); the graph is now rebuilt from the curated vault. Use
-        `mist_admin vault-rebuild --scope all`. The legacy body below is
-        retained for reference but is unreachable.
+        pollution); the graph is now rebuilt from the append-only
+        utterance log via `mist_admin graph-rebuild-from-log` (R1.2). The
+        legacy body below is retained for reference but is unreachable.
 
         Args:
             conversation_id: Formerly the conversation to regenerate; now
@@ -190,14 +200,16 @@ class GraphRegenerator:
 
         Raises:
             NotImplementedError: Always -- the legacy regeneration path is
-                superseded by ADR-010 vault-rebuild.
+                superseded (see the module docstring for the current
+                replacement commands).
         """
         # QUARANTINED per ADR-010 -- do not remove this raise; see module docstring
         raise NotImplementedError(
-            "Legacy utterance-based regeneration is superseded by ADR-010 "
-            "vault-rebuild. Re-deriving the graph from event-store utterances "
-            "would re-introduce eval pollution. Use `mist_admin vault-rebuild "
-            "--scope all` instead."
+            "Legacy utterance-based regeneration is superseded by ADR-010's "
+            "vault-derived rebuild, itself retired by R1.3 (Inv-A1). "
+            "Re-deriving the graph from event-store utterances would "
+            "re-introduce eval pollution. Use `mist_admin "
+            "graph-rebuild-from-log --dry-run` instead."
         )
 
         start_time = datetime.now()

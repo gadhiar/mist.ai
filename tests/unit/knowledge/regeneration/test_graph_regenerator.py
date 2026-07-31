@@ -1,16 +1,19 @@
 """Tests for the legacy utterance-based GraphRegenerator.
 
-QUARANTINED per ADR-010: vault markdown is the source of truth and the
-graph is re-derived from the curated vault (see
-backend/knowledge/curation/graph_regenerator.py). The legacy
-utterance-based regenerator in backend/knowledge/regeneration/ rebuilt
-the graph by replaying event-store utterances, which would re-introduce
-synthetic eval pollution. Its public entry points (`regenerate_all`,
-`regenerate_conversation`) now raise NotImplementedError immediately.
+QUARANTINED per ADR-010, retired further by R1.3 (Inv-A1): vault markdown
+is prose MIST reads, not a fact source, and a vault edit writes nothing to
+the graph. `backend/knowledge/curation/graph_regenerator.py`, the module
+this docstring used to point to, no longer exists (deleted by R1.3 Task
+6). The legacy utterance-based regenerator in backend/knowledge/regeneration/
+rebuilt the graph by replaying event-store utterances, which would
+re-introduce synthetic eval pollution. Its public entry points
+(`regenerate_all`, `regenerate_conversation`) now raise NotImplementedError
+immediately.
 
 What remains tested here:
   - The two public methods are quarantined (raise NotImplementedError
-    pointing at ADR-010 vault-rebuild).
+    pointing at the current replacement commands -- see
+    backend/knowledge/regeneration/graph_regenerator.py's module docstring).
   - Constructor dependency injection still wires correctly (the class is
     not deleted, only its replay entry points are disabled).
   - The ADR-009 provenance-preservation invariant of the
