@@ -1,8 +1,11 @@
 """ADR-010 Cluster 8 Phase 10: vault bootstrap from seed_data.
 
 Verifies that `bootstrap_vault_from_seed` writes identity/mist.md and
-users/<id>.md and that `emit_seed_vault_provenance` MERGE-creates the
-VaultNote nodes and DERIVED_FROM edges from each seeded entity.
+users/<id>.md. R1.4 Task 6 retired the DERIVED_FROM->VaultNote seed
+provenance edge (`emit_seed_vault_provenance`, formerly tested here) --
+seed facts now carry a `seed_version` property instead. See
+`tests/unit/knowledge/seed/test_no_vaultnote_provenance.py` for the
+mutation-proof guard against reintroduction.
 """
 
 from __future__ import annotations
@@ -10,7 +13,6 @@ from __future__ import annotations
 import pytest
 
 from backend.knowledge import admin
-from tests.mocks.neo4j import FakeNeo4jConnection
 
 # Reuse the minimal seed shape from test_admin_seed.
 SEED = {
@@ -179,149 +181,3 @@ class TestBootstrapVaultFromSeed:
         assert len(writer.identity_calls) == 1
         assert writer.identity_calls[0]["traits"] == []
         assert paths["identity_path"]
-
-
-# ---------------------------------------------------------------------------
-# TestEmitSeedVaultProvenance
-# ---------------------------------------------------------------------------
-
-
-class TestEmitSeedVaultProvenance:
-    def test_creates_two_vault_note_nodes(self) -> None:
-        # Arrange
-        conn = FakeNeo4jConnection()
-
-        # Act
-        admin.emit_seed_vault_provenance(
-            conn,
-            SEED,
-            identity_path="/v/identity/mist.md",
-            user_path="/v/users/user.md",
-            now_iso="2026-04-22T00:00:00Z",
-        )
-
-        # Assert -- exactly two VaultNote node MERGE writes
-        node_merges = [q for q, _ in conn.writes if "MERGE (vn:__Provenance__:VaultNote" in q]
-        assert len(node_merges) == 2
-
-    def test_emits_identity_edges_for_identity_traits_caps_prefs(self) -> None:
-        # Arrange
-        conn = FakeNeo4jConnection()
-
-        # Act
-        edges = admin.emit_seed_vault_provenance(
-            conn,
-            SEED,
-            identity_path="/v/identity/mist.md",
-            user_path="/v/users/user.md",
-        )
-
-        # Assert -- 1 identity + 2 traits + 1 capability + 1 preference = 5
-        # plus 1 user + 2 anchor entities = 3
-        # total = 8
-        assert edges == 8
-
-    def test_identity_entities_target_identity_path(self) -> None:
-        # Arrange
-        conn = FakeNeo4jConnection()
-
-        # Act
-        admin.emit_seed_vault_provenance(
-            conn,
-            SEED,
-            identity_path="/v/identity/mist.md",
-            user_path="/v/users/user.md",
-        )
-
-        # Assert -- mist-identity MERGE has identity_path target
-        derived_writes = [(q, p) for q, p in conn.writes if "MERGE (e)-[r:DERIVED_FROM]->(vn)" in q]
-        # Find the call for mist-identity entity
-        mist_calls = [p for _, p in derived_writes if p.get("entity_id") == "mist-identity"]
-        assert len(mist_calls) == 1
-        assert mist_calls[0]["path"] == "/v/identity/mist.md"
-
-    def test_user_entities_target_user_path(self) -> None:
-        # Arrange
-        conn = FakeNeo4jConnection()
-
-        # Act
-        admin.emit_seed_vault_provenance(
-            conn,
-            SEED,
-            identity_path="/v/identity/mist.md",
-            user_path="/v/users/user.md",
-        )
-
-        # Assert
-        derived_writes = [(q, p) for q, p in conn.writes if "MERGE (e)-[r:DERIVED_FROM]->(vn)" in q]
-        slalom_calls = [p for _, p in derived_writes if p.get("entity_id") == "slalom"]
-        assert len(slalom_calls) == 1
-        assert slalom_calls[0]["path"] == "/v/users/user.md"
-
-    def test_edges_carry_seed_event_id(self) -> None:
-        # Arrange -- seed-derived edges use event_id="seed" (literal in the
-        # Cypher) rather than a per-turn UUID. Phase 8 ontology_version /
-        # extraction_version / model_hash stamps are NOT applied to seed
-        # edges by design (seed entities are deterministic by construction
-        # via apply_seed; rebuild = re-run mist_admin seed).
-        conn = FakeNeo4jConnection()
-
-        # Act
-        admin.emit_seed_vault_provenance(
-            conn,
-            SEED,
-            identity_path="/v/identity/mist.md",
-            user_path="/v/users/user.md",
-        )
-
-        # Assert -- 'seed' literal appears on every DERIVED_FROM edge query;
-        # Phase 8 property names do not appear at all.
-        for q, _ in conn.writes:
-            if "MERGE (e)-[r:DERIVED_FROM]->(vn)" in q:
-                assert "r.event_id = 'seed'" in q
-                # Phase 8 stamps absent on seed edges
-                assert "ontology_version" not in q
-                assert "extraction_version" not in q
-                assert "model_hash" not in q
-
-    def test_idempotent_across_two_runs(self) -> None:
-        # Arrange + Act -- run twice; both rely on Cypher MERGE for idempotency.
-        # The number of MERGE calls doubles, but the underlying graph state is
-        # unchanged (Cypher MERGE semantics).
-        conn = FakeNeo4jConnection()
-        first = admin.emit_seed_vault_provenance(
-            conn, SEED, identity_path="/v/i.md", user_path="/v/u.md"
-        )
-        second = admin.emit_seed_vault_provenance(
-            conn, SEED, identity_path="/v/i.md", user_path="/v/u.md"
-        )
-
-        # Assert -- same edge count returned both times
-        assert first == second
-        # Caller-side determinism: second run does not change the contract.
-
-    def test_entity_match_spans_entity_and_selfmodel_partitions(self) -> None:
-        # R1.0 Task 5: identity-anchored seed nodes (mist-identity, traits,
-        # capabilities, preferences) now live in :__SelfModel__, not :__Entity__.
-        # Every DERIVED_FROM entity MATCH must use the :__Entity__|__SelfModel__
-        # disjunction so the edge lands regardless of which partition holds the
-        # node; a bare :__Entity__ match would silently miss self-model nodes.
-        # Arrange
-        conn = FakeNeo4jConnection()
-
-        # Act
-        admin.emit_seed_vault_provenance(
-            conn,
-            SEED,
-            identity_path="/v/identity/mist.md",
-            user_path="/v/users/user.md",
-        )
-
-        # Assert -- every DERIVED_FROM write matches the entity via the
-        # dual-partition disjunction, and none restricts the entity to
-        # :__Entity__ alone.
-        derived_writes = [q for q, _ in conn.writes if "MERGE (e)-[r:DERIVED_FROM]->(vn)" in q]
-        assert derived_writes, "expected DERIVED_FROM writes"
-        for q in derived_writes:
-            assert "MATCH (e:__Entity__|__SelfModel__ {id: $entity_id})" in q, q
-            assert "MATCH (e:__Entity__ {id: $entity_id})" not in q, q

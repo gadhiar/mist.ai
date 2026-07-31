@@ -166,10 +166,7 @@ async def bootstrap_vault_from_seed(
     ADR-010 Cluster 8 Phase 10: vault bootstrap. The graph layer is seeded
     from `scripts/seed_data.yaml`; this function mirrors that data into the
     vault so the canonical user-facing markdown notes exist before any
-    conversation. After this runs, every seed entity can carry a
-    `DERIVED_FROM` edge to its source vault note (see
-    `emit_seed_vault_provenance`), making the seeded subgraph formally
-    rebuildable from the vault per ADR-010 Invariant 6.
+    conversation.
 
     Idempotent. `upsert_identity` always overwrites the structured
     identity sections; `upsert_user` respects `authored_by in {user,
@@ -205,96 +202,6 @@ async def bootstrap_vault_from_seed(
         rendered_at=rendered_at,
     )
     return {"identity_path": identity_path, "user_path": user_path}
-
-
-def emit_seed_vault_provenance(
-    connection: GraphConnection,
-    seed_data: dict[str, Any],
-    identity_path: str,
-    user_path: str,
-    now_iso: str | None = None,
-) -> int:
-    """Emit DERIVED_FROM edges from each seeded entity to its bootstrap note.
-
-    ADR-010 Cluster 8 Phase 10: closes the rebuild loop for the seeded
-    subgraph. Every seeded entity gets a `DERIVED_FROM` edge to either
-    `identity/mist.md` (mist-identity, traits, capabilities, preferences)
-    or `users/<id>.md` (user, anchor entities). Each VaultNote node is
-    MERGE-idempotent on `path`, and each DERIVED_FROM edge is MERGE-
-    idempotent on (entity, vault_note), so re-running the bootstrap is
-    safe.
-
-    Phase 8 stamps (`ontology_version`, `extraction_version`, `model_hash`)
-    are NOT applied to seed-derived edges -- bootstrap entities are
-    deterministic by construction (provenance=seed, event_id=seed) so the
-    rebuild-determinism contract is trivially satisfied without per-edge
-    stamps. Vault-rebuild for seeded entities is "re-run mist_admin seed"
-    rather than re-running the extraction pipeline.
-
-    Args:
-        connection: Neo4j connection.
-        seed_data: Loaded seed_data.yaml dict (used to enumerate entity ids).
-        identity_path: Absolute path to `identity/mist.md` (from
-            bootstrap_vault_from_seed).
-        user_path: Absolute path to `users/<id>.md`.
-        now_iso: Optional ISO-8601 timestamp; defaults to now.
-
-    Returns:
-        Total number of DERIVED_FROM edges written (one per entity).
-    """
-    if now_iso is None:
-        now_iso = datetime.now(UTC).isoformat()
-
-    # MERGE the two VaultNote nodes once; per-entity loops below MATCH them.
-    for path in (identity_path, user_path):
-        connection.execute_write(
-            "MERGE (vn:__Provenance__:VaultNote {path: $path}) "
-            "ON CREATE SET vn.first_event_id = 'seed', vn.last_event_id = 'seed', "
-            "vn.created_at = $now, vn.updated_at = $now, vn.status = 'active' "
-            "ON MATCH SET vn.last_event_id = 'seed', vn.updated_at = $now",
-            {"path": path, "now": now_iso},
-        )
-
-    # Identity-anchored entities: mist-identity + traits + capabilities + preferences.
-    identity_entities: list[str] = [seed_data["mist_identity"]["id"]]
-    for section in ("traits", "capabilities", "preferences"):
-        for item in seed_data.get(section, []):
-            identity_entities.append(item["id"])
-
-    # User-anchored entities: user + anchor entities.
-    user_entities: list[str] = [seed_data["user"]["id"]]
-    for entity in seed_data.get("entities", []):
-        user_entities.append(entity["id"])
-
-    # Identity-anchored entities now live in the :__SelfModel__ partition
-    # (mist-identity + traits + capabilities + preferences); user-anchored
-    # entities stay in :__Entity__. The :__Entity__|__SelfModel__ disjunction
-    # matches a seed node in either partition so the DERIVED_FROM edge lands
-    # regardless of which side the node was seeded into.
-    edges_written = 0
-    for entity_id in identity_entities:
-        connection.execute_write(
-            "MATCH (e:__Entity__|__SelfModel__ {id: $entity_id}) "
-            "MATCH (vn:VaultNote {path: $path}) "
-            "MERGE (e)-[r:DERIVED_FROM]->(vn) "
-            "ON CREATE SET r.event_id = 'seed', r.created_at = $now "
-            "ON MATCH SET r.event_id = 'seed', r.updated_at = $now",
-            {"entity_id": entity_id, "path": identity_path, "now": now_iso},
-        )
-        edges_written += 1
-
-    for entity_id in user_entities:
-        connection.execute_write(
-            "MATCH (e:__Entity__|__SelfModel__ {id: $entity_id}) "
-            "MATCH (vn:VaultNote {path: $path}) "
-            "MERGE (e)-[r:DERIVED_FROM]->(vn) "
-            "ON CREATE SET r.event_id = 'seed', r.created_at = $now "
-            "ON MATCH SET r.event_id = 'seed', r.updated_at = $now",
-            {"entity_id": entity_id, "path": user_path, "now": now_iso},
-        )
-        edges_written += 1
-
-    return edges_written
 
 
 def apply_seed(

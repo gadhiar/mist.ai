@@ -148,10 +148,9 @@ def _do_vault_bootstrap(be: Any, config: Any, seed_data: dict[str, Any]) -> None
     """Run the vault bootstrap step for `cmd_seed` (Phase 10).
 
     Builds and starts a VaultWriter, writes identity/mist.md +
-    users/<id>.md from seed_data, then emits DERIVED_FROM edges from each
-    seeded entity to its bootstrap note. All vault operations are
-    idempotent so re-running `seed` is safe. Vault errors are logged but
-    never propagate -- graph seed already succeeded by the time this runs.
+    users/<id>.md from seed_data. Idempotent so re-running `seed` is safe.
+    Vault errors are logged but never propagate -- graph seed already
+    succeeded by the time this runs.
     """
     import asyncio
 
@@ -185,19 +184,6 @@ def _do_vault_bootstrap(be: Any, config: Any, seed_data: dict[str, Any]) -> None
 
     print(f"[seed]   identity_path: {paths['identity_path']}")
     print(f"[seed]   user_path:     {paths['user_path']}")
-
-    connection = _connect(be)
-    try:
-        edges = be.admin.emit_seed_vault_provenance(
-            connection,
-            seed_data,
-            identity_path=paths["identity_path"],
-            user_path=paths["user_path"],
-        )
-    finally:
-        connection.disconnect()
-
-    print(f"[seed] Vault bootstrap: wrote {edges} DERIVED_FROM edges to bootstrap notes")
 
 
 def cmd_graph_dump(args: argparse.Namespace) -> int:
