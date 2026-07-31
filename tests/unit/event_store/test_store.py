@@ -11,6 +11,8 @@ import pytest
 
 from backend.event_store.models import ConversationTurnEvent
 from backend.event_store.store import EventStore
+from backend.knowledge.config import KnowledgeConfig
+from backend.knowledge.ontologies import ONTOLOGY_V1_0_0
 
 
 def _build_turn_event(
@@ -239,3 +241,150 @@ class TestOrigin:
             for row in second._get_connection().execute("PRAGMA table_info(conversation_sessions)")
         }
         assert "origin" in cols
+
+
+class TestEnsureInitialEpoch:
+    """Provisional initial epoch -- see R1.4 Task 7 (spec 4.3, O2).
+
+    Uses `tmp_path` rather than the `:memory:` `store` fixture for the same
+    reason as `TestOrigin`: the pre-existing-database test needs a file it
+    can reopen with a second connection.
+    """
+
+    def test_first_call_inserts_a_row_marked_provisional(self, tmp_path):
+        """The provisional marking must be a real, queryable field."""
+        store = EventStore(db_path=str(tmp_path / "es.db"))
+        store.initialize()
+
+        epoch = store.ensure_initial_epoch(
+            now_iso="2026-07-31T00:00:00",
+            ontology_version="onto-x",
+            extraction_version="extract-x",
+            model_hash="hash-x",
+        )
+
+        assert epoch["provisional"] == 1
+        row = (
+            store._get_connection()
+            .execute("SELECT * FROM epoch_ledger WHERE epoch_id = ?", (epoch["epoch_id"],))
+            .fetchone()
+        )
+        assert row["provisional"] == 1
+        assert row["ontology_version"] == "onto-x"
+        assert row["extraction_version"] == "extract-x"
+        assert row["model_hash"] == "hash-x"
+        assert row["activated_at"] == "2026-07-31T00:00:00"
+        assert row["prev_epoch_id"] is None
+
+    def test_first_call_adds_exactly_one_row(self, tmp_path):
+        """Proves the first call genuinely inserts, not just that a later
+        no-op call finds a row already there.
+        """
+        store = EventStore(db_path=str(tmp_path / "es.db"))
+        store.initialize()
+
+        store.ensure_initial_epoch(now_iso="2026-07-31T00:00:00")
+
+        rows = store._get_connection().execute("SELECT * FROM epoch_ledger").fetchall()
+        assert len(rows) == 1
+
+    def test_second_call_does_not_insert_or_change_the_epoch(self, tmp_path):
+        """A second call -- even with different arguments -- must be a
+        pure no-op. Varying the arguments (rather than repeating the same
+        call) discriminates a real no-op from one that happens to produce
+        an identical row because the inputs matched.
+        """
+        store = EventStore(db_path=str(tmp_path / "es.db"))
+        store.initialize()
+
+        first = store.ensure_initial_epoch(
+            now_iso="2026-07-31T00:00:00",
+            ontology_version="onto-x",
+            extraction_version="extract-x",
+            model_hash="hash-x",
+        )
+        second = store.ensure_initial_epoch(
+            now_iso="2099-01-01T00:00:00",
+            ontology_version="onto-y",
+            extraction_version="extract-y",
+            model_hash="hash-y",
+        )
+
+        assert first == second
+        rows = store._get_connection().execute("SELECT * FROM epoch_ledger").fetchall()
+        assert len(rows) == 1, "a second call must not add a row"
+
+    def test_default_stamps_come_from_knowledge_config_and_ontology_module(self, tmp_path):
+        """A bare call (no override arguments) must not write placeholder
+        strings -- it should read the same sources the rest of the system
+        treats as the current ontology and extraction config.
+        """
+        store = EventStore(db_path=str(tmp_path / "es.db"))
+        store.initialize()
+
+        epoch = store.ensure_initial_epoch(now_iso="2026-07-31T00:00:00")
+
+        expected_config = KnowledgeConfig.from_env()
+        assert epoch["ontology_version"] == ONTOLOGY_V1_0_0.version
+        assert epoch["extraction_version"] == expected_config.extraction_version
+        assert epoch["model_hash"] == expected_config.model_hash
+
+    def test_does_not_overwrite_an_existing_non_provisional_epoch(self, tmp_path):
+        """A genuine epoch (written via `append_epoch`, not this method)
+        must not be superseded by a provisional one -- 'ensure a reference
+        exists' is not the same job as 'ensure a provisional epoch exists'.
+        """
+        store = EventStore(db_path=str(tmp_path / "es.db"))
+        store.initialize()
+        real_epoch_id = store.append_epoch(
+            ontology_version="real-onto",
+            extraction_version="real-extract",
+            model_hash="real-hash",
+            activated_at="2026-07-31T00:00:00",
+        )
+
+        result = store.ensure_initial_epoch(now_iso="2099-01-01T00:00:00")
+
+        assert result["epoch_id"] == real_epoch_id
+        assert result["ontology_version"] == "real-onto"
+        assert result["provisional"] == 0
+        rows = store._get_connection().execute("SELECT * FROM epoch_ledger").fetchall()
+        assert len(rows) == 1
+
+    def test_provisional_column_added_to_preexisting_db(self, tmp_path):
+        """A database created before `provisional` existed gains it on open."""
+        db = tmp_path / "legacy.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE epoch_ledger ("
+            "epoch_id INTEGER PRIMARY KEY AUTOINCREMENT, ontology_version TEXT NOT NULL, "
+            "extraction_version TEXT NOT NULL, model_hash TEXT NOT NULL, "
+            "activated_at TEXT NOT NULL, prev_epoch_id INTEGER)"
+        )
+        conn.commit()
+        conn.close()
+
+        store = EventStore(db_path=str(db))
+        store.initialize()
+
+        cols = {
+            row[1] for row in store._get_connection().execute("PRAGMA table_info(epoch_ledger)")
+        }
+        assert "provisional" in cols
+
+    def test_migration_guard_is_idempotent_across_reopens(self, tmp_path):
+        """The guarded ALTER must not raise `duplicate column name` the
+        second time a database that already has `provisional` is opened.
+        """
+        db_path = str(tmp_path / "es.db")
+        first = EventStore(db_path=db_path)
+        first.initialize()
+        first.close()
+
+        second = EventStore(db_path=db_path)
+        second.initialize()  # must not raise
+
+        cols = {
+            row[1] for row in second._get_connection().execute("PRAGMA table_info(epoch_ledger)")
+        }
+        assert "provisional" in cols

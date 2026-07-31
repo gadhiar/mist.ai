@@ -105,5 +105,7 @@ CREATE TABLE IF NOT EXISTS epoch_ledger (
     extraction_version TEXT NOT NULL,
     model_hash TEXT NOT NULL,
     activated_at TEXT NOT NULL,
-    prev_epoch_id INTEGER
+    prev_epoch_id INTEGER,
+    provisional INTEGER NOT NULL DEFAULT 0  -- R1.4 Task 7 (spec O2): 1 = bootstrap
+                                             -- placeholder, may be superseded by R1.6
 );

@@ -90,6 +90,17 @@ class EventStore:
             )
             logger.info("Event store: added `origin` column to conversation_sessions")
 
+        # R1.4 Task 7: `epoch_ledger` predates the `provisional` column --
+        # same guard shape as `origin` above, and for the same reason: a
+        # database created before this change needs the column added
+        # explicitly, since `CREATE TABLE IF NOT EXISTS` leaves it alone.
+        epoch_columns = {row[1] for row in conn.execute("PRAGMA table_info(epoch_ledger)")}
+        if "provisional" not in epoch_columns:
+            conn.execute(
+                "ALTER TABLE epoch_ledger ADD COLUMN provisional INTEGER NOT NULL DEFAULT 0"
+            )
+            logger.info("Event store: added `provisional` column to epoch_ledger")
+
         logger.info("Event store initialized at %s", self.db_path)
 
     def start_session(
@@ -442,6 +453,109 @@ class EventStore:
         conn = self._get_connection()
         rows = conn.execute("SELECT * FROM epoch_ledger ORDER BY epoch_id ASC").fetchall()
         return [dict(r) for r in rows]
+
+    def ensure_initial_epoch(
+        self,
+        *,
+        now_iso: str,
+        ontology_version: str | None = None,
+        extraction_version: str | None = None,
+        model_hash: str | None = None,
+    ) -> dict[str, Any]:
+        """Ensure the epoch ledger has a reference epoch, seeding one if empty.
+
+        R1.4 Task 7 (spec 4.3, O2): `epoch_ledger` starts with 0 rows, so
+        Gate 1 (rebuild equality) has nothing to rebuild against yet. This
+        writes a minimal epoch marked `provisional=1` -- a real column, not
+        a comment -- so R1.6 stays free to redefine epoch semantics when it
+        gives a consumer to the `ontology_version` / `extraction_version` /
+        `model_hash` stamps this table carries (the `RebuildStamps`
+        fields). This method's only job is to guarantee SOME reference
+        epoch exists; it does not un-defer O4 -- nothing yet reads these
+        columns back out.
+
+        Idempotent on more than "no exception raised": if the ledger
+        already holds any epoch -- the provisional one this method wrote on
+        a prior call, or a genuine one written later via `append_epoch` --
+        this returns that epoch unchanged rather than inserting a second
+        row. A caller that wants to replace a provisional epoch with a real
+        one should call `append_epoch` directly; this method never
+        overwrites an existing epoch, provisional or not.
+
+        `now_iso` is a caller-supplied parameter, never a clock read --
+        R1.3.1 shipped a `datetime.now()` fallback that drifted across UTC
+        midnight and mis-dated the only note MIST had ever written.
+
+        Args:
+            now_iso: ISO-8601 timestamp to stamp as `activated_at` on the
+                inserted epoch. Unused if an epoch already exists.
+            ontology_version: Stamp to write. Defaults to
+                `ONTOLOGY_V1_0_0.version` (`backend.knowledge.ontologies`)
+                when not given -- pass explicitly to keep a caller (tests
+                included) from depending on the knowledge layer's config.
+            extraction_version: Stamp to write. Defaults to
+                `KnowledgeConfig.from_env().extraction_version` when not
+                given.
+            model_hash: Stamp to write. Defaults to
+                `KnowledgeConfig.from_env().model_hash` when not given.
+
+        Returns:
+            The current epoch row as a dict -- either the one just
+            inserted, or the pre-existing one.
+        """
+        current = self.get_current_epoch()
+        if current is not None:
+            return current
+
+        if ontology_version is None or extraction_version is None or model_hash is None:
+            # Local import, not module-level, and only reached when a
+            # caller relies on a default: these stamp values are Layer-2
+            # (ontology / extraction) concepts recorded in the Layer-1
+            # ledger. Scoping the import keeps every other EventStore call
+            # site -- and any caller that passes all three explicitly --
+            # free of the knowledge-layer dependency.
+            from backend.knowledge.config import KnowledgeConfig
+            from backend.knowledge.ontologies import ONTOLOGY_V1_0_0
+
+            # .from_env() rather than the process-global get_config(): this
+            # writes a value permanently into the ledger, so it should
+            # reflect a fresh read of the deployment's actual env vars
+            # rather than whatever the mutable config singleton happens to
+            # hold at this moment (get_config()/set_config() can be
+            # repointed by unrelated code, e.g. test fixtures, for the life
+            # of the process).
+            config = KnowledgeConfig.from_env()
+            ontology_version = ontology_version or ONTOLOGY_V1_0_0.version
+            extraction_version = extraction_version or config.extraction_version
+            model_hash = model_hash or config.model_hash
+
+        conn = self._get_connection()
+        cursor = conn.execute(
+            """
+            INSERT INTO epoch_ledger (
+                ontology_version, extraction_version, model_hash, activated_at,
+                prev_epoch_id, provisional
+            ) VALUES (?, ?, ?, ?, NULL, 1)
+            """,
+            (ontology_version, extraction_version, model_hash, now_iso),
+        )
+
+        logger.info(
+            "Event store: wrote provisional initial epoch %d (ontology=%s, extraction=%s)",
+            cursor.lastrowid,
+            ontology_version,
+            extraction_version,
+        )
+
+        return {
+            "epoch_id": int(cursor.lastrowid),
+            "ontology_version": ontology_version,
+            "extraction_version": extraction_version,
+            "model_hash": model_hash,
+            "activated_at": now_iso,
+            "prev_epoch_id": None,
+            "provisional": 1,
+        }
 
     def create_reextraction_job(
         self,
