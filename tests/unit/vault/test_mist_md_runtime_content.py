@@ -78,9 +78,22 @@ class TestRuntimeGuidancePreserved:
         """Bucket-level folder names orient MIST for vault-write routing."""
         assert "sessions/" in mist_md_content
 
-    def test_authoring_invariant_vault_wins(self, mist_md_content: str):
-        """'User edits to vault are authoritative; on conflict, vault wins' is runtime."""
-        assert "vault wins" in mist_md_content
+    def test_authoring_invariant_is_split_by_content_type(self, mist_md_content: str):
+        """The authoring invariant is split by content type, and both halves are runtime.
+
+        Until R1 this asserted the literal "vault wins" -- ADR-010 Invariant 5's
+        blanket rule that the vault won every conflict. R1 inverted that half:
+        the graph is authoritative for FACTS and wins a fact conflict even
+        against human-authored prose. The other half survived unchanged --
+        user-written vault prose is still never overwritten.
+
+        Both are asserted because dropping either one silently restores a
+        wrong invariant to a file injected into MIST's context every turn:
+        without the first, a fact conflict reads as vault-wins again; without
+        the second, nothing states that user prose is protected.
+        """
+        assert "the graph wins" in mist_md_content
+        assert "never overwritten" in mist_md_content
 
     def test_vault_never_stores_inferred_beliefs(self, mist_md_content: str):
         """Vault writes must be user-approved events, not inferred content."""
