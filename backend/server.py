@@ -335,6 +335,48 @@ async def lifespan(app: FastAPI):
         logger.warning("Curation scheduler failed to start: %s", e)
         curation_scheduler = None
 
+    # R1.3.1: synthesize vault notes for sessions that crashed before session
+    # end (process kill, container restart) and so never reached
+    # ConversationHandler.end_session. Background and deferential -- boot is
+    # when the user is most likely to start talking, and a synthesis call
+    # would hold the GPU and delay their first token. Reached through the
+    # same voice_processor -> models -> knowledge -> conversation_handler
+    # chain the shutdown path below already uses to reach the handler.
+    catchup_task: asyncio.Task | None = None
+    try:
+        catchup_handler = (
+            voice_processor.models.knowledge.conversation_handler
+            if voice_processor and voice_processor.models and voice_processor.models.knowledge
+            else None
+        )
+        catchup_event_store = catchup_handler.event_store if catchup_handler is not None else None
+        # Scoped to the production event store only: `catchup_event_store`
+        # is whatever ConversationHandler.__init__ built from
+        # EVENT_STORE_DB_PATH (the same store live traffic writes to), never
+        # a separate path such as data/eval-run/event_store.db. If this
+        # wiring is ever parameterized to accept an alternate event store,
+        # that path must NOT be routed through catch-up.
+        if (
+            vault_writer is not None
+            and catchup_handler is not None
+            and catchup_event_store is not None
+        ):
+            from backend.vault.session_catchup import SessionNoteCatchup
+
+            catchup = SessionNoteCatchup(
+                event_store=catchup_event_store,
+                synthesizer=catchup_handler.session_synthesizer,
+                vault_writer=vault_writer,
+                vault_sessions_dir=Path(knowledge_config.vault.root) / "sessions",
+                sessions_with_graph_state=catchup_handler.graph_store.sessions_with_graph_state,
+                session_path_for=catchup_handler.derive_session_note_path,
+                is_conversation_active=lambda: bool(catchup_handler.sessions),
+            )
+            catchup_task = asyncio.create_task(catchup.run(), name="session-note-catchup")
+            logger.info("Session-note catch-up scheduled as a background task")
+    except Exception as e:  # noqa: BLE001 -- catch-up must never block startup
+        logger.warning("Session-note catch-up scheduling failed (non-fatal): %s", e)
+
     logger.info(f"Server ready on ws://{config.host}:{config.port}/ws")
     logger.info("=" * 60)
 
@@ -386,6 +428,10 @@ async def lifespan(app: FastAPI):
     health_status_task.cancel()
     heartbeat_task.cancel()
     broadcaster_task.cancel()
+    if catchup_task is not None:
+        # Best-effort background pass -- an in-flight session simply gets
+        # picked up again by the next boot's catch-up (bounded-retry gate).
+        catchup_task.cancel()
     if voice_processor and voice_processor.models:
         voice_processor.models.shutdown()
 

@@ -689,6 +689,78 @@ class TestPhase6PathPreAllocation:
 
 
 # ---------------------------------------------------------------------------
+# TestDeriveSessionNotePath (R1.3.1 Task 6) -- catch-up's path derivation
+# ---------------------------------------------------------------------------
+
+
+class TestDeriveSessionNotePath:
+    """`derive_session_note_path` gives startup catch-up the same path a
+    live session would have allocated, without touching `_vault_paths`.
+    """
+
+    def test_returns_none_when_vault_disabled(self) -> None:
+        # Arrange
+        handler = make_handler(vault_writer=None)
+
+        # Act
+        path = handler.derive_session_note_path("any-session", "hello there", "2026-07-29")
+
+        # Assert
+        assert path is None
+
+    def test_returns_a_path_derived_from_utterance_and_date(self) -> None:
+        # Arrange
+        fake_vault = FakeVaultWriter()
+        handler = make_handler(vault_writer=fake_vault)
+
+        # Act
+        path = handler.derive_session_note_path(
+            "s-crashed", "tell me about the vault architecture", "2026-07-29"
+        )
+
+        # Assert
+        assert path is not None
+        assert path.startswith("/tmp/vault/sessions/2026-07-29-")
+        assert path.endswith(".md")
+        assert "vault-architecture" in path
+
+    def test_does_not_prime_the_live_vault_paths_cache(self) -> None:
+        # Arrange -- catch-up runs for a session that is already over; it
+        # must not make a later live lookup for the same session_id reuse a
+        # catch-up-derived path.
+        fake_vault = FakeVaultWriter()
+        handler = make_handler(vault_writer=fake_vault)
+
+        # Act
+        handler.derive_session_note_path("s-crashed", "hello there", "2026-07-29")
+
+        # Assert
+        assert "s-crashed" not in handler._vault_paths
+
+    def test_matches_the_live_allocation_path_for_the_same_inputs(self) -> None:
+        # Arrange -- the load-bearing property: a catch-up note and a live
+        # note for the same session_id + first utterance must derive the
+        # same SLUG (dates naturally differ -- catch-up runs later than the
+        # session did -- so the slug, not the full path, is what must
+        # match, or the two note-writing paths silently diverge).
+        fake_vault = FakeVaultWriter()
+        handler = make_handler(vault_writer=fake_vault)
+        utterance = "walk me through the extraction pipeline"
+
+        # Act
+        live_path = handler._get_or_allocate_vault_path("s-live", first_utterance=utterance)
+        # A second handler models catch-up running in a fresh process, with
+        # no `_vault_paths` cache primed for "s-live".
+        catchup_handler = make_handler(vault_writer=FakeVaultWriter())
+        catchup_path = catchup_handler.derive_session_note_path("s-live", utterance, "2026-07-29")
+        expected_slug = handler._derive_session_slug_from_utterance(utterance, "s-live")
+
+        # Assert
+        assert live_path.endswith(f"-{expected_slug}.md")
+        assert catchup_path.endswith(f"-{expected_slug}.md")
+
+
+# ---------------------------------------------------------------------------
 # TestPhase9SlugDerivation -- session slug from first utterance content
 # ---------------------------------------------------------------------------
 

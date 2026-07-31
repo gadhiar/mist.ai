@@ -2302,6 +2302,39 @@ class ConversationHandler:
         self._vault_paths[session_id] = path
         return path
 
+    def derive_session_note_path(
+        self, session_id: str, first_utterance: str, date: str
+    ) -> str | None:
+        """Derive where a session's note belongs without allocating or caching.
+
+        Startup catch-up (`backend.vault.session_catchup.SessionNoteCatchup`)
+        needs the path for a session that never got one -- the process that
+        would have allocated it via `_get_or_allocate_vault_path` is gone.
+        This reuses the live path's slug derivation
+        (`_derive_session_slug_from_utterance`) so a catch-up note and a live
+        note for the same session land at the same place -- a second slug
+        algorithm would diverge silently.
+
+        Deliberately does NOT touch `_vault_paths`: catch-up must not prime
+        the live allocation cache for a session that is already over.
+
+        Args:
+            session_id: External session identifier (used only as the
+                deterministic-fallback seed inside slug derivation).
+            first_utterance: The session's first user utterance, used to
+                derive a content-meaningful slug.
+            date: `YYYY-MM-DD` the session occurred on, per
+                `VaultWriter.session_path`.
+
+        Returns:
+            Absolute vault note path, or None if the vault layer is
+            disabled (`_vault_writer is None`).
+        """
+        if self._vault_writer is None:
+            return None
+        slug = self._derive_session_slug_from_utterance(first_utterance, session_id)
+        return self._vault_writer.session_path(date, slug)
+
     def _derive_session_slug(self, session_id: str) -> str:
         """Sanitize a session_id into a vault-compatible kebab-case slug.
 

@@ -33,6 +33,43 @@ class TestInitializeSchemaProvenance:
         ), f"Expected provenance_type_idx, got writes: {issued}"
 
 
+class TestSessionsWithGraphState:
+    """R1.3.1 Task 6: the catch-up skip-filter query."""
+
+    def test_queries_extracted_from_conversation_context(self) -> None:
+        conn = FakeNeo4jConnection()
+        store = GraphStore(connection=conn, embedding_generator=FakeEmbeddingGenerator())
+
+        store.sessions_with_graph_state()
+
+        query, params = conn.queries[0]
+        assert "EXTRACTED_FROM" in query
+        assert "__Provenance__:ConversationContext" in query
+        assert params is None
+
+    def test_returns_distinct_session_ids_from_query_results(self) -> None:
+        conn = FakeNeo4jConnection(
+            query_results=[
+                {"session_id": "s-1"},
+                {"session_id": "s-2"},
+                {"session_id": "s-1"},
+            ]
+        )
+        store = GraphStore(connection=conn, embedding_generator=FakeEmbeddingGenerator())
+
+        result = store.sessions_with_graph_state()
+
+        assert result == {"s-1", "s-2"}
+
+    def test_returns_empty_set_when_no_entities_extracted(self) -> None:
+        conn = FakeNeo4jConnection(query_results=[])
+        store = GraphStore(connection=conn, embedding_generator=FakeEmbeddingGenerator())
+
+        result = store.sessions_with_graph_state()
+
+        assert result == set()
+
+
 class TestGraphHopEntityFilter:
     """ADR-009 v1.1: graph-hop expansion must filter all nodes to :__Entity__
     and restrict relationship types to the user-facing allowlist.

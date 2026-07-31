@@ -1011,6 +1011,31 @@ class GraphStore:
 
         return [dict(record) for record in results]
 
+    def sessions_with_graph_state(self) -> set[str]:
+        """Session ids that produced at least one entity in the graph.
+
+        The catch-up skip-filter (`backend.vault.session_catchup`): a
+        session that wrote nothing to the graph has nothing worth
+        synthesizing into a vault note. One query answers it for every
+        session at once rather than one query per candidate session.
+
+        This method is sync, like every other `GraphStore` method -- async
+        callers must go through `run_in_executor` (or `GraphExecutor`)
+        rather than calling it directly, per the codebase's async-boundary
+        rule for Neo4j access.
+
+        Returns:
+            Set of `conversation_id` strings with at least one
+            `EXTRACTED_FROM` edge into a `ConversationContext` node.
+        """
+        rows = self.connection.execute_query(
+            "MATCH (:__Entity__)-[:EXTRACTED_FROM]->"
+            "(ctx:__Provenance__:ConversationContext) "
+            "RETURN DISTINCT ctx.conversation_id AS session_id",
+            None,
+        )
+        return {r["session_id"] for r in rows if r.get("session_id")}
+
     def search_similar_entities(
         self, query_text: str, limit: int = 10, similarity_threshold: float = 0.7
     ) -> list[dict]:
