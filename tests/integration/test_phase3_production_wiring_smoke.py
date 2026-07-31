@@ -11,9 +11,9 @@ This test adds the protective regression: build_phase3_components +
 build_conversation_handler + the chain through a real GraphStore. R1.3
 retired the graph-write half of the old invariant-5 chain (Inv-A1: the vault
 is prose MIST reads, not a fact source) -- the headline test now asserts the
-INVERSE of what it used to: a vault user-edit (Bucket 1, users/<user>.md)
-produces zero graph edges and zero VaultNote provenance nodes, while the
-read-path cache-invalidation signal still fires.
+INVERSE of what it used to: a vault user-edit under users/<user>.md produces
+zero graph edges and zero VaultNote provenance nodes, while the read-path
+cache-invalidation signal still fires.
 
 Skip gating: tests skip on any host where sentence_transformers is not
 importable (Windows dev host) OR where Neo4j is not reachable at the URI
@@ -123,7 +123,7 @@ class _NoopSidecarIndex:
 
 
 class _FakeVaultWriter:
-    """Minimal VaultWriterProtocol double for the invariant-5 writeback surface.
+    """Minimal VaultWriterProtocol double for the authored_by writeback surface.
 
     Records mark_authored_by_user_edit calls without driving VaultWriter's
     real queue-consumer lifecycle. set_mist_write_marker is a no-op: no test
@@ -147,11 +147,19 @@ class _FakeVaultWriter:
 
 
 def _cleanup_smoke_nodes(graph_store, user_id: str, path: str) -> None:
-    """Remove smoke-test nodes from Neo4j to leave the graph clean.
+    """Remove this file's own synthetic test nodes from Neo4j.
 
-    Matches the __Entity__:User node, the __Provenance__:VaultNote node (keyed
-    by path), and the target entity nodes written by Bucket 1 upsert_user via
-    the natural path (id = "entity-python", "entity-rust").
+    Matches only this test's own synthetic `user_id` (always a `smoke-r13-*`
+    value, deliberately distinct from the real single-user graph's canonical
+    `id: 'user'` node -- this query must never risk matching, let alone
+    deleting, that node) and the `__Provenance__:VaultNote` keyed by this
+    test's own path. This is best-effort hygiene for the shared dev graph,
+    not the correctness guard: a regression that writes under a DIFFERENT id
+    scheme (the actual failure mode a real reviewer caught -- see
+    `_graph_counts` below) would leave residue this function cannot find by
+    construction. The `entity-python`/`entity-rust` cleanup that used to live
+    here matched the retired `upsert_user`'s naming scheme and is gone: no
+    code path writes those ids anymore.
     """
     try:
         conn = graph_store.connection
@@ -163,15 +171,26 @@ def _cleanup_smoke_nodes(graph_store, user_id: str, path: str) -> None:
             "MATCH (vn:__Provenance__:VaultNote {path: $path}) DETACH DELETE vn",
             {"path": path},
         )
-        # Clean up target entity nodes written by upsert_user natural path.
-        # upsert_user generates id = "entity-{display_name.lower()...}".
-        for eid in ("entity-python", "entity-rust"):
-            conn.execute_write(
-                "MATCH (e:__Entity__ {id: $eid}) DETACH DELETE e",
-                {"eid": eid},
-            )
     except Exception:  # noqa: BLE001 -- cleanup; don't mask assertion failures
         pass
+
+
+def _graph_counts(graph_store) -> tuple[int, int]:
+    """Return (node_count, relationship_count) across the whole graph.
+
+    The correctness guard for "a user-file edit writes nothing to the
+    graph": a before/after delta around a single `_do_reindex` call is
+    immune to the subject node's id scheme, edge direction, and exact
+    provenance-path string -- a shape-anchored query like `MATCH (u
+    {id: $user_id})-[r]->(t)` is not. A review mutation landed a real edge
+    under the graph's actual canonical user id (`id: 'user'`, not this
+    file's synthetic `smoke-r13-*` id) and a real inbound edge; both left
+    the shape-anchored query empty while changing these counts.
+    """
+    conn = graph_store.connection
+    nodes = conn.execute_query("MATCH (n) RETURN count(n) AS c", {})[0]["c"]
+    rels = conn.execute_query("MATCH ()-[r]->() RETURN count(r) AS c", {})[0]["c"]
+    return nodes, rels
 
 
 # ---------------------------------------------------------------------------
@@ -329,17 +348,12 @@ def _smoke_config(tmp_path: Path):
     return config
 
 
-async def _append_and_return(sink: list, event) -> None:
-    """Async listener adapter: record the event, return None."""
-    sink.append(event)
-
-
 # ---------------------------------------------------------------------------
 # Test 3: a real user-file edit produces no graph write, against real Neo4j
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not _neo4j_reachable(), reason="requires a reachable Neo4j")
+@requires_container
 class TestVaultUserEditWritesNoGraphFactsProduction:
     """R1.3 against a real Neo4j: a user-file edit leaves the graph untouched.
 
@@ -354,7 +368,7 @@ class TestVaultUserEditWritesNoGraphFactsProduction:
 
         graph_store = build_graph_store(_smoke_config(tmp_path))
         user_id = "smoke-r13-user"
-        target = tmp_path / "users" / f"{user_id}.md"
+        target = tmp_path / "vault" / "users" / f"{user_id}.md"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(
             "---\n"
@@ -371,42 +385,103 @@ class TestVaultUserEditWritesNoGraphFactsProduction:
                 sidecar_index=_NoopSidecarIndex(),
                 writer=_FakeVaultWriter(),
             )
+            before = _graph_counts(graph_store)
+
             await components.filewatcher._do_reindex(str(target), is_mist_write=False)
 
+            # Diagnostics: narrower shape checks against this test's own
+            # synthetic user_id and exact path. These give a specific,
+            # readable message for the regression shape the retired
+            # upsert_user actually wrote (outbound edge from the frontmatter
+            # user_id, VaultNote at the exact edited path). They are not the
+            # guard -- see the count-delta assert below.
             rows = graph_store.connection.execute_query(
                 "MATCH (u:__Entity__ {id: $user_id})-[r]->(t) RETURN type(r) AS rel_type",
                 {"user_id": user_id},
             )
             assert rows == [], (
-                "R1.3: a user-file edit must write no graph edges; "
-                f"found {[r['rel_type'] for r in rows]}"
+                "R1.3 diagnostic: a user-file edit wrote an outbound edge from "
+                f"id={user_id!r}; found {[r['rel_type'] for r in rows]}"
             )
 
             vault_notes = graph_store.connection.execute_query(
                 "MATCH (vn:__Provenance__:VaultNote {path: $path}) RETURN vn.path AS path",
                 {"path": str(target)},
             )
-            assert vault_notes == [], "R1.3: no VaultNote provenance node for an edited file"
+            assert (
+                vault_notes == []
+            ), "R1.3 diagnostic: a VaultNote provenance node exists for the edited file"
+
+            # The actual guard: any change in total node/relationship counts
+            # proves a graph write occurred, regardless of subject id scheme,
+            # edge direction, or exact path string -- see _graph_counts.
+            after = _graph_counts(graph_store)
+            assert after == before, (
+                "R1.3: a user-file edit must write nothing to the graph; "
+                f"node/relationship counts changed from {before} to {after}"
+            )
         finally:
             _cleanup_smoke_nodes(graph_store, user_id, str(target))
             graph_store.close()
 
     @pytest.mark.asyncio
     async def test_vault_user_edit_still_evicts_the_read_path_cache(self, tmp_path):
-        """The kept half of the chain: prose changes must reach the read path."""
-        from backend.factories import build_phase3_components
+        """The kept half of the chain: a vault edit still evicts the cached persona.
 
-        components = build_phase3_components(
-            config=_smoke_config(tmp_path),
-            sidecar_index=_NoopSidecarIndex(),
-            writer=_FakeVaultWriter(),
+        Walks the full production chain -- filewatcher publish -> the real
+        ConversationHandler._on_vault_rebuild -> _mist_context_cache eviction
+        -- not just the bus hop, so a regression that breaks the handler's
+        subscription or its path-to-user_id matching still fails this test.
+        """
+        from backend.chat.mist_context import MistContext
+        from backend.factories import (
+            build_conversation_handler,
+            build_graph_store,
+            build_phase3_components,
         )
-        received = []
-        components.invalidation_bus.subscribe(lambda event: _append_and_return(received, event))
-        target = tmp_path / "users" / "smoke-r13-user.md"
+
+        config = _smoke_config(tmp_path)
+        graph_store = build_graph_store(config)
+        user_id = "smoke-r13-user"
+        target = tmp_path / "vault" / "users" / f"{user_id}.md"
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("---\nuser_id: smoke-r13-user\n---\n\nEdited.\n", encoding="utf-8")
+        target.write_text(f"---\nuser_id: {user_id}\n---\n\nEdited.\n", encoding="utf-8")
 
-        await components.filewatcher._do_reindex(str(target), is_mist_write=False)
+        _cleanup_smoke_nodes(graph_store, user_id, str(target))
+        try:
+            components = build_phase3_components(
+                config=config,
+                sidecar_index=_NoopSidecarIndex(),
+                writer=_FakeVaultWriter(),
+            )
+            handler = build_conversation_handler(
+                config=config,
+                invalidation_bus=components.invalidation_bus,
+                vault_writer=None,
+                vault_sidecar=None,
+            )
 
-        assert [e.path for e in received] == [target]
+            session_id = "smoke-r13-session"
+            handler.get_or_create_session(session_id, user_id=user_id)
+            handler._mist_context_cache[session_id] = MistContext(
+                display_name="MIST",
+                pronouns="she/her",
+                self_concept="test stub",
+                traits=[],
+                capabilities=[],
+                preferences=[],
+            )
+            assert (
+                session_id in handler._mist_context_cache
+            ), "pre-condition: cache must be populated before the edit"
+
+            await components.filewatcher._do_reindex(str(target), is_mist_write=False)
+
+            assert session_id not in handler._mist_context_cache, (
+                f"R1.3: _mist_context_cache must be evicted for session {session_id!r} "
+                "after a vault user-edit -- the read-path cache-invalidation signal "
+                "must still fire even though the graph-write half of the chain retired"
+            )
+        finally:
+            _cleanup_smoke_nodes(graph_store, user_id, str(target))
+            graph_store.close()

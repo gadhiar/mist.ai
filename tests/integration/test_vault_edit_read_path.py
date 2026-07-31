@@ -156,10 +156,15 @@ class TestVaultEditReadPathPropagation:
 
     @pytest.mark.asyncio
     async def test_user_edit_writes_no_graph_facts(self, tmp_path: Path) -> None:
-        """The core R1.3 contract, asserted at the wiring level.
+        """A narrow wiring-level signal, not a proof: no graph attribute survives construction.
 
-        The filewatcher holds no graph handle at all now -- there is no seam
-        through which a vault edit could reach the graph.
+        This does not exercise a real graph write path (there is a real,
+        behavioral proof of that against Neo4j in
+        test_phase3_production_wiring_smoke.py::TestVaultUserEditWritesNoGraphFactsProduction,
+        and an exhaustive constructor whitelist plus import-layering guard at
+        tests/unit/vault/test_filewatcher_graph_noop.py). This test only
+        documents the fake-based intent: no `_regenerator` or `_graph_store`
+        attribute exists on the instance this suite constructs.
         """
         watcher, _sidecar, _writer, _listener = _build_filewatcher(tmp_path)
         target = tmp_path / "users" / "raj.md"
