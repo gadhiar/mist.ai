@@ -21,7 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from backend.errors import VaultWriteError
 from backend.knowledge.config import VaultConfig
@@ -33,6 +33,11 @@ from backend.vault.models import (
     parse_frontmatter,
     render_frontmatter,
 )
+
+if TYPE_CHECKING:
+    # Deferred: backend.chat imports backend.vault (SessionSynthesizer writes
+    # through VaultWriter), so a runtime import here would cycle back.
+    from backend.chat.session_synthesizer import SessionSynthesis
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +88,32 @@ def _session_id_from_path(path: Path) -> str:
     if m:
         return stem[m.end() :]
     return stem
+
+
+def _date_from_path(path: Path) -> str:
+    """Derive a deterministic frontmatter `date` from the session note path.
+
+    Uses the same `YYYY-MM-DD-` stem prefix as `_session_id_from_path` --
+    one rule rather than two -- so a full render of `write_session_note` is a
+    pure function of its arguments, with no wall-clock read in the common
+    case. This also makes the date *correct* rather than merely stable: a
+    session that happened yesterday and is synthesized today (startup
+    catch-up) gets the date it actually occurred on, not the render date.
+
+    Args:
+        path: Absolute path to the session note file.
+
+    Returns:
+        The `YYYY-MM-DD` prefix from the filename stem. Falls back to
+        today's UTC date when the stem does not start with a parseable date
+        (defensive -- the caller should always pass a well-formed path from
+        `session_path`).
+    """
+    stem = path.stem
+    m = _STEM_DATE_PREFIX_RE.match(stem)
+    if m:
+        return m.group(0)[:-1]  # drop the trailing "-" the regex captures
+    return datetime.now(UTC).date().isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +424,44 @@ class VaultWriter:
             {"vault_note_path": vault_note_path},
         )
 
+    async def write_session_note(
+        self,
+        vault_note_path: str,
+        synthesis: SessionSynthesis | None,
+        related_entities: list[str] | None = None,
+        status: str = "completed",
+    ) -> str | None:
+        """Render a session note in full and write it.
+
+        R1.3.1: replaces `append_turn_to_session` + `append_session_synthesis`
+        + `mark_session_completed`. Because the note is synthesis-only there is
+        no accumulated content to preserve, so this renders the whole file --
+        which makes it idempotent, and therefore safe to re-run after a partial
+        failure. The note is a pure function of (synthesis, related_entities,
+        status, path).
+
+        Args:
+            vault_note_path: Absolute path to the session note.
+            synthesis: Prose from `SessionSynthesizer`. None renders a stub,
+                which is how a `skipped` session is recorded.
+            related_entities: Entity ids this session touched, for the
+                prose-to-graph link.
+            status: `completed` normally; `skipped` when catch-up has given up
+                on the session (bounded retry).
+
+        Returns:
+            The path written.
+        """
+        return await self._enqueue(
+            "write_session_note",
+            {
+                "vault_note_path": vault_note_path,
+                "synthesis": synthesis,
+                "related_entities": related_entities or [],
+                "status": status,
+            },
+        )
+
     async def mark_authored_by_user_edit(self, path: Path) -> None:
         """Set frontmatter authored_by=user-edit on a vault file.
 
@@ -694,6 +763,7 @@ class VaultWriter:
             "mark_session_completed": self._handle_mark_session_completed,
             "append_session_synthesis": self._handle_append_session_synthesis,
             "mark_authored_by": self._handle_mark_authored_by,
+            "write_session_note": self._handle_write_session_note,
         }
         handler = handlers.get(job.kind)
         if handler is None:
@@ -703,6 +773,65 @@ class VaultWriter:
     # ------------------------------------------------------------------
     # Handlers (run inside consumer; may do blocking I/O via executor)
     # ------------------------------------------------------------------
+
+    async def _handle_write_session_note(self, args: dict[str, Any]) -> str:
+        path = Path(args["vault_note_path"])
+        synthesis: SessionSynthesis | None = args["synthesis"]
+        related_entities: list[str] = args["related_entities"]
+        status: str = args["status"]
+
+        self._mark_mist_write(path)
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                self._write_session_note_sync,
+                path,
+                synthesis,
+                related_entities,
+                status,
+            )
+        except OSError as exc:
+            raise VaultWriteError(f"Failed to write session note {path}: {exc}") from exc
+
+        return str(path)
+
+    def _write_session_note_sync(
+        self,
+        path: Path,
+        synthesis: SessionSynthesis | None,
+        related_entities: list[str],
+        status: str,
+    ) -> None:
+        """Synchronous full render. Overwrites any existing file by design.
+
+        Every field is recomputed from the arguments and the path -- nothing
+        is read back from an existing file first. That absence of a
+        read-modify-write step is what makes the render idempotent: calling
+        this twice with the same arguments against the same path produces
+        byte-identical output, which is the property `Task 6`'s catch-up
+        relies on to safely re-render after a partial failure.
+        """
+        canonical_session_id = _session_id_from_path(path)
+        note_date = _date_from_path(path)
+
+        fm = MistSessionFrontmatter(
+            session_id=canonical_session_id,
+            title=synthesis.title if synthesis else canonical_session_id,
+            date=note_date,
+            status=status,
+            related_entities=related_entities,
+            ontology_version=_ONTOLOGY_VERSION,
+            extraction_version=_EXTRACTION_VERSION,
+            model_hash=self._model_hash,
+        )
+
+        body_parts = [f"# Session: {fm.title}\n\n", f"**Date:** {fm.date}\n\n"]
+        if synthesis is not None:
+            body_parts.append(synthesis.body.rstrip() + "\n")
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(render_frontmatter(fm, "".join(body_parts)), encoding="utf-8")
 
     async def _handle_append_session_synthesis(self, args: dict[str, Any]) -> str | None:
         vault_note_path: str = args["vault_note_path"]
