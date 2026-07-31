@@ -320,6 +320,34 @@ class EventStore:
         cursor = conn.execute(query, params)
         return [self._decode_turn_row(dict(row)) for row in cursor.fetchall()]
 
+    def list_sessions_with_turns(self) -> list[str]:
+        """Session ids having at least one recorded turn, oldest first.
+
+        Used by the startup catch-up to find sessions that may need a vault
+        note. These are the event store's internal session ids -- the same
+        ids `get_turns` keys on -- not the external ids `ConversationHandler`
+        exposes to the chat layer. Callers resolving a catch-up candidate
+        back to a live conversation must go through
+        `ConversationHandler._es_session_ids` first.
+
+        Ordering is by the session's earliest turn rowid so a backlog
+        drains in conversation order.
+
+        Returns:
+            List of session_id strings, oldest first. Empty if no session
+            has a recorded turn.
+        """
+        conn = self._get_connection()
+        cursor = conn.execute(
+            """
+            SELECT session_id
+            FROM conversation_turn_events
+            GROUP BY session_id
+            ORDER BY MIN(rowid)
+            """
+        )
+        return [row[0] for row in cursor.fetchall()]
+
     def get_turn_count(self) -> int:
         """Total number of stored turns across all sessions.
 

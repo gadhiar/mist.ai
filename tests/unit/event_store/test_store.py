@@ -128,3 +128,27 @@ class TestTurnEvents:
         turns = store.get_turns("nonexistent-session-id")
 
         assert turns == []
+
+
+class TestListSessionsWithTurns:
+    def test_excludes_empty_sessions(self, store: EventStore):
+        """A session row with no turns has nothing to synthesize."""
+        empty = store.start_session()
+        populated = store.start_session()
+        store.append_turn(_build_turn_event(session_id=populated))
+
+        result = store.list_sessions_with_turns()
+
+        assert populated in result
+        assert empty not in result
+
+    def test_is_oldest_first(self, store: EventStore):
+        """Catch-up drains oldest first so a long backlog makes visible progress."""
+        first = store.start_session()
+        store.append_turn(_build_turn_event(session_id=first))
+        second = store.start_session()
+        store.append_turn(_build_turn_event(session_id=second))
+
+        result = store.list_sessions_with_turns()
+
+        assert result.index(first) < result.index(second)
