@@ -465,7 +465,9 @@ def test_do_reindex_error_path_never_reaches_a_graph_store(
 # discovered by mutation in an integration test.
 
 
-def test_production_bus_has_exactly_the_cache_eviction_listener(tmp_path: Path) -> None:
+def test_conversation_handler_subscribes_exactly_the_cache_eviction_listener(
+    tmp_path: Path,
+) -> None:
     """ConversationHandler.__init__ is the only sanctioned InvalidationBus subscriber.
 
     Builds the real `ConversationHandler.__init__` -- the sole `.subscribe(`
@@ -515,3 +517,78 @@ def test_production_bus_has_exactly_the_cache_eviction_listener(tmp_path: Path) 
     assert bus._listeners[0] == handler._on_vault_rebuild, (
         "the sole InvalidationBus subscriber must be " "ConversationHandler._on_vault_rebuild"
     )
+
+
+# ---------------------------------------------------------------------------
+# Check 5: connection-boundary guard -- catches net-zero and property writes
+# ---------------------------------------------------------------------------
+#
+# Check 4 governs WHO may subscribe to the production bus. It says nothing
+# about WHAT a sanctioned listener is allowed to do once invoked. The
+# production integration guard (test_phase3_production_wiring_smoke.py)
+# measures a node/relationship COUNT delta around the full vault-edit
+# sequence -- an instrument that is structurally blind to two write shapes:
+# a write immediately undone within the same listener call (net node/rel
+# count unchanged) and a property-only SET on an existing node (no node or
+# relationship count change at all, ever). A review mutation combining both
+# forms inside `_on_vault_rebuild` passed every guard on this branch,
+# including one that landed a property on the real canonical `id: 'user'`
+# node -- a production user fact, mutated by a vault-edit side effect,
+# caught by nothing.
+#
+# All three write shapes -- a plain node/edge create, a write-then-delete
+# netting zero, and a property-only SET -- share one property a count delta
+# does not: every one of them calls `GraphConnection.execute_write` at
+# least once. Trap at that connection boundary instead of inferring a write
+# occurred from its net effect on graph shape (the side-effect-boundary
+# pattern tests/CLAUDE.md prescribes).
+
+
+def test_on_vault_rebuild_performs_no_graph_writes(tmp_path: Path) -> None:
+    """A vault-change event delivered to the real listener writes nothing to Neo4j.
+
+    Builds the real ConversationHandler (so the real `_on_vault_rebuild` is
+    the one subscribed and invoked, not a fake), backed by a
+    `FakeNeo4jConnection`, and publishes a `VaultChangeEvent` through the
+    real `InvalidationBus`. Asserts `execute_write` was never called.
+
+    Unlike a node/relationship count delta, this is blind to none of the
+    three write shapes a mutation review found: a node/edge create, a
+    write-then-delete netting zero, and a property-only `SET` on an
+    existing node all call `execute_write` at least once, so
+    `assert_no_writes()` catches all three -- the count-delta guard in the
+    integration suite catches only the first.
+    """
+    from backend.chat.conversation_handler import ConversationHandler
+    from backend.knowledge.extraction.validator import ValidationResult
+    from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
+    from backend.knowledge.storage.graph_store import GraphStore
+    from backend.vault.conventions import ConventionsLoader
+    from backend.vault.invalidation_bus import InvalidationBus, VaultChangeEvent
+    from tests.mocks.config import build_test_config
+    from tests.mocks.embeddings import FakeEmbeddingGenerator
+    from tests.mocks.neo4j import FakeNeo4jConnection
+    from tests.mocks.ollama import FakeLLM
+
+    class _FakeExtractionPipeline:
+        async def extract_from_utterance(self, **kwargs: object) -> ValidationResult:
+            return ValidationResult(valid=True, entities=[], relationships=[])
+
+    bus = InvalidationBus()
+    conn = FakeNeo4jConnection()
+    gs = GraphStore(conn, FakeEmbeddingGenerator())
+    config = build_test_config()
+
+    ConversationHandler(
+        config=config,
+        graph_store=gs,
+        extraction_pipeline=_FakeExtractionPipeline(),
+        retriever=KnowledgeRetriever(config=config, graph_store=gs),
+        llm_provider=FakeLLM(),
+        conventions_loader=ConventionsLoader(tmp_path),
+        invalidation_bus=bus,
+    )
+
+    asyncio.run(bus.publish(VaultChangeEvent(path=tmp_path / "users" / "raj.md")))
+
+    conn.assert_no_writes()
