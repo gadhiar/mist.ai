@@ -21,7 +21,11 @@ the Task 11-14 addendum):
 - `check_containment` -- the prose and the frontmatter facts agree on
   which entities they mention.
 - `check_negation_proximity` -- the prose does not obviously contradict
-  a fact near where that fact's object is mentioned.
+  a fact near where that fact's object is mentioned. Shares
+  `_search_term_for` with `check_containment` (fixed together as C1 of
+  the R1.4 whole-branch review, after Task 14 fixed containment's half of
+  this and left negation-proximity searching the raw kebab id -- which
+  real prose never contains, so the gate passed having scanned nothing).
 
 None of these alone is sufficient, and none of them together proves
 semantic agreement between prose and facts -- see each gate's own
@@ -185,25 +189,54 @@ def check_node_definitions(
     return GateResult(passed=not failures, failures=failures)
 
 
+def _node_by_id(documents: list[SeedDocument]) -> dict[str, object]:
+    """Index every `SeedNode` across all documents by id.
+
+    Shared by `check_containment` and `check_negation_proximity` -- both
+    ask the same question ("how does this fact's object appear in
+    prose?") and answering it independently in two places is exactly
+    what let R1.4's C1 regression through: Task 14 fixed containment's
+    id-vs-display-name resolution and left negation-proximity on the raw
+    id, so the gate that should have caught an inversion near a trait's
+    prose mention (`**Transparent**`) was scanning for a string
+    (`trait-transparent`) that string never contains.
+    """
+    return {node.id: node for doc in documents for node in doc.nodes}
+
+
+def _search_term_for(fact_object: str, node_by_id: dict[str, object]) -> str:
+    """Resolve how a fact's object should be searched for in a document body.
+
+    A `SeedNode`'s `display_name` is what a human author actually writes
+    in prose (`**Transparent**`); the raw kebab id (`trait-transparent`)
+    is not prose at all and a literal-substring search for it against
+    real content fails (containment, Task 9) or silently never runs
+    (negation-proximity, C1) depending on which side of the check it
+    breaks. Falls back to the raw id when the object has no matching
+    `SeedNode` (referential integrity is `load_seed_documents`'s job, not
+    a gate's -- Task 11) or the node defines no `display_name`, so a
+    fact's object is never silently skipped over by either caller.
+    """
+    node = node_by_id.get(fact_object)
+    display_name = getattr(node, "display_name", None) if node is not None else None
+    return display_name or fact_object
+
+
 def check_containment(documents: list[SeedDocument]) -> GateResult:
     """Verify every fact's object is mentioned by display name in its document body.
 
     R1.4 Task 14: matches on the object node's `SeedNode.display_name`
-    (Task 11), not the raw `fact.object` id. The original Task 9
-    implementation checked the raw id as a literal substring, which is
-    structurally unable to pass against real prose -- `fact.object` is a
-    kebab id (`trait-transparent`); the prose describes it by display
-    name (`**Transparent**`), a string the id never equals. 29 of 30 real
+    (Task 11), not the raw `fact.object` id, via the shared
+    `_search_term_for` helper. The original Task 9 implementation checked
+    the raw id as a literal substring, which is structurally unable to
+    pass against real prose -- `fact.object` is a kebab id
+    (`trait-transparent`); the prose describes it by display name
+    (`**Transparent**`), a string the id never equals. 29 of 30 real
     facts failed under that check. A prefix-strip/hyphen-collapse
     normalization was scoped as the fix during Task 10 but never
     implemented; by the time this landed, Task 11 had given every node an
     exact `display_name`, which is strictly better than a heuristic
     reconstruction of one -- use it directly instead.
-
-    Falls back to the raw `fact.object` id when the object has no
-    matching `SeedNode` (referential integrity is `load_seed_documents`'s
-    job, not this gate's -- see Task 11) or the node defines no
-    `display_name`, so a fact is never silently skipped over.
 
     Case-insensitive: `slalom` must find `Slalom`.
 
@@ -222,14 +255,12 @@ def check_containment(documents: list[SeedDocument]) -> GateResult:
         name (or raw id, if undefined) does not appear in its own
         document's body.
     """
-    node_by_id = {node.id: node for doc in documents for node in doc.nodes}
+    node_by_id = _node_by_id(documents)
     failures: list[str] = []
     for doc in documents:
         body_lower = doc.body.lower()
         for fact in doc.facts:
-            node = node_by_id.get(fact.object)
-            display_name = getattr(node, "display_name", None) if node is not None else None
-            search_term = display_name or fact.object
+            search_term = _search_term_for(fact.object, node_by_id)
             if search_term.lower() not in body_lower:
                 failures.append(
                     f"{doc.source_path}: fact object {fact.object!r} "
@@ -269,11 +300,26 @@ _PROXIMITY_WINDOW = 60
 def check_negation_proximity(documents: list[SeedDocument]) -> GateResult:
     """Flag a fact whose object occurs near a negation marker in the body.
 
-    For every occurrence of a fact's object in its document body, scans
-    `_PROXIMITY_WINDOW` characters on either side (case-insensitive) for
-    one of `_NEGATION_MARKERS`. A marker inside that window flags the
+    For every occurrence of a fact's object's search term (Task 14's C1
+    fix: resolved via the same `_search_term_for` helper `check_containment`
+    uses, not the raw `fact.object` id -- see below) in its document body,
+    scans `_PROXIMITY_WINDOW` characters on either side (case-insensitive)
+    for one of `_NEGATION_MARKERS`. A marker inside that window flags the
     fact; a marker elsewhere in the document does not -- an unrelated
     negation about a different fact must not fail this one.
+
+    C1 (R1.4 whole-branch review): this gate previously searched the raw
+    `fact.object` kebab id (`trait-transparent`), which real prose never
+    contains -- it describes entities by `SeedNode.display_name`
+    (`**Transparent**`). `_find_all` therefore returned an empty list for
+    almost every real fact, the scan loop never ran, and the gate reported
+    `passed=True` having examined nothing: silent, not loud, which is why
+    it survived Task 14 (which fixed `check_containment`'s identical
+    defect, the loud-failing half of the same bug) -- live measurement
+    against the real seed source found only 4 of 30 facts scannable under
+    the raw-id search, 0 of 20 in `seed/mist.md` specifically, the entire
+    persona layer. Fixed by resolving the same display-name search term
+    `check_containment` resolves, via the shared `_search_term_for`.
 
     Partial, like `check_containment`: proximity is not parsing, so this
     cannot tell "Raj no longer works at Slalom" (a real inversion) apart
@@ -286,17 +332,18 @@ def check_negation_proximity(documents: list[SeedDocument]) -> GateResult:
 
     Returns:
         `GateResult` with one failure line per fact with a negation
-        marker near an occurrence of its object.
+        marker near an occurrence of its object's search term.
     """
+    node_by_id = _node_by_id(documents)
     failures: list[str] = []
     for doc in documents:
         body_lower = doc.body.lower()
         for fact in doc.facts:
-            object_lower = fact.object.lower()
-            if not object_lower:
+            search_term = _search_term_for(fact.object, node_by_id).lower()
+            if not search_term:
                 continue
-            for start in _find_all(body_lower, object_lower):
-                end = start + len(object_lower)
+            for start in _find_all(body_lower, search_term):
+                end = start + len(search_term)
                 window = body_lower[max(0, start - _PROXIMITY_WINDOW) : end + _PROXIMITY_WINDOW]
                 marker = next((m for m in _NEGATION_MARKERS if m in window), None)
                 if marker is not None:

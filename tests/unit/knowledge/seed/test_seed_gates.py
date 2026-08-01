@@ -13,14 +13,22 @@ that a token like `seed_version` appears somewhere in the query.
 from pathlib import Path
 
 from backend.knowledge.seed.gates import (
+    _node_by_id,
+    _search_term_for,
     check_containment,
     check_facts_present,
     check_negation_proximity,
     check_node_definitions,
 )
+from backend.knowledge.seed.loader import load_seed_documents
 from backend.knowledge.seed.models import SeedDocument, SeedFact, SeedNode
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 from tests.mocks.neo4j import FakeNeo4jConnection
+
+# Resolve path relative to repo root regardless of pytest invocation directory,
+# matching tests/unit/knowledge/test_seed_data.py's convention.
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_REAL_SEED_DIR = _REPO_ROOT / "mist-memory" / "seed"
 
 
 def _doc(
@@ -504,3 +512,144 @@ class TestNegationProximity:
         docs = [_doc(facts=[], body="No longer relevant prose with no assertions.")]
 
         assert check_negation_proximity(docs).passed
+
+    def test_flags_a_marker_near_a_display_name_when_the_raw_kebab_id_never_appears_in_prose(
+        self,
+    ):
+        """C1 (R1.4 whole-branch review), the exact real-content shape Gate 3's
+        equivalent test (`test_matches_on_display_name_when_the_kebab_id_never_
+        appears_in_prose`) already covers for containment: `trait-transparent`'s
+        display name is `Transparent`. The raw id never appears in prose that
+        says `no longer **Transparent**` -- every fixture in this class before
+        this one used a fact object that was ALSO the literal word the body
+        used, which is exactly why this gate's raw-id defect (searching
+        `fact.object` instead of the resolved display name) survived: those
+        fixtures made the guarded thing reachable when real seed content does
+        not. Pre-fix, `_find_all` would return `[]` for `trait-transparent`
+        against this body, the scan loop would never run, and the gate would
+        report `passed=True` having examined nothing.
+        """
+        docs = [
+            _doc(
+                facts=[("mist-identity", "HAS_TRAIT", "trait-transparent")],
+                nodes=[
+                    SeedNode(id="mist-identity", type="MistIdentity", display_name="MIST"),
+                    SeedNode(id="trait-transparent", type="MistTrait", display_name="Transparent"),
+                ],
+                partition=SELF_MODEL_LABEL,
+                body="MIST is no longer **Transparent** about her reasoning.",
+            )
+        ]
+
+        result = check_negation_proximity(docs)
+
+        assert not result.passed
+        assert "trait-transparent" in result.failures[0]
+
+    def test_falls_back_to_raw_id_when_the_object_has_no_matching_node(self):
+        """Referential integrity is load_seed_documents' job (Task 11), not
+        this gate's -- mirrors check_containment's identical fallback test.
+        """
+        docs = [
+            _doc(
+                facts=[("user", "WORKS_AT", "Slalom")],
+                body="Raj no longer works at Slalom.",
+                nodes=[],
+            )
+        ]
+
+        assert not check_negation_proximity(docs).passed
+
+    def test_falls_back_to_raw_id_when_the_node_defines_no_display_name(self):
+        docs = [
+            _doc(
+                facts=[("user", "WORKS_AT", "Slalom")],
+                nodes=[SeedNode(id="Slalom", type="Organization")],  # no display_name
+                body="Raj no longer works at Slalom.",
+            )
+        ]
+
+        assert not check_negation_proximity(docs).passed
+
+
+class TestNegationProximityRealSource:
+    """C1 (R1.4 whole-branch review): a gate exercised only by fixtures where
+    the guarded thing is reachable proves nothing about whether it is
+    reachable against real content -- exactly how this gate's raw-id defect
+    survived Task 14, which fixed the identical defect in check_containment
+    and left this gate on the raw id. Live measurement against the real
+    source before the fix: 4 of 30 facts scannable overall, 0 of 20 in
+    `seed/mist.md` (the entire persona layer). These tests run against the
+    actual `mist-memory/seed/*.md` source, not a synthetic fixture, so a
+    regression back to raw-id searching is caught here even if every
+    fixture-based test in `TestNegationProximity` kept passing.
+    """
+
+    def test_a_non_trivial_number_of_real_facts_are_reachable(self):
+        """Quantitative regression guard. `check_negation_proximity(...).passed`
+        was already, uselessly, `True` before the C1 fix -- a gate that
+        examines nothing still reports success. This asserts on the thing
+        that actually changed: whether each fact's resolved search term is
+        found in its document's body at all, which is what makes the scan
+        loop run in the first place. A drop back toward the pre-fix count
+        (4/30, 0/20 in mist.md) means the raw-id regression is back.
+        """
+        documents = load_seed_documents(_REAL_SEED_DIR)
+        node_by_id = _node_by_id(documents)
+
+        total = 0
+        reachable = 0
+        per_doc: dict[str, int] = {}
+        for doc in documents:
+            body_lower = doc.body.lower()
+            doc_reachable = 0
+            for fact in doc.facts:
+                total += 1
+                term = _search_term_for(fact.object, node_by_id).lower()
+                if term and term in body_lower:
+                    reachable += 1
+                    doc_reachable += 1
+            per_doc[str(doc.source_path)] = doc_reachable
+
+        assert total >= 25, "seed source shrank enough to invalidate this test's assumptions"
+        assert reachable >= 20, (
+            f"only {reachable}/{total} facts reachable -- expected display-name "
+            "resolution to make nearly all of them scannable; a drop toward the "
+            "pre-fix count (4/30) means the raw-id regression is back"
+        )
+        mist_doc = next(p for p in per_doc if p.endswith("mist.md"))
+        assert per_doc[mist_doc] >= 15, (
+            f"seed/mist.md (the persona layer) was 0/20 reachable before the C1 fix; "
+            f"now {per_doc[mist_doc]}, expected most of it reachable"
+        )
+
+    def test_passes_on_the_unmodified_real_source(self):
+        """Sanity: the fix must not introduce false positives against real,
+        unmodified content.
+        """
+        documents = load_seed_documents(_REAL_SEED_DIR)
+
+        result = check_negation_proximity(documents)
+
+        assert result.passed, result.failures
+
+    def test_flags_a_negation_planted_next_to_a_real_display_name(self):
+        """The mutation proof: take a real document, plant a real negation
+        marker directly next to a real fact's display name exactly as it
+        appears in the real prose, and confirm the gate fires. The marker
+        sits next to `**Transparent**`, which is what the fixed search term
+        resolves to; the pre-fix search term was `trait-transparent`, absent
+        from the body entirely, so this exact plant would have passed
+        silently under the old implementation.
+        """
+        documents = load_seed_documents(_REAL_SEED_DIR)
+        doc = next(d for d in documents if d.partition == SELF_MODEL_LABEL)
+        assert "- **Transparent**" in doc.body, "seed content changed; update this plant"
+
+        poisoned_body = doc.body.replace("- **Transparent**", "- no longer **Transparent**", 1)
+        poisoned_doc = doc.model_copy(update={"body": poisoned_body})
+
+        result = check_negation_proximity([poisoned_doc])
+
+        assert not result.passed
+        assert any("trait-transparent" in f for f in result.failures)
