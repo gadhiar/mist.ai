@@ -13,29 +13,63 @@ import pytest
 
 from backend.errors import SeedSourceError
 from backend.knowledge.seed.applier import apply_seed_documents
-from backend.knowledge.seed.models import SeedDocument, SeedFact
+from backend.knowledge.seed.models import SeedDocument, SeedFact, SeedNode
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
 _NOW = "2026-07-31T00:00:00+00:00"
+
+# R1.4 Task 12 (addendum): apply_seed_documents now requires every fact's
+# subject/object to have a matching SeedNode -- the applier's own defense
+# for a caller that constructs SeedDocuments directly, mirroring Task 11's
+# loader-level referential integrity. This placeholder type is used for
+# _doc()'s auto-generated nodes; tests that care about node type/property
+# content pass `nodes=` explicitly (see TestNodeDefinitionWrites).
+_PLACEHOLDER_TYPE = "Concept"
 
 
 def _doc(
     *,
     version: str = "profile-v1",
     facts: list[tuple[str, str, str]] | None = None,
+    nodes: list[SeedNode] | None = None,
     body: str = "test body",
     source_path: Path = Path("test.md"),
     partition: str = ENTITY_LABEL,
 ) -> SeedDocument:
-    """Build a valid SeedDocument. `facts` is a list of (subject, predicate, object)."""
+    """Build a valid SeedDocument. `facts` is a list of (subject, predicate, object).
+
+    When `nodes` is omitted, a `SeedNode` (placeholder type) is auto-generated
+    for every unique subject/object referenced by `facts`, so tests exercising
+    fact/partition/predicate behavior do not each need to author their own
+    `nodes:` block. Pass `nodes` explicitly to control type/properties.
+    """
     fact_objs = [SeedFact(subject=s, predicate=p, object=o) for s, p, o in (facts or [])]
+    if nodes is not None:
+        node_objs = nodes
+    else:
+        node_ids = sorted({n for f in fact_objs for n in (f.subject, f.object)})
+        node_objs = [SeedNode(id=i, type=_PLACEHOLDER_TYPE) for i in node_ids]
     return SeedDocument(
         seed_version=version,
+        nodes=node_objs,
         facts=fact_objs,
         body=body,
         source_path=source_path,
         partition=partition,
     )
+
+
+def _seed_version_param(params: dict) -> object:
+    """Extract seed_version from a write's params, wherever it lives.
+
+    Edge writes (`_MERGE_EDGE`) carry it as a top-level param. Node writes
+    (`_MERGE_NODE`, R1.4 Task 12) carry it inside the `properties` map,
+    matching `admin.py`'s established `merge_params` shape. Returns
+    `None` if present in neither location.
+    """
+    if "seed_version" in params:
+        return params["seed_version"]
+    return params.get("properties", {}).get("seed_version")
 
 
 class TestSeedVersionStamping:
@@ -46,12 +80,18 @@ class TestSeedVersionStamping:
 
         assert fake_connection.writes, "expected at least one write"
         for query, params in fake_connection.writes:
-            assert params.get("seed_version") == "profile-v1"
+            assert _seed_version_param(params) == "profile-v1"
             # A fake connection records whatever params are passed regardless of
             # whether the query text uses them, so checking params alone cannot
-            # catch a query that carries the value but never SETs it. Require the
-            # query string itself to reference seed_version too.
-            assert "seed_version" in query, f"query does not set seed_version: {query!r}"
+            # catch a query that carries the value but never applies it. Edge
+            # writes SET seed_version with a literal clause; node writes (R1.4
+            # Task 12) merge it via `n += $properties` (admin.py's established
+            # map-merge shape, which has no per-field literal to pin) -- check
+            # whichever mechanism this specific write actually uses.
+            if "seed_version" in params:  # edge write: literal SET
+                assert "seed_version" in query, f"query does not set seed_version: {query!r}"
+            else:  # node write: map-merge
+                assert "n += $properties" in query, f"query does not merge properties: {query!r}"
 
     def test_two_writes_happen_one_node_one_edge(self, fake_connection):
         """A single fact must produce exactly two writes -- one node MERGE per
@@ -75,7 +115,7 @@ class TestSeedVersionStamping:
         apply_seed_documents(fake_connection, docs, seed_version="profile-v2", now_iso=_NOW)
 
         for _query, params in fake_connection.writes:
-            assert params.get("seed_version") == "profile-v2"
+            assert _seed_version_param(params) == "profile-v2"
 
 
 class TestForwarding:
@@ -109,7 +149,14 @@ class TestForwarding:
         )
         docs = [
             SeedDocument(
-                seed_version="profile-v1", facts=[fact], body="b", source_path=Path("t.md")
+                seed_version="profile-v1",
+                nodes=[
+                    SeedNode(id="user", type=_PLACEHOLDER_TYPE),
+                    SeedNode(id="slalom", type=_PLACEHOLDER_TYPE),
+                ],
+                facts=[fact],
+                body="b",
+                source_path=Path("t.md"),
             )
         ]
 
@@ -356,6 +403,293 @@ class TestPartitionRouting:
         ]
 
         with pytest.raises(SeedSourceError, match="shared-id"):
+            apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        fake_connection.assert_no_writes()
+
+
+# ---------------------------------------------------------------------------
+# R1.4 Task 12 (addendum): node definitions written to the graph
+#
+# `_MERGE_NODE` used to set only `seed_version`/`created_at`/`updated_at`.
+# Task 10's live run proved that a wipe-and-recreate cycle then strips every
+# ontology label and descriptive property, because MERGE preserves untouched
+# properties on a MATCH but a fresh CREATE gets nothing beyond what the query
+# explicitly sets. THE ROUND-TRIP TEST BELOW IS THE HEADLINE: "a write
+# occurred" is precisely the assertion that let the original defect ship --
+# every test here asserts the WRITTEN properties equal the SOURCE properties,
+# not merely that execute_write was called.
+# ---------------------------------------------------------------------------
+
+
+class TestNodeDefinitionWrites:
+    def test_round_trip_every_written_property_matches_the_source(self, fake_connection):
+        """THE headline assertion of this task. Every property on the source
+        `SeedNode` -- not a sample, all of them -- must appear in the written
+        `properties` map with the exact source value. This is the test that
+        would have failed loudly against the pre-Task-12 applier: the old
+        `_MERGE_NODE` wrote none of display_name/description/pronouns, so
+        this assertion would have found an empty properties dict where a
+        full one belongs.
+        """
+        docs = [
+            _doc(
+                facts=[("mist-identity", "HAS_TRAIT", "trait-warm")],
+                partition=SELF_MODEL_LABEL,
+                nodes=[
+                    SeedNode(
+                        id="mist-identity",
+                        type="MistIdentity",
+                        display_name="MIST",
+                        pronouns="she/her",
+                        self_concept="a cognitive architecture",
+                    ),
+                    SeedNode(
+                        id="trait-warm",
+                        type="MistTrait",
+                        display_name="Warm",
+                        axis="Persona",
+                        description="Default register is warm and engaged.",
+                    ),
+                ],
+            )
+        ]
+
+        apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        node_writes = [(q, p) for q, p in fake_connection.writes if not p.get("predicate")]
+        by_id = {p["id"]: p["properties"] for _q, p in node_writes}
+
+        assert by_id["mist-identity"] == {
+            "entity_type": "MistIdentity",
+            "seed_version": "profile-v1",
+            "updated_at": _NOW,
+            "display_name": "MIST",
+            "pronouns": "she/her",
+            "self_concept": "a cognitive architecture",
+        }
+        assert by_id["trait-warm"] == {
+            "entity_type": "MistTrait",
+            "seed_version": "profile-v1",
+            "updated_at": _NOW,
+            "display_name": "Warm",
+            "axis": "Persona",
+            "description": "Default register is warm and engaged.",
+        }
+
+    def test_sets_the_ontology_type_as_a_graph_label(self, fake_connection):
+        docs = [
+            _doc(
+                facts=[("slalom", "WORKS_ON", "mist-ai")],
+                nodes=[
+                    SeedNode(id="slalom", type="Organization"),
+                    SeedNode(id="mist-ai", type="Project"),
+                ],
+            )
+        ]
+
+        apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        node_writes = [(q, p) for q, p in fake_connection.writes if not p.get("predicate")]
+        by_id = {p["id"]: q for q, p in node_writes}
+        assert "SET n:Organization" in by_id["slalom"]
+        assert "SET n:Project" in by_id["mist-ai"]
+
+    def test_properties_are_merged_not_set_field_by_field(self, fake_connection):
+        """`n += $properties` (admin.py's established shape) is what makes
+        re-seeding enforce the source as ground truth for every property it
+        defines while leaving properties the applier does not own (e.g.
+        `embedding`) untouched. Pin the merge clause itself, not just that
+        SOME node write happened.
+        """
+        docs = [_doc(facts=[("user", "WORKS_AT", "slalom")])]
+
+        apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        node_writes = [(q, p) for q, p in fake_connection.writes if not p.get("predicate")]
+        for query, _params in node_writes:
+            assert "ON CREATE SET n.created_at = $now, n += $properties" in query
+            assert "ON MATCH SET n += $properties" in query
+
+    def test_created_at_is_create_only(self, fake_connection):
+        """`created_at` must appear only in the ON CREATE branch -- re-seeding
+        an existing node must not overwrite its original creation timestamp,
+        mirroring admin.py's `_seed_internal_nodes` create-only field.
+        """
+        docs = [_doc(facts=[("user", "WORKS_AT", "slalom")])]
+
+        apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        node_writes = [(q, p) for q, p in fake_connection.writes if not p.get("predicate")]
+        for query, _params in node_writes:
+            on_create, _, rest = query.partition("ON MATCH")
+            assert "n.created_at = $now" in on_create
+            assert "n.created_at" not in rest
+
+    def test_entity_type_property_matches_the_interpolated_label(self, fake_connection):
+        """`entity_type` is stored as a PROPERTY in addition to the graph
+        LABEL (`SET n:{type}`) -- mirrors admin.py's `_seed_internal_nodes`
+        (`merge_params = {"entity_type": label, ...}`), since some readers
+        (e.g. `count_nodes_by_type`) query the property, not `labels(n)`.
+        """
+        docs = [
+            _doc(
+                facts=[("neo4j", "USES", "python")],
+                nodes=[
+                    SeedNode(id="neo4j", type="Technology"),
+                    SeedNode(id="python", type="Technology"),
+                ],
+            )
+        ]
+
+        apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        node_writes = [(q, p) for q, p in fake_connection.writes if not p.get("predicate")]
+        for _query, params in node_writes:
+            assert params["properties"]["entity_type"] == "Technology"
+
+
+class TestNodeTypeValidation:
+    """Mirrors TestPredicateValidation: the type label is interpolated at the
+    same Cypher boundary as the predicate, and Task 11's loader-level check
+    does not protect a caller that constructs SeedDocuments directly.
+    """
+
+    def test_rejects_type_not_in_the_ontology(self, fake_connection):
+        docs = [
+            _doc(
+                facts=[("thing", "USES", "other")],
+                nodes=[
+                    SeedNode(id="thing", type="NotARealType"),
+                    SeedNode(id="other", type="Concept"),
+                ],
+            )
+        ]
+
+        with pytest.raises(SeedSourceError, match="NotARealType"):
+            apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+    def test_rejects_before_any_write_happens(self, fake_connection):
+        docs = [
+            _doc(
+                facts=[("thing", "USES", "other")],
+                nodes=[
+                    SeedNode(id="thing", type="NotARealType"),
+                    SeedNode(id="other", type="Concept"),
+                ],
+            )
+        ]
+
+        with pytest.raises(SeedSourceError):
+            apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        fake_connection.assert_no_writes()
+
+    def test_error_names_the_source_file(self, fake_connection):
+        docs = [
+            _doc(
+                facts=[("thing", "USES", "other")],
+                nodes=[
+                    SeedNode(id="thing", type="NotARealType"),
+                    SeedNode(id="other", type="Concept"),
+                ],
+                source_path=Path("users/bad.md"),
+            )
+        ]
+
+        with pytest.raises(SeedSourceError, match="users/bad.md".replace("/", r"[\\/]")):
+            apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+    def test_error_suggests_the_closest_allowed_type_on_a_near_match(self, fake_connection):
+        docs = [
+            _doc(
+                facts=[("thing", "USES", "other")],
+                nodes=[
+                    SeedNode(id="thing", type="Organizaton"),
+                    SeedNode(id="other", type="Concept"),
+                ],
+            )
+        ]
+
+        with pytest.raises(SeedSourceError, match="Organization"):
+            apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+    @pytest.mark.parametrize(
+        "node_type",
+        [
+            pytest.param("MistIdentity", id="mist-identity"),
+            pytest.param("MistTrait", id="mist-trait"),
+            pytest.param("MistCapability", id="mist-capability"),
+            pytest.param("MistPreference", id="mist-preference"),
+            pytest.param("User", id="user"),
+            pytest.param("Organization", id="organization"),
+            pytest.param("Technology", id="technology"),
+        ],
+    )
+    def test_accepts_every_type_used_by_the_real_seed_source(self, fake_connection, node_type):
+        """These are the node types the real mist-memory/seed/*.md files will
+        use once Task 13 lands (verified against ALL_NODE_TYPE_NAMES).
+        """
+        docs = [
+            _doc(
+                facts=[("thing", "USES", "other")],
+                nodes=[SeedNode(id="thing", type=node_type), SeedNode(id="other", type="Concept")],
+            )
+        ]
+
+        apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        assert fake_connection.writes
+
+
+class TestApplierOwnDefenses:
+    """Task 11's loader (`load_seed_documents`) already rejects a fact
+    referencing an undefined node and a duplicate node id -- but a caller
+    that constructs `SeedDocument`s directly bypasses the loader entirely.
+    These tests prove the applier does not silently trust that upstream
+    check, mirroring the same defensive posture `_validate_node_types`
+    takes for `type`.
+    """
+
+    def test_rejects_a_fact_referencing_an_undefined_node(self, fake_connection):
+        """Bypasses `_doc()`'s auto-node-generation to construct a document
+        where a fact references an id with no `nodes:` entry at all -- the
+        exact shape of the R1.4 Task 10 live defect.
+        """
+        docs = [
+            SeedDocument(
+                seed_version="profile-v1",
+                nodes=[SeedNode(id="user", type=_PLACEHOLDER_TYPE)],
+                facts=[SeedFact(subject="user", predicate="USES", object="ghost")],
+                body="b",
+                source_path=Path("t.md"),
+            )
+        ]
+
+        with pytest.raises(SeedSourceError, match="ghost"):
+            apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        fake_connection.assert_no_writes()
+
+    def test_rejects_a_duplicate_node_id_across_documents(self, fake_connection):
+        docs = [
+            SeedDocument(
+                seed_version="profile-v1",
+                nodes=[SeedNode(id="user", type=_PLACEHOLDER_TYPE)],
+                facts=[],
+                body="b",
+                source_path=Path("a.md"),
+            ),
+            SeedDocument(
+                seed_version="profile-v1",
+                nodes=[SeedNode(id="user", type=_PLACEHOLDER_TYPE)],
+                facts=[],
+                body="b",
+                source_path=Path("b.md"),
+            ),
+        ]
+
+        with pytest.raises(SeedSourceError, match="user"):
             apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
 
         fake_connection.assert_no_writes()

@@ -17,10 +17,19 @@ import pytest
 
 from backend.errors import SeedSourceError
 from backend.knowledge.seed.applier import reseed, wipe_seed_version
-from backend.knowledge.seed.models import SeedDocument, SeedFact
+from backend.knowledge.seed.models import SeedDocument, SeedFact, SeedNode
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
 _NOW = "2026-07-31T00:00:00+00:00"
+
+# R1.4 Task 12 (addendum): apply_seed_documents (which reseed calls) now
+# requires every fact's subject/object to have a matching SeedNode -- the
+# applier's own defense, mirroring Task 11's loader-level referential
+# integrity, for a caller that constructs SeedDocuments directly. This
+# placeholder type is used for auto-generated nodes below; these tests
+# exercise wipe/reapply/validation ordering, not node type/property
+# richness (see test_seed_applier.py's TestNodeDefinitionWrites for that).
+_PLACEHOLDER_TYPE = "Concept"
 
 
 def _doc(
@@ -31,15 +40,35 @@ def _doc(
     source_path: Path = Path("test.md"),
     partition: str = ENTITY_LABEL,
 ) -> SeedDocument:
-    """Build a valid SeedDocument. `facts` is a list of (subject, predicate, object)."""
+    """Build a valid SeedDocument. `facts` is a list of (subject, predicate, object).
+
+    A `SeedNode` is auto-generated (placeholder type) for every unique
+    subject/object referenced by `facts`, satisfying referential integrity
+    without every test needing to author its own `nodes:` block.
+    """
     fact_objs = [SeedFact(subject=s, predicate=p, object=o) for s, p, o in (facts or [])]
+    node_ids = sorted({n for f in fact_objs for n in (f.subject, f.object)})
+    node_objs = [SeedNode(id=i, type=_PLACEHOLDER_TYPE) for i in node_ids]
     return SeedDocument(
         seed_version=version,
+        nodes=node_objs,
         facts=fact_objs,
         body=body,
         source_path=source_path,
         partition=partition,
     )
+
+
+def _seed_version_param(params: dict) -> object:
+    """Extract seed_version from a write's params, wherever it lives.
+
+    Wipe writes and edge writes carry it as a top-level param. Node writes
+    (`_MERGE_NODE`, R1.4 Task 12) carry it inside the `properties` map,
+    matching `admin.py`'s established `merge_params` shape.
+    """
+    if "seed_version" in params:
+        return params["seed_version"]
+    return params.get("properties", {}).get("seed_version")
 
 
 class TestWipeScoping:
@@ -185,7 +214,7 @@ class TestReseed:
         reseed(fake_connection, docs, seed_version="profile-v2", now_iso=_NOW)
 
         for _query, params in fake_connection.writes:
-            assert params["seed_version"] == "profile-v2"
+            assert _seed_version_param(params) == "profile-v2"
 
     def test_reseed_validates_predicates_before_wiping(self, fake_connection):
         """A bad predicate in the new source must abort before the wipe runs.
@@ -196,6 +225,27 @@ class TestReseed:
         docs = [_doc(facts=[("user", "NOT_A_REAL_PREDICATE", "thing")])]
 
         with pytest.raises(SeedSourceError):
+            reseed(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        fake_connection.assert_no_writes()
+
+    def test_reseed_validates_node_types_before_wiping(self, fake_connection):
+        """R1.4 Task 12: the same data-loss shape as the predicate case above,
+        for the node-type guard -- an unknown node type in the new source
+        must abort before the wipe runs, not empty a good graph and then
+        fail the re-apply.
+        """
+        docs = [
+            SeedDocument(
+                seed_version="profile-v1",
+                nodes=[SeedNode(id="thing", type="NotARealType")],
+                facts=[],
+                body="b",
+                source_path=Path("t.md"),
+            )
+        ]
+
+        with pytest.raises(SeedSourceError, match="NotARealType"):
             reseed(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
 
         fake_connection.assert_no_writes()
