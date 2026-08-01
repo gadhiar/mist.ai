@@ -46,10 +46,11 @@ _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # Matches the leading YYYY-MM-DD- date prefix in a session filename stem.
 _STEM_DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-")
 # Multiline-anchored, case-insensitive match for a markdown `## Provenance`
-# heading at line start. Used by `_upsert_user_sync` to decide whether to
-# append a writer-supplied default Provenance section. The line anchor
-# rejects quoted forms like `> ## Provenance`; the case-insensitive flag
-# accepts `## provenance` as the same logical section.
+# heading at line start. Used by `_upsert_user_sync` and
+# `_upsert_identity_body_sync` to decide whether to append a writer-supplied
+# default Provenance section. The line anchor rejects quoted forms like
+# `> ## Provenance`; the case-insensitive flag accepts `## provenance` as
+# the same logical section.
 _PROVENANCE_HEADING_RE = re.compile(r"(?im)^##\s+Provenance\s*$")
 
 # Stamp mirrors of KnowledgeConfig defaults (the writer is wired with
@@ -307,6 +308,51 @@ class VaultWriter:
                 "traits": traits,
                 "capabilities": capabilities,
                 "preferences": preferences,
+                "rendered_at": rendered_at,
+            },
+        )
+
+    async def upsert_identity_body(
+        self, body_markdown: str, source_path: str, rendered_at: str | None = None
+    ) -> str:
+        """Write or overwrite the MIST identity note at `identity/mist.md` from a prepared body.
+
+        Sibling to `upsert_identity`, added for R1.4 Task 10: where that
+        method renders structured trait/capability/preference dicts into
+        markdown, this one writes a caller-provided body verbatim -- the
+        shape the R1.4 seed source produces (`SeedDocument.body`, authored
+        directly in `mist-memory/seed/mist.md` rather than assembled from
+        per-item dicts `SeedFact` has no fields for). `upsert_identity` has
+        no production caller left after this task but keeps its Protocol
+        entry and existing tests untouched; this method is additive, not a
+        replacement.
+
+        Args:
+            body_markdown: Caller-provided markdown body. A `## Provenance`
+                section is appended automatically when the body does not
+                already supply one (mirrors `upsert_user`'s dedup guard via
+                `_PROVENANCE_HEADING_RE`).
+            source_path: Origin of `body_markdown`, rendered into the
+                appended Provenance section's `source` field (e.g. the
+                seed document's `source_path`). Passed in rather than
+                hardcoded so the footer never points at a deleted file.
+            rendered_at: Optional ISO 8601 timestamp string. When supplied,
+                pins the frontmatter `last_updated` date and the Provenance
+                `rendered_at` so the seeded identity note is byte-reproducible
+                (seed bootstrap under replay). None means wall-clock -- the
+                unchanged production default.
+
+        Returns:
+            Absolute path to the identity note.
+
+        Raises:
+            VaultWriteError: If the file write fails.
+        """
+        return await self._enqueue(
+            "upsert_identity_body",
+            {
+                "body_markdown": body_markdown,
+                "source_path": source_path,
                 "rendered_at": rendered_at,
             },
         )
@@ -622,6 +668,7 @@ class VaultWriter:
         """Route a job to its handler by `kind`."""
         handlers = {
             "upsert_identity": self._handle_upsert_identity,
+            "upsert_identity_body": self._handle_upsert_identity_body,
             "upsert_user": self._handle_upsert_user,
             "upsert_user_snapshot": self._handle_upsert_user_snapshot,
             "mark_authored_by": self._handle_mark_authored_by,
@@ -804,7 +851,11 @@ class VaultWriter:
         identity/mist.md is the bucket-3 curated persona file whose user
         edits are the most authoritative content in the vault. Files still
         carrying the machine-stamped birth value are refreshed normally so
-        seed_data.yaml updates flow through.
+        the seed source's updates flow through. (No production caller
+        remains as of R1.4 Task 10 -- see the sibling `upsert_identity_body`,
+        which the seed bootstrap now uses -- but this method and its
+        Protocol entry are retained rather than deleted; see that task's
+        report for the reasoning.)
 
         `rendered_at`, when supplied, pins the frontmatter `last_updated` date
         and the Provenance timestamp for reproducible writes (None ->
@@ -869,6 +920,91 @@ class VaultWriter:
         body = "".join(lines)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(render_frontmatter(fm, body), encoding="utf-8")
+
+    async def _handle_upsert_identity_body(self, args: dict[str, Any]) -> str:
+        body_markdown: str = args["body_markdown"]
+        source_path: str = args["source_path"]
+        rendered_at: str | None = args.get("rendered_at")
+
+        path = self._root / "identity" / "mist.md"
+        self._mark_mist_write(path)
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                self._upsert_identity_body_sync,
+                path,
+                body_markdown,
+                source_path,
+                rendered_at,
+            )
+        except OSError as exc:
+            raise VaultWriteError(f"Failed to write identity note {path}: {exc}") from exc
+
+        return str(path)
+
+    def _upsert_identity_body_sync(
+        self,
+        path: Path,
+        body_markdown: str,
+        source_path: str,
+        rendered_at: str | None = None,
+    ) -> None:
+        """Synchronous core of `upsert_identity_body`.
+
+        Mirrors `_upsert_user_sync`'s `authored_by` guard and Provenance-dedup
+        pattern -- the sibling `_upsert_identity_sync` renders from structured
+        lists and has no caller-provided body to guard or dedupe against, so
+        that logic is not shared code, only a shared pattern. `authored_by in
+        {user, user-edit}` refuses the write per ADR-010 Invariant 5:
+        identity/mist.md is bucket-3 curated persona content, and a hand-edit
+        takes precedence over any re-seed.
+
+        `rendered_at`, when supplied, pins the frontmatter `last_updated`
+        date and the Provenance timestamp for reproducible writes (None ->
+        wall-clock).
+        """
+        now_iso = rendered_at if rendered_at is not None else datetime.now(UTC).isoformat()
+        today = now_iso[:10]
+
+        if path.exists():
+            existing = path.read_text(encoding="utf-8")
+            fm_dict, existing_body = parse_frontmatter(existing)
+            authored_by_val = fm_dict.get("authored_by")
+            if authored_by_val in ("user", "user-edit"):
+                logger.warning(
+                    "Identity note %s has authored_by=%r -- body not overwritten "
+                    "(ADR-010 invariant 5)",
+                    path,
+                    authored_by_val,
+                )
+                fm_dict["last_updated"] = today
+                import yaml as _yaml
+
+                new_yaml = _yaml.safe_dump(
+                    fm_dict, sort_keys=False, default_flow_style=False, allow_unicode=True
+                )
+                new_content = f"---\n{new_yaml}---\n\n{existing_body}"
+                path.write_text(new_content, encoding="utf-8")
+                return
+
+        fm = MistIdentityFrontmatter(
+            authored_by=AuthoredBy.MIST,
+            version="1.0",
+            last_updated=today,
+            tags=["identity", "traits", "preferences"],
+        )
+
+        if _PROVENANCE_HEADING_RE.search(body_markdown):
+            full_body = body_markdown.rstrip("\n") + "\n"
+        else:
+            provenance_section = (
+                f"\n## Provenance\n- source: {source_path}\n- rendered_at: {now_iso}\n"
+            )
+            full_body = body_markdown.rstrip("\n") + "\n" + provenance_section
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(render_frontmatter(fm, full_body), encoding="utf-8")
 
     async def _handle_upsert_user(self, args: dict[str, Any]) -> str:
         user_id: str = args["user_id"]

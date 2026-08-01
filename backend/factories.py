@@ -430,6 +430,10 @@ def build_conversation_handler(
         # Replay-determinism clock seam: wall-clock in production (env unset),
         # a fixed instant under MIST_FIXED_CLOCK for reproducible replays.
         now_fn=build_now_fn(),
+        # R1.4 Task 10: MIST_SESSION_ORIGIN (default "real") -- the eval
+        # harness / CLI probes set it to "test" so their sessions are
+        # excludable from an R1.6 rebuild.
+        session_origin=config.event_store.session_origin,
     )
 
 

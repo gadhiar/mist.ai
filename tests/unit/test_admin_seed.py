@@ -501,3 +501,120 @@ def test_merge_relationship_endpoint_matches_both_partitions():
     assert not any(
         "MATCH (s:__Entity__ {" in q and "MATCH" in q and "__SelfModel__" not in q for q in issued
     ), f"MATCH restricted to __Entity__ only -- self-model rels would fail: {issued}"
+
+
+# ---------------------------------------------------------------------------
+# R1.4 Task 10: _backfill_embeddings_for_seed
+#
+# `_backfill_embeddings` (pre-R1.4) matches `MATCH (n:__Entity__) WHERE
+# n.provenance = 'seed' ...` -- verified live to structurally miss every
+# :__SelfModel__ node (all 21 currently-embedded nodes are :__SelfModel__,
+# zero are :__Entity__) and, separately, to stop matching anything at all
+# after a second `reseed()` because the wipe-then-recreate cycle does not
+# preserve `provenance` (only `seed_version` survives a delete+recreate,
+# since it is the one property `reseed()` itself re-stamps). These tests
+# pin the query SHAPE (label union, seed_version filter) rather than just
+# the read-then-write happy path, per this sub-project's established lesson
+# that a fake records params regardless of whether the query text uses them
+# -- asserting a token appears proves nothing about where it appears.
+# ---------------------------------------------------------------------------
+
+
+class _FakeEmbeddingGenerator:
+    """Records the text passed to generate_embedding; returns a fixed vector."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def generate_embedding(self, text: str) -> list[float]:
+        self.calls.append(text)
+        return [0.1, 0.2, 0.3]
+
+
+class TestBackfillEmbeddingsForSeed:
+    def test_query_matches_both_partitions_not_entity_only(self) -> None:
+        from backend.knowledge import admin
+        from tests.mocks.neo4j import FakeNeo4jConnection
+
+        conn = FakeNeo4jConnection(query_results=[])
+        admin._backfill_embeddings_for_seed(conn, _FakeEmbeddingGenerator(), "profile-v1")
+
+        assert conn.queries, "expected a read query"
+        read_query = conn.queries[0][0]
+        assert "__Entity__|__SelfModel__" in read_query, (
+            "must match the label union -- _backfill_embeddings' :__Entity__-only "
+            f"restriction structurally misses the self-model partition. Got: {read_query!r}"
+        )
+
+    def test_query_filters_on_seed_version_not_provenance(self) -> None:
+        from backend.knowledge import admin
+        from tests.mocks.neo4j import FakeNeo4jConnection
+
+        conn = FakeNeo4jConnection(query_results=[])
+        admin._backfill_embeddings_for_seed(conn, _FakeEmbeddingGenerator(), "profile-v1")
+
+        read_query = conn.queries[0][0]
+        assert "n.seed_version = $seed_version" in read_query, (
+            "must filter on seed_version -- provenance does not survive reseed()'s "
+            f"delete+recreate cycle on a second run. Got: {read_query!r}"
+        )
+        assert "provenance" not in read_query
+
+    def test_seed_version_forwarded_as_param(self) -> None:
+        from backend.knowledge import admin
+        from tests.mocks.neo4j import FakeNeo4jConnection
+
+        conn = FakeNeo4jConnection(query_results=[])
+        admin._backfill_embeddings_for_seed(conn, _FakeEmbeddingGenerator(), "profile-v1")
+
+        _, params = conn.queries[0]
+        assert params == {"seed_version": "profile-v1"}
+
+    def test_embeds_rows_missing_embedding_using_display_name_and_description(self) -> None:
+        from backend.knowledge import admin
+        from tests.mocks.neo4j import FakeNeo4jConnection
+
+        conn = FakeNeo4jConnection(
+            query_results=[
+                {"id": "slalom", "display_name": "Slalom", "description": "Consulting firm"},
+            ]
+        )
+        generator = _FakeEmbeddingGenerator()
+
+        count = admin._backfill_embeddings_for_seed(conn, generator, "profile-v1")
+
+        assert count == 1
+        assert generator.calls == ["Slalom — Consulting firm"]
+        write_query, write_params = conn.writes[0]
+        assert "SET n.embedding = $embedding" in write_query
+        assert "__Entity__|__SelfModel__" in write_query
+        assert write_params == {"id": "slalom", "embedding": [0.1, 0.2, 0.3]}
+
+    def test_falls_back_to_bare_id_when_display_name_and_description_absent(self) -> None:
+        """A node reseed() just recreated fresh (Task 10's documented, accepted
+        quality trade-off: seed_version survives the delete+recreate, but
+        display_name/description do not, since the applier never sets them).
+        """
+        from backend.knowledge import admin
+        from tests.mocks.neo4j import FakeNeo4jConnection
+
+        conn = FakeNeo4jConnection(
+            query_results=[{"id": "mist-identity", "display_name": None, "description": None}]
+        )
+        generator = _FakeEmbeddingGenerator()
+
+        admin._backfill_embeddings_for_seed(conn, generator, "profile-v1")
+
+        assert generator.calls == ["mist-identity"]
+
+    def test_no_writes_when_nothing_is_missing_an_embedding(self) -> None:
+        from backend.knowledge import admin
+        from tests.mocks.neo4j import FakeNeo4jConnection
+
+        conn = FakeNeo4jConnection(query_results=[])
+        generator = _FakeEmbeddingGenerator()
+
+        count = admin._backfill_embeddings_for_seed(conn, generator, "profile-v1")
+
+        assert count == 0
+        conn.assert_no_writes()

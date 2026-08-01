@@ -1,59 +1,46 @@
-"""ADR-010 Cluster 8 Phase 10: vault bootstrap from seed_data.
+"""R1.4 Task 10: vault bootstrap from the versioned seed source.
 
 Verifies that `bootstrap_vault_from_seed` writes identity/mist.md and
-users/<id>.md. R1.4 Task 6 retired the DERIVED_FROM->VaultNote seed
-provenance edge (`emit_seed_vault_provenance`, formerly tested here) --
-seed facts now carry a `seed_version` property instead. See
+users/<id>.md from `documents: list[SeedDocument]` -- the retired
+`scripts/seed_data.yaml` dict path (and its `_build_user_body_markdown`
+renderer, deleted this task) is gone. Each document's body is written
+VERBATIM; there is no structured-field rendering left on this path (that
+remains `upsert_identity`'s job, which has no production caller after this
+task -- see `backend/vault/writer.py`).
+
+R1.4 Task 6 retired the DERIVED_FROM->VaultNote seed provenance edge
+(`emit_seed_vault_provenance`, formerly tested here) -- seed facts now carry
+a `seed_version` property instead. See
 `tests/unit/knowledge/seed/test_no_vaultnote_provenance.py` for the
 mutation-proof guard against reintroduction.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from backend.errors import SeedSourceError
 from backend.knowledge import admin
+from backend.knowledge.seed.models import SeedDocument
+from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
-# Reuse the minimal seed shape from test_admin_seed.
-SEED = {
-    "ontology_version": "1.0.0",
-    "mist_identity": {
-        "id": "mist-identity",
-        "entity_type": "MistIdentity",
-        "display_name": "MIST",
-        "pronouns": "she/her",
-        "age_analog": "26-27",
-        "self_concept": "test concept",
-        "origin": "test origin",
-        "baseline_persona_seeded": True,
-        "growth_enabled": True,
-        "version": "0.1.0-mvp",
-    },
-    "traits": [
-        {"id": "trait-a", "display_name": "Trait A", "axis": "Persona", "description": "a"},
-        {"id": "trait-b", "display_name": "Trait B", "axis": "Persona", "description": "b"},
-    ],
-    "capabilities": [{"id": "cap-a", "display_name": "Cap A", "description": "a"}],
-    "preferences": [
-        {
-            "id": "pref-a",
-            "display_name": "Pref A",
-            "enforcement": "absolute",
-            "context": "a",
-        }
-    ],
-    "user": {
-        "id": "user",
-        "entity_type": "User",
-        "display_name": "Raj Gadhia",
-    },
-    "entities": [
-        {"id": "slalom", "entity_type": "Organization", "display_name": "Slalom"},
-        {"id": "python", "entity_type": "Technology", "display_name": "Python"},
-    ],
-    "identity_relationships": [],
-    "anchor_relationships": [],
-}
+_IDENTITY_DOC = SeedDocument(
+    seed_version="profile-v1",
+    facts=[],
+    body="# MIST Identity\n\n## Traits\n- **Warm** -- Default register is warm.\n",
+    source_path=Path("mist-memory/seed/mist.md"),
+    partition=SELF_MODEL_LABEL,
+)
+_USER_DOC = SeedDocument(
+    seed_version="profile-v1",
+    facts=[],
+    body="# user\n\n## Professional and Projects\nRaj Gadhia is a Software Engineer.\n",
+    source_path=Path("mist-memory/seed/user.md"),
+    partition=ENTITY_LABEL,
+)
+_DOCUMENTS = [_IDENTITY_DOC, _USER_DOC]
 
 
 # ---------------------------------------------------------------------------
@@ -62,19 +49,20 @@ SEED = {
 
 
 class FakeAsyncVaultWriter:
-    """Minimal async vault writer recording upsert_identity/upsert_user calls."""
+    """Minimal async vault writer recording upsert_identity_body/upsert_user calls."""
 
     def __init__(self, root: str = "/tmp/vault") -> None:
         self.root = root
         self.identity_calls: list[dict] = []
         self.user_calls: list[dict] = []
 
-    async def upsert_identity(self, traits, capabilities, preferences, rendered_at=None) -> str:
+    async def upsert_identity_body(
+        self, body_markdown: str, source_path: str, rendered_at=None
+    ) -> str:
         self.identity_calls.append(
             {
-                "traits": traits,
-                "capabilities": capabilities,
-                "preferences": preferences,
+                "body_markdown": body_markdown,
+                "source_path": source_path,
                 "rendered_at": rendered_at,
             }
         )
@@ -88,49 +76,6 @@ class FakeAsyncVaultWriter:
 
 
 # ---------------------------------------------------------------------------
-# TestBuildUserBodyMarkdown
-# ---------------------------------------------------------------------------
-
-
-class TestBuildUserBodyMarkdown:
-    def test_includes_display_name_as_h1(self) -> None:
-        body = admin._build_user_body_markdown(SEED["user"])
-        assert body.startswith("# Raj Gadhia")
-
-    def test_includes_profile_section(self) -> None:
-        body = admin._build_user_body_markdown(SEED["user"])
-        assert "## Profile" in body
-
-    def test_falls_back_to_id_when_display_name_missing(self) -> None:
-        body = admin._build_user_body_markdown({"id": "user"})
-        assert body.startswith("# user")
-
-    def test_skips_structural_keys(self) -> None:
-        body = admin._build_user_body_markdown(SEED["user"])
-        # id / entity_type / display_name are structural, not body content
-        assert "**id**" not in body
-        assert "**entity_type**" not in body
-        assert "**display_name**" not in body
-
-    def test_renders_extra_scalar_properties(self) -> None:
-        seed_with_extras = {
-            "id": "u",
-            "display_name": "X",
-            "title": "Engineer",
-            "city": "Chicago",
-        }
-        body = admin._build_user_body_markdown(seed_with_extras)
-        assert "**title**: Engineer" in body
-        assert "**city**: Chicago" in body
-
-    def test_deterministic_ordering(self) -> None:
-        # Same input -> same output across calls (alphabetical key order).
-        body_1 = admin._build_user_body_markdown(SEED["user"])
-        body_2 = admin._build_user_body_markdown(SEED["user"])
-        assert body_1 == body_2
-
-
-# ---------------------------------------------------------------------------
 # TestBootstrapVaultFromSeed
 # ---------------------------------------------------------------------------
 
@@ -140,7 +85,7 @@ class TestBootstrapVaultFromSeed:
     async def test_returns_both_paths(self) -> None:
         writer = FakeAsyncVaultWriter()
 
-        paths = await admin.bootstrap_vault_from_seed(writer, SEED)
+        paths = await admin.bootstrap_vault_from_seed(writer, _DOCUMENTS)
 
         assert "identity_path" in paths
         assert "user_path" in paths
@@ -148,36 +93,62 @@ class TestBootstrapVaultFromSeed:
         assert paths["user_path"].endswith("/users/user.md")
 
     @pytest.mark.asyncio
-    async def test_forwards_traits_capabilities_preferences(self) -> None:
+    async def test_identity_call_carries_body_and_source_verbatim(self) -> None:
         writer = FakeAsyncVaultWriter()
 
-        await admin.bootstrap_vault_from_seed(writer, SEED)
+        await admin.bootstrap_vault_from_seed(writer, _DOCUMENTS)
 
         assert len(writer.identity_calls) == 1
         call = writer.identity_calls[0]
-        assert call["traits"] == SEED["traits"]
-        assert call["capabilities"] == SEED["capabilities"]
-        assert call["preferences"] == SEED["preferences"]
+        assert call["body_markdown"] == _IDENTITY_DOC.body
+        assert call["source_path"] == str(_IDENTITY_DOC.source_path)
 
     @pytest.mark.asyncio
-    async def test_user_call_carries_user_id_and_body(self) -> None:
+    async def test_user_call_carries_user_id_from_source_stem_and_body_verbatim(self) -> None:
         writer = FakeAsyncVaultWriter()
 
-        await admin.bootstrap_vault_from_seed(writer, SEED)
+        await admin.bootstrap_vault_from_seed(writer, _DOCUMENTS)
 
         assert len(writer.user_calls) == 1
         call = writer.user_calls[0]
-        assert call["user_id"] == "user"
-        assert "Raj Gadhia" in call["body_markdown"]
+        assert call["user_id"] == "user"  # source_path.stem, not a frontmatter field
+        assert call["body_markdown"] == _USER_DOC.body
 
     @pytest.mark.asyncio
-    async def test_handles_empty_trait_lists(self) -> None:
+    async def test_rendered_at_threaded_to_both_calls(self) -> None:
         writer = FakeAsyncVaultWriter()
-        seed = {**SEED, "traits": [], "capabilities": [], "preferences": []}
 
-        paths = await admin.bootstrap_vault_from_seed(writer, seed)
+        await admin.bootstrap_vault_from_seed(
+            writer, _DOCUMENTS, rendered_at="2026-05-07T00:00:00+00:00"
+        )
 
-        # upsert_identity still called (empty rendering is valid)
-        assert len(writer.identity_calls) == 1
-        assert writer.identity_calls[0]["traits"] == []
-        assert paths["identity_path"]
+        assert writer.identity_calls[0]["rendered_at"] == "2026-05-07T00:00:00+00:00"
+        assert writer.user_calls[0]["rendered_at"] == "2026-05-07T00:00:00+00:00"
+
+    @pytest.mark.asyncio
+    async def test_raises_when_no_self_model_document(self) -> None:
+        writer = FakeAsyncVaultWriter()
+
+        with pytest.raises(SeedSourceError, match=SELF_MODEL_LABEL):
+            await admin.bootstrap_vault_from_seed(writer, [_USER_DOC])
+
+    @pytest.mark.asyncio
+    async def test_raises_when_no_entity_document(self) -> None:
+        writer = FakeAsyncVaultWriter()
+
+        with pytest.raises(SeedSourceError, match=ENTITY_LABEL):
+            await admin.bootstrap_vault_from_seed(writer, [_IDENTITY_DOC])
+
+    @pytest.mark.asyncio
+    async def test_raises_when_a_partition_has_two_documents(self) -> None:
+        writer = FakeAsyncVaultWriter()
+        dupe_user_doc = SeedDocument(
+            seed_version="profile-v1",
+            facts=[],
+            body="a second, ambiguous user document",
+            source_path=Path("mist-memory/seed/user2.md"),
+            partition=ENTITY_LABEL,
+        )
+
+        with pytest.raises(SeedSourceError, match=ENTITY_LABEL):
+            await admin.bootstrap_vault_from_seed(writer, [_IDENTITY_DOC, _USER_DOC, dupe_user_doc])

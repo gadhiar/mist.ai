@@ -201,6 +201,13 @@ class EventStoreConfig:
     enabled: bool = True  # Master switch for event store recording
     db_path: str | None = None  # Defaults to ~/.mist/event_store.db
     audio_dir: str | None = None  # Defaults to ~/.mist/audio/
+    # R1.4 Task 10: closes the gap T3 left open -- the `origin` column
+    # (EventStore.start_session) existed but nothing ever set it to
+    # anything but its "real" default, so harness/probe traffic recorded
+    # as real and would have polluted an R1.6 rebuild. Default direction is
+    # deliberate: a deployment that forgets to set this is counted as real
+    # rather than silently excluded from a future rebuild.
+    session_origin: str = "real"
 
     @classmethod
     def from_env(cls) -> "EventStoreConfig":
@@ -209,6 +216,7 @@ class EventStoreConfig:
             enabled=os.getenv("EVENT_STORE_ENABLED", "true").lower() == "true",
             db_path=os.getenv("EVENT_STORE_DB_PATH"),
             audio_dir=os.getenv("EVENT_STORE_AUDIO_DIR"),
+            session_origin=os.getenv("MIST_SESSION_ORIGIN", "real"),
         )
 
 
@@ -377,8 +385,9 @@ class VaultConfig:
     `VAULT_HOST_PATH`. Session soft caps drive auto-split behavior.
 
     The default user id (`raj`) is used to bootstrap `users/<id>.md` from
-    `scripts/seed_data.yaml` on first run; MIST currently only models a single
-    user, so this is not yet user-selectable per request.
+    the versioned seed source (`mist-memory/seed/`) on first run; MIST
+    currently only models a single user, so this is not yet user-selectable
+    per request.
     """
 
     enabled: bool = True

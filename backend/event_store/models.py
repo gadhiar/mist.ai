@@ -26,6 +26,11 @@ class ConversationSession:
     ended_at: datetime | None = None
     turn_count: int = 0
     input_modality: str = "voice"  # "voice", "text", "api"
+    # R1.4 Task 3 added the `origin` column (schema.sql) and start_session's
+    # write side; the read side was never wired up, so the column was
+    # write-only -- readable only via raw SQL, not through this model or
+    # get_session(). R1.4 Task 10 closes that: "real" | "test" | "seed".
+    origin: str = "real"
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict for SQLite insertion.
@@ -39,6 +44,7 @@ class ConversationSession:
             "ended_at": self.ended_at.isoformat() if self.ended_at else None,
             "turn_count": self.turn_count,
             "input_modality": self.input_modality,
+            "origin": self.origin,
         }
 
     @classmethod
@@ -57,6 +63,7 @@ class ConversationSession:
             ended_at=(datetime.fromisoformat(row["ended_at"]) if row.get("ended_at") else None),
             turn_count=row.get("turn_count", 0),
             input_modality=row.get("input_modality", "voice"),
+            origin=row.get("origin", "real"),
         )
 
 

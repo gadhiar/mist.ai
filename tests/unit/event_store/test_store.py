@@ -203,6 +203,30 @@ class TestOrigin:
         ).fetchone()
         assert row[0] == "test"
 
+    def test_get_session_surfaces_origin(self, tmp_path):
+        """R1.4 Task 10: origin was written since Task 3 but had no read path --
+        get_session()/ConversationSession silently dropped the column even
+        though `SELECT *` returned it. This is the read-side half of the gap.
+        """
+        store = EventStore(db_path=str(tmp_path / "es.db"))
+        store.initialize()
+
+        store.start_session("s-3", input_modality="text", origin="test")
+
+        session = store.get_session("s-3")
+        assert session is not None
+        assert session.origin == "test"
+
+    def test_get_session_defaults_origin_to_real(self, tmp_path):
+        store = EventStore(db_path=str(tmp_path / "es.db"))
+        store.initialize()
+
+        store.start_session("s-4", input_modality="text")
+
+        session = store.get_session("s-4")
+        assert session is not None
+        assert session.origin == "real"
+
     def test_origin_column_added_to_preexisting_db(self, tmp_path):
         """A database created before the column existed gains it on open."""
         db = tmp_path / "legacy.db"

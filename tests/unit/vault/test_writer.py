@@ -255,6 +255,177 @@ class TestUpsertIdentity:
 
 
 # ---------------------------------------------------------------------------
+# TestUpsertIdentityBody (R1.4 Task 10)
+#
+# Sibling to upsert_identity, added when bootstrap_vault_from_seed was
+# repointed onto documents: list[SeedDocument] -- SeedFact carries no
+# display_name/description, so the structured renderer above can no longer
+# be fed from the seed source. This method writes a caller-provided body
+# verbatim instead. upsert_identity (above) keeps its production-unrelated
+# ~10 tests and its own hardcoded "scripts/seed_data.yaml" Provenance
+# literal untouched by design -- see writer.py:866's docstring note.
+# ---------------------------------------------------------------------------
+
+
+class TestUpsertIdentityBody:
+    @pytest.mark.asyncio
+    async def test_creates_identity_file_with_body_verbatim(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        path_str = await vault_writer.upsert_identity_body(
+            "# MIST Identity\n\n## Traits\n- **Warm** -- test.\n",
+            source_path="mist-memory/seed/mist.md",
+        )
+
+        path = Path(path_str)
+        assert path.exists()
+        content = path.read_text(encoding="utf-8")
+        fm_dict, body = parse_frontmatter(content)
+
+        assert fm_dict["type"] == "mist-identity"
+        assert fm_dict["authored_by"] == "mist"
+        assert "## Traits" in body
+        assert "Warm" in body
+
+    @pytest.mark.asyncio
+    async def test_provenance_section_appended_with_real_source(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        path_str = await vault_writer.upsert_identity_body(
+            "# MIST Identity\n", source_path="mist-memory/seed/mist.md"
+        )
+
+        _, body = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
+        assert "## Provenance" in body
+        assert "- source: mist-memory/seed/mist.md" in body
+        assert "seed_data.yaml" not in body
+
+    @pytest.mark.asyncio
+    async def test_no_double_provenance_when_body_already_carries_one(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        """The R1.4 seed source's stale Provenance footer is stripped at the
+        source (Task 10, so the double-footer case does not occur in
+        production); this guards the writer's side of that sequencing
+        decision directly -- if a caller-provided body DOES still carry a
+        Provenance heading, the writer must not append a second one
+        (mirrors upsert_user's dedup guard).
+        """
+        import re as _re
+
+        body = "# MIST Identity\n\n## Provenance\n- source: elsewhere\n"
+        path_str = await vault_writer.upsert_identity_body(
+            body, source_path="mist-memory/seed/mist.md"
+        )
+
+        _, rendered = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
+        headings = _re.findall(r"(?m)^##\s+Provenance\s*$", rendered)
+        assert len(headings) == 1
+
+    @pytest.mark.asyncio
+    async def test_user_edit_file_body_not_overwritten(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        identity_path = tmp_path / "vault" / "identity" / "mist.md"
+        identity_path.parent.mkdir(parents=True, exist_ok=True)
+        identity_path.write_text(
+            "---\ntype: mist-identity\nauthored_by: user-edit\nversion: '1.0'\n"
+            "last_updated: 2026-04-01\ntags: []\n---\n\n"
+            "User-authored identity that must not be replaced.\n",
+            encoding="utf-8",
+        )
+
+        await vault_writer.upsert_identity_body(
+            "New seed-generated body.", source_path="mist-memory/seed/mist.md"
+        )
+
+        content = identity_path.read_text(encoding="utf-8")
+        assert "User-authored identity that must not be replaced." in content
+        assert "New seed-generated body." not in content
+
+    @pytest.mark.asyncio
+    async def test_user_authored_file_body_not_overwritten(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        identity_path = tmp_path / "vault" / "identity" / "mist.md"
+        identity_path.parent.mkdir(parents=True, exist_ok=True)
+        identity_path.write_text(
+            "---\ntype: mist-identity\nauthored_by: user\nversion: '1.0'\n"
+            "last_updated: 2026-04-01\ntags: []\n---\n\n"
+            "User original identity content.\n",
+            encoding="utf-8",
+        )
+
+        await vault_writer.upsert_identity_body(
+            "Seed replacement attempt.", source_path="mist-memory/seed/mist.md"
+        )
+
+        content = identity_path.read_text(encoding="utf-8")
+        assert "User original identity content." in content
+        assert "Seed replacement attempt." not in content
+
+    @pytest.mark.asyncio
+    async def test_mist_authored_file_is_overwritten(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        identity_path = tmp_path / "vault" / "identity" / "mist.md"
+        identity_path.parent.mkdir(parents=True, exist_ok=True)
+        identity_path.write_text(
+            "---\ntype: mist-identity\nauthored_by: mist\nversion: '1.0'\n"
+            "last_updated: 2026-04-01\ntags: []\n---\n\n"
+            "Old seed body.\n",
+            encoding="utf-8",
+        )
+
+        await vault_writer.upsert_identity_body(
+            "Updated seed body.", source_path="mist-memory/seed/mist.md"
+        )
+
+        content = identity_path.read_text(encoding="utf-8")
+        assert "Updated seed body." in content
+
+    @pytest.mark.asyncio
+    async def test_pipeline_authored_file_is_overwritten(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        """Live identity/mist.md carries authored_by: pipeline -- a value
+        outside the current AuthoredBy enum, predating it. The guard must
+        refuse only on user/user-edit, not on every non-mist value, or the
+        seed bootstrap would silently stop refreshing the live file the
+        first time this task's code actually runs against it.
+        """
+        identity_path = tmp_path / "vault" / "identity" / "mist.md"
+        identity_path.parent.mkdir(parents=True, exist_ok=True)
+        identity_path.write_text(
+            "---\ntype: mist-identity\nauthored_by: pipeline\nversion: '1.0'\n"
+            "last_updated: 2026-04-01\ntags: []\n---\n\n"
+            "Old pipeline-authored body.\n",
+            encoding="utf-8",
+        )
+
+        await vault_writer.upsert_identity_body(
+            "Updated seed body.", source_path="mist-memory/seed/mist.md"
+        )
+
+        content = identity_path.read_text(encoding="utf-8")
+        assert "Updated seed body." in content
+
+    @pytest.mark.asyncio
+    async def test_rendered_at_pins_last_updated_and_provenance(
+        self, vault_writer: VaultWriter, tmp_path: Path
+    ):
+        path_str = await vault_writer.upsert_identity_body(
+            "# MIST Identity\n",
+            source_path="mist-memory/seed/mist.md",
+            rendered_at="2026-05-07T01:01:33.155838+00:00",
+        )
+
+        fm_dict, body = parse_frontmatter(Path(path_str).read_text(encoding="utf-8"))
+        assert fm_dict["last_updated"] == "2026-05-07"
+        assert "- rendered_at: 2026-05-07T01:01:33.155838+00:00" in body
+
+
+# ---------------------------------------------------------------------------
 # TestUpsertUser
 # ---------------------------------------------------------------------------
 

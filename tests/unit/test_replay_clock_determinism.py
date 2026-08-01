@@ -32,6 +32,8 @@ import pytest_asyncio
 
 from backend.knowledge import admin
 from backend.knowledge.config import VaultConfig
+from backend.knowledge.seed.models import SeedDocument
+from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 from backend.vault.models import parse_frontmatter
 from backend.vault.writer import VaultWriter
 
@@ -168,13 +170,13 @@ class TestUpsertUserSnapshotClockInjection:
 
 
 class _RecordingWriter:
-    """Records upsert_user/upsert_identity args to assert rendered_at threading."""
+    """Records upsert_user/upsert_identity_body args to assert rendered_at threading."""
 
     def __init__(self) -> None:
         self.user_calls: list[dict] = []
         self.identity_calls: list[dict] = []
 
-    async def upsert_identity(self, traits, capabilities, preferences, rendered_at=None) -> str:
+    async def upsert_identity_body(self, body_markdown, source_path, rendered_at=None) -> str:
         self.identity_calls.append({"rendered_at": rendered_at})
         return "/tmp/vault/identity/mist.md"
 
@@ -183,23 +185,30 @@ class _RecordingWriter:
         return f"/tmp/vault/users/{user_id}.md"
 
 
-_SEED = {
-    "mist_identity": {"id": "mist-identity", "entity_type": "MistIdentity", "display_name": "MIST"},
-    "traits": [],
-    "capabilities": [],
-    "preferences": [],
-    "user": {"id": "user", "entity_type": "User", "display_name": "Raj Gadhia"},
-    "entities": [],
-    "identity_relationships": [],
-    "anchor_relationships": [],
-}
+_SEED_IDENTITY_DOC = SeedDocument(
+    seed_version="profile-v1",
+    facts=[],
+    body="# MIST Identity\n\n## Traits\n- **Warm** -- test.\n",
+    source_path=Path("mist-memory/seed/mist.md"),
+    partition=SELF_MODEL_LABEL,
+)
+_SEED_USER_DOC = SeedDocument(
+    seed_version="profile-v1",
+    facts=[],
+    body="# user\n\n## Professional and Projects\nRaj Gadhia is a Software Engineer.\n",
+    source_path=Path("mist-memory/seed/user.md"),
+    partition=ENTITY_LABEL,
+)
+_SEED_DOCUMENTS = [_SEED_IDENTITY_DOC, _SEED_USER_DOC]
 
 
 class TestBootstrapSeedClockThreading:
     @pytest.mark.asyncio
     async def test_bootstrap_threads_rendered_at_to_upsert_user(self) -> None:
         writer = _RecordingWriter()
-        await admin.bootstrap_vault_from_seed(writer, _SEED, rendered_at=FIXED_RENDERED_AT)
+        await admin.bootstrap_vault_from_seed(
+            writer, _SEED_DOCUMENTS, rendered_at=FIXED_RENDERED_AT
+        )
 
         assert writer.user_calls[0]["rendered_at"] == FIXED_RENDERED_AT
 
@@ -213,7 +222,9 @@ class TestBootstrapSeedClockThreading:
             writer = VaultWriter(cfg)
             await writer.start()
             try:
-                await admin.bootstrap_vault_from_seed(writer, _SEED, rendered_at=FIXED_RENDERED_AT)
+                await admin.bootstrap_vault_from_seed(
+                    writer, _SEED_DOCUMENTS, rendered_at=FIXED_RENDERED_AT
+                )
             finally:
                 await writer.stop()
             out.append((tmp_path / sub / "vault" / "users" / "user.md").read_text("utf-8"))

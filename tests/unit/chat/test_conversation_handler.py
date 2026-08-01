@@ -2132,6 +2132,63 @@ class TestRecordTurnEventRecordedAt:
         ) == (None, None)
 
 
+class TestRecordTurnEventSessionOrigin:
+    """R1.4 Task 10: session_origin threads from ConversationHandler's
+    constructor to EventStore.start_session. Verifies the production call
+    site (conversation_handler.py's _record_turn_event), not just that the
+    constructor stores the value -- storing it and forwarding it are
+    different failure modes.
+    """
+
+    def _handler(self, config, session_origin: str = "real"):
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        return ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=FakeExtractionPipeline(),
+            retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
+            session_origin=session_origin,
+        )
+
+    def test_default_session_origin_is_real(self):
+        handler = self._handler(
+            build_test_config(event_store_enabled=True, event_store_db_path=":memory:")
+        )
+        handler._record_turn_event(session_id="s1", user_message="hi", assistant_message="hey")
+
+        session = handler.event_store.get_session("s1")
+        assert session.origin == "real"
+
+    def test_injected_session_origin_forwarded_to_start_session(self):
+        handler = self._handler(
+            build_test_config(event_store_enabled=True, event_store_db_path=":memory:"),
+            session_origin="test",
+        )
+        handler._record_turn_event(session_id="s2", user_message="hi", assistant_message="hey")
+
+        session = handler.event_store.get_session("s2")
+        assert session.origin == "test"
+
+    def test_origin_not_reforwarded_on_an_existing_session(self):
+        """start_session is only called on first-turn creation (the
+        `es_session is None` branch); a second turn on the same session
+        must not attempt to re-insert with a different origin.
+        """
+        handler = self._handler(
+            build_test_config(event_store_enabled=True, event_store_db_path=":memory:"),
+            session_origin="test",
+        )
+        handler._record_turn_event(session_id="s3", user_message="one", assistant_message="a")
+        handler._record_turn_event(session_id="s3", user_message="two", assistant_message="b")
+
+        session = handler.event_store.get_session("s3")
+        assert session.origin == "test"
+        assert session.turn_count == 2
+
+
 class TestEventStoreIdNamespaceCollapse:
     """R1.3.1 fix round 1: the event store's session_id IS the chat-layer
     session_id -- `start_session` no longer mints its own `uuid4`, and

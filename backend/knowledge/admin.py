@@ -22,10 +22,11 @@ from typing import Any
 
 import yaml
 
-from backend.errors import Neo4jConnectionError, Neo4jQueryError
+from backend.errors import Neo4jConnectionError, Neo4jQueryError, SeedSourceError
 from backend.interfaces import GraphConnection
 from backend.knowledge.ontologies import EDGE_TYPES_BY_NAME, EXTRACTABLE_RELATIONSHIP_TYPES
-from backend.knowledge.storage.partitions import SELF_MODEL_LABEL, SELF_MODEL_TYPES
+from backend.knowledge.seed.models import SeedDocument
+from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL, SELF_MODEL_TYPES
 
 SEED_METADATA_FIELDS = (
     "confidence",
@@ -127,54 +128,54 @@ def ensure_schema(connection: GraphConnection) -> dict[str, int]:
     return counts
 
 
-def _build_user_body_markdown(user_seed: dict[str, Any]) -> str:
-    """Render the seed user dict into the body markdown for `users/<id>.md`.
+def _find_document_by_partition(documents: list[SeedDocument], partition: str) -> SeedDocument:
+    """Return the sole seed document carrying `partition`.
 
-    ADR-010 Cluster 8 Phase 10 bootstrap: produces a deterministic markdown
-    body suitable for `VaultWriter.upsert_user`. Stable section ordering
-    (display name -> properties) so re-runs produce byte-identical output.
-    The Provenance section is appended by the writer, not here.
+    Raises:
+        SeedSourceError: Zero or more than one document carries `partition`.
+            R1.4's real source is exactly one identity document
+            (`seed/mist.md`, SELF_MODEL_LABEL) and one user document
+            (`seed/user.md`, ENTITY_LABEL); ambiguity here is a
+            seed-authoring bug, not something to silently resolve by
+            picking the first match.
     """
-    lines: list[str] = []
-    display_name = user_seed.get("display_name") or user_seed.get("id", "User")
-    lines.append(f"# {display_name}")
-    lines.append("")
-    lines.append("## Profile")
-    lines.append("")
-    # Render scalar properties (skip id/entity_type which are frontmatter / structural).
-    skip_keys = {"id", "entity_type", "display_name"}
-    for key in sorted(user_seed.keys()):
-        if key in skip_keys:
-            continue
-        value = user_seed[key]
-        if isinstance(value, list | dict):
-            continue
-        lines.append(f"- **{key}**: {value}")
-    if len(lines) == 4:  # only the Profile heading was emitted
-        lines.append("- (no additional profile properties seeded)")
-    lines.append("")
-    return "\n".join(lines)
+    matches = [d for d in documents if d.partition == partition]
+    if len(matches) != 1:
+        raise SeedSourceError(
+            f"Expected exactly one seed document with partition {partition!r}, "
+            f"found {len(matches)} ({[str(d.source_path) for d in matches]})"
+        )
+    return matches[0]
 
 
 async def bootstrap_vault_from_seed(
     vault_writer: Any,
-    seed_data: dict[str, Any],
+    documents: list[SeedDocument],
     rendered_at: str | None = None,
 ) -> dict[str, str]:
-    """Render `identity/mist.md` and `users/<id>.md` from seed_data.
+    """Render `identity/mist.md` and `users/<id>.md` from the versioned seed source.
 
-    ADR-010 Cluster 8 Phase 10: vault bootstrap. The graph layer is seeded
-    from `scripts/seed_data.yaml`; this function mirrors that data into the
-    vault so the canonical user-facing markdown notes exist before any
-    conversation.
+    R1.4 Task 10: repointed from the retired `scripts/seed_data.yaml` dict
+    onto `documents: list[SeedDocument]` (`load_seed_documents` over
+    `mist-memory/seed/`). Each document's body is written VERBATIM to its
+    target vault note rather than assembled from structured per-field dicts
+    -- the seed source is authored directly as the note content (`seed/
+    mist.md`'s body IS `identity/mist.md`'s body; `seed/user.md`'s body IS
+    `users/user.md`'s body; verified byte-identical against both live notes
+    before this task landed). The identity document (partition
+    SELF_MODEL_LABEL) goes through the new `VaultWriter.upsert_identity_body`;
+    the user document (partition ENTITY_LABEL) goes through the existing
+    `VaultWriter.upsert_user`, using `source_path.stem` as the user id
+    (`mist-memory/seed/user.md` -> user_id `"user"`, matching the retired
+    `users/user.md`'s own `user_id` frontmatter field).
 
-    Idempotent. `upsert_identity` always overwrites the structured
-    identity sections; `upsert_user` respects `authored_by in {user,
-    user-edit}` and preserves user edits.
+    Idempotent. `upsert_identity_body` and `upsert_user` both respect
+    `authored_by in {user, user-edit}` and preserve user edits (ADR-010
+    Invariant 5).
 
     Args:
         vault_writer: Started VaultWriter instance.
-        seed_data: Loaded seed_data.yaml dict.
+        documents: Parsed seed documents (`load_seed_documents` output).
         rendered_at: Optional ISO 8601 timestamp string threaded to the
             writer so the seeded identity/user notes are byte-reproducible.
             The seeded `users/<id>.md` is read into the chat system prompt;
@@ -185,20 +186,23 @@ async def bootstrap_vault_from_seed(
         `{"identity_path": <abs>, "user_path": <abs>}`.
 
     Raises:
+        SeedSourceError: `documents` does not carry exactly one
+            SELF_MODEL_LABEL document and exactly one ENTITY_LABEL document.
         Whatever VaultWriter raises (typically VaultWriteError on irrecoverable
         filesystem or validation failures). The caller decides whether to
         propagate or swallow.
     """
-    identity_path = await vault_writer.upsert_identity(
-        traits=list(seed_data.get("traits", [])),
-        capabilities=list(seed_data.get("capabilities", [])),
-        preferences=list(seed_data.get("preferences", [])),
+    identity_doc = _find_document_by_partition(documents, SELF_MODEL_LABEL)
+    user_doc = _find_document_by_partition(documents, ENTITY_LABEL)
+
+    identity_path = await vault_writer.upsert_identity_body(
+        body_markdown=identity_doc.body,
+        source_path=str(identity_doc.source_path),
         rendered_at=rendered_at,
     )
-    user_seed = seed_data["user"]
     user_path = await vault_writer.upsert_user(
-        user_id=user_seed["id"],
-        body_markdown=_build_user_body_markdown(user_seed),
+        user_id=user_doc.source_path.stem,
+        body_markdown=user_doc.body,
         rendered_at=rendered_at,
     )
     return {"identity_path": identity_path, "user_path": user_path}
@@ -302,6 +306,75 @@ def _backfill_embeddings(connection: GraphConnection, embedding_generator: Any) 
         embedding = embedding_generator.generate_embedding(text)
         connection.execute_write(
             "MATCH (n:__Entity__ {id: $id}) SET n.embedding = $embedding",
+            {"id": row["id"], "embedding": list(embedding)},
+        )
+    return len(rows)
+
+
+def _backfill_embeddings_for_seed(
+    connection: GraphConnection, embedding_generator: Any, seed_version: str
+) -> int:
+    """Compute + SET embedding property on seeded nodes (either partition) missing one.
+
+    R1.4 Task 10: sibling to `_backfill_embeddings`, additive rather than a
+    signature change to that (still separately used and tested) function.
+    Matches on `seed_version` across the `:__Entity__|__SelfModel__` label
+    union rather than `provenance='seed'` restricted to `:__Entity__`,
+    because:
+
+    1. `reseed()`'s wipe-then-apply cycle (Task 5) deletes every
+       `seed_version`-stamped node once its edges are wiped, then recreates
+       it via `MERGE ... ON CREATE SET n.created_at = $now` -- which sets
+       only `created_at`/`seed_version`/`updated_at`. `provenance` (and
+       `display_name`/`description`, if the node was previously touched by
+       the retired `apply_seed`) do NOT survive a delete+recreate; there is
+       no property memory across a Neo4j node deletion. `seed_version` DOES
+       survive, because it is re-stamped by the very `reseed()` call this
+       function runs after -- it is the one predicate proven to hold on
+       every re-seed, first run or tenth.
+    2. The self-model partition (`:__SelfModel__`) is never also
+       `:__Entity__` (Task 4's partition-routing fix), so
+       `_backfill_embeddings`'s `MATCH (n:__Entity__)` structurally cannot
+       reach it. Verified against the live graph before this function was
+       written: all 21 currently-embedded nodes are `:__SelfModel__` and
+       zero are `:__Entity__` -- the label union is required, not
+       cosmetic, and `_backfill_embeddings` alone can never protect the
+       self-model's embeddings.
+
+    Uses `display_name + description` as the embedded text, same as
+    `_backfill_embeddings`; falls back to bare `id` when neither is present
+    (e.g. a node recreated fresh by `reseed` after losing those properties
+    in the delete+recreate above -- lower-quality embedding text, but a
+    real one, not a missing one).
+
+    Args:
+        connection: Sync graph connection.
+        embedding_generator: Provider exposing `generate_embedding(text)`.
+        seed_version: The exact stamp `reseed`/`apply_seed_documents` just
+            applied -- scopes the backfill to seed-owned nodes only, the
+            same discipline the wipe itself uses (Task 5).
+
+    Returns:
+        Count of nodes embedded.
+    """
+    query = """
+    MATCH (n:__Entity__|__SelfModel__)
+    WHERE n.seed_version = $seed_version AND n.embedding IS NULL
+    RETURN n.id AS id,
+           coalesce(n.display_name, n.name, n.id) AS display_name,
+           n.description AS description
+    """
+    rows = connection.execute_query(query, {"seed_version": seed_version})
+    if not rows:
+        return 0
+    for row in rows:
+        text_parts = [row["display_name"] or row["id"]]
+        if row["description"]:
+            text_parts.append(row["description"])
+        text = " — ".join(text_parts)
+        embedding = embedding_generator.generate_embedding(text)
+        connection.execute_write(
+            "MATCH (n:__Entity__|__SelfModel__ {id: $id}) SET n.embedding = $embedding",
             {"id": row["id"], "embedding": list(embedding)},
         )
     return len(rows)

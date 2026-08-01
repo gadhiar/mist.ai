@@ -29,9 +29,8 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
 
 ### Scripts (`scripts/`)
 - `start_dev.py` - Docker compose stack manager (start / stop / restart / logs)
-- `mist_admin.py` - Admin CLI (seed, replay, graph-stats, graph-reset, vault-rebuild, etc.)
+- `mist_admin.py` - Admin CLI (seed, seed-verify, replay, graph-stats, graph-reset, vault-rebuild, etc.)
 - `check_ai_slop.py` - AI-slop pattern checker (used by pre-commit)
-- `seed_data.yaml` - Knowledge graph seed entities and relationships
 - `eval_harness/` - Phase 3 evaluator + scorers for V1-V8 gauntlets
 
 ---
@@ -111,6 +110,9 @@ Per ADR-010 four-layer memory architecture. Filesystem markdown corpus + sidecar
 ```
 mist-memory/
 ├── MIST.md                      # Vault conventions (auto-loaded per ADR-014)
+├── seed/                        # Versioned seed source (R1.4 spec 2.0)
+│   ├── mist.md                  # Self-model facts + body -- mist_admin.py seed
+│   └── user.md                  # User facts + body -- mist_admin.py seed
 ├── sessions/                    # YYYY-MM-DD-<slug>.md per turn-stream session
 ├── identity/
 │   └── mist.md                  # MIST self-model (traits, prefs, capabilities)

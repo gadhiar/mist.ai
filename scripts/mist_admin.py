@@ -5,7 +5,9 @@ composition root in backend.factories so the CLI exercises the same code paths
 as the running backend.
 
 Tier 1 subcommands (graph operations):
-    seed                                    Apply seed_data.yaml idempotently.
+    seed [--seed-dir DIR]                   Wipe-then-apply the versioned seed
+                                             source (mist-memory/seed/*.md)
+                                             idempotently (R1.4 spec 2.0/O9).
     seed-verify [--seed-dir DIR]            Run facts-present, containment and
                                              negation-proximity gates against the
                                              versioned seed source (R1.4 spec 5).
@@ -56,6 +58,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from backend.knowledge.regeneration.log_regenerator import LogRegenerator
+    from backend.knowledge.seed.models import SeedDocument
 
 # Make `backend` importable when running from the host (mist-ai is not pip-installed).
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -63,7 +66,6 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 REPO_ROOT = _REPO_ROOT
-DEFAULT_SEED_PATH = REPO_ROOT / "scripts" / "seed_data.yaml"
 DEFAULT_SNAPSHOT_DIR = REPO_ROOT / "data" / "graph_snapshots"
 
 logger = logging.getLogger("mist_admin")
@@ -109,51 +111,81 @@ def _load_factories():
 
 
 def cmd_seed(args: argparse.Namespace) -> int:
+    """Wipe-then-apply the versioned seed source (R1.4 spec 2.0/O9).
+
+    Repointed in R1.4 Task 10 from the retired seed-YAML dict path
+    (`load_seed_yaml` + `apply_seed`) onto `load_seed_documents` +
+    `reseed` over `mist-memory/seed/*.md` -- `apply_seed`/`load_seed_yaml`
+    remain in `backend/knowledge/admin.py` (with their own test coverage
+    unaffected) as a follow-up cleanup candidate; nothing calls them
+    anymore.
+
+    `reseed` (not apply-only) matches spec O9: wipe-then-apply under one
+    shared `seed_version` is the contract, and it is the only thing that
+    exercises the wipe half at all -- an apply-only path would leave a
+    fact deleted from the source silently stuck in the graph forever.
+    """
     be = _load_backend()
-    seed_path = Path(args.seed_file) if args.seed_file else DEFAULT_SEED_PATH
-    print(f"[seed] Loading {seed_path}")
-    seed_data = be.admin.load_seed_yaml(seed_path)
+    from backend.knowledge.seed.applier import reseed
+    from backend.knowledge.seed.loader import load_seed_documents
 
-    embedding_generator = None
-    if not args.no_embeddings:
-        from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
+    config = be.get_config()
+    seed_dir = Path(args.seed_dir) if args.seed_dir else Path(config.vault.root) / "seed"
+    print(f"[seed] Loading seed documents from {seed_dir}")
+    documents = load_seed_documents(seed_dir)
+    seed_version = documents[0].seed_version  # loader enforces exactly one shared version
+    print(f"[seed] {len(documents)} document(s) at seed_version={seed_version!r}")
 
-        config = be.get_config()
-        print(f"[seed] Loading embedding model: {config.embedding.model_name}")
-        embedding_generator = EmbeddingGenerator(model_name=config.embedding.model_name)
-
+    now = datetime.now(UTC).isoformat()
     connection = _connect(be)
     try:
-        counts = be.admin.apply_seed(connection, seed_data, embedding_generator=embedding_generator)
+        counts = reseed(connection, documents, seed_version=seed_version, now_iso=now)
+        print("[seed] Applied (wipe-then-apply, idempotent):")
+        for layer, count in counts.items():
+            print(f"  {layer}: {count}")
+        print(f"[seed] Total writes: {sum(counts.values())}")
+
+        # Embedding backfill: the new applier stamps seed_version/created_at/
+        # updated_at only -- it never sets `embedding`, and a second `seed`
+        # run's wipe-then-recreate cycle does not preserve properties the
+        # applier itself does not set. _backfill_embeddings_for_seed matches
+        # on seed_version across BOTH graph partitions (unlike the pre-R1.4
+        # _backfill_embeddings, which is :__Entity__-only and provenance-
+        # scoped -- neither survives this applier's write shape). Disabled
+        # with --no-embeddings.
+        if not args.no_embeddings:
+            from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
+
+            print(f"[seed] Loading embedding model: {config.embedding.model_name}")
+            embedding_generator = EmbeddingGenerator(model_name=config.embedding.model_name)
+            embedded = be.admin._backfill_embeddings_for_seed(
+                connection, embedding_generator, seed_version
+            )
+            print(f"[seed] Embeddings backfilled: {embedded}")
     finally:
         connection.disconnect()
-    print("[seed] Applied (idempotent MERGE):")
-    for layer, count in counts.items():
-        print(f"  {layer}: {count}")
-    print(f"[seed] Total writes: {sum(counts.values())}")
 
     # ADR-010 Cluster 8 Phase 10: vault bootstrap. Mirrors the seeded
-    # identity/user data into the vault as canonical markdown notes and
-    # emits DERIVED_FROM edges from each seeded entity to its source vault
-    # note. Disabled with --no-vault-bootstrap. Skipped automatically when
-    # the vault subsystem is disabled in config.
+    # identity/user documents into the vault as canonical markdown notes.
+    # Disabled with --no-vault-bootstrap. Skipped automatically when the
+    # vault subsystem is disabled in config. R1.4 Task 6 retired the
+    # DERIVED_FROM->VaultNote provenance edge this used to also emit.
     if not getattr(args, "no_vault_bootstrap", False):
-        config = be.get_config()
         if config.vault.enabled:
-            _do_vault_bootstrap(be, config, seed_data)
+            _do_vault_bootstrap(be, config, documents)
         else:
             print("[seed] Vault bootstrap skipped: config.vault.enabled is False")
 
     return 0
 
 
-def _do_vault_bootstrap(be: Any, config: Any, seed_data: dict[str, Any]) -> None:
+def _do_vault_bootstrap(be: Any, config: Any, documents: list[SeedDocument]) -> None:
     """Run the vault bootstrap step for `cmd_seed` (Phase 10).
 
     Builds and starts a VaultWriter, writes identity/mist.md +
-    users/<id>.md from seed_data. Idempotent so re-running `seed` is safe.
-    Vault errors are logged but never propagate -- graph seed already
-    succeeded by the time this runs.
+    users/<id>.md from the seed documents. Idempotent so re-running `seed`
+    is safe. Vault errors are logged but never propagate -- graph seed
+    already succeeded by the time this runs.
     """
     import asyncio
 
@@ -174,7 +206,7 @@ def _do_vault_bootstrap(be: Any, config: Any, seed_data: dict[str, Any]) -> None
         await writer.start()
         try:
             return await be.admin.bootstrap_vault_from_seed(
-                writer, seed_data, rendered_at=rendered_at
+                writer, documents, rendered_at=rendered_at
             )
         finally:
             await writer.stop()
@@ -1380,11 +1412,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True, metavar="SUBCOMMAND")
 
-    p_seed = sub.add_parser("seed", help="Apply seed_data.yaml idempotently.")
+    p_seed = sub.add_parser("seed", help="Wipe-then-apply the versioned seed source idempotently.")
     p_seed.add_argument(
-        "--seed-file",
+        "--seed-dir",
         default=None,
-        help=f"Path to seed YAML (default: {DEFAULT_SEED_PATH}).",
+        help="Path to the seed source directory (default: <vault.root>/seed).",
     )
     p_seed.add_argument(
         "--no-embeddings",
@@ -1397,7 +1429,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Skip vault bootstrap (Phase 10). When omitted and "
             "config.vault.enabled is True, also writes identity/mist.md "
-            "and users/<id>.md and emits seed DERIVED_FROM edges."
+            "and users/<id>.md from the seed documents' bodies."
         ),
     )
     p_seed.set_defaults(func=cmd_seed)

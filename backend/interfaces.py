@@ -98,6 +98,9 @@ class VaultWriterProtocol(Protocol):
         preferences: list[dict],
         rendered_at: str | None = None,
     ) -> str: ...
+    async def upsert_identity_body(
+        self, body_markdown: str, source_path: str, rendered_at: str | None = None
+    ) -> str: ...
     async def upsert_user(
         self, user_id: str, body_markdown: str, rendered_at: str | None = None
     ) -> str: ...

@@ -93,13 +93,14 @@ class EntityNormalizer:
 
     # Bounded curated (id, type) overrides for recurring high-value entities,
     # keyed by CANONICAL id (post _canonicalize / static-alias). Seeded later
-    # from curated vocab (seed_data.yaml), NEVER from F2 probes. Authoritative:
-    # a registry hit overrides both id and type and short-circuits graph dedup
-    # and the resolver passes. Empty for now; populated in a later task.
+    # from curated vocab (the versioned seed source), NEVER from F2 probes.
+    # Authoritative: a registry hit overrides both id and type and
+    # short-circuits graph dedup and the resolver passes. Empty for now;
+    # populated in a later task.
     CANONICAL_REGISTRY: dict[str, tuple[str, str]] = {}
 
     # Bug G guard: reserved names for the MIST system itself always resolve
-    # to the canonical mist-identity node (seeded in scripts/seed_data.yaml).
+    # to the canonical mist-identity node (seeded in mist-memory/seed/mist.md).
     # Extraction that introduces new "mist" or "the-ai" entities pollutes
     # the graph with duplicates of the system's own identity node.
     #

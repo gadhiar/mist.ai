@@ -717,6 +717,7 @@ class ConversationHandler:
         vault_writer: VaultWriterProtocol | None = None,
         invalidation_bus: InvalidationBus | None = None,
         now_fn: Callable[[], datetime] | None = None,
+        session_origin: str = "real",
     ) -> None:
         """Initialize conversation handler.
 
@@ -753,11 +754,21 @@ class ConversationHandler:
                 path injects a FIXED clock so the user-snapshot timestamp is
                 reproducible and the greedy chat reply does not diverge run to
                 run (wired in `backend.factories.build_conversation_handler`).
+            session_origin: Provenance forwarded to `EventStore.start_session`
+                (R1.4 Task 10, closing a gap T3 left open -- the `origin`
+                column existed but nothing ever set it). "real" (default)
+                is genuine usage; the eval harness / probe traffic sets
+                "test" via `MIST_SESSION_ORIGIN`, wired in
+                `KnowledgeConfig.event_store.session_origin` ->
+                `backend.factories.build_conversation_handler`.
         """
         self.config = config
         # Injectable clock (DI seam). Default = real wall-clock so production
         # behavior is unchanged; the replay path supplies a fixed value.
         self._now_fn: Callable[[], datetime] = now_fn or (lambda: datetime.now(UTC))
+        # R1.4 Task 10: provenance forwarded to EventStore.start_session so
+        # harness/probe traffic can be excluded from an R1.6 rebuild.
+        self._session_origin = session_origin
         self.graph_store = graph_store
         self._extraction_pipeline = extraction_pipeline
         self.retriever = retriever
@@ -2001,8 +2012,9 @@ class ConversationHandler:
         """Return the canonical user_id for vault writes.
 
         Returns "user" by default to match the seed-bootstrap convention
-        (`scripts/seed_data.yaml` creates the User entity with `id: "user"`,
-        and `users/user.md` is what bootstrap_vault_from_seed writes to disk).
+        (`mist-memory/seed/user.md`'s filename stem is the User entity's
+        `id`, and `users/user.md` is what bootstrap_vault_from_seed writes
+        to disk).
         `VaultConfig.default_user_id` is honored ONLY if it has been
         explicitly set to something other than the dataclass default "raj"
         (which is vestigial and inconsistent with seed behavior). This keeps
@@ -2203,7 +2215,9 @@ class ConversationHandler:
             # doubles as both the existence check and the turn_index source.
             es_session = self.event_store.get_session(session_id)
             if es_session is None:
-                self.event_store.start_session(session_id, input_modality="text")
+                self.event_store.start_session(
+                    session_id, input_modality="text", origin=self._session_origin
+                )
                 turn_index = 0
             else:
                 turn_index = es_session.turn_count
