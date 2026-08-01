@@ -1090,3 +1090,170 @@ class TestEmbeddings:
 
         assert result.passed, result.failures
         assert generator.calls == ["mist-identity"]
+
+
+def _consistent_graph_rows(documents: list[SeedDocument]) -> dict[str, list[dict]]:
+    """A graph whose stored vectors agree with what `documents` authors.
+
+    Models exactly what `_backfill_embeddings_for_seed` writes: the
+    vector of `embedding_text_for(...)` for each authored node. Building
+    the graph side through the same builder the gate recomputes with is
+    deliberate but does have one blind spot worth naming -- a bug INSIDE
+    `embedding_text_for` moves both sides together and is invisible here.
+    That is precisely what `tests/unit/knowledge/test_embedding_text.py`
+    pins independently, by codepoint. What this fixture DOES establish is
+    the property that matters for the gate: authored text and stored
+    vector are two separate artifacts, and the mutation proof below moves
+    one without the other.
+    """
+    rows: dict[str, list[dict]] = {}
+    for doc in documents:
+        for node in doc.nodes:
+            text = embedding_text_for(
+                getattr(node, "display_name", None), getattr(node, "description", None), node.id
+            )
+            rows[node.id] = [{"embedding": _embedding_of(text)}]
+    return rows
+
+
+class TestEmbeddingGateRealSource:
+    """The same discipline `TestNegationProximityRealSource` established, for
+    the embedding gate: fixtures prove a gate CAN fire, only real source
+    proves it DOES reach real content. C1 passed every fixture-based test
+    it had while examining 0 of 20 real facts.
+
+    `FakeEmbeddingGenerator` is the right double here despite its docstring
+    warning that it is unsuitable for similarity-threshold testing. That
+    warning is about distinguishing SEMANTICALLY near texts, which this
+    gate never does: condition 4 compares a vector against a recomputation
+    from identical input text, and identical input yields cosine exactly
+    1.0 under any deterministic generator, SHA-256-derived or otherwise.
+    Loading the real MiniLM model would add several seconds and an
+    external dependency to the unit tier (budget: whole suite under 30s,
+    no external deps) and would prove nothing this does not. Do not
+    "fix" this to use the real generator.
+    """
+
+    def test_examines_every_node_the_real_source_defines(self):
+        """The quantitative floor. `mist-memory/seed/` currently defines 32
+        nodes (11 in `user.md`, 21 in `mist.md`) -- the exact count the live
+        graph holds, all 32 embedded. A floor rather than an equality so
+        adding a node does not break this, but a gate that stops reaching
+        real nodes -- the C1 failure mode, which was silent -- fails loudly
+        here.
+        """
+        documents = load_seed_documents(_REAL_SEED_DIR)
+        connection = FakeNeo4jConnection(
+            query_router=_router_by_id(_consistent_graph_rows(documents))
+        )
+
+        result = check_embeddings(
+            connection,
+            documents,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert result.examined >= 32, (
+            f"gate examined only {result.examined} real nodes; the real seed source "
+            "defines 32 (11 in user.md, 21 in mist.md). A drop means the gate has "
+            "stopped reaching real content -- the C1 failure mode, which reported "
+            "passed=True the whole time it was examining nothing"
+        )
+
+    def test_passes_against_unmodified_real_source(self):
+        """Sanity: no false positives against real content whose stored
+        vectors agree with it. Without this, a gate that failed everything
+        would satisfy the mutation proof below just as well.
+        """
+        documents = load_seed_documents(_REAL_SEED_DIR)
+        connection = FakeNeo4jConnection(
+            query_router=_router_by_id(_consistent_graph_rows(documents))
+        )
+
+        result = check_embeddings(
+            connection,
+            documents,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert result.passed, result.failures
+
+    def test_every_real_node_authors_its_own_display_name(self):
+        """`embedding_text_for`'s fallback to the bare id is legitimate but
+        must be reached deliberately, never by accident: all 32 real nodes
+        author a `display_name` today, so any node whose embedded text is
+        just its kebab id is a source-authoring defect, not a design
+        choice. Also pins that the 32 texts are distinct -- matching the
+        live graph's verified 32 distinct vectors. Two nodes embedding the
+        same text would be indistinguishable to vector retrieval.
+        """
+        documents = load_seed_documents(_REAL_SEED_DIR)
+
+        texts = [
+            embedding_text_for(
+                getattr(node, "display_name", None), getattr(node, "description", None), node.id
+            )
+            for doc in documents
+            for node in doc.nodes
+        ]
+        bare_ids = [
+            node.id
+            for doc in documents
+            for node in doc.nodes
+            if embedding_text_for(
+                getattr(node, "display_name", None), getattr(node, "description", None), node.id
+            )
+            == node.id
+        ]
+
+        assert bare_ids == [], f"real nodes fell back to the bare id: {bare_ids}"
+        assert len(set(texts)) == len(texts), "two real nodes embed identical text"
+
+    def test_a_display_name_edit_that_left_the_vector_behind_fires_on_that_node_alone(self):
+        """The mutation proof, and the whole reason this gate exists: change
+        one real node's authored text, leave the graph's vector where it
+        was, and the gate must name that node and only that node.
+
+        This is the live-reachable loss mode from `_WIPE_NODES` sparing a
+        node with a conversation-derived edge -- `ON MATCH SET` refreshes
+        the properties, the backfill's `WHERE n.embedding IS NULL` guard
+        skips it, and the vector goes stale in place. Every other gate
+        passes on this graph: the node is present, correctly labeled, has a
+        non-null `display_name`, its facts are intact, and its embedding is
+        384-d and unit-norm.
+        """
+        documents = load_seed_documents(_REAL_SEED_DIR)
+        rows = _consistent_graph_rows(documents)  # the graph as it was BEFORE the edit
+
+        target_doc = next(d for d in documents if any(n.id == "slalom" for n in d.nodes))
+        assert any(
+            getattr(n, "display_name", None) == "Slalom" for n in target_doc.nodes
+        ), "seed content changed; update this plant"
+        edited_nodes = [
+            (
+                n.model_copy(update={"display_name": "Slalom Consulting Group"})
+                if n.id == "slalom"
+                else n
+            )
+            for n in target_doc.nodes
+        ]
+        edited_doc = target_doc.model_copy(update={"nodes": edited_nodes})
+        edited_documents = [edited_doc if d is target_doc else d for d in documents]
+
+        result = check_embeddings(
+            FakeNeo4jConnection(query_router=_router_by_id(rows)),
+            edited_documents,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert not result.passed
+        assert len(result.failures) == 1, result.failures
+        assert "slalom" in result.failures[0]
+        assert "cosine" in result.failures[0]
+        assert result.examined >= 32
