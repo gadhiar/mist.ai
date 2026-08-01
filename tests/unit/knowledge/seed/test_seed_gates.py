@@ -1257,3 +1257,91 @@ class TestEmbeddingGateRealSource:
         assert "slalom" in result.failures[0]
         assert "cosine" in result.failures[0]
         assert result.examined >= 32
+
+    def test_real_source_exercises_both_branches_of_the_text_builder(self):
+        """`embedding_text_for` has two branches and real source uses both, so
+        the real-source proof must reach both.
+
+        `seed/user.md` authors no `description` on any of its 11 nodes;
+        `seed/mist.md` authors one on 14 of its 21. Every entity-partition
+        node therefore embeds on `display_name` alone while most of the
+        self-model embeds `display_name` + separator + description. That
+        asymmetry is legitimate authored content, not a defect -- which is
+        exactly why this asserts coverage of both branches and NOT that any
+        node must carry a description.
+
+        Floors of one, not of the current 18/14 split: a seed edit that adds
+        or removes a description is normal authoring and must not fail a
+        test. A seed edit that leaves the gate exercising only one branch
+        against real content is the C1 shape -- coverage quietly evaporating
+        while every test stays green -- and fails here.
+        """
+        documents = load_seed_documents(_REAL_SEED_DIR)
+
+        # Branch is derived from the builder's own contract -- a text longer
+        # than its leading component took the description branch -- rather
+        # than by searching for the separator, so this does not become a
+        # second place the separator is written down.
+        joined: list[str] = []
+        name_only: list[str] = []
+        for doc in documents:
+            for node in doc.nodes:
+                display_name = getattr(node, "display_name", None)
+                description = getattr(node, "description", None)
+                text = embedding_text_for(display_name, description, node.id)
+                if text == (display_name or node.id):
+                    name_only.append(text)
+                else:
+                    joined.append(text)
+
+        total = len(joined) + len(name_only)
+        assert len(joined) >= 1, (
+            "no real node exercises the display_name + description branch "
+            f"(observed at authoring time: 14 of mist.md's 21 nodes); {total} nodes total"
+        )
+        assert len(name_only) >= 1, (
+            "no real node exercises the display_name-only branch (observed at "
+            f"authoring time: all 11 of user.md's nodes); {total} nodes total"
+        )
+
+    def test_a_description_edit_that_left_the_vector_behind_fires_on_that_node_alone(self):
+        """The second half of the mutation proof, on the description branch.
+
+        The `display_name` plant above perturbs a `seed/user.md` node, which
+        has no description -- so on its own it proves only that the gate
+        notices drift in the FIRST component of the embedded text. A gate
+        that ignored `description` entirely would survive it. This one
+        perturbs the description of a real `seed/mist.md` node and leaves
+        its `display_name` untouched, so only the second component moves.
+        """
+        documents = load_seed_documents(_REAL_SEED_DIR)
+        rows = _consistent_graph_rows(documents)  # the graph as it was BEFORE the edit
+
+        target_doc = next(d for d in documents if any(n.id == "trait-transparent" for n in d.nodes))
+        target = next(n for n in target_doc.nodes if n.id == "trait-transparent")
+        assert getattr(target, "description", None), "seed content changed; update this plant"
+
+        edited_nodes = [
+            (
+                n.model_copy(update={"description": "Shows its work, including tool calls."})
+                if n.id == "trait-transparent"
+                else n
+            )
+            for n in target_doc.nodes
+        ]
+        edited_doc = target_doc.model_copy(update={"nodes": edited_nodes})
+        edited_documents = [edited_doc if d is target_doc else d for d in documents]
+
+        result = check_embeddings(
+            FakeNeo4jConnection(query_router=_router_by_id(rows)),
+            edited_documents,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert not result.passed
+        assert len(result.failures) == 1, result.failures
+        assert "trait-transparent" in result.failures[0]
+        assert "cosine" in result.failures[0]
+        assert result.examined >= 32
