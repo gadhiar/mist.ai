@@ -222,19 +222,28 @@ def _do_vault_bootstrap(be: Any, config: Any, documents: list[SeedDocument]) -> 
 
 
 def cmd_seed_verify(args: argparse.Namespace) -> int:
-    """Run the three seed-verification gates against the versioned seed source.
+    """Run the four seed-verification gates against the versioned seed source.
 
-    `facts-present` is the only gate that touches the graph, and only to
-    read -- it never writes (Gate 2, `backend.knowledge.seed.gates`).
+    `facts-present` and `node-definitions` are the two gates that touch
+    the graph, and only to read -- neither ever writes (Gate 2 and the
+    R1.4 Task 14 node-integrity gate, `backend.knowledge.seed.gates`).
     `containment` and `negation-proximity` check the source against
     itself and need no connection at all. Exits non-zero if any gate
     fails, so this is safe to wire into a pre-rebuild check.
+
+    `node-definitions` exists because `facts-present` alone was not
+    enough: R1.4 Task 10's live wipe-and-recreate defect stripped every
+    node's ontology label and descriptive property while leaving the
+    edges those facts describe intact (MERGE recreated them from the
+    source), so `facts-present` passed throughout on a graph that had
+    lost everything else.
     """
     be = _load_backend()
     from backend.knowledge.seed.gates import (
         check_containment,
         check_facts_present,
         check_negation_proximity,
+        check_node_definitions,
     )
     from backend.knowledge.seed.loader import load_seed_documents
 
@@ -251,6 +260,10 @@ def cmd_seed_verify(args: argparse.Namespace) -> int:
             (
                 "facts-present",
                 check_facts_present(connection, documents, seed_version=seed_version),
+            ),
+            (
+                "node-definitions",
+                check_node_definitions(connection, documents, seed_version=seed_version),
             ),
             ("containment", check_containment(documents)),
             ("negation-proximity", check_negation_proximity(documents)),

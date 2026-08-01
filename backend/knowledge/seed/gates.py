@@ -1,7 +1,8 @@
 """Verification gates for the versioned seed source.
 
-Three independent gates check different failure classes after a seed
-source is loaded (R1.4 spec section 5):
+Four independent gates check different failure classes after a seed
+source is loaded (R1.4 spec section 5, `check_node_definitions` added by
+the Task 11-14 addendum):
 
 - `check_facts_present` -- the graph actually holds what the source says
   it should. This is the gate that cannot be satisfied vacuously: it
@@ -10,6 +11,13 @@ source is loaded (R1.4 spec section 5):
   would hold just as well if both sides were empty, which is exactly how
   this sub-project lost 32 nodes / 30 relationships with zero provenance
   in the first place.
+- `check_node_definitions` -- every seeded NODE (not just every fact)
+  carries its ontology type label and a display name in the live graph.
+  This is the gate Task 10's live defect needed and did not have: Gate 2
+  checks that authored facts are present, and the wipe-and-recreate cycle
+  that stripped every node's ontology label and descriptive property left
+  the edges intact (MERGE recreated them from the source's facts), so
+  Gate 2 passed on a graph that had lost everything else.
 - `check_containment` -- the prose and the frontmatter facts agree on
   which entities they mention.
 - `check_negation_proximity` -- the prose does not obviously contradict
@@ -111,8 +119,93 @@ def check_facts_present(
     return GateResult(passed=not failures, failures=failures)
 
 
+# One MATCH clause carrying BOTH the document's partition label and the
+# node's ontology type label (`:{partition}:{type}`) -- a node missing
+# EITHER label fails to bind and is reported, rather than needing two
+# separate checks. This is deliberately the same interpolate-and-pin
+# discipline as `_CHECK_FACT_QUERY`'s predicate: Neo4j cannot parameterize
+# a label, and a query that only checked `display_name IS NOT NULL`
+# without also re-asserting the labels in the MATCH pattern would still
+# pass on a node holding the right property under the wrong label.
+_CHECK_NODE_QUERY = (
+    "MATCH (n:%s:%s {id: $id}) "
+    "WHERE n.seed_version = $seed_version AND n.display_name IS NOT NULL "
+    "RETURN count(n) AS n"
+)
+
+
+def check_node_definitions(
+    connection: GraphConnection,
+    documents: list[SeedDocument],
+    *,
+    seed_version: str,
+) -> GateResult:
+    """Verify every seeded node carries its ontology type label and a display name.
+
+    This is the gate R1.4 Task 10's live defect needed and did not have.
+    `reseed()`'s wipe-then-apply cycle stripped every node's ontology type
+    label (`MistIdentity`, `MistTrait`, `User`, `Organization`, ...) and
+    every descriptive property (including `display_name`) down to a bare
+    partition label plus `id`/timestamps/`seed_version` -- and
+    `check_facts_present` (Gate 2) passed throughout, because the edges
+    those facts describe were recreated correctly from the source; only
+    the NODES lost their identity. This gate checks the nodes directly:
+    for every `SeedNode` the source defines, the live graph node must
+    match on both its document's partition label and its ontology type
+    label in one MATCH clause (a node missing either fails to bind) and
+    carry a non-null `display_name`.
+
+    Read-only: issues `execute_query` only, never `execute_write`.
+
+    Args:
+        connection: Sync graph connection.
+        documents: Parsed seed documents to check.
+        seed_version: The version stamp every present node must carry.
+
+    Returns:
+        `GateResult` with one failure line per node whose live graph
+        counterpart is missing its partition label, its ontology type
+        label, or a non-null `display_name`.
+    """
+    failures: list[str] = []
+    for doc in documents:
+        for node in doc.nodes:
+            query = _CHECK_NODE_QUERY % (doc.partition, node.type)
+            results = connection.execute_query(
+                query,
+                {"id": node.id, "seed_version": seed_version},
+            )
+            if _count(results) < 1:
+                failures.append(
+                    f"{doc.source_path}: node {node.id!r} is missing its "
+                    f"{doc.partition!r} partition label, its {node.type!r} ontology "
+                    f"type label, or a non-null display_name at "
+                    f"seed_version={seed_version!r}"
+                )
+    return GateResult(passed=not failures, failures=failures)
+
+
 def check_containment(documents: list[SeedDocument]) -> GateResult:
-    """Verify every fact's object appears as a substring of its document body.
+    """Verify every fact's object is mentioned by display name in its document body.
+
+    R1.4 Task 14: matches on the object node's `SeedNode.display_name`
+    (Task 11), not the raw `fact.object` id. The original Task 9
+    implementation checked the raw id as a literal substring, which is
+    structurally unable to pass against real prose -- `fact.object` is a
+    kebab id (`trait-transparent`); the prose describes it by display
+    name (`**Transparent**`), a string the id never equals. 29 of 30 real
+    facts failed under that check. A prefix-strip/hyphen-collapse
+    normalization was scoped as the fix during Task 10 but never
+    implemented; by the time this landed, Task 11 had given every node an
+    exact `display_name`, which is strictly better than a heuristic
+    reconstruction of one -- use it directly instead.
+
+    Falls back to the raw `fact.object` id when the object has no
+    matching `SeedNode` (referential integrity is `load_seed_documents`'s
+    job, not this gate's -- see Task 11) or the node defines no
+    `display_name`, so a fact is never silently skipped over.
+
+    Case-insensitive: `slalom` must find `Slalom`.
 
     Does NOT prove semantic agreement. It proves the prose mentions the
     same entities the frontmatter asserts. Semantic inversion is the job
@@ -125,15 +218,22 @@ def check_containment(documents: list[SeedDocument]) -> GateResult:
         documents: Parsed seed documents to check.
 
     Returns:
-        `GateResult` with one failure line per fact whose object does not
-        appear in its own document's body.
+        `GateResult` with one failure line per fact whose object's display
+        name (or raw id, if undefined) does not appear in its own
+        document's body.
     """
+    node_by_id = {node.id: node for doc in documents for node in doc.nodes}
     failures: list[str] = []
     for doc in documents:
+        body_lower = doc.body.lower()
         for fact in doc.facts:
-            if fact.object not in doc.body:
+            node = node_by_id.get(fact.object)
+            display_name = getattr(node, "display_name", None) if node is not None else None
+            search_term = display_name or fact.object
+            if search_term.lower() not in body_lower:
                 failures.append(
                     f"{doc.source_path}: fact object {fact.object!r} "
+                    f"(searched for {search_term!r}) "
                     f"({fact.subject} {fact.predicate} {fact.object}) not found in "
                     "document body"
                 )

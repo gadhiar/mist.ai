@@ -14,12 +14,32 @@ source itself declares: 11 `:__Entity__` (anchor entities + the user) and
 21 `:__SelfModel__` (identity + traits + capabilities + preferences),
 0 `:__Provenance__`.
 
-This test performs a FULL graph wipe (`reset_graph(include_derived=True)`)
-against whatever `NEO4J_URI` the integration environment resolves to --
-verified to be the same live `mist-neo4j` instance `mist_admin.py seed`
-targets, not an isolated test database. Anyone running `tests/integration/`
-mutates the live graph as a side effect of this one test; back up the graph
-before running the integration suite, not only before a manual `seed` run.
+This test performs a FULL graph wipe (`reset_graph(include_derived=True)`).
+Until R1.4 Task 14 it ran unguarded against whatever `NEO4J_URI` the
+integration environment resolves to -- confirmed to be the same live
+`mist-neo4j` instance `mist_admin.py seed` targets, not an isolated test
+database, and confirmed to destroy real data: a live run against production
+wiped the seeded profile's embeddings during this task. This hazard is
+inherited from the original ADR-009 test (git history: `07f6aac`), not
+introduced by R1.4 -- T10's rewrite changed the seed-load call and the
+assertion counts and added a docstring warning, but the unguarded
+`real_neo4j_connection` fixture itself was untouched; `CODEBASE.md`'s R1.3
+entry already flagged the same hazard with the same proposed fix before this
+sub-project started.
+
+T14: `real_neo4j_connection` now SKIPS unless `MIST_EVAL_ISOLATION` is
+active, and validates its target through
+`backend.knowledge.eval_isolation.assert_neo4j_isolated` so a misconfigured
+`NEO4J_URI` (e.g. still pointed at the live instance) refuses rather than
+wiping the canonical graph. This test therefore no longer runs in the
+default `tests/integration/` pass -- a real coverage loss, accepted because
+the alternative is coverage purchased by periodically wiping the user's
+memory. To run it: stand up the disposable eval instance
+(`docker compose -f docker-compose.yml -f docker-compose.eval-neo4j.yml
+--profile eval up -d mist-neo4j-eval`) and point `NEO4J_URI` at
+`bolt://mist-neo4j-eval:7687` with `MIST_EVAL_ISOLATION=1`. Wiring that up
+by default (so this test genuinely runs again) is follow-up work, not done
+here.
 """
 
 from __future__ import annotations
@@ -32,6 +52,7 @@ import pytest
 
 from backend.knowledge import admin
 from backend.knowledge.config import Neo4jConfig
+from backend.knowledge.eval_isolation import assert_neo4j_isolated, is_eval_isolation_active
 from backend.knowledge.seed.applier import reseed
 from backend.knowledge.seed.loader import load_seed_documents
 from backend.knowledge.storage.neo4j_connection import Neo4jConnection
@@ -44,12 +65,30 @@ _SEED_DIR = _REPO_ROOT / "mist-memory" / "seed"
 
 @pytest.fixture
 def real_neo4j_connection():
-    """Provide a real Neo4jConnection targeting the running mist-neo4j container."""
+    """Provide a real Neo4jConnection targeting a disposable eval Neo4j instance.
+
+    Fail-closed by default: this test performs a full graph wipe, so it
+    SKIPS unless the caller has explicitly opted into eval isolation
+    (`MIST_EVAL_ISOLATION=1`), and even then routes the resolved config
+    through `assert_neo4j_isolated` -- a misconfigured `NEO4J_URI` that still
+    resolves to the live instance refuses rather than wiping it. See the
+    module docstring for the incident that motivated this and how to run
+    the test deliberately.
+    """
+    if not is_eval_isolation_active():
+        pytest.skip(
+            "test_seed_label_split.py performs a full graph wipe "
+            "(reset_graph(include_derived=True)) and must not run against the "
+            "live graph. Set MIST_EVAL_ISOLATION=1 and point NEO4J_URI at a "
+            "disposable instance (docker-compose.eval-neo4j.yml, --profile eval) "
+            "to run it."
+        )
     config = Neo4jConfig(
         uri=os.environ.get("NEO4J_URI", "bolt://localhost:7687"),
         username=os.environ.get("NEO4J_USER", "neo4j"),
         password=os.environ.get("NEO4J_PASSWORD", "password"),
     )
+    assert_neo4j_isolated(config)
     conn = Neo4jConnection(config=config)
     conn.connect()
     yield conn
