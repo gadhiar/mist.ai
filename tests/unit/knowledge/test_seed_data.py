@@ -8,9 +8,23 @@ The old source's structured per-preference dicts (`enforcement`,
 in the document's prose body, so the content assertions below check the
 body text rather than a structured field, and the presence/regression
 assertions check the fact list.
+
+R1.4 Task 11 (ADDENDUM): `load_seed_documents` now enforces referential
+integrity -- every fact's subject/object must have a matching `SeedNode`.
+`mist-memory/seed/mist.md` does not carry a `nodes:` block yet (that is
+Task 13's job: re-authoring the seed source with node definitions), so
+loading the REAL file now correctly raises `SeedSourceError` before this
+class's assertions ever run. This is the referential-integrity gate
+working exactly as designed against the real, still-incomplete seed
+source -- not a regression in this test file or in the loader. Marked
+`xfail(strict=True)` so it surfaces loudly (as an unexpected pass, which
+`strict=True` turns into a failure) the moment Task 13 lands and this
+class should go back to a real, enforced assertion.
 """
 
 from pathlib import Path
+
+import pytest
 
 from backend.knowledge.seed.loader import load_seed_documents
 from backend.knowledge.storage.partitions import SELF_MODEL_LABEL
@@ -36,6 +50,14 @@ def _has_preference_targets(document) -> set[str]:
     }
 
 
+@pytest.mark.xfail(
+    reason=(
+        "mist-memory/seed/mist.md has no `nodes:` block yet (R1.4 Task 13); "
+        "load_seed_documents' referential-integrity check (Task 11) correctly "
+        "rejects it until Task 13 lands. Remove this marker once it does."
+    ),
+    strict=True,
+)
 class TestMistPreferenceNoAiSlop:
     """Cluster 3: pref-no-ai-slop preference exists and has HAS_PREFERENCE edge from mist-identity."""
 

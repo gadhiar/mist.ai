@@ -1,15 +1,17 @@
 """Read and validate the versioned seed source from the vault."""
 
+import difflib
 import logging
 from pathlib import Path
 
 from pydantic import ValidationError
 
 from backend.errors import SeedSourceError
+from backend.knowledge.ontologies import ALL_NODE_TYPE_NAMES
 from backend.knowledge.storage.partitions import ENTITY_LABEL
 from backend.vault.models import parse_frontmatter
 
-from .models import SeedDocument, SeedFact
+from .models import SeedDocument, SeedFact, SeedNode
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +30,16 @@ def load_seed_documents(seed_dir: Path) -> list[SeedDocument]:
     Raises:
         SeedSourceError: The directory is missing or empty, a document is
             malformed (including an unrecognized `partition` value -- see
-            `SeedDocument.partition`), or the documents disagree on
-            `seed_version`. One global version is the contract (spec O10);
+            `SeedDocument.partition`), the documents disagree on
+            `seed_version` (one global version is the contract, spec O10;
             disagreement is a bug rather than something to reconcile
-            silently.
+            silently), a node's `type` is not a recognized ontology node
+            type, a node `id` is defined more than once (within or across
+            documents), or a fact's `subject`/`object` has no matching node
+            definition anywhere in the seed source (R1.4 Task 11 -- the
+            exact shape of the Task 10 live defect: a fact referencing an
+            undefined node used to write silently instead of failing to
+            load).
     """
     if not seed_dir.is_dir():
         raise SeedSourceError(f"Seed directory does not exist: {seed_dir}")
@@ -65,6 +73,11 @@ def load_seed_documents(seed_dir: Path) -> list[SeedDocument]:
             raise SeedSourceError(f"{path}: missing `seed_version`")
 
         try:
+            nodes = [SeedNode(**n) for n in fm.get("nodes", [])]
+        except (ValidationError, TypeError) as exc:
+            raise SeedSourceError(f"{path}: invalid `nodes` entry: {exc}") from exc
+
+        try:
             facts = [SeedFact(**f) for f in fm.get("facts", [])]
         except (ValidationError, TypeError) as exc:
             raise SeedSourceError(f"{path}: invalid `facts` entry: {exc}") from exc
@@ -84,6 +97,7 @@ def load_seed_documents(seed_dir: Path) -> list[SeedDocument]:
         try:
             doc = SeedDocument(
                 seed_version=str(version),
+                nodes=nodes,
                 facts=facts,
                 body=body,
                 source_path=path,
@@ -103,4 +117,111 @@ def load_seed_documents(seed_dir: Path) -> list[SeedDocument]:
             "One global version is the contract."
         )
 
+    # R1.4 Task 11 (ADDENDUM): whole-corpus node/fact validation, run only
+    # after every document has parsed successfully and the version check has
+    # passed -- these three checks operate across ALL documents together
+    # (a fact in one file may reference a node defined in another), so
+    # per-document validation cannot do them.
+    _validate_node_types(docs)
+    _validate_unique_node_ids(docs)
+    _validate_referential_integrity(docs)
+
     return docs
+
+
+def _validate_node_types(documents: list[SeedDocument]) -> None:
+    """Reject any node whose `type` is not a known ontology node type.
+
+    Mirrors `applier.py`'s `_validate_predicates` in shape (same
+    closest-match-suggestion pattern) but lives here, at load time, rather
+    than only at the Cypher-interpolation boundary -- unlike `predicate`,
+    which validates only in `applier.py` (Task 4 found that validating it
+    here would break Task 1's own fixture, which deliberately uses a
+    predicate outside the ontology for loader-only testing). `type` has no
+    such conflict, and Task 12's applier-side check is intentionally
+    redundant with this one, for the same reason `_validate_predicates`
+    guards the Cypher interpolation site directly rather than trusting an
+    upstream check alone.
+
+    Args:
+        documents: Parsed seed documents to validate.
+
+    Raises:
+        SeedSourceError: A node's `type` is not in `ALL_NODE_TYPE_NAMES`,
+            naming the type, the node id, the source file, and the closest
+            allowed type if there is an obvious near-match.
+    """
+    allowed = set(ALL_NODE_TYPE_NAMES)
+    for doc in documents:
+        for node in doc.nodes:
+            if node.type in allowed:
+                continue
+            suggestion = difflib.get_close_matches(node.type, ALL_NODE_TYPE_NAMES, n=1)
+            hint = f" Closest allowed type: {suggestion[0]!r}." if suggestion else ""
+            raise SeedSourceError(
+                f"{doc.source_path}: node {node.id!r} has unknown type {node.type!r}, "
+                f"not a recognized ontology node type.{hint}"
+            )
+
+
+def _validate_unique_node_ids(documents: list[SeedDocument]) -> None:
+    """Reject a node `id` defined more than once, within or across documents.
+
+    Two documents (or two entries in one document) both claiming the same
+    node id is an authoring conflict -- the same id cannot mean two
+    different node definitions, and silently letting the last one win would
+    make the seed source's meaning depend on file iteration order.
+
+    Args:
+        documents: Parsed seed documents to validate.
+
+    Raises:
+        SeedSourceError: A node id appears more than once, naming the id
+            and both source files.
+    """
+    seen: dict[str, Path] = {}
+    for doc in documents:
+        for node in doc.nodes:
+            first_seen = seen.get(node.id)
+            if first_seen is not None:
+                raise SeedSourceError(
+                    f"{doc.source_path}: node id {node.id!r} is already defined in "
+                    f"{first_seen} -- node ids must be unique across the whole seed source"
+                )
+            seen[node.id] = doc.source_path
+
+
+def _validate_referential_integrity(documents: list[SeedDocument]) -> None:
+    """Every fact's `subject` and `object` must have a matching `SeedNode`.
+
+    This is the exact shape of the R1.4 Task 10 live defect: a fact
+    referencing a node id the seed source never defines used to write
+    silently -- the applier's `_MERGE_NODE` stamped `seed_version`/
+    `created_at`/`updated_at` on whatever id it was handed and moved on,
+    producing a graph node with no ontology label and no descriptive
+    properties. Failing loudly here, before any graph write is attempted,
+    is what would have caught it. Checked across the WHOLE corpus (a fact
+    in `user.md` may reference a node defined in `mist.md`, or vice versa),
+    not per-document.
+
+    Args:
+        documents: Parsed seed documents to validate.
+
+    Raises:
+        SeedSourceError: A fact's `subject` or `object` has no matching
+            `SeedNode.id` anywhere in `documents`, naming the missing id,
+            which role it played (subject/object), the offending fact, and
+            the source file.
+    """
+    all_ids = {node.id for doc in documents for node in doc.nodes}
+    for doc in documents:
+        for fact in doc.facts:
+            for role, node_id in (("subject", fact.subject), ("object", fact.object)):
+                if node_id in all_ids:
+                    continue
+                raise SeedSourceError(
+                    f"{doc.source_path}: fact {role} {node_id!r} "
+                    f"({fact.subject} {fact.predicate} {fact.object}) has no matching "
+                    "node definition -- every fact's subject and object must appear as "
+                    "a node id somewhere in the seed source's `nodes:` blocks"
+                )

@@ -50,6 +50,54 @@ class SeedFact(BaseModel):
         return v.strip()
 
 
+class SeedNode(BaseModel):
+    """One node definition destined for the graph: ontology type + descriptive properties.
+
+    R1.4 Task 11 (ADDENDUM), added after Task 10's live run proved the seed
+    source could express FACTS (edges) but not NODE DEFINITIONS. A fact
+    referencing a node id with no `SeedNode` behind it used to write
+    silently -- the applier's `_MERGE_NODE` stamped `seed_version`/
+    `created_at`/`updated_at` on whatever id it was handed and moved on,
+    which is exactly how `reseed()`'s wipe-then-recreate cycle stripped
+    every ontology label and descriptive property off the live graph (see
+    the Task 10 report). `_validate_referential_integrity` in `loader.py` is
+    what would have caught it: a fact with no matching `SeedNode` now fails
+    to load at all, before any graph write is attempted.
+
+    `extra="allow"`, DELIBERATELY THE OPPOSITE of `SeedFact`'s
+    `extra="forbid"`, and not an inconsistency to "fix": `SeedFact`'s field
+    set is closed (subject/predicate/object/valid_from/valid_to) -- a
+    typo'd key silently dropping was a real Task 1 finding (I2), which is
+    exactly what `extra="forbid"` guards against there. `SeedNode`'s
+    property set is genuinely open by design: the identity node carries
+    `pronouns`/`self_concept`/`personality_summary`/`age_analog`/`origin`
+    that no other node has, traits carry `axis`, preferences carry
+    `enforcement`, and anchor entities carry neither -- this mirrors the
+    retired `apply_seed`'s per-entity YAML dicts, which had exactly this
+    shape (structural `id`/`type` plus whatever descriptive fields that
+    entity's kind uses). `extra="forbid"` here would reject every node's
+    own type-specific properties, which is the opposite of what this model
+    exists to carry.
+
+    `type` is NOT validated against the ontology in this model (mirrors
+    `SeedFact.predicate`, which is also unvalidated here) -- see
+    `loader.py`'s `_validate_node_types`, which does it as a standalone
+    pass, the same shape as `applier.py`'s `_validate_predicates`.
+    """
+
+    model_config = {"extra": "allow"}
+
+    id: str
+    type: str
+
+    @field_validator("id", "type")
+    @classmethod
+    def _non_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("id and type must be non-empty")
+        return v.strip()
+
+
 class SeedDocument(BaseModel):
     """One parsed seed markdown file.
 
@@ -76,11 +124,16 @@ class SeedDocument(BaseModel):
     `_validate_predicates` docstring) because the ontology's relationship
     types are too large and version-dependent to enumerate as a `Literal`.
     Defaults to the entity partition, the common case.
+
+    `nodes`: node definitions this document authors (R1.4 Task 11). Defaults
+    to empty for the same reason `facts` does -- a prose-only document that
+    defines no nodes and asserts no facts is legitimate.
     """
 
     model_config = {"extra": "forbid"}
 
     seed_version: str
+    nodes: list[SeedNode] = Field(default_factory=list)
     facts: list[SeedFact] = Field(default_factory=list)
     body: str
     source_path: Path
