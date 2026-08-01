@@ -8,9 +8,10 @@ Tier 1 subcommands (graph operations):
     seed [--seed-dir DIR]                   Wipe-then-apply the versioned seed
                                              source (mist-memory/seed/*.md)
                                              idempotently (R1.4 spec 2.0/O9).
-    seed-verify [--seed-dir DIR]            Run facts-present, containment and
-                                             negation-proximity gates against the
-                                             versioned seed source (R1.4 spec 5).
+    seed-verify [--seed-dir DIR]            Run the five gates (facts-present,
+                                             node-definitions, containment,
+                                             negation-proximity, embeddings)
+                                             against the versioned seed source.
     graph-dump [--format json|cypher]       Dump full __Entity__ subgraph.
     graph-stats                             Node/rel counts, confidence, orphans.
     graph-reset [--confirm] [--dry-run]     Wipe graph with safety guards.
@@ -155,6 +156,7 @@ def cmd_seed(args: argparse.Namespace) -> int:
         # with --no-embeddings.
         if not args.no_embeddings:
             from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
+            from backend.knowledge.seed.gates import check_embeddings
 
             print(f"[seed] Loading embedding model: {config.embedding.model_name}")
             embedding_generator = EmbeddingGenerator(model_name=config.embedding.model_name)
@@ -162,6 +164,28 @@ def cmd_seed(args: argparse.Namespace) -> int:
                 connection, embedding_generator, seed_version
             )
             print(f"[seed] Embeddings backfilled: {embedded}")
+
+            # I7: verify here, not only in `seed-verify`. The backfill runs
+            # AFTER the graph writes have already committed, so a failure in
+            # it (model load, cache miss, OOM) leaves a fully-seeded,
+            # fully-unembedded graph that every other gate passes -- which is
+            # the shape of both historical live losses. Reporting the count
+            # alone proves nothing: it counts rows the backfill THOUGHT it
+            # wrote, from the same code that failed to write them.
+            embedding_gate = check_embeddings(
+                connection,
+                documents,
+                seed_version=seed_version,
+                embedding_generator=embedding_generator,
+                expected_dimension=config.embedding.dimension,
+            )
+            status = "PASS" if embedding_gate.passed else "FAIL"
+            print(f"[seed] Embedding gate: {status} ({embedding_gate.examined} nodes examined)")
+            for failure in embedding_gate.failures:
+                print(f"  - {failure}")
+            if not embedding_gate.passed:
+                print("[seed] Seed applied but embeddings are NOT verified -- see above")
+                return 1
     finally:
         connection.disconnect()
 
@@ -222,11 +246,10 @@ def _do_vault_bootstrap(be: Any, config: Any, documents: list[SeedDocument]) -> 
 
 
 def cmd_seed_verify(args: argparse.Namespace) -> int:
-    """Run the four seed-verification gates against the versioned seed source.
+    """Run the five seed-verification gates against the versioned seed source.
 
-    `facts-present` and `node-definitions` are the two gates that touch
-    the graph, and only to read -- neither ever writes (Gate 2 and the
-    R1.4 Task 14 node-integrity gate, `backend.knowledge.seed.gates`).
+    `facts-present`, `node-definitions` and `embeddings` are the three
+    gates that touch the graph, and only to read -- none ever writes.
     `containment` and `negation-proximity` check the source against
     itself and need no connection at all. Exits non-zero if any gate
     fails, so this is safe to wire into a pre-rebuild check.
@@ -237,10 +260,24 @@ def cmd_seed_verify(args: argparse.Namespace) -> int:
     edges those facts describe intact (MERGE recreated them from the
     source), so `facts-present` passed throughout on a graph that had
     lost everything else.
+
+    `embeddings` (I7) exists because the same argument applies once more,
+    to a property none of the other four read. Embeddings have been lost
+    on live data TWICE, and no gate could see either loss:
+    `canonical_serialize.py` excludes `embedding` from the canonical
+    form, so `assert_rebuild_twice_identical` and `live_vs_rebuilt_report`
+    are byte-identical whether every vector is present, absent or
+    all-zero. The blindness is structural, not an oversight.
+
+    Note `embeddings` FAILS after a `seed --no-embeddings` run. That is
+    correct and intended -- that flag's own help says vector retrieval
+    will miss, and a graph in that state genuinely is incomplete.
     """
     be = _load_backend()
+    from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
     from backend.knowledge.seed.gates import (
         check_containment,
+        check_embeddings,
         check_facts_present,
         check_negation_proximity,
         check_node_definitions,
@@ -253,6 +290,13 @@ def cmd_seed_verify(args: argparse.Namespace) -> int:
     documents = load_seed_documents(seed_dir)
     seed_version = documents[0].seed_version  # loader enforces exactly one shared version
     print(f"[seed-verify] {len(documents)} document(s) at seed_version={seed_version!r}")
+
+    # `embeddings` is the only gate needing the embedding model, so it is
+    # constructed here rather than at import: `backend.knowledge.embeddings`
+    # exports `EmbeddingGenerator` lazily (I7 T1) precisely so the other four
+    # gates do not pay a ~2.8s `sentence_transformers` import they never use.
+    print(f"[seed-verify] Loading embedding model: {config.embedding.model_name}")
+    embedding_generator = EmbeddingGenerator(model_name=config.embedding.model_name)
 
     connection = _connect(be)
     try:
@@ -267,6 +311,16 @@ def cmd_seed_verify(args: argparse.Namespace) -> int:
             ),
             ("containment", check_containment(documents)),
             ("negation-proximity", check_negation_proximity(documents)),
+            (
+                "embeddings",
+                check_embeddings(
+                    connection,
+                    documents,
+                    seed_version=seed_version,
+                    embedding_generator=embedding_generator,
+                    expected_dimension=config.embedding.dimension,
+                ),
+            ),
         ]
     finally:
         connection.disconnect()
@@ -1449,7 +1503,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_seed_verify = sub.add_parser(
         "seed-verify",
-        help="Run facts-present, containment and negation-proximity gates on the seed source.",
+        help=(
+            "Run the five gates (facts-present, node-definitions, containment, "
+            "negation-proximity, embeddings) on the seed source."
+        ),
     )
     p_seed_verify.add_argument(
         "--seed-dir",
