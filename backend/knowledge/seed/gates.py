@@ -1,8 +1,8 @@
 """Verification gates for the versioned seed source.
 
-Four independent gates check different failure classes after a seed
+Five independent gates check different failure classes after a seed
 source is loaded (R1.4 spec section 5, `check_node_definitions` added by
-the Task 11-14 addendum):
+the Task 11-14 addendum, `check_embeddings` by I7):
 
 - `check_facts_present` -- the graph actually holds what the source says
   it should. This is the gate that cannot be satisfied vacuously: it
@@ -26,6 +26,15 @@ the Task 11-14 addendum):
   the R1.4 whole-branch review, after Task 14 fixed containment's half of
   this and left negation-proximity searching the raw kebab id -- which
   real prose never contains, so the gate passed having scanned nothing).
+- `check_embeddings` -- every seeded node carries a vector that is
+  present, correctly shaped, non-zero, and computed from the text the
+  source currently authors. This is the only gate that can see anything
+  about embeddings at all: `canonical_serialize` excludes `embedding`
+  from the canonical form, so `assert_rebuild_twice_identical` and
+  `live_vs_rebuilt_report` are byte-identical whether embeddings are
+  present, absent, or all-zero -- the blindness is structural, not an
+  oversight. Two live losses had already happened before this gate
+  existed, both invisible to all four gates above.
 
 None of these alone is sufficient, and none of them together proves
 semantic agreement between prose and facts -- see each gate's own
@@ -38,10 +47,12 @@ structured home so inversions rarely become prose-only edits.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 
-from backend.interfaces import GraphConnection
-from backend.knowledge.seed.models import SeedDocument
+from backend.interfaces import EmbeddingProvider, GraphConnection
+from backend.knowledge.embeddings.embedding_text import embedding_text_for
+from backend.knowledge.seed.models import SeedDocument, SeedNode
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
 logger = logging.getLogger(__name__)
@@ -55,10 +66,26 @@ class GateResult:
     carries one human-readable line per problem found, naming the source
     document and the specific fact involved -- see each `check_*`
     function for the exact message shape.
+
+    `examined` is how many units of work the gate actually inspected, so
+    that "did it look at anything?" is a query rather than a hope. R1.4's
+    C1: `check_negation_proximity` reported `passed=True` having examined
+    0 of 20 self-model facts, and nothing in the result could say so --
+    the pass and the vacuous pass were indistinguishable.
+
+    It defaults to 0 and ONLY `check_embeddings` populates it. Reading
+    `examined` off any of the other four gates therefore tells you
+    nothing: `check_containment(...).examined == 0` means "this gate does
+    not report a count", not "this gate examined nothing". The default is
+    deliberate -- it leaves the four pre-existing gates and every one of
+    their tests untouched -- but it is a footgun for anyone who later
+    treats `examined == 0` as a universal vacuity check, so populate it
+    in any gate that grows one rather than inferring it here.
     """
 
     passed: bool
     failures: list[str]
+    examined: int = 0
 
 
 # The subject/object MATCH clauses use the label union
@@ -187,6 +214,205 @@ def check_node_definitions(
                     f"seed_version={seed_version!r}"
                 )
     return GateResult(passed=not failures, failures=failures)
+
+
+# Returns the vector and NOTHING else. `check_embeddings` must not be
+# able to read the graph's own `display_name`/`description` even by
+# accident: it recomputes from the authored seed source, and a gate that
+# recomputed from the graph's properties would agree with itself by
+# construction whenever the applier and the backfill were both wrong in
+# the same way. Stale text is precisely the case where the graph's
+# properties are RIGHT and only its vector is old, so reading them back
+# would turn the comparison into a tautology. Withholding the columns is
+# stronger than declining to use them -- see Gate 2's docstring for the
+# same "the authored source is ground truth" discipline.
+_CHECK_EMBEDDING_QUERY = (
+    "MATCH (n:%s {id: $id}) "
+    "WHERE n.seed_version = $seed_version "
+    "RETURN n.embedding AS embedding"
+)
+
+# Below this L2 norm a stored vector is treated as the zero vector.
+# `EmbeddingGenerator.generate_embedding` returns `[0.0] * 384` for empty
+# or whitespace-only text -- right width, not null, and matching nothing
+# at query time, so only a norm check can see it. Not exact `== 0.0`:
+# float round-tripping through Neo4j and back is exact for zero today,
+# but an epsilon costs nothing and a near-zero vector is just as useless.
+_MIN_L2_NORM = 1e-6
+
+# Cosine floor for "this vector was computed from this text".
+# sentence-transformers is deterministic in eval mode, so the honest
+# comparison is equality -- but pinning bit-identity across processes,
+# library versions and hardware would make the gate brittle without
+# detecting anything more. Every real failure mode this catches (stale
+# text, a cross-wired vector, a different model) moves cosine far below
+# this, not marginally: two unrelated MiniLM sentence vectors sit around
+# 0.0-0.3, and even a one-word edit moves well past 0.001.
+_MIN_COSINE = 0.999
+
+
+def check_embeddings(
+    connection: GraphConnection,
+    documents: list[SeedDocument],
+    *,
+    seed_version: str,
+    embedding_generator: EmbeddingProvider,
+    expected_dimension: int,
+) -> GateResult:
+    """Verify every seeded node's stored vector matches its authored source text.
+
+    The gate the two live embedding losses needed and did not have. It is
+    the only check in the codebase that can see anything about embeddings
+    at all: `canonical_serialize` excludes `embedding` from the canonical
+    form, so every determinism and equality check in this sub-project is
+    byte-identical whether embeddings are present, absent, or all-zero.
+
+    Four conditions, in order, at most one failure line per node (a
+    dimension mismatch makes the cosine comparison meaningless, so later
+    conditions do not run once an earlier one fires):
+
+    1. The node is absent from the graph, or its `embedding` is null.
+       Reached by `--no-embeddings`, by a backfill that raised after the
+       graph writes had already committed, and by a post-wipe recreate.
+    2. The stored vector is not `expected_dimension` wide. Reached by an
+       `EMBEDDING_DIMENSION` change without a reindex.
+    3. Its L2 norm is essentially zero -- `generate_embedding`'s
+       empty-text branch.
+    4. Its cosine against a vector recomputed from the AUTHORED source
+       node falls below `_MIN_COSINE`.
+
+    Condition 4 is why this gate exists. `_WIPE_NODES` only deletes
+    seed-stamped nodes matching `NOT (n)--()`, so a seeded node that has
+    acquired a conversation-derived edge survives the wipe with its old
+    vector intact; the applier's `ON MATCH SET n += $properties` then
+    refreshes its `display_name` and `description` but not its
+    `embedding`, and `_backfill_embeddings_for_seed` skips it because its
+    `WHERE n.embedding IS NULL` guard is false. The node keeps,
+    indefinitely, a vector computed from text that is no longer authored
+    anywhere -- present, correctly shaped, unit-norm, and wrong. No
+    count-based or presence-based check can ever see that.
+
+    Recomputation goes through `embedding_text_for`, the same builder
+    both production backfills use (I7 Task 1), so the gate compares
+    against what the backfill would produce today rather than against a
+    third private copy of the join -- which is the shape C1 came in
+    through.
+
+    Fails closed: a run that examined zero nodes returns `passed=False`.
+    `check_negation_proximity` returning `passed=True` having examined 0
+    of 20 facts is a defect that already shipped once in this exact
+    module; a gate that examined nothing has proven nothing.
+
+    Read-only: issues `execute_query` only, never `execute_write`.
+
+    Args:
+        connection: Sync graph connection.
+        documents: Parsed seed documents to check.
+        seed_version: The version stamp every checked node must carry.
+        embedding_generator: Provider used to recompute each node's
+            vector from its authored text. Injected rather than
+            constructed here (no hidden construction in a callee either),
+            and it MUST be the same model the stored vectors were written
+            with -- a different model fails condition 4 for every node,
+            which is a true report of a real mismatch, not a false alarm.
+        expected_dimension: Width every stored vector must have.
+
+    Returns:
+        `GateResult` with one failure line per problem node, naming the
+        source document and the node id, and `examined` set to the number
+        of nodes inspected.
+    """
+    failures: list[str] = []
+    examined = 0
+    for doc in documents:
+        query = _CHECK_EMBEDDING_QUERY % doc.partition
+        for node in doc.nodes:
+            examined += 1
+            rows = connection.execute_query(
+                query,
+                {"id": node.id, "seed_version": seed_version},
+            )
+            failure = _embedding_failure(
+                doc=doc,
+                node=node,
+                rows=rows,
+                seed_version=seed_version,
+                embedding_generator=embedding_generator,
+                expected_dimension=expected_dimension,
+            )
+            if failure is not None:
+                failures.append(failure)
+    if examined == 0:
+        failures.append(
+            f"check_embeddings examined 0 nodes across {len(documents)} document(s) "
+            "-- refusing to report a pass on an empty examination set (a gate that "
+            "examined nothing has proven nothing; see check_negation_proximity, "
+            "which shipped reporting passed=True having examined 0 of 20 facts)"
+        )
+    return GateResult(passed=not failures, failures=failures, examined=examined)
+
+
+def _embedding_failure(
+    *,
+    doc: SeedDocument,
+    node: SeedNode,
+    rows: list[dict],
+    seed_version: str,
+    embedding_generator: EmbeddingProvider,
+    expected_dimension: int,
+) -> str | None:
+    """Return the first problem with one node's stored vector, or None.
+
+    Split out of `check_embeddings` so the four conditions read as an
+    ordered list rather than as nesting, and so the early-return
+    discipline (a later condition is meaningless once an earlier one
+    fires) is structural rather than a `continue` a future edit can drop.
+    """
+    prefix = f"{doc.source_path}: node {node.id!r}"
+    if not rows:
+        return (
+            f"{prefix} has no node in the graph under its {doc.partition!r} "
+            f"partition label at seed_version={seed_version!r}"
+        )
+    stored = rows[0].get("embedding")
+    if stored is None:
+        return f"{prefix} has a null embedding at seed_version={seed_version!r}"
+    if not isinstance(stored, list):
+        return (
+            f"{prefix} has an embedding of type {type(stored).__name__}, expected a "
+            "list of floats"
+        )
+    if len(stored) != expected_dimension:
+        return (
+            f"{prefix} has an embedding of {len(stored)} dimensions, expected "
+            f"{expected_dimension}"
+        )
+    norm = _l2_norm(stored)
+    if norm < _MIN_L2_NORM:
+        return (
+            f"{prefix} has a zero vector as its embedding (L2 norm {norm:.3g}) -- "
+            "the empty-text branch of generate_embedding, which matches nothing "
+            "at query time"
+        )
+    text = embedding_text_for(
+        getattr(node, "display_name", None), getattr(node, "description", None), node.id
+    )
+    recomputed = embedding_generator.generate_embedding(text)
+    if len(recomputed) != len(stored):
+        return (
+            f"{prefix} recomputed to {len(recomputed)} dimensions but the stored "
+            f"embedding has {len(stored)} -- the injected embedding_generator "
+            f"disagrees with expected_dimension={expected_dimension}"
+        )
+    similarity = _cosine(stored, recomputed)
+    if similarity < _MIN_COSINE:
+        return (
+            f"{prefix} has an embedding that does not match its authored source text "
+            f"(cosine {similarity:.4f} < {_MIN_COSINE}, authored text {text!r}) -- the "
+            "stored vector was computed from different text and no presence, "
+            "dimension or norm check can see it"
+        )
+    return None
 
 
 def _node_by_id(documents: list[SeedDocument]) -> dict[str, object]:
@@ -368,6 +594,29 @@ def _find_all(haystack: str, needle: str) -> list[int]:
         indices.append(idx)
         start = idx + 1
     return indices
+
+
+def _l2_norm(vector: list[float]) -> float:
+    """Euclidean length of a stored embedding."""
+    return math.sqrt(sum(float(x) * float(x) for x in vector))
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    """Cosine similarity of two equal-length vectors.
+
+    Pure Python rather than numpy: the gate compares at most a few dozen
+    384-d vectors per run, and `gates.py` is imported by every
+    `mist_admin.py` subcommand, so it stays dependency-light on purpose
+    (the same reason `embedding_text_for` lives in a module that pulls in
+    no model layer). Callers must have already established equal lengths;
+    `zip(strict=True)` turns a violation into a loud error rather than a
+    silently truncated -- and therefore wrong -- similarity.
+    """
+    dot = sum(float(x) * float(y) for x, y in zip(a, b, strict=True))
+    magnitude = _l2_norm(a) * _l2_norm(b)
+    if magnitude == 0.0:
+        return 0.0
+    return dot / magnitude
 
 
 def _count(results: list[dict]) -> int:

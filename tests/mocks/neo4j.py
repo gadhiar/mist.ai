@@ -32,10 +32,20 @@ class FakeNeo4jConnection:
         query_responses=None,
         write_errors=None,
         query_errors=None,
+        query_router=None,
     ):
         self._query_results = query_results or []
         self._write_results = write_results or []
         self._query_responses = query_responses or {}
+        # (query, params) -> rows, or None to fall through to the pattern and
+        # default behavior below. `query_responses` keys on the query TEXT,
+        # which cannot express a response that depends on the bound
+        # parameters -- and a parameterized query issued once per node is
+        # byte-identical every time, so a caller that reads one node at a
+        # time (`seed.gates.check_embeddings`) is untestable through it.
+        # Real Neo4j answers per parameter set; this is the hook that lets a
+        # test say so without hand-rolling a second connection fake.
+        self._query_router = query_router
         # Pattern -> exception: raise Neo4jQueryError when pattern appears in write query.
         self._write_errors: dict[str, Exception] = write_errors or {}
         # Pattern -> exception: raise Neo4jQueryError when pattern appears in read query.
@@ -58,6 +68,10 @@ class FakeNeo4jConnection:
         for pattern, exc in self._query_errors.items():
             if pattern in query:
                 raise exc
+        if self._query_router is not None:
+            routed = self._query_router(query, params)
+            if routed is not None:
+                return routed
         for pattern, results in self._query_responses.items():
             if pattern in query:
                 return results

@@ -12,10 +12,12 @@ that a token like `seed_version` appears somewhere in the query.
 
 from pathlib import Path
 
+from backend.knowledge.embeddings.embedding_text import embedding_text_for
 from backend.knowledge.seed.gates import (
     _node_by_id,
     _search_term_for,
     check_containment,
+    check_embeddings,
     check_facts_present,
     check_negation_proximity,
     check_node_definitions,
@@ -23,6 +25,7 @@ from backend.knowledge.seed.gates import (
 from backend.knowledge.seed.loader import load_seed_documents
 from backend.knowledge.seed.models import SeedDocument, SeedFact, SeedNode
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
+from tests.mocks.embeddings import EMBEDDING_DIMENSION, FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeNeo4jConnection
 
 # Resolve path relative to repo root regardless of pytest invocation directory,
@@ -653,3 +656,437 @@ class TestNegationProximityRealSource:
 
         assert not result.passed
         assert any("trait-transparent" in f for f in result.failures)
+
+
+def _embedding_of(text: str) -> list[float]:
+    """The vector `FakeEmbeddingGenerator` produces for `text`.
+
+    Built with a throwaway generator so arranging a graph row never
+    pollutes the `calls` list of the generator injected into the gate --
+    several tests below assert on exactly what text the gate asked to
+    embed, and a shared instance would make those assertions read back
+    the arrange step's own call.
+    """
+    return FakeEmbeddingGenerator().generate_embedding(text)
+
+
+def _router_by_id(rows_by_id: dict[str, list[dict]]):
+    """Route the gate's per-node read to a per-node response.
+
+    The gate issues one byte-identical parameterized query per node, so
+    the connection fake's pattern-keyed `query_responses` cannot
+    distinguish them -- only the bound `id` differs. Map an id to `[]` to
+    simulate a node absent from the graph.
+    """
+
+    def route(_query: str, params: dict | None) -> list[dict] | None:
+        return rows_by_id.get((params or {}).get("id"))
+
+    return route
+
+
+class TestEmbeddings:
+    """I7: the fifth gate. Two live losses of seed embeddings have already
+    happened and nothing in the codebase could see either, because
+    `canonical_serialize` excludes `embedding` from the canonical form --
+    every determinism and equality check is byte-identical whether
+    embeddings are present, absent, or all-zero.
+
+    Every failing case below is a state the live graph can actually reach:
+    a node wiped and recreated without its vector, a `--no-embeddings`
+    seed, a backfill that raised after the graph writes committed, a
+    dimension drift from an `EMBEDDING_DIMENSION` change, the
+    `generate_embedding` empty-text branch that returns `[0.0] * 384`, and
+    -- the one no presence-based check can reach -- a node whose authored
+    text changed while its vector did not.
+    """
+
+    def test_fails_when_the_node_is_absent_from_the_graph(self, fake_connection):
+        docs = [_doc(nodes=[SeedNode(id="slalom", type="Organization", display_name="Slalom")])]
+
+        result = check_embeddings(
+            fake_connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert not result.passed
+        assert "slalom" in result.failures[0]
+
+    def test_fails_when_the_stored_embedding_is_null(self):
+        """The `--no-embeddings` seed, and the post-wipe loss mode: the node
+        is present and correctly labeled, so Gate 2 and the node-definition
+        gate both pass, and it has no vector at all.
+        """
+        connection = FakeNeo4jConnection(query_results=[{"embedding": None}])
+        docs = [_doc(nodes=[SeedNode(id="slalom", type="Organization", display_name="Slalom")])]
+
+        result = check_embeddings(
+            connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert not result.passed
+        assert "slalom" in result.failures[0]
+        assert "null" in result.failures[0]
+
+    def test_fails_when_the_stored_embedding_has_the_wrong_dimension(self):
+        """`EMBEDDING_DIMENSION` drift: the model was swapped without a
+        reindex, so old vectors survive at the old width.
+        """
+        connection = FakeNeo4jConnection(query_results=[{"embedding": [0.1] * 128}])
+        docs = [_doc(nodes=[SeedNode(id="slalom", type="Organization", display_name="Slalom")])]
+
+        result = check_embeddings(
+            connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert not result.passed
+        assert "128" in result.failures[0]
+        assert str(EMBEDDING_DIMENSION) in result.failures[0]
+
+    def test_fails_when_the_stored_embedding_is_a_zero_vector(self):
+        """`EmbeddingGenerator.generate_embedding` returns `[0.0] * 384` for
+        empty text. That vector is the right width and is not null, so only
+        a norm check can see it -- and it matches nothing at query time.
+        """
+        connection = FakeNeo4jConnection(query_results=[{"embedding": [0.0] * EMBEDDING_DIMENSION}])
+        docs = [_doc(nodes=[SeedNode(id="slalom", type="Organization", display_name="Slalom")])]
+
+        result = check_embeddings(
+            connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert not result.passed
+        assert "zero vector" in result.failures[0]
+
+    def test_fails_when_the_stored_embedding_was_computed_from_different_text(self):
+        """THE condition this gate exists for, and the only one that catches
+        the live-reachable mode nothing else can see: `_WIPE_NODES` spares a
+        seeded node that has acquired a conversation-derived edge, the
+        applier's `ON MATCH SET n += $properties` refreshes its
+        `display_name`/`description` but not its `embedding`, and the
+        backfill then skips it because `WHERE n.embedding IS NULL` is false.
+        The node keeps a vector computed from text that is no longer
+        authored anywhere -- present, 384-d, unit-norm, and wrong.
+        """
+        connection = FakeNeo4jConnection(
+            query_results=[{"embedding": _embedding_of("Slalom — Consulting")}]
+        )
+        docs = [
+            _doc(
+                nodes=[
+                    SeedNode(
+                        id="slalom",
+                        type="Organization",
+                        display_name="Slalom",
+                        description="Consulting firm",  # the source text moved on
+                    )
+                ]
+            )
+        ]
+
+        result = check_embeddings(
+            connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert not result.passed
+        assert "slalom" in result.failures[0]
+        assert "cosine" in result.failures[0]
+
+    def test_passes_when_the_stored_embedding_matches_the_authored_source_text(self):
+        connection = FakeNeo4jConnection(
+            query_results=[
+                {"embedding": _embedding_of(embedding_text_for("Slalom", "Consulting firm", "s"))}
+            ]
+        )
+        docs = [
+            _doc(
+                nodes=[
+                    SeedNode(
+                        id="slalom",
+                        type="Organization",
+                        display_name="Slalom",
+                        description="Consulting firm",
+                    )
+                ]
+            )
+        ]
+
+        result = check_embeddings(
+            connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert result.passed, result.failures
+        assert result.examined == 1
+
+    def test_recomputes_from_the_authored_source_not_from_the_graph(self):
+        """Gate 2's rationale applied to vectors: the authored file is a
+        reference that cannot be vacuously satisfied. A gate that recomputed
+        from the graph's own `display_name` would agree with itself by
+        construction whenever the applier and the backfill were both wrong
+        in the same way -- and stale text is exactly the case where the
+        graph's properties are RIGHT and its vector is stale, so reading
+        them back would make the comparison a tautology.
+
+        Pinned two ways: the read query returns nothing but the vector (so
+        graph-sourced text is not merely unused, it is unavailable), and the
+        text handed to the generator is the one built from the authored
+        `SeedNode`.
+        """
+        connection = FakeNeo4jConnection(
+            query_results=[
+                {"embedding": _embedding_of(embedding_text_for("Slalom", "Consulting firm", "s"))}
+            ]
+        )
+        generator = FakeEmbeddingGenerator()
+        docs = [
+            _doc(
+                nodes=[
+                    SeedNode(
+                        id="slalom",
+                        type="Organization",
+                        display_name="Slalom",
+                        description="Consulting firm",
+                    )
+                ]
+            )
+        ]
+
+        check_embeddings(
+            connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=generator,
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        query, _params = connection.queries[0]
+        assert "RETURN n.embedding AS embedding" in query
+        assert "display_name" not in query
+        assert "description" not in query
+        assert generator.calls == [embedding_text_for("Slalom", "Consulting firm", "slalom")]
+
+    def test_fails_closed_when_the_documents_define_no_nodes(self):
+        """R1.4's C1 in one assertion: `check_negation_proximity` reported
+        `passed=True` having examined 0 of 20 facts. A gate that examined
+        nothing must never report success, however clean the input looked.
+        """
+        connection = FakeNeo4jConnection(query_results=[])
+        docs = [_doc(facts=[("user", "WORKS_AT", "slalom")])]  # facts, but no node definitions
+
+        result = check_embeddings(
+            connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert not result.passed
+        assert result.examined == 0
+        assert "0 nodes" in result.failures[0]
+
+    def test_fails_closed_on_an_empty_document_list(self):
+        connection = FakeNeo4jConnection(query_results=[])
+
+        result = check_embeddings(
+            connection,
+            [],
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert not result.passed
+        assert result.examined == 0
+
+    def test_examined_counts_every_node_the_gate_looked_at(self):
+        """`examined` is what makes "did it actually look at anything" a
+        query rather than a hope. It counts nodes inspected, passing and
+        failing alike -- a gate reporting `examined=0` for a source that
+        defines nodes is broken even if `failures` is empty.
+        """
+        connection = FakeNeo4jConnection(
+            query_router=_router_by_id(
+                {
+                    "slalom": [{"embedding": _embedding_of("Slalom")}],
+                    "python": [{"embedding": _embedding_of("Python")}],
+                }
+            )
+        )
+        docs = [
+            _doc(
+                nodes=[
+                    SeedNode(id="slalom", type="Organization", display_name="Slalom"),
+                    SeedNode(id="python", type="Technology", display_name="Python"),
+                ]
+            )
+        ]
+
+        result = check_embeddings(
+            connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert result.passed, result.failures
+        assert result.examined == 2
+
+    def test_reports_one_failure_per_bad_node_and_leaves_good_ones_alone(self):
+        connection = FakeNeo4jConnection(
+            query_router=_router_by_id(
+                {
+                    "slalom": [{"embedding": _embedding_of("Slalom")}],
+                    "python": [{"embedding": _embedding_of("a different node entirely")}],
+                }
+            )
+        )
+        docs = [
+            _doc(
+                nodes=[
+                    SeedNode(id="slalom", type="Organization", display_name="Slalom"),
+                    SeedNode(id="python", type="Technology", display_name="Python"),
+                ]
+            )
+        ]
+
+        result = check_embeddings(
+            connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert result.examined == 2
+        assert len(result.failures) == 1
+        assert "python" in result.failures[0]
+
+    def test_never_writes(self):
+        """A read-only check -- it must never issue execute_write."""
+        connection = FakeNeo4jConnection(query_results=[{"embedding": _embedding_of("Slalom")}])
+        docs = [_doc(nodes=[SeedNode(id="slalom", type="Organization", display_name="Slalom")])]
+
+        check_embeddings(
+            connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        connection.assert_no_writes()
+
+    def test_forwards_id_and_seed_version_as_params(self):
+        connection = FakeNeo4jConnection(query_results=[{"embedding": _embedding_of("Slalom")}])
+        docs = [_doc(nodes=[SeedNode(id="slalom", type="Organization", display_name="Slalom")])]
+
+        check_embeddings(
+            connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert len(connection.queries) == 1
+        _query, params = connection.queries[0]
+        assert params["id"] == "slalom"
+        assert params["seed_version"] == "profile-v1"
+
+    def test_uses_the_documents_partition_as_the_label_in_the_query_text(self):
+        """Neo4j cannot parameterize a label, and the two partitions cannot
+        see each other: a read restricted to `:__Entity__` returns no bind
+        for a `:__SelfModel__` node, which would report every persona node
+        -- the entire 21-node self-model layer, all of it embedded -- as
+        having no embedding.
+        """
+        connection = FakeNeo4jConnection(query_results=[{"embedding": _embedding_of("Warm")}])
+        docs = [
+            _doc(
+                nodes=[SeedNode(id="trait-warm", type="MistTrait", display_name="Warm")],
+                partition=SELF_MODEL_LABEL,
+            )
+        ]
+
+        check_embeddings(
+            connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        query, _params = connection.queries[0]
+        assert f"MATCH (n:{SELF_MODEL_LABEL} {{id: $id}})" in query
+
+    def test_filters_on_seed_version_in_the_where_clause(self):
+        """Pins the exact filtering clause, not merely that the token
+        `seed_version` appears somewhere in the query -- the hole Task 5
+        found in the wipe query.
+        """
+        connection = FakeNeo4jConnection(query_results=[{"embedding": _embedding_of("Slalom")}])
+        docs = [_doc(nodes=[SeedNode(id="slalom", type="Organization", display_name="Slalom")])]
+
+        check_embeddings(
+            connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        query, _params = connection.queries[0]
+        assert "WHERE n.seed_version = $seed_version" in query
+
+    def test_falls_back_to_the_bare_id_when_the_node_defines_no_display_name(self):
+        """The fallback path is legitimate (a node reseed() recreated fresh)
+        but must be reached deliberately: the gate embeds `node.id`, not an
+        empty string, which `generate_embedding` would turn into the zero
+        vector this same gate rejects.
+        """
+        connection = FakeNeo4jConnection(
+            query_results=[{"embedding": _embedding_of("mist-identity")}]
+        )
+        generator = FakeEmbeddingGenerator()
+        docs = [
+            _doc(
+                nodes=[SeedNode(id="mist-identity", type="MistIdentity")],  # no display_name
+                partition=SELF_MODEL_LABEL,
+            )
+        ]
+
+        result = check_embeddings(
+            connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=generator,
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert result.passed, result.failures
+        assert generator.calls == ["mist-identity"]
