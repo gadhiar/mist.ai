@@ -24,6 +24,7 @@ import yaml
 
 from backend.errors import Neo4jConnectionError, Neo4jQueryError, SeedSourceError
 from backend.interfaces import GraphConnection
+from backend.knowledge.embeddings.embedding_text import embedding_text_for
 from backend.knowledge.ontologies import EDGE_TYPES_BY_NAME, EXTRACTABLE_RELATIONSHIP_TYPES
 from backend.knowledge.seed.models import SeedDocument
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL, SELF_MODEL_TYPES
@@ -284,8 +285,10 @@ def apply_seed(
 def _backfill_embeddings(connection: GraphConnection, embedding_generator: Any) -> int:
     """Compute + SET embedding property on seeded nodes missing one.
 
-    Uses `display_name + description` as the text to embed. Only touches nodes
-    whose `provenance = 'seed'` so this is safe to re-run.
+    Uses `embedding_text_for` as the text to embed -- the same builder
+    `_backfill_embeddings_for_seed` and `seed.gates.check_embeddings` use
+    (I7 Task 1). Only touches nodes whose `provenance = 'seed'` so this is
+    safe to re-run.
     """
     query = """
     MATCH (n:__Entity__)
@@ -299,10 +302,7 @@ def _backfill_embeddings(connection: GraphConnection, embedding_generator: Any) 
     if not rows:
         return 0
     for row in rows:
-        text_parts = [row["display_name"] or row["id"]]
-        if row["description"]:
-            text_parts.append(row["description"])
-        text = " — ".join(text_parts)
+        text = embedding_text_for(row["display_name"], row["description"], row["id"])
         embedding = embedding_generator.generate_embedding(text)
         connection.execute_write(
             "MATCH (n:__Entity__ {id: $id}) SET n.embedding = $embedding",
@@ -368,10 +368,7 @@ def _backfill_embeddings_for_seed(
     if not rows:
         return 0
     for row in rows:
-        text_parts = [row["display_name"] or row["id"]]
-        if row["description"]:
-            text_parts.append(row["description"])
-        text = " — ".join(text_parts)
+        text = embedding_text_for(row["display_name"], row["description"], row["id"])
         embedding = embedding_generator.generate_embedding(text)
         connection.execute_write(
             "MATCH (n:__Entity__|__SelfModel__ {id: $id}) SET n.embedding = $embedding",
