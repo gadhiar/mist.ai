@@ -11,20 +11,17 @@ assertions check the fact list.
 
 R1.4 Task 11 (ADDENDUM): `load_seed_documents` now enforces referential
 integrity -- every fact's subject/object must have a matching `SeedNode`.
-`mist-memory/seed/mist.md` does not carry a `nodes:` block yet (that is
-Task 13's job: re-authoring the seed source with node definitions), so
-loading the REAL file now correctly raises `SeedSourceError` before this
-class's assertions ever run. This is the referential-integrity gate
-working exactly as designed against the real, still-incomplete seed
-source -- not a regression in this test file or in the loader. Marked
-`xfail(strict=True)` so it surfaces loudly (as an unexpected pass, which
-`strict=True` turns into a failure) the moment Task 13 lands and this
-class should go back to a real, enforced assertion.
+Between Task 11 landing and Task 13, `mist-memory/seed/mist.md` carried no
+`nodes:` block, so loading the real file correctly raised `SeedSourceError`
+and this class was marked `xfail(strict=True)`. R1.4 Task 13 re-authored
+the seed source with node definitions (scripted extraction from the
+retired `scripts/seed_data.yaml`, cross-checked against both that YAML and
+the live graph node-by-node) -- the marker is removed as of that task,
+per its own `strict=True` design: an unexpected pass would have failed
+loudly rather than silently, which is exactly what did NOT happen.
 """
 
 from pathlib import Path
-
-import pytest
 
 from backend.knowledge.seed.loader import load_seed_documents
 from backend.knowledge.storage.partitions import SELF_MODEL_LABEL
@@ -50,14 +47,6 @@ def _has_preference_targets(document) -> set[str]:
     }
 
 
-@pytest.mark.xfail(
-    reason=(
-        "mist-memory/seed/mist.md has no `nodes:` block yet (R1.4 Task 13); "
-        "load_seed_documents' referential-integrity check (Task 11) correctly "
-        "rejects it until Task 13 lands. Remove this marker once it does."
-    ),
-    strict=True,
-)
 class TestMistPreferenceNoAiSlop:
     """Cluster 3: pref-no-ai-slop preference exists and has HAS_PREFERENCE edge from mist-identity."""
 
