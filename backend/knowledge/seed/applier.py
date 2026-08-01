@@ -148,11 +148,33 @@ def apply_seed_documents(
                 "`SeedNode` definition -- every fact's subject and object must "
                 "have a node definition (R1.4 Task 11/12)"
             )
+        # Authored properties spread FIRST, applier-owned stamps LAST -- a
+        # dict literal's later keys win. R1.4 whole-branch review, I4: the
+        # original ordering put the spread last, so an authored
+        # `seed_version`/`entity_type`/`updated_at` (SeedNode's extra="allow"
+        # lets any name through) silently overrode the applier's own stamp.
+        # `SeedNode._no_applier_owned_extras` (models.py) now rejects that at
+        # construction time, but this ordering is an independent second
+        # layer: it holds even for a `SeedNode` that reached this function
+        # without going through that validator (`model_construct`, or a
+        # future caller that constructs `SeedDocument`s directly) -- the
+        # same "loader check doesn't protect a direct constructor" reasoning
+        # this file already applies to `_validate_node_types`/
+        # `_validate_predicates`.
+        #
+        # `created_at` is excluded from the spread entirely, not merely
+        # ordered to lose: unlike the three keys above, it is never supposed
+        # to be a member of `properties` at all -- it is set exclusively by
+        # `_MERGE_NODE`'s own `ON CREATE SET n.created_at = $now` clause. An
+        # authored `created_at` slipping into `properties` would reach the
+        # graph via `n += $properties` on BOTH branches, corrupting the
+        # create-only guarantee on every future ON MATCH re-seed, not merely
+        # losing a values comparison on write.
         properties = {
+            **{k: v for k, v in node.model_dump().items() if k not in ("id", "type", "created_at")},
             "entity_type": node.type,
             "seed_version": seed_version,
             "updated_at": now_iso,
-            **{k: v for k, v in node.model_dump().items() if k not in ("id", "type")},
         }
         connection.execute_write(
             _MERGE_NODE % (node_partitions[node_id], node.type),

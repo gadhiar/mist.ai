@@ -35,11 +35,14 @@ def load_seed_documents(seed_dir: Path) -> list[SeedDocument]:
             disagreement is a bug rather than something to reconcile
             silently), a node's `type` is not a recognized ontology node
             type, a node `id` is defined more than once (within or across
-            documents), or a fact's `subject`/`object` has no matching node
+            documents), a fact's `subject`/`object` has no matching node
             definition anywhere in the seed source (R1.4 Task 11 -- the
             exact shape of the Task 10 live defect: a fact referencing an
             undefined node used to write silently instead of failing to
-            load).
+            load), or a node is defined but referenced by no fact at all
+            (R1.4 whole-branch review, I5 -- the applier writes nodes driven
+            by fact references, not `doc.nodes` membership, so an
+            unreferenced node would be silently written nowhere).
     """
     if not seed_dir.is_dir():
         raise SeedSourceError(f"Seed directory does not exist: {seed_dir}")
@@ -125,6 +128,7 @@ def load_seed_documents(seed_dir: Path) -> list[SeedDocument]:
     _validate_node_types(docs)
     _validate_unique_node_ids(docs)
     _validate_referential_integrity(docs)
+    _validate_no_unreferenced_node_definitions(docs)
 
     return docs
 
@@ -225,3 +229,57 @@ def _validate_referential_integrity(documents: list[SeedDocument]) -> None:
                     "node definition -- every fact's subject and object must appear as "
                     "a node id somewhere in the seed source's `nodes:` blocks"
                 )
+
+
+def _validate_no_unreferenced_node_definitions(documents: list[SeedDocument]) -> None:
+    """Every defined `SeedNode` must be referenced by at least one fact.
+
+    R1.4 whole-branch review, I5: `apply_seed_documents` writes nodes driven
+    by FACT references (`_assign_node_partitions`'s output, unchanged since
+    Task 4) -- not by `doc.nodes` membership -- while `check_node_definitions`
+    (Gate 4, Task 14) iterates `doc.nodes` directly. The two lists agree
+    today (32 fact-referenced ids, 32 defined nodes, zero difference either
+    way, verified live) but nothing enforces that BY CONSTRUCTION: the model
+    fully permits defining a node with no fact naming it as subject or
+    object. Such a node would be silently written nowhere -- the applier
+    never visits an id `_assign_node_partitions` did not produce -- and the
+    live graph would then genuinely fail `check_node_definitions` for that
+    id, not because either the write path or the gate has a bug, but
+    because the source authored something the write path was never going
+    to act on. Rejecting it here at load time keeps `doc.nodes` and "what
+    the applier writes" a single authority instead of two lists that
+    happen, so far, to agree.
+
+    The complementary direction (`_validate_referential_integrity`, a fact
+    referencing a node with no definition) was Task 11's original headline
+    check; this is the reverse gap, found by the whole-branch review rather
+    than by symmetry with that check at the time.
+
+    Checked across the whole corpus, like `_validate_referential_integrity`
+    -- a node defined in one document may legitimately be referenced only
+    by a fact in another.
+
+    Args:
+        documents: Parsed seed documents to validate.
+
+    Raises:
+        SeedSourceError: A `SeedNode.id` is defined but never appears as a
+            fact's subject or object anywhere in `documents`, naming the id
+            and its source file.
+    """
+    referenced_ids = {
+        node_id
+        for doc in documents
+        for fact in doc.facts
+        for node_id in (fact.subject, fact.object)
+    }
+    for doc in documents:
+        for node in doc.nodes:
+            if node.id in referenced_ids:
+                continue
+            raise SeedSourceError(
+                f"{doc.source_path}: node {node.id!r} is defined but no fact "
+                "references it as subject or object -- the applier writes nodes "
+                "driven by fact references, so an unreferenced node definition "
+                "would be silently written nowhere (R1.4 whole-branch review, I5)"
+            )

@@ -549,6 +549,104 @@ class TestNodeDefinitionWrites:
             assert params["properties"]["entity_type"] == "Technology"
 
 
+class TestAuthoredStampsNeverWinOverTheAppliersOwn:
+    """R1.4 whole-branch review, I4: `SeedNode.extra="allow"` let an authored
+    property share a name with one of the applier's own bookkeeping stamps
+    (`entity_type`/`seed_version`/`updated_at`/`created_at`). The original
+    `properties` dict literal spread the authored extras LAST, so an
+    authored `seed_version` silently won over the applier's own -- for
+    `seed_version` specifically, that makes the node un-wipeable by any
+    future `wipe_seed_version` call scoped on the real version, permanent
+    graph litter.
+
+    `SeedNode._no_applier_owned_extras` (models.py) now rejects these four
+    names as extras at construction time, for every normal caller (the
+    loader's `SeedNode(**n)` included). The tests below prove the applier's
+    OWN ordering is an independent second layer, not a decoration on top of
+    that validator: they build the poisoned node via `SeedNode.
+    model_construct`, which bypasses Pydantic validation entirely (the
+    model's own documented escape hatch for exactly this "what if an
+    upstream invariant were violated" scenario) -- constructing this input
+    through ordinary `SeedNode(...)` is no longer possible at all, which is
+    itself a demonstration that the model-level guard works.
+
+    `SeedDocument` is ALSO built via `model_construct` in these two tests,
+    not ordinary construction: `SeedDocument(nodes=[...])` re-validates
+    each list item even when it is already a `SeedNode` instance (pydantic-
+    core's handling of a `list[Model]` field re-runs item validation
+    regardless of `revalidate_instances`), which would re-trigger
+    `_no_applier_owned_extras` on `poisoned_node` at the OUTER construction
+    site and defeat the point of building it unvalidated in the first
+    place.
+    """
+
+    def test_authored_stamps_never_win_over_the_appliers_own_values(self, fake_connection):
+        poisoned_node = SeedNode.model_construct(
+            id="user",
+            type="User",
+            display_name="Raj Gadhia",
+            entity_type="Bogus",
+            seed_version="evil-version",
+            updated_at="1999-01-01T00:00:00+00:00",
+            created_at="1999-01-01T00:00:00+00:00",
+        )
+        docs = [
+            SeedDocument.model_construct(
+                seed_version="profile-v1",
+                nodes=[poisoned_node, SeedNode(id="python", type="Technology")],
+                facts=[SeedFact(subject="user", predicate="USES", object="python")],
+                body="b",
+                source_path=Path("t.md"),
+                partition=ENTITY_LABEL,
+            )
+        ]
+
+        apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        node_writes = [(q, p) for q, p in fake_connection.writes if not p.get("predicate")]
+        by_id = {p["id"]: p["properties"] for _q, p in node_writes}
+        user_props = by_id["user"]
+
+        assert user_props["entity_type"] == "User", user_props
+        assert user_props["seed_version"] == "profile-v1", user_props
+        assert user_props["updated_at"] == _NOW, user_props
+        # A legitimate extra property (not one of the four reserved names)
+        # must still flow through untouched -- this is not a lockdown of
+        # extra="allow", only of the four applier-owned names.
+        assert user_props["display_name"] == "Raj Gadhia"
+
+    def test_authored_created_at_never_enters_the_properties_map_at_all(self, fake_connection):
+        """`created_at` is a stricter case than the other three: it must not
+        merely lose a values comparison, it must never be a KEY in
+        `properties` at all, because `properties` is merged via `n +=
+        $properties` on both the ON CREATE and ON MATCH branches -- an
+        authored `created_at` reaching that map would overwrite the real
+        creation timestamp on every future re-seed, not just the first
+        write, corrupting `_MERGE_NODE`'s create-only guarantee for that
+        field.
+        """
+        poisoned_node = SeedNode.model_construct(
+            id="user", type="User", created_at="1999-01-01T00:00:00+00:00"
+        )
+        docs = [
+            SeedDocument.model_construct(
+                seed_version="profile-v1",
+                nodes=[poisoned_node, SeedNode(id="python", type="Technology")],
+                facts=[SeedFact(subject="user", predicate="USES", object="python")],
+                body="b",
+                source_path=Path("t.md"),
+                partition=ENTITY_LABEL,
+            )
+        ]
+
+        apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        node_writes = [(q, p) for q, p in fake_connection.writes if not p.get("predicate")]
+        by_id = {p["id"]: p["properties"] for _q, p in node_writes}
+
+        assert "created_at" not in by_id["user"], by_id["user"]
+
+
 class TestNodeTypeValidation:
     """Mirrors TestPredicateValidation: the type label is interpolated at the
     same Cypher boundary as the predicate, and Task 11's loader-level check

@@ -9,9 +9,21 @@ are never split into synchronized files because that invites silent drift.
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
+
+# Properties `applier.py`'s `_MERGE_NODE` stamps itself on every write
+# (`entity_type`/`seed_version`/`updated_at` via the `properties` map,
+# `created_at` via its own `ON CREATE SET` clause). `SeedNode.extra="allow"`
+# exists so a node's genuinely open-ended descriptive properties pass
+# through untouched (see the class docstring) -- but these four are not
+# descriptive properties, they are the applier's own bookkeeping, and an
+# authored value under one of these names is a bug, not a preference: see
+# `_no_applier_owned_extras` below.
+_APPLIER_OWNED_NODE_PROPERTIES = frozenset(
+    {"entity_type", "seed_version", "updated_at", "created_at"}
+)
 
 
 class SeedFact(BaseModel):
@@ -83,6 +95,23 @@ class SeedNode(BaseModel):
     `SeedFact.predicate`, which is also unvalidated here) -- see
     `loader.py`'s `_validate_node_types`, which does it as a standalone
     pass, the same shape as `applier.py`'s `_validate_predicates`.
+
+    R1.4 whole-branch review, I4: `_no_applier_owned_extras` rejects an
+    authored `entity_type`/`seed_version`/`updated_at`/`created_at` at
+    construction time. Before this, `extra="allow"` let a document author
+    one of these names as an ordinary descriptive property, and
+    `apply_seed_documents` built its write with the authored spread applied
+    LAST, so the authored value silently won over the applier's own stamp.
+    For `seed_version` specifically this is not cosmetic: `wipe_seed_version`
+    scopes its delete on an exact `seed_version` match, so a node carrying
+    any other value is never matched by a future wipe and becomes permanent,
+    un-wipeable graph litter -- the exact hazard Task 4's dispatch raised,
+    arriving through a door neither that task nor Task 11 anticipated. Put
+    here rather than only reordering the applier's spread (which is also
+    fixed, independently) because rejecting the bad input at the one point
+    every construction path -- the loader's `SeedNode(**n)` and any direct
+    caller alike -- passes through is strictly stronger than trusting every
+    downstream writer to order its own merge correctly forever.
     """
 
     model_config = {"extra": "allow"}
@@ -96,6 +125,21 @@ class SeedNode(BaseModel):
         if not v or not v.strip():
             raise ValueError("id and type must be non-empty")
         return v.strip()
+
+    @model_validator(mode="after")
+    def _no_applier_owned_extras(self) -> "SeedNode":
+        collisions = _APPLIER_OWNED_NODE_PROPERTIES & (self.model_extra or {}).keys()
+        if collisions:
+            raise ValueError(
+                f"node {self.id!r} authors {sorted(collisions)}, which the applier "
+                "stamps itself on every write (entity_type/seed_version/updated_at/"
+                "created_at are applier-owned bookkeeping, not descriptive "
+                "properties) -- an authored value here would silently win over the "
+                "applier's own stamp, and for seed_version specifically would make "
+                "this node un-wipeable by any future reseed (R1.4 whole-branch "
+                "review, I4)"
+            )
+        return self
 
 
 class SeedDocument(BaseModel):

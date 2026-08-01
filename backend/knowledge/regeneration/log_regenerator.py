@@ -103,14 +103,16 @@ class LogRegenerator:
         (`mist-memory/seed/mist.md`, verified to cover all 21 :__SelfModel__
         nodes), so this copy is redundant belt-and-braces rather than the sole
         durable source. Retiring it requires `rebuild()` to gain a seed-apply
-        step -- R1.6's composition work, not this method's contract. That step
-        cannot simply call `apply_seed_documents` unmodified: that function
-        hardcodes the `:__Entity__` label for every node it writes
-        (`backend/knowledge/seed/applier.py`), with no routing to
-        `:__SelfModel__` for self-model types the way `admin.py`'s older seed
-        path does. Applied as-is against self-model content, it would create
-        `:__Entity__` nodes colliding on id with the existing `:__SelfModel__`
-        nodes (e.g. `mist-identity`) rather than replacing them.
+        step -- R1.6's composition work, not this method's contract. `R1.4
+        whole-branch review, I1`: `apply_seed_documents` already routes each
+        node to the partition its own `SeedDocument.partition` declares
+        (`_assign_node_partitions`, R1.4 Task 4's rework, `5bbaac1`) --
+        `:__SelfModel__` content lands on `:__SelfModel__`, not on a
+        colliding `:__Entity__` copy. That is not the remaining gap. The
+        remaining gap is that `rebuild()` has no seed-apply step of any kind
+        yet -- nothing in this class calls `apply_seed_documents` or
+        `reseed` against the staging graph at all, so there is nothing this
+        copy could be replaced by until R1.6 adds one.
         """
         nodes = source_conn.execute_query(
             f"MATCH (n:{SELF_MODEL_LABEL}) "
@@ -276,9 +278,10 @@ class LogRegenerator:
         # source_conn and staging_conn are provided. Task 3 callers omit both and
         # are unaffected.
         # R1.4: the self-model is now also authored in mist-memory/seed/, but this
-        # copy stays -- rebuild() has no seed-apply step, and apply_seed_documents
-        # cannot stand in for it unmodified (see copy_self_model_partition
-        # docstring). Retirement is R1.6's composition work.
+        # copy stays -- rebuild() has no seed-apply step at all yet (partition
+        # routing itself is not the blocker; see copy_self_model_partition
+        # docstring, corrected R1.4 whole-branch review I1). Retirement is R1.6's
+        # composition work.
         if source_conn is not None and staging_conn is not None:
             self.copy_self_model_partition(source_conn, staging_conn)
             self.rederive_self_model_cross_layer_edges(source_conn, staging_conn)

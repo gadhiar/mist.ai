@@ -413,3 +413,109 @@ Raj uses Neo4j.
     docs = load_seed_documents(d)
 
     assert len(docs) == 2
+
+
+# ---------------------------------------------------------------------------
+# R1.4 whole-branch review, I4: a document authoring one of the applier's own
+# bookkeeping property names (entity_type/seed_version/updated_at/created_at)
+# as a node's descriptive property must fail loudly at load time, not load
+# successfully and silently win over the applier's stamp downstream.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "reserved_key",
+    [
+        pytest.param("entity_type", id="entity_type"),
+        pytest.param("seed_version", id="seed_version"),
+        pytest.param("updated_at", id="updated_at"),
+        pytest.param("created_at", id="created_at"),
+    ],
+)
+def test_rejects_a_node_authoring_an_applier_owned_property_name(tmp_path: Path, reserved_key: str):
+    """Drives real YAML through the actual load path (`SeedNode(**n)` in
+    loader.py), not a direct `SeedNode(...)` construction -- this is what
+    proves the guard fires on the input an author could actually type into
+    `mist-memory/seed/*.md`, not merely that the model's own validator
+    exists in isolation.
+    """
+    poisoned = _DOC.replace(
+        '{id: user, type: User, display_name: "Raj Gadhia"}',
+        f'{{id: user, type: User, display_name: "Raj Gadhia", {reserved_key}: "evil"}}',
+    )
+    d = _write(tmp_path, "user.md", poisoned)
+
+    with pytest.raises(SeedSourceError, match=reserved_key):
+        load_seed_documents(d)
+
+
+def test_a_non_reserved_extra_property_still_loads_fine(tmp_path: Path):
+    """Sanity: the I4 guard rejects exactly the four reserved names, not
+    `extra="allow"` generally -- already covered by
+    `test_node_preserves_arbitrary_extra_properties` above, restated here
+    for locality with the reserved-name tests it is easy to conflate with.
+    """
+    with_extra = _DOC.replace(
+        '{id: user, type: User, display_name: "Raj Gadhia"}',
+        '{id: user, type: User, display_name: "Raj Gadhia", title: "Software Engineer"}',
+    )
+    d = _write(tmp_path, "user.md", with_extra)
+
+    docs = load_seed_documents(d)
+
+    assert next(n for n in docs[0].nodes if n.id == "user").title == "Software Engineer"
+
+
+# ---------------------------------------------------------------------------
+# R1.4 whole-branch review, I5: the reverse of referential integrity -- every
+# DEFINED node must be referenced by at least one fact, or the applier (which
+# writes nodes driven by fact references, not `doc.nodes` membership) would
+# silently write it nowhere.
+# ---------------------------------------------------------------------------
+
+
+def test_rejects_a_defined_but_unreferenced_node(tmp_path: Path):
+    unreferenced = _DOC.replace(
+        "  - {id: python, type: Technology, display_name: Python}",
+        "  - {id: python, type: Technology, display_name: Python}\n"
+        "  - {id: rust, type: Technology, display_name: Rust}",
+    )
+    d = _write(tmp_path, "user.md", unreferenced)
+
+    with pytest.raises(SeedSourceError, match="rust"):
+        load_seed_documents(d)
+
+
+def test_unreferenced_node_check_resolves_across_documents(tmp_path: Path):
+    """A node defined in one document may legitimately be referenced only by
+    a fact in another -- mirrors
+    `test_referential_integrity_resolves_across_documents` for the reverse
+    check, so a whole-corpus scope regression in either direction is caught.
+    """
+    node_doc = """---
+type: mist-seed
+seed_version: profile-v1
+nodes:
+  - {id: neo4j, type: Technology, display_name: Neo4j}
+facts: []
+---
+
+Neo4j is a graph database.
+"""
+    fact_doc = """---
+type: mist-seed
+seed_version: profile-v1
+nodes:
+  - {id: user, type: User, display_name: "Raj Gadhia"}
+facts:
+  - {subject: user, predicate: USES, object: neo4j}
+---
+
+Raj uses Neo4j.
+"""
+    _write(tmp_path, "a-technologies.md", node_doc)
+    d = _write(tmp_path, "b-user.md", fact_doc)
+
+    docs = load_seed_documents(d)
+
+    assert len(docs) == 2
