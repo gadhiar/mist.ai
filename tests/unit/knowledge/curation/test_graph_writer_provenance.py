@@ -8,6 +8,7 @@ from backend.knowledge.curation.confidence import ConfidenceManager
 from backend.knowledge.curation.graph_writer import CurationGraphWriter
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
+from tests.unit.knowledge.curation._graph_writer_fakes import TEST_REBUILD_STAMPS
 
 
 @pytest.mark.asyncio
@@ -15,7 +16,9 @@ async def test_ensure_conversation_context_uses_provenance_label() -> None:
     # Arrange
     conn = FakeNeo4jConnection()
     executor = FakeGraphExecutor(connection=conn)
-    writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
+    writer = CurationGraphWriter(
+        executor, FakeEmbeddingGenerator(), ConfidenceManager(), TEST_REBUILD_STAMPS
+    )
 
     # Act
     await writer._ensure_conversation_context(
@@ -40,7 +43,9 @@ async def test_create_learning_event_uses_provenance_label() -> None:
     # Arrange
     conn = FakeNeo4jConnection()
     executor = FakeGraphExecutor(connection=conn)
-    writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
+    writer = CurationGraphWriter(
+        executor, FakeEmbeddingGenerator(), ConfidenceManager(), TEST_REBUILD_STAMPS
+    )
 
     # Act (C2 cutover: action-shaped public method replaces the
     # SupersessionAction-typed private one)
@@ -79,7 +84,9 @@ async def test_create_new_fact_learning_event_uses_provenance_label() -> None:
     # Arrange
     conn = FakeNeo4jConnection()
     executor = FakeGraphExecutor(connection=conn)
-    writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
+    writer = CurationGraphWriter(
+        executor, FakeEmbeddingGenerator(), ConfidenceManager(), TEST_REBUILD_STAMPS
+    )
 
     # Act
     await writer._create_new_fact_learning_event(
@@ -116,7 +123,9 @@ async def test_ensure_external_source_uses_provenance_label() -> None:
     # Arrange
     conn = FakeNeo4jConnection()
     executor = FakeGraphExecutor(connection=conn)
-    writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
+    writer = CurationGraphWriter(
+        executor, FakeEmbeddingGenerator(), ConfidenceManager(), TEST_REBUILD_STAMPS
+    )
 
     from backend.knowledge.curation.graph_writer import SourceMetadata
 
@@ -149,7 +158,9 @@ async def test_ensure_vector_chunks_uses_provenance_label() -> None:
     # Arrange
     conn = FakeNeo4jConnection()
     executor = FakeGraphExecutor(connection=conn)
-    writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
+    writer = CurationGraphWriter(
+        executor, FakeEmbeddingGenerator(), ConfidenceManager(), TEST_REBUILD_STAMPS
+    )
 
     # Act
     await writer._ensure_vector_chunks(

@@ -28,6 +28,7 @@ from backend.knowledge.embeddings.embedding_text import embedding_text_for
 from backend.knowledge.ontologies import EDGE_TYPES_BY_NAME, EXTRACTABLE_RELATIONSHIP_TYPES
 from backend.knowledge.seed.models import SeedDocument
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL, SELF_MODEL_TYPES
+from backend.knowledge.version_stamps import ONTOLOGY_VERSION
 
 SEED_METADATA_FIELDS = (
     "confidence",
@@ -235,7 +236,7 @@ def apply_seed(
     from each node's `display_name + description` text.
     """
     now = datetime.now(UTC).isoformat()
-    ontology_version = seed_data.get("ontology_version", "1.2.1")
+    ontology_version = seed_data.get("ontology_version", ONTOLOGY_VERSION)
     counts: dict[str, int] = {}
 
     schema_counts = ensure_schema(connection)

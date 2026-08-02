@@ -38,7 +38,9 @@ class RebuildStamps:
 
     Stable for the lifetime of the writer -- the LLM binary and ontology
     version do not change mid-process. Constructed from `KnowledgeConfig`
-    in the factory and injected into `CurationGraphWriter`.
+    in the factory and injected into `CurationGraphWriter` as a required
+    dependency; `ontology_version` and `extraction_version` trace back to
+    `backend.knowledge.version_stamps`, the single authority for both.
     """
 
     ontology_version: str
@@ -96,13 +98,16 @@ class CurationGraphWriter:
         executor: GraphExecutor,
         embedding_provider: EmbeddingProvider,
         confidence_manager: ConfidenceManager,
-        rebuild_stamps: RebuildStamps | None = None,
+        rebuild_stamps: RebuildStamps,
     ) -> None:
         self._executor = executor
         self._embedding_provider = embedding_provider
         self._confidence_manager = confidence_manager
-        # ADR-010 Phase 8, re-anchored by R1.3: stamps appear on every
-        # EXTRACTED_FROM edge when set. None omits the stamp properties.
+        # ADR-010 Phase 8, re-anchored by R1.3: stamps ride every entity write
+        # and every EXTRACTED_FROM edge. Required, not optional: `ontology_version`
+        # is a required universal entity property, so a writer without stamps
+        # could only ever emit a wrong-by-default literal (it used to emit
+        # "1.2.1") or an invalid entity. `build_curation_pipeline` injects it.
         self._rebuild_stamps = rebuild_stamps
 
     async def write(
@@ -255,9 +260,7 @@ class CurationGraphWriter:
                 "aliases": aliases,
                 # 4.7 drift fix: stamped from config via RebuildStamps, no
                 # hardcoded version literal.
-                "ontology_version": (
-                    self._rebuild_stamps.ontology_version if self._rebuild_stamps else "1.2.1"
-                ),
+                "ontology_version": self._rebuild_stamps.ontology_version,
             },
         )
 
@@ -282,10 +285,10 @@ class CurationGraphWriter:
         log row. The vault is not a fact source under Inv-A1, so no
         `DERIVED_FROM -> VaultNote` edge is written.
 
-        Epoch stamps ride this edge when `rebuild_stamps` was injected at
-        construction, keeping the per-turn (ontology, extraction, model) triple
-        auditable in the graph now that the VaultNote anchor that used to carry
-        them is retired.
+        Epoch stamps always ride this edge (`rebuild_stamps` is a required
+        constructor dependency), keeping the per-turn (ontology, extraction,
+        model) triple auditable in the graph now that the VaultNote anchor that
+        used to carry them is retired.
         """
         params: dict[str, str] = {
             "entity_id": entity_id,
@@ -293,31 +296,23 @@ class CurationGraphWriter:
             "event_id": event_id,
             "now": now,
         }
-        if self._rebuild_stamps is None:
-            create_set = (
-                "r.source_utterance_id = $event_id, r.created_at = $now, r.status = 'active'"
-            )
-            match_set = (
-                "r.source_utterance_id = $event_id, r.updated_at = $now, r.status = 'active'"
-            )
-        else:
-            params["ontology_version"] = self._rebuild_stamps.ontology_version
-            params["extraction_version"] = self._rebuild_stamps.extraction_version
-            params["model_hash"] = self._rebuild_stamps.model_hash
-            stamp_clause = (
-                ", r.ontology_version = $ontology_version"
-                ", r.extraction_version = $extraction_version"
-                ", r.model_hash = $model_hash"
-                ", r.derived_at = $now"
-            )
-            create_set = (
-                "r.source_utterance_id = $event_id, r.created_at = $now, "
-                "r.status = 'active'" + stamp_clause
-            )
-            match_set = (
-                "r.source_utterance_id = $event_id, r.updated_at = $now, "
-                "r.status = 'active'" + stamp_clause
-            )
+        params["ontology_version"] = self._rebuild_stamps.ontology_version
+        params["extraction_version"] = self._rebuild_stamps.extraction_version
+        params["model_hash"] = self._rebuild_stamps.model_hash
+        stamp_clause = (
+            ", r.ontology_version = $ontology_version"
+            ", r.extraction_version = $extraction_version"
+            ", r.model_hash = $model_hash"
+            ", r.derived_at = $now"
+        )
+        create_set = (
+            "r.source_utterance_id = $event_id, r.created_at = $now, "
+            "r.status = 'active'" + stamp_clause
+        )
+        match_set = (
+            "r.source_utterance_id = $event_id, r.updated_at = $now, "
+            "r.status = 'active'" + stamp_clause
+        )
 
         await self._executor.execute_write(
             "MATCH (e:__Entity__ {id: $entity_id}) "

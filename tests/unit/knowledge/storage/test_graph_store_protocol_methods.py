@@ -91,14 +91,17 @@ class TestCurrentOntologyVersion:
 
         assert result == "2.3.4"
 
-    def test_default_version_matches_config(self):
-        from backend.knowledge.storage.graph_store import _DEFAULT_ONTOLOGY_VERSION
+    def test_default_version_is_derived_from_the_active_ontology(self):
+        """The stale `_DEFAULT_ONTOLOGY_VERSION = "1.1.0"` literal is gone: the
+        default now reads the ontology object, so it cannot drift behind it.
+        """
+        from backend.knowledge.ontologies.v1_0_0 import ONTOLOGY_V1_0_0
 
         store = _make_store()
 
         result = store.current_ontology_version()
 
-        assert result == _DEFAULT_ONTOLOGY_VERSION
+        assert result == ONTOLOGY_V1_0_0.version
 
 
 def test_graph_store_has_no_upsert_user() -> None:

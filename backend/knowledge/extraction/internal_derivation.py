@@ -19,6 +19,7 @@ from backend.knowledge.extraction.internal_prompts import (
 from backend.knowledge.extraction.signal_detector import SignalDetectionResult, SignalDetector
 from backend.knowledge.storage.graph_executor import GraphExecutor
 from backend.knowledge.storage.partitions import SELF_MODEL_LABEL, SELF_MODEL_TYPES
+from backend.knowledge.version_stamps import ONTOLOGY_VERSION
 from backend.llm.models import LLMRequest
 
 logger = logging.getLogger(__name__)
@@ -209,6 +210,7 @@ class InternalKnowledgeDeriver:
                 "now": now,
                 "event_id": event_id,
                 "session_id": session_id,
+                "ontology_version": ONTOLOGY_VERSION,
             }
 
             # Add type-specific properties
@@ -237,7 +239,7 @@ class InternalKnowledgeDeriver:
                 "e.status = 'active', "
                 "e.created_at = $now, "
                 "e.updated_at = $now, "
-                "e.ontology_version = '1.0.0'"
+                "e.ontology_version = $ontology_version"
             )
             if prop_sets:
                 create_set += ", " + prop_sets

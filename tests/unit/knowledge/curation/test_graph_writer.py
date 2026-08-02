@@ -9,6 +9,7 @@ import pytest
 
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
+from tests.unit.knowledge.curation._graph_writer_fakes import TEST_REBUILD_STAMPS
 from tests.unit.knowledge.curation.conftest import make_entity_dict
 
 
@@ -20,7 +21,9 @@ class TestEntityUpsert:
 
         conn = FakeNeo4jConnection()
         executor = FakeGraphExecutor(connection=conn)
-        writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
+        writer = CurationGraphWriter(
+            executor, FakeEmbeddingGenerator(), ConfidenceManager(), TEST_REBUILD_STAMPS
+        )
 
         entities = [make_entity_dict(entity_id="python", display_name="Python")]
         result = await writer.write(
@@ -74,7 +77,9 @@ class TestProvenance:
 
         conn = FakeNeo4jConnection()
         executor = FakeGraphExecutor(connection=conn)
-        writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
+        writer = CurationGraphWriter(
+            executor, FakeEmbeddingGenerator(), ConfidenceManager(), TEST_REBUILD_STAMPS
+        )
 
         entities = [make_entity_dict(entity_id="rust", display_name="Rust")]
         await writer.write(
@@ -98,7 +103,9 @@ class TestProvenance:
 
         conn = FakeNeo4jConnection()
         executor = FakeGraphExecutor(connection=conn)
-        writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
+        writer = CurationGraphWriter(
+            executor, FakeEmbeddingGenerator(), ConfidenceManager(), TEST_REBUILD_STAMPS
+        )
 
         entities = [make_entity_dict(entity_id="python")]
         await writer.write(
@@ -120,7 +127,9 @@ class TestBeliefChangeLearningEvent:
 
         conn = FakeNeo4jConnection()
         executor = FakeGraphExecutor(connection=conn)
-        writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
+        writer = CurationGraphWriter(
+            executor, FakeEmbeddingGenerator(), ConfidenceManager(), TEST_REBUILD_STAMPS
+        )
 
         await writer.create_belief_change_learning_event(
             reason="contradiction",
@@ -147,7 +156,9 @@ class TestEmptyInput:
 
         conn = FakeNeo4jConnection()
         executor = FakeGraphExecutor(connection=conn)
-        writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
+        writer = CurationGraphWriter(
+            executor, FakeEmbeddingGenerator(), ConfidenceManager(), TEST_REBUILD_STAMPS
+        )
 
         result = await writer.write(
             entities=[],

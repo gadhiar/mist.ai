@@ -327,16 +327,30 @@ class TestExtractionVersionDriftGuard:
         ).hexdigest()
         assert digest == self.PINNED_SHA256, (
             "Extraction prompt content changed WITHOUT an extraction_version "
-            "bump. Update KnowledgeConfig.extraction_version (field default + "
-            "EXTRACTION_VERSION env default) and backend/vault/writer.py "
-            "_EXTRACTION_VERSION, then re-pin PINNED_SHA256 here. The "
-            "extraction cache keys on the version string -- skipping the bump "
-            "makes R1 rebuilds silently serve stale extractions."
+            "bump. Update EXTRACTION_VERSION in "
+            "backend/knowledge/version_stamps.py -- the single authority, "
+            "which every other site imports -- then re-pin PINNED_SHA256 "
+            "here. The extraction cache keys on the version string; skipping "
+            "the bump makes R1 rebuilds silently serve stale extractions."
         )
 
-    def test_config_default_matches_pinned_version(self):
-        from backend.knowledge.config import KnowledgeConfig
-        from backend.vault.writer import _EXTRACTION_VERSION
+    def test_single_authority_holds_the_pinned_version(self):
+        from backend.knowledge.version_stamps import EXTRACTION_VERSION
 
-        assert KnowledgeConfig.extraction_version == "2026-06-14-r5"
-        assert _EXTRACTION_VERSION == "2026-06-14-r5"
+        assert EXTRACTION_VERSION == "2026-06-14-r5"
+
+    def test_config_default_is_the_single_authority(self):
+        from backend.knowledge.config import KnowledgeConfig
+        from backend.knowledge.version_stamps import EXTRACTION_VERSION
+
+        assert KnowledgeConfig.extraction_version == EXTRACTION_VERSION
+
+    def test_vault_writer_stamps_the_single_authority(self):
+        """The writer imports the authority; it no longer mirrors a literal."""
+        from backend.knowledge.version_stamps import EXTRACTION_VERSION
+        from backend.vault import writer
+
+        assert writer.EXTRACTION_VERSION == EXTRACTION_VERSION
+        assert not hasattr(
+            writer, "_EXTRACTION_VERSION"
+        ), "the mirrored literal is deleted, not merely unreferenced"

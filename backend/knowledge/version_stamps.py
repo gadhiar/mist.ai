@@ -1,0 +1,56 @@
+"""Single authority for the rebuild-determinism version stamps.
+
+MIST stamps every entity, fact edge, and provenance edge with an
+(`ontology_version`, `extraction_version`, `model_hash`) triple. The stamps are
+descriptive -- no pipeline code branches on them; the active ontology is chosen
+by Python import, and `canonical_serialize` deliberately excludes the triple so
+the determinism proof reads "same log + same epoch => same facts". One mechanism
+makes their CONSISTENCY load-bearing anyway: `extraction_cache.cache_key` hashes
+`event_id|ontology_version|extraction_version|model_hash`, so two sites
+disagreeing about a stamp is not a mislabel but a hard cache miss that makes a
+deterministic rebuild impossible.
+
+The split this module enforces:
+
+- A version that describes CODE lives in code and is DERIVED, never restated.
+  `ONTOLOGY_VERSION` reads the active ontology object itself, so the stamp
+  cannot disagree with the ontology actually in use.
+- `EXTRACTION_VERSION` describes the extraction prompt, which has no derivable
+  source, so it is the one literal here -- mechanically paired to the prompt
+  content by `TestExtractionVersionDriftGuard`.
+- `model_hash` names a DEPLOYED MODEL FILE rather than code, so it stays on
+  `KnowledgeConfig` and remains env-configurable via `MIST_MODEL_HASH`.
+
+`EXTRACTION_VERSION` would naturally live beside the prompt it describes in
+`backend/knowledge/extraction/prompts.py`, but `backend/knowledge/config.py`
+cannot import it from there: the `backend.knowledge.extraction` package
+`__init__` eagerly imports `ontology_extractor`, which imports
+`KnowledgeConfig`, so the import cycles whenever `config` is the entry module.
+This module is a leaf -- it imports the ontology and nothing else -- so every
+consumer can read it regardless of import order.
+"""
+
+from __future__ import annotations
+
+from backend.knowledge.ontologies.v1_0_0 import ONTOLOGY_V1_0_0
+
+# Derived, never restated. `TestOntologyVersionHasOneAuthority` fails if any
+# module under `backend/` reintroduces a literal ontology-version stamp.
+ONTOLOGY_VERSION: str = ONTOLOGY_V1_0_0.version
+
+# Bump whenever EXTRACTION_SYSTEM_PROMPT / EXTRACTION_USER_TEMPLATE or the
+# ontology contract they encode changes, then re-pin PINNED_SHA256 in
+# tests/unit/knowledge/extraction/test_prompts.py.
+# 2026-06-12-r1: deep-review prompt fix (direction rules for
+# USES/DEPENDS_ON/WORKS_WITH source sets, undirected WORKS_WITH).
+# 2026-06-12-r2: emit assertion_kind signal (assert|cease|retract) per
+# relationship (C3 spec 6.2 -- cessation/retraction reconciliation).
+# 2026-06-12-r3: RECOMMENDS / HAS_HABIT predicates (ontology v1.3.0) plus
+# date-entity discrimination (Rules 16-17, Examples 23-24).
+# 2026-06-12-r4: precision rules -- HAS_HABIT recurrence-cadence tightening
+# (Rule 17) + no prepositional over-extraction (Rule 18).
+# 2026-06-14-r5: MECE taxonomy -- Abstraction fallback type, abstract-type
+# tests block (Rules 19-20), third-party facts rule, retire Topic/Milestone
+# from entity list (22 -> 21), retype Example 9 Milestone -> Event, add
+# Examples 25-26 (third-party shape, Abstraction fallback).
+EXTRACTION_VERSION: str = "2026-06-14-r5"

@@ -357,16 +357,22 @@ class TestKnowledgeConfigVaultWiring:
 
 
 class TestRebuildDeterminismStamps:
-    """ADR-010 Phase 8 config fields used to stamp DERIVED_FROM->VaultNote edges
-    so vault-rebuild can detect ontology / extraction prompt / model drift.
+    """ADR-010 Phase 8 config fields used to stamp entity-provenance edges so a
+    consumer can detect ontology / extraction prompt / model drift.
+
+    `ontology_version` and `extraction_version` are code-owned and read from
+    `backend.knowledge.version_stamps`; only `model_hash`, which names a
+    deployed model file, is env-configurable. The single-authority contract
+    itself is pinned in tests/unit/knowledge/test_version_stamps.py.
     """
 
-    def test_default_extraction_version_matches_adr_010(self):
+    def test_default_extraction_version_is_the_single_authority(self):
         from backend.knowledge.config import (
             EmbeddingConfig,
             ExtractionConfig,
             Neo4jConfig,
         )
+        from backend.knowledge.version_stamps import EXTRACTION_VERSION
 
         config = KnowledgeConfig(
             neo4j=Neo4jConfig(),
@@ -375,13 +381,7 @@ class TestRebuildDeterminismStamps:
             extraction=ExtractionConfig(),
         )
 
-        # ADR-010 example string -- matches vault writer's _EXTRACTION_VERSION
-        # constant. When extraction prompts or ontology change, bump this.
-        # Bumped 2026-06-14-r5: MECE taxonomy -- Abstraction fallback type,
-        # abstract-type tests block (Rules 19-20), third-party facts rule (Rule 19),
-        # retire Topic/Milestone from entity list (22 -> 21), retype Example 9
-        # Milestone -> Event, add Examples 25-26.
-        assert config.extraction_version == "2026-06-14-r5"
+        assert config.extraction_version == EXTRACTION_VERSION
 
     def test_default_model_hash_matches_active_llm(self):
         from backend.knowledge.config import (
@@ -400,11 +400,17 @@ class TestRebuildDeterminismStamps:
         # Default identifies the active Gemma 4 E4B Q5 K M build.
         assert config.model_hash == "gemma-4-e4b-q5-k-m-carteakey-full-v1"
 
-    def test_from_env_reads_extraction_version_override(self):
+    def test_from_env_ignores_extraction_version_override(self):
+        """The override is deleted: it is what let a deployment pin a stamp the
+        running code disagreed with, and extraction_cache turns that
+        disagreement into a hard miss rather than a mislabel.
+        """
+        from backend.knowledge.version_stamps import EXTRACTION_VERSION
+
         with _env(EXTRACTION_VERSION="2027-01-01-r3"):
             config = KnowledgeConfig.from_env()
 
-        assert config.extraction_version == "2027-01-01-r3"
+        assert config.extraction_version == EXTRACTION_VERSION
 
     def test_from_env_reads_model_hash_override(self):
         with _env(MIST_MODEL_HASH="custom-llama-7b-v2"):
@@ -413,8 +419,10 @@ class TestRebuildDeterminismStamps:
         assert config.model_hash == "custom-llama-7b-v2"
 
     def test_from_env_falls_back_to_default_when_unset(self):
+        from backend.knowledge.version_stamps import EXTRACTION_VERSION
+
         with _env(EXTRACTION_VERSION=None, MIST_MODEL_HASH=None):
             config = KnowledgeConfig.from_env()
 
-        assert config.extraction_version == "2026-06-14-r5"
+        assert config.extraction_version == EXTRACTION_VERSION
         assert config.model_hash == "gemma-4-e4b-q5-k-m-carteakey-full-v1"

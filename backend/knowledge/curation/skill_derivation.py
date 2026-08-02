@@ -15,6 +15,7 @@ from backend.knowledge.config import SkillDerivationConfig
 from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
 from backend.knowledge.storage.graph_executor import GraphExecutor
 from backend.knowledge.storage.partitions import SELF_MODEL_LABEL
+from backend.knowledge.version_stamps import ONTOLOGY_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +168,7 @@ class SkillDerivationJob:
             "  e.status = 'active', "
             "  e.created_at = $now, "
             "  e.updated_at = $now, "
-            "  e.ontology_version = '1.0.0' "
+            "  e.ontology_version = $ontology_version "
             "WITH e "
             "MERGE (u:__Entity__ {id: 'user'}) "
             "MERGE (u)-[:KNOWS]->(e)",
@@ -177,6 +178,7 @@ class SkillDerivationJob:
                 "proficiency": proficiency,
                 "tool_type": tool_type,
                 "now": now,
+                "ontology_version": ONTOLOGY_VERSION,
             },
         )
 
@@ -229,7 +231,7 @@ class SkillDerivationJob:
             "  e.status = 'active', "
             "  e.created_at = $now, "
             "  e.updated_at = $now, "
-            "  e.ontology_version = '1.0.0' "
+            "  e.ontology_version = $ontology_version "
             "SET e:MistCapability "
             "WITH e "
             "MATCH (m:MistIdentity {id: 'mist-identity'}) "
@@ -240,6 +242,7 @@ class SkillDerivationJob:
                 "tool_type": tool_type,
                 "proficiency": proficiency,
                 "now": now,
+                "ontology_version": ONTOLOGY_VERSION,
             },
         )
         return True

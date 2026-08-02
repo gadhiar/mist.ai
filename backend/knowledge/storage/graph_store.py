@@ -10,13 +10,9 @@ from typing import Any
 
 from backend.errors import Neo4jQueryError
 from backend.interfaces import EmbeddingProvider, GraphConnection
+from backend.knowledge.version_stamps import ONTOLOGY_VERSION
 
 logger = logging.getLogger(__name__)
-
-# Default ontology version -- keep in sync with KnowledgeConfig.ontology_version.
-# GraphStore does not import KnowledgeConfig to avoid circular dependencies;
-# the factory injects the live value via the `ontology_version` constructor param.
-_DEFAULT_ONTOLOGY_VERSION = "1.1.0"
 
 # ADR-009 v1.1: user-facing relationship types allowed during graph-hop expansion.
 # Mirrors the full user-facing edge set in backend/knowledge/ontologies/v1_0_0.py.
@@ -111,7 +107,7 @@ class GraphStore:
         self,
         connection: GraphConnection,
         embedding_generator: EmbeddingProvider,
-        ontology_version: str = _DEFAULT_ONTOLOGY_VERSION,
+        ontology_version: str = ONTOLOGY_VERSION,
     ):
         """Initialize graph store with injected dependencies.
 
@@ -124,8 +120,8 @@ class GraphStore:
                 own `ontology_version` argument, and the curation path stamps
                 from `RebuildStamps`. Retained without a production caller for
                 R1.4's seed-utterance migration and R1.6's rebuild closure.
-                Defaults to the module constant, which tracks
-                `KnowledgeConfig.ontology_version`.
+                Defaults to the derived ontology stamp, so it cannot disagree
+                with the ontology actually in use.
         """
         self.connection = connection
         self.embedding_generator = embedding_generator
@@ -651,7 +647,7 @@ class GraphStore:
         graph_document,
         utterance_id: str | None = None,
         chunk_id: str | None = None,
-        ontology_version: str = "1.0.0",  # Default to current ontology version
+        ontology_version: str = ONTOLOGY_VERSION,
     ):
         """Store extracted entities and relationships from LLMGraphTransformer.
 
@@ -692,7 +688,7 @@ class GraphStore:
         entities: list[dict],
         relationships: list[dict],
         utterance_id: str,
-        ontology_version: str = "1.0.0",
+        ontology_version: str = ONTOLOGY_VERSION,
     ) -> None:
         """Store entities and relationships from ValidationResult format.
 
@@ -1358,9 +1354,9 @@ class GraphStore:
             m.confidence = 1.0,
             m.status = 'active',
             m.created_at = datetime(),
-            m.ontology_version = '1.0.0'
+            m.ontology_version = $ontology_version
         """
-        self.connection.execute_write(query)
+        self.connection.execute_write(query, {"ontology_version": self._ontology_version})
         logger.debug("MistIdentity singleton ensured")
 
     def get_mist_identity_context(self) -> dict:

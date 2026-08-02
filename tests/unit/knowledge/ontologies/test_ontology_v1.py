@@ -393,9 +393,14 @@ class TestOntologyVersion:
         assert ONTOLOGY_V1_0_0.parent_version == "1.3.0"
 
     def test_vault_writer_ontology_version_paired(self):
-        # The vault writer stamps _ONTOLOGY_VERSION into session-note
+        # The vault writer stamps the ontology version into session-note
         # frontmatter; it must track the active ontology version so rebuilt
-        # notes record the schema they were written under.
-        from backend.vault.writer import _ONTOLOGY_VERSION
+        # notes record the schema they were written under. It used to mirror
+        # the value as its own `_ONTOLOGY_VERSION` literal -- it now imports
+        # the derived stamp, so the pairing holds by construction.
+        from backend.vault import writer
 
-        assert ONTOLOGY_V1_0_0.version == _ONTOLOGY_VERSION
+        assert ONTOLOGY_V1_0_0.version == writer.ONTOLOGY_VERSION
+        assert not hasattr(
+            writer, "_ONTOLOGY_VERSION"
+        ), "the mirrored literal is deleted, not merely unreferenced"

@@ -8,6 +8,8 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
+from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
+
 load_dotenv()
 
 
@@ -573,7 +575,6 @@ class KnowledgeConfig:
     enable_knowledge_integration: bool = True  # Master switch for knowledge system
 
     # System settings
-    ontology_version: str = "1.4.0"  # Current ontology version (MECE taxonomy, 2026-06-14)
     enable_versioning: bool = True  # Track ontology versions
     enable_provenance: bool = True  # Track extraction provenance
 
@@ -584,26 +585,19 @@ class KnowledgeConfig:
     # `mist_admin vault-rebuild` no longer reads these -- R1.3 made it a
     # sidecar-only reindex with no graph-side comparison; no command consumes
     # the drift signal today.
-    # `extraction_version` should bump when EXTRACTION_SYSTEM_PROMPT or the
-    # ontology contract changes. `model_hash` is an immutable identifier for
-    # the LLM binary actually running extraction (recipe + quantization +
-    # weights). The prompt<->version pairing is mechanically enforced by
-    # TestExtractionVersionDriftGuard (pins a sha256 of the prompt content);
-    # a prompt edit without a bump would make R1 cache rebuilds silently
-    # serve stale extractions.
-    # 2026-06-12-r1: deep-review prompt fix (direction rules for
-    # USES/DEPENDS_ON/WORKS_WITH source sets, undirected WORKS_WITH).
-    # 2026-06-12-r2: emit assertion_kind signal (assert|cease|retract) per
-    # relationship (C3 spec 6.2 -- cessation/retraction reconciliation).
-    # 2026-06-12-r3: RECOMMENDS / HAS_HABIT predicates (ontology v1.3.0) plus
-    # date-entity discrimination (Rules 16-17, Examples 23-24).
-    # 2026-06-12-r4: precision rules -- HAS_HABIT recurrence-cadence tightening
-    # (Rule 17) + no prepositional over-extraction (Rule 18).
-    # 2026-06-14-r5: MECE taxonomy -- Abstraction fallback type, abstract-type
-    # tests block (Rules 19-20), third-party facts rule, retire Topic/Milestone
-    # from entity list (22 -> 21), retype Example 9 Milestone -> Event, add
-    # Examples 25-26 (third-party shape, Abstraction fallback).
-    extraction_version: str = "2026-06-14-r5"
+    #
+    # `ontology_version` and `extraction_version` describe CODE, so they are
+    # NOT env-configurable: they are read from `backend.knowledge.version_stamps`,
+    # which derives the ontology stamp from the active ontology object itself.
+    # An env override let a deployment pin a stamp that disagreed with the code
+    # actually running, which is exactly the drift this collapse removes --
+    # `extraction_cache.cache_key` turns such a disagreement into a hard miss.
+    #
+    # `model_hash` names the LLM binary actually running extraction (recipe +
+    # quantization + weights). That genuinely varies per deployment, so it stays
+    # env-configurable via MIST_MODEL_HASH.
+    ontology_version: str = ONTOLOGY_VERSION
+    extraction_version: str = EXTRACTION_VERSION
     model_hash: str = "gemma-4-e4b-q5-k-m-carteakey-full-v1"
 
     # Auto-RAG configuration
@@ -656,10 +650,12 @@ class KnowledgeConfig:
             filewatcher=FilewatcherConfig.from_env(),
             enable_knowledge_integration=os.getenv("ENABLE_KNOWLEDGE_INTEGRATION", "true").lower()
             == "true",
-            ontology_version=os.getenv("ONTOLOGY_VERSION", "1.4.0"),
             enable_versioning=os.getenv("ENABLE_VERSIONING", "true").lower() == "true",
             enable_provenance=os.getenv("ENABLE_PROVENANCE", "true").lower() == "true",
-            extraction_version=os.getenv("EXTRACTION_VERSION", "2026-06-14-r5"),
+            # ontology_version / extraction_version are deliberately absent:
+            # they describe code, so the dataclass defaults (derived from
+            # version_stamps) are the only authority. Only model_hash, which
+            # names a deployed model file, is overridable.
             model_hash=os.getenv("MIST_MODEL_HASH", "gemma-4-e4b-q5-k-m-carteakey-full-v1"),
             auto_inject_docs=os.getenv("AUTO_INJECT_DOCS", "true").lower() == "true",
             auto_inject_limit=int(os.getenv("AUTO_INJECT_LIMIT", "3")),

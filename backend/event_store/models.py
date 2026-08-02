@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from backend.knowledge.version_stamps import ONTOLOGY_VERSION
+
 
 @dataclass
 class ConversationSession:
@@ -108,8 +110,8 @@ class ConversationTurnEvent:
     llm_model: str | None = None
     llm_parameters: dict[str, Any] | None = None
 
-    # Versioning
-    ontology_version: str = "1.0.0"
+    # Versioning -- derived, never restated (see backend.knowledge.version_stamps).
+    ontology_version: str = ONTOLOGY_VERSION
 
     # Assigned by EventStore.append_turn(), not by caller
     event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -189,5 +191,5 @@ class ConversationTurnEvent:
             tts_model=row.get("tts_model"),
             llm_model=row.get("llm_model"),
             llm_parameters=_parse_json(row.get("llm_parameters")),
-            ontology_version=row.get("ontology_version", "1.0.0"),
+            ontology_version=row.get("ontology_version", ONTOLOGY_VERSION),
         )

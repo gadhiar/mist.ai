@@ -26,10 +26,13 @@ class TestBugAProvenance:
         from backend.knowledge.curation.graph_writer import CurationGraphWriter
         from tests.mocks.embeddings import FakeEmbeddingGenerator
         from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
+        from tests.unit.knowledge.curation._graph_writer_fakes import TEST_REBUILD_STAMPS
 
         conn = FakeNeo4jConnection()
         executor = FakeGraphExecutor(connection=conn)
-        writer = CurationGraphWriter(executor, FakeEmbeddingGenerator(), ConfidenceManager())
+        writer = CurationGraphWriter(
+            executor, FakeEmbeddingGenerator(), ConfidenceManager(), TEST_REBUILD_STAMPS
+        )
 
         # Simulate a fresh-entity write from extraction output.
         entity = {

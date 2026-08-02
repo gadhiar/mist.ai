@@ -11,6 +11,7 @@ from backend.knowledge.curation.reconciliation import (
 )
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
+from tests.unit.knowledge.curation._graph_writer_fakes import TEST_REBUILD_STAMPS
 from tests.unit.knowledge.curation.conftest import (
     make_entity_dict,
     make_relationship_dict,
@@ -62,7 +63,8 @@ def _build_pipeline(*, connection=None, engine=None, graph_writer=None, deduplic
         CurationPipeline(
             deduplicator=deduplicator or EntityDeduplicator(executor, embeddings, confidence),
             reconciliation_engine=eng,
-            graph_writer=graph_writer or CurationGraphWriter(executor, embeddings, confidence),
+            graph_writer=graph_writer
+            or CurationGraphWriter(executor, embeddings, confidence, TEST_REBUILD_STAMPS),
         ),
         conn,
         eng,
@@ -440,7 +442,7 @@ class TestErrorHandling:
         pipeline = CurationPipeline(
             deduplicator=FailingDeduplicator(executor, embeddings, confidence),
             reconciliation_engine=_SpyEngine(),
-            graph_writer=CurationGraphWriter(executor, embeddings, confidence),
+            graph_writer=CurationGraphWriter(executor, embeddings, confidence, TEST_REBUILD_STAMPS),
         )
 
         validation = make_validation_result(entities=[make_entity_dict()])

@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 from backend.errors import VaultWriteError
 from backend.knowledge.config import VaultConfig
+from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
 from backend.vault.models import (
     AuthoredBy,
     MistIdentityFrontmatter,
@@ -52,12 +53,6 @@ _STEM_DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-")
 # `> ## Provenance`; the case-insensitive flag accepts `## provenance` as
 # the same logical section.
 _PROVENANCE_HEADING_RE = re.compile(r"(?im)^##\s+Provenance\s*$")
-
-# Stamp mirrors of KnowledgeConfig defaults (the writer is wired with
-# VaultConfig only). Keep in lockstep with backend/knowledge/config.py --
-# TestExtractionVersionDriftGuard pins the prompt<->version pairing.
-_ONTOLOGY_VERSION = "1.4.0"
-_EXTRACTION_VERSION = "2026-06-14-r5"
 
 
 def _session_id_from_path(path: Path) -> str:
@@ -771,8 +766,8 @@ class VaultWriter:
             status=status,
             authored_by=authored_by,
             related_entities=sorted(set(related_entities)),
-            ontology_version=_ONTOLOGY_VERSION,
-            extraction_version=_EXTRACTION_VERSION,
+            ontology_version=ONTOLOGY_VERSION,
+            extraction_version=EXTRACTION_VERSION,
             model_hash=self._model_hash,
         )
 

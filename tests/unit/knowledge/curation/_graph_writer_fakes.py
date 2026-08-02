@@ -16,6 +16,16 @@ from backend.knowledge.curation.graph_writer import CurationGraphWriter, Rebuild
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
 
+# `rebuild_stamps` is a required dependency on CurationGraphWriter, so tests
+# that do not care about stamp VALUES still have to supply one. These are the
+# canonical test stamps -- deliberately not the production values, so a test
+# asserting on them cannot accidentally pass by matching a real default.
+TEST_REBUILD_STAMPS = RebuildStamps(
+    ontology_version="1.4.0-test",
+    extraction_version="2026-06-14-r5-test",
+    model_hash="test-model-hash",
+)
+
 
 def make_writer(
     rebuild_stamps: RebuildStamps | None = None,
@@ -26,7 +36,7 @@ def make_writer(
         executor=FakeGraphExecutor(connection=conn),
         embedding_provider=FakeEmbeddingGenerator(),
         confidence_manager=ConfidenceManager(),
-        rebuild_stamps=rebuild_stamps,
+        rebuild_stamps=rebuild_stamps or TEST_REBUILD_STAMPS,
     )
     return writer, conn
 

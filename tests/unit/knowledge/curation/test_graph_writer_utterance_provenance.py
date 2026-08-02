@@ -12,10 +12,14 @@ reconciled relationship edges (reconciliation.py).
 
 import pytest
 
+from backend.knowledge.curation.confidence import ConfidenceManager
 from backend.knowledge.curation.graph_writer import (
+    CurationGraphWriter,
     RebuildStamps,
     WriteResult,
 )
+from tests.mocks.embeddings import FakeEmbeddingGenerator
+from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
 
 # Reuse the fake connection helpers from the file this replaces.
 from tests.unit.knowledge.curation._graph_writer_fakes import (
@@ -78,23 +82,19 @@ class TestUtteranceAnchor:
         assert "r.event_id" not in query, "the old property name is retired"
         assert params["event_id"] == "evt-42"
 
-    @pytest.mark.asyncio
-    async def test_extracted_from_edge_omits_stamps_when_unset(self) -> None:
-        writer, conn = make_writer(rebuild_stamps=None)
-        await writer.write(
-            entities=[{"id": "python", "type": "Technology", "name": "Python"}],
-            merge_actions=[],
-            event_id="evt-1",
-            session_id="sess-1",
-        )
-        query, params = writes_matching(conn, "EXTRACTED_FROM")[0]
-        assert "ontology_version" not in query
-        assert "ontology_version" not in params
-        # Guards the SET-clause concatenation: a lost separator or comma
-        # between the status literal and the following ON MATCH keyword
-        # would still leave every substring assertion above passing, so
-        # this pins the exact boundary a malformed splice would break.
-        assert "r.status = 'active' ON MATCH SET" in query
+    def test_writer_cannot_be_built_without_stamps(self) -> None:
+        """The unstamped mode is deleted, not merely unused.
+
+        It was never coherent: `ontology_version` is a required universal
+        entity property, so a stamp-less writer could only emit a
+        wrong-by-default literal (it emitted "1.2.1") or an invalid entity.
+        """
+        with pytest.raises(TypeError):
+            CurationGraphWriter(
+                executor=FakeGraphExecutor(connection=FakeNeo4jConnection()),
+                embedding_provider=FakeEmbeddingGenerator(),
+                confidence_manager=ConfidenceManager(),
+            )
 
     @pytest.mark.asyncio
     async def test_extracted_from_edge_carries_stamps_on_both_branches(self) -> None:
