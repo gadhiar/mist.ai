@@ -1,0 +1,390 @@
+# Golden log -- authored turn schedule (R1.4.5)
+#
+# The `log` half of `graph = f(seed@version, log, epoch)`, authored as a repo fixture.
+# NEVER written to the live event store: `scripts/golden_log/generate.py` materializes it
+# into an isolated EventStore + ExtractionCache that the caller supplies.
+#
+# Gap-schedule rationale, elapsed-time table, and close-reason coverage: GAP-SCHEDULE.md
+# (authored and committed BEFORE any R1.5 staleness-window constant was consulted).
+#
+# Turn entry shape:
+#   id        deterministic; becomes event_id `golden-<id>`. Never generated.
+#   at        authored ISO-8601 timestamp. Load-bearing content, not metadata.
+#   utterance required only for authored turns; gold turns take theirs from the corpus.
+#   record    present => authored inline, in GOLD shape (translated by the same code path
+#             as the corpus). Absent => `id` must resolve to a tag in gold_corpus.
+#
+# session_id is derived as `golden-YYYY-MM` from `at` (pinned by
+# tests/unit/golden_log/test_generate.py). Turns are listed in timestamp order, so rowid
+# order and timestamp order agree -- the replay reads rowid order.
+
+gold_corpus: data/ingest/extraction-gold-2026-06-14.jsonl
+log_end: "2026-07-15T12:00:00+00:00"
+
+turns:
+  - {id: ext-01-uses, at: "2025-09-02T08:00:00+00:00"}
+  - {id: ext-02-dislikes, at: "2025-09-03T09:00:00+00:00"}
+  - {id: ext-03-works-at, at: "2025-09-05T10:00:00+00:00"}
+
+  # P1 -- oldest never-restated LEARNING (310 d to log end).
+  - id: stale-learning-haskell
+    at: "2025-09-08T09:00:00+00:00"
+    utterance: "I started picking up Haskell this weekend."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: haskell, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: LEARNING, target: haskell, target_type: Technology}
+
+  - {id: ext-04-event-on-date, at: "2025-09-10T11:00:00+00:00"}
+  - {id: ext-05-metric, at: "2025-09-11T12:00:00+00:00"}
+  - {id: ext-06-learning, at: "2025-09-19T13:00:00+00:00"}
+  - {id: ext-07-expert, at: "2025-09-22T14:00:00+00:00"}
+
+  # Negative control A, first assertion -- restated twice later, must survive any window.
+  - id: fresh-learning-swift-1
+    at: "2025-09-25T10:00:00+00:00"
+    utterance: "I'm learning Swift."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: swift, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: LEARNING, target: swift, target_type: Technology}
+
+  - {id: ext-08-third-party-person, at: "2025-10-04T15:00:00+00:00"}
+  - {id: ext-09-valid-time, at: "2025-10-06T16:00:00+00:00"}
+  - {id: ext-10-directive-negative, at: "2025-10-12T17:00:00+00:00"}
+
+  # Re-assertion sequence (spec 4b), assertion 1 of 4.
+  - id: reassert-uses-postgres-1
+    at: "2025-10-20T11:00:00+00:00"
+    utterance: "I use PostgreSQL for everything that needs a real database."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: postgresql, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: USES, target: postgresql, target_type: Technology}
+
+  - {id: ext-11-smalltalk-negative, at: "2025-10-30T18:00:00+00:00"}
+  - {id: ext-12-structural-isa, at: "2025-10-31T19:00:00+00:00"}
+  - {id: ext-13-uses-editor, at: "2025-11-01T08:00:00+00:00"}
+  - {id: ext-14-uses-usedfor, at: "2025-11-02T09:00:00+00:00"}
+  - {id: ext-15-dislikes-negation, at: "2025-11-04T10:00:00+00:00"}
+  - {id: ext-16-dislikes, at: "2025-11-09T11:00:00+00:00"}
+  - {id: ext-17-works-at, at: "2025-11-10T12:00:00+00:00"}
+  - {id: ext-18-works-at, at: "2025-11-18T13:00:00+00:00"}
+  - {id: ext-19-prefers, at: "2025-11-21T14:00:00+00:00"}
+  - {id: ext-20-event-on-date, at: "2025-12-03T15:00:00+00:00"}
+  - {id: ext-21-milestone-on-date, at: "2025-12-05T16:00:00+00:00"}
+  - {id: ext-22-milestone-on-date, at: "2025-12-11T17:00:00+00:00"}
+  - {id: ext-23-event-on-date, at: "2025-12-29T18:00:00+00:00"}
+  - {id: ext-24-metric, at: "2025-12-30T19:00:00+00:00"}
+  - {id: ext-25-metric, at: "2025-12-31T08:00:00+00:00"}
+  - {id: ext-26-learning, at: "2026-01-01T09:00:00+00:00"}
+  - {id: ext-27-expert, at: "2026-01-03T10:00:00+00:00"}
+  - {id: ext-28-struggles, at: "2026-01-08T11:00:00+00:00"}
+  - {id: ext-29-third-party-knows, at: "2026-01-09T12:00:00+00:00"}
+
+  # P2 -- never-restated LEARNING (181 d to log end).
+  - id: stale-learning-ocaml
+    at: "2026-01-15T09:00:00+00:00"
+    utterance: "I'm learning OCaml to understand the ML family properly."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: ocaml, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: LEARNING, target: ocaml, target_type: Technology}
+
+  - {id: ext-30-third-party-knows, at: "2026-01-17T13:00:00+00:00"}
+  - {id: ext-31-third-party-recommends, at: "2026-01-20T14:00:00+00:00"}
+
+  # Re-assertion sequence, assertion 2 of 4.
+  - id: reassert-uses-postgres-2
+    at: "2026-01-25T11:00:00+00:00"
+    utterance: "Still on PostgreSQL for the new service."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: postgresql, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: USES, target: postgresql, target_type: Technology}
+
+  - {id: ext-32-third-party-recommends, at: "2026-02-01T15:00:00+00:00"}
+  - {id: ext-33-validtime-since, at: "2026-02-03T16:00:00+00:00"}
+  - {id: ext-34-validtime-from, at: "2026-02-09T17:00:00+00:00"}
+
+  # Negative control A, second assertion.
+  - id: fresh-learning-swift-2
+    at: "2026-02-10T10:00:00+00:00"
+    utterance: "Still working through Swift, slowly."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: swift, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: LEARNING, target: swift, target_type: Technology}
+
+  - {id: ext-35-validtime-until, at: "2026-02-27T18:00:00+00:00"}
+  - {id: ext-36-validtime-between, at: "2026-02-28T19:00:00+00:00"}
+  - {id: ext-37-directive-negative, at: "2026-03-01T08:00:00+00:00"}
+  - {id: ext-38-question-negative, at: "2026-03-02T09:00:00+00:00"}
+  - {id: ext-39-hypothetical-negative, at: "2026-03-04T10:00:00+00:00"}
+  - {id: ext-40-directive-negative, at: "2026-03-09T11:00:00+00:00"}
+  - {id: ext-41-structural-isa, at: "2026-03-10T12:00:00+00:00"}
+
+  # Prior for ext-43 -- without it the cease flags cease_without_prior instead of closing.
+  - id: prior-uses-mongodb
+    at: "2026-03-14T10:00:00+00:00"
+    utterance: "We moved the events store onto MongoDB."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: mongodb, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: USES, target: mongodb, target_type: Technology}
+
+  - {id: ext-42-structural-partof, at: "2026-03-18T13:00:00+00:00"}
+  - {id: ext-43-cease-stated-date, at: "2026-03-21T14:00:00+00:00"}
+
+  # Prior for ext-44. WORKS_AT is SINGLE, so this assertion also closes the open
+  # workplace edge by single_supersession -- the third of the five close reasons.
+  - id: prior-works-at-wayfair
+    at: "2026-03-28T10:00:00+00:00"
+    utterance: "I joined Wayfair last week."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: wayfair, type: Organization}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: WORKS_AT, target: wayfair, target_type: Organization}
+
+  # Prior for ext-45 -- negative control B (spoken cease, already closed by C3).
+  - id: prior-learning-clojure
+    at: "2026-03-30T10:00:00+00:00"
+    utterance: "I'm learning Clojure."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: clojure, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: LEARNING, target: clojure, target_type: Technology}
+
+  - {id: ext-44-cease-workplace, at: "2026-04-02T15:00:00+00:00"}
+  - {id: ext-45-cease-learning, at: "2026-04-04T16:00:00+00:00"}
+
+  - id: prior-uses-vim
+    at: "2026-04-06T10:00:00+00:00"
+    utterance: "I use Vim for quick edits over SSH."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: vim, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: USES, target: vim, target_type: Technology}
+
+  - {id: ext-46-cease-anymore, at: "2026-04-10T17:00:00+00:00"}
+
+  # P3 -- never-restated LEARNING (92 d to log end).
+  - id: stale-learning-zig
+    at: "2026-04-14T09:00:00+00:00"
+    utterance: "I'm learning Zig for the allocator model."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: zig, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: LEARNING, target: zig, target_type: Technology}
+
+  - id: prior-uses-notion
+    at: "2026-04-20T10:00:00+00:00"
+    utterance: "I use Notion to keep project notes."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: notion, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: USES, target: notion, target_type: Technology}
+
+  - id: prior-learning-scala
+    at: "2026-04-22T10:00:00+00:00"
+    utterance: "I'm learning Scala for the Spark work."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: scala, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: LEARNING, target: scala, target_type: Technology}
+
+  - id: prior-works-at-figma
+    at: "2026-04-25T10:00:00+00:00"
+    utterance: "I work at Figma now."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: figma, type: Organization}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: WORKS_AT, target: figma, target_type: Organization}
+
+  - {id: ext-47-cease-dropped, at: "2026-04-28T18:00:00+00:00"}
+  - {id: ext-48-retract-never-actually, at: "2026-04-29T19:00:00+00:00"}
+  - {id: ext-49-retract-misspoke, at: "2026-04-30T08:00:00+00:00"}
+
+  - id: prior-works-at-initech
+    at: "2026-04-30T20:00:00+00:00"
+    utterance: "I work at Initech."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: initech, type: Organization}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: WORKS_AT, target: initech, target_type: Organization}
+
+  - {id: ext-50-retract-scratch-that, at: "2026-05-01T09:00:00+00:00"}
+
+  - id: prior-uses-kafka
+    at: "2026-05-02T10:00:00+00:00"
+    utterance: "I use Kafka for the ingestion pipeline."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: kafka, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: USES, target: kafka, target_type: Technology}
+
+  - {id: ext-51-retract-was-wrong, at: "2026-05-03T10:00:00+00:00"}
+
+  - id: prior-learning-elixir
+    at: "2026-05-05T10:00:00+00:00"
+    utterance: "I'm learning Elixir."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: elixir, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: LEARNING, target: elixir, target_type: Technology}
+
+  - {id: ext-52-retract-correction, at: "2026-05-08T11:00:00+00:00"}
+
+  - id: prior-works-at-zeta
+    at: "2026-05-08T20:00:00+00:00"
+    utterance: "I work at Zeta."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: zeta, type: Organization}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: WORKS_AT, target: zeta, target_type: Organization}
+
+  - {id: ext-53-same-turn-single-pair, at: "2026-05-09T12:00:00+00:00"}
+
+  - id: prior-uses-redis
+    at: "2026-05-14T10:00:00+00:00"
+    utterance: "I use Redis for the session cache."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: redis, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: USES, target: redis, target_type: Technology}
+
+  - {id: ext-54-same-turn-single-pair, at: "2026-05-17T13:00:00+00:00"}
+  - {id: ext-55-habit, at: "2026-05-20T14:00:00+00:00"}
+
+  # Re-assertion sequence, assertion 3 of 4.
+  - id: reassert-uses-postgres-3
+    at: "2026-05-25T11:00:00+00:00"
+    utterance: "PostgreSQL again for the reporting store."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: postgresql, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: USES, target: postgresql, target_type: Technology}
+
+  - {id: ext-56-habit, at: "2026-06-01T15:00:00+00:00"}
+  - {id: ext-57-habit, at: "2026-06-03T16:00:00+00:00"}
+  - {id: ext-58-dateentity-stative-since, at: "2026-06-09T17:00:00+00:00"}
+
+  # Close reason 4 of 5: STRUGGLES_WITH contradicts the EXPERT_IN python from ext-07.
+  - id: contradiction-struggles-python
+    at: "2026-06-10T10:00:00+00:00"
+    utterance: "Honestly I struggle with Python's async model."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: python, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: STRUGGLES_WITH, target: python, target_type: Technology}
+
+  # P4 -- never-restated LEARNING (31 d to log end).
+  - id: stale-learning-nim
+    at: "2026-06-14T09:00:00+00:00"
+    utterance: "I'm learning Nim."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: nim, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: LEARNING, target: nim, target_type: Technology}
+
+  # Close reason 5 of 5: EXPERT_IN progression-supersedes the LEARNING rust from ext-06.
+  # Also a control -- LEARNING rust is 269 d old at log end but is closed by progression,
+  # so a staleness pass must not claim it.
+  - id: progression-expert-rust
+    at: "2026-06-15T10:00:00+00:00"
+    utterance: "I'd call myself an expert in Rust at this point."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: rust, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: EXPERT_IN, target: rust, target_type: Technology}
+
+  - {id: ext-59-dateentity-stative-since, at: "2026-06-27T18:00:00+00:00"}
+  - {id: ext-60-dateentity-event-on, at: "2026-06-28T19:00:00+00:00"}
+
+  # Re-assertion sequence, assertion 4 of 4 -- 14 d before log end.
+  - id: reassert-uses-postgres-4
+    at: "2026-07-01T11:00:00+00:00"
+    utterance: "Still PostgreSQL, still no regrets."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: postgresql, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: USES, target: postgresql, target_type: Technology}
+
+  # P5 -- newest never-restated LEARNING (9 d to log end).
+  - id: stale-learning-lua
+    at: "2026-07-06T09:00:00+00:00"
+    utterance: "I'm learning Lua for the plugin work."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: lua, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: LEARNING, target: lua, target_type: Technology}
+
+  # Negative control A, third assertion -- 7 d before log end.
+  - id: fresh-learning-swift-3
+    at: "2026-07-08T10:00:00+00:00"
+    utterance: "Back on Swift this week."
+    record:
+      expected_entities:
+        - {id: user, type: User}
+        - {id: swift, type: Technology}
+      expected_relationships:
+        - {source: user, source_type: User, predicate: LEARNING, target: swift, target_type: Technology}
+
+  # Fixes log end at a turn that asserts nothing, so every elapsed time above is stable
+  # against wall-clock and does not depend on the last fact-bearing turn.
+  - id: log-tail-anchor
+    at: "2026-07-15T12:00:00+00:00"
+    utterance: "Anyway, that's all for now."
+    record:
+      expected_entities: []
+      expected_relationships: []
