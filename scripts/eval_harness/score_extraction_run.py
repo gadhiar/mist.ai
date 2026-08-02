@@ -45,6 +45,18 @@ from backend.knowledge.ontologies.hierarchy import (  # noqa: E402
     children_of,
     parent_of,
 )
+from scripts.golden_log.native_shape import (  # noqa: E402
+    GOLD_PREDICATE_FIELD,
+    GOLD_SOURCE_FIELD,
+    GOLD_TARGET_FIELD,
+    GOLD_VALID_FROM_FIELD,
+    GOLD_VALID_TO_FIELD,
+    native_endpoints,
+    native_entity_id,
+    native_entity_type,
+    native_predicate,
+    native_properties,
+)
 
 EXTRACTION_CALL_SITE = "extraction.ontology"
 EXTRACTION_UTTERANCE_PATTERN = re.compile(r'Utterance:\s*"(.+?)"\s*\n\s*Output:', re.DOTALL)
@@ -163,13 +175,13 @@ def iter_gold_probes(path: Path) -> list[GoldProbe]:
             tag = obj.get("tag", f"probe-{line_no}")
             rels = tuple(
                 GoldRel(
-                    source=canonical_id(r["source"]),
+                    source=canonical_id(r[GOLD_SOURCE_FIELD]),
                     source_type=r["source_type"],
-                    predicate=r["predicate"],
-                    target=canonical_id(r["target"]),
+                    predicate=r[GOLD_PREDICATE_FIELD],
+                    target=canonical_id(r[GOLD_TARGET_FIELD]),
                     target_type=r["target_type"],
-                    valid_from=r.get("valid_from"),
-                    valid_to=r.get("valid_to"),
+                    valid_from=r.get(GOLD_VALID_FROM_FIELD),
+                    valid_to=r.get(GOLD_VALID_TO_FIELD),
                     assertion_kind=str(r.get("assertion_kind", "assert")),
                 )
                 for r in obj.get("expected_relationships", [])
@@ -244,8 +256,8 @@ def parse_produced(
     for e in parsed.get("entities", []):
         if not isinstance(e, dict):
             continue
-        etype = str(e.get("type", ""))
-        raw_id = str(e.get("id") or e.get("name") or "")
+        etype = native_entity_type(e)
+        raw_id = native_entity_id(e)
         props = e.get("properties") if isinstance(e.get("properties"), dict) else {}
         # Metric entities get a value-first canonical id so word-order splits
         # (requests-per-second-12000 vs 12000-requests-per-second) collapse before
@@ -261,14 +273,15 @@ def parse_produced(
     for r in parsed.get("relationships", []):
         if not isinstance(r, dict):
             continue
-        source = canonical_id(str(r.get("source", "")))
-        target = canonical_id(str(r.get("target", "")))
+        raw_source, raw_target = native_endpoints(r)
+        source = canonical_id(raw_source)
+        target = canonical_id(raw_target)
         rels.append(
             {
                 "source": metric_id_remap.get(source, source),
                 "target": metric_id_remap.get(target, target),
-                "predicate": str(r.get("type", "")),
-                "properties": r.get("properties") or {},
+                "predicate": native_predicate(r),
+                "properties": native_properties(r),
             }
         )
     return True, tuple(entities), type_by_id, tuple(rels)
