@@ -835,6 +835,32 @@ class ConversationHandler:
             try:
                 self.event_store = EventStore(db_path=es_config.db_path)
                 self.event_store.initialize()
+                # R1.4 Task 7 built `ensure_initial_epoch` (five unit tests,
+                # correct, idempotent) and never called it from production --
+                # verified 2026-08-01: a repo-wide grep found the method only
+                # in `store.py` and its own test module, and the live
+                # `epoch_ledger` held 0 rows despite R1.4's record stating a
+                # provisional epoch had been written. `rebuild()` reads
+                # `epoch["activated_at"]` and the stamp triple, so with no row
+                # there is nothing for R1.6's `live == rebuilt` closure to
+                # rebuild against.
+                #
+                # Here rather than in `mist_admin.py`, which also constructs an
+                # EventStore: this is the one path production always takes, and
+                # the CLI's is only taken when someone runs a subcommand.
+                #
+                # `now_iso` from the injected clock, never a clock read inside
+                # the store -- the method's own docstring records why (R1.3.1
+                # shipped a `datetime.now()` fallback that drifted across UTC
+                # midnight and mis-dated the only note MIST had ever written).
+                # `_now_fn` is assigned well above this block, so it is bound.
+                #
+                # Inside this `try` deliberately: every realistic failure mode
+                # (a broken/unwritable SQLite file) already fails
+                # `initialize()` one line up, so a separate handler would guard
+                # against nothing while adding a bare `except Exception` the
+                # error-handling convention forbids.
+                self.event_store.ensure_initial_epoch(now_iso=self._now_fn().isoformat())
                 logger.info("Event store enabled at %s", self.event_store.db_path)
             except Exception as e:
                 logger.error("Failed to initialize event store: %s", e, exc_info=True)
