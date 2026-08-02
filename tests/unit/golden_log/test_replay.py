@@ -187,6 +187,57 @@ class TestCacheCoverage:
                 staging_uri=STAGING_URI, live_uri=LIVE_URI, epoch=drifted_epoch
             )
 
+    @pytest.mark.asyncio
+    async def test_a_stamp_mismatch_is_distinguishable_from_a_genuinely_cold_turn(
+        self, tmp_path, golden_turns
+    ):
+        # A stamp mismatch and a real cache hole raise the same ColdCacheError, so a proof
+        # that cannot tell them apart will misattribute the failure. Two things separate
+        # them here. First, `materialize_isolated` verifies coverage under the triple it
+        # just wrote, so after it returns, a hole cannot be the cause. Second, the error
+        # names the stamps it looked under.
+        materialized = materialize_isolated(golden_turns, root=tmp_path / "iso")
+        drifted = {**materialized.epoch, "extraction_version": "2026-01-01-r0"}
+        regenerator = LogRegenerator(
+            event_store=materialized.event_store,
+            extraction_cache=materialized.extraction_cache,
+            staging_curation_pipeline=RecordingCurationPipeline(),
+        )
+
+        with pytest.raises(ColdCacheError) as excinfo:
+            await regenerator.rebuild(staging_uri=STAGING_URI, live_uri=LIVE_URI, epoch=drifted)
+
+        message = str(excinfo.value)
+        # ALL turns cold, not some: the signature of a stamp mismatch rather than a hole.
+        assert f"{EXPECTED_TURN_COUNT} of {EXPECTED_TURN_COUNT} turns are uncached" in message
+        assert "extraction=2026-01-01-r0" in message
+
+    @pytest.mark.asyncio
+    async def test_the_cold_cache_message_does_not_name_model_hash(self, tmp_path, golden_turns):
+        # Known diagnostic gap, pinned rather than left to be rediscovered. `model_hash` is
+        # a third of the cache key and the two triples in this system DIFFER in it
+        # (`factories.py` composes "|emb:<embedding model>"; epoch rows carry the bare
+        # value). A model_hash mismatch therefore produces a ColdCacheError that reports
+        # matching ontology and extraction versions and gives no hint at the real cause.
+        materialized = materialize_isolated(golden_turns, root=tmp_path / "iso")
+        drifted = {
+            **materialized.epoch,
+            "model_hash": f"{materialized.epoch['model_hash']}|emb:all-MiniLM-L6-v2",
+        }
+        regenerator = LogRegenerator(
+            event_store=materialized.event_store,
+            extraction_cache=materialized.extraction_cache,
+            staging_curation_pipeline=RecordingCurationPipeline(),
+        )
+
+        with pytest.raises(ColdCacheError) as excinfo:
+            await regenerator.rebuild(staging_uri=STAGING_URI, live_uri=LIVE_URI, epoch=drifted)
+
+        assert "emb:" not in str(excinfo.value), (
+            "ColdCacheError now names model_hash -- delete this test and stop warning about "
+            "the blind spot in the report"
+        )
+
 
 class TestReplayedContent:
     @pytest.mark.asyncio

@@ -41,6 +41,16 @@ ONTOLOGY_VERSION: str = ONTOLOGY_V1_0_0.version
 # Bump whenever EXTRACTION_SYSTEM_PROMPT / EXTRACTION_USER_TEMPLATE or the
 # ontology contract they encode changes, then re-pin PINNED_SHA256 in
 # tests/unit/knowledge/extraction/test_prompts.py.
+#
+# ALSO on a bump: the R1.4.5 golden log's authored extraction cache goes cold,
+# because `extraction_cache.cache_key` hashes this value. It is not a migration
+# -- the cache is regenerated, not converted -- and it is not a manual step
+# either: `scripts/golden_log/generate.py` derives the triple from here and
+# materializes a fresh cache per test run, so nothing needs re-authoring. The
+# checked-in artifact holds only payloads, never keys. Regenerate it only when
+# the SCHEDULE or the gold corpus changes:
+#     python -m scripts.golden_log.generate            # rewrite
+#     python -m scripts.golden_log.generate --check    # verify current
 # 2026-06-12-r1: deep-review prompt fix (direction rules for
 # USES/DEPENDS_ON/WORKS_WITH source sets, undirected WORKS_WITH).
 # 2026-06-12-r2: emit assertion_kind signal (assert|cease|retract) per

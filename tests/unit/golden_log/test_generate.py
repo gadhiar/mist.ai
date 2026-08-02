@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from backend.knowledge.config import KnowledgeConfig
+from backend.knowledge.extraction_cache import cache_key
 from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
 from scripts.golden_log.generate import (
     ARTIFACT_PATH,
@@ -196,6 +197,26 @@ class TestStampsHaveOneAuthority:
         assert materialized.epoch["extraction_version"] == EXTRACTION_VERSION
         assert materialized.epoch["model_hash"] == KnowledgeConfig.from_env().model_hash
 
+    def test_epoch_model_hash_is_the_bare_config_value_not_the_composed_writer_stamp(
+        self, turns, tmp_path
+    ):
+        # Arrange: two triples exist and they differ in model_hash. `factories.py` composes
+        # f"{config.model_hash}|emb:{config.embedding.model_name}" into RebuildStamps, which
+        # is what lands on every edge. `EventStore` epoch rows carry the BARE value, and the
+        # cache key hashes the EPOCH's. Harmonizing the epoch onto the composed form would
+        # take this corpus permanently cold, deterministically, on every turn.
+        materialized = materialize_isolated(turns, root=tmp_path / "isolated")
+
+        # Assert
+        assert materialized.epoch["model_hash"] == KnowledgeConfig.from_env().model_hash
+        assert "|emb:" not in materialized.epoch["model_hash"]
+
+    def test_no_golden_log_module_reaches_for_the_writer_stamps(self):
+        # Assert: RebuildStamps is the OTHER triple. Reading it here is the whole bug.
+        for path in sorted(Path("scripts/golden_log").rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            assert "RebuildStamps" not in source, f"{path}: reads the writer stamp triple"
+
     def test_epoch_is_written_to_the_isolated_store_not_read_from_live(self, turns, tmp_path):
         # Assert: the fixture's epoch is epoch 1 OF ITS OWN LEDGER. Live epoch_id 1 carries
         # a pre-collapse extraction_version and must never be depended on.
@@ -267,6 +288,48 @@ class TestMaterialize:
 
         assert all(hit is not None for hit in hits)
         assert len(hits) == EXPECTED_TURN_COUNT
+
+    def test_the_write_triple_is_the_read_triple(self, turns, tmp_path):
+        # Assert: the key the cache was WRITTEN under is the key the rebuild COMPUTES.
+        # `LogRegenerator` derives its lookup from epoch[ontology|extraction|model_hash], so
+        # this recomputes that key independently and requires a row under it.
+        materialized = materialize_isolated(turns, root=tmp_path / "isolated")
+        epoch = materialized.epoch
+
+        rebuild_key = cache_key(
+            turns[0].event_id,
+            epoch["ontology_version"],
+            epoch["extraction_version"],
+            epoch["model_hash"],
+        )
+        stored = (
+            materialized.extraction_cache._get_connection()
+            .execute(
+                "SELECT cache_key FROM extraction_cache WHERE event_id = ?", (turns[0].event_id,)
+            )
+            .fetchone()
+        )
+
+        assert stored is not None
+        assert stored["cache_key"] == rebuild_key
+
+    def test_the_composed_writer_model_hash_would_miss(self, turns, tmp_path):
+        # Assert: names the concrete failure mode rather than trusting it cannot happen.
+        # Keying on `factories`' composed model_hash produces a different key -- a total,
+        # permanent cold cache. This is why the epoch triple is the one that matters.
+        materialized = materialize_isolated(turns, root=tmp_path / "isolated")
+        epoch = materialized.epoch
+        composed = f"{epoch['model_hash']}|emb:all-MiniLM-L6-v2"
+
+        assert (
+            materialized.extraction_cache.get(
+                turns[0].event_id,
+                epoch["ontology_version"],
+                epoch["extraction_version"],
+                composed,
+            )
+            is None
+        )
 
     def test_cached_payload_is_the_native_shape_the_replay_feeds_forward(self, turns, tmp_path):
         # Assert: rebuild hands `cached["relationships"]` straight to ValidationResult, so
