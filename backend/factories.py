@@ -203,6 +203,7 @@ def build_curation_pipeline(
     """
     from backend.knowledge.curation.graph_writer import RebuildStamps
     from backend.knowledge.embeddings import EmbeddingGenerator
+    from backend.knowledge.version_stamps import compose_model_hash
 
     if embedding_provider is None:
         embedding_provider = EmbeddingGenerator(config.embedding.model_name)
@@ -216,7 +217,7 @@ def build_curation_pipeline(
     rebuild_stamps = RebuildStamps(
         ontology_version=config.ontology_version,
         extraction_version=config.extraction_version,
-        model_hash=f"{config.model_hash}|emb:{config.embedding.model_name}",
+        model_hash=compose_model_hash(config),
     )
     return CurationPipeline(
         deduplicator=EntityDeduplicator(executor, embedding_provider, confidence_mgr),

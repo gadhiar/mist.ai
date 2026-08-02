@@ -64,3 +64,42 @@ ONTOLOGY_VERSION: str = ONTOLOGY_V1_0_0.version
 # from entity list (22 -> 21), retype Example 9 Milestone -> Event, add
 # Examples 25-26 (third-party shape, Abstraction fallback).
 EXTRACTION_VERSION: str = "2026-06-14-r5"
+
+
+def compose_model_hash(config: object) -> str:
+    """Return the `model_hash` stamp: the LLM hash folded with the embedding model.
+
+    **Both the LLM and the embedding model belong in this stamp**, and the second
+    one is not obvious. Task R1.1e established why: the deterministic identity
+    resolver compares STORED embedding vectors by cosine, so a different embedding
+    model produces different vectors, and a near-threshold merge (~0.92) can flip.
+    The same log then yields a different graph. Folding the embedding model in
+    makes an embedding swap a NEW EPOCH rather than a silent cross-epoch
+    determinism break -- pinned by
+    `test_rebuild_stamps_model_hash_includes_embedding_model_identity`.
+
+    This exists as a shared function because the two sites that need the value
+    disagreed. Review finding L4 (2026-08-02): `build_curation_pipeline` composed
+    it while `EventStore.ensure_initial_epoch` wrote the bare `config.model_hash`,
+    so the epoch triple and the writer triple differed on 2 of 3 fields.
+
+    That is not cosmetic. `extraction_cache.cache_key` hashes
+    `event_id|ontology_version|extraction_version|model_hash` and `LogRegenerator`
+    builds its lookup from the EPOCH row, so a disagreement is a total, permanent
+    `ColdCacheError` on every turn of every rebuild -- the failure mode this
+    module's docstring names.
+
+    The collapse deliberately goes toward the COMPOSED form, not the bare one: the
+    composed value is the determinism-correct one, and dropping it to make the two
+    sides agree would have deleted an R1.1e guard. Callers must not re-compose
+    this inline.
+
+    Args:
+        config: A `KnowledgeConfig`. Typed loosely to keep this module a leaf --
+            importing `KnowledgeConfig` here would reintroduce the cycle the
+            module docstring describes.
+
+    Returns:
+        The composite stamp, e.g. `"gemma-...-v1|emb:all-MiniLM-L6-v2"`.
+    """
+    return f"{config.model_hash}|emb:{config.embedding.model_name}"  # type: ignore[attr-defined]

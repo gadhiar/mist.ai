@@ -860,7 +860,24 @@ class ConversationHandler:
                 # `initialize()` one line up, so a separate handler would guard
                 # against nothing while adding a bare `except Exception` the
                 # error-handling convention forbids.
-                self.event_store.ensure_initial_epoch(now_iso=self._now_fn().isoformat())
+                # Stamps passed EXPLICITLY from the config this process is
+                # actually stamping writes with. Left to its defaults,
+                # `ensure_initial_epoch` performs a SECOND, independent
+                # `KnowledgeConfig.from_env()` read inside the store, and writes
+                # the BARE `config.model_hash` -- while `build_curation_pipeline`
+                # stamps edges with the composed form. Review finding L4
+                # (2026-08-02): the epoch triple and the writer triple differed
+                # on 2 of 3 fields, and since `LogRegenerator` keys the
+                # extraction cache off the EPOCH row, that is a permanent
+                # `ColdCacheError` on every rebuild rather than a mislabel.
+                from backend.knowledge.version_stamps import compose_model_hash
+
+                self.event_store.ensure_initial_epoch(
+                    now_iso=self._now_fn().isoformat(),
+                    ontology_version=self.config.ontology_version,
+                    extraction_version=self.config.extraction_version,
+                    model_hash=compose_model_hash(self.config),
+                )
                 logger.info("Event store enabled at %s", self.event_store.db_path)
             except Exception as e:
                 logger.error("Failed to initialize event store: %s", e, exc_info=True)
