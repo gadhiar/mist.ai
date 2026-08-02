@@ -1,22 +1,41 @@
 # Golden log -- the gap schedule
 
-**Authored 2026-08-02, BEFORE any R1.5 staleness-window constant was consulted.**
+**Authored and committed 2026-08-02, before the executor read any R1.5 document.**
 
-This file exists to make that ordering checkable. The elapsed-time distribution below was
-fixed first, committed first, and the R1.5 design document was deliberately not read while
-choosing it. Anyone auditing this can verify the claim from `git log --diff-filter=A` on this
-file versus the commit that introduces a window constant.
-
----
-
-## 1. Why the ordering matters
+## 1. Why the ordering matters, and what is actually claimed here
 
 Spec 6b: whoever authors this log chooses the gaps, and will naturally author gaps that
 straddle whatever staleness window R1.5 already contains. The test then passes by
 construction and reads as calibration evidence. Authored data sits closer to real data than
 a fixture does, which makes that false confidence more expensive, not less.
 
-So the gaps were chosen from a property that is independent of any particular window value.
+**Spec 6b's mitigation as literally worded -- "fixed before R1.5's window constant is
+chosen" -- was already unachievable when R1.4.5 began.**
+`docs/superpowers/specs/2026-08-01-r1.5-staleness-design.md` section 6 predates this file by
+a day and already names a candidate: 180 days, borrowed from
+`CONFIDENCE_EXTERNAL.decay_half_life_days` rather than derived fresh. It is a candidate
+rather than a settled constant, but it existed. And `docs/` is gitignored, so git history
+cannot establish ordering against it either -- the audit route the first draft of this file
+suggested does not exist.
+
+So the claim made here is the narrower one that is actually true:
+
+1. **Process:** the R1.5 design and plan were deliberately not opened while the schedule was
+   being authored. The schedule was committed (`938568c`) before either was read.
+2. **Property, not ordering:** the gaps satisfy a rule chosen without reference to any window
+   value, stated in section 2 below and machine-checked by
+   `tests/unit/golden_log/test_generate.py::TestGapScheduleShape`. That test asserts a
+   *spread*, never a threshold, so it cannot be quietly retuned to match a constant later.
+3. **Disclosure:** under the 180-day candidate the eight never-restated LEARNING assertions
+   split four stale (310, 298, 195, 181 d) and four fresh (137, 92, 31, 9 d). `ocaml` at
+   181 d lands one day past 180. That near-boundary is coincidence, not tuning -- 181 falls
+   out of the authored ladder -- but it is called out here so nobody reads it as evidence
+   the window was validated at its edge.
+
+Point 1 is a process claim and is not independently verifiable. Point 2 is, and is the one
+that should carry weight.
+
+---
 
 ## 2. The property the schedule is built on
 
