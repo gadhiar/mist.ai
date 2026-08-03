@@ -754,6 +754,78 @@ class TestEmbeddings:
         assert "128" in result.failures[0]
         assert str(EMBEDDING_DIMENSION) in result.failures[0]
 
+    def test_fails_when_the_stored_embedding_is_wider_than_configured(self):
+        """The direction the narrow case cannot cover, and the one that shipped
+        a hole.
+
+        `test_fails_when_the_stored_embedding_has_the_wrong_dimension` feeds a
+        vector NARROWER than `expected_dimension`. In that direction the later
+        `len(recomputed) != len(stored)` guard fires too, so the dimension
+        check is never the only thing standing -- and mutating `!=` to `<` in
+        that check left the ENTIRE suite byte-identical.
+
+        Wide-and-self-consistent is the live scenario: `EMBEDDING_MODEL` is
+        upgraded to a 768-d model while `EMBEDDING_DIMENSION` stays 384 (two
+        independent env vars). Stored vectors are 768 wide, the generator
+        recomputes 768 wide, so the length-agreement check passes and cosine is
+        1.0. Only the dimension check can see it, and only if it compares for
+        INEQUALITY rather than for "too small".
+
+        Consequence if it passes: the gate reports PASS on a graph whose every
+        vector is the wrong width for the configured dimension and for the
+        vector index built at 384.
+        """
+
+        class _WideGenerator:
+            """Returns a 768-d vector identical to the stored one, so every
+            downstream check agrees and only the dimension check can fire.
+            """
+
+            def generate_embedding(self, text: str) -> list[float]:
+                return [0.1] * 768
+
+        connection = FakeNeo4jConnection(query_results=[{"embedding": [0.1] * 768}])
+        docs = [_doc(nodes=[SeedNode(id="slalom", type="Organization", display_name="Slalom")])]
+
+        result = check_embeddings(
+            connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=_WideGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert not result.passed, (
+            "a 768-d vector passed a gate configured for 384 -- the dimension "
+            "check is comparing magnitude rather than inequality, so an "
+            "embedding-model upgrade without a reindex reports healthy"
+        )
+        assert "768" in result.failures[0]
+        assert str(EMBEDDING_DIMENSION) in result.failures[0]
+
+    def test_fails_when_the_stored_embedding_is_not_a_list(self):
+        """The `isinstance` branch had zero test reach.
+
+        A non-list `embedding` property would raise `TypeError` inside `len()`
+        and take out `seed-verify` / `cmd_seed` with a traceback instead of
+        emitting a clean gate failure line. Low likelihood -- the driver returns
+        lists for array properties -- but the branch existed unexercised, so
+        deleting it was invisible to the suite.
+        """
+        connection = FakeNeo4jConnection(query_results=[{"embedding": "not-a-vector"}])
+        docs = [_doc(nodes=[SeedNode(id="slalom", type="Organization", display_name="Slalom")])]
+
+        result = check_embeddings(
+            connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert not result.passed
+        assert "str" in result.failures[0]
+
     def test_fails_when_the_stored_embedding_is_a_zero_vector(self):
         """`EmbeddingGenerator.generate_embedding` returns `[0.0] * 384` for
         empty text. That vector is the right width and is not null, so only

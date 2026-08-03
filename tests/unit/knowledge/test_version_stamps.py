@@ -91,6 +91,29 @@ def _named_bindings(tree: ast.AST) -> list[tuple[str, ast.AST]]:
             for target in node.targets:
                 if isinstance(target, ast.Name):
                     bindings.append((target.id, node.value))
+                # `params["ontology_version"] = "1.4.0"` -- a Subscript target
+                # with a string-constant slice. Added 2026-08-02 after an audit
+                # found this shape passed BOTH layers of this guard: the walk
+                # handled only `ast.Name` targets, and the Cypher line regex
+                # needs the stamp name immediately followed by `=`, which the
+                # intervening `"]` breaks.
+                #
+                # It is not a hypothetical shape. It is the house idiom for
+                # stamping Cypher params -- live at `admin.py`,
+                # `graph_writer.py` (x2) -- and two of those are lines the
+                # version-stamp collapse itself rewrote, so it is the single
+                # most likely route for a literal to come back.
+                elif isinstance(target, ast.Subscript):
+                    key = target.slice
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        bindings.append((key.value, node.value))
+                # `self.ontology_version = "1.4.0"`. The docstring above already
+                # credits this walk with covering module and class attributes;
+                # before this branch that coverage came only INCIDENTALLY from
+                # the Cypher line regex, so tightening that regex would have
+                # silently dropped it.
+                elif isinstance(target, ast.Attribute):
+                    bindings.append((target.attr, node.value))
         elif isinstance(node, ast.keyword) and node.arg is not None:
             bindings.append((node.arg, node.value))
         elif isinstance(node, ast.Dict):
