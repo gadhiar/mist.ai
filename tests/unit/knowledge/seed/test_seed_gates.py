@@ -738,6 +738,14 @@ class TestEmbeddings:
     def test_fails_when_the_stored_embedding_has_the_wrong_dimension(self):
         """`EMBEDDING_DIMENSION` drift: the model was swapped without a
         reindex, so old vectors survive at the old width.
+
+        Pins the dimension check's own message shape, not merely the two
+        numbers in it. The generator here is the default 384-d one, so the
+        LATER `len(recomputed) != len(stored)` condition would also fire on
+        this input -- and its message names `384` and `128` too, so bare
+        substring assertions on those numbers are satisfied whichever
+        condition produced the line. That is how `!=` -> `>` stayed green:
+        this test passed while the condition it is named for never ran.
         """
         connection = FakeNeo4jConnection(query_results=[{"embedding": [0.1] * 128}])
         docs = [_doc(nodes=[SeedNode(id="slalom", type="Organization", display_name="Slalom")])]
@@ -751,6 +759,10 @@ class TestEmbeddings:
         )
 
         assert not result.passed
+        assert "dimensions, expected" in result.failures[0], (
+            "the failure line did not come from the dimension check -- a later "
+            f"condition produced it: {result.failures[0]!r}"
+        )
         assert "128" in result.failures[0]
         assert str(EMBEDDING_DIMENSION) in result.failures[0]
 
@@ -803,14 +815,69 @@ class TestEmbeddings:
         assert "768" in result.failures[0]
         assert str(EMBEDDING_DIMENSION) in result.failures[0]
 
+    def test_fails_when_the_stored_embedding_is_narrower_than_configured_and_self_consistent(self):
+        """The mirror of the wide case, and the mutant the wide case leaves alive.
+
+        Adding the wide test killed `!=` -> `<`, but `!=` -> `>` survived the
+        whole suite afterwards. Both surviving operators are the ones that are
+        FALSE on equality (`<`, `>`, `!=`); every operator that is TRUE on
+        equality (`<=`, `>=`, `==`) fires on healthy 384-d vectors and breaks
+        the passing tests loudly, so those need no guarding.
+
+        `test_fails_when_the_stored_embedding_has_the_wrong_dimension` cannot
+        kill `>`, because it injects a 384-d generator against a 128-d stored
+        vector: with `>`, the dimension check falls through and the later
+        `len(recomputed) != len(stored)` condition fires instead. The gate
+        still fails, so the test still passes -- by way of a condition it was
+        not written to exercise.
+
+        Self-consistency is what removes that backstop. The live scenario is
+        `EMBEDDING_MODEL` swapped DOWN (a 128-d or 256-d model) while
+        `EMBEDDING_DIMENSION` stays 384: stored and recomputed are both narrow,
+        so they agree, cosine is 1.0, and only an inequality comparison can see
+        it. Same defect as the wide case, opposite direction -- a graph whose
+        every vector is the wrong width for the vector index reports healthy.
+        """
+        narrow_dimension = 128
+        stored = FakeEmbeddingGenerator(dimension=narrow_dimension).generate_embedding("Slalom")
+        connection = FakeNeo4jConnection(query_results=[{"embedding": stored}])
+        docs = [_doc(nodes=[SeedNode(id="slalom", type="Organization", display_name="Slalom")])]
+
+        result = check_embeddings(
+            connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(dimension=narrow_dimension),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert not result.passed, (
+            "a 128-d vector passed a gate configured for 384 -- the stored vector "
+            "and the recomputation agree with each other, so cosine is 1.0 and the "
+            "dimension check is the only condition that can see the drift"
+        )
+        assert "dimensions, expected" in result.failures[0], (
+            "the failure line did not come from the dimension check -- a later "
+            f"condition produced it: {result.failures[0]!r}"
+        )
+        assert str(narrow_dimension) in result.failures[0]
+        assert str(EMBEDDING_DIMENSION) in result.failures[0]
+
     def test_fails_when_the_stored_embedding_is_not_a_list(self):
         """The `isinstance` branch had zero test reach.
 
-        A non-list `embedding` property would raise `TypeError` inside `len()`
-        and take out `seed-verify` / `cmd_seed` with a traceback instead of
-        emitting a clean gate failure line. Low likelihood -- the driver returns
-        lists for array properties -- but the branch existed unexercised, so
-        deleting it was invisible to the suite.
+        What removing the branch actually does, measured rather than assumed:
+        a `str` does NOT raise `TypeError` inside `len()` -- it is Sized, so
+        `len("not-a-vector")` is 12 and the dimension check reports
+        `"has an embedding of 12 dimensions, expected 384"`. A confidently
+        wrong line about the wrong condition is worse than a traceback,
+        because it sends the reader after a dimension drift that never
+        happened. Only a non-Sized value (a float, an int) tracebacks.
+
+        Low likelihood either way -- the driver returns lists for array
+        properties -- but the branch existed unexercised, so deleting it was
+        invisible to the suite. The assertion below is on the type name, which
+        is the one thing no other condition's message can produce.
         """
         connection = FakeNeo4jConnection(query_results=[{"embedding": "not-a-vector"}])
         docs = [_doc(nodes=[SeedNode(id="slalom", type="Organization", display_name="Slalom")])]

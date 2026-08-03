@@ -34,8 +34,11 @@ from __future__ import annotations
 
 from backend.knowledge.ontologies.v1_0_0 import ONTOLOGY_V1_0_0
 
-# Derived, never restated. `TestOntologyVersionHasOneAuthority` fails if any
-# module under `backend/` reintroduces a literal ontology-version stamp.
+# Derived, never restated. `TestNoBackendModuleRestatesAStamp` (in
+# tests/unit/knowledge/test_version_stamps.py) fails if any module under
+# `backend/` reintroduces a literal ontology-version stamp. It catches the
+# binding shapes listed on `_named_bindings` there; a literal that needs
+# constant propagation to see is out of its reach.
 ONTOLOGY_VERSION: str = ONTOLOGY_V1_0_0.version
 
 # Bump whenever EXTRACTION_SYSTEM_PROMPT / EXTRACTION_USER_TEMPLATE or the
