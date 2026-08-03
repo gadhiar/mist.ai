@@ -5,6 +5,7 @@ Based on CSM demo architecture - production-ready for web frontend
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -604,9 +605,10 @@ async def websocket_endpoint(websocket: WebSocket):
         return
 
     # Send session_started handshake per ADR-017. The session_id is a fresh
-    # UUID per WebSocket connection; internal subsystems still use the
-    # default-session model (multi-session multiplexing is years away per
-    # project context). The wire-level session_id is FE-visible only today.
+    # UUID per WebSocket connection and is threaded into every turn this
+    # connection dispatches (see the audio / text branches below), so the
+    # EventStore session, the mist-context cache key, and vault session-note
+    # frontmatter all key off this value rather than a shared placeholder.
     session_id = str(uuid.uuid4())
     await websocket.send_json(
         {
@@ -659,10 +661,21 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 logger.info(f"Received complete audio: {len(audio_data)} samples @ {sample_rate}Hz")
 
-                # Process complete audio directly (transcribe -> LLM -> TTS)
+                # Process complete audio directly (transcribe -> LLM -> TTS).
+                # functools.partial because run_in_executor forwards positional
+                # args only, and the session id must arrive by keyword to stay
+                # readable at the boundary. The executor thread does not inherit
+                # this coroutine's context, so the callee publishes the session
+                # id into `current_session_id` itself.
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
-                    None, voice_processor.process_complete_audio, audio_data, sample_rate
+                    None,
+                    functools.partial(
+                        voice_processor.process_complete_audio,
+                        audio_data,
+                        sample_rate,
+                        session_id=session_id,
+                    ),
                 )
 
             elif msg_type == "text":
@@ -679,7 +692,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Process (will spawn thread internally)
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
-                    None, voice_processor._process_conversation_turn, user_text
+                    None,
+                    functools.partial(
+                        voice_processor._process_conversation_turn,
+                        user_text,
+                        session_id=session_id,
+                    ),
                 )
 
             elif msg_type == "interrupt":
@@ -794,9 +812,15 @@ async def websocket_endpoint(websocket: WebSocket):
             log_handler.set_streaming(False, None)
         # Gap #1a / ADR-011 bucket 2: flip status of any active sessions
         # this connection touched. Fire-and-forget; failures swallowed
-        # internally per Invariant 6. We end ALL tracked sessions on the
-        # handler since a single WebSocket connection corresponds to one
-        # default-session conversation in the current architecture.
+        # internally per Invariant 6.
+        #
+        # KNOWN LIMITATION: `end_session()` takes no session id and ends ALL
+        # sessions tracked by the handler. That was harmless when every
+        # connection shared one session; now that each connection carries its
+        # own `session_id`, a disconnect on one connection also ends the
+        # sessions of any other connections still open. Narrowing this to the
+        # disconnecting connection's session is a separate change -- the
+        # session id minted above is the value it would take.
         try:
             handler = (
                 voice_processor.models.knowledge.conversation_handler

@@ -13,7 +13,10 @@ import threading
 import time
 from typing import Any
 
-from request_context import current_request_id
+# Package-qualified: `request_context` and `backend.request_context` are two
+# distinct module objects (backend/ is a namespace package that is also on
+# sys.path), so importers must agree on one name or the ContextVars diverge.
+from backend.request_context import current_request_id
 
 _thread_local = threading.local()
 

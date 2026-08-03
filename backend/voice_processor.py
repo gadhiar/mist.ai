@@ -33,8 +33,20 @@ from audio_protocol import (
     generate_fade_out,
     rms_normalize,
 )
-from request_context import current_request_id, new_request_id, spawn_with_context
 from voice_models.model_manager import ModelManager
+
+# Package-qualified on purpose. `backend/` is a namespace package AND is on
+# sys.path, so `request_context` and `backend.request_context` resolve to two
+# DISTINCT module objects holding two distinct ContextVar instances. A turn
+# that set the session id on one and read it from the other would propagate
+# nothing. Every importer of this module must use the `backend.`-qualified
+# name -- see also log_handler.py and chat/knowledge_integration.py.
+from backend.request_context import (
+    current_request_id,
+    current_session_id,
+    new_request_id,
+    spawn_with_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -449,7 +461,9 @@ class VoiceProcessor:
         tts_total = time.time() - tts_start_time
         log_timestamp(f"TTS consumer done ({tts_total:.2f}s, {chunk_count} chunks)")
 
-    def _process_conversation_turn(self, user_text, request_id: str | None = None):
+    def _process_conversation_turn(
+        self, user_text, request_id: str | None = None, session_id: str | None = None
+    ):
         """Process one conversation turn with LLM-TTS pipeline parallelism.
 
         Args:
@@ -457,6 +471,13 @@ class VoiceProcessor:
             request_id: Adopt this id (voice path mints it at speech ingress
                 so STT logs and the turn share one id); None mints fresh
                 (text path, pending-input respawns).
+            session_id: The originating connection's session id, published to
+                `current_session_id` for the rest of this call chain. Set here
+                rather than by the caller because `loop.run_in_executor` does
+                not copy the caller's context into the worker thread. None
+                leaves the ambient value untouched, which is what the
+                pending-input respawn needs -- `spawn_with_context` already
+                copied the in-flight turn's session into that thread.
         """
         if not self.generation_lock.acquire(blocking=False):
             # Latest-wins queueing (mirrors the voice path): the in-flight
@@ -483,6 +504,8 @@ class VoiceProcessor:
                 new_request_id()
             else:
                 current_request_id.set(request_id)
+            if session_id is not None:
+                current_session_id.set(session_id)
             log_timestamp(f"Starting conversation turn for: '{user_text}'")
 
             self.interrupt_flag.clear()
@@ -691,9 +714,22 @@ class VoiceProcessor:
                     log_timestamp(f"Processing pending input: '{pending_input}'")
                     spawn_with_context(self._process_conversation_turn, pending_input)
 
-    def process_complete_audio(self, audio_data, sample_rate):
-        """Process complete audio from client (no VAD needed; the client controls recording window)."""
+    def process_complete_audio(self, audio_data, sample_rate, session_id: str | None = None):
+        """Process complete audio from client (no VAD needed; the client controls recording window).
+
+        Args:
+            audio_data: Complete utterance samples from the client.
+            sample_rate: Sample rate of `audio_data`.
+            session_id: The originating connection's session id. Published to
+                `current_session_id` here, on the executor side, because
+                `loop.run_in_executor` does not copy the caller's context.
+                The set must precede `spawn_with_context`, which snapshots
+                the current context for the transcription thread.
+        """
         log_timestamp(f"Processing complete audio: {len(audio_data)} samples @ {sample_rate}Hz")
+
+        if session_id is not None:
+            current_session_id.set(session_id)
 
         # Transcribe and process immediately in a new thread
         spawn_with_context(self._process_user_speech, audio_data, sample_rate)

@@ -14,6 +14,7 @@ from backend.chat.stream_events import Complete, Token, WSEvent
 from backend.factories import build_conversation_handler
 from backend.knowledge.config import KnowledgeConfig
 from backend.llm import StreamingLLMProvider
+from backend.request_context import current_session_id
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,6 @@ class KnowledgeIntegration:
         """
         self.enabled = False
         self.conversation_handler: ConversationHandler | None = None
-        self.current_session_id = "default"
         self._llm_provider = llm_provider
         self._config = config
         self._invalidation_bus = invalidation_bus
@@ -126,7 +126,11 @@ class KnowledgeIntegration:
 
         Args:
             user_text: User's message.
-            session_id: Optional session ID (uses default if not provided).
+            session_id: Explicit session ID override. When None (the live
+                voice/text path, which does not thread it through
+                `ModelManager.generate_llm_response`), the session is read
+                from the `current_session_id` context var published at the
+                executor boundary by `VoiceProcessor`.
             event_loop: Asyncio event loop for the streaming generator. Required
                 in the live-server / voice path. When None, falls back to
                 `asyncio.run` (test/CLI contexts).
@@ -153,7 +157,22 @@ class KnowledgeIntegration:
             yield "I'm sorry, the knowledge system is not available right now."
             return
 
-        sid = session_id or self.current_session_id
+        sid = session_id or current_session_id.get()
+        if sid is None:
+            # Deliberately fatal rather than defaulted. Every turn reaching
+            # here has crossed a WebSocket handshake that minted a session id,
+            # so an unset value is a wiring defect in the executor-boundary
+            # plumbing, not a runtime condition. Substituting a placeholder is
+            # exactly what routed every connection and every restart into one
+            # shared session for as long as it went unnoticed. The caller
+            # (`VoiceProcessor._process_conversation_turn`) converts this into
+            # an ADR-017 error event, so the turn fails visibly instead of
+            # writing to the wrong session.
+            raise ValueError(
+                "No session id for this turn: pass session_id explicitly or set "
+                "current_session_id at the executor boundary "
+                "(VoiceProcessor.process_complete_audio / _process_conversation_turn)"
+            )
 
         if event_loop is None:
             # Test / CLI fallback: drain the async generator inline.
@@ -244,16 +263,16 @@ class KnowledgeIntegration:
             # running as a zombie. cancel() on a finished future is a no-op.
             fut.cancel()
 
-    def set_session_id(self, session_id: str):
-        """Set the current session ID."""
-        self.current_session_id = session_id
-        logger.info(f"Session ID set to: {session_id}")
+    def clear_session(self, session_id: str):
+        """Clear a conversation session.
 
-    def clear_session(self, session_id: str | None = None):
-        """Clear a conversation session."""
+        Args:
+            session_id: Session to clear. Required -- there is no ambient
+                default to fall back to, and clearing the wrong session
+                silently would be worse than a TypeError at the call site.
+        """
         if self.conversation_handler:
-            sid = session_id or self.current_session_id
-            self.conversation_handler.clear_session(sid)
+            self.conversation_handler.clear_session(session_id)
 
     def is_enabled(self) -> bool:
         """Check if knowledge integration is enabled."""
