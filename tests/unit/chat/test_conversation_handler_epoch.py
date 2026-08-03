@@ -3,8 +3,11 @@
 These exist because of a specific, repeated failure in this codebase, and the
 shape of the tests matters more than their count.
 
-`EventStore.ensure_initial_epoch` shipped in R1.4 Task 7 with five unit tests
-of its own. Every one of them was correct. Not one of them asserted that
+`EventStore.ensure_initial_epoch` shipped in R1.4 Task 7 with SEVEN unit tests
+of its own (`TestEnsureInitialEpoch` in `tests/unit/event_store/test_store.py`;
+this docstring said "five" until 2026-08-03, a number that had been copied
+forward into `conversation_handler.py` as well -- counted, not recalled).
+Every one of them was correct. Not one of them asserted that
 anything in production ever CALLED it -- and nothing did, for the whole of
 R1.4, R1.4's whole-branch review, and the merge. The live `epoch_ledger` held
 0 rows while the project record stated a provisional epoch had been written.
@@ -55,7 +58,7 @@ def _build_handler(config, *, now_fn=None) -> ConversationHandler:
 
 
 class TestProductionCallerExists:
-    """The assertion the original five tests were missing."""
+    """The assertion the original seven tests were missing."""
 
     def test_constructing_a_handler_leaves_an_epoch_in_the_ledger(self):
         # Arrange

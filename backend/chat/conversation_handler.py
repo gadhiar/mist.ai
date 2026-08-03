@@ -835,8 +835,9 @@ class ConversationHandler:
             try:
                 self.event_store = EventStore(db_path=es_config.db_path)
                 self.event_store.initialize()
-                # R1.4 Task 7 built `ensure_initial_epoch` (five unit tests,
-                # correct, idempotent) and never called it from production --
+                # R1.4 Task 7 built `ensure_initial_epoch` (SEVEN unit tests in
+                # `TestEnsureInitialEpoch`, all correct, idempotent) and never
+                # called it from production --
                 # verified 2026-08-01: a repo-wide grep found the method only
                 # in `store.py` and its own test module, and the live
                 # `epoch_ledger` held 0 rows despite R1.4's record stating a
