@@ -52,6 +52,7 @@ class RecordingConversationHandler:
 
     def __init__(self, before_yield: threading.Barrier | None = None) -> None:
         self.session_ids: list[str] = []
+        self.ended_sessions: list[str | None] = []
         self.called = threading.Event()
         self._before_yield = before_yield
         self._lock = threading.Lock()
@@ -65,8 +66,17 @@ class RecordingConversationHandler:
         yield Token(text="ok")
         yield Complete(final_response="ok")
 
-    async def end_session(self) -> None:
-        """Called by the endpoint's disconnect path."""
+    async def end_session(self, session_id: str | None = None) -> None:
+        """Called by the endpoint's disconnect path. Records the id it was scoped to.
+
+        Records rather than asserts because the interesting value is WHICH
+        session was ended, and `None` (end everything) must be distinguishable
+        from a specific id. The endpoint wraps this call in
+        `except Exception: logger.warning`, so a signature mismatch here would
+        be swallowed silently rather than failing a test -- which is exactly
+        why the assertion is on the recorded value, not on "it did not raise".
+        """
+        self.ended_sessions.append(session_id)
 
     def clear_session(self, session_id: str) -> None:
         """Present so `KnowledgeIntegration.clear_session` has a real target."""
@@ -169,6 +179,51 @@ def reset_session_context():
     token = current_session_id.set(None)
     yield
     current_session_id.reset(token)
+
+
+class TestDisconnectEndsOnlyItsOwnSession:
+    """A disconnect must end THIS connection's session, not every session.
+
+    `end_session(session_id=None)` ends every session the handler tracks. That
+    was harmless while all connections shared the single "default" session, but
+    giving each connection its own id turned that no-op into a live bug: one
+    client disconnecting would write every other open connection's vault note
+    early and evict their paths.
+
+    The parameter was already implemented and documented; only the call site
+    omitted it. So this is the reachability shape again -- an implemented
+    parameter never passed -- and the assertion has to be on the value that
+    ARRIVED, because the endpoint swallows exceptions from this call.
+    """
+
+    @pytest.mark.asyncio
+    async def test_disconnect_scopes_end_session_to_the_handshake_id(self, monkeypatch):
+        # Arrange
+        handler = RecordingConversationHandler()
+        vp = build_voice_processor(handler, asyncio.get_running_loop())
+
+        # Act -- the FakeWebSocket raises WebSocketDisconnect once its script
+        # is exhausted, which drives the endpoint's real disconnect path.
+        ws = await run_endpoint(monkeypatch, vp, [{"type": "text", "text": "hi"}])
+
+        # Assert
+        assert handler.ended_sessions == [ws.handshake_session_id], (
+            "disconnect did not scope end_session to this connection's session. "
+            f"Got {handler.ended_sessions!r}; None means 'end every tracked "
+            "session', which ends other live connections' sessions too."
+        )
+
+    @pytest.mark.asyncio
+    async def test_disconnect_never_ends_every_session(self, monkeypatch):
+        """The specific regression: `None` must never reach `end_session`."""
+        handler = RecordingConversationHandler()
+        vp = build_voice_processor(handler, asyncio.get_running_loop())
+
+        await run_endpoint(monkeypatch, vp, [{"type": "text", "text": "hi"}])
+
+        assert (
+            None not in handler.ended_sessions
+        ), "end_session was called with None, which ends EVERY tracked session"
 
 
 class TestSessionIdReachesHandler:

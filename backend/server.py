@@ -814,13 +814,17 @@ async def websocket_endpoint(websocket: WebSocket):
         # this connection touched. Fire-and-forget; failures swallowed
         # internally per Invariant 6.
         #
-        # KNOWN LIMITATION: `end_session()` takes no session id and ends ALL
-        # sessions tracked by the handler. That was harmless when every
-        # connection shared one session; now that each connection carries its
-        # own `session_id`, a disconnect on one connection also ends the
-        # sessions of any other connections still open. Narrowing this to the
-        # disconnecting connection's session is a separate change -- the
-        # session id minted above is the value it would take.
+        # Scoped to THIS connection's session. `end_session(session_id=None)`
+        # ends every session the handler tracks, which was harmless while all
+        # connections shared the single "default" session -- but the P6 fix gave
+        # each connection its own id, which turned that no-op into a live bug: a
+        # disconnect on one connection would end the sessions of every other
+        # connection still open, writing their vault notes early and evicting
+        # their paths.
+        #
+        # The parameter was already implemented and documented ("Specific
+        # session to end. When None, ends every tracked session_id"); only the
+        # call site omitted it. Passing the minted id is the whole fix.
         try:
             handler = (
                 voice_processor.models.knowledge.conversation_handler
@@ -828,7 +832,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 else None
             )
             if handler is not None and hasattr(handler, "end_session"):
-                await handler.end_session()
+                await handler.end_session(session_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Session-end signal handler failed (non-fatal): %s", exc, exc_info=False)
 
