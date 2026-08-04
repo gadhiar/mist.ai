@@ -14,6 +14,11 @@ from datetime import UTC, datetime
 
 from backend.knowledge.ontologies.v1_0_0 import ONTOLOGY_V1_0_0
 from backend.knowledge.storage.graph_executor import GraphExecutor
+from backend.knowledge.storage.partitions import (
+    ENTITY_LABEL,
+    PROVENANCE_LABEL,
+    SELF_MODEL_LABEL,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,17 +77,45 @@ MATCH (e:__Entity__)
 WHERE e.status = 'active'
 RETURN e.entity_type AS entity_type, count(e) AS cnt
 """
+# Deliberately :__Entity__-only, unlike _COVERAGE_QUERY below: this score's
+# denominator is _COUNT_QUERY's total, which is also :__Entity__-only. The two
+# must range over the same partition or the ratio is meaningless.
 
-_SELF_MODEL_QUERY = """\
-MATCH (e:__Entity__)
-WHERE e.status = 'active'
-  AND e.knowledge_domain = 'internal'
-RETURN count(e) AS internal_count
+# Coverage's denominator is the WHOLE ontology (_TOTAL_ONTOLOGY_TYPES, 30
+# types), which includes the 5 self-model types and the provenance types --
+# none of which carry :__Entity__ any more. Reusing _CONSISTENCY_QUERY here
+# left the numerator structurally unable to reach its own denominator, capping
+# coverage at 25/30 = 83.3%. Before the ADR-009 and R1.0 partition splits every
+# node carried :__Entity__ and numerator and denominator did range over the
+# same universe; the splits broke that, and the label union restores it.
+_COVERAGE_QUERY = f"""\
+MATCH (e:{ENTITY_LABEL}|{SELF_MODEL_LABEL}|{PROVENANCE_LABEL})
+WHERE coalesce(e.status, 'active') = 'active'
+RETURN e.entity_type AS entity_type, count(e) AS cnt
 """
 
-_REL_COUNT_QUERY = """\
-MATCH ()-[r]->()
-RETURN count(r) AS total_rels
+# The self-model lives in its own partition, disjoint from :__Entity__ since
+# the R1.0 relabel (scripts/migrations/selfmodel_partition.py): it is authored
+# identity, preserved across an :__Entity__ rebuild rather than re-derived.
+# Reading it through :__Entity__ counted zero nodes forever, pinning this
+# sub-score at 0 and capping `overall` at 85.
+#
+# No `knowledge_domain = 'internal'` predicate. Every type in SELF_MODEL_TYPES
+# is KnowledgeDomain.INTERNAL by ontology definition, so inside this partition
+# the test is a tautology -- and one live data fails anyway: the seed applier
+# writes only the properties the source authors, and `mist-memory/seed/mist.md`
+# authors `knowledge_domain` on `mist-identity` alone, so 20 of the 21 seeded
+# self-model nodes do not carry it. Carried forward, it would have turned a
+# score stuck at 0 into a score stuck at 20.
+#
+# `status` is coalesced for the same reason -- those same 20 nodes carry no
+# `status` either, so a bare `e.status = 'active'` would count exactly one
+# node. A node explicitly marked non-active is still excluded. Mirrors the
+# `coalesce(r.is_latest_belief, true)` idiom in _CONNECTIVITY_QUERY above.
+_SELF_MODEL_QUERY = f"""\
+MATCH (e:{SELF_MODEL_LABEL})
+WHERE coalesce(e.status, 'active') = 'active'
+RETURN count(e) AS self_model_count
 """
 
 
@@ -221,8 +254,12 @@ class GraphHealthScorer:
         return min(100.0, valid_count / total * 100)
 
     async def _score_coverage(self) -> float:
-        """Distinct entity types used / total ontology types * 100."""
-        records = await self._executor.execute_query(_CONSISTENCY_QUERY)
+        """Distinct entity types used / total ontology types * 100.
+
+        Scans all three partitions, because the denominator counts all three
+        partitions' types.
+        """
+        records = await self._executor.execute_query(_COVERAGE_QUERY)
         if not records:
             return 0.0
         distinct_types = {
@@ -231,9 +268,13 @@ class GraphHealthScorer:
         return min(100.0, len(distinct_types) / _TOTAL_ONTOLOGY_TYPES * 100)
 
     async def _score_self_model(self) -> float:
-        """min(100, internal_entity_count / 5 * 100)."""
+        """min(100, self_model_node_count / 5 * 100).
+
+        Counts the :__SelfModel__ partition, not :__Entity__ -- see
+        _SELF_MODEL_QUERY for why the two are disjoint.
+        """
         records = await self._executor.execute_query(_SELF_MODEL_QUERY)
         if not records:
             return 0.0
-        internal_count = records[0]["internal_count"]
-        return min(100.0, internal_count / 5 * 100)
+        self_model_count = records[0]["self_model_count"]
+        return min(100.0, self_model_count / 5 * 100)
