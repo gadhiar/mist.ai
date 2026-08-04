@@ -446,12 +446,33 @@ def build_curation_scheduler(
 ):
     """Create a fully wired CurationScheduler with all maintenance jobs.
 
+    Every parameter below defaults to None so tests can build a scheduler
+    without a live stack. In PRODUCTION all three must be supplied from the
+    live ConversationHandler -- `backend/server.py` does this. Until
+    2026-08-03 it did not, and the defaults documented here as a test
+    affordance were the only behaviour the running system ever had.
+
     Args:
         config: Knowledge subsystem configuration.
-        event_store: Optional event store for SelfReflectionJob. When None,
-            the reflection job returns immediately with zero counts.
-        tracker: Optional ToolUsageTracker for SkillDerivationJob. When None,
-            a default tracker is created from config.
+        event_store: Event store backing SelfReflectionJob. When None,
+            `SelfReflectionJob.run` returns zero counts on its FIRST line and
+            no internal knowledge is derived from conversation history at all
+            -- the job is inert, not merely idle. A production None is
+            legitimate only when `config.event_store.enabled` is False.
+        tracker: ToolUsageTracker backing SkillDerivationJob. Must be the SAME
+            instance ConversationHandler records tool calls into (its
+            `_tool_usage_tracker`, wired by `build_conversation_handler`).
+            When None, a fresh tracker is built here that nothing ever records
+            into, so `detect_patterns()` returns nothing on every run and no
+            Skill / MistCapability is ever derived. This is a wrong-instance
+            hazard, not merely a missing-value one: passing SOME tracker is
+            not enough, it must be that one.
+        llm_provider: Provider for InternalKnowledgeDeriver. When None, a
+            second provider is built here via `build_llm_provider(config)`
+            with no `debug_logger`, so the deriver's LLM calls emit no
+            `phase: "llm_call"` JSONL records even when the gate is on, and
+            the extra `LlamaServerProvider` opens a duplicate pair of OpenAI
+            clients that nothing closes. Pass the live handler's provider.
     """
     from backend.knowledge.curation.centrality import CentralityAnalyzer
     from backend.knowledge.curation.community import CommunityDetector

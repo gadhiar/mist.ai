@@ -13,7 +13,9 @@ import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 # Fix Windows console encoding for Unicode characters
 if sys.platform == "win32":
@@ -45,6 +47,11 @@ from factories import (  # isort:skip
 )
 from knowledge.config import KnowledgeConfig  # isort:skip
 from log_handler import WebSocketLogHandler  # isort:skip
+
+if TYPE_CHECKING:
+    from backend.interfaces import EventStoreProvider
+    from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
+    from backend.llm import StreamingLLMProvider
 
 # Setup logging -- console + persistent file
 _log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -321,6 +328,82 @@ async def _shutdown_session_note_catchup(catchup_task: "asyncio.Task | None") ->
         await catchup_task
 
 
+@dataclass(frozen=True, slots=True)
+class CurationDependencies:
+    """The live collaborators `build_curation_scheduler` must be given.
+
+    `handler_found` exists to separate the two ways a field can be None,
+    which are indistinguishable at the call site: the ConversationHandler
+    was not reachable at all (a wiring failure -- two jobs are inert), versus
+    the handler was reached and its event store is legitimately absent
+    because `config.event_store.enabled` is False (a configured choice).
+    """
+
+    event_store: "EventStoreProvider | None"
+    tracker: "ToolUsageTracker | None"
+    llm_provider: "StreamingLLMProvider | None"
+    handler_found: bool
+
+
+def _resolve_curation_dependencies(voice_processor) -> CurationDependencies:
+    """Pull the curation scheduler's live collaborators off the ConversationHandler.
+
+    Until 2026-08-03 `lifespan` called `build_curation_scheduler(knowledge_config)`
+    and nothing else, leaving `event_store`, `tracker` and `llm_provider` at
+    their None defaults. That one line disabled two of the scheduler's nine
+    jobs with no error, no warning, and a fully green test suite:
+
+      - `SelfReflectionJob.run` returns `ReflectionResult(0, 0, 0.0)` on its
+        first line when `event_store` is None, so no internal knowledge was
+        ever derived from conversation history.
+      - the factory built a FRESH `ToolUsageTracker` for `SkillDerivationJob`,
+        while every `.record()` call went to the DIFFERENT instance
+        `build_conversation_handler` wired into `ConversationHandler` as
+        `self._tool_usage_tracker`. Skill derivation therefore called
+        `detect_patterns()` on a tracker that had never received a record --
+        zero patterns, always, so no Skill / KNOWS / MistCapability /
+        HAS_CAPABILITY was ever derived.
+
+    `llm_provider` is taken from the handler rather than left to the factory's
+    own `build_llm_provider(config)`: the factory's call passes no
+    `debug_logger`, so the deriver's LLM calls would be structurally invisible
+    to the `phase: "llm_call"` JSONL stream even with the gate on, and a
+    second `LlamaServerProvider` means a duplicate pair of OpenAI clients
+    (and connection pools) that nothing closes.
+
+    Extracted from `lifespan()` for the same testability reason as
+    `_build_session_note_catchup`: WHICH object each dependency points at is
+    the entire content of the fix, and identity cannot be asserted without
+    booting the full model stack unless the resolution is its own function.
+    See `tests/unit/test_curation_scheduler_wiring.py`.
+
+    Reaches the handler through the same defensive chain the end-session
+    broadcast and the shutdown drain already use.
+
+    Returns:
+        A `CurationDependencies` holding the live handler's own objects, or
+        all-None with `handler_found=False` when no handler is reachable.
+    """
+    handler = (
+        voice_processor.models.knowledge.conversation_handler
+        if voice_processor and voice_processor.models and voice_processor.models.knowledge
+        else None
+    )
+    if handler is None:
+        return CurationDependencies(
+            event_store=None,
+            tracker=None,
+            llm_provider=None,
+            handler_found=False,
+        )
+    return CurationDependencies(
+        event_store=handler.event_store,
+        tracker=handler._tool_usage_tracker,
+        llm_provider=handler._provider,
+        handler_found=True,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
@@ -439,9 +522,31 @@ async def lifespan(app: FastAPI):
     logging.getLogger().addHandler(log_handler)
     logger.info("WebSocket log handler attached")
 
-    # Start curation scheduler for periodic graph maintenance
+    # Start curation scheduler for periodic graph maintenance.
+    #
+    # Every falsy-default parameter is supplied explicitly -- see
+    # `_resolve_curation_dependencies` for what leaving them defaulted cost
+    # (two of the nine jobs structurally incapable of producing output).
+    # `voice_processor.initialize()` has already completed above, so the
+    # ConversationHandler these come off is the live one.
+    curation_deps = _resolve_curation_dependencies(voice_processor)
+    if not curation_deps.handler_found:
+        logger.warning(
+            "Curation scheduler: no ConversationHandler reachable -- self_reflection and "
+            "skill_derivation will be inert for this process"
+        )
+    elif curation_deps.event_store is None:
+        logger.info(
+            "Curation scheduler: event store disabled (config.event_store.enabled=False) "
+            "-- self_reflection reports zero counts by configuration, not by omission"
+        )
     try:
-        curation_scheduler = build_curation_scheduler(knowledge_config)
+        curation_scheduler = build_curation_scheduler(
+            knowledge_config,
+            event_store=curation_deps.event_store,
+            tracker=curation_deps.tracker,
+            llm_provider=curation_deps.llm_provider,
+        )
         await curation_scheduler.start()
         logger.info("Curation scheduler started")
     except Exception as e:
