@@ -454,10 +454,12 @@ def build_curation_scheduler(
 
     Args:
         config: Knowledge subsystem configuration.
-        event_store: Event store backing SelfReflectionJob. When None,
-            `SelfReflectionJob.run` returns zero counts on its FIRST line and
-            no internal knowledge is derived from conversation history at all
-            -- the job is inert, not merely idle. A production None is
+        event_store: Event store backing SelfReflectionJob, and (D3) the
+            scheduler's run recorder. When None, `SelfReflectionJob.run`
+            returns zero counts on its FIRST line and no internal knowledge is
+            derived from conversation history at all -- the job is inert, not
+            merely idle -- AND every job's result is logged and discarded
+            rather than written to `curation_job_runs`. A production None is
             legitimate only when `config.event_store.enabled` is False.
         tracker: ToolUsageTracker backing SkillDerivationJob. Must be the SAME
             instance ConversationHandler records tool calls into (its
@@ -545,7 +547,14 @@ def build_curation_scheduler(
                 ),
                 skill_job,
             ),
-        ]
+        ],
+        # D3: the same store, in its second role. Job results were discarded by
+        # `_loop` entirely until 2026-08-03; they now land in
+        # `curation_job_runs` (and health scores additionally in
+        # `graph_health_events`) in the event-store SQLite DB. None here means
+        # the scheduler logs results and drops them, which is why
+        # `CurationScheduler.__init__` warns rather than defaulting quietly.
+        run_recorder=event_store,
     )
 
 

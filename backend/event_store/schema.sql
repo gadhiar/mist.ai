@@ -81,6 +81,36 @@ CREATE TABLE IF NOT EXISTS graph_health_events (
     community_count INTEGER
 );
 
+-- Curation job run ledger (D3): one row per curation job EXECUTION.
+--
+-- Distinct from `graph_health_events` above, which is a metric TIME SERIES for
+-- one job. This is the audit fact for all of them: it answers "did the job run,
+-- what did it look at, and what did it change" for every registered job,
+-- including the ones that mutate nothing and the ones that raised.
+--
+-- The three facts are deliberately separate columns rather than one summary,
+-- because the failure this table exists to expose is a job that returns zeros
+-- WITHOUT LOOKING -- indistinguishable in the logs from a job that looked and
+-- correctly found nothing. `examined` and `produced` separate those:
+--   examined > 0, produced = 0  -> ran, looked at N, changed nothing (idle)
+--   examined = 0, produced = 0  -> ran, looked at nothing (empty input OR inert)
+--   examined IS NULL            -> the result type declares no examined counter
+--   produced IS NULL            -> read-only job (measures, never mutates), or
+--                                  outcome='failed' so no result exists
+CREATE TABLE IF NOT EXISTS curation_job_runs (
+    run_id TEXT PRIMARY KEY,
+    job_name TEXT NOT NULL,
+    trigger_source TEXT NOT NULL,             -- 'scheduled', 'manual'
+    started_at TEXT NOT NULL,                 -- ISO-8601, scheduler-measured
+    duration_ms REAL NOT NULL,                -- scheduler-measured wall clock
+    outcome TEXT NOT NULL,                    -- 'completed', 'failed'
+    result_type TEXT,                         -- class name run() returned
+    examined INTEGER,                         -- see note above
+    produced INTEGER,                         -- see note above
+    metrics TEXT,                             -- JSON: every field of the result
+    error TEXT                                -- NULL unless outcome='failed'
+);
+
 -- Materialized graph registry (Phase 5)
 CREATE TABLE IF NOT EXISTS materialized_graph_registry (
     graph_id TEXT PRIMARY KEY,
@@ -96,6 +126,8 @@ CREATE TABLE IF NOT EXISTS materialized_graph_registry (
 CREATE INDEX IF NOT EXISTS idx_turns_session ON conversation_turn_events(session_id);
 CREATE INDEX IF NOT EXISTS idx_turns_timestamp ON conversation_turn_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_turns_ontology ON conversation_turn_events(ontology_version);
+CREATE INDEX IF NOT EXISTS idx_curation_runs_job ON curation_job_runs(job_name, started_at);
+CREATE INDEX IF NOT EXISTS idx_health_events_time ON graph_health_events(timestamp);
 
 -- Append-only epoch ledger (F3): records each (ontology, extraction, model)
 -- epoch so the graph is a projection of (log, epoch). Never mutated.

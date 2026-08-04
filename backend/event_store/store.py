@@ -602,6 +602,179 @@ class EventStore:
             "provisional": 1,
         }
 
+    # ------------------------------------------------------------------
+    # Curation observability (D3)
+    # ------------------------------------------------------------------
+
+    def append_curation_job_run(
+        self,
+        *,
+        run_id: str,
+        job_name: str,
+        trigger_source: str,
+        started_at: str,
+        duration_ms: float,
+        outcome: str,
+        result_type: str | None,
+        examined: int | None,
+        produced: int | None,
+        metrics: str | None,
+        error: str | None,
+    ) -> str:
+        """Record one curation job execution. Append-only.
+
+        Every parameter is keyword-only: the row has four integer-ish columns
+        in a row (`duration_ms`, `examined`, `produced`) whose meanings are not
+        recoverable from position at a call site.
+
+        `examined` and `produced` are stored as separate nullable columns
+        rather than folded into `metrics` so a later query can filter on them
+        without parsing JSON -- see `schema.sql` for what each NULL means.
+
+        Args:
+            run_id: Unique id for this execution.
+            job_name: The `JobConfig.name` that ran.
+            trigger_source: 'scheduled' (the loop) or 'manual' (`run_once`).
+            started_at: ISO-8601 timestamp taken before the job was awaited.
+            duration_ms: Scheduler-measured wall clock, not the job's own.
+            outcome: 'completed' if `run()` returned, 'failed' if it raised.
+            result_type: Class name of the returned result, None on failure.
+            examined: Units of input the job reports having looked at.
+            produced: Units of output the job reports having written.
+            metrics: JSON object of every field of the result, or None.
+            error: Exception text, None unless outcome is 'failed'.
+
+        Returns:
+            The `run_id` that was written.
+        """
+        conn = self._get_connection()
+        conn.execute(
+            """
+            INSERT INTO curation_job_runs (
+                run_id, job_name, trigger_source, started_at, duration_ms,
+                outcome, result_type, examined, produced, metrics, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                job_name,
+                trigger_source,
+                started_at,
+                duration_ms,
+                outcome,
+                result_type,
+                examined,
+                produced,
+                metrics,
+                error,
+            ),
+        )
+        return run_id
+
+    def get_curation_job_runs(
+        self, job_name: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Read back curation job runs, most recent first.
+
+        Ordered by rowid rather than `started_at`: two runs of different jobs
+        in the same scheduler pass can share an ISO timestamp to the
+        microsecond, and insertion order is the only total order available.
+
+        Args:
+            job_name: Restrict to one job. None returns every job's runs.
+            limit: Maximum rows to return.
+
+        Returns:
+            List of row dicts with `metrics` decoded from JSON.
+        """
+        conn = self._get_connection()
+        if job_name is None:
+            cursor = conn.execute(
+                "SELECT * FROM curation_job_runs ORDER BY rowid DESC LIMIT ?",
+                (limit,),
+            )
+        else:
+            cursor = conn.execute(
+                "SELECT * FROM curation_job_runs WHERE job_name = ? ORDER BY rowid DESC LIMIT ?",
+                (job_name, limit),
+            )
+        return [self._decode_metrics_row(dict(row)) for row in cursor.fetchall()]
+
+    def append_graph_health_event(
+        self,
+        *,
+        event_id: str,
+        timestamp: str,
+        health_score: float,
+        metrics: str,
+        entity_count: int | None,
+        relationship_count: int | None,
+        archived_count: int | None = None,
+        community_count: int | None = None,
+    ) -> str:
+        """Record one graph health measurement. Append-only.
+
+        This is the health TIME SERIES the `graph_health_events` table was
+        declared for in Phase 4 and that nothing ever wrote to. It is not a
+        substitute for `curation_job_runs`: `health_score` is NOT NULL, so a
+        health run that RAISED has no representable row here. The run ledger
+        records that; this records the measurement.
+
+        `archived_count` and `community_count` stay None. They are outputs of
+        `ConfidenceDecayJob` and `CommunityDetector`, which run on their own
+        intervals -- filling them from a different job's most recent run would
+        stamp this measurement with numbers that were not measured with it.
+
+        Args:
+            event_id: Unique id for this measurement.
+            timestamp: ISO-8601 timestamp of the measurement.
+            health_score: The composite 0-100 `overall` score.
+            metrics: JSON object of the component sub-scores.
+            entity_count: Active entity count at measurement time.
+            relationship_count: Current-belief relationship count.
+            archived_count: Not populated by the scheduler. See above.
+            community_count: Not populated by the scheduler. See above.
+
+        Returns:
+            The `event_id` that was written.
+        """
+        conn = self._get_connection()
+        conn.execute(
+            """
+            INSERT INTO graph_health_events (
+                event_id, timestamp, health_score, metrics,
+                entity_count, relationship_count, archived_count, community_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                timestamp,
+                health_score,
+                metrics,
+                entity_count,
+                relationship_count,
+                archived_count,
+                community_count,
+            ),
+        )
+        return event_id
+
+    def get_graph_health_events(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Read back graph health measurements, most recent first.
+
+        Args:
+            limit: Maximum rows to return.
+
+        Returns:
+            List of row dicts with `metrics` decoded from JSON.
+        """
+        conn = self._get_connection()
+        cursor = conn.execute(
+            "SELECT * FROM graph_health_events ORDER BY rowid DESC LIMIT ?",
+            (limit,),
+        )
+        return [self._decode_metrics_row(dict(row)) for row in cursor.fetchall()]
+
     def create_reextraction_job(
         self,
         job_id: str,
@@ -705,4 +878,24 @@ class EventStore:
             if value is not None and isinstance(value, str):
                 with contextlib.suppress(json.JSONDecodeError, TypeError):
                     row[field_name] = json.loads(value)
+        return row
+
+    @staticmethod
+    def _decode_metrics_row(row: dict[str, Any]) -> dict[str, Any]:
+        """Decode the `metrics` JSON column on a curation or health row.
+
+        A value that fails to parse is left as its raw string rather than
+        dropped -- a reader diagnosing a job would rather see malformed JSON
+        than a silent None.
+
+        Args:
+            row: Raw dict from sqlite3.Row.
+
+        Returns:
+            The same dict with `metrics` decoded when it parses.
+        """
+        value = row.get("metrics")
+        if isinstance(value, str):
+            with contextlib.suppress(json.JSONDecodeError, TypeError):
+                row["metrics"] = json.loads(value)
         return row
