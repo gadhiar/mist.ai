@@ -387,6 +387,21 @@ def _embedding_failure(
             f"{prefix} has an embedding of {len(stored)} dimensions, expected "
             f"{expected_dimension}"
         )
+    # Element type, not just container type. `_l2_norm` calls `float(x)` per
+    # element, so a correctly-shaped list of non-numeric values reaches it and
+    # raises ValueError -- a traceback out of `seed-verify` / `cmd_seed` instead
+    # of the clean per-node failure line every other condition here produces.
+    # Reachable in exactly one way, which is why this is a condition and not a
+    # comment: `SeedNode` is `extra="allow"` and `embedding` is not applier-owned,
+    # so an authored `embedding:` key in `mist-memory/seed/*.md` flows straight
+    # through `$properties` to the graph. The Neo4j driver itself always returns
+    # lists of floats for array properties, so the driver path cannot produce it.
+    bad = next((x for x in stored if not isinstance(x, int | float) or isinstance(x, bool)), None)
+    if bad is not None:
+        return (
+            f"{prefix} has a non-numeric value of type {type(bad).__name__} in its "
+            "embedding, expected a list of floats"
+        )
     norm = _l2_norm(stored)
     if norm < _MIN_L2_NORM:
         return (

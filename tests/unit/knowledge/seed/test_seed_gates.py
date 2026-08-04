@@ -863,6 +863,38 @@ class TestEmbeddings:
         assert str(narrow_dimension) in result.failures[0]
         assert str(EMBEDDING_DIMENSION) in result.failures[0]
 
+    def test_fails_when_the_embedding_is_a_correctly_sized_list_of_non_numbers(self):
+        """Container type and width are both right; the ELEMENTS are not numbers.
+
+        This slips past `isinstance(stored, list)` and past the dimension
+        check, and lands in `_l2_norm`, whose `float(x)` raises ValueError --
+        a traceback out of `seed-verify` rather than the clean per-node line
+        every other condition produces.
+
+        Reachable through exactly one route, which is why it is a condition
+        and not a comment: `SeedNode` is `extra="allow"` and `embedding` is
+        not applier-owned, so an authored `embedding:` key in the seed source
+        flows through `$properties` into the graph unvalidated. The Neo4j
+        driver always returns lists of floats for array properties, so no
+        driver path produces this.
+        """
+        connection = FakeNeo4jConnection(
+            query_results=[{"embedding": ["nope"] * EMBEDDING_DIMENSION}]
+        )
+        docs = [_doc(nodes=[SeedNode(id="slalom", type="Organization", display_name="Slalom")])]
+
+        result = check_embeddings(
+            connection,
+            docs,
+            seed_version="profile-v1",
+            embedding_generator=FakeEmbeddingGenerator(),
+            expected_dimension=EMBEDDING_DIMENSION,
+        )
+
+        assert not result.passed
+        assert "non-numeric" in result.failures[0]
+        assert "str" in result.failures[0]
+
     def test_fails_when_the_stored_embedding_is_not_a_list(self):
         """The `isinstance` branch had zero test reach.
 
