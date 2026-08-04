@@ -6,9 +6,8 @@
 
 | Fact | Value | How verified |
 |---|---|---|
-| Local `main` HEAD | `987651f` | `git log` |
-| Working branch | `fix/register-remediation-2026-08-03` @ `d4bf16c`, **8 commits, NOT yet merged** | `git log main..HEAD` |
-| Commits ahead of origin | **27** (19 on `main` + 8 on the branch), never pushed | `git rev-list --count origin/main..HEAD` |
+| Local `main` HEAD | `9b363ba` -- the remediation branch is **ff-MERGED**, branch deleted | `git log` |
+| Commits ahead of origin | **31**, never pushed | `git rev-list --count origin/main..HEAD` |
 | Unit suite | **2761 passed / 7 skipped / 4 xfailed / 0 failed** (was 2679 at branch point, +82) | full run in container, clean tree, post-commit |
 | Ontology version | **1.4.0** | `backend.knowledge.version_stamps.ONTOLOGY_VERSION` at runtime |
 | Extraction version | **2026-06-14-r5** | same module, runtime |
@@ -52,9 +51,40 @@ indistinguishable in the logs, which is why hydration (R1.4.6) is now sequenced 
 Full register: `docs/superpowers/specs/2026-08-02-review-findings-register.md` (gitignored,
 local only).
 
-**REMEDIATION BRANCH, 2026-08-03 (8 commits, awaiting the whole-branch review gate before merge).**
-`fix/register-remediation-2026-08-03`. Live graph untouched at 32/30 throughout; no write of any
-kind was made to Neo4j, the event store, or the vault.
+**REMEDIATION, 2026-08-03 -- 12 commits, MERGED to local `main` @ `9b363ba`, branch deleted.**
+Live graph untouched at 32/30 throughout; no write of any kind was made to Neo4j, the event
+store, or the vault.
+
+**HOW THE MERGE GATE ACTUALLY RAN, stated plainly because it is not the usual shape.** FOUR
+successive read-only review agents (a `scripts/` auditor, a whole-branch reviewer, and two narrow
+single-question gates) completed their work and then went idle WITHOUT returning any report.
+Every implementation agent reported normally; only the review agents failed, which points at how
+they were dispatched rather than at the agents. **No independent review verdict exists for this
+branch.** The gate was therefore run by the coordinator directly, and covered:
+
+- Every commit's central claim mutation-proved independently of its authoring agent, production
+  file restored byte-identically each time.
+- **The composition-root mutation matrix, both directions.** Reverting the `server.py` call site
+  fails the AST guard (1 test) while the wiring tests stay GREEN (12 pass); making the resolver
+  return `None` leaves the AST guard GREEN (7 pass) while 5 wiring tests FAIL. Neither mechanism
+  subsumes the other and neither is dead.
+- **Exemption anti-rot**, verified length-sensitive rather than always-raising: a reasonless
+  entry raises, an empty callee raises, a >=60-char justification is accepted.
+- **Scope creep on the rebuild change, cleared by enumeration.** Exactly ONE production caller of
+  `get_all_turns_for_reextraction` (`log_regenerator.py:247`), which passes `origins` explicitly.
+  The store defaults to `None` (neutral read); only the REBUILD defaults to `('real',)`
+  (fail-closed policy). No existing caller's behaviour changed.
+- **The composition risk, cleared empirically.** `CurationScheduler._loop` initializes
+  `last_run.get(name, 0.0)`, so every enabled job fires IMMEDIATELY at start. A real container
+  restart ran all three newly-wired jobs against the live graph for the first time; graph before
+  and after 32/30, nothing written.
+- The import change verified at RUNTIME (container restarted, single `Started server process`,
+  zero first-party duplicates scanned inside the running container), not by tests alone.
+
+**NOT covered by any party:** a systematic fact-check of the commit messages' claims, and a dead-fix
+sweep across ALL new guards rather than the highest-risk one. Those two categories are exactly
+where the previous session's own deliverables failed THREE times, so treat them as open risk on
+this branch rather than as cleared.
 
 | Commit | Substance |
 |---|---|
