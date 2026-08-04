@@ -3,7 +3,7 @@
 `backend/` is a PEP 420 namespace package -- there is no `backend/__init__.py`
 -- and `backend/server.py`, the production entry point (the image runs
 `CMD ["python", "backend/server.py"]`), puts BOTH the repository root and
-`backend/` itself on `sys.path` (server.py:33-35). Under that path layout a
+`backend/` itself on `sys.path` (server.py:36-37). Under that path layout a
 single file such as `backend/request_context.py` is importable under two
 different dotted names, `request_context` and `backend.request_context`, and
 Python will execute it twice and keep two independent module objects.
@@ -17,11 +17,20 @@ because each side was internally consistent. No behavioural test could see the
 problem, because the problem is *identity*, not behaviour -- which is why the
 guard has to look at `sys.modules` directly.
 
-Both tests below run the import in a subprocess. That is deliberate: importing
-the production graph into the pytest interpreter would permanently rewrite that
+Both probes run the import in a subprocess. That is deliberate: importing the
+production graph into the pytest interpreter would permanently rewrite that
 interpreter's `sys.path` and `sys.modules` for every test that runs afterwards,
 and a pristine child is also the only way to observe a `sys.modules` that is
-production's rather than production's-plus-whatever-pytest-imported.
+production's rather than production's-plus-whatever-pytest-imported. Each probe
+runs ONCE per module (module-scoped fixtures) and every test reads its result.
+
+Three things here are asserted as strict-equality baselines rather than as
+thresholds: the duplicate module pairs, and the set of modules that fail to
+import. A count or a floor would let the checked surface shrink quietly while
+still reporting green, which is the same "emptiness is a universal alibi"
+failure this guard exists to remove. Strict equality means both a regression
+AND a fix break the build until someone edits the baseline deliberately, so
+every list below can only shrink.
 """
 
 import json
@@ -35,8 +44,17 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# Roots walked by the "all-roots" probe. `dependencies/` is deliberately NOT
+# walked: it is vendored Apache-2.0 CSM code that the project treats as legacy
+# and inactive, it is not ours to re-spell, and importing it would drag in a
+# dormant torch model stack. It remains COVERED anyway -- the duplicate scan is
+# scoped by path, not by walked root, so if anything ever loads a
+# dependencies/csm module under two names the check still fires. See the
+# `model_manager.py:13` note on _ROOT_MODULE_FLOORS below.
+WALKED_ROOTS = ("backend", "src", "scripts")
+
 # Probe program. Populates sys.modules the way production does, then dumps
-# {module name -> resolved __file__} as JSON for the parent to analyse.
+# what loaded, what failed to load, and how many modules each root offered.
 _PROBE = r'''
 import ast
 import importlib
@@ -48,8 +66,9 @@ import sys
 
 mode, repo_root, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
 backend_dir = os.path.join(repo_root, "backend")
+walked_roots = ("backend", "src", "scripts")
 
-# Mirror backend/server.py:33-35. The production entry point puts the repo root
+# Mirror backend/server.py:36-37. The production entry point puts the repo root
 # AND backend/ on sys.path, and that path layout is precisely what makes one
 # file importable under two names. Without reproducing it the check cannot see
 # the defect it exists to catch.
@@ -75,13 +94,16 @@ class _NoFileHandler(logging.Handler):
 
 logging.FileHandler = _NoFileHandler
 
+attempted = {}
+failed = {}
+
 if mode == "entrypoint":
     # Execute exactly the top-level import statements of server.py, parsed out
     # of the file itself rather than copied into this probe. A hand-copied
     # import list would go stale the first time someone edits server.py -- the
     # same "built, tested, and wired to nothing" failure this file exists to
-    # prevent. Only the imports are executed, not the module body, so the
-    # probe does not construct the FastAPI app or touch the log.
+    # prevent. Only the imports are executed, not the module body, so the probe
+    # does not construct the FastAPI app or touch the log.
     source = pathlib.Path(backend_dir, "server.py").read_text(encoding="utf-8")
     namespace = {"__name__": "__mist_entrypoint_probe__"}
     for node in ast.parse(source).body:
@@ -91,19 +113,26 @@ if mode == "entrypoint":
             )
             exec(compiled, namespace)
 else:
-    root = pathlib.Path(backend_dir)
-    for path in sorted(root.rglob("*.py")):
-        parts = list(path.relative_to(root.parent).with_suffix("").parts)
-        if parts[-1] == "__init__":
-            parts = parts[:-1]
-        try:
-            importlib.import_module(".".join(parts))
-        except BaseException:
-            # A module that will not import is simply not covered by this run.
-            # That is not a module-identity failure and must not be reported as
-            # one. The parent's coverage floor catches wholesale import
-            # collapse, so this cannot silently hollow the check out.
-            pass
+    for root_name in walked_roots:
+        root = pathlib.Path(repo_root, root_name)
+        count = 0
+        for path in sorted(root.rglob("*.py")):
+            parts = list(path.relative_to(root.parent).with_suffix("").parts)
+            if parts[-1] == "__init__":
+                parts = parts[:-1]
+            module_name = ".".join(parts)
+            count += 1
+            try:
+                importlib.import_module(module_name)
+            except BaseException as exc:
+                # Recorded, never swallowed. A module that silently stopped
+                # importing would shrink the surface this guard examines while
+                # it kept reporting green -- the exact defect class the guard
+                # exists to remove. BaseException because a script that calls
+                # sys.exit() at import raises SystemExit, which is a failure to
+                # import like any other.
+                failed[module_name] = "{0}: {1}".format(type(exc).__name__, exc)
+        attempted[root_name] = count
 
 loaded = {}
 for name, module in list(sys.modules.items()):
@@ -114,7 +143,8 @@ for name, module in list(sys.modules.items()):
         # miss real duplicates and invent fake ones.
         loaded[name] = os.path.realpath(file)
 
-pathlib.Path(out_path).write_text(json.dumps(loaded), encoding="utf-8")
+payload = {"loaded": loaded, "failed": failed, "attempted": attempted}
+pathlib.Path(out_path).write_text(json.dumps(payload), encoding="utf-8")
 '''
 
 # Installed distributions legitimately alias themselves (setuptools.extern.*,
@@ -142,16 +172,16 @@ def _is_first_party(path: str) -> bool:
     return not any(marker in candidate.parts for marker in _INSTALLED_PACKAGE_MARKERS)
 
 
-def _run_probe(mode: str) -> dict[str, str]:
-    """Import the backend in a clean interpreter; return {module name -> file}."""
+def _run_probe(mode: str) -> dict:
+    """Import in a clean interpreter; return {loaded, failed, attempted}."""
     with tempfile.TemporaryDirectory() as tmp:
-        out_path = Path(tmp) / "loaded.json"
+        out_path = Path(tmp) / "probe.json"
         result = subprocess.run(
             [sys.executable, "-c", _PROBE, mode, str(REPO_ROOT), str(out_path)],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=900,
         )
         # A probe that crashed would report zero duplicates and pass. Fail loudly
         # instead -- a guard that goes vacuous on error is worse than no guard.
@@ -161,6 +191,24 @@ def _run_probe(mode: str) -> dict[str, str]:
             f"--- stderr ---\n{result.stderr[-4000:]}"
         )
         return json.loads(out_path.read_text(encoding="utf-8"))
+
+
+@pytest.fixture(scope="module")
+def entrypoint_probe() -> dict:
+    """One subprocess, shared by every test that reads the entry-point graph."""
+    return _run_probe("entrypoint")
+
+
+@pytest.fixture(scope="module")
+def all_roots_probe() -> dict:
+    """One subprocess covering backend/, src/ and scripts/ together.
+
+    A single interpreter for all three roots is not just cheaper than three --
+    it is more sensitive. Duplicate identity only shows up when both spellings
+    are resident at once, so co-loading the roots can reveal cross-root
+    collisions that per-root probes would each individually miss.
+    """
+    return _run_probe("all-roots")
 
 
 def _first_party_duplicates(loaded: dict[str, str]) -> dict[str, list[str]]:
@@ -194,17 +242,21 @@ def _describe(duplicates: dict[str, list[str]]) -> str:
 # Found 2026-08-03 while building this guard. Root cause: server.py imports
 # `config`, `voice_processor`, `factories`, `knowledge.config` and `log_handler`
 # by bare name, while 341 import sites inside backend/ spell the same modules
-# `backend.*`.
+# `backend.*`. Tracked as a work item; do NOT rewrite the imports from here.
 ENTRY_POINT_BASELINE = {
     "backend/factories.py": ["backend.factories", "factories"],
     "backend/knowledge/__init__.py": ["backend.knowledge", "knowledge"],
     "backend/knowledge/config.py": ["backend.knowledge.config", "knowledge.config"],
 }
 
-# The whole-tree walk reaches modules the entry point does not, so it sees a
+# The all-roots walk reaches modules the entry point does not, so it sees a
 # superset: the six extra pairs are collision-capable today and become live the
 # moment any reachable module imports them under the other spelling.
-WHOLE_TREE_BASELINE = {
+#
+# Every entry is still under backend/. Walking src/ and scripts/ on 2026-08-03
+# added 44 modules and found NO duplicate of its own -- those two trees are
+# clean, and this baseline records that.
+ALL_ROOTS_BASELINE = {
     **ENTRY_POINT_BASELINE,
     "backend/audio_protocol.py": ["audio_protocol", "backend.audio_protocol"],
     "backend/config.py": ["backend.config", "config"],
@@ -217,12 +269,55 @@ WHOLE_TREE_BASELINE = {
     "backend/voice_processor.py": ["backend.voice_processor", "voice_processor"],
 }
 
-# Coverage floors. A probe that imported almost nothing would find no
-# duplicates and pass, which is the exact shape of vacuous green this guard
-# exists to make impossible. Set well under the real counts (entry point ~60,
-# whole tree ~120) so ordinary growth never trips them.
+# Modules that do not import, as a strict-equality baseline. EMPTY is the
+# correct state and the state as of 2026-08-03: all 158 modules across the
+# three roots import cleanly.
+#
+# This replaced a silent `except BaseException: pass`, which let a module drop
+# out of the examined surface with no signal at all -- a guard quietly checking
+# less than it did yesterday while still reporting green.
+#
+# Format if an entry is ever genuinely warranted: module name -> exception type
+# name, with an inline comment giving the WHY (optional dependency absent in the
+# test image, hardware/CUDA requirement, and so on). "It started failing" is not
+# a justification; an entry without a stated reason is rot. Comparison is on the
+# exception TYPE only, because messages carry absolute paths and versions that
+# would churn the baseline.
+IMPORT_FAILURE_BASELINE: dict[str, str] = {}
+
+# Per-root floors on how many modules the walk OFFERED (not how many loaded).
+# These catch a whole root silently dropping out of the walk -- a bad rglob, a
+# renamed directory, a bad relative_to -- which would otherwise shrink the
+# surface without failing anything. Set below the real counts (backend 114,
+# src 14, scripts 30) so ordinary growth never trips them.
+#
+# Related live hazard these floors do NOT cover, recorded here because it is
+# the reason src/ was worth walking: backend/voice_models/model_manager.py:12-13
+# inserts the repo root and then the RELATIVE path "dependencies/csm" onto
+# sys.path, so it resolves only when CWD is the repo root. Combined with the
+# bare `from generator import Segment` at model_manager.py:240/736 and
+# src/multimodal/tts.py:38/103/199, dependencies/csm/generator.py is
+# double-identity-capable. It stays latent only because CSM is dormant behind
+# Chatterbox and those imports sit inside functions, where a static walk cannot
+# reach them. If CSM is ever reactivated the duplicate scan will catch it.
+_ROOT_MODULE_FLOORS = {"backend": 90, "src": 10, "scripts": 20}
+
+# Floors on first-party modules actually resident in sys.modules. A probe that
+# imported almost nothing would find no duplicates and pass, which is the exact
+# shape of vacuous green this guard exists to make impossible. Real counts are
+# ~80 and ~150.
 _ENTRY_POINT_MODULE_FLOOR = 40
-_WHOLE_TREE_MODULE_FLOOR = 100
+_ALL_ROOTS_MODULE_FLOOR = 100
+
+
+def _assert_no_hollow_probe(probe: dict, floor: int) -> None:
+    """Fail unless the probe actually loaded a production-sized graph."""
+    resident = [n for n, p in probe["loaded"].items() if _is_first_party(p)]
+    assert len(resident) >= floor, (
+        f"probe loaded only {len(resident)} first-party modules (floor {floor}) "
+        "-- it is not exercising the real graph, so its 'no duplicates' result "
+        "means nothing"
+    )
 
 
 def _assert_matches_baseline(found: dict[str, list[str]], baseline: dict[str, list[str]]) -> None:
@@ -256,37 +351,81 @@ def _assert_matches_baseline(found: dict[str, list[str]], baseline: dict[str, li
 class TestProductionEntryPointModuleIdentity:
     """What the running server actually loads, via server.py's own imports."""
 
-    def test_the_production_entry_point_loads_no_new_source_file_under_two_names(self):
+    def test_the_production_entry_point_loads_no_new_source_file_under_two_names(
+        self, entrypoint_probe
+    ):
         # Arrange / Act
-        loaded = _run_probe("entrypoint")
+        duplicates = _first_party_duplicates(entrypoint_probe["loaded"])
 
         # Assert -- coverage floor first, so a hollow probe cannot pass quietly.
-        first_party = [n for n, p in loaded.items() if _is_first_party(p)]
-        assert len(first_party) >= _ENTRY_POINT_MODULE_FLOOR, (
-            f"probe loaded only {len(first_party)} first-party modules "
-            f"(floor {_ENTRY_POINT_MODULE_FLOOR}) -- it is not exercising the "
-            "production graph, so its 'no duplicates' result means nothing"
-        )
-
-        _assert_matches_baseline(_first_party_duplicates(loaded), ENTRY_POINT_BASELINE)
+        _assert_no_hollow_probe(entrypoint_probe, _ENTRY_POINT_MODULE_FLOOR)
+        _assert_matches_baseline(duplicates, ENTRY_POINT_BASELINE)
 
 
-class TestWholeBackendTreeModuleIdentity:
-    """Every module under backend/, including those the entry point misses."""
+class TestAllRootsModuleIdentity:
+    """Every module under backend/, src/ and scripts/, co-loaded in one run."""
 
-    def test_importing_every_backend_module_loads_no_new_source_file_under_two_names(self):
+    def test_walking_every_root_loads_no_new_source_file_under_two_names(self, all_roots_probe):
         # Arrange / Act
-        loaded = _run_probe("whole-tree")
+        duplicates = _first_party_duplicates(all_roots_probe["loaded"])
 
         # Assert
-        first_party = [n for n, p in loaded.items() if _is_first_party(p)]
-        assert len(first_party) >= _WHOLE_TREE_MODULE_FLOOR, (
-            f"probe loaded only {len(first_party)} first-party modules "
-            f"(floor {_WHOLE_TREE_MODULE_FLOOR}) -- the tree walk is broken, so "
-            "its 'no duplicates' result means nothing"
+        _assert_no_hollow_probe(all_roots_probe, _ALL_ROOTS_MODULE_FLOOR)
+        _assert_matches_baseline(duplicates, ALL_ROOTS_BASELINE)
+
+    def test_every_root_still_offers_the_walk_a_full_set_of_modules(self, all_roots_probe):
+        # Arrange / Act
+        attempted = all_roots_probe["attempted"]
+
+        # Assert
+        assert set(attempted) == set(WALKED_ROOTS), (
+            f"the walk covered {sorted(attempted)} but should cover "
+            f"{sorted(WALKED_ROOTS)} -- a root stopped being examined"
         )
 
-        _assert_matches_baseline(_first_party_duplicates(loaded), WHOLE_TREE_BASELINE)
+        thin = {r: n for r, n in attempted.items() if n < _ROOT_MODULE_FLOORS[r]}
+        assert not thin, (
+            f"a root offered fewer modules than its floor: {thin} "
+            f"(floors {_ROOT_MODULE_FLOORS}). The walk is finding less than it "
+            "used to, so any clean result from it covers less than it claims."
+        )
+
+
+class TestEveryWalkedModuleStillImports:
+    """The surface this guard examines must not shrink without saying so."""
+
+    def test_no_module_under_the_walked_roots_has_stopped_importing(self, all_roots_probe):
+        # Arrange / Act
+        failed: dict[str, str] = all_roots_probe["failed"]
+
+        # Assert
+        new = {n: d for n, d in failed.items() if n not in IMPORT_FAILURE_BASELINE}
+        assert not new, (
+            "A module under the walked roots no longer imports:\n\n"
+            + "\n".join(f"  {name}\n      {detail}" for name, detail in sorted(new.items()))
+            + "\n\nUntil this is fixed that module is invisible to the "
+            "module-identity check, which will keep reporting green over a "
+            "surface that just shrank. Fix the import, or add a baseline entry "
+            "with a written justification if it genuinely cannot import here."
+        )
+
+        recovered = sorted(set(IMPORT_FAILURE_BASELINE) - set(failed))
+        assert not recovered, (
+            f"Good news, and this test needs updating: {', '.join(recovered)} "
+            "imports again. Delete the entry from IMPORT_FAILURE_BASELINE so "
+            "the recovery is locked in."
+        )
+
+        drifted = {
+            name: detail
+            for name, detail in failed.items()
+            if name in IMPORT_FAILURE_BASELINE
+            and detail.split(":", 1)[0] != IMPORT_FAILURE_BASELINE[name]
+        }
+        assert not drifted, (
+            f"a known-failing module now fails differently: {drifted}. The "
+            "recorded justification may no longer describe the real cause."
+        )
 
 
 @pytest.mark.xfail(
@@ -302,8 +441,8 @@ class TestWholeBackendTreeModuleIdentity:
         "not an allowlist."
     ),
 )
-def test_no_backend_source_file_is_ever_loaded_twice():
-    duplicates = _first_party_duplicates(_run_probe("entrypoint"))
+def test_no_backend_source_file_is_ever_loaded_twice(entrypoint_probe):
+    duplicates = _first_party_duplicates(entrypoint_probe["loaded"])
 
     assert not duplicates, (
         "the production entry point loads these files under two module "
