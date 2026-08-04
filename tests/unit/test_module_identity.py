@@ -1,12 +1,20 @@
 """Guard: one source file must never be loaded under two module names.
 
 `backend/` is a PEP 420 namespace package -- there is no `backend/__init__.py`
--- and `backend/server.py`, the production entry point (the image runs
-`CMD ["python", "backend/server.py"]`), puts BOTH the repository root and
-`backend/` itself on `sys.path` (server.py:36-37). Under that path layout a
+-- and the production entry point runs `CMD ["python", "backend/server.py"]`,
+which makes CPython put the SCRIPT's directory, `backend/`, at `sys.path[0]`.
+`server.py:39` then adds the repository root so the `backend.*` spelling
+resolves. Both directories are therefore on `sys.path`, and under that layout a
 single file such as `backend/request_context.py` is importable under two
 different dotted names, `request_context` and `backend.request_context`, and
 Python will execute it twice and keep two independent module objects.
+
+The 2026-08-03 fix unified every first-party import on the `backend.` spelling,
+so nothing loads a bare name any more and both baselines below are empty. It did
+NOT -- and could not -- take `backend/` off `sys.path`: that placement comes
+from script-directory semantics, not from an insert that could be deleted. The
+bare spelling remains *importable*, so this guard remains load-bearing rather
+than historical, and the probe below still reproduces both path entries.
 
 That is not a style complaint. Module-level state belongs to the module
 *object*, so a `ContextVar` defined in such a file exists twice over: a `.set()`
@@ -68,10 +76,14 @@ mode, repo_root, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
 backend_dir = os.path.join(repo_root, "backend")
 walked_roots = ("backend", "src", "scripts")
 
-# Mirror backend/server.py:36-37. The production entry point puts the repo root
-# AND backend/ on sys.path, and that path layout is precisely what makes one
-# file importable under two names. Without reproducing it the check cannot see
-# the defect it exists to catch.
+# Reproduce the production path layout. Both entries are real: `python
+# backend/server.py` puts backend/ at sys.path[0] via script-directory
+# semantics, and server.py:39 adds the repo root. That layout is precisely what
+# makes one file importable under two names, so the probe must keep BOTH -- the
+# 2026-08-03 import unification removed the redundant explicit insert of
+# backend/, not backend/ itself. Dropping backend_dir here would make the check
+# pass for a reason that does not hold in production, which is a weaker guard
+# wearing a green badge.
 sys.path.insert(0, repo_root)
 sys.path.insert(0, backend_dir)
 
@@ -231,42 +243,39 @@ def _describe(duplicates: dict[str, list[str]]) -> str:
     )
 
 
-# Known-broken baseline, NOT an exemption list. Each entry is a live defect:
-# these files really are executed twice in the running server, so their
-# module-level state really is duplicated. The tests assert the found set
-# EQUALS this baseline, which means a new duplicate fails immediately and
-# fixing one of these also fails until the entry is deleted here. The baseline
-# can only shrink, and `test_no_backend_source_file_is_ever_loaded_twice`
-# below stays red until it reaches zero.
+# Known-broken baseline, NOT an exemption list. Each entry would be a live
+# defect: a file really executed twice in the running server, with its
+# module-level state really duplicated. The tests assert the found set EQUALS
+# this baseline, so a new duplicate fails immediately and fixing one also fails
+# until its entry is deleted here. The baseline can only shrink.
 #
-# Found 2026-08-03 while building this guard. Root cause: server.py imports
-# `config`, `voice_processor`, `factories`, `knowledge.config` and `log_handler`
-# by bare name, while 341 import sites inside backend/ spell the same modules
-# `backend.*`. Tracked as a work item; do NOT rewrite the imports from here.
-ENTRY_POINT_BASELINE = {
-    "backend/factories.py": ["backend.factories", "factories"],
-    "backend/knowledge/__init__.py": ["backend.knowledge", "knowledge"],
-    "backend/knowledge/config.py": ["backend.knowledge.config", "knowledge.config"],
-}
+# EMPTY is the correct state and the state as of 2026-08-03.
+#
+# History, kept because it is the whole reason this guard exists. When the guard
+# was built on 2026-08-03 it recorded three live duplicates here --
+# backend/factories.py, backend/knowledge/__init__.py and
+# backend/knowledge/config.py -- because server.py imported `config`,
+# `voice_processor`, `factories`, `knowledge.config` and `log_handler` by bare
+# name while 341 import sites inside backend/ spelled the same modules
+# `backend.*`. factories.py is the dependency-injection wiring module, so the
+# DI graph was built twice in production. Those imports were unified onto the
+# `backend.` spelling later the same day (server.py:50-59,
+# voice_processor.py:31/40), which emptied this baseline and the one below.
+ENTRY_POINT_BASELINE: dict[str, list[str]] = {}
 
 # The all-roots walk reaches modules the entry point does not, so it sees a
-# superset: the six extra pairs are collision-capable today and become live the
-# moment any reachable module imports them under the other spelling.
+# superset. It once carried six extra pairs -- audio_protocol, config,
+# log_handler, voice_models, voice_models.model_manager and voice_processor --
+# which were collision-capable rather than live: they would have duplicated the
+# moment any reachable module imported them the other way. Two of them were in
+# fact already live through voice_processor.py's bare `audio_protocol` and
+# `voice_models.model_manager` imports. All six were resolved by the same
+# unification, so this baseline is empty too.
 #
-# Every entry is still under backend/. Walking src/ and scripts/ on 2026-08-03
-# added 44 modules and found NO duplicate of its own -- those two trees are
-# clean, and this baseline records that.
-ALL_ROOTS_BASELINE = {
+# Walking src/ and scripts/ on 2026-08-03 added 44 modules and found NO
+# duplicate of its own -- those two trees were clean then and are clean now.
+ALL_ROOTS_BASELINE: dict[str, list[str]] = {
     **ENTRY_POINT_BASELINE,
-    "backend/audio_protocol.py": ["audio_protocol", "backend.audio_protocol"],
-    "backend/config.py": ["backend.config", "config"],
-    "backend/log_handler.py": ["backend.log_handler", "log_handler"],
-    "backend/voice_models/__init__.py": ["backend.voice_models", "voice_models"],
-    "backend/voice_models/model_manager.py": [
-        "backend.voice_models.model_manager",
-        "voice_models.model_manager",
-    ],
-    "backend/voice_processor.py": ["backend.voice_processor", "voice_processor"],
 }
 
 # Modules that do not import, as a strict-equality baseline. EMPTY is the
@@ -428,22 +437,21 @@ class TestEveryWalkedModuleStillImports:
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known live defect found 2026-08-03: backend/factories.py, "
-        "backend/knowledge/__init__.py and backend/knowledge/config.py are each "
-        "executed twice in the running server because server.py imports them by "
-        "bare name while the rest of backend/ imports them as backend.*. This "
-        "marker is strict, so the moment the imports are unified this test "
-        "XPASSes and fails the suite, forcing the marker and the baselines above "
-        "to be removed. It is the reminder that the baseline is a defect list, "
-        "not an allowlist."
-    ),
-)
 def test_no_backend_source_file_is_ever_loaded_twice(entrypoint_probe):
+    """The absolute statement, independent of any baseline.
+
+    Carried `@pytest.mark.xfail(strict=True)` from 2026-08-03 until the imports
+    were unified the same day; the marker then XPASSed and failed the suite,
+    which is exactly what it was for. It is a plain assertion now. Unlike the
+    baseline-comparing tests above, this one cannot be satisfied by editing a
+    dict -- it stays honest even if someone adds an entry to a baseline instead
+    of fixing the duplicate.
+    """
+    # Arrange / Act
     duplicates = _first_party_duplicates(entrypoint_probe["loaded"])
 
+    # Assert -- coverage floor first, so a hollow probe cannot pass quietly.
+    _assert_no_hollow_probe(entrypoint_probe, _ENTRY_POINT_MODULE_FLOOR)
     assert not duplicates, (
         "the production entry point loads these files under two module "
         f"names:\n{_describe(duplicates)}"

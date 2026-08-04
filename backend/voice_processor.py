@@ -19,13 +19,23 @@ import torch
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-# Import VAD
+# Import VAD. `isort:skip` pins this to the sys.path insert directly above it;
+# without the marker it would be sorted in with the backend block below and
+# would then run before the path that makes it resolvable.
 sys.path.insert(0, str(project_root / "dependencies" / "csm"))
-from vad import AudioStreamProcessor
+from vad import AudioStreamProcessor  # isort:skip
 
-# Import from backend.voice_models explicitly
-sys.path.insert(0, str(project_root / "backend"))
-from audio_protocol import (
+# Package-qualified on purpose, all three of them. `backend/` is a PEP 420
+# namespace package that is ALSO on sys.path, so a bare `request_context` and
+# `backend.request_context` resolve to two DISTINCT module objects built from
+# one file, holding two distinct sets of module-level state -- a write through
+# one name is invisible through the other. request_context holds the session-id
+# ContextVars, so the bare spelling made session propagation a silent no-op;
+# `audio_protocol` and `voice_models.model_manager` were in fact being loaded
+# twice this way until the imports were unified on 2026-08-03. Every importer
+# must use the `backend.`-qualified name -- see also log_handler.py and
+# chat/knowledge_integration.py.
+from backend.audio_protocol import (
     MSG_AUDIO_CHUNK,
     MSG_AUDIO_COMPLETE,
     MSG_INTERRUPT_FADE,
@@ -34,20 +44,13 @@ from audio_protocol import (
     generate_fade_out,
     rms_normalize,
 )
-from voice_models.model_manager import ModelManager
-
-# Package-qualified on purpose. `backend/` is a namespace package AND is on
-# sys.path, so `request_context` and `backend.request_context` resolve to two
-# DISTINCT module objects holding two distinct ContextVar instances. A turn
-# that set the session id on one and read it from the other would propagate
-# nothing. Every importer of this module must use the `backend.`-qualified
-# name -- see also log_handler.py and chat/knowledge_integration.py.
 from backend.request_context import (
     current_request_id,
     current_session_id,
     new_request_id,
     spawn_with_context,
 )
+from backend.voice_models.model_manager import ModelManager
 
 logger = logging.getLogger(__name__)
 

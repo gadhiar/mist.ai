@@ -31,22 +31,32 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-# Add project root to path
+# `python backend/server.py` makes CPython prepend the SCRIPT's directory --
+# backend/ -- to sys.path, but not the repository root. The root has to be added
+# here or the `backend.`-qualified imports below cannot resolve. Adding backend/
+# a second time was redundant with sys.path[0] and is gone.
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
-sys.path.insert(0, str(project_root / "backend"))
 
-# Import config BEFORE voice_processor to avoid CSM config conflict
-from config import DEFAULT_CONFIG  # isort:skip
-from voice_processor import VoiceProcessor  # isort:skip
-from factories import (  # isort:skip
+# Every first-party import below is `backend.`-qualified deliberately. backend/
+# is a PEP 420 namespace package that is ALSO on sys.path, so `config` and
+# `backend.config` resolve to two DISTINCT module objects built from one file.
+# Module-level state belongs to the module object, so the factories wiring,
+# ContextVars and caches would each exist twice, and a write through one name
+# would be invisible through the other. The bare spelling was additionally
+# ambiguous with dependencies/csm/config.py -- which is what the old
+# "import config BEFORE voice_processor" ordering existed to work around. The
+# qualified name removes both hazards outright.
+from backend.config import DEFAULT_CONFIG  # isort:skip
+from backend.voice_processor import VoiceProcessor  # isort:skip
+from backend.factories import (  # isort:skip
     build_curation_scheduler,
     build_phase3_components,
     build_sidecar_index,
     build_vault_writer,
 )
-from knowledge.config import KnowledgeConfig  # isort:skip
-from log_handler import WebSocketLogHandler  # isort:skip
+from backend.knowledge.config import KnowledgeConfig  # isort:skip
+from backend.log_handler import WebSocketLogHandler  # isort:skip
 
 if TYPE_CHECKING:
     from backend.interfaces import EventStoreProvider
@@ -943,11 +953,29 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 if __name__ == "__main__":
-    # Run server
+    # Pass the app OBJECT, never the "server:app" import STRING.
+    #
+    # The image runs `python backend/server.py`, which binds this file to
+    # `__main__`. Uvicorn resolves a string target with
+    # `importlib.import_module("server")`, which finds this same file again on
+    # sys.path and executes the ENTIRE module body a second time as a second
+    # module object. `app`, `active_connections`, `active_connections_lock`,
+    # `message_queue`, `voice_processor` and `log_handler` all existed twice,
+    # the root logger collected two FileHandlers on the same log file (every
+    # line was written twice), and the copy uvicorn actually served was the
+    # `server` one -- so state written by the `__main__` copy was invisible to
+    # every request. `import_from_string` returns a non-string target
+    # unchanged, so passing the object cannot re-import.
+    #
+    # Trade-off, stated explicitly: an app object disables uvicorn's `reload`
+    # and multi-`workers` modes, which both require an import string to respawn
+    # the app in a child process. `reload` is False here and MIST runs a single
+    # worker holding GPU models and in-process state, so neither is usable
+    # anyway -- but switching either one back on now requires moving the entry
+    # point out of this file rather than just flipping the flag.
     uvicorn.run(
-        "server:app",
+        app,
         host=config.host,
         port=config.port,
         log_level="info",
-        reload=False,  # Set to True for development
     )
