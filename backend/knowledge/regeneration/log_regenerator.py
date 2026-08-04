@@ -15,6 +15,7 @@ gates the staging URI, and the live `source` connection is read-only.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from dataclasses import dataclass
 
@@ -23,6 +24,15 @@ from backend.knowledge.curation.pipeline import CurationResult
 from backend.knowledge.eval_isolation import assert_rebuild_target_not_live
 from backend.knowledge.extraction.validator import ValidationResult
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
+
+logger = logging.getLogger(__name__)
+
+# Provenance values a rebuild of the CANONICAL graph replays. Fail-closed:
+# `origin` is a guard R1.4 added so probe and eval traffic could be kept out of
+# the graph, so the default excludes everything not marked genuine usage. A
+# caller that genuinely wants fixture traffic replayed (the golden log, whose
+# sessions are `origin='test'` by construction) must say so explicitly.
+CANONICAL_ORIGINS: tuple[str, ...] = ("real",)
 
 
 class ColdCacheError(MistError):
@@ -179,6 +189,7 @@ class LogRegenerator:
         resume_from: str | None = None,
         source_conn=None,
         staging_conn=None,
+        origins: tuple[str, ...] = CANONICAL_ORIGINS,
     ) -> RebuildReport:
         """Replay the log into staging from the cache. Never writes to live.
 
@@ -196,6 +207,10 @@ class LogRegenerator:
                 copied forward from source into staging after the replay loop.
             staging_conn: Optional Neo4jConnection to the staging graph (write). Must
                 be provided together with source_conn to enable self-model copy-forward.
+            origins: Session provenance values to replay. Defaults to
+                `CANONICAL_ORIGINS` (`('real',)`) -- a rebuild of the canonical
+                graph must not absorb probe or eval traffic. Pass explicitly to
+                replay fixture traffic (`('test',)` for the golden log).
 
         Returns:
             RebuildReport with job_id, turns_processed, turns_failed, staging_uri,
@@ -215,7 +230,48 @@ class LogRegenerator:
                 "Pass the original job_id returned by the initial rebuild call."
             )
 
-        turns = self._events.get_all_turns_for_reextraction(after_event_id=resume_from)
+        # The scoping ontology_version comes from the epoch ROW, not from
+        # `backend.knowledge.version_stamps.ONTOLOGY_VERSION`. This is not a
+        # style preference. The cache keys below are derived from
+        # `epoch["ontology_version"]`, so selecting turns under any other
+        # authority would ask the cache for a triple the selection was not
+        # made under -- exactly the two-authorities drift that caused the
+        # 2026-08-02 incident. One epoch row, one triple, one selection.
+        #
+        # Until this call, `rebuild()` selected EVERY turn ever logged and then
+        # demanded the current epoch's cache cover all of them. Any turn from a
+        # superseded ontology epoch was a guaranteed miss -> ColdCacheError ->
+        # abort before a single node was written. It passed only because the
+        # live log is empty. The `epoch` in `graph = f(seed, log, epoch)` had
+        # no scoping role at all.
+        turns = self._events.get_all_turns_for_reextraction(
+            ontology_version=epoch["ontology_version"],
+            after_event_id=resume_from,
+            origins=origins,
+        )
+        # Scoping can now select nothing from a non-empty log, which the cache
+        # coverage gate would pass vacuously and every downstream assertion
+        # would read as "the log was empty". Make that state auditable rather
+        # than silent -- a rebuild that replays none of a populated log is
+        # almost always a misconfigured epoch or origin, not a real no-op.
+        total_logged = self._events.get_turn_count()
+        logger.info(
+            "Rebuild scope: %d of %d logged turns selected (epoch=%s, ontology=%s, origins=%s)",
+            len(turns),
+            total_logged,
+            epoch["epoch_id"],
+            epoch["ontology_version"],
+            ",".join(origins),
+        )
+        if total_logged and not turns:
+            logger.warning(
+                "Rebuild selected 0 of %d logged turns: no turn matches ontology=%s AND "
+                "origin in (%s). The replay will be a no-op.",
+                total_logged,
+                epoch["ontology_version"],
+                ",".join(origins),
+            )
+
         self._assert_cache_coverage(turns, epoch)
 
         if resume_from is None:

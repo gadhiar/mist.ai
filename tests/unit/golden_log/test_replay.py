@@ -45,6 +45,13 @@ EXPECTED_TURN_COUNT = 87
 STAGING_URI = "bolt://golden-log-staging:7687"
 LIVE_URI = "bolt://mist-neo4j:7687"
 
+# `generate.SESSION_ORIGIN` is "test": the golden log is fixture traffic and is
+# "never counted as genuine usage by anything that filters on origin". Since
+# `rebuild` now reads that guard and defaults to `('real',)`, replaying the
+# fixture requires saying so. Passing this explicitly is the point -- a default
+# that quietly swept fixture traffic into a canonical rebuild is the L2 bug.
+GOLDEN_LOG_ORIGINS = ("test",)
+
 
 @dataclass(slots=True)
 class ReplayedTurn:
@@ -122,7 +129,10 @@ async def replay_golden_log(root, turns=None) -> tuple[Any, RecordingCurationPip
         staging_curation_pipeline=recorder,
     )
     report = await regenerator.rebuild(
-        staging_uri=STAGING_URI, live_uri=LIVE_URI, epoch=materialized.epoch
+        staging_uri=STAGING_URI,
+        live_uri=LIVE_URI,
+        epoch=materialized.epoch,
+        origins=GOLDEN_LOG_ORIGINS,
     )
     return report, recorder, materialized
 
@@ -130,6 +140,44 @@ async def replay_golden_log(root, turns=None) -> tuple[Any, RecordingCurationPip
 @pytest.fixture(scope="module")
 def golden_turns():
     return build_golden_turns()
+
+
+class TestTheOriginGuardIsLoadBearing:
+    """`origins=GOLDEN_LOG_ORIGINS` must be a guard, not a decoration.
+
+    Every other test in this file passes `origins=("test",)` explicitly. If the default were
+    later widened back to include fixture traffic, all of them would keep passing -- the
+    argument still present, still spelled correctly, and no longer doing anything. That is
+    the same green-mutation shape as the L2 bug this argument exists to fix: the `origin`
+    discriminator was written, read back, and tested for two rounds while no selection ever
+    consulted it.
+
+    This is the only test that fails when the default stops excluding fixture traffic.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_default_origins_replay_none_of_the_golden_log(self, tmp_path, golden_turns):
+        # Arrange: the same 87-turn fixture every other test in this file replays, with the
+        # cache warmed under the epoch triple -- so nothing but the origin guard can keep a
+        # turn out of the replay.
+        materialized = materialize_isolated(golden_turns, root=tmp_path / "iso")
+        recorder = RecordingCurationPipeline()
+        regenerator = LogRegenerator(
+            event_store=materialized.event_store,
+            extraction_cache=materialized.extraction_cache,
+            staging_curation_pipeline=recorder,
+        )
+
+        # Act: no `origins` -- whatever a rebuild of the CANONICAL graph does by default.
+        report = await regenerator.rebuild(
+            staging_uri=STAGING_URI, live_uri=LIVE_URI, epoch=materialized.epoch
+        )
+
+        # Assert: the log is populated and the canonical rebuild replayed none of it.
+        # `generate.SESSION_ORIGIN` is "test"; a canonical rebuild is not fixture traffic's.
+        assert materialized.event_store.get_turn_count() == EXPECTED_TURN_COUNT
+        assert report.turns_processed == 0
+        assert recorder.calls == []
 
 
 class TestReplayIsNotVacuous:
@@ -184,7 +232,10 @@ class TestCacheCoverage:
         # Act / Assert
         with pytest.raises(ColdCacheError, match="uncached"):
             await regenerator.rebuild(
-                staging_uri=STAGING_URI, live_uri=LIVE_URI, epoch=drifted_epoch
+                staging_uri=STAGING_URI,
+                live_uri=LIVE_URI,
+                epoch=drifted_epoch,
+                origins=GOLDEN_LOG_ORIGINS,
             )
 
     @pytest.mark.asyncio
@@ -205,7 +256,12 @@ class TestCacheCoverage:
         )
 
         with pytest.raises(ColdCacheError) as excinfo:
-            await regenerator.rebuild(staging_uri=STAGING_URI, live_uri=LIVE_URI, epoch=drifted)
+            await regenerator.rebuild(
+                staging_uri=STAGING_URI,
+                live_uri=LIVE_URI,
+                epoch=drifted,
+                origins=GOLDEN_LOG_ORIGINS,
+            )
 
         message = str(excinfo.value)
         # ALL turns cold, not some: the signature of a stamp mismatch rather than a hole.
@@ -231,7 +287,12 @@ class TestCacheCoverage:
         )
 
         with pytest.raises(ColdCacheError) as excinfo:
-            await regenerator.rebuild(staging_uri=STAGING_URI, live_uri=LIVE_URI, epoch=drifted)
+            await regenerator.rebuild(
+                staging_uri=STAGING_URI,
+                live_uri=LIVE_URI,
+                epoch=drifted,
+                origins=GOLDEN_LOG_ORIGINS,
+            )
 
         assert "emb:" not in str(excinfo.value), (
             "ColdCacheError now names model_hash -- delete this test and stop warning about "

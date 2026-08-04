@@ -326,42 +326,87 @@ class EventStore:
         self,
         ontology_version: str | None = None,
         after_event_id: str | None = None,
+        origins: tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
         """Retrieve turns for re-extraction during ontology migration.
 
         Optionally filters by the ontology_version they were originally
-        extracted under, and supports cursor-based resumption via
-        after_event_id.
+        extracted under, by the provenance of the session they belong to, and
+        supports cursor-based resumption via after_event_id.
+
+        All three filters default to None (no filtering) because this is a
+        neutral store read, not the rebuild's policy. The rebuild decides what
+        it is a projection of; see `LogRegenerator.rebuild`, which passes an
+        epoch-derived `ontology_version` and a fail-closed `origins`.
+
+        NULL / absent origin: a turn is joined to its session with a LEFT JOIN
+        and a missing or NULL origin is COALESCEd to 'real'. Two reasons, both
+        already-settled rulings in this codebase rather than a new one.
+        (1) `initialize()` adds the column with `NOT NULL DEFAULT 'real'`, and
+        SQLite back-fills every pre-existing row with that default -- so rows
+        that predate the discriminator are already 'real' on disk, and
+        excluding NULL would contradict the migration. (2) `start_session`
+        documents the same ruling for its own default: "a caller that forgets
+        is counted as real rather than silently excluded from a rebuild".
+        The residual NULL case is a turn whose session row is absent entirely
+        (a legacy database written with foreign keys off). Counting it as real
+        replays it; excluding it would silently drop history from a graph whose
+        entire contract is that it is a total function of the log. Losing
+        history fails the contract; replaying an unmarked turn does not.
 
         Args:
             ontology_version: Only return turns tagged with this version.
             after_event_id: Resume after this event_id (for job checkpointing).
+            origins: Only return turns whose session has one of these origins
+                ('real', 'test', 'seed'). None disables the filter entirely.
+                An empty tuple is rejected -- it would select nothing, which a
+                caller cannot distinguish from an empty log.
 
         Returns:
             List of turn dicts ordered by rowid (insertion order).
+
+        Raises:
+            ValueError: If origins is an empty tuple.
         """
+        if origins is not None and not origins:
+            raise ValueError(
+                "origins must be a non-empty tuple of provenance values, or None to "
+                "disable origin filtering. An empty tuple selects no turns at all, which "
+                "a rebuild cannot distinguish from an empty log."
+            )
+
         conditions: list[str] = []
         params: list[str] = []
 
         if ontology_version is not None:
-            conditions.append("ontology_version = ?")
+            conditions.append("e.ontology_version = ?")
             params.append(ontology_version)
 
         if after_event_id is not None:
             # Use rowid for stable ordering since event_id is a UUID
             conditions.append(
-                "rowid > (SELECT rowid FROM conversation_turn_events WHERE event_id = ?)"
+                "e.rowid > (SELECT rowid FROM conversation_turn_events WHERE event_id = ?)"
             )
             params.append(after_event_id)
+
+        if origins is not None:
+            placeholders = ", ".join(["?"] * len(origins))
+            conditions.append(f"COALESCE(s.origin, 'real') IN ({placeholders})")
+            params.extend(origins)
 
         where_clause = ""
         if conditions:
             where_clause = "WHERE " + " AND ".join(conditions)
 
+        # LEFT JOIN, not INNER: an inner join would silently drop a turn whose
+        # session row is missing, turning a data-integrity problem into missing
+        # history. session_id is the sessions table's PRIMARY KEY, so the join
+        # cannot multiply rows.
         query = f"""
-            SELECT * FROM conversation_turn_events
+            SELECT e.* FROM conversation_turn_events AS e
+            LEFT JOIN conversation_sessions AS s ON s.session_id = e.session_id
             {where_clause}
-            ORDER BY rowid ASC
+            ORDER BY e.rowid ASC
         """  # nosec B608 -- where_clause is built from hardcoded conditions with parameterized values
 
         conn = self._get_connection()

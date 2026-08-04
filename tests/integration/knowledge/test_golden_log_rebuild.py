@@ -1,4 +1,4 @@
-"""Graph-level rebuild-twice over the golden log (R1.4.5), staging-isolated.
+r"""Graph-level rebuild-twice over the golden log (R1.4.5), staging-isolated.
 
 `tests/unit/golden_log/test_replay.py` proves the replay executes and is deterministic in
 the PAYLOAD STREAM it hands to curation. It cannot prove the reconciliation of that stream
@@ -18,6 +18,12 @@ Requires the staging Neo4j profile:
 Staging wiring (endpoint discovery, the target-is-not-live guard, and the pipeline factory
 call) is imported from `test_log_regenerator` rather than restated, so the two cannot drift.
 """
+
+# ruff: noqa: F811 -- `staging_conn` is a pytest FIXTURE re-exported above so pytest
+# registers it; every test then takes a parameter of the same name for injection. Ruff
+# reads each parameter as redefining the import. It is the standard fixture pattern, not
+# a redefinition defect, and it is file-wide rather than per-line so a new test does not
+# have to rediscover it.
 
 from __future__ import annotations
 
@@ -60,7 +66,13 @@ async def _rebuild_into_staging(staging_conn, root):
         staging_curation_pipeline=_build_staging_pipeline(staging_conn),
     )
     report = await regenerator.rebuild(
-        staging_uri=_staging_uri(), live_uri=_LIVE_URI, epoch=materialized.epoch
+        staging_uri=_staging_uri(),
+        live_uri=_LIVE_URI,
+        epoch=materialized.epoch,
+        # `generate.SESSION_ORIGIN` is "test". `rebuild` now reads the origin
+        # guard and defaults to ('real',), so replaying fixture traffic has to
+        # be declared. See tests/unit/golden_log/test_replay.py.
+        origins=("test",),
     )
     return report
 

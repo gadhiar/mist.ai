@@ -136,6 +136,128 @@ class TestTurnEvents:
         assert turns == []
 
 
+class TestGetAllTurnsForReextraction:
+    """The selection a rebuild is a projection of.
+
+    The read-back behaviour of the `ontology_version` filter was already covered; what was
+    not, until R1.6's remediation, was `origins` -- the R1.4 provenance guard the selection
+    never consulted, so probe traffic was replayable into the canonical graph. Caller-side
+    coverage lives in `tests/unit/knowledge/regeneration/test_rebuild_scoping.py`.
+    """
+
+    def _seed(self, store: EventStore) -> None:
+        store.start_session("s-real", input_modality="text", origin="real")
+        store.start_session("s-test", input_modality="text", origin="test")
+        store.append_turn(
+            ConversationTurnEvent(
+                session_id="s-real",
+                turn_index=0,
+                timestamp=datetime.now(UTC),
+                user_utterance="real",
+                system_response="ok",
+                ontology_version="1.4.0",
+                event_id="e-real",
+            )
+        )
+        store.append_turn(
+            ConversationTurnEvent(
+                session_id="s-test",
+                turn_index=0,
+                timestamp=datetime.now(UTC),
+                user_utterance="probe",
+                system_response="ok",
+                ontology_version="1.4.0",
+                event_id="e-test",
+            )
+        )
+        store.append_turn(
+            ConversationTurnEvent(
+                session_id="s-real",
+                turn_index=1,
+                timestamp=datetime.now(UTC),
+                user_utterance="legacy",
+                system_response="ok",
+                ontology_version="1.0.0",
+                event_id="e-legacy",
+            )
+        )
+
+    def test_no_filters_returns_every_turn(self, store: EventStore):
+        self._seed(store)
+
+        turns = store.get_all_turns_for_reextraction()
+
+        assert [t["event_id"] for t in turns] == ["e-real", "e-test", "e-legacy"]
+
+    def test_origins_excludes_other_provenance(self, store: EventStore):
+        self._seed(store)
+
+        turns = store.get_all_turns_for_reextraction(origins=("real",))
+
+        assert [t["event_id"] for t in turns] == ["e-real", "e-legacy"]
+
+    def test_origins_accepts_multiple_values(self, store: EventStore):
+        self._seed(store)
+
+        turns = store.get_all_turns_for_reextraction(origins=("real", "test"))
+
+        assert len(turns) == 3
+
+    def test_ontology_version_and_origins_compose(self, store: EventStore):
+        self._seed(store)
+
+        turns = store.get_all_turns_for_reextraction(ontology_version="1.4.0", origins=("real",))
+
+        assert [t["event_id"] for t in turns] == ["e-real"]
+
+    def test_after_event_id_composes_with_the_other_filters(self, store: EventStore):
+        self._seed(store)
+
+        turns = store.get_all_turns_for_reextraction(
+            ontology_version="1.4.0", after_event_id="e-real", origins=("real", "test")
+        )
+
+        assert [t["event_id"] for t in turns] == ["e-test"]
+
+    def test_a_turn_with_no_session_row_counts_as_real(self, store: EventStore):
+        """NULL origin ruling: the LEFT JOIN COALESCEs a missing session to 'real'.
+
+        `initialize()` back-fills the column with 'real' on every pre-existing session row,
+        so an absent session row is the only way a joined origin is NULL. Excluding it would
+        silently drop history from a graph defined as a total function of the log.
+        """
+        conn = store._get_connection()
+        conn.execute("PRAGMA foreign_keys=OFF")
+        store.append_turn(
+            ConversationTurnEvent(
+                session_id="s-never-written",
+                turn_index=0,
+                timestamp=datetime.now(UTC),
+                user_utterance="orphan",
+                system_response="ok",
+                event_id="e-orphan",
+            )
+        )
+        conn.execute("PRAGMA foreign_keys=ON")
+
+        assert [t["event_id"] for t in store.get_all_turns_for_reextraction(origins=("real",))] == [
+            "e-orphan"
+        ]
+        assert store.get_all_turns_for_reextraction(origins=("test",)) == []
+
+    def test_the_join_does_not_duplicate_turns(self, store: EventStore):
+        """session_id is the sessions PRIMARY KEY, so the join must be 1:1."""
+        self._seed(store)
+
+        assert len(store.get_all_turns_for_reextraction(origins=("real", "test", "seed"))) == 3
+
+    def test_an_empty_origins_tuple_is_rejected(self, store: EventStore):
+        self._seed(store)
+
+        with pytest.raises(ValueError, match="non-empty"):
+            store.get_all_turns_for_reextraction(origins=())
+
+
 class TestListSessionsWithTurns:
     def test_excludes_empty_sessions(self, store: EventStore):
         """A session row with no turns has nothing to synthesize."""
