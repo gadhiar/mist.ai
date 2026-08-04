@@ -36,8 +36,11 @@ Principles:
 - Verifies queries work against real database, LLM responses parse correctly.
 - Requires the Docker stack running (mist-neo4j + mist-llm via
   `docker compose up -d`); the bitemporal currency tests additionally
-  target the disposable eval instance (`--profile eval up mist-neo4j-eval`)
-  and skip cleanly when it is absent.
+  target the disposable eval instance and skip cleanly when it is absent.
+  That instance is defined in a separate compose file, so BOTH `-f` flags are
+  required -- without them the service does not exist and the command fails:
+  `docker compose -f docker-compose.yml -f docker-compose.eval-neo4j.yml --profile eval up -d mist-neo4j-eval`
+  (teardown: the same two `-f` flags with `--profile eval rm -sfv mist-neo4j-eval`).
 - Run with: `pytest tests/integration/ -v`
 - Fixtures in `tests/integration/conftest.py` handle connection setup/teardown.
 
@@ -55,12 +58,19 @@ Principles:
 | Source file | Test file |
 |---|---|
 | `backend/knowledge/storage/graph_store.py` | `tests/unit/knowledge/storage/test_graph_store.py` |
-| `backend/knowledge/extraction/pipeline.py` | `tests/unit/knowledge/extraction/test_pipeline.py` |
-| `backend/knowledge/extraction/normalizer.py` | `tests/unit/knowledge/extraction/test_normalizer.py` |
+| `backend/knowledge/extraction/validator.py` | `tests/unit/knowledge/extraction/test_validator.py` |
+| `backend/knowledge/extraction/preprocessor.py` | `tests/unit/knowledge/extraction/test_preprocessor.py` |
 | `backend/knowledge/retrieval/knowledge_retriever.py` | `tests/unit/knowledge/retrieval/test_knowledge_retriever.py` |
 | `backend/knowledge/ontologies/v1_0_0.py` | `tests/unit/knowledge/ontologies/test_ontology_v1.py` |
 
 Every test file has a corresponding `__init__.py` in its directory. Create one if missing.
+
+When a module's tests outgrow one file, split by aspect as
+`test_<module>_<aspect>.py` and keep the directory mirror intact. This is why
+some modules have no bare `test_<module>.py`: `extraction/pipeline.py` is covered
+by `test_pipeline_curation.py`, `test_pipeline_dedup.py`, and
+`test_pipeline_extract_from_event.py`. `ls` the directory before citing a test
+path in this file -- every row above is a real path as of 2026-08-03.
 
 ---
 

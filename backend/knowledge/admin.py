@@ -336,11 +336,13 @@ def _backfill_embeddings_for_seed(
     2. The self-model partition (`:__SelfModel__`) is never also
        `:__Entity__` (Task 4's partition-routing fix), so
        `_backfill_embeddings`'s `MATCH (n:__Entity__)` structurally cannot
-       reach it. Verified against the live graph before this function was
-       written: all 21 currently-embedded nodes are `:__SelfModel__` and
-       zero are `:__Entity__` -- the label union is required, not
-       cosmetic, and `_backfill_embeddings` alone can never protect the
-       self-model's embeddings.
+       reach it -- whatever either partition currently holds. That
+       disjointness, not any particular node count, is what makes the label
+       union required rather than cosmetic: `_backfill_embeddings` alone can
+       never protect the self-model's embeddings. (When this function was
+       written every embedded node happened to be `:__SelfModel__`; both
+       partitions carry embedded nodes today. The counts moved, the argument
+       did not.)
 
     Uses `display_name + description` as the embedded text, same as
     `_backfill_embeddings`; falls back to bare `id` when neither is present

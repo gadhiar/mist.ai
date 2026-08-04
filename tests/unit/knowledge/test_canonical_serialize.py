@@ -101,8 +101,10 @@ class TestCanonicalGraphForm:
         assert "source_utterance_id" in form  # deterministic provenance retained
 
     def test_multi_edge_between_same_pair_sorts_deterministically(self):
-        # Two USES edges user->rust from different events must sort stably by
-        # source_event_id (the property the live graph actually persists).
+        # Two USES edges user->rust from different events must sort stably by the
+        # legacy `source_event_id` -- the pre-C1 property name that no write path
+        # sets today, but that `_rel_key` still reads first so pre-C1 rows keep
+        # their tiebreak. Present-day rows carry `source_utterance_id` instead.
         rels = [
             {
                 "source": "user",

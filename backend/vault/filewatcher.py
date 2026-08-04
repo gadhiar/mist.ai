@@ -7,12 +7,16 @@ atomic-replace-on-save (delete + create within ~100ms) collapses to a single
 reindex call. A periodic mtime audit job catches dropped events (Windows
 ReadDirectoryChangesW overflow).
 
-Lifecycle note: `atexit` registration is the caller's responsibility.
-The factory (Phase 5) calls `atexit.register(filewatcher.stop)`. This class
-only provides `start()` and `stop()`.
+Lifecycle note: this class provides only `start()` and `stop()` and registers
+no process-exit hook of its own. `build_phase3_components`
+(`backend/factories.py`) constructs it UNSTARTED; the FastAPI `lifespan` in
+`backend/server.py` owns both ends -- `start(loop)` during startup, `stop()`
+during shutdown -- and is the only non-test caller of either. Do NOT add an
+`atexit` registration: nothing registers one today, and one would double-stop
+the observer alongside the lifespan shutdown.
 
-Under `uvicorn --reload`, the reload hook must call `stop()` before
-re-instantiating. See `backend/factories.py` for wiring.
+`uvicorn.run(reload=False)` in `backend/server.py`, so there is no reload
+hook to coordinate with; lifespan shutdown is the single stop path.
 """
 
 from __future__ import annotations
@@ -138,7 +142,10 @@ class VaultFilewatcher:
         fw.clear_mist_write(path)   # Called by VaultWriter after a write
         fw.stop()                   # Stops observer + cancels timers
 
-    The caller is responsible for registering `atexit.register(fw.stop)`.
+    The caller owns the lifecycle. In the server that caller is the FastAPI
+    `lifespan` in `backend/server.py`, which calls `start(loop)` on startup
+    and `stop()` on shutdown. There is no `atexit` registration anywhere and
+    none should be added -- see the module docstring.
     """
 
     def __init__(

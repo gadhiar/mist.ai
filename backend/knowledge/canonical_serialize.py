@@ -20,8 +20,9 @@ from typing import Any
 from backend.knowledge.admin import dump_graph_json
 
 # Wall-clock audit fields excluded from the canonical form. Log-tied provenance
-# (event_id, source_event_id, recorded_at, evidence, first_event_id,
-# last_event_id) is RETAINED -- it is deterministic given the immutable log.
+# (event_id, source_utterance_id, recorded_at, evidence, first_event_id,
+# last_event_id, plus the legacy source_event_id where it survives) is RETAINED
+# -- it is deterministic given the immutable log.
 AUDIT_FIELDS = frozenset(
     {
         "created_at",
@@ -32,10 +33,16 @@ AUDIT_FIELDS = frozenset(
     }
 )
 
-# Epoch-derived metadata: deterministic for a fixed epoch but DRIFTS across the
-# historical stamps a live graph accumulates (seed 1.2.0 / config 1.4.0 / writer
-# fallback 1.2.1). Excluded from the content form so the proof is "same log +
-# same epoch => same facts", not "same stamps".
+# Epoch-derived metadata. Present-day stamps have a single authority
+# (`backend/knowledge/version_stamps.py`, collapsed 2026-08-02), so a fresh write
+# and a fresh rebuild already agree. The exclusion is therefore about HISTORICAL
+# DATA COMPATIBILITY, not about reconciling authorities: rows written under
+# earlier stamp values persist in the graph, and a rebuild re-stamps them with
+# today's triple. Do NOT un-exclude these on the grounds that the authorities now
+# agree -- comparing the stamps makes `live == rebuilt` fail on every legacy row,
+# over a difference that says nothing about whether the FACTS were reproduced.
+# The proof is deliberately "same log + same epoch => same facts", not
+# "same stamps".
 EPOCH_STAMP_FIELDS = frozenset({"ontology_version", "extraction_version", "model_hash"})
 
 
@@ -75,8 +82,12 @@ def _node_key(n: dict[str, Any]) -> str:
 
 def _rel_key(r: dict[str, Any]) -> tuple[str, str, str, str, str, str, str]:
     props = r.get("properties") or {}
-    # The live graph persists `source_event_id` (graph_writer.py:314); C1 renames
-    # provenance to `source_utterance_id`. Read either so the tiebreak is stable.
+    # Every relationship write path persists `source_utterance_id`
+    # (`graph_writer._ensure_extracted_from`, reconciliation's fact-edge MERGEs).
+    # `source_event_id` is the pre-C1 name: still declared in the ontology's
+    # universal relationship properties, but written by no relationship path, and
+    # carried by 0 live edges. It is read FIRST only so pre-C1 rows keep the same
+    # tiebreak they had before the rename.
     utt = props.get("source_event_id") or props.get("source_utterance_id") or ""
     # version_key (= event_id|valid_from|valid_to, the C2 MERGE identity) makes
     # the key total over valid-time-distinct versions. DURABLE/provenance edges

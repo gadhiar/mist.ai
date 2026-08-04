@@ -133,15 +133,15 @@ Sidecar index at `data/vault_sidecar.db` (sqlite-vec `vec0` + FTS5 over heading-
 ```
 docs/
 ├── decisions/                   # Repo-scoped ADRs (snake_case adr_NNN_*.md)
-│   ├── adr_001_vision.md
-│   ├── adr_007_sesame_csm.md
-│   └── adr_008_lancedb_vector_store.md
+│   └── adr_008_lancedb_vector_store.md   # the only ADR held in-repo
 ├── audit/                       # Historical audit reports (Flutter-era; superseded)
 ├── guides/                      # Setup + reference guides
 └── superpowers/specs/           # Phase implementation specs
 ```
 
 Cross-project ADRs (memory architecture, integration contracts, etc.) live in `knowledge-vault/Decisions/` with the `ADR-NNN-kebab-case.md` convention. See vault for the authoritative cross-project decision set.
+
+Almost every ADR is in the vault, not in-repo. This section previously listed `adr_001_vision.md` and `adr_007_sesame_csm.md` under `docs/decisions/`; neither file has ever existed there. Those decisions are `knowledge-vault/Decisions/ADR-002-mist-vision-and-architecture.md` and `ADR-005-sesame-csm-tts.md`. The two numbering schemes are independent -- an `adr_NNN` in this repo does not correspond to `ADR-NNN` in the vault (in-repo `adr_008_lancedb_vector_store.md` is vault `ADR-007-lancedb-vector-store.md`). `ls docs/decisions/` before citing a repo-scoped ADR path.
 
 ---
 
@@ -191,12 +191,12 @@ Tauri Frontend renders spatial composition
 
 ### Backend -> Knowledge Graph
 - `KnowledgeRetriever.retrieve()` -> graph + vector + RRF merge -> facts injected into context
-- `ExtractionPipeline.extract_from_utterance()` (fire-and-forget) -> typed entities + relationships -> CurationPipeline -> GraphStore -> Neo4j MERGE upserts with DERIVED_FROM provenance
+- `ExtractionPipeline.extract_from_utterance()` (fire-and-forget) -> typed entities + relationships -> CurationPipeline -> GraphStore -> Neo4j MERGE upserts, anchored by an `EXTRACTED_FROM -> ConversationContext` edge carrying `source_utterance_id`. R1.3 re-anchored provenance here from the retired `DERIVED_FROM -> VaultNote` edge; `DERIVED_FROM` survives in the ontology only for synthesis-sourced entity-to-chunk edges (`graph_writer.py`), not for extraction.
 
 ### Backend -> Vault
-- `VaultWriter.append_turn_to_session()` after event-store write (per-turn)
+- `VaultWriter.write_session_note()` at session end. R1.3.1 retired the per-turn `append_turn_to_session` write; the note is rendered whole from the session synthesis, and `tests/unit/vault/test_no_per_turn_vault_write.py` pins that the per-turn path stays gone.
 - `VaultSidecarIndex` reindex on filewatcher events (500ms debounce)
-- `mist_admin vault-rebuild --scope <path>` for ontology version bumps
+- `mist_admin vault-rebuild --confirm` drops and re-indexes the whole sidecar; `mist_admin vault-reindex --scope <path>` re-indexes a single note. `--scope` is a `vault-reindex` flag -- `vault-rebuild` does not parse it.
 
 ---
 
