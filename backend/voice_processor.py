@@ -799,12 +799,29 @@ class VoiceProcessor:
         session that has already been ended has its words replayed into a live
         one.
 
-        Deliberately does NOT touch `_turn_epoch`, `models.tts_generation_id`
-        or `is_speaking`. The first two are monotonic counters carrying no
-        session identity -- zeroing them would break the staleness comparison at
-        `_tts_consumer`'s epoch check, silently suppressing a live consumer's
-        emit. `is_speaking` is owned by the in-flight turn's `finally`, which
-        runs on every exit path; clearing it from here races that owner.
+        Deliberately does NOT touch anything else:
+        - `_turn_epoch` / `models.tts_generation_id` are monotonic counters
+          carrying no session identity -- zeroing them would break the
+          staleness comparison at `_tts_consumer`'s epoch check, silently
+          suppressing a live consumer's emit.
+        - `is_speaking` is owned by the in-flight turn's `finally`, which runs
+          on every exit path; clearing it from here races that owner.
+        - `interrupt_flag` is owned the same way, by the unconditional clear at
+          the top of `_process_conversation_turn`, so a stale set flag is
+          already cleared before the next turn could read it -- and clearing
+          it from here can actively hurt: a client can send `interrupt`
+          (setting the flag) and then disconnect while that turn is still in
+          flight, and clearing the flag here would let the turn the user just
+          cancelled run to completion instead of stopping at its own
+          interrupt check.
+        - `audio_queue` has no writer anywhere in `backend/` -- it is declared
+          at `:137` and never written or read (`KNOWN_ISSUES.md:114-115`
+          already records it as an unused attribute) -- so there is nothing
+          to drain.
+        - VAD state is fed only by `process_audio_chunk`, which has no caller
+          in `backend/` (`KNOWN_ISSUES.md:117-118` records it as deprecated
+          dead code), and the live audio path `process_complete_audio` does
+          not use VAD.
 
         Caller must ensure this is the last connection. Resetting while another
         connection is live would discard that connection's legitimately parked
@@ -812,11 +829,4 @@ class VoiceProcessor:
         """
         with self.input_lock:
             self.latest_user_input = None
-        self.interrupt_flag.clear()
-        while True:
-            try:
-                self.audio_queue.get_nowait()
-            except queue.Empty:
-                break
-        self.reset_vad()
         log_timestamp("Connection state reset (last client disconnected)")

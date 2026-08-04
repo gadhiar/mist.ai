@@ -137,11 +137,18 @@ class KnowledgeIntegration:
             on the producer side).
 
         Side-effect:
-            Sets ``current_turn_complete`` to the last ``Complete`` event seen
-            on the bridge (or ``None`` if the stream errored or returned no
-            Complete). Callers that need ``duration_ms`` / ``tool_calls_used``
-            for ADR-017 ``stream_complete`` payloads should read it after the
+            Sets `current_turn_complete` to the last `Complete` event seen on
+            the bridge (or `None` if the stream errored or returned no
+            Complete). Callers that need `duration_ms` / `tool_calls_used` for
+            ADR-017 `stream_complete` payloads should read it after the
             generator finishes.
+
+            Also sets `current_turn_error` to a `(kind, message)` tuple on
+            any of the three error paths (bridge exception, bridge timeout,
+            inline-drain exception), or leaves it `None` on a clean stream.
+            The caller reads `current_turn_error` first -- ahead of
+            `current_turn_complete` -- to choose between an ADR-017 `error`
+            event and a normal `stream_complete`.
         """
         # Reset bridge side-channels for this turn.
         current_turn_complete.set(None)

@@ -680,9 +680,8 @@ def _reset_voice_state_if_last_connection() -> bool:
     """Clear singleton connection state once no client remains.
 
     `voice_processor` is shared by every entry in `active_connections`, so its
-    connection-scoped state (a parked utterance, a set interrupt flag, buffered
-    audio, VAD state) outlives the connection that produced it and becomes the
-    next session's starting state.
+    connection-scoped state (a parked utterance) outlives the connection that
+    produced it and becomes the next session's starting state.
 
     Guarded on the set being EMPTY rather than firing on every disconnect: with
     a concurrent connection still open, the parked utterance may be that

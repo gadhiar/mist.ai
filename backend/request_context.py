@@ -45,7 +45,11 @@ current_session_id: ContextVar[str | None] = ContextVar("current_session_id", de
 # turn of the process or on none of them -- there is no turn that skips it
 # after another turn set a value. Executor threads ARE pooled and reused with
 # no fresh context, so if `enabled` ever becomes runtime-mutable, that
-# assumption breaks and the consumer must reset again.
+# assumption breaks and the consumer must reset again. The pending-input
+# respawn path (`voice_processor.py:745`, inside `spawn_with_context`) also
+# inherits these vars via `copy_context` rather than starting fresh, so it is
+# this producer-side reset-before-first-yield -- not anything on the respawn
+# path -- that keeps a respawned turn from reading the finishing turn's values.
 current_turn_complete: ContextVar["Complete | None"] = ContextVar(
     "current_turn_complete", default=None
 )

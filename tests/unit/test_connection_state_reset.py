@@ -35,26 +35,6 @@ def test_reset_clears_a_parked_utterance():
     assert vp.latest_user_input is None
 
 
-def test_reset_clears_a_set_interrupt_flag():
-    """A stale set flag would cancel the NEXT session's first turn."""
-    vp = build_voice_processor()
-    vp.interrupt_flag.set()
-
-    vp.reset_connection_state()
-
-    assert not vp.interrupt_flag.is_set()
-
-
-def test_reset_drains_buffered_audio():
-    vp = build_voice_processor()
-    vp.audio_queue.put(b"stale frame")
-    vp.audio_queue.put(b"another")
-
-    vp.reset_connection_state()
-
-    assert vp.audio_queue.empty()
-
-
 def test_reset_takes_the_input_lock():
     """The drain at voice_processor.py:733 reads the slot under `input_lock`;
     the reset writes it, so it must take the same lock or it can clear the slot
