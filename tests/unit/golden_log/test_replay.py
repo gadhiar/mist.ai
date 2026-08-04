@@ -42,7 +42,12 @@ from scripts.golden_log.generate import build_golden_turns, materialize_isolated
 from scripts.golden_log.native_shape import native_predicate, native_properties
 
 EXPECTED_TURN_COUNT = 87
-STAGING_URI = "bolt://golden-log-staging:7687"
+# The REAL staging endpoint, not a per-file synthetic name. Connections here are
+# fakes and never dial it, but `assert_rebuild_target_not_live` is an allowlist
+# of disposable endpoints (hardened 2026-08-04 from a denylist that let
+# `bolt://localhost:7687` through to the live graph), so a made-up hostname is
+# now correctly refused.
+STAGING_URI = "bolt://mist-neo4j-staging:7687"
 LIVE_URI = "bolt://mist-neo4j:7687"
 
 # `generate.SESSION_ORIGIN` is "test": the golden log is fixture traffic and is

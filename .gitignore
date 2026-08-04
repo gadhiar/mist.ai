@@ -86,3 +86,11 @@ data/ingest/
 data/runtime/
 data/eval-run/
 data/*-backup-*
+
+# R1.4.6 hydration. `dev-state/` is the dev profile's live-ish store root (the
+# ONLY writable mount of mist-backend-dev); `data/hydration-snapshots/` holds
+# the versioned artifacts snapshot.py dumps out of it. Both are regenerable --
+# dev-state by restore, the artifacts by a hydration run -- and both contain
+# SQLite/vault state that must never enter git history.
+dev-state/
+data/hydration-snapshots/

@@ -45,6 +45,22 @@ ONTOLOGY_VERSION: str = ONTOLOGY_V1_0_0.version
 # ontology contract they encode changes, then re-pin PINNED_SHA256 in
 # tests/unit/knowledge/extraction/test_prompts.py.
 #
+# ALSO on a bump: the R1.4.6 hydration artifact goes stale. Hydration drives an
+# authored corpus through the LIVE path into the isolated `dev` stack
+# (docker-compose.dev-hydration.yml) so the dev graph carries reconciliation-
+# written edges instead of the two-property seed shape. It costs 87 LLM turns,
+# so it is a RARE REGENERATION on exactly three triggers -- an ontology bump,
+# a prompt bump (this constant), or a corpus change -- and the rest of the time
+# developers restore the snapshot:
+#     python -m scripts.hydration.snapshot list      # which artifacts are fresh
+#     python -m scripts.hydration.snapshot restore --artifact <dir>
+#
+# Nothing needs doing here on a bump. `scripts/hydration/manifest.py` READS
+# this value rather than restating it, so the next `restore` recomputes the
+# triple, sees the drift, and REFUSES the artifact by name -- the same
+# derived-not-restated discipline that keeps the extraction cache honest. The
+# refusal is the notification; regenerate when it fires.
+#
 # ALSO on a bump: the R1.4.5 golden log's authored extraction cache goes cold,
 # because `extraction_cache.cache_key` hashes this value. It is not a migration
 # -- the cache is regenerated, not converted -- and it is not a manual step

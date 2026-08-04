@@ -1,0 +1,204 @@
+# docker-compose.dev-hydration.yml
+# R1.4.6 T1 -- the `dev` profile: an isolated stack for hydration.
+#
+# Hydration drives authored utterances through the LIVE path so the dev graph
+# stops being seed-shaped. That means a real backend, a real Neo4j, and real
+# store writes -- which is exactly why every one of them has to be somewhere
+# the live stack cannot see.
+#
+# ISOLATION IS BY MOUNT, NOT BY CONFIGURATION. `mist-backend-dev` bind-mounts
+# ONLY ./dev-state. It does not mount ./data and it does not mount
+# ./mist-memory. So a misconfigured EVENT_STORE_DB_PATH pointing at
+# /app/data/event_store.db does not corrupt the live store -- it writes into
+# the container's throwaway upper layer and dies with the container. The env
+# vars below say where state SHOULD go; the absent mounts make it structurally
+# impossible for it to go anywhere else. `assert_isolated_root` in
+# backend/knowledge/eval_isolation.py is the third layer, for tooling run from
+# a shell that has the live container's environment.
+#
+# Follows docker-compose.eval-neo4j.yml's shape (profile gate, separate
+# instance, own ports, main project network) with one deliberate divergence:
+# STATE IS ON A NAMED VOLUME, NOT tmpfs. Eval state is disposable by design.
+# A hydrated graph costs 87 LLM turns, so `docker compose down` must not
+# destroy it before it has been snapshotted (scripts/hydration/snapshot.py).
+#
+# Ports, all four instances distinct so a host-side client cannot confuse them:
+#   live 7474/7687 | eval 7475/7688 | staging 7476/7689 | dev 7477/7690
+#
+# Usage (from repo root -- pass the override file too, so any live service
+# this command touches keeps its normal merged definition):
+#   docker compose -f docker-compose.yml -f docker-compose.override.yml \
+#     -f docker-compose.dev-hydration.yml --profile dev up -d \
+#     mist-neo4j-dev mist-backend-dev
+#   # ... run hydration against ws://localhost:8002/ws ...
+#   docker compose -f docker-compose.yml -f docker-compose.override.yml \
+#     -f docker-compose.dev-hydration.yml --profile dev stop \
+#     mist-backend-dev mist-neo4j-dev
+#
+# Naming the services explicitly matters: a bare `up -d` would also reconcile
+# the live services.
+services:
+  mist-neo4j-dev:
+    image: neo4j:5
+    container_name: mist-neo4j-dev
+    profiles: ["dev"]
+    ports:
+      - "7477:7474"   # HTTP (host 7477; live 7474, eval 7475, staging 7476)
+      - "7690:7687"   # Bolt (host 7690; live 7687, eval 7688, staging 7689)
+    environment:
+      - NEO4J_AUTH=${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-password}
+      - NEO4J_PLUGINS=["apoc"]
+    volumes:
+      # Named volume, NOT tmpfs. See the header: a hydrated graph is expensive
+      # to reproduce, so it survives container removal. `docker volume rm
+      # mist.ai_mist-neo4j-dev-data` is the deliberate way to discard it.
+      - mist-neo4j-dev-data:/data
+      - mist-neo4j-dev-logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  mist-backend-dev:
+    # RUNS THE LIVE BACKEND'S IMAGE, and declares no build of its own. Two
+    # reasons, and the first is correctness rather than convenience: T2 drives
+    # this backend precisely because `server.py`'s composition root is the code
+    # whose defects hydration exists to expose, and a separately-built image is
+    # a second artifact that can drift from the one production runs. Reusing
+    # the tag means the fixture is produced by the same binary as production,
+    # by construction. Second, the image is ~62GB; a second copy is neither
+    # free to build nor free to keep.
+    #
+    # Build it the normal way if it is missing:
+    #   docker compose build mist-backend
+    image: ${MIST_BACKEND_IMAGE:-mistai-mist-backend:latest}
+    container_name: mist-backend-dev
+    profiles: ["dev"]
+    ports:
+      - "8002:8001"   # host 8002; live backend keeps 8001
+    # R1.4.6 T2 decided hydration drives this backend OVER THE WIRE rather than
+    # importing ConversationHandler, so that server.py's composition root -- the
+    # code whose defects hydration exists to expose -- is the thing under test.
+    # This service therefore has to be a real, fully wired backend.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # --- isolated stores. Literals, not ${VAR:-default} interpolation. -----
+      # The base compose reads ${MIST_VAULT_ROOT:-...} etc. from the HOST shell,
+      # so a developer exporting those to configure the dev stack would silently
+      # retarget the LIVE backend on its next recreate. Hardcoding here severs
+      # that coupling: the dev stack cannot be steered by variables the live
+      # stack also reads. Compose `environment` beats `env_file`, so a stale
+      # .env cannot override these either.
+      - NEO4J_URI=bolt://mist-neo4j-dev:7687
+      - NEO4J_USERNAME=${NEO4J_USERNAME:-neo4j}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-password}
+      - NEO4J_DATABASE=neo4j
+      - EVENT_STORE_DB_PATH=/app/dev-state/event_store.db
+      - EVENT_STORE_AUDIO_DIR=/app/dev-state/audio
+      - VECTOR_STORE_DATA_DIR=/app/dev-state/vector_store
+      - MIST_VAULT_ROOT=/app/dev-state/vault
+      - MIST_SIDECAR_DB_PATH=/app/dev-state/vault_sidecar.db
+      # The extraction cache is not separately configurable -- it is derived as
+      # <dirname(EVENT_STORE_DB_PATH)>/extraction_cache.db (scripts/mist_admin.py).
+      # Setting the event store path therefore also relocates the cache.
+      #
+      # --- marks this container as the hydration target ---------------------
+      - MIST_HYDRATION_ISOLATION=1
+      # Sessions are recorded origin='real', and that is a decision rather than
+      # an omission. `origin` exists to keep fixture traffic out of the
+      # CANONICAL graph, and it discriminates WITHIN one event store. This
+      # store holds nothing but hydration traffic, so there is nothing to
+      # discriminate against -- while LogRegenerator.rebuild defaults to
+      # origins=('real',), so marking these turns otherwise would make the
+      # dev-stack rebuild select zero turns and R1.6's `live == rebuilt`
+      # closure vacuous. Isolation from production is the separate store, not
+      # a marker column; labelling these turns non-real would reintroduce, at
+      # the origin field, exactly the "structurally distinguishable from usage"
+      # defect this phase exists to remove.
+      - MIST_SESSION_ORIGIN=real
+      #
+      # --- determinism ------------------------------------------------------
+      # T2 pins the clock on the BACKEND's environment (the driving process is
+      # over the wire and cannot reach _now_fn). Empty default so bringing the
+      # stack up for any other reason does not silently freeze time.
+      - MIST_FIXED_CLOCK=${MIST_FIXED_CLOCK:-}
+      - LLM_TEMPERATURE=0.0
+      #
+      # --- shared, stateless ------------------------------------------------
+      # llama-server holds no per-stack state, so the dev backend borrows the
+      # live one rather than loading a second copy of the model into 12GB.
+      - LLM_SERVER_URL=http://mist-llm:8080
+      - LLM_BACKEND=llamacpp
+      - MODEL=${MODEL:-gemma-4-e4b}
+      #
+      # --- voice off --------------------------------------------------------
+      # Hydration is a text-path replay. TTS off skips the Chatterbox load
+      # (model_manager.py:123), which is ~3.9GB of VRAM the live backend is
+      # already holding.
+      - TTS_ENABLED=false
+      - ENABLE_KNOWLEDGE_INTEGRATION=true
+      - WATCHFILES_FORCE_POLLING=1
+    user: "1000:1000"
+    volumes:
+      # THE ONLY WRITABLE STATE MOUNT. Read the header before adding another.
+      - ./dev-state:/app/dev-state
+      - ./dev-state/logs:/app/logs
+      # The single, deliberately NARROW exception: snapshot artifacts live under
+      # data/ beside data/golden-log/, following the convention this repo uses
+      # for large generated fixtures, and they must OUTLIVE `rm -rf dev-state`
+      # -- an artifact stored inside the thing you delete is not a backup.
+      # Mounting the subdirectory rather than ./data is what keeps the guarantee
+      # intact: /app/data itself stays the container's own empty layer, so the
+      # dev backend still cannot see data/event_store.db or any other live store.
+      # Verify with `docker exec mist-backend-dev ls /app/data`.
+      - ./data/hydration-snapshots:/app/data/hydration-snapshots
+      # Read-only, and not really an exception: the golden log is a CHECKED-IN
+      # repo fixture, not live state. The snapshot manifest digests it to
+      # identify which corpus produced an artifact, so without it every
+      # staleness check would be vacuous -- which `digest_corpus` refuses
+      # rather than silently recording "unknown".
+      - ./data/golden-log:/app/data/golden-log:ro
+      # Code, read-only, mirroring docker-compose.override.yml. Read-only is
+      # not merely hygiene here: it is what keeps a dev-stack process from
+      # editing the tree the live stack is running from.
+      - ./backend:/app/backend:ro
+      - ./src:/app/src:ro
+      - ./dependencies:/app/dependencies:ro
+      - ./scripts:/app/scripts:ro
+      - ./tests:/app/tests:ro
+      - ./voice_profiles:/app/voice_profiles:ro
+      # Model caches are content-addressed and read-mostly; sharing them avoids
+      # a second 3-4GB download.
+      - mist-hf-cache:/home/appuser/.cache/huggingface
+      - mist-torch-cache:/home/appuser/.cache/torch
+    depends_on:
+      mist-neo4j-dev:
+        condition: service_healthy
+      mist-llm:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # No `restart: unless-stopped`. The live backend restarts because it is a
+    # service; this one is a fixture harness, and a hydration run that dies
+    # mid-corpus must stay dead rather than silently restart and replay a
+    # partial log into a half-built graph.
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  mist-neo4j-dev-data:
+  mist-neo4j-dev-logs:

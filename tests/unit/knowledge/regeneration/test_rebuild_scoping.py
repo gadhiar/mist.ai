@@ -46,7 +46,13 @@ from backend.knowledge.extraction.validator import ValidationResult
 from backend.knowledge.extraction_cache import ExtractionCache
 from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
 
-STAGING_URI = "bolt://rebuild-scoping-staging:7687"
+# The REAL staging endpoint, not a per-file synthetic name. Connections here are
+# fakes and never dial it, but `assert_rebuild_target_not_live` is an allowlist
+# of disposable endpoints (hardened 2026-08-04 from a denylist that let
+# `bolt://localhost:7687` through to the live graph), so a made-up hostname is
+# now correctly refused. Naming the instance the rebuild actually targets also
+# stops these tests from asserting against a topology that does not exist.
+STAGING_URI = "bolt://mist-neo4j-staging:7687"
 LIVE_URI = "bolt://mist-neo4j:7687"
 
 CURRENT_ONTOLOGY = "1.4.0"
