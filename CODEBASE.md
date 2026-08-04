@@ -6,8 +6,9 @@
 
 | Fact | Value | How verified |
 |---|---|---|
-| Local `main` HEAD | `9b363ba` -- the remediation branch is **ff-MERGED**, branch deleted | `git log` |
-| Commits ahead of origin | **31**, never pushed | `git rev-list --count origin/main..HEAD` |
+| Local `main` HEAD | `4ae31fc` | `git log` |
+| Commits ahead of origin | **35**, never pushed | `git rev-list --count origin/main..HEAD` |
+| Unit suite | **2918 passed / 7 skipped / 3 xfailed / 0 failed** | full run, clean tree |
 | Unit suite | **2761 passed / 7 skipped / 4 xfailed / 0 failed** (was 2679 at branch point, +82) | full run in container, clean tree, post-commit |
 | Ontology version | **1.4.0** | `backend.knowledge.version_stamps.ONTOLOGY_VERSION` at runtime |
 | Extraction version | **2026-06-14-r5** | same module, runtime |
@@ -51,7 +52,38 @@ indistinguishable in the logs, which is why hydration (R1.4.6) is now sequenced 
 Full register: `docs/superpowers/specs/2026-08-02-review-findings-register.md` (gitignored,
 local only).
 
-**REMEDIATION, 2026-08-03 -- 12 commits, MERGED to local `main` @ `9b363ba`, branch deleted.**
+**POST-MERGE, 2026-08-04 -- three more pieces landed on `main` (`b1be0e3`, `e7ade99`, `4ae31fc`).**
+
+- **`b1be0e3` -- A LIVE-GRAPH LOSS HAZARD, found in the surface the review never searched.**
+  `assert_rebuild_target_not_live` was a DENYLIST OF ONE HOSTNAME SPELLING. Measured against
+  `live = bolt://mist-neo4j:7687`: `bolt://mist-neo4j:7687` refused, but **`bolt://localhost:7687`
+  and `bolt://127.0.0.1:7687` PASSED** -- the same database, since the live bolt port is
+  host-published. `mist_admin.py:573` calls that guard and `:589` then runs
+  `MATCH (n) DETACH DELETE n` unconditionally, so `--staging-uri bolt://localhost:7687` -- the
+  natural spelling from the host -- would have wiped the canonical graph. Now an allowlist, and
+  deliberately narrower than first specified: staging ONLY, excluding eval (the test DB) and dev
+  (because R1.6 treats the DEV graph as the "live" side, so admitting it as a write target would
+  let a rebuild delete an 87-turn hydrated fixture).
+- **`e7ade99` -- D3.** Curation job runs are now persisted to `curation_job_runs`, with
+  `examined` and `produced` as SEPARATE columns so "ran, looked at nothing" is a different row
+  from "ran, looked at N, changed nothing". `graph_health_events` is written too and kept
+  distinct -- it is a metric time series for one job; the new table is the audit fact for all of
+  them. `run_once()` and `_loop` now share one execution path so they cannot drift.
+- **`4ae31fc` -- R1.4.6 T1 + T4.** Dev compose profile, mechanical isolation guard (refuses a
+  root that IS, SITS UNDER, or **CONTAINS** live state -- the third arm matters because `restore`
+  clears its target), and snapshot/restore whose manifest READS the stamp triple rather than
+  restating it, so a stale artifact refuses itself by name. T2 (the hydrator) and T3 are NOT
+  built: the corpus must be authored with Raj.
+
+**Still open from the `scripts/` audit** (`docs/superpowers/specs/2026-08-04-scripts-audit.md`,
+gitignored): `graph-rebuild-from-log` writes job rows and a schema script to the LIVE SQLite
+event store at `~/.mist` despite advertising dry-run only -- both isolation guards are Neo4j-only
+and neither has any notion of the event store. Severity bounded (append-only rows, not a wipe),
+but the contract claim and the writes cannot both stand. The audit also flagged its own biggest
+gap: ~3900 lines of eval-harness scorer logic, which is exactly where "passed=True over zero
+examined" lives.
+
+**PRIOR -- REMEDIATION, 2026-08-03 -- 12 commits, MERGED to local `main` @ `9b363ba`, branch deleted.**
 Live graph untouched at 32/30 throughout; no write of any kind was made to Neo4j, the event
 store, or the vault.
 
