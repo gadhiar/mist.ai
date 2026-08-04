@@ -1,6 +1,7 @@
 """Voice Processor - Handles voice conversation logic."""
 
 import asyncio
+import functools
 import json
 import logging
 import queue
@@ -106,7 +107,17 @@ class VoiceProcessor:
         # sentence queue drains. Independent of generation_lock -- LLM for
         # turn N+1 can run while TTS for turn N still holds this lock.
         self.tts_render_lock = threading.Lock()
-        self.latest_user_input = None
+        # Latest-wins pending input as `(user_text, session_id)`. The session
+        # travels WITH the text because the drain in `_process_conversation_turn`
+        # respawns the queued turn from the FINISHING turn's thread, and
+        # `spawn_with_context` snapshots that thread's context -- so an
+        # id-less slot silently hands the queued turn the previous session's
+        # `current_session_id`. That id selects the conversation history, the
+        # EventStore session, the vault note and the graph provenance, so the
+        # crossing misfiles one connection's utterance into another's memory.
+        # A single slot, not a map: latest-wins overwrites in place, so this
+        # cannot accumulate per-connection entries.
+        self.latest_user_input: tuple[str, str | None] | None = None
         self.input_lock = threading.Lock()
         # Monotonic turn counter (incremented under generation_lock). A
         # previous turn's still-draining TTS consumer compares its captured
@@ -253,7 +264,10 @@ class VoiceProcessor:
             # If AI is speaking, queue it for later (CSM pattern: only keep latest!)
             if self.is_speaking:
                 with self.input_lock:
-                    self.latest_user_input = user_text
+                    # Capture the session from THIS thread's context: the
+                    # drain that later replays this text runs on a different
+                    # thread carrying a different session.
+                    self.latest_user_input = (user_text, current_session_id.get())
                     log_timestamp(f"AI currently speaking, input queued: '{user_text[:50]}...'")
                 return
 
@@ -485,7 +499,13 @@ class VoiceProcessor:
             # input left the FE turn promise waiting forever
             # (deep review febe-observability-11).
             with self.input_lock:
-                self.latest_user_input = user_text
+                # `session_id` is the caller's argument rather than the context
+                # var: this early return happens BEFORE the publish below, so
+                # the ambient value here is still whatever the executor thread
+                # was last used for. Fall back to the context var for callers
+                # that legitimately pass None (the voice path and the respawn,
+                # both of which arrive with their session already published).
+                self.latest_user_input = (user_text, session_id or current_session_id.get())
             log_timestamp("Generation already in progress; queued latest input")
             return
 
@@ -709,10 +729,22 @@ class VoiceProcessor:
             # Check for pending input
             with self.input_lock:
                 if self.latest_user_input and not self.interrupt_flag.is_set():
-                    pending_input = self.latest_user_input
+                    pending_input, pending_session_id = self.latest_user_input
                     self.latest_user_input = None
                     log_timestamp(f"Processing pending input: '{pending_input}'")
-                    spawn_with_context(self._process_conversation_turn, pending_input)
+                    # `session_id` is passed EXPLICITLY, not left to context
+                    # inheritance: `spawn_with_context` copies THIS thread's
+                    # context, whose `current_session_id` is the finishing
+                    # turn's session, not the queued turn's. `functools.partial`
+                    # because `spawn_with_context`'s **kwargs go to
+                    # `threading.Thread`, not to the target.
+                    spawn_with_context(
+                        functools.partial(
+                            self._process_conversation_turn,
+                            pending_input,
+                            session_id=pending_session_id,
+                        )
+                    )
 
     def process_complete_audio(self, audio_data, sample_rate, session_id: str | None = None):
         """Process complete audio from client (no VAD needed; the client controls recording window).

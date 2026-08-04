@@ -62,6 +62,23 @@ class KnowledgeIntegration:
         # can read duration_ms / tool_calls_used after generate_response_streaming
         # returns (the generator yields only strings; ADR-017 stream_complete
         # needs the metadata). Reset at the top of each streaming call.
+        #
+        # These two attributes are per-TURN state on an object that is a
+        # process-wide singleton (one KnowledgeIntegration per ModelManager per
+        # the module-level `server.voice_processor`). They are safe only
+        # because of an invariant enforced in ANOTHER file: the sole reader,
+        # `VoiceProcessor._process_conversation_turn`, does both the write
+        # (by driving this generator) and the read inside one non-reentrant
+        # `generation_lock` hold -- acquired at voice_processor.py:501,
+        # released at voice_processor.py:727. A concurrent turn cannot
+        # observe a partially-updated value because it cannot enter at all;
+        # it takes the pending-input path instead.
+        #
+        # If that lock is ever made per-session, released earlier, or dropped
+        # in favour of true concurrent turns, these become last-writer-wins
+        # across sessions and must move to `backend.request_context`
+        # ContextVars (producer and consumer share one context here, so a
+        # ContextVar is the correct shape).
         self.last_complete: Complete | None = None
         # Bridge side-channel: last error captured per turn as (kind, message)
         # so callers can emit a discriminated ADR-017 error event instead of
