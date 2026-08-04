@@ -7,9 +7,9 @@
 | Fact | Value | How verified |
 |---|---|---|
 | Local `main` HEAD | `987651f` | `git log` |
-| Commits ahead of origin | **19**, never pushed | `git rev-list --count origin/main..HEAD` |
-| Working branch | `fix/register-remediation-2026-08-03` (off `987651f`) | `git branch --show-current` |
-| Unit suite | **2679 passed / 7 skipped / 3 xfailed** | full run in container |
+| Working branch | `fix/register-remediation-2026-08-03` @ `d4bf16c`, **8 commits, NOT yet merged** | `git log main..HEAD` |
+| Commits ahead of origin | **27** (19 on `main` + 8 on the branch), never pushed | `git rev-list --count origin/main..HEAD` |
+| Unit suite | **2761 passed / 7 skipped / 4 xfailed / 0 failed** (was 2679 at branch point, +82) | full run in container, clean tree, post-commit |
 | Ontology version | **1.4.0** | `backend.knowledge.version_stamps.ONTOLOGY_VERSION` at runtime |
 | Extraction version | **2026-06-14-r5** | same module, runtime |
 | Live graph | 32 nodes / 30 relationships | read-only Cypher |
@@ -51,6 +51,48 @@ data, returned zeros" and "job ran with a null dependency, returned zeros before
 indistinguishable in the logs, which is why hydration (R1.4.6) is now sequenced BEFORE R1.5.
 Full register: `docs/superpowers/specs/2026-08-02-review-findings-register.md` (gitignored,
 local only).
+
+**REMEDIATION BRANCH, 2026-08-03 (8 commits, awaiting the whole-branch review gate before merge).**
+`fix/register-remediation-2026-08-03`. Live graph untouched at 32/30 throughout; no write of any
+kind was made to Neo4j, the event store, or the vault.
+
+| Commit | Substance |
+|---|---|
+| `7c1fbc1` | This file -- ~11 false/stale claims corrected, each re-read from source |
+| `c48729f` | Module-identity guard (Mechanism B) + mirror mutants surviving in two guards shipped 2026-08-03 |
+| `feb472a` | **LIVE BUG** -- a queued turn inherited the previous turn's `session_id` |
+| `538f848` | Mechanism A composition-root guard + `server.py:444`, the one line behind three dead features |
+| `2658aba` | **LIVE BUGS x2** -- self-model score pinned at 0; coverage capped at 83.3% |
+| `0a75e34` | **LIVE BUGS x2** -- the rebuild never scoped turns by epoch or by origin |
+| `4657305` | Comments describing wiring that does not exist (`atexit`, `source_event_id`, stamp authorities) |
+| `d4bf16c` | The module-identity guard was silently examining less than it did the day before |
+
+**The most important find was not on the work list.** `VoiceProcessor.latest_user_input` held a
+parked utterance's TEXT and nothing else. The drain that replays it runs on the FINISHING turn's
+thread, and `spawn_with_context` snapshots the CALLING thread's context -- so a queued turn
+inherited `current_session_id` from whichever turn happened to finish. That id selects the
+conversation history, the EventStore session, the vault note path and the graph provenance, so
+**one connection's utterance was filed into another connection's memory.** Inert until 2026-08-03
+because every session id was the literal `"default"`; making session ids real converted it from
+latent to live. It is the THIRD member of that class after `end_session` ending every session --
+expect more, and see the R1.4.6 T0 sweep.
+
+**Two consequences of this branch's own fixes, stated because they are easy to miss:**
+
+1. **D3 got worse.** `scheduler.py:135` discards every `JobResult`. Until `538f848` both affected
+   jobs returned all-zero results, so discarding them lost nothing; they now produce real counts
+   that `_loop` throws away. Graph WRITES still land -- only the counts are lost.
+2. **The self-model health score now pins at 100.** `min(100, count/5*100)` against 21 seeded
+   nodes. The fix moved it from permanently-0 to permanently-100; both are near-zero signal, and
+   the second is less alarming, which arguably makes it worse. The threshold of 5 predates the
+   21-node seed. Scoring-policy decision, deliberately left open.
+
+**Method note worth carrying.** The single most useful result of the night came from mutation-
+testing with the ACTUAL historical bug rather than a synthetic sentinel. A `:__Nonexistent__`
+label mutation probes only the label axis and passed on the first try; restoring the real
+original query -- which carried a PREDICATE as well as a label -- exposed a second axis where the
+test fake silently dropped any WHERE clause it had no model for. A synthetic mutation proves a
+test can fail; only the real bug proves the test covers the axis the code was wrong on.
 
 **This header previously carried ~11 false or stale claims** and is read into every session by
 `/mist-status`, so the errors propagated. They are corrected in this revision and named here so
