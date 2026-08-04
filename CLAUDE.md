@@ -70,7 +70,7 @@ Keep it current as a side effect of routine work -- do NOT treat updating it as 
 Rules:
 - **Ground every claim in real state.** Read `git -C "D:\Users\rajga\mist.ai" status` / `log` and the vault workstream note; never copy a hash, count, or version forward without verifying it against the source. If a number cannot be verified (e.g. an ontology rel-type count), flag it rather than guessing.
 - **Preserve history.** Demote the prior header entry to a nested `PRIOR ENTRY --` rather than deleting it (the running-history style this file already uses).
-- **Docs are local-only.** CODEBASE.md and CLAUDE.md are never pushed to origin (no-push-docs convention + repo push-gating).
+- **Docs are TRACKED and PUSHED.** CODEBASE.md and CLAUDE.md live in git and go to origin like any other file. What stays local is the `docs/` tree -- specs, plans, and findings registers -- which is gitignored (`.gitignore:69`), along with `tests/CLAUDE.md` (`.gitignore:73` matches `CLAUDE.md` at any depth, but the two root files predate the rule and remain tracked). **This line previously read "Docs are local-only ... never pushed to origin" while both files were already tracked AND already present on `origin/main`** -- a documented convention contradicted by observable state, which is precisely the defect class the 2026-08-03 reachability work existed to remove. Corrected 2026-08-04 rather than left standing.
 - **Schema / convention / structure changes** belong in this CLAUDE.md, not only in CODEBASE.md.
 
 ---
