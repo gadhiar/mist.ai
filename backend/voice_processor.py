@@ -788,3 +788,35 @@ class VoiceProcessor:
         if self.vad_processor:
             self.vad_processor.reset()
             log_timestamp("VAD reset")
+
+    def reset_connection_state(self) -> None:
+        """Clear connection-scoped residue after the last client disconnects.
+
+        `VoiceProcessor` is a process-wide singleton, so state left behind by a
+        closed connection is state the NEXT session starts with. The sharp case
+        is `latest_user_input`: a parked utterance outlives the connection that
+        produced it, and the next turn's `finally` drains and respawns it, so a
+        session that has already been ended has its words replayed into a live
+        one.
+
+        Deliberately does NOT touch `_turn_epoch`, `models.tts_generation_id`
+        or `is_speaking`. The first two are monotonic counters carrying no
+        session identity -- zeroing them would break the staleness comparison at
+        `_tts_consumer`'s epoch check, silently suppressing a live consumer's
+        emit. `is_speaking` is owned by the in-flight turn's `finally`, which
+        runs on every exit path; clearing it from here races that owner.
+
+        Caller must ensure this is the last connection. Resetting while another
+        connection is live would discard that connection's legitimately parked
+        input.
+        """
+        with self.input_lock:
+            self.latest_user_input = None
+        self.interrupt_flag.clear()
+        while True:
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
+        self.reset_vad()
+        log_timestamp("Connection state reset (last client disconnected)")

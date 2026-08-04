@@ -676,6 +676,30 @@ async def health():
     }
 
 
+def _reset_voice_state_if_last_connection() -> bool:
+    """Clear singleton connection state once no client remains.
+
+    `voice_processor` is shared by every entry in `active_connections`, so its
+    connection-scoped state (a parked utterance, a set interrupt flag, buffered
+    audio, VAD state) outlives the connection that produced it and becomes the
+    next session's starting state.
+
+    Guarded on the set being EMPTY rather than firing on every disconnect: with
+    a concurrent connection still open, the parked utterance may be that
+    connection's, and clearing it would drop a live client's queued message.
+
+    Returns:
+        True if the reset ran, False if a connection remains or the voice
+        processor has not been constructed yet.
+    """
+    if active_connections:
+        return False
+    if voice_processor is None:
+        return False
+    voice_processor.reset_connection_state()
+    return True
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for voice + text conversation.
@@ -919,6 +943,11 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         async with active_connections_lock:
             active_connections.discard(websocket)
+        # Ordering matters: this must run AFTER the discard (so the emptiness
+        # check sees this connection gone) and BEFORE `end_session` below (so a
+        # parked utterance cannot be drained into a turn while the session it
+        # belongs to is being closed).
+        _reset_voice_state_if_last_connection()
         # ADR-017: log subscription is per-connection ephemeral -- drop this
         # connection's subscription and close the global gate when no
         # subscriber remains.
