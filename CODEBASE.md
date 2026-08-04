@@ -1,19 +1,69 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-08-03 (**I7 + R1.4.5 golden log + whole-codebase reachability review COMPLETE and ff-merged to local `main` @ `987651f`; remediation of that review IN PROGRESS on `fix/register-remediation-2026-08-03`.**
+**Last Updated:** 2026-08-04 (**R1.4.6 T0 -- singleton per-session state sweep -- COMPLETE and ff-merged to `main`. This is the last prerequisite before the R1.4.6 T2/T3 hydrator, which needs a multi-session corpus authored WITH Raj.**
 
-**VERIFIED STATE (2026-08-03, every number re-read from source, not carried forward):**
+**VERIFIED STATE (2026-08-04, every row re-read from source at branch close, not carried forward):**
 
 | Fact | Value | How verified |
 |---|---|---|
-| Local `main` HEAD | `4ae31fc` | `git log` |
-| Commits ahead of origin | **35**, never pushed | `git rev-list --count origin/main..HEAD` |
-| Unit suite | **2918 passed / 7 skipped / 3 xfailed / 0 failed** | full run, clean tree |
-| Unit suite | **2761 passed / 7 skipped / 4 xfailed / 0 failed** (was 2679 at branch point, +82) | full run in container, clean tree, post-commit |
+| Local `main` HEAD | `1598412` + this docs commit | `git log` after ff-merge |
+| Commits ahead of origin | **0** after push -- `main` and `origin/main` MATCH | `git rev-list --count origin/main..HEAD` |
+| Unit suite | **2926 passed / 7 skipped / 3 xfailed / 0 failed** | full run in container, clean tree, run by the coordinator directly -- NOT self-reported by an implementer |
+| Suite warnings | 9, all from files this branch never touched | warnings summary inspected source-by-source |
 | Ontology version | **1.4.0** | `backend.knowledge.version_stamps.ONTOLOGY_VERSION` at runtime |
 | Extraction version | **2026-06-14-r5** | same module, runtime |
-| Live graph | 32 nodes / 30 relationships | read-only Cypher |
-| `epoch_ledger` | 2 rows; `epoch_id 2` current, supersedes the drifted row | 2026-08-03 repair |
+| Live graph | 32 nodes / 30 relationships, UNTOUCHED this session | no Neo4j write of any kind was made |
+| `epoch_ledger` | 2 rows; `epoch_id 2` current | unchanged since the 2026-08-03 repair |
+| Stack | `mist-backend` / `mist-llm` / `mist-neo4j` all Up (healthy) | `docker compose ps` |
+
+**What R1.4.6 T0 shipped** (4 commits, `036ae3b..1598412`, suite 2918 -> 2926):
+
+- **`4f4ec7b` + `264587c` -- the turn-result side-channel moved off the singleton.**
+  `KnowledgeIntegration.last_complete` / `last_error` were per-TURN values on a process-wide
+  object, safe only because of a `generation_lock` invariant enforced in a different file.
+  They are now ContextVars in `backend/request_context.py`. A consumer-side reset was built
+  and then REMOVED in `264587c` as unreachable: `KnowledgeIntegration.enabled` is assigned
+  only in `__init__` and never flips, so the producer either runs on every turn of the process
+  or on none, and its reset is the first statement of the generator body. What remains is a
+  test pinning that ordering, mutation-proved to fail when the reset moves below a yield.
+- **`02f9c7c` + `1598412` -- a closed connection's residue can no longer reach the next
+  session.** Nothing in the disconnect path reset any `VoiceProcessor` state, so a parked
+  utterance outlived the connection that produced it and the next turn's `finally` drained and
+  respawned it -- replaying an already-ended session's words into a live one, the same
+  misfiling class as `feb472a` by a different route. `reset_connection_state()` clears
+  `latest_user_input` under `input_lock`, called only when `active_connections` is empty.
+
+**`reset_connection_state` deliberately does almost nothing, and that is the finding.** It
+shipped clearing four things; the whole-branch review proved three of them unreachable and the
+fourth actively harmful, and `1598412` reduced it to one. `audio_queue` has no writer anywhere
+in `backend/` (`KNOWN_ISSUES.md:114-115` already recorded it as unused, and the test that
+"proved" the drain worked supplied its own precondition). VAD state is fed only by
+`process_audio_chunk`, which has no caller (`KNOWN_ISSUES.md:117-118`). And
+`interrupt_flag.clear()` was a **regression**: every in-turn reader sits downstream of that
+turn's own unconditional clear, so it could never help -- but a client that interrupts and then
+disconnects would have had the cancelled turn run to completion and persist into the closing
+session. Each exclusion now carries its verified reason in the method's docstring.
+
+**Five rationales were falsified on this branch, and the pattern is worth more than the fixes.**
+Four were in the implementation plan (a consumer reset justified by a branch that cannot vary;
+a `TYPE_CHECKING` import justified by a cycle that does not exist; the `audio_queue` and VAD
+resets) and the fifth was in the fix for the other four (a docstring claiming `audio_queue`'s
+"only feeder, `process_audio_chunk`" when that function feeds `vad_processor` and `audio_queue`
+has no feeder at all). In every case **the conclusion was right and the stated reason was
+invented rather than checked**, and every one took seconds of `grep` to falsify. That is the
+same defect class the 2026-08-03 review named -- a documented claim contradicted by observable
+state -- occurring inside the documents describing its removal. The scoped per-task reviews
+could not catch most of them, because the deadness lives OUTSIDE the diff, in the absence of a
+caller and in `KNOWN_ISSUES.md`. The whole-branch gate is what caught them.
+
+**Also filed:** `docs/superpowers/specs/2026-08-04-connection-scoped-transport.md` (local,
+untracked per `.gitignore:69`) -- two transport-layer defects found during the sweep and
+deliberately NOT fixed here: `broadcast_messages` (`server.py:105-125`) sends every message to
+every connection, and `interrupt_flag` is one shared `Event` so any client's interrupt cancels
+every in-flight turn. Neither is fixable at the attribute layer. Its open question must be
+settled first: whether broadcast is partly INTENDED, since MIST is single-user and mirroring
+across two windows is plausible design. ADR-017 calls multi-client "out of scope for v1.0" and
+the broadcaster "single-channel", which leans toward artifact rather than intent.
 
 **What landed 2026-08-03** (19 commits, `a5a7499..987651f`, ff-merged to local `main`, unit suite
 2552 -> 2679, live graph untouched throughout except one deliberate epoch repair):
