@@ -531,15 +531,6 @@ class VoiceProcessor:
                 current_request_id.set(request_id)
             if session_id is not None:
                 current_session_id.set(session_id)
-            # Reset the per-turn result side-channels. This thread comes from a
-            # REUSED executor pool that installs no fresh context, so without
-            # this it carries the previous turn's Complete / error. The producer
-            # resets them too, but only when it runs -- with knowledge disabled
-            # `generate_llm_response` takes the fallback branch and the producer
-            # never executes, which is the exact path the old `if knowledge`
-            # guard on the read was covering.
-            current_turn_complete.set(None)
-            current_turn_error.set(None)
             log_timestamp(f"Starting conversation turn for: '{user_text}'")
 
             self.interrupt_flag.clear()

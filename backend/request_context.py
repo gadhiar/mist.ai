@@ -38,11 +38,14 @@ current_session_id: ContextVar[str | None] = ContextVar("current_session_id", de
 # body executes in its caller's context -- so a ContextVar carries the value
 # back without the singleton instance attribute these replace.
 #
-# These MUST be reset at turn start by the consumer, not only by the producer.
-# `run_in_executor(None, ...)` uses a POOLED, REUSED thread and installs no
-# fresh context, so a pool thread retains whatever the previous turn set. The
-# producer's own reset does not cover the path where knowledge is disabled and
-# the producer never runs at all.
+# The producer resets both at the top of `generate_response_streaming`, before
+# it yields anything, so a consumer never reads a prior turn's value. No
+# consumer-side reset exists or is needed: `KnowledgeIntegration.enabled` is
+# set once in __init__ and never flips, so the producer either runs on every
+# turn of the process or on none of them -- there is no turn that skips it
+# after another turn set a value. Executor threads ARE pooled and reused with
+# no fresh context, so if `enabled` ever becomes runtime-mutable, that
+# assumption breaks and the consumer must reset again.
 current_turn_complete: ContextVar["Complete | None"] = ContextVar(
     "current_turn_complete", default=None
 )
