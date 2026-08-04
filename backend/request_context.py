@@ -1,16 +1,19 @@
 """Request context propagation via contextvars.
 
-Provides a per-request ID and a per-connection session ID that flow through
-async and threaded call chains, enabling log records to be grouped by
-conversation turn and each turn to be attributed to the WebSocket connection
-that originated it.
+Provides a per-request ID, a per-connection session ID, and per-turn result
+side-channels that flow through async and threaded call chains, enabling log
+records to be grouped by conversation turn and each turn to be attributed to
+the WebSocket connection that originated it.
 """
 
 import itertools
 import threading
 from collections.abc import Callable
 from contextvars import ContextVar, copy_context
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from backend.chat.stream_events import Complete
 
 current_request_id: ContextVar[str | None] = ContextVar("current_request_id", default=None)
 
@@ -26,6 +29,26 @@ current_request_id: ContextVar[str | None] = ContextVar("current_request_id", de
 # "default"; consumers must treat None as a wiring error rather than
 # substitute a fallback.
 current_session_id: ContextVar[str | None] = ContextVar("current_session_id", default=None)
+
+# Per-TURN result side-channel. `generate_response_streaming` yields only
+# strings and dicts, but ADR-017's `stream_complete` needs `duration_ms` /
+# `tool_calls_used`, and a bridge timeout needs a discriminated error rather
+# than error text yielded as a fake token. Producer and consumer run on the
+# same thread -- the consumer drives the producer's generator, and a generator
+# body executes in its caller's context -- so a ContextVar carries the value
+# back without the singleton instance attribute these replace.
+#
+# These MUST be reset at turn start by the consumer, not only by the producer.
+# `run_in_executor(None, ...)` uses a POOLED, REUSED thread and installs no
+# fresh context, so a pool thread retains whatever the previous turn set. The
+# producer's own reset does not cover the path where knowledge is disabled and
+# the producer never runs at all.
+current_turn_complete: ContextVar["Complete | None"] = ContextVar(
+    "current_turn_complete", default=None
+)
+current_turn_error: ContextVar[tuple[str, str] | None] = ContextVar(
+    "current_turn_error", default=None
+)
 
 _counter = itertools.count(1)
 _counter_lock = threading.Lock()

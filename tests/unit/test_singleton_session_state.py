@@ -100,8 +100,6 @@ def build_voice_processor(
     ki = object.__new__(KnowledgeIntegration)
     ki.enabled = True
     ki.conversation_handler = handler
-    ki.last_complete = None
-    ki.last_error = None
 
     mm = object.__new__(ModelManager)
     mm.knowledge = ki

@@ -125,8 +125,6 @@ def build_knowledge_integration(handler: RecordingConversationHandler) -> Knowle
     ki = object.__new__(KnowledgeIntegration)
     ki.enabled = True
     ki.conversation_handler = handler
-    ki.last_complete = None
-    ki.last_error = None
     return ki
 
 

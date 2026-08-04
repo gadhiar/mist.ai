@@ -14,7 +14,7 @@ from backend.chat.stream_events import Complete, Token, WSEvent
 from backend.factories import build_conversation_handler
 from backend.knowledge.config import KnowledgeConfig
 from backend.llm import StreamingLLMProvider
-from backend.request_context import current_session_id
+from backend.request_context import current_session_id, current_turn_complete, current_turn_error
 
 logger = logging.getLogger(__name__)
 
@@ -58,33 +58,11 @@ class KnowledgeIntegration:
         self._llm_provider = llm_provider
         self._config = config
         self._invalidation_bus = invalidation_bus
-        # Bridge side-channel: last Complete event captured per turn so callers
-        # can read duration_ms / tool_calls_used after generate_response_streaming
-        # returns (the generator yields only strings; ADR-017 stream_complete
-        # needs the metadata). Reset at the top of each streaming call.
-        #
-        # These two attributes are per-TURN state on an object that is a
-        # process-wide singleton (one KnowledgeIntegration per ModelManager per
-        # the module-level `server.voice_processor`). They are safe only
-        # because of an invariant enforced in ANOTHER file: the sole reader,
-        # `VoiceProcessor._process_conversation_turn`, does both the write
-        # (by driving this generator) and the read inside one non-reentrant
-        # `generation_lock` hold -- acquired at voice_processor.py:501,
-        # released at voice_processor.py:727. A concurrent turn cannot
-        # observe a partially-updated value because it cannot enter at all;
-        # it takes the pending-input path instead.
-        #
-        # If that lock is ever made per-session, released earlier, or dropped
-        # in favour of true concurrent turns, these become last-writer-wins
-        # across sessions and must move to `backend.request_context`
-        # ContextVars (producer and consumer share one context here, so a
-        # ContextVar is the correct shape).
-        self.last_complete: Complete | None = None
-        # Bridge side-channel: last error captured per turn as (kind, message)
-        # so callers can emit a discriminated ADR-017 error event instead of
-        # yielding error strings as fake llm_token chunks. Closes Phase 1
-        # fix #3 (synthetic llm_token leak from bridge timeout) cleanly.
-        self.last_error: tuple[str, str] | None = None
+        # Bridge side-channels for per-turn results live in
+        # `backend.request_context` ContextVars, not on this object: this class
+        # is a process-wide singleton, and a per-turn value on a singleton is
+        # last-writer-wins the moment anything runs two turns. See
+        # `current_turn_complete` / `current_turn_error` for the full rationale.
 
         try:
             if llm_provider is None:
@@ -159,15 +137,15 @@ class KnowledgeIntegration:
             on the producer side).
 
         Side-effect:
-            Sets ``self.last_complete`` to the last ``Complete`` event seen on
-            the bridge (or ``None`` if the stream errored or returned no
+            Sets ``current_turn_complete`` to the last ``Complete`` event seen
+            on the bridge (or ``None`` if the stream errored or returned no
             Complete). Callers that need ``duration_ms`` / ``tool_calls_used``
             for ADR-017 ``stream_complete`` payloads should read it after the
             generator finishes.
         """
         # Reset bridge side-channels for this turn.
-        self.last_complete = None
-        self.last_error = None
+        current_turn_complete.set(None)
+        current_turn_error.set(None)
 
         if not self.enabled or not self.conversation_handler:
             logger.warning("Knowledge integration not available, cannot generate response")
@@ -215,7 +193,7 @@ class KnowledgeIntegration:
             except Exception as e:
                 logger.error("Error in knowledge integration: %s", e, exc_info=True)
                 # Capture on side-channel; caller emits discriminated error.
-                self.last_error = ("server", str(e))
+                current_turn_error.set(("server", str(e)))
                 return
 
         # Live-server / voice path: bridge async stream to sync via queue.
@@ -249,16 +227,16 @@ class KnowledgeIntegration:
                     # user saw fail).
                     fut.cancel()
                     # Phase 1 fix #3: capture timeout on side-channel instead of
-                    # yielding error text as a fake token. Caller reads last_error
-                    # after the generator returns and emits a discriminated
-                    # ADR-017 error event.
-                    self.last_error = ("timeout", "response timeout")
+                    # yielding error text as a fake token. Caller reads
+                    # current_turn_error after the generator returns and emits a
+                    # discriminated ADR-017 error event.
+                    current_turn_error.set(("timeout", "response timeout"))
                     return
                 if item is DONE:
                     return
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__error__":
                     # Capture on side-channel; caller emits discriminated error.
-                    self.last_error = ("server", str(item[1]))
+                    current_turn_error.set(("server", str(item[1])))
                     return
                 if isinstance(item, Token):
                     yield item.text
@@ -270,10 +248,10 @@ class KnowledgeIntegration:
                 elif isinstance(item, Complete):
                     # Producer side finished; DONE sentinel will arrive next. We
                     # don't yield the Complete event itself (caller wants tokens),
-                    # but capture it on the integration object so callers can read
-                    # self.last_complete after the generator returns to access
-                    # duration_ms / tool_calls_used per ADR-017 stream_complete.
-                    self.last_complete = item
+                    # but capture it on current_turn_complete so callers can read
+                    # it after the generator returns to access duration_ms /
+                    # tool_calls_used per ADR-017 stream_complete.
+                    current_turn_complete.set(item)
         finally:
             # GeneratorExit (voice interrupt closes this generator early) and
             # any consumer-side exception must not leave the producer turn

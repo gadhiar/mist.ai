@@ -47,6 +47,8 @@ from backend.audio_protocol import (
 from backend.request_context import (
     current_request_id,
     current_session_id,
+    current_turn_complete,
+    current_turn_error,
     new_request_id,
     spawn_with_context,
 )
@@ -529,6 +531,15 @@ class VoiceProcessor:
                 current_request_id.set(request_id)
             if session_id is not None:
                 current_session_id.set(session_id)
+            # Reset the per-turn result side-channels. This thread comes from a
+            # REUSED executor pool that installs no fresh context, so without
+            # this it carries the previous turn's Complete / error. The producer
+            # resets them too, but only when it runs -- with knowledge disabled
+            # `generate_llm_response` takes the fallback branch and the producer
+            # never executes, which is the exact path the old `if knowledge`
+            # guard on the read was covering.
+            current_turn_complete.set(None)
+            current_turn_error.set(None)
             log_timestamp(f"Starting conversation turn for: '{user_text}'")
 
             self.interrupt_flag.clear()
@@ -619,8 +630,7 @@ class VoiceProcessor:
             # ADR-017. Priority: error (set on the bridge side-channel by
             # KnowledgeIntegration on bridge timeout or streaming exception)
             # > cancellation (user interrupt) > clean completion.
-            knowledge = getattr(self.models, "knowledge", None)
-            last_error = getattr(knowledge, "last_error", None) if knowledge else None
+            last_error = current_turn_error.get()
             if last_error is not None:
                 error_kind, error_message = last_error
                 asyncio.run_coroutine_threadsafe(
@@ -651,11 +661,11 @@ class VoiceProcessor:
                     self.loop,
                 )
             else:
-                # tool_calls_used / duration_ms come from the bridge
-                # side-channel populated by KnowledgeIntegration. last_complete
-                # is None when knowledge is disabled or the stream finished
-                # before Complete was seen; default to 0 in that case.
-                last_complete = getattr(knowledge, "last_complete", None) if knowledge else None
+                # tool_calls_used / duration_ms come from the per-turn
+                # ContextVar the producer sets. None when knowledge is disabled
+                # (the producer never runs) or the stream ended before Complete
+                # was seen; default to 0 in that case.
+                last_complete = current_turn_complete.get()
                 tool_calls_used = last_complete.tool_calls_used if last_complete else 0
                 asyncio.run_coroutine_threadsafe(
                     self.message_queue.put(
