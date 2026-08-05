@@ -11,7 +11,7 @@ Every gate passes on an empty gold corpus, including the join-integrity check
 `matched_probes == total_probes` that exists to stop exactly this -- on an empty
 corpus it is `0 == 0`. `--strict` therefore exits 0.
 
-A mistyped path is NOT the trigger: `main():689-690` checks `args.gold.exists()`
+A mistyped path is NOT the trigger: `main():843-845` checks `args.gold.exists()`
 and exits 2. The trigger is a gold file that exists and yields zero probes --
 empty, blank-line-only, all-comment, truncated, or over-filtered. Verified by
 execution: all three of those shapes return 0 probes and pass every gate.

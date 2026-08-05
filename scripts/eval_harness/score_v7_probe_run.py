@@ -18,7 +18,8 @@ Usage:
 Default output is a markdown report on stdout. `--output` writes to a file;
 `--json-output` emits a machine-readable dump for downstream consumers.
 `--strict` exits non-zero when the design-doc thresholds (precision >= 0.90,
-recall >= 0.90, 0/5 false positives on negatives) are not met.
+recall >= 0.90, 0/5 false positives on negatives, >= 1 negative-control probe
+examined) are not met.
 
 Spec: scripts/eval_harness/v7_probe_set_design.md ("Acceptance criteria",
 "How to run") + mist-ai-tool-calling-production-rigor workstream

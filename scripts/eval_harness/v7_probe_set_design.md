@@ -63,8 +63,9 @@ A production-ready MIST build, running this probe set with each line treated as 
 - **Tool-selection precision** (of tool calls, fraction that matched the expected positive): >= 0.90.
 - **Tool-selection recall** (of expected positives, fraction that fired the tool): >= 0.90.
 - **False-positive rate on negative controls**: 0/5.
+- **Negative-control examination**: at least 1 of the 5 negative controls must actually join a debug-JSONL turn. A block that examined zero negatives fails this criterion outright -- "0/5 false positives" is trivially true whether every negative was adjudicated clean or every negative never joined at all, and the two must not read as the same result.
 
-These thresholds mirror the `phase3_orchestrator.sh` baseline of `tool_selection >= 0.90` used elsewhere in the harness. The stricter "0/5 on negatives" is a discrete check rather than a rate, to flag single over-eager calls immediately.
+These thresholds mirror the `phase3_orchestrator.sh` baseline of `tool_selection >= 0.90` used elsewhere in the harness. The stricter "0/5 on negatives" is a discrete check rather than a rate, to flag single over-eager calls immediately. The negative-control-examination criterion was added 2026-08-05 (`V7Report.negatives_vacuous`); see the eval-harness scorer audit, section 2.1.
 
 ## acceptable_tools mechanism (C3 Task 14)
 
