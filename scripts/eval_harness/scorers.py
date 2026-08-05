@@ -714,6 +714,25 @@ SCORER_REGISTRY: dict[str, Scorer] = {
 }
 
 
+# scorer name -> what its `examined` count counts.
+#
+# An explicit declaration rather than a docstring convention or field-name
+# sniffing, for the reason run_record.py:22-29 gives about its own registry: a
+# heuristic silently mis-classifies the next entry someone adds, producing a
+# number that reads as a diagnosis while being wrong. The guard test asserts
+# this dict and SCORER_REGISTRY have identical keys, so an eighth scorer cannot
+# ship an uninterpretable count.
+SCORER_EXAMINES: dict[str, str] = {
+    "schema_conformance": "entities plus relationships in the parsed extraction",
+    "schema_conformance_lenient": "entities and relationships after repair, same count as strict",
+    "tool_selection": "1 when no-call expected; else tool name (0/1) plus argument keys compared",
+    "personality": "characters in the response content checked against style markers",
+    "rag_integration": "gold facts checked for recall, forbidden facts for false positives",
+    "coherence": "characters in the response content checked by the coherence heuristics",
+    "speed": "whether a metrics bundle was present to score (1) or absent (0)",
+}
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

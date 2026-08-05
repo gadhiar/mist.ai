@@ -124,3 +124,22 @@ def test_every_registered_scorer_returns_a_score_outcome(name):
     outcome = scorer({"response_content": ""}, {})
 
     assert isinstance(outcome, ScoreOutcome), f"{name} did not return a ScoreOutcome"
+
+
+def test_every_scorer_declares_what_examined_means():
+    """A count nobody can interpret is not an improvement on no count.
+
+    This test is the anti-rot mechanism: a scorer added to SCORER_REGISTRY
+    without a SCORER_EXAMINES entry fails the suite rather than shipping an
+    uninterpretable number. Mirrors run_record.py's registry guard.
+    """
+    from eval_harness.scorers import SCORER_EXAMINES
+
+    missing = sorted(set(SCORER_REGISTRY) - set(SCORER_EXAMINES))
+    assert not missing, f"scorers missing an examined declaration: {missing}"
+
+    stale = sorted(set(SCORER_EXAMINES) - set(SCORER_REGISTRY))
+    assert not stale, f"declarations for scorers that no longer exist: {stale}"
+
+    for name, description in SCORER_EXAMINES.items():
+        assert len(description) >= 20, f"{name}'s declaration is too short to be useful"
