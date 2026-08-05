@@ -1,6 +1,6 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-08-04 (**Eval-harness scorer audit + the non-vacuity fix for `scorers.py` COMPLETE and ff-merged. R1.4.6 T0 landed earlier the same day. Next: the R1.4.6 T2/T3 hydrator, which needs a multi-session corpus authored WITH Raj.**
+**Last Updated:** 2026-08-05 (**Eval-harness scorer audit + the non-vacuity fix for `scorers.py` COMPLETE and ff-merged. R1.4.6 T0 landed earlier the same day. Next: the R1.4.6 T2/T3 hydrator, which needs a multi-session corpus authored WITH Raj.**
 
 ---
 
@@ -15,10 +15,19 @@
 - `SCORER_EXAMINES` declares what each count counts, guarded by a test that fails when a scorer is added without one -- mutation-proved in both directions.
 - Reports and `dump_run_scores_json` print the count, so a score and its denominator travel together.
 
-**NOT closed, and named so nobody reads the above as more than it is:**
+**Also closed 2026-08-05** (`609dbdf..0636743`, suite 2952 -> 2975), for **F2 and V7 only**:
 
-- **The four standalone probe scorers are untouched** -- `score_extraction_run.py` (F2) and `score_v7/v8/v9_probe_run.py`. They share no code with `scorers.py`. F2 still passes every gate vacuously on an empty gold corpus, **triggerable by a config or path error alone**, and its negative-control claims remain unfalsifiable for any past run. V7 can still print PASS with zero negative-control probes examined. Full detail: `docs/superpowers/specs/2026-08-04-eval-harness-scorer-audit.md` sections 2.1-2.2.
-- **The five-site guard list is hand-maintained.** `enforce_non_vacuity`'s docstring says so honestly, but that is a stated discipline, not a mechanism -- nothing fails if a sixth site is added unguarded. The analogous fix is a static check, as `SCORER_EXAMINES` got.
+- **F2 fails closed on a corpus with zero probes.** Verified by execution beforehand: `score_run([], {})` returned entity precision 1.0, rel precision 1.0, typing 1.0, and `_gates_pass` True. The join-integrity check that exists to stop this was what let it through -- `matched_probes == total_probes` is `0 == 0`. A probe-less gold file now exits 1 under `--strict` and prints a VACUOUS RUN banner explaining the rows reflect an empty corpus. **The trigger was never a mistyped path** (`main()` guards that and exits 2) but a gold file that exists and parses to nothing -- truncated, emptied, all-comment, over-filtered.
+- **Every F2 gate row carries its denominator.** Two rows reading an identical 0.833 now render `25/30` and `5/6`; a gate with no meaningful count renders `n/a`, not `0/0`. All nine pairs were independently traced to the computations that produce them.
+- **V7 fails closed when zero negative controls were examined.** Confirmed by execution first: `acceptance_pass()` returned True at precision 1.0 / recall 1.0 / FP 0 while all five negatives were `verdict="missing"`.
+- **The five-site `enforce_non_vacuity` list is now a mechanism**, not a discipline -- an AST + heredoc static check that fires when an unguarded `.score` read is added, mutation-proved in both directions.
+
+**STILL NOT closed, and named so nobody reads the above as more than it is:**
+
+- **V7 still passes over POSITIVE probes it never examined.** Structurally identical to the negative-control defect just fixed, and untouched by it. A positive probe that never joins gets `verdict="missing"` -- counted in neither TP nor FN -- so it drops out of the recall denominator rather than counting against it, and `acceptance_pass()` has no missing-positives term. Verified 2026-08-05: 10 of 20 positives never joining still yields precision 1.000, recall 1.000, PASS, `--strict` exit 0. Recorded rather than fixed because it needs its own mutation proof and review. **Second-order risk from our own fix:** the report now renders a "Negative controls examined" row which, sitting beside symmetric-looking Precision and Recall rows, can imply examination is verified generally. It is verified only for negatives.
+- **`score_v8_probe_run.py` and `score_v9_predicate_run.py` are untouched.** V9 was independently re-verified to fail closed already; V8's audited problem was the misquoted `0.938`, not a scorer defect.
+- **The candidate-drop finding is untouched** (audit section 2.3): a candidate whose llama-server never becomes healthy is silently dropped from every scored table while still counted as a candidate.
+- **Past denominators remain unrecoverable.** Counts are printed going forward, not backward.
 - **Historical numbers are not invalidated, and their denominators are not recoverable.** The recorded F2 figures were computed from real data (none equal the vacuous defaults). But gate rows never printed counts, so whether the 0.83 relationship-precision near-miss rested on 25 comparisons or 5 cannot be recovered from the report as generated.
 - **`V8 0.938` should not be cited as evidence of model capability again.** It is a recall sub-metric from iter2, whose acceptance verdict was FAIL on over-extraction -- the exact defect class it was used to rule out. All four recorded V8 baselines show FAIL (`scripts/eval_harness/v8_probe_set_design.md:67-72`).
 
