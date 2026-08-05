@@ -396,6 +396,20 @@ class Report:
             return 1.0
         return self.specificity_numerator / self.specificity_denominator
 
+    @property
+    def vacuous(self) -> bool:
+        """True when this run read zero probes from the gold corpus.
+
+        Every per-metric property above (`entity_precision`, `rel_precision`,
+        `typing_accuracy`, `specificity`, ...) takes its vacuous default of 1.0
+        when its own denominator is 0, and `related_to_rate` takes 0.0 -- so a
+        zero-probe run renders as a wall of passing rows, not a wall of zeros.
+        This flag is the one field that is False by coincidence for a real run
+        and True by construction for a run that examined nothing, so a renderer
+        can say "no probes read" instead of printing those rows at all.
+        """
+        return self.total_probes == 0
+
 
 def _date_matches(expected: str | None, produced: Any) -> bool:
     if expected is None:
@@ -598,6 +612,17 @@ def render_markdown(report: Report) -> str:
     lines = [
         "# Extraction Accuracy Report (F2)",
         "",
+    ]
+    if report.vacuous:
+        lines += [
+            "**VACUOUS RUN -- 0 probes were read from the gold corpus. No gate "
+            "below was meaningfully evaluated and this is not a pass.** The "
+            "metric rows still render because every precision/recall/typing "
+            "ratio takes its no-denominator default (1.0, or 0.0 for RELATED_TO "
+            "rate) -- they reflect an empty corpus, not a successful run.",
+            "",
+        ]
+    lines += [
         f"- Probes: {report.total_probes} (matched in debug log: {report.matched_probes})",
         "",
         "| Metric | Value | Gate | Pass |",
@@ -638,6 +663,7 @@ def render_json(report: Report) -> str:
         {
             "total_probes": report.total_probes,
             "matched_probes": report.matched_probes,
+            "vacuous": report.vacuous,
             "entity_precision": report.entity_precision,
             "entity_recall": report.entity_recall,
             "rel_precision": report.rel_precision,
@@ -654,6 +680,12 @@ def render_json(report: Report) -> str:
 
 
 def _gates_pass(report: Report) -> bool:
+    if report.total_probes == 0:
+        # The join check below cannot catch this: on an empty corpus
+        # `matched_probes == total_probes` is `0 == 0`, and every precision
+        # and typing metric takes its vacuous default of 1.0. A wrong --gold
+        # path scored a full PASS until 2026-08-05.
+        return False
     return (
         report.matched_probes == report.total_probes  # a broken join must not pass
         and report.negative_violations == 0  # no hallucinated facts on negative controls
