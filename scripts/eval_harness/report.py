@@ -97,6 +97,11 @@ def _write_headline_table(
     candidate_by_id: dict[str, Any],
     test_order: list[str],
 ) -> None:
+    # No examined count on this column, deliberately: `quality` sums mean_score
+    # across tests whose examined units are incommensurable (entities for
+    # schema conformance, characters for coherence, a 0/1 flag for speed).
+    # A count here would look like a measurement and would not be one -- see
+    # `_render_test_cell` for the per-test count, which is comparable.
     lines.append("## Headline: Quality vs Speed")
     lines.append("")
     lines.append(
@@ -200,6 +205,9 @@ def _write_winners(
         examined = _render_examined(best_ts.examined_total)
         lines.append(f"- **{name}**: {display} ({best_score:.3f}, examined={examined})")
 
+    # No examined count here either, for the same reason as the headline
+    # table: aggregate_quality_score is a cross-test mean, and its inputs
+    # don't share a counting unit -- see the comment on _write_headline_table.
     best_overall_id: str | None = None
     best_overall_score = -1.0
     for candidate_id, scores in run_scores.per_candidate.items():
