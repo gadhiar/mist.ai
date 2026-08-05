@@ -463,28 +463,72 @@ def cmd_graph_backfill_bitemporal(args: argparse.Namespace) -> int:
         connection.disconnect()
 
 
-def _assert_replay_source_exists(db_path: str, label: str) -> None:
-    """Refuse a rebuild whose replay source is absent, rather than creating one.
+def _assert_replay_source_exists(db_path: str, label: str, required_table: str) -> None:
+    """Refuse a rebuild whose replay source is absent or unpopulated by schema.
 
-    Raises `ColdCacheError` so the CLI's existing REFUSED branch reports it as a
-    decision (exit 2) instead of surfacing a bare `sqlite3.OperationalError: no such
-    table` from the first read.
+    Checks the SCHEMA, not merely the path. An existence-only check let two realistic
+    states through, and the first is the common one:
+
+    - A machine that ran the PRE-FIX CLI has a store that `initialize()` created and
+      left empty. The file exists, so an existence check passes -- on exactly the
+      machines the original bug touched.
+    - A truncated, half-copied, or interrupted-`cp` file also passes `Path.exists()`.
+
+    In both cases the first read raised a bare `sqlite3.OperationalError: no such
+    table`, which `cmd_graph_rebuild_from_log` does not catch (it handles only
+    `RebuildTargetError`, `ColdCacheError` and `RebuildDeterminismError`), so it
+    escaped as a traceback -- the exact outcome this guard's docstring claimed to
+    prevent.
+
+    The connection is opened READ-ONLY via a `file:...?mode=ro` URI. That is not
+    decoration: `EventStore._get_connection` runs `PRAGMA journal_mode=WAL`, which
+    mutates a non-WAL database's header and creates `-wal`/`-shm` sidecars, so
+    checking through the normal path would make this guard itself a write.
 
     Args:
         db_path: Filesystem path to the SQLite store being replayed.
         label: Human name used in the refusal ("event store" / "extraction cache").
+        required_table: A table the store must already have for the replay to read it.
+
+    Raises:
+        ColdCacheError: When the file is missing, is not a readable SQLite database,
+            or lacks `required_table`. Raised so the CLI's REFUSED branch reports a
+            decision (exit 2) rather than surfacing a traceback.
     """
+    import sqlite3
     from pathlib import Path as _Path
 
     from backend.knowledge.regeneration.log_regenerator import ColdCacheError
 
+    _MISSING = (
+        "A rebuild REPLAYS an existing log and will not create one -- creating it here "
+        "would write to live state under a dry-run flag, and an empty store would then "
+        "be indistinguishable from a missing one. Point the config at the real store, "
+        "or run the traffic that populates it."
+    )
+
     if not _Path(db_path).exists():
+        raise ColdCacheError(f"No {label} at {db_path}. {_MISSING}")
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            found = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (required_table,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
         raise ColdCacheError(
-            f"No {label} at {db_path}. A rebuild REPLAYS an existing log and will not "
-            f"create one -- creating it here would write to live state under a dry-run "
-            f"flag, and an empty store would then be indistinguishable from a missing "
-            f"one. Point the config at the real store, or run the traffic that "
-            f"populates it."
+            f"The {label} at {db_path} is not a readable SQLite database ({exc}). {_MISSING}"
+        ) from exc
+
+    if found is None:
+        raise ColdCacheError(
+            f"The {label} at {db_path} has no `{required_table}` table, so it has never "
+            f"been initialized (a pre-fix run of this command created empty stores just "
+            f"like this). {_MISSING}"
         )
 
 
@@ -532,15 +576,15 @@ def _build_log_regenerator(
     extraction_cache = ExtractionCache(cache_path)
 
     # NEITHER store is initialize()d here, and that is the point. `initialize()` is a
-    # WRITE -- mkdir(parents=True), executescript(schema.sql), and a conditional
-    # `ALTER TABLE` migration (store.py:75-99) -- performed by a command whose entire
-    # advertised contract is "proof-first, dry-run only". Calling it also MANUFACTURED
-    # the absence it was meant to tolerate: on a machine with no event store it created
-    # an empty one and the run then reported "No epochs found", which reads identically
-    # to a store that exists and is empty. A rebuild replays an existing log; it does
-    # not bring one into being.
-    _assert_replay_source_exists(event_store_path, "event store")
-    _assert_replay_source_exists(cache_path, "extraction cache")
+    # WRITE -- mkdir(parents=True) at store.py:75, executescript(schema.sql) at :80, and
+    # TWO conditional `ALTER TABLE` migrations at :88-90 and :99-101 -- performed by a
+    # command whose entire advertised contract is "proof-first, dry-run only". Calling it
+    # also MANUFACTURED the absence it was meant to tolerate: on a machine with no event
+    # store it created an empty one and the run then reported "No epochs found", which
+    # reads identically to a store that exists and is empty. A rebuild replays an
+    # existing log; it does not bring one into being.
+    _assert_replay_source_exists(event_store_path, "event store", "epoch_ledger")
+    _assert_replay_source_exists(cache_path, "extraction cache", "extraction_cache")
 
     # Real embedding provider (all-MiniLM-L6-v2). Eager load is acceptable here:
     # this is an admin CLI (sync batch), NOT the async server event loop, so there

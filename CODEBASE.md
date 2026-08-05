@@ -50,26 +50,54 @@ touched), with staging Neo4j up:
 The two rows from one invocation are the doubling made visible. Live `re_extraction_jobs` was 0
 before this work and is 0 after; the defect was latent and never fired against live.
 
-**Three regression mechanisms, each mutation-proved in both directions.**
-`tests/unit/scripts/test_rebuild_cli_is_read_only.py` statically checks that
-`_build_log_regenerator` initializes neither store, guards both, and wires `NullRebuildJournal()`.
-Re-adding `initialize()`, dropping a guard, or swapping in a durable journal each fails exactly one
-test; restoring makes all three green. `RecordingEventStore` in `test_rebuild_scoping.py` also lost
-its job-write methods, so a regression that reaches for one now fails with `AttributeError`.
+**The precondition that makes those two numbers comparable, stated because omitting it made the
+record unreproducible.** Both runs were handed a MANUFACTURED `extraction_cache.db` in the copy
+directory, created by a separate harness command, because no production code path creates one
+(see the open item below). Without it the post-fix run refuses at `_assert_replay_source_exists`
+before `LogRegenerator` is constructed and returns `0` for an entirely different reason -- so a
+reader reproducing this from the original wording would have measured the refusal and read it as
+the fix. The whole-branch review raised precisely that (HIGH-2/F1). Re-verified 2026-08-05 with
+the cache present: the post-fix run prints `[rebuild] determinism gate PASSED (rebuild-twice
+byte-identical)` and exits 0, so the journal path WAS exercised and the `0` measures it. **The
+proof stands; the record of it was incomplete** -- the same defect class as the code bug, in the
+documentation.
+
+**Regression mechanisms, each mutation-proved in both directions.**
+`tests/unit/scripts/test_rebuild_cli_is_read_only.py` asserts BEHAVIOURALLY that
+`_build_log_regenerator` initializes neither replay source, refuses a missing/unschema'd/truncated
+one, and constructs a journal whose runtime `type` is `NullRebuildJournal`. Its first version
+checked those properties with `ast` and the review defeated all three with a single mutant that
+fully restored the live write -- by moving `initialize()` one frame out into a module-level helper
+(an AST rule scoped to one function stops at the frame boundary) and by
+`import EventStoreRebuildJournal as NullRebuildJournal` (the spelling the rule matched stayed
+identical while the object became durable and live-bound). Both mutants now fail. The file also
+carried a FALSE justification for going static -- that a behavioural test needed a model load and
+a live Neo4j -- which was never checked before being written; patching the function-local imports
+reaches it with neither. `RecordingEventStore` in `test_rebuild_scoping.py` also lost its
+job-write methods, so a regression that reaches for one fails with `AttributeError`.
 
 **STILL NOT closed, named so the above is not read as more than it is:**
 
-- **Nothing in production ever writes an extraction cache.** The only non-test `ExtractionCache(...)`
-  constructions are `mist_admin.py` (this read-only replay path) and `scripts/golden_log/generate.py:330`,
-  which writes `extraction-cache.db` at its own disposable root -- a DIFFERENT filename from the
-  `extraction_cache.db` the CLI derives. So on the live path the cache is permanently empty, and a
-  rebuild of a non-empty log would `ColdCacheError`. This was previously hidden: `initialize()`
-  created the empty file and the log being empty made coverage pass vacuously. The fix surfaces it
-  as a refusal instead. **Not a regression -- a pre-existing gap the fix stopped concealing.**
-- **The rebuild's determinism gate has been passing over an EMPTY corpus.** The live log holds 0
-  turns (`conversation_turn_events`: 0, `conversation_sessions`: 0), so "rebuild-twice
-  byte-identical" currently compares two empty graphs. Same vacuity class the 2026-08-05 scorer
-  audit closed for F2 and V7; not yet closed here.
+- **Nothing in production ever writes an extraction cache, so `graph-rebuild-from-log --dry-run`
+  is now UNCONDITIONALLY non-functional against any live-derived config.** `grep -rn
+  "ExtractionCache\|extraction_cache" backend/` returns zero hits; the only non-test
+  constructions are `mist_admin.py` (this read-only replay path) and
+  `scripts/golden_log/generate.py:330`, which writes `extraction-cache.db` at its own disposable
+  root -- a DIFFERENT filename from the `extraction_cache.db` the CLI derives. Every invocation
+  therefore hits `ColdCacheError` and exits 2. **An earlier draft of this entry said "a rebuild of
+  a non-empty log would ColdCacheError"; that condition was wrong in both directions** and the
+  review falsified it (F3). The guard tests schema, not coverage, so it fires on an empty log too;
+  and on a machine where the pre-fix `initialize()` already created an empty cache the old
+  existence-only check did NOT fire at all -- which is why the guard now checks for the required
+  table rather than the path. The refusal is correct, but **the R1.6 live==rebuilt closure gate
+  has no runnable path until a production writer for the extraction cache exists.** That
+  prerequisite is now the blocking item, and nothing else in the repo tracks it.
+- **The determinism gate compares two empty graphs whenever it can run at all.** The live log
+  holds 0 turns (`conversation_turn_events`: 0, `conversation_sessions`: 0), so "rebuild-twice
+  byte-identical" is vacuous over live data. Stated in the past/conditional tense deliberately:
+  the review falsified an earlier present-tense phrasing (F2), since after this branch the gate
+  is unreachable on a live config at all (previous bullet). Same vacuity class the 2026-08-05
+  scorer audit closed for F2 and V7; not closed here.
 - **`--dry-run` is still `required=True` and still never read** (audit Q1-3). It is no longer
   certifying something false, but it remains a flag that cannot alter control flow. A durable-journal
   branch was deliberately NOT added behind it -- that would be a dead branch justified by a future

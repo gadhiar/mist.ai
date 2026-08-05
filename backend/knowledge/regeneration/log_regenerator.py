@@ -15,8 +15,14 @@ That sentence was true and too narrow. It said nothing about the two SQLite
 stores this class also holds, and the event store is where the rebuild wrote its
 own job/checkpoint rows -- into whichever store it was handed, which for the CLI
 is the LIVE one. Progress now goes to an explicitly injected `journal` (see
-rebuild_journal.py); the `event_store` dependency is the replay SOURCE and is
-read from only. Neither isolation guard could have caught the old behaviour:
+rebuild_journal.py); the `event_store` dependency is the replay SOURCE and no
+row is ever written to it.
+
+Precisely "no rows", not "no bytes": `EventStore._get_connection` runs `PRAGMA
+journal_mode=WAL` on every open, which rewrites a non-WAL database's header and
+creates `-wal`/`-shm` sidecars. Harmless here -- the live store is already WAL --
+but stated exactly, because a too-broad sentence in this same docstring is what
+hid the original defect. Neither isolation guard could have caught that defect:
 both reason about bolt URIs and cannot see a SQLite path.
 """
 
@@ -31,6 +37,7 @@ from backend.errors import MistError
 from backend.knowledge.curation.pipeline import CurationResult
 from backend.knowledge.eval_isolation import assert_rebuild_target_not_live
 from backend.knowledge.extraction.validator import ValidationResult
+from backend.knowledge.regeneration.rebuild_journal import RebuildJournal
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
 logger = logging.getLogger(__name__)
@@ -88,7 +95,12 @@ class LogRegenerator:
     )
 
     def __init__(
-        self, *, event_store, extraction_cache, staging_curation_pipeline, journal
+        self,
+        *,
+        event_store,
+        extraction_cache,
+        staging_curation_pipeline,
+        journal: RebuildJournal,
     ) -> None:
         self._events = event_store
         self._cache = extraction_cache
@@ -237,7 +249,9 @@ class LogRegenerator:
 
         Raises:
             ColdCacheError: If any turn in the epoch is not in the extraction cache.
-            RebuildError: If resume_from is set but job_id is None.
+            RebuildError: If resume_from is set but job_id is None, or if resume_from
+                is set while `journal` is non-durable (no checkpoint rows were ever
+                persisted, so there is no cursor to resume against).
         """
         assert_rebuild_target_not_live(staging_uri, live_uri)
 
