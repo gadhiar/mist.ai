@@ -356,9 +356,19 @@ class Report:
         return self._pr(self.entity_tp, self.entity_fp, self.entity_fn)[0]
 
     @property
+    def entity_precision_denominator(self) -> int:
+        """Comparisons behind `entity_precision`: TP + FP produced entities."""
+        return self.entity_tp + self.entity_fp
+
+    @property
     def entity_recall(self) -> float:
         """Entity recall across all probes."""
         return self._pr(self.entity_tp, self.entity_fp, self.entity_fn)[1]
+
+    @property
+    def entity_recall_denominator(self) -> int:
+        """Comparisons behind `entity_recall`: TP + FN gold entities."""
+        return self.entity_tp + self.entity_fn
 
     @property
     def rel_precision(self) -> float:
@@ -366,9 +376,19 @@ class Report:
         return self._pr(self.rel_tp, self.rel_fp, self.rel_fn)[0]
 
     @property
+    def rel_precision_denominator(self) -> int:
+        """Comparisons behind `rel_precision`: TP + FP produced relationships."""
+        return self.rel_tp + self.rel_fp
+
+    @property
     def rel_recall(self) -> float:
         """Relationship recall across all probes."""
         return self._pr(self.rel_tp, self.rel_fp, self.rel_fn)[1]
+
+    @property
+    def rel_recall_denominator(self) -> int:
+        """Comparisons behind `rel_recall`: TP + FN gold relationships."""
+        return self.rel_tp + self.rel_fn
 
     @property
     def typing_accuracy(self) -> float:
@@ -601,11 +621,33 @@ def score_reconciliation() -> None:
     print("reconciliation-action accuracy: SKIPPED (requires C2 telemetry)", file=sys.stderr)
 
 
-def _row(name: str, value: float, gate: float | None, op: str) -> str:
+def _render_count(numerator: int | None, denominator: int | None) -> str:
+    """Render a gate's backing numerator/denominator, or `n/a` if absent.
+
+    Mirrors the None-vs-0 discipline established in eval_harness/report.py's
+    `_render_examined`: no count supplied (this gate has no denominator to
+    show) renders as `n/a`, distinct from a real denominator of `0` (counted,
+    found nothing), which renders as e.g. `0/0`.
+    """
+    if numerator is None or denominator is None:
+        return "n/a"
+    return f"{numerator}/{denominator}"
+
+
+def _row(
+    name: str,
+    value: float,
+    gate: float | None,
+    op: str,
+    *,
+    numerator: int | None = None,
+    denominator: int | None = None,
+) -> str:
+    count = _render_count(numerator, denominator)
     if gate is None:
-        return f"| {name} | {value:.3f} | - | - |"
+        return f"| {name} | {value:.3f} | {count} | - | - |"
     ok = value >= gate if op == ">=" else value <= gate
-    return f"| {name} | {value:.3f} | {op} {gate:.2f} | {'PASS' if ok else 'FAIL'} |"
+    return f"| {name} | {value:.3f} | {count} | {op} {gate:.2f} | {'PASS' if ok else 'FAIL'} |"
 
 
 def render_markdown(report: Report) -> str:
@@ -625,17 +667,74 @@ def render_markdown(report: Report) -> str:
     lines += [
         f"- Probes: {report.total_probes} (matched in debug log: {report.matched_probes})",
         "",
-        "| Metric | Value | Gate | Pass |",
-        "|---|---|---|---|",
-        _row("Entity precision", report.entity_precision, ENTITY_PRECISION_GATE, ">="),
-        _row("Entity recall", report.entity_recall, ENTITY_RECALL_GATE, ">="),
-        _row("Relationship precision", report.rel_precision, REL_PRECISION_GATE, ">="),
-        _row("Relationship recall", report.rel_recall, REL_RECALL_GATE, ">="),
-        _row("Typing accuracy", report.typing_accuracy, TYPING_ACCURACY_GATE, ">="),
-        _row("RELATED_TO rate", report.related_to_rate, RELATED_TO_RATE_LIMIT, "<="),
-        _row("Valid-time accuracy", report.valid_time_accuracy, None, ""),
-        _row("Specificity (leaf vs parent)", report.specificity, SPECIFICITY_FLOOR, ">="),
-        f"| Negative-control violations | {report.negative_violations} | == 0 | "
+        "| Metric | Value | Count | Gate | Pass |",
+        "|---|---|---|---|---|",
+        _row(
+            "Entity precision",
+            report.entity_precision,
+            ENTITY_PRECISION_GATE,
+            ">=",
+            numerator=report.entity_tp,
+            denominator=report.entity_precision_denominator,
+        ),
+        _row(
+            "Entity recall",
+            report.entity_recall,
+            ENTITY_RECALL_GATE,
+            ">=",
+            numerator=report.entity_tp,
+            denominator=report.entity_recall_denominator,
+        ),
+        _row(
+            "Relationship precision",
+            report.rel_precision,
+            REL_PRECISION_GATE,
+            ">=",
+            numerator=report.rel_tp,
+            denominator=report.rel_precision_denominator,
+        ),
+        _row(
+            "Relationship recall",
+            report.rel_recall,
+            REL_RECALL_GATE,
+            ">=",
+            numerator=report.rel_tp,
+            denominator=report.rel_recall_denominator,
+        ),
+        _row(
+            "Typing accuracy",
+            report.typing_accuracy,
+            TYPING_ACCURACY_GATE,
+            ">=",
+            numerator=report.typing_ok,
+            denominator=report.typing_total,
+        ),
+        _row(
+            "RELATED_TO rate",
+            report.related_to_rate,
+            RELATED_TO_RATE_LIMIT,
+            "<=",
+            numerator=report.related_to_count,
+            denominator=report.produced_rel_total,
+        ),
+        _row(
+            "Valid-time accuracy",
+            report.valid_time_accuracy,
+            None,
+            "",
+            numerator=report.valid_time_ok,
+            denominator=report.valid_time_total,
+        ),
+        _row(
+            "Specificity (leaf vs parent)",
+            report.specificity,
+            SPECIFICITY_FLOOR,
+            ">=",
+            numerator=report.specificity_numerator,
+            denominator=report.specificity_denominator,
+        ),
+        f"| Negative-control violations | {report.negative_violations} | "
+        f"{_render_count(report.negative_violations, report.negative_probes)} | == 0 | "
         f"{'PASS' if report.negative_violations == 0 else 'FAIL'} |",
         "",
         "## Assertion-kind buckets",
@@ -659,6 +758,13 @@ def render_markdown(report: Report) -> str:
 
 
 def render_json(report: Report) -> str:
+    """Render the machine-readable report, counts included.
+
+    `render_markdown`'s Count column and these fields read the same Report
+    attributes -- this is the durable artifact, so a ratio without its
+    backing numerator/denominator here is exactly as unfalsifiable as it
+    would be in the markdown table.
+    """
     return json.dumps(
         {
             "total_probes": report.total_probes,
@@ -666,12 +772,28 @@ def render_json(report: Report) -> str:
             "vacuous": report.vacuous,
             "entity_precision": report.entity_precision,
             "entity_recall": report.entity_recall,
+            "entity_tp": report.entity_tp,
+            "entity_fp": report.entity_fp,
+            "entity_fn": report.entity_fn,
             "rel_precision": report.rel_precision,
             "rel_recall": report.rel_recall,
+            "rel_tp": report.rel_tp,
+            "rel_fp": report.rel_fp,
+            "rel_fn": report.rel_fn,
             "typing_accuracy": report.typing_accuracy,
+            "typing_ok": report.typing_ok,
+            "typing_total": report.typing_total,
             "related_to_rate": report.related_to_rate,
+            "related_to_count": report.related_to_count,
+            "produced_rel_total": report.produced_rel_total,
             "valid_time_accuracy": report.valid_time_accuracy,
+            "valid_time_ok": report.valid_time_ok,
+            "valid_time_total": report.valid_time_total,
             "specificity": report.specificity,
+            "specificity_numerator": report.specificity_numerator,
+            "specificity_denominator": report.specificity_denominator,
+            "negative_probes": report.negative_probes,
+            "negative_violations": report.negative_violations,
             "assertion_kind_buckets": report.assertion_kind_buckets,
             "per_probe": report.per_probe,
         },
