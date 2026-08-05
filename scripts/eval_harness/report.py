@@ -340,13 +340,18 @@ def rescore_from_jsonl(
 def dump_run_scores_json(run_scores: RunScores, path: Path) -> None:
     """Dump RunScores to a JSON file for offline analysis.
 
-    This is the durable artifact: the markdown report gets regenerated, but
-    this file is what a future reader actually has when re-examining a past
-    run. `examined_total` rides `json.dumps` straight through -- Python's
-    `None` serializes to JSON `null` natively -- so `null` here means the
-    same thing it means in the markdown report: no case could report a
-    count. It must never read as `0`, which would claim a scorer looked and
-    found nothing when in fact it could not say.
+    No production code calls this today -- `run.py` writes only the markdown
+    report (`generate_markdown_report`, called from `main()`), and the
+    per-run durable artifact is `CaseResult.to_jsonl()`, written before
+    scoring runs and correctly carrying no examined count at that stage.
+    This function stays correct for whenever it is wired rather than closing
+    a live gap.
+
+    `examined_total` rides `json.dumps` straight through -- Python's `None`
+    serializes to JSON `null` natively -- so `null` here means the same
+    thing it means in the markdown report: no case could report a count. It
+    must never read as `0`, which would claim a scorer looked and found
+    nothing when in fact it could not say.
     """
     payload: dict[str, Any] = {"per_candidate": {}}
     for candidate_id, scores in run_scores.per_candidate.items():
