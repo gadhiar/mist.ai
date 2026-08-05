@@ -75,6 +75,30 @@ Rules:
 
 ---
 
+## Plan Verification Protocol
+
+Implementation plans and design specs assert things about the codebase -- "X has no caller," "this would create a cycle," "that branch varies per turn." **Those assertions get executed by people and agents who will not re-derive them.** A false one propagates into code, tests that certify it, and a docstring that documents it.
+
+This is not hypothetical. On 2026-08-04, R1.4.6 T0 shipped with **five falsified rationales** on one branch: four in the plan, and a fifth inside the fix for the other four. In every case the CONCLUSION was correct and the STATED REASON was invented rather than checked. Each fell to a few seconds of `grep`. Two of them (`audio_queue` having no writer, `process_audio_chunk` having no caller) were **already documented in `KNOWN_ISSUES.md:114-118`** -- the information was in the repo and nobody looked.
+
+The diagnosis is specific and worth stating, because it makes the rule actionable: **every falsified claim was about code the author had not opened.** The claims about code that HAD been read -- the three deliberate non-resets in `reset_connection_state` -- were correct and survived two independent reviews. Same author, same session, same confidence in the prose. The only variable was whether the file had been read. Uniform confidence over non-uniform verification is what makes the bad claims indistinguishable from the good ones.
+
+### Rules
+
+- **Every causal claim about the codebase carries the command that establishes it.** Not "no cycle exists" but ``no cycle: `grep '^from\|^import' backend/chat/stream_events.py` -> dataclasses, typing only``. If you cannot produce the command, you have not checked -- and you find that out while writing, not two hours later in review.
+- **Before mandating work on any attribute or method, grep `KNOWN_ISSUES.md` for it.** It is a backlog of known-dead and known-broken things. It is cheap to search and it is routinely not searched.
+- **Run a claim-check pass before dispatching a plan.** One agent, one job: extract every factual assertion about the codebase from the plan and verify each against source. This is mechanical and cheap. It is the same work a whole-branch reviewer does -- but before any implementer builds on a false premise, rather than after commits, task reviews, a fix wave, and follow-up corrections.
+- **State unverified claims as unverified.** If a conclusion is right but you have not established why, say so ("do not reset this -- reason not verified") rather than supplying a plausible mechanism. A missing reason is a prompt to check; a wrong reason is a trap.
+
+### Why the fix belongs upstream, not in more review
+
+The reviews on that branch worked -- every finding was caught. **Scoped per-task review structurally CANNOT catch this class**, because the deadness lives outside the diff: you cannot see that `audio_queue` has no producer by reading a diff that adds a consumer to it. Only the whole-branch gate could, and it did. So:
+
+- **Never waive the whole-branch review gate.** 2026-08-03 recorded "no independent review verdict exists for this branch" as not-done rather than waived; 2026-08-04 is the concrete case for why that bar is right.
+- **Do not answer this failure mode with more downstream review layers.** That makes the late catch more expensive without moving it earlier.
+
+---
+
 ## Project Context
 
 ### Current Architecture (Updated: 2026-05-11)
