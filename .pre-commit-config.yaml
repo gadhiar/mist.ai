@@ -35,7 +35,10 @@ repos:
     rev: v2.2.6
     hooks:
       - id: codespell
-        args: [--ignore-words-list=crate,nd,te,thre,hass,bloc,lod]
+        # No inline --ignore-words-list: pyproject.toml's [tool.codespell] is the
+        # single source of truth. The inline copy overrode it and had drifted
+        # (pyproject listed 'deriver', the inline args did not).
+        additional_dependencies: ["tomli"]
         exclude: ^(dependencies/|\.git/|\.venv/)
 
   # AI slop detection (runs only on changed files)

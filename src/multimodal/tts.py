@@ -37,8 +37,9 @@ def _load_finetuned_csm(weights_path: str, device: str = "cuda"):
     _ensure_csm_path()
     from generator import Generator
     from huggingface_hub import hf_hub_download
-    from models import Model, ModelArgs
     from safetensors.torch import load_file
+
+    from models import Model, ModelArgs
 
     # Load base model architecture and weights from HuggingFace
     base_path = hf_hub_download(repo_id="sesame/csm-1b", filename="model.safetensors")

@@ -218,4 +218,4 @@ skips = ["B101"]  # Skip assert_used (we use asserts appropriately)
 
 [tool.codespell]
 skip = "*.git,*.venv,venv,*.pyc,*.egg-info,*.lock,dependencies"
-ignore-words-list = "crate,nd,te,thre,hass,bloc,lod,deriver"
+ignore-words-list = "crate,nd,te,thre,hass,bloc,lod,deriver,retuned"

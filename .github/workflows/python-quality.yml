@@ -1,25 +1,39 @@
+# CI runs the SAME hooks, at the SAME pinned versions, as the local pre-commit gate.
+#
+# This file used to install its own linters unpinned:
+#
+#     pip install black ruff mypy bandit[toml] codespell
+#
+# while `.pre-commit-config.yaml` pinned black 24.1.1 / ruff v0.1.15 / bandit 1.7.6 /
+# codespell v2.2.6. So the two gates enforced DIFFERENT rules, and the CI side changed
+# whenever an upstream release shipped -- with nothing in this repository changing. That
+# is how pushes started failing on already-committed, locally-clean code: black 24.1.1
+# accepts `backend/event_store/store.py` and `backend/vault/sidecar_index.py`; black
+# 26.3.1 reformats both under the 2024 stable multiline-string style. Same files, same
+# pyproject.toml, different tool version.
+#
+# Running `pre-commit run --all-files` makes that drift structurally impossible rather
+# than something two lists have to be kept in sync on: there is now exactly one place
+# where a linter version is declared, and it is the file developers already run against.
+# Bumping a hook becomes a deliberate edit to `.pre-commit-config.yaml`, visible in review.
 name: Python Code Quality
 
 on:
   push:
-    branches: [main, feat/**, dev/**]
-    paths:
-      - 'backend/**'
-      - 'scripts/**'
-      - '**.py'
-      - 'requirements.txt'
-      - 'pyproject.toml'
+    # Every branch. The previous filter was [main, feat/**, dev/**], which silently
+    # skipped the gate on the `fix/**` and `chore/**` prefixes this repo also uses --
+    # so a branch could be developed and merged having never been checked.
+    branches: ['**']
   pull_request:
     branches: [main]
-    paths:
-      - 'backend/**'
-      - 'scripts/**'
-      - '**.py'
-      - 'requirements.txt'
-      - 'pyproject.toml'
+
+# No `paths:` filter. The gate now covers markdown, YAML, TOML and JSON as well as
+# Python (codespell, check-yaml, check-toml, check-json, the AI-slop check), so
+# restricting it to Python paths would let those hooks pass by never running.
 
 jobs:
-  lint-and-format:
+  quality:
+    name: pre-commit (all files)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -31,51 +45,27 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install black ruff mypy bandit[toml] codespell
+      - name: Install pre-commit
+        run: python -m pip install --upgrade pip pre-commit
 
-      - name: Check code formatting with Black
-        run: |
-          black --check backend/ scripts/
-          if [ $? -ne 0 ]; then
-            echo "Code is not formatted. Run: black backend/ scripts/"
-            exit 1
-          fi
+      # Hook environments are expensive to build and change only when the config
+      # does, so key the cache on the config hash.
+      - name: Cache pre-commit environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-py3.11-${{ hashFiles('.pre-commit-config.yaml') }}
 
-      - name: Lint with Ruff
-        run: |
-          ruff check backend/ scripts/
-          if [ $? -ne 0 ]; then
-            echo "Linting issues found. Run: ruff check backend/ scripts/ --fix"
-            exit 1
-          fi
+      - name: Run all hooks
+        run: pre-commit run --all-files --show-diff-on-failure
 
-      - name: Type check with mypy (optional, continue on error)
-        run: |
-          mypy backend/ --follow-imports=silent || echo "Type checking found issues (non-blocking)"
-        continue-on-error: true
-
-      - name: Security scan with Bandit
-        run: |
-          bandit -c pyproject.toml -r backend/ scripts/
-          if [ $? -ne 0 ]; then
-            echo "Security issues found. Review output above."
-            exit 1
-          fi
-
-      - name: Spell check with codespell
-        run: |
-          codespell --skip="*.git,*.venv,venv,*.pyc,*.egg-info,*.lock,dependencies" --ignore-words-list="crate,nd,te,thre,hass,bloc,lod"
-          if [ $? -ne 0 ]; then
-            echo "Spelling errors found. Review output above."
-            exit 1
-          fi
-
-  test:
+  # mypy is NOT a pre-commit hook and is advisory only, exactly as it was before this
+  # file was rewritten. It is kept as its own non-blocking job so its findings stay
+  # visible without gating a merge -- dropping it would have silently narrowed coverage.
+  types:
+    name: mypy (advisory)
     runs-on: ubuntu-latest
-    if: false  # Disabled until tests are added
+    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -86,10 +76,8 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+      - name: Install mypy
+        run: python -m pip install --upgrade pip mypy
 
-      - name: Run tests
-        run: |
-          pytest tests/ -v --cov=backend --cov-report=term-missing
+      - name: Type check
+        run: mypy backend/ --follow-imports=silent || echo "Type checking found issues (non-blocking)"

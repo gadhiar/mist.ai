@@ -19,7 +19,6 @@ from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSIO
 from scripts.golden_log.generate import (
     ARTIFACT_PATH,
     EVENT_ID_PREFIX,
-    SCHEDULE_PATH,
     GoldenLogError,
     assert_isolated_root,
     build_golden_turns,
