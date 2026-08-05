@@ -175,6 +175,34 @@ class V7Report:
         return sum(1 for o in self.outcomes if o.verdict == "missing")
 
     @property
+    def examined_negatives(self) -> int:
+        """Count of negative probes actually joined to a debug-JSONL turn.
+
+        A negative probe with no matching observation reports verdict=
+        "missing" and is neither `true_negatives` nor `false_positives` --
+        it was listed in the input, not adjudicated. This is the count of
+        negatives that resolved to a real tn/fp verdict, i.e. were actually
+        examined.
+        """
+        return self.true_negatives + self.false_positives
+
+    @property
+    def negatives_vacuous(self) -> bool:
+        """True when zero negative-control probes were ever examined.
+
+        `false_positives <= NEGATIVE_FALSE_POSITIVE_LIMIT` (0 <= 0) is
+        trivially satisfied both when every negative correctly stayed
+        silent and when every negative never joined a debug-JSONL record at
+        all -- `false_positives` alone cannot tell "checked, found nothing
+        wrong" apart from "never checked." This flag is computed directly
+        from `examined_negatives` on every call, never defaulted or left
+        unpopulated on some code path, so a reader cannot mistake "did not
+        examine" for "examined, found zero" -- the exact footgun documented
+        on `backend/knowledge/seed/gates.py`'s `GateResult.examined`.
+        """
+        return self.examined_negatives == 0
+
+    @property
     def precision(self) -> float:
         """TP / (TP + FP). 0.0 when no tools fired (no decisions to score)."""
         denom = self.true_positives + self.false_positives
@@ -187,11 +215,18 @@ class V7Report:
         return self.true_positives / denom if denom else 0.0
 
     def acceptance_pass(self) -> bool:
-        """True when precision, recall, and the negative-FP rule all clear."""
+        """True when precision, recall, the negative-FP rule, and non-vacuity all clear.
+
+        A negative-control block that examined zero negatives
+        (`negatives_vacuous`) must fail here even though
+        `false_positives <= NEGATIVE_FALSE_POSITIVE_LIMIT` is trivially true
+        at 0 -- zero examined is not zero violations.
+        """
         return (
             self.precision >= PRECISION_THRESHOLD
             and self.recall >= RECALL_THRESHOLD
             and self.false_positives <= NEGATIVE_FALSE_POSITIVE_LIMIT
+            and not self.negatives_vacuous
         )
 
 
@@ -384,7 +419,8 @@ def render_markdown(report: V7Report) -> str:
         f"{report.acceptable_true_positives} acceptable (dual-accept fallback)"
     )
     lines.append(
-        f"- False positives on negatives: " f"{report.false_positives} / {len(report.negatives)}"
+        f"- False positives on negatives: {report.false_positives} / {len(report.negatives)} "
+        f"({report.examined_negatives} examined)"
     )
     lines.append("")
     lines.append("## Acceptance Criteria")
@@ -392,11 +428,17 @@ def render_markdown(report: V7Report) -> str:
     p_ok = report.precision >= PRECISION_THRESHOLD
     r_ok = report.recall >= RECALL_THRESHOLD
     n_ok = report.false_positives <= NEGATIVE_FALSE_POSITIVE_LIMIT
+    neg_examined_ok = not report.negatives_vacuous
     lines.append(f"- [{'PASS' if p_ok else 'FAIL'}] Precision >= {PRECISION_THRESHOLD}")
     lines.append(f"- [{'PASS' if r_ok else 'FAIL'}] Recall >= {RECALL_THRESHOLD}")
     lines.append(
         f"- [{'PASS' if n_ok else 'FAIL'}] "
         f"False positives on negatives <= {NEGATIVE_FALSE_POSITIVE_LIMIT}"
+    )
+    lines.append(
+        f"- [{'PASS' if neg_examined_ok else 'FAIL'}] "
+        f"Negative controls examined ({report.examined_negatives}/{len(report.negatives)} > 0) "
+        "-- zero examined is not zero violations"
     )
     lines.append("")
     lines.append(f"**Verdict:** {'PASS' if report.acceptance_pass() else 'FAIL'}")
@@ -461,6 +503,7 @@ def render_json(report: V7Report) -> str:
             "fn": report.false_negatives,
             "tn": report.true_negatives,
             "fp": report.false_positives,
+            "examined_negatives": report.examined_negatives,
         },
         "headline": {
             "precision": report.precision,
@@ -473,6 +516,7 @@ def render_json(report: V7Report) -> str:
             "precision_threshold": PRECISION_THRESHOLD,
             "recall_threshold": RECALL_THRESHOLD,
             "negative_fp_limit": NEGATIVE_FALSE_POSITIVE_LIMIT,
+            "negatives_vacuous": report.negatives_vacuous,
             "passed": report.acceptance_pass(),
         },
         "outcomes": [

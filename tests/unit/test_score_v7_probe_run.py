@@ -811,13 +811,21 @@ class TestRenderMarkdown:
     """Markdown rendering surfaces the load-bearing fields."""
 
     def test_includes_pass_verdict_when_clean(self):
+        # A real PASS requires an examined (not just present) negative
+        # control -- see TestNegativeControlNonVacuity. A report with zero
+        # negatives can never legitimately PASS after that fix.
         report = V7Report(
             outcomes=[
                 ProbeOutcome(
                     probe=build_probe(),
                     observation=build_observation(),
                     verdict="tp",
-                )
+                ),
+                ProbeOutcome(
+                    probe=build_probe(tag="v7-21-neg-x", utterance="C", expected_tool=None),
+                    observation=build_observation(utterance="C", tool_calls=()),
+                    verdict="tn",
+                ),
             ]
         )
 
@@ -852,13 +860,20 @@ class TestRenderJson:
     """JSON rendering round-trips outcomes and acceptance metadata."""
 
     def test_json_structure(self):
+        # A real PASS requires an examined (not just present) negative
+        # control -- see TestNegativeControlNonVacuity.
         report = V7Report(
             outcomes=[
                 ProbeOutcome(
                     probe=build_probe(),
                     observation=build_observation(),
                     verdict="tp",
-                )
+                ),
+                ProbeOutcome(
+                    probe=build_probe(tag="v7-21-neg-x", utterance="C", expected_tool=None),
+                    observation=build_observation(utterance="C", tool_calls=()),
+                    verdict="tn",
+                ),
             ]
         )
 
@@ -868,7 +883,7 @@ class TestRenderJson:
         assert payload["headline"]["precision"] == 1.0
         assert payload["acceptance"]["precision_threshold"] == PRECISION_THRESHOLD
         assert payload["acceptance"]["passed"] is True
-        assert len(payload["outcomes"]) == 1
+        assert len(payload["outcomes"]) == 2
         assert payload["outcomes"][0]["verdict"] == "tp"
 
 
@@ -881,6 +896,10 @@ class TestCLI:
     """End-to-end CLI behavior with synthetic input + debug files."""
 
     def _setup_files(self, tmp_path: Path, *, fire_tool: bool) -> tuple[Path, Path]:
+        # Includes one negative-control probe (v7-21) that always joins and
+        # stays silent, independent of `fire_tool` -- a real PASS requires
+        # at least one examined negative (see TestNegativeControlNonVacuity),
+        # and `fire_tool` only varies the positive probe's outcome.
         input_path = tmp_path / "v7.jsonl"
         debug_path = tmp_path / "debug.jsonl"
         write_jsonl(
@@ -893,7 +912,12 @@ class TestCLI:
                         "tool_call": "query_knowledge_graph",
                         "rationale": "direct recall",
                     },
-                }
+                },
+                {
+                    "utterance": "What is the capital of France?",
+                    "tag": "v7-21-neg-general-knowledge",
+                    "expected_behavior": {"tool_call": None},
+                },
             ],
         )
         tool_calls = [["query_knowledge_graph"]] if fire_tool else [[]]
@@ -904,7 +928,12 @@ class TestCLI:
                     utterance="What languages do I use?",
                     session_id="v7-test",
                     tool_calls_per_pass=tool_calls,
-                )
+                ),
+                make_turn_record(
+                    utterance="What is the capital of France?",
+                    session_id="v7-test",
+                    tool_calls_per_pass=[[]],
+                ),
             ],
         )
         return input_path, debug_path
