@@ -338,13 +338,28 @@ def rescore_from_jsonl(
 
 
 def dump_run_scores_json(run_scores: RunScores, path: Path) -> None:
-    """Dump RunScores to a JSON file for offline analysis."""
+    """Dump RunScores to a JSON file for offline analysis.
+
+    This is the durable artifact: the markdown report gets regenerated, but
+    this file is what a future reader actually has when re-examining a past
+    run. `examined_total` rides `json.dumps` straight through -- Python's
+    `None` serializes to JSON `null` natively -- so `null` here means the
+    same thing it means in the markdown report: no case could report a
+    count. It must never read as `0`, which would claim a scorer looked and
+    found nothing when in fact it could not say.
+    """
     payload: dict[str, Any] = {"per_candidate": {}}
     for candidate_id, scores in run_scores.per_candidate.items():
         payload["per_candidate"][candidate_id] = {
             "mean_tokens_per_second": scores.mean_tokens_per_second,
             "p50_total_time_ms": scores.p50_total_time_ms,
             "p95_total_time_ms": scores.p95_total_time_ms,
+            # No aggregate examined_total here, for the same reason the
+            # headline table and "Overall quality leader" omit one: this
+            # quality score is a cross-test mean, and the per-test examined
+            # counts it draws on do not share a unit (entities, characters,
+            # a 0/1 flag). Aggregating them would look like a measurement
+            # and would not be one. The real count is per_test below.
             "aggregate_quality_score": scores.aggregate_quality_score(),
             "error_count": scores.error_count,
             "per_test": {
@@ -353,6 +368,7 @@ def dump_run_scores_json(run_scores: RunScores, path: Path) -> None:
                     "pass_count": ts.pass_count,
                     "fail_count": ts.fail_count,
                     "error_count": ts.error_count,
+                    "examined_total": ts.examined_total,
                 }
                 for name, ts in scores.per_test.items()
             },

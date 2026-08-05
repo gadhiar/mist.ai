@@ -10,12 +10,15 @@ one from being unfalsifiable.
 builds its cells inline inside `_write_per_test_matrix`. This suite extracts
 and tests `_render_test_cell` (the matrix cell for one candidate/test pair)
 and `_render_examined` (the shared None-vs-0 rendering rule), then verifies
-the same rule reaches the two other places a `TestScores`/`CaseScore` score is
-printed: the winners section and the failure drill-down.
+the same rule reaches every other place a `TestScores`/`CaseScore` score is
+printed: the per-test matrix itself (wired, not just the extracted cell),
+the winners section, the failure drill-down, and the JSON dump consumed by
+offline analysis.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -28,7 +31,9 @@ from eval_harness.report import (  # noqa: E402  -- after sys.path insertion
     _render_examined,
     _render_test_cell,
     _write_failure_drill_down,
+    _write_per_test_matrix,
     _write_winners,
+    dump_run_scores_json,
 )
 from eval_harness.scorers import (  # noqa: E402  -- after sys.path insertion
     CandidateScores,
@@ -152,3 +157,103 @@ def test_failure_drill_down_shows_examined_count():
 
     rendered = "\n".join(lines)
     assert "examined=5" in rendered
+
+
+def test_per_test_matrix_shows_examined_count():
+    """Prove the count reaches the actual rendered matrix, not just the
+    extracted `_render_test_cell` helper it is built from.
+
+    A helper that is correct and called from nowhere verified is the exact
+    defect class this branch removes -- this is the flagship rendering site
+    and needs its own wiring-level proof, not just unit coverage of the cell.
+    """
+    ts = _TestScores(test_name="relationship_precision")
+    ts.case_scores.append(
+        CaseScore(
+            candidate_id="c1",
+            test_name="relationship_precision",
+            case_id="k1",
+            iteration=1,
+            passed=True,
+            score=0.83,
+            breakdown={},
+            examined=25,
+            error=None,
+        )
+    )
+    ts.pass_count = 1
+    candidate_scores = CandidateScores(candidate_id="c1", per_test={"relationship_precision": ts})
+    run_scores = RunScores(per_candidate={"c1": candidate_scores})
+
+    lines: list[str] = []
+    _write_per_test_matrix(
+        lines, run_scores, candidate_by_id={}, test_order=["relationship_precision"]
+    )
+
+    rendered = "\n".join(lines)
+    assert "examined=25" in rendered
+
+
+def test_dump_run_scores_json_includes_examined_total(tmp_path):
+    """The JSON dump is the durable artifact -- the audit's 0.83 near-miss is
+    unrecoverable today precisely because this file has no examined count.
+    Markdown falsifiability does not help a reader working from the JSON.
+    """
+    ts = _TestScores(test_name="relationship_precision")
+    ts.case_scores.append(
+        CaseScore(
+            candidate_id="c1",
+            test_name="relationship_precision",
+            case_id="k1",
+            iteration=1,
+            passed=True,
+            score=0.83,
+            breakdown={},
+            examined=25,
+            error=None,
+        )
+    )
+    ts.pass_count = 1
+    candidate_scores = CandidateScores(candidate_id="c1", per_test={"relationship_precision": ts})
+    run_scores = RunScores(per_candidate={"c1": candidate_scores})
+    out_path = tmp_path / "scores.json"
+
+    dump_run_scores_json(run_scores, out_path)
+
+    payload = json.loads(out_path.read_text(encoding="utf-8"))
+    per_test = payload["per_candidate"]["c1"]["per_test"]["relationship_precision"]
+    assert per_test["examined_total"] == 25
+
+
+def test_dump_run_scores_json_renders_none_as_null_not_zero(tmp_path):
+    """None must survive serialization as JSON `null`, not collapse to `0` --
+    the same distinction the markdown report preserves, at the boundary where
+    it matters most: the artifact a future reader actually has.
+    """
+    ts = _TestScores(test_name="coherence")
+    ts.case_scores.append(
+        CaseScore(
+            candidate_id="c1",
+            test_name="coherence",
+            case_id="k1",
+            iteration=1,
+            passed=True,
+            score=1.0,
+            breakdown={},
+            examined=None,
+            error=None,
+        )
+    )
+    ts.pass_count = 1
+    candidate_scores = CandidateScores(candidate_id="c1", per_test={"coherence": ts})
+    run_scores = RunScores(per_candidate={"c1": candidate_scores})
+    out_path = tmp_path / "scores.json"
+
+    dump_run_scores_json(run_scores, out_path)
+
+    raw_text = out_path.read_text(encoding="utf-8")
+    payload = json.loads(raw_text)
+    per_test = payload["per_candidate"]["c1"]["per_test"]["coherence"]
+    assert per_test["examined_total"] is None
+    assert '"examined_total": null' in raw_text
+    assert '"examined_total": 0' not in raw_text
