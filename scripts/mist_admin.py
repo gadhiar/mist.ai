@@ -463,6 +463,31 @@ def cmd_graph_backfill_bitemporal(args: argparse.Namespace) -> int:
         connection.disconnect()
 
 
+def _assert_replay_source_exists(db_path: str, label: str) -> None:
+    """Refuse a rebuild whose replay source is absent, rather than creating one.
+
+    Raises `ColdCacheError` so the CLI's existing REFUSED branch reports it as a
+    decision (exit 2) instead of surfacing a bare `sqlite3.OperationalError: no such
+    table` from the first read.
+
+    Args:
+        db_path: Filesystem path to the SQLite store being replayed.
+        label: Human name used in the refusal ("event store" / "extraction cache").
+    """
+    from pathlib import Path as _Path
+
+    from backend.knowledge.regeneration.log_regenerator import ColdCacheError
+
+    if not _Path(db_path).exists():
+        raise ColdCacheError(
+            f"No {label} at {db_path}. A rebuild REPLAYS an existing log and will not "
+            f"create one -- creating it here would write to live state under a dry-run "
+            f"flag, and an empty store would then be indistinguishable from a missing "
+            f"one. Point the config at the real store, or run the traffic that "
+            f"populates it."
+        )
+
+
 def _build_log_regenerator(
     be: Any, staging_conn: Any, epoch_id: int | None
 ) -> tuple[LogRegenerator, dict[str, Any]]:
@@ -478,7 +503,8 @@ def _build_log_regenerator(
     embeddings are deterministic for identical input text, so rebuild-twice
     determinism still holds. EventStore and ExtractionCache are constructed from
     config paths (defaulting to ~/.mist/ siblings when the config carries no
-    explicit override).
+    explicit override) and are READ-ONLY replay sources: the regenerator's own
+    job/checkpoint rows go to a `NullRebuildJournal`, never to the live ledger.
 
     Returns (LogRegenerator, epoch_dict).
     """
@@ -489,21 +515,32 @@ def _build_log_regenerator(
     from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
     from backend.knowledge.extraction_cache import ExtractionCache
     from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
+    from backend.knowledge.regeneration.rebuild_journal import NullRebuildJournal
     from backend.knowledge.storage.graph_executor import GraphExecutor
     from backend.knowledge.storage.graph_store import GraphStore
 
     config = be.get_config()
 
     # EventStore: use config path or fall back to the default ~/.mist/event_store.db.
+    # Both spellings are LIVE state, so this store is a replay SOURCE only -- see the
+    # `journal=` argument below.
     event_store_path = config.event_store.db_path or str(_Path.home() / ".mist" / "event_store.db")
     event_store = EventStore(event_store_path)
-    # initialize() is idempotent: safe against a pre-existing store.
-    event_store.initialize()
 
     # ExtractionCache: lives alongside the event store db.
     cache_path = str(_Path(event_store_path).parent / "extraction_cache.db")
     extraction_cache = ExtractionCache(cache_path)
-    extraction_cache.initialize()
+
+    # NEITHER store is initialize()d here, and that is the point. `initialize()` is a
+    # WRITE -- mkdir(parents=True), executescript(schema.sql), and a conditional
+    # `ALTER TABLE` migration (store.py:75-99) -- performed by a command whose entire
+    # advertised contract is "proof-first, dry-run only". Calling it also MANUFACTURED
+    # the absence it was meant to tolerate: on a machine with no event store it created
+    # an empty one and the run then reported "No epochs found", which reads identically
+    # to a store that exists and is empty. A rebuild replays an existing log; it does
+    # not bring one into being.
+    _assert_replay_source_exists(event_store_path, "event store")
+    _assert_replay_source_exists(cache_path, "extraction cache")
 
     # Real embedding provider (all-MiniLM-L6-v2). Eager load is acceptable here:
     # this is an admin CLI (sync batch), NOT the async server event loop, so there
@@ -525,6 +562,15 @@ def _build_log_regenerator(
         event_store=event_store,
         extraction_cache=extraction_cache,
         staging_curation_pipeline=pipeline,
+        # The dry-run proof is not a rebuild of record: nothing reads its job rows
+        # (`get_reextraction_job` has no production caller), and `_build_once` runs
+        # twice per invocation, so a durable journal here would append two
+        # `rebuild-<epoch>-<uuid>` rows plus a checkpoint per turn to the LIVE ledger
+        # every time the determinism gate is run. Wired unconditionally rather than
+        # behind `args.dry_run` because dry-run is the ONLY mode this command has
+        # (`--dry-run` is `required=True`); a durable branch here would be a dead
+        # branch justifying itself with a future caller.
+        journal=NullRebuildJournal(),
     )
 
     # Resolve epoch -- raise ColdCacheError so the handler's REFUSED branch fires.

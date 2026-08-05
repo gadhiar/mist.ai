@@ -81,7 +81,10 @@ class TestSelfModelCopyForward:
         )
 
         regen = LogRegenerator(
-            event_store=None, extraction_cache=None, staging_curation_pipeline=None
+            event_store=None,
+            extraction_cache=None,
+            staging_curation_pipeline=None,
+            journal=None,  # these two methods never journal
         )
         copied = regen.copy_self_model_partition(src, dst)
         rederived = regen.rederive_self_model_cross_layer_edges(src, dst)
@@ -120,7 +123,10 @@ class TestSelfModelCopyForward:
             {},
         )
         regen = LogRegenerator(
-            event_store=None, extraction_cache=None, staging_curation_pipeline=None
+            event_store=None,
+            extraction_cache=None,
+            staging_curation_pipeline=None,
+            journal=None,  # these two methods never journal
         )
         regen.copy_self_model_partition(src, dst)
         rederived = regen.rederive_self_model_cross_layer_edges(src, dst)

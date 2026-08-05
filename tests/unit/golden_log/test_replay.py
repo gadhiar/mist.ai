@@ -38,6 +38,7 @@ from backend.knowledge.regeneration.rebuild_gate import (
     RebuildDeterminismError,
     assert_rebuild_twice_identical,
 )
+from backend.knowledge.regeneration.rebuild_journal import EventStoreRebuildJournal
 from scripts.golden_log.generate import build_golden_turns, materialize_isolated
 from scripts.golden_log.native_shape import native_predicate, native_properties
 
@@ -131,6 +132,7 @@ async def replay_golden_log(root, turns=None) -> tuple[Any, RecordingCurationPip
     regenerator = LogRegenerator(
         event_store=materialized.event_store,
         extraction_cache=materialized.extraction_cache,
+        journal=EventStoreRebuildJournal(materialized.event_store),
         staging_curation_pipeline=recorder,
     )
     report = await regenerator.rebuild(
@@ -170,6 +172,7 @@ class TestTheOriginGuardIsLoadBearing:
         regenerator = LogRegenerator(
             event_store=materialized.event_store,
             extraction_cache=materialized.extraction_cache,
+            journal=EventStoreRebuildJournal(materialized.event_store),
             staging_curation_pipeline=recorder,
         )
 
@@ -231,6 +234,7 @@ class TestCacheCoverage:
         regenerator = LogRegenerator(
             event_store=materialized.event_store,
             extraction_cache=materialized.extraction_cache,
+            journal=EventStoreRebuildJournal(materialized.event_store),
             staging_curation_pipeline=RecordingCurationPipeline(),
         )
 
@@ -257,6 +261,7 @@ class TestCacheCoverage:
         regenerator = LogRegenerator(
             event_store=materialized.event_store,
             extraction_cache=materialized.extraction_cache,
+            journal=EventStoreRebuildJournal(materialized.event_store),
             staging_curation_pipeline=RecordingCurationPipeline(),
         )
 
@@ -288,6 +293,7 @@ class TestCacheCoverage:
         regenerator = LogRegenerator(
             event_store=materialized.event_store,
             extraction_cache=materialized.extraction_cache,
+            journal=EventStoreRebuildJournal(materialized.event_store),
             staging_curation_pipeline=RecordingCurationPipeline(),
         )
 

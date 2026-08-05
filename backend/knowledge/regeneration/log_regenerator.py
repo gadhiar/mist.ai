@@ -8,8 +8,16 @@ Each result is curated + reconciled into staging via the existing
 self-model copy-forward + cross-layer re-derivation (R1.2 Task 4) and the
 build-then-swap CUTOVER (deferred) are separate.
 
-The rebuild NEVER writes to the live graph: `assert_rebuild_target_not_live`
+The rebuild NEVER writes to the live GRAPH: `assert_rebuild_target_not_live`
 gates the staging URI, and the live `source` connection is read-only.
+
+That sentence was true and too narrow. It said nothing about the two SQLite
+stores this class also holds, and the event store is where the rebuild wrote its
+own job/checkpoint rows -- into whichever store it was handed, which for the CLI
+is the LIVE one. Progress now goes to an explicitly injected `journal` (see
+rebuild_journal.py); the `event_store` dependency is the replay SOURCE and is
+read from only. Neither isolation guard could have caught the old behaviour:
+both reason about bolt URIs and cannot see a SQLite path.
 """
 
 from __future__ import annotations
@@ -57,8 +65,11 @@ class RebuildReport:
 class LogRegenerator:
     """Rebuilds a staging entity graph from the event log + extraction cache.
 
-    Dependencies are injected (DI rule): the event store, the extraction cache,
-    and a curation pipeline already wired to the STAGING graph store.
+    Dependencies are injected (DI rule): the event store to replay FROM, the
+    extraction cache, a curation pipeline already wired to the STAGING graph
+    store, and the journal its own progress rows are written TO. The last one is
+    required precisely because the first must be the live store -- see
+    rebuild_journal.py.
     """
 
     # Intra-self-model edges (both endpoints in :__SelfModel__) -- copied verbatim.
@@ -76,10 +87,18 @@ class LogRegenerator:
         "IMPLEMENTED_WITH",
     )
 
-    def __init__(self, *, event_store, extraction_cache, staging_curation_pipeline) -> None:
+    def __init__(
+        self, *, event_store, extraction_cache, staging_curation_pipeline, journal
+    ) -> None:
         self._events = event_store
         self._cache = extraction_cache
         self._curation = staging_curation_pipeline
+        # `journal` is REQUIRED, not defaulted to `event_store`. A default is what
+        # the bug looked like: the replay source must be the LIVE store, so any
+        # implicit "journal into the store you were given" sends a dry-run proof's
+        # job rows straight to the live ledger. Every caller now states where its
+        # progress goes. See rebuild_journal.py.
+        self._journal = journal
 
     def _assert_cache_coverage(self, turns: list[dict], epoch: dict) -> None:
         uncached = [
@@ -230,6 +249,17 @@ class LogRegenerator:
                 "Pass the original job_id returned by the initial rebuild call."
             )
 
+        # A resume reads a cursor the journal was supposed to have persisted. A
+        # non-durable journal never wrote one, so the resume would silently replay
+        # from `resume_from` against a job row that does not exist and report
+        # success. Refuse instead of half-honouring it.
+        if resume_from is not None and not self._journal.durable:
+            raise RebuildError(
+                f"Cannot resume with a non-durable journal ({type(self._journal).__name__}): "
+                "no checkpoint rows were ever written, so there is no cursor to resume "
+                "against. Resume requires a durable journal (EventStoreRebuildJournal)."
+            )
+
         # The scoping ontology_version comes from the epoch ROW, not from
         # `backend.knowledge.version_stamps.ONTOLOGY_VERSION`. This is not a
         # style preference. The cache keys below are derived from
@@ -280,7 +310,7 @@ class LogRegenerator:
             if job_id is None:
                 job_id = f"rebuild-{epoch['epoch_id']}-{uuid.uuid4().hex[:8]}"
             started_at = turns[0]["timestamp"] if turns else epoch["activated_at"]
-            self._events.create_reextraction_job(
+            self._journal.create(
                 job_id=job_id,
                 target_ontology_version=epoch["ontology_version"],
                 source_ontology_version=None,
@@ -319,10 +349,10 @@ class LogRegenerator:
                 collected_errors.extend(result.stage_errors)
             processed += 1
             last_ts = turn["timestamp"]
-            self._events.checkpoint_reextraction_job(job_id, turn["event_id"], processed, last_ts)
+            self._journal.checkpoint(job_id, turn["event_id"], processed, last_ts)
 
         final_status = "failed" if turns_failed else "completed"
-        self._events.finalize_reextraction_job(
+        self._journal.finalize(
             job_id=job_id,
             status=final_status,
             failed=turns_failed,
