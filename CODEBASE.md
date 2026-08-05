@@ -1,6 +1,26 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-08-04 (**R1.4.6 T0 -- singleton per-session state sweep -- COMPLETE and ff-merged to `main`. This is the last prerequisite before the R1.4.6 T2/T3 hydrator, which needs a multi-session corpus authored WITH Raj.**
+**Last Updated:** 2026-08-04 (**Eval-harness scorer audit + the non-vacuity fix for `scorers.py` COMPLETE and ff-merged. R1.4.6 T0 landed earlier the same day. Next: the R1.4.6 T2/T3 hydrator, which needs a multi-session corpus authored WITH Raj.**
+
+---
+
+## Eval-harness scorers: what is closed and what is NOT
+
+**Stated precisely, because the temptation to write "scorer vacuity closed" is exactly the defect this work removed.**
+
+**Closed** for the seven scorers in `scripts/eval_harness/scorers.py` (`cf48440..842bb90`, suite 2926 -> 2952):
+
+- Each returns a `ScoreOutcome` carrying `examined: int | None`, and `enforce_non_vacuity()` forces a fail at `examined == 0`. `None` (cannot count) stays distinct from `0` (looked, found nothing) end to end -- guard, aggregation, markdown, and JSON `null`.
+- **All five dispatch sites are guarded**, not one. The whole-branch gate found the guard applied only in `_ingest_record` while four sites read `.score` raw -- including the **D2 kill-switch** that decides whether phases D3-D5 run, where a candidate extracting nothing scored 1.0 and the switch did not trip. Fixed, with a test that extracts the live heredoc from `phase3_orchestrator.sh` and proves the behaviour by subprocess.
+- `SCORER_EXAMINES` declares what each count counts, guarded by a test that fails when a scorer is added without one -- mutation-proved in both directions.
+- Reports and `dump_run_scores_json` print the count, so a score and its denominator travel together.
+
+**NOT closed, and named so nobody reads the above as more than it is:**
+
+- **The four standalone probe scorers are untouched** -- `score_extraction_run.py` (F2) and `score_v7/v8/v9_probe_run.py`. They share no code with `scorers.py`. F2 still passes every gate vacuously on an empty gold corpus, **triggerable by a config or path error alone**, and its negative-control claims remain unfalsifiable for any past run. V7 can still print PASS with zero negative-control probes examined. Full detail: `docs/superpowers/specs/2026-08-04-eval-harness-scorer-audit.md` sections 2.1-2.2.
+- **The five-site guard list is hand-maintained.** `enforce_non_vacuity`'s docstring says so honestly, but that is a stated discipline, not a mechanism -- nothing fails if a sixth site is added unguarded. The analogous fix is a static check, as `SCORER_EXAMINES` got.
+- **Historical numbers are not invalidated, and their denominators are not recoverable.** The recorded F2 figures were computed from real data (none equal the vacuous defaults). But gate rows never printed counts, so whether the 0.83 relationship-precision near-miss rested on 25 comparisons or 5 cannot be recovered from the report as generated.
+- **`V8 0.938` should not be cited as evidence of model capability again.** It is a recall sub-metric from iter2, whose acceptance verdict was FAIL on over-extraction -- the exact defect class it was used to rule out. All four recorded V8 baselines show FAIL (`scripts/eval_harness/v8_probe_set_design.md:67-72`).
 
 **VERIFIED STATE (2026-08-04, every row re-read from source at branch close, not carried forward):**
 
