@@ -113,8 +113,11 @@ def load_d5_jsonls(phase_d5_dir: Path) -> dict[str, CandidateAggregate]:
             expected = rec.get("expected") or {}
             try:
                 # scorer() returns a ScoreOutcome (not a 3-tuple) as of
-                # 2026-08-04's non-vacuity work; read .score off it directly.
-                score = scorer(rec, expected).score
+                # 2026-08-04's non-vacuity work. Routed through
+                # enforce_non_vacuity the same way _ingest_record is in
+                # scorers.py, so a vacuous extraction scores 0.0 here too
+                # instead of the raw, unguarded ScoreOutcome value.
+                score = scorers.enforce_non_vacuity(scorer(rec, expected)).score
             except (KeyError, ValueError, TypeError):
                 # Matches the exception set _ingest_record uses for the same
                 # call in scorers.py -- a scorer crashing on malformed real

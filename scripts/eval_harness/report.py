@@ -97,11 +97,12 @@ def _write_headline_table(
     candidate_by_id: dict[str, Any],
     test_order: list[str],
 ) -> None:
-    # No examined count on this column, deliberately: `quality` sums mean_score
-    # across tests whose examined units are incommensurable (entities for
-    # schema conformance, characters for coherence, a 0/1 flag for speed).
-    # A count here would look like a measurement and would not be one -- see
-    # `_render_test_cell` for the per-test count, which is comparable.
+    # No examined count on this column, deliberately: `quality` averages
+    # mean_score across tests whose examined units are incommensurable
+    # (entities for schema conformance, characters for coherence, a 0/1 flag
+    # for speed). A count here would look like a measurement and would not
+    # be one -- see `_render_test_cell` for the per-test count, which is
+    # comparable.
     lines.append("## Headline: Quality vs Speed")
     lines.append("")
     lines.append(

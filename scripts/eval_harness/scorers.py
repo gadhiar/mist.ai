@@ -176,10 +176,19 @@ class ScoreOutcome:
 def enforce_non_vacuity(outcome: ScoreOutcome) -> ScoreOutcome:
     """Refuse a pass that examined nothing.
 
-    Applied centrally at the dispatch site rather than inside each scorer, so a
-    scorer added later cannot forget it. The registry declaration in
-    `SCORER_EXAMINES` plus its guard test is what makes that coverage real
-    rather than assumed.
+    Called explicitly at each of this project's scorer-dispatch sites --
+    `_ingest_record` below, `exoneration_verdict.py`, and the three scoring
+    blocks in `phase3_orchestrator.sh` -- rather than folded into each
+    scorer, so a scorer added later cannot forget it at any one of them.
+
+    That list is maintained by hand, not enforced: nothing currently fails a
+    build if a new dispatch site reads `.score` off a `ScoreOutcome` without
+    routing through this function first. Four of the five sites above were
+    missed this way on 2026-08-04 and fixed after a whole-branch review, not
+    before -- `SCORER_EXAMINES` and its guard test only check that a scorer
+    name has a declared examined-count meaning, not that every caller
+    applies this guard. Grep for raw `.score` reads on `ScoreOutcome`-typed
+    values before trusting that a new dispatch site is covered.
     """
     if outcome.examined is None:
         return replace(outcome, breakdown={**outcome.breakdown, "examined_unknown": True})
@@ -695,9 +704,11 @@ def score_schema_conformance_lenient(
     proxied["response_content"] = cleaned
     outcome = score_schema_conformance(proxied, expected)
     breakdown = {**outcome.breakdown, "lenient_repairs_applied": cleaned != raw}
-    # examined: identical to the strict scorer's count. This wrapper only
-    # repairs the raw string before delegating -- it inspects the same
-    # entities/relationships the strict scorer counted.
+    # examined: this delegates to the strict scorer, but on the repaired
+    # response, not the raw one -- so it is strict's count of the REPAIRED
+    # extraction, which can exceed what strict would report on the raw
+    # response. That gap is precisely the malformed-but-repairable case this
+    # variant exists to handle, not an edge case to gloss over.
     return ScoreOutcome(
         passed=outcome.passed, score=outcome.score, breakdown=breakdown, examined=outcome.examined
     )
@@ -724,7 +735,11 @@ SCORER_REGISTRY: dict[str, Scorer] = {
 # ship an uninterpretable count.
 SCORER_EXAMINES: dict[str, str] = {
     "schema_conformance": "entities plus relationships in the parsed extraction",
-    "schema_conformance_lenient": "entities and relationships after repair, same count as strict",
+    "schema_conformance_lenient": (
+        "entities plus relationships in the repaired extraction -- can exceed "
+        "strict's count on the same input when repair recovers content strict "
+        "could not parse at all"
+    ),
     "tool_selection": "1 when no-call expected; else tool name (0/1) plus argument keys compared",
     "personality": "characters in the response content checked against style markers",
     "rag_integration": "gold facts checked for recall, forbidden facts for false positives",

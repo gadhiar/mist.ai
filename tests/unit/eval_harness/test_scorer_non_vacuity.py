@@ -19,6 +19,8 @@ floor rather than a rewrite.
 
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -143,3 +145,60 @@ def test_every_scorer_declares_what_examined_means():
 
     for name, description in SCORER_EXAMINES.items():
         assert len(description) >= 20, f"{name}'s declaration is too short to be useful"
+
+
+def _extract_heredoc(source: str, start_marker: str) -> str:
+    """Pull one `python <<PYEOF ... PYEOF` block's body out of orchestrator shell source.
+
+    The D2 kill-switch is embedded Python inside phase3_orchestrator.sh, not an
+    importable function -- there is nothing to `import` and call directly. This
+    reads the block out of the live file at test time, so the test exercises
+    exactly what the shell script would run, and fails if a future edit strips
+    `enforce_non_vacuity` from that block, not just from a copy pasted into this
+    test file.
+    """
+    start = source.index(start_marker) + len(start_marker)
+    end = source.index("\nPYEOF", start)
+    return source[start:end]
+
+
+def test_d2_kill_switch_does_not_score_a_vacuous_extraction_as_a_pass(tmp_path):
+    """The D2 kill-switch decides whether phases D3-D5 run at all.
+
+    Before this branch's fix, this block read `.score` off a raw ScoreOutcome:
+    an empty extraction scored 1.0 (the audit's own canonical vacuous example,
+    reproduced verbatim in this file's module docstring) and the kill-switch
+    would never trip on it. It must now score 0.0.
+    """
+    orchestrator_path = _REPO_ROOT / "scripts" / "eval_harness" / "phase3_orchestrator.sh"
+    source = orchestrator_path.read_text(encoding="utf-8")
+    heredoc = _extract_heredoc(source, "local best_schema; best_schema=$(python <<PYEOF\n")
+    assert "enforce_non_vacuity" in heredoc, "guard is missing from the extracted block"
+
+    candidate_id = "vacuous-candidate"
+    jsonl_path = tmp_path / f"{candidate_id}.jsonl"
+    jsonl_path.write_text(
+        json.dumps(
+            {
+                "test_name": "schema_conformance",
+                "response_content": '{"entities": [], "relationships": []}',
+                "expected": {},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    script = heredoc.replace("${d2_result_dir}", str(tmp_path)).replace(
+        "${best_gemma_d2}", candidate_id
+    )
+
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "0.000"

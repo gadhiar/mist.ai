@@ -300,8 +300,10 @@ for jsonl in d.glob("*.jsonl"):
             continue
         try:
             # scorer() returns a ScoreOutcome, not a 3-tuple, as of the
-            # 2026-08-04 non-vacuity work.
-            score = scorer(r, r.get("expected") or {}).score
+            # 2026-08-04 non-vacuity work. Routed through
+            # enforce_non_vacuity the same way _ingest_record is in
+            # scorers.py, so a vacuous extraction scores 0.0 here too.
+            score = scorers.enforce_non_vacuity(scorer(r, r.get("expected") or {})).score
             scores.append(float(score))
         except (KeyError, ValueError, TypeError):
             # Same exception set _ingest_record uses for this call in
@@ -440,8 +442,10 @@ for jsonl in d.glob("*.jsonl"):
             continue
         try:
             # scorer() returns a ScoreOutcome, not a 3-tuple, as of the
-            # 2026-08-04 non-vacuity work.
-            score = scorer(r, r.get("expected") or {}).score
+            # 2026-08-04 non-vacuity work. Routed through
+            # enforce_non_vacuity the same way _ingest_record is in
+            # scorers.py, so a vacuous extraction scores 0.0 here too.
+            score = scorers.enforce_non_vacuity(scorer(r, r.get("expected") or {})).score
             scores.append(float(score))
         except (KeyError, ValueError, TypeError):
             # Same exception set _ingest_record uses for this call in
@@ -480,8 +484,13 @@ else:
             continue
         try:
             # score_schema_conformance() returns a ScoreOutcome, not a
-            # 3-tuple, as of the 2026-08-04 non-vacuity work.
-            score = scorers.score_schema_conformance(r, r.get("expected") or {}).score
+            # 3-tuple, as of the 2026-08-04 non-vacuity work. Routed
+            # through enforce_non_vacuity: this is the D2 kill-switch, and
+            # a vacuous extraction must score 0.0 here, not 1.0, or the
+            # kill-switch never trips.
+            score = scorers.enforce_non_vacuity(
+                scorers.score_schema_conformance(r, r.get("expected") or {})
+            ).score
             scores.append(float(score))
         except (KeyError, ValueError, TypeError):
             # Same exception set _ingest_record uses for this call in
