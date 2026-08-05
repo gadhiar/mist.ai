@@ -22,7 +22,7 @@ import logging
 import re
 import statistics
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -147,6 +147,49 @@ class CaseScore:
     score: float
     breakdown: dict[str, Any]
     error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ScoreOutcome:
+    """One scorer's verdict, carrying how much it looked at.
+
+    `examined` is the count of items the scorer actually inspected -- entities
+    and relationships for schema conformance, expected tool calls for tool
+    selection, and so on. It exists because a scorer built from
+    `len(bad_things) == 0` checks passes vacuously on an empty input: verified
+    2026-08-04, an empty extraction scored (True, 1.0) on schema conformance.
+
+    `None` and `0` are DIFFERENT facts and must not be collapsed. `0` means the
+    scorer looked and found nothing to check, which is a hard failure. `None`
+    means the scorer has no way to count its own input, which is a declared gap
+    -- visible in the breakdown, but not a failure, because failing it would
+    make such scorers permanently red and train readers to ignore the signal.
+    """
+
+    passed: bool
+    score: float
+    breakdown: dict[str, Any]
+    examined: int | None
+
+
+def enforce_non_vacuity(outcome: ScoreOutcome) -> ScoreOutcome:
+    """Refuse a pass that examined nothing.
+
+    Applied centrally at the dispatch site rather than inside each scorer, so a
+    scorer added later cannot forget it. The registry declaration in
+    `SCORER_EXAMINES` plus its guard test is what makes that coverage real
+    rather than assumed.
+    """
+    if outcome.examined is None:
+        return replace(outcome, breakdown={**outcome.breakdown, "examined_unknown": True})
+    if outcome.examined == 0:
+        return replace(
+            outcome,
+            passed=False,
+            score=0.0,
+            breakdown={**outcome.breakdown, "vacuous": True},
+        )
+    return outcome
 
 
 @dataclass(slots=True)
