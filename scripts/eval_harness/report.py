@@ -21,7 +21,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from scripts.eval_harness.scorers import RunScores
+from scripts.eval_harness.scorers import RunScores, TestScores
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +145,7 @@ def _write_per_test_matrix(
             if ts is None:
                 row += " n/a |"
             else:
-                row += f" {ts.mean_score:.2f} ({ts.pass_count}/{ts.pass_count + ts.fail_count}) |"
+                row += f" {_render_test_cell(ts)} |"
         lines.append(row)
     lines.append("")
 
@@ -184,6 +184,7 @@ def _write_winners(
     lines.append("")
     for name in test_order:
         best_id: str | None = None
+        best_ts: TestScores | None = None
         best_score = -1.0
         for candidate_id, scores in run_scores.per_candidate.items():
             ts = scores.per_test.get(name)
@@ -192,10 +193,12 @@ def _write_winners(
             if ts.mean_score > best_score:
                 best_score = ts.mean_score
                 best_id = candidate_id
-        if best_id is None:
+                best_ts = ts
+        if best_id is None or best_ts is None:
             continue
         display = _display_name(best_id, candidate_by_id)
-        lines.append(f"- **{name}**: {display} ({best_score:.3f})")
+        examined = _render_examined(best_ts.examined_total)
+        lines.append(f"- **{name}**: {display} ({best_score:.3f}, examined={examined})")
 
     best_overall_id: str | None = None
     best_overall_score = -1.0
@@ -246,7 +249,8 @@ def _write_failure_drill_down(
             lines.append(f"**{test_name}** — {ts.fail_count} failures")
             lines.append("")
             for cs in failures:
-                lines.append(f"- `{cs.case_id}` score={cs.score:.2f}")
+                examined = _render_examined(cs.examined)
+                lines.append(f"- `{cs.case_id}` score={cs.score:.2f} (examined={examined})")
                 if cs.error:
                     lines.append(f"  - error: `{cs.error}`")
                 errors = cs.breakdown.get("errors")
@@ -280,6 +284,29 @@ def _write_raw_data_pointer(lines: list[str], report_path: Path) -> None:
 def _display_name(candidate_id: str, candidate_by_id: dict[str, Any]) -> str:
     c = candidate_by_id.get(candidate_id)
     return c.display_name if c is not None else candidate_id
+
+
+def _render_examined(value: int | None) -> str:
+    """Render an examined count, keeping `None` distinct from `0`.
+
+    `0` means a scorer looked and found nothing to check -- a real,
+    reportable fact. `None` means a scorer could not count its own input --
+    a declared gap. Collapsing both to `0` would erase that distinction and
+    reintroduce the unfalsifiable reports this field exists to prevent.
+    """
+    return "n/a" if value is None else str(value)
+
+
+def _render_test_cell(ts: TestScores) -> str:
+    """Render one candidate's score for one test, with its examined count.
+
+    A score without its denominator is not falsifiable after the fact: a
+    mean of 0.83 rests on a different claim if it came from 25 comparisons
+    than if it came from 5, and this cell is where that claim gets read.
+    """
+    total = ts.pass_count + ts.fail_count
+    examined = _render_examined(ts.examined_total)
+    return f"{ts.mean_score:.2f} ({ts.pass_count}/{total}, examined={examined})"
 
 
 # ---------------------------------------------------------------------------
