@@ -299,9 +299,14 @@ for jsonl in d.glob("*.jsonl"):
         if not scorer:
             continue
         try:
-            _, score, _ = scorer(r, r.get("expected") or {})
+            # scorer() returns a ScoreOutcome, not a 3-tuple, as of the
+            # 2026-08-04 non-vacuity work.
+            score = scorer(r, r.get("expected") or {}).score
             scores.append(float(score))
-        except Exception:
+        except (KeyError, ValueError, TypeError):
+            # Same exception set _ingest_record uses for this call in
+            # scorers.py; anything outside it is a real bug and should
+            # propagate rather than silently zero the score.
             scores.append(0.0)
     if scores:
         results[jsonl.stem] = statistics.fmean(scores)
@@ -434,9 +439,14 @@ for jsonl in d.glob("*.jsonl"):
         if not scorer:
             continue
         try:
-            _, score, _ = scorer(r, r.get("expected") or {})
+            # scorer() returns a ScoreOutcome, not a 3-tuple, as of the
+            # 2026-08-04 non-vacuity work.
+            score = scorer(r, r.get("expected") or {}).score
             scores.append(float(score))
-        except Exception:
+        except (KeyError, ValueError, TypeError):
+            # Same exception set _ingest_record uses for this call in
+            # scorers.py; anything outside it is a real bug and should
+            # propagate rather than silently zero the score.
             scores.append(0.0)
     if scores:
         results[jsonl.stem] = statistics.fmean(scores)
@@ -469,9 +479,14 @@ else:
         if r.get("test_name") != "schema_conformance":
             continue
         try:
-            _, score, _ = scorers.score_schema_conformance(r, r.get("expected") or {})
+            # score_schema_conformance() returns a ScoreOutcome, not a
+            # 3-tuple, as of the 2026-08-04 non-vacuity work.
+            score = scorers.score_schema_conformance(r, r.get("expected") or {}).score
             scores.append(float(score))
-        except Exception:
+        except (KeyError, ValueError, TypeError):
+            # Same exception set _ingest_record uses for this call in
+            # scorers.py; anything outside it is a real bug and should
+            # propagate rather than silently zero the score.
             scores.append(0.0)
     print(f"{statistics.fmean(scores):.3f}" if scores else "0.0")
 PYEOF

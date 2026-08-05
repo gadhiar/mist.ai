@@ -112,8 +112,15 @@ def load_d5_jsonls(phase_d5_dir: Path) -> dict[str, CandidateAggregate]:
                 continue
             expected = rec.get("expected") or {}
             try:
-                _, score, _ = scorer(rec, expected)
-            except Exception:  # noqa: BLE001
+                # scorer() returns a ScoreOutcome (not a 3-tuple) as of
+                # 2026-08-04's non-vacuity work; read .score off it directly.
+                score = scorer(rec, expected).score
+            except (KeyError, ValueError, TypeError):
+                # Matches the exception set _ingest_record uses for the same
+                # call in scorers.py -- a scorer crashing on malformed real
+                # data is a real signal and should not vanish into a bare
+                # except; anything outside this set is a genuine bug and
+                # should propagate rather than being silently zeroed.
                 score = 0.0
             per_iter_buffer.setdefault(test_name, {}).setdefault(rec.get("case_id", ""), []).append(
                 float(score)

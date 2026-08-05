@@ -146,6 +146,7 @@ class CaseScore:
     passed: bool
     score: float
     breakdown: dict[str, Any]
+    examined: int | None
     error: str | None
 
 
@@ -217,6 +218,18 @@ class TestScores:
             return 0.0
         return self.pass_count / total
 
+    @property
+    def examined_total(self) -> int | None:
+        """Sum of examined counts, or None if no case could report one.
+
+        None propagates rather than reading as 0: a test whose scorers cannot
+        count must not be reported as having examined nothing.
+        """
+        counts = [cs.examined for cs in self.case_scores if cs.examined is not None]
+        if not counts:
+            return None
+        return sum(counts)
+
 
 @dataclass(slots=True)
 class CandidateScores:
@@ -283,16 +296,14 @@ class RunScores:
 # ---------------------------------------------------------------------------
 
 
-Scorer = Callable[[dict[str, Any], dict[str, Any]], tuple[bool, float, dict[str, Any]]]
+Scorer = Callable[[dict[str, Any], dict[str, Any]], ScoreOutcome]
 
 
-def score_schema_conformance(
-    result: dict[str, Any], expected: dict[str, Any]
-) -> tuple[bool, float, dict[str, Any]]:
+def score_schema_conformance(result: dict[str, Any], expected: dict[str, Any]) -> ScoreOutcome:
     """Score a JSON extraction response against MIST's ontology.
 
-    Returns a (passed, score, breakdown) triple where score in [0, 1] is
-    the mean of five structural checks:
+    Returns a ScoreOutcome where score in [0, 1] is the mean of five
+    structural checks:
       1. JSON parses successfully.
       2. Top-level schema has `entities` (list) and `relationships` (list).
       3. Every entity type is in the extractable set.
@@ -312,15 +323,19 @@ def score_schema_conformance(
     parsed = _parse_json_lenient(raw)
     if parsed is None:
         breakdown["errors"].append("JSON parse failed")
-        return False, 0.0, breakdown
+        # examined=0: nothing parsed, so there is no entities/relationships
+        # list to count. Already a hard fail; the guard changes nothing here.
+        return ScoreOutcome(passed=False, score=0.0, breakdown=breakdown, examined=0)
     breakdown["json_valid"] = True
 
     if not isinstance(parsed, dict) or "entities" not in parsed or "relationships" not in parsed:
         breakdown["errors"].append("missing entities/relationships keys")
-        return False, 0.2, breakdown
+        # examined=0: shape is wrong, so there is nothing to count items from
+        # -- same reasoning as the JSON-parse-failure branch above.
+        return ScoreOutcome(passed=False, score=0.2, breakdown=breakdown, examined=0)
     if not isinstance(parsed["entities"], list) or not isinstance(parsed["relationships"], list):
         breakdown["errors"].append("entities/relationships not lists")
-        return False, 0.2, breakdown
+        return ScoreOutcome(passed=False, score=0.2, breakdown=breakdown, examined=0)
     breakdown["schema_shape_ok"] = True
 
     bad_entity_types: list[str] = []
@@ -395,12 +410,16 @@ def score_schema_conformance(
         score = 0.5 * score + 0.5 * recall_avg
         passed = passed and recall_avg >= 0.8
 
-    return passed, score, breakdown
+    # examined = len(entities) + len(relationships): the graph elements this
+    # scorer actually inspected while building bad_entity_types /
+    # bad_relationship_types / unresolved_refs above. A structurally valid but
+    # empty extraction (`{"entities": [], "relationships": []}`) examines 0 --
+    # the exact input the audit found scoring a vacuous (True, 1.0).
+    examined = len(parsed["entities"]) + len(parsed["relationships"])
+    return ScoreOutcome(passed=passed, score=score, breakdown=breakdown, examined=examined)
 
 
-def score_tool_selection(
-    result: dict[str, Any], expected: dict[str, Any]
-) -> tuple[bool, float, dict[str, Any]]:
+def score_tool_selection(result: dict[str, Any], expected: dict[str, Any]) -> ScoreOutcome:
     """Score a tool-calling response against expected tool name + args."""
     tool_calls = result.get("response_tool_calls") or []
     expected_tool_name: str | None = expected.get("tool_name")
@@ -414,33 +433,49 @@ def score_tool_selection(
     }
 
     if expected_no_call:
+        # examined=1 either way: the one criterion checked is "did any tool
+        # call occur." A correct no-call is a real, deliberate pass -- not
+        # vacuous -- so it must not examine 0.
         if len(tool_calls) == 0:
-            return True, 1.0, breakdown
+            return ScoreOutcome(passed=True, score=1.0, breakdown=breakdown, examined=1)
         breakdown["errors"] = ["expected no tool call but model produced one"]
-        return False, 0.0, breakdown
+        return ScoreOutcome(passed=False, score=0.0, breakdown=breakdown, examined=1)
 
     if not tool_calls:
+        # examined=0: no call was expected to be absent, none arrived, so
+        # there is no name or argument to compare against. Already a hard
+        # fail; the guard changes nothing here.
         breakdown["errors"] = ["no tool_calls in response"]
-        return False, 0.0, breakdown
+        return ScoreOutcome(passed=False, score=0.0, breakdown=breakdown, examined=0)
 
     first = tool_calls[0]
     actual_name = first.get("name", "")
     breakdown["actual_tool_name"] = actual_name
     name_match = expected_tool_name is None or actual_name == expected_tool_name
+    # name_examined is 1 only when an expected name was actually supplied --
+    # `expected_tool_name is None` short-circuits name_match to True without
+    # comparing anything, so that case examines nothing on the name axis.
+    name_examined = 1 if expected_tool_name is not None else 0
     if not name_match:
         breakdown["errors"] = [
             f"tool name mismatch: expected {expected_tool_name} got {actual_name}"
         ]
-        return False, 0.0, breakdown
+        return ScoreOutcome(passed=False, score=0.0, breakdown=breakdown, examined=name_examined)
 
     if expected_args is None:
-        return True, 1.0, breakdown
+        # examined=name_examined: if expected_tool_name was also None here,
+        # `expected` supplied no criteria at all and this scorer validated
+        # nothing -- examined=0 lets the non-vacuity guard catch that, closing
+        # the same "expected={}" vacuous-pass hole the audit found in
+        # schema_conformance (this branch used to return (True, 1.0)
+        # unconditionally regardless of whether anything was checked).
+        return ScoreOutcome(passed=True, score=1.0, breakdown=breakdown, examined=name_examined)
 
     try:
         actual_args = json.loads(first.get("arguments_json") or "{}")
     except json.JSONDecodeError:
         breakdown["errors"] = ["tool arguments_json is not valid JSON"]
-        return False, 0.25, breakdown
+        return ScoreOutcome(passed=False, score=0.25, breakdown=breakdown, examined=name_examined)
 
     breakdown["actual_args"] = actual_args
     arg_hits = 0
@@ -451,12 +486,17 @@ def score_tool_selection(
     arg_score = arg_hits / arg_total if arg_total else 1.0
     breakdown["arg_score"] = arg_score
     passed = name_match and arg_score >= 0.75
-    return passed, 0.5 + 0.5 * arg_score, breakdown
+    # examined = name_examined + arg_total: every criterion this call actually
+    # compared. If expected_tool_name was unset and expected_args == {}
+    # (present but empty), examined is 0 -- nothing was really compared, same
+    # vacuous shape as above.
+    examined = name_examined + arg_total
+    return ScoreOutcome(
+        passed=passed, score=0.5 + 0.5 * arg_score, breakdown=breakdown, examined=examined
+    )
 
 
-def score_personality(
-    result: dict[str, Any], expected: dict[str, Any]
-) -> tuple[bool, float, dict[str, Any]]:
+def score_personality(result: dict[str, Any], expected: dict[str, Any]) -> ScoreOutcome:
     """Score a response against personality markers and length envelope."""
     content = result.get("response_content", "").strip()
     breakdown: dict[str, Any] = {
@@ -500,12 +540,13 @@ def score_personality(
     breakdown["must_score"] = must_score
     breakdown["forbidden_score"] = forbidden_score
     breakdown["length_ok"] = length_ok
-    return passed, score, breakdown
+    # examined = length of the response content the regex/length checks above
+    # actually ran over. An empty response examines 0 characters -- the exact
+    # input the audit found scoring a vacuous (True, 1.0).
+    return ScoreOutcome(passed=passed, score=score, breakdown=breakdown, examined=len(content))
 
 
-def score_rag_integration(
-    result: dict[str, Any], expected: dict[str, Any]
-) -> tuple[bool, float, dict[str, Any]]:
+def score_rag_integration(result: dict[str, Any], expected: dict[str, Any]) -> ScoreOutcome:
     """Score RAG recall: does the response surface the expected facts?"""
     content = result.get("response_content", "").lower()
     gold_facts: list[str] = expected.get("must_contain_facts", [])
@@ -517,7 +558,10 @@ def score_rag_integration(
     }
 
     if not gold_facts:
-        return True, 1.0, breakdown
+        # examined=len(gold_facts)=0: forbidden_facts is never inspected on
+        # this early-return path (pre-existing behavior, unchanged here), so
+        # counting it would overstate what this call actually checked.
+        return ScoreOutcome(passed=True, score=1.0, breakdown=breakdown, examined=len(gold_facts))
 
     hits = sum(1 for fact in gold_facts if fact.lower() in content)
     recall = hits / len(gold_facts)
@@ -531,12 +575,14 @@ def score_rag_integration(
 
     passed = recall >= 0.7 and not forbidden_hits
     score = recall * (0.5 if forbidden_hits else 1.0)
-    return passed, score, breakdown
+    # examined = len(must_contain_facts) + len(must_not_contain_facts): every
+    # fact this call actually inspected -- required facts for recall, plus
+    # forbidden facts checked for false positives.
+    examined = len(gold_facts) + len(forbidden_facts)
+    return ScoreOutcome(passed=passed, score=score, breakdown=breakdown, examined=examined)
 
 
-def score_coherence(
-    result: dict[str, Any], expected: dict[str, Any]
-) -> tuple[bool, float, dict[str, Any]]:
+def score_coherence(result: dict[str, Any], expected: dict[str, Any]) -> ScoreOutcome:
     """Heuristic coherence checks: non-empty, no repetition loops, finish reason ok."""
     content = result.get("response_content", "").strip()
     finish_reason = result.get("finish_reason", "")
@@ -548,7 +594,10 @@ def score_coherence(
 
     if not content:
         breakdown["errors"].append("empty response")
-        return False, 0.0, breakdown
+        # examined=0: matches breakdown["length_chars"] above. Already a hard
+        # fail -- there is nothing here for the repetition/length/forbidden
+        # checks below to run over.
+        return ScoreOutcome(passed=False, score=0.0, breakdown=breakdown, examined=0)
 
     if finish_reason == "length":
         breakdown["errors"].append("finish_reason=length (likely mid-sentence cutoff)")
@@ -590,12 +639,15 @@ def score_coherence(
     ]
     score = sum(1 for c in checks_passed if c) / len(checks_passed)
     passed = all(checks_passed)
-    return passed, score, breakdown
+    # examined = length of the content the heuristics above actually ran over,
+    # mirroring breakdown["length_chars"] and score_personality's rule. The
+    # fixed count of 5 heuristics is not used -- it never changes with input,
+    # so it could not signal a vacuous case the way a real content-derived
+    # count can.
+    return ScoreOutcome(passed=passed, score=score, breakdown=breakdown, examined=len(content))
 
 
-def score_speed(
-    result: dict[str, Any], expected: dict[str, Any]
-) -> tuple[bool, float, dict[str, Any]]:
+def score_speed(result: dict[str, Any], expected: dict[str, Any]) -> ScoreOutcome:
     """Score a speed sample: metrics only, no quality check.
 
     Score = tokens_per_second / target_tps, capped at 1.0.
@@ -611,12 +663,22 @@ def score_speed(
         "completion_tokens": metrics.get("completion_tokens"),
     }
     passed = tps >= target_tps
-    return passed, score, breakdown
+    # This scorer is not counting items, it is answering "did I have a
+    # metrics bundle to score" -- examined=1 when a real metrics record was
+    # present (even a slow one), 0 when metrics is empty/missing entirely.
+    # Zero-when-absent is correct, not None: this scorer CAN tell "no
+    # metrics" apart from "a real sample," so None would wrongly claim it
+    # cannot count when it can. It also matches this scorer's own existing
+    # fail-closed behavior for the degenerate case (tps defaults to 0.0,
+    # target_tps defaults to 30.0, so passed is already False here
+    # regardless of the guard).
+    examined = 1 if metrics else 0
+    return ScoreOutcome(passed=passed, score=score, breakdown=breakdown, examined=examined)
 
 
 def score_schema_conformance_lenient(
     result: dict[str, Any], expected: dict[str, Any]
-) -> tuple[bool, float, dict[str, Any]]:
+) -> ScoreOutcome:
     """Score schema_conformance with minimum-scope output repair.
 
     Applies two repairs to raw response before scoring:
@@ -631,9 +693,14 @@ def score_schema_conformance_lenient(
     cleaned = _apply_minimum_lenient_repair(raw)
     proxied = dict(result)
     proxied["response_content"] = cleaned
-    passed, score, breakdown = score_schema_conformance(proxied, expected)
-    breakdown["lenient_repairs_applied"] = cleaned != raw
-    return passed, score, breakdown
+    outcome = score_schema_conformance(proxied, expected)
+    breakdown = {**outcome.breakdown, "lenient_repairs_applied": cleaned != raw}
+    # examined: identical to the strict scorer's count. This wrapper only
+    # repairs the raw string before delegating -- it inspects the same
+    # entities/relationships the strict scorer counted.
+    return ScoreOutcome(
+        passed=outcome.passed, score=outcome.score, breakdown=breakdown, examined=outcome.examined
+    )
 
 
 SCORER_REGISTRY: dict[str, Scorer] = {
@@ -772,6 +839,9 @@ def _ingest_record(
     if record.get("error"):
         scores.error_count += 1
         test_scores.error_count += 1
+        # examined=None: no scorer ran here -- the candidate's run itself
+        # errored before there was any response to score. That is a declared
+        # gap, not a count of zero examined items.
         case_score = CaseScore(
             candidate_id=candidate_id,
             test_name=test_name,
@@ -780,6 +850,7 @@ def _ingest_record(
             passed=False,
             score=0.0,
             breakdown={"error": record["error"]},
+            examined=None,
             error=record["error"],
         )
         test_scores.case_scores.append(case_score)
@@ -789,28 +860,49 @@ def _ingest_record(
     test_type = test_type_by_name.get(test_name, test_name)
     scorer = SCORER_REGISTRY.get(test_type)
     if scorer is None:
+        # Recording rather than returning: a bare `return` removed the case from
+        # both numerator and denominator, so a renamed test type would silently
+        # shrink the sample instead of failing. Found during the 2026-08-04
+        # scorer audit grounding, not part of its filed findings.
         logger.warning("no scorer for test type %r", test_type)
+        test_scores.case_scores.append(
+            CaseScore(
+                candidate_id=candidate_id,
+                test_name=test_name,
+                case_id=case_id,
+                iteration=int(record.get("iteration", 1)),
+                passed=False,
+                score=0.0,
+                breakdown={"no_scorer_for_test_type": test_type},
+                examined=None,
+                error=None,
+            )
+        )
+        test_scores.fail_count += 1
         return
 
     expected = expected_by_test_case.get((test_name, case_id), {})
     try:
-        passed, score, breakdown = scorer(record, expected)
+        outcome = enforce_non_vacuity(scorer(record, expected))
     except (KeyError, ValueError, TypeError) as exc:
         logger.exception("scorer crashed for %s/%s", candidate_id, case_id)
-        passed, score, breakdown = False, 0.0, {"scorer_error": str(exc)}
+        outcome = ScoreOutcome(
+            passed=False, score=0.0, breakdown={"scorer_error": str(exc)}, examined=None
+        )
 
     case_score = CaseScore(
         candidate_id=candidate_id,
         test_name=test_name,
         case_id=case_id,
         iteration=int(record.get("iteration", 1)),
-        passed=passed,
-        score=score,
-        breakdown=breakdown,
+        passed=outcome.passed,
+        score=outcome.score,
+        breakdown=outcome.breakdown,
+        examined=outcome.examined,
         error=None,
     )
     test_scores.case_scores.append(case_score)
-    if passed:
+    if outcome.passed:
         test_scores.pass_count += 1
     else:
         test_scores.fail_count += 1
