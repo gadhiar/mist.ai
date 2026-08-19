@@ -242,6 +242,58 @@ class TestTheReplaySourcesAreNeverInitialized:
         with pytest.raises(ColdCacheError, match="epoch_ledger"):
             _build(str(db_path))
 
+    def test_the_guard_opens_the_store_on_a_connection_that_refuses_writes(self, tmp_path):
+        """The `?mode=ro` the guard's docstring calls essential, actually enforced.
+
+        Nothing else in this file can see it. Every other test's verdict is decided by
+        the file's CONTENTS, so a mutant spelling the open `sqlite3.connect(db_path)`
+        -- read-write, no URI -- passes all of them: the guard reads the same schema
+        either way and never writes, so the mode is invisible to a black-box
+        assertion.
+
+        This probes the connection the guard actually opened rather than the text of
+        the call. `sqlite3.connect` is wrapped, the real connection is handed back
+        untouched, and a `CREATE TABLE` is attempted on it first and rolled back. On a
+        `mode=ro` connection SQLite raises `OperationalError`; on a read-write one the
+        statement succeeds. That is the property, not its spelling -- an equivalent
+        read-only open written some other way still passes.
+
+        The FIRST open is the event-store guard's. `EventStore.__init__` and
+        `ExtractionCache.__init__` do no I/O, so nothing connects before it, and the
+        read-write `get_current_epoch()` open that legitimately follows the guards is
+        later in the list.
+        """
+        import sqlite3
+
+        # Arrange
+        db_path = _seed_replay_sources(tmp_path)
+        opens: list[tuple[str, bool]] = []
+        real_connect = sqlite3.connect
+
+        def _spy(target, *args, **kwargs):
+            conn = real_connect(target, *args, **kwargs)
+            try:
+                conn.execute("CREATE TABLE _writability_probe (x)")
+                conn.rollback()
+                opens.append((str(target), True))
+            except sqlite3.OperationalError:
+                opens.append((str(target), False))
+            return conn
+
+        # Act
+        with patch("sqlite3.connect", _spy):
+            regen, _epoch = _build(db_path)
+
+        # Assert
+        assert isinstance(regen, LogRegenerator)
+        assert opens, "the guard opened no sqlite connection at all"
+        target, writable = opens[0]
+        assert not writable, (
+            f"the replay-source guard opened {target} on a WRITABLE connection. The "
+            "guard runs against the LIVE store under a command whose contract is "
+            "dry-run only, so the open must be read-only."
+        )
+
     def test_a_hash_in_the_store_path_neither_misreads_nor_creates_a_database(self, tmp_path):
         """`#` is URI syntax, and the guard interpolates the path into a URI.
 
