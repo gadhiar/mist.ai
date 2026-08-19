@@ -499,9 +499,35 @@ def _assert_replay_source_exists(
     a `ColdCacheError` and was never a traceback.
 
     The connection is opened READ-ONLY via a `file:...?mode=ro` URI. That is not
-    decoration: `EventStore._get_connection` runs `PRAGMA journal_mode=WAL`, which
-    mutates a non-WAL database's header and creates `-wal`/`-shm` sidecars, so
-    checking through the normal path would make this guard itself a write.
+    decoration: `EventStore._get_connection` runs `PRAGMA journal_mode=WAL`
+    (store.py:64), which mutates a non-WAL database's header and creates
+    `-wal`/`-shm` sidecars, so checking through the normal path would make this
+    guard a writer of database content.
+
+    `mode=ro` is not, however, byte-free, and that is recorded here rather than left
+    as the earlier implication that it made this guard a non-write. MEASURED against
+    a temp-dir WAL store carrying this schema, on the container (sqlite 3.37.2,
+    Linux) and on the host the CLI actually runs on (sqlite 3.45.1, Windows), with
+    sha256 compared before and after: the main database and the `-wal` are
+    byte-IDENTICAL, but where no `-shm` exists the first read CREATES a 32768-byte
+    `-shm` wal-index beside the store and leaves it there after `close()`. SQLite
+    needs that wal-index to read a WAL database. So the guard does not alter the
+    store, and it does add a sidecar.
+
+    That is also why `sqlite3.OperationalError` is handled apart from every other
+    `sqlite3.Error` below. When the wal-index cannot be created the read raises
+    `OperationalError` on a store whose schema is entirely intact -- MEASURED as
+    "unable to open database file" against a read-only directory and against a `:ro`
+    docker bind mount, and "attempt to write a readonly database" when no `-wal` is
+    present either. Reporting that as "not a readable SQLite database" accuses a
+    healthy store of corruption. Both branches still REFUSE, because the guard cannot
+    read the schema either way and the replay's own reads would fail identically; only
+    the diagnosis differs. The two are cleanly separable by type: a truncated file
+    raises `sqlite3.DatabaseError` ("file is not a database") which is NOT an
+    `OperationalError`, while the wal-index failure is. Note the raise surfaces from
+    `execute()`, not from `sqlite3.connect()` -- `connect()` returns a Connection and
+    the wal-index is materialised on first read -- but both sit inside the same `try`,
+    so the handled outcome is the same.
 
     EVERY table the replay reads must be named, not just one. Gating on a single
     table leaves a store that has it but lacks a sibling passing the guard and then
@@ -553,6 +579,22 @@ def _assert_replay_source_exists(
             }
         finally:
             conn.close()
+    except sqlite3.OperationalError as exc:
+        # NOT corruption. SQLite must create a `-shm` wal-index to read a WAL
+        # database, and a read-only connection cannot create one where the
+        # directory is not writable, so a healthy store on read-only media or a
+        # `:ro` mount lands here with its schema fully intact. Refuse anyway -- the
+        # replay's reads would fail the same way -- but do not call it corrupt.
+        raise ColdCacheError(
+            f"The {label} at {db_path} exists but could not be opened read-only "
+            f"({exc}). This is NOT evidence that the store is corrupt: SQLite needs "
+            f"a `-shm` wal-index to read a WAL database and a read-only connection "
+            f"must create it when absent, so a store on read-only media, a `:ro` "
+            f"bind mount, or a directory this process cannot write fails here with "
+            f"its schema intact. Re-run where the store's DIRECTORY is writable, or "
+            f"copy the store together with any `-wal` and `-shm` siblings somewhere "
+            f"writable and point the config there."
+        ) from exc
     except sqlite3.Error as exc:
         raise ColdCacheError(
             f"The {label} at {db_path} is not a readable SQLite database ({exc}). {_MISSING}"

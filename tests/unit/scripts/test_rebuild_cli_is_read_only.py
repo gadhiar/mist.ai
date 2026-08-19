@@ -83,7 +83,13 @@ def _seed_replay_sources(root: Path) -> str:
         model_hash=MODEL_HASH,
         activated_at=EPOCH_TS,
     )
-    ExtractionCache(str(root / "extraction_cache.db")).initialize()
+    cache = ExtractionCache(str(root / "extraction_cache.db"))
+    cache.initialize()
+    # Closed rather than left to GC: an open writer keeps `-wal`/`-shm` sidecars
+    # alive, and whether a `-shm` exists decides whether a read-only open of a WAL
+    # database has to create one. The wal-index test below needs that deterministic.
+    store.close()
+    cache.close()
     return str(db_path)
 
 
@@ -235,6 +241,75 @@ class TestTheReplaySourcesAreNeverInitialized:
         # Act / Assert -- refused as a decision, not surfaced as OperationalError
         with pytest.raises(ColdCacheError, match="epoch_ledger"):
             _build(str(db_path))
+
+    def test_a_wal_store_that_cannot_build_its_index_is_not_reported_as_corrupt(self, tmp_path):
+        """A healthy store must never be refused with a corruption diagnosis.
+
+        SQLite needs a `-shm` wal-index to read a WAL database, and a read-only
+        connection has to create one when it is absent. Where it cannot -- read-only
+        media, a `:ro` bind mount, a directory this process cannot write -- the read
+        raises `sqlite3.OperationalError` on a store whose schema is entirely intact.
+        Folding that into the same handler as `DatabaseError: file is not a database`
+        reports a healthy store as corrupt and sends the operator to restore a backup
+        they do not need.
+
+        Refusing is still correct (the replay's own reads would fail identically);
+        only the diagnosis has to be honest. The positive control below is what makes
+        this a test of the DIAGNOSIS rather than of some error being raised: the same
+        store passes the guard moments earlier, with only the directory's writability
+        changed between the two calls.
+        """
+        import os
+        import sqlite3
+        import stat
+
+        from backend.knowledge.regeneration.log_regenerator import ColdCacheError
+
+        # Arrange -- a valid store, checkpointed so no sidecar carries unflushed data
+        store_dir = tmp_path / "readonly"
+        store_dir.mkdir()
+        db_path = _seed_replay_sources(store_dir)
+
+        def _drop_sidecars() -> None:
+            for sidecar in list(store_dir.glob("*-wal")) + list(store_dir.glob("*-shm")):
+                sidecar.unlink()
+
+        conn = sqlite3.connect(db_path)
+        assert (
+            conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        ), "precondition: this test is about WAL databases; the store is not one"
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.close()
+        _drop_sidecars()
+
+        # Positive control -- the very same store passes while the directory is writable
+        regen, _epoch = _build(db_path)
+        assert isinstance(regen, LogRegenerator), "precondition: the store must be healthy"
+        _drop_sidecars()
+
+        os.chmod(store_dir, stat.S_IRUSR | stat.S_IXUSR)
+        try:
+            try:
+                (store_dir / "canary").touch()
+                pytest.skip("this process can write a read-only directory; precondition unmet")
+            except OSError:
+                pass
+
+            # Act -- identical store, identical call, only the directory changed
+            with pytest.raises(ColdCacheError) as refusal:
+                _build(db_path)
+        finally:
+            os.chmod(store_dir, stat.S_IRWXU)
+
+        # Assert -- refused, but NOT as a corrupt database
+        message = str(refusal.value)
+        assert "not a readable SQLite database" not in message, (
+            "a healthy store whose wal-index could not be created was reported as "
+            f"corrupt. Refusing is right; this diagnosis is not. Message: {message}"
+        )
+        assert (
+            "could not be opened read-only" in message
+        ), f"the refusal does not name the real cause. Message: {message}"
 
     def test_a_truncated_replay_source_is_refused(self, tmp_path):
         """A half-copied or interrupted-`cp` file also passes `Path.exists()`."""
