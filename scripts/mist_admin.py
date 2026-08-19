@@ -476,11 +476,14 @@ def _assert_replay_source_exists(db_path: str, label: str, required_table: str) 
 
     Neither is caught by an existence check, and on both the first read raises out of
     `sqlite3` rather than returning: `DatabaseError: file is not a database` for the
-    truncated file, `OperationalError: no such table` for the schema-less one.
-    `cmd_graph_rebuild_from_log` catches neither -- it handles only `RebuildTargetError`,
-    `ColdCacheError` and `RebuildDeterminismError` (:700, :703, :706) and `main()` only
-    `ModuleNotFoundError`, `FileNotFoundError` and `MistError` (:2134, :2151, :2154) --
-    so both escape as a traceback instead of a refusal.
+    truncated file, `OperationalError: no such table` for the schema-less one. Nothing
+    catches either: `cmd_graph_rebuild_from_log` handles only `RebuildTargetError`,
+    `ColdCacheError` and `RebuildDeterminismError` (:716, :719, :722), and the `main()`
+    try that wraps the command dispatch handles only `ModuleNotFoundError`,
+    `FileNotFoundError` and `MistError` (:2148, :2155, :2158). `main()`'s OTHER
+    `ModuleNotFoundError` handler (:2138) sits above that try, guarding the lazy
+    `MistError` import, and never sees a command's exception. So both escape as a
+    traceback instead of a refusal.
 
     What the schema check does NOT buy, recorded because an earlier version of this
     docstring asserted the opposite and called it the common case: a store that a
