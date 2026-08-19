@@ -480,10 +480,11 @@ def _assert_replay_source_exists(
     `sqlite3` rather than returning: `DatabaseError: file is not a database` for the
     truncated file, `OperationalError: no such table` for the schema-less one. Nothing
     catches either: `cmd_graph_rebuild_from_log` handles only `RebuildTargetError`,
-    `ColdCacheError` and `RebuildDeterminismError` (:716, :719, :722), and the `main()`
-    try that wraps the command dispatch handles only `ModuleNotFoundError`,
-    `FileNotFoundError` and `MistError` (:2148, :2155, :2158). `main()`'s OTHER
-    `ModuleNotFoundError` handler (:2138) sits above that try, guarding the lazy
+    `ColdCacheError` and `RebuildDeterminismError` (:808, :811, :814 -- the only three
+    `except` lines between that function's `def` at :748 and the next at :824), and the
+    `main()` try that wraps the command dispatch handles only `ModuleNotFoundError`,
+    `FileNotFoundError` and `MistError` (:2240, :2247, :2250). `main()`'s OTHER
+    `ModuleNotFoundError` handler (:2230) sits above that try, guarding the lazy
     `MistError` import, and never sees a command's exception. So both escape as a
     traceback instead of a refusal.
 
