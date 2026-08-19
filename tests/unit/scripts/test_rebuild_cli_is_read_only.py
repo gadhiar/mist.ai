@@ -191,30 +191,53 @@ class TestTheReplaySourcesAreNeverInitialized:
 
         assert not cache_path.exists(), "the refused run created the cache it refused to find"
 
-    def test_an_event_store_missing_a_conversation_table_is_refused(self, tmp_path):
-        """The gate must cover EVERY table the replay reads, not just `epoch_ledger`.
+    @pytest.mark.parametrize(
+        "dropped",
+        [
+            pytest.param("epoch_ledger", id="epoch_ledger"),
+            pytest.param("conversation_sessions", id="conversation_sessions"),
+            pytest.param("conversation_turn_events", id="conversation_turn_events"),
+        ],
+    )
+    def test_an_event_store_missing_any_replayed_table_is_refused(self, tmp_path, dropped):
+        """The gate must cover EVERY table the replay reads -- each one enforced.
 
         `LogRegenerator` calls exactly two `EventStore` methods --
         `get_all_turns_for_reextraction` (`conversation_turn_events` LEFT JOIN
         `conversation_sessions`, store.py:406-407) and `get_turn_count`
         (`conversation_turn_events`, :454) -- while `_build_log_regenerator` itself
-        reads `epoch_ledger`. A store carrying `epoch_ledger` alone passes an
-        `epoch_ledger`-only gate and then raises a bare `OperationalError: no such
-        table` on the first read, which is the outcome this guard exists to prevent.
+        reads `epoch_ledger`. A store missing any one of the three passes a gate that
+        does not name it and then raises a bare `OperationalError: no such table` on
+        the first read, which is the outcome this guard exists to prevent.
+
+        PARAMETRIZED over all three deliberately. The single-case version of this test
+        dropped `conversation_turn_events` only, and a whole-branch review showed that
+        removing `conversation_sessions` from the gate left the entire file green --
+        the table was in the tuple with nothing holding it there, and the surviving
+        mutant reproduced the exact traceback the commit claimed to have closed. One
+        case per gated table is what makes the tuple's contents load-bearing.
         """
         import sqlite3
 
         from backend.knowledge.regeneration.log_regenerator import ColdCacheError
 
-        # Arrange -- a fully valid store, then one conversation table removed
+        # Arrange -- a fully valid store, then exactly one replayed table removed.
+        # `foreign_keys=OFF` because `conversation_turn_events` REFERENCES
+        # `conversation_sessions`, so the parent cannot be dropped with them on.
         db_path = _seed_replay_sources(tmp_path)
         conn = sqlite3.connect(db_path)
-        conn.execute("DROP TABLE conversation_turn_events")
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute(f"DROP TABLE {dropped}")  # nosec B608 -- parametrized literal
         conn.commit()
+        remaining = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
         conn.close()
+        assert dropped not in remaining, "precondition: the table must actually be gone"
 
-        # Act / Assert -- `epoch_ledger` is still present, so only a widened gate refuses
-        with pytest.raises(ColdCacheError, match="conversation_turn_events"):
+        # Act / Assert -- the other two are still present, so only a gate naming
+        # THIS table can refuse, and the refusal must name it
+        with pytest.raises(ColdCacheError, match=rf"`{dropped}`"):
             _build(db_path)
 
     def test_a_store_that_exists_but_was_never_initialized_is_refused(self, tmp_path):
