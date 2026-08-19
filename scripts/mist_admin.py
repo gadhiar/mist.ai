@@ -463,7 +463,9 @@ def cmd_graph_backfill_bitemporal(args: argparse.Namespace) -> int:
         connection.disconnect()
 
 
-def _assert_replay_source_exists(db_path: str, label: str, required_table: str) -> None:
+def _assert_replay_source_exists(
+    db_path: str, label: str, required_tables: tuple[str, ...]
+) -> None:
     """Refuse a rebuild whose replay source is absent or carries no schema.
 
     Checks the SCHEMA, not merely the path. What that buys over `Path.exists()` is two
@@ -501,15 +503,26 @@ def _assert_replay_source_exists(db_path: str, label: str, required_table: str) 
     mutates a non-WAL database's header and creates `-wal`/`-shm` sidecars, so
     checking through the normal path would make this guard itself a write.
 
+    EVERY table the replay reads must be named, not just one. Gating on a single
+    table leaves a store that has it but lacks a sibling passing the guard and then
+    tracebacking on the first read -- the failure mode this function exists to convert
+    into a decision. The event store's replay reads exactly three:
+    `epoch_ledger` (`get_current_epoch` store.py:493, `list_epochs` :499, both called
+    from `_build_log_regenerator`), and `conversation_turn_events` LEFT JOIN
+    `conversation_sessions` (`get_all_turns_for_reextraction` :406-407, plus
+    `get_turn_count` :454) -- the only two `EventStore` methods `LogRegenerator` calls
+    (`grep -n "self._events" log_regenerator.py` -> :291, :301, and the :105 assignment).
+
     Args:
         db_path: Filesystem path to the SQLite store being replayed.
         label: Human name used in the refusal ("event store" / "extraction cache").
-        required_table: A table the store must already have for the replay to read it.
+        required_tables: Every table the store must already have for the replay to
+            read it. Order is preserved in the refusal message.
 
     Raises:
-        ColdCacheError: When the file is missing, is not a readable SQLite database,
-            or lacks `required_table`. Raised so the CLI's REFUSED branch reports a
-            decision (exit 2) rather than surfacing a traceback.
+        ColdCacheError: When the file is missing, cannot be opened, is not a readable
+            SQLite database, or lacks any of `required_tables`. Raised so the CLI's
+            REFUSED branch reports a decision (exit 2) rather than a traceback.
     """
     import sqlite3
     from pathlib import Path as _Path
@@ -526,13 +539,18 @@ def _assert_replay_source_exists(db_path: str, label: str, required_table: str) 
     if not _Path(db_path).exists():
         raise ColdCacheError(f"No {label} at {db_path}. {_MISSING}")
 
+    placeholders = ", ".join("?" * len(required_tables))
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         try:
-            found = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                (required_table,),
-            ).fetchone()
+            present = {
+                row[0]
+                for row in conn.execute(
+                    f"SELECT name FROM sqlite_master WHERE type='table' "  # nosec B608
+                    f"AND name IN ({placeholders})",
+                    required_tables,
+                ).fetchall()
+            }
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -540,11 +558,13 @@ def _assert_replay_source_exists(db_path: str, label: str, required_table: str) 
             f"The {label} at {db_path} is not a readable SQLite database ({exc}). {_MISSING}"
         ) from exc
 
-    if found is None:
+    missing = [table for table in required_tables if table not in present]
+    if missing:
         raise ColdCacheError(
-            f"The {label} at {db_path} has no `{required_table}` table, so it was not "
-            f"created by `initialize()` -- a 0-byte file left by `touch` or by a bare "
-            f"`sqlite3.connect()` on the path looks exactly like this. {_MISSING}"
+            f"The {label} at {db_path} has no {', '.join(f'`{t}`' for t in missing)} "
+            f"table(s), so it was not created by `initialize()` -- a 0-byte file left "
+            f"by `touch` or by a bare `sqlite3.connect()` on the path looks exactly "
+            f"like this. {_MISSING}"
         )
 
 
@@ -599,8 +619,14 @@ def _build_log_regenerator(
     # store it created an empty one and the run then reported "No epochs found", which
     # reads identically to a store that exists and is empty. A rebuild replays an
     # existing log; it does not bring one into being.
-    _assert_replay_source_exists(event_store_path, "event store", "epoch_ledger")
-    _assert_replay_source_exists(cache_path, "extraction cache", "extraction_cache")
+    _assert_replay_source_exists(
+        event_store_path,
+        "event store",
+        # Every table the replay reads, not just the epoch one -- see the guard's
+        # docstring for the call sites that read each.
+        ("epoch_ledger", "conversation_sessions", "conversation_turn_events"),
+    )
+    _assert_replay_source_exists(cache_path, "extraction cache", ("extraction_cache",))
 
     # Real embedding provider (all-MiniLM-L6-v2). Eager load is acceptable here:
     # this is an admin CLI (sync batch), NOT the async server event loop, so there

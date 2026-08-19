@@ -180,6 +180,32 @@ class TestTheReplaySourcesAreNeverInitialized:
 
         assert not cache_path.exists(), "the refused run created the cache it refused to find"
 
+    def test_an_event_store_missing_a_conversation_table_is_refused(self, tmp_path):
+        """The gate must cover EVERY table the replay reads, not just `epoch_ledger`.
+
+        `LogRegenerator` calls exactly two `EventStore` methods --
+        `get_all_turns_for_reextraction` (`conversation_turn_events` LEFT JOIN
+        `conversation_sessions`, store.py:406-407) and `get_turn_count`
+        (`conversation_turn_events`, :454) -- while `_build_log_regenerator` itself
+        reads `epoch_ledger`. A store carrying `epoch_ledger` alone passes an
+        `epoch_ledger`-only gate and then raises a bare `OperationalError: no such
+        table` on the first read, which is the outcome this guard exists to prevent.
+        """
+        import sqlite3
+
+        from backend.knowledge.regeneration.log_regenerator import ColdCacheError
+
+        # Arrange -- a fully valid store, then one conversation table removed
+        db_path = _seed_replay_sources(tmp_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute("DROP TABLE conversation_turn_events")
+        conn.commit()
+        conn.close()
+
+        # Act / Assert -- `epoch_ledger` is still present, so only a widened gate refuses
+        with pytest.raises(ColdCacheError, match="conversation_turn_events"):
+            _build(db_path)
+
     def test_a_store_that_exists_but_was_never_initialized_is_refused(self, tmp_path):
         """Existence is not enough: a 0-byte file passes `Path.exists()`.
 
