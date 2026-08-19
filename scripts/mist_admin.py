@@ -464,21 +464,34 @@ def cmd_graph_backfill_bitemporal(args: argparse.Namespace) -> int:
 
 
 def _assert_replay_source_exists(db_path: str, label: str, required_table: str) -> None:
-    """Refuse a rebuild whose replay source is absent or unpopulated by schema.
+    """Refuse a rebuild whose replay source is absent or carries no schema.
 
-    Checks the SCHEMA, not merely the path. An existence-only check let two realistic
-    states through, and the first is the common one:
+    Checks the SCHEMA, not merely the path. What that buys over `Path.exists()` is two
+    states, both of which pass an existence check:
 
-    - A machine that ran the PRE-FIX CLI has a store that `initialize()` created and
-      left empty. The file exists, so an existence check passes -- on exactly the
-      machines the original bug touched.
-    - A truncated, half-copied, or interrupted-`cp` file also passes `Path.exists()`.
+    - A truncated, half-copied, or interrupted-`cp` file.
+    - A file created by something other than `initialize()` -- `touch`, or a
+      `sqlite3.connect()` that opened the path and wrote no schema (both leave a
+      0-byte file).
 
-    In both cases the first read raised a bare `sqlite3.OperationalError: no such
-    table`, which `cmd_graph_rebuild_from_log` does not catch (it handles only
-    `RebuildTargetError`, `ColdCacheError` and `RebuildDeterminismError`), so it
-    escaped as a traceback -- the exact outcome this guard's docstring claimed to
-    prevent.
+    Neither is caught by an existence check, and on both the first read raises out of
+    `sqlite3` rather than returning: `DatabaseError: file is not a database` for the
+    truncated file, `OperationalError: no such table` for the schema-less one.
+    `cmd_graph_rebuild_from_log` catches neither -- it handles only `RebuildTargetError`,
+    `ColdCacheError` and `RebuildDeterminismError` (:700, :703, :706) and `main()` only
+    `ModuleNotFoundError`, `FileNotFoundError` and `MistError` (:2134, :2151, :2154) --
+    so both escape as a traceback instead of a refusal.
+
+    What the schema check does NOT buy, recorded because an earlier version of this
+    docstring asserted the opposite and called it the common case: a store that a
+    PRE-FIX run of this command created and left empty passes this check too.
+    `EventStore.initialize()` executescripts `schema.sql`, which carries
+    `CREATE TABLE IF NOT EXISTS epoch_ledger` (schema.sql:134), and
+    `ExtractionCache.initialize()` executescripts a DDL whose sole statement is
+    `CREATE TABLE IF NOT EXISTS extraction_cache` -- so on exactly those machines both
+    required tables exist, are empty, and this guard passes. The run proceeds to
+    `_build_log_regenerator`'s "No epochs found in the event store" refusal, which is
+    a `ColdCacheError` and was never a traceback.
 
     The connection is opened READ-ONLY via a `file:...?mode=ro` URI. That is not
     decoration: `EventStore._get_connection` runs `PRAGMA journal_mode=WAL`, which
@@ -526,9 +539,9 @@ def _assert_replay_source_exists(db_path: str, label: str, required_table: str) 
 
     if found is None:
         raise ColdCacheError(
-            f"The {label} at {db_path} has no `{required_table}` table, so it has never "
-            f"been initialized (a pre-fix run of this command created empty stores just "
-            f"like this). {_MISSING}"
+            f"The {label} at {db_path} has no `{required_table}` table, so it was not "
+            f"created by `initialize()` -- a 0-byte file left by `touch` or by a bare "
+            f"`sqlite3.connect()` on the path looks exactly like this. {_MISSING}"
         )
 
 

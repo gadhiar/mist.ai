@@ -75,6 +75,13 @@ carried a FALSE justification for going static -- that a behavioural test needed
 a live Neo4j -- which was never checked before being written; patching the function-local imports
 reaches it with neither. `RecordingEventStore` in `test_rebuild_scoping.py` also lost its
 job-write methods, so a regression that reaches for one fails with `AttributeError`.
+**"Each mutation-proved" was itself an over-claim until 2026-08-18.** The builder calls
+`_assert_replay_source_exists` TWICE (event store, then extraction cache), every refusal test
+drove the event store, and because that is the guard checked first, deleting the extraction-cache
+call left the whole file green. Closed by
+`test_a_missing_extraction_cache_is_refused_even_with_a_valid_event_store`, which seeds a valid
+event store so only the second guard can refuse; mutation-proved in both directions (delete the
+call -> 1 failed / 5 passed with `DID NOT RAISE`; restore -> 6 passed).
 
 **STILL NOT closed, named so the above is not read as more than it is:**
 
@@ -86,12 +93,23 @@ job-write methods, so a regression that reaches for one fails with `AttributeErr
   root -- a DIFFERENT filename from the `extraction_cache.db` the CLI derives. Every invocation
   therefore hits `ColdCacheError` and exits 2. **An earlier draft of this entry said "a rebuild of
   a non-empty log would ColdCacheError"; that condition was wrong in both directions** and the
-  review falsified it (F3). The guard tests schema, not coverage, so it fires on an empty log too;
-  and on a machine where the pre-fix `initialize()` already created an empty cache the old
-  existence-only check did NOT fire at all -- which is why the guard now checks for the required
-  table rather than the path. The refusal is correct, but **the R1.6 live==rebuilt closure gate
-  has no runnable path until a production writer for the extraction cache exists.** That
-  prerequisite is now the blocking item, and nothing else in the repo tracks it.
+  review falsified it (F3). The guard tests schema, not coverage, so it fires on an empty log too.
+  **A SECOND false claim was written into this entry while correcting the first, and is corrected
+  here 2026-08-18 rather than removed:** it said that on a machine where the pre-fix `initialize()`
+  had already created an empty cache the old existence-only check did NOT fire at all, and that
+  this was why the guard now checks for the required table rather than the path. Both halves are
+  wrong. `ExtractionCache.initialize()` executescripts a DDL whose sole statement is
+  `CREATE TABLE IF NOT EXISTS extraction_cache`, so such a machine HAS the table and the NEW check
+  passes there too -- the schema check buys nothing on the machines it was said to be for.
+  (Verified by execution: `initialize()` into a temp dir, then
+  `SELECT name FROM sqlite_master WHERE type='table'` over a `mode=ro` connection, returns
+  `['extraction_cache']`; the event store's equivalent returns a list containing `epoch_ledger`,
+  from `schema.sql:134`.) What the schema check DOES buy over an existence check is the truncated
+  file and the 0-byte file that `touch` or a bare `sqlite3.connect()` on the path leaves -- on
+  both, the first read raises out of `sqlite3` and escapes as a traceback. The refusal is correct
+  and the guard is worth keeping; only its stated reason was invented. **The R1.6 live==rebuilt
+  closure gate has no runnable path until a production writer for the extraction cache exists.**
+  That prerequisite is now the blocking item, and nothing else in the repo tracks it.
 - **The determinism gate compares two empty graphs whenever it can run at all.** The live log
   holds 0 turns (`conversation_turn_events`: 0, `conversation_sessions`: 0), so "rebuild-twice
   byte-identical" is vacuous over live data. Stated in the past/conditional tense deliberately:

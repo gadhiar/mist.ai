@@ -157,14 +157,45 @@ class TestTheReplaySourcesAreNeverInitialized:
 
         assert not missing.exists(), "the refused run created the store it refused to find"
 
-    def test_a_store_that_exists_but_was_never_initialized_is_refused(self, tmp_path):
-        """Existence is not enough, and this is the COMMON case, not an exotic one.
+    def test_a_missing_extraction_cache_is_refused_even_with_a_valid_event_store(self, tmp_path):
+        """Covers the SECOND `_assert_replay_source_exists` call. Nothing else here does.
 
-        Any machine that ran the pre-fix CLI has stores that its `initialize()` created
-        and left empty. An existence-only guard passes there -- on exactly the machines
-        the original bug touched -- and the first read then raised a bare
-        `sqlite3.OperationalError: no such table`, which `cmd_graph_rebuild_from_log`
-        does not catch, so it escaped as a traceback rather than a refusal.
+        Every other refusal test in this file points a broken path at the EVENT STORE,
+        and `_build_log_regenerator` checks the event store first -- so in all of them
+        the event-store call is the raiser and the extraction-cache call is never
+        reached. Deleting the cache guard leaves every one of them green. This test
+        seeds a valid, initialized event store so the first guard passes, then removes
+        the cache alone, leaving the second guard as the only thing that can refuse.
+        """
+        from backend.knowledge.regeneration.log_regenerator import ColdCacheError
+
+        # Arrange -- both replay sources seeded, then the cache alone removed
+        db_path = _seed_replay_sources(tmp_path)
+        cache_path = tmp_path / "extraction_cache.db"
+        cache_path.unlink()
+
+        # Act / Assert -- the event store is valid, so this can only be the cache guard
+        with pytest.raises(ColdCacheError, match="extraction cache"):
+            _build(db_path)
+
+        assert not cache_path.exists(), "the refused run created the cache it refused to find"
+
+    def test_a_store_that_exists_but_was_never_initialized_is_refused(self, tmp_path):
+        """Existence is not enough: a 0-byte file passes `Path.exists()`.
+
+        `sqlite3.connect(path).close()` leaves exactly that -- a real, readable,
+        schema-less database -- and so does `touch`. Under an existence-only guard the
+        run proceeds and the first read raises a bare
+        `sqlite3.OperationalError: no such table: epoch_ledger`, which
+        `cmd_graph_rebuild_from_log` does not catch, so it escapes as a traceback
+        rather than a refusal.
+
+        This is NOT the state a pre-fix run of the CLI left behind, and an earlier
+        version of this docstring claimed it was, calling it the common case.
+        `EventStore.initialize()` executescripts `schema.sql`, which carries
+        `CREATE TABLE IF NOT EXISTS epoch_ledger`, so a pre-fix machine's store HAS the
+        table (empty) and passes this guard; it refuses later and for a different
+        reason, `ColdCacheError("No epochs found in the event store")`.
         """
         # Arrange -- a real, readable, EMPTY SQLite database with no schema at all
         import sqlite3
