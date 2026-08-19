@@ -618,18 +618,44 @@ def _assert_replay_source_exists(
         db_path: Filesystem path to the SQLite store being replayed.
         label: Human name used in the refusal ("event store" / "extraction cache").
         required_tables: Every table the store must already have for the replay to
-            read it. Order is preserved in the refusal message.
+            read it. Order is preserved in the refusal message. Must be non-empty --
+            an empty tuple disables the gate rather than relaxing it, so it is
+            rejected outright.
 
     Raises:
         ColdCacheError: When the file is missing, cannot be opened, is not a readable
             SQLite database, or lacks any of `required_tables`. Raised so the CLI's
             REFUSED branch reports a decision (exit 2) rather than a traceback.
+        ValueError: When `required_tables` is empty. A caller bug, deliberately NOT a
+            `ColdCacheError`: the CLI catches that and would report the operator's
+            store as refused for a fault that is entirely in this process.
     """
     import sqlite3
     from pathlib import Path as _Path
     from urllib.parse import quote as _quote
 
     from backend.knowledge.regeneration.log_regenerator import ColdCacheError
+
+    # An empty tuple does not mean "check nothing" -- it turns the gate OFF, silently.
+    # MEASURED: `", ".join("?" * 0)` is `""`, `name IN ()` is valid SQLite returning no
+    # rows, so `present` comes back empty, `missing` is `[]`, and the guard PASSES any
+    # file it can open, including a schema-less 0-byte one. That is exactly the outcome
+    # this function exists to prevent, reached by handing it nothing to check. The
+    # widened tuple signature is what newly made it expressible; the scalar parameter it
+    # replaced could not spell it.
+    #
+    # `raise`, not `assert`: `assert` is stripped under `python -O`, which would delete
+    # this check from the build where a silent pass is least recoverable. `ValueError`
+    # rather than `ColdCacheError` because this is a CALLER bug, not a verdict on the
+    # store -- `ColdCacheError` is caught by `cmd_graph_rebuild_from_log` and reported
+    # as a refusal (exit 2), which would blame an operator's healthy store for a
+    # programming error.
+    if not required_tables:
+        raise ValueError(
+            f"_assert_replay_source_exists({label!r}) was given an empty "
+            f"`required_tables`. At least one table is required: an empty tuple "
+            f"disables the schema check silently and passes any openable file."
+        )
 
     _MISSING = (
         "A rebuild REPLAYS an existing log and will not create one -- creating it here "

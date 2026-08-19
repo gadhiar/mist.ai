@@ -416,6 +416,36 @@ class TestTheReplaySourcesAreNeverInitialized:
             "could not be opened read-only" in message
         ), f"the refusal does not name the real cause. Message: {message}"
 
+    def test_an_empty_required_tables_is_rejected_instead_of_disabling_the_gate(self, tmp_path):
+        """`required_tables=()` used to pass ANY openable file, silently.
+
+        Not a relaxation of the gate but a removal of it: `", ".join("?" * 0)` is the
+        empty string, `name IN ()` is valid SQLite returning no rows, so `present` is
+        empty, `missing` is empty, and every file that opens passes. The negative
+        control below is the point -- the same schema-less store this suite already
+        proves is refused under a real gate sails through under an empty one.
+
+        Reachable only because the parameter was widened from a single table name to
+        a tuple; the scalar it replaced could not express "no tables".
+        """
+        import sqlite3
+
+        import scripts.mist_admin as mist_admin
+        from backend.knowledge.regeneration.log_regenerator import ColdCacheError
+
+        # Arrange -- a real, readable, schema-less database: nothing to find
+        db_path = tmp_path / "event_store.db"
+        sqlite3.connect(str(db_path)).close()
+
+        # Negative control -- a real gate refuses this store, so the file is not the
+        # reason the empty-tuple call would have passed
+        with pytest.raises(ColdCacheError, match="epoch_ledger"):
+            mist_admin._assert_replay_source_exists(str(db_path), "event store", ("epoch_ledger",))
+
+        # Act / Assert -- the empty tuple is a caller bug, not a verdict on the store
+        with pytest.raises(ValueError, match="required_tables"):
+            mist_admin._assert_replay_source_exists(str(db_path), "event store", ())
+
     def test_a_truncated_replay_source_is_refused(self, tmp_path):
         """A half-copied or interrupted-`cp` file also passes `Path.exists()`."""
         from backend.knowledge.regeneration.log_regenerator import ColdCacheError
