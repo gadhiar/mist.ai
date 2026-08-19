@@ -507,13 +507,20 @@ def _assert_replay_source_exists(
 
     `mode=ro` is not, however, byte-free, and that is recorded here rather than left
     as the earlier implication that it made this guard a non-write. MEASURED against
-    a temp-dir WAL store carrying this schema, on the container (sqlite 3.37.2,
-    Linux) and on the host the CLI actually runs on (sqlite 3.45.1, Windows), with
-    sha256 compared before and after: the main database and the `-wal` are
-    byte-IDENTICAL, but where no `-shm` exists the first read CREATES a 32768-byte
-    `-shm` wal-index beside the store and leaves it there after `close()`. SQLite
-    needs that wal-index to read a WAL database. So the guard does not alter the
-    store, and it does add a sidecar.
+    a temp-dir store carrying this schema, on the container (sqlite 3.37.2, Linux)
+    and on the host the CLI actually runs on (sqlite 3.45.1, Windows), with sha256
+    compared before and after: the main database file is byte-IDENTICAL in every
+    case, and on a WAL store with neither sidecar present the first read CREATES
+    TWO files beside it -- a 0-byte `-wal` AND a 32768-byte `-shm` wal-index -- and
+    leaves both there after `close()`. Same count and same sizes on both platforms.
+    On a NON-WAL store the same read creates nothing at all. So the guard never
+    alters the store, and on a WAL store it adds two sidecars.
+
+    Two, not one: an earlier version of this paragraph said "a sidecar" and named
+    only the `-shm`. The omitted file is not incidental -- the refusal path below
+    turns on both of them, and a correction that named only the `-wal` instead was
+    equally wrong. Both were written from a measurement that varied one file at a
+    time; the matrix below varies both.
 
     The path is percent-encoded into that URI rather than f-string interpolated, and
     the bug that motivates it is not cosmetic. MEASURED on both platforms above, with
@@ -532,14 +539,40 @@ def _assert_replay_source_exists(
     narrower fix that touches only the escaping is the one used.
 
     That is also why `sqlite3.OperationalError` is handled apart from every other
-    `sqlite3.Error` below. When the wal-index cannot be created the read raises
-    `OperationalError` on a store whose schema is entirely intact -- MEASURED as
-    "unable to open database file" against a read-only directory and against a `:ro`
-    docker bind mount, and "attempt to write a readonly database" when no `-wal` is
-    present either. Reporting that as "not a readable SQLite database" accuses a
-    healthy store of corruption. Both branches still REFUSE, because the guard cannot
-    read the schema either way and the replay's own reads would fail identically; only
-    the diagnosis differs. The two are cleanly separable by type: a truncated file
+    `sqlite3.Error` below. A read-only open of a WAL store can fail on a store whose
+    schema is entirely intact, and the mechanism is BOTH sidecars, not either one
+    alone. MEASURED on the container (sqlite 3.37.2), two identical runs, varying
+    `-wal` and `-shm` independently against a `chmod 0500` directory and against a
+    `docker run -v <dir>:/mnt:ro` bind mount:
+
+    - Both sidecars already present: READ OK, under BOTH read-only mechanisms.
+    - `-wal` present, `-shm` absent: refused, "unable to open database file", under
+      both mechanisms. `-wal` size is irrelevant (0-byte and 8272-byte both refused).
+    - `-wal` absent: refused, and a present `-shm` does not save it. "attempt to
+      write a readonly database" under `chmod 0500`, "unable to open database file"
+      under the `:ro` mount.
+
+    The invariant across every row: the read succeeds if and only if both sidecars
+    are ALREADY on disk. Where the directory is writable all of those states succeed,
+    because the read creates whichever is missing -- which is the same fact as the
+    two-sidecar creation measured above, seen from the failure side.
+
+    So the operable statement is "both siblings, or a writable directory", NOT
+    "SQLite needs a `-shm`". That earlier framing predicts that copying the `.db`
+    and the `-shm` to writable media is enough; MEASURED, that state still refuses.
+    A subsequent correction claiming the opposite -- that with the `-shm` absent the
+    read SUCCEEDS if a `-wal` exists -- does not reproduce here either: that row
+    refuses on both mechanisms. Neither single-file mechanism survives the matrix.
+
+    The sqlite message varies with which sidecar is missing AND with how the location
+    is read-only, so it is reported verbatim rather than diagnosed. `OperationalError`
+    also covers failures that are not about the wal-index at all -- `db_path` naming a
+    directory, or `database is locked` -- which is why the message below states the
+    two-sibling rule as the WAL-store case and then defers to the sqlite error rather
+    than asserting one universal cause. Reporting any of this as "not a readable
+    SQLite database" accuses a healthy store of corruption. Both branches still
+    REFUSE, because the guard cannot read the schema either way and the replay's own
+    reads would fail identically; only the diagnosis differs. The two are cleanly separable by type: a truncated file
     raises `sqlite3.DatabaseError` ("file is not a database") which is NOT an
     `OperationalError`, while the wal-index failure is. Note the raise surfaces from
     `execute()`, not from `sqlite3.connect()` -- `connect()` returns a Connection and
@@ -613,21 +646,29 @@ def _assert_replay_source_exists(
         finally:
             conn.close()
     except sqlite3.OperationalError as exc:
-        # NOT corruption. SQLite must create a `-shm` wal-index to read a WAL
-        # database, and a read-only connection cannot create one where the
-        # directory is not writable, so a healthy store on read-only media or a
-        # `:ro` mount lands here with its schema fully intact. Refuse anyway -- the
-        # replay's reads would fail the same way -- but do not call it corrupt.
+        # NOT corruption. A read-only open of a WAL store needs BOTH the `-wal` and
+        # the `-shm` on disk and creates whichever is absent, which it cannot do
+        # where the location is not writable -- so a healthy store on read-only
+        # media or a `:ro` mount lands here with its schema fully intact. Measured
+        # both ways round: a present `-shm` does not rescue a missing `-wal`, and a
+        # present `-wal` does not rescue a missing `-shm`. Causes unrelated to the
+        # wal-index land here too (a path naming a directory, a locked database),
+        # so the message defers to the sqlite error rather than asserting one.
+        # Refuse either way -- the replay's reads would fail the same -- but do not
+        # call it corrupt.
         raise ColdCacheError(
             f"The {label} at {db_path} exists but could not be opened read-only "
-            f"({exc}). This is NOT evidence that the store is corrupt. The usual "
-            f"cause is the wal-index: SQLite needs a `-shm` to read a WAL database "
-            f"and a read-only connection must create it when absent, so a store on "
-            f"read-only media, a `:ro` bind mount, or a directory this process "
-            f"cannot write fails here with its schema intact. Check that the store's "
-            f"DIRECTORY is writable, or copy the store together with any `-wal` and "
-            f"`-shm` siblings somewhere writable and point the config there. If the "
-            f"directory is writable, the sqlite error above is the thing to read."
+            f"({exc}). This is NOT evidence that the store is corrupt. For a WAL "
+            f"database in a location this process cannot write, the read needs BOTH "
+            f"the `-wal` and the `-shm` sibling to be present already and is refused "
+            f"when EITHER is missing -- copying only one of them does not work, and "
+            f"MEASURED, with both present the same read succeeds on read-only media "
+            f"and through a `:ro` bind mount. So either copy the store together with "
+            f"BOTH siblings somewhere writable and point the config there, or make "
+            f"the store's DIRECTORY writable so the read can create the missing one. "
+            f"Not every failure here is about the wal-index (a path naming a "
+            f"directory, or a locked database, also land here), so the sqlite error "
+            f"above is the thing to read."
         ) from exc
     except sqlite3.Error as exc:
         raise ColdCacheError(

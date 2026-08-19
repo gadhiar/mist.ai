@@ -86,8 +86,8 @@ def _seed_replay_sources(root: Path) -> str:
     cache = ExtractionCache(str(root / "extraction_cache.db"))
     cache.initialize()
     # Closed rather than left to GC: an open writer keeps `-wal`/`-shm` sidecars
-    # alive, and whether a `-shm` exists decides whether a read-only open of a WAL
-    # database has to create one. The wal-index test below needs that deterministic.
+    # alive, and whether those two exist decides whether a read-only open of a WAL
+    # database has to create them. The wal-index test below needs that deterministic.
     store.close()
     cache.close()
     return str(db_path)
@@ -341,13 +341,22 @@ class TestTheReplaySourcesAreNeverInitialized:
     def test_a_wal_store_that_cannot_build_its_index_is_not_reported_as_corrupt(self, tmp_path):
         """A healthy store must never be refused with a corruption diagnosis.
 
-        SQLite needs a `-shm` wal-index to read a WAL database, and a read-only
-        connection has to create one when it is absent. Where it cannot -- read-only
-        media, a `:ro` bind mount, a directory this process cannot write -- the read
-        raises `sqlite3.OperationalError` on a store whose schema is entirely intact.
-        Folding that into the same handler as `DatabaseError: file is not a database`
-        reports a healthy store as corrupt and sends the operator to restore a backup
-        they do not need.
+        A read-only open of a WAL database needs BOTH its `-wal` and its `-shm`
+        wal-index on disk, and creates whichever is absent. Where it cannot --
+        read-only media, a `:ro` bind mount, a directory this process cannot write --
+        the read raises `sqlite3.OperationalError` on a store whose schema is
+        entirely intact. Folding that into the same handler as `DatabaseError: file
+        is not a database` reports a healthy store as corrupt and sends the operator
+        to restore a backup they do not need.
+
+        BOTH, not either alone, and this docstring previously said `-shm` only.
+        MEASURED on the container (sqlite 3.37.2) varying the two files
+        independently against a `chmod 0500` directory and a `:ro` bind mount: the
+        read succeeds if and only if both are already present. A present `-shm` does
+        not rescue a missing `-wal` and a present `-wal` does not rescue a missing
+        `-shm`. This test seeds the both-absent state (`_drop_sidecars` runs after
+        the positive control, which creates both), which is the row that raises
+        "attempt to write a readonly database" under a `chmod 0500` directory.
 
         Refusing is still correct (the replay's own reads would fail identically);
         only the diagnosis has to be honest. The positive control below is what makes
