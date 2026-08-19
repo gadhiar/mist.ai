@@ -105,11 +105,23 @@ class LogRegenerator:
         self._events = event_store
         self._cache = extraction_cache
         self._curation = staging_curation_pipeline
-        # `journal` is REQUIRED, not defaulted to `event_store`. A default is what
-        # the bug looked like: the replay source must be the LIVE store, so any
-        # implicit "journal into the store you were given" sends a dry-run proof's
-        # job rows straight to the live ledger. Every caller now states where its
-        # progress goes. See rebuild_journal.py.
+        # `journal` is REQUIRED, not defaulted to `event_store`, and the REQUIREDNESS
+        # is the whole of the protection. A default is what the bug looked like: the
+        # replay source must be the LIVE store, so any implicit "journal into the
+        # store you were given" sends a dry-run proof's job rows straight to the live
+        # ledger. Every caller now states where its progress goes.
+        #
+        # The `: RebuildJournal` annotation above DOCUMENTS the contract; it does not
+        # enforce it. Under `from __future__ import annotations` (:29) the annotation
+        # is never evaluated, and nothing here runs `isinstance`, even though the
+        # Protocol is `@runtime_checkable` (rebuild_journal.py:32). Verified rather
+        # than assumed: `LogRegenerator.__init__.__annotations__` is
+        # `{'journal': 'RebuildJournal', ...}` -- the string, unresolved -- and
+        # constructing with `journal="not a journal at all"` succeeds, while omitting
+        # it raises `TypeError: missing 1 required keyword-only argument: 'journal'`.
+        # So a caller that passes the WRONG journal is caught by review and by
+        # test_rebuild_cli_is_read_only.py, not here; a caller that passes NONE cannot
+        # construct the object at all. Do not read the annotation as a runtime guard.
         self._journal = journal
 
     def _assert_cache_coverage(self, turns: list[dict], epoch: dict) -> None:

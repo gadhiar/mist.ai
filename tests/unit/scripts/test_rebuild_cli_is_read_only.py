@@ -161,6 +161,11 @@ class TestTheReplaySourcesAreNeverInitialized:
         with pytest.raises(ColdCacheError, match="event store"):
             _build(str(missing))
 
+        # Structurally green today and RETAINED deliberately, so it is not deleted as
+        # dead: `EventStore.__init__` (store.py:38-48) does no disk I/O and the guard
+        # raises before any later statement touches the filesystem, so nothing in the
+        # current path could create this file. It encodes the invariant, not the
+        # current call graph -- an `__init__` that gained a `mkdir` would trip it.
         assert not missing.exists(), "the refused run created the store it refused to find"
 
     def test_a_missing_extraction_cache_is_refused_even_with_a_valid_event_store(self, tmp_path):
