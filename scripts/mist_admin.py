@@ -522,6 +522,21 @@ def _assert_replay_source_exists(
     equally wrong. Both were written from a measurement that varied one file at a
     time; the matrix below varies both.
 
+    SCOPE, so the next reader does not over-read the paragraph above: THIS FUNCTION
+    is read-only. The COMMAND is not. `_build_log_regenerator` calls
+    `get_current_epoch()` / `list_epochs()` immediately after these two guards, and
+    both go through `EventStore._get_connection`, which is a plain read-write
+    `sqlite3.connect` followed by `PRAGMA journal_mode=WAL` (cited by symbol:
+    `grep -n "def _get_connection" backend/event_store/store.py`). On a
+    NON-WAL store that PRAGMA rewrites the database header: MEASURED on a store
+    seeded `journal_mode=delete`, the file's sha256 is unchanged across this guard
+    (`604fbd03fbe4abae` before and after, no sidecars created) and then CHANGES to
+    `c4119ee56d4cb9c4` on the first `_get_connection`, with `journal_mode` left as
+    `wal`. Recorded, not fixed: it predates this branch, and a production store is
+    already WAL (both `schema.sql` and `_get_connection` set it), so there the
+    header write is a no-op and only the sidecars appear. The point is that
+    "read-only" is a property of this guard alone, not of the command.
+
     The path is percent-encoded into that URI rather than f-string interpolated, and
     the bug that motivates it is not cosmetic. MEASURED on both platforms above, with
     a store under a directory named `release#2`: `f"file:{db_path}?mode=ro"` puts
