@@ -93,6 +93,55 @@ def _seed_replay_sources(root: Path) -> str:
     return str(db_path)
 
 
+def _store_fingerprint(*paths: Path) -> dict[str, object]:
+    """Byte digest of each MAIN database file, plus its logical contents.
+
+    Two independent checks, because they catch different writes and neither subsumes
+    the other:
+
+    - sha256 of the main file catches anything reaching the database proper, including
+      the header rewrite `PRAGMA journal_mode=WAL` performs on a non-WAL store.
+    - `sqlite_master` plus per-table row counts, read through a fresh connection,
+      catches a COMMITTED write still sitting in the `-wal` and not yet checkpointed
+      into the main file. A byte digest of the main file alone misses that entirely,
+      which matters because these stores are WAL. MEASURED, same store, same write:
+      committed AND closed changes the main file's sha256 (a clean `close()`
+      checkpoints); committed and NOT closed leaves it byte-identical while the new
+      table is plainly visible to a fresh reader. The review that asked for this
+      assertion asked for the digest only, which the second of those defeats.
+
+    The `-wal`/`-shm` sidecars are deliberately EXCLUDED from the digest. The guard's
+    own read-only open creates both on a WAL store (MEASURED: a 0-byte `-wal` and a
+    32768-byte `-shm`, on the container and on the host), and their appearance is not
+    a write to the store's contents -- digesting them would make this assertion fail
+    on correct code.
+    """
+    import hashlib
+    import sqlite3
+
+    fingerprint: dict[str, object] = {}
+    for path in paths:
+        fingerprint[f"{path.name}:sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        conn = sqlite3.connect(str(path))
+        try:
+            # Every object, not just tables: an added index or trigger is a schema
+            # write too, and this is the cheapest way to notice one.
+            fingerprint[f"{path.name}:schema"] = sorted(
+                (row[0], row[1]) for row in conn.execute("SELECT type, name FROM sqlite_master")
+            )
+            fingerprint[f"{path.name}:rows"] = {
+                table: conn.execute(f"SELECT COUNT(*) FROM `{table}`").fetchone()[0]  # nosec B608
+                for table in sorted(
+                    row[0]
+                    for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                    if not row[0].startswith("sqlite_")
+                )
+            }
+        finally:
+            conn.close()
+    return fingerprint
+
+
 def _backend_stub(db_path: str) -> SimpleNamespace:
     """Minimal stand-in for `_load_backend()`: the builder only calls `be.get_config()`."""
     config = build_test_config()
@@ -315,11 +364,22 @@ class TestTheReplaySourcesAreNeverInitialized:
         `ExtractionCache.__init__` do no I/O, so nothing connects before it, and the
         read-write `get_current_epoch()` open that legitimately follows the guards is
         later in the list.
+
+        `opens[0]` alone is NOT enough, and a whole-branch review proved it: it pins
+        "the first connection opened is read-only", not "nothing writes". A mutant
+        adding a second, ordinary read-write open inside the guard performed thirteen
+        committed CREATE TABLE + INSERT pairs against the replay sources across the
+        file and left all ten tests green. The fingerprint assertion below is what
+        closes that: it compares both stores before and after `_build`, so a write
+        anywhere in the call graph fails this test regardless of which connection made
+        it or how it was spelled.
         """
         import sqlite3
 
         # Arrange
         db_path = _seed_replay_sources(tmp_path)
+        cache_path = tmp_path / "extraction_cache.db"
+        before = _store_fingerprint(Path(db_path), cache_path)
         opens: list[tuple[str, bool]] = []
         real_connect = sqlite3.connect
 
@@ -351,6 +411,15 @@ class TestTheReplaySourcesAreNeverInitialized:
             f"the replay-source guard opened {target} on a WRITABLE connection. The "
             "guard runs against the LIVE store under a command whose contract is "
             "dry-run only, so the open must be read-only."
+        )
+
+        # And nothing anywhere in the call graph actually wrote to either store --
+        # the property `opens[0]` cannot see. Sidecars excluded; see the helper.
+        assert _store_fingerprint(Path(db_path), cache_path) == before, (
+            "`_build_log_regenerator` CHANGED a replay source. The main database "
+            "bytes, the schema, or a row count differs across the call. This command "
+            "replays an existing log under a dry-run-only contract; it must not write "
+            "to the log it replays."
         )
 
     def test_a_hash_in_the_store_path_neither_misreads_nor_creates_a_database(self, tmp_path):
