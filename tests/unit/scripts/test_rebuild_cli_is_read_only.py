@@ -416,6 +416,48 @@ class TestTheReplaySourcesAreNeverInitialized:
             "could not be opened read-only" in message
         ), f"the refusal does not name the real cause. Message: {message}"
 
+    def test_a_pre_migration_conversation_sessions_is_refused_not_tracebacked(self, tmp_path):
+        """The gate is table-granular; the replay's dependency is column-granular.
+
+        `LogRegenerator.rebuild` calls `get_all_turns_for_reextraction` with `origins`
+        defaulting to `CANONICAL_ORIGINS` (`('real',)`), which is not `None`, so the
+        query always carries `COALESCE(s.origin, 'real') IN (?)`.
+        `conversation_sessions.origin` arrives via a conditional `ALTER TABLE` inside
+        `EventStore.initialize()` -- and this command deliberately never calls it. So
+        a store with all three tables but a pre-migration `conversation_sessions`
+        passed the widened gate and then raised a bare
+        `OperationalError: no such column: s.origin` out of `cmd_graph_rebuild_from_log`,
+        which catches only `RebuildTargetError`, `ColdCacheError` and
+        `RebuildDeterminismError`.
+
+        The assertion that does the work is the ColdCacheError: without the column
+        check `_build` returns a regenerator and this test fails on `DID NOT RAISE`.
+        """
+        import sqlite3
+
+        from backend.knowledge.regeneration.log_regenerator import ColdCacheError
+
+        # Arrange -- a fully valid store, then `origin` removed from the sessions table.
+        # Rebuilt by hand rather than `ALTER TABLE ... DROP COLUMN`, which SQLite
+        # refuses on this table ("incomplete input") because its DDL ends in a comment.
+        db_path = _seed_replay_sources(tmp_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("DROP TABLE conversation_sessions")
+        conn.execute(
+            "CREATE TABLE conversation_sessions ("
+            "session_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT, "
+            "turn_count INTEGER DEFAULT 0, input_modality TEXT DEFAULT 'voice')"
+        )
+        conn.commit()
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(conversation_sessions)")}
+        conn.close()
+        assert "origin" not in columns, "precondition: the column must actually be gone"
+
+        # Act / Assert -- a decision, not a traceback, and it names the column
+        with pytest.raises(ColdCacheError, match="conversation_sessions.origin"):
+            _build(db_path)
+
     def test_an_empty_required_tables_is_rejected_instead_of_disabling_the_gate(self, tmp_path):
         """`required_tables=()` used to pass ANY openable file, silently.
 

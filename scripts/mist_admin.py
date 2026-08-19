@@ -464,7 +464,10 @@ def cmd_graph_backfill_bitemporal(args: argparse.Namespace) -> int:
 
 
 def _assert_replay_source_exists(
-    db_path: str, label: str, required_tables: tuple[str, ...]
+    db_path: str,
+    label: str,
+    required_tables: tuple[str, ...],
+    required_columns: dict[str, tuple[str, ...]] | None = None,
 ) -> None:
     """Refuse a rebuild whose replay source is absent or carries no schema.
 
@@ -614,6 +617,30 @@ def _assert_replay_source_exists(
     numbers into a file under active edit are a citation that expires, so this one
     names the symbols a grep will find instead.
 
+    The same argument runs one level down, to COLUMNS, which is why
+    `required_columns` exists. A table-granular gate leaves a store that has all
+    three tables but a pre-migration `conversation_sessions` passing and then
+    tracebacking on the first read -- the identical failure mode, one level lower.
+    `LogRegenerator.rebuild` calls `get_all_turns_for_reextraction` with `origins`
+    defaulting to `CANONICAL_ORIGINS` (`('real',)`, non-`None`), so the query always
+    includes `COALESCE(s.origin, 'real') IN (?)`, and `conversation_sessions.origin`
+    is added by a conditional `ALTER TABLE` inside `initialize()` -- which this
+    command deliberately does not call. MEASURED against a store carrying all three
+    tables with `origin` dropped: `GUARD: PASSED`, then
+    `OperationalError: no such column: s.origin`, and the only `except` clauses in
+    `cmd_graph_rebuild_from_log` are `RebuildTargetError`, `ColdCacheError` and
+    `RebuildDeterminismError` (resolved from the AST, not read off a line number),
+    so it escapes as a traceback.
+
+    `epoch_ledger.provisional` has the same conditional-`ALTER TABLE` shape and is
+    deliberately NOT gated. Two independent checks: `grep -n provisional` over
+    `backend/knowledge/regeneration/ scripts/mist_admin.py` returns nothing, and --
+    the stronger one, because absence of a grep hit is not absence of a dependency --
+    MEASURED against a store whose `epoch_ledger` lacks the column, both
+    `get_current_epoch()` and `list_epochs()` return their rows normally. They are
+    `SELECT *`, so the column's absence is invisible to them. Gating on it would
+    refuse stores the replay can read.
+
     Args:
         db_path: Filesystem path to the SQLite store being replayed.
         label: Human name used in the refusal ("event store" / "extraction cache").
@@ -621,12 +648,17 @@ def _assert_replay_source_exists(
             read it. Order is preserved in the refusal message. Must be non-empty --
             an empty tuple disables the gate rather than relaxing it, so it is
             rejected outright.
+        required_columns: `{table: (column, ...)}` the replay also depends on, checked
+            with `PRAGMA table_info` AFTER the table gate passes. Keys must appear in
+            `required_tables`. Empty by default: a column is worth naming here only
+            when a live query would break without it.
 
     Raises:
         ColdCacheError: When the file is missing, cannot be opened, is not a readable
             SQLite database, or lacks any of `required_tables`. Raised so the CLI's
             REFUSED branch reports a decision (exit 2) rather than a traceback.
-        ValueError: When `required_tables` is empty. A caller bug, deliberately NOT a
+        ValueError: When `required_tables` is empty, or `required_columns` names a
+            table `required_tables` does not. Caller bugs, deliberately NOT a
             `ColdCacheError`: the CLI catches that and would report the operator's
             store as refused for a fault that is entirely in this process.
     """
@@ -657,6 +689,19 @@ def _assert_replay_source_exists(
             f"disables the schema check silently and passes any openable file."
         )
 
+    required_columns = required_columns or {}
+    # Same shape of trap as the empty tuple above: a column requirement on a table
+    # the gate does not require would run `PRAGMA table_info` on a possibly-absent
+    # table, get an empty result, and report every one of its columns missing --
+    # a refusal blaming the wrong thing. Caller bug, so ValueError.
+    _ungated = sorted(set(required_columns) - set(required_tables))
+    if _ungated:
+        raise ValueError(
+            f"_assert_replay_source_exists({label!r}) was given `required_columns` "
+            f"for {_ungated}, which are not in `required_tables`. Columns can only "
+            f"be required on a table the gate already requires."
+        )
+
     _MISSING = (
         "A rebuild REPLAYS an existing log and will not create one -- creating it here "
         "would write to live state under a dry-run flag, and an empty store would then "
@@ -673,6 +718,7 @@ def _assert_replay_source_exists(
     uri = "file:" + _quote(str(_Path(db_path).resolve())) + "?mode=ro"
 
     placeholders = ", ".join("?" * len(required_tables))
+    present_columns: dict[str, set[str]] = {}
     try:
         conn = sqlite3.connect(uri, uri=True)
         try:
@@ -684,6 +730,13 @@ def _assert_replay_source_exists(
                     required_tables,
                 ).fetchall()
             }
+            for _table in required_columns:
+                # PRAGMA takes no bound parameters, hence the interpolation. The
+                # values are this module's own literals, checked above to be a
+                # subset of `required_tables`; nothing operator-supplied reaches it.
+                present_columns[_table] = {
+                    row[1] for row in conn.execute(f"PRAGMA table_info({_table})")  # nosec B608
+                }
         finally:
             conn.close()
     except sqlite3.OperationalError as exc:
@@ -723,6 +776,28 @@ def _assert_replay_source_exists(
             f"table(s), so it was not created by `initialize()` -- a 0-byte file left "
             f"by `touch` or by a bare `sqlite3.connect()` on the path looks exactly "
             f"like this. {_MISSING}"
+        )
+
+    # Checked AFTER the table gate, and it has to be: `PRAGMA table_info` on an
+    # absent table returns no rows rather than raising, so running this first would
+    # report every required column of a missing table as missing and bury the real
+    # fault. A store failing both gets the table refusal, which is the actionable one.
+    missing_columns = [
+        f"{table}.{column}"
+        for table, columns in required_columns.items()
+        for column in columns
+        if column not in present_columns.get(table, set())
+    ]
+    if missing_columns:
+        raise ColdCacheError(
+            f"The {label} at {db_path} has every required table but is missing "
+            f"{', '.join(f'`{c}`' for c in missing_columns)}, so it predates a "
+            f"migration the replay's queries depend on. Those columns are added by "
+            f"`EventStore.initialize()`'s conditional `ALTER TABLE`s, which this "
+            f"command deliberately does not call -- see the comment on the "
+            f"`_assert_replay_source_exists` calls in `_build_log_regenerator`. "
+            f"Start the backend once against this store to run the migration, then "
+            f"re-run the rebuild."
         )
 
 
@@ -783,6 +858,17 @@ def _build_log_regenerator(
         # Every table the replay reads, not just the epoch one -- see the guard's
         # docstring for the call sites that read each.
         ("epoch_ledger", "conversation_sessions", "conversation_turn_events"),
+        # And the one COLUMN it reads that a pre-migration store can lack. The
+        # replay's turn query filters on `COALESCE(s.origin, 'real')` unconditionally
+        # (`origins` defaults to `CANONICAL_ORIGINS`, which is not `None`), and
+        # `origin` arrives via an `ALTER TABLE` inside the `initialize()` this command
+        # does not call -- so without this the store passes the table gate and then
+        # raises `no such column: s.origin` as a bare traceback.
+        #
+        # `epoch_ledger.provisional` has the same migration shape and is deliberately
+        # absent here: `get_current_epoch`/`list_epochs` are `SELECT *`, and a store
+        # lacking the column was measured to read fine through both.
+        {"conversation_sessions": ("origin",)},
     )
     _assert_replay_source_exists(cache_path, "extraction cache", ("extraction_cache",))
 
