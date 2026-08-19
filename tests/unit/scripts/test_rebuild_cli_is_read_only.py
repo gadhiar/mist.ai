@@ -281,10 +281,35 @@ class TestTheReplaySourcesAreNeverInitialized:
 
         This probes the connection the guard actually opened rather than the text of
         the call. `sqlite3.connect` is wrapped, the real connection is handed back
-        untouched, and a `CREATE TABLE` is attempted on it first and rolled back. On a
-        `mode=ro` connection SQLite raises `OperationalError`; on a read-write one the
-        statement succeeds. That is the property, not its spelling -- an equivalent
-        read-only open written some other way still passes.
+        untouched, and a `CREATE TABLE` is attempted on it inside an EXPLICIT
+        transaction which is then rolled back. On a `mode=ro` connection SQLite raises
+        `OperationalError`; on a read-write one the statement succeeds. That is the
+        property, not its spelling -- an equivalent read-only open written some other
+        way still passes.
+
+        The explicit `BEGIN` is load-bearing, and this docstring previously claimed
+        the probe was "rolled back" when it was not. MEASURED: `conn.rollback()` on
+        its own leaves `_writability_probe` in the store under BOTH the default
+        `isolation_level` and the `isolation_level=None` that `EventStore` and
+        `ExtractionCache` use. Python's sqlite3 auto-begins a transaction only for
+        INSERT/UPDATE/DELETE/REPLACE, so the DDL was never inside one to revert, and
+        under autocommit there is no transaction at all. Replaying `_build` under the
+        old probe and inspecting both stores afterwards: three connections probed, and
+        `_writability_probe` left behind in `event_store.db`. So this test wrote to a
+        replay source, in a file whose governing thesis is that the replay sources are
+        never written. Only the event store, not the extraction cache -- the cache is
+        opened read-only by the guard and never read-write in this flow, so the one
+        read-write connection is `EventStore._get_connection` serving
+        `get_current_epoch()`.
+
+        With the `BEGIN`, MEASURED across all four combinations of {read-write,
+        mode=ro} x {default isolation, isolation_level=None}: no `_writability_probe`
+        survives, the main database's sha256 is unchanged, and the connection is still
+        usable for the guard's own read afterwards. The review that found this
+        suggested `BEGIN IMMEDIATE` + `ROLLBACK` instead; that was measured too and
+        REJECTED -- `BEGIN IMMEDIATE` does NOT raise on a `mode=ro` connection, so it
+        reports the guard's read-only open as writable and fails this test on correct
+        code.
 
         The FIRST open is the event-store guard's. `EventStore.__init__` and
         `ExtractionCache.__init__` do no I/O, so nothing connects before it, and the
@@ -300,12 +325,18 @@ class TestTheReplaySourcesAreNeverInitialized:
 
         def _spy(target, *args, **kwargs):
             conn = real_connect(target, *args, **kwargs)
+            # The BEGIN is what makes this probe non-mutating: SQLite's DDL IS
+            # transactional, so the ROLLBACK reverts the CREATE TABLE -- whereas
+            # `conn.rollback()` on its own reverts nothing, because nothing had
+            # begun a transaction. Measured both ways; see the docstring.
+            conn.execute("BEGIN")
             try:
                 conn.execute("CREATE TABLE _writability_probe (x)")
-                conn.rollback()
                 opens.append((str(target), True))
             except sqlite3.OperationalError:
                 opens.append((str(target), False))
+            finally:
+                conn.execute("ROLLBACK")
             return conn
 
         # Act
