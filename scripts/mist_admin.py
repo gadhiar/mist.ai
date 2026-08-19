@@ -514,6 +514,22 @@ def _assert_replay_source_exists(
     needs that wal-index to read a WAL database. So the guard does not alter the
     store, and it does add a sidecar.
 
+    The path is percent-encoded into that URI rather than f-string interpolated, and
+    the bug that motivates it is not cosmetic. MEASURED on both platforms above, with
+    a store under a directory named `release#2`: `f"file:{db_path}?mode=ro"` puts
+    everything after the `#` into the URI FRAGMENT, so SQLite opened
+    `.../release` -- a different path -- and, because `?mode=ro` was inside that
+    discarded fragment, opened it read-write-CREATE. The run created a database file
+    that did not exist, found an empty `sqlite_master`, and refused a healthy store
+    for having no `epoch_ledger`. A dry-run command silently creating a database
+    because of URI syntax is the same defect class this branch exists to remove.
+    `%XX` misparses too (`v%41B` and `50%25off` both raised
+    `OperationalError: unable to open database file`); a bare `%` not followed by two
+    hex digits happens to survive. `pathlib.Path.as_uri()` was measured equally
+    correct on every shape tested, but it emits the `file://<authority>/...` form,
+    which changes the URI shape for path classes not tested here (UNC), so the
+    narrower fix that touches only the escaping is the one used.
+
     That is also why `sqlite3.OperationalError` is handled apart from every other
     `sqlite3.Error` below. When the wal-index cannot be created the read raises
     `OperationalError` on a store whose schema is entirely intact -- MEASURED as
@@ -552,6 +568,7 @@ def _assert_replay_source_exists(
     """
     import sqlite3
     from pathlib import Path as _Path
+    from urllib.parse import quote as _quote
 
     from backend.knowledge.regeneration.log_regenerator import ColdCacheError
 
@@ -565,9 +582,14 @@ def _assert_replay_source_exists(
     if not _Path(db_path).exists():
         raise ColdCacheError(f"No {label} at {db_path}. {_MISSING}")
 
+    # The path is being interpolated into a URI, so it must be percent-encoded: `#`,
+    # `?` and `%XX` are URI syntax, not filename characters. See the docstring for what
+    # the unescaped f-string this replaces actually did.
+    uri = "file:" + _quote(str(_Path(db_path).resolve())) + "?mode=ro"
+
     placeholders = ", ".join("?" * len(required_tables))
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(uri, uri=True)
         try:
             present = {
                 row[0]
@@ -587,13 +609,14 @@ def _assert_replay_source_exists(
         # replay's reads would fail the same way -- but do not call it corrupt.
         raise ColdCacheError(
             f"The {label} at {db_path} exists but could not be opened read-only "
-            f"({exc}). This is NOT evidence that the store is corrupt: SQLite needs "
-            f"a `-shm` wal-index to read a WAL database and a read-only connection "
-            f"must create it when absent, so a store on read-only media, a `:ro` "
-            f"bind mount, or a directory this process cannot write fails here with "
-            f"its schema intact. Re-run where the store's DIRECTORY is writable, or "
-            f"copy the store together with any `-wal` and `-shm` siblings somewhere "
-            f"writable and point the config there."
+            f"({exc}). This is NOT evidence that the store is corrupt. The usual "
+            f"cause is the wal-index: SQLite needs a `-shm` to read a WAL database "
+            f"and a read-only connection must create it when absent, so a store on "
+            f"read-only media, a `:ro` bind mount, or a directory this process "
+            f"cannot write fails here with its schema intact. Check that the store's "
+            f"DIRECTORY is writable, or copy the store together with any `-wal` and "
+            f"`-shm` siblings somewhere writable and point the config there. If the "
+            f"directory is writable, the sqlite error above is the thing to read."
         ) from exc
     except sqlite3.Error as exc:
         raise ColdCacheError(

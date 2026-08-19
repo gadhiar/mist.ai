@@ -242,6 +242,45 @@ class TestTheReplaySourcesAreNeverInitialized:
         with pytest.raises(ColdCacheError, match="epoch_ledger"):
             _build(str(db_path))
 
+    def test_a_hash_in_the_store_path_neither_misreads_nor_creates_a_database(self, tmp_path):
+        """`#` is URI syntax, and the guard interpolates the path into a URI.
+
+        With the path f-string'd in unescaped, everything after `#` becomes the URI
+        FRAGMENT. Two things follow, and the second is the serious one: SQLite opens a
+        DIFFERENT path (everything before the `#`), and `?mode=ro` -- which sits inside
+        the discarded fragment -- is never applied, so the open is read-write-CREATE.
+        The run creates a database that did not exist, reads an empty `sqlite_master`,
+        and refuses a healthy store for having no `epoch_ledger`.
+
+        Which assertion does the work, stated so neither is read as more than it is:
+        against the unescaped f-string it is the `_build` call itself that fails, on
+        the refusal, before the stray-file assertion is reached. The stray-file
+        assertion is retained for the variant the refusal cannot see -- a truncated
+        path that happens to land on a database carrying these tables, where the run
+        would proceed against the WRONG store having created or written it. That the
+        creation is real, and not merely possible, was measured separately: opening
+        `file:<dir>/release#2/event_store.db?mode=ro` created `<dir>/release` and then
+        accepted a `CREATE TABLE` on it, because `?mode=ro` was inside the fragment.
+
+        Path SHAPE, not a Windows drive letter: the suite runs in the Linux backend
+        container, and `#` is a legal filename character on both platforms.
+        """
+        # Arrange -- a valid store beneath a directory whose name carries a `#`
+        store_dir = tmp_path / "release#2"
+        store_dir.mkdir()
+        db_path = _seed_replay_sources(store_dir)
+
+        # Act -- the guard must resolve to the real store, not to `<tmp_path>/release`
+        regen, _epoch = _build(db_path)
+
+        # Assert
+        assert isinstance(regen, LogRegenerator)
+        assert not (tmp_path / "release").exists(), (
+            "the guard truncated the path at `#` and opened `<tmp_path>/release` "
+            "read-write, creating a database file. `?mode=ro` landed in the URI "
+            "fragment and was never applied."
+        )
+
     def test_a_wal_store_that_cannot_build_its_index_is_not_reported_as_corrupt(self, tmp_path):
         """A healthy store must never be refused with a corruption diagnosis.
 
