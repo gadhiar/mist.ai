@@ -553,8 +553,18 @@ def _assert_replay_source_exists(
     `epoch_ledger` (`get_current_epoch` store.py:493, `list_epochs` :499, both called
     from `_build_log_regenerator`), and `conversation_turn_events` LEFT JOIN
     `conversation_sessions` (`get_all_turns_for_reextraction` :406-407, plus
-    `get_turn_count` :454) -- the only two `EventStore` methods `LogRegenerator` calls
-    (`grep -n "self._events" log_regenerator.py` -> :291, :301, and the :105 assignment).
+    `get_turn_count` :454) -- the only two `EventStore` methods `LogRegenerator` calls.
+
+    That last claim is cited by SYMBOL, not by line, and deliberately:
+    `grep -n "self._events" log_regenerator.py` returns exactly three hits -- the
+    assignment in `LogRegenerator.__init__`, and the two calls above, BOTH inside
+    `LogRegenerator.rebuild`. The previous spelling of this citation gave the two
+    calls as `:291` and `:301`; an edit twelve lines above them, on this same branch,
+    shifted both onto comment text, so a reader running the docstring's own
+    reproduction command landed on comments and would have concluded the "only two
+    methods" claim was unsupported. The claim was true; the pointer had rotted. Line
+    numbers into a file under active edit are a citation that expires, so this one
+    names the symbols a grep will find instead.
 
     Args:
         db_path: Filesystem path to the SQLite store being replayed.
