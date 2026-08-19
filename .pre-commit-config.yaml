@@ -67,6 +67,15 @@ repos:
       - id: detect-private-key
       - id: mixed-line-ending
         args: [--fix=lf]
+        # .gitattributes pins `*.bat text eol=crlf` -- Windows batch files require CRLF,
+        # and `eol=crlf` is an explicit checkout instruction that applies on EVERY
+        # platform, including the ubuntu-latest CI runner. Without this exclude the two
+        # rules directly contradict each other: git checks the .bat files out as CRLF,
+        # this hook rewrites them to LF, and the hook exits 1. Verified by execution
+        # against an LF checkout -- `scripts/start_frontend.bat` (7 CR bytes) and
+        # `scripts/install-git-hooks.bat` (114 CR bytes) were the only two files the
+        # full-repo run touched. The blobs are LF; only the checkout is CRLF.
+        exclude: \.bat$
 
 # Configuration
 default_language_version:
