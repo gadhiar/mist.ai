@@ -483,19 +483,30 @@ def _assert_replay_source_exists(
     `sqlite3` rather than returning: `DatabaseError: file is not a database` for the
     truncated file, `OperationalError: no such table` for the schema-less one. Nothing
     catches either: `cmd_graph_rebuild_from_log` handles only `RebuildTargetError`,
-    `ColdCacheError` and `RebuildDeterminismError` (:808, :811, :814 -- the only three
-    `except` lines between that function's `def` at :748 and the next at :824), and the
-    `main()` try that wraps the command dispatch handles only `ModuleNotFoundError`,
-    `FileNotFoundError` and `MistError` (:2240, :2247, :2250). `main()`'s OTHER
-    `ModuleNotFoundError` handler (:2230) sits above that try, guarding the lazy
-    `MistError` import, and never sees a command's exception. So both escape as a
-    traceback instead of a refusal.
+    `ColdCacheError` and `RebuildDeterminismError` -- the only three `except` clauses
+    in that function's body (`grep -n "^def cmd_graph_rebuild_from_log" scripts/mist_admin.py`
+    finds it; the next `^def` bounds it) -- and the `main()` try whose body is
+    `return args.func(args)` handles only `ModuleNotFoundError`, `FileNotFoundError`
+    and `MistError` (`grep -n "^def main" scripts/mist_admin.py`). `main()`'s OTHER
+    `ModuleNotFoundError` handler is the one attached to the lazy
+    `from backend.errors import MistError` import ABOVE that try; it never sees a
+    command's exception. So both escape as a traceback instead of a refusal.
+
+    Cited by symbol rather than by line throughout, and that is not stylistic: an
+    earlier spelling of this same paragraph gave all eight of those handlers as line
+    numbers, and five later commits on this branch shifted every one of them by a
+    cumulative 178 lines -- entirely by inserting text ABOVE them, since the handlers
+    are at byte-identical offsets INSIDE their own functions across that whole range.
+    The commit that introduced those eight numbers had them exactly right. A citation
+    an unrelated edit can invalidate will be wrong before it is next read, so the
+    reproduction command is the citation here and the line number is not recorded.
 
     What the schema check does NOT buy, recorded because an earlier version of this
     docstring asserted the opposite and called it the common case: a store that a
     PRE-FIX run of this command created and left empty passes this check too.
     `EventStore.initialize()` executescripts `schema.sql`, which carries
-    `CREATE TABLE IF NOT EXISTS epoch_ledger` (schema.sql:134), and
+    `CREATE TABLE IF NOT EXISTS epoch_ledger`
+    (`grep -n "epoch_ledger" backend/event_store/schema.sql`), and
     `ExtractionCache.initialize()` executescripts a DDL whose sole statement is
     `CREATE TABLE IF NOT EXISTS extraction_cache` -- so on exactly those machines both
     required tables exist, are empty, and this guard passes. The run proceeds to
@@ -504,7 +515,8 @@ def _assert_replay_source_exists(
 
     The connection is opened READ-ONLY via a `file:...?mode=ro` URI. That is not
     decoration: `EventStore._get_connection` runs `PRAGMA journal_mode=WAL`
-    (store.py:64), which mutates a non-WAL database's header and creates
+    (`grep -n "journal_mode" backend/event_store/store.py`, inside that method),
+    which mutates a non-WAL database's header and creates
     `-wal`/`-shm` sidecars, so checking through the normal path would make this
     guard a writer of database content.
 
@@ -601,17 +613,20 @@ def _assert_replay_source_exists(
     table leaves a store that has it but lacks a sibling passing the guard and then
     tracebacking on the first read -- the failure mode this function exists to convert
     into a decision. The event store's replay reads exactly three:
-    `epoch_ledger` (`get_current_epoch` store.py:493, `list_epochs` :499, both called
-    from `_build_log_regenerator`), and `conversation_turn_events` LEFT JOIN
-    `conversation_sessions` (`get_all_turns_for_reextraction` :406-407, plus
-    `get_turn_count` :454) -- the only two `EventStore` methods `LogRegenerator` calls.
+    `epoch_ledger` (read by `EventStore.get_current_epoch` and `EventStore.list_epochs`,
+    both called from `_build_log_regenerator`), and `conversation_turn_events` LEFT JOIN
+    `conversation_sessions` (read by `EventStore.get_all_turns_for_reextraction`, plus
+    `EventStore.get_turn_count`) -- the only two `EventStore` methods `LogRegenerator`
+    calls. Each method carries its own `SELECT`, so the method is the citation:
+    `grep -nE "def (get_current_epoch|list_epochs|get_all_turns_for_reextraction|get_turn_count)"
+    backend/event_store/store.py` returns exactly those four.
 
     That last claim is cited by SYMBOL, not by line, and deliberately:
-    `grep -n "self._events" log_regenerator.py` returns exactly three hits -- the
-    assignment in `LogRegenerator.__init__`, and the two calls above, BOTH inside
-    `LogRegenerator.rebuild`. The previous spelling of this citation gave the two
-    calls as `:291` and `:301`; an edit twelve lines above them, on this same branch,
-    shifted both onto comment text, so a reader running the docstring's own
+    `grep -n "self._events" backend/knowledge/regeneration/log_regenerator.py` returns
+    exactly three hits -- the assignment in `LogRegenerator.__init__`, and the two calls
+    above, BOTH inside `LogRegenerator.rebuild`. The previous spelling of this citation
+    gave the two calls as bare line numbers; an edit a dozen lines above them, on this
+    same branch, shifted both onto comment text, so a reader running the docstring's own
     reproduction command landed on comments and would have concluded the "only two
     methods" claim was unsupported. The claim was true; the pointer had rotted. Line
     numbers into a file under active edit are a citation that expires, so this one
@@ -845,8 +860,9 @@ def _build_log_regenerator(
     extraction_cache = ExtractionCache(cache_path)
 
     # NEITHER store is initialize()d here, and that is the point. `initialize()` is a
-    # WRITE -- mkdir(parents=True) at store.py:75, executescript(schema.sql) at :80, and
-    # TWO conditional `ALTER TABLE` migrations at :88-90 and :99-101 -- performed by a
+    # WRITE -- `mkdir(parents=True)`, `executescript(schema.sql)`, and TWO conditional
+    # `ALTER TABLE` migrations, all in the body of `EventStore.initialize`
+    # (`grep -n "def initialize" backend/event_store/store.py`) -- performed by a
     # command whose entire advertised contract is "proof-first, dry-run only". Calling it
     # also MANUFACTURED the absence it was meant to tolerate: on a machine with no event
     # store it created an empty one and the run then reported "No epochs found", which
