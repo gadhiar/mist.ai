@@ -665,17 +665,23 @@ def _assert_replay_source_exists(
             rejected outright.
         required_columns: `{table: (column, ...)}` the replay also depends on, checked
             with `PRAGMA table_info` AFTER the table gate passes. Keys must appear in
-            `required_tables`. Empty by default: a column is worth naming here only
-            when a live query would break without it.
+            `required_tables`, and each value must name at least one column -- an
+            empty value tuple disables that table's column check rather than relaxing
+            it, so it is rejected the same way an empty `required_tables` is. The
+            whole dict is empty by default, and THAT spelling is legal: it honestly
+            means "no columns required". A column is worth naming here only when a
+            live query would break without it.
 
     Raises:
         ColdCacheError: When the file is missing, cannot be opened, is not a readable
-            SQLite database, or lacks any of `required_tables`. Raised so the CLI's
-            REFUSED branch reports a decision (exit 2) rather than a traceback.
+            SQLite database, lacks any of `required_tables`, or lacks any required
+            column. Raised so the CLI's REFUSED branch reports a decision (exit 2)
+            rather than a traceback.
         ValueError: When `required_tables` is empty, or `required_columns` names a
-            table `required_tables` does not. Caller bugs, deliberately NOT a
-            `ColdCacheError`: the CLI catches that and would report the operator's
-            store as refused for a fault that is entirely in this process.
+            table `required_tables` does not, or maps a table to an empty column
+            tuple. Caller bugs, deliberately NOT a `ColdCacheError`: the CLI catches
+            that and would report the operator's store as refused for a fault that is
+            entirely in this process.
     """
     import sqlite3
     from pathlib import Path as _Path
@@ -715,6 +721,28 @@ def _assert_replay_source_exists(
             f"_assert_replay_source_exists({label!r}) was given `required_columns` "
             f"for {_ungated}, which are not in `required_tables`. Columns can only "
             f"be required on a table the gate already requires."
+        )
+
+    # And the empty-argument trap literally one level down from `required_tables=()`.
+    # `{table: ()}` READS as "gate this table's columns" and gates nothing: the
+    # `for column in columns` comprehension below yields no entries, `missing_columns`
+    # comes back empty, and there is no raise. MEASURED against a store whose
+    # `conversation_sessions` was rebuilt without `origin`, all three tables present:
+    # `{"conversation_sessions": ("origin",)}` -> ColdCacheError, as designed;
+    # `{"conversation_sessions": ()}`          -> PASSED, no refusal.
+    #
+    # The empty DICT stays legal and is NOT this trap. It is the default, it honestly
+    # means "no columns required", and it is the correct call for the extraction cache,
+    # whose DDL has no `ALTER TABLE` to outrun. Only the empty VALUE lies about what it
+    # is doing, which is the same distinction `required_tables=()` failed to survive.
+    _no_columns = sorted(table for table, columns in required_columns.items() if not columns)
+    if _no_columns:
+        raise ValueError(
+            f"_assert_replay_source_exists({label!r}) was given `required_columns` "
+            f"with an empty column tuple for {_no_columns}. Name at least one column "
+            f"or drop the key entirely: an empty tuple disables that table's column "
+            f"check silently rather than relaxing it. Pass `required_columns={{}}` to "
+            f"require no columns at all -- that spelling is supported and honest."
         )
 
     _MISSING = (

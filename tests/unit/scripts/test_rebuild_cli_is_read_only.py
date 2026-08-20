@@ -653,6 +653,93 @@ class TestTheReplaySourcesAreNeverInitialized:
         with pytest.raises(ValueError, match="required_tables"):
             mist_admin._assert_replay_source_exists(str(db_path), "event store", ())
 
+    def test_an_empty_required_columns_tuple_is_rejected_instead_of_disabling_the_gate(
+        self, tmp_path
+    ):
+        """`{table: ()}` is the empty-`required_tables` trap one level down.
+
+        It READS as "gate this table's columns" and gates nothing: the comprehension
+        that builds `missing_columns` iterates `for column in columns`, so an empty
+        value yields no entries, `missing_columns` is empty, and the guard passes.
+
+        The negative control is what makes this a gate test rather than a store test --
+        the SAME pre-migration store is refused when the tuple names `origin`, so the
+        emptiness of the tuple is the only variable. Measured before the fix: the real
+        gate raised `ColdCacheError`, the empty tuple PASSED with no refusal.
+
+        `required_columns={}` is deliberately NOT rejected and is asserted here too. It
+        is the default, it means "no columns required", and the extraction-cache call
+        site relies on it. Rejecting the empty dict would break an honest caller; the
+        empty VALUE is the one that lies.
+        """
+        import sqlite3
+
+        import scripts.mist_admin as mist_admin
+        from backend.knowledge.regeneration.log_regenerator import ColdCacheError
+
+        # Arrange -- all three tables present, but `conversation_sessions` rebuilt
+        # without the `origin` column `initialize()`'s ALTER TABLE would add. Rebuilt
+        # by hand for the reason the sibling test records: SQLite refuses
+        # `ALTER TABLE ... DROP COLUMN` on this table because its DDL ends in a comment.
+        db_path = _seed_replay_sources(tmp_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("DROP TABLE conversation_sessions")
+        conn.execute(
+            "CREATE TABLE conversation_sessions ("
+            "session_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT, "
+            "turn_count INTEGER DEFAULT 0, input_modality TEXT DEFAULT 'voice')"
+        )
+        conn.commit()
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(conversation_sessions)")}
+        conn.close()
+        assert "origin" not in columns, "precondition: the column must actually be gone"
+
+        tables = ("epoch_ledger", "conversation_sessions", "conversation_turn_events")
+
+        # Negative control -- a real column gate refuses this store, so the tuple's
+        # emptiness is the only variable between this call and the next
+        with pytest.raises(ColdCacheError, match="conversation_sessions.origin"):
+            mist_admin._assert_replay_source_exists(
+                db_path, "event store", tables, {"conversation_sessions": ("origin",)}
+            )
+
+        # Act / Assert -- the empty value tuple is a caller bug, not a verdict
+        with pytest.raises(ValueError, match="required_columns"):
+            mist_admin._assert_replay_source_exists(
+                db_path, "event store", tables, {"conversation_sessions": ()}
+            )
+
+        # And the empty DICT remains legal: it means "no columns required"
+        mist_admin._assert_replay_source_exists(db_path, "event store", tables, {})
+
+    def test_a_required_column_on_an_ungated_table_is_rejected(self, tmp_path):
+        """Requiring a column on a table the TABLE gate does not require is a caller bug.
+
+        `PRAGMA table_info` on an absent table returns no rows rather than raising, so
+        this shape would report every one of that table's required columns as missing
+        and refuse the operator's store for a fault entirely inside this process.
+
+        The check existed with nothing holding it: removing the whole `_ungated` block
+        left all 14 tests in this file green. That is the same "a check nothing enforces
+        is decoration" standard the sibling `required_tables` raise was held to, and it
+        shipped with a test while this one did not.
+        """
+        import scripts.mist_admin as mist_admin
+
+        # Arrange -- a healthy store; the store is not what is under test
+        db_path = _seed_replay_sources(tmp_path)
+
+        # Act / Assert -- `epoch_ledger` is a real table, deliberately NOT in the
+        # gate tuple passed here, so the column requirement has nothing to stand on
+        with pytest.raises(ValueError, match="required_columns"):
+            mist_admin._assert_replay_source_exists(
+                db_path,
+                "event store",
+                ("conversation_sessions",),
+                {"epoch_ledger": ("provisional",)},
+            )
+
     def test_a_truncated_replay_source_is_refused(self, tmp_path):
         """A half-copied or interrupted-`cp` file also passes `Path.exists()`."""
         from backend.knowledge.regeneration.log_regenerator import ColdCacheError
