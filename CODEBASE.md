@@ -1,10 +1,22 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-08-05 (**Audit finding Q2-1 CLOSED: `graph-rebuild-from-log --dry-run` no
-longer writes to the live SQLite event store. Proved by execution -- pre-fix code wrote 2 job rows
-per invocation, post-fix 0, both against a COPY of the live store. Suite 2975 -> 2983. Next: the
-R1.4.6 T2/T3 hydrator, which needs a multi-session corpus authored WITH Raj.**)
+**Last Updated:** 2026-08-19 (**Audit finding Q2-1 CLOSED AND MERGED to `main` (`a81c474`,
+`--no-ff`). Four review waves; each found something the previous one missed. Wave 2's "Minor 6"
+was misclassified and was the real find -- a `#` in the store path became a URI fragment, so
+`?mode=ro` was never applied and the "read-only" open was read-write-CREATE, in the guard added
+to close Q2-1. Wave 3 killed a mutant guard that performed 13 committed writes to the replay
+sources while all ten tests passed. Wave 4 found eight docstring citations stale by exactly +178
+lines, broken by the wave that had just fixed a citation -- so every line-number reference in
+`scripts/mist_admin.py` is now enclosing-symbol-plus-grep, and line shifts can no longer generate
+findings there. Suite 2975 -> 2996, 0 failed. Live graph 32 nodes and the live event store
+(212992 bytes, mtime 2026-08-02) untouched throughout. Next: the R1.4.6 T2/T3 hydrator, which
+needs a multi-session corpus authored WITH Raj, and extraction-cache Phase 1 Task 1, which is
+blocked on a third claim-check of its plan.**)
 
+- **PRIOR ENTRY --** 2026-08-05: Audit finding Q2-1 closed on a branch (not yet merged):
+  `graph-rebuild-from-log --dry-run` no longer writes to the live SQLite event store. Proved by
+  execution -- pre-fix code wrote 2 job rows per invocation, post-fix 0, both against a COPY of
+  the live store. Suite 2975 -> 2983 at that point.
 - **PRIOR ENTRY --** 2026-08-05: Eval-harness scorer audit + the non-vacuity fix for `scorers.py`
   COMPLETE and ff-merged. R1.4.6 T0 landed earlier the same day.
 
@@ -256,8 +268,9 @@ local only).
   `assert_rebuild_target_not_live` was a DENYLIST OF ONE HOSTNAME SPELLING. Measured against
   `live = bolt://mist-neo4j:7687`: `bolt://mist-neo4j:7687` refused, but **`bolt://localhost:7687`
   and `bolt://127.0.0.1:7687` PASSED** -- the same database, since the live bolt port is
-  host-published. `mist_admin.py:573` calls that guard and `:589` then runs
-  `MATCH (n) DETACH DELETE n` unconditionally, so `--staging-uri bolt://localhost:7687` -- the
+  host-published. `cmd_graph_rebuild_from_log` calls that guard and then runs
+  `MATCH (n) DETACH DELETE n` unconditionally (`grep -n "assert_rebuild_target_not_live\|DETACH
+  DELETE" scripts/mist_admin.py`), so `--staging-uri bolt://localhost:7687` -- the
   natural spelling from the host -- would have wiped the canonical graph. Now an allowlist, and
   deliberately narrower than first specified: staging ONLY, excluding eval (the test DB) and dev
   (because R1.6 treats the DEV graph as the "live" side, so admitting it as a write target would
