@@ -101,14 +101,28 @@ def _store_fingerprint(*paths: Path) -> dict[str, object]:
 
     - sha256 of the main file catches anything reaching the database proper, including
       the header rewrite `PRAGMA journal_mode=WAL` performs on a non-WAL store.
-    - `sqlite_master` plus per-table row counts, read through a fresh connection,
-      catches a COMMITTED write still sitting in the `-wal` and not yet checkpointed
-      into the main file. A byte digest of the main file alone misses that entirely,
-      which matters because these stores are WAL. MEASURED, same store, same write:
-      committed AND closed changes the main file's sha256 (a clean `close()`
-      checkpoints); committed and NOT closed leaves it byte-identical while the new
-      table is plainly visible to a fresh reader. The review that asked for this
-      assertion asked for the digest only, which the second of those defeats.
+    - `sqlite_master` plus a per-table sha256 over the table's ROWS, read through a
+      fresh connection, catches a COMMITTED write still sitting in the `-wal` and not
+      yet checkpointed into the main file. A byte digest of the main file alone misses
+      that entirely, which matters because these stores are WAL. MEASURED, same store,
+      same write: committed AND closed changes the main file's sha256 (a clean
+      `close()` checkpoints); committed and NOT closed leaves it byte-identical while
+      the new table is plainly visible to a fresh reader. The review that asked for
+      this assertion asked for the digest only, which the second of those defeats.
+
+    The row leg digests CONTENTS, not `COUNT(*)`, and the difference is not academic.
+    Counts were what this helper compared until a re-review demonstrated the hole with
+    a mutant: an in-place `UPDATE epoch_ledger SET model_hash=...`, committed on a
+    connection left open, adds no schema object and changes no count, and its bytes
+    stay in the `-wal` where the main file's sha256 cannot see them. It sat in both
+    legs' blind spots at once and the assertion reported the store unchanged.
+    MEASURED, reproduced independently before this change: `model_hash` went from
+    `test-model-hash` to `MUTATED-BY-F3D` across `_build` with `fingerprint equal?
+    True` and all six keys reporting `same`. That mutant fails this test now.
+
+    Not a hypothetical shape, either: `EventStore` caches its connection in
+    `self._conn` and `_build_log_regenerator` never closes it, so a regression writing
+    through the store's own API reproduces the open-connection condition exactly.
 
     The `-wal`/`-shm` sidecars are deliberately EXCLUDED from the digest. The guard's
     own read-only open creates both on a WAL store (MEASURED: a 0-byte `-wal` and a
@@ -129,8 +143,18 @@ def _store_fingerprint(*paths: Path) -> dict[str, object]:
             fingerprint[f"{path.name}:schema"] = sorted(
                 (row[0], row[1]) for row in conn.execute("SELECT type, name FROM sqlite_master")
             )
-            fingerprint[f"{path.name}:rows"] = {
-                table: conn.execute(f"SELECT COUNT(*) FROM `{table}`").fetchone()[0]  # nosec B608
+            fingerprint[f"{path.name}:rowdigest"] = {
+                table: hashlib.sha256(
+                    "\n".join(
+                        # repr, then sort the STRINGS: sorting the tuples themselves
+                        # raises TypeError the moment one column holds both NULL and
+                        # text, which the event store's nullable columns allow.
+                        sorted(
+                            repr(tuple(row))
+                            for row in conn.execute(f"SELECT * FROM `{table}`")  # nosec B608
+                        )
+                    ).encode()
+                ).hexdigest()
                 for table in sorted(
                     row[0]
                     for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -370,9 +394,27 @@ class TestTheReplaySourcesAreNeverInitialized:
         adding a second, ordinary read-write open inside the guard performed thirteen
         committed CREATE TABLE + INSERT pairs against the replay sources across the
         file and left all ten tests green. The fingerprint assertion below is what
-        closes that: it compares both stores before and after `_build`, so a write
-        anywhere in the call graph fails this test regardless of which connection made
-        it or how it was spelled.
+        closes that.
+
+        What that assertion guarantees, stated as narrowly as it is true, because the
+        sentence it replaces claimed "a write anywhere in the call graph fails this
+        test" and a re-reviewer falsified it with a mutant that passed. For each of the
+        two stores it compares, before and after `_build`: the main file's bytes, every
+        `sqlite_master` object, and a sha256 over the rows of every non-internal table,
+        read through a FRESH connection. So a COMMITTED write to either store's schema
+        or table contents fails this test whichever connection made it, however the
+        open was spelled, and whether or not it has been checkpointed out of the `-wal`.
+
+        Three things it still cannot see, none of them closed by this assertion:
+
+        - A write to any file other than these two. Only the paths passed in are
+          digested; a regression writing to a third database is invisible here.
+        - A write undone again before `_build` returns. The comparison is endpoint to
+          endpoint, not a journal of what happened in between.
+        - Changes confined to sqlite's own `sqlite_*` tables, which the row scan skips,
+          or to the `-wal`/`-shm` sidecars, which the byte digest excludes. Committed
+          DATA in the `-wal` is still caught -- the fresh connection reads through it --
+          so what is excluded is the sidecar bytes, not the writes they carry.
         """
         import sqlite3
 
@@ -417,9 +459,9 @@ class TestTheReplaySourcesAreNeverInitialized:
         # the property `opens[0]` cannot see. Sidecars excluded; see the helper.
         assert _store_fingerprint(Path(db_path), cache_path) == before, (
             "`_build_log_regenerator` CHANGED a replay source. The main database "
-            "bytes, the schema, or a row count differs across the call. This command "
-            "replays an existing log under a dry-run-only contract; it must not write "
-            "to the log it replays."
+            "bytes, the schema, or the contents of a table differ across the call. "
+            "This command replays an existing log under a dry-run-only contract; it "
+            "must not write to the log it replays."
         )
 
     def test_a_hash_in_the_store_path_neither_misreads_nor_creates_a_database(self, tmp_path):
