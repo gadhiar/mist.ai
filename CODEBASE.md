@@ -1,6 +1,125 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-08-05 (**Eval-harness scorer audit + the non-vacuity fix for `scorers.py` COMPLETE and ff-merged. R1.4.6 T0 landed earlier the same day. Next: the R1.4.6 T2/T3 hydrator, which needs a multi-session corpus authored WITH Raj.**
+**Last Updated:** 2026-08-05 (**Audit finding Q2-1 CLOSED: `graph-rebuild-from-log --dry-run` no
+longer writes to the live SQLite event store. Proved by execution -- pre-fix code wrote 2 job rows
+per invocation, post-fix 0, both against a COPY of the live store. Suite 2975 -> 2983. Next: the
+R1.4.6 T2/T3 hydrator, which needs a multi-session corpus authored WITH Raj.**)
+
+- **PRIOR ENTRY --** 2026-08-05: Eval-harness scorer audit + the non-vacuity fix for `scorers.py`
+  COMPLETE and ff-merged. R1.4.6 T0 landed earlier the same day.
+
+---
+
+## The rebuild's dry-run is now actually dry (audit Q2-1)
+
+**The defect.** `mist_admin graph-rebuild-from-log --dry-run`, whose entire advertised contract is
+"proof-first, dry-run only", wrote to the LIVE SQLite event store on every run: `initialize()` on
+both stores (`mkdir` + `executescript` + a conditional `ALTER TABLE`), then a
+`rebuild-<epoch>-<uuid>` job row, a checkpoint per turn, and a finalize -- **doubled**, because
+`_build_once` runs twice for the determinism gate.
+
+**Why no guard caught it, and why no guard ever would have.** `assert_rebuild_target_not_live` and
+`assert_neo4j_isolated` both reason about bolt URIs; a SQLite path is invisible to them. The
+isolation model equated "live state" with "the live Neo4j graph". `LogRegenerator` held THREE
+dependencies and only the Neo4j leg was guarded -- while that same class had already solved the
+identical problem on its Neo4j leg, where `source_conn` reads live and `staging_conn` takes the
+writes.
+
+**The fix is structural, not another guard.** The event store was doing two unrelated jobs: it was
+the replay SOURCE (which must be live) and the sink for the rebuild's own progress rows (which must
+not be). `backend/knowledge/regeneration/rebuild_journal.py` splits them --
+`EventStoreRebuildJournal` (durable, used by the golden-log replay and integration tests against
+their own disposable stores) and `NullRebuildJournal` (records nothing, wired by the CLI).
+`journal` is a REQUIRED constructor argument: a default is exactly what the bug looked like, since
+any implicit "journal into the store you were given" sends a proof run's rows to the live ledger.
+`rebuild()` now also refuses `resume_from` against a non-durable journal rather than silently
+restarting from the top and reporting success.
+
+**Both `initialize()` calls are gone**, replaced by `_assert_replay_source_exists`. Calling
+`initialize()` also MANUFACTURED the absence it was meant to tolerate: on a machine with no event
+store it created an empty one, and the run then reported "No epochs found" -- indistinguishable
+from a store that exists and is empty. A rebuild replays an existing log; it does not bring one
+into being.
+
+**Proved by execution, not by reading the diff.** Against a COPY of the live store (live never
+touched), with staging Neo4j up:
+
+    pre-fix   -> re_extraction_jobs: 2   ('rebuild-1-1b369bed', 'rebuild-1-07ad9814')
+    post-fix  -> re_extraction_jobs: 0
+
+The two rows from one invocation are the doubling made visible. Live `re_extraction_jobs` was 0
+before this work and is 0 after; the defect was latent and never fired against live.
+
+**The precondition that makes those two numbers comparable, stated because omitting it made the
+record unreproducible.** Both runs were handed a MANUFACTURED `extraction_cache.db` in the copy
+directory, created by a separate harness command, because no production code path creates one
+(see the open item below). Without it the post-fix run refuses at `_assert_replay_source_exists`
+before `LogRegenerator` is constructed and returns `0` for an entirely different reason -- so a
+reader reproducing this from the original wording would have measured the refusal and read it as
+the fix. The whole-branch review raised precisely that (HIGH-2/F1). Re-verified 2026-08-05 with
+the cache present: the post-fix run prints `[rebuild] determinism gate PASSED (rebuild-twice
+byte-identical)` and exits 0, so the journal path WAS exercised and the `0` measures it. **The
+proof stands; the record of it was incomplete** -- the same defect class as the code bug, in the
+documentation.
+
+**Regression mechanisms, each mutation-proved in both directions.**
+`tests/unit/scripts/test_rebuild_cli_is_read_only.py` asserts BEHAVIOURALLY that
+`_build_log_regenerator` initializes neither replay source, refuses a missing/unschema'd/truncated
+one, and constructs a journal whose runtime `type` is `NullRebuildJournal`. Its first version
+checked those properties with `ast` and the review defeated all three with a single mutant that
+fully restored the live write -- by moving `initialize()` one frame out into a module-level helper
+(an AST rule scoped to one function stops at the frame boundary) and by
+`import EventStoreRebuildJournal as NullRebuildJournal` (the spelling the rule matched stayed
+identical while the object became durable and live-bound). Both mutants now fail. The file also
+carried a FALSE justification for going static -- that a behavioural test needed a model load and
+a live Neo4j -- which was never checked before being written; patching the function-local imports
+reaches it with neither. `RecordingEventStore` in `test_rebuild_scoping.py` also lost its
+job-write methods, so a regression that reaches for one fails with `AttributeError`.
+**"Each mutation-proved" was itself an over-claim until 2026-08-18.** The builder calls
+`_assert_replay_source_exists` TWICE (event store, then extraction cache), every refusal test
+drove the event store, and because that is the guard checked first, deleting the extraction-cache
+call left the whole file green. Closed by
+`test_a_missing_extraction_cache_is_refused_even_with_a_valid_event_store`, which seeds a valid
+event store so only the second guard can refuse; mutation-proved in both directions (delete the
+call -> 1 failed / 5 passed with `DID NOT RAISE`; restore -> 6 passed).
+
+**STILL NOT closed, named so the above is not read as more than it is:**
+
+- **Nothing in production ever writes an extraction cache, so `graph-rebuild-from-log --dry-run`
+  is now UNCONDITIONALLY non-functional against any live-derived config.** `grep -rn
+  "ExtractionCache\|extraction_cache" backend/` returns zero hits; the only non-test
+  constructions are `mist_admin.py` (this read-only replay path) and
+  `scripts/golden_log/generate.py:330`, which writes `extraction-cache.db` at its own disposable
+  root -- a DIFFERENT filename from the `extraction_cache.db` the CLI derives. Every invocation
+  therefore hits `ColdCacheError` and exits 2. **An earlier draft of this entry said "a rebuild of
+  a non-empty log would ColdCacheError"; that condition was wrong in both directions** and the
+  review falsified it (F3). The guard tests schema, not coverage, so it fires on an empty log too.
+  **A SECOND false claim was written into this entry while correcting the first, and is corrected
+  here 2026-08-18 rather than removed:** it said that on a machine where the pre-fix `initialize()`
+  had already created an empty cache the old existence-only check did NOT fire at all, and that
+  this was why the guard now checks for the required table rather than the path. Both halves are
+  wrong. `ExtractionCache.initialize()` executescripts a DDL whose sole statement is
+  `CREATE TABLE IF NOT EXISTS extraction_cache`, so such a machine HAS the table and the NEW check
+  passes there too -- the schema check buys nothing on the machines it was said to be for.
+  (Verified by execution: `initialize()` into a temp dir, then
+  `SELECT name FROM sqlite_master WHERE type='table'` over a `mode=ro` connection, returns
+  `['extraction_cache']`; the event store's equivalent returns a list containing `epoch_ledger`,
+  from `schema.sql:134`.) What the schema check DOES buy over an existence check is the truncated
+  file and the 0-byte file that `touch` or a bare `sqlite3.connect()` on the path leaves -- on
+  both, the first read raises out of `sqlite3` and escapes as a traceback. The refusal is correct
+  and the guard is worth keeping; only its stated reason was invented. **The R1.6 live==rebuilt
+  closure gate has no runnable path until a production writer for the extraction cache exists.**
+  That prerequisite is now the blocking item, and nothing else in the repo tracks it.
+- **The determinism gate compares two empty graphs whenever it can run at all.** The live log
+  holds 0 turns (`conversation_turn_events`: 0, `conversation_sessions`: 0), so "rebuild-twice
+  byte-identical" is vacuous over live data. Stated in the past/conditional tense deliberately:
+  the review falsified an earlier present-tense phrasing (F2), since after this branch the gate
+  is unreachable on a live config at all (previous bullet). Same vacuity class the 2026-08-05
+  scorer audit closed for F2 and V7; not closed here.
+- **`--dry-run` is still `required=True` and still never read** (audit Q1-3). It is no longer
+  certifying something false, but it remains a flag that cannot alter control flow. A durable-journal
+  branch was deliberately NOT added behind it -- that would be a dead branch justified by a future
+  caller.
 
 ---
 

@@ -13,6 +13,7 @@ from backend.event_store.store import EventStore
 from backend.knowledge.config import Neo4jConfig
 from backend.knowledge.extraction_cache import ExtractionCache
 from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
+from backend.knowledge.regeneration.rebuild_journal import EventStoreRebuildJournal
 from backend.knowledge.storage.neo4j_connection import Neo4jConnection
 
 # Staging endpoint (NEVER live). In-network service name, then host-published port.
@@ -145,6 +146,7 @@ def _build_regenerator_with_one_turn(
         event_store=event_store,
         extraction_cache=cache,
         staging_curation_pipeline=pipeline,
+        journal=EventStoreRebuildJournal(event_store),
     )
     return regen, event_store, cache, _TEST_EPOCH
 
@@ -164,6 +166,7 @@ def _build_regenerator_with_uncached_turn(
         event_store=event_store,
         extraction_cache=cache,
         staging_curation_pipeline=pipeline,
+        journal=EventStoreRebuildJournal(event_store),
     )
     return regen, event_store, cache, _TEST_EPOCH
 
@@ -324,6 +327,7 @@ class TestLogRegeneratorReplay:
             event_store=event_store,
             extraction_cache=cache,
             staging_curation_pipeline=pipeline,
+            journal=EventStoreRebuildJournal(event_store),
         )
 
         # Act: first rebuild into staging.

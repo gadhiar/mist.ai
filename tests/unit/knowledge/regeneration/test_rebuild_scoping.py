@@ -45,6 +45,7 @@ from backend.knowledge.curation.reconciliation import ReconcileTurnResult
 from backend.knowledge.extraction.validator import ValidationResult
 from backend.knowledge.extraction_cache import ExtractionCache
 from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
+from backend.knowledge.regeneration.rebuild_journal import EventStoreRebuildJournal
 
 # The REAL staging endpoint, not a per-file synthetic name. Connections here are
 # fakes and never dial it, but `assert_rebuild_target_not_live` is an allowlist
@@ -93,17 +94,11 @@ class RecordingEventStore:
     def get_turn_count(self) -> int:
         return self.inner.get_turn_count()
 
-    def create_reextraction_job(self, **kwargs: Any) -> None:
-        self.inner.create_reextraction_job(**kwargs)
-
-    def checkpoint_reextraction_job(self, *args: Any) -> None:
-        self.inner.checkpoint_reextraction_job(*args)
-
-    def finalize_reextraction_job(self, **kwargs: Any) -> None:
-        self.inner.finalize_reextraction_job(**kwargs)
-
-    def get_reextraction_job(self, job_id: str) -> dict[str, Any] | None:
-        return self.inner.get_reextraction_job(job_id)
+    # No job/checkpoint methods, deliberately. They were here while `LogRegenerator`
+    # wrote its progress back into the store it was replaying -- the coupling that sent
+    # a dry-run's rows to the LIVE ledger. Progress now goes to an injected journal, so
+    # the replay source's contract is reads only, and a regression that reaches for a
+    # write here fails with AttributeError instead of passing silently.
 
     @property
     def only_selection_call(self) -> dict[str, Any]:
@@ -270,6 +265,11 @@ def build_world(*, cache_superseded_turn: bool = True, with_orphan: bool = False
             event_store=recording_store,
             extraction_cache=cache,
             staging_curation_pipeline=recorder,
+            # Durable, and pointed at the SAME underlying store the log came from --
+            # which is the legitimate wiring for a rebuild of record, and what makes
+            # `test_the_job_ledger_totals_only_the_scoped_turns` still meaningful.
+            # It is a deliberate choice here, not the default it used to be.
+            journal=EventStoreRebuildJournal(store),
         ),
     )
 

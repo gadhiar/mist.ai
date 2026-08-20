@@ -32,6 +32,7 @@ import pytest
 from backend.knowledge.canonical_serialize import canonical_graph_form
 from backend.knowledge.regeneration.log_regenerator import LogRegenerator
 from backend.knowledge.regeneration.rebuild_gate import assert_rebuild_twice_identical
+from backend.knowledge.regeneration.rebuild_journal import EventStoreRebuildJournal
 from scripts.golden_log.generate import build_golden_turns, materialize_isolated
 from tests.integration.knowledge.test_log_regenerator import (
     _ENDPOINT,
@@ -64,6 +65,7 @@ async def _rebuild_into_staging(staging_conn, root):
         event_store=materialized.event_store,
         extraction_cache=materialized.extraction_cache,
         staging_curation_pipeline=_build_staging_pipeline(staging_conn),
+        journal=EventStoreRebuildJournal(materialized.event_store),
     )
     report = await regenerator.rebuild(
         staging_uri=_staging_uri(),

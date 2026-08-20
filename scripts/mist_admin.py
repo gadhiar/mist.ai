@@ -463,6 +463,387 @@ def cmd_graph_backfill_bitemporal(args: argparse.Namespace) -> int:
         connection.disconnect()
 
 
+def _assert_replay_source_exists(
+    db_path: str,
+    label: str,
+    required_tables: tuple[str, ...],
+    required_columns: dict[str, tuple[str, ...]] | None = None,
+) -> None:
+    """Refuse a rebuild whose replay source is absent or carries no schema.
+
+    Checks the SCHEMA, not merely the path. What that buys over `Path.exists()` is two
+    states, both of which pass an existence check:
+
+    - A truncated, half-copied, or interrupted-`cp` file.
+    - A file created by something other than `initialize()` -- `touch`, or a
+      `sqlite3.connect()` that opened the path and wrote no schema (both leave a
+      0-byte file).
+
+    Neither is caught by an existence check, and on both the first read raises out of
+    `sqlite3` rather than returning: `DatabaseError: file is not a database` for the
+    truncated file, `OperationalError: no such table` for the schema-less one. Nothing
+    catches either: `cmd_graph_rebuild_from_log` handles only `RebuildTargetError`,
+    `ColdCacheError` and `RebuildDeterminismError` -- the only three `except` clauses
+    in that function's body (`grep -n "^def cmd_graph_rebuild_from_log" scripts/mist_admin.py`
+    finds it; the next `^def` bounds it) -- and the `main()` try whose body is
+    `return args.func(args)` handles only `ModuleNotFoundError`, `FileNotFoundError`
+    and `MistError` (`grep -n "^def main" scripts/mist_admin.py`). `main()`'s OTHER
+    `ModuleNotFoundError` handler is the one attached to the lazy
+    `from backend.errors import MistError` import ABOVE that try; it never sees a
+    command's exception. So both escape as a traceback instead of a refusal.
+
+    Cited by symbol rather than by line throughout, and that is not stylistic: an
+    earlier spelling of this same paragraph gave all eight of those handlers as line
+    numbers, and five later commits on this branch shifted every one of them by a
+    cumulative 178 lines -- entirely by inserting text ABOVE them, since the handlers
+    are at byte-identical offsets INSIDE their own functions across that whole range.
+    The commit that introduced those eight numbers had them exactly right. A citation
+    an unrelated edit can invalidate will be wrong before it is next read, so the
+    reproduction command is the citation here and the line number is not recorded.
+
+    What the schema check does NOT buy, recorded because an earlier version of this
+    docstring asserted the opposite and called it the common case: a store that a
+    PRE-FIX run of this command created and left empty passes this check too.
+    `EventStore.initialize()` executescripts `schema.sql`, which carries
+    `CREATE TABLE IF NOT EXISTS epoch_ledger`
+    (`grep -n "epoch_ledger" backend/event_store/schema.sql`), and
+    `ExtractionCache.initialize()` executescripts a DDL whose sole statement is
+    `CREATE TABLE IF NOT EXISTS extraction_cache` -- so on exactly those machines both
+    required tables exist, are empty, and this guard passes. The run proceeds to
+    `_build_log_regenerator`'s "No epochs found in the event store" refusal, which is
+    a `ColdCacheError` and was never a traceback.
+
+    The connection is opened READ-ONLY via a `file:...?mode=ro` URI. That is not
+    decoration: `EventStore._get_connection` runs `PRAGMA journal_mode=WAL`
+    (`grep -n "journal_mode" backend/event_store/store.py`, inside that method),
+    which mutates a non-WAL database's header and creates
+    `-wal`/`-shm` sidecars, so checking through the normal path would make this
+    guard a writer of database content.
+
+    `mode=ro` is not, however, byte-free, and that is recorded here rather than left
+    as the earlier implication that it made this guard a non-write. MEASURED against
+    a temp-dir store carrying this schema, on the container (sqlite 3.37.2, Linux)
+    and on the host the CLI actually runs on (sqlite 3.45.1, Windows), with sha256
+    compared before and after: the main database file is byte-IDENTICAL in every
+    case, and on a WAL store with neither sidecar present the first read CREATES
+    TWO files beside it -- a 0-byte `-wal` AND a 32768-byte `-shm` wal-index -- and
+    leaves both there after `close()`. Same count and same sizes on both platforms.
+    On a NON-WAL store the same read creates nothing at all. So the guard never
+    alters the store, and on a WAL store it adds two sidecars.
+
+    Two, not one: an earlier version of this paragraph said "a sidecar" and named
+    only the `-shm`. The omitted file is not incidental -- the refusal path below
+    turns on both of them, and a correction that named only the `-wal` instead was
+    equally wrong. Both were written from a measurement that varied one file at a
+    time; the matrix below varies both.
+
+    SCOPE, so the next reader does not over-read the paragraph above: THIS FUNCTION
+    is read-only. The COMMAND is not. `_build_log_regenerator` calls
+    `get_current_epoch()` / `list_epochs()` immediately after these two guards, and
+    both go through `EventStore._get_connection`, which is a plain read-write
+    `sqlite3.connect` followed by `PRAGMA journal_mode=WAL` (cited by symbol:
+    `grep -n "def _get_connection" backend/event_store/store.py`). On a
+    NON-WAL store that PRAGMA rewrites the database header: MEASURED on a store
+    seeded `journal_mode=delete`, the file's sha256 is unchanged across this guard
+    (`604fbd03fbe4abae` before and after, no sidecars created) and then CHANGES to
+    `c4119ee56d4cb9c4` on the first `_get_connection`, with `journal_mode` left as
+    `wal`. Recorded, not fixed: it predates this branch, and a production store is
+    already WAL (both `schema.sql` and `_get_connection` set it), so there the
+    header write is a no-op and only the sidecars appear. The point is that
+    "read-only" is a property of this guard alone, not of the command.
+
+    The path is percent-encoded into that URI rather than f-string interpolated, and
+    the bug that motivates it is not cosmetic. MEASURED on both platforms above, with
+    a store under a directory named `release#2`: `f"file:{db_path}?mode=ro"` puts
+    everything after the `#` into the URI FRAGMENT, so SQLite opened
+    `.../release` -- a different path -- and, because `?mode=ro` was inside that
+    discarded fragment, opened it read-write-CREATE. The run created a database file
+    that did not exist, found an empty `sqlite_master`, and refused a healthy store
+    for having no `epoch_ledger`. A dry-run command silently creating a database
+    because of URI syntax is the same defect class this branch exists to remove.
+    `%XX` misparses too (`v%41B` and `50%25off` both raised
+    `OperationalError: unable to open database file`); a bare `%` not followed by two
+    hex digits happens to survive. `pathlib.Path.as_uri()` was measured equally
+    correct on every shape tested, but it emits the `file://<authority>/...` form,
+    which changes the URI shape for path classes not tested here (UNC), so the
+    narrower fix that touches only the escaping is the one used.
+
+    That is also why `sqlite3.OperationalError` is handled apart from every other
+    `sqlite3.Error` below. A read-only open of a WAL store can fail on a store whose
+    schema is entirely intact, and the mechanism is BOTH sidecars, not either one
+    alone. MEASURED on the container (sqlite 3.37.2), two identical runs, varying
+    `-wal` and `-shm` independently against a `chmod 0500` directory and against a
+    `docker run -v <dir>:/mnt:ro` bind mount:
+
+    - Both sidecars already present: READ OK, under BOTH read-only mechanisms.
+    - `-wal` present, `-shm` absent: refused, "unable to open database file", under
+      both mechanisms. `-wal` size is irrelevant (0-byte and 8272-byte both refused).
+    - `-wal` absent: refused, and a present `-shm` does not save it. "attempt to
+      write a readonly database" under `chmod 0500`, "unable to open database file"
+      under the `:ro` mount.
+
+    The invariant across every row: the read succeeds if and only if both sidecars
+    are ALREADY on disk. Where the directory is writable all of those states succeed,
+    because the read creates whichever is missing -- which is the same fact as the
+    two-sidecar creation measured above, seen from the failure side.
+
+    So the operable statement is "both siblings, or a writable directory", NOT
+    "SQLite needs a `-shm`". That earlier framing predicts that copying the `.db`
+    and the `-shm` to writable media is enough; MEASURED, that state still refuses.
+    A subsequent correction claiming the opposite -- that with the `-shm` absent the
+    read SUCCEEDS if a `-wal` exists -- does not reproduce here either: that row
+    refuses on both mechanisms. Neither single-file mechanism survives the matrix.
+
+    The sqlite message varies with which sidecar is missing AND with how the location
+    is read-only, so it is reported verbatim rather than diagnosed. `OperationalError`
+    also covers failures that are not about the wal-index at all -- `db_path` naming a
+    directory, or `database is locked` -- which is why the message below states the
+    two-sibling rule as the WAL-store case and then defers to the sqlite error rather
+    than asserting one universal cause. Reporting any of this as "not a readable
+    SQLite database" accuses a healthy store of corruption. Both branches still
+    REFUSE, because the guard cannot read the schema either way and the replay's own
+    reads would fail identically; only the diagnosis differs. The two are cleanly separable by type: a truncated file
+    raises `sqlite3.DatabaseError` ("file is not a database") which is NOT an
+    `OperationalError`, while the wal-index failure is. Note the raise surfaces from
+    `execute()`, not from `sqlite3.connect()` -- `connect()` returns a Connection and
+    the wal-index is materialised on first read -- but both sit inside the same `try`,
+    so the handled outcome is the same.
+
+    EVERY table the replay reads must be named, not just one. Gating on a single
+    table leaves a store that has it but lacks a sibling passing the guard and then
+    tracebacking on the first read -- the failure mode this function exists to convert
+    into a decision. The event store's replay reads exactly three:
+    `epoch_ledger` (read by `EventStore.get_current_epoch` and `EventStore.list_epochs`,
+    both called from `_build_log_regenerator`), and `conversation_turn_events` LEFT JOIN
+    `conversation_sessions` (read by `EventStore.get_all_turns_for_reextraction`, plus
+    `EventStore.get_turn_count`) -- the only two `EventStore` methods `LogRegenerator`
+    calls. Each method carries its own `SELECT`, so the method is the citation:
+    `grep -nE "def (get_current_epoch|list_epochs|get_all_turns_for_reextraction|get_turn_count)"
+    backend/event_store/store.py` returns exactly those four.
+
+    That last claim is cited by SYMBOL, not by line, and deliberately:
+    `grep -n "self._events" backend/knowledge/regeneration/log_regenerator.py` returns
+    exactly three hits -- the assignment in `LogRegenerator.__init__`, and the two calls
+    above, BOTH inside `LogRegenerator.rebuild`. The previous spelling of this citation
+    gave the two calls as bare line numbers; an edit a dozen lines above them, on this
+    same branch, shifted both onto comment text, so a reader running the docstring's own
+    reproduction command landed on comments and would have concluded the "only two
+    methods" claim was unsupported. The claim was true; the pointer had rotted. Line
+    numbers into a file under active edit are a citation that expires, so this one
+    names the symbols a grep will find instead.
+
+    The same argument runs one level down, to COLUMNS, which is why
+    `required_columns` exists. A table-granular gate leaves a store that has all
+    three tables but a pre-migration `conversation_sessions` passing and then
+    tracebacking on the first read -- the identical failure mode, one level lower.
+    `LogRegenerator.rebuild` calls `get_all_turns_for_reextraction` with `origins`
+    defaulting to `CANONICAL_ORIGINS` (`('real',)`, non-`None`), so the query always
+    includes `COALESCE(s.origin, 'real') IN (?)`, and `conversation_sessions.origin`
+    is added by a conditional `ALTER TABLE` inside `initialize()` -- which this
+    command deliberately does not call. MEASURED against a store carrying all three
+    tables with `origin` dropped: `GUARD: PASSED`, then
+    `OperationalError: no such column: s.origin`, and the only `except` clauses in
+    `cmd_graph_rebuild_from_log` are `RebuildTargetError`, `ColdCacheError` and
+    `RebuildDeterminismError` (resolved from the AST, not read off a line number),
+    so it escapes as a traceback.
+
+    `epoch_ledger.provisional` has the same conditional-`ALTER TABLE` shape and is
+    deliberately NOT gated. Two independent checks: `grep -n provisional` over
+    `backend/knowledge/regeneration/ scripts/mist_admin.py` returns nothing, and --
+    the stronger one, because absence of a grep hit is not absence of a dependency --
+    MEASURED against a store whose `epoch_ledger` lacks the column, both
+    `get_current_epoch()` and `list_epochs()` return their rows normally. They are
+    `SELECT *`, so the column's absence is invisible to them. Gating on it would
+    refuse stores the replay can read.
+
+    Args:
+        db_path: Filesystem path to the SQLite store being replayed.
+        label: Human name used in the refusal ("event store" / "extraction cache").
+        required_tables: Every table the store must already have for the replay to
+            read it. Order is preserved in the refusal message. Must be non-empty --
+            an empty tuple disables the gate rather than relaxing it, so it is
+            rejected outright.
+        required_columns: `{table: (column, ...)}` the replay also depends on, checked
+            with `PRAGMA table_info` AFTER the table gate passes. Keys must appear in
+            `required_tables`, and each value must name at least one column -- an
+            empty value tuple disables that table's column check rather than relaxing
+            it, so it is rejected the same way an empty `required_tables` is. The
+            whole dict is empty by default, and THAT spelling is legal: it honestly
+            means "no columns required". A column is worth naming here only when a
+            live query would break without it.
+
+    Raises:
+        ColdCacheError: When the file is missing, cannot be opened, is not a readable
+            SQLite database, lacks any of `required_tables`, or lacks any required
+            column. Raised so the CLI's REFUSED branch reports a decision (exit 2)
+            rather than a traceback.
+        ValueError: When `required_tables` is empty, or `required_columns` names a
+            table `required_tables` does not, or maps a table to an empty column
+            tuple. Caller bugs, deliberately NOT a `ColdCacheError`: the CLI catches
+            that and would report the operator's store as refused for a fault that is
+            entirely in this process.
+    """
+    import sqlite3
+    from pathlib import Path as _Path
+    from urllib.parse import quote as _quote
+
+    from backend.knowledge.regeneration.log_regenerator import ColdCacheError
+
+    # An empty tuple does not mean "check nothing" -- it turns the gate OFF, silently.
+    # MEASURED: `", ".join("?" * 0)` is `""`, `name IN ()` is valid SQLite returning no
+    # rows, so `present` comes back empty, `missing` is `[]`, and the guard PASSES any
+    # file it can open, including a schema-less 0-byte one. That is exactly the outcome
+    # this function exists to prevent, reached by handing it nothing to check. The
+    # widened tuple signature is what newly made it expressible; the scalar parameter it
+    # replaced could not spell it.
+    #
+    # `raise`, not `assert`: `assert` is stripped under `python -O`, which would delete
+    # this check from the build where a silent pass is least recoverable. `ValueError`
+    # rather than `ColdCacheError` because this is a CALLER bug, not a verdict on the
+    # store -- `ColdCacheError` is caught by `cmd_graph_rebuild_from_log` and reported
+    # as a refusal (exit 2), which would blame an operator's healthy store for a
+    # programming error.
+    if not required_tables:
+        raise ValueError(
+            f"_assert_replay_source_exists({label!r}) was given an empty "
+            f"`required_tables`. At least one table is required: an empty tuple "
+            f"disables the schema check silently and passes any openable file."
+        )
+
+    required_columns = required_columns or {}
+    # Same shape of trap as the empty tuple above: a column requirement on a table
+    # the gate does not require would run `PRAGMA table_info` on a possibly-absent
+    # table, get an empty result, and report every one of its columns missing --
+    # a refusal blaming the wrong thing. Caller bug, so ValueError.
+    _ungated = sorted(set(required_columns) - set(required_tables))
+    if _ungated:
+        raise ValueError(
+            f"_assert_replay_source_exists({label!r}) was given `required_columns` "
+            f"for {_ungated}, which are not in `required_tables`. Columns can only "
+            f"be required on a table the gate already requires."
+        )
+
+    # And the empty-argument trap literally one level down from `required_tables=()`.
+    # `{table: ()}` READS as "gate this table's columns" and gates nothing: the
+    # `for column in columns` comprehension below yields no entries, `missing_columns`
+    # comes back empty, and there is no raise. MEASURED against a store whose
+    # `conversation_sessions` was rebuilt without `origin`, all three tables present:
+    # `{"conversation_sessions": ("origin",)}` -> ColdCacheError, as designed;
+    # `{"conversation_sessions": ()}`          -> PASSED, no refusal.
+    #
+    # The empty DICT stays legal and is NOT this trap. It is the default, it honestly
+    # means "no columns required", and it is the correct call for the extraction cache,
+    # whose DDL has no `ALTER TABLE` to outrun. Only the empty VALUE lies about what it
+    # is doing, which is the same distinction `required_tables=()` failed to survive.
+    _no_columns = sorted(table for table, columns in required_columns.items() if not columns)
+    if _no_columns:
+        raise ValueError(
+            f"_assert_replay_source_exists({label!r}) was given `required_columns` "
+            f"with an empty column tuple for {_no_columns}. Name at least one column "
+            f"or drop the key entirely: an empty tuple disables that table's column "
+            f"check silently rather than relaxing it. Pass `required_columns={{}}` to "
+            f"require no columns at all -- that spelling is supported and honest."
+        )
+
+    _MISSING = (
+        "A rebuild REPLAYS an existing log and will not create one -- creating it here "
+        "would write to live state under a dry-run flag, and an empty store would then "
+        "be indistinguishable from a missing one. Point the config at the real store, "
+        "or run the traffic that populates it."
+    )
+
+    if not _Path(db_path).exists():
+        raise ColdCacheError(f"No {label} at {db_path}. {_MISSING}")
+
+    # The path is being interpolated into a URI, so it must be percent-encoded: `#`,
+    # `?` and `%XX` are URI syntax, not filename characters. See the docstring for what
+    # the unescaped f-string this replaces actually did.
+    uri = "file:" + _quote(str(_Path(db_path).resolve())) + "?mode=ro"
+
+    placeholders = ", ".join("?" * len(required_tables))
+    present_columns: dict[str, set[str]] = {}
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            present = {
+                row[0]
+                for row in conn.execute(
+                    f"SELECT name FROM sqlite_master WHERE type='table' "  # nosec B608
+                    f"AND name IN ({placeholders})",
+                    required_tables,
+                ).fetchall()
+            }
+            for _table in required_columns:
+                # PRAGMA takes no bound parameters, hence the interpolation. The
+                # values are this module's own literals, checked above to be a
+                # subset of `required_tables`; nothing operator-supplied reaches it.
+                present_columns[_table] = {
+                    row[1] for row in conn.execute(f"PRAGMA table_info({_table})")  # nosec B608
+                }
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as exc:
+        # NOT corruption. A read-only open of a WAL store needs BOTH the `-wal` and
+        # the `-shm` on disk and creates whichever is absent, which it cannot do
+        # where the location is not writable -- so a healthy store on read-only
+        # media or a `:ro` mount lands here with its schema fully intact. Measured
+        # both ways round: a present `-shm` does not rescue a missing `-wal`, and a
+        # present `-wal` does not rescue a missing `-shm`. Causes unrelated to the
+        # wal-index land here too (a path naming a directory, a locked database),
+        # so the message defers to the sqlite error rather than asserting one.
+        # Refuse either way -- the replay's reads would fail the same -- but do not
+        # call it corrupt.
+        raise ColdCacheError(
+            f"The {label} at {db_path} exists but could not be opened read-only "
+            f"({exc}). This is NOT evidence that the store is corrupt. For a WAL "
+            f"database in a location this process cannot write, the read needs BOTH "
+            f"the `-wal` and the `-shm` sibling to be present already and is refused "
+            f"when EITHER is missing -- copying only one of them does not work, and "
+            f"MEASURED, with both present the same read succeeds on read-only media "
+            f"and through a `:ro` bind mount. So either copy the store together with "
+            f"BOTH siblings somewhere writable and point the config there, or make "
+            f"the store's DIRECTORY writable so the read can create the missing one. "
+            f"Not every failure here is about the wal-index (a path naming a "
+            f"directory, or a locked database, also land here), so the sqlite error "
+            f"above is the thing to read."
+        ) from exc
+    except sqlite3.Error as exc:
+        raise ColdCacheError(
+            f"The {label} at {db_path} is not a readable SQLite database ({exc}). {_MISSING}"
+        ) from exc
+
+    missing = [table for table in required_tables if table not in present]
+    if missing:
+        raise ColdCacheError(
+            f"The {label} at {db_path} has no {', '.join(f'`{t}`' for t in missing)} "
+            f"table(s), so it was not created by `initialize()` -- a 0-byte file left "
+            f"by `touch` or by a bare `sqlite3.connect()` on the path looks exactly "
+            f"like this. {_MISSING}"
+        )
+
+    # Checked AFTER the table gate, and it has to be: `PRAGMA table_info` on an
+    # absent table returns no rows rather than raising, so running this first would
+    # report every required column of a missing table as missing and bury the real
+    # fault. A store failing both gets the table refusal, which is the actionable one.
+    missing_columns = [
+        f"{table}.{column}"
+        for table, columns in required_columns.items()
+        for column in columns
+        if column not in present_columns.get(table, set())
+    ]
+    if missing_columns:
+        raise ColdCacheError(
+            f"The {label} at {db_path} has every required table but is missing "
+            f"{', '.join(f'`{c}`' for c in missing_columns)}, so it predates a "
+            f"migration the replay's queries depend on. Those columns are added by "
+            f"`EventStore.initialize()`'s conditional `ALTER TABLE`s, which this "
+            f"command deliberately does not call -- see the comment on the "
+            f"`_assert_replay_source_exists` calls in `_build_log_regenerator`. "
+            f"Start the backend once against this store to run the migration, then "
+            f"re-run the rebuild."
+        )
+
+
 def _build_log_regenerator(
     be: Any, staging_conn: Any, epoch_id: int | None
 ) -> tuple[LogRegenerator, dict[str, Any]]:
@@ -478,7 +859,8 @@ def _build_log_regenerator(
     embeddings are deterministic for identical input text, so rebuild-twice
     determinism still holds. EventStore and ExtractionCache are constructed from
     config paths (defaulting to ~/.mist/ siblings when the config carries no
-    explicit override).
+    explicit override) and are READ-ONLY replay sources: the regenerator's own
+    job/checkpoint rows go to a `NullRebuildJournal`, never to the live ledger.
 
     Returns (LogRegenerator, epoch_dict).
     """
@@ -489,21 +871,50 @@ def _build_log_regenerator(
     from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
     from backend.knowledge.extraction_cache import ExtractionCache
     from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
+    from backend.knowledge.regeneration.rebuild_journal import NullRebuildJournal
     from backend.knowledge.storage.graph_executor import GraphExecutor
     from backend.knowledge.storage.graph_store import GraphStore
 
     config = be.get_config()
 
     # EventStore: use config path or fall back to the default ~/.mist/event_store.db.
+    # Both spellings are LIVE state, so this store is a replay SOURCE only -- see the
+    # `journal=` argument below.
     event_store_path = config.event_store.db_path or str(_Path.home() / ".mist" / "event_store.db")
     event_store = EventStore(event_store_path)
-    # initialize() is idempotent: safe against a pre-existing store.
-    event_store.initialize()
 
     # ExtractionCache: lives alongside the event store db.
     cache_path = str(_Path(event_store_path).parent / "extraction_cache.db")
     extraction_cache = ExtractionCache(cache_path)
-    extraction_cache.initialize()
+
+    # NEITHER store is initialize()d here, and that is the point. `initialize()` is a
+    # WRITE -- `mkdir(parents=True)`, `executescript(schema.sql)`, and TWO conditional
+    # `ALTER TABLE` migrations, all in the body of `EventStore.initialize`
+    # (`grep -n "def initialize" backend/event_store/store.py`) -- performed by a
+    # command whose entire advertised contract is "proof-first, dry-run only". Calling it
+    # also MANUFACTURED the absence it was meant to tolerate: on a machine with no event
+    # store it created an empty one and the run then reported "No epochs found", which
+    # reads identically to a store that exists and is empty. A rebuild replays an
+    # existing log; it does not bring one into being.
+    _assert_replay_source_exists(
+        event_store_path,
+        "event store",
+        # Every table the replay reads, not just the epoch one -- see the guard's
+        # docstring for the call sites that read each.
+        ("epoch_ledger", "conversation_sessions", "conversation_turn_events"),
+        # And the one COLUMN it reads that a pre-migration store can lack. The
+        # replay's turn query filters on `COALESCE(s.origin, 'real')` unconditionally
+        # (`origins` defaults to `CANONICAL_ORIGINS`, which is not `None`), and
+        # `origin` arrives via an `ALTER TABLE` inside the `initialize()` this command
+        # does not call -- so without this the store passes the table gate and then
+        # raises `no such column: s.origin` as a bare traceback.
+        #
+        # `epoch_ledger.provisional` has the same migration shape and is deliberately
+        # absent here: `get_current_epoch`/`list_epochs` are `SELECT *`, and a store
+        # lacking the column was measured to read fine through both.
+        {"conversation_sessions": ("origin",)},
+    )
+    _assert_replay_source_exists(cache_path, "extraction cache", ("extraction_cache",))
 
     # Real embedding provider (all-MiniLM-L6-v2). Eager load is acceptable here:
     # this is an admin CLI (sync batch), NOT the async server event loop, so there
@@ -525,6 +936,15 @@ def _build_log_regenerator(
         event_store=event_store,
         extraction_cache=extraction_cache,
         staging_curation_pipeline=pipeline,
+        # The dry-run proof is not a rebuild of record: nothing reads its job rows
+        # (`get_reextraction_job` has no production caller), and `_build_once` runs
+        # twice per invocation, so a durable journal here would append two
+        # `rebuild-<epoch>-<uuid>` rows plus a checkpoint per turn to the LIVE ledger
+        # every time the determinism gate is run. Wired unconditionally rather than
+        # behind `args.dry_run` because dry-run is the ONLY mode this command has
+        # (`--dry-run` is `required=True`); a durable branch here would be a dead
+        # branch justifying itself with a future caller.
+        journal=NullRebuildJournal(),
     )
 
     # Resolve epoch -- raise ColdCacheError so the handler's REFUSED branch fires.
