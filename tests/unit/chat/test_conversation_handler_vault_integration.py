@@ -652,9 +652,14 @@ class TestPhase6PathPreAllocation:
         assert "vault_note_path" not in recorder.calls[0]
 
     @pytest.mark.asyncio
-    async def test_step_0_runs_even_when_extraction_skipped_for_short_message(self) -> None:
-        # Arrange -- short messages skip extraction dispatch entirely. Path
-        # pre-allocation still runs in handle_message (Phase 6 invariant --
+    async def test_step_0_runs_for_short_messages_now_dispatched_to_the_pipeline(self) -> None:
+        # Arrange -- extraction-cache-phase-1 Task 3 moved the <3-word gate
+        # out of the handler and into ExtractionPipeline.extract_from_utterance
+        # as Gate 0 (grep -n "if event_id:" backend/chat/conversation_handler.py
+        # -- the word-count condition that used to guard this dispatch is
+        # gone). The handler now dispatches to the pipeline whenever event_id
+        # is set, regardless of message length; gating is the pipeline's job.
+        # Path pre-allocation still runs in handle_message (Phase 6 invariant --
         # R1.3.1: the path only feeds the session-end note, so priming it
         # here just keeps the slug stable for whenever end_session runs).
         fake_vault = FakeVaultWriter()
@@ -662,12 +667,18 @@ class TestPhase6PathPreAllocation:
         recorder = FakeExtractionPipeline()
         handler._extraction_pipeline = recorder
 
-        # Act -- a message under 3 words skips extraction dispatch.
+        # Act -- a message under 3 words is now still dispatched to the pipeline.
         await handler.handle_message(user_message="Hi", session_id="short-phase6")
-        await asyncio.sleep(0.05)
+        await handler._drain_extraction_tasks()
 
-        # Assert -- path pre-allocated even though extraction was skipped.
-        assert recorder.calls == []
+        # Assert -- dispatch happened; FakeExtractionPipeline is a handler-level
+        # double and does not itself implement Gate 0, so seeing the call here
+        # confirms only that the handler no longer gates -- Gate 0 behavior
+        # itself is covered by
+        # tests/unit/knowledge/extraction/test_pipeline_cache_writes.py against
+        # the real pipeline.
+        assert len(recorder.calls) == 1
+        assert recorder.calls[0]["utterance"] == "Hi"
         assert "short-phase6" in handler._vault_paths
 
     @pytest.mark.asyncio

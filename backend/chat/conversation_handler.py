@@ -1646,7 +1646,7 @@ class ConversationHandler:
 
             # Fire-and-forget background extraction. Tracked so end_session/
             # aclose can drain instead of abandoning to GC.
-            if event_id and len(user_message.split()) >= 3:
+            if event_id:
                 task = asyncio.create_task(
                     self._extract_knowledge_async(
                         utterance=user_message,

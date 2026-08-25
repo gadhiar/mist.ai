@@ -33,12 +33,14 @@ from backend.knowledge.extraction.preprocessor import PreProcessor
 from backend.knowledge.extraction.scope_classifier import SubjectScopeClassifier
 from backend.knowledge.extraction.temporal import TemporalResolver
 from backend.knowledge.extraction.validator import ExtractionValidator, ValidationResult
+from backend.knowledge.extraction_cache import OUTCOME_SKIPPED, SKIP_TOO_SHORT
 from backend.knowledge.storage.graph_store import GraphStore
 
 if TYPE_CHECKING:
-    from backend.knowledge.curation.graph_writer import SourceMetadata
+    from backend.knowledge.curation.graph_writer import RebuildStamps, SourceMetadata
     from backend.knowledge.curation.pipeline import CurationPipeline, CurationResult
     from backend.knowledge.extraction.internal_derivation import InternalKnowledgeDeriver
+    from backend.knowledge.extraction_cache import ExtractionCache
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +215,8 @@ class ExtractionPipeline:
         embedding_provider: EmbeddingProvider | None = None,
         extraction_config: ExtractionConfig | None = None,
         scope_classifier: SubjectScopeClassifier | None = None,
+        extraction_cache: ExtractionCache | None = None,
+        rebuild_stamps: RebuildStamps | None = None,
     ) -> None:
         """Initialize the extraction pipeline with injected stage processors.
 
@@ -239,6 +243,16 @@ class ExtractionPipeline:
                 Stage 2 and writes the subject_scope + confidence into
                 PreProcessedInput.metadata. When None, Stage 1.5 is
                 skipped and Stage 2 treats scope as "unknown".
+            extraction_cache: Optional cache of Stage-2 extraction decisions
+                (F3, extraction-cache-phase-1). When provided, pre-extraction
+                gates record their skip via `_record_skip`. When None, gates
+                still short-circuit the pipeline exactly as before -- no row
+                is written, which is the status quo this phase incrementally
+                replaces gate by gate, not a new failure mode.
+            rebuild_stamps: Optional (ontology_version, extraction_version,
+                model_hash) triple to stamp on cache rows. Required alongside
+                `extraction_cache` for `_record_skip` to write; when either is
+                None, `_record_skip` no-ops.
         """
         self.graph_store = graph_store
         self.event_store = event_store
@@ -253,6 +267,8 @@ class ExtractionPipeline:
         self._embedding_provider = embedding_provider
         self._config = extraction_config or ExtractionConfig()
         self._scope_classifier = scope_classifier
+        self._extraction_cache = extraction_cache
+        self._rebuild_stamps = rebuild_stamps
 
         # Rate limiter state
         self._extraction_timestamps: list[float] = []
@@ -409,6 +425,32 @@ class ExtractionPipeline:
         while len(self._dedup_cache) > self._config.dedup_cache_size:
             self._dedup_cache.popitem(last=False)
 
+    def _record_skip(self, event_id: str, skip_reason: str, created_at: str) -> None:
+        """Record a pre-extraction gate skip to the cache.
+
+        No-ops when `extraction_cache` or `rebuild_stamps` is None (the
+        default) -- a pipeline built without either simply writes no row,
+        which is the status quo this phase incrementally replaces, not a
+        new hazard (extraction-cache-phase-1 Task 3 ruling).
+
+        Args:
+            event_id: The event store event ID this turn belongs to.
+            skip_reason: One of the `SKIP_*` constants in extraction_cache.py.
+            created_at: The recorded_at timestamp for this turn (C1
+                bitemporal recorded_at, not wall-clock now()).
+        """
+        if self._extraction_cache is None or self._rebuild_stamps is None:
+            return
+        self._extraction_cache.put(
+            event_id,
+            self._rebuild_stamps.ontology_version,
+            self._rebuild_stamps.extraction_version,
+            self._rebuild_stamps.model_hash,
+            outcome=OUTCOME_SKIPPED,
+            created_at=created_at,
+            skip_reason=skip_reason,
+        )
+
     # ------------------------------------------------------------------
     # Main extraction entry points
     # ------------------------------------------------------------------
@@ -458,6 +500,17 @@ class ExtractionPipeline:
             # Temporal resolution anchors to the event's fact-time so a rebuild
             # resolves "last year" identically to the live turn (C1).
             reference_date = datetime.fromisoformat(recorded_at)
+
+        # -- Gate 0: too short to carry a fact --
+        # Moved here from conversation_handler.py in phase 1. Left in the
+        # handler it prevented this function from being called at all, so a
+        # gated turn produced NO cache row -- making "the pipeline skipped it"
+        # indistinguishable from "the row was lost". One place decides, one
+        # place records.
+        if len(utterance.split()) < 3:
+            self._record_skip(event_id, SKIP_TOO_SHORT, recorded_at)
+            logger.info("Extraction skipped (too short) for '%s'", utterance[:60])
+            return ValidationResult(valid=True)
 
         pipeline_start = time.perf_counter()
 

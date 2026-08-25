@@ -226,9 +226,11 @@ class TestStage15Disabled:
         classifier = SubjectScopeClassifier(llm=llm)
         pipeline = _build_pipeline(extractor=extractor, scope_classifier=classifier)
 
-        # Act
+        # Act -- three words: under 3 would now trip Gate 0 (extraction-cache-
+        # phase-1 Task 3) before Stage 1.5 ever runs, which is not what this
+        # test is exercising.
         await pipeline.extract_from_utterance(
-            utterance="Ambiguous.",
+            utterance="This is ambiguous.",
             conversation_history=[],
             event_id=TEST_EVENT_ID,
             session_id=TEST_SESSION_ID,
