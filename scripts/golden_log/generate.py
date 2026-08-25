@@ -274,6 +274,38 @@ def assert_isolated_root(root: Path) -> None:
             )
 
 
+def golden_log_cache_path(root: Path) -> str:
+    """The golden log's OWN cache. Authored entities, never model output."""
+    return str(root / "extraction-cache.db")
+
+
+def assert_not_production_root(root: Path) -> None:
+    """Refuse to write authored ground truth where the live cache lives.
+
+    A rebuild reading authored entities reproduces the IDEAL graph and scores
+    itself perfect against its own answer key -- with no symptom to notice.
+    `assert_isolated_root` (above) reasons about live data roots generically,
+    from a static candidate list that skips a root absent from the box; this
+    pins the ONE path Task 5 (`backend/factories.py:production_cache_path`)
+    actually derives for the live extraction cache, from the same authority,
+    so the invariant survives a future change to either derivation.
+
+    Raises:
+        GoldenLogError: When `root` resolves to the production cache's parent
+            directory.
+    """
+    from backend.factories import production_cache_path
+    from backend.knowledge.config import KnowledgeConfig
+
+    prod = Path(production_cache_path(KnowledgeConfig.from_env())).parent.resolve()
+    if Path(root).resolve() == prod:
+        raise GoldenLogError(
+            f"refusing to write the golden log's authored extractions into the "
+            f"production cache root {prod}. The production cache records what the "
+            f"model produced; these are ground truth."
+        )
+
+
 def materialize_isolated(
     turns: list[GoldenTurn], *, root: Path, activated_at: str | None = None
 ) -> MaterializedGoldenLog:
@@ -327,7 +359,8 @@ def materialize_isolated(
     for session_id in dict.fromkeys(turn.session_id for turn in turns):
         event_store.start_session(session_id, input_modality=INPUT_MODALITY, origin=SESSION_ORIGIN)
 
-    extraction_cache = ExtractionCache(str(root / "extraction-cache.db"))
+    assert_not_production_root(root)
+    extraction_cache = ExtractionCache(golden_log_cache_path(root))
     extraction_cache.initialize()
 
     for turn in turns:

@@ -233,6 +233,30 @@ def build_curation_pipeline(
     )
 
 
+def production_cache_path(config: KnowledgeConfig) -> str:
+    """The one path the LIVE extraction cache lives at.
+
+    Named rather than inlined so the golden-log generator can refuse to equal
+    it (spec D10, `scripts/golden_log/generate.py:assert_not_production_root`):
+    two literals in two files is how they drift.
+
+    Mirrors `_build_log_regenerator` in scripts/mist_admin.py (`grep -nE
+    'event_store_path = |cache_path = ' scripts/mist_admin.py`), extended to
+    propagate the ":memory:" sentinel: `ExtractionCache.initialize()` already
+    special-cases it (`grep -n 'if self.db_path != ":memory:"'
+    backend/knowledge/extraction_cache.py`), but `Path(event_store_path).parent`
+    on the bare sentinel resolves to a relative "." -- silently landing an
+    on-disk "extraction_cache.db" in the process CWD for any caller with an
+    in-memory event store, rather than the in-memory cache that setup implies.
+    """
+    from pathlib import Path
+
+    event_store_path = config.event_store.db_path or str(Path.home() / ".mist" / "event_store.db")
+    if event_store_path == ":memory:":
+        return ":memory:"
+    return str(Path(event_store_path).parent / "extraction_cache.db")
+
+
 def build_extraction_pipeline(
     config: KnowledgeConfig,
     graph_store: GraphStore | None = None,
@@ -242,8 +266,6 @@ def build_extraction_pipeline(
     debug_logger: "DebugJSONLLogger | None" = None,  # noqa: F821
 ) -> ExtractionPipeline:
     """Create a fully wired ExtractionPipeline."""
-    from pathlib import Path as _Path
-
     from backend.knowledge.curation.graph_writer import RebuildStamps
     from backend.knowledge.extraction_cache import ExtractionCache
     from backend.knowledge.version_stamps import compose_model_hash
@@ -288,22 +310,10 @@ def build_extraction_pipeline(
         )
 
     # F3 (extraction-cache-phase-1) Task 5: cache sits beside the event store
-    # -- one path convention, not two. Mirrors `_build_log_regenerator` in
-    # scripts/mist_admin.py exactly (`grep -nE 'event_store_path = |cache_path
-    # = ' scripts/mist_admin.py`), extended to propagate the ":memory:"
-    # sentinel: `ExtractionCache.initialize()` already special-cases it
-    # (`grep -n 'if self.db_path != ":memory:"' backend/knowledge/extraction_cache.py`),
-    # but `Path(event_store_path).parent` on the bare sentinel resolves to a
-    # relative "." -- silently landing an on-disk "extraction_cache.db" in
-    # the process CWD for any caller with an in-memory event store, rather
-    # than the in-memory cache that setup implies.
-    event_store_path = config.event_store.db_path or str(_Path.home() / ".mist" / "event_store.db")
-    cache_path = (
-        ":memory:"
-        if event_store_path == ":memory:"
-        else str(_Path(event_store_path).parent / "extraction_cache.db")
-    )
-    extraction_cache = ExtractionCache(cache_path)
+    # -- one path convention, not two. Task 7 pulled the derivation out to
+    # `production_cache_path` above so the golden-log generator can refuse to
+    # equal it (spec D10) without duplicating this expression a third time.
+    extraction_cache = ExtractionCache(production_cache_path(config))
     extraction_cache.initialize()
 
     # Constructed here, from the same KnowledgeConfig that
