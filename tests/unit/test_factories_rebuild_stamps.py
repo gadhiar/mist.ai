@@ -153,12 +153,39 @@ class TestCrossFactoryStampAgreement:
         inequality neither existing per-field-pin test can see (each only
         checks its own factory's output against config, never the other
         factory's output). Reverted via Edit, re-ran -- PASSED.
+
+        This mutation is the actual proof that both construction sites ran --
+        deliberately NOT an `extraction_stamps is not curation_stamps` object-
+        identity check. Review round 2 (Minor 1) found that check inert today
+        (the two attribute paths cannot alias) and actively wrong for the
+        future it exists to guard: if `build_extraction_pipeline` is ever
+        changed to construct one `RebuildStamps` and inject it into both
+        consumers -- the production-path collapse review round 1 named as
+        still the best available fix, once four external callers of
+        `build_curation_pipeline` ruled out a full single-site collapse -- an
+        identity check would fail on exactly that correct change and read as
+        a regression. Equality has no such failure mode: one shared instance
+        is trivially `==` to itself.
         """
         from backend.factories import build_extraction_pipeline
         from tests.mocks.config import build_test_config
         from tests.mocks.embeddings import FakeEmbeddingGenerator
-        from tests.mocks.neo4j import FakeNeo4jConnection
         from tests.mocks.ollama import FakeLLM
+
+        class _RefusingConnection:
+            """Stands in for Neo4jConnection. Fails loudly if anything in the
+            construction path queries or writes -- the same tripwire used by
+            the sibling wiring tests in
+            tests/unit/test_factories_wire_extraction_cache.py, kept at one
+            strictness level for this hazard across the phase rather than
+            silently tolerating reads here while refusing them there.
+            """
+
+            def execute_query(self, *args, **kwargs):
+                raise AssertionError("the stamp-agreement test must not read a graph")
+
+            def execute_write(self, *args, **kwargs):
+                raise AssertionError("the stamp-agreement test must not write a graph")
 
         class _FakeGraphStore:
             """Both attributes `build_extraction_pipeline` reads off `gs`.
@@ -172,7 +199,7 @@ class TestCrossFactoryStampAgreement:
             """
 
             def __init__(self) -> None:
-                self.connection = FakeNeo4jConnection()
+                self.connection = _RefusingConnection()
                 self.embedding_generator = FakeEmbeddingGenerator()
 
         config = build_test_config()
@@ -185,7 +212,13 @@ class TestCrossFactoryStampAgreement:
         # GraphStore/Neo4jConnection when `graph_store` is falsy (it is not,
         # here -- `gs` is truthy so `gs = graph_store or build_graph_store(config)`
         # short-circuits) or when include_internal_derivation's default
-        # branch calls `gs.ensure_mist_identity()` (turned off here).
+        # branch calls `gs.ensure_mist_identity()` (turned off here). A third
+        # protection point matters specifically because include_curation=True
+        # routes the executor into three curation collaborators:
+        # `build_graph_executor(config, gs.connection)` is itself
+        # `conn = connection or build_neo4j_connection(config)`
+        # (`backend/factories.py:123-128`), short-circuited by this same
+        # truthy fake before a real Neo4jConnection is ever built.
         pipeline = build_extraction_pipeline(
             config,
             graph_store=gs,
@@ -202,8 +235,3 @@ class TestCrossFactoryStampAgreement:
         assert isinstance(extraction_stamps, RebuildStamps)
         assert isinstance(curation_stamps, RebuildStamps)
         assert extraction_stamps == curation_stamps
-        # Positive proof this exercised both construction sites rather than
-        # comparing a stamps object against itself or two Nones.
-        assert extraction_stamps is not curation_stamps
-        # Graph-safety: no write occurred through either fake connection.
-        gs.connection.assert_no_writes()

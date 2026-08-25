@@ -41,6 +41,15 @@ class RebuildStamps:
     in the factory and injected into `CurationGraphWriter` as a required
     dependency; `ontology_version` and `extraction_version` trace back to
     `backend.knowledge.version_stamps`, the single authority for both.
+
+    `backend/factories.py` constructs this at two sites (one per consumer --
+    `build_curation_pipeline` and `build_extraction_pipeline`) from the same
+    `KnowledgeConfig`; a cross-factory test
+    (`tests/unit/test_factories_rebuild_stamps.py::TestCrossFactoryStampAgreement`)
+    asserts the two outputs are `==`. That coverage relies on every field here
+    keeping the dataclass default `compare=True` -- a field declared with
+    `field(compare=False)` would be silently excluded from `__eq__` and could
+    diverge between the two sites undetected.
     """
 
     ontology_version: str
