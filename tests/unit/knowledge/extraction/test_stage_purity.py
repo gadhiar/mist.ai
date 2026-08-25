@@ -90,14 +90,16 @@ def test_stage_6_validation_is_deterministic_and_order_stable():
 
 @pytest.mark.asyncio
 async def test_stage_5_normalize_is_pure_and_issues_no_graph_queries():
-    """Stage 5 is a pure function of its argument.
+    r"""Stage 5 is a pure function of its argument.
 
     Both constructor dependencies are vestigial: `embedding_generator` and
-    `executor` are stored and never read after the R1.1d strip
-    (normalizer.py:134, 140-141), and `normalize()`'s own docstring states it
-    "issues no graph queries" -- graph-identity resolution moved to the curation
-    deduper (Stage 7a). Passing None for both is therefore valid, and a rebuild
-    can run Stage 5 with no graph and no model.
+    `executor` are stored in `EntityNormalizer.__init__` and never read
+    anywhere else in the module (`grep -n "self\._embedding_generator\|self\._executor"
+    backend/knowledge/extraction/normalizer.py` -- both hits are the assignments
+    in `__init__`, no other match in the file), and `normalize()`'s own
+    docstring states it "issues no graph queries" -- graph-identity resolution
+    moved to the curation deduper (Stage 7a). Passing None for both is
+    therefore valid, and a rebuild can run Stage 5 with no graph and no model.
 
     If passing None raises, that assumption is dead and spec D2 needs revisiting
     -- stop and report rather than supplying a real collaborator to make it pass.
