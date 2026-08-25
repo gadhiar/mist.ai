@@ -241,18 +241,41 @@ class TestToolUsageTrackerDI:
 
 
 class TestShortMessageSkip:
-    # The word-count threshold is: len(user_message.split()) >= 3.
-    # Messages with fewer than 3 words skip both auto-RAG retrieval AND
-    # background extraction scheduling in handle_message.
+    # The word-count threshold (len(user_message.split()) >= 3) still gates
+    # auto-RAG retrieval in handle_message (`conversation_handler.py:1429`,
+    # untouched by extraction-cache-phase-1 Task 3). It no longer gates
+    # background extraction scheduling: Task 3 moved that decision out of
+    # the handler and into ExtractionPipeline.extract_from_utterance as
+    # Gate 0 (`grep -n "if event_id:" backend/chat/conversation_handler.py`
+    # -- the word-count condition that used to guard this dispatch is gone).
+    # The handler now dispatches extraction whenever event_id is set,
+    # regardless of message length; a short message reaches the pipeline
+    # and is gated there instead of never being dispatched at all.
 
     @pytest.mark.asyncio
-    async def test_short_message_skips_extraction(self):
-        """handle_message should NOT trigger extraction for messages < 3 words."""
+    async def test_short_message_still_triggers_extraction_dispatch(self):
+        """handle_message dispatches extraction even for messages < 3 words.
+
+        Pre-Task-3 this class asserted the opposite (dispatch was skipped
+        for short messages). Retargeted rather than deleted: the handler-level
+        dispatch contract (short and long messages behave identically) reads
+        naturally paired with test_long_message_triggers_extraction below,
+        and unlike
+        test_conversation_handler_vault_integration.py::TestPhase6PathPreAllocation
+        ::test_step_0_runs_for_short_messages_now_dispatched_to_the_pipeline
+        (which also asserts a Phase 6 vault-path invariant this file has
+        nothing to do with), this test isolates just the dispatch property.
+        Gate 0 itself -- the pipeline deciding to extract nothing from a
+        short utterance -- is covered by
+        tests/unit/knowledge/extraction/test_pipeline_cache_writes.py
+        ::TestGate0::test_short_utterance_is_gated_inside_the_pipeline.
+        """
         from unittest.mock import AsyncMock
 
         conn = FakeNeo4jConnection()
         gs = GraphStore(conn, FakeEmbeddingGenerator())
-        config = build_test_config()
+        # Enable in-memory event store so handle_message produces a non-None event_id.
+        config = build_test_config(event_store_enabled=True, event_store_db_path=":memory:")
         pipeline = FakeExtractionPipeline()
 
         handler = ConversationHandler(
@@ -268,16 +291,16 @@ class TestShortMessageSkip:
         handler._extraction_pipeline.extract_from_utterance = AsyncMock()
 
         await handler.handle_message(
-            user_message="hi there",  # 2 words — below threshold
+            user_message="hi there",  # 2 words -- below the OLD handler-side threshold
             session_id="short-s1",
         )
 
-        # Give any scheduled tasks a moment to run
+        # Give the scheduled background task a moment to fire
         import asyncio
 
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
 
-        handler._extraction_pipeline.extract_from_utterance.assert_not_called()
+        handler._extraction_pipeline.extract_from_utterance.assert_called()
 
     @pytest.mark.asyncio
     async def test_long_message_triggers_extraction(self):
