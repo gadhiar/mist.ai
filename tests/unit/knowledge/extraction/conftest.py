@@ -27,13 +27,21 @@ def fake_llm():
 
 
 class SpyCache:
-    """Records what the pipeline decided, without a database."""
+    """Records what the pipeline decided, without a database.
+
+    Records `created_at` alongside outcome/skip_reason: it must be the
+    caller's C1 bitemporal `recorded_at`, never wall-clock `now()` -- a
+    wall-clock value would make the cache row non-reproducible across a
+    rebuild of the same log. A mutant that swaps in `datetime.now(UTC)`
+    would satisfy every other assertion in this suite silently; only
+    checking the recorded value here catches it.
+    """
 
     def __init__(self):
-        self.calls: list[tuple[str, str, str | None]] = []
+        self.calls: list[tuple[str, str, str | None, str]] = []
 
     def put(self, event_id, ontology_version, extraction_version, model_hash, **kw):
-        self.calls.append((event_id, kw["outcome"], kw.get("skip_reason")))
+        self.calls.append((event_id, kw["outcome"], kw.get("skip_reason"), kw["created_at"]))
 
     def get(self, *a, **kw):
         return None

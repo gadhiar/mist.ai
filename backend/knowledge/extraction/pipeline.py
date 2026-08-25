@@ -250,10 +250,30 @@ class ExtractionPipeline:
                 is written, which is the status quo this phase incrementally
                 replaces gate by gate, not a new failure mode.
             rebuild_stamps: Optional (ontology_version, extraction_version,
-                model_hash) triple to stamp on cache rows. Required alongside
-                `extraction_cache` for `_record_skip` to write; when either is
-                None, `_record_skip` no-ops.
+                model_hash) triple to stamp on cache rows. Must be provided
+                together with `extraction_cache`, or not at all -- see Raises.
+
+        Raises:
+            ValueError: `extraction_cache` and `rebuild_stamps` were not both
+                provided or both omitted. A pipeline wired with only one of
+                the two would have `_record_skip` silently write no row on
+                every gate, with no error and no log -- the mis-wire would
+                surface only much later as a `ColdCacheError` from a rebuild,
+                pointing at the rebuild rather than at this construction
+                site. Caught here instead.
         """
+        if extraction_cache is not None and rebuild_stamps is None:
+            raise ValueError(
+                "rebuild_stamps is required when extraction_cache is provided -- "
+                "without it _record_skip cannot stamp a cache row and would "
+                "silently write nothing"
+            )
+        if rebuild_stamps is not None and extraction_cache is None:
+            raise ValueError(
+                "extraction_cache is required when rebuild_stamps is provided -- "
+                "without it there is nothing for _record_skip to write to"
+            )
+
         self.graph_store = graph_store
         self.event_store = event_store
         self._preprocessor = preprocessor
@@ -428,10 +448,12 @@ class ExtractionPipeline:
     def _record_skip(self, event_id: str, skip_reason: str, created_at: str) -> None:
         """Record a pre-extraction gate skip to the cache.
 
-        No-ops when `extraction_cache` or `rebuild_stamps` is None (the
-        default) -- a pipeline built without either simply writes no row,
-        which is the status quo this phase incrementally replaces, not a
-        new hazard (extraction-cache-phase-1 Task 3 ruling).
+        No-ops when `extraction_cache` and `rebuild_stamps` are both None
+        (the constructor default) -- a pipeline built without either simply
+        writes no row, which is the status quo this phase incrementally
+        replaces, not a new hazard (extraction-cache-phase-1 Task 3 ruling).
+        A pipeline wired with only one of the two cannot reach this method:
+        `__init__` rejects that combination at construction time.
 
         Args:
             event_id: The event store event ID this turn belongs to.
@@ -439,7 +461,9 @@ class ExtractionPipeline:
             created_at: The recorded_at timestamp for this turn (C1
                 bitemporal recorded_at, not wall-clock now()).
         """
-        if self._extraction_cache is None or self._rebuild_stamps is None:
+        if self._extraction_cache is None:
+            # __init__ guarantees extraction_cache and rebuild_stamps are
+            # both None or both set -- checking one is sufficient.
             return
         self._extraction_cache.put(
             event_id,
@@ -506,7 +530,10 @@ class ExtractionPipeline:
         # handler it prevented this function from being called at all, so a
         # gated turn produced NO cache row -- making "the pipeline skipped it"
         # indistinguishable from "the row was lost". One place decides, one
-        # place records.
+        # place records. Runs before Gate 1 (rate limit): a turn that is both
+        # too short and rate-limited records "too_short", not
+        # "rate_limited" -- the utterance carries no fact either way, so the
+        # more specific, cheaper-to-check reason wins.
         if len(utterance.split()) < 3:
             self._record_skip(event_id, SKIP_TOO_SHORT, recorded_at)
             logger.info("Extraction skipped (too short) for '%s'", utterance[:60])
