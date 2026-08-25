@@ -59,16 +59,21 @@ VALID_SKIP_REASONS = frozenset(
 
 
 def cache_key(event_id: str, extraction_version: str, model_hash: str) -> str:
-    """Content-address an extraction by event plus the stamps that fed the LLM.
+    r"""Content-address an extraction by event plus the stamps that fed the LLM.
 
     `ontology_version` is deliberately ABSENT (spec D3). Stage 5 (normalize) and
-    Stage 6 (validate) are the only ontology consumers, and both now run in
-    REPLAYED code -- so an ontology change is re-derived on every rebuild rather
-    than invalidating the cache.
+    Stage 6 (validate) are the only ontology consumers in code that runs AFTER the
+    cached LLM call -- both now run in REPLAYED code, so an ontology change there
+    is re-derived on every rebuild rather than invalidating the cache. Verified via
+    `grep -n "ALLOWED_ENTITY_TYPES\|ALLOWED_RELATIONSHIP_TYPES"
+    backend/knowledge/extraction/ontology_extractor.py
+    backend/knowledge/extraction/validator.py`: both constants are DEFINED in
+    `ontology_extractor.py` and READ only inside `validator.py`.
 
     Prompt-VISIBLE ontology changes still invalidate, with no discipline
-    required: `prompts.py` holds the entity list as literal text, so any edit
-    fails the pinned sha256 in
+    required: `prompts.py` holds the entity list as literal text -- a THIRD
+    ontology consumer, but one that runs BEFORE the cached LLM call rather than
+    after -- so any edit fails the pinned sha256 in
     `tests/unit/knowledge/extraction/test_prompts.py::TestExtractionVersionDriftGuard`
     until `EXTRACTION_VERSION` is bumped -- and that IS in the key.
 
@@ -111,8 +116,14 @@ class ExtractionCache:
 
         None means "this turn was never recorded". It is NOT the same as an
         entry whose outcome is 'skipped' with empty lists -- that one means "the
-        live pipeline looked and decided not to extract". Keeping those distinct
-        end-to-end is the whole point of spec D1.
+        live pipeline looked and decided not to extract". This method keeps that
+        distinction on every read; whether a CALLER acts on it is a separate
+        question this task does not answer. `grep -n "self._cache.get("
+        backend/knowledge/regeneration/log_regenerator.py` shows both call sites
+        still test the result for `is None` only, so a 'skipped' row and an
+        'extracted' row are both "covered" to `_assert_cache_coverage` today.
+        Keeping the distinction end-to-end, so callers branch on `outcome` too,
+        is spec D1's target state -- not something this task changed.
         """
         key = cache_key(event_id, extraction_version, model_hash)
         row = (

@@ -289,8 +289,9 @@ class TestMaterialize:
 
     def test_the_write_triple_is_the_read_triple(self, turns, tmp_path):
         # Assert: the key the cache was WRITTEN under is the key the rebuild COMPUTES.
-        # `LogRegenerator` derives its lookup from epoch[ontology|extraction|model_hash], so
-        # this recomputes that key independently and requires a row under it.
+        # `LogRegenerator` derives its lookup from epoch[extraction|model_hash] (D3 dropped
+        # ontology_version from the key), so this recomputes that key independently and
+        # requires a row under it.
         materialized = materialize_isolated(turns, root=tmp_path / "isolated")
         epoch = materialized.epoch
 

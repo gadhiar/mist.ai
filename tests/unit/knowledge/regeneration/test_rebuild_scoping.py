@@ -374,7 +374,7 @@ class TestScopingConsequences:
 
     @pytest.mark.asyncio
     async def test_a_turn_from_a_superseded_ontology_epoch_is_not_replayed(self):
-        # Arrange: the superseded turn IS cached under the current triple, so its exclusion
+        # Arrange: the superseded turn IS cached under the current stamp pair, so its exclusion
         # can only be the ontology filter -- not an incidental ColdCacheError.
         world = build_world(cache_superseded_turn=True)
         assert (
@@ -419,7 +419,7 @@ class TestScopingConsequences:
 
     @pytest.mark.asyncio
     async def test_test_origin_traffic_is_not_replayed_into_the_canonical_graph(self):
-        # Arrange: cached under the current triple and tagged with the current ontology, so
+        # Arrange: cached under the current stamp pair and tagged with the current ontology, so
         # only the origin guard can exclude it.
         world = build_world()
 
