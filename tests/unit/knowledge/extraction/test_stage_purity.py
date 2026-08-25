@@ -21,14 +21,21 @@ constant fixed at import or an instance rebuilt identically on every
 construction -- not that the stages ignore it.
 
 What this module actually establishes, and no more:
-- No stage reads the wall clock (Stage 4 only -- directly trapped below;
-  Stages 3, 5, 6 have no `datetime`/`time`/`random`/`uuid`/`os.environ`
-  reference at all, confirmed by
-  `grep -nE 'datetime\.|\.now\(|\.today\(|utcnow|time\.|random|uuid|os\.environ'
-  backend/knowledge/extraction/{confidence,temporal,validator,normalizer}.py`
-  -> zero matches across all four files, and the same pattern fires on
-  `backend/knowledge/admin.py` (a file that does call `datetime.now(`),
-  confirming it is a live check, not a pattern that cannot fire).
+- No stage reads the wall clock (Stage 4 only -- directly trapped below).
+  Stages 3, 5, 6 (confidence.py, validator.py, normalizer.py) have no
+  `datetime`/`time`/`random`/`uuid`/`os.environ` reference AT ALL -- not
+  even an unused import -- confirmed by
+  `grep -nE 'datetime\.|\.now\(|\.today\(|utcnow|time\.|random|uuid|os\.environ|^import (datetime|time)\b|^from (datetime|time) '
+  backend/knowledge/extraction/{confidence,validator,normalizer}.py` ->
+  zero matches (deliberately excludes temporal.py, which legitimately does
+  `from datetime import datetime` for its `reference_date` parameter type --
+  an import, not a clock read, and Stage 4's own clock-freedom is what the
+  monkeypatch trap below establishes instead). The same pattern fires on a
+  file with a bare `import datetime`/`import time` and no dotted use
+  (confirming the added alternation actually extends coverage, not just
+  restates the dotted-call check) and on `backend/knowledge/admin.py`
+  (which does call `datetime.now(`), confirming it is a live check, not a
+  pattern that cannot fire.
 - Given fixed module/instance state (true within one process and, since none
   of that state is seeded from `random`/clock/env, true across processes
   too), each stage returns byte-identical output for byte-identical input
