@@ -388,6 +388,21 @@ class LogRegenerator:
             extraction = ExtractionResult(
                 entities=cached["entities"],
                 relationships=cached["relationships"],
+                # The cache holds RAW Stage-2 output (spec D2) -- no source_utterance,
+                # since Stage 3's hedge/third-party confidence adjustment is one of the
+                # things replay re-derives, not something the cache is trusted for.
+                # `turn["user_utterance"]` is byte-identical to what fed the live
+                # extraction: `conversation_handler._record_turn_event` writes
+                # `user_utterance=user_message` to the event store, and the SAME
+                # `user_message` is what `_extract_knowledge_async` passes as
+                # `utterance=` on to `pre_process`, whose `original_text=utterance`
+                # assignment is unconditional (`preprocessor.py`, no branch rewrites it
+                # first). Omitting this left the adjustment permanently inert on
+                # replay: `extraction.source_utterance` defaulted to `""`, so
+                # `ConfidenceScorer.adjust_confidence`'s hedge-pattern search never
+                # matched anything, and a rebuild would silently disagree with the live
+                # graph on every hedged or third-party-attributed relationship.
+                source_utterance=turn["user_utterance"],
             )
             # Stages 3-6, re-run rather than cached (spec D2). Pure code, no
             # model -- pinned by tests/unit/knowledge/extraction/test_stage_purity.py.

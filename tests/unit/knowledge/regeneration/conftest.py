@@ -1,14 +1,16 @@
-"""Shared fixtures for LogRegenerator replay tests (Task 6).
+"""Shared fixtures for LogRegenerator replay tests (Task 6, fix round 1).
 
 `regenerator_factory` builds a `LogRegenerator` wired to test doubles at the
 documented I/O boundaries (`tests/CLAUDE.md`'s mocking table): a real
 in-memory `EventStore` and a real in-memory `ExtractionCache` (both SQLite --
 that table's "Filesystem / SQLite" row prescribes the real store over a
 hand-rolled fake, precisely so a signature drift on `.get()`/`.put()` fails
-here instead of being silently absorbed), `RecordingCurationPipeline`
-(reused from `test_rebuild_scoping.py` rather than re-invented, per the
-task brief) as the curation-pipeline double, and `NullRebuildJournal` (a
-real, already-shipped no-op production class -- not a fake) as the journal.
+here instead of being silently absorbed), `_ContentRecordingCurationPipeline`
+(a local superset of `test_rebuild_scoping.RecordingCurationPipeline` -- fix
+round 1 needs the actual relationships that reached curation, not just the
+event_id, to prove a Stage-3 confidence adjustment survived replay) as the
+curation-pipeline double, and `NullRebuildJournal` (a real, already-shipped
+no-op production class -- not a fake) as the journal.
 
 Stages 3-6 (confidence_scorer, temporal_resolver, normalizer, validator)
 default to the REAL production components. This is not for realism alone:
@@ -22,6 +24,7 @@ assert on.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -29,6 +32,10 @@ import pytest
 
 from backend.event_store.models import ConversationTurnEvent
 from backend.event_store.store import EventStore
+from backend.knowledge.curation.deduplication import DeduplicationResult
+from backend.knowledge.curation.graph_writer import WriteResult
+from backend.knowledge.curation.pipeline import CurationResult
+from backend.knowledge.curation.reconciliation import ReconcileTurnResult
 from backend.knowledge.extraction.confidence import ConfidenceScorer
 from backend.knowledge.extraction.normalizer import EntityNormalizer
 from backend.knowledge.extraction.temporal import TemporalResolver
@@ -36,7 +43,6 @@ from backend.knowledge.extraction.validator import ExtractionValidator, Validati
 from backend.knowledge.extraction_cache import OUTCOME_EXTRACTED, OUTCOME_SKIPPED, ExtractionCache
 from backend.knowledge.regeneration.log_regenerator import LogRegenerator
 from backend.knowledge.regeneration.rebuild_journal import NullRebuildJournal
-from tests.unit.knowledge.regeneration.test_rebuild_scoping import RecordingCurationPipeline
 
 # Must match REBUILD_ARGS["epoch"] in test_replay_runs_stages.py exactly: the turn
 # seeded below is filtered by `epoch["ontology_version"]` and looked up in the
@@ -108,11 +114,51 @@ class _RecordingValidator:
 
 
 # ---------------------------------------------------------------------------
+# Curation-pipeline double.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _ContentRecordingCurationPipeline:
+    """Records what the replay loop hands to curation -- event_ids AND content.
+
+    A strict superset of `test_rebuild_scoping.RecordingCurationPipeline` (kept
+    `event_ids` so `test_a_skipped_row_replays_as_a_no_op_not_a_failure`'s
+    `regenerator._curation.event_ids == []` assertion is unaffected): fix round 1
+    needs the actual relationships that reached curation to prove a Stage-3
+    confidence adjustment survived replay, which an event-id-only recorder cannot
+    show.
+    """
+
+    event_ids: list[str] = field(default_factory=list)
+    relationships: list[list[dict]] = field(default_factory=list)
+
+    async def curate_and_store(
+        self,
+        validation_result: ValidationResult,
+        event_id: str,
+        session_id: str,
+        source_metadata: Any = None,
+        recorded_at: str | None = None,
+    ) -> CurationResult:
+        self.event_ids.append(event_id)
+        self.relationships.append(validation_result.relationships)
+        return CurationResult(
+            write_result=WriteResult(),
+            dedup_result=DeduplicationResult(entities=[], merge_actions=[], entities_merged=0),
+            reconcile_result=ReconcileTurnResult(),
+            curation_time_ms=0.0,
+            validated_entities=validation_result.entities,
+            validated_relationships=validation_result.relationships,
+        )
+
+
+# ---------------------------------------------------------------------------
 # I/O-boundary doubles: real SQLite stores, seeded with exactly one turn.
 # ---------------------------------------------------------------------------
 
 
-def _build_event_store() -> EventStore:
+def _build_event_store(*, utterance: str = "I use Rust.") -> EventStore:
     """One turn, current ontology, origin='real' -- selected by rebuild()'s default scope."""
     store = EventStore(db_path=":memory:")
     store.initialize()
@@ -122,7 +168,7 @@ def _build_event_store() -> EventStore:
             session_id=_TURN_SESSION_ID,
             turn_index=0,
             timestamp=datetime.fromisoformat(_TURN_TS),
-            user_utterance="I use Rust.",
+            user_utterance=utterance,
             system_response="Noted.",
             ontology_version=_ONTOLOGY_VERSION,
             event_id=_TURN_EVENT_ID,
@@ -131,10 +177,23 @@ def _build_event_store() -> EventStore:
     return store
 
 
-def _build_cache(*, outcome: str, skip_reason: str | None) -> ExtractionCache:
+def _build_cache(
+    *,
+    outcome: str,
+    skip_reason: str | None,
+    entities: list[dict] | None = None,
+    relationships: list[dict] | None = None,
+) -> ExtractionCache:
     """One row for the seeded turn, keyed on the epoch's extraction stamp pair."""
     cache = ExtractionCache(":memory:")
     cache.initialize()
+    if outcome == OUTCOME_SKIPPED:
+        cache_entities, cache_relationships = [], []
+    else:
+        cache_entities = (
+            entities if entities is not None else [{"id": "rust", "type": "Technology"}]
+        )
+        cache_relationships = relationships if relationships is not None else []
     cache.put(
         _TURN_EVENT_ID,
         _ONTOLOGY_VERSION,
@@ -142,8 +201,8 @@ def _build_cache(*, outcome: str, skip_reason: str | None) -> ExtractionCache:
         _MODEL_HASH,
         outcome=outcome,
         skip_reason=skip_reason,
-        entities=[] if outcome == OUTCOME_SKIPPED else [{"id": "rust", "type": "Technology"}],
-        relationships=[],
+        entities=cache_entities,
+        relationships=cache_relationships,
         created_at=_TURN_TS,
     )
     return cache
@@ -163,6 +222,13 @@ def regenerator_factory():
             slot -- the one constructor parameter Stages 3-6 collectively have for
             an external dependency, and the one `normalize()` never reads after
             assignment. Lets a test prove nothing touches it.
+        utterance: the seeded turn's `user_utterance` (default "I use Rust.").
+            Fix round 1: this is what `ConfidenceScorer.adjust_confidence` reads
+            as `extraction.source_utterance` during replay.
+        entities: overrides the cached (raw Stage-2) entities list. Defaults to
+            a single Technology entity when cached_outcome is OUTCOME_EXTRACTED.
+        relationships: overrides the cached (raw Stage-2) relationships list.
+            Defaults to `[]`.
     """
 
     def _build(
@@ -171,6 +237,9 @@ def regenerator_factory():
         cached_outcome: str = OUTCOME_EXTRACTED,
         skip_reason: str | None = None,
         llm: Any = None,
+        utterance: str = "I use Rust.",
+        entities: list[dict] | None = None,
+        relationships: list[dict] | None = None,
     ) -> LogRegenerator:
         if stage_sink is not None:
             confidence_scorer: Any = _RecordingConfidenceScorer(stage_sink)
@@ -184,9 +253,14 @@ def regenerator_factory():
             validator = ExtractionValidator()
 
         return LogRegenerator(
-            event_store=_build_event_store(),
-            extraction_cache=_build_cache(outcome=cached_outcome, skip_reason=skip_reason),
-            staging_curation_pipeline=RecordingCurationPipeline(),
+            event_store=_build_event_store(utterance=utterance),
+            extraction_cache=_build_cache(
+                outcome=cached_outcome,
+                skip_reason=skip_reason,
+                entities=entities,
+                relationships=relationships,
+            ),
+            staging_curation_pipeline=_ContentRecordingCurationPipeline(),
             journal=NullRebuildJournal(),
             confidence_scorer=confidence_scorer,
             temporal_resolver=temporal_resolver,
