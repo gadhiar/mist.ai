@@ -108,13 +108,13 @@ def compose_model_hash(config: object) -> str:
     so the epoch triple and the writer triple differed on 2 of 3 fields.
 
     That is not cosmetic. `extraction_cache.cache_key` hashes
-    `event_id|extraction_version|model_hash` (verified via `grep -n 'raw =
-    "|".join' backend/knowledge/extraction_cache.py`) and `LogRegenerator` builds
-    its lookup from the EPOCH row, so a `model_hash` disagreement -- the L4
-    incident above -- is still a total, permanent `ColdCacheError` on every turn
-    of every rebuild, the failure mode this module's docstring names.
-    `ontology_version` no longer carries that risk (spec D3): a disagreement
-    there is a mislabel now, not a cache miss.
+    `event_id|extraction_version|model_hash`
+    (verified via `grep -n 'raw = "|".join' backend/knowledge/extraction_cache.py`)
+    and `LogRegenerator` builds its lookup from the EPOCH row, so a
+    `model_hash` disagreement -- the field L4 differed on -- is still a total,
+    permanent `ColdCacheError` on every turn of every rebuild, the failure mode
+    this module's docstring names. `ontology_version` no longer carries that
+    risk (spec D3): a disagreement there is a mislabel now, not a cache miss.
 
     The collapse deliberately goes toward the COMPOSED form, not the bare one: the
     composed value is the determinism-correct one, and dropping it to make the two

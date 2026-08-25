@@ -126,9 +126,12 @@ class SnapshotIdentity:
         """Read the identity of the CURRENT tree.
 
         The stamps come from `backend.knowledge.version_stamps`. There is
-        deliberately no parameter and no literal for them: a manifest that can
-        state its own triple could disagree with the extraction cache, which is
-        the drift collapsing the four authorities removed.
+        deliberately no parameter and no literal for any of the three: a
+        restated value could disagree with the single authority. A restated
+        `extraction_version` or `model_hash` would also miss the extraction
+        cache; `ontology_version` no longer carries that consequence (spec D3),
+        but restating it would still reintroduce the drift collapsing the four
+        authorities removed.
         """
         # Imported here rather than at module scope: `KnowledgeConfig.from_env`
         # reads the environment, and a manifest module that touches env at
