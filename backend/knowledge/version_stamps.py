@@ -5,10 +5,15 @@ MIST stamps every entity, fact edge, and provenance edge with an
 descriptive -- no pipeline code branches on them; the active ontology is chosen
 by Python import, and `canonical_serialize` deliberately excludes the triple so
 the determinism proof reads "same log + same epoch => same facts". One mechanism
-makes their CONSISTENCY load-bearing anyway: `extraction_cache.cache_key` hashes
-`event_id|ontology_version|extraction_version|model_hash`, so two sites
-disagreeing about a stamp is not a mislabel but a hard cache miss that makes a
-deterministic rebuild impossible.
+makes `extraction_version` and `model_hash`'s CONSISTENCY load-bearing anyway:
+`extraction_cache.cache_key` hashes `event_id|extraction_version|model_hash`
+(verified via `grep -n 'raw = "|".join' backend/knowledge/extraction_cache.py`),
+so two sites disagreeing about EITHER of those two stamps is not a mislabel but
+a hard cache miss that makes a deterministic rebuild impossible. `ontology_version`
+is the exception, as of `extraction-cache-phase-1` spec D3: it is still stamped
+on every edge for audit, but deliberately excluded from the cache key, so two
+sites disagreeing about it now IS a mislabel a rebuild will not catch on its
+own -- not a cache miss.
 
 The split this module enforces:
 
@@ -103,10 +108,13 @@ def compose_model_hash(config: object) -> str:
     so the epoch triple and the writer triple differed on 2 of 3 fields.
 
     That is not cosmetic. `extraction_cache.cache_key` hashes
-    `event_id|ontology_version|extraction_version|model_hash` and `LogRegenerator`
-    builds its lookup from the EPOCH row, so a disagreement is a total, permanent
-    `ColdCacheError` on every turn of every rebuild -- the failure mode this
-    module's docstring names.
+    `event_id|extraction_version|model_hash` (verified via `grep -n 'raw =
+    "|".join' backend/knowledge/extraction_cache.py`) and `LogRegenerator` builds
+    its lookup from the EPOCH row, so a `model_hash` disagreement -- the L4
+    incident above -- is still a total, permanent `ColdCacheError` on every turn
+    of every rebuild, the failure mode this module's docstring names.
+    `ontology_version` no longer carries that risk (spec D3): a disagreement
+    there is a mislabel now, not a cache miss.
 
     The collapse deliberately goes toward the COMPOSED form, not the bare one: the
     composed value is the determinism-correct one, and dropping it to make the two

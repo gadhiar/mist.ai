@@ -15,13 +15,20 @@ So the artifact records its PRODUCER INPUTS, and restore recomputes them:
 | `model_hash`         | `version_stamps.compose_model_hash`      |
 | corpus digest        | sha256 over the corpus file(s)           |
 
-The first three are exactly the triple `extraction_cache.cache_key` hashes, and
-they are READ FROM THE SINGLE AUTHORITY, never restated here. That is what makes
-staleness detection require no discipline: bumping `EXTRACTION_VERSION` in
-`backend/knowledge/version_stamps.py` invalidates every artifact on the next
-restore automatically. The person bumping it does not have to know this file
-exists -- which is the only kind of invalidation that survives contact with a
-real project.
+The first three used to be exactly the triple `extraction_cache.cache_key`
+hashed. As of `extraction-cache-phase-1` spec D3, that equivalence no longer
+holds: `cache_key` hashes only `event_id|extraction_version|model_hash`
+(verified via `grep -n 'raw = "|".join' backend/knowledge/extraction_cache.py`),
+so an `ontology_version`-only change no longer misses the extraction cache. It
+still makes a hydration artifact STALE, because the check below compares all
+three producer inputs DIRECTLY against the single authority -- unlike the
+extraction cache, this comparison was never routed through `cache_key`, so D3
+does not touch it. They are READ FROM THE SINGLE AUTHORITY, never restated
+here. That is what makes staleness detection require no discipline: bumping
+`EXTRACTION_VERSION` in `backend/knowledge/version_stamps.py` invalidates every
+artifact on the next restore automatically. The person bumping it does not have
+to know this file exists -- which is the only kind of invalidation that
+survives contact with a real project.
 
 The corpus digest is the fourth input because the first three cannot see it. A
 re-cut turn schedule with the same prompt and the same ontology produces a
