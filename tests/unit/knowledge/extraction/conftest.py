@@ -13,7 +13,7 @@ from backend.knowledge.extraction.pipeline import ExtractionPipeline
 from backend.knowledge.extraction.preprocessor import PreProcessor
 from backend.knowledge.extraction.temporal import TemporalResolver
 from backend.knowledge.extraction.validator import ExtractionValidator
-from backend.knowledge.extraction_cache import SKIP_BELOW_SIGNIFICANCE, SKIP_RATE_LIMITED
+from backend.knowledge.extraction_cache import SKIP_RATE_LIMITED
 from backend.knowledge.storage.graph_store import GraphStore
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeNeo4jConnection
@@ -78,13 +78,24 @@ def pipeline_factory():
     Keyword args (stable for the whole extraction-cache-phase-1 phase -- later
     tasks add test functions that call this fixture, not new fixture params):
         force_gate: preset pipeline/config state so a specific pre-extraction
-            gate trips on the next call. One of `SKIP_RATE_LIMITED` or
-            `SKIP_BELOW_SIGNIFICANCE` (from backend.knowledge.extraction_cache),
-            or None (default) to leave every gate open. `SKIP_TOO_SHORT` and
-            `SKIP_DUPLICATE` are NOT settable here: both depend on the
-            utterance text passed to extract_from_utterance at call time (an
+            gate trips on the next call. Only `SKIP_RATE_LIMITED` (from
+            backend.knowledge.extraction_cache) is settable this way -- it
+            maps cleanly onto `rate_limit_max_per_minute=0` at construction
+            time. None (default) leaves every gate open. The other three
+            SKIP_* reasons are deliberately NOT settable here:
+            `SKIP_TOO_SHORT` and `SKIP_DUPLICATE` depend on the utterance
+            text passed to extract_from_utterance at call time (an
             under-3-word utterance; a second call repeating the first's
-            utterance) rather than on any state fixable at construction time.
+            utterance), not on anything fixable at construction time.
+            `SKIP_BELOW_SIGNIFICANCE` looks config-settable but is not:
+            verified via a throwaway pipeline_factory(force_gate=...) run
+            that `_SOURCE_THRESHOLDS["conversation"]` in pipeline.py
+            (`grep -n "_SOURCE_THRESHOLDS: dict" backend/knowledge/extraction/pipeline.py`)
+            hardcodes 0.3 for the default extraction_source and is read via
+            `_SOURCE_THRESHOLDS.get(extraction_source, self._config.significance_threshold)`
+            -- so `self._config.significance_threshold` is only consulted for
+            an extraction_source absent from that table, never for the
+            "conversation" default this fixture builds pipelines for.
         extractor_returns: an ExtractionResult for the mocked Stage-2
             extractor to return when reached. When None (default), Stage 2 is
             wired to fail the test if it is ever reached -- see
@@ -104,20 +115,17 @@ def pipeline_factory():
     ):
         spy_cache = cache if cache is not None else SpyCache()
 
-        if force_gate is not None and force_gate not in (
-            SKIP_RATE_LIMITED,
-            SKIP_BELOW_SIGNIFICANCE,
-        ):
+        if force_gate is not None and force_gate != SKIP_RATE_LIMITED:
             raise ValueError(
                 f"force_gate={force_gate!r} is not settable via pipeline_factory -- "
-                "see the fixture docstring for SKIP_TOO_SHORT / SKIP_DUPLICATE"
+                "see the fixture docstring for why"
             )
 
         embeddings = FakeEmbeddingGenerator()
         graph_store = GraphStore(connection=FakeNeo4jConnection(), embedding_generator=embeddings)
 
         extraction_config = ExtractionConfig(
-            significance_threshold=(1.1 if force_gate == SKIP_BELOW_SIGNIFICANCE else 0.0),
+            significance_threshold=0.0,
             rate_limit_max_per_minute=(0 if force_gate == SKIP_RATE_LIMITED else 1000),
             dedup_similarity_threshold=0.95,
             dedup_cache_size=200,
