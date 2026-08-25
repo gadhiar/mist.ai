@@ -242,7 +242,8 @@ class TestToolUsageTrackerDI:
 
 class TestShortMessageSkip:
     # The word-count threshold (len(user_message.split()) >= 3) still gates
-    # auto-RAG retrieval in handle_message (`conversation_handler.py:1429`,
+    # auto-RAG retrieval in handle_message
+    # (`grep -n "auto_inject_enabled = " backend/chat/conversation_handler.py`,
     # untouched by extraction-cache-phase-1 Task 3). It no longer gates
     # background extraction scheduling: Task 3 moved that decision out of
     # the handler and into ExtractionPipeline.extract_from_utterance as
@@ -306,9 +307,12 @@ class TestShortMessageSkip:
     async def test_long_message_triggers_extraction(self):
         """handle_message SHOULD trigger extraction for messages >= 3 words.
 
-        The extraction task is gated on (event_id AND word_count >= 3). The
-        event store must be enabled so handle_message produces a non-None
-        event_id; without it the task is never created regardless of word count.
+        The extraction task is gated on event_id alone
+        (`grep -n "if event_id:" backend/chat/conversation_handler.py`) --
+        word count no longer participates at the handler level as of
+        extraction-cache-phase-1 Task 3. The event store must be enabled so
+        handle_message produces a non-None event_id; without it the task is
+        never created regardless of word count.
         """
         import asyncio
         from unittest.mock import AsyncMock
