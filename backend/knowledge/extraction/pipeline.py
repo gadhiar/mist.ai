@@ -28,12 +28,22 @@ from backend.interfaces import EmbeddingProvider, EventStoreProvider
 from backend.knowledge.config import ExtractionConfig
 from backend.knowledge.extraction.confidence import ConfidenceScorer
 from backend.knowledge.extraction.normalizer import EntityNormalizer
-from backend.knowledge.extraction.ontology_extractor import OntologyConstrainedExtractor
+from backend.knowledge.extraction.ontology_extractor import (
+    ExtractionResult,
+    OntologyConstrainedExtractor,
+)
 from backend.knowledge.extraction.preprocessor import PreProcessor
 from backend.knowledge.extraction.scope_classifier import SubjectScopeClassifier
 from backend.knowledge.extraction.temporal import TemporalResolver
 from backend.knowledge.extraction.validator import ExtractionValidator, ValidationResult
-from backend.knowledge.extraction_cache import OUTCOME_SKIPPED, SKIP_TOO_SHORT
+from backend.knowledge.extraction_cache import (
+    OUTCOME_EXTRACTED,
+    OUTCOME_SKIPPED,
+    SKIP_BELOW_SIGNIFICANCE,
+    SKIP_DUPLICATE,
+    SKIP_RATE_LIMITED,
+    SKIP_TOO_SHORT,
+)
 from backend.knowledge.storage.graph_store import GraphStore
 
 if TYPE_CHECKING:
@@ -245,9 +255,11 @@ class ExtractionPipeline:
                 skipped and Stage 2 treats scope as "unknown".
             extraction_cache: Optional cache of Stage-2 extraction decisions
                 (F3, extraction-cache-phase-1). When provided, pre-extraction
-                gates record their skip via `_record_skip`. When None, gates
-                still short-circuit the pipeline exactly as before -- no row
-                is written, which is the status quo this phase incrementally
+                gates record their skip via `_record_skip`, and the
+                post-Stage-2 site records the raw extraction (empty or not)
+                via `_record_extraction`. When None, gates still
+                short-circuit the pipeline exactly as before -- no row is
+                written, which is the status quo this phase incrementally
                 replaces gate by gate, not a new failure mode.
             rebuild_stamps: Optional (ontology_version, extraction_version,
                 model_hash) triple to stamp on cache rows. Must be provided
@@ -455,6 +467,11 @@ class ExtractionPipeline:
         A pipeline wired with only one of the two cannot reach this method:
         `__init__` rejects that combination at construction time.
 
+        Failure-isolated by design: a cache write that raises degrades
+        REBUILDABILITY, never the conversation. The alternative -- letting a
+        full disk end a user's turn -- trades a recoverable defect for an
+        unrecoverable one.
+
         Args:
             event_id: The event store event ID this turn belongs to.
             skip_reason: One of the `SKIP_*` constants in extraction_cache.py.
@@ -465,15 +482,76 @@ class ExtractionPipeline:
             # __init__ guarantees extraction_cache and rebuild_stamps are
             # both None or both set -- checking one is sufficient.
             return
-        self._extraction_cache.put(
-            event_id,
-            self._rebuild_stamps.ontology_version,
-            self._rebuild_stamps.extraction_version,
-            self._rebuild_stamps.model_hash,
-            outcome=OUTCOME_SKIPPED,
-            created_at=created_at,
-            skip_reason=skip_reason,
-        )
+        try:
+            self._extraction_cache.put(
+                event_id,
+                self._rebuild_stamps.ontology_version,
+                self._rebuild_stamps.extraction_version,
+                self._rebuild_stamps.model_hash,
+                outcome=OUTCOME_SKIPPED,
+                created_at=created_at,
+                skip_reason=skip_reason,
+            )
+        except Exception:
+            logger.warning(
+                "[WARNING] extraction cache write failed for event %s (skip=%s); "
+                "this turn will not be rebuildable",
+                event_id,
+                skip_reason,
+                exc_info=True,
+            )
+
+    def _record_extraction(
+        self,
+        event_id: str,
+        extraction: ExtractionResult,
+        scope: str | None,
+        scope_confidence: float | None,
+        created_at: str,
+    ) -> None:
+        """Record the RAW Stage-2 output -- before Stages 3-6 touch it.
+
+        The boundary is deliberate (spec D2). Stages 3-6 are pure and a
+        rebuild re-runs them, so caching their output instead would freeze
+        the ontology's effects into the row and force a full LLM re-run on
+        every ontology bump.
+
+        No-ops when `extraction_cache` and `rebuild_stamps` are both None,
+        mirroring `_record_skip`. Failure-isolated the same way: a cache
+        write that raises degrades rebuildability, never the conversation.
+
+        Args:
+            event_id: The event store event ID this turn belongs to.
+            extraction: The Stage-2 ExtractionResult, before confidence
+                scoring, temporal resolution, normalization, or validation.
+            scope: The Stage 1.5 subject-scope classification, or None when
+                the scope classifier is disabled.
+            scope_confidence: Confidence for `scope`, or None to match.
+            created_at: The recorded_at timestamp for this turn (C1
+                bitemporal recorded_at, not wall-clock now()).
+        """
+        if self._extraction_cache is None:
+            return
+        try:
+            self._extraction_cache.put(
+                event_id,
+                self._rebuild_stamps.ontology_version,
+                self._rebuild_stamps.extraction_version,
+                self._rebuild_stamps.model_hash,
+                outcome=OUTCOME_EXTRACTED,
+                created_at=created_at,
+                entities=extraction.entities,
+                relationships=extraction.relationships,
+                scope=scope,
+                scope_confidence=scope_confidence,
+            )
+        except Exception:
+            logger.warning(
+                "[WARNING] extraction cache write failed for event %s; "
+                "this turn will not be rebuildable",
+                event_id,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Main extraction entry points
@@ -543,6 +621,7 @@ class ExtractionPipeline:
 
         # -- Gate 1: Rate limit (before any processing) --
         if not self._check_rate_limit():
+            self._record_skip(event_id, SKIP_RATE_LIMITED, recorded_at)
             logger.info("Extraction skipped (rate-limited) for '%s'", utterance[:60])
             return ValidationResult(valid=True)
 
@@ -568,6 +647,7 @@ class ExtractionPipeline:
         )
         significance = self._compute_significance(utterance, embedding)
         if significance < sig_threshold:
+            self._record_skip(event_id, SKIP_BELOW_SIGNIFICANCE, recorded_at)
             logger.info(
                 "Extraction skipped (significance %.3f < %.3f) for '%s'",
                 significance,
@@ -578,6 +658,7 @@ class ExtractionPipeline:
 
         # -- Gate 3: Input deduplication --
         if embedding is not None and self._check_dedup(utterance, embedding):
+            self._record_skip(event_id, SKIP_DUPLICATE, recorded_at)
             logger.info("Extraction skipped (duplicate) for '%s'", utterance[:60])
             return ValidationResult(valid=True)
 
@@ -618,6 +699,19 @@ class ExtractionPipeline:
         extraction = await self._extractor.extract(pre_processed)
         stage_2_ms = (time.perf_counter() - stage_start) * 1000
         logger.debug("Stage 2 (extraction): %.1fms", stage_2_ms)
+
+        # Site 5 of 5. Placed here rather than in each downstream branch so the
+        # empty short-circuit and the full Stages 3-6 path share ONE write.
+        # Stage 2 ran in both cases, so both are outcome='extracted'; an empty
+        # payload means the model looked and found nothing, which is a different
+        # fact from a 'skipped' row where it never looked.
+        self._record_extraction(
+            event_id,
+            extraction,
+            pre_processed.metadata.get("subject_scope"),
+            pre_processed.metadata.get("subject_scope_confidence"),
+            recorded_at,
+        )
 
         # Stamp source provenance onto the extraction result
         if source_metadata is not None:
