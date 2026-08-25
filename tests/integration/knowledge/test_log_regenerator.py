@@ -11,7 +11,7 @@ import pytest
 from backend.event_store.models import ConversationTurnEvent
 from backend.event_store.store import EventStore
 from backend.knowledge.config import Neo4jConfig
-from backend.knowledge.extraction_cache import ExtractionCache
+from backend.knowledge.extraction_cache import OUTCOME_EXTRACTED, ExtractionCache
 from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
 from backend.knowledge.regeneration.rebuild_journal import EventStoreRebuildJournal
 from backend.knowledge.storage.neo4j_connection import Neo4jConnection
@@ -136,6 +136,7 @@ def _build_regenerator_with_one_turn(
         _TEST_EPOCH["ontology_version"],
         _TEST_EPOCH["extraction_version"],
         _TEST_EPOCH["model_hash"],
+        outcome=OUTCOME_EXTRACTED,
         entities=[{"id": "python", "type": "Technology", "display_name": "Python"}],
         relationships=[],
         created_at=_TURN_TS,
@@ -308,6 +309,7 @@ class TestLogRegeneratorReplay:
             epoch["ontology_version"],
             epoch["extraction_version"],
             epoch["model_hash"],
+            outcome=OUTCOME_EXTRACTED,
             entities=[{"id": "python", "type": "Technology", "display_name": "Python"}],
             relationships=[],
             created_at=ts_a,
@@ -317,6 +319,7 @@ class TestLogRegeneratorReplay:
             epoch["ontology_version"],
             epoch["extraction_version"],
             epoch["model_hash"],
+            outcome=OUTCOME_EXTRACTED,
             entities=[{"id": "fastapi", "type": "Technology", "display_name": "FastAPI"}],
             relationships=[],
             created_at=ts_b,

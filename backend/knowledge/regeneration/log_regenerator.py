@@ -130,7 +130,6 @@ class LogRegenerator:
             for t in turns
             if self._cache.get(
                 t["event_id"],
-                epoch["ontology_version"],
                 epoch["extraction_version"],
                 epoch["model_hash"],
             )
@@ -354,7 +353,6 @@ class LogRegenerator:
         for turn in turns:
             cached = self._cache.get(
                 turn["event_id"],
-                epoch["ontology_version"],
                 epoch["extraction_version"],
                 epoch["model_hash"],
             )

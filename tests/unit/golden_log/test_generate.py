@@ -278,7 +278,6 @@ class TestMaterialize:
         hits = [
             materialized.extraction_cache.get(
                 turn.event_id,
-                epoch["ontology_version"],
                 epoch["extraction_version"],
                 epoch["model_hash"],
             )
@@ -297,7 +296,6 @@ class TestMaterialize:
 
         rebuild_key = cache_key(
             turns[0].event_id,
-            epoch["ontology_version"],
             epoch["extraction_version"],
             epoch["model_hash"],
         )
@@ -323,7 +321,6 @@ class TestMaterialize:
         assert (
             materialized.extraction_cache.get(
                 turns[0].event_id,
-                epoch["ontology_version"],
                 epoch["extraction_version"],
                 composed,
             )
@@ -337,7 +334,6 @@ class TestMaterialize:
         epoch = materialized.epoch
         cached = materialized.extraction_cache.get(
             "golden-ext-01-uses",
-            epoch["ontology_version"],
             epoch["extraction_version"],
             epoch["model_hash"],
         )

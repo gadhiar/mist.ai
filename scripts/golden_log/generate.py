@@ -34,7 +34,7 @@ from backend.errors import MistError
 from backend.event_store.models import ConversationTurnEvent
 from backend.event_store.store import EventStore
 from backend.knowledge.config import KnowledgeConfig
-from backend.knowledge.extraction_cache import ExtractionCache
+from backend.knowledge.extraction_cache import OUTCOME_EXTRACTED, ExtractionCache
 from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
 
 from .translate import GOLD_UTTERANCE_FIELD, load_gold_corpus, translate_gold_record
@@ -345,6 +345,7 @@ def materialize_isolated(
             epoch["ontology_version"],
             epoch["extraction_version"],
             epoch["model_hash"],
+            outcome=OUTCOME_EXTRACTED,
             entities=turn.entities,
             relationships=turn.relationships,
             created_at=turn.timestamp,
@@ -355,7 +356,6 @@ def materialize_isolated(
         for turn in turns
         if extraction_cache.get(
             turn.event_id,
-            epoch["ontology_version"],
             epoch["extraction_version"],
             epoch["model_hash"],
         )

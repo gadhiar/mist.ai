@@ -43,7 +43,7 @@ from backend.knowledge.curation.graph_writer import WriteResult
 from backend.knowledge.curation.pipeline import CurationResult
 from backend.knowledge.curation.reconciliation import ReconcileTurnResult
 from backend.knowledge.extraction.validator import ValidationResult
-from backend.knowledge.extraction_cache import ExtractionCache
+from backend.knowledge.extraction_cache import OUTCOME_EXTRACTED, ExtractionCache
 from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
 from backend.knowledge.regeneration.rebuild_journal import EventStoreRebuildJournal
 
@@ -191,6 +191,7 @@ def _warm(cache: ExtractionCache, epoch: dict[str, Any], event_id: str) -> None:
         epoch["ontology_version"],
         epoch["extraction_version"],
         epoch["model_hash"],
+        outcome=OUTCOME_EXTRACTED,
         entities=[{"id": "rust", "type": "Technology", "display_name": "Rust"}],
         relationships=[],
         created_at=TURN_TS,
@@ -379,7 +380,6 @@ class TestScopingConsequences:
         assert (
             world.cache.get(
                 SUPERSEDED,
-                world.epoch["ontology_version"],
                 world.epoch["extraction_version"],
                 world.epoch["model_hash"],
             )
@@ -406,7 +406,6 @@ class TestScopingConsequences:
         assert (
             world.cache.get(
                 SUPERSEDED,
-                world.epoch["ontology_version"],
                 world.epoch["extraction_version"],
                 world.epoch["model_hash"],
             )
