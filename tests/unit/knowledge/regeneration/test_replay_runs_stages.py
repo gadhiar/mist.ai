@@ -17,6 +17,7 @@ all four stages regardless. The recording fakes actually used --
 """
 
 import copy
+import dataclasses
 from datetime import datetime
 
 import pytest
@@ -150,26 +151,36 @@ async def test_a_hedged_utterance_gets_the_same_confidence_penalty_on_replay(reg
 
 # Fields `LogRegenerator.rebuild()`'s replay loop actually populates on the
 # `ExtractionResult` it builds from the cached row -- must be kept in sync with that
-# constructor call (`entities=`, `relationships=`, `source_utterance=`). Everything
-# else `ExtractionResult` carries (`raw_llm_output`, `extraction_time_ms`,
-# `source_metadata`) is something replay does NOT supply; a stage reading one of
-# those would silently diverge live from rebuilt exactly the way `source_utterance`
-# did before fix round 1.
+# constructor call (`entities=`, `relationships=`, `source_utterance=`).
 _FIELDS_REPLAY_SUPPLIES = frozenset({"entities", "relationships", "source_utterance"})
+
+# DERIVED, not enumerated: every ExtractionResult field replay does NOT supply. A
+# field added to ExtractionResult in the future is automatically in this set (it is
+# in `dataclasses.fields(...)` and, by construction, not yet in
+# `_FIELDS_REPLAY_SUPPLIES` unless someone adds it there too) -- the same reasoning
+# Task 5's cross-factory `==` used over per-field pins: derived beats enumerated
+# whenever the enumeration can go stale. Fix round 2 shipped this as a literal
+# `{"raw_llm_output", "extraction_time_ms", "source_metadata"}`, which covered
+# exactly what existed on review day and nothing added after it -- precisely the
+# recurrence this guard exists to prevent, just one field away.
+_FIELDS_REPLAY_OMITS = (
+    frozenset(f.name for f in dataclasses.fields(ExtractionResult)) - _FIELDS_REPLAY_SUPPLIES
+)
 
 
 class _FieldAccessGuardedExtractionResult(ExtractionResult):
     """Raises the instant a field replay does not supply is read.
 
     Structural guard against the defect class fix round 1 closed recurring: nothing
-    enforces that Stages 3-6 only read the three fields above. Before that fix, a
-    stage reading `source_utterance` got `""` silently -- no exception, no test
-    failure, just a rebuilt graph that quietly disagreed with the live one. A future
-    stage reading `raw_llm_output`, `extraction_time_ms`, or `source_metadata` (none
-    of which replay supplies AT ALL, not even as an empty default standing in for a
-    real value) would fail the identical way. This guard turns that into an
-    immediate, loud failure at the read site instead of a silent divergence
-    discovered later by comparing graphs.
+    enforces that Stages 3-6 only read the fields in `_FIELDS_REPLAY_SUPPLIES`.
+    Before that fix, a stage reading `source_utterance` got `""` silently -- no
+    exception, no test failure, just a rebuilt graph that quietly disagreed with the
+    live one. A future stage reading any field in `_FIELDS_REPLAY_OMITS` (today:
+    `raw_llm_output`, `extraction_time_ms`, `source_metadata` -- none of which
+    replay supplies AT ALL, not even as an empty default standing in for a real
+    value) would fail the identical way. This guard turns that into an immediate,
+    loud failure at the read site instead of a silent divergence discovered later by
+    comparing graphs.
 
     Deliberately a RUNTIME behavioral check (`__getattribute__`), not a source-text
     scan. `TestNoUnguardedEarlyReturn` (test_pipeline_cache_writes.py) counts a
@@ -187,13 +198,10 @@ class _FieldAccessGuardedExtractionResult(ExtractionResult):
       a realistic shape for the four stage methods this guards.
     - `vars(extraction)`, `extraction.__dict__[...]`, and `dataclasses.asdict(extraction)`
       all read `__dict__` directly and never invoke `__getattribute__`.
-    - A field added to `ExtractionResult` in the future, under a name that happens
-      to already be in `_FIELDS_REPLAY_SUPPLIES`, would not be caught -- only the
-      three fields known today to be unsupplied are guarded, by name.
     """
 
     def __getattribute__(self, name: str):
-        if name in {"raw_llm_output", "extraction_time_ms", "source_metadata"}:
+        if name in _FIELDS_REPLAY_OMITS:
             raise AssertionError(
                 f"Stage 3-6 code read ExtractionResult.{name}, which "
                 "LogRegenerator.rebuild()'s replay loop does not supply. Either the "
