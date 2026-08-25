@@ -4,26 +4,35 @@ r"""Stages 3-6 must be deterministic given their arguments: same input twice
 Spec D2 moves the cache boundary to just after Stage 2 and lets a rebuild
 re-run Stages 3-6. That is only sound if those stages are deterministic --
 but not, precisely, "functions of their arguments" alone. Each stage also
-reads fixed module/class state that is not part of the `ExtractionResult`
-argument: confidence.py's `HEDGE_PATTERNS`/`THIRD_PARTY_PATTERNS`, temporal.py's
-pattern table, validator.py's `OntologyConstrainedExtractor.ALLOWED_ENTITY_TYPES`/
+reads fixed state that is not part of the `ExtractionResult` argument:
+confidence.py's class-level `HEDGE_PATTERNS`/`THIRD_PARTY_PATTERNS`,
+validator.py's `OntologyConstrainedExtractor.ALLOWED_ENTITY_TYPES`/
 `ALLOWED_RELATIONSHIP_TYPES` (`grep -c "ALLOWED_ENTITY_TYPES\|ALLOWED_RELATIONSHIP_TYPES"
-backend/knowledge/extraction/validator.py` -> 2 read sites), and normalizer.py's
-`RETIRED_TYPE_MAP`/`CANONICAL_REGISTRY`/`STATIC_ALIASES`. D2 needs that state
-to itself be deterministic per replay (true today: all of it is Python
-module-level constants, fixed at import), not that the stages ignore it.
+backend/knowledge/extraction/validator.py` -> 2 read sites), and
+normalizer.py's `RETIRED_TYPE_MAP`/`CANONICAL_REGISTRY`/`STATIC_ALIASES` --
+all module/class-level constants, fixed at import. temporal.py's pattern
+table is different in kind: `self._patterns` is INSTANCE state, not module
+state -- it is built fresh, from the same literal `re.compile` calls, inside
+`TemporalResolver.__init__` on every construction
+(`grep -n "self._patterns" backend/knowledge/extraction/temporal.py` -> the
+sole assignment is at `__init__`, not module scope). D2 needs all of this
+state to itself be deterministic per replay -- true today, whether it is a
+constant fixed at import or an instance rebuilt identically on every
+construction -- not that the stages ignore it.
 
 What this module actually establishes, and no more:
 - No stage reads the wall clock (Stage 4 only -- directly trapped below;
   Stages 3, 5, 6 have no `datetime`/`time`/`random`/`uuid`/`os.environ`
   reference at all, confirmed by
-  `grep -nE 'datetime\\.|\\.now\\(|\\.today\\(|utcnow|time\\.|random|uuid|os\\.environ'
+  `grep -nE 'datetime\.|\.now\(|\.today\(|utcnow|time\.|random|uuid|os\.environ'
   backend/knowledge/extraction/{confidence,temporal,validator,normalizer}.py`
-  -> zero matches across all four files).
-- Given fixed module state (true within one process and, since none of that
-  state is seeded from `random`/clock/env, true across processes too), each
-  stage returns byte-identical output for byte-identical input across two
-  calls on the same instance.
+  -> zero matches across all four files, and the same pattern fires on
+  `backend/knowledge/admin.py` (a file that does call `datetime.now(`),
+  confirming it is a live check, not a pattern that cannot fire).
+- Given fixed module/instance state (true within one process and, since none
+  of that state is seeded from `random`/clock/env, true across processes
+  too), each stage returns byte-identical output for byte-identical input
+  across two calls on the same instance.
 
 It says nothing about unordered iteration over a *different* kind of hidden
 state (a global counter, a set built from a source that isn't itself
@@ -34,10 +43,13 @@ confirmed to catch (applied to source, run, seen RED, reverted) during
 review.
 
 Diagnostic over the paths its fixtures reach, written before the D2 rebuild
-driver that will assume Stages 3-6 are safe to re-run. (`cache_key`'s
-ontology-version drop already landed at 49c880d and rests on this same
-assumption for where Stage 2's cache boundary sits, not for Stages 3-6
-themselves -- the rebuild driver that re-runs Stages 3-6 is still unwritten.)
+driver that will re-run Stages 3-6 end to end -- that driver is still
+unwritten. D3 already partially depends on this assumption, though:
+`cache_key`'s own docstring (landed at 49c880d) states that Stage 5 and
+Stage 6 "both now run in REPLAYED code, so an ontology change there is
+re-derived on every rebuild rather than invalidating the cache" -- a direct
+reliance on Stages 5-6 being safely re-runnable, not merely a claim about
+where Stage 2's cache boundary sits.
 """
 
 import copy
