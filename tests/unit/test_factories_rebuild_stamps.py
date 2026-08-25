@@ -113,3 +113,97 @@ class TestBuildCurationPipelineWiring:
         assert isinstance(stamps, RebuildStamps)
         assert cfg.model_hash in stamps.model_hash
         assert cfg.embedding.model_name in stamps.model_hash
+
+
+class TestCrossFactoryStampAgreement:
+    """`RebuildStamps` is constructed at two sites in `backend/factories.py`
+    (`grep -n "rebuild_stamps = RebuildStamps(" backend/factories.py` -> two
+    hits): once inside `build_curation_pipeline` (above), once inside
+    `build_extraction_pipeline`. With `include_curation=True` (the default),
+    a single call to `build_extraction_pipeline` constructs BOTH -- so this
+    is not two independent call graphs, it is one production call
+    constructing the stamps object twice.
+
+    Task 5 review Important-2: `test_factory_constructs_stamps_from_config`
+    above and Task 5's own wiring test
+    (`test_live_pipeline_rebuild_stamps_match_config`,
+    tests/unit/test_factories_wire_extraction_cache.py) each pin three NAMED
+    fields against config, independently, per factory. Both would keep
+    passing if a fourth field were added to `RebuildStamps` and wired into
+    only ONE of the two construction sites -- the exact "two sites
+    disagreeing on N of M fields" shape review finding L4 (2026-08-02) was,
+    reachable today despite both per-field pins being green. `RebuildStamps`
+    is a frozen dataclass with generated field-wise `__eq__`
+    (`test_rebuild_stamps_dataclass_is_frozen` above pins `frozen=True`), so
+    comparing the two objects for equality -- rather than field by field --
+    covers a field added to the dataclass later automatically, without this
+    test needing to be edited when it grows.
+    """
+
+    def test_extraction_and_curation_stamps_are_identical(self) -> None:
+        """Mutant this kills: editing ONE of the two `RebuildStamps(...)`
+        construction sites in `backend/factories.py` (e.g. swapping which
+        config field feeds `model_hash`, or hardcoding a value) while leaving
+        the other unchanged. Verified: changed `build_extraction_pipeline`'s
+        `rebuild_stamps = RebuildStamps(...)` call to pass
+        `ontology_version="mutated"` unconditionally instead of
+        `config.ontology_version`, re-ran this test -- FAILED with
+        `extraction_stamps.ontology_version == 'mutated'` against
+        `curation_stamps.ontology_version` carrying the real config value, an
+        inequality neither existing per-field-pin test can see (each only
+        checks its own factory's output against config, never the other
+        factory's output). Reverted via Edit, re-ran -- PASSED.
+        """
+        from backend.factories import build_extraction_pipeline
+        from tests.mocks.config import build_test_config
+        from tests.mocks.embeddings import FakeEmbeddingGenerator
+        from tests.mocks.neo4j import FakeNeo4jConnection
+        from tests.mocks.ollama import FakeLLM
+
+        class _FakeGraphStore:
+            """Both attributes `build_extraction_pipeline` reads off `gs`.
+
+            `embedding_generator` is a real `FakeEmbeddingGenerator` (not
+            `None`) so `build_curation_pipeline`'s
+            `if embedding_provider is None: embedding_provider =
+            EmbeddingGenerator(...)` fallback never fires -- this test needs
+            no real SentenceTransformer and no `@requires_sentence_transformers`
+            marker.
+            """
+
+            def __init__(self) -> None:
+                self.connection = FakeNeo4jConnection()
+                self.embedding_generator = FakeEmbeddingGenerator()
+
+        config = build_test_config()
+        gs = _FakeGraphStore()
+
+        # include_curation=True (the default) is the point of this test --
+        # it is what makes build_extraction_pipeline construct BOTH stamps
+        # objects in one call. include_internal_derivation=False keeps this
+        # graph-safe: build_extraction_pipeline only ever opens a real
+        # GraphStore/Neo4jConnection when `graph_store` is falsy (it is not,
+        # here -- `gs` is truthy so `gs = graph_store or build_graph_store(config)`
+        # short-circuits) or when include_internal_derivation's default
+        # branch calls `gs.ensure_mist_identity()` (turned off here).
+        pipeline = build_extraction_pipeline(
+            config,
+            graph_store=gs,
+            llm_provider=FakeLLM(),
+            include_curation=True,
+            include_internal_derivation=False,
+        )
+
+        extraction_stamps = pipeline._rebuild_stamps  # type: ignore[attr-defined]
+        curation_stamps = (
+            pipeline._curation_pipeline._graph_writer._rebuild_stamps  # type: ignore[attr-defined]
+        )
+
+        assert isinstance(extraction_stamps, RebuildStamps)
+        assert isinstance(curation_stamps, RebuildStamps)
+        assert extraction_stamps == curation_stamps
+        # Positive proof this exercised both construction sites rather than
+        # comparing a stamps object against itself or two Nones.
+        assert extraction_stamps is not curation_stamps
+        # Graph-safety: no write occurred through either fake connection.
+        gs.connection.assert_no_writes()

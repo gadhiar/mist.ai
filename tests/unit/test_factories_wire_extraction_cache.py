@@ -52,12 +52,25 @@ def test_live_pipeline_is_built_with_a_real_extraction_cache(tmp_path):
 
     Mutant this kills: deleting (or no-oping) the `extraction_cache=` /
     `rebuild_stamps=` arguments on the `ExtractionPipeline(...)` construction
-    in `build_extraction_pipeline`. With either argument dropped, `_extraction_cache`
-    on the built pipeline stays `None` (Task 3's default) and the first
-    assertion fails. A mutant that passes a *fresh, uninitialised*
-    `ExtractionCache()` instead of one that ran `.initialize()` is also
-    caught -- the PRAGMA assertion below reads the actual sqlite schema, not
-    a mock.
+    in `build_extraction_pipeline`. Three distinct drops, each verified
+    directly against running source:
+      - Drop only `extraction_cache=`: Task 3's pairing guard raises
+        `ValueError: extraction_cache is required when rebuild_stamps is
+        provided` from inside `ExtractionPipeline.__init__` -- the call in
+        `build_extraction_pipeline` itself raises, so the test fails on an
+        uncaught `ValueError`, never reaching the `isinstance` line.
+      - Drop only `rebuild_stamps=`: the guard's other branch raises
+        `ValueError: rebuild_stamps is required when extraction_cache is
+        provided` -- same failure mode, opposite message.
+      - Drop both: both-None is the pairing guard's legal default (no
+        `ValueError`), so `_extraction_cache` on the built pipeline stays
+        `None` (Task 3's default) and the `isinstance` assertion below fails
+        with a plain `AssertionError`.
+    All three are caught by this test, by three different exceptions -- only
+    the "drop both" case reaches the assertion the docstring below names. A
+    mutant that passes a *fresh, uninitialised* `ExtractionCache()` instead of
+    one that ran `.initialize()` is also caught -- the PRAGMA assertion below
+    reads the actual sqlite schema, not a mock.
 
     Graph-safety mechanism (why this cannot reach `build_graph_store`):
     `build_extraction_pipeline` only ever opens a real `GraphStore` /
@@ -142,3 +155,41 @@ def test_live_pipeline_rebuild_stamps_match_config(tmp_path):
     assert stamps.ontology_version == "wiring-test-ontology-version"
     assert stamps.extraction_version == "wiring-test-extraction-version"
     assert stamps.model_hash == compose_model_hash(config)
+
+
+def test_live_pipeline_cache_stays_in_memory_when_event_store_is_in_memory():
+    """The ":memory:" sentinel must propagate from the event store path into
+    the derived cache path, not get silently dropped.
+
+    `build_test_config()`'s default `event_store_db_path` is ":memory:"
+    (`tests/mocks/config.py:41`), which is truthy, so `event_store_path or
+    ...` never falls back to the `~/.mist/...` default -- it is
+    ":memory:" verbatim. `Path(":memory:").parent` is a relative "." with no
+    meaningful parent, so deriving the cache path with the same
+    `.parent / "extraction_cache.db"` join used for a real path would
+    silently produce the bare relative path "extraction_cache.db" -- an
+    on-disk file in the process CWD -- for a caller whose event store is
+    explicitly in-memory (no rebuildability intended).
+
+    Mutant this kills: reverting the cache-path derivation to the
+    unconditional `str(_Path(event_store_path).parent /
+    "extraction_cache.db")` (this task's original form, without the
+    ":memory:" special case). Verified: with that reverted, this test failed
+    with `assert 'extraction_cache.db' == ':memory:'` -- the previous
+    behaviour, confirmed directly rather than assumed.
+    """
+    from backend.factories import build_extraction_pipeline
+    from tests.mocks.config import build_test_config
+
+    config = build_test_config()
+    assert config.event_store.db_path == ":memory:"
+
+    pipeline = build_extraction_pipeline(
+        config,
+        graph_store=_FakeGraphStore(),
+        llm_provider=_FakeLLM(),
+        include_curation=False,
+        include_internal_derivation=False,
+    )
+
+    assert pipeline._extraction_cache.db_path == ":memory:"

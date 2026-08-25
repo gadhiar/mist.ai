@@ -290,18 +290,35 @@ def build_extraction_pipeline(
     # F3 (extraction-cache-phase-1) Task 5: cache sits beside the event store
     # -- one path convention, not two. Mirrors `_build_log_regenerator` in
     # scripts/mist_admin.py exactly (`grep -nE 'event_store_path = |cache_path
-    # = ' scripts/mist_admin.py`).
+    # = ' scripts/mist_admin.py`), extended to propagate the ":memory:"
+    # sentinel: `ExtractionCache.initialize()` already special-cases it
+    # (`grep -n 'if self.db_path != ":memory:"' backend/knowledge/extraction_cache.py`),
+    # but `Path(event_store_path).parent` on the bare sentinel resolves to a
+    # relative "." -- silently landing an on-disk "extraction_cache.db" in
+    # the process CWD for any caller with an in-memory event store, rather
+    # than the in-memory cache that setup implies.
     event_store_path = config.event_store.db_path or str(_Path.home() / ".mist" / "event_store.db")
-    cache_path = str(_Path(event_store_path).parent / "extraction_cache.db")
+    cache_path = (
+        ":memory:"
+        if event_store_path == ":memory:"
+        else str(_Path(event_store_path).parent / "extraction_cache.db")
+    )
     extraction_cache = ExtractionCache(cache_path)
     extraction_cache.initialize()
 
     # Constructed here, from the same KnowledgeConfig that
     # build_curation_pipeline constructs its own RebuildStamps from (`grep -n
-    # "rebuild_stamps = RebuildStamps(" backend/factories.py`). One
-    # construction site per process. Review finding L4 (2026-08-02) was two
-    # sites disagreeing on 2 of 3 fields, which made every rebuild a
-    # permanent ColdCacheError rather than a mislabel.
+    # "rebuild_stamps = RebuildStamps(" backend/factories.py` -> two hits, one
+    # per consumer). NOT one construction site per process: with
+    # include_curation=True (the default), this function also calls
+    # build_curation_pipeline above, so a single production call constructs
+    # BOTH stamps objects in one process. Both sites derive all three fields
+    # from this same config (never the bare config.model_hash), and
+    # tests/unit/test_factories_rebuild_stamps.py::TestCrossFactoryStampAgreement
+    # pins the two outputs equal so a future edit cannot silently diverge
+    # them. Review finding L4 (2026-08-02) was two sites disagreeing on 2 of
+    # 3 fields, which made every rebuild a permanent ColdCacheError rather
+    # than a mislabel.
     rebuild_stamps = RebuildStamps(
         ontology_version=config.ontology_version,
         extraction_version=config.extraction_version,
