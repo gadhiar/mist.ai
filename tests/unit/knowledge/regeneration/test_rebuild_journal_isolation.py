@@ -36,7 +36,10 @@ from backend.knowledge.curation.deduplication import DeduplicationResult
 from backend.knowledge.curation.graph_writer import WriteResult
 from backend.knowledge.curation.pipeline import CurationResult
 from backend.knowledge.curation.reconciliation import ReconcileTurnResult
-from backend.knowledge.extraction.validator import ValidationResult
+from backend.knowledge.extraction.confidence import ConfidenceScorer
+from backend.knowledge.extraction.normalizer import EntityNormalizer
+from backend.knowledge.extraction.temporal import TemporalResolver
+from backend.knowledge.extraction.validator import ExtractionValidator, ValidationResult
 from backend.knowledge.extraction_cache import OUTCOME_EXTRACTED, ExtractionCache
 from backend.knowledge.regeneration.log_regenerator import LogRegenerator, RebuildError
 from backend.knowledge.regeneration.rebuild_journal import (
@@ -176,6 +179,14 @@ def _regenerator(source: Any, journal: Any) -> tuple[LogRegenerator, RecordingCu
             extraction_cache=_warm_cache(),
             staging_curation_pipeline=recorder,
             journal=journal,
+            # This file's assertions are about WHERE writes land (source vs.
+            # journal store), not about Stages 3-6, so the real (pure, no
+            # external dependency) production components are the simplest
+            # correct wiring -- Task 6 (extraction-cache-phase-1).
+            confidence_scorer=ConfidenceScorer(),
+            temporal_resolver=TemporalResolver(),
+            normalizer=EntityNormalizer(embedding_generator=None, executor=None),
+            validator=ExtractionValidator(),
         ),
         recorder,
     )

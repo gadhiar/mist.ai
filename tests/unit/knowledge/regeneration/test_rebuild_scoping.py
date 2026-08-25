@@ -42,7 +42,10 @@ from backend.knowledge.curation.deduplication import DeduplicationResult
 from backend.knowledge.curation.graph_writer import WriteResult
 from backend.knowledge.curation.pipeline import CurationResult
 from backend.knowledge.curation.reconciliation import ReconcileTurnResult
-from backend.knowledge.extraction.validator import ValidationResult
+from backend.knowledge.extraction.confidence import ConfidenceScorer
+from backend.knowledge.extraction.normalizer import EntityNormalizer
+from backend.knowledge.extraction.temporal import TemporalResolver
+from backend.knowledge.extraction.validator import ExtractionValidator, ValidationResult
 from backend.knowledge.extraction_cache import OUTCOME_EXTRACTED, ExtractionCache
 from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
 from backend.knowledge.regeneration.rebuild_journal import EventStoreRebuildJournal
@@ -271,6 +274,14 @@ def build_world(*, cache_superseded_turn: bool = True, with_orphan: bool = False
             # `test_the_job_ledger_totals_only_the_scoped_turns` still meaningful.
             # It is a deliberate choice here, not the default it used to be.
             journal=EventStoreRebuildJournal(store),
+            # This file's assertions are about SCOPING (which turns get selected),
+            # not about Stages 3-6, so the real (pure, no external dependency)
+            # production components are the simplest correct wiring -- Task 6
+            # (extraction-cache-phase-1).
+            confidence_scorer=ConfidenceScorer(),
+            temporal_resolver=TemporalResolver(),
+            normalizer=EntityNormalizer(embedding_generator=None, executor=None),
+            validator=ExtractionValidator(),
         ),
     )
 

@@ -869,6 +869,10 @@ def _build_log_regenerator(
     from backend.event_store.store import EventStore
     from backend.factories import build_curation_pipeline
     from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
+    from backend.knowledge.extraction.confidence import ConfidenceScorer
+    from backend.knowledge.extraction.normalizer import EntityNormalizer
+    from backend.knowledge.extraction.temporal import TemporalResolver
+    from backend.knowledge.extraction.validator import ExtractionValidator
     from backend.knowledge.extraction_cache import ExtractionCache
     from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
     from backend.knowledge.regeneration.rebuild_journal import NullRebuildJournal
@@ -936,6 +940,21 @@ def _build_log_regenerator(
         event_store=event_store,
         extraction_cache=extraction_cache,
         staging_curation_pipeline=pipeline,
+        confidence_scorer=ConfidenceScorer(),
+        temporal_resolver=TemporalResolver(),
+        # Stage 5 is pure: `normalize()` issues no graph queries (R1.1d strip
+        # moved graph-identity resolution to the curation deduper, Stage 7a).
+        # `embedding_generator` and `executor` are retained on the class only
+        # for constructor-signature compatibility and are never read after
+        # assignment (`grep -n "self\._embedding_generator\|self\._executor"
+        # backend/knowledge/extraction/normalizer.py` -> both hits are the
+        # `__init__` assignments, neither is read again). Passing None costs
+        # nothing and avoids wiring a staging-graph executor into a stage that
+        # cannot use it.
+        normalizer=EntityNormalizer(embedding_generator=None, executor=None),
+        validator=ExtractionValidator(
+            min_confidence=config.extraction.min_extraction_confidence,
+        ),
         # The dry-run proof is not a rebuild of record: nothing reads its job rows
         # (`get_reextraction_job` has no production caller), and `_build_once` runs
         # twice per invocation, so a durable journal here would append two
