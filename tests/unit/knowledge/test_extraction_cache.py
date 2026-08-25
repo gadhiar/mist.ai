@@ -1,5 +1,7 @@
 """Content-addressed extraction cache (F3)."""
 
+import hashlib
+
 import pytest
 
 from backend.knowledge.extraction_cache import (
@@ -21,6 +23,21 @@ def test_cache_key_is_deterministic():
     a = cache_key("evt-1", "2026-06-14-r5", "model-abc")
     b = cache_key("evt-1", "2026-06-14-r5", "model-abc")
     assert a == b
+
+
+def test_cache_key_is_the_sha256_of_the_three_named_inputs_only():
+    """Pins the digest to a value recomputed from ONLY the three parameters --
+    not any hidden module-level constant `cache_key` might read in addition.
+
+    Mutant this kills: folding a module global (e.g. `ONTOLOGY_VERSION`) into
+    the hashed string INSIDE `cache_key`, without adding it as a parameter,
+    would still pass `test_cache_key_is_deterministic` and the ontology-bump
+    collision test below -- neither varies the global mid-test, so both are
+    structurally blind to it. This test recomputes the expected digest
+    independently from the exact three named inputs and nothing else, so any
+    extra input folded into the hash changes the digest and fails the equality.
+    """
+    assert cache_key("evt-1", "v1", "m1") == hashlib.sha256(b"evt-1|v1|m1").hexdigest()
 
 
 def test_cache_key_changes_with_extraction_version_and_model():
@@ -273,17 +290,24 @@ def test_migration_preserves_existing_rows_and_backfills_the_outcome_default(tmp
 def test_a_freshly_created_table_and_a_migrated_one_have_the_same_columns(tmp_path):
     """`_DDL` and `_MIGRATION_COLUMNS` declare the four new columns independently.
 
+    Compares (name, type, notnull, dflt_value) tuples, not just column names --
+    a name-only comparison would miss a column that exists on both paths but
+    with a differing type, NOT NULL, or DEFAULT between the two declarations.
+
     Mutant this kills: adding (or renaming) a column in `_DDL` alone, without the
     matching entry in `_MIGRATION_COLUMNS`, gives freshly created databases a
     schema that migrated (pre-phase-1) databases never receive -- `put()`'s fixed
     INSERT column list would then raise `sqlite3.OperationalError` on an older
     database only, an age-dependent failure this test catches at the schema level
-    before any INSERT is attempted.
+    before any INSERT is attempted. The same comparison also catches the two
+    declarations drifting on TYPE/NOT NULL/DEFAULT for a column both sides agree
+    exists by name.
     """
     fresh = ExtractionCache(":memory:")
     fresh.initialize()
     fresh_cols = {
-        row[1] for row in fresh._get_connection().execute("PRAGMA table_info(extraction_cache)")
+        (row[1], row[2], row[3], row[4])
+        for row in fresh._get_connection().execute("PRAGMA table_info(extraction_cache)")
     }
 
     db = tmp_path / "old.db"
@@ -291,7 +315,8 @@ def test_a_freshly_created_table_and_a_migrated_one_have_the_same_columns(tmp_pa
     migrated = ExtractionCache(str(db))
     migrated.initialize()
     migrated_cols = {
-        row[1] for row in migrated._get_connection().execute("PRAGMA table_info(extraction_cache)")
+        (row[1], row[2], row[3], row[4])
+        for row in migrated._get_connection().execute("PRAGMA table_info(extraction_cache)")
     }
 
     assert fresh_cols == migrated_cols

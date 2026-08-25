@@ -65,10 +65,9 @@ def cache_key(event_id: str, extraction_version: str, model_hash: str) -> str:
     Stage 6 (validate) are the only ontology consumers in code that runs AFTER the
     cached LLM call -- both now run in REPLAYED code, so an ontology change there
     is re-derived on every rebuild rather than invalidating the cache. Verified via
-    `grep -n "ALLOWED_ENTITY_TYPES\|ALLOWED_RELATIONSHIP_TYPES"
-    backend/knowledge/extraction/ontology_extractor.py
-    backend/knowledge/extraction/validator.py`: both constants are DEFINED in
-    `ontology_extractor.py` and READ only inside `validator.py`.
+    `grep -rn "ALLOWED_ENTITY_TYPES\|ALLOWED_RELATIONSHIP_TYPES" backend/ scripts/`:
+    both constants are DEFINED in `ontology_extractor.py` and READ only inside
+    `validator.py` -- repo-wide, not just in those two files.
 
     Prompt-VISIBLE ontology changes still invalidate, with no discipline
     required: `prompts.py` holds the entity list as literal text -- a THIRD

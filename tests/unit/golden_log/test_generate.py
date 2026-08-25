@@ -287,7 +287,7 @@ class TestMaterialize:
         assert all(hit is not None for hit in hits)
         assert len(hits) == EXPECTED_TURN_COUNT
 
-    def test_the_write_triple_is_the_read_triple(self, turns, tmp_path):
+    def test_the_write_stamp_pair_is_the_read_stamp_pair(self, turns, tmp_path):
         # Assert: the key the cache was WRITTEN under is the key the rebuild COMPUTES.
         # `LogRegenerator` derives its lookup from epoch[extraction|model_hash] (D3 dropped
         # ontology_version from the key), so this recomputes that key independently and
