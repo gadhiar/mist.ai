@@ -17,11 +17,15 @@ all four stages regardless. The recording fakes actually used --
 """
 
 import copy
+from datetime import datetime
 
 import pytest
 
 from backend.knowledge.extraction.confidence import ConfidenceScorer
+from backend.knowledge.extraction.normalizer import EntityNormalizer
 from backend.knowledge.extraction.ontology_extractor import ExtractionResult
+from backend.knowledge.extraction.temporal import TemporalResolver
+from backend.knowledge.extraction.validator import ExtractionValidator
 
 # `rebuild()` is keyword-only and `live_uri` and `epoch` have NO defaults
 # (`grep -n "async def rebuild" backend/knowledge/regeneration/log_regenerator.py`, one
@@ -69,8 +73,17 @@ async def test_a_skipped_row_replays_as_a_no_op_not_a_failure(regenerator_factor
 
 
 @pytest.mark.asyncio
-async def test_replay_needs_no_model(regenerator_factory):
-    """Stages 3-6 are pure (Task 2). If a model is reached, this raises."""
+async def test_replay_never_touches_the_normalizers_dead_dependencies(regenerator_factory):
+    """Stages 3-6 are pure (Task 2). If a model is reached, this raises.
+
+    Narrower than it sounds: `EntityNormalizer` is the ONLY one of the four Stage 3-6
+    components with a constructor parameter that could hold anything model- or
+    graph-shaped (`embedding_generator`, `executor`) -- `ConfidenceScorer()` and
+    `TemporalResolver()` take no arguments at all, and `ExtractionValidator()`'s only
+    argument is a float threshold. So this test exercises purity for exactly one slot
+    pair; for the other three components the property holds by construction (there is
+    nothing to reach), not because this test ran anything against them.
+    """
 
     class ExplodingLLM:
         def __getattr__(self, _):
@@ -133,3 +146,102 @@ async def test_a_hedged_utterance_gets_the_same_confidence_penalty_on_replay(reg
     replayed_relationships = regenerator._curation.relationships[0]
     assert replayed_relationships, "the USES relationship must have survived validation"
     assert replayed_relationships[0]["properties"]["confidence"] == expected_confidence
+
+
+# Fields `LogRegenerator.rebuild()`'s replay loop actually populates on the
+# `ExtractionResult` it builds from the cached row -- must be kept in sync with that
+# constructor call (`entities=`, `relationships=`, `source_utterance=`). Everything
+# else `ExtractionResult` carries (`raw_llm_output`, `extraction_time_ms`,
+# `source_metadata`) is something replay does NOT supply; a stage reading one of
+# those would silently diverge live from rebuilt exactly the way `source_utterance`
+# did before fix round 1.
+_FIELDS_REPLAY_SUPPLIES = frozenset({"entities", "relationships", "source_utterance"})
+
+
+class _FieldAccessGuardedExtractionResult(ExtractionResult):
+    """Raises the instant a field replay does not supply is read.
+
+    Structural guard against the defect class fix round 1 closed recurring: nothing
+    enforces that Stages 3-6 only read the three fields above. Before that fix, a
+    stage reading `source_utterance` got `""` silently -- no exception, no test
+    failure, just a rebuilt graph that quietly disagreed with the live one. A future
+    stage reading `raw_llm_output`, `extraction_time_ms`, or `source_metadata` (none
+    of which replay supplies AT ALL, not even as an empty default standing in for a
+    real value) would fail the identical way. This guard turns that into an
+    immediate, loud failure at the read site instead of a silent divergence
+    discovered later by comparing graphs.
+
+    Deliberately a RUNTIME behavioral check (`__getattribute__`), not a source-text
+    scan. `TestNoUnguardedEarlyReturn` (test_pipeline_cache_writes.py) counts a
+    literal string across `inspect.getsource(...)` and documents its own failure
+    mode: a comment or docstring containing that literal token inflates the count
+    and masks a real violation behind a false-passing equality. Intercepting the
+    actual attribute read has no equivalent hole -- a comment mentioning
+    `raw_llm_output` cannot trigger `__getattribute__`; only real code reading
+    `extraction.raw_llm_output` can.
+
+    Known non-coverage, stated rather than hidden (Task 4's lesson: say what a guard
+    does and does not catch):
+    - `object.__getattribute__(extraction, "raw_llm_output")`, called directly on
+      the base class rather than through the instance, bypasses this override. Not
+      a realistic shape for the four stage methods this guards.
+    - `vars(extraction)`, `extraction.__dict__[...]`, and `dataclasses.asdict(extraction)`
+      all read `__dict__` directly and never invoke `__getattribute__`.
+    - A field added to `ExtractionResult` in the future, under a name that happens
+      to already be in `_FIELDS_REPLAY_SUPPLIES`, would not be caught -- only the
+      three fields known today to be unsupplied are guarded, by name.
+    """
+
+    def __getattribute__(self, name: str):
+        if name in {"raw_llm_output", "extraction_time_ms", "source_metadata"}:
+            raise AssertionError(
+                f"Stage 3-6 code read ExtractionResult.{name}, which "
+                "LogRegenerator.rebuild()'s replay loop does not supply. Either the "
+                "read is a bug, or replay must start supplying this field from the "
+                "cached row or the replayed turn -- otherwise a rebuilt graph will "
+                "silently disagree with the live one, the way source_utterance did "
+                "before fix round 1."
+            )
+        return super().__getattribute__(name)
+
+    def __repr__(self) -> str:
+        # The dataclass-generated __repr__ reads every field, including the three
+        # this class exists to forbid -- so a failure's traceback trying to render
+        # `self` would re-trigger the guard mid-repr (pytest catches this and prints
+        # "raised in repr()", which obscures the real failure). Report only the
+        # fields this class allows a read of.
+        return (
+            f"{type(self).__name__}(entities={self.entities!r}, "
+            f"relationships={self.relationships!r}, source_utterance={self.source_utterance!r})"
+        )
+
+
+@pytest.mark.asyncio
+async def test_stages_3_to_6_only_read_fields_replay_actually_supplies():
+    """The structural guard: run the REAL Stages 3-6 against a field-access trap.
+
+    Not a LogRegenerator test -- it exercises the four stage components directly,
+    the same way `LogRegenerator.rebuild()`'s loop calls them (same method names,
+    same argument shapes), against an `ExtractionResult` that raises the instant
+    anything outside `_FIELDS_REPLAY_SUPPLIES` is read. No assertion beyond "this
+    completes without raising": the guard class itself is the assertion mechanism.
+    """
+    guarded = _FieldAccessGuardedExtractionResult(
+        entities=[
+            {"id": "user", "type": "User"},
+            {"id": "rust", "type": "Technology"},
+        ],
+        relationships=[
+            {"source": "user", "target": "rust", "type": "USES", "properties": {"confidence": 0.9}}
+        ],
+        source_utterance="I use Rust.",
+    )
+
+    extraction = ConfidenceScorer().adjust_confidence(guarded)
+    extraction = TemporalResolver().resolve(
+        extraction, datetime.fromisoformat("2026-07-01T09:00:00+00:00")
+    )
+    extraction = await EntityNormalizer(embedding_generator=None, executor=None).normalize(
+        extraction
+    )
+    ExtractionValidator().validate(extraction)

@@ -218,10 +218,14 @@ def regenerator_factory():
         cached_outcome: OUTCOME_EXTRACTED (default) or OUTCOME_SKIPPED.
         skip_reason: required (and only valid) when cached_outcome is OUTCOME_SKIPPED
             -- ExtractionCache.put enforces this itself.
-        llm: when given, wired into the (real) normalizer's `embedding_generator`
-            slot -- the one constructor parameter Stages 3-6 collectively have for
-            an external dependency, and the one `normalize()` never reads after
-            assignment. Lets a test prove nothing touches it.
+        llm: when given, wired into BOTH of the (real) normalizer's constructor
+            slots -- `embedding_generator` and `executor` -- the only two places
+            Stages 3-6 collectively hold anything that could be model- or
+            graph-shaped, and the two `normalize()` never reads after assignment.
+            Both, not just one: Task 4 established that `None` cannot catch a
+            regression guarded by `is not None` (a re-introduced
+            `if self._executor is not None: ...` would pass silently if `executor`
+            stayed `None` here). Lets a test prove nothing touches either.
         utterance: the seeded turn's `user_utterance` (default "I use Rust.").
             Fix round 1: this is what `ConfidenceScorer.adjust_confidence` reads
             as `extraction.source_utterance` during replay.
@@ -249,7 +253,7 @@ def regenerator_factory():
         else:
             confidence_scorer = ConfidenceScorer()
             temporal_resolver = TemporalResolver()
-            normalizer = EntityNormalizer(embedding_generator=llm, executor=None)
+            normalizer = EntityNormalizer(embedding_generator=llm, executor=llm)
             validator = ExtractionValidator()
 
         return LogRegenerator(
