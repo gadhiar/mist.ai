@@ -242,6 +242,12 @@ def build_extraction_pipeline(
     debug_logger: "DebugJSONLLogger | None" = None,  # noqa: F821
 ) -> ExtractionPipeline:
     """Create a fully wired ExtractionPipeline."""
+    from pathlib import Path as _Path
+
+    from backend.knowledge.curation.graph_writer import RebuildStamps
+    from backend.knowledge.extraction_cache import ExtractionCache
+    from backend.knowledge.version_stamps import compose_model_hash
+
     gs = graph_store or build_graph_store(config)
     executor = build_graph_executor(config, gs.connection)
 
@@ -281,6 +287,27 @@ def build_extraction_pipeline(
             config=config.scope_classifier,
         )
 
+    # F3 (extraction-cache-phase-1) Task 5: cache sits beside the event store
+    # -- one path convention, not two. Mirrors `_build_log_regenerator` in
+    # scripts/mist_admin.py exactly (`grep -nE 'event_store_path = |cache_path
+    # = ' scripts/mist_admin.py`).
+    event_store_path = config.event_store.db_path or str(_Path.home() / ".mist" / "event_store.db")
+    cache_path = str(_Path(event_store_path).parent / "extraction_cache.db")
+    extraction_cache = ExtractionCache(cache_path)
+    extraction_cache.initialize()
+
+    # Constructed here, from the same KnowledgeConfig that
+    # build_curation_pipeline constructs its own RebuildStamps from (`grep -n
+    # "rebuild_stamps = RebuildStamps(" backend/factories.py`). One
+    # construction site per process. Review finding L4 (2026-08-02) was two
+    # sites disagreeing on 2 of 3 fields, which made every rebuild a
+    # permanent ColdCacheError rather than a mislabel.
+    rebuild_stamps = RebuildStamps(
+        ontology_version=config.ontology_version,
+        extraction_version=config.extraction_version,
+        model_hash=compose_model_hash(config),
+    )
+
     return ExtractionPipeline(
         preprocessor=PreProcessor(),
         extractor=OntologyConstrainedExtractor(config, llm=provider),
@@ -299,6 +326,8 @@ def build_extraction_pipeline(
         embedding_provider=gs.embedding_generator,
         extraction_config=config.extraction,
         scope_classifier=scope_classifier,
+        extraction_cache=extraction_cache,
+        rebuild_stamps=rebuild_stamps,
     )
 
 
