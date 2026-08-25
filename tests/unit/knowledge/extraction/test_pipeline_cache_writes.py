@@ -491,7 +491,13 @@ class TestNoUnguardedEarlyReturn:
     returns spelled exactly `return ValidationResult(valid=True)`. A new
     exit using a differently-shaped literal (extra kwargs, a different
     return type) would not change either count and would not be caught
-    here -- the same limitation the reviewed fix for this gap named.
+    here -- the same limitation the reviewed fix for this gap named. The
+    call side carries the worse-direction risk: `call_count` is a textual
+    count over the WHOLE method body, so a future comment or docstring line
+    that happens to contain the literal text `self._record_skip(` or
+    `self._record_extraction(` would inflate it and mask a genuinely
+    missing write behind a false-passing equality -- do not write either
+    token in a comment or docstring inside this method.
     """
 
     def test_gate_shaped_exit_count_matches_recorder_call_count(self):
