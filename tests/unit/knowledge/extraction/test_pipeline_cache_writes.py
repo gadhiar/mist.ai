@@ -108,14 +108,14 @@ class TestConstructorPairing:
         ColdCacheError from a rebuild, pointing at the rebuild rather than
         at this construction site.
         """
-        with pytest.raises(ValueError, match="rebuild_stamps"):
+        with pytest.raises(ValueError, match="rebuild_stamps is required"):
             ExtractionPipeline(
                 **self._kwargs(extraction_cache=object(), rebuild_stamps=None),
             )
 
     def test_rejects_rebuild_stamps_without_extraction_cache(self):
         """Mirror of the above: rebuild_stamps without extraction_cache."""
-        with pytest.raises(ValueError, match="extraction_cache"):
+        with pytest.raises(ValueError, match="extraction_cache is required"):
             ExtractionPipeline(
                 **self._kwargs(extraction_cache=None, rebuild_stamps=object()),
             )

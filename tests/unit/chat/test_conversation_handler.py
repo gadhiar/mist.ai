@@ -240,7 +240,7 @@ class TestToolUsageTrackerDI:
         assert handler._tool_usage_tracker is None
 
 
-class TestShortMessageSkip:
+class TestExtractionDispatchGating:
     # The word-count threshold (len(user_message.split()) >= 3) still gates
     # auto-RAG retrieval in handle_message
     # (`grep -n "auto_inject_enabled = " backend/chat/conversation_handler.py`,
@@ -296,12 +296,10 @@ class TestShortMessageSkip:
             session_id="short-s1",
         )
 
-        # Give the scheduled background task a moment to fire
-        import asyncio
+        # Deterministic wait for the fire-and-forget task, rather than a sleep.
+        await handler._drain_extraction_tasks()
 
-        await asyncio.sleep(0.05)
-
-        handler._extraction_pipeline.extract_from_utterance.assert_called()
+        handler._extraction_pipeline.extract_from_utterance.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_long_message_triggers_extraction(self):
