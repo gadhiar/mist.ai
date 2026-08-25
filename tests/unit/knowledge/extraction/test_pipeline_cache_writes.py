@@ -6,6 +6,8 @@ called at all -- so a gated turn produced no cache row. Moved into the
 pipeline (Task 3) so the pipeline itself can record the skip.
 """
 
+import inspect
+import sqlite3
 from unittest.mock import AsyncMock
 
 import pytest
@@ -18,6 +20,7 @@ from backend.knowledge.extraction.ontology_extractor import (
 )
 from backend.knowledge.extraction.pipeline import ExtractionPipeline
 from backend.knowledge.extraction.preprocessor import PreProcessor
+from backend.knowledge.extraction.scope_classifier import ScopeResult
 from backend.knowledge.extraction.temporal import TemporalResolver
 from backend.knowledge.extraction.validator import ExtractionValidator
 from backend.knowledge.extraction_cache import (
@@ -26,6 +29,7 @@ from backend.knowledge.extraction_cache import (
     SKIP_BELOW_SIGNIFICANCE,
     SKIP_DUPLICATE,
     SKIP_RATE_LIMITED,
+    SKIP_TOO_SHORT,
 )
 from backend.knowledge.storage.graph_store import GraphStore
 from tests.mocks.embeddings import FakeEmbeddingGenerator
@@ -58,7 +62,7 @@ class TestGate0:
         )
         assert result.entities == []
         assert spy_cache.calls == [
-            ("evt-short", "skipped", "too_short", "2026-08-18T00:00:00+00:00"),
+            ("evt-short", "skipped", "too_short", "2026-08-18T00:00:00+00:00", None, None),
         ]
 
     @pytest.mark.asyncio
@@ -88,7 +92,7 @@ class TestGate0:
         )
 
         assert spy_cache.calls == [
-            ("evt-three", "extracted", None, "2026-08-18T00:00:00+00:00"),
+            ("evt-three", "extracted", None, "2026-08-18T00:00:00+00:00", None, None),
         ]
         pipeline._extractor.extract.assert_awaited_once()
 
@@ -255,8 +259,30 @@ class TestGates1Through3RecordTheirReason:
         )
 
         assert spy_cache.calls == [
-            (event_id, OUTCOME_SKIPPED, expected_reason, "2026-08-18T00:00:00+00:00"),
+            (event_id, OUTCOME_SKIPPED, expected_reason, "2026-08-18T00:00:00+00:00", None, None),
         ]
+
+
+class TestSkipReasonVocabularyIsPinned:
+    """The SKIP_*/OUTCOME_* values are the on-disk vocabulary -- the literal
+    strings written into the extraction_cache table's `outcome` and
+    `skip_reason` columns. Every other assertion in this file compares a
+    constant to itself (`expected_reason=SKIP_DUPLICATE` against
+    `spy_cache.calls`, which is built from the SAME constant the production
+    code imports), so a change to a constant's VALUE -- not its existence --
+    would silently split old and new cache rows with nothing here noticing.
+    This is the one place that pins the literals.
+    """
+
+    def test_skip_reason_literal_values(self):
+        assert SKIP_TOO_SHORT == "too_short"
+        assert SKIP_RATE_LIMITED == "rate_limited"
+        assert SKIP_BELOW_SIGNIFICANCE == "below_significance"
+        assert SKIP_DUPLICATE == "duplicate"
+
+    def test_outcome_literal_values(self):
+        assert OUTCOME_EXTRACTED == "extracted"
+        assert OUTCOME_SKIPPED == "skipped"
 
 
 class TestSiteFiveRecordsExtractedOutcome:
@@ -277,7 +303,7 @@ class TestSiteFiveRecordsExtractedOutcome:
         )
 
         assert spy_cache.calls == [
-            ("evt-ok", OUTCOME_EXTRACTED, None, "2026-08-18T00:00:00+00:00"),
+            ("evt-ok", OUTCOME_EXTRACTED, None, "2026-08-18T00:00:00+00:00", None, None),
         ]
 
     @pytest.mark.asyncio
@@ -294,17 +320,72 @@ class TestSiteFiveRecordsExtractedOutcome:
         )
 
         assert spy_cache.calls == [
-            ("evt-empty", OUTCOME_EXTRACTED, None, "2026-08-18T00:00:00+00:00"),
+            ("evt-empty", OUTCOME_EXTRACTED, None, "2026-08-18T00:00:00+00:00", None, None),
+        ]
+
+
+class _FixedScopeClassifier:
+    """Minimal Stage 1.5 double: always returns the same scope/confidence.
+
+    A real SubjectScopeClassifier + FakeLLM (see test_pipeline_scope_classifier.py)
+    would work too, but this file only needs a non-None value to reach the
+    cache row, not to test the classifier itself.
+    """
+
+    def __init__(self, scope: str, confidence: float) -> None:
+        self._scope = scope
+        self._confidence = confidence
+
+    async def classify(self, pre_processed) -> ScopeResult:
+        return ScopeResult(scope=self._scope, confidence=self._confidence, reasoning="stub")
+
+
+class TestSiteFiveRecordsScopeMetadata:
+    """`scope` and `scope_confidence` are the two columns Task 1 added
+    specifically for this write. Every other test in this file drives a
+    pipeline with no scope_classifier, so both are always None there --
+    a mutant transposing the two arguments at the `_record_extraction` call
+    site, or reading the wrong `pre_processed.metadata` key, would be
+    invisible without a test that drives a non-None value through.
+    """
+
+    @pytest.mark.asyncio
+    async def test_extraction_records_scope_and_confidence_from_stage_1_5(self, pipeline_factory):
+        pipeline, spy_cache = pipeline_factory(
+            extractor_returns=_extraction_with_python_entity(),
+            scope_classifier=_FixedScopeClassifier("user-scope", 0.87),
+        )
+
+        await pipeline.extract_from_utterance(
+            utterance=UTTERANCE,
+            conversation_history=[],
+            event_id="evt-scope",
+            session_id="sess-1",
+            recorded_at="2026-08-18T00:00:00+00:00",
+        )
+
+        assert spy_cache.calls == [
+            (
+                "evt-scope",
+                OUTCOME_EXTRACTED,
+                None,
+                "2026-08-18T00:00:00+00:00",
+                "user-scope",
+                0.87,
+            ),
         ]
 
 
 class TestFiveSiteCountGuard:
-    """The count guard: every decision path writes exactly one row.
+    """The count guard: every KNOWN decision path writes exactly one row.
 
     Branch 1 on 2026-08-04 (842bb90) applied a guard to one of five dispatch
-    sites; only the whole-branch gate caught it. If a new early return is
-    added to extract_from_utterance without a paired cache write, or an
-    existing write is deleted, this fails.
+    sites; only the whole-branch gate caught it. This test proves that
+    deleting an existing write breaks its case (mutation-proved -- see
+    task-4-report.md "Fix round 1"). It does NOT prove that a SIXTH,
+    unenumerated early return would be caught: enumeration is exactly what a
+    new site escapes, since nothing here would construct a case for it.
+    TestNoUnguardedEarlyReturn below closes that gap structurally.
     """
 
     @pytest.mark.asyncio
@@ -378,20 +459,85 @@ class TestFiveSiteCountGuard:
         assert len(spy_cache.calls) == 1, f"gate={label} wrote {len(spy_cache.calls)} rows"
 
 
+class TestNoUnguardedEarlyReturn:
+    """Source-level guard, in the spirit of TestNoBackendModuleRestatesAStamp
+    (tests/unit/knowledge/test_version_stamps.py): a SIXTH early return added
+    to extract_from_utterance without a paired recorder call is exactly the
+    842bb90 shape (a guard applied to one of five sites), and it is
+    invisible to TestFiveSiteCountGuard above by construction -- that test
+    only enumerates the five sites known when it was written.
+
+    Today, every "the pipeline decided not to produce a result this turn"
+    exit is spelled `return ValidationResult(valid=True)`: the four gates
+    use it directly, and the post-Stage-2 empty short-circuit reuses it
+    (an empty Stage-2 result is still valid=True with nothing extracted).
+    `grep -c "return ValidationResult(valid=True)"` against this method's
+    source is 5; `grep -c` for `self._record_skip(` + `self._record_extraction(`
+    is 4 + 1 = 5. That equality is not "each exit is individually paired"
+    -- the empty short-circuit shares Site 5's single _record_extraction
+    call with the two success-path returns below it (`return curation_result`,
+    `return result`), which are not `ValidationResult(valid=True)`-shaped
+    and so are not in this count at all. It holds because right now no
+    gate-shaped exit exists without a recorder call, and no recorder call
+    exists without at least one gate-shaped exit.
+
+    Adding a new gate-shaped exit WITHOUT a paired call changes the exit
+    count but not the call count, breaking the equality -- this test fails.
+    Adding one correctly, WITH a call, moves both counts together and this
+    test stays silent -- it exists to catch omission, not to tax every
+    future correct addition.
+
+    Known limitation, stated rather than hidden: this only catches early
+    returns spelled exactly `return ValidationResult(valid=True)`. A new
+    exit using a differently-shaped literal (extra kwargs, a different
+    return type) would not change either count and would not be caught
+    here -- the same limitation the reviewed fix for this gap named.
+    """
+
+    def test_gate_shaped_exit_count_matches_recorder_call_count(self):
+        source = inspect.getsource(ExtractionPipeline.extract_from_utterance)
+        exit_count = source.count("return ValidationResult(valid=True)")
+        call_count = source.count("self._record_skip(") + source.count("self._record_extraction(")
+
+        assert exit_count == call_count, (
+            f"extract_from_utterance has {exit_count} gate-shaped early returns "
+            f"(`return ValidationResult(valid=True)`) but {call_count} recorder "
+            "calls (_record_skip + _record_extraction) -- a new early return "
+            "of this shape needs a paired _record_skip call, or must be "
+            "provably covered by an earlier _record_extraction the way the "
+            "post-Stage-2 empty short-circuit is. Update this test's "
+            "docstring to explain the new pairing once verified."
+        )
+
+
+class _ExplodingCache:
+    """A cache double raising the exception type production code isolates.
+
+    sqlite3.OperationalError, not a placeholder RuntimeError: it is the real
+    exception type a SQLite-backed ExtractionCache raises for an actual
+    "disk full" condition, and it is exactly what `_record_skip` /
+    `_record_extraction`'s narrowed `except (sqlite3.Error, OSError)` is
+    written to catch (see TestCacheWriteExceptionNarrowing below for the
+    complementary case: what must NOT be caught).
+    """
+
+    def put(self, *a, **kw):
+        raise sqlite3.OperationalError("disk full")
+
+    def get(self, *a, **kw):
+        return None
+
+
 class TestCacheWriteFailureIsolation:
-    """A cache write that raises must degrade rebuildability, never the turn."""
+    """A cache write that raises an operational storage error must degrade
+    rebuildability, never the turn -- for both recorder methods.
+    """
 
     @pytest.mark.asyncio
-    async def test_a_failing_cache_write_never_breaks_the_turn(self, pipeline_factory):
-        class ExplodingCache:
-            def put(self, *a, **kw):
-                raise RuntimeError("disk full")
-
-            def get(self, *a, **kw):
-                return None
-
+    async def test_a_failing_extraction_write_never_breaks_the_turn(self, pipeline_factory):
+        """_record_extraction's isolation (Site 5, the outcome='extracted' path)."""
         pipeline, _ = pipeline_factory(
-            cache=ExplodingCache(), extractor_returns=_extraction_with_python_entity()
+            cache=_ExplodingCache(), extractor_returns=_extraction_with_python_entity()
         )
 
         result = await pipeline.extract_from_utterance(
@@ -402,4 +548,92 @@ class TestCacheWriteFailureIsolation:
             recorded_at="2026-08-18T00:00:00+00:00",
         )
 
-        assert result is not None  # the turn completed
+        # The turn completed AND produced the extraction -- not merely a
+        # non-None placeholder, which a mutant short-circuiting to an empty
+        # ValidationResult on cache failure would also satisfy.
+        assert result.valid is True
+        assert result.entities == _extraction_with_python_entity().entities
+        assert result.relationships == []
+
+    @pytest.mark.asyncio
+    async def test_a_failing_skip_write_never_breaks_the_turn(self, pipeline_factory):
+        """_record_skip's isolation (the four gate paths) -- the
+        extraction-path test above only exercises _record_extraction's
+        try/except; a narrowing mutant applied to only one of the two
+        methods would be invisible without this.
+        """
+        pipeline, _ = pipeline_factory(cache=_ExplodingCache())
+
+        result = await pipeline.extract_from_utterance(
+            utterance="ok",  # two words -- trips Gate 0
+            conversation_history=[],
+            event_id="evt-boom-skip",
+            session_id="sess-1",
+            recorded_at="2026-08-18T00:00:00+00:00",
+        )
+
+        assert result.valid is True
+        assert result.entities == []
+
+
+class TestCacheWriteExceptionNarrowing:
+    """ValueError/TypeError from a cache write must NOT be isolated.
+
+    Both mean the CALLER passed something wrong -- ExtractionCache.put's own
+    fail-closed guards on an inconsistent outcome/skip_reason pair
+    (extraction_cache.py:173,176,178,180), or json.dumps on a
+    non-serializable payload. Swallowing either reproduces the exact
+    silent-failure mode Task 3's constructor pairing guard exists to
+    prevent: no error, no log beyond a warning that hides the real cause,
+    surfacing only much later as a ColdCacheError pointing at a rebuild
+    rather than at this call.
+
+    Each test below drives a DIFFERENT recorder method (_record_extraction
+    via extractor_returns, _record_skip via force_gate) with its own cache
+    double and its own distinct exception type -- per this phase's standing
+    pytest.raises(match=...) rule, two adjacent checks must key on what
+    DIFFERS, so a mutant narrowing only one of the two methods' except
+    clauses cannot pass both.
+    """
+
+    @pytest.mark.asyncio
+    async def test_extraction_recorder_propagates_value_error(self, pipeline_factory):
+        class BadCache:
+            def put(self, *a, **kw):
+                raise ValueError("outcome='skipped' requires a skip_reason")
+
+            def get(self, *a, **kw):
+                return None
+
+        pipeline, _ = pipeline_factory(
+            cache=BadCache(), extractor_returns=_extraction_with_python_entity()
+        )
+
+        with pytest.raises(ValueError, match="skip_reason"):
+            await pipeline.extract_from_utterance(
+                utterance=UTTERANCE,
+                conversation_history=[],
+                event_id="evt-bad-cache-extraction",
+                session_id="sess-1",
+                recorded_at="2026-08-18T00:00:00+00:00",
+            )
+
+    @pytest.mark.asyncio
+    async def test_skip_recorder_propagates_type_error(self, pipeline_factory):
+        class BadCache:
+            def put(self, *a, **kw):
+                raise TypeError("Object of type bytes is not JSON serializable")
+
+            def get(self, *a, **kw):
+                return None
+
+        pipeline, _ = pipeline_factory(cache=BadCache(), force_gate=SKIP_RATE_LIMITED)
+
+        with pytest.raises(TypeError, match="JSON serializable"):
+            await pipeline.extract_from_utterance(
+                utterance=UTTERANCE,
+                conversation_history=[],
+                event_id="evt-bad-cache-skip",
+                session_id="sess-1",
+                recorded_at="2026-08-18T00:00:00+00:00",
+            )

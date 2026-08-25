@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import sqlite3
 import time
 from collections import OrderedDict
 from datetime import UTC, datetime
@@ -467,10 +468,18 @@ class ExtractionPipeline:
         A pipeline wired with only one of the two cannot reach this method:
         `__init__` rejects that combination at construction time.
 
-        Failure-isolated by design: a cache write that raises degrades
-        REBUILDABILITY, never the conversation. The alternative -- letting a
-        full disk end a user's turn -- trades a recoverable defect for an
-        unrecoverable one.
+        Failure-isolated by design, but only for operational storage
+        failures -- a full disk or a lost connection degrades
+        REBUILDABILITY, never the conversation. `sqlite3.Error` and
+        `OSError` are caught for that reason. `ValueError` (raised by
+        `ExtractionCache.put`'s own fail-closed guards on an inconsistent
+        outcome/skip_reason pair -- `extraction_cache.py:173,176,178,180`)
+        and `TypeError` (from `json.dumps` on a non-serializable payload)
+        are deliberately NOT caught: those mean the CALLER passed something
+        wrong, and swallowing them would reproduce the exact silent-failure
+        mode Task 3's constructor pairing guard exists to prevent --
+        surfacing only later as a `ColdCacheError` pointing at a rebuild
+        rather than at this call.
 
         Args:
             event_id: The event store event ID this turn belongs to.
@@ -492,7 +501,7 @@ class ExtractionPipeline:
                 created_at=created_at,
                 skip_reason=skip_reason,
             )
-        except Exception:
+        except (sqlite3.Error, OSError):
             logger.warning(
                 "[WARNING] extraction cache write failed for event %s (skip=%s); "
                 "this turn will not be rebuildable",
@@ -517,8 +526,11 @@ class ExtractionPipeline:
         every ontology bump.
 
         No-ops when `extraction_cache` and `rebuild_stamps` are both None,
-        mirroring `_record_skip`. Failure-isolated the same way: a cache
-        write that raises degrades rebuildability, never the conversation.
+        mirroring `_record_skip`. Failure-isolated the same way and for the
+        same reason: `sqlite3.Error` / `OSError` (operational storage
+        failures) are caught; `ValueError` (the `put` guards) and
+        `TypeError` (non-serializable payload) propagate, because both mean
+        this call passed something wrong rather than that storage failed.
 
         Args:
             event_id: The event store event ID this turn belongs to.
@@ -545,7 +557,7 @@ class ExtractionPipeline:
                 scope=scope,
                 scope_confidence=scope_confidence,
             )
-        except Exception:
+        except (sqlite3.Error, OSError):
             logger.warning(
                 "[WARNING] extraction cache write failed for event %s; "
                 "this turn will not be rebuildable",

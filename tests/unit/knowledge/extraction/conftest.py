@@ -39,13 +39,29 @@ class SpyCache:
     rebuild of the same log. A mutant that swaps in `datetime.now(UTC)`
     would satisfy every other assertion in this suite silently; only
     checking the recorded value here catches it.
+
+    Also records `scope` + `scope_confidence` (Task 4 addition): both are
+    columns `_record_extraction` writes for every 'extracted' row, and
+    `None` on every 'skipped' row since Stage 1.5 runs after the gates that
+    write those. Without recording them here, a mutant transposing the two
+    arguments at the `_record_extraction` call site, or reading the wrong
+    `pre_processed.metadata` key, would be invisible to this whole file.
     """
 
     def __init__(self):
-        self.calls: list[tuple[str, str, str | None, str]] = []
+        self.calls: list[tuple[str, str, str | None, str, str | None, float | None]] = []
 
     def put(self, event_id, ontology_version, extraction_version, model_hash, **kw):
-        self.calls.append((event_id, kw["outcome"], kw.get("skip_reason"), kw["created_at"]))
+        self.calls.append(
+            (
+                event_id,
+                kw["outcome"],
+                kw.get("skip_reason"),
+                kw["created_at"],
+                kw.get("scope"),
+                kw.get("scope_confidence"),
+            )
+        )
 
     def get(self, *a, **kw):
         return None
@@ -126,6 +142,9 @@ def pipeline_factory():
             wired to fail the test if it is ever reached -- see
             `_unreachable_extractor`.
         cache: a cache double to inject in place of the default SpyCache.
+        scope_classifier: a Stage 1.5 double (anything with an async
+            `classify(pre_processed)` -- see `SubjectScopeClassifier`).
+            None (default) disables Stage 1.5, as before Task 4.
 
     Returns:
         A `(pipeline, spy_cache)` tuple, where `spy_cache` is either the
@@ -138,6 +157,7 @@ def pipeline_factory():
         dedup_utterance: str | None = None,
         extractor_returns=None,
         cache=None,
+        scope_classifier=None,
     ):
         spy_cache = cache if cache is not None else SpyCache()
 
@@ -183,6 +203,7 @@ def pipeline_factory():
             internal_deriver=None,
             embedding_provider=embeddings,
             extraction_config=extraction_config,
+            scope_classifier=scope_classifier,
             extraction_cache=spy_cache,
             rebuild_stamps=_TEST_STAMPS,
         )
