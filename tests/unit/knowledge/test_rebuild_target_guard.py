@@ -101,11 +101,35 @@ class TestAllowlistOverride:
             )
 
     def test_widening_the_override_to_include_live_still_refuses(self, monkeypatch):
-        # The second arm earns its keep here: an operator cannot hand themselves
-        # the wipe by adding the live endpoint to their own allowlist.
+        # An operator cannot hand themselves the wipe by adding the live
+        # endpoint to their own allowlist.
+        #
+        # This test used to match "resolves to the live graph", pinning the
+        # `live_uri` equality arm specifically. The hardcoded live denylist now
+        # fires FIRST for this spelling, so the message changed while the
+        # refusal did not. Matching on "live" keeps the test's actual subject --
+        # that the override cannot admit live -- without pinning WHICH arm
+        # catches it. The arm-specific case is
+        # `test_the_live_uri_arm_still_catches_a_non_denylisted_live_endpoint`.
         monkeypatch.setenv("MIST_REBUILD_NEO4J_HOSTS", "mist-neo4j:7687")
-        with pytest.raises(RebuildTargetError, match="resolves to the live graph"):
+        with pytest.raises(RebuildTargetError, match="live"):
             assert_rebuild_target_not_live(target_uri=LIVE, live_uri=LIVE)
+
+    def test_the_live_uri_arm_still_catches_a_non_denylisted_live_endpoint(self, monkeypatch):
+        """The `live_uri` arm is not made redundant by the denylist.
+
+        The denylist covers the three canonical spellings of THIS deployment's
+        live graph. A live instance reachable at some other address -- a remote
+        host, a relocated port -- is outside it, and only the `live_uri`
+        comparison catches that. Both arms are load-bearing, for different
+        threats: the denylist against an operator's override, this against a
+        deployment the denylist does not know about.
+        """
+        remote_live = "bolt://neo4j.internal.example:7687"
+        monkeypatch.setenv("MIST_REBUILD_NEO4J_HOSTS", "neo4j.internal.example:7687")
+
+        with pytest.raises(RebuildTargetError, match="resolves to the live graph"):
+            assert_rebuild_target_not_live(target_uri=remote_live, live_uri=remote_live)
 
     def test_empty_override_refuses_rather_than_allowing_everything(self, monkeypatch):
         monkeypatch.setenv("MIST_REBUILD_NEO4J_HOSTS", " , ")
@@ -122,3 +146,50 @@ class TestAllowlistOverride:
             assert_rebuild_target_not_live(
                 target_uri="bolt://mist-neo4j-staging:7687", live_uri=LIVE
             )
+
+    @pytest.mark.parametrize(
+        "live_uri",
+        [
+            pytest.param("bolt://mist-neo4j-dev:7687", id="live-uri-inferred-as-dev"),
+            pytest.param("bolt://mist-neo4j-staging:7687", id="live-uri-inferred-as-staging"),
+        ],
+    )
+    def test_refuses_a_live_target_even_when_live_uri_is_not_live(self, monkeypatch, live_uri):
+        """The second arm is only as good as the `live_uri` it is handed.
+
+        `cmd_graph_rebuild_from_log` INFERS live_uri from ambient config
+        (`be.get_config().neo4j.uri`). The rebuild can only run inside
+        `mist-backend-dev` -- the sole process whose EVENT_STORE_DB_PATH points
+        at the hydrated store -- and there `NEO4J_URI` is the DEV instance. So
+        in the only place the command can run, the "target resolves to live" arm
+        compares the target against the dev graph and is vacuous.
+
+        Combine that with a widened `MIST_REBUILD_NEO4J_HOSTS` (which REPLACES
+        the allowlist) and both arms pass on a live target. The hardcoded live
+        denylist is the arm no caller and no environment can weaken.
+        """
+        monkeypatch.setenv("MIST_REBUILD_NEO4J_HOSTS", "mist-neo4j:7687,localhost:7687")
+
+        with pytest.raises(RebuildTargetError, match="live"):
+            assert_rebuild_target_not_live(target_uri=LIVE, live_uri=live_uri)
+
+    def test_refuses_the_host_published_live_spelling_under_a_widened_override(self, monkeypatch):
+        """`bolt://localhost:7687` is the live graph -- the port is host-published.
+
+        This is the exact spelling that caused the original incident the
+        allowlist was introduced to prevent.
+        """
+        monkeypatch.setenv("MIST_REBUILD_NEO4J_HOSTS", "localhost:7687")
+
+        with pytest.raises(RebuildTargetError, match="live"):
+            assert_rebuild_target_not_live(
+                target_uri="bolt://localhost:7687",
+                live_uri="bolt://mist-neo4j-dev:7687",
+            )
+
+    def test_staging_still_passes_with_the_denylist_in_place(self):
+        """Pairing guard: the denylist must not refuse the one target this permits."""
+        assert_rebuild_target_not_live(
+            target_uri="bolt://mist-neo4j-staging:7687",
+            live_uri=LIVE,
+        )

@@ -65,8 +65,72 @@ DEFAULT_DEV_NEO4J_ENDPOINTS = "mist-neo4j-dev:7687,localhost:7690,127.0.0.1:7690
 # graphs, not scratch space for a rebuild. Override via MIST_REBUILD_NEO4J_HOSTS.
 DEFAULT_REBUILD_NEO4J_ENDPOINTS = "mist-neo4j-staging:7687,localhost:7689,127.0.0.1:7689"
 
+# The canonical graph, in every spelling that reaches it.
+#
+# DELIBERATELY NOT env-overridable, and deliberately not derived from config.
+# This is a DENYLIST, checked BEFORE every allowlist in this module, and a
+# denylist an operator can empty is an allowlist wearing a different name.
+#
+# Why it is needed on top of the allowlists: every `_parse_endpoint_allowlist`
+# override REPLACES its allowlist rather than extending it (see
+# `test_allowlist_is_env_overridable`). So a single environment variable could
+# admit a live endpoint to a guard that gates a `DETACH DELETE`.
+# `assert_rebuild_target_not_live` already had a second arm against that, but it
+# compares against a `live_uri` its CALLER supplies -- and
+# `cmd_graph_rebuild_from_log` infers that from ambient config, which inside
+# `mist-backend-dev` resolves to the DEV instance, making the arm vacuous in the
+# only process where the rebuild can run. `assert_neo4j_dev_isolated` had no
+# second arm at all, while gating the more destructive tool (snapshot restore).
+#
+# `localhost:7687` and `127.0.0.1:7687` are here because the live bolt port is
+# host-published in `docker-compose.yml`, so they are the SAME DATABASE as
+# `mist-neo4j:7687`. That equivalence is what made the original live-graph loss
+# possible: the pre-allowlist guard compared URI strings, so the host spelling
+# passed a check the service-name spelling failed.
+LIVE_NEO4J_ENDPOINTS: frozenset[tuple[str, int]] = frozenset(
+    {
+        ("mist-neo4j", 7687),
+        ("localhost", 7687),
+        ("127.0.0.1", 7687),
+    }
+)
+
 _TRUTHY = {"1", "true", "yes", "on"}
 _FALSY = {"", "0", "false", "no", "off"}
+
+
+def _assert_not_live_endpoint(
+    host: str,
+    port: int,
+    uri: str,
+    error_cls: type[Exception],
+    *,
+    action: str,
+) -> None:
+    """Refuse any (host, port) naming the canonical graph, whatever the allowlists say.
+
+    Args:
+        host: Parsed hostname, compared case-insensitively.
+        port: Parsed port. A portless URI must be refused by the caller before
+            reaching here -- live and the disposable instances differ only by
+            port on the host, so a missing port cannot be told apart from live.
+        uri: The original URI, for the message.
+        error_cls: Raised type. Callers pass the error their own CLI catches, so
+            a refusal reads as a refusal rather than a crash.
+        action: What the caller was about to do, named in the message so an
+            operator knows which tool refused and why.
+    """
+    if (host.lower(), port) in LIVE_NEO4J_ENDPOINTS:
+        raise error_cls(
+            f"{uri!r} is the live graph, and {action} would destroy it. Refused by "
+            f"the hardcoded live denylist {sorted(LIVE_NEO4J_ENDPOINTS)}, which no "
+            "environment variable can widen or empty -- including the "
+            "MIST_*_NEO4J_HOSTS overrides, which REPLACE their allowlists and so "
+            "could otherwise admit this endpoint. The live bolt port is "
+            "host-published, so 'localhost:7687' and 'mist-neo4j:7687' are the same "
+            "database."
+        )
+
 
 # backend/knowledge/eval_isolation.py -> backend/knowledge -> backend -> repo root
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -212,8 +276,13 @@ def assert_rebuild_target_not_live(target_uri: str, live_uri: str) -> None:
     `mist-neo4j-eval` precisely so a rebuild dry-run cannot clobber the test DB,
     and the same argument now covers `mist-neo4j-dev`: R1.6 compares live
     against rebuilt on the dev stack, where the DEV graph is the "live" side, so
-    admitting it as a WRITE target would let a rebuild delete an 87-turn
-    hydrated fixture.
+    admitting it as a WRITE target would let a rebuild delete the hydrated
+    fixture. (This sentence said "an 87-turn hydrated fixture" until 2026-08-26.
+    No such fixture exists or ever did: the dev graph is 4 nodes and 1
+    relationship with 0 conversation turns, per
+    `data/hydration-snapshots/r1.4.6-smoke/manifest.json`. The 87 belongs to the
+    golden log, an authored corpus. The exclusion is correct on its own merits;
+    only the stated size was invented.)
 
     `live_uri` is still compared, and is not redundant: an operator who widens
     `MIST_REBUILD_NEO4J_HOSTS` to include a live endpoint is caught by the
@@ -246,6 +315,17 @@ def assert_rebuild_target_not_live(target_uri: str, live_uri: str) -> None:
             "and staging instances differ only by port on the host, so a portless "
             "target cannot be told apart from the live graph."
         )
+
+    # Hardcoded denylist FIRST: the two arms below both depend on inputs a
+    # caller or an operator controls (`live_uri`, and the env-overridable
+    # allowlist). This one depends on neither.
+    _assert_not_live_endpoint(
+        target.hostname,
+        target_port,
+        target_uri,
+        RebuildTargetError,
+        action="a rebuild's unconditional MATCH (n) DETACH DELETE n",
+    )
 
     if target.hostname.lower() == live.hostname.lower() and same_port:
         raise RebuildTargetError(
@@ -367,6 +447,19 @@ def assert_neo4j_dev_isolated(uri: str) -> None:
             f"Hydration target {uri!r} has no parseable host:port. Point it at the "
             "dev instance (e.g. bolt://mist-neo4j-dev:7687). Refusing to run."
         )
+    # Hardcoded denylist FIRST -- see LIVE_NEO4J_ENDPOINTS. The allowlist below
+    # is env-overridable and the override REPLACES it, so without this arm one
+    # variable could point this guard's callers at the canonical graph. Those
+    # callers include `snapshot restore`, which runs
+    # `MATCH (n) WITH n LIMIT 10000 DETACH DELETE n`.
+    _assert_not_live_endpoint(
+        host,
+        port,
+        uri,
+        EvalIsolationError,
+        action="a hydration or snapshot-restore write",
+    )
+
     if (host.lower(), port) not in _allowed_dev_endpoints():
         raise EvalIsolationError(
             f"Hydration target '{uri}' is not a recognized dev endpoint. Allowed: "
