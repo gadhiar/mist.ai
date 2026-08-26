@@ -1734,6 +1734,123 @@ def cmd_replay(args: argparse.Namespace) -> int:
     return 0 if fail_count == 0 else 1
 
 
+def cmd_hydrate(args: argparse.Namespace) -> int:
+    """Drive an authored corpus through the live path inside the dev container.
+
+    This is a COMPOSITION, not a driver. `run_replay` already reads a per-line
+    `session_id` from JSONL input (see its `sid = entry.get("session_id", ...)`)
+    and already builds a real `ConversationHandler` through the factories, which
+    is where the hydration clock is wired. MIS-129 names writing a second driver
+    as the specific wrong turn here: "the gap is timestamp injection, NOT 'no
+    driver exists'."
+
+    What this adds is the safety envelope around that driver:
+
+      preflight -> replay -> postcondition
+
+    Preflight refuses on four conditions, two of which are otherwise SILENT:
+    no isolation flag, no hydration clock (every turn would be wall-clock
+    stamped and the gate would still pass), a clock that does not cover the
+    corpus, and corpus sessions that already carry turns. Postcondition refuses
+    if curation ran during the window.
+
+    Deliberately NOT in scope: the snapshot. `scripts/hydration/snapshot.py`
+    exists and is a separate, explicit step -- folding it in here would make a
+    failed postcondition ambiguous about whether an artifact was written.
+    """
+    # Isolation FIRST -- before `_load_backend`, before the corpus is read,
+    # before a handler exists. It needs none of them (its own backend import is
+    # lazy), and `_load_backend` plus handler construction attaches the LIVE
+    # event store when this runs on the wrong container. A command whose answer
+    # is "no" should reach that answer before touching what it is refusing to
+    # touch.
+    from scripts.hydration import preflight
+
+    try:
+        preflight.assert_hydration_isolation()
+    except preflight.HydrationPreflightError as e:
+        print(f"[hydrate] REFUSED: {e}", file=sys.stderr)
+        return 2
+
+    be = _load_backend()
+    from backend.factories import build_conversation_handler
+    from scripts.hydration.postconditions import (
+        HydrationPostconditionError,
+        assert_no_curation_job_runs,
+    )
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Hydration corpus not found: {input_path}")
+    inputs = _read_replay_inputs(input_path)
+    if not inputs:
+        print(f"[hydrate] No inputs in {input_path}")
+        return 0
+
+    missing_keys = [
+        i for i, row in enumerate(inputs) if "session_id" not in row or "turn_index" not in row
+    ]
+    if missing_keys:
+        print(
+            f"[hydrate] {len(missing_keys)} corpus rows lack session_id or turn_index "
+            f"(first at line {missing_keys[0] + 1}). The hydration clock keys on both; "
+            "a corpus without them cannot carry an authored timeline.",
+            file=sys.stderr,
+        )
+        return 1
+
+    config = be.get_config()
+    print(f"[hydrate] {len(inputs)} turns from {input_path}")
+    print("[hydrate] Building conversation handler (may load embedding model)...")
+
+    sidecar = _build_cli_sidecar(config)
+    try:
+        handler = build_conversation_handler(config, vault_sidecar=sidecar)
+
+        # Preflight AFTER the handler is built (that is where the clock lands)
+        # but BEFORE a single turn is driven. Nothing above this line writes.
+        #
+        # Caught rather than propagated: a refusal is an EXPECTED outcome of
+        # this command, and a stack trace reads as a crash. Exit 2 distinguishes
+        # "refused to start" from exit 1's "ran and some turns failed" -- the
+        # first leaves the graph untouched, the second leaves it partial, and a
+        # caller scripting this needs to tell them apart.
+        try:
+            preflight.run_all(
+                clock=handler._hydration_clock,
+                rows=inputs,
+                event_store=handler.event_store,
+            )
+        except preflight.HydrationPreflightError as e:
+            print(f"[hydrate] REFUSED: {e}", file=sys.stderr)
+            return 2
+        print("[hydrate] Preflight passed.")
+
+        results = asyncio.run(
+            run_replay(handler, inputs, args.session_id or "hydration", args.user_id or "User")
+        )
+        _print_replay_summary(results)
+
+        if handler.event_store is not None:
+            try:
+                assert_no_curation_job_runs(handler.event_store)
+            except HydrationPostconditionError as e:
+                # Exit 2 as well: the run completed, but its output is not
+                # usable, and a caller must not proceed to snapshot or compare.
+                print(f"[hydrate] CONTAMINATED: {e}", file=sys.stderr)
+                return 2
+            print("[hydrate] Postcondition passed: no curation ran during the window.")
+    finally:
+        _close_cli_sidecar(sidecar)
+
+    fail_count = sum(1 for r in results if not r["ok"])
+    if fail_count:
+        print(f"[hydrate] {fail_count} turn(s) failed -- the graph is PARTIAL.", file=sys.stderr)
+        return 1
+    print("[hydrate] Complete. Snapshot separately: scripts/hydration/snapshot.py")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -2217,6 +2334,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_replay.set_defaults(func=cmd_replay)
+
+    p_hydrate = sub.add_parser(
+        "hydrate",
+        help="Drive an authored corpus through the live path (dev container only).",
+    )
+    p_hydrate.add_argument(
+        "input",
+        help="Path to the corpus JSONL. Every row needs session_id and turn_index.",
+    )
+    p_hydrate.add_argument(
+        "--session-id",
+        default=None,
+        help="Fallback session for rows without one. Corpus rows should carry "
+        "their own; the hydration clock keys on it.",
+    )
+    p_hydrate.add_argument("--user-id", default="User", help="User identifier (default: User).")
+    p_hydrate.set_defaults(func=cmd_hydrate)
 
     # ---- Cluster 8 Phase 11: vault subcommands -----------------------------
     p_vstatus = sub.add_parser(

@@ -36,7 +36,21 @@
 #   docker compose -f docker-compose.yml -f docker-compose.override.yml \
 #     -f docker-compose.dev-hydration.yml --profile dev exec mist-backend-dev \
 #     python scripts/mist_admin.py seed --seed-dir /app/seed
-#   # ... run hydration against ws://localhost:8002/ws ...
+#   # Hydrate IN-PROCESS inside the dev container. `mist_admin replay` is the
+#   # driver (it already reads per-line session_id from JSONL and builds a real
+#   # ConversationHandler through the factories); `hydrate` wraps it in the
+#   # preflight/postcondition envelope. MIST_HYDRATION_CLOCK must be set on the
+#   # container or preflight refuses -- without it every turn is wall-clock
+#   # stamped and the corpus's authored timeline is lost silently.
+#   docker compose -f docker-compose.yml -f docker-compose.override.yml \
+#     -f docker-compose.dev-hydration.yml --profile dev exec mist-backend-dev \
+#     python scripts/mist_admin.py hydrate /app/data/golden-log/golden-log.jsonl
+#
+#   # The WebSocket route (ws://localhost:8002/ws) remains guarded by
+#   # assert_ws_target_not_live + scripts/hydration/target.py, but is NOT the
+#   # primary path: session_id is generated server-side per connection
+#   # (server.py, uuid4), so a WS client cannot tell the backend which corpus
+#   # session it is driving, and the hydration clock keys on exactly that.
 #   docker compose -f docker-compose.yml -f docker-compose.override.yml \
 #     -f docker-compose.dev-hydration.yml --profile dev stop \
 #     mist-backend-dev mist-neo4j-dev
