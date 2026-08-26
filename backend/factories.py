@@ -83,6 +83,50 @@ def resolve_fixed_rendered_at() -> str | None:
     return value
 
 
+_HYDRATION_CLOCK_ENV = "MIST_HYDRATION_CLOCK"
+
+
+def build_hydration_clock():
+    """Build the B2 authored-timestamp clock, or None for every normal process.
+
+    Reads MIST_HYDRATION_CLOCK, a path to a JSONL corpus carrying `session_id`,
+    `turn_index` and `timestamp` per line -- which the golden log already does,
+    so no new fixture format is involved.
+
+    REFUSES unless MIST_HYDRATION_ISOLATION is also set. A keyed clock silently
+    rewriting fact-time is exactly the thing that must never be reachable on
+    live: every bitemporal edge a turn produces inherits `recorded_at`, so a
+    clock active by accident would author a false history that both sides of
+    the gate would then agree on. Requiring the isolation flag means the live
+    backend cannot build one even if the path variable leaks into its
+    environment.
+
+    Returns:
+        A `HydrationClock`, or None when MIST_HYDRATION_CLOCK is unset.
+
+    Raises:
+        HydrationClockError: when the path is set outside a hydration-isolated
+            process, or the corpus cannot be loaded. Both fail the process
+            rather than degrading to wall-clock -- a hydration run that
+            silently used the wall clock would produce a green gate over a
+            timeline that never existed.
+    """
+    from backend.chat.hydration_clock import HydrationClockError, load_hydration_clock
+    from backend.knowledge.eval_isolation import is_hydration_isolation_active
+
+    raw = os.getenv(_HYDRATION_CLOCK_ENV)
+    if raw is None or raw.strip() == "":
+        return None
+    if not is_hydration_isolation_active():
+        raise HydrationClockError(
+            f"{_HYDRATION_CLOCK_ENV} is set but MIST_HYDRATION_ISOLATION is not. A "
+            "keyed clock rewrites `recorded_at`, the fact-time authority for every "
+            "bitemporal edge a turn produces, so it must be unreachable outside a "
+            "hydration-isolated process. Refusing to build one."
+        )
+    return load_hydration_clock(raw.strip())
+
+
 def build_now_fn() -> Callable[[], datetime]:
     """Build the injectable clock for ConversationHandler.
 
@@ -548,6 +592,7 @@ def build_conversation_handler(
         # Replay-determinism clock seam: wall-clock in production (env unset),
         # a fixed instant under MIST_FIXED_CLOCK for reproducible replays.
         now_fn=build_now_fn(),
+        hydration_clock=build_hydration_clock(),
         # R1.4 Task 10: MIST_SESSION_ORIGIN (default "real") -- the eval
         # harness / CLI probes set it to "test" so their sessions are
         # excludable from an R1.6 rebuild.
