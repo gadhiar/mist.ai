@@ -242,17 +242,24 @@ def production_cache_path(config: KnowledgeConfig) -> str:
     two literals in two files is how they drift.
 
     `_build_log_regenerator` in scripts/mist_admin.py CALLS this function
-    rather than deriving the path itself (I2, whole-branch review -- before
-    that fix it re-derived the same expression inline, a second copy this
-    docstring's opening claim was false while it existed). Propagates the
+    rather than deriving the path itself (I2, whole-branch review). Before
+    that fix it re-derived the same expression inline instead -- a second
+    copy of the expression this paragraph already named when it existed (see
+    below), not something the docstring concealed or got wrong: the opening
+    claim above is about what THIS function is FOR, and remains true on its
+    own terms. What was true was UNDER-ACHIEVED while the second copy stood:
+    a caller could still drift the two derivations apart, exactly the
+    failure mode the golden-log generator's refuse-to-equal check exists to
+    catch, just not caught for path DERIVATION itself. Propagates the
     ":memory:" sentinel: `ExtractionCache.initialize()` already special-cases
     it (`grep -n 'if self.db_path != ":memory:"' backend/knowledge/extraction_cache.py`),
     but `Path(event_store_path).parent` on the bare sentinel resolves to a
     relative "." -- silently landing an on-disk "extraction_cache.db" in the
     process CWD for any caller with an in-memory event store, rather than the
     in-memory cache that setup implies. `grep -n 'production_cache_path'
-    scripts/mist_admin.py` now finds the import and the call, not a second
-    derivation.
+    scripts/mist_admin.py` now returns three hits -- the import, a comment
+    naming this function, and the call -- zero of which are a second
+    derivation of the path expression itself.
     """
     from pathlib import Path
 
@@ -337,19 +344,33 @@ def build_extraction_pipeline(
         extraction_cache = ExtractionCache(production_cache_path(config))
         extraction_cache.initialize()
     except (sqlite3.Error, OSError) as exc:
+        # This runs once, at composition-root construction time -- there is
+        # no single "turn" to blame it on. The degradation is PROCESS-WIDE:
+        # every turn this process extracts for the rest of its lifetime will
+        # be unrebuildable, not just whichever turn happens to trigger the
+        # next factory build. Extraction and the conversation itself proceed
+        # unaffected; only rebuildability is lost.
         logger.warning(
-            "Extraction cache unavailable at %s, continuing without it: "
-            "this turn's extraction will not be rebuildable, but the turn "
-            "itself is unaffected: %s",
+            "Extraction cache unavailable at %s -- this process will run "
+            "without one: every turn it extracts will be unrebuildable for "
+            "the rest of this process's lifetime, though extraction and the "
+            "conversation itself are unaffected: %s",
             production_cache_path(config),
             exc,
         )
         extraction_cache = None
 
     # Constructed here, from the same KnowledgeConfig that
-    # build_curation_pipeline constructs its own RebuildStamps from (`grep -n
-    # "rebuild_stamps = RebuildStamps(" backend/factories.py` -> two hits, one
-    # per consumer). NOT one construction site per process: with
+    # build_curation_pipeline constructs its own RebuildStamps from -- both
+    # real construction sites, and only those two, are found by `grep -nE
+    # "^\s+(rebuild_stamps = )?RebuildStamps\(" backend/factories.py`
+    # (build_curation_pipeline's assignment, and this function's own
+    # RebuildStamps(...) call below; the plain `rebuild_stamps =
+    # RebuildStamps(` substring this replaced also matched THIS comment once
+    # the second site became a conditional expression in I1's fix, which is
+    # why the pattern is anchored to line-start rather than substring-matched
+    # -- verify with the command above before trusting the count again). NOT
+    # one construction site per process: with
     # include_curation=True (the default), this function also calls
     # build_curation_pipeline above, so a single production call constructs
     # BOTH stamps objects in one process. Both sites derive all three fields

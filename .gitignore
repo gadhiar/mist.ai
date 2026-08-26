@@ -81,6 +81,9 @@ CODEBASE.md
 data/event_store.db
 data/event_store.db-shm
 data/event_store.db-wal
+data/extraction_cache.db
+data/extraction_cache.db-shm
+data/extraction_cache.db-wal
 data/graph_snapshots/
 data/ingest/
 data/runtime/
