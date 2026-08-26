@@ -371,7 +371,15 @@ local only).
   natural spelling from the host -- would have wiped the canonical graph. Now an allowlist, and
   deliberately narrower than first specified: staging ONLY, excluding eval (the test DB) and dev
   (because R1.6 treats the DEV graph as the "live" side, so admitting it as a write target would
-  let a rebuild delete an 87-turn hydrated fixture).
+  let a rebuild delete the hydrated fixture). **CORRECTED 2026-08-25: this bullet said "an 87-turn
+  hydrated fixture". The dev graph is not that and never was.** Its own snapshot manifest
+  (`data/hydration-snapshots/r1.4.6-smoke/manifest.json`) records `graph_nodes: 4`,
+  `graph_relationships: 1`, `conversation_turn_events: 0`, `conversation_sessions: 0` -- a smoke
+  artifact, as its directory name says. The 87 belongs to the GOLDEN LOG, an authored corpus, whose
+  path that same manifest records as its `corpus_path`. The two were compressed into one claim.
+  The exclusion of dev from the allowlist remains correct on its own merits (a rebuild must not be
+  able to delete the fixture, whatever its size); only the stated size was invented. Verify the
+  current shape with the manifest rather than this sentence.
 - **`e7ade99` -- D3.** Curation job runs are now persisted to `curation_job_runs`, with
   `examined` and `produced` as SEPARATE columns so "ran, looked at nothing" is a different row
   from "ran, looked at N, changed nothing". `graph_health_events` is written too and kept
