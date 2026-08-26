@@ -288,6 +288,9 @@ class TestLogRegeneratorReplay:
         pipeline is deterministic.
         """
         from backend.knowledge.canonical_serialize import canonical_graph_form
+        from backend.knowledge.regeneration.rebuild_gate import (
+            assert_canonical_form_non_vacuous,
+        )
 
         # Arrange: event store + cache with 2 turns.
         event_store = EventStore(str(tmp_path / "events.db"))
@@ -375,6 +378,14 @@ class TestLogRegeneratorReplay:
             epoch=epoch,
         )
         form_b = canonical_graph_form(staging_conn, include_provenance=False)
+
+        # Assert: fail closed on vacuity BEFORE the equality assertion. Two empty
+        # graphs are byte-identical, so `form_a == form_b` alone is green over a
+        # rebuild that produced nothing. This test previously had no vacuity guard
+        # of any kind; its sibling in test_golden_log_rebuild.py had one that could
+        # never fire. See test_rebuild_gate_vacuity.py.
+        assert_canonical_form_non_vacuous(form_a)
+        assert_canonical_form_non_vacuous(form_b)
 
         # Assert: byte-identical proves deterministic log-driven rebuild.
         assert form_a == form_b

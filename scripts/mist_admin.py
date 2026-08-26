@@ -12,8 +12,14 @@ Tier 1 subcommands (graph operations):
                                              node-definitions, containment,
                                              negation-proximity, embeddings)
                                              against the versioned seed source.
-    graph-dump [--format json|cypher]       Dump full __Entity__ subgraph.
+    graph-backup [--output PATH]            FULL graph backup: all partitions,
+                                            embeddings retained. Use this before
+                                            any risky operation.
+    graph-dump [--format json|cypher]       Dump the __Entity__ subgraph only
+                                            (analysis view, embeddings stripped).
+                                            NOT a backup -- see graph-backup.
     graph-stats                             Node/rel counts, confidence, orphans.
+                                            Leads with a partition census.
     graph-reset [--confirm] [--dry-run]     Wipe graph with safety guards.
     stack-status                            Probe Neo4j + llama-server + backend.
 
@@ -365,10 +371,44 @@ def cmd_graph_dump(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_graph_backup(args: argparse.Namespace) -> int:
+    """Write a full-graph, all-partitions, embeddings-retained JSON backup.
+
+    Distinct from `graph-dump`, which is an ANALYSIS view of the `:__Entity__`
+    subgraph with embeddings stripped. On the live graph that view covers 11 of
+    32 nodes and none of the 20 intra-self-model relationships, so it is not a
+    backup and must not be used as one before a risky operation.
+    """
+    be = _load_backend()
+    connection = _connect(be)
+    try:
+        payload = be.admin.dump_full_graph_json(connection)
+    finally:
+        connection.disconnect()
+
+    if args.output:
+        out_path = Path(args.output)
+    else:
+        stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H%M%SZ")
+        out_path = Path("data/graph_snapshots") / f"full-backup-{stamp}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+    print(
+        f"[graph-backup] Wrote {out_path} "
+        f"({payload['node_count']} nodes, {payload['rel_count']} relationships)"
+    )
+    if payload["node_count"] == 0:
+        print("[graph-backup] WARNING: the graph is empty; this backup restores nothing.")
+    return 0
+
+
 def cmd_graph_stats(args: argparse.Namespace) -> int:
     be = _load_backend()
     connection = _connect(be)
     try:
+        partition_counts = be.admin.count_nodes_by_partition(connection)
+        rel_partition_counts = be.admin.count_relationships_by_partition(connection)
         node_counts = be.admin.count_nodes_by_type(connection)
         rel_counts = be.admin.count_relationships_by_type(connection)
         confidence = be.admin.get_confidence_distribution(connection)
@@ -381,7 +421,27 @@ def cmd_graph_stats(args: argparse.Namespace) -> int:
         connection.disconnect()
 
     print("[graph-stats]")
-    print(f"\nNodes by entity_type ({sum(r['count'] for r in node_counts)} total):")
+
+    # Printed FIRST and label-agnostic, because every other section below is
+    # scoped to one partition. `count_nodes_by_type` is `MATCH (n:__Entity__)`,
+    # so the "Nodes by entity_type" total that used to lead this output read 11
+    # on a 32-node graph -- and would still read 11 with the whole
+    # :__SelfModel__ partition destroyed.
+    print(f"\nNodes by partition ({sum(r['count'] for r in partition_counts)} total):")
+    for row in partition_counts:
+        print(f"  {row['partition']:<24} {row['count']:>6}")
+
+    total_rels = sum(r["count"] for r in rel_partition_counts)
+    print(f"\nRelationships by partition ({total_rels} total):")
+    if not rel_partition_counts:
+        print("  (none)")
+    for row in rel_partition_counts:
+        print(f"  {row['partitions']:<40} {row['count']:>6}")
+
+    print(
+        f"\nNodes by entity_type "
+        f"({sum(r['count'] for r in node_counts)} total, :__Entity__ ONLY):"
+    )
     if not node_counts:
         print("  (empty graph)")
     for row in node_counts:
@@ -1961,7 +2021,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_seed_verify.set_defaults(func=cmd_seed_verify)
 
-    p_dump = sub.add_parser("graph-dump", help="Dump the __Entity__ subgraph.")
+    p_backup = sub.add_parser(
+        "graph-backup",
+        help=(
+            "Full-graph backup: every partition, embeddings retained. "
+            "Use this before any risky operation -- graph-dump is NOT a backup."
+        ),
+    )
+    p_backup.add_argument(
+        "--output",
+        default=None,
+        help="Destination file (default: data/graph_snapshots/full-backup-<UTC timestamp>.json).",
+    )
+    p_backup.set_defaults(func=cmd_graph_backup)
+
+    p_dump = sub.add_parser(
+        "graph-dump",
+        help="Dump the __Entity__ subgraph (ANALYSIS view, embeddings stripped -- not a backup).",
+    )
     p_dump.add_argument(
         "--format",
         choices=["json", "cypher"],
