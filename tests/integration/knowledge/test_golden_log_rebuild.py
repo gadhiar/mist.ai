@@ -31,7 +31,10 @@ import pytest
 
 from backend.knowledge.canonical_serialize import canonical_graph_form
 from backend.knowledge.regeneration.log_regenerator import LogRegenerator
-from backend.knowledge.regeneration.rebuild_gate import assert_rebuild_twice_identical
+from backend.knowledge.regeneration.rebuild_gate import (
+    assert_canonical_form_non_vacuous,
+    assert_rebuild_twice_identical,
+)
 from backend.knowledge.regeneration.rebuild_journal import EventStoreRebuildJournal
 from scripts.golden_log.generate import build_golden_turns, materialize_isolated
 from tests.integration.knowledge.test_log_regenerator import (
@@ -100,7 +103,11 @@ class TestGoldenLogRebuild:
         # Assert: fail closed on vacuity first -- an empty log would make the gate trivial.
         assert report_a.turns_processed == EXPECTED_TURN_COUNT
         assert report_b.turns_processed == EXPECTED_TURN_COUNT
-        assert form_a.strip(), "canonical form is empty; the rebuild produced no graph"
+        # Was `assert form_a.strip(), ...` -- inert. canonical_graph_form returns a
+        # JSON envelope, so an empty graph is truthy after .strip() and this line
+        # could never fail. See test_rebuild_gate_vacuity.py.
+        assert_canonical_form_non_vacuous(form_a)
+        assert_canonical_form_non_vacuous(form_b)
 
         assert_rebuild_twice_identical(form_a, form_b)
 

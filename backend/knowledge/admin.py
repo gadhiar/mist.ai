@@ -27,7 +27,12 @@ from backend.interfaces import GraphConnection
 from backend.knowledge.embeddings.embedding_text import embedding_text_for
 from backend.knowledge.ontologies import EDGE_TYPES_BY_NAME, EXTRACTABLE_RELATIONSHIP_TYPES
 from backend.knowledge.seed.models import SeedDocument
-from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL, SELF_MODEL_TYPES
+from backend.knowledge.storage.partitions import (
+    ENTITY_LABEL,
+    PROVENANCE_LABEL,
+    SELF_MODEL_LABEL,
+    SELF_MODEL_TYPES,
+)
 from backend.knowledge.version_stamps import ONTOLOGY_VERSION
 
 SEED_METADATA_FIELDS = (
@@ -761,6 +766,150 @@ def _dump_subgraph(connection: GraphConnection, label: str) -> dict[str, list[di
         for row in connection.execute_query(rel_query)
     ]
     return {"nodes": nodes, "relationships": relationships}
+
+
+def dump_full_graph_json(connection: GraphConnection) -> dict[str, Any]:
+    """Return the ENTIRE graph, every partition, embeddings retained -- a backup.
+
+    Deliberately NOT a flag on `dump_graph_json`. That function's default output
+    is what `canonical_graph_form` serialises
+    (`grep -n "payload = dump_graph_json" backend/knowledge/canonical_serialize.py`),
+    so widening its scope would silently change what the rebuild determinism
+    gate compares. These are different jobs: `dump_graph_json` is an ANALYSIS
+    view of the entity subgraph; this is a RESTORABLE copy of everything.
+
+    Three differences from `dump_graph_json`, each deliberate:
+
+    - LABEL-AGNOSTIC. `_dump_subgraph` matches `(n:__Entity__)` and, for edges,
+      `(s:L)-[r]->(t:L)` with BOTH endpoints carrying one label. On the live
+      graph that captured 11 of 32 nodes and none of the 20 intra-self-model
+      relationships. A backup that silently omits two thirds of the graph is
+      worse than no backup, because it is reached for in exactly the moment it
+      is relied on.
+    - EMBEDDINGS RETAINED. `_dump_subgraph` calls `_strip_embedding`, correct
+      for an analysis view and wrong here: `canonical_serialize` also excludes
+      `embedding`, so a vectorless restore is invisible to every determinism
+      gate in the repo and surfaces only as degraded retrieval.
+    - COUNTS EMITTED, so a truncated artifact is detectable without a graph to
+      compare against.
+
+    Ordering is by node id then by (source, type, target), so two dumps of one
+    graph do not differ by row order. Nodes with no `id` property sort last
+    under a stable sentinel rather than raising.
+    """
+    node_query = """
+    MATCH (n)
+    RETURN n.id AS id, labels(n) AS labels, properties(n) AS properties
+    """
+    rel_query = """
+    MATCH (s)-[r]->(t)
+    RETURN s.id AS source, type(r) AS type, t.id AS target, properties(r) AS properties
+    """
+    nodes = [
+        {
+            "id": row["id"],
+            "labels": sorted(row["labels"]),
+            "properties": dict(row["properties"]),
+        }
+        for row in connection.execute_query(node_query)
+    ]
+    relationships = [
+        {
+            "source": row["source"],
+            "type": row["type"],
+            "target": row["target"],
+            "properties": dict(row["properties"]),
+        }
+        for row in connection.execute_query(rel_query)
+    ]
+    nodes.sort(key=lambda n: (n["id"] is None, n["id"] or ""))
+    relationships.sort(
+        key=lambda r: (
+            r["source"] is None,
+            r["source"] or "",
+            r["type"] or "",
+            r["target"] or "",
+        )
+    )
+    return {
+        "nodes": nodes,
+        "relationships": relationships,
+        "node_count": len(nodes),
+        "rel_count": len(relationships),
+    }
+
+
+def count_nodes_by_partition(connection: GraphConnection) -> list[dict[str, Any]]:
+    """Return node counts per partition label, including unpartitioned nodes.
+
+    `count_nodes_by_type` is `MATCH (n:__Entity__)` -- its docstring says so --
+    which means `graph-stats` reported "11 total" for a 32-node graph and would
+    report an unchanged 11 after the entire `:__SelfModel__` partition was
+    destroyed. That is the specific blindness that made the 2026-07-31
+    live-data-loss incident hard to see, and it is why this exists.
+
+    `(unpartitioned)` is reported rather than dropped: a node carrying no
+    partition label is invisible to every partition-scoped query in the
+    codebase, so a census that omitted it would reproduce the same class of
+    blind spot it is here to close. The counts therefore sum to `MATCH (n)`.
+    """
+    counts: dict[str, int] = {
+        ENTITY_LABEL: 0,
+        SELF_MODEL_LABEL: 0,
+        PROVENANCE_LABEL: 0,
+        "(unpartitioned)": 0,
+    }
+    rows = connection.execute_query("MATCH (n) RETURN n.id AS id, labels(n) AS labels")
+    for row in rows:
+        labels = set(row["labels"])
+        partitions = labels & {ENTITY_LABEL, SELF_MODEL_LABEL, PROVENANCE_LABEL}
+        if not partitions:
+            counts["(unpartitioned)"] += 1
+            continue
+        # A node carrying two partition labels is a defect, not a category --
+        # count it under each so the census total still reconciles loudly
+        # against `MATCH (n)` rather than hiding the overlap.
+        for partition in partitions:
+            counts[partition] += 1
+    return [{"partition": name, "count": count} for name, count in counts.items()]
+
+
+def _partition_of(labels: list[str]) -> str:
+    """Name the partition a node's label set belongs to, for census bucketing."""
+    for label in (ENTITY_LABEL, SELF_MODEL_LABEL, PROVENANCE_LABEL):
+        if label in labels:
+            return label
+    return "(unpartitioned)"
+
+
+def count_relationships_by_partition(connection: GraphConnection) -> list[dict[str, Any]]:
+    """Return relationship counts bucketed by (source partition -> target partition).
+
+    The edge-side twin of `count_nodes_by_partition`.
+    `count_relationships_by_type` is scoped to edges whose endpoints are both
+    `:__Entity__`, so on the live graph it reported 10 of 30 relationships --
+    the 20 intra-self-model edges were invisible, exactly like the 21 nodes
+    carrying them.
+
+    Buckets are exclusive (each edge is counted once), so the totals reconcile
+    against `MATCH ()-[r]->()`. A cross-partition edge gets its own bucket
+    rather than being folded into either endpoint's, because "the self-model
+    points at an entity" is the interesting case, not a rounding error.
+    """
+    rows = connection.execute_query(
+        """
+        MATCH (s)-[r]->(t)
+        RETURN labels(s) AS source_labels, type(r) AS type, labels(t) AS target_labels
+        """
+    )
+    counts: dict[str, int] = {}
+    for row in rows:
+        key = f"{_partition_of(row['source_labels'])} -> {_partition_of(row['target_labels'])}"
+        counts[key] = counts.get(key, 0) + 1
+    return [
+        {"partitions": name, "count": count}
+        for name, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
 
 
 def dump_graph_json(
