@@ -1,9 +1,14 @@
 # MIST.AI Codebase Context
 
 **Last Updated:** 2026-08-25 (**extraction-cache Phase 1 (spec D1, D2, D3, D10) COMPLETE on
-branch `feat/extraction-cache-production-writer` -- NOT merged, NOT pushed. 31 commits: 28 landed
-the seven implementation tasks, 3 more close a whole-branch-review fix wave (this entry is part of
-the third). The production extraction path now writes one extraction-cache row per turn --
+branch `feat/extraction-cache-production-writer` -- NOT merged, NOT pushed. Commit count:
+`git log --oneline main..HEAD | wc -l` (32 at the moment this line was written -- do not hardcode
+that number here again; run the command, since this file's own commits keep advancing it and a
+hardcoded count goes stale the instant it is committed). The first 28 landed the seven
+implementation tasks; every commit after that closes one or more whole-branch-review fix waves --
+see this file's PRIOR ENTRY history below and `.superpowers/sdd/2026-08-18-extraction-cache-phase-1/`
+for which waves and how many. The production extraction path now writes one extraction-cache row
+per turn --
 outcome, skip reason, the C1 bitemporal `recorded_at`, and the Stage 1.5 subject-scope
 classification -- and `graph-rebuild-from-log` replays Stages 3-6 as PURE CODE against that cached
 Stage-2 decision, re-deriving everything ontology-dependent rather than trusting the cached
@@ -36,7 +41,7 @@ unit suite. The controller measured 3068/7/3/0 and instructed me not to"). 3069 
 wave's own re-measurement, +1 from this wave's new degraded-path test proving I1's fix, and was
 independently re-measured a second time by the scoped re-review after this wave landed (also
 3069/7/3/0). Live graph 32 nodes / 30 relationships,
-reverified live after this fix wave, unchanged throughout all 31 commits. Suite warnings are
+reverified live after this fix wave, unchanged throughout every commit on this branch. Suite warnings are
 DELIBERATELY not quoted as a number here: measured 7, 8, 9, and 10 across separate runs at
 identical commits on this same branch -- not reproducible, unlike pass/skip/xfail, which are
 stable and are what is reported.
