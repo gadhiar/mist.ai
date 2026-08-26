@@ -1,10 +1,13 @@
 # MIST.AI Codebase Context
 
 **Last Updated:** 2026-08-25 (**extraction-cache Phase 1 (spec D1, D2, D3, D10) COMPLETE,
-MERGED to `main` at `c2cc748` (`--no-ff`), and PUSHED -- `main` and `origin/main` are both at
-`227ad8f`. (An earlier revision of this entry said "NOT pushed; `origin/main` is still `330ff1c`",
-which was true when written and was falsified by the push later the same day. Verify with `git
-rev-parse HEAD origin/main` rather than trusting this line.)
+MERGED to `main` at `c2cc748` (`--no-ff`), and PUSHED. Whether `main` and `origin/main` currently
+agree is deliberately NOT stated as a hash here -- run `git rev-parse HEAD origin/main`, which
+answers it and cannot go stale. (Two prior revisions of this line did state it and both were
+falsified within the day: the first said "NOT pushed; `origin/main` is still `330ff1c`", which the
+push invalidated; the replacement pinned `227ad8f`, which the very next merge invalidated. The
+second was written by a session that had just fixed the first -- which is the argument for a
+command over a value, not for being more careful with values.)
 `--no-ff` deliberately, not a rebase: the review documents cite this branch's commit hashes and a
 rebase would invalidate every one (the same reasoning as the 2026-08-19 Q2-1 merge). Branch
 `feat/extraction-cache-production-writer` merged at its tip `1171423`; commit count on the merged
