@@ -146,7 +146,18 @@ def cmd_seed(args: argparse.Namespace) -> int:
     now = datetime.now(UTC).isoformat()
     connection = _connect(be)
     try:
-        counts = reseed(connection, documents, seed_version=seed_version, now_iso=now)
+        # `allow_live=True` (F1): seeding the canonical graph is this command's
+        # entire purpose, and it is the ONLY caller in the repo that says so.
+        # Everywhere else -- the R1.7 seed-apply step above all, where
+        # `source_conn` and `staging_conn` differ by six characters -- the
+        # default refusal stands.
+        counts = reseed(
+            connection,
+            documents,
+            seed_version=seed_version,
+            now_iso=now,
+            allow_live=True,
+        )
         print("[seed] Applied (wipe-then-apply, idempotent):")
         for layer, count in counts.items():
             print(f"  {layer}: {count}")

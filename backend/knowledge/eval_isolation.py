@@ -1,8 +1,9 @@
 """Fail-closed isolation guards for runs that must not touch live state.
 
-Four guards live here, one per way a non-live run can reach live state. Three
-of the four are ALLOWLISTS over `(host, port)`, and that uniformity is the
-point: the fourth was a denylist, and the denylist was the one with the hole.
+Five guards live here, one per way a non-live run can reach live state. Four
+of the five are ALLOWLISTS over `(host, port)`, and that uniformity is the
+point: the remaining one was a denylist, and the denylist was the one with the
+hole.
 
 **Neo4j, eval (`assert_neo4j_isolated`).** The throwaway-trio (event store /
 vault / sidecar) is isolated via env vars (see
@@ -25,6 +26,13 @@ defeated by forgetting to set a variable.
 **Neo4j, rebuild (`assert_rebuild_target_not_live`).** The rebuild's WRITE
 target, which it `DETACH DELETE`s before loading. Also an allowlist, narrower
 still: staging only, since eval and dev are other people's disposable graphs.
+
+**Backend WebSocket, hydration (`assert_ws_target_not_live`).** The hydrator's
+`--ws-url`. The only guard over HTTP rather than bolt, and the only one whose
+subject is the backend rather than a database. Live publishes 8001, dev
+publishes 8002; one digit, and the dev stack sets MIST_SESSION_ORIGIN=real, so
+a misdirected run is unrecoverable rather than merely wrong. Pure -- the
+network handshake that pairs with it is `scripts/hydration/target.py`.
 
 **Filesystem (`assert_isolated_root`).** Refuses a dev/hydration state root
 that is, sits under, or CONTAINS a live state directory.
@@ -65,6 +73,11 @@ DEFAULT_DEV_NEO4J_ENDPOINTS = "mist-neo4j-dev:7687,localhost:7690,127.0.0.1:7690
 # graphs, not scratch space for a rebuild. Override via MIST_REBUILD_NEO4J_HOSTS.
 DEFAULT_REBUILD_NEO4J_ENDPOINTS = "mist-neo4j-staging:7687,localhost:7689,127.0.0.1:7689"
 
+# The hydrator's WebSocket target (F3). `mist-backend-dev:8001` is the
+# container-internal spelling; `localhost:8002` is the host spelling the
+# dev-hydration runbook documents. Override via MIST_DEV_WS_HOSTS.
+DEFAULT_DEV_WS_ENDPOINTS = "mist-backend-dev:8001,localhost:8002,127.0.0.1:8002"
+
 # The canonical graph, in every spelling that reaches it.
 #
 # DELIBERATELY NOT env-overridable, and deliberately not derived from config.
@@ -92,6 +105,23 @@ LIVE_NEO4J_ENDPOINTS: frozenset[tuple[str, int]] = frozenset(
         ("mist-neo4j", 7687),
         ("localhost", 7687),
         ("127.0.0.1", 7687),
+    }
+)
+
+# The live BACKEND, same treatment (F3). `docker-compose.yml:11` publishes
+# `8001:8001`; the dev override publishes `8002:8001`. Host-side the two differ
+# by one digit, and the dev stack sets MIST_SESSION_ORIGIN=real, so turns
+# misdirected here are indistinguishable from genuine usage and un-excludable
+# from every future rebuild.
+#
+# Note `localhost:8001` is refused even though, from INSIDE the dev container,
+# it names the dev backend. That is a false refusal, not a false pass, and the
+# documented runbook is host-side. Fail-closed in the safe direction.
+LIVE_WS_ENDPOINTS: frozenset[tuple[str, int]] = frozenset(
+    {
+        ("mist-backend", 8001),
+        ("localhost", 8001),
+        ("127.0.0.1", 8001),
     }
 )
 
@@ -153,16 +183,57 @@ def is_eval_isolation_active() -> bool:
             not treat an operator typo ('ture', 'enabled') as "isolation off"
             and silently run unguarded against the live graph.
     """
-    raw = os.getenv("MIST_EVAL_ISOLATION", "")
+    return _parse_isolation_flag("MIST_EVAL_ISOLATION")
+
+
+def _parse_isolation_flag(env_var: str) -> bool:
+    """Parse one isolation activation flag, failing closed on anything unrecognized.
+
+    Shared by `is_eval_isolation_active` and `is_hydration_isolation_active` so
+    there is ONE definition of what "isolation on" means. Two independent
+    parses of the same concept can disagree, and a disagreement here reads as
+    "isolated" to one caller and "not isolated" to another.
+
+    Args:
+        env_var: Name of the variable to read. Named in the error message so an
+            operator knows which one they mistyped.
+
+    Raises:
+        EvalIsolationError: for unrecognized values. A fail-closed guard must
+            not treat an operator typo ('ture', 'enabled') as "isolation off"
+            and silently run unguarded against the live graph.
+    """
+    raw = os.getenv(env_var, "")
     value = raw.strip().lower()
     if value in _TRUTHY:
         return True
     if value in _FALSY:
         return False
     raise EvalIsolationError(
-        f"Unrecognized MIST_EVAL_ISOLATION value {raw!r}; use '1' to activate "
+        f"Unrecognized {env_var} value {raw!r}; use '1' to activate "
         "or unset to deactivate. Refusing to guess for a fail-closed guard."
     )
+
+
+def is_hydration_isolation_active() -> bool:
+    """True when this process is running as the hydration target (F4).
+
+    Set to `1` on `mist-backend-dev` in `docker-compose.dev-hydration.yml`. The
+    LIVE backend never sets it, and that asymmetry is the whole mechanism: the
+    hydrator reads this back off its target's `/health` and refuses to send a
+    single turn unless it is True.
+
+    Before F4 the variable was decorative -- set in the dev compose under a
+    comment claiming it "marks this container as the hydration target", with no
+    production reader anywhere. It converts a mistyped `--ws-url` (live is
+    `:8001`, dev is `:8002`) from "87 fictional turns written to the live event
+    store" into "refused in under a second".
+
+    The turns would have been unrecoverable, not merely wrong: the dev stack
+    sets `MIST_SESSION_ORIGIN=real`, so they would be indistinguishable from
+    genuine usage and un-excludable from every future rebuild.
+    """
+    return _parse_isolation_flag("MIST_HYDRATION_ISOLATION")
 
 
 def _parse_endpoint_allowlist(env_var: str, default: str) -> set[tuple[str, int]]:
@@ -198,6 +269,98 @@ def _allowed_endpoints() -> set[tuple[str, int]]:
 def _allowed_dev_endpoints() -> set[tuple[str, int]]:
     """Parse the dev/hydration endpoint allowlist from env (or the default)."""
     return _parse_endpoint_allowlist("MIST_DEV_NEO4J_HOSTS", DEFAULT_DEV_NEO4J_ENDPOINTS)
+
+
+def assert_neo4j_uri_not_live(uri: str, *, action: str) -> None:
+    """Refuse `uri` if it names the canonical graph, whatever else is true of it.
+
+    The denylist arm on its own, exposed for callers that need "not live"
+    without also asserting "and is one of MY disposable endpoints". Seed-apply
+    is the motivating case (F1): it legitimately targets staging, dev, AND live,
+    so an allowlist would be wrong -- only the live case needs to be spelled out
+    by the caller.
+
+    Args:
+        uri: A bolt URI. A portless or unparsable URI is refused: live and the
+            disposable instances differ only by port on the host.
+        action: What the caller was about to do, named in the refusal so an
+            operator knows which tool refused and why.
+
+    Raises:
+        EvalIsolationError: when the URI names live, or cannot be parsed well
+            enough to prove it does not.
+    """
+    parsed = urlparse(uri)
+    host = parsed.hostname
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if host is None or port is None:
+        raise EvalIsolationError(
+            f"{uri!r} has no parseable host:port, so {action} cannot be shown to "
+            "miss the live graph. Live and the disposable instances differ only "
+            "by port on the host. Refusing rather than guessing."
+        )
+    _assert_not_live_endpoint(host, port, uri, EvalIsolationError, action=action)
+
+
+def assert_ws_target_not_live(ws_url: str) -> None:
+    """Refuse a hydrator WebSocket target that is, or might be, the live backend (F3).
+
+    The fifth guard, and the only one over HTTP rather than bolt. Same shape as
+    its siblings: a hardcoded denylist that no environment variable can widen,
+    checked BEFORE an env-overridable allowlist. That ordering is F5's lesson --
+    `MIST_DEV_WS_HOSTS` REPLACES the allowlist wholesale, so an allowlist-only
+    guard could be pointed back at live by the very override meant to widen it
+    for CI.
+
+    Pure by design: no network call. The handshake that DOES touch the network
+    lives in `scripts/hydration/target.py` and calls this first, so a hydrator
+    aimed at live is refused without ever contacting live.
+
+    Args:
+        ws_url: The `--ws-url` the operator passed. Required, never defaulted --
+            a default is a value nobody checked.
+
+    Raises:
+        EvalIsolationError: when the target names the live backend, is not a
+            recognized dev endpoint, or has no parseable host:port. Live and dev
+            differ ONLY by port on the host, so a portless URL is unresolvable
+            and is refused rather than defaulted.
+    """
+    parsed = urlparse(ws_url)
+    host = parsed.hostname
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if host is None or port is None:
+        raise EvalIsolationError(
+            f"--ws-url {ws_url!r} has no parseable host:port. Live and dev differ "
+            "only by port on the host (live 8001, dev 8002), so a missing port "
+            "cannot be told apart from live. Pass the full URL, e.g. "
+            "ws://localhost:8002/ws. Refusing to guess."
+        )
+    if (host.lower(), port) in LIVE_WS_ENDPOINTS:
+        raise EvalIsolationError(
+            f"--ws-url {ws_url!r} is the live backend, and hydration would write "
+            f"authored turns into the live event store. Refused by the hardcoded "
+            f"denylist {sorted(LIVE_WS_ENDPOINTS)}, which no environment variable "
+            "can widen or empty -- including MIST_DEV_WS_HOSTS, which REPLACES "
+            "its allowlist and so could otherwise admit this endpoint. The dev "
+            "stack sets MIST_SESSION_ORIGIN=real, so such turns would be "
+            "indistinguishable from genuine usage and un-excludable from every "
+            "future rebuild. Use the dev port (ws://localhost:8002/ws)."
+        )
+    allowed = _parse_endpoint_allowlist("MIST_DEV_WS_HOSTS", DEFAULT_DEV_WS_ENDPOINTS)
+    if (host.lower(), port) not in allowed:
+        raise EvalIsolationError(
+            f"--ws-url {ws_url!r} is not a recognized hydration endpoint. "
+            f"Allowed: {sorted(allowed)} (override via MIST_DEV_WS_HOSTS). "
+            "Allowlist, not denylist: an unrecognized target fails closed rather "
+            "than falling through."
+        )
 
 
 def assert_neo4j_isolated(neo4j_config: Neo4jConfig) -> None:
