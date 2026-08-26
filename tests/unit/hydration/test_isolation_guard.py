@@ -162,6 +162,58 @@ class TestAssertNeo4jDevIsolated:
         with pytest.raises(EvalIsolationError):
             assert_neo4j_dev_isolated("bolt://mist-neo4j-dev:7687")
 
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            pytest.param("bolt://mist-neo4j:7687", id="live-service-name"),
+            pytest.param("bolt://localhost:7687", id="live-host-published-port"),
+            pytest.param("bolt://127.0.0.1:7687", id="live-loopback"),
+        ],
+    )
+    def test_env_override_cannot_admit_a_live_endpoint(self, monkeypatch, uri):
+        """The override REPLACES the allowlist, so it can admit anything -- except live.
+
+        `_parse_endpoint_allowlist` does `os.getenv(env_var, default)`: the
+        override replaces the allowlist wholesale rather than extending it, and
+        `test_allowlist_is_env_overridable` above pins that. Before the live
+        denylist, that made one env var sufficient to point this guard's callers
+        at the canonical graph -- and its caller set includes `snapshot restore`,
+        which runs `MATCH (n) WITH n LIMIT 10000 DETACH DELETE n`.
+
+        `assert_rebuild_target_not_live` already had a second arm for exactly
+        this, and documents why: "an operator who widens
+        MIST_REBUILD_NEO4J_HOSTS to include a live endpoint is caught by the
+        second arm rather than being handed the wipe by their own override."
+        The dev guard gates the MORE destructive tool and had only one arm.
+        """
+        host_port = uri.removeprefix("bolt://")
+        monkeypatch.setenv("MIST_DEV_NEO4J_HOSTS", host_port)
+
+        with pytest.raises(EvalIsolationError, match="live"):
+            assert_neo4j_dev_isolated(uri)
+
+    def test_live_denylist_is_not_env_overridable(self, monkeypatch):
+        """No environment variable may widen the denylist -- that is its whole point.
+
+        Sweeps every isolation-related variable in the module. A denylist that
+        an override can empty is an allowlist wearing a different name.
+        """
+        for var in (
+            "MIST_DEV_NEO4J_HOSTS",
+            "MIST_EVAL_NEO4J_HOSTS",
+            "MIST_REBUILD_NEO4J_HOSTS",
+            "MIST_EVAL_ISOLATION",
+            "MIST_HYDRATION_ISOLATION",
+        ):
+            monkeypatch.setenv(var, "mist-neo4j:7687")
+
+        with pytest.raises(EvalIsolationError, match="live"):
+            assert_neo4j_dev_isolated("bolt://mist-neo4j:7687")
+
+    def test_the_dev_endpoint_still_passes_with_the_denylist_in_place(self):
+        """Pairing guard: the denylist must not refuse the endpoint this guard exists to admit."""
+        assert_neo4j_dev_isolated("bolt://mist-neo4j-dev:7687")
+
     def test_empty_allowlist_refuses_rather_than_allowing_everything(self, monkeypatch):
         monkeypatch.setenv("MIST_DEV_NEO4J_HOSTS", " , ")
         with pytest.raises(EvalIsolationError, match="empty allowlist"):
