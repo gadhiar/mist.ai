@@ -867,7 +867,7 @@ def _build_log_regenerator(
     from pathlib import Path as _Path
 
     from backend.event_store.store import EventStore
-    from backend.factories import build_curation_pipeline
+    from backend.factories import build_curation_pipeline, production_cache_path
     from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
     from backend.knowledge.extraction.confidence import ConfidenceScorer
     from backend.knowledge.extraction.normalizer import EntityNormalizer
@@ -887,8 +887,15 @@ def _build_log_regenerator(
     event_store_path = config.event_store.db_path or str(_Path.home() / ".mist" / "event_store.db")
     event_store = EventStore(event_store_path)
 
-    # ExtractionCache: lives alongside the event store db.
-    cache_path = str(_Path(event_store_path).parent / "extraction_cache.db")
+    # ExtractionCache: lives alongside the event store db. `production_cache_path`
+    # (`backend/factories.py`) is the sole derivation of that path (I2, whole-branch
+    # review) -- this call site duplicated the expression inline until now, which
+    # meant the ":memory:" sentinel did not propagate here the way it already does
+    # in `build_extraction_pipeline`: with `EVENT_STORE_DB_PATH=":memory:"` the
+    # inline join silently produced the bare relative "extraction_cache.db" in the
+    # process CWD instead of an in-memory cache. Deliberately NOT calling
+    # `.initialize()` on the result, same as before -- see the comment below.
+    cache_path = production_cache_path(config)
     extraction_cache = ExtractionCache(cache_path)
 
     # NEITHER store is initialize()d here, and that is the point. `initialize()` is a

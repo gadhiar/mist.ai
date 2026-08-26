@@ -14,6 +14,8 @@ refactor slides past; this test builds the real pipeline object and reads its
 attributes, so it only passes if the wiring actually happened.
 """
 
+import pytest
+
 from backend.knowledge.extraction_cache import ExtractionCache
 
 
@@ -193,3 +195,60 @@ def test_live_pipeline_cache_stays_in_memory_when_event_store_is_in_memory():
     )
 
     assert pipeline._extraction_cache.db_path == ":memory:"
+
+
+def test_live_pipeline_degrades_gracefully_when_cache_initialization_fails(tmp_path):
+    """The cache's `initialize()` -- `mkdir` + `sqlite3.connect` -- is I/O that can
+    fail on an unwritable or absent data root (I1, whole-branch review). Before
+    this fix, that failure propagated straight out of `build_extraction_pipeline`,
+    through `build_conversation_handler`'s unguarded call site, into
+    `KnowledgeIntegration.__init__`'s outer `except Exception` -- which logs
+    "Knowledge integration disabled" and silently degrades MIST to a plain LLM:
+    no graph, no retrieval, no extraction, no vault. This test proves the
+    pipeline itself now absorbs the failure and comes up in the SAME degraded
+    mode `ExtractionPipeline` already supports on purpose: `extraction_cache`
+    and `rebuild_stamps` both `None`, which `_record_skip` / `_record_extraction`
+    already no-op on (`grep -n "if self._extraction_cache is None" \
+    backend/knowledge/extraction/pipeline.py`).
+
+    Mutant this kills: deleting the `try/except (sqlite3.Error, OSError)` around
+    the cache construction in `build_extraction_pipeline` (or narrowing it to a
+    non-matching exception type). With the guard removed, this test fails with
+    the raw `OSError` subclass propagating out of `build_extraction_pipeline`
+    instead of a pipeline being returned; with the guard restored, it fails
+    instead (correctly) if `extraction_cache` or `rebuild_stamps` comes back
+    non-None, since the pairing guard in `ExtractionPipeline.__init__` would
+    then have rejected a mismatched pair before construction even completed.
+
+    Forces the failure deterministically rather than relying on OS permission
+    bits (unreliable across platforms and CI users): the event store's parent
+    directory is a FILE, not a directory, so `Path(cache_path).parent.mkdir(
+    parents=True, exist_ok=True)` inside `ExtractionCache.initialize()` raises
+    an `OSError` subclass (`NotADirectoryError` on POSIX, `FileExistsError` on
+    Windows) when it tries to create a directory where a file already sits.
+    Verified directly against `ExtractionCache` below, before trusting the
+    factory to hit the same branch through `production_cache_path`.
+    """
+    from backend.factories import build_extraction_pipeline
+    from tests.mocks.config import build_test_config
+
+    blocker = tmp_path / "blocked-by-a-file"
+    blocker.write_text("not a directory")
+    event_store_path = str(blocker / "subdir" / "event_store.db")
+    cache_path = str(blocker / "subdir" / "extraction_cache.db")
+
+    with pytest.raises(OSError):
+        ExtractionCache(cache_path).initialize()
+
+    config = build_test_config(event_store_db_path=event_store_path)
+
+    pipeline = build_extraction_pipeline(
+        config,
+        graph_store=_FakeGraphStore(),
+        llm_provider=_FakeLLM(),
+        include_curation=False,
+        include_internal_derivation=False,
+    )
+
+    assert pipeline._extraction_cache is None
+    assert pipeline._rebuild_stamps is None
