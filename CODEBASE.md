@@ -1,7 +1,10 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-08-25 (**extraction-cache Phase 1 (spec D1, D2, D3, D10) COMPLETE and
-MERGED to `main` at `c2cc748` (`--no-ff`) -- NOT pushed; `origin/main` is still `330ff1c`.
+**Last Updated:** 2026-08-25 (**extraction-cache Phase 1 (spec D1, D2, D3, D10) COMPLETE,
+MERGED to `main` at `c2cc748` (`--no-ff`), and PUSHED -- `main` and `origin/main` are both at
+`227ad8f`. (An earlier revision of this entry said "NOT pushed; `origin/main` is still `330ff1c`",
+which was true when written and was falsified by the push later the same day. Verify with `git
+rev-parse HEAD origin/main` rather than trusting this line.)
 `--no-ff` deliberately, not a rebase: the review documents cite this branch's commit hashes and a
 rebase would invalidate every one (the same reasoning as the 2026-08-19 Q2-1 merge). Branch
 `feat/extraction-cache-production-writer` merged at its tip `1171423`; commit count on the merged
@@ -66,6 +69,33 @@ spec section 8: Phase 2 and 3 are coupled and must land together), which couple 
 (D8, `diff`/`promote`) is INDEPENDENT of that pair and ships any time after Phase 1; D9 accrues
 automatically with no separate work -- corrected here after this file's first draft folded both
 into a single misleading "(D4-D9)" range.**)
+
+- **FOLLOW-UP --** 2026-08-25 (same day, post-merge): three carried items closed before opening
+  R1.6. (1) **The eval-gated integration tests were run** -- they had skipped throughout Phase 1
+  because they need the EVAL instance, not the staging one Phase 1 stood up. Brought up
+  `docker-compose.eval-neo4j.yml --profile eval` (bolt 7688) and ran all five files: **12 passed**
+  (`test_deterministic_resolver`, `test_bitemporal_currency_live`, `test_selfmodel_partition` gate
+  on a socket probe and run automatically once the instance is up; `test_seed_label_split` is
+  fail-closed and additionally needs `MIST_EVAL_ISOLATION=1` +
+  `NEO4J_URI=bolt://mist-neo4j-eval:7687`). Live graph verified 32/30 after -- `test_seed_label_split`
+  performs a full `reset_graph(include_derived=True)`, so that check is the point, not a formality.
+  Eval instance torn down (tmpfs, wiped). (2) **`_SOURCE_THRESHOLDS` shadowing FIXED** (KNOWN_ISSUES
+  I5) -- see that file for the full record. The diagnostic inverted the issue's own framing: the
+  logged bug was "a dead config knob", but `orchestrator_summary` and `agent_tool_output` have ZERO
+  production callers while the real production sources (`admin-cli`, `v2-ingest`,
+  `v2-ingest-commit`) have no table entries at all -- so the table's only live entry was the one
+  breaking the config, and the abstraction, not just the knob, was the defect. Fixed by removing the
+  `"conversation"` key; the `.get(source, config)` lookup was already correct. **A no-op on
+  production data** (all three threshold authorities read 0.3, exactly the removed hardcode), which
+  is why it was done NOW: that free window closes the moment the env knob is tuned, after which the
+  same fix splits cached extraction history into pre- and post-fix decisions. Suite **3070 -> 3075**,
+  0 failed; live graph 32/30 unchanged. A second finding fell out of the diagnostic and is recorded
+  because it is the same defect class Phase 1's review kept surfacing: **eight test sites set
+  `significance_threshold=0.0` intending to disable the significance gate, and for the
+  `conversation` default source that never worked** -- they ran against a 0.3 gate while their code
+  said 0.0, passing only because their utterances scored above it. The fix makes them truthful; they
+  were deliberately not otherwise touched. (3) This file's own "NOT pushed" claim was corrected --
+  it was falsified by the push later the same day.
 
 - **PRIOR ENTRY --** 2026-08-19: Audit finding Q2-1 CLOSED AND MERGED to `main` (`a81c474`,
   `--no-ff`). Four review waves; each found something the previous one missed. Wave 2's "Minor 6"

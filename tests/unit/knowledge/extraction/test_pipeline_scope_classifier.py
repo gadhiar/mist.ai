@@ -288,8 +288,12 @@ class TestStage15OrderingAfterGates:
     @pytest.mark.asyncio
     async def test_classifier_skipped_when_significance_below_threshold(self):
         """A below-threshold utterance returns early without invoking the classifier."""
-        # Arrange -- threshold 2.0 is unreachable; pass a non-registered extraction_source
-        # so the config threshold is used instead of the _SOURCE_THRESHOLDS default.
+        # Arrange -- threshold 2.0 is unreachable. The explicit non-registered
+        # extraction_source below is now redundant (since the _SOURCE_THRESHOLDS
+        # shadowing fix, the "conversation" default also resolves through config)
+        # but is retained deliberately: it keeps this test's subject the CLASSIFIER
+        # rather than threshold resolution, which
+        # test_pipeline_significance_threshold.py owns.
         extractor = _empty_extractor()
         classifier = _CountingClassifier()
         config = ExtractionConfig(
@@ -303,7 +307,7 @@ class TestStage15OrderingAfterGates:
             extractor=extractor, scope_classifier=classifier, extraction_config=config
         )
 
-        # Act -- extraction_source="test_unregistered" falls back to config.significance_threshold.
+        # Act -- extraction_source="test_unregistered" resolves to config.significance_threshold.
         result = await pipeline.extract_from_utterance(
             utterance="I use Rust.",
             conversation_history=[],
