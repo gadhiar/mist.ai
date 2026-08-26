@@ -122,18 +122,22 @@ def pipeline_factory():
             `SKIP_TOO_SHORT` depends on the utterance text passed to
             extract_from_utterance at call time (an under-3-word utterance),
             not on anything fixable at construction time.
-            `SKIP_BELOW_SIGNIFICANCE` looks config-settable but is not:
-            verified via a throwaway pipeline_factory(force_gate=...) run
-            that `_SOURCE_THRESHOLDS["conversation"]` in pipeline.py
-            (`grep -n "_SOURCE_THRESHOLDS: dict" backend/knowledge/extraction/pipeline.py`)
-            hardcodes 0.3 for the default extraction_source and is read via
-            `_SOURCE_THRESHOLDS.get(extraction_source, self._config.significance_threshold)`
-            -- so `self._config.significance_threshold` is only consulted for
-            an extraction_source absent from that table, never for the
-            "conversation" default this fixture builds pipelines for. Drive
-            it instead by passing a non-"conversation" `extraction_source`
-            (its threshold IS in that table) at call time together with a
-            low information-density utterance.
+            `SKIP_BELOW_SIGNIFICANCE` IS config-settable as of the
+            `_SOURCE_THRESHOLDS` shadowing fix: "conversation" is no longer a
+            key in that table
+            (`grep -n "_SOURCE_THRESHOLDS: dict" backend/knowledge/extraction/pipeline.py`),
+            so the default extraction_source this fixture builds pipelines
+            for now resolves through `self._config.significance_threshold`
+            like any other unregistered source. Raise that config value above
+            the utterance's score to force the gate.
+
+            An earlier revision of this docstring said the opposite -- that
+            the gate "looks config-settable but is not" -- and instructed
+            callers to work around it by passing a non-"conversation"
+            `extraction_source`. That was accurate against the hardcoded 0.3
+            and is now false. The workaround still functions (an unregistered
+            source has always resolved through config) but is no longer
+            necessary.
         dedup_utterance: required when `force_gate=SKIP_DUPLICATE`; the
             exact utterance text the caller will pass to
             `extract_from_utterance` next. Ignored otherwise.

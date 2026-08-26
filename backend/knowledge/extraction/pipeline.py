@@ -71,9 +71,22 @@ ENTITY_TYPE_IMPORTANCE: dict[str, float] = {
     "Location": 0.5,
 }
 
-# Significance thresholds per extraction source.
+# Significance thresholds for sources that deliberately DEVIATE from the
+# configured baseline. A source absent from this table resolves to
+# `ExtractionConfig.significance_threshold` (env: SIGNIFICANCE_THRESHOLD) at
+# the lookup below.
+#
+# "conversation" is deliberately ABSENT. It is the default extraction_source
+# and the dominant production path, so an entry here would shadow the
+# configured threshold on the one path that matters most -- which is exactly
+# the bug this table used to carry. It resolves through config instead.
+# `test_pipeline_significance_threshold.py` guards the absence.
+#
+# The two entries that remain encode an intended ORDERING against that
+# configured baseline: a pre-digested orchestrator summary clears a LOWER bar
+# than ordinary conversation, and noisy agent tool output a HIGHER one. Both
+# are Command Center ingest sources with no caller yet.
 _SOURCE_THRESHOLDS: dict[str, float] = {
-    "conversation": 0.3,
     "orchestrator_summary": 0.2,
     "agent_tool_output": 0.5,
 }

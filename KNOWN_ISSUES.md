@@ -228,8 +228,26 @@ constraints are not relearned later.
   on unexpected data shapes (e.g., LLM returns properties as string
   instead of dict), entire pipeline crashes. Wrap each stage in try/except.
 
-- [ ] **pipeline.py -- `_SOURCE_THRESHOLDS` shadows the configured
-  significance threshold on the dominant extraction source.** `sig_threshold
+- [x] **pipeline.py -- `_SOURCE_THRESHOLDS` shadows the configured
+  significance threshold on the dominant extraction source.** -- RESOLVED
+  2026-08-25. The `"conversation"` entry was removed, so the default (and
+  dominant) extraction source now resolves through
+  `ExtractionConfig.significance_threshold` like any other unregistered
+  source; the `.get(source, config)` lookup itself was already correct and is
+  unchanged. A no-op on production data at the time of the fix -- the
+  dataclass default, the `from_env` default and `.env` all read 0.3, exactly
+  the value the removed entry hardcoded -- so no cached extraction decision
+  was invalidated and no rebuild diverged. Fixed inside that free window
+  deliberately: once the env knob is tuned, the same fix becomes a behaviour
+  change that splits cached history. Guarded by
+  `tests/unit/knowledge/extraction/test_pipeline_significance_threshold.py`
+  (5 tests: behavioural pair, structural absence guard, the ordering bracket,
+  and a characterisation test pinning the no-op claim). The two surviving
+  table entries (`orchestrator_summary`, `agent_tool_output`) are retained as
+  Command Center ingest sources and now encode an ordering against the
+  configured baseline rather than against a constant. Original report follows.
+
+  `sig_threshold
   = _SOURCE_THRESHOLDS.get(extraction_source, self._config.significance_threshold)`
   (`grep -n "sig_threshold = _SOURCE_THRESHOLDS.get" backend/knowledge/extraction/pipeline.py`)
   uses `self._config.significance_threshold` only as the fallback for a
