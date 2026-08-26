@@ -1,10 +1,16 @@
 """Structural guard: the version stamps have exactly one authority each.
 
 Six sites used to restate `ontology_version` / `extraction_version`, and they
-disagreed (1.1.0, 1.2.1, 1.4.0 live at once). The stamps are descriptive, so
-the disagreement was invisible -- until `extraction_cache.cache_key`, which
-hashes `event_id|ontology_version|extraction_version|model_hash` and turns a
-mislabel into a hard cache miss that makes a deterministic rebuild impossible.
+disagreed (1.1.0, 1.2.1, 1.4.0 live at once). The stamps are descriptive, so a
+disagreement is invisible to every pipeline branch. For `extraction_version` it
+is still caught downstream anyway: `extraction_cache.cache_key` hashes it
+(currently `event_id|extraction_version|model_hash`;
+verified via `grep -n 'raw = "|".join' backend/knowledge/extraction_cache.py`),
+turning a mislabel into a hard cache miss that makes a deterministic rebuild
+impossible. As of `extraction-cache-phase-1` spec D3, `ontology_version` is
+deliberately OUT of that key, so a disagreement there is a silent mislabel
+with no such downstream catch -- this scan is now the ONLY thing that catches
+it.
 
 The collapse: the ontology stamp is DERIVED from the ontology object itself,
 the extraction stamp lives in `backend.knowledge.version_stamps`, and neither is

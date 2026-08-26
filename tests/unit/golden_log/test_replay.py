@@ -32,7 +32,10 @@ from backend.knowledge.curation.deduplication import DeduplicationResult
 from backend.knowledge.curation.graph_writer import WriteResult
 from backend.knowledge.curation.pipeline import CurationResult
 from backend.knowledge.curation.reconciliation import ReconcileTurnResult
-from backend.knowledge.extraction.validator import ValidationResult
+from backend.knowledge.extraction.confidence import ConfidenceScorer
+from backend.knowledge.extraction.normalizer import EntityNormalizer
+from backend.knowledge.extraction.temporal import TemporalResolver
+from backend.knowledge.extraction.validator import ExtractionValidator, ValidationResult
 from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
 from backend.knowledge.regeneration.rebuild_gate import (
     RebuildDeterminismError,
@@ -57,6 +60,22 @@ LIVE_URI = "bolt://mist-neo4j:7687"
 # fixture requires saying so. Passing this explicitly is the point -- a default
 # that quietly swept fixture traffic into a canonical rebuild is the L2 bug.
 GOLDEN_LOG_ORIGINS = ("test",)
+
+
+def _stage_components() -> dict[str, Any]:
+    """Real Stage 3-6 components (Task 6, extraction-cache-phase-1).
+
+    None of `ConfidenceScorer()`/`TemporalResolver()`/`ExtractionValidator()` takes an
+    argument that could reach a graph or a model, and `EntityNormalizer.normalize()`
+    issues no graph queries at all -- so the real components are the simplest correct
+    wiring here, same as `_build_log_regenerator` in scripts/mist_admin.py.
+    """
+    return {
+        "confidence_scorer": ConfidenceScorer(),
+        "temporal_resolver": TemporalResolver(),
+        "normalizer": EntityNormalizer(embedding_generator=None, executor=None),
+        "validator": ExtractionValidator(),
+    }
 
 
 @dataclass(slots=True)
@@ -134,6 +153,7 @@ async def replay_golden_log(root, turns=None) -> tuple[Any, RecordingCurationPip
         extraction_cache=materialized.extraction_cache,
         journal=EventStoreRebuildJournal(materialized.event_store),
         staging_curation_pipeline=recorder,
+        **_stage_components(),
     )
     report = await regenerator.rebuild(
         staging_uri=STAGING_URI,
@@ -174,6 +194,7 @@ class TestTheOriginGuardIsLoadBearing:
             extraction_cache=materialized.extraction_cache,
             journal=EventStoreRebuildJournal(materialized.event_store),
             staging_curation_pipeline=recorder,
+            **_stage_components(),
         )
 
         # Act: no `origins` -- whatever a rebuild of the CANONICAL graph does by default.
@@ -236,6 +257,7 @@ class TestCacheCoverage:
             extraction_cache=materialized.extraction_cache,
             journal=EventStoreRebuildJournal(materialized.event_store),
             staging_curation_pipeline=RecordingCurationPipeline(),
+            **_stage_components(),
         )
 
         # Act / Assert
@@ -263,6 +285,7 @@ class TestCacheCoverage:
             extraction_cache=materialized.extraction_cache,
             journal=EventStoreRebuildJournal(materialized.event_store),
             staging_curation_pipeline=RecordingCurationPipeline(),
+            **_stage_components(),
         )
 
         with pytest.raises(ColdCacheError) as excinfo:
@@ -295,6 +318,7 @@ class TestCacheCoverage:
             extraction_cache=materialized.extraction_cache,
             journal=EventStoreRebuildJournal(materialized.event_store),
             staging_curation_pipeline=RecordingCurationPipeline(),
+            **_stage_components(),
         )
 
         with pytest.raises(ColdCacheError) as excinfo:

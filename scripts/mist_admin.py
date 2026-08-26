@@ -867,8 +867,12 @@ def _build_log_regenerator(
     from pathlib import Path as _Path
 
     from backend.event_store.store import EventStore
-    from backend.factories import build_curation_pipeline
+    from backend.factories import build_curation_pipeline, production_cache_path
     from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
+    from backend.knowledge.extraction.confidence import ConfidenceScorer
+    from backend.knowledge.extraction.normalizer import EntityNormalizer
+    from backend.knowledge.extraction.temporal import TemporalResolver
+    from backend.knowledge.extraction.validator import ExtractionValidator
     from backend.knowledge.extraction_cache import ExtractionCache
     from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
     from backend.knowledge.regeneration.rebuild_journal import NullRebuildJournal
@@ -883,8 +887,15 @@ def _build_log_regenerator(
     event_store_path = config.event_store.db_path or str(_Path.home() / ".mist" / "event_store.db")
     event_store = EventStore(event_store_path)
 
-    # ExtractionCache: lives alongside the event store db.
-    cache_path = str(_Path(event_store_path).parent / "extraction_cache.db")
+    # ExtractionCache: lives alongside the event store db. `production_cache_path`
+    # (`backend/factories.py`) is the sole derivation of that path (I2, whole-branch
+    # review) -- this call site duplicated the expression inline until now, which
+    # meant the ":memory:" sentinel did not propagate here the way it already does
+    # in `build_extraction_pipeline`: with `EVENT_STORE_DB_PATH=":memory:"` the
+    # inline join silently produced the bare relative "extraction_cache.db" in the
+    # process CWD instead of an in-memory cache. Deliberately NOT calling
+    # `.initialize()` on the result, same as before -- see the comment below.
+    cache_path = production_cache_path(config)
     extraction_cache = ExtractionCache(cache_path)
 
     # NEITHER store is initialize()d here, and that is the point. `initialize()` is a
@@ -936,6 +947,21 @@ def _build_log_regenerator(
         event_store=event_store,
         extraction_cache=extraction_cache,
         staging_curation_pipeline=pipeline,
+        confidence_scorer=ConfidenceScorer(),
+        temporal_resolver=TemporalResolver(),
+        # Stage 5 is pure: `normalize()` issues no graph queries (R1.1d strip
+        # moved graph-identity resolution to the curation deduper, Stage 7a).
+        # `embedding_generator` and `executor` are retained on the class only
+        # for constructor-signature compatibility and are never read after
+        # assignment (`grep -n "self\._embedding_generator\|self\._executor"
+        # backend/knowledge/extraction/normalizer.py` -> both hits are the
+        # `__init__` assignments, neither is read again). Passing None costs
+        # nothing and avoids wiring a staging-graph executor into a stage that
+        # cannot use it.
+        normalizer=EntityNormalizer(embedding_generator=None, executor=None),
+        validator=ExtractionValidator(
+            min_confidence=config.extraction.min_extraction_confidence,
+        ),
         # The dry-run proof is not a rebuild of record: nothing reads its job rows
         # (`get_reextraction_job` has no production caller), and `_build_once` runs
         # twice per invocation, so a durable journal here would append two

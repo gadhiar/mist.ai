@@ -278,7 +278,6 @@ class TestMaterialize:
         hits = [
             materialized.extraction_cache.get(
                 turn.event_id,
-                epoch["ontology_version"],
                 epoch["extraction_version"],
                 epoch["model_hash"],
             )
@@ -288,16 +287,16 @@ class TestMaterialize:
         assert all(hit is not None for hit in hits)
         assert len(hits) == EXPECTED_TURN_COUNT
 
-    def test_the_write_triple_is_the_read_triple(self, turns, tmp_path):
+    def test_the_write_stamp_pair_is_the_read_stamp_pair(self, turns, tmp_path):
         # Assert: the key the cache was WRITTEN under is the key the rebuild COMPUTES.
-        # `LogRegenerator` derives its lookup from epoch[ontology|extraction|model_hash], so
-        # this recomputes that key independently and requires a row under it.
+        # `LogRegenerator` derives its lookup from epoch[extraction|model_hash] (D3 dropped
+        # ontology_version from the key), so this recomputes that key independently and
+        # requires a row under it.
         materialized = materialize_isolated(turns, root=tmp_path / "isolated")
         epoch = materialized.epoch
 
         rebuild_key = cache_key(
             turns[0].event_id,
-            epoch["ontology_version"],
             epoch["extraction_version"],
             epoch["model_hash"],
         )
@@ -323,7 +322,6 @@ class TestMaterialize:
         assert (
             materialized.extraction_cache.get(
                 turns[0].event_id,
-                epoch["ontology_version"],
                 epoch["extraction_version"],
                 composed,
             )
@@ -337,7 +335,6 @@ class TestMaterialize:
         epoch = materialized.epoch
         cached = materialized.extraction_cache.get(
             "golden-ext-01-uses",
-            epoch["ontology_version"],
             epoch["extraction_version"],
             epoch["model_hash"],
         )

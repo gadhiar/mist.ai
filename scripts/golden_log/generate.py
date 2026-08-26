@@ -34,7 +34,7 @@ from backend.errors import MistError
 from backend.event_store.models import ConversationTurnEvent
 from backend.event_store.store import EventStore
 from backend.knowledge.config import KnowledgeConfig
-from backend.knowledge.extraction_cache import ExtractionCache
+from backend.knowledge.extraction_cache import OUTCOME_EXTRACTED, ExtractionCache
 from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
 
 from .translate import GOLD_UTTERANCE_FIELD, load_gold_corpus, translate_gold_record
@@ -274,6 +274,59 @@ def assert_isolated_root(root: Path) -> None:
             )
 
 
+def golden_log_cache_path(root: Path) -> str:
+    """The golden log's OWN cache. Authored entities, never model output."""
+    return str(root / "extraction-cache.db")
+
+
+def assert_not_production_root(root: Path) -> None:
+    """Refuse to write authored ground truth where the live cache lives.
+
+    A rebuild reading authored entities reproduces the IDEAL graph and scores
+    itself perfect against its own answer key -- with no symptom to notice.
+    `assert_isolated_root` (above) reasons about live data roots generically,
+    from a static candidate list that skips a root absent from the box; this
+    pins the ONE path Task 5 (`backend/factories.py:production_cache_path`)
+    actually derives for the live extraction cache, from the same authority,
+    so the invariant survives a future change to either derivation.
+
+    Matches an EXACT equal root only -- unlike `assert_isolated_root`'s
+    `resolved == live or live in resolved.parents`, a root merely under the
+    production root is not refused here. That is intentional: the hazard is
+    a colliding FILE, and the golden log's cache filename is fixed within
+    `root` (`golden_log_cache_path`), so a subdirectory of the production
+    root produces a different path, not a collision.
+
+    When the production event store is configured `":memory:"`,
+    `production_cache_path` returns the bare sentinel with no real parent
+    directory. This refuses to compare at all in that case rather than
+    taking `.parent` of the sentinel string, which resolves to the process
+    CWD and would silently retarget the guard onto an unrelated directory
+    (review round 1, Minor 1) -- refusing legitimate roots that happen to
+    equal the CWD while never refusing the real live directories. An
+    in-memory production cache has no on-disk file for the golden log's
+    cache to collide with, so there is nothing to guard against.
+
+    Raises:
+        GoldenLogError: When `root` resolves to the production cache's parent
+            directory. Never raised while the production cache is
+            ":memory:".
+    """
+    from backend.factories import production_cache_path
+    from backend.knowledge.config import KnowledgeConfig
+
+    live_cache_path = production_cache_path(KnowledgeConfig.from_env())
+    if live_cache_path == ":memory:":
+        return
+    prod = Path(live_cache_path).parent.resolve()
+    if Path(root).resolve() == prod:
+        raise GoldenLogError(
+            f"refusing to write the golden log's authored extractions into the "
+            f"production cache root {prod}. The production cache records what the "
+            f"model produced; these are ground truth."
+        )
+
+
 def materialize_isolated(
     turns: list[GoldenTurn], *, root: Path, activated_at: str | None = None
 ) -> MaterializedGoldenLog:
@@ -327,7 +380,8 @@ def materialize_isolated(
     for session_id in dict.fromkeys(turn.session_id for turn in turns):
         event_store.start_session(session_id, input_modality=INPUT_MODALITY, origin=SESSION_ORIGIN)
 
-    extraction_cache = ExtractionCache(str(root / "extraction-cache.db"))
+    assert_not_production_root(root)
+    extraction_cache = ExtractionCache(golden_log_cache_path(root))
     extraction_cache.initialize()
 
     for turn in turns:
@@ -345,6 +399,7 @@ def materialize_isolated(
             epoch["ontology_version"],
             epoch["extraction_version"],
             epoch["model_hash"],
+            outcome=OUTCOME_EXTRACTED,
             entities=turn.entities,
             relationships=turn.relationships,
             created_at=turn.timestamp,
@@ -355,7 +410,6 @@ def materialize_isolated(
         for turn in turns
         if extraction_cache.get(
             turn.event_id,
-            epoch["ontology_version"],
             epoch["extraction_version"],
             epoch["model_hash"],
         )

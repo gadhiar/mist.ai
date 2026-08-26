@@ -38,6 +38,7 @@ from tests.integration.knowledge.test_log_regenerator import (
     _ENDPOINT,
     _LIVE_URI,
     _build_staging_pipeline,
+    _stage_components,
     _staging_uri,
 )
 from tests.integration.knowledge.test_log_regenerator import (
@@ -66,6 +67,7 @@ async def _rebuild_into_staging(staging_conn, root):
         extraction_cache=materialized.extraction_cache,
         staging_curation_pipeline=_build_staging_pipeline(staging_conn),
         journal=EventStoreRebuildJournal(materialized.event_store),
+        **_stage_components(),
     )
     report = await regenerator.rebuild(
         staging_uri=_staging_uri(),

@@ -11,10 +11,31 @@ import pytest
 from backend.event_store.models import ConversationTurnEvent
 from backend.event_store.store import EventStore
 from backend.knowledge.config import Neo4jConfig
-from backend.knowledge.extraction_cache import ExtractionCache
+from backend.knowledge.extraction.confidence import ConfidenceScorer
+from backend.knowledge.extraction.normalizer import EntityNormalizer
+from backend.knowledge.extraction.temporal import TemporalResolver
+from backend.knowledge.extraction.validator import ExtractionValidator
+from backend.knowledge.extraction_cache import OUTCOME_EXTRACTED, ExtractionCache
 from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
 from backend.knowledge.regeneration.rebuild_journal import EventStoreRebuildJournal
 from backend.knowledge.storage.neo4j_connection import Neo4jConnection
+
+
+def _stage_components() -> dict:
+    """Real Stage 3-6 components (Task 6, extraction-cache-phase-1).
+
+    None of `ConfidenceScorer()`/`TemporalResolver()`/`ExtractionValidator()` takes an
+    argument that could reach a graph or a model, and `EntityNormalizer.normalize()`
+    issues no graph queries at all -- so the real components are the simplest correct
+    wiring here, same as `_build_log_regenerator` in scripts/mist_admin.py.
+    """
+    return {
+        "confidence_scorer": ConfidenceScorer(),
+        "temporal_resolver": TemporalResolver(),
+        "normalizer": EntityNormalizer(embedding_generator=None, executor=None),
+        "validator": ExtractionValidator(),
+    }
+
 
 # Staging endpoint (NEVER live). In-network service name, then host-published port.
 _CANDIDATES = [("mist-neo4j-staging", 7687), ("localhost", 7689), ("127.0.0.1", 7689)]
@@ -136,6 +157,7 @@ def _build_regenerator_with_one_turn(
         _TEST_EPOCH["ontology_version"],
         _TEST_EPOCH["extraction_version"],
         _TEST_EPOCH["model_hash"],
+        outcome=OUTCOME_EXTRACTED,
         entities=[{"id": "python", "type": "Technology", "display_name": "Python"}],
         relationships=[],
         created_at=_TURN_TS,
@@ -147,6 +169,7 @@ def _build_regenerator_with_one_turn(
         extraction_cache=cache,
         staging_curation_pipeline=pipeline,
         journal=EventStoreRebuildJournal(event_store),
+        **_stage_components(),
     )
     return regen, event_store, cache, _TEST_EPOCH
 
@@ -167,6 +190,7 @@ def _build_regenerator_with_uncached_turn(
         extraction_cache=cache,
         staging_curation_pipeline=pipeline,
         journal=EventStoreRebuildJournal(event_store),
+        **_stage_components(),
     )
     return regen, event_store, cache, _TEST_EPOCH
 
@@ -308,6 +332,7 @@ class TestLogRegeneratorReplay:
             epoch["ontology_version"],
             epoch["extraction_version"],
             epoch["model_hash"],
+            outcome=OUTCOME_EXTRACTED,
             entities=[{"id": "python", "type": "Technology", "display_name": "Python"}],
             relationships=[],
             created_at=ts_a,
@@ -317,6 +342,7 @@ class TestLogRegeneratorReplay:
             epoch["ontology_version"],
             epoch["extraction_version"],
             epoch["model_hash"],
+            outcome=OUTCOME_EXTRACTED,
             entities=[{"id": "fastapi", "type": "Technology", "display_name": "FastAPI"}],
             relationships=[],
             created_at=ts_b,
@@ -328,6 +354,7 @@ class TestLogRegeneratorReplay:
             extraction_cache=cache,
             staging_curation_pipeline=pipeline,
             journal=EventStoreRebuildJournal(event_store),
+            **_stage_components(),
         )
 
         # Act: first rebuild into staging.

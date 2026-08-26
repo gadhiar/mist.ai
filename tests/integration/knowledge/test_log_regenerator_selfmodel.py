@@ -85,6 +85,14 @@ class TestSelfModelCopyForward:
             extraction_cache=None,
             staging_curation_pipeline=None,
             journal=None,  # these two methods never journal
+            # These tests exercise only copy_self_model_partition /
+            # rederive_self_model_cross_layer_edges, neither of which touches
+            # Stages 3-6 (Task 6, extraction-cache-phase-1) -- required now, but
+            # never read by either method.
+            confidence_scorer=None,
+            temporal_resolver=None,
+            normalizer=None,
+            validator=None,
         )
         copied = regen.copy_self_model_partition(src, dst)
         rederived = regen.rederive_self_model_cross_layer_edges(src, dst)
@@ -127,6 +135,14 @@ class TestSelfModelCopyForward:
             extraction_cache=None,
             staging_curation_pipeline=None,
             journal=None,  # these two methods never journal
+            # These tests exercise only copy_self_model_partition /
+            # rederive_self_model_cross_layer_edges, neither of which touches
+            # Stages 3-6 (Task 6, extraction-cache-phase-1) -- required now, but
+            # never read by either method.
+            confidence_scorer=None,
+            temporal_resolver=None,
+            normalizer=None,
+            validator=None,
         )
         regen.copy_self_model_partition(src, dst)
         rederived = regen.rederive_self_model_cross_layer_edges(src, dst)

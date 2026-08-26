@@ -13,6 +13,7 @@ For tests, bypass factories and pass fakes directly to constructors.
 
 import logging
 import os
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -233,6 +234,41 @@ def build_curation_pipeline(
     )
 
 
+def production_cache_path(config: KnowledgeConfig) -> str:
+    """The one path the LIVE extraction cache lives at.
+
+    Named rather than inlined so the golden-log generator can refuse to equal
+    it (spec D10, `scripts/golden_log/generate.py:assert_not_production_root`):
+    two literals in two files is how they drift.
+
+    `_build_log_regenerator` in scripts/mist_admin.py CALLS this function
+    rather than deriving the path itself (I2, whole-branch review). Before
+    that fix it re-derived the same expression inline instead -- a second
+    copy of the expression this paragraph already named when it existed (see
+    below), not something the docstring concealed or got wrong: the opening
+    claim above is about what THIS function is FOR, and remains true on its
+    own terms. What was true was UNDER-ACHIEVED while the second copy stood:
+    a caller could still drift the two derivations apart, exactly the
+    failure mode the golden-log generator's refuse-to-equal check exists to
+    catch, just not caught for path DERIVATION itself. Propagates the
+    ":memory:" sentinel: `ExtractionCache.initialize()` already special-cases
+    it (`grep -n 'if self.db_path != ":memory:"' backend/knowledge/extraction_cache.py`),
+    but `Path(event_store_path).parent` on the bare sentinel resolves to a
+    relative "." -- silently landing an on-disk "extraction_cache.db" in the
+    process CWD for any caller with an in-memory event store, rather than the
+    in-memory cache that setup implies. `grep -n 'production_cache_path'
+    scripts/mist_admin.py` now returns three hits -- the import, a comment
+    naming this function, and the call -- zero of which are a second
+    derivation of the path expression itself.
+    """
+    from pathlib import Path
+
+    event_store_path = config.event_store.db_path or str(Path.home() / ".mist" / "event_store.db")
+    if event_store_path == ":memory:":
+        return ":memory:"
+    return str(Path(event_store_path).parent / "extraction_cache.db")
+
+
 def build_extraction_pipeline(
     config: KnowledgeConfig,
     graph_store: GraphStore | None = None,
@@ -242,6 +278,10 @@ def build_extraction_pipeline(
     debug_logger: "DebugJSONLLogger | None" = None,  # noqa: F821
 ) -> ExtractionPipeline:
     """Create a fully wired ExtractionPipeline."""
+    from backend.knowledge.curation.graph_writer import RebuildStamps
+    from backend.knowledge.extraction_cache import ExtractionCache
+    from backend.knowledge.version_stamps import compose_model_hash
+
     gs = graph_store or build_graph_store(config)
     executor = build_graph_executor(config, gs.connection)
 
@@ -281,6 +321,81 @@ def build_extraction_pipeline(
             config=config.scope_classifier,
         )
 
+    # F3 (extraction-cache-phase-1) Task 5: cache sits beside the event store
+    # -- one path convention, not two. Task 7 pulled the derivation out to
+    # `production_cache_path` above so the golden-log generator can refuse to
+    # equal it (spec D10) without duplicating this expression a third time.
+    #
+    # I1 (whole-branch review): construction is I/O -- `initialize()` creates
+    # the parent directory and opens a sqlite3 connection, and both raise on
+    # an unwritable or absent data root. This call sits at the composition
+    # root every production path runs through (`build_conversation_handler`
+    # -> `build_extraction_pipeline`), and an uncaught exception here
+    # propagates up into `KnowledgeIntegration.__init__`'s outer
+    # `except Exception`, which silently degrades MIST to a plain LLM -- no
+    # graph, no retrieval, no extraction, no vault -- reported as one
+    # WARNING line. `sqlite3.Error` and `OSError` are the same pair
+    # `_record_skip` / `_record_extraction` already narrow to (`grep -n
+    # "except (sqlite3.Error, OSError)" backend/knowledge/extraction/pipeline.py`),
+    # and this call is failure-isolated the same way the vector store below
+    # already is (`grep -n "vector_store = None" backend/factories.py`) --
+    # the new code was the exception to a pattern its own neighbours follow.
+    try:
+        extraction_cache = ExtractionCache(production_cache_path(config))
+        extraction_cache.initialize()
+    except (sqlite3.Error, OSError) as exc:
+        # This runs once, at composition-root construction time -- there is
+        # no single "turn" to blame it on. The degradation is PROCESS-WIDE:
+        # every turn this process extracts for the rest of its lifetime will
+        # be unrebuildable, not just whichever turn happens to trigger the
+        # next factory build. Extraction and the conversation itself proceed
+        # unaffected; only rebuildability is lost.
+        logger.warning(
+            "Extraction cache unavailable at %s -- this process will run "
+            "without one: every turn it extracts will be unrebuildable for "
+            "the rest of this process's lifetime, though extraction and the "
+            "conversation itself are unaffected: %s",
+            production_cache_path(config),
+            exc,
+        )
+        extraction_cache = None
+
+    # Constructed here, from the same KnowledgeConfig that
+    # build_curation_pipeline constructs its own RebuildStamps from -- both
+    # real construction sites, and only those two, are found by `grep -nE
+    # "^\s+(rebuild_stamps = )?RebuildStamps\(" backend/factories.py`
+    # (build_curation_pipeline's assignment, and this function's own
+    # RebuildStamps(...) call below; the plain `rebuild_stamps =
+    # RebuildStamps(` substring this replaced also matched THIS comment once
+    # the second site became a conditional expression in I1's fix, which is
+    # why the pattern is anchored to line-start rather than substring-matched
+    # -- verify with the command above before trusting the count again). NOT
+    # one construction site per process: with
+    # include_curation=True (the default), this function also calls
+    # build_curation_pipeline above, so a single production call constructs
+    # BOTH stamps objects in one process. Both sites derive all three fields
+    # from this same config (never the bare config.model_hash), and
+    # tests/unit/test_factories_rebuild_stamps.py::TestCrossFactoryStampAgreement
+    # pins the two outputs equal so a future edit cannot silently diverge
+    # them. Review finding L4 (2026-08-02) was two sites disagreeing on 2 of
+    # 3 fields, which made every rebuild a permanent ColdCacheError rather
+    # than a mislabel.
+    #
+    # None when the cache above failed to initialize: `ExtractionPipeline`'s
+    # constructor pairing guard requires `extraction_cache` and
+    # `rebuild_stamps` to be both None or both set, and both-None is the
+    # degraded mode that guard exists to allow, not a violation of it --
+    # `_record_skip` / `_record_extraction` already no-op on it.
+    rebuild_stamps = (
+        RebuildStamps(
+            ontology_version=config.ontology_version,
+            extraction_version=config.extraction_version,
+            model_hash=compose_model_hash(config),
+        )
+        if extraction_cache is not None
+        else None
+    )
+
     return ExtractionPipeline(
         preprocessor=PreProcessor(),
         extractor=OntologyConstrainedExtractor(config, llm=provider),
@@ -299,6 +414,8 @@ def build_extraction_pipeline(
         embedding_provider=gs.embedding_generator,
         extraction_config=config.extraction,
         scope_classifier=scope_classifier,
+        extraction_cache=extraction_cache,
+        rebuild_stamps=rebuild_stamps,
     )
 
 

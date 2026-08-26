@@ -32,11 +32,13 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 
 from backend.errors import MistError
 from backend.knowledge.curation.pipeline import CurationResult
 from backend.knowledge.eval_isolation import assert_rebuild_target_not_live
-from backend.knowledge.extraction.validator import ValidationResult
+from backend.knowledge.extraction.ontology_extractor import ExtractionResult
+from backend.knowledge.extraction_cache import OUTCOME_SKIPPED
 from backend.knowledge.regeneration.rebuild_journal import RebuildJournal
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
@@ -101,6 +103,10 @@ class LogRegenerator:
         extraction_cache,
         staging_curation_pipeline,
         journal: RebuildJournal,
+        confidence_scorer,
+        temporal_resolver,
+        normalizer,
+        validator,
     ) -> None:
         self._events = event_store
         self._cache = extraction_cache
@@ -123,6 +129,18 @@ class LogRegenerator:
         # test_rebuild_cli_is_read_only.py, not here; a caller that passes NONE cannot
         # construct the object at all. Do not read the annotation as a runtime guard.
         self._journal = journal
+        # confidence_scorer / temporal_resolver / normalizer / validator are REQUIRED
+        # for the same reason `journal` is: a default is how a silently-skipped stage
+        # survives. The cache holds RAW Stage-2 output (spec D2) -- replay's whole
+        # point is to re-run Stages 3-6 against it under the CURRENT ontology, so an
+        # ontology bump is re-derived rather than replaying stale post-Stage-6 state.
+        # A caller that forgets one of these four cannot construct a LogRegenerator at
+        # all; a caller that passes the wrong one still runs, same non-guarantee as
+        # `journal` above.
+        self._confidence_scorer = confidence_scorer
+        self._temporal_resolver = temporal_resolver
+        self._normalizer = normalizer
+        self._validator = validator
 
     def _assert_cache_coverage(self, turns: list[dict], epoch: dict) -> None:
         uncached = [
@@ -130,7 +148,6 @@ class LogRegenerator:
             for t in turns
             if self._cache.get(
                 t["event_id"],
-                epoch["ontology_version"],
                 epoch["extraction_version"],
                 epoch["model_hash"],
             )
@@ -354,16 +371,47 @@ class LogRegenerator:
         for turn in turns:
             cached = self._cache.get(
                 turn["event_id"],
-                epoch["ontology_version"],
                 epoch["extraction_version"],
                 epoch["model_hash"],
             )
             # coverage was asserted above, so cached is never None here
-            vr = ValidationResult(
-                valid=True,
+            if cached["outcome"] == OUTCOME_SKIPPED:
+                # A recorded decision, not a gap. The live pipeline looked at
+                # this turn and declined; replaying it as a no-op is what makes
+                # `live == rebuilt` reachable at all. Re-deciding here would need
+                # the wall clock (rate limit) and a model (significance).
+                processed += 1
+                last_ts = turn["timestamp"]
+                self._journal.checkpoint(job_id, turn["event_id"], processed, last_ts)
+                continue
+
+            extraction = ExtractionResult(
                 entities=cached["entities"],
                 relationships=cached["relationships"],
+                # The cache holds RAW Stage-2 output (spec D2) -- no source_utterance,
+                # since Stage 3's hedge/third-party confidence adjustment is one of the
+                # things replay re-derives, not something the cache is trusted for.
+                # `turn["user_utterance"]` is byte-identical to what fed the live
+                # extraction: `conversation_handler._record_turn_event` writes
+                # `user_utterance=user_message` to the event store, and the SAME
+                # `user_message` is what `_extract_knowledge_async` passes as
+                # `utterance=` on to `pre_process`, whose `original_text=utterance`
+                # assignment is unconditional (`preprocessor.py`, no branch rewrites it
+                # first). Omitting this left the adjustment permanently inert on
+                # replay: `extraction.source_utterance` defaulted to `""`, so
+                # `ConfidenceScorer.adjust_confidence`'s hedge-pattern search never
+                # matched anything, and a rebuild would silently disagree with the live
+                # graph on every hedged or third-party-attributed relationship.
+                source_utterance=turn["user_utterance"],
             )
+            # Stages 3-6, re-run rather than cached (spec D2). Pure code, no
+            # model -- pinned by tests/unit/knowledge/extraction/test_stage_purity.py.
+            reference_date = datetime.fromisoformat(turn["timestamp"])
+            extraction = self._confidence_scorer.adjust_confidence(extraction)
+            extraction = self._temporal_resolver.resolve(extraction, reference_date)
+            extraction = await self._normalizer.normalize(extraction)
+            vr = self._validator.validate(extraction)
+
             result: CurationResult = await self._curation.curate_and_store(
                 vr,
                 event_id=turn["event_id"],

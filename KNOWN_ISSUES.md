@@ -228,6 +228,24 @@ constraints are not relearned later.
   on unexpected data shapes (e.g., LLM returns properties as string
   instead of dict), entire pipeline crashes. Wrap each stage in try/except.
 
+- [ ] **pipeline.py -- `_SOURCE_THRESHOLDS` shadows the configured
+  significance threshold on the dominant extraction source.** `sig_threshold
+  = _SOURCE_THRESHOLDS.get(extraction_source, self._config.significance_threshold)`
+  (`grep -n "sig_threshold = _SOURCE_THRESHOLDS.get" backend/knowledge/extraction/pipeline.py`)
+  uses `self._config.significance_threshold` only as the fallback for a
+  source with no entry in `_SOURCE_THRESHOLDS`. `"conversation"` -- the
+  dominant extraction source -- HAS an entry (hardcoded `0.3`), so for it the
+  hardcoded value always wins and the env-settable `SIGNIFICANCE_THRESHOLD`
+  is never consulted. Silent because all three defaults happen to be `0.3`
+  -- a differing override is the only way to observe it. Pre-existing and
+  out of scope for extraction-cache-phase-1, but that phase raises its
+  severity: the significance decision this line makes is now written to the
+  extraction cache (`ExtractionCache.put`, `outcome`/`skip_reason`) and
+  inherited verbatim by every rebuild (`log_regenerator.py` replays the
+  cached decision rather than re-deciding it), so a dead config knob is no
+  longer only a live-tuning surprise -- it is now baked into rebuildable
+  history.
+
 - [x] **entity_extractor.py:59 -- Legacy `node_properties=False`.** -- resolved in Phase 2B, entity_extractor.py deleted
 
 ### Storage + Retrieval (Section F)

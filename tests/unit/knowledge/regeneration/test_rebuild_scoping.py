@@ -42,8 +42,11 @@ from backend.knowledge.curation.deduplication import DeduplicationResult
 from backend.knowledge.curation.graph_writer import WriteResult
 from backend.knowledge.curation.pipeline import CurationResult
 from backend.knowledge.curation.reconciliation import ReconcileTurnResult
-from backend.knowledge.extraction.validator import ValidationResult
-from backend.knowledge.extraction_cache import ExtractionCache
+from backend.knowledge.extraction.confidence import ConfidenceScorer
+from backend.knowledge.extraction.normalizer import EntityNormalizer
+from backend.knowledge.extraction.temporal import TemporalResolver
+from backend.knowledge.extraction.validator import ExtractionValidator, ValidationResult
+from backend.knowledge.extraction_cache import OUTCOME_EXTRACTED, ExtractionCache
 from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
 from backend.knowledge.regeneration.rebuild_journal import EventStoreRebuildJournal
 
@@ -191,6 +194,7 @@ def _warm(cache: ExtractionCache, epoch: dict[str, Any], event_id: str) -> None:
         epoch["ontology_version"],
         epoch["extraction_version"],
         epoch["model_hash"],
+        outcome=OUTCOME_EXTRACTED,
         entities=[{"id": "rust", "type": "Technology", "display_name": "Rust"}],
         relationships=[],
         created_at=TURN_TS,
@@ -270,6 +274,14 @@ def build_world(*, cache_superseded_turn: bool = True, with_orphan: bool = False
             # `test_the_job_ledger_totals_only_the_scoped_turns` still meaningful.
             # It is a deliberate choice here, not the default it used to be.
             journal=EventStoreRebuildJournal(store),
+            # This file's assertions are about SCOPING (which turns get selected),
+            # not about Stages 3-6, so the real (pure, no external dependency)
+            # production components are the simplest correct wiring -- Task 6
+            # (extraction-cache-phase-1).
+            confidence_scorer=ConfidenceScorer(),
+            temporal_resolver=TemporalResolver(),
+            normalizer=EntityNormalizer(embedding_generator=None, executor=None),
+            validator=ExtractionValidator(),
         ),
     )
 
@@ -373,13 +385,12 @@ class TestScopingConsequences:
 
     @pytest.mark.asyncio
     async def test_a_turn_from_a_superseded_ontology_epoch_is_not_replayed(self):
-        # Arrange: the superseded turn IS cached under the current triple, so its exclusion
+        # Arrange: the superseded turn IS cached under the current stamp pair, so its exclusion
         # can only be the ontology filter -- not an incidental ColdCacheError.
         world = build_world(cache_superseded_turn=True)
         assert (
             world.cache.get(
                 SUPERSEDED,
-                world.epoch["ontology_version"],
                 world.epoch["extraction_version"],
                 world.epoch["model_hash"],
             )
@@ -406,7 +417,6 @@ class TestScopingConsequences:
         assert (
             world.cache.get(
                 SUPERSEDED,
-                world.epoch["ontology_version"],
                 world.epoch["extraction_version"],
                 world.epoch["model_hash"],
             )
@@ -420,7 +430,7 @@ class TestScopingConsequences:
 
     @pytest.mark.asyncio
     async def test_test_origin_traffic_is_not_replayed_into_the_canonical_graph(self):
-        # Arrange: cached under the current triple and tagged with the current ontology, so
+        # Arrange: cached under the current stamp pair and tagged with the current ontology, so
         # only the origin guard can exclude it.
         world = build_world()
 
