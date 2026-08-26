@@ -1,13 +1,20 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-08-25 (**extraction-cache Phase 1 (spec D1, D2, D3, D10) COMPLETE on
-branch `feat/extraction-cache-production-writer` -- NOT merged, NOT pushed. Commit count:
-`git log --oneline main..HEAD | wc -l` (32 at the moment this line was written -- do not hardcode
-that number here again; run the command, since this file's own commits keep advancing it and a
-hardcoded count goes stale the instant it is committed). The first 28 landed the seven
+**Last Updated:** 2026-08-25 (**extraction-cache Phase 1 (spec D1, D2, D3, D10) COMPLETE and
+MERGED to `main` at `c2cc748` (`--no-ff`) -- NOT pushed; `origin/main` is still `330ff1c`.
+`--no-ff` deliberately, not a rebase: the review documents cite this branch's commit hashes and a
+rebase would invalidate every one (the same reasoning as the 2026-08-19 Q2-1 merge). Branch
+`feat/extraction-cache-production-writer` merged at its tip `1171423`; commit count on the merged
+branch: `git log --oneline 330ff1c..1171423 | wc -l` -- run it rather than hardcoding, since a
+hardcoded count goes stale the instant it is committed. The first 28 landed the seven
 implementation tasks; every commit after that closes one or more whole-branch-review fix waves --
 see this file's PRIOR ENTRY history below and `.superpowers/sdd/2026-08-18-extraction-cache-phase-1/`
-for which waves and how many. The production extraction path now writes one extraction-cache row
+for which waves and how many.
+
+Post-merge verification on `main` @ `c2cc748`, measured not inherited: suite **3070 passed / 6
+skipped / 3 xfailed / 0 failed**; live graph **32 nodes / 30 relationships**; tree clean (the
+`data/extraction_cache.db` a factory-built test now creates is gitignored as of this phase, so
+"tree clean" is a usable signal again). Same preconditions as below. The production extraction path now writes one extraction-cache row
 per turn --
 outcome, skip reason, the C1 bitemporal `recorded_at`, and the Stage 1.5 subject-scope
 classification -- and `graph-rebuild-from-log` replays Stages 3-6 as PURE CODE against that cached
