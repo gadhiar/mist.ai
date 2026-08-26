@@ -49,6 +49,50 @@ def test_golden_log_refuses_to_write_into_the_production_root():
         gen.assert_not_production_root(prod_root)
 
 
+def test_golden_log_permits_writing_to_an_ordinary_root(tmp_path):
+    """Review round 1, Minor 3: the refuse direction is proven above; this
+    proves the guard is not an unconditional raise. The 24 tests in
+    tests/unit/golden_log/ (test_generate.py, test_replay.py) already
+    exercise `materialize_isolated` end-to-end against ordinary `tmp_path`
+    roots and would catch an always-raise regression, but this pins the
+    permit direction locally, in the file someone reads when modifying the
+    guard.
+
+    Mutant this kills: `if True or Path(root).resolve() == prod:` (always
+    raise, over-eager).
+    """
+    from scripts.golden_log import generate as gen
+
+    gen.assert_not_production_root(tmp_path)  # must not raise
+
+
+def test_golden_log_does_not_misfire_when_the_production_cache_is_in_memory(monkeypatch):
+    """Review round 1, Minor 1: `production_cache_path` returns the bare
+    ":memory:" sentinel when the production event store is configured
+    in-memory (`backend/factories.py:production_cache_path`). Before this
+    fix, `assert_not_production_root` took `.parent` of that string
+    unconditionally -- `Path(":memory:").parent` is a relative "." whose
+    `.resolve()` is the process CWD, not a production root -- silently
+    retargeting the guard onto an unrelated directory instead of refusing
+    to compare at all. `EVENT_STORE_DB_PATH` is unreachable at ":memory:"
+    through the running container's real config (`.env:52`,
+    `docker-compose.yml:39` both set a real path), so this test drives the
+    sentinel branch directly via monkeypatch.
+
+    Mutant this kills: removing the ":memory:" early-return and letting
+    execution fall through to the unconditional `.parent.resolve()` branch
+    -- this test would then raise `GoldenLogError` for a root that merely
+    happens to equal the process CWD, which has nothing to do with any real
+    production cache.
+    """
+    monkeypatch.setenv("EVENT_STORE_DB_PATH", ":memory:")
+    from scripts.golden_log import generate as gen
+
+    misresolved_root = Path(":memory:").parent.resolve()  # what the old bug computed as "prod"
+
+    gen.assert_not_production_root(misresolved_root)  # must not raise
+
+
 def test_golden_log_and_production_cache_use_different_filenames():
     """The root check above is D10's real, sufficient invariant: two
     different roots can never produce the same path regardless of filename.

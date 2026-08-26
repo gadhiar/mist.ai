@@ -290,14 +290,35 @@ def assert_not_production_root(root: Path) -> None:
     actually derives for the live extraction cache, from the same authority,
     so the invariant survives a future change to either derivation.
 
+    Matches an EXACT equal root only -- unlike `assert_isolated_root`'s
+    `resolved == live or live in resolved.parents`, a root merely under the
+    production root is not refused here. That is intentional: the hazard is
+    a colliding FILE, and the golden log's cache filename is fixed within
+    `root` (`golden_log_cache_path`), so a subdirectory of the production
+    root produces a different path, not a collision.
+
+    When the production event store is configured `":memory:"`,
+    `production_cache_path` returns the bare sentinel with no real parent
+    directory. This refuses to compare at all in that case rather than
+    taking `.parent` of the sentinel string, which resolves to the process
+    CWD and would silently retarget the guard onto an unrelated directory
+    (review round 1, Minor 1) -- refusing legitimate roots that happen to
+    equal the CWD while never refusing the real live directories. An
+    in-memory production cache has no on-disk file for the golden log's
+    cache to collide with, so there is nothing to guard against.
+
     Raises:
         GoldenLogError: When `root` resolves to the production cache's parent
-            directory.
+            directory. Never raised while the production cache is
+            ":memory:".
     """
     from backend.factories import production_cache_path
     from backend.knowledge.config import KnowledgeConfig
 
-    prod = Path(production_cache_path(KnowledgeConfig.from_env())).parent.resolve()
+    live_cache_path = production_cache_path(KnowledgeConfig.from_env())
+    if live_cache_path == ":memory:":
+        return
+    prod = Path(live_cache_path).parent.resolve()
     if Path(root).resolve() == prod:
         raise GoldenLogError(
             f"refusing to write the golden log's authored extractions into the "
