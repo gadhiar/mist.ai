@@ -111,18 +111,22 @@ class ExtractionCache:
         return self._conn
 
     def get(self, event_id: str, extraction_version: str, model_hash: str) -> dict[str, Any] | None:
-        """Return the cached extraction DECISION for the stamp pair, or None on miss.
+        r"""Return the cached extraction DECISION for the stamp pair, or None on miss.
 
         None means "this turn was never recorded". It is NOT the same as an
         entry whose outcome is 'skipped' with empty lists -- that one means "the
         live pipeline looked and decided not to extract". This method keeps that
-        distinction on every read; whether a CALLER acts on it is a separate
-        question this task does not answer. `grep -n "self._cache.get("
-        backend/knowledge/regeneration/log_regenerator.py` shows both call sites
-        still test the result for `is None` only, so a 'skipped' row and an
-        'extracted' row are both "covered" to `_assert_cache_coverage` today.
-        Keeping the distinction end-to-end, so callers branch on `outcome` too,
-        is spec D1's target state -- not something this task changed.
+        distinction on every read; the two call sites in
+        `backend/knowledge/regeneration/log_regenerator.py` (`grep -n
+        "self._cache.get(" backend/knowledge/regeneration/log_regenerator.py`)
+        now act on it differently, and correctly so for different reasons:
+        `_assert_cache_coverage` still tests `is None` only -- correctly, because
+        a recorded decision (either outcome) IS coverage; a 'skipped' row is not
+        a gap. The replay loop in `rebuild()` branches on `outcome` (`grep -n
+        'cached\["outcome"\]' backend/knowledge/regeneration/log_regenerator.py`)
+        and treats a `skipped` row as a no-op turn rather than re-deciding it --
+        spec D1's target state, landed in this same branch (Task 6), not a
+        pending follow-up.
         """
         key = cache_key(event_id, extraction_version, model_hash)
         row = (
