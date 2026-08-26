@@ -183,10 +183,10 @@ def is_eval_isolation_active() -> bool:
             not treat an operator typo ('ture', 'enabled') as "isolation off"
             and silently run unguarded against the live graph.
     """
-    return _parse_isolation_flag("MIST_EVAL_ISOLATION")
+    return parse_isolation_flag("MIST_EVAL_ISOLATION")
 
 
-def _parse_isolation_flag(env_var: str) -> bool:
+def parse_isolation_flag(env_var: str) -> bool:
     """Parse one isolation activation flag, failing closed on anything unrecognized.
 
     Shared by `is_eval_isolation_active` and `is_hydration_isolation_active` so
@@ -233,7 +233,7 @@ def is_hydration_isolation_active() -> bool:
     sets `MIST_SESSION_ORIGIN=real`, so they would be indistinguishable from
     genuine usage and un-excludable from every future rebuild.
     """
-    return _parse_isolation_flag("MIST_HYDRATION_ISOLATION")
+    return parse_isolation_flag("MIST_HYDRATION_ISOLATION")
 
 
 def _parse_endpoint_allowlist(env_var: str, default: str) -> set[tuple[str, int]]:

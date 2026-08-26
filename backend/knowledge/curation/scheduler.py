@@ -13,12 +13,19 @@ examined" from "what it produced".
 import asyncio
 import contextlib
 import logging
+import os
 import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+
+from backend.knowledge.eval_isolation import (
+    EvalIsolationError,
+    is_hydration_isolation_active,
+    parse_isolation_flag,
+)
 
 from .run_record import (
     OUTCOME_COMPLETED,
@@ -51,6 +58,38 @@ class JobResult:
     duration_ms: float
     error: str | None = None
     result: Any = None
+
+
+def curation_scheduler_enabled() -> bool:
+    """Whether the background curation loop may start (B1). Defaults to TRUE.
+
+    The scheduler makes every enabled job due on its FIRST pass, so a 24-hour
+    interval fires immediately -- fine for live, fatal for a `live == rebuilt`
+    gate. `SkillDerivationJob` writes a node AND an edge inside the compared
+    `:__Entity__` surface (`skill_derivation.py:160,173-174`), and
+    `orphan_detector.py:86` / `confidence_decay.py:39` write `status`, which
+    `canonical_serialize` does not exclude. None of it is a function of the log,
+    so no rebuild can reproduce any of it.
+
+    Defaults to True so adding the knob changes nothing about live. Reads
+    MIST_CURATION_SCHEDULER_ENABLED.
+
+    Fails toward OFF on an unrecognized value, which is the OPPOSITE of
+    `is_hydration_isolation_active`'s raise -- deliberately. That one is read by
+    a CLI which can print a refusal and exit; this one is read during server
+    startup, where raising would take the backend down over a typo. A scheduler
+    that did not run is a recoverable annoyance; a scheduler that ran during a
+    gate run is a corrupted comparison.
+    """
+    if os.getenv("MIST_CURATION_SCHEDULER_ENABLED") is None:
+        return True
+    try:
+        return parse_isolation_flag("MIST_CURATION_SCHEDULER_ENABLED")
+    except EvalIsolationError as exc:
+        logger.warning(
+            "MIST_CURATION_SCHEDULER_ENABLED unparsable, disabling the scheduler: %s", exc
+        )
+        return False
 
 
 class CurationScheduler:
@@ -197,9 +236,30 @@ class CurationScheduler:
             logger.error("Failed to record curation run for job %s: %s", job_result.name, e)
 
     async def start(self) -> None:
-        """Start the background scheduler loop."""
+        """Start the background scheduler loop.
+
+        Gated here rather than at the server call site so every caller inherits
+        the check (B1). Note `run_all_once` is deliberately NOT gated -- it is
+        an explicit ops action, and the `curation_job_runs` postcondition
+        (`scripts/hydration/postconditions.py`) is what covers it.
+        """
         if self._running:
             logger.warning("Scheduler already running")
+            return
+
+        # Structural no beats explicit yes: nothing legitimately runs curation
+        # against a hydration target, and forgetting the knob during a
+        # hydration run is the precise failure B1 exists to prevent. Same
+        # reasoning that gives `assert_neo4j_dev_isolated` no off switch.
+        if is_hydration_isolation_active():
+            logger.info(
+                "Curation scheduler NOT started: MIST_HYDRATION_ISOLATION is set. Its "
+                "jobs write nodes, edges and `status` inside the compared :__Entity__ "
+                "surface, none of it derivable from the log."
+            )
+            return
+        if not curation_scheduler_enabled():
+            logger.info("Curation scheduler NOT started: MIST_CURATION_SCHEDULER_ENABLED is off.")
             return
 
         self._running = True

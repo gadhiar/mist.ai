@@ -30,6 +30,12 @@
 #   docker compose -f docker-compose.yml -f docker-compose.override.yml \
 #     -f docker-compose.dev-hydration.yml --profile dev up -d \
 #     mist-neo4j-dev mist-backend-dev
+#   # Seed the dev graph. --seed-dir is REQUIRED here (B4): the seed source is
+#   # mounted at /app/seed, outside MIST_VAULT_ROOT, so the derived default
+#   # (config.vault.root / "seed") does not exist in this container.
+#   docker compose -f docker-compose.yml -f docker-compose.override.yml \
+#     -f docker-compose.dev-hydration.yml --profile dev exec mist-backend-dev \
+#     python scripts/mist_admin.py seed --seed-dir /app/seed
 #   # ... run hydration against ws://localhost:8002/ws ...
 #   docker compose -f docker-compose.yml -f docker-compose.override.yml \
 #     -f docker-compose.dev-hydration.yml --profile dev stop \
@@ -162,6 +168,23 @@ services:
       # staleness check would be vacuous -- which `digest_corpus` refuses
       # rather than silently recording "unknown".
       - ./data/golden-log:/app/data/golden-log:ro
+      # B4: the seed SOURCE, read-only, following the golden-log precedent
+      # directly above -- authored, checked-in content, not live state.
+      #
+      # The dev stack sets MIST_VAULT_ROOT=/app/dev-state/vault, which has no
+      # seed/, so `mist_admin seed` had no source at all in this container.
+      # Both obvious fixes break the isolation guarantee the header states:
+      # mounting ./mist-memory re-exposes the live vault wholesale, and
+      # repointing MIST_VAULT_ROOT at it redirects every vault WRITE the
+      # 87-turn hydration run makes onto the live vault.
+      #
+      # Mounting only the seed subdirectory, read-only, and at a path OUTSIDE
+      # the vault root keeps both properties: the source is readable, the live
+      # vault is not, and nothing can write back. Callers must pass
+      # `--seed-dir /app/seed` explicitly rather than letting cmd_seed derive
+      # it from config.vault.root -- deriving it is what would silently send
+      # the lookup back into dev-state.
+      - ./mist-memory/seed:/app/seed:ro
       # Code, read-only, mirroring docker-compose.override.yml. Read-only is
       # not merely hygiene here: it is what keeps a dev-stack process from
       # editing the tree the live stack is running from.
