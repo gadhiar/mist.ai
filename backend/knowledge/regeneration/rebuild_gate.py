@@ -203,6 +203,75 @@ def assert_extraction_cache_non_vacuous(rows, *, minimum: int) -> None:
         )
 
 
+def _self_model_node_count(form: str, *, side: str) -> int:
+    """Read the self-model node count from a canonical form, or refuse."""
+    try:
+        payload = json.loads(form)
+    except json.JSONDecodeError as exc:
+        raise RebuildVacuityError(f"{side} form is not a canonical graph form: {exc}") from exc
+    if "self_model" not in payload:
+        raise RebuildVacuityError(
+            f"{side} form carries no 'self_model' key, so it was produced WITHOUT "
+            "include_self_model=True. Comparing two such forms would report the "
+            "self-model verified while never having looked at it -- the most "
+            "dangerous pass available here. Rebuild the form with "
+            "include_self_model=True."
+        )
+    nodes = payload["self_model"].get("nodes")
+    if not isinstance(nodes, list):
+        raise RebuildVacuityError(f"{side} form's self_model.nodes is not a list")
+    return len(nodes)
+
+
+def assert_self_model_applied(live_form: str, rebuilt_form: str) -> None:
+    """Hard gate: the self-model must be present on both sides AND equal.
+
+    Non-zero AND equal, never merely equal, and the distinction is the whole
+    reason this exists. The closure design's sequencing error was exactly this:
+    delete copy-forward, wire a seed-apply that writes zero nodes, and every
+    existing gate stays green -- determinism passes because two empty
+    self-models are byte-identical, and `live == rebuilt` passes because it
+    never looked at that partition at all. The retirement would have been
+    proven by nothing.
+
+    So "applied nothing" and "applied correctly" have to be different
+    observables. An equality check alone cannot tell them apart; a count floor
+    alone cannot catch a partial apply. Both, together, can.
+
+    Args:
+        live_form: Canonical form of the source graph, built with
+            `include_self_model=True`.
+        rebuilt_form: Canonical form of the staging graph, same setting.
+
+    Raises:
+        RebuildVacuityError: when either form lacks the partition (a caller
+            bug that would otherwise pass silently), when both sides are empty,
+            when the rebuild applied nothing, or when the counts disagree.
+    """
+    live = _self_model_node_count(live_form, side="live")
+    rebuilt = _self_model_node_count(rebuilt_form, side="rebuilt")
+
+    if live == 0 and rebuilt == 0:
+        raise RebuildVacuityError(
+            "self-model gate FAILED: both sides carry 0 self-model nodes. Two empty "
+            "partitions are byte-identical, so an equality check over them is green "
+            "and meaningless. Either the seed was never applied or the partition was "
+            "never populated; neither is a passing state."
+        )
+    if rebuilt == 0:
+        raise RebuildVacuityError(
+            f"self-model gate FAILED: the rebuild applied nothing -- live carries "
+            f"{live} self-model node(s), the rebuild carries 0. This is the "
+            "seed-apply-writes-zero case the copy-forward retirement must not be "
+            "able to hide."
+        )
+    if live != rebuilt:
+        raise RebuildVacuityError(
+            f"self-model gate FAILED: live carries {live} self-model node(s), the "
+            f"rebuild carries {rebuilt}. A partial apply is not a pass."
+        )
+
+
 def assert_rebuild_twice_identical(build_a: str, build_b: str) -> None:
     """Hard gate: two rebuilds of the same epoch+log must be byte-identical."""
     if build_a != build_b:

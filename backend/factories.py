@@ -313,12 +313,40 @@ def production_cache_path(config: KnowledgeConfig) -> str:
     return str(Path(event_store_path).parent / "extraction_cache.db")
 
 
+def resolve_internal_derivation(explicit: bool | None) -> bool:
+    """Whether Stage 9 (internal knowledge derivation) may run.
+
+    Stage 9 runs on the LIVE path (`pipeline.py:813`) and NEVER on rebuild --
+    `log_regenerator.py` has zero references to it. It MERGEs into
+    `SELF_MODEL_LABEL`, so today it sits outside the `:__Entity__`-only
+    comparison surface and the asymmetry is invisible. The moment MIS-131 adds
+    `include_self_model=True` it becomes a live-only writer INSIDE the compared
+    surface, and the gate goes RED for a reason unrelated to seed-apply.
+
+    Hydration isolation forces it OFF and an explicit `True` cannot override
+    that -- structural no beats explicit yes, the same rule
+    `CurationScheduler.start()` follows (B1). A caller passing True is
+    asserting intent about ingestion, not about whether the comparison surface
+    stays derivable.
+
+    Args:
+        explicit: A caller's stated preference, or None for "decide from
+            context". None yields True in production, so nothing about live
+            changes by this function existing.
+    """
+    from backend.knowledge.eval_isolation import is_hydration_isolation_active
+
+    if is_hydration_isolation_active():
+        return False
+    return True if explicit is None else explicit
+
+
 def build_extraction_pipeline(
     config: KnowledgeConfig,
     graph_store: GraphStore | None = None,
     llm_provider: StreamingLLMProvider | None = None,
     include_curation: bool = True,
-    include_internal_derivation: bool = True,
+    include_internal_derivation: bool | None = None,
     debug_logger: "DebugJSONLLogger | None" = None,  # noqa: F821
 ) -> ExtractionPipeline:
     """Create a fully wired ExtractionPipeline."""
@@ -346,7 +374,7 @@ def build_extraction_pipeline(
     provider = llm_provider or build_llm_provider(config)
 
     internal_deriver = None
-    if include_internal_derivation:
+    if resolve_internal_derivation(include_internal_derivation):
         from backend.knowledge.extraction.internal_derivation import InternalKnowledgeDeriver
 
         internal_deriver = InternalKnowledgeDeriver(

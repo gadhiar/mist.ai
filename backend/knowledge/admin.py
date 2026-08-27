@@ -916,6 +916,7 @@ def dump_graph_json(
     connection: GraphConnection,
     *,
     include_provenance: bool = False,
+    include_self_model: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     """Return the __Entity__ subgraph as a JSON-serializable dict.
 
@@ -926,8 +927,22 @@ def dump_graph_json(
     - ``cross_layer_edges``: list of edge dicts spanning ``:__Entity__`` and
       ``:__Provenance__`` (both directions).
 
-    Default behaviour (``include_provenance=False``) is unchanged — only the
-    entity subgraph is returned.
+    When *include_self_model* is True two further keys are included (MIS-131):
+
+    - ``self_model``: dict with ``nodes`` and ``relationships`` for the
+      ``:__SelfModel__`` partition.
+    - ``self_model_cross_layer_edges``: edges spanning ``:__Entity__`` and
+      ``:__SelfModel__`` (both directions). Neither `_dump_subgraph` call can
+      see these -- each requires BOTH endpoints to carry its label -- so
+      without this key they stay invisible to the gate exactly as the
+      partition itself was.
+
+    The two switches are ORTHOGONAL, not a ladder: a caller wanting the
+    self-model is not forced to also take provenance, which is log-derived but
+    deliberately not gated.
+
+    Default behaviour (both False) is unchanged — only the entity subgraph is
+    returned.
     """
     result = _dump_subgraph(connection, "__Entity__")
 
@@ -949,6 +964,26 @@ def dump_graph_json(
                 "properties": row["properties"],
             }
             for row in connection.execute_query(cross_query)
+        ]
+
+    if include_self_model:
+        result["self_model"] = _dump_subgraph(connection, SELF_MODEL_LABEL)
+
+        self_model_cross_query = """
+        MATCH (s)-[r]->(t)
+        WHERE (s:__Entity__ AND t:__SelfModel__) OR (s:__SelfModel__ AND t:__Entity__)
+        RETURN s.id AS source, type(r) AS type, t.id AS target,
+               properties(r) AS properties
+        ORDER BY s.id, type(r), t.id
+        """
+        result["self_model_cross_layer_edges"] = [
+            {
+                "source": row["source"],
+                "type": row["type"],
+                "target": row["target"],
+                "properties": row["properties"],
+            }
+            for row in connection.execute_query(self_model_cross_query)
         ]
 
     return result

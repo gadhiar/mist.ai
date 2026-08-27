@@ -130,7 +130,9 @@ def _rel_key(r: dict[str, Any]) -> tuple[str, str, str, str, str, str, str]:
     )
 
 
-def canonical_graph_form(connection, *, include_provenance: bool = False) -> str:
+def canonical_graph_form(
+    connection, *, include_provenance: bool = False, include_self_model: bool = False
+) -> str:
     """Return a deterministic canonical string for the graph.
 
     Excludes wall-clock/audit fields + embeddings; sorts nodes by id, edges by
@@ -139,7 +141,11 @@ def canonical_graph_form(connection, *, include_provenance: bool = False) -> str
     Two graphs with identical content produce identical strings regardless of
     write wall-clock time or write order.
     """
-    payload = dump_graph_json(connection, include_provenance=include_provenance)
+    payload = dump_graph_json(
+        connection,
+        include_provenance=include_provenance,
+        include_self_model=include_self_model,
+    )
 
     canon: dict[str, Any] = {
         "nodes": [_node(n) for n in sorted(payload["nodes"], key=_node_key)],
@@ -154,5 +160,19 @@ def canonical_graph_form(connection, *, include_provenance: bool = False) -> str
         }
         canon["cross_layer_edges"] = [
             _rel(r) for r in sorted(payload["cross_layer_edges"], key=_rel_key)
+        ]
+    if include_self_model:
+        # Same canonicalisation as the entity partition. The exclusion rules are
+        # about the FIELDS, not about which partition they sit in, and two
+        # partitions applying different rules would diverge on wall-clock noise
+        # rather than on content.
+        canon["self_model"] = {
+            "nodes": [_node(n) for n in sorted(payload["self_model"]["nodes"], key=_node_key)],
+            "relationships": [
+                _rel(r) for r in sorted(payload["self_model"]["relationships"], key=_rel_key)
+            ],
+        }
+        canon["self_model_cross_layer_edges"] = [
+            _rel(r) for r in sorted(payload["self_model_cross_layer_edges"], key=_rel_key)
         ]
     return json.dumps(canon, sort_keys=True, indent=2) + "\n"
