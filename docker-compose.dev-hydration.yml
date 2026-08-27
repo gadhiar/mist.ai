@@ -46,11 +46,17 @@
 #     -f docker-compose.dev-hydration.yml --profile dev exec mist-backend-dev \
 #     python scripts/mist_admin.py hydrate /app/data/golden-log/golden-log.jsonl
 #
-#   # The WebSocket route (ws://localhost:8002/ws) remains guarded by
-#   # assert_ws_target_not_live + scripts/hydration/target.py, but is NOT the
-#   # primary path: session_id is generated server-side per connection
-#   # (server.py, uuid4), so a WS client cannot tell the backend which corpus
-#   # session it is driving, and the hydration clock keys on exactly that.
+#   # The WebSocket route (ws://localhost:8002/ws) is NOT the primary path and
+#   # is NOT currently guarded on any live call path. assert_ws_target_not_live
+#   # and scripts/hydration/target.py EXIST and are tested, but nothing invokes
+#   # them -- they were written before the send loop, and the send loop was then
+#   # established to be the wrong design: session_id is generated server-side
+#   # per connection (server.py, uuid4), so a WS client cannot tell the backend
+#   # which corpus session it is driving, and the hydration clock keys on
+#   # exactly that. Anyone reviving the WS route must WIRE those guards in; an
+#   # earlier revision of this comment claimed the route "remains guarded",
+#   # which would have left the `--ws-url ws://localhost:8001/ws` typo they
+#   # were written for completely unblocked.
 #   docker compose -f docker-compose.yml -f docker-compose.override.yml \
 #     -f docker-compose.dev-hydration.yml --profile dev stop \
 #     mist-backend-dev mist-neo4j-dev
@@ -128,6 +134,21 @@ services:
       #
       # --- marks this container as the hydration target ---------------------
       - MIST_HYDRATION_ISOLATION=1
+      # B2: the corpus whose AUTHORED timestamps `_record_turn_event` stamps
+      # instead of the wall clock. Without it every turn is stamped with the
+      # moment the run happened, collapsing the golden log's gap ladder
+      # (2025-09 -> 2026-07-15) onto one instant -- and the gate would still
+      # pass, because both sides read that same flattened timeline back out of
+      # the event store. `preflight.assert_clock_present` refuses rather than
+      # letting that happen, which means WITHOUT this line the documented
+      # runbook above exits 2 every time. (It did, until review caught it: the
+      # runbook named the variable as required and nothing ever set it.)
+      #
+      # Points at the read-only golden-log mount, not the corpus argument --
+      # `factories.build_hydration_clock` reads the env var, and it also
+      # refuses to build a clock at all unless MIST_HYDRATION_ISOLATION is set,
+      # so this pair is inert on any container that is not this one.
+      - MIST_HYDRATION_CLOCK=/app/data/golden-log/golden-log.jsonl
       # Sessions are recorded origin='real', and that is a decision rather than
       # an omission. `origin` exists to keep fixture traffic out of the
       # CANONICAL graph, and it discriminates WITHIN one event store. This

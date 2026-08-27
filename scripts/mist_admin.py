@@ -1377,6 +1377,8 @@ async def run_replay(
     inputs: list[dict[str, Any]],
     default_session_id: str,
     default_user_id: str = "User",
+    *,
+    stop_on_failure: bool = False,
 ) -> list[dict[str, Any]]:
     """Replay a list of inputs through `run_chat`, preserving per-entry metadata.
 
@@ -1405,6 +1407,20 @@ async def run_replay(
             if key in entry:
                 result[key] = entry[key]
         results.append(result)
+        if stop_on_failure and not result["ok"]:
+            # Hydration aborts; eval replays do not. An eval run wants every
+            # probe scored even when some fail, but a hydration run that has
+            # already diverged is producing a PARTIAL graph, and every further
+            # turn is inference spent making it larger rather than usable --
+            # roughly an hour on the 87-turn corpus. Returning early also means
+            # the caller's fail_count sees the failure immediately.
+            logger.warning(
+                "run_replay stopping at input %d of %d: %s",
+                len(results),
+                len(inputs),
+                result.get("error"),
+            )
+            break
     return results
 
 
@@ -1572,7 +1588,7 @@ async def run_extraction_only_replay(
     return results
 
 
-def _read_replay_inputs(path: Path) -> list[dict[str, Any]]:
+def _read_replay_inputs(path: Path, *, with_line_numbers: bool = False) -> list[dict[str, Any]]:
     """Load replay inputs from a JSONL or plain-text file.
 
     JSONL (`.jsonl`/`.json`): one JSON object per line, each with at least
@@ -1600,10 +1616,18 @@ def _read_replay_inputs(path: Path) -> list[dict[str, Any]]:
                 obj = json.loads(line)
             except json.JSONDecodeError as e:
                 raise ValueError(f"Invalid JSON on line {i} of {path}: {e}") from e
+            # `_lineno` is OPT-IN. It carries the TRUE file line, which matters
+            # because blank and '#' lines are skipped above without advancing
+            # the list index -- so index+1 and file line diverge on any corpus
+            # with a header comment, and a diagnostic pointing an operator at
+            # the wrong row is worse than none. Opt-in rather than always-on so
+            # this shared helper's return shape (and cmd_replay's contract, and
+            # three existing tests asserting exact dicts) stays unchanged.
+            lineno = {"_lineno": i} if with_line_numbers else {}
             if isinstance(obj, str):
-                items.append({"utterance": obj})
+                items.append({"utterance": obj, **lineno})
             elif isinstance(obj, dict):
-                items.append(obj)
+                items.append({**obj, **lineno})
             else:
                 raise ValueError(
                     f"Line {i} of {path}: expected object or string, " f"got {type(obj).__name__}"
@@ -1777,23 +1801,30 @@ def cmd_hydrate(args: argparse.Namespace) -> int:
     from scripts.hydration.postconditions import (
         HydrationPostconditionError,
         assert_no_curation_job_runs,
+        snapshot_curation_run_ids,
     )
 
     input_path = Path(args.input)
     if not input_path.exists():
         raise FileNotFoundError(f"Hydration corpus not found: {input_path}")
-    inputs = _read_replay_inputs(input_path)
+    inputs = _read_replay_inputs(input_path, with_line_numbers=True)
     if not inputs:
-        print(f"[hydrate] No inputs in {input_path}")
-        return 0
+        # NOT exit 0. A caller scripting `hydrate && snapshot && compare` would
+        # otherwise proceed to compare two seed-only graphs -- exactly the
+        # vacuous-green case `assert_replay_derived_non_vacuous` exists to
+        # refuse. "Nothing to drive" is an error here, whatever it means
+        # elsewhere.
+        print(f"[hydrate] REFUSED: no inputs in {input_path}", file=sys.stderr)
+        return 2
 
     missing_keys = [
         i for i, row in enumerate(inputs) if "session_id" not in row or "turn_index" not in row
     ]
     if missing_keys:
+        first = inputs[missing_keys[0]].get("_lineno", missing_keys[0] + 1)
         print(
             f"[hydrate] {len(missing_keys)} corpus rows lack session_id or turn_index "
-            f"(first at line {missing_keys[0] + 1}). The hydration clock keys on both; "
+            f"(first at line {first}). The hydration clock keys on both; "
             "a corpus without them cannot carry an authored timeline.",
             file=sys.stderr,
         )
@@ -1826,14 +1857,26 @@ def cmd_hydrate(args: argparse.Namespace) -> int:
             return 2
         print("[hydrate] Preflight passed.")
 
+        # Capture the ledger BEFORE driving anything. dev-state is a named
+        # volume that outlives `docker compose down`, so pre-existing rows are
+        # normal; without a baseline the postcondition would report every later
+        # run CONTAMINATED over rows this run did not write.
+        curation_baseline = snapshot_curation_run_ids(handler.event_store)
+
         results = asyncio.run(
-            run_replay(handler, inputs, args.session_id or "hydration", args.user_id or "User")
+            run_replay(
+                handler,
+                inputs,
+                args.session_id or "hydration",
+                args.user_id or "User",
+                stop_on_failure=True,
+            )
         )
         _print_replay_summary(results)
 
         if handler.event_store is not None:
             try:
-                assert_no_curation_job_runs(handler.event_store)
+                assert_no_curation_job_runs(handler.event_store, baseline=curation_baseline)
             except HydrationPostconditionError as e:
                 # Exit 2 as well: the run completed, but its output is not
                 # usable, and a caller must not proceed to snapshot or compare.

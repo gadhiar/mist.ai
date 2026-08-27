@@ -187,6 +187,11 @@ def assert_extraction_cache_non_vacuous(rows, *, minimum: int) -> None:
         raise ValueError(
             f"minimum={minimum} would be satisfied by an empty cache; pass at least 1."
         )
+    # Materialise first: `rows` is the natural shape for a cursor or generator,
+    # and the failure branch below calls len(rows). Measuring after consuming
+    # would replace this gate's diagnosis with a TypeError from inside its own
+    # error path -- a guard that crashes instead of explaining.
+    rows = list(rows)
     substantive = sum(
         1
         for row in rows

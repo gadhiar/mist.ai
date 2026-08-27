@@ -104,6 +104,17 @@ def assert_hydration_target(
             f"({exc}). Refusing an unverifiable target."
         ) from exc
 
+    if not isinstance(payload, dict):
+        # `json.loads` returns any JSON type. A bare scalar (42, null, true)
+        # would make the `in` test below raise TypeError, which neither except
+        # clause above catches -- so a misconfigured proxy would produce a
+        # stack trace instead of this module's promised refusal. Fail-closed
+        # either way; this is about the diagnosis.
+        raise HydrationTargetError(
+            f"Hydration target {url!r} returned a non-object JSON payload "
+            f"({type(payload).__name__}). Refusing an unverifiable target."
+        )
+
     if "hydration_isolation" not in payload:
         raise HydrationTargetError(
             f"Hydration target {url!r} did not report `hydration_isolation`. That "

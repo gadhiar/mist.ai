@@ -73,10 +73,23 @@ class TestCurationSchedulerEnabled:
         """Live behaviour must be unchanged by adding a knob."""
         assert curation_scheduler_enabled() is True
 
-    @pytest.mark.parametrize("raw", ["0", "false", "no", "off", ""])
+    @pytest.mark.parametrize("raw", ["0", "false", "no", "off"])
     def test_explicit_falsy_disables(self, monkeypatch, raw):
         monkeypatch.setenv(_KNOB, raw)
         assert curation_scheduler_enabled() is False
+
+    @pytest.mark.parametrize("raw", ["", "   "])
+    def test_empty_means_unset_not_off(self, monkeypatch, raw):
+        """Reversed by review, and it was a live-stack hazard.
+
+        `parse_isolation_flag` reads with a "" default and "" is in _FALSY, so
+        treating empty as a value meant `- MIST_CURATION_SCHEDULER_ENABLED=`
+        in a compose file (or a bare trailing line in .env) silently disabled
+        curation on LIVE, with only an INFO line as evidence. Docker Compose
+        writes an empty value there, not an absent one.
+        """
+        monkeypatch.setenv(_KNOB, raw)
+        assert curation_scheduler_enabled() is True
 
     @pytest.mark.parametrize("raw", ["1", "true", "on"])
     def test_explicit_truthy_enables(self, monkeypatch, raw):
@@ -156,12 +169,12 @@ class _FakeStore:
 
 class TestAssertNoCurationJobRuns:
     def test_an_empty_ledger_passes(self):
-        assert_no_curation_job_runs(_FakeStore([]))
+        assert_no_curation_job_runs(_FakeStore([]), baseline=frozenset())
 
     def test_any_run_refuses(self):
         store = _FakeStore([{"job_name": "skill_derivation", "outcome": "ok"}])
         with pytest.raises(HydrationPostconditionError, match="skill_derivation"):
-            assert_no_curation_job_runs(store)
+            assert_no_curation_job_runs(store, baseline=frozenset())
 
     def test_it_names_every_job_that_ran(self):
         """An operator needs to know the blast radius, not just that it happened."""
@@ -172,9 +185,49 @@ class TestAssertNoCurationJobRuns:
             ]
         )
         with pytest.raises(HydrationPostconditionError) as exc:
-            assert_no_curation_job_runs(store)
+            assert_no_curation_job_runs(store, baseline=frozenset())
         assert "skill_derivation" in str(exc.value)
         assert "orphan_detection" in str(exc.value)
+
+    def test_a_pre_existing_run_in_the_baseline_is_ignored(self):
+        """The windowing, and the reason for it.
+
+        `dev-state/` is a named volume that survives `docker compose down`, so
+        the ledger is not empty just because THIS run wrote nothing. Without a
+        baseline, one dev boot without MIST_HYDRATION_ISOLATION would report
+        every later hydration CONTAMINATED forever, with no way to tell a real
+        contamination from a stale row.
+        """
+        store = _FakeStore([{"run_id": "old-1", "job_name": "confidence_decay"}])
+        assert_no_curation_job_runs(store, baseline=frozenset({"old-1"}))
+
+    def test_a_new_run_is_still_caught_alongside_a_baseline(self):
+        """Non-vacuity for the test above: windowing must not disable the gate.
+
+        Ignoring pre-existing rows is only safe if a row that appeared DURING
+        the window still refuses. Without this, a baseline that swallowed
+        everything would look identical to one that works.
+        """
+        store = _FakeStore(
+            [
+                {"run_id": "old-1", "job_name": "confidence_decay"},
+                {"run_id": "new-1", "job_name": "skill_derivation"},
+            ]
+        )
+        with pytest.raises(HydrationPostconditionError, match="skill_derivation"):
+            assert_no_curation_job_runs(store, baseline=frozenset({"old-1"}))
+
+    def test_the_message_names_only_the_new_run(self):
+        """An operator chasing a stale row is chasing the wrong thing."""
+        store = _FakeStore(
+            [
+                {"run_id": "old-1", "job_name": "confidence_decay"},
+                {"run_id": "new-1", "job_name": "skill_derivation"},
+            ]
+        )
+        with pytest.raises(HydrationPostconditionError) as exc:
+            assert_no_curation_job_runs(store, baseline=frozenset({"old-1"}))
+        assert "confidence_decay" not in str(exc.value)
 
     def test_it_catches_the_manual_trigger_that_start_does_not_gate(self):
         """`run_all_once` bypasses `start()` entirely; the ledger still records it.
@@ -184,4 +237,4 @@ class TestAssertNoCurationJobRuns:
         """
         store = _FakeStore([{"job_name": "confidence_decay", "outcome": "ok"}])
         with pytest.raises(HydrationPostconditionError):
-            assert_no_curation_job_runs(store)
+            assert_no_curation_job_runs(store, baseline=frozenset())

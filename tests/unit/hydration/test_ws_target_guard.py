@@ -191,3 +191,40 @@ class TestAssertHydrationTarget:
         monkey = "wss://mist-backend-dev:8001/ws"
         assert_hydration_target(monkey)
         assert fake_health["seen_urls"] == ["https://mist-backend-dev:8001/health"]
+
+
+class TestNonObjectHealthPayload:
+    """Cloud-review finding: a bare JSON scalar crashed instead of refusing.
+
+    `json.loads` returns any JSON type. `"hydration_isolation" not in 42`
+    raises TypeError, which neither except clause in `assert_hydration_target`
+    catches -- so a misconfigured proxy produced a stack trace rather than this
+    module's promised refusal. Fail-closed either way; this is about the
+    diagnosis being legible.
+    """
+
+    @pytest.fixture
+    def fake_health(self, monkeypatch):
+        state = {"payload": {"hydration_isolation": True}, "seen_urls": []}
+
+        def _fetch(url, timeout):  # noqa: ARG001
+            state["seen_urls"].append(url)
+            return state["payload"]
+
+        monkeypatch.setattr("scripts.hydration.target._fetch_health", _fetch)
+        return state
+
+    @pytest.mark.parametrize("payload", [42, None, True, "healthy", 3.5])
+    def test_a_scalar_payload_refuses_with_a_message(self, fake_health, payload):
+        fake_health["payload"] = payload
+        with pytest.raises(HydrationTargetError, match="non-object JSON"):
+            assert_hydration_target("ws://localhost:8002/ws")
+
+    def test_a_list_payload_refuses_too(self, fake_health):
+        """`in` happens to WORK on a list, returning False -- correct by
+        accident, via the 'did not report' arm. The isinstance check makes it
+        correct by design, with a message naming the real problem.
+        """
+        fake_health["payload"] = [1, 2, 3]
+        with pytest.raises(HydrationTargetError, match="non-object JSON"):
+            assert_hydration_target("ws://localhost:8002/ws")

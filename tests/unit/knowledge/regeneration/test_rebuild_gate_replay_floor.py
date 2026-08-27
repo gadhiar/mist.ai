@@ -172,3 +172,23 @@ class TestAssertExtractionCacheNonVacuous:
         """An utterance can yield a relationship between known entities."""
         rows = [{"outcome": "extracted", "entities": [], "relationships": [{"type": "USES"}]}]
         assert_extraction_cache_non_vacuous(rows, minimum=1)
+
+
+class TestCacheRowsMayBeAnIterable:
+    """Cloud/code review: the gate called len(rows) after consuming rows.
+
+    `rows` is untyped and a cursor or generator is the natural shape for
+    "cache rows". The failure branch calls `len(rows)` for its message, so a
+    generator turned this gate's diagnosis into a TypeError raised from inside
+    its own error path -- a guard that crashes instead of explaining.
+    """
+
+    def test_a_generator_of_substantive_rows_passes(self):
+        rows = ({"outcome": "extracted", "entities": [{"id": "e"}]} for _ in range(3))
+        assert_extraction_cache_non_vacuous(rows, minimum=3)
+
+    def test_a_generator_that_fails_still_produces_the_diagnosis(self):
+        """The actual bug: the error path, not the happy path."""
+        rows = ({"outcome": "skipped", "entities": []} for _ in range(4))
+        with pytest.raises(RebuildVacuityError, match="of 4 row"):
+            assert_extraction_cache_non_vacuous(rows, minimum=1)

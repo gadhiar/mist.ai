@@ -95,14 +95,48 @@ class TestCorpusShapeGuard:
         mist_admin.cmd_hydrate(_args(_corpus(tmp_path, rows)))
         assert "line 2" in capsys.readouterr().err
 
-    def test_an_empty_corpus_is_a_noop_not_a_failure(self, tmp_path, monkeypatch):
-        """Nothing to drive is not the same as something went wrong."""
+    def test_the_line_number_survives_comments_and_blanks(self, tmp_path, monkeypatch, capsys):
+        """The case the test above could not catch, named by the cloud review.
+
+        `_read_replay_inputs` skips blank and '#' lines WITHOUT advancing the
+        list index, so index+1 and the true file line diverge by the number of
+        skipped rows above the offender. The test above passes on an unadorned
+        corpus for that exact reason -- adding a header comment falsifies it.
+
+        Here the bad row is on file line 4; a list-index diagnostic would say
+        line 2 and send an operator to the blank line.
+        """
+        monkeypatch.setenv(_ISOLATION, "1")
+        monkeypatch.setattr(mist_admin, "_load_backend", lambda: None)
+
+        path = tmp_path / "commented.jsonl"
+        lines = [
+            "# header comment",
+            "",
+            json.dumps({"session_id": "s", "turn_index": 0, "utterance": "ok"}),
+            json.dumps({"utterance": "missing keys"}),
+        ]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        mist_admin.cmd_hydrate(_args(path))
+        err = capsys.readouterr().err
+        assert "line 4" in err, err
+
+    def test_an_empty_corpus_is_refused(self, tmp_path, monkeypatch):
+        """Reversed by review, whose argument beat this test's original one.
+
+        This asserted exit 0 on the reasoning that "nothing to drive is not the
+        same as something went wrong". But a caller scripting
+        `hydrate && snapshot && compare` then proceeds to compare two seed-only
+        graphs -- precisely the vacuous-green case
+        `assert_replay_derived_non_vacuous` was added to refuse. In a hydration
+        context an empty corpus IS an error.
+        """
         monkeypatch.setenv(_ISOLATION, "1")
         monkeypatch.setattr(mist_admin, "_load_backend", lambda: None)
 
         path = tmp_path / "empty.jsonl"
         path.write_text("", encoding="utf-8")
-        assert mist_admin.cmd_hydrate(_args(path)) == 0
+        assert mist_admin.cmd_hydrate(_args(path)) == 2
 
 
 class TestRegistered:
@@ -112,3 +146,81 @@ class TestRegistered:
         args = parser.parse_args(["hydrate", "some/corpus.jsonl"])
         assert args.func is mist_admin.cmd_hydrate
         assert args.input == "some/corpus.jsonl"
+
+
+class TestStopOnFailure:
+    """A hydration run that has diverged must not keep spending inference.
+
+    `run_replay` is shared with `cmd_replay`, which wants every eval probe
+    scored even when some fail. Hydration is the opposite: once a turn fails
+    the graph is PARTIAL, and every further turn makes it larger rather than
+    usable -- roughly an hour on the 87-turn corpus. So the behaviour is
+    opt-in per caller, not a change to the shared driver.
+    """
+
+    @pytest.mark.asyncio
+    async def test_default_scores_every_input(self):
+        """cmd_replay's contract is unchanged."""
+        seen = []
+
+        async def _chat(handler, utterance, sid, uid):  # noqa: ARG001
+            seen.append(utterance)
+            return {"utterance": utterance, "ok": False, "error": "boom", "response": None}
+
+        import scripts.mist_admin as ma
+
+        original = ma.run_chat
+        ma.run_chat = _chat
+        try:
+            results = await ma.run_replay(None, [{"utterance": "a"}, {"utterance": "b"}], "s")
+        finally:
+            ma.run_chat = original
+        assert seen == ["a", "b"]
+        assert len(results) == 2
+
+    @pytest.mark.asyncio
+    async def test_stop_on_failure_aborts_at_the_first_bad_turn(self):
+        seen = []
+
+        async def _chat(handler, utterance, sid, uid):  # noqa: ARG001
+            seen.append(utterance)
+            return {
+                "utterance": utterance,
+                "ok": utterance != "a",
+                "error": "boom",
+                "response": None,
+            }
+
+        import scripts.mist_admin as ma
+
+        original = ma.run_chat
+        ma.run_chat = _chat
+        try:
+            results = await ma.run_replay(
+                None, [{"utterance": "a"}, {"utterance": "b"}], "s", stop_on_failure=True
+            )
+        finally:
+            ma.run_chat = original
+        assert seen == ["a"], "the second turn must never be driven"
+        assert len(results) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_clean_run_is_not_truncated(self):
+        """Non-vacuity: prove the abort is conditional, not unconditional."""
+        seen = []
+
+        async def _chat(handler, utterance, sid, uid):  # noqa: ARG001
+            seen.append(utterance)
+            return {"utterance": utterance, "ok": True, "error": None, "response": "ok"}
+
+        import scripts.mist_admin as ma
+
+        original = ma.run_chat
+        ma.run_chat = _chat
+        try:
+            await ma.run_replay(
+                None, [{"utterance": "a"}, {"utterance": "b"}], "s", stop_on_failure=True
+            )
+        finally:
+            ma.run_chat = original
+        assert seen == ["a", "b"]

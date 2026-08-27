@@ -1676,6 +1676,25 @@ class ConversationHandler:
             return assistant_message
 
         except Exception as e:
+            # HYDRATION ABORTS; live recovers. Recording an error turn is right
+            # when a human is on the other end -- it is what they saw, and the
+            # transcript stays honest. During hydration it is contamination: the
+            # turn below would be written with the corpus's AUTHORED timestamp
+            # and origin='real', making a fabricated "I encountered an error"
+            # turn structurally indistinguishable from a genuine one, and the
+            # `live == rebuilt` gate would compare it without complaint. Worse,
+            # `handle_message` returns that string NORMALLY, so `run_chat` scores
+            # the turn ok=True and `mist_admin hydrate` reports "Complete".
+            #
+            # This also stops swallowing HydrationClockError. Before it, that
+            # error was caught here and `_record_turn_event` was called AGAIN
+            # below, raising the same error from inside this except block --
+            # masking the original traceback, and turning the intended fail-loud
+            # into "fail every remaining turn one at a time" (an hour of
+            # inference on 87 turns, plus error messages polluting session
+            # history that later turns then read as context).
+            if self._hydration_clock is not None:
+                raise
             logger.error(f"Error handling message: {e}", exc_info=True)
             error_msg = f"I encountered an error: {str(e)}"
             session.add_message("assistant", error_msg)

@@ -334,9 +334,34 @@ def resolve_internal_derivation(explicit: bool | None) -> bool:
             context". None yields True in production, so nothing about live
             changes by this function existing.
     """
-    from backend.knowledge.eval_isolation import is_hydration_isolation_active
+    from backend.knowledge.eval_isolation import (
+        EvalIsolationError,
+        is_hydration_isolation_active,
+    )
 
-    if is_hydration_isolation_active():
+    try:
+        isolated = is_hydration_isolation_active()
+    except EvalIsolationError as exc:
+        # Same rationale as `curation_scheduler_enabled`, which this call site
+        # originally missed. `is_hydration_isolation_active` RAISES on an
+        # unrecognized value, which is right for a CLI that can print a refusal
+        # -- but this runs during `build_extraction_pipeline`, inside
+        # `KnowledgeIntegration.__init__`'s broad `except Exception`. So
+        # a mistyped MIST_HYDRATION_ISOLATION did not disable Stage 9,
+        # it silently disabled the ENTIRE knowledge subsystem (no graph, no
+        # retrieval, no extraction, no vault) with one warning line.
+        #
+        # Degrade toward isolated=True: Stage 9 OFF is the safe direction, and
+        # an unparsable isolation flag is not evidence that we are NOT
+        # hydrating.
+        logger.warning(
+            "MIST_HYDRATION_ISOLATION unparsable, disabling Stage 9 internal "
+            "derivation as the safe default: %s",
+            exc,
+        )
+        return False
+
+    if isolated:
         return False
     return True if explicit is None else explicit
 

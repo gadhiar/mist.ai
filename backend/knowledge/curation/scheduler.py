@@ -81,7 +81,13 @@ def curation_scheduler_enabled() -> bool:
     that did not run is a recoverable annoyance; a scheduler that ran during a
     gate run is a corrupted comparison.
     """
-    if os.getenv("MIST_CURATION_SCHEDULER_ENABLED") is None:
+    raw = os.getenv("MIST_CURATION_SCHEDULER_ENABLED")
+    if raw is None or raw.strip() == "":
+        # Empty is UNSET, not "off". `parse_isolation_flag` reads with a ""
+        # default and "" is in _FALSY, so an `is None` check alone would let
+        # `- MIST_CURATION_SCHEDULER_ENABLED=` in a compose file (or a bare
+        # trailing line in .env) silently disable curation on the LIVE stack
+        # with only an INFO line to show for it.
         return True
     try:
         return parse_isolation_flag("MIST_CURATION_SCHEDULER_ENABLED")
@@ -235,7 +241,7 @@ class CurationScheduler:
         except sqlite3.Error as e:
             logger.error("Failed to record curation run for job %s: %s", job_result.name, e)
 
-    async def start(self) -> None:
+    async def start(self) -> bool:
         """Start the background scheduler loop.
 
         Gated here rather than at the server call site so every caller inherits
@@ -245,19 +251,23 @@ class CurationScheduler:
         """
         if self._running:
             logger.warning("Scheduler already running")
-            return
+            return False
 
         # Structural no beats explicit yes: nothing legitimately runs curation
         # against a hydration target, and forgetting the knob during a
         # hydration run is the precise failure B1 exists to prevent. Same
         # reasoning that gives `assert_neo4j_dev_isolated` no off switch.
         if is_hydration_isolation_active():
+            # Returns False so the caller can tell "did not start" from
+            # "started" -- server.py logged "Curation scheduler started"
+            # unconditionally on the next line, which is actively misleading
+            # when diagnosing a hydration run.
             logger.info(
                 "Curation scheduler NOT started: MIST_HYDRATION_ISOLATION is set. Its "
                 "jobs write nodes, edges and `status` inside the compared :__Entity__ "
                 "surface, none of it derivable from the log."
             )
-            return
+            return False
         if not curation_scheduler_enabled():
             logger.info("Curation scheduler NOT started: MIST_CURATION_SCHEDULER_ENABLED is off.")
             return
@@ -268,6 +278,7 @@ class CurationScheduler:
             "Curation scheduler started with %d jobs",
             sum(1 for c, _ in self._jobs if c.enabled),
         )
+        return True
 
     async def stop(self) -> None:
         """Stop the scheduler."""

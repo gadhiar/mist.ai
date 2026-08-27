@@ -14,6 +14,7 @@ Preconditions live here; `postconditions.py` holds what must be true after.
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,78 @@ def assert_clock_covers_corpus(clock: Any, rows: list[dict[str, Any]]) -> None:
         )
 
 
+def assert_sessions_sequential(rows: list[dict[str, Any]]) -> None:
+    """Refuse unless each session's rows appear as turn_index 0, 1, 2, ... in FILE order.
+
+    Found by the cloud review, and it is a fail-GREEN gap in the mechanism
+    built to prevent fail-green.
+
+    `assert_clock_covers_corpus` checks that every corpus key EXISTS in the
+    clock. It says nothing about order. But the runtime lookup does not use the
+    corpus row's `turn_index` at all -- `_record_turn_event` derives the key
+    from the event store's `turn_count`, a sequential 0,1,2,... counter, and
+    `run_replay` drives rows in FILE order. The two agree only when the corpus
+    is authored in strict per-session order.
+
+    Reshuffle a session's rows and every lookup still finds a real key, so the
+    clock's fail-closed miss never fires: every turn gets a plausible authored
+    timestamp attached to the wrong utterance. `recorded_at` is the fact-time
+    authority for every bitemporal edge the turn produces, so the error
+    propagates into valid-time, supersession ordering and currency -- and both
+    sides of the gate then read those same false stamps back out of the event
+    store and agree.
+
+    The cloud review rated this a nit because today's golden log happens to be
+    strictly ascending. That is a property of the current DATA, not of the
+    code, and MIS-134's work will author new corpora.
+
+    Raises:
+        HydrationPreflightError: naming the session, the expected index and
+            what was found, since a corpus author needs all three.
+    """
+    seen: dict[str, int] = defaultdict(int)
+    for row in rows:
+        session = str(row["session_id"])
+        expected = seen[session]
+        actual = int(row["turn_index"])
+        if actual != expected:
+            raise HydrationPreflightError(
+                f"Session {session!r} is out of order: expected turn_index={expected} "
+                f"at this position, found {actual}. The runtime keys the hydration "
+                "clock on the event store's sequential turn_count, not on the "
+                "corpus's turn_index, so rows must appear in strict per-session "
+                "order starting from 0. Out of order, every lookup still finds a "
+                "real key and every turn gets the WRONG authored timestamp -- which "
+                "both sides of the gate would then agree on."
+            )
+        seen[session] += 1
+
+
+def assert_event_store_present(event_store: Any) -> None:
+    """Refuse when the conversation handler has no event store.
+
+    `ConversationHandler.__init__` sets `self.event_store = None` on ANY
+    initialization exception, logging an error and continuing. In that state a
+    hydration run burns every corpus turn through full inference, writes
+    nothing (`_record_turn_event` returns early, so no extraction task is even
+    spawned), skips `assert_sessions_unused`, skips the curation postcondition,
+    and exits 0 reporting "Complete".
+
+    That is the silent-green shape this module exists to refuse, arrived at
+    from a direction none of the other checks cover.
+    """
+    if event_store is None:
+        raise HydrationPreflightError(
+            "The conversation handler has no event store. `ConversationHandler` "
+            "degrades to `event_store = None` on any init failure and logs an "
+            "ERROR rather than raising, so this is usually a misconfigured "
+            "EVENT_STORE_DB_PATH or an unwritable dev-state volume -- check the "
+            "backend log for 'Failed to initialize event store'. Refusing: a run "
+            "in this state would drive every turn through inference, write "
+            "nothing, and report success."
+        )
+
+
 def assert_sessions_unused(event_store: _SessionReader, rows: list[dict[str, Any]]) -> None:
     """Refuse when any corpus session already has turns in the event store.
 
@@ -137,12 +210,18 @@ def run_all(*, clock: Any, rows: list[dict[str, Any]], event_store: _SessionRead
 
     Order is deliberate: isolation before anything that could write, clock
     presence before clock coverage (coverage on a None clock is a TypeError,
-    not a diagnosis), and the store check last since it is the only one that
-    touches I/O.
+    not a diagnosis), ordering after coverage (an uncovered key is the simpler
+    diagnosis of the two), and the store checks last since they are the only
+    ones that touch I/O.
+
+    A missing event store is now a REFUSAL rather than a skipped check. It was
+    the latter, which meant an init failure silently disabled the two checks
+    most likely to catch the resulting mess.
     """
     assert_hydration_isolation()
     assert_clock_present(clock)
     assert_clock_covers_corpus(clock, rows)
-    if event_store is not None:
-        assert_sessions_unused(event_store, rows)
+    assert_sessions_sequential(rows)
+    assert_event_store_present(event_store)
+    assert_sessions_unused(event_store, rows)
     logger.info("Hydration preflight passed: %d turns, clock %s", len(rows), clock.source_path)

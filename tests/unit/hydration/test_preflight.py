@@ -21,7 +21,9 @@ from scripts.hydration.preflight import (
     HydrationPreflightError,
     assert_clock_covers_corpus,
     assert_clock_present,
+    assert_event_store_present,
     assert_hydration_isolation,
+    assert_sessions_sequential,
     assert_sessions_unused,
     run_all,
 )
@@ -155,7 +157,92 @@ class TestRunAll:
         with pytest.raises(HydrationPreflightError, match="MIST_HYDRATION_CLOCK"):
             run_all(clock=None, rows=_ROWS, event_store=None)
 
-    def test_a_missing_event_store_skips_only_that_check(self, monkeypatch):
-        """Event store disabled is a legitimate config, not a preflight failure."""
+    def test_a_missing_event_store_now_refuses(self, monkeypatch):
+        """Reversed by review, and the old reasoning was wrong.
+
+        This previously read "event store disabled is a legitimate config, not
+        a preflight failure" and SKIPPED both store-dependent checks.
+        `ConversationHandler` sets `event_store = None` on any init exception
+        and logs rather than raising, so in that state a hydration run drives
+        every corpus turn through full inference, writes nothing, skips
+        `assert_sessions_unused`, skips the curation postcondition, and exits 0
+        reporting "Complete" -- the silent-green shape this module exists to
+        refuse.
+        """
         monkeypatch.setenv(_ISOLATION, "1")
-        run_all(clock=_clock(), rows=_ROWS, event_store=None)
+        with pytest.raises(HydrationPreflightError, match="no event store"):
+            run_all(clock=_clock(), rows=_ROWS, event_store=None)
+
+
+class TestAssertSessionsSequential:
+    """Cloud-review finding: coverage was checked, order never was.
+
+    The runtime keys the clock on the event store's sequential `turn_count`,
+    not on the corpus row's `turn_index`, and `run_replay` drives rows in FILE
+    order. Reshuffle a session and every lookup still finds a real key -- so
+    the clock's fail-closed miss never fires and every turn gets a plausible
+    authored timestamp attached to the wrong utterance. Fails GREEN.
+    """
+
+    def test_ordered_rows_pass(self):
+        assert_sessions_sequential(_ROWS)
+
+    def test_interleaved_sessions_are_fine(self):
+        """Order is per-session, not global. Two sessions may interleave."""
+        assert_sessions_sequential(
+            [
+                {"session_id": "a", "turn_index": 0},
+                {"session_id": "b", "turn_index": 0},
+                {"session_id": "a", "turn_index": 1},
+                {"session_id": "b", "turn_index": 1},
+            ]
+        )
+
+    def test_a_reshuffled_session_is_refused(self):
+        """The exact fail-green case: all keys covered, all stamps wrong."""
+        rows = [
+            {"session_id": "s", "turn_index": 2},
+            {"session_id": "s", "turn_index": 0},
+            {"session_id": "s", "turn_index": 1},
+        ]
+        with pytest.raises(HydrationPreflightError, match="expected turn_index=0"):
+            assert_sessions_sequential(rows)
+
+    def test_a_gap_is_refused(self):
+        rows = [{"session_id": "s", "turn_index": 0}, {"session_id": "s", "turn_index": 2}]
+        with pytest.raises(HydrationPreflightError, match="found 2"):
+            assert_sessions_sequential(rows)
+
+    def test_a_session_not_starting_at_zero_is_refused(self):
+        """turn_count starts at 0 for a fresh session; the corpus must too."""
+        with pytest.raises(HydrationPreflightError):
+            assert_sessions_sequential([{"session_id": "s", "turn_index": 1}])
+
+    def test_the_real_golden_log_is_in_order(self):
+        """Non-vacuity against the corpus this actually guards.
+
+        Also establishes that the fix does not reject today's data -- the
+        reason the cloud review rated this a nit is that this assertion holds
+        right now, which is a property of the data, not of the code.
+        """
+        import json
+        from pathlib import Path
+
+        rows = [
+            json.loads(line)
+            for line in Path("data/golden-log/golden-log.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        assert len(rows) >= 80
+        assert_sessions_sequential(rows)
+
+
+class TestAssertEventStorePresent:
+    def test_a_store_passes(self):
+        assert_event_store_present(_FakeStore())
+
+    def test_none_refuses(self):
+        with pytest.raises(HydrationPreflightError, match="no event store"):
+            assert_event_store_present(None)

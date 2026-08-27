@@ -36,7 +36,28 @@ class _JobRunReader(Protocol):
     ) -> list[dict[str, Any]]: ...
 
 
-def assert_no_curation_job_runs(event_store: _JobRunReader, *, limit: int = 100) -> None:
+def snapshot_curation_run_ids(event_store: _JobRunReader, *, limit: int = 1000) -> frozenset[str]:
+    """Capture which curation runs already exist, BEFORE a hydration run starts.
+
+    `dev-state/` is a named volume that survives `docker compose down`, so the
+    ledger is NOT empty just because this run has not written to it. If the dev
+    backend was ever brought up once without MIST_HYDRATION_ISOLATION, or
+    someone invoked `run_all_once`, those rows persist -- and a postcondition
+    that simply asserts "the table is empty" reports CONTAMINATED on every
+    subsequent run, forever, with no way to tell a real contamination from a
+    stale one.
+
+    `run_id` is the windowing key rather than `started_at`: it is exact, and it
+    does not depend on clocks agreeing across a container restart.
+    """
+    return frozenset(
+        row["run_id"] for row in event_store.get_curation_job_runs(limit=limit) if row.get("run_id")
+    )
+
+
+def assert_no_curation_job_runs(
+    event_store: _JobRunReader, *, baseline: frozenset[str], limit: int = 1000
+) -> None:
     """Refuse if any curation job ran during the hydration window.
 
     Curation writes into the compared `:__Entity__` surface and none of it is a
@@ -49,6 +70,12 @@ def assert_no_curation_job_runs(event_store: _JobRunReader, *, limit: int = 100)
     Args:
         event_store: Anything exposing `get_curation_job_runs`. The dev stack's
             store, read after the run completes.
+        baseline: The `run_id` set captured by `snapshot_curation_run_ids`
+            BEFORE the run. Required, not defaulted: an empty default would
+            silently reproduce the "whole ledger must be empty" bug this
+            parameter exists to fix, and a caller that has not captured a
+            baseline cannot distinguish its own contamination from a stale
+            row on a persistent volume.
         limit: Rows to read. The default is far above the handful a
             contaminated run would produce; this is a tripwire, not a census.
 
@@ -57,15 +84,23 @@ def assert_no_curation_job_runs(event_store: _JobRunReader, *, limit: int = 100)
             times. The blast radius is what determines whether the graph can be
             salvaged or has to be rebuilt, so listing it beats a bare boolean.
     """
-    runs = event_store.get_curation_job_runs(limit=limit)
+    runs = [
+        row
+        for row in event_store.get_curation_job_runs(limit=limit)
+        if row.get("run_id") not in baseline
+    ]
     if not runs:
-        logger.info("Hydration postcondition OK: curation_job_runs is empty.")
+        logger.info(
+            "Hydration postcondition OK: no curation run appeared during the window "
+            "(%d pre-existing run(s) ignored).",
+            len(baseline),
+        )
         return
 
     counts = Counter(row.get("job_name", "<unnamed>") for row in runs)
     detail = ", ".join(f"{name} x{count}" for name, count in sorted(counts.items()))
     raise HydrationPostconditionError(
-        f"Curation ran during hydration: {detail}. These jobs write nodes, edges "
+        f"Curation ran DURING this hydration run: {detail}. These jobs write nodes, edges "
         "and `status` inside the compared :__Entity__ surface, and no rebuild can "
         "reproduce them -- the hydrated graph is contaminated and must be "
         "discarded rather than compared. Check MIST_HYDRATION_ISOLATION on the "

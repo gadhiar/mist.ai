@@ -561,8 +561,14 @@ async def lifespan(app: FastAPI):
             tracker=curation_deps.tracker,
             llm_provider=curation_deps.llm_provider,
         )
-        await curation_scheduler.start()
-        logger.info("Curation scheduler started")
+        if await curation_scheduler.start():
+            logger.info("Curation scheduler started")
+        else:
+            # start() now returns False when it declined (hydration isolation,
+            # or the disable knob) rather than raising. Logging "started"
+            # unconditionally was misleading in exactly the situation an
+            # operator would be reading this log to diagnose.
+            logger.info("Curation scheduler not started (see reason above)")
     except Exception as e:
         logger.warning("Curation scheduler failed to start: %s", e)
         curation_scheduler = None
