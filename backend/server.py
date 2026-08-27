@@ -56,6 +56,10 @@ from backend.factories import (  # isort:skip
     build_vault_writer,
 )
 from backend.knowledge.config import KnowledgeConfig  # isort:skip
+from backend.knowledge.eval_isolation import (  # isort:skip
+    EvalIsolationError,
+    is_hydration_isolation_active,
+)
 from backend.log_handler import WebSocketLogHandler  # isort:skip
 
 if TYPE_CHECKING:
@@ -557,8 +561,14 @@ async def lifespan(app: FastAPI):
             tracker=curation_deps.tracker,
             llm_provider=curation_deps.llm_provider,
         )
-        await curation_scheduler.start()
-        logger.info("Curation scheduler started")
+        if await curation_scheduler.start():
+            logger.info("Curation scheduler started")
+        else:
+            # start() now returns False when it declined (hydration isolation,
+            # or the disable knob) rather than raising. Logging "started"
+            # unconditionally was misleading in exactly the situation an
+            # operator would be reading this log to diagnose.
+            logger.info("Curation scheduler not started (see reason above)")
     except Exception as e:
         logger.warning("Curation scheduler failed to start: %s", e)
         curation_scheduler = None
@@ -668,12 +678,39 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """Detailed health check."""
+    """Detailed health check.
+
+    `hydration_isolation` (F4) is the positive handshake the hydrator requires
+    before sending its first turn. The live backend never sets
+    MIST_HYDRATION_ISOLATION, so this field is how a hydrator pointed at the
+    wrong port finds out before it writes anything.
+    """
     return {
         "status": "healthy",
         "models_loaded": voice_processor is not None,
         "active_connections": len(active_connections),
+        "hydration_isolation": _hydration_isolation_for_health(),
     }
+
+
+def _hydration_isolation_for_health() -> bool:
+    """Report the F4 flag, degrading a config typo to False rather than a 500.
+
+    `is_hydration_isolation_active` raises on an unrecognized value, which is
+    correct for a guard invoked from a CLI that can print the refusal. A health
+    endpoint is different: raising here would hand the hydrator a connection
+    error instead of an answer, and an operator a stack trace instead of a
+    cause.
+
+    False is the fail-closed direction -- the hydrator refuses unless True --
+    so a typo blocks the run either way. The warning names the raw value so the
+    block is diagnosable from the target container's log.
+    """
+    try:
+        return is_hydration_isolation_active()
+    except EvalIsolationError as exc:
+        logger.warning("hydration_isolation unparsable, reporting False: %s", exc)
+        return False
 
 
 def _reset_voice_state_if_last_connection() -> bool:

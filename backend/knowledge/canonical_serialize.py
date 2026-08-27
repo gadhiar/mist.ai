@@ -45,15 +45,41 @@ AUDIT_FIELDS = frozenset(
 # "same stamps".
 EPOCH_STAMP_FIELDS = frozenset({"ontology_version", "extraction_version", "model_hash"})
 
+# Derived artifacts: reproducible in principle, not compared in practice.
+# `embedding` is large and float-noisy, and excluding it has a documented cost
+# -- `seed/gates.py:264-268` records that a canonical form is byte-identical
+# whether embeddings are present, absent, or all-zero, so a seed-apply that
+# skips the backfill yields a graph nothing can retrieve from AND certifies
+# clean. MIS-130 carries a separate presence-and-dimension assertion because
+# THIS set cannot cover it.
+DERIVED_ARTIFACT_FIELDS = frozenset({"embedding"})
+
+# Excluded on NODES only; the same property on an edge is compared.
+#
+# Edge `confidence` is reinforce-only -- `graph_writer.py:251` takes a monotonic
+# max on write -- and therefore log-deterministic. Node `confidence` is
+# additionally written by `ConfidenceDecayJob` (`confidence_decay.py:34,39`)
+# off the wall clock, which is the entire reason for the asymmetry.
+#
+# That reason is CONDITIONAL, and the condition is now controllable: the decay
+# job is a scheduler job, and `CurationScheduler.start()` refuses to run under
+# MIST_HYDRATION_ISOLATION (B1). With the scheduler off, node confidence has
+# only log-deterministic writers and this exclusion costs coverage rather than
+# buying determinism -- MIS-131's exclusion decision, closed 2026-08-26. Do not
+# simply delete it: the un-exclusion and the scheduler-off knob are one change,
+# because the exclusion is correct whenever the job CAN run.
+NODE_ONLY_EXCLUDED_FIELDS = frozenset({"confidence"})
+
 
 def _canon_props(props: dict[str, Any], *, is_node: bool) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for k, v in props.items():
-        if k in AUDIT_FIELDS or k in EPOCH_STAMP_FIELDS or k == "embedding":
+        if k in AUDIT_FIELDS or k in EPOCH_STAMP_FIELDS or k in DERIVED_ARTIFACT_FIELDS:
             continue
-        # Node `confidence` is wall-clock-decayed (confidence_decay.py); edge
-        # `confidence` is reinforce-only (log-deterministic) and is retained.
-        if is_node and k == "confidence":
+        # See NODE_ONLY_EXCLUDED_FIELDS: node `confidence` is wall-clock-decayed
+        # while the decay job can run; edge `confidence` is reinforce-only
+        # (log-deterministic) and is retained.
+        if is_node and k in NODE_ONLY_EXCLUDED_FIELDS:
             continue
         out[k] = sorted(v) if isinstance(v, list) else v
     return out
@@ -104,7 +130,9 @@ def _rel_key(r: dict[str, Any]) -> tuple[str, str, str, str, str, str, str]:
     )
 
 
-def canonical_graph_form(connection, *, include_provenance: bool = False) -> str:
+def canonical_graph_form(
+    connection, *, include_provenance: bool = False, include_self_model: bool = False
+) -> str:
     """Return a deterministic canonical string for the graph.
 
     Excludes wall-clock/audit fields + embeddings; sorts nodes by id, edges by
@@ -113,7 +141,11 @@ def canonical_graph_form(connection, *, include_provenance: bool = False) -> str
     Two graphs with identical content produce identical strings regardless of
     write wall-clock time or write order.
     """
-    payload = dump_graph_json(connection, include_provenance=include_provenance)
+    payload = dump_graph_json(
+        connection,
+        include_provenance=include_provenance,
+        include_self_model=include_self_model,
+    )
 
     canon: dict[str, Any] = {
         "nodes": [_node(n) for n in sorted(payload["nodes"], key=_node_key)],
@@ -128,5 +160,19 @@ def canonical_graph_form(connection, *, include_provenance: bool = False) -> str
         }
         canon["cross_layer_edges"] = [
             _rel(r) for r in sorted(payload["cross_layer_edges"], key=_rel_key)
+        ]
+    if include_self_model:
+        # Same canonicalisation as the entity partition. The exclusion rules are
+        # about the FIELDS, not about which partition they sit in, and two
+        # partitions applying different rules would diverge on wall-clock noise
+        # rather than on content.
+        canon["self_model"] = {
+            "nodes": [_node(n) for n in sorted(payload["self_model"]["nodes"], key=_node_key)],
+            "relationships": [
+                _rel(r) for r in sorted(payload["self_model"]["relationships"], key=_rel_key)
+            ],
+        }
+        canon["self_model_cross_layer_edges"] = [
+            _rel(r) for r in sorted(payload["self_model_cross_layer_edges"], key=_rel_key)
         ]
     return json.dumps(canon, sort_keys=True, indent=2) + "\n"

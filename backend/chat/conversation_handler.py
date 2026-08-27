@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from backend.chat.context_budget import ContextBudgetPlanner
+from backend.chat.hydration_clock import HydrationClockError
 from backend.chat.mist_context import MistContext
 from backend.chat.session_synthesizer import SessionSynthesizer
 from backend.chat.slop_detector import SlopDetector
@@ -42,6 +43,7 @@ from backend.llm.models import ToolCall as LLMToolCall
 from backend.vault.conventions import ConventionsLoader
 
 if TYPE_CHECKING:
+    from backend.chat.hydration_clock import HydrationClock
     from backend.debug_jsonl_logger import DebugJSONLLogger, TurnRecord
     from backend.interfaces import VaultWriterProtocol
     from backend.knowledge.extraction.pipeline import ExtractionPipeline
@@ -717,6 +719,7 @@ class ConversationHandler:
         vault_writer: VaultWriterProtocol | None = None,
         invalidation_bus: InvalidationBus | None = None,
         now_fn: Callable[[], datetime] | None = None,
+        hydration_clock: HydrationClock | None = None,
         session_origin: str = "real",
     ) -> None:
         """Initialize conversation handler.
@@ -754,6 +757,13 @@ class ConversationHandler:
                 path injects a FIXED clock so the user-snapshot timestamp is
                 reproducible and the greedy chat reply does not diverge run to
                 run (wired in `backend.factories.build_conversation_handler`).
+            hydration_clock: B2. When present, `_record_turn_event` stamps the
+                CORPUS's authored timestamp for `(session_id, turn_index)`
+                instead of reading a clock, so a hydration run reproduces the
+                golden log's gap ladder rather than collapsing 87 turns onto
+                the moment the run happened. None in production and in eval;
+                only a hydration-isolated process builds one (wired in
+                `backend.factories.build_hydration_clock`).
             session_origin: Provenance forwarded to `EventStore.start_session`
                 (R1.4 Task 10, closing a gap T3 left open -- the `origin`
                 column existed but nothing ever set it). "real" (default)
@@ -766,6 +776,9 @@ class ConversationHandler:
         # Injectable clock (DI seam). Default = real wall-clock so production
         # behavior is unchanged; the replay path supplies a fixed value.
         self._now_fn: Callable[[], datetime] = now_fn or (lambda: datetime.now(UTC))
+        # B2: authored per-turn timestamps for a hydration run. None in
+        # production and in eval; only a hydration-isolated process builds one.
+        self._hydration_clock = hydration_clock
         # R1.4 Task 10: provenance forwarded to EventStore.start_session so
         # harness/probe traffic can be excluded from an R1.6 rebuild.
         self._session_origin = session_origin
@@ -1663,6 +1676,25 @@ class ConversationHandler:
             return assistant_message
 
         except Exception as e:
+            # HYDRATION ABORTS; live recovers. Recording an error turn is right
+            # when a human is on the other end -- it is what they saw, and the
+            # transcript stays honest. During hydration it is contamination: the
+            # turn below would be written with the corpus's AUTHORED timestamp
+            # and origin='real', making a fabricated "I encountered an error"
+            # turn structurally indistinguishable from a genuine one, and the
+            # `live == rebuilt` gate would compare it without complaint. Worse,
+            # `handle_message` returns that string NORMALLY, so `run_chat` scores
+            # the turn ok=True and `mist_admin hydrate` reports "Complete".
+            #
+            # This also stops swallowing HydrationClockError. Before it, that
+            # error was caught here and `_record_turn_event` was called AGAIN
+            # below, raising the same error from inside this except block --
+            # masking the original traceback, and turning the intended fail-loud
+            # into "fail every remaining turn one at a time" (an hour of
+            # inference on 87 turns, plus error messages polluting session
+            # history that later turns then read as context).
+            if self._hydration_clock is not None:
+                raise
             logger.error(f"Error handling message: {e}", exc_info=True)
             error_msg = f"I encountered an error: {str(e)}"
             session.add_message("assistant", error_msg)
@@ -2221,6 +2253,29 @@ class ConversationHandler:
             profile_path,
         )
 
+    def _resolve_recorded_at(self, session_id: str, turn_index: int) -> datetime:
+        """Fact-time for one turn: authored under hydration, injected clock otherwise.
+
+        Production and eval both take the `_now_fn` arm -- production's default
+        is wall-clock and eval's is MIST_FIXED_CLOCK's single pinned instant, and
+        neither changes behaviour by this method existing.
+
+        The hydration arm is keyed rather than sequential on purpose. A
+        sequential clock couples to call ORDER, so one extra `now_fn()` call
+        anywhere in a turn shifts every later turn silently and the run still
+        completes -- a wrong timeline that fails GREEN, since both sides of the
+        gate read the timestamp back out of the event store. Keying on
+        `(session_id, turn_index)` cannot desync, and a miss raises rather than
+        falling back (see `HydrationClock.recorded_at_for`).
+
+        Note the key's `turn_index` comes from the event store's `turn_count`,
+        not from the corpus. That the two agree is exactly the property the
+        fail-closed miss is there to check.
+        """
+        if self._hydration_clock is not None:
+            return self._hydration_clock.recorded_at_for(session_id, turn_index)
+        return self._now_fn()
+
     def _record_turn_event(
         self,
         session_id: str,
@@ -2279,7 +2334,13 @@ class ConversationHandler:
             # UTC-aware fact-time: this exact instant becomes recorded_at on
             # every bitemporal edge the turn produces (never wall-clock at
             # write time, design 4.2).
-            recorded_at = datetime.now(UTC)
+            #
+            # B2: this read used to be `datetime.now(UTC)` directly, BYPASSING
+            # the `_now_fn` DI seam three lines under a comment saying it must
+            # not be a wall-clock read. Routing it through `_resolve_recorded_at`
+            # closes that bypass and is what lets a hydration run stamp the
+            # corpus's authored timeline instead of the moment it ran.
+            recorded_at = self._resolve_recorded_at(session_id, turn_index)
             event = ConversationTurnEvent(
                 session_id=session_id,
                 turn_index=turn_index,
@@ -2297,6 +2358,18 @@ class ConversationHandler:
             event_id = self.event_store.append_turn(event)
             logger.debug("Recorded turn event %s for session %s", event_id, session_id)
             return event_id, recorded_at.isoformat()
+
+        except HydrationClockError:
+            # NOT swallowed, unlike everything below. The blanket handler exists
+            # so an event-store failure cannot break a live conversation; a
+            # missing authored timestamp is a different kind of thing. It means
+            # the run has desynced from its corpus, and swallowing it would let
+            # hydration complete while silently dropping turns -- producing a
+            # graph the gate would then compare, and pass, against a corpus it
+            # no longer matches. Only reachable when a hydration clock is
+            # injected, which never happens outside a hydration-isolated
+            # process (`factories.build_hydration_clock`).
+            raise
 
         except Exception as e:
             # Log but never propagate -- event store failure must not

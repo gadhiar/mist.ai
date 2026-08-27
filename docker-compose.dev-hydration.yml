@@ -30,7 +30,33 @@
 #   docker compose -f docker-compose.yml -f docker-compose.override.yml \
 #     -f docker-compose.dev-hydration.yml --profile dev up -d \
 #     mist-neo4j-dev mist-backend-dev
-#   # ... run hydration against ws://localhost:8002/ws ...
+#   # Seed the dev graph. --seed-dir is REQUIRED here (B4): the seed source is
+#   # mounted at /app/seed, outside MIST_VAULT_ROOT, so the derived default
+#   # (config.vault.root / "seed") does not exist in this container.
+#   docker compose -f docker-compose.yml -f docker-compose.override.yml \
+#     -f docker-compose.dev-hydration.yml --profile dev exec mist-backend-dev \
+#     python scripts/mist_admin.py seed --seed-dir /app/seed
+#   # Hydrate IN-PROCESS inside the dev container. `mist_admin replay` is the
+#   # driver (it already reads per-line session_id from JSONL and builds a real
+#   # ConversationHandler through the factories); `hydrate` wraps it in the
+#   # preflight/postcondition envelope. MIST_HYDRATION_CLOCK must be set on the
+#   # container or preflight refuses -- without it every turn is wall-clock
+#   # stamped and the corpus's authored timeline is lost silently.
+#   docker compose -f docker-compose.yml -f docker-compose.override.yml \
+#     -f docker-compose.dev-hydration.yml --profile dev exec mist-backend-dev \
+#     python scripts/mist_admin.py hydrate /app/data/golden-log/golden-log.jsonl
+#
+#   # The WebSocket route (ws://localhost:8002/ws) is NOT the primary path and
+#   # is NOT currently guarded on any live call path. assert_ws_target_not_live
+#   # and scripts/hydration/target.py EXIST and are tested, but nothing invokes
+#   # them -- they were written before the send loop, and the send loop was then
+#   # established to be the wrong design: session_id is generated server-side
+#   # per connection (server.py, uuid4), so a WS client cannot tell the backend
+#   # which corpus session it is driving, and the hydration clock keys on
+#   # exactly that. Anyone reviving the WS route must WIRE those guards in; an
+#   # earlier revision of this comment claimed the route "remains guarded",
+#   # which would have left the `--ws-url ws://localhost:8001/ws` typo they
+#   # were written for completely unblocked.
 #   docker compose -f docker-compose.yml -f docker-compose.override.yml \
 #     -f docker-compose.dev-hydration.yml --profile dev stop \
 #     mist-backend-dev mist-neo4j-dev
@@ -108,6 +134,21 @@ services:
       #
       # --- marks this container as the hydration target ---------------------
       - MIST_HYDRATION_ISOLATION=1
+      # B2: the corpus whose AUTHORED timestamps `_record_turn_event` stamps
+      # instead of the wall clock. Without it every turn is stamped with the
+      # moment the run happened, collapsing the golden log's gap ladder
+      # (2025-09 -> 2026-07-15) onto one instant -- and the gate would still
+      # pass, because both sides read that same flattened timeline back out of
+      # the event store. `preflight.assert_clock_present` refuses rather than
+      # letting that happen, which means WITHOUT this line the documented
+      # runbook above exits 2 every time. (It did, until review caught it: the
+      # runbook named the variable as required and nothing ever set it.)
+      #
+      # Points at the read-only golden-log mount, not the corpus argument --
+      # `factories.build_hydration_clock` reads the env var, and it also
+      # refuses to build a clock at all unless MIST_HYDRATION_ISOLATION is set,
+      # so this pair is inert on any container that is not this one.
+      - MIST_HYDRATION_CLOCK=/app/data/golden-log/golden-log.jsonl
       # Sessions are recorded origin='real', and that is a decision rather than
       # an omission. `origin` exists to keep fixture traffic out of the
       # CANONICAL graph, and it discriminates WITHIN one event store. This
@@ -162,6 +203,23 @@ services:
       # staleness check would be vacuous -- which `digest_corpus` refuses
       # rather than silently recording "unknown".
       - ./data/golden-log:/app/data/golden-log:ro
+      # B4: the seed SOURCE, read-only, following the golden-log precedent
+      # directly above -- authored, checked-in content, not live state.
+      #
+      # The dev stack sets MIST_VAULT_ROOT=/app/dev-state/vault, which has no
+      # seed/, so `mist_admin seed` had no source at all in this container.
+      # Both obvious fixes break the isolation guarantee the header states:
+      # mounting ./mist-memory re-exposes the live vault wholesale, and
+      # repointing MIST_VAULT_ROOT at it redirects every vault WRITE the
+      # 87-turn hydration run makes onto the live vault.
+      #
+      # Mounting only the seed subdirectory, read-only, and at a path OUTSIDE
+      # the vault root keeps both properties: the source is readable, the live
+      # vault is not, and nothing can write back. Callers must pass
+      # `--seed-dir /app/seed` explicitly rather than letting cmd_seed derive
+      # it from config.vault.root -- deriving it is what would silently send
+      # the lookup back into dev-state.
+      - ./mist-memory/seed:/app/seed:ro
       # Code, read-only, mirroring docker-compose.override.yml. Read-only is
       # not merely hygiene here: it is what keeps a dev-stack process from
       # editing the tree the live stack is running from.

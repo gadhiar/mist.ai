@@ -83,6 +83,50 @@ def resolve_fixed_rendered_at() -> str | None:
     return value
 
 
+_HYDRATION_CLOCK_ENV = "MIST_HYDRATION_CLOCK"
+
+
+def build_hydration_clock():
+    """Build the B2 authored-timestamp clock, or None for every normal process.
+
+    Reads MIST_HYDRATION_CLOCK, a path to a JSONL corpus carrying `session_id`,
+    `turn_index` and `timestamp` per line -- which the golden log already does,
+    so no new fixture format is involved.
+
+    REFUSES unless MIST_HYDRATION_ISOLATION is also set. A keyed clock silently
+    rewriting fact-time is exactly the thing that must never be reachable on
+    live: every bitemporal edge a turn produces inherits `recorded_at`, so a
+    clock active by accident would author a false history that both sides of
+    the gate would then agree on. Requiring the isolation flag means the live
+    backend cannot build one even if the path variable leaks into its
+    environment.
+
+    Returns:
+        A `HydrationClock`, or None when MIST_HYDRATION_CLOCK is unset.
+
+    Raises:
+        HydrationClockError: when the path is set outside a hydration-isolated
+            process, or the corpus cannot be loaded. Both fail the process
+            rather than degrading to wall-clock -- a hydration run that
+            silently used the wall clock would produce a green gate over a
+            timeline that never existed.
+    """
+    from backend.chat.hydration_clock import HydrationClockError, load_hydration_clock
+    from backend.knowledge.eval_isolation import is_hydration_isolation_active
+
+    raw = os.getenv(_HYDRATION_CLOCK_ENV)
+    if raw is None or raw.strip() == "":
+        return None
+    if not is_hydration_isolation_active():
+        raise HydrationClockError(
+            f"{_HYDRATION_CLOCK_ENV} is set but MIST_HYDRATION_ISOLATION is not. A "
+            "keyed clock rewrites `recorded_at`, the fact-time authority for every "
+            "bitemporal edge a turn produces, so it must be unreachable outside a "
+            "hydration-isolated process. Refusing to build one."
+        )
+    return load_hydration_clock(raw.strip())
+
+
 def build_now_fn() -> Callable[[], datetime]:
     """Build the injectable clock for ConversationHandler.
 
@@ -269,12 +313,65 @@ def production_cache_path(config: KnowledgeConfig) -> str:
     return str(Path(event_store_path).parent / "extraction_cache.db")
 
 
+def resolve_internal_derivation(explicit: bool | None) -> bool:
+    """Whether Stage 9 (internal knowledge derivation) may run.
+
+    Stage 9 runs on the LIVE path (`pipeline.py:813`) and NEVER on rebuild --
+    `log_regenerator.py` has zero references to it. It MERGEs into
+    `SELF_MODEL_LABEL`, so today it sits outside the `:__Entity__`-only
+    comparison surface and the asymmetry is invisible. The moment MIS-131 adds
+    `include_self_model=True` it becomes a live-only writer INSIDE the compared
+    surface, and the gate goes RED for a reason unrelated to seed-apply.
+
+    Hydration isolation forces it OFF and an explicit `True` cannot override
+    that -- structural no beats explicit yes, the same rule
+    `CurationScheduler.start()` follows (B1). A caller passing True is
+    asserting intent about ingestion, not about whether the comparison surface
+    stays derivable.
+
+    Args:
+        explicit: A caller's stated preference, or None for "decide from
+            context". None yields True in production, so nothing about live
+            changes by this function existing.
+    """
+    from backend.knowledge.eval_isolation import (
+        EvalIsolationError,
+        is_hydration_isolation_active,
+    )
+
+    try:
+        isolated = is_hydration_isolation_active()
+    except EvalIsolationError as exc:
+        # Same rationale as `curation_scheduler_enabled`, which this call site
+        # originally missed. `is_hydration_isolation_active` RAISES on an
+        # unrecognized value, which is right for a CLI that can print a refusal
+        # -- but this runs during `build_extraction_pipeline`, inside
+        # `KnowledgeIntegration.__init__`'s broad `except Exception`. So
+        # a mistyped MIST_HYDRATION_ISOLATION did not disable Stage 9,
+        # it silently disabled the ENTIRE knowledge subsystem (no graph, no
+        # retrieval, no extraction, no vault) with one warning line.
+        #
+        # Degrade toward isolated=True: Stage 9 OFF is the safe direction, and
+        # an unparsable isolation flag is not evidence that we are NOT
+        # hydrating.
+        logger.warning(
+            "MIST_HYDRATION_ISOLATION unparsable, disabling Stage 9 internal "
+            "derivation as the safe default: %s",
+            exc,
+        )
+        return False
+
+    if isolated:
+        return False
+    return True if explicit is None else explicit
+
+
 def build_extraction_pipeline(
     config: KnowledgeConfig,
     graph_store: GraphStore | None = None,
     llm_provider: StreamingLLMProvider | None = None,
     include_curation: bool = True,
-    include_internal_derivation: bool = True,
+    include_internal_derivation: bool | None = None,
     debug_logger: "DebugJSONLLogger | None" = None,  # noqa: F821
 ) -> ExtractionPipeline:
     """Create a fully wired ExtractionPipeline."""
@@ -302,7 +399,7 @@ def build_extraction_pipeline(
     provider = llm_provider or build_llm_provider(config)
 
     internal_deriver = None
-    if include_internal_derivation:
+    if resolve_internal_derivation(include_internal_derivation):
         from backend.knowledge.extraction.internal_derivation import InternalKnowledgeDeriver
 
         internal_deriver = InternalKnowledgeDeriver(
@@ -548,6 +645,7 @@ def build_conversation_handler(
         # Replay-determinism clock seam: wall-clock in production (env unset),
         # a fixed instant under MIST_FIXED_CLOCK for reproducible replays.
         now_fn=build_now_fn(),
+        hydration_clock=build_hydration_clock(),
         # R1.4 Task 10: MIST_SESSION_ORIGIN (default "real") -- the eval
         # harness / CLI probes set it to "test" so their sessions are
         # excludable from an R1.6 rebuild.

@@ -146,7 +146,18 @@ def cmd_seed(args: argparse.Namespace) -> int:
     now = datetime.now(UTC).isoformat()
     connection = _connect(be)
     try:
-        counts = reseed(connection, documents, seed_version=seed_version, now_iso=now)
+        # `allow_live=True` (F1): seeding the canonical graph is this command's
+        # entire purpose, and it is the ONLY caller in the repo that says so.
+        # Everywhere else -- the R1.7 seed-apply step above all, where
+        # `source_conn` and `staging_conn` differ by six characters -- the
+        # default refusal stands.
+        counts = reseed(
+            connection,
+            documents,
+            seed_version=seed_version,
+            now_iso=now,
+            allow_live=True,
+        )
         print("[seed] Applied (wipe-then-apply, idempotent):")
         for layer, count in counts.items():
             print(f"  {layer}: {count}")
@@ -1366,6 +1377,8 @@ async def run_replay(
     inputs: list[dict[str, Any]],
     default_session_id: str,
     default_user_id: str = "User",
+    *,
+    stop_on_failure: bool = False,
 ) -> list[dict[str, Any]]:
     """Replay a list of inputs through `run_chat`, preserving per-entry metadata.
 
@@ -1394,6 +1407,20 @@ async def run_replay(
             if key in entry:
                 result[key] = entry[key]
         results.append(result)
+        if stop_on_failure and not result["ok"]:
+            # Hydration aborts; eval replays do not. An eval run wants every
+            # probe scored even when some fail, but a hydration run that has
+            # already diverged is producing a PARTIAL graph, and every further
+            # turn is inference spent making it larger rather than usable --
+            # roughly an hour on the 87-turn corpus. Returning early also means
+            # the caller's fail_count sees the failure immediately.
+            logger.warning(
+                "run_replay stopping at input %d of %d: %s",
+                len(results),
+                len(inputs),
+                result.get("error"),
+            )
+            break
     return results
 
 
@@ -1561,7 +1588,7 @@ async def run_extraction_only_replay(
     return results
 
 
-def _read_replay_inputs(path: Path) -> list[dict[str, Any]]:
+def _read_replay_inputs(path: Path, *, with_line_numbers: bool = False) -> list[dict[str, Any]]:
     """Load replay inputs from a JSONL or plain-text file.
 
     JSONL (`.jsonl`/`.json`): one JSON object per line, each with at least
@@ -1589,10 +1616,18 @@ def _read_replay_inputs(path: Path) -> list[dict[str, Any]]:
                 obj = json.loads(line)
             except json.JSONDecodeError as e:
                 raise ValueError(f"Invalid JSON on line {i} of {path}: {e}") from e
+            # `_lineno` is OPT-IN. It carries the TRUE file line, which matters
+            # because blank and '#' lines are skipped above without advancing
+            # the list index -- so index+1 and file line diverge on any corpus
+            # with a header comment, and a diagnostic pointing an operator at
+            # the wrong row is worse than none. Opt-in rather than always-on so
+            # this shared helper's return shape (and cmd_replay's contract, and
+            # three existing tests asserting exact dicts) stays unchanged.
+            lineno = {"_lineno": i} if with_line_numbers else {}
             if isinstance(obj, str):
-                items.append({"utterance": obj})
+                items.append({"utterance": obj, **lineno})
             elif isinstance(obj, dict):
-                items.append(obj)
+                items.append({**obj, **lineno})
             else:
                 raise ValueError(
                     f"Line {i} of {path}: expected object or string, " f"got {type(obj).__name__}"
@@ -1721,6 +1756,142 @@ def cmd_replay(args: argparse.Namespace) -> int:
 
     fail_count = sum(1 for r in results if not r["ok"])
     return 0 if fail_count == 0 else 1
+
+
+def cmd_hydrate(args: argparse.Namespace) -> int:
+    """Drive an authored corpus through the live path inside the dev container.
+
+    This is a COMPOSITION, not a driver. `run_replay` already reads a per-line
+    `session_id` from JSONL input (see its `sid = entry.get("session_id", ...)`)
+    and already builds a real `ConversationHandler` through the factories, which
+    is where the hydration clock is wired. MIS-129 names writing a second driver
+    as the specific wrong turn here: "the gap is timestamp injection, NOT 'no
+    driver exists'."
+
+    What this adds is the safety envelope around that driver:
+
+      preflight -> replay -> postcondition
+
+    Preflight refuses on four conditions, two of which are otherwise SILENT:
+    no isolation flag, no hydration clock (every turn would be wall-clock
+    stamped and the gate would still pass), a clock that does not cover the
+    corpus, and corpus sessions that already carry turns. Postcondition refuses
+    if curation ran during the window.
+
+    Deliberately NOT in scope: the snapshot. `scripts/hydration/snapshot.py`
+    exists and is a separate, explicit step -- folding it in here would make a
+    failed postcondition ambiguous about whether an artifact was written.
+    """
+    # Isolation FIRST -- before `_load_backend`, before the corpus is read,
+    # before a handler exists. It needs none of them (its own backend import is
+    # lazy), and `_load_backend` plus handler construction attaches the LIVE
+    # event store when this runs on the wrong container. A command whose answer
+    # is "no" should reach that answer before touching what it is refusing to
+    # touch.
+    from scripts.hydration import preflight
+
+    try:
+        preflight.assert_hydration_isolation()
+    except preflight.HydrationPreflightError as e:
+        print(f"[hydrate] REFUSED: {e}", file=sys.stderr)
+        return 2
+
+    be = _load_backend()
+    from backend.factories import build_conversation_handler
+    from scripts.hydration.postconditions import (
+        HydrationPostconditionError,
+        assert_no_curation_job_runs,
+        snapshot_curation_run_ids,
+    )
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Hydration corpus not found: {input_path}")
+    inputs = _read_replay_inputs(input_path, with_line_numbers=True)
+    if not inputs:
+        # NOT exit 0. A caller scripting `hydrate && snapshot && compare` would
+        # otherwise proceed to compare two seed-only graphs -- exactly the
+        # vacuous-green case `assert_replay_derived_non_vacuous` exists to
+        # refuse. "Nothing to drive" is an error here, whatever it means
+        # elsewhere.
+        print(f"[hydrate] REFUSED: no inputs in {input_path}", file=sys.stderr)
+        return 2
+
+    missing_keys = [
+        i for i, row in enumerate(inputs) if "session_id" not in row or "turn_index" not in row
+    ]
+    if missing_keys:
+        first = inputs[missing_keys[0]].get("_lineno", missing_keys[0] + 1)
+        print(
+            f"[hydrate] {len(missing_keys)} corpus rows lack session_id or turn_index "
+            f"(first at line {first}). The hydration clock keys on both; "
+            "a corpus without them cannot carry an authored timeline.",
+            file=sys.stderr,
+        )
+        return 1
+
+    config = be.get_config()
+    print(f"[hydrate] {len(inputs)} turns from {input_path}")
+    print("[hydrate] Building conversation handler (may load embedding model)...")
+
+    sidecar = _build_cli_sidecar(config)
+    try:
+        handler = build_conversation_handler(config, vault_sidecar=sidecar)
+
+        # Preflight AFTER the handler is built (that is where the clock lands)
+        # but BEFORE a single turn is driven. Nothing above this line writes.
+        #
+        # Caught rather than propagated: a refusal is an EXPECTED outcome of
+        # this command, and a stack trace reads as a crash. Exit 2 distinguishes
+        # "refused to start" from exit 1's "ran and some turns failed" -- the
+        # first leaves the graph untouched, the second leaves it partial, and a
+        # caller scripting this needs to tell them apart.
+        try:
+            preflight.run_all(
+                clock=handler._hydration_clock,
+                rows=inputs,
+                event_store=handler.event_store,
+            )
+        except preflight.HydrationPreflightError as e:
+            print(f"[hydrate] REFUSED: {e}", file=sys.stderr)
+            return 2
+        print("[hydrate] Preflight passed.")
+
+        # Capture the ledger BEFORE driving anything. dev-state is a named
+        # volume that outlives `docker compose down`, so pre-existing rows are
+        # normal; without a baseline the postcondition would report every later
+        # run CONTAMINATED over rows this run did not write.
+        curation_baseline = snapshot_curation_run_ids(handler.event_store)
+
+        results = asyncio.run(
+            run_replay(
+                handler,
+                inputs,
+                args.session_id or "hydration",
+                args.user_id or "User",
+                stop_on_failure=True,
+            )
+        )
+        _print_replay_summary(results)
+
+        if handler.event_store is not None:
+            try:
+                assert_no_curation_job_runs(handler.event_store, baseline=curation_baseline)
+            except HydrationPostconditionError as e:
+                # Exit 2 as well: the run completed, but its output is not
+                # usable, and a caller must not proceed to snapshot or compare.
+                print(f"[hydrate] CONTAMINATED: {e}", file=sys.stderr)
+                return 2
+            print("[hydrate] Postcondition passed: no curation ran during the window.")
+    finally:
+        _close_cli_sidecar(sidecar)
+
+    fail_count = sum(1 for r in results if not r["ok"])
+    if fail_count:
+        print(f"[hydrate] {fail_count} turn(s) failed -- the graph is PARTIAL.", file=sys.stderr)
+        return 1
+    print("[hydrate] Complete. Snapshot separately: scripts/hydration/snapshot.py")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -2206,6 +2377,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_replay.set_defaults(func=cmd_replay)
+
+    p_hydrate = sub.add_parser(
+        "hydrate",
+        help="Drive an authored corpus through the live path (dev container only).",
+    )
+    p_hydrate.add_argument(
+        "input",
+        help="Path to the corpus JSONL. Every row needs session_id and turn_index.",
+    )
+    p_hydrate.add_argument(
+        "--session-id",
+        default=None,
+        help="Fallback session for rows without one. Corpus rows should carry "
+        "their own; the hydration clock keys on it.",
+    )
+    p_hydrate.add_argument("--user-id", default="User", help="User identifier (default: User).")
+    p_hydrate.set_defaults(func=cmd_hydrate)
 
     # ---- Cluster 8 Phase 11: vault subcommands -----------------------------
     p_vstatus = sub.add_parser(

@@ -1,6 +1,46 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-08-25 (**extraction-cache Phase 1 (spec D1, D2, D3, D10) COMPLETE,
+**Last Updated:** 2026-08-26 (**R1.6 closed bar its ADR's evidence; R1.7's prerequisites complete.
+Six commits on `feat/r1.7-hydration-safety-and-blockers`, NOT merged.** `main` is unchanged at
+`7ecec0c`. Whether the branch and its remote agree: `git rev-parse HEAD origin/feat/r1.7-hydration-safety-and-blockers`.
+
+**Read this first: everything on that branch is instrumentation, and none of it has been run.**
+No hydration, no snapshot, no rebuild, no comparison. The live graph is untouched -- verified
+after the last commit at 32 nodes / 30 relationships, 11 `:__Entity__` / 21 `:__SelfModel__`,
+identical to before the branch started. A future session must not read "R1.6/R1.7 prerequisites
+Done" as "the graph has been proven rebuildable"; those are different sentences and only the first
+is earned.
+
+Tickets closed: MIS-128 (F5/F6, earlier), MIS-133 (F1/F3/F4), MIS-129 (B1/B2/B4), MIS-131
+(comparison surface + non-vacuity floors). Still open: MIS-130 (seed-apply + embedding backfill,
+now unblocked) and MIS-132 (ADR-023 drafted at `status: proposed`, evidence section deliberately
+EMPTY -- it cannot close until a real gate run fills it, and it still needs the 3+ reviewer pass
+`feedback_multi_reviewer_adrs` calls for on an ADR retiring two ADR-010 invariants).
+
+What landed, in one line each: a fifth isolation guard plus a positive `/health` handshake for the
+hydrator's WS target; a default-CLOSED `allow_live` on the seed applier, checked at the write site
+because every other guard reasons about URI strings and the applier takes a connection OBJECT; a
+curation-scheduler off switch that hydration isolation can force but no knob can override; the seed
+source mounted read-only outside the vault root; a KEYED hydration clock so the corpus's authored
+timeline survives replay (MIST_FIXED_CLOCK could not do this -- it is one constant, which flattens
+87 turns and fails GREEN); `mist_admin hydrate` wrapping the EXISTING `run_replay` driver in a
+preflight/postcondition envelope; and the comparison surface extended to `:__SelfModel__` with a
+sub-gate that distinguishes "applied nothing" from "applied correctly".
+
+Suite measured on the branch tip, not inherited: **3295 passed / 6 skipped / 3 xfailed / 0
+failed**. Baseline at branch point was 3102. Every guard added was mutation-tested -- 23 mutants
+across the six commits, all killed; the mutation-revert discipline in `tests/CLAUDE.md` was
+followed (file copies, never `git checkout --`, tree confirmed marker-free before each suite run).
+
+Two ticket framings were found incomplete while implementing and are corrected in the tickets
+themselves: MIS-129's B2 reads as "a clock seam must be built" when one already existed and
+`_record_turn_event` merely bypassed it; MIS-131 asks for a pin over "all three exclusion
+frozensets" when there were two, the other two exclusions being magic strings its own remedy could
+not have reached.)
+
+<!-- Prior header, demoted per the CODEBASE.md maintenance protocol. -->
+
+**PRIOR ENTRY --** 2026-08-25 (**extraction-cache Phase 1 (spec D1, D2, D3, D10) COMPLETE,
 MERGED to `main` at `c2cc748` (`--no-ff`), and PUSHED. Whether `main` and `origin/main` currently
 agree is deliberately NOT stated as a hash here -- run `git rev-parse HEAD origin/main`, which
 answers it and cannot go stale. (Two prior revisions of this line did state it and both were
@@ -617,20 +657,30 @@ Plan artifact for overnight post-MVP run: `~/.claude/plans/peaceful-greeting-bee
 ## Active Work
 
 ### Current Focus
-make-mist-usable Phase 2 / Sub-project A (MIS-120). **Latest landed on `main`:** audit finding
-Q2-1 close-out at `330ff1c`, 2026-08-19 (see header PRIOR ENTRY) -- `main` HEAD is `330ff1c`,
-confirmed via `git rev-parse main` (and `origin/main` matches: both `330ff1c`) from the
-extraction-cache branch. `git merge-base HEAD main` returns the same value here but is the WRONG
-command to cite for this claim -- it names the branch point, which would still read `330ff1c` if
-`main` had since advanced past it; `git rev-parse main` is what actually establishes current
-`main` HEAD. **In flight, not yet merged:** extraction-cache Phase 1 (spec D1, D2, D3, D10) on
-branch `feat/extraction-cache-production-writer`, COMPLETE as of this entry (see header) -- this
-is the cache warm-up enabler the previous wording of this line was still waiting on: the
-production extraction path now writes the cache row every rebuild needs. NEXT, in order: merge
-this branch -> extraction-cache Phase 2/3 (D4, then D5/D6/D7 -- coupled per spec section 8) ->
-R1.6 (`live == rebuilt` GREEN closure gate + the new ADR formalizing graph-wins-for-facts,
-superseding ADR-010 Inv-5/Inv-6). Phase 4 (D8) is independent and can land any time after Phase 1;
-it is not part of that merge-blocking sequence. R1.4 and R1.4.6 (seed-utterance
+make-mist-usable Phase 2 / Sub-project A (MIS-120), now in R1.6/R1.7. **Latest landed on `main`:**
+MIS-128's F5/F6 isolation denylist, merged 2026-08-26 -- establish current `main` HEAD with
+`git rev-parse main` rather than trusting a hash written here, and note that
+`git merge-base HEAD main` is the WRONG command for that claim: it names the branch point, which
+reads the same whether or not `main` has advanced past it.
+
+**In flight, not merged:** `feat/r1.7-hydration-safety-and-blockers`, six commits (see header).
+R1.6 is closed except MIS-132's evidence; R1.7's prerequisites are done and its actual work is
+not started.
+
+**The ordering that matters, because it is not the obvious one.** MIS-132 (ADR-023) is an R1.6
+ticket but closes LAST: its evidence section can only be filled by a gate run, which is R1.7. And
+per the closure design's corrected sequencing (section 5), MIS-131 had to precede MIS-130 -- with
+no `:__SelfModel__` comparison surface, a seed-apply writing zero nodes passes every gate, because
+two empty self-models are byte-identical and the old surface never looked at that partition. That
+constraint is now satisfied.
+
+NEXT, in order: MIS-130 (seed-apply + embedding backfill) -> hydrate -> snapshot -> rebuild ->
+compare -> fill ADR-023's evidence -> 3+ reviewer pass -> accept -> mark ADR-010 `superseded_by`
+with an inline banner over Invariants 5 and 6 ONLY (it must stay `status: accepted`; marking it
+wholesale superseded would retire four invariants ADR-023 reaffirms). Two R1.5-related
+constraints are recorded in the design doc and easy to trip: R1.5's LEARNING staleness pass is
+specified to run at REBUILD time, so it must not land before the gate is taken; and extraction
+Phase 2/3 (D4, D5/D6/D7) is independent of this sequence. R1.4 and R1.4.6 (seed-utterance
 migration, hydrator work) are ALSO landed on `main` before `330ff1c` -- this line previously read
 as if R1.3 (2026-07-30) were still the latest landed work, which understated 6+ commits/weeks of
 progress; the header's PRIOR ENTRY chain is the accurate history, not this paragraph, whenever the

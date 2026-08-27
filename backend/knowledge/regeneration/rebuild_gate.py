@@ -62,6 +62,221 @@ def assert_canonical_form_non_vacuous(form: str, *, minimum_nodes: int = 1) -> N
         )
 
 
+# The property pair that distinguishes a reconciliation-written edge from a
+# seed-written one. From the R1.4.6 hydration design's T5 acceptance test:
+# hydrated edges must be "structurally indistinguishable from usage edges" --
+# carrying `version_key`, `source_utterance_id`, `recorded_at` and a currency
+# triple -- "not the two-property seed shape".
+#
+# BOTH are required, never either. `canonical_serialize._rel_key` already sorts
+# on both, so both survive into the canonical form, and a seed edge that
+# happens to carry one should not be counted as replay output.
+REPLAY_EDGE_MARKERS = frozenset({"source_utterance_id", "version_key"})
+
+
+def _relationships(form: str) -> list[dict]:
+    """Parse a canonical form's relationships, refusing anything that is not one."""
+    try:
+        rels = json.loads(form)["relationships"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RebuildVacuityError(
+            f"not a canonical graph form, so its edges cannot be counted: {exc}"
+        ) from exc
+    if not isinstance(rels, list):
+        raise RebuildVacuityError(
+            f"canonical form's 'relationships' is {type(rels).__name__}, not a list"
+        )
+    return rels
+
+
+def count_replay_derived_edges(form: str) -> int:
+    """Count edges in `form` carrying the full replay marker set."""
+    return sum(
+        1
+        for rel in _relationships(form)
+        if set((rel.get("properties") or {}).keys()) >= REPLAY_EDGE_MARKERS
+    )
+
+
+def assert_replay_derived_non_vacuous(form: str, *, minimum_edges: int) -> None:
+    """Hard gate: the REPLAY must have produced edges, not just the seed.
+
+    `assert_canonical_form_non_vacuous` counts every node including seed-derived
+    ones, and its docstring says so. That is not a floor on the replay: 100% of
+    today's live graph is seed content (32 nodes, 0 conversation turns), so a
+    whole-graph floor of any size up to 32 is satisfied with the replay having
+    produced nothing at all, and the gate would compare two identical
+    seed-shaped graphs and pass.
+
+    This bounds the subset that only a replay can create.
+
+    Args:
+        form: A canonical graph form.
+        minimum_edges: How many replay-derived edges the corpus must yield.
+            Must be >= 1 -- a floor of zero is satisfied by anything, including
+            exactly the emptiness this gate exists to refuse.
+
+    Raises:
+        ValueError: for `minimum_edges < 1`, which is a caller bug, not a gate
+            failure -- surfaced as a different type so it cannot be mistaken
+            for one.
+        RebuildVacuityError: when the form is unparsable or carries too few
+            replay-derived edges.
+    """
+    if minimum_edges < 1:
+        raise ValueError(
+            f"minimum_edges={minimum_edges} would be satisfied by an empty replay; "
+            "pass at least 1."
+        )
+    count = count_replay_derived_edges(form)
+    if count < minimum_edges:
+        raise RebuildVacuityError(
+            f"replay non-vacuity gate FAILED: {count} replay-derived edge(s) "
+            f"(carrying {sorted(REPLAY_EDGE_MARKERS)}), but at least "
+            f"{minimum_edges} are required. Seed-written edges do not count: a "
+            "graph that is entirely seed proves nothing about the replay, and "
+            "the whole-graph node floor cannot tell the two apart."
+        )
+
+
+def assert_turns_processed(*, processed: int, expected: int) -> None:
+    """Hard gate: the replay consumed exactly the corpus, no more and no less.
+
+    Equality rather than a floor, in both directions. Fewer turns means a
+    partial graph. MORE turns means the event store was not empty when the run
+    started, which shifts every hydration-clock key -- the same divergence
+    `scripts/hydration/preflight.assert_sessions_unused` checks for up front,
+    caught here from the other end in case the run bypassed preflight.
+
+    Raises:
+        ValueError: when `expected < 1`; a corpus of zero turns cannot support
+            a gate.
+        RebuildVacuityError: on any mismatch.
+    """
+    if expected < 1:
+        raise ValueError(f"expected={expected} turns cannot support a gate; pass at least 1.")
+    if processed != expected:
+        direction = "short" if processed < expected else "over"
+        raise RebuildVacuityError(
+            f"turns gate FAILED ({direction}): {processed} turns processed, {expected} "
+            "expected. Fewer means a partial graph; more means the event store was "
+            "not empty at the start, which shifts every hydration-clock key."
+        )
+
+
+def assert_extraction_cache_non_vacuous(rows, *, minimum: int) -> None:
+    """Hard gate: the cache holds real extraction output, not successful nothings.
+
+    Counts only rows whose outcome is `extracted` AND whose payload is
+    non-empty. Both conditions matter and for different reasons: a `skipped`
+    row is a recorded decision rather than output, and an `extracted` row with
+    an empty entity and relationship list is what a truncated or refused model
+    response records. A count of rows alone reports a healthy cache built
+    entirely from the latter.
+
+    Args:
+        rows: Cache rows, each with `outcome` and optional `entities` /
+            `relationships` payload lists.
+        minimum: How many substantive rows the corpus must yield. Must be >= 1.
+
+    Raises:
+        ValueError: for `minimum < 1`.
+        RebuildVacuityError: when too few rows carry real payloads.
+    """
+    if minimum < 1:
+        raise ValueError(
+            f"minimum={minimum} would be satisfied by an empty cache; pass at least 1."
+        )
+    # Materialise first: `rows` is the natural shape for a cursor or generator,
+    # and the failure branch below calls len(rows). Measuring after consuming
+    # would replace this gate's diagnosis with a TypeError from inside its own
+    # error path -- a guard that crashes instead of explaining.
+    rows = list(rows)
+    substantive = sum(
+        1
+        for row in rows
+        if row.get("outcome") == "extracted"
+        and ((row.get("entities") or []) or (row.get("relationships") or []))
+    )
+    if substantive < minimum:
+        raise RebuildVacuityError(
+            f"extraction-cache non-vacuity gate FAILED: {substantive} row(s) with "
+            f"outcome='extracted' and a non-empty payload, but at least {minimum} "
+            f"are required (of {len(rows)} row(s) total). Skipped rows are recorded "
+            "decisions, not output, and an extracted row with an empty payload is "
+            "what a truncated model response records."
+        )
+
+
+def _self_model_node_count(form: str, *, side: str) -> int:
+    """Read the self-model node count from a canonical form, or refuse."""
+    try:
+        payload = json.loads(form)
+    except json.JSONDecodeError as exc:
+        raise RebuildVacuityError(f"{side} form is not a canonical graph form: {exc}") from exc
+    if "self_model" not in payload:
+        raise RebuildVacuityError(
+            f"{side} form carries no 'self_model' key, so it was produced WITHOUT "
+            "include_self_model=True. Comparing two such forms would report the "
+            "self-model verified while never having looked at it -- the most "
+            "dangerous pass available here. Rebuild the form with "
+            "include_self_model=True."
+        )
+    nodes = payload["self_model"].get("nodes")
+    if not isinstance(nodes, list):
+        raise RebuildVacuityError(f"{side} form's self_model.nodes is not a list")
+    return len(nodes)
+
+
+def assert_self_model_applied(live_form: str, rebuilt_form: str) -> None:
+    """Hard gate: the self-model must be present on both sides AND equal.
+
+    Non-zero AND equal, never merely equal, and the distinction is the whole
+    reason this exists. The closure design's sequencing error was exactly this:
+    delete copy-forward, wire a seed-apply that writes zero nodes, and every
+    existing gate stays green -- determinism passes because two empty
+    self-models are byte-identical, and `live == rebuilt` passes because it
+    never looked at that partition at all. The retirement would have been
+    proven by nothing.
+
+    So "applied nothing" and "applied correctly" have to be different
+    observables. An equality check alone cannot tell them apart; a count floor
+    alone cannot catch a partial apply. Both, together, can.
+
+    Args:
+        live_form: Canonical form of the source graph, built with
+            `include_self_model=True`.
+        rebuilt_form: Canonical form of the staging graph, same setting.
+
+    Raises:
+        RebuildVacuityError: when either form lacks the partition (a caller
+            bug that would otherwise pass silently), when both sides are empty,
+            when the rebuild applied nothing, or when the counts disagree.
+    """
+    live = _self_model_node_count(live_form, side="live")
+    rebuilt = _self_model_node_count(rebuilt_form, side="rebuilt")
+
+    if live == 0 and rebuilt == 0:
+        raise RebuildVacuityError(
+            "self-model gate FAILED: both sides carry 0 self-model nodes. Two empty "
+            "partitions are byte-identical, so an equality check over them is green "
+            "and meaningless. Either the seed was never applied or the partition was "
+            "never populated; neither is a passing state."
+        )
+    if rebuilt == 0:
+        raise RebuildVacuityError(
+            f"self-model gate FAILED: the rebuild applied nothing -- live carries "
+            f"{live} self-model node(s), the rebuild carries 0. This is the "
+            "seed-apply-writes-zero case the copy-forward retirement must not be "
+            "able to hide."
+        )
+    if live != rebuilt:
+        raise RebuildVacuityError(
+            f"self-model gate FAILED: live carries {live} self-model node(s), the "
+            f"rebuild carries {rebuilt}. A partial apply is not a pass."
+        )
+
+
 def assert_rebuild_twice_identical(build_a: str, build_b: str) -> None:
     """Hard gate: two rebuilds of the same epoch+log must be byte-identical."""
     if build_a != build_b:

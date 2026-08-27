@@ -22,6 +22,7 @@ from pathlib import Path
 
 from backend.errors import SeedSourceError
 from backend.interfaces import GraphConnection
+from backend.knowledge.eval_isolation import assert_neo4j_uri_not_live
 from backend.knowledge.ontologies import ALL_NODE_TYPE_NAMES
 from backend.knowledge.ontologies.v1_0_0 import ALL_EDGE_TYPE_NAMES
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
@@ -87,12 +88,39 @@ _WIPE_NODES = (
 )
 
 
+def _assert_seed_target_permitted(
+    connection: GraphConnection, *, allow_live: bool, action: str
+) -> None:
+    """Refuse a live target unless the caller said `allow_live` (F1).
+
+    Default-CLOSED, and at the WRITE site rather than the call site. Every
+    isolation guard in the repo reasons about URI strings; these two functions
+    take a connection OBJECT, so none of them could be pointed at the thing
+    issuing the writes. A guard the caller must remember to add is absent
+    exactly when it matters -- at the R1.7 seed-apply insertion point
+    (`log_regenerator.py:445`), `source_conn` and `staging_conn` are both in
+    scope and differ by six characters.
+
+    A connection with no readable `.config.uri` is NOT a real `Neo4jConnection`
+    and cannot reach live, so it passes. That is the test-double case, and it is
+    sound rather than a loophole: the threat model is a real connection aimed at
+    the canonical graph, and a real one always exposes its URI.
+    """
+    if allow_live:
+        return
+    uri = getattr(getattr(connection, "config", None), "uri", None)
+    if uri is None:
+        return
+    assert_neo4j_uri_not_live(uri, action=action)
+
+
 def apply_seed_documents(
     connection: GraphConnection,
     documents: list[SeedDocument],
     *,
     seed_version: str,
     now_iso: str,
+    allow_live: bool = False,
 ) -> dict[str, int]:
     """Write every fact in `documents` to the graph, stamped with `seed_version`.
 
@@ -119,6 +147,9 @@ def apply_seed_documents(
         now_iso: Timestamp for `created_at` / `updated_at`. Passed in rather
             than read from the clock so application is byte-reproducible --
             two calls with identical input must produce identical writes.
+        allow_live: Permit a connection pointed at the canonical graph (F1).
+            Defaults to False so the dangerous call is the one that has to be
+            spelled out; `cmd_seed` is the only production caller that sets it.
 
     Returns:
         Counts keyed `nodes` and `facts`.
@@ -135,6 +166,9 @@ def apply_seed_documents(
             directly, bypassing `load_seed_documents`, is not protected by
             a loader-only check).
     """
+    _assert_seed_target_permitted(
+        connection, allow_live=allow_live, action="applying seed documents"
+    )
     _validate_predicates(documents)
     _validate_node_types(documents)
     node_partitions = _assign_node_partitions(documents)
@@ -253,6 +287,7 @@ def reseed(
     *,
     seed_version: str,
     now_iso: str,
+    allow_live: bool = False,
 ) -> dict[str, int]:
     """Wipe `seed_version` and re-apply `documents` under the same version.
 
@@ -280,6 +315,10 @@ def reseed(
             -- a caller cannot wipe one version and apply another.
         now_iso: Timestamp forwarded to `apply_seed_documents`. Required,
             not read from the clock, so re-seeding is byte-reproducible.
+        allow_live: Permit a connection pointed at the canonical graph (F1).
+            Checked here BEFORE the wipe, not only in the delegate -- a guard
+            that fired after `wipe_seed_version` would refuse an already-empty
+            graph.
 
     Returns:
         Counts keyed `nodes` and `facts`, from the re-apply.
@@ -292,12 +331,22 @@ def reseed(
             more than once, or a fact references an undefined node id.
             Raised before the wipe runs.
     """
+    # BEFORE the wipe, and independently of the delegate's own guard: by the
+    # time `apply_seed_documents` refused, `wipe_seed_version` would already
+    # have emptied the graph. This is the 2026-07-31 loss path.
+    _assert_seed_target_permitted(connection, allow_live=allow_live, action="re-seeding")
     _validate_predicates(documents)
     _validate_node_types(documents)
     _assign_node_partitions(documents)
     _collect_node_definitions(documents)
     wipe_seed_version(connection, seed_version)
-    return apply_seed_documents(connection, documents, seed_version=seed_version, now_iso=now_iso)
+    return apply_seed_documents(
+        connection,
+        documents,
+        seed_version=seed_version,
+        now_iso=now_iso,
+        allow_live=allow_live,
+    )
 
 
 def _count(results: list[dict]) -> int:
