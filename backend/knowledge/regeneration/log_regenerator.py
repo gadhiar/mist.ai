@@ -39,6 +39,7 @@ from backend.knowledge.curation.pipeline import CurationResult
 from backend.knowledge.eval_isolation import assert_rebuild_target_not_live
 from backend.knowledge.extraction.ontology_extractor import ExtractionResult
 from backend.knowledge.extraction_cache import OUTCOME_SKIPPED
+from backend.knowledge.ontologies import EDGE_TYPES_BY_NAME
 from backend.knowledge.regeneration.rebuild_journal import RebuildJournal
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
@@ -88,12 +89,17 @@ class LogRegenerator:
         "HAS_PREFERENCE",
         "IS_UNCERTAIN_ABOUT",
     )
-    # Cross-layer edges (self-model -> :__Entity__) -- re-derived by canonical id.
-    _CROSS_LAYER_EDGES = (
-        "MIST_HAS_TRAIT",
-        "MIST_HAS_CAPABILITY",
-        "MIST_HAS_PREFERENCE",
-        "IMPLEMENTED_WITH",
+    # Cross-layer edges (self-model <-> :__Entity__) are discovered STRUCTURALLY --
+    # see `rederive_self_model_cross_layer_edges`. There is deliberately no edge-type
+    # tuple here. The retired `_CROSS_LAYER_EDGES` named four of the ten types the
+    # ontology permits from a self-model source (`ADAPTED_FOR`, `DEPENDS_ON`,
+    # `REFERENCES_DOCUMENT`, `USES`, `WORKS_WITH`, `RELATED_TO` were missing) and none
+    # of the reverse direction, so every unlisted type was dropped on rebuild.
+    # A hand-list that must agree with the ontology drifts from it on the next bump;
+    # a longer hand-list only moves the next drift further out.
+    _PARTITION_DIRECTIONS = (
+        (SELF_MODEL_LABEL, ENTITY_LABEL),
+        (ENTITY_LABEL, SELF_MODEL_LABEL),
     )
 
     def __init__(
@@ -211,24 +217,58 @@ class LogRegenerator:
         return len(nodes)
 
     def rederive_self_model_cross_layer_edges(self, source_conn, staging_conn) -> dict[str, int]:
-        """Re-create cross-layer self-model -> :__Entity__ edges in staging by id.
+        """Re-create cross-layer self-model <-> :__Entity__ edges in staging by id.
 
-        Reads each cross-layer edge from source and MERGEs it in staging keyed on
-        canonical (id) at both ends. Skips (and counts) edges whose target entity
-        id is absent from staging (a target that the log-replay did not produce,
-        e.g. a formerly vault-derived-only entity). Returns {edges, skipped}.
+        Reads every edge spanning the two partitions in EITHER direction and MERGEs it
+        in staging keyed on canonical (id) at both ends. Skips (and counts) edges whose
+        target id is absent from staging (a target the log-replay did not produce, e.g.
+        a formerly vault-derived-only entity).
+
+        The partition-pair predicate is deliberately the same one `dump_graph_json` uses
+        to collect `self_model_cross_layer_edges` (`admin.py:972-981`, structural with no
+        type filter, both directions). The comparison surface and the re-derivation must
+        cover the same set of edges: an edge the comparison reads but the re-derivation
+        does not re-create is a guaranteed RED on the `live == rebuilt` gate that says
+        nothing about determinism. That cost is why this reads structurally rather than
+        from a list -- and why the two queries must stay in step if either is edited.
+
+        Edge types come from the DATA (Cypher cannot parameterize a relationship type,
+        so the type is interpolated) and are therefore validated against the ontology
+        first; an undeclared type is refused and counted rather than interpolated.
+        Partition labels are module constants, never data.
+
+        NOT handled here: self-model <-> :__Provenance__ edges, which the ontology permits
+        as `LEARNED_SELF` (-> LearningEvent), `DERIVED_FROM` (-> VectorChunk /
+        ExternalSource / VaultNote), and `RELATED_TO` to a provenance target. No gate key
+        compares them either -- `cross_layer_edges` covers entity <-> provenance and this
+        one covers entity <-> self-model, so self-model <-> provenance is in neither. That
+        blind spot is a comparison-surface decision (ADR-023's residue table), not this
+        method's contract, and is recorded rather than silently closed here.
+
+        Returns {edges, skipped, unknown}.
         """
-        created, skipped = 0, 0
-        for edge_type in self._CROSS_LAYER_EDGES:
+        created, skipped, unknown = 0, 0, 0
+        for source_label, target_label in self._PARTITION_DIRECTIONS:
             edges = source_conn.execute_query(
-                f"MATCH (s:{SELF_MODEL_LABEL})-[r:{edge_type}]->(t:{ENTITY_LABEL}) "
-                "RETURN s.id AS s, t.id AS t, properties(r) AS props",
+                f"MATCH (s:{source_label})-[r]->(t:{target_label}) "
+                "RETURN s.id AS s, type(r) AS type, t.id AS t, properties(r) AS props",
                 {},
             )
             for e in edges:
+                edge_type = e["type"]
+                if edge_type not in EDGE_TYPES_BY_NAME:
+                    logger.warning(
+                        "Cross-layer edge type %r on %s->%s is not declared in the "
+                        "ontology; refusing to re-derive it",
+                        edge_type,
+                        e["s"],
+                        e["t"],
+                    )
+                    unknown += 1
+                    continue
                 result = staging_conn.execute_write(
-                    f"MATCH (s:{SELF_MODEL_LABEL} {{id: $s}}) "
-                    f"MATCH (t:{ENTITY_LABEL} {{id: $t}}) "
+                    f"MATCH (s:{source_label} {{id: $s}}) "
+                    f"MATCH (t:{target_label} {{id: $t}}) "
                     f"MERGE (s)-[r:{edge_type}]->(t) SET r = $props "
                     "RETURN count(r) AS n",
                     {"s": e["s"], "t": e["t"], "props": e["props"]},
@@ -237,7 +277,7 @@ class LogRegenerator:
                     created += 1
                 else:
                     skipped += 1
-        return {"edges": created, "skipped": skipped}
+        return {"edges": created, "skipped": skipped, "unknown": unknown}
 
     async def rebuild(
         self,
