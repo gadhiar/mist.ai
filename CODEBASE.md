@@ -43,9 +43,50 @@ query even with both switches on. That is a genuinely silent drop, it changes wh
 section 4 must enumerate, and it is a gate-surface decision rather than a regenerator bug.
 Left for ADR-023, which is under a 4-reviewer pass as of this session.
 
-Tickets unchanged: MIS-128/129/131/133 Done. **MIS-132** (ADR-023, `status: proposed`,
-evidence section EMPTY by design) and **MIS-130** (seed-apply + embedding backfill, the last
-code prerequisite) both still open in Backlog.
+**Also this session: the gate was wired (MIS-137).** A 4-reviewer pass on ADR-023 found that
+`live == rebuilt` was not a gate at all -- `mist_admin.py` PRINTED `live_vs_rebuilt_report` and
+returned 0, so `hydrate && rebuild && echo GREEN` printed GREEN on any divergence -- and that
+all five non-vacuity floors had zero production callers, called only from tests. Both are now
+closed:
+
+- New `assert_live_equals_rebuilt` raising `RebuildDivergenceError`, deliberately NOT
+  `RebuildDeterminismError`: rebuild-twice disagreeing is non-determinism, rebuilt disagreeing
+  with live is a derivation gap, and one exit code for both costs the operator the diagnosis.
+- `cmd_graph_rebuild_from_log` now wires the turns gate, the whole-graph node floor (on both
+  builds AND on live), and the replay-derived edge floor, then the equality gate. Non-vacuity
+  runs BEFORE equality because two empty graphs are equal.
+- **Exit codes, one per failure family:** 0 green, 1 non-determinism, 2 refused before
+  measuring, 3 live != rebuilt, 4 a non-vacuity floor failed.
+- **Fails closed on an unchosen floor.** `--expect-turns` and `--min-replay-edges` are required
+  and undefaulted, refused before any `connect()`; a defaulted floor is a number nobody chose
+  that the run then reports as passed. `--diagnostic` is the explicit escape and prints a
+  banner saying no gate ran. Verified against the real CLI: exit 2 with no floors, exit 2 on a
+  live staging target (the isolation guard still fires first).
+- Four mutants applied and all killed: assertion reverted to a print (2 RED, including the
+  exit-code test); turns + replay floors dropped (3 RED); the two exception types merged (3 RED
+  -- it silently rerouted a derivation gap to exit 1); fail-closed check disabled (3 RED).
+
+**Not wired, recorded rather than dropped:** `assert_extraction_cache_non_vacuous`. It needs a
+new `ExtractionCache` row-read method, and its failure mode is largely subsumed here -- a cache
+of `extracted`-but-empty payloads yields no replay edges, which the replay floor already
+catches, and cache COVERAGE is already fail-closed via `ColdCacheError`. Left on MIS-137.
+
+Suite **3334 -> 3353 passed / 6 skipped / 3 xfailed / 0 failed**. Branch
+`feat/mis-137-wire-the-rebuild-gate`, NOT merged, NOT pushed.
+
+Tickets: MIS-128/129/131/133 Done. **MIS-132** (ADR-023, `status: proposed`, evidence section
+EMPTY by design) and **MIS-130** (seed-apply + embedding backfill) both still open in Backlog.
+Filed 2026-09-14 from the reviewer pass: **MIS-137** (wire the gate -- this session),
+**MIS-138** (fix the derivation function: four undeclared inputs, two hidden domain filters,
+rowid-not-event_id replay order, composition order), **MIS-139** (self-model <-> provenance has
+no term in `dump_graph_json` under any switch), **MIS-140** (P0 live-state backup -- the event
+store and extraction cache have none, and `graph-backup` has no loader), **MIS-141** (dedup
+Tier 3 bare-except + reachability probe), **MIS-142** (seed-source digest), **MIS-143**
+(read-time precedence), **MIS-144** (deterministic fact-correction affordance).
+
+**Agreed sequencing, 2026-09-14:** wire the instrument (MIS-137, done) -> fix the function
+(MIS-138) -> retire copy-forward (MIS-130) -> **pause for review** -> hydrate. The pause is
+explicit: do not start the 87-turn run without it.
 
 **PRIOR ENTRY --** 2026-08-26 (**R1.6 closed bar its ADR's evidence; R1.7's prerequisites complete.
 Six commits on `feat/r1.7-hydration-safety-and-blockers`, NOT merged** -- falsified by the merge
