@@ -47,7 +47,11 @@ from backend.knowledge.extraction.normalizer import EntityNormalizer
 from backend.knowledge.extraction.temporal import TemporalResolver
 from backend.knowledge.extraction.validator import ExtractionValidator, ValidationResult
 from backend.knowledge.extraction_cache import OUTCOME_EXTRACTED, ExtractionCache
-from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
+from backend.knowledge.regeneration.log_regenerator import (
+    ColdCacheError,
+    LogRegenerator,
+    RebuildScopeError,
+)
 from backend.knowledge.regeneration.rebuild_journal import EventStoreRebuildJournal
 
 # The REAL staging endpoint, not a per-file synthetic name. Connections here are
@@ -201,7 +205,12 @@ def _warm(cache: ExtractionCache, epoch: dict[str, Any], event_id: str) -> None:
     )
 
 
-def build_world(*, cache_superseded_turn: bool = True, with_orphan: bool = False) -> ScopedWorld:
+def build_world(
+    *,
+    cache_superseded_turn: bool = True,
+    with_orphan: bool = False,
+    empty_log: bool = False,
+) -> ScopedWorld:
     """Seed a log spanning two ontology epochs and two session origins.
 
     Layout (4 turns, or 5 with the orphan):
@@ -211,6 +220,10 @@ def build_world(*, cache_superseded_turn: bool = True, with_orphan: bool = False
       (no session row)               -> ORPHAN               @ CURRENT_ONTOLOGY
 
     A correctly scoped rebuild replays REAL_ONE and REAL_TWO -- and ORPHAN when present.
+
+    `empty_log=True` seeds the epoch and the sessions but NO turns, which is the
+    control case for the scope refusal: selecting nothing from an empty log is
+    correct, and only selecting nothing from a POPULATED log is a misconfiguration.
     """
     store = EventStore(db_path=":memory:")
     store.initialize()
@@ -227,25 +240,28 @@ def build_world(*, cache_superseded_turn: bool = True, with_orphan: bool = False
     store.start_session("s-real-legacy", input_modality="text", origin="real")
     store.start_session("s-test", input_modality="text", origin="test")
 
-    _append_turn(store, session_id="s-real", event_id=REAL_ONE, ontology_version=CURRENT_ONTOLOGY)
-    _append_turn(
-        store,
-        session_id="s-real",
-        event_id=REAL_TWO,
-        ontology_version=CURRENT_ONTOLOGY,
-        turn_index=1,
-    )
-    _append_turn(
-        store,
-        session_id="s-real-legacy",
-        event_id=SUPERSEDED,
-        ontology_version=SUPERSEDED_ONTOLOGY,
-    )
-    _append_turn(
-        store, session_id="s-test", event_id=TEST_ORIGIN, ontology_version=CURRENT_ONTOLOGY
-    )
-    if with_orphan:
-        _append_turn_with_no_session_row(store, event_id=ORPHAN)
+    if not empty_log:
+        _append_turn(
+            store, session_id="s-real", event_id=REAL_ONE, ontology_version=CURRENT_ONTOLOGY
+        )
+        _append_turn(
+            store,
+            session_id="s-real",
+            event_id=REAL_TWO,
+            ontology_version=CURRENT_ONTOLOGY,
+            turn_index=1,
+        )
+        _append_turn(
+            store,
+            session_id="s-real-legacy",
+            event_id=SUPERSEDED,
+            ontology_version=SUPERSEDED_ONTOLOGY,
+        )
+        _append_turn(
+            store, session_id="s-test", event_id=TEST_ORIGIN, ontology_version=CURRENT_ONTOLOGY
+        )
+        if with_orphan:
+            _append_turn_with_no_session_row(store, event_id=ORPHAN)
 
     cache = ExtractionCache(":memory:")
     cache.initialize()
@@ -477,18 +493,52 @@ class TestScopingConsequences:
 
 
 class TestScopingIsObservable:
-    """Scoping can now select nothing from a populated log. That must not be silent."""
+    """Scoping can select nothing from a populated log. That must not be silent."""
 
     @pytest.mark.asyncio
-    async def test_a_rebuild_that_selects_nothing_from_a_populated_log_warns(self, caplog):
+    async def test_a_rebuild_that_selects_nothing_from_a_populated_log_refuses(self):
+        """Promoted from a warning to a refusal. MIS-138.
+
+        This test previously asserted `report.turns_processed == 0` plus a WARNING,
+        and that was the defect rather than the coverage: selecting 0 of N>0 turns
+        means the replay is a no-op, the cache-coverage gate passes vacuously over
+        an empty selection, and every downstream assertion reads the result as "the
+        log was empty". The run completes and reports success.
+
+        It is also not a hypothetical configuration slip. `epoch["ontology_version"]`
+        is a DOMAIN FILTER on the selection, and turns are stamped with the version
+        current when they were written -- so the first ontology bump after any turns
+        exist makes `WHERE e.ontology_version = <new>` select zero, permanently, for
+        every historical turn. MIST has bumped 1.0.0 -> 1.1.0 -> 1.3.0 -> 1.4.0.
+        A warning on that state is a warning nobody reads on a rebuild that
+        silently produced nothing.
+
+        Refusing before any write is the earlier, cheaper failure.
+        """
         world = build_world()
         world.epoch = {**world.epoch, "ontology_version": "0.0.0-matches-no-turn"}
 
-        with caplog.at_level(logging.WARNING):
-            report = await rebuild(world)
+        with pytest.raises(RebuildScopeError) as exc:
+            await rebuild(world)
+
+        body = str(exc.value)
+        assert "0 of 4" in body
+        assert "0.0.0-matches-no-turn" in body, "the refusal must name the filter that excluded"
+
+    @pytest.mark.asyncio
+    async def test_an_empty_log_is_not_a_scope_refusal(self):
+        """The guard must fire on a MISSED populated log, never on a genuinely empty one.
+
+        Otherwise it refuses the one state it cannot diagnose -- a fresh store with
+        no turns yet, where selecting nothing is correct rather than misconfigured.
+        The non-vacuity floors (MIS-137) are what catch an empty-log rebuild, and
+        they say so in their own language.
+        """
+        world = build_world(empty_log=True)
+
+        report = await rebuild(world)
 
         assert report.turns_processed == 0
-        assert "selected 0 of 4 logged turns" in caplog.text
 
     @pytest.mark.asyncio
     async def test_a_normal_rebuild_logs_the_scope_it_selected(self, caplog):
@@ -498,6 +548,48 @@ class TestScopingIsObservable:
             await rebuild(world)
 
         assert "2 of 4 logged turns selected" in caplog.text
+
+
+class TestTheReportRecordsItsOwnDomain:
+    """A run's evidence must state the domain it selected under. MIS-138.
+
+    ADR-023 section 2 named three inputs and described `epoch` as "supplying
+    `extraction_version` and `model_hash`" -- omitting that `ontology_version` and
+    `origins` RESTRICT THE DOMAIN of the log rather than stamping the output. A
+    report that carries only `turns_processed` cannot distinguish "replayed the
+    whole log" from "replayed the 2 turns this epoch could see out of 4", so
+    section 7's evidence would have to take the domain on trust from a plan.
+
+    These are the fields that make the domain an observed fact about the run.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_report_names_the_ontology_version_it_selected_under(self):
+        world = build_world()
+
+        report = await rebuild(world)
+
+        assert report.ontology_version == CURRENT_ONTOLOGY
+
+    @pytest.mark.asyncio
+    async def test_the_report_names_the_origins_it_selected_under(self):
+        world = build_world()
+
+        report = await rebuild(world, origins=("real", "test"))
+
+        assert report.origins == ("real", "test")
+
+    @pytest.mark.asyncio
+    async def test_the_report_carries_both_selected_and_total_logged(self):
+        """The ratio is the point: 2 of 4 is a scoped run, 2 of 2 is a whole-log run,
+        and `turns_processed` alone cannot tell them apart.
+        """
+        world = build_world()
+
+        report = await rebuild(world)
+
+        assert report.turns_processed == 2
+        assert report.total_logged == 4
 
 
 class TestEmptyOriginsIsRejected:

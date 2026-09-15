@@ -12,6 +12,16 @@ class RebuildDeterminismError(MistError):
     """Raised when two rebuilds of the same log produce different canonical forms."""
 
 
+class RebuildDivergenceError(MistError):
+    """The rebuild is deterministic and disagrees with the live graph.
+
+    Separate from `RebuildDeterminismError` on purpose -- see
+    `assert_live_equals_rebuilt`. Non-determinism and a derivation gap are
+    different findings with different remedies, and collapsing them costs the
+    operator the diagnosis.
+    """
+
+
 class RebuildVacuityError(MistError):
     """Raised when a canonical form describes too small a graph to prove anything."""
 
@@ -294,11 +304,66 @@ def assert_rebuild_twice_identical(build_a: str, build_b: str) -> None:
         )
 
 
-def live_vs_rebuilt_report(live_form: str, rebuilt_form: str) -> str:
-    """Diagnostic (NOT a gate in R1.2): describe live vs rebuilt divergence.
+def assert_live_equals_rebuilt(live_form: str, rebuilt_form: str) -> None:
+    """Hard gate: the rebuilt entity subgraph must equal the live one.
 
-    `live == rebuilt` green closure is deferred to R1.6 (after vault->graph
-    retirement + seed migration make the live graph purely log-derived).
+    Promoted from `live_vs_rebuilt_report` (below), which computed exactly this
+    diff and returned it as a STRING. The only runnable comparison in the repo
+    therefore printed its own red result and exited 0 -- `mist_admin.py:1125-1126`
+    -- so `hydrate && rebuild && echo GREEN` printed GREEN on any divergence, and
+    ADR-023's reserved evidence field "Mutation results proving the gate can fail"
+    had no assertion to mutate against. MIS-137.
+
+    Deliberately raises `RebuildDivergenceError` and NOT
+    `RebuildDeterminismError`. `assert_rebuild_twice_identical` failing means
+    NON-DETERMINISM: identical inputs produced two different graphs.
+    This failing means a DERIVATION GAP: the rebuild is perfectly deterministic
+    and disagrees with live. Different causes, different remedies, and a caller
+    mapping both onto one exit code cannot tell an operator which happened.
+
+    Both forms must be built with the SAME `include_provenance` /
+    `include_self_model` switches. Comparing across switch sets compares two
+    different surfaces, and the diff would be dominated by the surface difference
+    rather than by content.
+
+    Caveat this assertion cannot enforce, recorded because a green result here
+    will be cited: while `rebuild()` still populates `:__SelfModel__` by copying
+    from `source_conn` (the live store, i.e. this function's own left-hand side),
+    a form built with `include_self_model=True` compares that partition against a
+    copy of itself and is green by construction. Keep that switch OFF until the
+    copy-forward retirement lands (MIS-130), or report the partition as copied
+    rather than reproduced.
+
+    Raises:
+        RebuildDivergenceError: when the two canonical forms differ.
+    """
+    if live_form == rebuilt_form:
+        return
+    diff = "\n".join(
+        difflib.unified_diff(
+            live_form.splitlines(),
+            rebuilt_form.splitlines(),
+            fromfile="live",
+            tofile="rebuilt",
+            lineterm="",
+        )
+    )
+    n = sum(
+        1
+        for line in diff.splitlines()
+        if line and line[0] in "+-" and not line.startswith(("+++", "---"))
+    )
+    raise RebuildDivergenceError(
+        f"live != rebuilt: {n} differing canonical line(s). The rebuild is not a "
+        "reproduction of the live entity subgraph.\n" + diff
+    )
+
+
+def live_vs_rebuilt_report(live_form: str, rebuilt_form: str) -> str:
+    """Diagnostic, NOT a gate -- use `assert_live_equals_rebuilt` for that.
+
+    Retained for the explicit `--diagnostic` mode and for callers that want the
+    divergence described without failing. Every gate path uses the assertion.
     """
     if live_form == rebuilt_form:
         return "live == rebuilt: no divergence (entity subgraph canonical forms match)."

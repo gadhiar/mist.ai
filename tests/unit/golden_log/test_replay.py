@@ -36,7 +36,11 @@ from backend.knowledge.extraction.confidence import ConfidenceScorer
 from backend.knowledge.extraction.normalizer import EntityNormalizer
 from backend.knowledge.extraction.temporal import TemporalResolver
 from backend.knowledge.extraction.validator import ExtractionValidator, ValidationResult
-from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
+from backend.knowledge.regeneration.log_regenerator import (
+    ColdCacheError,
+    LogRegenerator,
+    RebuildScopeError,
+)
 from backend.knowledge.regeneration.rebuild_gate import (
     RebuildDeterminismError,
     assert_rebuild_twice_identical,
@@ -197,16 +201,27 @@ class TestTheOriginGuardIsLoadBearing:
             **_stage_components(),
         )
 
-        # Act: no `origins` -- whatever a rebuild of the CANONICAL graph does by default.
-        report = await regenerator.rebuild(
-            staging_uri=STAGING_URI, live_uri=LIVE_URI, epoch=materialized.epoch
-        )
-
-        # Assert: the log is populated and the canonical rebuild replayed none of it.
-        # `generate.SESSION_ORIGIN` is "test"; a canonical rebuild is not fixture traffic's.
+        # Precondition: the log IS populated, so only the origin guard can empty the
+        # selection.
         assert materialized.event_store.get_turn_count() == EXPECTED_TURN_COUNT
-        assert report.turns_processed == 0
-        assert recorder.calls == []
+
+        # Act + Assert: no `origins` -- whatever a rebuild of the CANONICAL graph does
+        # by default. `generate.SESSION_ORIGIN` is "test"; a canonical rebuild is not
+        # fixture traffic's.
+        #
+        # This assertion was `report.turns_processed == 0` until MIS-138 promoted
+        # "selected nothing from a populated log" from a warning to a refusal. The
+        # guard's purpose is unchanged and now stated more strongly: it does not
+        # merely exclude fixture traffic quietly, it refuses to produce a graph from
+        # an empty selection. The test still fails if the default widens to include
+        # fixture traffic -- it would then replay and not raise.
+        with pytest.raises(RebuildScopeError) as exc:
+            await regenerator.rebuild(
+                staging_uri=STAGING_URI, live_uri=LIVE_URI, epoch=materialized.epoch
+            )
+
+        assert "origin in (real)" in str(exc.value), "the refusal must name the filter"
+        assert recorder.calls == [], "refused, but only after replaying something"
 
 
 class TestReplayIsNotVacuous:

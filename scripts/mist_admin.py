@@ -1065,18 +1065,68 @@ def _build_log_regenerator(
 
 
 def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
-    """Build a staging graph from the log twice; assert determinism; report live divergence."""
+    """Build a staging graph from the log twice, then gate it. MIS-137.
+
+    Exit codes, one per failure family so the operator learns WHICH gate spoke:
+
+    ==== =========================================================================
+    0    every gate green
+    1    rebuild-twice disagreed -- NON-DETERMINISM
+    2    refused before measuring (live target, cold cache, or no floors chosen)
+    3    live != rebuilt -- a DERIVATION GAP, not non-determinism
+    4    a non-vacuity floor failed -- the run proved nothing
+    ==== =========================================================================
+
+    Before MIS-137 this function printed `live_vs_rebuilt_report` and returned 0,
+    so it could not fail on a divergence of any size, and none of the five
+    non-vacuity floors had a production caller at all.
+    """
     import asyncio as _asyncio
 
     from backend.knowledge.canonical_serialize import canonical_graph_form
     from backend.knowledge.config import Neo4jConfig
     from backend.knowledge.eval_isolation import RebuildTargetError, assert_rebuild_target_not_live
-    from backend.knowledge.regeneration.log_regenerator import ColdCacheError
+    from backend.knowledge.regeneration.log_regenerator import ColdCacheError, RebuildScopeError
     from backend.knowledge.regeneration.rebuild_gate import (
         RebuildDeterminismError,
+        RebuildDivergenceError,
+        RebuildVacuityError,
+        assert_canonical_form_non_vacuous,
+        assert_live_equals_rebuilt,
         assert_rebuild_twice_identical,
+        assert_replay_derived_non_vacuous,
+        assert_turns_processed,
         live_vs_rebuilt_report,
     )
+
+    diagnostic = bool(getattr(args, "diagnostic", False))
+    expect_turns = getattr(args, "expect_turns", None)
+    min_replay_edges = getattr(args, "min_replay_edges", None)
+
+    # Fail closed on an unchosen floor, and do it before any connect().
+    #
+    # `assert_turns_processed` and `assert_replay_derived_non_vacuous` both refuse
+    # a floor below 1 with ValueError, because a floor of zero is satisfied by the
+    # emptiness they exist to refuse. A DEFAULTED floor is the same defect one
+    # level up: a number nobody chose, derived from nothing, that the run then
+    # reports as passed. So both are required, and both come from the corpus.
+    if not diagnostic:
+        missing = [
+            flag
+            for flag, value in (
+                ("--expect-turns", expect_turns),
+                ("--min-replay-edges", min_replay_edges),
+            )
+            if value is None
+        ]
+        if missing:
+            print(
+                f"[rebuild] REFUSED: {' and '.join(missing)} must be given, sized from the "
+                "corpus being replayed. A defaulted floor is a floor nobody chose, and it "
+                "would be reported as a pass. Pass --diagnostic to describe divergence "
+                "without gating."
+            )
+            return 2
 
     be = _load_backend()
     # Resolve live_uri early (no connection needed) so the isolation guard
@@ -1106,7 +1156,7 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
             staging_conn.execute_write("MATCH (n) DETACH DELETE n", {})
             regen, epoch = _build_log_regenerator(be, staging_conn, args.epoch)
             # Each call gets a unique job_id automatically (job_id left unset).
-            _asyncio.run(
+            report = _asyncio.run(
                 regen.rebuild(
                     staging_uri=args.staging_uri,
                     live_uri=live_uri,
@@ -1115,14 +1165,58 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
                     staging_conn=staging_conn,
                 )
             )
-            return canonical_graph_form(staging_conn, include_provenance=False)
+            # The report is returned, not discarded: `turns_processed` is the only
+            # thing that separates "replayed the corpus" from "selected zero turns
+            # and serialised an empty graph twice", and both builds are checked
+            # rather than just the one that reaches the comparison.
+            return canonical_graph_form(staging_conn, include_provenance=False), report
 
-        build_a = _build_once()
-        build_b = _build_once()
+        build_a, report_a = _build_once()
+        build_b, report_b = _build_once()
         assert_rebuild_twice_identical(build_a, build_b)
         print("[rebuild] determinism gate PASSED (rebuild-twice byte-identical)")
+
+        # Same switches on both sides. Comparing across switch sets compares two
+        # different surfaces and the diff is dominated by the surface, not content.
         live_form = canonical_graph_form(live_conn, include_provenance=False)
-        print(live_vs_rebuilt_report(live_form, build_b))
+
+        if diagnostic:
+            print(
+                "[rebuild] DIAGNOSTIC MODE: the live-vs-rebuilt comparison below is "
+                "not a gate. No non-vacuity floor ran, and this command will exit 0 "
+                "whatever the comparison says. Do not cite this run as evidence."
+            )
+            print(live_vs_rebuilt_report(live_form, build_b))
+            return 0
+
+        # Non-vacuity BEFORE equality, deliberately: two empty graphs are equal,
+        # so an equality gate taken first reports green on a run that did nothing.
+        for label, form, turns in (
+            ("rebuild-1", build_a, report_a.turns_processed),
+            ("rebuild-2", build_b, report_b.turns_processed),
+        ):
+            assert_turns_processed(processed=turns, expected=expect_turns)
+            assert_canonical_form_non_vacuous(form, minimum_nodes=1)
+            assert_replay_derived_non_vacuous(form, minimum_edges=min_replay_edges)
+            print(f"[rebuild] non-vacuity gates PASSED for {label} ({turns} turns replayed)")
+
+        # The DOMAIN, printed from the report rather than from the args, so the run
+        # states what it actually selected under. ADR-023 section 7 needs this as an
+        # observed fact -- `ontology_version` and `origins` restrict which turns are
+        # in the function's domain, and a turn count alone cannot show it. MIS-138.
+        print(
+            f"[rebuild] domain: {report_b.turns_processed} of {report_b.total_logged} logged "
+            f"turn(s), ontology_version={report_b.ontology_version!r}, "
+            f"origins={','.join(report_b.origins)}"
+        )
+
+        # The live side gets the node floor too. A live graph that serialises to
+        # nothing means the comparison is between two emptinesses whatever the
+        # rebuild did, and the equality gate below would call that agreement.
+        assert_canonical_form_non_vacuous(live_form, minimum_nodes=1)
+
+        assert_live_equals_rebuilt(live_form, build_b)
+        print("[rebuild] live == rebuilt gate PASSED (entity subgraph canonical forms match)")
         return 0
     except RebuildTargetError as exc:
         print(f"[rebuild] REFUSED: {exc}")
@@ -1130,9 +1224,22 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
     except ColdCacheError as exc:
         print(f"[rebuild] REFUSED: {exc}")
         return 2
+    except RebuildScopeError as exc:
+        # Same family as a cold cache: a configuration problem caught before any
+        # measurement, not a gate verdict. MIS-138.
+        print(f"[rebuild] REFUSED: {exc}")
+        return 2
     except RebuildDeterminismError as exc:
         print(f"[rebuild] {exc}")
         return 1
+    except RebuildDivergenceError as exc:
+        # Distinct from 1: the rebuild is deterministic and disagrees with live.
+        print(f"[rebuild] {exc}")
+        return 3
+    except RebuildVacuityError as exc:
+        # Distinct from both: nothing was disproved, but nothing was proved either.
+        print(f"[rebuild] {exc}")
+        return 4
     finally:
         if live_conn is not None:
             live_conn.disconnect()
@@ -2464,6 +2571,35 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Epoch id (default: current).",
+    )
+    # Deliberately no defaults: a floor nobody chose is reported as a pass.
+    # See cmd_graph_rebuild_from_log's fail-closed check. MIS-137.
+    p_rebuild.add_argument(
+        "--expect-turns",
+        type=int,
+        default=None,
+        help=(
+            "Exact turn count the replay must consume, sized from the corpus. "
+            "Required unless --diagnostic."
+        ),
+    )
+    p_rebuild.add_argument(
+        "--min-replay-edges",
+        type=int,
+        default=None,
+        help=(
+            "Minimum edges carrying the replay markers (source_utterance_id + "
+            "version_key), sized from the corpus. Seed edges do not count. "
+            "Required unless --diagnostic."
+        ),
+    )
+    p_rebuild.add_argument(
+        "--diagnostic",
+        action="store_true",
+        help=(
+            "Describe live-vs-rebuilt divergence WITHOUT gating: no floors, exit 0 "
+            "regardless. Prints a banner saying so. Not evidence."
+        ),
     )
     p_rebuild.set_defaults(func=cmd_graph_rebuild_from_log)
 

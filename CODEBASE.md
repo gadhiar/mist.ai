@@ -1,7 +1,144 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-08-26 (**R1.6 closed bar its ADR's evidence; R1.7's prerequisites complete.
-Six commits on `feat/r1.7-hydration-safety-and-blockers`, NOT merged.** `main` is unchanged at
+**Last Updated:** 2026-09-14 (**The R1.7 branch IS merged. Design section 8.2 closed. Still
+nothing hydrated, rebuilt, or gated.**
+
+The header below this one was stale in the way its own maintenance protocol exists to catch:
+it said "Six commits on `feat/r1.7-hydration-safety-and-blockers`, **NOT merged**" and "`main`
+is unchanged at `7ecec0c`", while the branch had been merged `--no-ff` at `cc11fb7` in the
+same session that wrote it. Run `git log --oneline -1` and `git status -sb` rather than
+trusting any hash in this file; at the time of writing `main` is at `cc11fb7` and level with
+`origin/main`, tree carrying only the change described next.
+
+**Read this first, because it has not changed and is the thing most likely to be
+misremembered after a gap:** everything R1.6/R1.7 built is INSTRUMENTATION, and none of it
+has been run. No hydration, no snapshot, no rebuild, no comparison. "R1.6/R1.7 prerequisites
+Done" and "the graph has been proven rebuildable" remain different sentences and only the
+first is earned. Live graph verified unchanged this session at 32 nodes / 30 relationships
+(10 `:__Entity__` + 20 `:__SelfModel__` edges, zero cross-layer edges of any kind).
+
+**This session (2026-09-14), after an 18-day gap:** design section 8.2 closed --
+`LogRegenerator._CROSS_LAYER_EDGES` retired in favour of a structural read. The hand-list
+named 4 of the 10 ontology-permitted self-model -> entity edge types and none of the reverse
+direction, so 6 types plus a whole direction were dropped on rebuild. The design doc's own
+entry understated the COUNT: it said "6 types" where the ontology accepts a `MistIdentity`
+source on 16, of which 10 can reach an `:__Entity__` target and 4 were handled. Its "drops them
+silently" was **CORRECT** -- an earlier revision of this entry recast it as a visible false RED
+and that was RETRACTED the same day, after the ADR-023 reviewers caught it. The surface is not
+compared at all today (`include_self_model` defaults False; `mist_admin.py:1118,1123` omit it),
+and `mist_admin.py:1125-1126` prints the live-vs-rebuilt report then returns 0, so a diff there
+is not a failure regardless. The false claim was about the one file that had not been opened --
+the caller, where the default takes effect -- which is exactly the Plan Verification Protocol's
+documented failure mode, committed in the same file that documents it. Latent
+only because zero cross-layer edges exist on live today. Suite **3325 -> 3334 passed / 6
+skipped / 3 xfailed / 0 failed**, measured after the change, not inherited. Three mutants
+applied and killed. `black --check --line-length 100` clean; `check_ai_slop.py --critical-only`
+reports 7 pre-existing `data/ingest/*.md` files and nothing new.
+
+**Opened in the same pass, deliberately not closed (new design section 8.3):** self-model
+<-> `:__Provenance__` edges (`LEARNED_SELF`, `DERIVED_FROM`, `RELATED_TO` to a provenance
+target) are compared by **no gate key at all** -- `cross_layer_edges` covers entity <->
+provenance, `self_model_cross_layer_edges` covers entity <-> self-model, and there is no third
+query even with both switches on. That is a genuinely silent drop, it changes what ADR-023
+section 4 must enumerate, and it is a gate-surface decision rather than a regenerator bug.
+Left for ADR-023, which is under a 4-reviewer pass as of this session.
+
+**Also this session: the gate was wired (MIS-137).** A 4-reviewer pass on ADR-023 found that
+`live == rebuilt` was not a gate at all -- `mist_admin.py` PRINTED `live_vs_rebuilt_report` and
+returned 0, so `hydrate && rebuild && echo GREEN` printed GREEN on any divergence -- and that
+all five non-vacuity floors had zero production callers, called only from tests. Both are now
+closed:
+
+- New `assert_live_equals_rebuilt` raising `RebuildDivergenceError`, deliberately NOT
+  `RebuildDeterminismError`: rebuild-twice disagreeing is non-determinism, rebuilt disagreeing
+  with live is a derivation gap, and one exit code for both costs the operator the diagnosis.
+- `cmd_graph_rebuild_from_log` now wires the turns gate, the whole-graph node floor (on both
+  builds AND on live), and the replay-derived edge floor, then the equality gate. Non-vacuity
+  runs BEFORE equality because two empty graphs are equal.
+- **Exit codes, one per failure family:** 0 green, 1 non-determinism, 2 refused before
+  measuring, 3 live != rebuilt, 4 a non-vacuity floor failed.
+- **Fails closed on an unchosen floor.** `--expect-turns` and `--min-replay-edges` are required
+  and undefaulted, refused before any `connect()`; a defaulted floor is a number nobody chose
+  that the run then reports as passed. `--diagnostic` is the explicit escape and prints a
+  banner saying no gate ran. Verified against the real CLI: exit 2 with no floors, exit 2 on a
+  live staging target (the isolation guard still fires first).
+- Four mutants applied and all killed: assertion reverted to a print (2 RED, including the
+  exit-code test); turns + replay floors dropped (3 RED); the two exception types merged (3 RED
+  -- it silently rerouted a derivation gap to exit 1); fail-closed check disabled (3 RED).
+
+**Not wired, recorded rather than dropped:** `assert_extraction_cache_non_vacuous`. It needs a
+new `ExtractionCache` row-read method, and its failure mode is largely subsumed here -- a cache
+of `extracted`-but-empty payloads yields no replay edges, which the replay floor already
+catches, and cache COVERAGE is already fail-closed via `ColdCacheError`. Left on MIS-137.
+
+**Then the derivation function was corrected (MIS-138).** Three defects in what
+`graph = f(seed, log, epoch)` actually computes:
+
+- **Replay order was a property of the database FILE, not the log.** The selection read
+  `ORDER BY e.rowid ASC`, and `schema.sql` declares `event_id TEXT PRIMARY KEY` with no
+  INTEGER PRIMARY KEY, so rowid is an implicit physical row number SQLite documents VACUUM may
+  renumber. Now `ORDER BY e.timestamp, e.session_id, e.turn_index` -- all three in the log.
+  `timestamp` leads because that is the order the LIVE path applied turns in. Not cosmetic:
+  dedup resolves each entity against whatever is already in the target graph, so order decides
+  which entity wins `display_name`, `description`, `entity_type` and the alias union.
+- **`ConversationTurnEvent.to_row` now normalises `timestamp` to UTC**, and that is what makes
+  the SQL ordering correct rather than tidy. SQLite compares TEXT lexicographically, so ISO
+  order equals chronological order only while every value carries the same offset --
+  `10:00+05:00` (05:00Z) sorts after `06:00+00:00` (06:00Z) as a string while being earlier as
+  an instant. Every caller happens to pass UTC today; that was a property of the CALLERS and is
+  now a property of the STORE. Naive datetimes are deliberately left alone (`astimezone` on a
+  naive value would invent a system-local offset).
+- **`after_event_id` resumes by the same triple** (row-value comparison), because a cursor
+  keyed on a different order than the ORDER BY can skip or repeat turns once the two disagree.
+- **Selecting 0 turns from a POPULATED log now raises `RebuildScopeError` (exit 2)** instead of
+  logging a warning and continuing. The old path no-opped, passed cache coverage vacuously over
+  an empty selection, and reported success having produced nothing. This is not an exotic slip:
+  `epoch["ontology_version"]` is a DOMAIN FILTER, turns carry the version current when written,
+  so the first ontology bump after any turns exist empties the selection permanently for every
+  historical turn. Scoped to a populated log deliberately -- an empty log selecting nothing is
+  correct, and that case belongs to the non-vacuity floors.
+- **`RebuildReport` now records the domain it ran under** (`ontology_version`, `origins`,
+  `total_logged`), and the CLI prints it from the report rather than from its own args. ADR-023
+  section 7 needs the domain as an observed fact; `turns_processed` alone cannot distinguish
+  "replayed the whole log" from "replayed the subset this epoch could see".
+
+Three mutants applied and killed: rowid ordering restored (5 RED), UTC normalisation removed
+(2 RED -- including the mixed-offset misordering test, proving it load-bearing), scope refusal
+disabled (2 RED across two files).
+
+**Composition order is documented, not yet asserted.** The seed-apply-before-replay constraint
+now sits as a comment directly above the replay loop in `rebuild()` -- the insertion point
+MIS-130's implementer will edit -- naming the two non-commuting writers
+(`seed/applier.py:62` unconditional `n += $properties` vs `graph_writer.py:251-256`
+longest-wins) and why the post-loop composition step is the trap. The matching gate assertion
+lands WITH the seed step, deliberately not before it: an assertion with no production caller is
+exactly the defect MIS-137 existed to fix.
+
+Two behaviour changes updated existing tests rather than being worked around, both recorded in
+their docstrings: `test_rebuild_scoping.py`'s scope test pinned "warn and continue", and
+`test_replay.py`'s origin-guard test pinned "replays none". Both now assert the refusal, which
+states the same intent more strongly.
+
+Suite **3334 -> 3367 passed / 6 skipped / 3 xfailed / 0 failed**. Branch
+`feat/mis-137-wire-the-rebuild-gate`, NOT merged, NOT pushed.
+
+Tickets: MIS-128/129/131/133 Done. **MIS-132** (ADR-023, `status: proposed`, evidence section
+EMPTY by design) and **MIS-130** (seed-apply + embedding backfill) both still open in Backlog.
+Filed 2026-09-14 from the reviewer pass: **MIS-137** (wire the gate -- this session),
+**MIS-138** (fix the derivation function: four undeclared inputs, two hidden domain filters,
+rowid-not-event_id replay order, composition order), **MIS-139** (self-model <-> provenance has
+no term in `dump_graph_json` under any switch), **MIS-140** (P0 live-state backup -- the event
+store and extraction cache have none, and `graph-backup` has no loader), **MIS-141** (dedup
+Tier 3 bare-except + reachability probe), **MIS-142** (seed-source digest), **MIS-143**
+(read-time precedence), **MIS-144** (deterministic fact-correction affordance).
+
+**Agreed sequencing, 2026-09-14:** wire the instrument (MIS-137, done) -> fix the function
+(MIS-138) -> retire copy-forward (MIS-130) -> **pause for review** -> hydrate. The pause is
+explicit: do not start the 87-turn run without it.
+
+**PRIOR ENTRY --** 2026-08-26 (**R1.6 closed bar its ADR's evidence; R1.7's prerequisites complete.
+Six commits on `feat/r1.7-hydration-safety-and-blockers`, NOT merged** -- falsified by the merge
+later the same day; see the correction above. `main` is unchanged at
 `7ecec0c`. Whether the branch and its remote agree: `git rev-parse HEAD origin/feat/r1.7-hydration-safety-and-blockers`.
 
 **Read this first: everything on that branch is instrumentation, and none of it has been run.**
@@ -598,7 +735,7 @@ PRIOR ENTRY -- 2026-07-31 (R1.4 -- seed-utterance migration + Phase-1 data gate 
 - **Knowledge Seed:** 32-node baseline (1 MistIdentity + 9 MistTraits + 5 MistCapabilities + 6 MistPreferences + 1 User + 10 anchor entities; 20 identity relationships + 10 anchor relationships = 30 facts; all 32 embedded), now seeded via the versioned seed source (`mist-memory/seed/{mist,user}.md`, `mist_admin.py seed` -> `load_seed_documents` + `reseed`). **Safe to re-seed** as of R1.4 T11-T14: `SeedNode` (T11) + the applier writing ontology type labels and descriptive properties (T12) + the real source carrying node definitions (T13) means a wipe-and-recreate cycle now correctly restores every label and property -- proven twice live, including one run that performed a genuine full wipe. `scripts/seed_data.yaml` is deleted, and **that deletion IS on `main`** (verified 2026-08-03: `git ls-tree main scripts/` has no match, and the file is absent from the working tree). The "on this branch, not on `main`" qualifier was written pre-merge and was never updated when `feat/r1.4-seed-source-and-data-gate` was ff-merged; the deletion commit is `84a5bd9`. T13 restored the file only transiently/untracked to script the node extraction, then re-deleted it -- the extraction itself is preserved in `mist-memory` commit `02a6bdc` and in git history. Two known-open, non-blocking items: Gate 3 fails on 5/30 real facts (genuine content drift, not a gate bug) and a full wipe drops legacy `provenance`/`confidence`/etc. bookkeeping properties that predate the `SeedFact`/`SeedNode` model -- see header.
 - **Vault Layer (Cluster 8, in progress):** NOTE -- the Phase 5/6/8 text in this bullet is HISTORICAL as of R1.3 + R1.3.1. Per-turn session-note appending and the `DERIVED_FROM`->`VaultNote` provenance edge described below are BOTH DELETED. Current behavior: one MIST-authored session note per session, written once at session end (or by startup catch-up) as an LLM synthesis sourced from the event-store log, via the single `VaultWriter.write_session_note` full-render path; entity provenance is `EXTRACTED_FROM`->`ConversationContext` carrying `source_utterance_id`. `RebuildStamps` still ride that edge family but remain WRITE-ONLY (no consumer reads them; deferred to R1.4/R1.6). The Phase 9 slug derivation and Phase 10 seed bootstrap paragraphs below remain accurate. Retained verbatim for archaeology: `backend/vault/` package with `VaultWriter` (serialized `asyncio.Queue` consumer for session-note appends, identity/user upserts), `VaultSidecarIndex` (sqlite-vec `vec0` + FTS5 + RRF hybrid query over two-tier chunks), `VaultFilewatcher` (watchdog daemon thread with 500ms debounce + asyncio bridge + 60s mtime audit job + MIST-write coordination for user-edit detection), Pydantic frontmatter models for the four `mist-*` note types, and `AuthoredBy` 5-state authorship enum. Wired through `VaultConfig` / `SidecarIndexConfig` / `FilewatcherConfig` on `KnowledgeConfig`. **Phase 5 integrated:** single server-owned VaultWriter built and started in `server.py` lifespan, plumbed through `VoiceProcessor -> ModelManager -> KnowledgeIntegration -> ConversationHandler`, with per-turn vault append after event-store write (failure-isolated per ADR-010 Invariant 6). **Phase 6 integrated:** `vault_note_path` is pre-allocated synchronously at `handle_message` Step 0 (via `_get_or_allocate_vault_path`) and threaded through `_extract_knowledge_async` -> `ExtractionPipeline.extract_from_utterance` -> `CurationPipeline.curate_and_store` -> `CurationGraphWriter.write`. Every upserted entity now emits a `DERIVED_FROM` edge to a `:__Provenance__:VaultNote {path}` node (MERGE-idempotent on path). New `VaultNote` ontology node type registered as bridging; `DERIVED_FROM` edge extended to permit `VaultNote` targets and `MistIdentity` sources. The graph is now formally rebuildable from the vault. **Phase 8 integrated:** rebuild-determinism stamps. New `RebuildStamps` frozen dataclass (`ontology_version`, `extraction_version`, `model_hash`) constructed by `build_curation_pipeline` from `KnowledgeConfig` and injected into `CurationGraphWriter`. Every `DERIVED_FROM`->`VaultNote` edge now carries the three stamps + `derived_at` timestamp on both ON CREATE and ON MATCH branches so re-extractions land the current stamps. New config fields `KnowledgeConfig.extraction_version` (default `"2026-04-17-r1"`, env `EXTRACTION_VERSION`) and `KnowledgeConfig.model_hash` (default `"gemma-4-e4b-q5-k-m-carteakey-full-v1"`, env `MIST_MODEL_HASH`). **Phase 9 integrated:** retrieval routing + slug improvement. QueryClassifier extended with a `historical` intent (regex patterns matching "what did we discuss"/"remember when"/"last time"/etc.) routed to the vault sidecar; `hybrid` now produces three-way RRF merges across graph + vector + vault sidecar via `_merge_rrf_three_way`. New `QueryIntentConfig` fields per ADR-010 weight table (`rrf_vault_weight=0.4` hybrid; historical-specific `0.2/0.1/0.7` graph/vector/vault). `KnowledgeRetriever` accepts an optional `vault_sidecar: SidecarIndexProtocol` plumbed top-down through `VoiceProcessor -> ModelManager -> KnowledgeIntegration -> build_conversation_handler -> build_knowledge_retriever`; `_vault_sidecar_retrieve` wraps `query_hybrid` and converts vec0+FTS5 results to `RetrievedFact` rows. Session slug derivation now extracts significant words from the FIRST USER UTTERANCE (stopwords + short tokens filtered, top 5 retained) with a 4-char SHA-256(session_id) suffix for guaranteed per-session uniqueness — produces filenames like `2026-04-22-vault-architecture-mist-a3f1.md` instead of opaque `2026-04-22-<sanitized-session-id>.md`. **Phase 10, AS IT ACTUALLY STANDS TODAY (corrected 2026-08-03 -- the prior text was re-certified as accurate while describing two functions that no longer run):** seed vault bootstrap. `mist_admin seed` calls `bootstrap_vault_from_seed(vault_writer, documents: list[SeedDocument], rendered_at)` (`backend/knowledge/admin.py:153`), which R1.4 T10 repointed off the retired `scripts/seed_data.yaml` dict and onto the versioned seed source. Each document's body is written VERBATIM -- `seed/mist.md`'s body IS `identity/mist.md`'s body -- rather than assembled from structured per-field dicts. The identity document goes through `VaultWriter.upsert_identity_body`; the user document through `VaultWriter.upsert_user` keyed on `source_path.stem`. **`VaultWriter.upsert_identity` (writer.py:272) is DEAD -- zero production callers**, retained only behind the `VaultWriterProtocol`. **`emit_seed_vault_provenance` no longer exists in production -- zero references outside two test docstrings that record its retirement.** R1.4 retired the last `DERIVED_FROM`->`VaultNote` path, so no `:__Provenance__:VaultNote` node or per-entity provenance edge is created by seeding any more; entity provenance is `EXTRACTED_FROM`->`ConversationContext` carrying `source_utterance_id`. `--no-vault-bootstrap` (`mist_admin.py:1494`) still opts out; bootstrap still auto-skips when `config.vault.enabled` is False. Filewatcher + sidecar share the same lifecycle. Phase 11 (CLI subcommands `vault-status` / `vault-reindex` / `vault-rebuild` / `vault-migrate`) is next.
 - **Graph Regeneration (Sub-project A / R1):** `backend/knowledge/regeneration/` -- `log_regenerator.py` (cache-driven log->graph rebuild into an isolated staging graph; `ColdCacheError` on any extraction-cache miss, no in-loop LLM; self-model copy-forward + cross-layer edge re-derivation) + `rebuild_gate.py` (rebuild-twice byte-identical determinism gate + divergence report). Driven by `scripts/mist_admin.py graph-rebuild-from-log --dry-run`; fenced off from live by `backend/knowledge/eval_isolation.py:assert_rebuild_target_not_live` + `docker-compose.staging-neo4j.yml`. PROOF-FIRST as of R1.2 (2026-06-29): determinism proven at the unit level; NOT yet run against live data (cold-cache refusal -- warm-up is the documented prerequisite). **R1.3 (vault->graph fact retirement) COMPLETE 2026-07-30:** every vault-file-edit -> Neo4j-fact write path is now deleted (`GraphRegenerator` class, `GraphStore.upsert_user`, orphan-marking, `extract_from_file`, the vault-rebuild `--scope`/`--retry-orphaned` CLI modes); the only surviving `GraphRegenerator` reference is the quarantined `backend/knowledge/regeneration/graph_regenerator.py` (legacy utterance-based, byte-unchanged, not this class). **R1.3.1 (vault write-policy correction) COMPLETE 2026-07-31:** per-turn vault appending removed, session notes are end-of-session synthesis from the event-store log plus a startup catch-up pass, and the two session-id namespaces are collapsed into one (`EventStore.start_session` takes the chat-layer id; `_es_session_ids` deleted). **R1.4 (seed-utterance migration) is NEXT and LOAD-BEARING**, not optional follow-up: the Phase-1 curated-profile facts the now-deleted `upsert_user` used to write will NOT survive a graph rebuild until migrated onto seed-utterances, and that migration must run and validate before any live `live == rebuilt` cutover (R1.6). **R1.4 now carries a hard precondition discovered during R1.3.1's final review:** the 11 legacy event-store sessions predate the namespace collapse and carry old `uuid4` ids, so the moment R1.4 re-seeds `ConversationContext` nodes keyed on event-store ids, all 11 become matching catch-up candidates, find no note at their derived path (the slug hash differs -- `-9199` from the event-store id vs the real note's `-37a8` from the retired external id), and write a SECOND note for a session that already has one. The existing note is `authored_by: user-edit`, so the R1.3.1 user-edit guard will REFUSE to overwrite it -- meaning the duplicate lands alongside rather than clobbering -- but the duplicate is still wrong. Drain or age-bound those 11 rows BEFORE re-seeding. Real cutover + `live == rebuilt` closure = R1.6, which also owns the new ADR formalizing graph-wins-for-facts (ADR-010 Inv-5/Inv-6 stay formally unamended through R1.3 by design).
-- **Tests:** **3069 unit tests passing, 7 skipped, 3 xfailed, 0 failed** (verified by a full container run on 2026-08-25, extraction-cache Phase 1 fix-wave landing -- see header; this line last read 2679 as of 2026-08-03 and had gone stale relative to the header's own 2996/3068 figures by the time this correction was made -- exactly the drift this line's own rule exists to prevent). Integration, re-verified 2026-08-25 by the coordinator (not this pass's own run) against current HEAD with a disposable staging Neo4j up (`docker compose -f docker-compose.yml -f docker-compose.staging-neo4j.yml --profile staging up -d mist-neo4j-staging`; auto-torn-down afterward via `--profile staging rm -sfv mist-neo4j-staging` -- its state is tmpfs, wiped on removal): `tests/integration/knowledge/` -> **12 passed, 14 skipped, 0 failed.** The rebuild coverage specifically -- `test_log_regenerator.py` + `test_golden_log_rebuild.py` -- is **8 passed, 0 failed**, including `test_cache_driven_rebuild_builds_entity_graph`, `test_cold_cache_refuses`, `test_rebuild_twice_byte_identical`, and `test_rebuild_twice_is_byte_identical_over_a_log_with_real_turns`. Every skip requires the separate *eval* Neo4j instance, which was NOT brought up this pass -- **the eval-gated tests did not run**; that gap is not closed by this verification and should not be read as closed. Live graph checked 32/30 both before and after. Superseded here the file's own earlier note ("last recorded 2026-08-03: 58 collected... 2 failed"), which predated this branch's changes to the replay path entirely. **There is exactly ONE authoritative unit-test count in this file, here.** A previous revision carried three mutually inconsistent counts in three places; if you update this number, update it here and nowhere else, and re-read it from a real run rather than from a task report. Run inside container: `MSYS_NO_PATHCONV=1 docker compose exec -T mist-backend python -m pytest tests/unit/ -q`. Suite warnings are not a stable count on this branch (see header) and are not tracked here. **Suite was fully green as of `40c8c35`** -- the long-standing `test_filewatcher.py` debounce flake was closed by replacing 13 fixed-sleep waits with a bounded `_wait_for` poll helper (see the 2026-08-19 PRIOR ENTRY). Verified 5/5 across both fixed (`-p no:randomly`) and default random ordering. When adding filewatcher tests, use `_wait_for` rather than `asyncio.sleep`, and pass `settle=` whenever the assertion is exactly-N or negative.
+- **Tests:** **3334 unit tests passing, 6 skipped, 3 xfailed, 0 failed** (verified by a full container run on 2026-09-14, the design-8.2 cross-layer-coverage change -- see header. Two prior values this line skipped: 3069 on 2026-08-25 (extraction-cache Phase 1 fix wave) and 3325 measured at the `cc11fb7` merge, which landed in the header but never here -- the drift this line's own rule exists to prevent, recorded rather than quietly overwritten; this line last read 2679 as of 2026-08-03 and had gone stale relative to the header's own 2996/3068 figures by the time this correction was made -- exactly the drift this line's own rule exists to prevent). Integration, re-verified 2026-08-25 by the coordinator (not this pass's own run) against current HEAD with a disposable staging Neo4j up (`docker compose -f docker-compose.yml -f docker-compose.staging-neo4j.yml --profile staging up -d mist-neo4j-staging`; auto-torn-down afterward via `--profile staging rm -sfv mist-neo4j-staging` -- its state is tmpfs, wiped on removal): `tests/integration/knowledge/` -> **12 passed, 14 skipped, 0 failed.** The rebuild coverage specifically -- `test_log_regenerator.py` + `test_golden_log_rebuild.py` -- is **8 passed, 0 failed**, including `test_cache_driven_rebuild_builds_entity_graph`, `test_cold_cache_refuses`, `test_rebuild_twice_byte_identical`, and `test_rebuild_twice_is_byte_identical_over_a_log_with_real_turns`. Every skip requires the separate *eval* Neo4j instance, which was NOT brought up this pass -- **the eval-gated tests did not run**; that gap is not closed by this verification and should not be read as closed. Live graph checked 32/30 both before and after. Superseded here the file's own earlier note ("last recorded 2026-08-03: 58 collected... 2 failed"), which predated this branch's changes to the replay path entirely. **There is exactly ONE authoritative unit-test count in this file, here.** A previous revision carried three mutually inconsistent counts in three places; if you update this number, update it here and nowhere else, and re-read it from a real run rather than from a task report. Run inside container: `MSYS_NO_PATHCONV=1 docker compose exec -T mist-backend python -m pytest tests/unit/ -q`. Suite warnings are not a stable count on this branch (see header) and are not tracked here. **Suite was fully green as of `40c8c35`** -- the long-standing `test_filewatcher.py` debounce flake was closed by replacing 13 fixed-sleep waits with a bounded `_wait_for` poll helper (see the 2026-08-19 PRIOR ENTRY). Verified 5/5 across both fixed (`-p no:randomly`) and default random ordering. When adding filewatcher tests, use `_wait_for` rather than `asyncio.sleep`, and pass `settle=` whenever the assertion is exactly-N or negative.
 
 ### Frontend (Tauri 2.x + React 19 + react-three-fiber)
 - **Repo:** separate git repository nested at `./mist-frontend/` inside this repo (own .git, no remote configured; intentional per `feedback_no_push_docs`).

@@ -39,6 +39,7 @@ from backend.knowledge.curation.pipeline import CurationResult
 from backend.knowledge.eval_isolation import assert_rebuild_target_not_live
 from backend.knowledge.extraction.ontology_extractor import ExtractionResult
 from backend.knowledge.extraction_cache import OUTCOME_SKIPPED
+from backend.knowledge.ontologies import EDGE_TYPES_BY_NAME
 from backend.knowledge.regeneration.rebuild_journal import RebuildJournal
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
@@ -56,6 +57,14 @@ class ColdCacheError(MistError):
     """Raised when the extraction cache does not cover 100% of the epoch's turns."""
 
 
+class RebuildScopeError(MistError):
+    """The selection matched no turn in a populated log.
+
+    A configuration failure, not a gate failure, and refused before any write.
+    See the raise site in `rebuild` for why a warning was not enough. MIS-138.
+    """
+
+
 class RebuildError(MistError):
     """Raised when a rebuild operation cannot proceed."""
 
@@ -69,6 +78,17 @@ class RebuildReport:
     turns_failed: int
     staging_uri: str
     epoch_id: int
+    # The DOMAIN the selection ran under, recorded so a run's evidence states it
+    # rather than a plan asserting it. `ontology_version` and `origins` are not
+    # merely stamps -- both RESTRICT which turns are in the function's domain, and
+    # `turns_processed` alone cannot distinguish "replayed the whole log" from
+    # "replayed the subset this epoch could see". MIS-138; feeds ADR-023 section 7.
+    #
+    # Defaulted so existing constructions stay valid; `rebuild` always populates
+    # them.
+    ontology_version: str | None = None
+    origins: tuple[str, ...] = ()
+    total_logged: int = 0
 
 
 class LogRegenerator:
@@ -88,12 +108,17 @@ class LogRegenerator:
         "HAS_PREFERENCE",
         "IS_UNCERTAIN_ABOUT",
     )
-    # Cross-layer edges (self-model -> :__Entity__) -- re-derived by canonical id.
-    _CROSS_LAYER_EDGES = (
-        "MIST_HAS_TRAIT",
-        "MIST_HAS_CAPABILITY",
-        "MIST_HAS_PREFERENCE",
-        "IMPLEMENTED_WITH",
+    # Cross-layer edges (self-model <-> :__Entity__) are discovered STRUCTURALLY --
+    # see `rederive_self_model_cross_layer_edges`. There is deliberately no edge-type
+    # tuple here. The retired `_CROSS_LAYER_EDGES` named four of the ten types the
+    # ontology permits from a self-model source (`ADAPTED_FOR`, `DEPENDS_ON`,
+    # `REFERENCES_DOCUMENT`, `USES`, `WORKS_WITH`, `RELATED_TO` were missing) and none
+    # of the reverse direction, so every unlisted type was dropped on rebuild.
+    # A hand-list that must agree with the ontology drifts from it on the next bump;
+    # a longer hand-list only moves the next drift further out.
+    _PARTITION_DIRECTIONS = (
+        (SELF_MODEL_LABEL, ENTITY_LABEL),
+        (ENTITY_LABEL, SELF_MODEL_LABEL),
     )
 
     def __init__(
@@ -211,24 +236,58 @@ class LogRegenerator:
         return len(nodes)
 
     def rederive_self_model_cross_layer_edges(self, source_conn, staging_conn) -> dict[str, int]:
-        """Re-create cross-layer self-model -> :__Entity__ edges in staging by id.
+        """Re-create cross-layer self-model <-> :__Entity__ edges in staging by id.
 
-        Reads each cross-layer edge from source and MERGEs it in staging keyed on
-        canonical (id) at both ends. Skips (and counts) edges whose target entity
-        id is absent from staging (a target that the log-replay did not produce,
-        e.g. a formerly vault-derived-only entity). Returns {edges, skipped}.
+        Reads every edge spanning the two partitions in EITHER direction and MERGEs it
+        in staging keyed on canonical (id) at both ends. Skips (and counts) edges whose
+        target id is absent from staging (a target the log-replay did not produce, e.g.
+        a formerly vault-derived-only entity).
+
+        The partition-pair predicate is deliberately the same one `dump_graph_json` uses
+        to collect `self_model_cross_layer_edges` (`admin.py:972-981`, structural with no
+        type filter, both directions). The comparison surface and the re-derivation must
+        cover the same set of edges: an edge the comparison reads but the re-derivation
+        does not re-create is a guaranteed RED on the `live == rebuilt` gate that says
+        nothing about determinism. That cost is why this reads structurally rather than
+        from a list -- and why the two queries must stay in step if either is edited.
+
+        Edge types come from the DATA (Cypher cannot parameterize a relationship type,
+        so the type is interpolated) and are therefore validated against the ontology
+        first; an undeclared type is refused and counted rather than interpolated.
+        Partition labels are module constants, never data.
+
+        NOT handled here: self-model <-> :__Provenance__ edges, which the ontology permits
+        as `LEARNED_SELF` (-> LearningEvent), `DERIVED_FROM` (-> VectorChunk /
+        ExternalSource / VaultNote), and `RELATED_TO` to a provenance target. No gate key
+        compares them either -- `cross_layer_edges` covers entity <-> provenance and this
+        one covers entity <-> self-model, so self-model <-> provenance is in neither. That
+        blind spot is a comparison-surface decision (ADR-023's residue table), not this
+        method's contract, and is recorded rather than silently closed here.
+
+        Returns {edges, skipped, unknown}.
         """
-        created, skipped = 0, 0
-        for edge_type in self._CROSS_LAYER_EDGES:
+        created, skipped, unknown = 0, 0, 0
+        for source_label, target_label in self._PARTITION_DIRECTIONS:
             edges = source_conn.execute_query(
-                f"MATCH (s:{SELF_MODEL_LABEL})-[r:{edge_type}]->(t:{ENTITY_LABEL}) "
-                "RETURN s.id AS s, t.id AS t, properties(r) AS props",
+                f"MATCH (s:{source_label})-[r]->(t:{target_label}) "
+                "RETURN s.id AS s, type(r) AS type, t.id AS t, properties(r) AS props",
                 {},
             )
             for e in edges:
+                edge_type = e["type"]
+                if edge_type not in EDGE_TYPES_BY_NAME:
+                    logger.warning(
+                        "Cross-layer edge type %r on %s->%s is not declared in the "
+                        "ontology; refusing to re-derive it",
+                        edge_type,
+                        e["s"],
+                        e["t"],
+                    )
+                    unknown += 1
+                    continue
                 result = staging_conn.execute_write(
-                    f"MATCH (s:{SELF_MODEL_LABEL} {{id: $s}}) "
-                    f"MATCH (t:{ENTITY_LABEL} {{id: $t}}) "
+                    f"MATCH (s:{source_label} {{id: $s}}) "
+                    f"MATCH (t:{target_label} {{id: $t}}) "
                     f"MERGE (s)-[r:{edge_type}]->(t) SET r = $props "
                     "RETURN count(r) AS n",
                     {"s": e["s"], "t": e["t"], "props": e["props"]},
@@ -237,7 +296,7 @@ class LogRegenerator:
                     created += 1
                 else:
                     skipped += 1
-        return {"edges": created, "skipped": skipped}
+        return {"edges": created, "skipped": skipped, "unknown": unknown}
 
     async def rebuild(
         self,
@@ -337,12 +396,33 @@ class LogRegenerator:
             ",".join(origins),
         )
         if total_logged and not turns:
-            logger.warning(
-                "Rebuild selected 0 of %d logged turns: no turn matches ontology=%s AND "
-                "origin in (%s). The replay will be a no-op.",
-                total_logged,
-                epoch["ontology_version"],
-                ",".join(origins),
+            # Refusal, not a warning. MIS-138.
+            #
+            # This was a `logger.warning` and the run continued: the replay no-ops,
+            # `_assert_cache_coverage([])` passes vacuously over an empty selection,
+            # and every downstream assertion reads the result as "the log was
+            # empty". The rebuild reports success having produced nothing.
+            #
+            # The trigger is not an exotic misconfiguration. `ontology_version` is a
+            # DOMAIN FILTER here, and turns are stamped with the version current when
+            # they were written -- so the first ontology bump after any turns exist
+            # makes this selection empty for every historical turn, permanently.
+            # MIST has bumped 1.0.0 -> 1.1.0 -> 1.3.0 -> 1.4.0. A rebuild spanning a
+            # bump is therefore the expected case, not the edge case, and warning
+            # about it while proceeding is how it would reach a gate.
+            #
+            # Scoped to a POPULATED log deliberately: selecting nothing from an empty
+            # log is correct, and refusing there would reject the one state this
+            # cannot diagnose. An empty-log rebuild is the non-vacuity floors' job.
+            raise RebuildScopeError(
+                f"Rebuild selected 0 of {total_logged} logged turns: no turn matches "
+                f"ontology_version={epoch['ontology_version']!r} AND origin in "
+                f"({','.join(origins)}). Refusing rather than replaying nothing -- a "
+                "no-op replay passes cache coverage vacuously and is indistinguishable "
+                "downstream from an empty log. If the log spans an ontology bump, the "
+                "historical turns carry the OLD version and this epoch cannot select "
+                "them; if the corpus is probe or eval traffic, pass its origin "
+                "explicitly."
             )
 
         self._assert_cache_coverage(turns, epoch)
@@ -368,6 +448,33 @@ class LogRegenerator:
         collected_errors: list[str] = []
         last_ts: str = epoch["activated_at"]
 
+        # SEED-APPLY GOES HERE, ABOVE THIS LOOP -- not after it. MIS-130/MIS-138.
+        #
+        # `rebuild()` has no seed-apply step yet; the `:__SelfModel__` partition is
+        # copied forward instead (see the calls after this loop, and
+        # `copy_self_model_partition`'s docstring). When MIS-130 replaces that with a
+        # real `apply_seed_documents` against staging, ORDER IS LOAD-BEARING and the
+        # two writers do not commute:
+        #
+        #   seed      `ON MATCH SET n += $properties`      (seed/applier.py:62)
+        #               -- unconditional clobber of every authored property
+        #   extraction `display_name = CASE WHEN size(existing) < size(new) ...`
+        #               (curation/graph_writer.py:251-256) -- longest-wins
+        #
+        # Live applies seed FIRST (`mist_admin seed` then `mist_admin hydrate`, per
+        # docker-compose.dev-hydration.yml), so replayed facts reconcile ONTO seeded
+        # nodes. Seeding AFTER this loop would let `n += $properties` overwrite values
+        # the replay resolved by the longest-wins rule, producing a different graph
+        # from identical inputs. `display_name` and `description` are in no exclusion
+        # frozenset, so the gate sees it -- as a RED it will read as non-determinism.
+        #
+        # The existing post-loop composition step is the trap: it is the natural place
+        # to add "one more" step, and it is the wrong side of the loop for this one.
+        #
+        # The matching gate assertion (seed node count non-zero BEFORE the first
+        # replayed turn is applied) lands WITH the seed step, deliberately not before
+        # it -- an assertion with no production caller is the defect MIS-137 existed
+        # to fix, and adding a second one here would reproduce it.
         for turn in turns:
             cached = self._cache.get(
                 turn["event_id"],
@@ -452,4 +559,7 @@ class LogRegenerator:
             turns_failed=turns_failed,
             staging_uri=staging_uri,
             epoch_id=epoch["epoch_id"],
+            ontology_version=epoch["ontology_version"],
+            origins=tuple(origins),
+            total_logged=total_logged,
         )
