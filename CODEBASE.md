@@ -1,6 +1,49 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-09-14 (**The R1.7 branch IS merged. Design section 8.2 closed. Still
+**Last Updated:** 2026-09-15 (**MIS-130 is built as three commits on
+`feat/mis-130-derive-the-self-model`, NOT merged and NOT pushed. `graph = f(seed, log, epoch)`
+is finally true. Still nothing hydrated, rebuilt, or gated.**
+
+Run `git log --oneline -1` and `git status -sb` rather than trusting any hash here. At the
+time of writing `main` is at `72b2564` and level with `origin/main`; the branch is
+`1fee21e` -> `f90f1d1` -> `afa5f34` on top of it, tree clean. Live graph re-verified
+read-only after all three commits: **32 nodes / 30 relationships**, unchanged.
+
+**MIS-130 SEQUENCING, RULED 2026-09-14.** MIS-130's own text ("retire the copies only AFTER
+the comparison surface can observe it") and the ADR-023 reviewers ("retire copy-forward
+BEFORE extending the surface") read as a contradiction. They are not one. MIS-130 bundles two
+separable changes under one ticket, and each constraint governs one half. Split into three
+ordered commits, both constraints hold and neither yields:
+
+- **A (`1fee21e`)** retire `copy_self_model_partition` and
+  `rederive_self_model_cross_layer_edges`; `rebuild()` no longer accepts `source_conn`. Had to
+  precede the surface extension: extending it while the copy stood would compare the
+  `:__SelfModel__` partition against a copy of the comparison's own left-hand side -- green by
+  construction, presented as coverage. Also removed a latent contamination route: the copy
+  MERGEd `labels(n)` verbatim from live, so a dual-labelled node would have put live content
+  into the compared `:__Entity__` partition with no symptom.
+- **B (`f90f1d1`)** a real seed-apply against staging via the injected `StagingSeeder`,
+  positioned BEFORE the replay loop (the two writers do not commute), with two floors --
+  `assert_seed_applied` (a node COUNT at the apply site, which is why B did not need the
+  surface extension) and `assert_seed_embeddings_present` (a RE-READ, because
+  `canonical_serialize` excludes `embedding` and an unembedded graph is byte-identical to a
+  correct one). `--min-seed-nodes` is required and undefaulted like the other two floors.
+- **C (`afa5f34`)** the compared surface now carries `:__SelfModel__` and `:__Provenance__`,
+  `assert_self_model_applied` runs BEFORE the equality gate, and MIS-139's fourth clause
+  (self-model <-> provenance) exists at last -- that pair was previously absent from the
+  canonical form under EVERY switch combination, so a dropped `LEARNED_SELF` was unobservable.
+
+Suite **3325 -> 3407 passed / 6 skipped / 3 xfailed / 0 failed**, measured on the committed
+tree. Eighteen mutants across the three commits, all killed.
+
+**Two caveats that are not resolved by this branch.** First, the integration tests touched by
+B's required-argument change have been READ but not EXECUTED -- the eval and staging Neo4j
+instances are both down -- so "the call sites are correct" rests on reading. Second, nothing
+exercises the real `StagingSeeder` against a real Neo4j; the three functions it composes each
+have R1.4 integration coverage but the composition does not. Both are recorded in
+`tests/mocks/seeder.py` and belong with the hydration work, which needs those instances anyway.
+
+**PRIOR ENTRY -- 2026-09-14:** (**The R1.7 branch IS merged. Design section 8.2 closed. Still
 nothing hydrated, rebuilt, or gated.**
 
 The header below this one was stale in the way its own maintenance protocol exists to catch:
