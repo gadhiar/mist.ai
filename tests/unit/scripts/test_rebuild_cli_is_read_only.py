@@ -61,6 +61,14 @@ EMBEDDINGS = "backend.knowledge.embeddings.embedding_generator.EmbeddingGenerato
 GRAPH_STORE = "backend.knowledge.storage.graph_store.GraphStore"
 GRAPH_EXECUTOR = "backend.knowledge.storage.graph_executor.GraphExecutor"
 BUILD_PIPELINE = "backend.factories.build_curation_pipeline"
+# MIS-130 step B added a seed corpus load to the builder. It is a filesystem
+# collaborator like the four above and is patched out for the same reason: this
+# file's assertions are about whether the two REPLAY SOURCES get written to, and a
+# real seed read would make every test here depend on a fixture corpus that has
+# nothing to do with what they check. `StagingSeeder`'s own behaviour is covered
+# in tests/unit/knowledge/regeneration/test_staging_seeder.py.
+LOAD_SEED = "backend.knowledge.seed.loader.load_seed_documents"
+STAGING_SEEDER = "backend.knowledge.regeneration.staging_seeder.StagingSeeder"
 
 ONTOLOGY = "1.4.0"
 EXTRACTION = "2026-06-14-r5"
@@ -184,8 +192,14 @@ def _build(db_path: str, extra_patches: dict[str, Any] | None = None):
     import scripts.mist_admin as mist_admin
 
     with ExitStack() as stack:
-        for target in (EMBEDDINGS, GRAPH_STORE, GRAPH_EXECUTOR, BUILD_PIPELINE):
+        for target in (EMBEDDINGS, GRAPH_STORE, GRAPH_EXECUTOR, BUILD_PIPELINE, STAGING_SEEDER):
             stack.enter_context(patch(target))
+        # Carries `seed_version` because the builder reads it off document zero to
+        # construct the seeder; patching the seeder class does not stop its
+        # ARGUMENTS being evaluated.
+        stack.enter_context(
+            patch(LOAD_SEED, lambda _dir: [SimpleNamespace(seed_version="test-seed-1")])
+        )
         for target, replacement in (extra_patches or {}).items():
             stack.enter_context(patch(target, replacement))
         return mist_admin._build_log_regenerator(_backend_stub(db_path), object(), None)

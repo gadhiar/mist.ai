@@ -5,11 +5,33 @@ staging Neo4j, deterministically, with NO in-loop LLM: every turn's extraction
 result is pulled from the content-addressed ExtractionCache (coverage REQUIRED).
 Each result is curated + reconciled into staging via the existing
 `curate_and_store` (dedup + reconcile_turn under the Inv-A9 write lock). The
-self-model copy-forward + cross-layer re-derivation (R1.2 Task 4) and the
-build-then-swap CUTOVER (deferred) are separate.
+build-then-swap CUTOVER (deferred) is separate.
+
+The self-model copy-forward + cross-layer re-derivation (R1.2 Task 4) is GONE as
+of MIS-130 step A. It read the LIVE graph and MERGEd the `:__SelfModel__`
+partition into staging verbatim (`SET x = $props`), so the shipped function was
+`f(log, epoch, live_graph)` while the R1 spec claims `f(seed, log, epoch)`.
+
+Step B replaced it with a real seed-apply against staging (`StagingSeeder`),
+positioned BEFORE the replay loop rather than where the copy sat after it: the
+two writers do not commute, so the position is part of the contract and not a
+detail. Two floors run with it and before the first turn -- `assert_seed_applied`
+(a node COUNT, so "applied nothing" and "applied something" are different
+observables without needing a comparison surface) and
+`assert_seed_embeddings_present` (a RE-READ, because `canonical_serialize`
+excludes `embedding` and an unembedded graph is byte-identical to a correct one).
+
+What is still owed, as of step B, is step C: the compared surface does not read
+the `:__SelfModel__` partition at all (`canonical_graph_form`'s
+`include_self_model` defaults False), so the seed-apply is verified by its own
+floors and NOT yet by `live == rebuilt`. Do not describe this class as proving
+the self-model is reproducible until that lands.
 
 The rebuild NEVER writes to the live GRAPH: `assert_rebuild_target_not_live`
-gates the staging URI, and the live `source` connection is read-only.
+gates the staging URI, and no live connection reaches this class at all any more
+-- `rebuild()` takes `live_uri` only as a guard VALUE to compare against, never
+as a handle. Pinned by
+tests/unit/knowledge/regeneration/test_rebuild_has_no_live_source.py.
 
 That sentence was true and too narrow. It said nothing about the two SQLite
 stores this class also holds, and the event store is where the rebuild wrote its
@@ -39,9 +61,11 @@ from backend.knowledge.curation.pipeline import CurationResult
 from backend.knowledge.eval_isolation import assert_rebuild_target_not_live
 from backend.knowledge.extraction.ontology_extractor import ExtractionResult
 from backend.knowledge.extraction_cache import OUTCOME_SKIPPED
-from backend.knowledge.ontologies import EDGE_TYPES_BY_NAME
+from backend.knowledge.regeneration.rebuild_gate import (
+    assert_seed_applied,
+    assert_seed_embeddings_present,
+)
 from backend.knowledge.regeneration.rebuild_journal import RebuildJournal
-from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +113,12 @@ class RebuildReport:
     ontology_version: str | None = None
     origins: tuple[str, ...] = ()
     total_logged: int = 0
+    # The seed half of the domain, recorded for the same reason as the three above:
+    # `graph = f(seed, log, epoch)` has THREE inputs, and a report naming only the
+    # log's two describes a function it did not run. A run whose seed wrote 21 nodes
+    # and one whose seed wrote 3 are different derivations that `turns_processed`
+    # cannot distinguish. MIS-130 step B; feeds ADR-023 section 7.
+    seed_nodes_written: int = 0
 
 
 class LogRegenerator:
@@ -101,25 +131,13 @@ class LogRegenerator:
     rebuild_journal.py.
     """
 
-    # Intra-self-model edges (both endpoints in :__SelfModel__) -- copied verbatim.
-    _INTRA_SELF_MODEL_EDGES = (
-        "HAS_TRAIT",
-        "HAS_CAPABILITY",
-        "HAS_PREFERENCE",
-        "IS_UNCERTAIN_ABOUT",
-    )
-    # Cross-layer edges (self-model <-> :__Entity__) are discovered STRUCTURALLY --
-    # see `rederive_self_model_cross_layer_edges`. There is deliberately no edge-type
-    # tuple here. The retired `_CROSS_LAYER_EDGES` named four of the ten types the
-    # ontology permits from a self-model source (`ADAPTED_FOR`, `DEPENDS_ON`,
-    # `REFERENCES_DOCUMENT`, `USES`, `WORKS_WITH`, `RELATED_TO` were missing) and none
-    # of the reverse direction, so every unlisted type was dropped on rebuild.
-    # A hand-list that must agree with the ontology drifts from it on the next bump;
-    # a longer hand-list only moves the next drift further out.
-    _PARTITION_DIRECTIONS = (
-        (SELF_MODEL_LABEL, ENTITY_LABEL),
-        (ENTITY_LABEL, SELF_MODEL_LABEL),
-    )
+    # No self-model edge-type tuples live here any more (MIS-130 step A). They drove
+    # `copy_self_model_partition` and `rederive_self_model_cross_layer_edges`, both
+    # retired: the partition they populated was a verbatim photocopy of live, which
+    # made the shipped function `f(log, epoch, live_graph)` rather than the spec's
+    # `f(seed, log, epoch)`. The replacement is the injected `staging_seeder`, not a
+    # shorter or a longer list. See
+    # tests/unit/knowledge/regeneration/test_rebuild_has_no_live_source.py.
 
     def __init__(
         self,
@@ -128,6 +146,7 @@ class LogRegenerator:
         extraction_cache,
         staging_curation_pipeline,
         journal: RebuildJournal,
+        staging_seeder,
         confidence_scorer,
         temporal_resolver,
         normalizer,
@@ -136,6 +155,15 @@ class LogRegenerator:
         self._events = event_store
         self._cache = extraction_cache
         self._curation = staging_curation_pipeline
+        # REQUIRED for the same reason `journal` is, and the reason is sharper here.
+        # `rebuild()` used to reach the `:__SelfModel__` partition by copying it from
+        # the LIVE graph; step A deleted that, so between A and B a rebuild produced
+        # no self-model at all. A DEFAULTED seeder would make that state reachable
+        # again and silent -- and it is the one state MIS-130's hazard paragraph is
+        # about, because an empty partition passes determinism (two empty partitions
+        # are byte-identical) and passes `live == rebuilt` (the compared surface does
+        # not read it). A regenerator that cannot seed cannot be constructed.
+        self._seeder = staging_seeder
         # `journal` is REQUIRED, not defaulted to `event_store`, and the REQUIREDNESS
         # is the whole of the protection. A default is what the bug looked like: the
         # replay source must be the LIVE store, so any implicit "journal into the
@@ -186,128 +214,15 @@ class LogRegenerator:
                 f"warm the cache before rebuilding. First uncached: {uncached[:3]}"
             )
 
-    def copy_self_model_partition(self, source_conn, staging_conn) -> int:
-        """Copy :__SelfModel__ nodes + intra-self-model edges from source to staging.
-
-        Preserve (option A): nodes + their HAS_*/IS_UNCERTAIN_ABOUT edges are
-        copied verbatim (by id + labels + properties). Cross-layer MIST_HAS_*
-        edges are NOT copied here (re-derived separately -- their targets are
-        fresh :__Entity__ nodes from the replay). Returns the node count copied.
-
-        As of R1.4 the self-model is also authored as ordinary seed content
-        (`mist-memory/seed/mist.md`, verified to cover all 21 :__SelfModel__
-        nodes), so this copy is redundant belt-and-braces rather than the sole
-        durable source. Retiring it requires `rebuild()` to gain a seed-apply
-        step -- R1.6's composition work, not this method's contract. `R1.4
-        whole-branch review, I1`: `apply_seed_documents` already routes each
-        node to the partition its own `SeedDocument.partition` declares
-        (`_assign_node_partitions`, R1.4 Task 4's rework, `5bbaac1`) --
-        `:__SelfModel__` content lands on `:__SelfModel__`, not on a
-        colliding `:__Entity__` copy. That is not the remaining gap. The
-        remaining gap is that `rebuild()` has no seed-apply step of any kind
-        yet -- nothing in this class calls `apply_seed_documents` or
-        `reseed` against the staging graph at all, so there is nothing this
-        copy could be replaced by until R1.6 adds one.
-        """
-        nodes = source_conn.execute_query(
-            f"MATCH (n:{SELF_MODEL_LABEL}) "
-            "RETURN n.id AS id, labels(n) AS labels, properties(n) AS props",
-            {},
-        )
-        for n in nodes:
-            labels = ":".join(lbl for lbl in n["labels"])  # includes __SelfModel__ + typed label
-            staging_conn.execute_write(
-                f"MERGE (x:{labels} {{id: $id}}) SET x = $props",
-                {"id": n["id"], "props": n["props"]},
-            )
-        for edge_type in self._INTRA_SELF_MODEL_EDGES:
-            edges = source_conn.execute_query(
-                f"MATCH (s:{SELF_MODEL_LABEL})-[r:{edge_type}]->(t:{SELF_MODEL_LABEL}) "
-                "RETURN s.id AS s, t.id AS t, properties(r) AS props",
-                {},
-            )
-            for e in edges:
-                staging_conn.execute_write(
-                    f"MATCH (s:{SELF_MODEL_LABEL} {{id: $s}}) "
-                    f"MATCH (t:{SELF_MODEL_LABEL} {{id: $t}}) "
-                    f"MERGE (s)-[r:{edge_type}]->(t) SET r = $props",
-                    {"s": e["s"], "t": e["t"], "props": e["props"]},
-                )
-        return len(nodes)
-
-    def rederive_self_model_cross_layer_edges(self, source_conn, staging_conn) -> dict[str, int]:
-        """Re-create cross-layer self-model <-> :__Entity__ edges in staging by id.
-
-        Reads every edge spanning the two partitions in EITHER direction and MERGEs it
-        in staging keyed on canonical (id) at both ends. Skips (and counts) edges whose
-        target id is absent from staging (a target the log-replay did not produce, e.g.
-        a formerly vault-derived-only entity).
-
-        The partition-pair predicate is deliberately the same one `dump_graph_json` uses
-        to collect `self_model_cross_layer_edges` (`admin.py:972-981`, structural with no
-        type filter, both directions). The comparison surface and the re-derivation must
-        cover the same set of edges: an edge the comparison reads but the re-derivation
-        does not re-create is a guaranteed RED on the `live == rebuilt` gate that says
-        nothing about determinism. That cost is why this reads structurally rather than
-        from a list -- and why the two queries must stay in step if either is edited.
-
-        Edge types come from the DATA (Cypher cannot parameterize a relationship type,
-        so the type is interpolated) and are therefore validated against the ontology
-        first; an undeclared type is refused and counted rather than interpolated.
-        Partition labels are module constants, never data.
-
-        NOT handled here: self-model <-> :__Provenance__ edges, which the ontology permits
-        as `LEARNED_SELF` (-> LearningEvent), `DERIVED_FROM` (-> VectorChunk /
-        ExternalSource / VaultNote), and `RELATED_TO` to a provenance target. No gate key
-        compares them either -- `cross_layer_edges` covers entity <-> provenance and this
-        one covers entity <-> self-model, so self-model <-> provenance is in neither. That
-        blind spot is a comparison-surface decision (ADR-023's residue table), not this
-        method's contract, and is recorded rather than silently closed here.
-
-        Returns {edges, skipped, unknown}.
-        """
-        created, skipped, unknown = 0, 0, 0
-        for source_label, target_label in self._PARTITION_DIRECTIONS:
-            edges = source_conn.execute_query(
-                f"MATCH (s:{source_label})-[r]->(t:{target_label}) "
-                "RETURN s.id AS s, type(r) AS type, t.id AS t, properties(r) AS props",
-                {},
-            )
-            for e in edges:
-                edge_type = e["type"]
-                if edge_type not in EDGE_TYPES_BY_NAME:
-                    logger.warning(
-                        "Cross-layer edge type %r on %s->%s is not declared in the "
-                        "ontology; refusing to re-derive it",
-                        edge_type,
-                        e["s"],
-                        e["t"],
-                    )
-                    unknown += 1
-                    continue
-                result = staging_conn.execute_write(
-                    f"MATCH (s:{source_label} {{id: $s}}) "
-                    f"MATCH (t:{target_label} {{id: $t}}) "
-                    f"MERGE (s)-[r:{edge_type}]->(t) SET r = $props "
-                    "RETURN count(r) AS n",
-                    {"s": e["s"], "t": e["t"], "props": e["props"]},
-                )
-                if result and result[0]["n"] > 0:
-                    created += 1
-                else:
-                    skipped += 1
-        return {"edges": created, "skipped": skipped, "unknown": unknown}
-
     async def rebuild(
         self,
         *,
         staging_uri: str,
         live_uri: str,
         epoch: dict,
+        min_seed_nodes: int,
         job_id: str | None = None,
         resume_from: str | None = None,
-        source_conn=None,
-        staging_conn=None,
         origins: tuple[str, ...] = CANONICAL_ORIGINS,
     ) -> RebuildReport:
         """Replay the log into staging from the cache. Never writes to live.
@@ -317,15 +232,15 @@ class LogRegenerator:
             live_uri: Bolt URI for the live Neo4j (guard only; never written to).
             epoch: Epoch dict with ontology_version, extraction_version, model_hash,
                 epoch_id, activated_at.
+            min_seed_nodes: Floor the seed-apply must clear before the replay loop
+                runs. REQUIRED and undefaulted, for the reason MIS-137 gave about
+                `--expect-turns`: a defaulted floor is a number nobody chose that
+                the run then reports as passed. A caller that has not decided what
+                a healthy seed looks like cannot start a rebuild.
             job_id: Optional caller-provided job identifier. For fresh runs this is
                 optional (a unique id is generated). For resume runs this is REQUIRED
                 (it must match the row created during the initial run).
             resume_from: Event ID to resume after (cursor-based); None for a full run.
-            source_conn: Optional Neo4jConnection to the live source graph (read-only).
-                When provided alongside staging_conn, the self-model partition is
-                copied forward from source into staging after the replay loop.
-            staging_conn: Optional Neo4jConnection to the staging graph (write). Must
-                be provided together with source_conn to enable self-model copy-forward.
             origins: Session provenance values to replay. Defaults to
                 `CANONICAL_ORIGINS` (`('real',)`) -- a rebuild of the canonical
                 graph must not absorb probe or eval traffic. Pass explicitly to
@@ -448,13 +363,9 @@ class LogRegenerator:
         collected_errors: list[str] = []
         last_ts: str = epoch["activated_at"]
 
-        # SEED-APPLY GOES HERE, ABOVE THIS LOOP -- not after it. MIS-130/MIS-138.
+        # SEED-APPLY, ABOVE THIS LOOP -- not after it. MIS-130/MIS-138.
         #
-        # `rebuild()` has no seed-apply step yet; the `:__SelfModel__` partition is
-        # copied forward instead (see the calls after this loop, and
-        # `copy_self_model_partition`'s docstring). When MIS-130 replaces that with a
-        # real `apply_seed_documents` against staging, ORDER IS LOAD-BEARING and the
-        # two writers do not commute:
+        # ORDER IS LOAD-BEARING and the two writers do not commute:
         #
         #   seed      `ON MATCH SET n += $properties`      (seed/applier.py:62)
         #               -- unconditional clobber of every authored property
@@ -468,13 +379,30 @@ class LogRegenerator:
         # from identical inputs. `display_name` and `description` are in no exclusion
         # frozenset, so the gate sees it -- as a RED it will read as non-determinism.
         #
-        # The existing post-loop composition step is the trap: it is the natural place
-        # to add "one more" step, and it is the wrong side of the loop for this one.
+        # The now-empty post-loop position is the trap: it is the natural place to add
+        # "one more" step, and it is the wrong side of the loop for this one. The
+        # retired copy-forward sat there, so "put the replacement where the old thing
+        # was" is precisely the wrong instinct here.
         #
-        # The matching gate assertion (seed node count non-zero BEFORE the first
-        # replayed turn is applied) lands WITH the seed step, deliberately not before
-        # it -- an assertion with no production caller is the defect MIS-137 existed
-        # to fix, and adding a second one here would reproduce it.
+        # `now_iso` is the EPOCH's activated_at, never the wall clock: the applier
+        # takes it explicitly so application is byte-reproducible, and two rebuilds of
+        # one epoch must stamp identical created_at/updated_at or
+        # `assert_rebuild_twice_identical` fails on wall-clock noise rather than on
+        # content -- a RED that says nothing about determinism while looking exactly
+        # like one that does.
+        seed_result = self._seeder.apply(now_iso=epoch["activated_at"])
+
+        # Both floors run BEFORE the first turn is replayed, because a gate that fires
+        # only once the expensive work is done is a report, not a gate. They are two
+        # assertions rather than one because neither subsumes the other: a partial
+        # apply has nodes AND embeddings, a failed backfill has nodes and NO
+        # embeddings, and only the pair tells both apart from a correct run. The
+        # embedding one matters disproportionately here because `canonical_serialize`
+        # EXCLUDES `embedding`, so an unembedded rebuild is byte-identical to an
+        # embedded one and every downstream gate certifies it.
+        assert_seed_applied(nodes_written=seed_result.nodes_written, minimum=min_seed_nodes)
+        assert_seed_embeddings_present(seed_result.embedding_gate)
+
         for turn in turns:
             cached = self._cache.get(
                 turn["event_id"],
@@ -541,17 +469,18 @@ class LogRegenerator:
             updated_at=last_ts,
         )
 
-        # Self-model copy-forward (R1.2 Task 4): optional -- only runs when both
-        # source_conn and staging_conn are provided. Task 3 callers omit both and
-        # are unaffected.
-        # R1.4: the self-model is now also authored in mist-memory/seed/, but this
-        # copy stays -- rebuild() has no seed-apply step at all yet (partition
-        # routing itself is not the blocker; see copy_self_model_partition
-        # docstring, corrected R1.4 whole-branch review I1). Retirement is R1.6's
-        # composition work.
-        if source_conn is not None and staging_conn is not None:
-            self.copy_self_model_partition(source_conn, staging_conn)
-            self.rederive_self_model_cross_layer_edges(source_conn, staging_conn)
+        # NOTHING GOES HERE. The self-model copy-forward that used to occupy this
+        # position is retired (MIS-130 step A), and its replacement does not belong
+        # on this side of the loop: a seed-apply must run BEFORE the replay, because
+        # seed's `ON MATCH SET n += $properties` (seed/applier.py:62) and
+        # extraction's longest-wins `display_name` CASE (graph_writer.py:251-256) do
+        # not commute. The ordering rationale in full sits above the replay loop,
+        # deliberately at the position the step must take rather than at the position
+        # the retired one had.
+        #
+        # This comment exists because the empty slot is the hazard: a post-loop
+        # composition step is the natural place to add "one more thing", and it is
+        # the wrong side of the loop for the one thing still owed here.
 
         return RebuildReport(
             job_id=job_id,
@@ -562,4 +491,5 @@ class LogRegenerator:
             ontology_version=epoch["ontology_version"],
             origins=tuple(origins),
             total_logged=total_logged,
+            seed_nodes_written=seed_result.nodes_written,
         )

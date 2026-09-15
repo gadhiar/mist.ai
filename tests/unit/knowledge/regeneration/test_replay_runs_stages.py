@@ -28,7 +28,8 @@ from backend.knowledge.extraction.ontology_extractor import ExtractionResult
 from backend.knowledge.extraction.temporal import TemporalResolver
 from backend.knowledge.extraction.validator import ExtractionValidator
 
-# `rebuild()` is keyword-only and `live_uri` and `epoch` have NO defaults
+# `rebuild()` is keyword-only and `live_uri`, `epoch` and `min_seed_nodes` have NO
+# defaults
 # (`grep -n "async def rebuild" backend/knowledge/regeneration/log_regenerator.py`, one
 # hit -- read the signature there). Calling it with staging_uri alone raises TypeError
 # before any assertion runs. `epoch` must carry the same stamp fields the cache is
@@ -43,6 +44,10 @@ REBUILD_ARGS = {
         "model_hash": "test-model-hash",
         "activated_at": "2026-08-18T00:00:00+00:00",
     },
+    # Undefaulted on purpose (MIS-130): a floor nobody chose is reported as a pass.
+    # These tests are about the STAGES, not the seed, so the factory's default
+    # healthy seeder clears a floor of 1 and gets out of the way.
+    "min_seed_nodes": 1,
 }
 
 

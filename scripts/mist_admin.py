@@ -947,6 +947,8 @@ def _build_log_regenerator(
     from backend.knowledge.extraction_cache import ExtractionCache
     from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
     from backend.knowledge.regeneration.rebuild_journal import NullRebuildJournal
+    from backend.knowledge.regeneration.staging_seeder import StagingSeeder
+    from backend.knowledge.seed.loader import load_seed_documents
     from backend.knowledge.storage.graph_executor import GraphExecutor
     from backend.knowledge.storage.graph_store import GraphStore
 
@@ -998,6 +1000,22 @@ def _build_log_regenerator(
     )
     _assert_replay_source_exists(cache_path, "extraction cache", ("extraction_cache",))
 
+    # Seed corpus: the third input to `graph = f(seed, log, epoch)`, and until
+    # MIS-130 step B the only one the rebuild did not actually have. Loaded from
+    # the SAME directory and by the SAME loader the live `seed` command uses
+    # (`mist_admin.py:140-143`), so a rebuild derives the self-model from the same
+    # source live was seeded from rather than photocopying live's copy of it.
+    # `load_seed_documents` enforces exactly one shared `seed_version` across the
+    # corpus, which is why reading it off document zero is sound.
+    #
+    # Positioned AFTER `_assert_replay_source_exists` deliberately. Loading it
+    # earlier made a missing seed directory preempt the replay-source refusals,
+    # so an absent event store reported `SeedSourceError` instead of the
+    # `ColdCacheError` naming the actual missing input. Refusal ORDER is part of
+    # the diagnosis, not an implementation detail.
+    seed_dir = _Path(config.vault.root) / "seed"
+    seed_documents = load_seed_documents(seed_dir)
+
     # Real embedding provider (all-MiniLM-L6-v2). Eager load is acceptable here:
     # this is an admin CLI (sync batch), NOT the async server event loop, so there
     # is no event-loop lazy-loading hazard. A single instance is shared across
@@ -1042,6 +1060,19 @@ def _build_log_regenerator(
         # (`--dry-run` is `required=True`); a durable branch here would be a dead
         # branch justifying itself with a future caller.
         journal=NullRebuildJournal(),
+        # MIS-130 step B. The seeder writes to STAGING and is handed `staging_conn`,
+        # never `live_conn`. Those two names differ by six characters at this call
+        # site, which `_assert_seed_target_permitted`'s docstring calls out by name;
+        # the refusal that protects against getting it wrong is at the WRITE site
+        # (`seed/applier.py:91`, default-CLOSED), not here, because a guard the
+        # caller must remember to add is absent exactly when it matters.
+        staging_seeder=StagingSeeder(
+            connection=staging_conn,
+            documents=seed_documents,
+            seed_version=seed_documents[0].seed_version,
+            embedding_generator=embedding_provider,
+            expected_dimension=config.embedding.dimension,
+        ),
     )
 
     # Resolve epoch -- raise ColdCacheError so the handler's REFUSED branch fires.
@@ -1095,6 +1126,7 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
         assert_live_equals_rebuilt,
         assert_rebuild_twice_identical,
         assert_replay_derived_non_vacuous,
+        assert_self_model_applied,
         assert_turns_processed,
         live_vs_rebuilt_report,
     )
@@ -1102,6 +1134,7 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
     diagnostic = bool(getattr(args, "diagnostic", False))
     expect_turns = getattr(args, "expect_turns", None)
     min_replay_edges = getattr(args, "min_replay_edges", None)
+    min_seed_nodes = getattr(args, "min_seed_nodes", None)
 
     # Fail closed on an unchosen floor, and do it before any connect().
     #
@@ -1116,6 +1149,7 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
             for flag, value in (
                 ("--expect-turns", expect_turns),
                 ("--min-replay-edges", min_replay_edges),
+                ("--min-seed-nodes", min_seed_nodes),
             )
             if value is None
         ]
@@ -1156,20 +1190,36 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
             staging_conn.execute_write("MATCH (n) DETACH DELETE n", {})
             regen, epoch = _build_log_regenerator(be, staging_conn, args.epoch)
             # Each call gets a unique job_id automatically (job_id left unset).
+            # No connection to live is passed, and `rebuild()` no longer accepts one
+            # (MIS-130 step A). `live_uri` stays: it is a guard VALUE that
+            # `assert_rebuild_target_not_live` compares the staging URI against, not
+            # a handle anything connects through. Until step B lands the seed-apply,
+            # the rebuilt `:__SelfModel__` partition is empty -- which changes no gate
+            # result, because the compared surface is `:__Entity__`-only.
+            # `min_seed_nodes` is 1 under --diagnostic rather than absent: diagnostic
+            # turns the GATES off, and this is not one of them -- it is the guard that
+            # keeps the seed step from silently being a no-op, which would make the
+            # diagnostic output itself describe a graph the run never built. The floor
+            # of 1 is the weakest non-vacuous value, so diagnostic still reports on
+            # something rather than on nothing.
             report = _asyncio.run(
                 regen.rebuild(
                     staging_uri=args.staging_uri,
                     live_uri=live_uri,
                     epoch=epoch,
-                    source_conn=live_conn,
-                    staging_conn=staging_conn,
+                    min_seed_nodes=1 if min_seed_nodes is None else min_seed_nodes,
                 )
             )
             # The report is returned, not discarded: `turns_processed` is the only
             # thing that separates "replayed the corpus" from "selected zero turns
             # and serialised an empty graph twice", and both builds are checked
             # rather than just the one that reaches the comparison.
-            return canonical_graph_form(staging_conn, include_provenance=False), report
+            return (
+                canonical_graph_form(
+                    staging_conn, include_provenance=True, include_self_model=True
+                ),
+                report,
+            )
 
         build_a, report_a = _build_once()
         build_b, report_b = _build_once()
@@ -1178,7 +1228,31 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
 
         # Same switches on both sides. Comparing across switch sets compares two
         # different surfaces and the diff is dominated by the surface, not content.
-        live_form = canonical_graph_form(live_conn, include_provenance=False)
+        #
+        # BOTH switches are on as of MIS-130 step C, and both are load-bearing:
+        #
+        # - `include_self_model` puts the partition into the compared surface at
+        #   all. On the live graph it is 21 of 32 nodes and 20 of 30 relationships,
+        #   previously invisible. Safe to turn on only now that step A retired
+        #   `copy_self_model_partition`: while the copy stood, this compared the
+        #   partition against a copy of the comparison's own LEFT-HAND SIDE --
+        #   green by construction, and it would have been read as new coverage.
+        # - `include_provenance` is required for MIS-139's fourth clause. The
+        #   self-model <-> provenance pair (`LEARNED_SELF` -> `LearningEvent`,
+        #   `DERIVED_FROM`, `RELATED_TO`) is emitted only when BOTH switches are
+        #   on, because an edge spans two partitions and this is the only pair
+        #   whose both ends sit behind a switch. With provenance off, a dropped
+        #   `LEARNED_SELF` stays invisible exactly as before.
+        #
+        # `:__Provenance__` itself is still NOT claimed reproducible -- ADR-023
+        # section 4 excludes it. Including it here widens what the equality gate
+        # READS; it does not promote it to something the ADR asserts. That
+        # distinction belongs in the ADR's residue table (MIS-132), and a RED on a
+        # provenance key should be read as the gate telling the truth about a
+        # surface the ADR has not yet decided on.
+        live_form = canonical_graph_form(
+            live_conn, include_provenance=True, include_self_model=True
+        )
 
         if diagnostic:
             print(
@@ -1215,8 +1289,20 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
         # rebuild did, and the equality gate below would call that agreement.
         assert_canonical_form_non_vacuous(live_form, minimum_nodes=1)
 
+        # BEFORE equality, and this ordering is the whole reason the assertion
+        # exists. Two empty self-models are byte-identical, so `live == rebuilt`
+        # alone would certify a rebuild that applied NO seed at all. Non-zero AND
+        # equal makes 'applied nothing' and 'applied correctly' different
+        # observables; equality alone cannot tell them apart and a count floor
+        # alone cannot catch a partial apply.
+        assert_self_model_applied(live_form, build_b)
+        print("[rebuild] self-model gate PASSED (partition present on both sides and equal)")
+
         assert_live_equals_rebuilt(live_form, build_b)
-        print("[rebuild] live == rebuilt gate PASSED (entity subgraph canonical forms match)")
+        print(
+            "[rebuild] live == rebuilt gate PASSED (entity + self-model + provenance "
+            "canonical forms match)"
+        )
         return 0
     except RebuildTargetError as exc:
         print(f"[rebuild] REFUSED: {exc}")
@@ -2591,6 +2677,18 @@ def build_parser() -> argparse.ArgumentParser:
             "Minimum edges carrying the replay markers (source_utterance_id + "
             "version_key), sized from the corpus. Seed edges do not count. "
             "Required unless --diagnostic."
+        ),
+    )
+    p_rebuild.add_argument(
+        "--min-seed-nodes",
+        type=int,
+        default=None,
+        help=(
+            "Minimum nodes the seed-apply must write to staging BEFORE the replay "
+            "loop runs, sized from the seed corpus. Guards the case where the "
+            "seed-apply writes nothing: an empty self-model partition is "
+            "byte-identical to another empty one, so determinism and equality both "
+            "pass over it. Required unless --diagnostic. MIS-130."
         ),
     )
     p_rebuild.add_argument(

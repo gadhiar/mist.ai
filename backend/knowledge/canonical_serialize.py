@@ -175,4 +175,13 @@ def canonical_graph_form(
         canon["self_model_cross_layer_edges"] = [
             _rel(r) for r in sorted(payload["self_model_cross_layer_edges"], key=_rel_key)
         ]
+    if include_provenance and include_self_model:
+        # MIS-139's fourth clause, canonicalised on the same terms as the other
+        # three. Sorted for the reason every list here is sorted: two graphs with
+        # identical content must produce identical strings regardless of the order
+        # the driver happened to return rows in, or the equality gate reports a diff
+        # caused by query order rather than by content.
+        canon["self_model_provenance_edges"] = [
+            _rel(r) for r in sorted(payload["self_model_provenance_edges"], key=_rel_key)
+        ]
     return json.dumps(canon, sort_keys=True, indent=2) + "\n"

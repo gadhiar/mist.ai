@@ -43,6 +43,7 @@ from backend.knowledge.extraction.validator import ExtractionValidator, Validati
 from backend.knowledge.extraction_cache import OUTCOME_EXTRACTED, OUTCOME_SKIPPED, ExtractionCache
 from backend.knowledge.regeneration.log_regenerator import LogRegenerator
 from backend.knowledge.regeneration.rebuild_journal import NullRebuildJournal
+from tests.mocks.seeder import FakeStagingSeeder
 
 # Must match REBUILD_ARGS["epoch"] in test_replay_runs_stages.py exactly: the turn
 # seeded below is filtered by `epoch["ontology_version"]` and looked up in the
@@ -132,6 +133,12 @@ class _ContentRecordingCurationPipeline:
 
     event_ids: list[str] = field(default_factory=list)
     relationships: list[list[dict]] = field(default_factory=list)
+    # Shared with the seeder double when a test needs the ORDER of the two
+    # relative to each other -- seed-apply must precede the replay loop, and the
+    # two writers do not commute (`seed/applier.py:62` clobbers,
+    # `curation/graph_writer.py:251-256` is longest-wins). A per-double list
+    # cannot express "before".
+    order_sink: list[str] | None = None
 
     async def curate_and_store(
         self,
@@ -143,6 +150,8 @@ class _ContentRecordingCurationPipeline:
     ) -> CurationResult:
         self.event_ids.append(event_id)
         self.relationships.append(validation_result.relationships)
+        if self.order_sink is not None:
+            self.order_sink.append("curate")
         return CurationResult(
             write_result=WriteResult(),
             dedup_result=DeduplicationResult(entities=[], merge_actions=[], entities_merged=0),
@@ -244,6 +253,11 @@ def regenerator_factory():
         utterance: str = "I use Rust.",
         entities: list[dict] | None = None,
         relationships: list[dict] | None = None,
+        order_sink: list[str] | None = None,
+        seed_stamps: list[str] | None = None,
+        seed_nodes: int = 21,
+        embedding_gate_passed: bool = True,
+        embedding_examined: int = 21,
     ) -> LogRegenerator:
         if stage_sink is not None:
             confidence_scorer: Any = _RecordingConfidenceScorer(stage_sink)
@@ -264,8 +278,15 @@ def regenerator_factory():
                 entities=entities,
                 relationships=relationships,
             ),
-            staging_curation_pipeline=_ContentRecordingCurationPipeline(),
+            staging_curation_pipeline=_ContentRecordingCurationPipeline(order_sink=order_sink),
             journal=NullRebuildJournal(),
+            staging_seeder=FakeStagingSeeder(
+                order_sink=order_sink,
+                stamps=seed_stamps,
+                nodes=seed_nodes,
+                gate_passed=embedding_gate_passed,
+                examined=embedding_examined,
+            ),
             confidence_scorer=confidence_scorer,
             temporal_resolver=temporal_resolver,
             normalizer=normalizer,

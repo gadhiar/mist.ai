@@ -986,6 +986,44 @@ def dump_graph_json(
             for row in connection.execute_query(self_model_cross_query)
         ]
 
+    if include_provenance and include_self_model:
+        # The FOURTH clause (MIS-139). The three above cover intra-partition,
+        # entity <-> provenance, and entity <-> self-model. Self-model <->
+        # provenance was in none of them, so it was absent from the canonical form
+        # under EVERY switch combination -- not merely off by default, but
+        # unreachable. The ontology permits three such edges from a `MistIdentity`
+        # source: `LEARNED_SELF` -> `LearningEvent` (written
+        # `:__Provenance__:LearningEvent`, `curation/graph_writer.py:456,489`, and
+        # emitted on a belief change on the live path), `DERIVED_FROM` ->
+        # VectorChunk / ExternalSource / VaultNote, and `RELATED_TO` to any
+        # provenance target.
+        #
+        # Requires BOTH switches, unlike the other two which each hang off one.
+        # That is not an inconsistency: an edge spans two partitions, and this is
+        # the only pair whose BOTH ends are behind a switch. Asking for one end
+        # alone and receiving edges into a partition the caller did not ask for
+        # would make the surface depend on something the caller cannot see.
+        #
+        # Structural, with no type filter, both directions -- the same shape as the
+        # other two. A type list here would drift from the ontology on the next
+        # bump, which is the defect `_CROSS_LAYER_EDGES` was retired for.
+        self_model_provenance_query = """
+        MATCH (s)-[r]->(t)
+        WHERE (s:__SelfModel__ AND t:__Provenance__) OR (s:__Provenance__ AND t:__SelfModel__)
+        RETURN s.id AS source, type(r) AS type, t.id AS target,
+               properties(r) AS properties
+        ORDER BY s.id, type(r), t.id
+        """
+        result["self_model_provenance_edges"] = [
+            {
+                "source": row["source"],
+                "type": row["type"],
+                "target": row["target"],
+                "properties": row["properties"],
+            }
+            for row in connection.execute_query(self_model_provenance_query)
+        ]
+
     return result
 
 
