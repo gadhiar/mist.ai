@@ -1156,13 +1156,17 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
             staging_conn.execute_write("MATCH (n) DETACH DELETE n", {})
             regen, epoch = _build_log_regenerator(be, staging_conn, args.epoch)
             # Each call gets a unique job_id automatically (job_id left unset).
+            # No connection to live is passed, and `rebuild()` no longer accepts one
+            # (MIS-130 step A). `live_uri` stays: it is a guard VALUE that
+            # `assert_rebuild_target_not_live` compares the staging URI against, not
+            # a handle anything connects through. Until step B lands the seed-apply,
+            # the rebuilt `:__SelfModel__` partition is empty -- which changes no gate
+            # result, because the compared surface is `:__Entity__`-only.
             report = _asyncio.run(
                 regen.rebuild(
                     staging_uri=args.staging_uri,
                     live_uri=live_uri,
                     epoch=epoch,
-                    source_conn=live_conn,
-                    staging_conn=staging_conn,
                 )
             )
             # The report is returned, not discarded: `turns_processed` is the only
