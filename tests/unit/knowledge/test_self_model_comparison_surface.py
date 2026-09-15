@@ -164,3 +164,53 @@ class TestAssertSelfModelApplied:
         """
         with pytest.raises(RebuildVacuityError, match="include_self_model"):
             assert_self_model_applied(json.dumps({"nodes": []}), json.dumps({"nodes": []}))
+
+
+class TestADroppedCrossLayerEdgeIsObservable:
+    """Discharges the premise of the coverage test retired in MIS-130 step A.
+
+    `test_cross_layer_edge_coverage.py` was deleted along with
+    `rederive_self_model_cross_layer_edges`, and its own docstring recorded that
+    closing the type-coverage gap "buys no coverage" while the compared surface
+    did not read the partition at all. Step C turned the surface on. These tests
+    establish what that bought: a self-model <-> entity edge present on live and
+    absent from the rebuild now changes the canonical form, so the gate sees it.
+
+    Asserted at the FORM level deliberately. The CLI-level version of this test
+    was written first and then deleted, because the wiring fixture's
+    `canonical_graph_form` fake returns preset strings and ignores the switches --
+    so it passed unchanged with `include_self_model=False`, proving only that the
+    equality gate fires on forms that differ, which was never in doubt. Here the
+    switch genuinely decides whether the key exists, and a mutant turning it off
+    kills these.
+
+    What this does NOT settle: whether replay SHOULD produce that edge, or
+    whether ADR-023 should exclude the pair by name. That is MIS-132's decision.
+    Only the observability of the answer is established here.
+    """
+
+    @staticmethod
+    def _edge():
+        return {
+            "source": "mist-identity",
+            "type": "ADAPTED_FOR",
+            "target": "e1",
+            "properties": {},
+        }
+
+    def test_the_edge_is_absent_from_the_default_surface(self):
+        """The blindness this closes, stated as a live assertion rather than prose."""
+        form = json.loads(canonical_graph_form(_connection(cross_edges=[self._edge()])))
+        assert "self_model_cross_layer_edges" not in form
+
+    def test_a_dropped_edge_changes_the_form(self):
+        with_edge = canonical_graph_form(
+            _connection(cross_edges=[self._edge()]), include_self_model=True
+        )
+        without = canonical_graph_form(_connection(cross_edges=[]), include_self_model=True)
+
+        assert with_edge != without, (
+            "dropping a self-model <-> entity edge left the canonical form "
+            "byte-identical, so the gate cannot distinguish a rebuild that produced "
+            "the edge from one that silently dropped it."
+        )

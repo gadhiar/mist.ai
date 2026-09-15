@@ -1126,6 +1126,7 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
         assert_live_equals_rebuilt,
         assert_rebuild_twice_identical,
         assert_replay_derived_non_vacuous,
+        assert_self_model_applied,
         assert_turns_processed,
         live_vs_rebuilt_report,
     )
@@ -1213,7 +1214,12 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
             # thing that separates "replayed the corpus" from "selected zero turns
             # and serialised an empty graph twice", and both builds are checked
             # rather than just the one that reaches the comparison.
-            return canonical_graph_form(staging_conn, include_provenance=False), report
+            return (
+                canonical_graph_form(
+                    staging_conn, include_provenance=True, include_self_model=True
+                ),
+                report,
+            )
 
         build_a, report_a = _build_once()
         build_b, report_b = _build_once()
@@ -1222,7 +1228,31 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
 
         # Same switches on both sides. Comparing across switch sets compares two
         # different surfaces and the diff is dominated by the surface, not content.
-        live_form = canonical_graph_form(live_conn, include_provenance=False)
+        #
+        # BOTH switches are on as of MIS-130 step C, and both are load-bearing:
+        #
+        # - `include_self_model` puts the partition into the compared surface at
+        #   all. On the live graph it is 21 of 32 nodes and 20 of 30 relationships,
+        #   previously invisible. Safe to turn on only now that step A retired
+        #   `copy_self_model_partition`: while the copy stood, this compared the
+        #   partition against a copy of the comparison's own LEFT-HAND SIDE --
+        #   green by construction, and it would have been read as new coverage.
+        # - `include_provenance` is required for MIS-139's fourth clause. The
+        #   self-model <-> provenance pair (`LEARNED_SELF` -> `LearningEvent`,
+        #   `DERIVED_FROM`, `RELATED_TO`) is emitted only when BOTH switches are
+        #   on, because an edge spans two partitions and this is the only pair
+        #   whose both ends sit behind a switch. With provenance off, a dropped
+        #   `LEARNED_SELF` stays invisible exactly as before.
+        #
+        # `:__Provenance__` itself is still NOT claimed reproducible -- ADR-023
+        # section 4 excludes it. Including it here widens what the equality gate
+        # READS; it does not promote it to something the ADR asserts. That
+        # distinction belongs in the ADR's residue table (MIS-132), and a RED on a
+        # provenance key should be read as the gate telling the truth about a
+        # surface the ADR has not yet decided on.
+        live_form = canonical_graph_form(
+            live_conn, include_provenance=True, include_self_model=True
+        )
 
         if diagnostic:
             print(
@@ -1259,8 +1289,20 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
         # rebuild did, and the equality gate below would call that agreement.
         assert_canonical_form_non_vacuous(live_form, minimum_nodes=1)
 
+        # BEFORE equality, and this ordering is the whole reason the assertion
+        # exists. Two empty self-models are byte-identical, so `live == rebuilt`
+        # alone would certify a rebuild that applied NO seed at all. Non-zero AND
+        # equal makes 'applied nothing' and 'applied correctly' different
+        # observables; equality alone cannot tell them apart and a count floor
+        # alone cannot catch a partial apply.
+        assert_self_model_applied(live_form, build_b)
+        print("[rebuild] self-model gate PASSED (partition present on both sides and equal)")
+
         assert_live_equals_rebuilt(live_form, build_b)
-        print("[rebuild] live == rebuilt gate PASSED (entity subgraph canonical forms match)")
+        print(
+            "[rebuild] live == rebuilt gate PASSED (entity + self-model + provenance "
+            "canonical forms match)"
+        )
         return 0
     except RebuildTargetError as exc:
         print(f"[rebuild] REFUSED: {exc}")

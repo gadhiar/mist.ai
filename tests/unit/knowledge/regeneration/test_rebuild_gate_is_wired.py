@@ -67,7 +67,13 @@ LIVE_URI = "bolt://mist-neo4j:7687"
 STAGING_URI = "bolt://mist-neo4j-staging:7687"
 
 
-def _form(*, nodes: int = 2, replay_edges: int = 2, tag: str = "a") -> str:
+def _form(
+    *,
+    nodes: int = 2,
+    replay_edges: int = 2,
+    tag: str = "a",
+    self_model_nodes: int = 21,
+) -> str:
     """A canonical-form string with `replay_edges` edges carrying both markers.
 
     `source_utterance_id` and `version_key` together are `REPLAY_EDGE_MARKERS` --
@@ -91,6 +97,30 @@ def _form(*, nodes: int = 2, replay_edges: int = 2, tag: str = "a") -> str:
             }
             for i in range(replay_edges)
         ],
+        # MIS-130 step C put the self-model partition INTO the compared surface,
+        # so a form the gate reads now carries it. `self_model_nodes=0` is how a
+        # test drives the case `assert_self_model_applied` exists to refuse: a
+        # rebuild that applied nothing, which every OTHER gate certifies as
+        # correct because two empty partitions are byte-identical.
+        "self_model": {
+            "nodes": [
+                {"id": f"sm{i}", "labels": ["__SelfModel__"], "properties": {}}
+                for i in range(self_model_nodes)
+            ],
+            "relationships": [],
+        },
+        # Present and empty so the fake form carries the shape the extended surface
+        # actually produces. No parameter to vary them: the tests that need a
+        # populated cross-layer key assert at the FORM level, in
+        # test_self_model_comparison_surface.py and
+        # test_self_model_provenance_surface.py, where the switch genuinely decides
+        # whether the key exists. This fixture's `canonical_graph_form` fake ignores
+        # the switches, so a dropped-edge test written here would pass with the
+        # surface turned off -- proving only that the equality gate fires on forms
+        # that differ, which was never in question. Two such tests were written and
+        # deleted for exactly that reason.
+        "self_model_cross_layer_edges": [],
+        "self_model_provenance_edges": [],
     }
     return json.dumps(payload, sort_keys=True, indent=2) + "\n"
 
@@ -285,6 +315,46 @@ class TestTheCommandWiresTheGates:
 
         assert len(wired["forms"]) == 3, "expected two staging builds and one live"
         assert wired["forms"][0] == wired["forms"][1] == wired["forms"][2]
+
+    def test_every_form_includes_the_self_model_partition(self, wired):
+        """MIS-130 step C. Until now the gate compared `:__Entity__` only.
+
+        On the live graph that was 11 nodes of 32 -- twenty-one structurally
+        invisible. Safe to turn on only now that step A retired the copy-forward:
+        while the copy stood, this compared the partition against a copy of the
+        comparison's own left-hand side, which is green by construction and would
+        have been presented as new coverage.
+        """
+        wired["set"]()
+        mist_admin.cmd_graph_rebuild_from_log(_args())
+
+        assert wired["forms"], "no form was serialised at all"
+        assert all(k.get("include_self_model") for k in wired["forms"]), (
+            f"a form was built without include_self_model: {wired['forms']}. The "
+            "gate would report the self-model verified while never having looked."
+        )
+
+    def test_every_form_includes_provenance_so_the_fourth_clause_is_reachable(self, wired):
+        """MIS-139: self-model <-> provenance needs BOTH switches to be emitted."""
+        wired["set"]()
+        mist_admin.cmd_graph_rebuild_from_log(_args())
+
+        assert all(k.get("include_provenance") for k in wired["forms"]), (
+            "provenance is off, so `self_model_provenance_edges` is absent from "
+            "every form and a dropped LEARNED_SELF edge stays invisible."
+        )
+
+    def test_self_model_gate_is_wired(self, wired, capsys):
+        """A rebuild that applied no self-model must fail, not pass."""
+        wired["set"](
+            live=_form(tag="same", self_model_nodes=21),
+            rebuilt=[
+                _form(tag="same", self_model_nodes=0),
+                _form(tag="same", self_model_nodes=0),
+            ],
+        )
+        assert mist_admin.cmd_graph_rebuild_from_log(_args()) == 4
+        assert "self-model gate FAILED" in capsys.readouterr().out
 
     def test_turns_gate_is_wired(self, wired, capsys):
         wired["set"](turns=86)
