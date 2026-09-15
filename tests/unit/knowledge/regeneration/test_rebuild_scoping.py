@@ -53,6 +53,7 @@ from backend.knowledge.regeneration.log_regenerator import (
     RebuildScopeError,
 )
 from backend.knowledge.regeneration.rebuild_journal import EventStoreRebuildJournal
+from tests.mocks.seeder import FakeStagingSeeder
 
 # The REAL staging endpoint, not a per-file synthetic name. Connections here are
 # fakes and never dial it, but `assert_rebuild_target_not_live` is an allowlist
@@ -290,6 +291,7 @@ def build_world(
             # `test_the_job_ledger_totals_only_the_scoped_turns` still meaningful.
             # It is a deliberate choice here, not the default it used to be.
             journal=EventStoreRebuildJournal(store),
+            staging_seeder=FakeStagingSeeder(),
             # This file's assertions are about SCOPING (which turns get selected),
             # not about Stages 3-6, so the real (pure, no external dependency)
             # production components are the simplest correct wiring -- Task 6
@@ -304,7 +306,10 @@ def build_world(
 
 async def rebuild(world: ScopedWorld, **overrides: Any):
     return await world.regenerator.rebuild(
-        staging_uri=STAGING_URI, live_uri=LIVE_URI, epoch=world.epoch, **overrides
+        staging_uri=STAGING_URI,
+        live_uri=LIVE_URI,
+        epoch=world.epoch,
+        **{"min_seed_nodes": 1, **overrides},
     )
 
 

@@ -48,6 +48,7 @@ from backend.knowledge.regeneration.rebuild_gate import (
 from backend.knowledge.regeneration.rebuild_journal import EventStoreRebuildJournal
 from scripts.golden_log.generate import build_golden_turns, materialize_isolated
 from scripts.golden_log.native_shape import native_predicate, native_properties
+from tests.mocks.seeder import FakeStagingSeeder
 
 EXPECTED_TURN_COUNT = 87
 # The REAL staging endpoint, not a per-file synthetic name. Connections here are
@@ -157,6 +158,7 @@ async def replay_golden_log(root, turns=None) -> tuple[Any, RecordingCurationPip
         extraction_cache=materialized.extraction_cache,
         journal=EventStoreRebuildJournal(materialized.event_store),
         staging_curation_pipeline=recorder,
+        staging_seeder=FakeStagingSeeder(),
         **_stage_components(),
     )
     report = await regenerator.rebuild(
@@ -164,6 +166,7 @@ async def replay_golden_log(root, turns=None) -> tuple[Any, RecordingCurationPip
         live_uri=LIVE_URI,
         epoch=materialized.epoch,
         origins=GOLDEN_LOG_ORIGINS,
+        min_seed_nodes=1,
     )
     return report, recorder, materialized
 
@@ -198,6 +201,7 @@ class TestTheOriginGuardIsLoadBearing:
             extraction_cache=materialized.extraction_cache,
             journal=EventStoreRebuildJournal(materialized.event_store),
             staging_curation_pipeline=recorder,
+            staging_seeder=FakeStagingSeeder(),
             **_stage_components(),
         )
 
@@ -217,7 +221,10 @@ class TestTheOriginGuardIsLoadBearing:
         # fixture traffic -- it would then replay and not raise.
         with pytest.raises(RebuildScopeError) as exc:
             await regenerator.rebuild(
-                staging_uri=STAGING_URI, live_uri=LIVE_URI, epoch=materialized.epoch
+                staging_uri=STAGING_URI,
+                live_uri=LIVE_URI,
+                epoch=materialized.epoch,
+                min_seed_nodes=1,
             )
 
         assert "origin in (real)" in str(exc.value), "the refusal must name the filter"
@@ -272,6 +279,7 @@ class TestCacheCoverage:
             extraction_cache=materialized.extraction_cache,
             journal=EventStoreRebuildJournal(materialized.event_store),
             staging_curation_pipeline=RecordingCurationPipeline(),
+            staging_seeder=FakeStagingSeeder(),
             **_stage_components(),
         )
 
@@ -282,6 +290,7 @@ class TestCacheCoverage:
                 live_uri=LIVE_URI,
                 epoch=drifted_epoch,
                 origins=GOLDEN_LOG_ORIGINS,
+                min_seed_nodes=1,
             )
 
     @pytest.mark.asyncio
@@ -300,6 +309,7 @@ class TestCacheCoverage:
             extraction_cache=materialized.extraction_cache,
             journal=EventStoreRebuildJournal(materialized.event_store),
             staging_curation_pipeline=RecordingCurationPipeline(),
+            staging_seeder=FakeStagingSeeder(),
             **_stage_components(),
         )
 
@@ -309,6 +319,7 @@ class TestCacheCoverage:
                 live_uri=LIVE_URI,
                 epoch=drifted,
                 origins=GOLDEN_LOG_ORIGINS,
+                min_seed_nodes=1,
             )
 
         message = str(excinfo.value)
@@ -333,6 +344,7 @@ class TestCacheCoverage:
             extraction_cache=materialized.extraction_cache,
             journal=EventStoreRebuildJournal(materialized.event_store),
             staging_curation_pipeline=RecordingCurationPipeline(),
+            staging_seeder=FakeStagingSeeder(),
             **_stage_components(),
         )
 
@@ -342,6 +354,7 @@ class TestCacheCoverage:
                 live_uri=LIVE_URI,
                 epoch=drifted,
                 origins=GOLDEN_LOG_ORIGINS,
+                min_seed_nodes=1,
             )
 
         assert "emb:" not in str(excinfo.value), (

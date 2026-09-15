@@ -47,6 +47,7 @@ from tests.integration.knowledge.test_log_regenerator import (
 from tests.integration.knowledge.test_log_regenerator import (
     staging_conn as staging_conn,  # noqa: F401 -- re-exported so pytest registers the fixture
 )
+from tests.mocks.seeder import FakeStagingSeeder
 
 EXPECTED_TURN_COUNT = 87
 
@@ -70,12 +71,14 @@ async def _rebuild_into_staging(staging_conn, root):
         extraction_cache=materialized.extraction_cache,
         staging_curation_pipeline=_build_staging_pipeline(staging_conn),
         journal=EventStoreRebuildJournal(materialized.event_store),
+        staging_seeder=FakeStagingSeeder(),
         **_stage_components(),
     )
     report = await regenerator.rebuild(
         staging_uri=_staging_uri(),
         live_uri=_LIVE_URI,
         epoch=materialized.epoch,
+        min_seed_nodes=1,
         # `generate.SESSION_ORIGIN` is "test". `rebuild` now reads the origin
         # guard and defaults to ('real',), so replaying fixture traffic has to
         # be declared. See tests/unit/golden_log/test_replay.py.

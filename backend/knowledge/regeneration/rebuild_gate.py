@@ -382,3 +382,83 @@ def live_vs_rebuilt_report(live_form: str, rebuilt_form: str) -> str:
         if line and line[0] in "+-" and not line.startswith(("+++", "---"))
     )
     return f"live != rebuilt: {n} differing canonical lines (expected pre-R1.3/R1.4).\n" + diff
+
+
+def assert_seed_applied(*, nodes_written: int, minimum: int) -> None:
+    """Hard gate: the seed-apply wrote real nodes, BEFORE the replay loop ran.
+
+    This is the floor MIS-130's sequencing paragraph asks for, and it reads a
+    COUNT at the apply site rather than a canonical form. That distinction is
+    what lets the seed-apply land before the comparison surface is extended:
+    "applied nothing" and "applied something" become different observables
+    without any comparison surface existing. Delete the copy-forward, wire a
+    seed-apply that writes zero nodes, and every OTHER gate stays green --
+    determinism passes because two empty self-models are byte-identical, and
+    `live == rebuilt` passes because the compared surface never looks at that
+    partition. This is the assertion that does not.
+
+    `minimum` is the caller's floor and is deliberately not defaulted anywhere
+    up the stack, for the reason MIS-137 gave: a defaulted floor is a number
+    nobody chose that the run then reports as passed.
+
+    Args:
+        nodes_written: Nodes the seed-apply reports having written to staging.
+        minimum: The floor this run was configured with. Must be at least 1.
+
+    Raises:
+        ValueError: when `minimum < 1`; a floor of zero is not a gate.
+        RebuildVacuityError: when fewer than `minimum` nodes were written.
+    """
+    if minimum < 1:
+        raise ValueError(f"minimum={minimum} seed nodes cannot support a gate; pass at least 1.")
+    if nodes_written < minimum:
+        raise RebuildVacuityError(
+            f"seed gate FAILED: the seed-apply wrote {nodes_written} node(s), floor is "
+            f"{minimum}. A rebuild whose seed step wrote nothing produces an empty "
+            "self-model partition that every other gate certifies as correct: two "
+            "empty partitions are byte-identical and the compared surface does not "
+            "read them. Nothing downstream can catch this, which is why it is caught "
+            "here."
+        )
+
+
+def assert_seed_embeddings_present(gate_result) -> None:
+    """Hard gate: the seeded nodes carry usable embeddings.
+
+    A second floor rather than a clause of `assert_seed_applied`, because a node
+    count cannot see this failure and the canonical form is blind to it BY
+    DESIGN: `canonical_serialize` excludes `embedding` (`seed/gates.py:264-268`
+    -- "byte-identical whether embeddings are present, absent, or all-zero").
+    `apply_seed_documents` never writes `embedding` either; only the backfill
+    does. So a seed-apply that skips or fails the backfill yields a graph
+    nothing can retrieve from, and it certifies as identical to one that did
+    not. Embeddings have already been silently lost on live data twice for
+    exactly this reason (`mist_admin.py:257-270`).
+
+    Takes a `GateResult` from `check_embeddings` rather than the backfill's own
+    count on purpose. The backfill runs after the seed writes have committed, so
+    a failure inside it leaves a fully-seeded, fully-unembedded graph; and its
+    returned count is rows it THOUGHT it wrote, reported by the same code that
+    failed to write them. `check_embeddings` re-reads the graph.
+
+    A pass that examined nothing is refused too. `check_embeddings` is the only
+    seed gate that populates `examined` (`seed/gates.py:62-88`), so the check is
+    meaningful here and would be meaningless against the other four.
+
+    Raises:
+        RebuildVacuityError: when the gate failed, or passed vacuously.
+    """
+    if not gate_result.passed:
+        detail = "; ".join(gate_result.failures) or "no detail reported"
+        raise RebuildVacuityError(
+            f"seed embedding gate FAILED: {detail}. The canonical form cannot catch "
+            "this -- it excludes `embedding` -- so an unembedded rebuild would compare "
+            "byte-identical to an embedded one while retrieving nothing."
+        )
+    if gate_result.examined == 0:
+        raise RebuildVacuityError(
+            "seed embedding gate FAILED: it passed having examined 0 nodes. A gate "
+            "that looked at nothing reports the same `passed=True` as one that "
+            "verified everything, and this is the shape of both historical live "
+            "embedding losses."
+        )

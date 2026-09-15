@@ -170,6 +170,10 @@ def _args(**kw) -> argparse.Namespace:
         "epoch": None,
         "expect_turns": 87,
         "min_replay_edges": 2,
+        # MIS-130 step B: the third required floor. Sized from the seed corpus
+        # (`mist-memory/seed/mist.md` authors 21 :__SelfModel__ nodes), same as the
+        # other two are sized from the replay corpus.
+        "min_seed_nodes": 21,
         "diagnostic": False,
     }
     base.update(kw)
@@ -248,6 +252,18 @@ class TestFailsClosedWithoutChosenFloors:
         wired["set"]()
         assert mist_admin.cmd_graph_rebuild_from_log(_args(min_replay_edges=None)) == 2
         assert "--min-replay-edges" in capsys.readouterr().out
+
+    def test_missing_min_seed_nodes_refuses(self, wired, capsys):
+        """The seed floor is required on the same terms as the other two.
+
+        MIS-130 step B. Without it a seed-apply that writes zero nodes produces an
+        empty `:__SelfModel__` partition, and every other gate certifies it: two
+        empty partitions are byte-identical, so determinism passes, and the
+        compared surface does not read that partition, so equality passes too.
+        """
+        wired["set"]()
+        assert mist_admin.cmd_graph_rebuild_from_log(_args(min_seed_nodes=None)) == 2
+        assert "--min-seed-nodes" in capsys.readouterr().out
 
     def test_no_rebuild_is_attempted_when_refused(self, wired):
         wired["set"]()

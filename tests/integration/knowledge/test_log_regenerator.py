@@ -19,6 +19,7 @@ from backend.knowledge.extraction_cache import OUTCOME_EXTRACTED, ExtractionCach
 from backend.knowledge.regeneration.log_regenerator import ColdCacheError, LogRegenerator
 from backend.knowledge.regeneration.rebuild_journal import EventStoreRebuildJournal
 from backend.knowledge.storage.neo4j_connection import Neo4jConnection
+from tests.mocks.seeder import FakeStagingSeeder
 
 
 def _stage_components() -> dict:
@@ -169,6 +170,7 @@ def _build_regenerator_with_one_turn(
         extraction_cache=cache,
         staging_curation_pipeline=pipeline,
         journal=EventStoreRebuildJournal(event_store),
+        staging_seeder=FakeStagingSeeder(),
         **_stage_components(),
     )
     return regen, event_store, cache, _TEST_EPOCH
@@ -190,6 +192,7 @@ def _build_regenerator_with_uncached_turn(
         extraction_cache=cache,
         staging_curation_pipeline=pipeline,
         journal=EventStoreRebuildJournal(event_store),
+        staging_seeder=FakeStagingSeeder(),
         **_stage_components(),
     )
     return regen, event_store, cache, _TEST_EPOCH
@@ -208,6 +211,7 @@ class TestLogRegeneratorReplay:
             staging_uri=_staging_uri(),
             live_uri=_LIVE_URI,
             epoch=epoch,
+            min_seed_nodes=1,
         )
 
         # Assert: the turn's cached entity was written to staging.
@@ -222,7 +226,12 @@ class TestLogRegeneratorReplay:
         # Arrange: a turn with NO cache entry -> coverage check must refuse.
         regen, _, _, epoch = _build_regenerator_with_uncached_turn(tmp_path, staging_conn)
         with pytest.raises(ColdCacheError, match="uncached"):
-            await regen.rebuild(staging_uri=_staging_uri(), live_uri=_LIVE_URI, epoch=epoch)
+            await regen.rebuild(
+                staging_uri=_staging_uri(),
+                live_uri=_LIVE_URI,
+                epoch=epoch,
+                min_seed_nodes=1,
+            )
 
     @pytest.mark.asyncio
     async def test_rebuild_finalizes_job_completed(self, staging_conn, tmp_path):
@@ -234,6 +243,7 @@ class TestLogRegeneratorReplay:
             staging_uri=_staging_uri(),
             live_uri=_LIVE_URI,
             epoch=epoch,
+            min_seed_nodes=1,
         )
 
         # Assert report fields
@@ -260,11 +270,13 @@ class TestLogRegeneratorReplay:
             staging_uri=_staging_uri(),
             live_uri=_LIVE_URI,
             epoch=epoch,
+            min_seed_nodes=1,
         )
         report2 = await regen.rebuild(
             staging_uri=_staging_uri(),
             live_uri=_LIVE_URI,
             epoch=epoch,
+            min_seed_nodes=1,
         )
 
         # Both runs must complete without IntegrityError and produce distinct ids
@@ -357,6 +369,7 @@ class TestLogRegeneratorReplay:
             extraction_cache=cache,
             staging_curation_pipeline=pipeline,
             journal=EventStoreRebuildJournal(event_store),
+            staging_seeder=FakeStagingSeeder(),
             **_stage_components(),
         )
 
@@ -365,6 +378,7 @@ class TestLogRegeneratorReplay:
             staging_uri=_staging_uri(),
             live_uri=_LIVE_URI,
             epoch=epoch,
+            min_seed_nodes=1,
         )
         form_a = canonical_graph_form(staging_conn, include_provenance=False)
 
@@ -376,6 +390,7 @@ class TestLogRegeneratorReplay:
             staging_uri=_staging_uri(),
             live_uri=_LIVE_URI,
             epoch=epoch,
+            min_seed_nodes=1,
         )
         form_b = canonical_graph_form(staging_conn, include_provenance=False)
 

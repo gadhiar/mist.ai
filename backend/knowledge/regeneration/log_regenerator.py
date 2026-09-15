@@ -10,12 +10,22 @@ build-then-swap CUTOVER (deferred) is separate.
 The self-model copy-forward + cross-layer re-derivation (R1.2 Task 4) is GONE as
 of MIS-130 step A. It read the LIVE graph and MERGEd the `:__SelfModel__`
 partition into staging verbatim (`SET x = $props`), so the shipped function was
-`f(log, epoch, live_graph)` while the R1 spec claims `f(seed, log, epoch)`. Its
-replacement is a seed-apply against staging, which lands in step B and belongs
-BEFORE the replay loop, not after it -- the two writers do not commute. Until
-then the rebuilt self-model partition is empty, which is honest incompleteness
-rather than a regression in coverage: no gate compared that partition before the
-retirement either.
+`f(log, epoch, live_graph)` while the R1 spec claims `f(seed, log, epoch)`.
+
+Step B replaced it with a real seed-apply against staging (`StagingSeeder`),
+positioned BEFORE the replay loop rather than where the copy sat after it: the
+two writers do not commute, so the position is part of the contract and not a
+detail. Two floors run with it and before the first turn -- `assert_seed_applied`
+(a node COUNT, so "applied nothing" and "applied something" are different
+observables without needing a comparison surface) and
+`assert_seed_embeddings_present` (a RE-READ, because `canonical_serialize`
+excludes `embedding` and an unembedded graph is byte-identical to a correct one).
+
+What is still owed, as of step B, is step C: the compared surface does not read
+the `:__SelfModel__` partition at all (`canonical_graph_form`'s
+`include_self_model` defaults False), so the seed-apply is verified by its own
+floors and NOT yet by `live == rebuilt`. Do not describe this class as proving
+the self-model is reproducible until that lands.
 
 The rebuild NEVER writes to the live GRAPH: `assert_rebuild_target_not_live`
 gates the staging URI, and no live connection reaches this class at all any more
@@ -51,6 +61,10 @@ from backend.knowledge.curation.pipeline import CurationResult
 from backend.knowledge.eval_isolation import assert_rebuild_target_not_live
 from backend.knowledge.extraction.ontology_extractor import ExtractionResult
 from backend.knowledge.extraction_cache import OUTCOME_SKIPPED
+from backend.knowledge.regeneration.rebuild_gate import (
+    assert_seed_applied,
+    assert_seed_embeddings_present,
+)
 from backend.knowledge.regeneration.rebuild_journal import RebuildJournal
 
 logger = logging.getLogger(__name__)
@@ -99,6 +113,12 @@ class RebuildReport:
     ontology_version: str | None = None
     origins: tuple[str, ...] = ()
     total_logged: int = 0
+    # The seed half of the domain, recorded for the same reason as the three above:
+    # `graph = f(seed, log, epoch)` has THREE inputs, and a report naming only the
+    # log's two describes a function it did not run. A run whose seed wrote 21 nodes
+    # and one whose seed wrote 3 are different derivations that `turns_processed`
+    # cannot distinguish. MIS-130 step B; feeds ADR-023 section 7.
+    seed_nodes_written: int = 0
 
 
 class LogRegenerator:
@@ -115,8 +135,8 @@ class LogRegenerator:
     # `copy_self_model_partition` and `rederive_self_model_cross_layer_edges`, both
     # retired: the partition they populated was a verbatim photocopy of live, which
     # made the shipped function `f(log, epoch, live_graph)` rather than the spec's
-    # `f(seed, log, epoch)`. The replacement is a seed-apply against staging (step B),
-    # not a shorter or a longer list. See
+    # `f(seed, log, epoch)`. The replacement is the injected `staging_seeder`, not a
+    # shorter or a longer list. See
     # tests/unit/knowledge/regeneration/test_rebuild_has_no_live_source.py.
 
     def __init__(
@@ -126,6 +146,7 @@ class LogRegenerator:
         extraction_cache,
         staging_curation_pipeline,
         journal: RebuildJournal,
+        staging_seeder,
         confidence_scorer,
         temporal_resolver,
         normalizer,
@@ -134,6 +155,15 @@ class LogRegenerator:
         self._events = event_store
         self._cache = extraction_cache
         self._curation = staging_curation_pipeline
+        # REQUIRED for the same reason `journal` is, and the reason is sharper here.
+        # `rebuild()` used to reach the `:__SelfModel__` partition by copying it from
+        # the LIVE graph; step A deleted that, so between A and B a rebuild produced
+        # no self-model at all. A DEFAULTED seeder would make that state reachable
+        # again and silent -- and it is the one state MIS-130's hazard paragraph is
+        # about, because an empty partition passes determinism (two empty partitions
+        # are byte-identical) and passes `live == rebuilt` (the compared surface does
+        # not read it). A regenerator that cannot seed cannot be constructed.
+        self._seeder = staging_seeder
         # `journal` is REQUIRED, not defaulted to `event_store`, and the REQUIREDNESS
         # is the whole of the protection. A default is what the bug looked like: the
         # replay source must be the LIVE store, so any implicit "journal into the
@@ -190,6 +220,7 @@ class LogRegenerator:
         staging_uri: str,
         live_uri: str,
         epoch: dict,
+        min_seed_nodes: int,
         job_id: str | None = None,
         resume_from: str | None = None,
         origins: tuple[str, ...] = CANONICAL_ORIGINS,
@@ -201,6 +232,11 @@ class LogRegenerator:
             live_uri: Bolt URI for the live Neo4j (guard only; never written to).
             epoch: Epoch dict with ontology_version, extraction_version, model_hash,
                 epoch_id, activated_at.
+            min_seed_nodes: Floor the seed-apply must clear before the replay loop
+                runs. REQUIRED and undefaulted, for the reason MIS-137 gave about
+                `--expect-turns`: a defaulted floor is a number nobody chose that
+                the run then reports as passed. A caller that has not decided what
+                a healthy seed looks like cannot start a rebuild.
             job_id: Optional caller-provided job identifier. For fresh runs this is
                 optional (a unique id is generated). For resume runs this is REQUIRED
                 (it must match the row created during the initial run).
@@ -327,14 +363,9 @@ class LogRegenerator:
         collected_errors: list[str] = []
         last_ts: str = epoch["activated_at"]
 
-        # SEED-APPLY GOES HERE, ABOVE THIS LOOP -- not after it. MIS-130/MIS-138.
+        # SEED-APPLY, ABOVE THIS LOOP -- not after it. MIS-130/MIS-138.
         #
-        # `rebuild()` has no seed-apply step yet, and as of step A it no longer has
-        # the copy-forward that stood in for one either -- so the `:__SelfModel__`
-        # partition of a rebuild is currently EMPTY. That is the honest state, not a
-        # regression: the copy was a verbatim photocopy of live and no gate compared
-        # the partition it populated. When step B adds a real `apply_seed_documents`
-        # against staging, ORDER IS LOAD-BEARING and the two writers do not commute:
+        # ORDER IS LOAD-BEARING and the two writers do not commute:
         #
         #   seed      `ON MATCH SET n += $properties`      (seed/applier.py:62)
         #               -- unconditional clobber of every authored property
@@ -348,13 +379,30 @@ class LogRegenerator:
         # from identical inputs. `display_name` and `description` are in no exclusion
         # frozenset, so the gate sees it -- as a RED it will read as non-determinism.
         #
-        # The existing post-loop composition step is the trap: it is the natural place
-        # to add "one more" step, and it is the wrong side of the loop for this one.
+        # The now-empty post-loop position is the trap: it is the natural place to add
+        # "one more" step, and it is the wrong side of the loop for this one. The
+        # retired copy-forward sat there, so "put the replacement where the old thing
+        # was" is precisely the wrong instinct here.
         #
-        # The matching gate assertion (seed node count non-zero BEFORE the first
-        # replayed turn is applied) lands WITH the seed step, deliberately not before
-        # it -- an assertion with no production caller is the defect MIS-137 existed
-        # to fix, and adding a second one here would reproduce it.
+        # `now_iso` is the EPOCH's activated_at, never the wall clock: the applier
+        # takes it explicitly so application is byte-reproducible, and two rebuilds of
+        # one epoch must stamp identical created_at/updated_at or
+        # `assert_rebuild_twice_identical` fails on wall-clock noise rather than on
+        # content -- a RED that says nothing about determinism while looking exactly
+        # like one that does.
+        seed_result = self._seeder.apply(now_iso=epoch["activated_at"])
+
+        # Both floors run BEFORE the first turn is replayed, because a gate that fires
+        # only once the expensive work is done is a report, not a gate. They are two
+        # assertions rather than one because neither subsumes the other: a partial
+        # apply has nodes AND embeddings, a failed backfill has nodes and NO
+        # embeddings, and only the pair tells both apart from a correct run. The
+        # embedding one matters disproportionately here because `canonical_serialize`
+        # EXCLUDES `embedding`, so an unembedded rebuild is byte-identical to an
+        # embedded one and every downstream gate certifies it.
+        assert_seed_applied(nodes_written=seed_result.nodes_written, minimum=min_seed_nodes)
+        assert_seed_embeddings_present(seed_result.embedding_gate)
+
         for turn in turns:
             cached = self._cache.get(
                 turn["event_id"],
@@ -443,4 +491,5 @@ class LogRegenerator:
             ontology_version=epoch["ontology_version"],
             origins=tuple(origins),
             total_logged=total_logged,
+            seed_nodes_written=seed_result.nodes_written,
         )

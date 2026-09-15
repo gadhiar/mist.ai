@@ -46,6 +46,7 @@ from backend.knowledge.regeneration.rebuild_journal import (
     EventStoreRebuildJournal,
     NullRebuildJournal,
 )
+from tests.mocks.seeder import FakeStagingSeeder
 
 STAGING_URI = "bolt://mist-neo4j-staging:7687"
 LIVE_URI = "bolt://mist-neo4j:7687"
@@ -179,6 +180,7 @@ def _regenerator(source: Any, journal: Any) -> tuple[LogRegenerator, RecordingCu
             extraction_cache=_warm_cache(),
             staging_curation_pipeline=recorder,
             journal=journal,
+            staging_seeder=FakeStagingSeeder(),
             # This file's assertions are about WHERE writes land (source vs.
             # journal store), not about Stages 3-6, so the real (pure, no
             # external dependency) production components are the simplest
@@ -202,7 +204,9 @@ class TestTheSourceStoreIsNeverWritten:
         regen, recorder = _regenerator(source, NullRebuildJournal())
 
         # Act -- RefusingEventStore turns any write into a test failure
-        report = await regen.rebuild(staging_uri=STAGING_URI, live_uri=LIVE_URI, epoch=_epoch())
+        report = await regen.rebuild(
+            staging_uri=STAGING_URI, live_uri=LIVE_URI, epoch=_epoch(), min_seed_nodes=1
+        )
 
         # Assert -- the replay still did its real work
         assert report.turns_processed == 2
@@ -217,7 +221,9 @@ class TestTheSourceStoreIsNeverWritten:
         regen, _ = _regenerator(source, EventStoreRebuildJournal(journal_store))
 
         # Act
-        report = await regen.rebuild(staging_uri=STAGING_URI, live_uri=LIVE_URI, epoch=_epoch())
+        report = await regen.rebuild(
+            staging_uri=STAGING_URI, live_uri=LIVE_URI, epoch=_epoch(), min_seed_nodes=1
+        )
 
         # Assert -- the row exists, and it exists in the journal's store
         job = journal_store.get_reextraction_job(report.job_id)
@@ -241,6 +247,7 @@ class TestResumeRequiresADurableJournal:
                 staging_uri=STAGING_URI,
                 live_uri=LIVE_URI,
                 epoch=_epoch(),
+                min_seed_nodes=1,
                 job_id="rebuild-1-abcdef",
                 resume_from=TURN_ONE,
             )
