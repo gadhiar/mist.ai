@@ -9,7 +9,7 @@ tool_calls, llm_parameters) are JSON-serialized for storage.
 import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from backend.knowledge.version_stamps import ONTOLOGY_VERSION
@@ -121,14 +121,37 @@ class ConversationTurnEvent:
 
         JSON-encodes complex fields. Converts datetime to ISO-8601 string.
 
+        `timestamp` is normalised to UTC first, and that is load-bearing rather
+        than tidiness. SQLite compares TEXT lexicographically, and
+        `get_all_turns_for_reextraction` orders the REPLAY by this column -- so
+        lexicographic order equals chronological order only while every stored
+        value carries the same offset. `2026-01-01T10:00:00+05:00` (05:00Z) sorts
+        after `2026-01-01T06:00:00+00:00` (06:00Z) as a string while being earlier
+        as an instant, so one mixed-offset writer silently misorders a rebuild --
+        and replay order decides dedup outcomes
+        (`curation/deduplication.py:130-172`).
+
+        Every caller happens to pass UTC today (`datetime.now(UTC)` on the live
+        path; `load_hydration_clock` normalises and refuses naive values). That is
+        a property of the CALLERS. Normalising here makes the canonical stored
+        format a property of the STORE, so the ordering's correctness does not
+        depend on auditing writers. MIS-138.
+
+        Naive datetimes are left alone deliberately: `astimezone` on a naive value
+        assumes system-local time, which would invent an offset. The hydration
+        clock already refuses naive values at the boundary that matters.
+
         Returns:
             Dict with string keys matching column names.
         """
+        stamp = self.timestamp
+        if stamp.tzinfo is not None:
+            stamp = stamp.astimezone(UTC)
         return {
             "event_id": self.event_id,
             "session_id": self.session_id,
             "turn_index": self.turn_index,
-            "timestamp": self.timestamp.isoformat(),
+            "timestamp": stamp.isoformat(),
             "user_utterance": self.user_utterance,
             "system_response": self.system_response,
             "context_window": (

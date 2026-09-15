@@ -383,9 +383,15 @@ class EventStore:
             params.append(ontology_version)
 
         if after_event_id is not None:
-            # Use rowid for stable ordering since event_id is a UUID
+            # "After" must mean after IN REPLAY ORDER, not after by rowid. A cursor
+            # keyed on a different order than the ORDER BY below can skip or repeat
+            # turns the moment the two disagree -- which is exactly what inserting
+            # out of chronological order produces. Row-value comparison keeps the
+            # cursor and the order the same expression (SQLite >= 3.15).
             conditions.append(
-                "e.rowid > (SELECT rowid FROM conversation_turn_events WHERE event_id = ?)"
+                "(e.timestamp, e.session_id, e.turn_index) > "
+                "(SELECT timestamp, session_id, turn_index "
+                " FROM conversation_turn_events WHERE event_id = ?)"
             )
             params.append(after_event_id)
 
@@ -402,11 +408,32 @@ class EventStore:
         # session row is missing, turning a data-integrity problem into missing
         # history. session_id is the sessions table's PRIMARY KEY, so the join
         # cannot multiply rows.
+        # Ordered by CONTENT, not by the database file. MIS-138.
+        #
+        # This read was `ORDER BY e.rowid ASC`, whose comment said "use rowid for
+        # stable ordering since event_id is a UUID" -- right about `event_id`
+        # (assigned `str(uuid.uuid4())`, so ordering by it is an arbitrary
+        # permutation) and wrong about the remedy. `schema.sql` declares
+        # `event_id TEXT PRIMARY KEY` with no INTEGER PRIMARY KEY, so rowid is an
+        # implicit physical row number that SQLite documents VACUUM may renumber.
+        # Replay order was therefore a property of the FILE, while ADR-023 claims
+        # the entity subgraph is a function of the LOG.
+        #
+        # Not cosmetic: `EntityDeduplicator._find_existing` resolves each incoming
+        # entity against whatever is already in the target graph, so processing
+        # order decides which entity wins display_name, description, entity_type
+        # and the alias union.
+        #
+        # `timestamp` leads because it is the order the LIVE path applied turns in
+        # (arrival order), which is what a rebuild must reproduce;
+        # (session_id, turn_index) is the deterministic tiebreak for equal stamps.
+        # Lexicographic TEXT ordering equals chronological ordering because
+        # `ConversationTurnEvent.to_row` normalises the column to UTC.
         query = f"""
             SELECT e.* FROM conversation_turn_events AS e
             LEFT JOIN conversation_sessions AS s ON s.session_id = e.session_id
             {where_clause}
-            ORDER BY e.rowid ASC
+            ORDER BY e.timestamp ASC, e.session_id ASC, e.turn_index ASC
         """  # nosec B608 -- where_clause is built from hardcoded conditions with parameterized values
 
         conn = self._get_connection()

@@ -145,6 +145,12 @@ class _FakeReport:
         self.turns_failed = 0
         self.staging_uri = STAGING_URI
         self.epoch_id = 1
+        # The domain the selection ran under (MIS-138). Present here because the
+        # command prints it from the REPORT rather than from its own args, so a
+        # report missing these fields is a real breakage rather than a fake's gap.
+        self.ontology_version = "1.4.0"
+        self.origins = ("real",)
+        self.total_logged = turns_processed
 
 
 class _FakeRegen:

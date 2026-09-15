@@ -57,6 +57,14 @@ class ColdCacheError(MistError):
     """Raised when the extraction cache does not cover 100% of the epoch's turns."""
 
 
+class RebuildScopeError(MistError):
+    """The selection matched no turn in a populated log.
+
+    A configuration failure, not a gate failure, and refused before any write.
+    See the raise site in `rebuild` for why a warning was not enough. MIS-138.
+    """
+
+
 class RebuildError(MistError):
     """Raised when a rebuild operation cannot proceed."""
 
@@ -70,6 +78,17 @@ class RebuildReport:
     turns_failed: int
     staging_uri: str
     epoch_id: int
+    # The DOMAIN the selection ran under, recorded so a run's evidence states it
+    # rather than a plan asserting it. `ontology_version` and `origins` are not
+    # merely stamps -- both RESTRICT which turns are in the function's domain, and
+    # `turns_processed` alone cannot distinguish "replayed the whole log" from
+    # "replayed the subset this epoch could see". MIS-138; feeds ADR-023 section 7.
+    #
+    # Defaulted so existing constructions stay valid; `rebuild` always populates
+    # them.
+    ontology_version: str | None = None
+    origins: tuple[str, ...] = ()
+    total_logged: int = 0
 
 
 class LogRegenerator:
@@ -377,12 +396,33 @@ class LogRegenerator:
             ",".join(origins),
         )
         if total_logged and not turns:
-            logger.warning(
-                "Rebuild selected 0 of %d logged turns: no turn matches ontology=%s AND "
-                "origin in (%s). The replay will be a no-op.",
-                total_logged,
-                epoch["ontology_version"],
-                ",".join(origins),
+            # Refusal, not a warning. MIS-138.
+            #
+            # This was a `logger.warning` and the run continued: the replay no-ops,
+            # `_assert_cache_coverage([])` passes vacuously over an empty selection,
+            # and every downstream assertion reads the result as "the log was
+            # empty". The rebuild reports success having produced nothing.
+            #
+            # The trigger is not an exotic misconfiguration. `ontology_version` is a
+            # DOMAIN FILTER here, and turns are stamped with the version current when
+            # they were written -- so the first ontology bump after any turns exist
+            # makes this selection empty for every historical turn, permanently.
+            # MIST has bumped 1.0.0 -> 1.1.0 -> 1.3.0 -> 1.4.0. A rebuild spanning a
+            # bump is therefore the expected case, not the edge case, and warning
+            # about it while proceeding is how it would reach a gate.
+            #
+            # Scoped to a POPULATED log deliberately: selecting nothing from an empty
+            # log is correct, and refusing there would reject the one state this
+            # cannot diagnose. An empty-log rebuild is the non-vacuity floors' job.
+            raise RebuildScopeError(
+                f"Rebuild selected 0 of {total_logged} logged turns: no turn matches "
+                f"ontology_version={epoch['ontology_version']!r} AND origin in "
+                f"({','.join(origins)}). Refusing rather than replaying nothing -- a "
+                "no-op replay passes cache coverage vacuously and is indistinguishable "
+                "downstream from an empty log. If the log spans an ontology bump, the "
+                "historical turns carry the OLD version and this epoch cannot select "
+                "them; if the corpus is probe or eval traffic, pass its origin "
+                "explicitly."
             )
 
         self._assert_cache_coverage(turns, epoch)
@@ -408,6 +448,33 @@ class LogRegenerator:
         collected_errors: list[str] = []
         last_ts: str = epoch["activated_at"]
 
+        # SEED-APPLY GOES HERE, ABOVE THIS LOOP -- not after it. MIS-130/MIS-138.
+        #
+        # `rebuild()` has no seed-apply step yet; the `:__SelfModel__` partition is
+        # copied forward instead (see the calls after this loop, and
+        # `copy_self_model_partition`'s docstring). When MIS-130 replaces that with a
+        # real `apply_seed_documents` against staging, ORDER IS LOAD-BEARING and the
+        # two writers do not commute:
+        #
+        #   seed      `ON MATCH SET n += $properties`      (seed/applier.py:62)
+        #               -- unconditional clobber of every authored property
+        #   extraction `display_name = CASE WHEN size(existing) < size(new) ...`
+        #               (curation/graph_writer.py:251-256) -- longest-wins
+        #
+        # Live applies seed FIRST (`mist_admin seed` then `mist_admin hydrate`, per
+        # docker-compose.dev-hydration.yml), so replayed facts reconcile ONTO seeded
+        # nodes. Seeding AFTER this loop would let `n += $properties` overwrite values
+        # the replay resolved by the longest-wins rule, producing a different graph
+        # from identical inputs. `display_name` and `description` are in no exclusion
+        # frozenset, so the gate sees it -- as a RED it will read as non-determinism.
+        #
+        # The existing post-loop composition step is the trap: it is the natural place
+        # to add "one more" step, and it is the wrong side of the loop for this one.
+        #
+        # The matching gate assertion (seed node count non-zero BEFORE the first
+        # replayed turn is applied) lands WITH the seed step, deliberately not before
+        # it -- an assertion with no production caller is the defect MIS-137 existed
+        # to fix, and adding a second one here would reproduce it.
         for turn in turns:
             cached = self._cache.get(
                 turn["event_id"],
@@ -492,4 +559,7 @@ class LogRegenerator:
             turns_failed=turns_failed,
             staging_uri=staging_uri,
             epoch_id=epoch["epoch_id"],
+            ontology_version=epoch["ontology_version"],
+            origins=tuple(origins),
+            total_logged=total_logged,
         )

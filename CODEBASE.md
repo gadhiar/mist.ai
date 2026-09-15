@@ -71,7 +71,55 @@ new `ExtractionCache` row-read method, and its failure mode is largely subsumed 
 of `extracted`-but-empty payloads yields no replay edges, which the replay floor already
 catches, and cache COVERAGE is already fail-closed via `ColdCacheError`. Left on MIS-137.
 
-Suite **3334 -> 3353 passed / 6 skipped / 3 xfailed / 0 failed**. Branch
+**Then the derivation function was corrected (MIS-138).** Three defects in what
+`graph = f(seed, log, epoch)` actually computes:
+
+- **Replay order was a property of the database FILE, not the log.** The selection read
+  `ORDER BY e.rowid ASC`, and `schema.sql` declares `event_id TEXT PRIMARY KEY` with no
+  INTEGER PRIMARY KEY, so rowid is an implicit physical row number SQLite documents VACUUM may
+  renumber. Now `ORDER BY e.timestamp, e.session_id, e.turn_index` -- all three in the log.
+  `timestamp` leads because that is the order the LIVE path applied turns in. Not cosmetic:
+  dedup resolves each entity against whatever is already in the target graph, so order decides
+  which entity wins `display_name`, `description`, `entity_type` and the alias union.
+- **`ConversationTurnEvent.to_row` now normalises `timestamp` to UTC**, and that is what makes
+  the SQL ordering correct rather than tidy. SQLite compares TEXT lexicographically, so ISO
+  order equals chronological order only while every value carries the same offset --
+  `10:00+05:00` (05:00Z) sorts after `06:00+00:00` (06:00Z) as a string while being earlier as
+  an instant. Every caller happens to pass UTC today; that was a property of the CALLERS and is
+  now a property of the STORE. Naive datetimes are deliberately left alone (`astimezone` on a
+  naive value would invent a system-local offset).
+- **`after_event_id` resumes by the same triple** (row-value comparison), because a cursor
+  keyed on a different order than the ORDER BY can skip or repeat turns once the two disagree.
+- **Selecting 0 turns from a POPULATED log now raises `RebuildScopeError` (exit 2)** instead of
+  logging a warning and continuing. The old path no-opped, passed cache coverage vacuously over
+  an empty selection, and reported success having produced nothing. This is not an exotic slip:
+  `epoch["ontology_version"]` is a DOMAIN FILTER, turns carry the version current when written,
+  so the first ontology bump after any turns exist empties the selection permanently for every
+  historical turn. Scoped to a populated log deliberately -- an empty log selecting nothing is
+  correct, and that case belongs to the non-vacuity floors.
+- **`RebuildReport` now records the domain it ran under** (`ontology_version`, `origins`,
+  `total_logged`), and the CLI prints it from the report rather than from its own args. ADR-023
+  section 7 needs the domain as an observed fact; `turns_processed` alone cannot distinguish
+  "replayed the whole log" from "replayed the subset this epoch could see".
+
+Three mutants applied and killed: rowid ordering restored (5 RED), UTC normalisation removed
+(2 RED -- including the mixed-offset misordering test, proving it load-bearing), scope refusal
+disabled (2 RED across two files).
+
+**Composition order is documented, not yet asserted.** The seed-apply-before-replay constraint
+now sits as a comment directly above the replay loop in `rebuild()` -- the insertion point
+MIS-130's implementer will edit -- naming the two non-commuting writers
+(`seed/applier.py:62` unconditional `n += $properties` vs `graph_writer.py:251-256`
+longest-wins) and why the post-loop composition step is the trap. The matching gate assertion
+lands WITH the seed step, deliberately not before it: an assertion with no production caller is
+exactly the defect MIS-137 existed to fix.
+
+Two behaviour changes updated existing tests rather than being worked around, both recorded in
+their docstrings: `test_rebuild_scoping.py`'s scope test pinned "warn and continue", and
+`test_replay.py`'s origin-guard test pinned "replays none". Both now assert the refusal, which
+states the same intent more strongly.
+
+Suite **3334 -> 3367 passed / 6 skipped / 3 xfailed / 0 failed**. Branch
 `feat/mis-137-wire-the-rebuild-gate`, NOT merged, NOT pushed.
 
 Tickets: MIS-128/129/131/133 Done. **MIS-132** (ADR-023, `status: proposed`, evidence section

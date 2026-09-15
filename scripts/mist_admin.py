@@ -1086,7 +1086,7 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
     from backend.knowledge.canonical_serialize import canonical_graph_form
     from backend.knowledge.config import Neo4jConfig
     from backend.knowledge.eval_isolation import RebuildTargetError, assert_rebuild_target_not_live
-    from backend.knowledge.regeneration.log_regenerator import ColdCacheError
+    from backend.knowledge.regeneration.log_regenerator import ColdCacheError, RebuildScopeError
     from backend.knowledge.regeneration.rebuild_gate import (
         RebuildDeterminismError,
         RebuildDivergenceError,
@@ -1200,6 +1200,16 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
             assert_replay_derived_non_vacuous(form, minimum_edges=min_replay_edges)
             print(f"[rebuild] non-vacuity gates PASSED for {label} ({turns} turns replayed)")
 
+        # The DOMAIN, printed from the report rather than from the args, so the run
+        # states what it actually selected under. ADR-023 section 7 needs this as an
+        # observed fact -- `ontology_version` and `origins` restrict which turns are
+        # in the function's domain, and a turn count alone cannot show it. MIS-138.
+        print(
+            f"[rebuild] domain: {report_b.turns_processed} of {report_b.total_logged} logged "
+            f"turn(s), ontology_version={report_b.ontology_version!r}, "
+            f"origins={','.join(report_b.origins)}"
+        )
+
         # The live side gets the node floor too. A live graph that serialises to
         # nothing means the comparison is between two emptinesses whatever the
         # rebuild did, and the equality gate below would call that agreement.
@@ -1212,6 +1222,11 @@ def cmd_graph_rebuild_from_log(args: argparse.Namespace) -> int:
         print(f"[rebuild] REFUSED: {exc}")
         return 2
     except ColdCacheError as exc:
+        print(f"[rebuild] REFUSED: {exc}")
+        return 2
+    except RebuildScopeError as exc:
+        # Same family as a cold cache: a configuration problem caught before any
+        # measurement, not a gate verdict. MIS-138.
         print(f"[rebuild] REFUSED: {exc}")
         return 2
     except RebuildDeterminismError as exc:
