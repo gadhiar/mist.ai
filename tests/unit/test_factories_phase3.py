@@ -535,12 +535,13 @@ class TestPhase55BusWiring:
         bus = InvalidationBus()
         fake_connection = FakeNeo4jConnection()
         graph_store = GraphStore(fake_connection, FakeEmbeddingGenerator())
+        fake_vector_store = FakeVectorStore()
 
         handler = build_conversation_handler(
             config=config,
             invalidation_bus=bus,
             graph_store=graph_store,
-            vector_store=FakeVectorStore(),
+            vector_store=fake_vector_store,
             llm_provider=FakeLLM(),
         )
 
@@ -552,6 +553,10 @@ class TestPhase55BusWiring:
         # build_extraction_pipeline's Stage 9 setup and the MistIdentity
         # MERGE landed on the fake connection, not a real Neo4j instance.
         fake_connection.assert_write_executed("MERGE (m:__SelfModel__:MistIdentity")
+        # Forwarding verification: the injected vector_store reached the
+        # retriever the factory built, rather than being ignored in favour
+        # of a real vector store the factory constructs itself.
+        assert handler.retriever._vector_store is fake_vector_store
 
 
 class TestRealKnowledgeIntegrationBusParam:
