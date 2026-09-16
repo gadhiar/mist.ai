@@ -26,17 +26,10 @@ What these tests do NOT prove:
 This file proves the autouse fixture's two effects independently: that it
 sets MIST_EVAL_ISOLATION (the flag classes), and that it clears
 MIST_EVAL_NEO4J_HOSTS so a widened allowlist cannot silently admit the live
-endpoint (TestEnvOverrideIsCleared). It does not prove these are the ONLY
-effects of removing the fixture would have, only that removing it (or
-disabling its `autouse=True`) is caught: the tests that assert the flag is
-set, and the tests that assert `connect()` raises `EvalIsolationError`, flip
-to failing or erroring when the fixture is gone -- each such claim was
-verified by disabling the fixture and rerunning this file, not assumed. Any
-test whose assertion holds independently of the fixture (for example, that
-an env var neither the fixture nor the test sets is absent) proves nothing
-about the fixture and is not evidence for its removal; see
-TestEnvOverrideIsCleared's docstring for why the old version of that check
-was exactly this trap.
+endpoint (TestEnvOverrideIsCleared). It does not prove these are the
+fixture's only effects. Removing the fixture, or disabling its autouse,
+makes the flag tests and the connect() refusal tests fail; this was
+verified by mutation.
 """
 
 import os
