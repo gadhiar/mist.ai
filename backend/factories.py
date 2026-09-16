@@ -522,6 +522,8 @@ def build_conversation_handler(
     vault_writer: "VaultWriter | None" = None,
     vault_sidecar: SidecarIndexProtocol | None = None,
     invalidation_bus: "InvalidationBus | None" = None,
+    graph_store: GraphStore | None = None,
+    vector_store: "VectorStoreProvider | None" = None,  # noqa: F821
 ):
     """Create a fully wired ConversationHandler.
 
@@ -568,6 +570,14 @@ def build_conversation_handler(
             When provided the handler registers `_on_vault_rebuild` to receive
             vault-change events and evict stale mist_context caches. The
             bus must be the same instance returned by `build_phase3_components`.
+        graph_store: Optional pre-built GraphStore. When None, one is
+            constructed from config via `build_graph_store` (opens a real
+            Neo4j connection). Tests inject a `GraphStore` wrapping a fake
+            connection to avoid touching Neo4j.
+        vector_store: Optional pre-built vector store. When None, one is
+            constructed via `build_vector_store(config)` with the existing
+            graceful fallback to graph-only retrieval on failure. Tests
+            inject a fake vector store to avoid touching LanceDB.
     """
     from pathlib import Path
 
@@ -595,7 +605,9 @@ def build_conversation_handler(
             gate_summary,
         )
 
-    gs = build_graph_store(config)
+    gs = graph_store
+    if gs is None:
+        gs = build_graph_store(config)
     provider = llm_provider or build_llm_provider(config, debug_logger=debug_logger)
     pipeline = build_extraction_pipeline(
         config,
@@ -606,11 +618,13 @@ def build_conversation_handler(
     )
 
     # Build vector store with graceful fallback
-    vector_store = None
-    try:
-        vector_store = build_vector_store(config)
-    except (VectorStoreError, Exception) as exc:
-        logger.warning("Vector store unavailable, falling back to graph-only retrieval: %s", exc)
+    if vector_store is None:
+        try:
+            vector_store = build_vector_store(config)
+        except (VectorStoreError, Exception) as exc:
+            logger.warning(
+                "Vector store unavailable, falling back to graph-only retrieval: %s", exc
+            )
 
     retriever = build_knowledge_retriever(
         config=config,
