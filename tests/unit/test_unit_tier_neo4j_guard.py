@@ -66,11 +66,13 @@ class TestEnvOverrideIsCleared:
     close -- a class-scoped override widening MIST_EVAL_NEO4J_HOSTS to admit
     the live endpoint -- then proves the per-test fixture still wins.
 
-    Pytest sets up higher-scoped fixtures before function-scoped autouse
-    fixtures, so the class-scoped `_widen_allowlist_to_admit_live` below
-    runs first on every test in this class, and the function-scoped autouse
-    `_guard_unit_tier_against_live_neo4j` in conftest.py runs after it,
-    deleting the override each time.
+    The class-scoped `_widen_allowlist_to_admit_live` below runs once and
+    sets the MIST_EVAL_NEO4J_HOSTS override. The function-scoped autouse
+    `_guard_unit_tier_against_live_neo4j` in conftest.py clears it with its
+    delenv during each test, and that test's own `monkeypatch` fixture
+    teardown restores it afterwards. So every test in the class starts
+    with the override present, and relies on that delenv to clear it
+    again.
 
     Verified by mutation: removing ONLY the `monkeypatch.delenv(...)` line
     from the autouse fixture (leaving its `setenv` line intact) makes
