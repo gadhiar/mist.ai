@@ -9,11 +9,14 @@ Dependency notes:
   is indented inside a function body. Verify with:
   `grep -n "import EmbeddingGenerator" backend/factories.py`
   -- all 5 hits are indented, none at column 0.
-  Tests that CALL a factory function which builds a default EmbeddingGenerator
-  when no embedding_generator/embedding_provider is injected (e.g.
-  build_graph_store, build_curation_scheduler) require sentence_transformers
-  (Linux/container only) at call time, not at import time. These tests are
-  marked @requires_sentence_transformers and skipped on Windows.
+  Tests that CALL a factory function that builds an EmbeddingGenerator
+  internally require sentence_transformers (Linux/container only) at call
+  time, not at import time. build_graph_store takes an optional
+  embedding_generator parameter and only builds a default when it is None;
+  build_curation_scheduler has no such parameter and always builds one
+  (both directly, and indirectly via its own call to build_graph_store).
+  These tests are marked @requires_sentence_transformers and skipped on
+  Windows.
 - Config-logic tests (None returns for disabled state) can be simulated
   without importing factories by replicating the guard logic -- platform-neutral.
 """

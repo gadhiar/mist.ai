@@ -27,9 +27,18 @@ def _guard_unit_tier_against_live_neo4j(monkeypatch):
     explicitly (not a fallback default) for the live dev container, so a unit
     test that reaches `connect()` would otherwise write to the canonical graph.
 
-    Function-scoped (the default) and NOT session- or module-scoped: a
-    broader scope would leak MIST_EVAL_ISOLATION into integration tests
-    collected in the same pytest run.
+    Function-scoped (the default): a session-scoped guard would leak
+    MIST_EVAL_ISOLATION into integration tests that run after the unit
+    tests in the same pytest invocation (for example `pytest tests/unit
+    tests/integration`, where explicit path order determines collection
+    order). Function scope also lets a test's own monkeypatch override
+    MIST_EVAL_ISOLATION or MIST_EVAL_NEO4J_HOSTS from within the test body
+    -- see tests/unit/test_eval_isolation.py, which sets
+    MIST_EVAL_ISOLATION to other values (and, in
+    TestAssertNeo4jIsolated.test_allowlist_is_env_overridable, sets
+    MIST_EVAL_NEO4J_HOSTS) to exercise `is_eval_isolation_active()` and
+    `assert_neo4j_isolated()` directly; that override works only because
+    both fixtures share the same function-scoped `monkeypatch` instance.
 
     What this does NOT catch:
     - A test that names an eval endpoint itself (e.g. bolt://mist-neo4j-eval:7687
