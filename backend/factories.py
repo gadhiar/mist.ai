@@ -523,7 +523,7 @@ def build_conversation_handler(
     vault_sidecar: SidecarIndexProtocol | None = None,
     invalidation_bus: "InvalidationBus | None" = None,
     graph_store: GraphStore | None = None,
-    vector_store: "LanceDBVectorStore | None" = None,  # noqa: F821
+    vector_store: "VectorStoreProvider | None" = None,  # noqa: F821
 ):
     """Create a fully wired ConversationHandler.
 

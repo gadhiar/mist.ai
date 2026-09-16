@@ -6,8 +6,9 @@ VaultFilewatcher and an InvalidationBus sharing the same bus instance.
 Dependency notes:
 - backend.factories does not import EmbeddingGenerator at module scope: every
   `from backend.knowledge.embeddings import EmbeddingGenerator` in that module
-  is indented inside a function body (`grep -n "from backend.knowledge.embeddings
-  import EmbeddingGenerator" backend/factories.py` -- every hit is indented).
+  is indented inside a function body. Verify with:
+  `grep -n "import EmbeddingGenerator" backend/factories.py`
+  -- all 5 hits are indented, none at column 0.
   Tests that CALL a factory function which builds a default EmbeddingGenerator
   when no embedding_generator/embedding_provider is injected (e.g.
   build_graph_store, build_curation_scheduler) require sentence_transformers
@@ -502,18 +503,19 @@ class TestPhase55BusWiring:
 
     @requires_sentence_transformers
     def test_build_conversation_handler_subscribes_on_vault_rebuild_when_bus_provided(
-        self, tmp_path
+        self, tmp_path, monkeypatch
     ):
         """build_conversation_handler wires real ConversationHandler._on_vault_rebuild.
 
-        Requires sentence_transformers. Injects a GraphStore wrapping
-        FakeNeo4jConnection (and FakeEmbeddingGenerator), a FakeVectorStore,
-        and a FakeLLM so this test never opens a real Neo4j connection or
-        builds a real LanceDB vector store. Verifies that the real factory
-        passes the bus into the real ConversationHandler, the listener
-        appears in bus._listeners, and the MistIdentity singleton MERGE
-        (run by extraction-pipeline Stage 9 setup) reaches the injected fake
-        connection rather than a real one.
+        Gated by @requires_sentence_transformers; whether the injected-fakes
+        path below still imports sentence_transformers is not verified either
+        way. Injects a GraphStore wrapping FakeNeo4jConnection (and
+        FakeEmbeddingGenerator), a FakeVectorStore, and a FakeLLM so this test
+        never opens a real Neo4j connection or builds a real LanceDB vector
+        store. Verifies that the real factory passes the bus into the real
+        ConversationHandler, the listener appears in bus._listeners, and the
+        MistIdentity singleton MERGE (run by extraction-pipeline Stage 9
+        setup) reaches the injected fake connection rather than a real one.
         """
         from backend.chat.conversation_handler import ConversationHandler
         from backend.factories import build_conversation_handler
@@ -524,6 +526,11 @@ class TestPhase55BusWiring:
         from tests.mocks.ollama import FakeLLM
         from tests.unit.knowledge.conftest import FakeVectorStore
 
+        # Explicit assumption: Stage 9 (and this test's MistIdentity MERGE
+        # assertion below) only runs when hydration isolation is off. The
+        # dev-hydration stack sets MIST_HYDRATION_ISOLATION, which would fail
+        # this test for a reason unrelated to bus wiring.
+        monkeypatch.delenv("MIST_HYDRATION_ISOLATION", raising=False)
         config = _make_config(tmp_path)
         bus = InvalidationBus()
         fake_connection = FakeNeo4jConnection()
