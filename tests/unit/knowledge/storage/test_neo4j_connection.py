@@ -19,7 +19,7 @@ MODULE = "backend.knowledge.storage.neo4j_connection"
 def _make_config(**overrides) -> Neo4jConfig:
     """Build a Neo4jConfig with test defaults."""
     defaults = {
-        "uri": "bolt://localhost:7687",
+        "uri": "bolt://mist-neo4j-eval:7687",
         "username": "neo4j",
         "password": "test-password",
         "database": "testdb",

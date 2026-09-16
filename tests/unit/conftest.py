@@ -14,6 +14,48 @@ from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
 
 
+@pytest.fixture(autouse=True)
+def _guard_unit_tier_against_live_neo4j(monkeypatch):
+    """Force every unit test to run as an eval-isolated run.
+
+    Sets MIST_EVAL_ISOLATION=1 and unsets MIST_EVAL_NEO4J_HOSTS for the
+    duration of the test, so `Neo4jConnection.connect()` -- which calls
+    `assert_neo4j_isolated(self.config)` before creating a driver -- refuses
+    any (host, port) outside the eval allowlist
+    (DEFAULT_EVAL_NEO4J_ENDPOINTS: mist-neo4j-eval:7687, localhost:7688,
+    127.0.0.1:7688). `docker-compose.yml:23` sets NEO4J_URI=bolt://mist-neo4j:7687
+    explicitly (not a fallback default) for the live dev container, so a unit
+    test that reaches `connect()` would otherwise write to the canonical graph.
+
+    Function-scoped (the default): a session-scoped guard would leak
+    MIST_EVAL_ISOLATION into integration tests that run after the unit
+    tests in the same pytest invocation (for example `pytest tests/unit
+    tests/integration`, where explicit path order determines collection
+    order). With function scope, each test starts from the values this
+    fixture sets, and the test body can still override them with its own
+    monkeypatch calls -- see tests/unit/test_eval_isolation.py.
+
+    What this does NOT catch:
+    - A test that names an eval endpoint itself (e.g. bolt://mist-neo4j-eval:7687
+      or bolt://localhost:7688) passes the guard; the guard only refuses
+      non-eval endpoints, it does not forbid connecting at all.
+    - Module-scoped fixtures or import-time code that reach Neo4j before this
+      function-scoped fixture runs -- autouse fixtures still run in fixture
+      dependency/scope order, so a broader-scoped fixture executes first.
+    - Running with `--noconftest`, which skips this file entirely.
+    - A test that itself clears or overwrites MIST_EVAL_ISOLATION or
+      MIST_EVAL_NEO4J_HOSTS after this fixture runs -- the test body's own
+      monkeypatch calls win because they share the same function-scoped
+      monkeypatch and run later.
+
+    This is a live-write guard, not a hermeticity guarantee: it stops
+    `Neo4jConnection.connect()` from reaching the live graph, but does not by
+    itself make a test deterministic, network-free, or free of other I/O.
+    """
+    monkeypatch.setenv("MIST_EVAL_ISOLATION", "1")
+    monkeypatch.delenv("MIST_EVAL_NEO4J_HOSTS", raising=False)
+
+
 @pytest.fixture
 def fake_connection():
     """A FakeNeo4jConnection with no pre-configured results."""

@@ -30,6 +30,7 @@ Principles:
 - All I/O replaced by fakes from `tests/mocks/`.
 - Target: entire suite runs in under 30 seconds.
 - Run with: `pytest tests/unit/`
+- `tests/unit/conftest.py` sets `MIST_EVAL_ISOLATION=1` and unsets `MIST_EVAL_NEO4J_HOSTS` for every unit test, so `Neo4jConnection.connect()` refuses any non-eval endpoint; tests needing a graph inject a fake.
 
 ### `integration/` -- Real Neo4j + llama-server
 

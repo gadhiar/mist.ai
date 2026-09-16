@@ -2,7 +2,7 @@
 
 **Created:** 2026-03-22
 **Source:** Comprehensive 8-agent backend audit (6 sectional + integration + fix rounds)
-**Last Updated:** 2026-06-14 (MIS-124 / ontology v1.4.0 close-out: F2 typing gate CLEARED 0.909; rel-precision documented near-miss 0.833 -- residual bounded to model extraction quality (event-naming, metric structured-field emission, predicate choice) + small-model prompt sensitivity / flash-attn near-tie, deferred to a constrained-decoding / larger-model decision, NOT more canonicalization. Prior -- 2026-06-13 C3 close-out: 2 production-reproducibility findings added.)
+**Last Updated:** 2026-09-16 (MIS-146 hermetic unit tier: Test Isolation section added, 5 open items, tracked as MIS-147 and MIS-148 where filed. Prior -- 2026-06-14: MIS-124 / ontology v1.4.0 close-out: F2 typing gate CLEARED 0.909; rel-precision documented near-miss 0.833 -- residual bounded to model extraction quality (event-naming, metric structured-field emission, predicate choice) + small-model prompt sensitivity / flash-attn near-tie, deferred to a constrained-decoding / larger-model decision, NOT more canonicalization. Prior -- 2026-06-13 C3 close-out: 2 production-reproducibility findings added.)
 
 > This file tracks unresolved issues found during the pre-Phase-2 audit.
 > Items here are P3 (maintenance risk) -- not blocking, but should be
@@ -79,6 +79,63 @@ constraints are not relearned later.
   byte-reproducible across restarts. Latent prompt-reproducibility bug; no
   behavioral impact observed. Real fix: sort the enum members at schema-build
   time so ordering is deterministic without relying on `PYTHONHASHSEED`.
+
+---
+
+## Test Isolation (2026-09-16, MIS-146 hermetic unit tier)
+
+Surfaced while making the unit tier hermetic and safe against the live graph.
+MIS-146 itself is closed by dependency injection on `build_conversation_handler`
+plus the autouse eval-isolation fixture in `tests/unit/conftest.py`; these are
+the adjacent findings it deliberately left out of scope.
+
+- [ ] **Eval guard has no live-denylist arm (MIS-148).** The comment at
+  `backend/knowledge/eval_isolation.py:84-85` says the live denylist is checked
+  before every allowlist in the module. `assert_neo4j_isolated` (`:366-398`)
+  checks only the allowlist; the dev and rebuild guards do check the denylist
+  first (`:618`, `:485`). Because `_parse_endpoint_allowlist` (`:246`) is
+  `os.getenv(env_var, default)`, setting `MIST_EVAL_NEO4J_HOSTS` REPLACES the
+  eval allowlist, so an eval run with that variable naming a live host is
+  authorised. The unit tier is protected because its fixture unsets the
+  variable; eval runs are not.
+
+- [ ] **Unit tests that read `mist-memory/` fail in a checkout without it
+  (MIS-147).** `mist-memory/` is gitignored and absent from git worktrees, so a
+  unit-tier run from a worktree in an isolated no-network container fails 25
+  node IDs: 5 in
+  `tests/unit/knowledge/test_seed_data.py::TestMistPreferenceNoAiSlop`, 9 in
+  `tests/unit/knowledge/seed/test_seed_gates.py` (`TestEmbeddingGateRealSource` 6,
+  `TestNegationProximityRealSource` 3), and 11 errors in
+  `tests/unit/vault/test_mist_md_runtime_content.py`. Measured by that run on
+  2026-09-16. A unit test that reads the
+  canonical memory corpus is not hermetic; the fix is to move these onto
+  `tests/fixtures/test-vault` or an injected fixture.
+
+- [ ] **`docker/backend/Dockerfile:93` pins nothing.** The line is
+  `RUN pip install pytest>=8.0 pytest-asyncio>=0.24`, unquoted, so the shell
+  parses each `>=...` as an output redirection: it runs
+  `pip install pytest pytest-asyncio`, creates files named `=8.0` and `=0.24`,
+  and sends stdout to the last one. The version floors never reach pip. The
+  built image carries pytest 7.4.4 (`python -m pytest --version` in a container
+  built from `mistai-mist-backend`, 2026-09-16), below the stated `>=8.0`.
+  Quote the specifiers, then decide which pin is intended.
+
+- [ ] **`EvalIsolationError` escapes the Neo4j error handlers.**
+  `EvalIsolationError` subclasses `RuntimeError`
+  (`backend/knowledge/eval_isolation.py:169`), not `MistError`. The health check
+  in `backend/knowledge/admin.py` catches only `Neo4jConnectionError` and
+  `Neo4jQueryError` (`:1202`, `:1204`), and `scripts/mist_admin.py` catches
+  `MistError` (`:2997`). With `MIST_EVAL_ISOLATION=1` and a non-allowlisted URI,
+  both surface a traceback instead of a structured refusal. Affects eval runs
+  only.
+
+- [ ] **`build_extraction_pipeline` falls back to a real graph store with `or`.**
+  `backend/factories.py:382` is `gs = graph_store or build_graph_store(config)`,
+  so an injected store that evaluates false would be replaced by a real one that
+  opens Neo4j. `build_conversation_handler` uses an `is None` test instead
+  (`:608-610`). Latent today: `GraphStore` (`backend/knowledge/storage/graph_store.py:97`)
+  has no base class and defines neither `__bool__` nor `__len__`, so every
+  instance is truthy. Change to `is None` for consistency.
 
 ---
 
