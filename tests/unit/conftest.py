@@ -31,14 +31,9 @@ def _guard_unit_tier_against_live_neo4j(monkeypatch):
     MIST_EVAL_ISOLATION into integration tests that run after the unit
     tests in the same pytest invocation (for example `pytest tests/unit
     tests/integration`, where explicit path order determines collection
-    order). Function scope also lets a test's own monkeypatch override
-    MIST_EVAL_ISOLATION or MIST_EVAL_NEO4J_HOSTS from within the test body
-    -- see tests/unit/test_eval_isolation.py, which sets
-    MIST_EVAL_ISOLATION to other values (and, in
-    TestAssertNeo4jIsolated.test_allowlist_is_env_overridable, sets
-    MIST_EVAL_NEO4J_HOSTS) to exercise `is_eval_isolation_active()` and
-    `assert_neo4j_isolated()` directly; that override works only because
-    both fixtures share the same function-scoped `monkeypatch` instance.
+    order). With function scope, each test starts from the values this
+    fixture sets, and the test body can still override them with its own
+    monkeypatch calls -- see tests/unit/test_eval_isolation.py.
 
     What this does NOT catch:
     - A test that names an eval endpoint itself (e.g. bolt://mist-neo4j-eval:7687
