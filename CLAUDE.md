@@ -492,11 +492,26 @@ Frontend test conventions live in the nested mist-frontend repo at `./mist-front
 ## Testing
 
 See `TESTING.md` for conventions and `tests/CLAUDE.md` for AI-specific
-test guidance. Run tests inside the backend container:
+test guidance. Run tests inside the backend container. On Git Bash for
+Windows, `MSYS_NO_PATHCONV=1` stops the shell rewriting container paths such
+as `/app`, and `-T` skips TTY allocation for a non-interactive run:
 
 ```bash
-docker compose exec mist-backend python -m pytest tests/unit/
+MSYS_NO_PATHCONV=1 docker compose exec -T mist-backend python -m pytest tests/unit/
 ```
+
+The unit tier never writes to the live graph. An autouse fixture in
+`tests/unit/conftest.py` sets `MIST_EVAL_ISOLATION=1` and unsets
+`MIST_EVAL_NEO4J_HOSTS` for every unit test, so `Neo4jConnection.connect()`
+refuses any endpoint outside the default eval allowlist. That includes the
+live `bolt://mist-neo4j:7687`, which `docker-compose.yml` sets as `NEO4J_URI`
+inside the backend container.
+
+That fixture is a live-write guard, not hermeticity. It still admits the eval
+endpoints, and it does nothing about other I/O. A unit test that needs a graph
+or vector store injects a fake -- for example
+`build_conversation_handler(graph_store=..., vector_store=..., llm_provider=...)`
+-- instead of letting a factory build a real one.
 
 ---
 
