@@ -23,22 +23,20 @@ What these tests do NOT prove:
   env vars itself after the autouse fixture runs -- both are named as blind
   spots in the fixture's own docstring, not proven or disproven here.
 
-Six of the eight tests below depend on MIST_EVAL_ISOLATION being active
-WITHOUT setting it locally, and are what fail if the autouse fixture in
-conftest.py is removed (or its `autouse=True` is disabled): verified by
-disabling it and rerunning this file, which produced exactly this 6-failed/
-2-passed split. The two that keep passing are unrelated to the fixture --
-`test_mist_eval_neo4j_hosts_is_unset` (the var is absent whether or not the
-fixture ran) and `test_build_test_config_defaults_to_localhost_7687_when_unset`
-(asserts a config default, not an isolation outcome) -- and their continuing
-to pass is expected, not a gap in this file's coverage of the fixture. The
-six that fail: `test_mist_eval_isolation_env_var_is_set` and
-`test_is_eval_isolation_active_reports_true` because the flag and
-`is_eval_isolation_active()` revert to unset/False; the three
-`test_connect_raises_before_creating_a_driver` cases and
-`test_connect_with_the_fallback_config_raises_before_creating_a_driver`
-because `assert_neo4j_isolated()` then no-ops, `GraphDatabase.driver` IS
-called, and no `EvalIsolationError` is raised.
+This file proves the autouse fixture's two effects independently: that it
+sets MIST_EVAL_ISOLATION (the flag classes), and that it clears
+MIST_EVAL_NEO4J_HOSTS so a widened allowlist cannot silently admit the live
+endpoint (TestEnvOverrideIsCleared). It does not prove these are the ONLY
+effects of removing the fixture would have, only that removing it (or
+disabling its `autouse=True`) is caught: the tests that assert the flag is
+set, and the tests that assert `connect()` raises `EvalIsolationError`, flip
+to failing or erroring when the fixture is gone -- each such claim was
+verified by disabling the fixture and rerunning this file, not assumed. Any
+test whose assertion holds independently of the fixture (for example, that
+an env var neither the fixture nor the test sets is absent) proves nothing
+about the fixture and is not evidence for its removal; see
+TestEnvOverrideIsCleared's docstring for why the old version of that check
+was exactly this trap.
 """
 
 import os
@@ -63,8 +61,53 @@ class TestFlagIsActiveByDefault:
     def test_is_eval_isolation_active_reports_true(self):
         assert is_eval_isolation_active() is True
 
-    def test_mist_eval_neo4j_hosts_is_unset(self):
+
+class TestEnvOverrideIsCleared:
+    """The fixture's delenv, not just its setenv, is load-bearing.
+
+    Asserting only that MIST_EVAL_NEO4J_HOSTS is absent (with nothing ever
+    setting it) is a guard that can be silently SATISFIED: the assertion
+    passes whether or not the fixture's delenv ever ran, because there was
+    never a value to clear (tests/CLAUDE.md, "Say what a guard does AND does
+    not catch"). This class instead ARRANGES the hole the delenv exists to
+    close -- a class-scoped override widening MIST_EVAL_NEO4J_HOSTS to admit
+    the live endpoint -- then proves the per-test fixture still wins.
+
+    Pytest sets up higher-scoped fixtures before function-scoped autouse
+    fixtures, so the class-scoped `_widen_allowlist_to_admit_live` below
+    runs first on every test in this class, and the function-scoped autouse
+    `_guard_unit_tier_against_live_neo4j` in conftest.py runs after it,
+    deleting the override each time.
+
+    Verified by mutation: removing ONLY the `monkeypatch.delenv(...)` line
+    from the autouse fixture (leaving its `setenv` line intact) makes
+    `test_connect_still_raises_despite_the_class_scoped_override` fail with
+    `DID NOT RAISE`, because the override then survives into the test body
+    and admits the live endpoint. Restoring the delenv line makes it pass
+    again; both states were run, not assumed.
+    """
+
+    @pytest.fixture(scope="class", autouse=True)
+    def _widen_allowlist_to_admit_live(self):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv("MIST_EVAL_NEO4J_HOSTS", "mist-neo4j:7687")
+            yield
+
+    def test_override_is_absent_by_the_time_the_test_runs(self):
         assert "MIST_EVAL_NEO4J_HOSTS" not in os.environ
+
+    @patch(f"{MODULE}.GraphDatabase")
+    def test_connect_still_raises_despite_the_class_scoped_override(self, mock_gdb):
+        # Arrange
+        config = Neo4jConfig(uri="bolt://mist-neo4j:7687")
+        conn = Neo4jConnection(config)
+
+        # Act / Assert
+        with pytest.raises(EvalIsolationError):
+            conn.connect()
+
+        # Side-effect boundary: the guard must refuse before any driver exists.
+        mock_gdb.driver.assert_not_called()
 
 
 class TestConnectRefusesLiveEndpoints:

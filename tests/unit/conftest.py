@@ -23,9 +23,9 @@ def _guard_unit_tier_against_live_neo4j(monkeypatch):
     `assert_neo4j_isolated(self.config)` before creating a driver -- refuses
     any (host, port) outside the eval allowlist
     (DEFAULT_EVAL_NEO4J_ENDPOINTS: mist-neo4j-eval:7687, localhost:7688,
-    127.0.0.1:7688). In the live dev container NEO4J_URI defaults to
-    bolt://mist-neo4j:7687, so a unit test that reaches `connect()` would
-    otherwise write to the canonical graph.
+    127.0.0.1:7688). `docker-compose.yml:23` sets NEO4J_URI=bolt://mist-neo4j:7687
+    explicitly (not a fallback default) for the live dev container, so a unit
+    test that reaches `connect()` would otherwise write to the canonical graph.
 
     Function-scoped (the default) and NOT session- or module-scoped: a
     broader scope would leak MIST_EVAL_ISOLATION into integration tests
