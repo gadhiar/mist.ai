@@ -1,6 +1,39 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-09-15, context-load reconciliation (**MIS-130 IS merged at `02e5177` and
+**Last Updated:** 2026-09-16, MIS-146 (**the unit tier no longer opens Neo4j, and is now guarded
+against live-graph writes. Still nothing hydrated, rebuilt, or gated.**
+
+**MIS-146, merged as `cec485e` (PR #7).** `docker compose exec mist-backend python -m pytest
+tests/unit/` -- the command this file and `CLAUDE.md` told everyone to use -- was opening a write
+transaction against the LIVE graph on every run. `docker-compose.yml:23` sets
+`NEO4J_URI=bolt://mist-neo4j:7687` explicitly inside the container, so `tests/mocks/config.py`'s
+localhost fallback never applied; `build_conversation_handler` built a real graph store and called
+`ensure_mist_identity()`, a `MERGE ... ON CREATE SET` on `__SelfModel__:MistIdentity`. Benign where
+the node already existed, but a create on an empty or mid-rebuild graph -- exactly the window a
+rebuild-determinism gate measures. Same class as the `6a5b2c0` incident recorded below.
+
+Two changes, landed together because either alone breaks the live-container suite:
+
+- **Dependency injection (`backend/factories.py`).** `build_conversation_handler` now takes optional
+  `graph_store` and `vector_store`, matching `build_extraction_pipeline`. Guarded with
+  `if gs is None`, not `or`, so an injected fake that evaluates falsy is not silently replaced.
+- **An autouse guard (`tests/unit/conftest.py`).** `_guard_unit_tier_against_live_neo4j` is
+  function-scoped, sets `MIST_EVAL_ISOLATION=1` and clears `MIST_EVAL_NEO4J_HOSTS` (which REPLACES
+  the allowlist rather than extending it), so `Neo4jConnection.connect()`'s existing
+  `assert_neo4j_isolated` refuses any endpoint outside `DEFAULT_EVAL_NEO4J_ENDPOINTS`. The guard was
+  already in the connect path and simply never activated. Its docstring records what it does NOT
+  catch: a test naming an eval endpoint itself, module-scoped or import-time code that runs before a
+  function-scoped fixture, and `--noconftest`.
+
+The failing test was `tests/unit/test_factories_phase3.py:492`; its class docstring claimed these
+tests needed neither `sentence_transformers` nor Neo4j, which was false. `KNOWN_ISSUES.md` gained
+four entries, including that the eval guard lacks the live denylist arm and that unit tests reading
+`mist-memory/` cannot run in worker containers. `TESTING.md` and `CLAUDE.md:492-500` updated.
+
+**Not covered by the pull request:** the live-container run itself. Pull, then
+`MSYS_NO_PATHCONV=1 docker compose exec -T mist-backend python -m pytest tests/unit/`.
+
+**PRIOR ENTRY -- 2026-09-15, context-load reconciliation:** (**MIS-130 IS merged at `02e5177` and
 pushed. The two caveats the entry below records are CLOSED. Still nothing hydrated, rebuilt, or
 gated.**
 
