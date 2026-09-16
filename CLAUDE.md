@@ -625,55 +625,21 @@ Full documentation: [docs/AI_SLOP_CHECKER.md](docs/AI_SLOP_CHECKER.md)
 - Glob/Grep for finding files
 - Bash only for git, build tools, not file operations
 
-### Agentic Teams (Preferred for Max Effort)
+### Delegated Work
 
-When on max plan/effort, **always prefer dispatching parallel agent teams**
-over sequential solo work. This is the primary execution mode for non-trivial
-implementation tasks.
+Delegated work on this machine follows the main-lead protocol, not agent teams. Agent teams are
+turned off (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0`).
 
-**When to use agentic teams:**
-- 2+ independent tasks with no shared state or sequential dependencies
-- Test writing for multiple components (each test file = independent agent)
-- Implementing features across different modules (backend areas, or backend vs frontend coordination)
-- Audit, review, or exploration tasks covering different subsystems
+- A persistent `main-lead` session owns goals and delegates to sub-leads, workers and reviewers as
+  nested background subagents.
+- Every goal's plan is approved by Raj before implementation starts, and every merge is confirmed by
+  him.
+- One worktree per worker, on `agent/<goal>/<task>`. Worker commands run in no-network containers.
+- Delegates never write `CLAUDE.md`, `CODEBASE.md`, `KNOWN_ISSUES.md`, or the knowledge vault.
 
-**How to dispatch:**
-- Use `Agent` tool with multiple concurrent invocations in a single message
-- Give each agent a complete, self-contained prompt (agents share no context)
-- Use `run_in_background: true` for genuinely independent work
-- Name agents for `SendMessage` follow-up if needed
-
-**Role framing (required):**
-Every agent prompt MUST open with an expert role definition. Role framing
-changes how the agent reasons about quality, trade-offs, and edge cases.
-
-Format: `**Role:** You are a [seniority] [domain] [title] with deep expertise
-in [specific technologies/patterns]. You have [relevant experience].`
-
-Examples:
-- Implementation: "You are a senior Python backend engineer with expertise in
-  asyncio, threading, and WebSocket server architecture."
-- Implementation: "You are a senior knowledge-graph engineer with deep expertise
-  in Neo4j Cypher, ontology design, and entity extraction pipelines."
-- Review: "You are a principal engineer reviewing code for thread safety,
-  performance, and production readiness."
-- Research: "You are a systems researcher with expertise in distributed
-  architectures and protocol design."
-
-Match the role to the task domain. Be specific about technologies -- "Python
-expert" is weaker than "Python asyncio + WebSocket expert with Neo4j driver
-experience."
-
-**Rules:**
-- Each agent gets a clear scope -- no overlapping file edits
-- Agent prompts must include all necessary context (file paths, interfaces, conventions)
-- Prefer foreground when results inform next steps; background for independent work
-- Review agent output before committing -- agents are trusted but verified
-
-**Anti-patterns:**
-- Don't dispatch agents for trivial single-file edits
-- Don't have multiple agents edit the same file (merge conflicts)
-- Don't use agents when tasks have sequential dependencies
+The operating rules for delegates live in the `delegate-rules` skill, which is preloaded into every
+delegate, including the expert role-framing requirement for any agent prompt. See the global
+`~/.claude/CLAUDE.md` "Main Lead Operating Model" section.
 
 ### Task Agent (Explore/Research)
 
