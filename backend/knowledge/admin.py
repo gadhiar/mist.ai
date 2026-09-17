@@ -994,14 +994,15 @@ def _quote_graph_ident(name: str) -> str:
 
 
 def _label_pattern(labels: Sequence[str]) -> str:
-    """Render a multi-label pattern body, e.g. ``__Entity__`:`Person``.
+    """Render a multi-label pattern body: backtick-quoted labels joined by colons.
 
     Its own function because the separator is load-bearing and silent when
-    wrong: joining quoted labels with "" yields `` `A``B` ``, which Cypher reads
-    as ONE label literally named ``A`B`` -- a doubled backtick is the escape for
-    a literal one inside a quoted identifier. The CREATE then succeeds, the
-    nodes come back with a single nonsense label, and the failure surfaces much
-    later as relationships whose endpoints do not resolve.
+    wrong. Joining the quoted labels with an empty string instead of a colon
+    puts two backticks in the middle, and a doubled backtick is the escape for a
+    literal one inside a quoted identifier -- so Cypher reads the result as ONE
+    label whose name contains a backtick. The CREATE then succeeds, the nodes
+    come back with a single nonsense label, and the failure surfaces much later
+    as relationships whose endpoints do not resolve.
     """
     return ":".join(_quote_graph_ident(label) for label in labels)
 
