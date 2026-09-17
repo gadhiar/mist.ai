@@ -97,8 +97,14 @@ def assert_backup_destination(path: Path | str, *, purpose: str = "backup") -> P
         assert_isolated_root(resolved, purpose=purpose)
     except IsolatedRootError as exc:
         # Re-raised, not re-implemented. The guard's own text names the path and
-        # which live directory it collided with; this only adds the remedy.
-        raise BackupDestinationError(f"{exc} {_WHAT_TO_DO}") from exc
+        # which live directory it collided with. The second clause is there
+        # because that text says "a hydration run" -- it is shared with
+        # `scripts/hydration/`, and without this an operator running a backup
+        # reads it and wonders whether they invoked the wrong tool.
+        raise BackupDestinationError(
+            f"{exc} (That wording is the shared live-state guard's; it refuses "
+            f"this backup for the same reason.) {_WHAT_TO_DO}"
+        ) from exc
 
     # The new arm, and the only one that catches `<repo>/backups`.
     if REPO_ROOT in resolved.parents:
