@@ -1147,8 +1147,15 @@ def restore_graph_from_artifact(
 
     Raises:
         GraphArtifactError: When an endpoint cannot be re-anchored, a label is
-            unquotable, or the server created fewer relationships than the batch
-            held -- in which case the graph is partially loaded and says so.
+            unquotable, or the server created a number of relationships not
+            equal to the batch size -- in which case the graph is partially
+            loaded and says so. The check is `created != len(batch)`, not
+            `created < len(batch)`: OVER-creation is a real failure mode, not a
+            hypothetical one, because relationships are re-anchored by
+            `MATCH (a {id: ...})` and two nodes sharing an id would attach every
+            edge to both. `assert_artifact_is_relinkable` refuses duplicate ids
+            up front, so this arm is the second line of defence rather than the
+            first.
     """
     assert_artifact_is_relinkable(artifact)
 
