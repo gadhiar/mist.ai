@@ -144,8 +144,10 @@ is what lets a restore run from the host shell.
 ### 4.2 Place the handshake marker
 
 The restore refuses any target that has not identified itself. Identification is a file YOU create
-in the target root:
+in the target root. `./dev-state` may not exist yet -- it is created by the dev BACKEND service,
+which this rehearsal does not start -- so create it first:
 
+    mkdir -p ./dev-state
     touch ./dev-state/MIST_RESTORE_TARGET
 
 Nothing in MIST.AI creates that file. The live state root will never carry it, however it is
