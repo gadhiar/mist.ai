@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import socket
 import urllib.error
 import urllib.request
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,7 @@ import yaml
 from backend.errors import Neo4jConnectionError, Neo4jQueryError, SeedSourceError
 from backend.interfaces import GraphConnection
 from backend.knowledge.embeddings.embedding_text import embedding_text_for
+from backend.knowledge.graph_artifact import GraphArtifactError, build_artifact
 from backend.knowledge.ontologies import EDGE_TYPES_BY_NAME, EXTRACTABLE_RELATIONSHIP_TYPES
 from backend.knowledge.seed.models import SeedDocument
 from backend.knowledge.storage.partitions import (
@@ -33,7 +36,13 @@ from backend.knowledge.storage.partitions import (
     SELF_MODEL_LABEL,
     SELF_MODEL_TYPES,
 )
-from backend.knowledge.version_stamps import ONTOLOGY_VERSION
+from backend.knowledge.version_stamps import (
+    EXTRACTION_VERSION,
+    ONTOLOGY_VERSION,
+    compose_model_hash,
+)
+
+logger = logging.getLogger(__name__)
 
 SEED_METADATA_FIELDS = (
     "confidence",
@@ -836,6 +845,375 @@ def dump_full_graph_json(connection: GraphConnection) -> dict[str, Any]:
         "relationships": relationships,
         "node_count": len(nodes),
         "rel_count": len(relationships),
+    }
+
+
+# Name of the temporary index `scripts/hydration/snapshot.py` creates to re-link
+# relationship endpoints during a hydration restore
+# (`grep -n "RESTORE_INDEX_NAME =" scripts/hydration/snapshot.py`). Restated here
+# rather than imported: `backend/` must not depend on `scripts/`, and the two
+# artifact formats are versioned separately. It is excluded from captured DDL
+# because a backup taken after a hydration restore would otherwise record the
+# scaffolding index as part of the graph's schema.
+HYDRATION_SCAFFOLDING_INDEX = "restore_key_tmp"
+
+# Rows per write transaction during a restore. Entity nodes carry a 384-float
+# embedding, so the node batch is sized for payload rather than row count.
+_RESTORE_NODE_BATCH = 200
+_RESTORE_REL_BATCH = 500
+
+
+def read_schema_ddl(connection: GraphConnection) -> dict[str, list[str]]:
+    """Capture constraint and index DDL as the server itself states it.
+
+    Read from `SHOW CONSTRAINTS` / `SHOW INDEXES` rather than re-derived from
+    `GraphStore.initialize_schema`, for two reasons: it records the schema the
+    instance ACTUALLY had, including the vector index at its real dimension, and
+    it needs no embedding model just to construct a `GraphStore`.
+
+    Three classes of object are excluded, each for its own reason -- the same
+    reasoning `scripts/hydration/snapshot.py:_read_schema_ddl` documents:
+
+    - constraint-owned indexes, because creating the constraint creates them, so
+      replaying both makes the server reject the second statement;
+    - LOOKUP indexes, which the server creates and maintains itself;
+    - `HYDRATION_SCAFFOLDING_INDEX`, which is another tool's restore
+      scaffolding rather than part of any graph's schema.
+
+    Returns:
+        `{"constraints": [<createStatement>, ...], "indexes": [...]}`, each list
+        ordered by object name so two captures of one schema do not differ by
+        row order.
+    """
+    constraints = connection.execute_query(
+        "SHOW CONSTRAINTS YIELD name, createStatement RETURN name, createStatement ORDER BY name"
+    )
+    indexes = connection.execute_query(
+        "SHOW INDEXES YIELD name, type, owningConstraint, createStatement "
+        "WHERE owningConstraint IS NULL AND type <> 'LOOKUP' AND name <> $scaffolding "
+        "RETURN name, createStatement ORDER BY name",
+        {"scaffolding": HYDRATION_SCAFFOLDING_INDEX},
+    )
+    return {
+        "constraints": [row["createStatement"] for row in constraints],
+        "indexes": [row["createStatement"] for row in indexes],
+    }
+
+
+def graph_version_stamps(config: Any) -> dict[str, str]:
+    """Return the stamp triple a backup RECORDS about the build that took it.
+
+    Recorded for audit and never enforced on read -- `load_artifact` checks the
+    artifact FORMAT version and nothing else. That is the deliberate opposite of
+    `SnapshotManifest.assert_fresh`
+    (`grep -n "def assert_fresh" scripts/hydration/manifest.py`), which refuses a
+    hydration fixture whose stamps drifted from the running code. Correct there,
+    because a fixture must match the code under test; wrong here, because a
+    disaster-recovery artifact that self-invalidates on an `EXTRACTION_VERSION`
+    bump is worse than no artifact at all.
+
+    Args:
+        config: A `KnowledgeConfig`. Typed loosely for the same reason
+            `compose_model_hash` is -- this reads two of its attributes.
+    """
+    return {
+        "ontology_version": ONTOLOGY_VERSION,
+        "extraction_version": EXTRACTION_VERSION,
+        "model_hash": compose_model_hash(config),
+    }
+
+
+def dump_full_graph_artifact(
+    connection: GraphConnection,
+    *,
+    source_uri: str,
+    database: str | None,
+    stamps: dict[str, str],
+) -> dict[str, Any]:
+    """Capture the whole graph as a versioned, type-preserving artifact.
+
+    `dump_full_graph_json` returns DRIVER-NATIVE values -- a `DateTime` stays a
+    `DateTime` -- which is correct for a caller that inspects them and fatal for
+    one that serialises them with `json.dumps(..., default=str)`. This wraps that
+    payload in `backend.knowledge.graph_artifact`, which tags every value that
+    has no JSON form and refuses any value whose round trip is unverified.
+
+    The DDL is captured alongside the data because a restored graph with no
+    constraints or vector index is not the graph that was backed up: retrieval
+    silently degrades rather than failing.
+
+    Args:
+        connection: Graph connection to read from.
+        source_uri: The bolt URI being captured, recorded in the artifact so a
+            restore operator can see which instance it came from.
+        database: The database name, or None when the deployment has one.
+        stamps: From `graph_version_stamps`. Recorded, never enforced.
+
+    Returns:
+        The artifact dict, ready for `graph_artifact.dumps_artifact`.
+
+    Raises:
+        GraphArtifactError: When a property value cannot be round-tripped.
+    """
+    payload = dump_full_graph_json(connection)
+    unanchored = sum(
+        1 for rel in payload["relationships"] if rel["source"] is None or rel["target"] is None
+    )
+    if unanchored:
+        # Loud here rather than at restore: the artifact addresses endpoints by
+        # the `id` property, so an edge touching an id-less node cannot be
+        # expressed and will not come back. The graph is still in front of the
+        # operator at capture time; at restore time it is not.
+        logger.warning(
+            "[graph-backup] %d relationship(s) touch a node with no `id` property. "
+            "The artifact addresses endpoints by `id`, so these edges cannot be "
+            "restored. Give those nodes an id before relying on this backup.",
+            unanchored,
+        )
+    return build_artifact(
+        nodes=payload["nodes"],
+        relationships=payload["relationships"],
+        schema=read_schema_ddl(connection),
+        counts={"nodes": payload["node_count"], "relationships": payload["rel_count"]},
+        stamps=stamps,
+        source={"uri": source_uri, "database": database},
+    )
+
+
+def _quote_graph_ident(name: str) -> str:
+    """Backtick-quote a label or relationship type for a restore statement.
+
+    Labels and relationship types cannot be parameterized in Cypher, so they are
+    interpolated. The values come from an artifact rather than from a live
+    prompt, but a backtick inside one would still break out of the quoting, so
+    it is refused rather than escaped.
+    """
+    if not name or "`" in name:
+        raise GraphArtifactError(f"refusing unquotable label or relationship type {name!r}")
+    return f"`{name}`"
+
+
+def _label_pattern(labels: Sequence[str]) -> str:
+    """Render a multi-label pattern body, e.g. ``__Entity__`:`Person``.
+
+    Its own function because the separator is load-bearing and silent when
+    wrong: joining quoted labels with "" yields `` `A``B` ``, which Cypher reads
+    as ONE label literally named ``A`B`` -- a doubled backtick is the escape for
+    a literal one inside a quoted identifier. The CREATE then succeeds, the
+    nodes come back with a single nonsense label, and the failure surfaces much
+    later as relationships whose endpoints do not resolve.
+    """
+    return ":".join(_quote_graph_ident(label) for label in labels)
+
+
+def _assert_artifact_is_relinkable(artifact: dict[str, Any]) -> None:
+    """Refuse an artifact whose relationships cannot be re-anchored, BEFORE writing.
+
+    Restore clears the target first, so a failure discovered half way through
+    the load leaves neither the old graph nor the new one. Every endpoint is
+    therefore resolved against the node list up front.
+
+    Duplicate ids are refused for the same reason: `MATCH (a {id: $id})` against
+    two matching nodes creates the relationship twice, so the restored graph
+    would have more edges than the artifact recorded.
+    """
+    ids: set[str] = set()
+    duplicates: set[str] = set()
+    for node in artifact["nodes"]:
+        node_id = node.get("id")
+        if node_id is None:
+            continue
+        if node_id in ids:
+            duplicates.add(node_id)
+        ids.add(node_id)
+    if duplicates:
+        raise GraphArtifactError(
+            f"artifact carries {len(duplicates)} duplicated node id(s) "
+            f"(e.g. {sorted(duplicates)[:3]}). Relationships are re-anchored by `id`, "
+            "so a duplicate would attach every edge to both nodes."
+        )
+
+    missing = sorted(
+        {
+            endpoint
+            for rel in artifact["relationships"]
+            for endpoint in (rel.get("source"), rel.get("target"))
+            if endpoint is None or endpoint not in ids
+        },
+        key=lambda value: (value is None, value or ""),
+    )
+    if missing:
+        raise GraphArtifactError(
+            f"artifact has {len(missing)} relationship endpoint(s) that no node in it "
+            f"provides (e.g. {missing[:3]}). A `None` endpoint means the captured node "
+            "had no `id` property. Restoring would produce a graph with fewer edges "
+            "than the artifact records, so it is refused before anything is written."
+        )
+
+
+def clear_graph(connection: GraphConnection) -> int:
+    """Detach-delete every node, in bounded batches.
+
+    Batched rather than one `MATCH (n) DETACH DELETE n`, which builds the whole
+    delete in a single transaction and can exhaust heap on a graph large enough
+    to be worth backing up.
+
+    Returns:
+        The number of nodes deleted.
+    """
+    deleted = 0
+    while True:
+        rows = connection.execute_write(
+            "MATCH (n) WITH n LIMIT 10000 DETACH DELETE n RETURN count(n) AS deleted"
+        )
+        batch = int(rows[0]["deleted"]) if rows else 0
+        deleted += batch
+        if batch == 0:
+            return deleted
+
+
+def _ddl_object_name(statement: str) -> str | None:
+    """Pull the object name out of a Neo4j `createStatement`.
+
+    The name follows the CONSTRAINT/INDEX keyword and its POSITION varies, which
+    is why this scans instead of indexing: Neo4j 5 emits
+    ``CREATE CONSTRAINT `n` FOR ...`` (token 2) but ``CREATE RANGE INDEX `n` FOR
+    ...`` and ``CREATE VECTOR INDEX `n` ...`` (token 3). Reading token 2
+    unconditionally returns the literal "INDEX" for every index, so no index ever
+    matches an existing name and a restore re-creates all of them -- which the
+    server rejects with EquivalentSchemaRuleAlreadyExists.
+    """
+    parts = statement.split()
+    if not parts or parts[0].upper() != "CREATE":
+        return None
+    for position, token in enumerate(parts):
+        # Bare keyword only: an object actually NAMED "index" arrives
+        # backtick-quoted and must not be mistaken for the keyword.
+        if token.upper() in {"CONSTRAINT", "INDEX"} and "`" not in token:
+            if position + 1 < len(parts):
+                return parts[position + 1].strip("`")
+            return None
+    return None
+
+
+def apply_schema_ddl(connection: GraphConnection, schema: dict[str, list[str]]) -> int:
+    """Replay captured DDL, skipping anything already present BY NAME.
+
+    Skipping by name rather than catching the server's "equivalent already
+    exists" error: an exception-swallowing loop here would also swallow a
+    genuinely malformed statement and leave the restored graph silently
+    unindexed, which shows up as degraded retrieval rather than as a failure.
+
+    Returns:
+        The number of statements actually executed.
+    """
+    existing = {
+        row["name"] for row in connection.execute_query("SHOW CONSTRAINTS YIELD name RETURN name")
+    } | {row["name"] for row in connection.execute_query("SHOW INDEXES YIELD name RETURN name")}
+
+    applied = 0
+    for statement in list(schema.get("constraints", [])) + list(schema.get("indexes", [])):
+        name = _ddl_object_name(statement)
+        if name and name in existing:
+            continue
+        connection.execute_write(statement)
+        applied += 1
+    return applied
+
+
+def restore_graph_from_artifact(
+    connection: GraphConnection, artifact: dict[str, Any]
+) -> dict[str, int]:
+    """Load a decoded artifact into a graph, replacing whatever is there.
+
+    DESTRUCTIVE: the target is detach-deleted first, so a restore into the wrong
+    instance destroys it. The caller is responsible for the isolation guard --
+    `assert_neo4j_dev_isolated` in `scripts/mist_admin.py` -- because the URI is
+    a CLI/config concern and a guard buried here could be bypassed by any other
+    caller of this function.
+
+    Takes the output of `graph_artifact.load_artifact`, whose properties are
+    already driver-native values. Writing is deliberately plain Cypher: APOC
+    would allow dynamic labels in one statement, but a backup that only restores
+    onto a plugin-equipped server is a backup with a footnote.
+
+    Args:
+        connection: Graph connection to write to.
+        artifact: The result of `load_artifact`.
+
+    Returns:
+        `{"deleted": int, "schema_statements": int, "nodes": int, "relationships": int}`.
+
+    Raises:
+        GraphArtifactError: When an endpoint cannot be re-anchored, a label is
+            unquotable, or the server created fewer relationships than the batch
+            held -- in which case the graph is partially loaded and says so.
+    """
+    _assert_artifact_is_relinkable(artifact)
+
+    deleted = clear_graph(connection)
+    schema_statements = apply_schema_ddl(connection, artifact.get("schema", {}))
+
+    by_labels: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    for node in artifact["nodes"]:
+        by_labels.setdefault(tuple(sorted(node.get("labels") or [])), []).append(node)
+
+    node_count = 0
+    for labels, group in sorted(by_labels.items()):
+        for start in range(0, len(group), _RESTORE_NODE_BATCH):
+            batch = group[start : start + _RESTORE_NODE_BATCH]
+            rows = [{"props": node.get("properties") or {}} for node in batch]
+            if labels:
+                statement = (
+                    f"UNWIND $rows AS row CREATE (n:{_label_pattern(labels)}) SET n = row.props"
+                )
+            else:
+                # A node with no labels is legal in Neo4j and appears in this
+                # graph as an unpartitioned node
+                # (`grep -n "(unpartitioned)" backend/knowledge/admin.py`), so it
+                # is restored rather than dropped.
+                statement = "UNWIND $rows AS row CREATE (n) SET n = row.props"
+            connection.execute_write(statement, {"rows": rows})
+            node_count += len(batch)
+
+    by_type: dict[str, list[dict[str, Any]]] = {}
+    for relationship in artifact["relationships"]:
+        by_type.setdefault(relationship["type"], []).append(relationship)
+
+    rel_count = 0
+    for rel_type, group in sorted(by_type.items()):
+        for start in range(0, len(group), _RESTORE_REL_BATCH):
+            batch = group[start : start + _RESTORE_REL_BATCH]
+            rows = connection.execute_write(
+                "UNWIND $rows AS row "
+                "MATCH (a {id: row.source}) MATCH (b {id: row.target}) "
+                f"CREATE (a)-[r:{_quote_graph_ident(rel_type)}]->(b) SET r = row.props "
+                "RETURN count(r) AS created",
+                {
+                    "rows": [
+                        {
+                            "source": rel["source"],
+                            "target": rel["target"],
+                            "props": rel.get("properties") or {},
+                        }
+                        for rel in batch
+                    ]
+                },
+            )
+            created = int(rows[0]["created"]) if rows else 0
+            if created != len(batch):
+                raise GraphArtifactError(
+                    f"restore created {created} of {len(batch)} {rel_type} relationships. "
+                    "An endpoint id did not resolve in the target, so the graph is now "
+                    "PARTIALLY LOADED. Re-run the restore against an empty target."
+                )
+            rel_count += created
+
+    return {
+        "deleted": deleted,
+        "schema_statements": schema_statements,
+        "nodes": node_count,
+        "relationships": rel_count,
     }
 
 
