@@ -27,11 +27,14 @@ too" is actually visible.
 
 The critical character written into the fixture file below is built with
 `chr()` at runtime rather than written as a literal glyph, so this source file
-stays ASCII and does not itself contain a critical finding.
+stays ASCII. (The checker would not flag this file in any case: the skip
+pattern it uses for its own source, anchored on the name ending
+`check_ai_slop.py`, also matches this file's name.)
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -144,13 +147,14 @@ print(json.dumps(result))
 def test_conversation_handler_still_resolves_under_the_normal_interpreter():
     """The lazy import must still actually resolve the name when asked.
 
-    Skips rather than fails if this environment itself lacks a dependency
-    ConversationHandler needs (e.g. dotenv) -- that is a real environment gap,
-    not a regression in the lazy-import mechanism this file guards.
+    Skips only when dotenv, the dependency that motivated the lazy import, is
+    not installed. Any other ImportError -- including the one raised when
+    `backend/chat/__init__.py` no longer provides the name -- fails the test.
     """
-    try:
-        from backend.chat import ConversationHandler
-    except ImportError as exc:
-        pytest.skip(f"normal test environment lacks a dependency for ConversationHandler: {exc}")
+    if importlib.util.find_spec("dotenv") is None:
+        pytest.skip("dotenv is not installed, so ConversationHandler cannot be imported")
 
-    assert ConversationHandler is not None
+    from backend.chat import ConversationHandler
+    from backend.chat.conversation_handler import ConversationHandler as direct
+
+    assert ConversationHandler is direct
