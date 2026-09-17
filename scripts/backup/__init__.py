@@ -12,8 +12,13 @@ Module map:
     `stores`       the named SQLite stores, captured through `sqlite3.backup()`
     `manifest`     what an artifact says about itself; the layout version check
     `dump`         the capture command and its CLI
+    `target`       where a restore may write: the handshake marker and the
+                   typed confirmation token
+    `restore`      the destructive leg, its four gates and its CLI
+    `prune`        retention by manifest timestamp, and what it refuses to touch
     `errors`       `BackupError` and friends, all under `MistError`
 
-The restore leg, the destructive guard and retention are MIS-140 T2 and land in
-this package beside these modules.
+`README.md` beside these modules is the operator runbook: how to take a backup,
+what is and is not captured, the restore rehearsal against the dev-hydration
+stack, and why no schedule is armed.
 """
