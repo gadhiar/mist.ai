@@ -265,6 +265,15 @@ Examples:
   python scripts/check_ai_slop.py --fix --format markdown
         """,
     )
+    parser.add_argument(
+        "files",
+        nargs="*",
+        help=(
+            "Specific file paths to check (e.g. from pre-commit). When given, "
+            "checks exactly these paths (skipping any that do not exist) "
+            "instead of scanning --path."
+        ),
+    )
     parser.add_argument("--fix", action="store_true", help="Auto-fix fixable patterns")
     parser.add_argument(
         "--path", type=str, default=".", help="Path to check (default: current directory)"
@@ -302,35 +311,40 @@ Examples:
     original_patterns = PATTERNS
     PATTERNS = patterns_to_check
 
-    root_path = Path(args.path)
-    if not root_path.exists():
-        print(f"[ERROR] Path does not exist: {root_path}")
-        sys.exit(1)
-
     # Get all text files to check
     file_extensions = [".py", ".md", ".txt", ".yaml", ".yml", ".json", ".dart", ".sh"]
     files_to_check = []
 
-    if root_path.is_file():
-        files_to_check = [root_path]
+    if args.files:
+        # Explicit file list (e.g. from pre-commit's pass_filenames). Checks
+        # exactly these paths and does not fall back to scanning --path.
+        files_to_check = [Path(f) for f in args.files if Path(f).exists()]
     else:
-        # If incremental mode, only check git diff files
-        if args.incremental:
-            git_files = get_git_diff_files()
-            for ext in file_extensions:
-                files_to_check.extend(
-                    [
-                        f
-                        for f in root_path.rglob(f"*{ext}")
-                        if f in git_files or any(p in git_files for p in f.parents)
-                    ]
-                )
-            if not files_to_check:
-                print("No changed files to check (git diff is empty)")
-                sys.exit(0)
+        root_path = Path(args.path)
+        if not root_path.exists():
+            print(f"[ERROR] Path does not exist: {root_path}")
+            sys.exit(1)
+
+        if root_path.is_file():
+            files_to_check = [root_path]
         else:
-            for ext in file_extensions:
-                files_to_check.extend(root_path.rglob(f"*{ext}"))
+            # If incremental mode, only check git diff files
+            if args.incremental:
+                git_files = get_git_diff_files()
+                for ext in file_extensions:
+                    files_to_check.extend(
+                        [
+                            f
+                            for f in root_path.rglob(f"*{ext}")
+                            if f in git_files or any(p in git_files for p in f.parents)
+                        ]
+                    )
+                if not files_to_check:
+                    print("No changed files to check (git diff is empty)")
+                    sys.exit(0)
+            else:
+                for ext in file_extensions:
+                    files_to_check.extend(root_path.rglob(f"*{ext}"))
 
     # Filter out skipped files
     files_to_check = [f for f in files_to_check if not should_skip_file(f)]

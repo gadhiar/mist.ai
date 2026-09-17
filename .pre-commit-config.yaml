@@ -41,14 +41,16 @@ repos:
         additional_dependencies: ["tomli"]
         exclude: ^(dependencies/|\.git/|\.venv/)
 
-  # AI slop detection (runs only on changed files)
+  # AI slop detection (runs on the files pre-commit passes it: staged files
+  # locally, every tracked file matching the filter below under --all-files)
   - repo: local
     hooks:
       - id: check-ai-slop
         name: Check for AI slop patterns
-        entry: python scripts/check_ai_slop.py --incremental --critical-only --no-color
+        entry: python scripts/check_ai_slop.py --critical-only --no-color
         language: system
-        pass_filenames: false
+        pass_filenames: true
+        files: \.(py|md|txt|ya?ml|json|dart|sh)$
 
   # General file quality checks
   - repo: https://github.com/pre-commit/pre-commit-hooks
