@@ -444,11 +444,10 @@ def cmd_graph_restore(args: argparse.Namespace) -> int:
     Destructive twice over: the target is detach-deleted before the load, and
     the artifact's DDL is replayed onto it. The target therefore goes through
     `assert_neo4j_dev_isolated` BEFORE the artifact file is even read. That
-    guard is ungated by design and this command does not catch its refusal: an
-    `EvalIsolationError` propagates as a traceback with a non-zero exit, because
-    a wiped live graph is not a failure mode worth trading for tidier output.
-    Restoring INTO live is an operator decision that belongs with the operator,
-    not a flag on this command.
+    guard is ungated by design and this command does not catch its refusal:
+    `main` prints the `EvalIsolationError` and exits 1, so the operator reads
+    why the target was refused. Restoring INTO live is an operator decision
+    that belongs with the operator, not a flag on this command.
 
     `--confirm` is required to write. Without it the artifact is still fully
     loaded and checked -- envelope, version, every tagged value, and every
@@ -3076,9 +3075,21 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s %(name)s: %(message)s",
     )
 
-    # Lazy MistError import so `--help` works without the neo4j driver installed.
+    # Lazy imports so `--help` works without the neo4j driver installed.
+    #
+    # `EvalIsolationError` is imported beside `MistError` because it is NOT one:
+    # `grep -n "class EvalIsolationError\|class IsolatedRootError"
+    # backend/knowledge/eval_isolation.py` -> `EvalIsolationError(RuntimeError)`
+    # at :169 and `IsolatedRootError(MistError)` at :510. So the root-guard
+    # refusal already printed through the `MistError` arm below while the
+    # endpoint-guard refusal escaped as a traceback -- for `graph-restore` and
+    # for every other command these guards cover. A refusal to write the live
+    # graph is the single most important line this tool ever prints, and an
+    # operator reaching for a restore must read the reason, not a stack trace
+    # ending in one.
     try:
         from backend.errors import MistError
+        from backend.knowledge.eval_isolation import EvalIsolationError
     except ModuleNotFoundError as e:
         print(
             f"[error] Missing dependency: {e}. Install with "
@@ -3099,7 +3110,7 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError as e:
         print(f"[error] {e}", file=sys.stderr)
         return 1
-    except MistError as e:
+    except (MistError, EvalIsolationError) as e:
         print(f"[error] {e.__class__.__name__}: {e}", file=sys.stderr)
         return 1
 

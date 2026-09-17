@@ -357,6 +357,30 @@ class TestGraphRestoreRefusesANonIsolatedTarget:
         assert mist_admin.cmd_graph_restore(args) == 0
         assert "--confirm" in capsys.readouterr().out
 
+    def test_main_prints_the_refusal_and_exits_1_rather_than_tracing_back(self, tmp_path, capsys):
+        """The refusal is the most important line this tool prints. It must be readable.
+
+        `EvalIsolationError` is a bare `RuntimeError`, not a `MistError`
+        (`grep -n "class EvalIsolationError" backend/knowledge/eval_isolation.py`
+        -> `EvalIsolationError(RuntimeError)`), so `main`'s `MistError` arm did
+        not cover it and a guarded command ended in a stack trace. `main` now
+        names it explicitly alongside `MistError`.
+        """
+        exit_code = mist_admin.main(
+            [
+                "graph-restore",
+                str(tmp_path / "does-not-exist.json"),
+                "--uri",
+                "bolt://mist-neo4j:7687",
+                "--confirm",
+            ]
+        )
+
+        assert exit_code == 1
+        stderr = capsys.readouterr().err
+        assert "[error] EvalIsolationError:" in stderr
+        assert "live graph" in stderr
+
     def test_a_stale_extraction_version_does_not_block_the_load(self):
         """Stamps are recorded, never enforced. See `graph_version_stamps`."""
         loaded = load_artifact(
