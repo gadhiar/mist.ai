@@ -13,8 +13,13 @@ Tier 1 subcommands (graph operations):
                                              negation-proximity, embeddings)
                                              against the versioned seed source.
     graph-backup [--output PATH]            FULL graph backup: all partitions,
-                                            embeddings retained. Use this before
-                                            any risky operation.
+                                            embeddings retained, temporals and
+                                            Points tagged rather than
+                                            stringified. Use this before any
+                                            risky operation.
+    graph-restore ARTIFACT [--confirm]      DESTRUCTIVE: replace a graph with a
+        [--uri BOLT_URI]                     backup artifact. Target must pass
+                                             the dev-endpoint isolation guard.
     graph-dump [--format json|cypher]       Dump the __Entity__ subgraph only
                                             (analysis view, embeddings stripped).
                                             NOT a backup -- see graph-backup.
@@ -59,6 +64,7 @@ import logging
 import sys
 import time
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -389,11 +395,28 @@ def cmd_graph_backup(args: argparse.Namespace) -> int:
     subgraph with embeddings stripped. On the live graph that view covers 11 of
     32 nodes and none of the 20 intra-self-model relationships, so it is not a
     backup and must not be used as one before a risky operation.
+
+    Serialised through `backend.knowledge.graph_artifact`, not through
+    `json.dumps(payload, indent=2, default=str)` as this command did until
+    MIS-140 T3. `default=str` fires on every value `json` cannot encode, so each
+    Neo4j temporal, Point and byte string was written as its `str()` form with
+    nothing recording that it had happened -- and the file carried no version
+    field, so a loader could never tell which shape it was holding. The artifact
+    now tags those values and `graph-restore` reads them back with their types
+    intact.
     """
+    from backend.knowledge.graph_artifact import dumps_artifact
+
     be = _load_backend()
+    config = be.get_config()
     connection = _connect(be)
     try:
-        payload = be.admin.dump_full_graph_json(connection)
+        artifact = be.admin.dump_full_graph_artifact(
+            connection,
+            source_uri=config.neo4j.uri,
+            database=config.neo4j.database,
+            stamps=be.admin.graph_version_stamps(config),
+        )
     finally:
         connection.disconnect()
 
@@ -403,14 +426,72 @@ def cmd_graph_backup(args: argparse.Namespace) -> int:
         stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H%M%SZ")
         out_path = Path("data/graph_snapshots") / f"full-backup-{stamp}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    out_path.write_text(dumps_artifact(artifact), encoding="utf-8")
 
+    counts = artifact["counts"]
     print(
         f"[graph-backup] Wrote {out_path} "
-        f"({payload['node_count']} nodes, {payload['rel_count']} relationships)"
+        f"({counts['nodes']} nodes, {counts['relationships']} relationships)"
     )
-    if payload["node_count"] == 0:
+    if counts["nodes"] == 0:
         print("[graph-backup] WARNING: the graph is empty; this backup restores nothing.")
+    return 0
+
+
+def cmd_graph_restore(args: argparse.Namespace) -> int:
+    """Load a graph artifact into a target instance, REPLACING its contents.
+
+    Destructive twice over: the target is detach-deleted before the load, and
+    the artifact's DDL is replayed onto it. The target therefore goes through
+    `assert_neo4j_dev_isolated` BEFORE the artifact file is even read. That
+    guard is ungated by design and this command does not catch its refusal:
+    `main` prints the `EvalIsolationError` and exits 1, so the operator reads
+    why the target was refused. Restoring INTO live is an operator decision
+    that belongs with the operator, not a flag on this command.
+
+    `--confirm` is required to write. Without it the artifact is still fully
+    loaded and checked -- envelope, version, every tagged value, and every
+    relationship endpoint via `assert_artifact_is_relinkable` -- and the counts
+    are printed. That is how an operator verifies a backup file is restorable
+    BEFORE the day they need it, which is the only day a broken one is found.
+    """
+    from backend.knowledge.eval_isolation import assert_neo4j_dev_isolated
+    from backend.knowledge.graph_artifact import load_artifact
+
+    be = _load_backend()
+    uri = args.uri or be.get_config().neo4j.uri
+    assert_neo4j_dev_isolated(uri)
+
+    artifact_path = Path(args.artifact)
+    if not artifact_path.exists():
+        raise FileNotFoundError(f"[graph-restore] artifact not found: {artifact_path}")
+    artifact = load_artifact(json.loads(artifact_path.read_text(encoding="utf-8")))
+    be.admin.assert_artifact_is_relinkable(artifact)
+
+    counts = artifact.get("counts", {})
+    print(
+        f"[graph-restore] {artifact_path} -- format_version "
+        f"{artifact['format_version']}, captured_at {artifact.get('captured_at')}, "
+        f"{len(artifact['nodes'])} nodes, {len(artifact['relationships'])} relationships "
+        f"(recorded counts: {counts})"
+    )
+    print(f"[graph-restore] stamps (recorded, not enforced): {artifact.get('stamps')}")
+    if not args.confirm:
+        print("[graph-restore] Artifact is readable. Re-run with --confirm to write it.")
+        return 0
+
+    connection = be.Neo4jConnection(replace(be.get_config().neo4j, uri=uri))
+    connection.connect()
+    try:
+        report = be.admin.restore_graph_from_artifact(connection, artifact)
+    finally:
+        connection.disconnect()
+
+    print(
+        f"[graph-restore] Into {uri}: deleted {report['deleted']} pre-existing nodes, "
+        f"applied {report['schema_statements']} schema statements, wrote "
+        f"{report['nodes']} nodes and {report['relationships']} relationships."
+    )
     return 0
 
 
@@ -2399,6 +2480,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_backup.set_defaults(func=cmd_graph_backup)
 
+    p_restore = sub.add_parser(
+        "graph-restore",
+        help=(
+            "DESTRUCTIVE: replace a graph with the contents of a backup artifact. "
+            "The target must pass the dev-endpoint isolation guard."
+        ),
+    )
+    p_restore.add_argument("artifact", help="Path to a graph-backup artifact JSON file.")
+    p_restore.add_argument(
+        "--uri",
+        default=None,
+        help=(
+            "Target bolt URI (default: NEO4J_URI from config). Checked against the "
+            "dev-endpoint allowlist before the artifact is read."
+        ),
+    )
+    p_restore.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Execute the restore. Without it the artifact is only validated and summarised.",
+    )
+    p_restore.set_defaults(func=cmd_graph_restore)
+
     p_dump = sub.add_parser(
         "graph-dump",
         help="Dump the __Entity__ subgraph (ANALYSIS view, embeddings stripped -- not a backup).",
@@ -2971,9 +3075,21 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s %(name)s: %(message)s",
     )
 
-    # Lazy MistError import so `--help` works without the neo4j driver installed.
+    # Lazy imports so `--help` works without the neo4j driver installed.
+    #
+    # `EvalIsolationError` is imported beside `MistError` because it is NOT one:
+    # `grep -n "class EvalIsolationError\|class IsolatedRootError"
+    # backend/knowledge/eval_isolation.py` -> `EvalIsolationError(RuntimeError)`
+    # at :169 and `IsolatedRootError(MistError)` at :510. So the root-guard
+    # refusal already printed through the `MistError` arm below while the
+    # endpoint-guard refusal escaped as a traceback -- for `graph-restore` and
+    # for every other command these guards cover. A refusal to write the live
+    # graph is the single most important line this tool ever prints, and an
+    # operator reaching for a restore must read the reason, not a stack trace
+    # ending in one.
     try:
         from backend.errors import MistError
+        from backend.knowledge.eval_isolation import EvalIsolationError
     except ModuleNotFoundError as e:
         print(
             f"[error] Missing dependency: {e}. Install with "
@@ -2994,7 +3110,7 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError as e:
         print(f"[error] {e}", file=sys.stderr)
         return 1
-    except MistError as e:
+    except (MistError, EvalIsolationError) as e:
         print(f"[error] {e.__class__.__name__}: {e}", file=sys.stderr)
         return 1
 
