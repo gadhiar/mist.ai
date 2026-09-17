@@ -154,7 +154,7 @@ def test_conversation_handler_still_resolves_under_the_normal_interpreter():
     if importlib.util.find_spec("dotenv") is None:
         pytest.skip("dotenv is not installed, so ConversationHandler cannot be imported")
 
+    import backend.chat.conversation_handler as conversation_handler_module
     from backend.chat import ConversationHandler
-    from backend.chat.conversation_handler import ConversationHandler as direct
 
-    assert ConversationHandler is direct
+    assert ConversationHandler is conversation_handler_module.ConversationHandler
