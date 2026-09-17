@@ -25,9 +25,9 @@ behavioural pass (the script runs) would not by itself prove the coupling is
 gone -- `sys.modules` is the only place "did this drag in conversation_handler
 too" is actually visible.
 
-All findings written into the fixture files below use unicode escape
-sequences rather than literal characters, so this test file does not itself
-trip `check_ai_slop.py`'s own scan.
+The critical character written into the fixture file below is built with
+`chr()` at runtime rather than written as a literal glyph, so this source file
+stays ASCII and does not itself contain a critical finding.
 """
 
 from __future__ import annotations
