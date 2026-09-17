@@ -16,7 +16,11 @@ Tier 1 subcommands (graph operations):
                                             embeddings retained, temporals and
                                             Points tagged rather than
                                             stringified. Use this before any
-                                            risky operation.
+                                            risky operation. Writes under
+                                            $MIST_BACKUP_ROOT, which is required
+                                            and has no default; a destination on
+                                            live state or inside the repo is
+                                            refused.
     graph-restore ARTIFACT [--confirm]      DESTRUCTIVE: replace a graph with a
         [--uri BOLT_URI]                     backup artifact. Target must pass
                                              the dev-endpoint isolation guard.
@@ -404,8 +408,25 @@ def cmd_graph_backup(args: argparse.Namespace) -> int:
     field, so a loader could never tell which shape it was holding. The artifact
     now tags those values and `graph-restore` reads them back with their types
     intact.
+
+    THE DESTINATION CHANGED IN MIS-140 T1, and it is the more important change.
+    This command used to default to `data/graph_snapshots/`
+    (`git show ebe1b0d:scripts/mist_admin.py | grep -n 'data/graph_snapshots'`
+    -> :427) -- inside the live state root it is meant to outlive. Losing
+    `./data` therefore took the event store, the extraction cache, the vault
+    sidecar AND every graph backup in one stroke. There is now no default: the
+    destination comes from `MIST_BACKUP_ROOT` or from an explicit `--output`,
+    and both go through `scripts.backup.destination`, which refuses a path under
+    `./data`, under the repository, or on any other live root. The refusal is
+    loud and there is no fallback.
     """
     from backend.knowledge.graph_artifact import dumps_artifact
+    from scripts.backup.destination import resolve_backup_file
+
+    # Resolved BEFORE the graph is read, so a misconfigured destination costs no
+    # query time and cannot be discovered only after a long dump.
+    stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H%M%SZ")
+    out_path = resolve_backup_file(f"full-backup-{stamp}.json", args.output, purpose="graph-backup")
 
     be = _load_backend()
     config = be.get_config()
@@ -420,11 +441,6 @@ def cmd_graph_backup(args: argparse.Namespace) -> int:
     finally:
         connection.disconnect()
 
-    if args.output:
-        out_path = Path(args.output)
-    else:
-        stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H%M%SZ")
-        out_path = Path("data/graph_snapshots") / f"full-backup-{stamp}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(dumps_artifact(artifact), encoding="utf-8")
 
@@ -2476,7 +2492,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_backup.add_argument(
         "--output",
         default=None,
-        help="Destination file (default: data/graph_snapshots/full-backup-<UTC timestamp>.json).",
+        help=(
+            "Destination file. Default: $MIST_BACKUP_ROOT/full-backup-<UTC timestamp>.json. "
+            "MIST_BACKUP_ROOT is REQUIRED and has no fallback; a destination under "
+            "./data, under the repository, or on live state is refused."
+        ),
     )
     p_backup.set_defaults(func=cmd_graph_backup)
 
