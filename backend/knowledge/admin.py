@@ -1007,7 +1007,7 @@ def _label_pattern(labels: Sequence[str]) -> str:
     return ":".join(_quote_graph_ident(label) for label in labels)
 
 
-def _assert_artifact_is_relinkable(artifact: dict[str, Any]) -> None:
+def assert_artifact_is_relinkable(artifact: dict[str, Any]) -> None:
     """Refuse an artifact whose relationships cannot be re-anchored, BEFORE writing.
 
     Restore clears the target first, so a failure discovered half way through
@@ -1150,7 +1150,7 @@ def restore_graph_from_artifact(
             unquotable, or the server created fewer relationships than the batch
             held -- in which case the graph is partially loaded and says so.
     """
-    _assert_artifact_is_relinkable(artifact)
+    assert_artifact_is_relinkable(artifact)
 
     deleted = clear_graph(connection)
     schema_statements = apply_schema_ddl(connection, artifact.get("schema", {}))

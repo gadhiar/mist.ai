@@ -450,23 +450,24 @@ def cmd_graph_restore(args: argparse.Namespace) -> int:
     Restoring INTO live is an operator decision that belongs with the operator,
     not a flag on this command.
 
-    `--confirm` is required to write. Without it the artifact is loaded and
-    validated -- envelope, version, every tagged value, every relationship
-    endpoint -- and the counts are printed, which is also how an operator checks
-    that a backup file is readable before needing it.
+    `--confirm` is required to write. Without it the artifact is still fully
+    loaded and checked -- envelope, version, every tagged value, and every
+    relationship endpoint via `assert_artifact_is_relinkable` -- and the counts
+    are printed. That is how an operator verifies a backup file is restorable
+    BEFORE the day they need it, which is the only day a broken one is found.
     """
     from backend.knowledge.eval_isolation import assert_neo4j_dev_isolated
     from backend.knowledge.graph_artifact import load_artifact
 
-    uri = args.uri
-    if uri is None:
-        uri = _load_backend().get_config().neo4j.uri
+    be = _load_backend()
+    uri = args.uri or be.get_config().neo4j.uri
     assert_neo4j_dev_isolated(uri)
 
     artifact_path = Path(args.artifact)
     if not artifact_path.exists():
         raise FileNotFoundError(f"[graph-restore] artifact not found: {artifact_path}")
     artifact = load_artifact(json.loads(artifact_path.read_text(encoding="utf-8")))
+    be.admin.assert_artifact_is_relinkable(artifact)
 
     counts = artifact.get("counts", {})
     print(
@@ -480,9 +481,7 @@ def cmd_graph_restore(args: argparse.Namespace) -> int:
         print("[graph-restore] Artifact is readable. Re-run with --confirm to write it.")
         return 0
 
-    be = _load_backend()
-    config = be.get_config()
-    connection = be.Neo4jConnection(replace(config.neo4j, uri=uri))
+    connection = be.Neo4jConnection(replace(be.get_config().neo4j, uri=uri))
     connection.connect()
     try:
         report = be.admin.restore_graph_from_artifact(connection, artifact)
