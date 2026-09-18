@@ -213,6 +213,18 @@ class TestVec0Readback:
             read_back_store(broken)
         assert "integrity" in str(excinfo.value)
 
+    def test_a_truncated_store_is_refused_by_the_gate(self, state_root, tmp_path):
+        # The second corruption class `read_back_store` claims to catch: a real
+        # database missing its tail. Asserted rather than assumed, because the
+        # docstring names it.
+        destination = tmp_path / "out" / "event_store.db"
+        copy_store(state_root / "event_store.db", destination)
+        whole = destination.read_bytes()
+        destination.write_bytes(whole[: len(whole) // 2])
+        with pytest.raises(BackupError) as excinfo:
+            read_back_store(destination)
+        assert "integrity" in str(excinfo.value)
+
     def test_a_store_with_no_virtual_tables_reports_nothing_uncounted(self, state_root, tmp_path):
         destination = tmp_path / "out" / "event_store.db"
         copy_store(state_root / "event_store.db", destination)

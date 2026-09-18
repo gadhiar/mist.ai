@@ -304,10 +304,10 @@ def _unsound_copy(db_path: Path, detail: str) -> BackupError:
     """The one readback failure that is about the FILE rather than the reader."""
     return BackupError(
         f"captured store {db_path} failed readback: {detail}. This is the "
-        "integrity gate, not a row count: the copy is damaged or is not a "
-        "SQLite database, so the artifact is incomplete and must not be relied "
-        "on. A table this process merely lacks the module to read is reported "
-        "as uncounted instead and does not reach here."
+        "integrity gate, not a row count: SQLite could not open the copy or "
+        "would not certify it, so the artifact is incomplete and must not be "
+        "relied on. A table this process merely lacks the module to read is "
+        "reported as uncounted instead and never reaches here."
     )
 
 

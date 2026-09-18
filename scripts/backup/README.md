@@ -69,7 +69,7 @@ Captured, in one artifact directory:
 | `stores/vault_sidecar.db`    | vault chunk index, with its embeddings                          |
 | `graph.json`                 | every node and relationship, all partitions, INCLUDING embeddings |
 | `vault/`                     | a copy of the whole `mist-memory/` tree                          |
-| `manifest.json`              | layout version, `created_at`, per-file sha256, row counts, graph counts, git HEAD, producer stamps |
+| `manifest.json`              | layout version, `created_at`, per-file sha256, row counts, uncounted tables, graph counts, git HEAD, producer stamps |
 
 The three stores are captured BY NAME, never by glob. The live `./data` also holds
 `event_store.pre-r1.4-backup-2026-07-31.db` and `event_store.pre-reset-backup-2026-06-09.db`; a
@@ -77,6 +77,32 @@ glob would sweep both in, and a hurried restore could then load a months-old eve
 
 Graph embeddings travel as exact `list[float]`, not as strings. A restore returns the same floats,
 which is why the rehearsal in section 4 checks equality rather than similarity.
+
+### How a captured store is verified (layout version 2)
+
+`PRAGMA integrity_check` is the gate. Each copy is reopened and checked; a copy that fails is a
+damaged file and the dump stops with the artifact left as `.partial`. The per-table row counts in
+`manifest.json` are REPORTING, not a gate, because a `SELECT COUNT(*)` that fails says what the
+verifying process lacks rather than what the file holds.
+
+`vault_sidecar.db` is the concrete case. It holds the sqlite-vec virtual table `vault_chunks_vec`,
+which no connection can query without the extension loaded (`no such module: vec0`), so counting it
+used to fail the whole dump on a byte-correct copy (MIS-153). Its four backing tables are ordinary
+tables and count either way. The dump now loads sqlite-vec for every store; where the extension is
+unavailable, the tables that could not be counted are listed in that store's `uncounted_tables` and
+named in a `[backup] WARNING` line, and the artifact is still written. Install `sqlite-vec>=0.1.3`
+(already in `requirements.txt`) to get their counts.
+
+Two consequences worth knowing before reading a manifest:
+
+- `row_counts` may be PARTIAL. A table missing from it is not an empty table; check
+  `uncounted_tables` before reading a gap as a zero.
+- sqlite-vec's shadow tables (`vault_chunks_vec_chunks`, `_info`, `_rowids`, `_vector_chunks00`)
+  appear in `row_counts` as themselves. They are not filtered, because filtering would mean
+  hardcoding one extension's internal naming.
+
+Neither check establishes vec0 SEMANTIC validity: `COUNT(*)` on a `vec0` table counts its rowid
+shadow table, not the vectors.
 
 ### NOT captured: `data/vector_store/`
 
