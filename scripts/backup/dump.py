@@ -126,8 +126,10 @@ class DumpReport:
     graph_nodes: int
     graph_relationships: int
     vault_files: int
-    # Empty on a complete count. Non-empty means the artifact is sound and its
-    # row counts are partial -- see `read_back_store`.
+    # Empty on a complete count. Non-empty means the affected STORE COPIES
+    # passed `integrity_check` and their row counts are partial -- see
+    # `read_back_store`. It says nothing about the vault or graph legs, which
+    # that readback never examines.
     stores_uncounted: tuple[UncountedTables, ...] = ()
 
 
