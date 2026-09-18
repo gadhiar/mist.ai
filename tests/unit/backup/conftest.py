@@ -230,9 +230,17 @@ class InMemoryGraphConnection(FakeNeo4jConnection):
     `FakeNeo4jConnection` alone returns canned rows for every write, which is
     enough to assert that a restore issued the right statements and not enough
     to assert that the graph coming out equals the graph that went in. That
-    equality is the whole claim MIS-140 makes, so the fake executes the four
-    write shapes `restore_graph_from_artifact` emits -- detach-delete, DDL,
-    batched node CREATE, batched relationship CREATE -- against dicts.
+    equality is the whole claim MIS-140 makes, so the fake executes the write
+    shapes `restore_graph_from_artifact` emits -- detach-delete, schema DROP,
+    schema CREATE, batched node CREATE, batched relationship CREATE -- against
+    dicts.
+
+    THE DROP ARMS MODEL A STATEMENT THE SCHEMA-REPLACEMENT CHANGE INTRODUCED. The
+    restore leg now drops the target's constraints and indexes before applying
+    the artifact's, so a target fixture carrying schema makes `DROP CONSTRAINT`
+    and `DROP INDEX` appear. `execute_write` raises `AssertionError` on any shape
+    it does not recognise, so without those arms the first fixture given schema
+    would fail on a statement that has nothing to do with what it is testing.
 
     Values are stored by reference-free copy and never stringified, so an
     embedding that arrives as `list[float]` is compared as `list[float]`.
@@ -337,6 +345,22 @@ class InMemoryGraphConnection(FakeNeo4jConnection):
             self.relationships = []
             return [FakeNeo4jRecord({"deleted": deleted})]
 
+        # `DROP CONSTRAINT <name>` and `DROP INDEX <name>` remove the entry from
+        # the matching registry. The graph restore leg drops the target's schema
+        # before applying the artifact's, so a target fixture that CARRIES
+        # constraints or indexes makes these statements appear
+        # (`grep -n "DROP CONSTRAINT" backend/knowledge/admin.py` -> :1127).
+        # Without these two arms the fall-through below raises `AssertionError`,
+        # and the failure only shows up once a fixture is given schema -- which
+        # is exactly what the restore preflight tests here do.
+        upper = query.strip().upper()
+        if upper.startswith("DROP CONSTRAINT"):
+            self.constraints.pop(_dropped_name(query), None)
+            return []
+        if upper.startswith("DROP INDEX"):
+            self.indexes.pop(_dropped_name(query), None)
+            return []
+
         if query.strip().upper().startswith("CREATE CONSTRAINT"):
             self.constraints[_ddl_name(query)] = query
             return []
@@ -372,6 +396,17 @@ class InMemoryGraphConnection(FakeNeo4jConnection):
             return [FakeNeo4jRecord({"created": created})]
 
         raise AssertionError(f"InMemoryGraphConnection got an unexpected write: {query!r}")
+
+
+def _dropped_name(statement: str) -> str:
+    """Pull the object name out of `DROP CONSTRAINT|INDEX <name> [IF EXISTS]`.
+
+    The name is the third token and arrives backtick-quoted, because the drop
+    leg quotes it (`grep -n "_quote_graph_ident(name)"
+    backend/knowledge/admin.py` -> :1127,1137).
+    """
+    parts = statement.split()
+    return parts[2].strip("`") if len(parts) > 2 else ""
 
 
 def _ddl_name(statement: str) -> str:
@@ -430,6 +465,29 @@ def target_graph() -> InMemoryGraphConnection:
     return InMemoryGraphConnection(
         nodes=[{"labels": ["__Entity__"], "properties": {"id": "stale", "name": "stale"}}],
         relationships=[],
+    )
+
+
+@pytest.fixture
+def target_graph_with_schema() -> InMemoryGraphConnection:
+    """A restore target that already carries schema, under names the artifact never used.
+
+    `rt_entity_id` is the name the MIS-140 rehearsal target actually carried over
+    the same `(:__Entity__ {id})` schema as the artifact's `c1`. Restoring into
+    this fixture exercises the DROP arms of `InMemoryGraphConnection`, which the
+    schema-free `target_graph` never reaches.
+    """
+    return InMemoryGraphConnection(
+        nodes=[{"labels": ["__Entity__"], "properties": {"id": "stale", "name": "stale"}}],
+        relationships=[],
+        constraints={
+            "rt_entity_id": "CREATE CONSTRAINT `rt_entity_id` FOR (n:__Entity__) "
+            "REQUIRE n.id IS UNIQUE"
+        },
+        indexes={
+            "rt_embedding": "CREATE VECTOR INDEX `rt_embedding` FOR (n:__Entity__) "
+            "ON (n.embedding)"
+        },
     )
 
 

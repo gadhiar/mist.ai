@@ -4,6 +4,10 @@ Everything here is built in the worktree: three WAL-mode SQLite stores, a vault
 tree standing in for `mist-memory/` (absent from every worktree, because it is
 gitignored with zero tracked files), and a graph fake. The container has no
 network and reaches neither the live stack nor Neo4j.
+
+`TestVaultCounts` is MIS-156 and covers the two vault numbers a capture now
+reports: the corpus count, and the total that includes the `.git` plumbing the
+dump captures on purpose.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from scripts.backup.dump import (
     EXIT_DESTINATION_REFUSED,
     GRAPH_FILENAME,
     VAULT_DIRNAME,
+    _print_report,
     main,
     read_git_head,
     run_dump,
@@ -71,6 +76,7 @@ class TestRoundTrip:
         assert report.stores_absent == ()
         assert report.graph_nodes == 2
         assert report.graph_relationships == 1
+        assert report.vault_corpus_files == 2
         assert report.vault_files == 2
 
     def test_the_graph_leg_reads_back_through_the_shared_loader(
@@ -157,6 +163,7 @@ class TestTheManifest:
         assert manifest.graph["nodes"] == 2
         assert manifest.graph["relationships"] == 1
         assert manifest.graph["format_version"] == 1
+        assert manifest.vault["corpus_file_count"] == 2
         assert manifest.vault["file_count"] == 2
 
     def test_it_records_the_stamps_without_gating_on_them(self, manifest):
@@ -267,8 +274,114 @@ class TestAbsentSources:
         assert manifest.vault == {
             "directory": VAULT_DIRNAME,
             "source_present": False,
+            "corpus_file_count": 0,
             "file_count": 0,
         }
+
+
+class TestVaultCounts:
+    """MIS-156: the two numbers a capture reports for the vault, and their gap.
+
+    The rehearsal reported "117 vault files" as though that measured the corpus.
+    On the host it was 13 notes and 104 git objects, so 89% of the headline
+    number was plumbing and an operator could not tell from it whether their
+    notes had come back. The fix is two counts, not a smaller one: `.git` stays
+    captured because `mist-memory/` has no remote and its commits exist nowhere
+    else.
+    """
+
+    # Three files under `.git/`: two directly inside it and one nested two
+    # levels deeper, so a rule that only matched the first level under the vault
+    # root, or only the immediate parent directory, would not pass this.
+    GIT_FILES = (".git/HEAD", ".git/config", ".git/objects/ab/cdef01")
+
+    @pytest.fixture
+    def vault_with_git(self, tmp_path):
+        """A vault shaped like the live one: notes plus a `.git` directory.
+
+        Built here rather than in `conftest.py` because the shared `vault_root`
+        fixture is also the input to the restore tests (`test_restore.py`
+        builds its artifact by calling the real `run_dump`), and giving every
+        one of them a `.git` subtree would change what those tests measure.
+        """
+        root = tmp_path / "mist-memory-with-git"
+        (root / "identity").mkdir(parents=True)
+        (root / "identity" / "mist.md").write_text("# MIST\n", encoding="utf-8")
+        (root / "users").mkdir()
+        (root / "users" / "raj.md").write_text("# Raj\n", encoding="utf-8")
+        for relative in self.GIT_FILES:
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"plumbing: {relative}\n", encoding="utf-8")
+        return root
+
+    def test_a_git_subtree_is_captured_whole_and_the_counts_differ_by_it(
+        self, backup_root, graph_connection, state_root, vault_with_git
+    ):
+        report = dump(backup_root, graph_connection, state_root, vault_with_git)
+        captured = report.artifact_dir / VAULT_DIRNAME
+
+        # CAPTURED, not ignored. `mist-memory/` has no remote and no upstream,
+        # so excluding `.git` would be the only copy of its history going
+        # missing -- a new data-loss mode inside a data-loss fix.
+        for relative in self.GIT_FILES:
+            assert (captured / relative).is_file()
+        assert (captured / "identity" / "mist.md").read_text(encoding="utf-8") == "# MIST\n"
+
+        assert report.vault_corpus_files == 2
+        assert report.vault_files == 2 + len(self.GIT_FILES)
+        assert report.vault_files - report.vault_corpus_files == len(self.GIT_FILES)
+
+    def test_a_vault_with_no_git_reports_the_two_counts_equal(
+        self, backup_root, graph_connection, state_root, vault_root
+    ):
+        # The gap is the plumbing and nothing else: with no `.git` present the
+        # corpus count must not be a different measure that happens to be lower.
+        assert not (vault_root / ".git").exists()
+        report = dump(backup_root, graph_connection, state_root, vault_root)
+        assert report.vault_corpus_files == report.vault_files == 2
+
+    def test_the_manifest_carries_both_counts(
+        self, backup_root, graph_connection, state_root, vault_with_git
+    ):
+        # ADDED beside `file_count`, never redefining it: `BackupManifest`
+        # carries no version field, so an old manifest and a new one would
+        # disagree about what `file_count` means with nothing to tell them
+        # apart. `file_count` therefore still counts every file.
+        report = dump(backup_root, graph_connection, state_root, vault_with_git)
+        manifest = read_manifest(report.artifact_dir)
+        assert manifest.vault["corpus_file_count"] == 2
+        assert manifest.vault["file_count"] == 5
+        assert manifest.vault["source_present"] is True
+
+    def test_the_dump_output_labels_both_counts(
+        self, backup_root, graph_connection, state_root, vault_with_git, capsys
+    ):
+        report = dump(backup_root, graph_connection, state_root, vault_with_git)
+        _print_report(report)
+        printed = capsys.readouterr().out
+        assert "2 vault corpus file(s)" in printed
+        assert "5 including .git plumbing" in printed
+        # Neither number may appear as a bare "N vault files", which is the
+        # shape that produced the 117 figure.
+        assert "5 vault files" not in printed
+        assert "2 vault files" not in printed
+
+    def test_a_vault_of_pure_plumbing_warns_that_no_notes_were_captured(
+        self, backup_root, graph_connection, state_root, tmp_path, capsys
+    ):
+        # A state the single count could not express: files were captured, and
+        # not one of them is a note. Under the old reporting this printed a
+        # reassuring non-zero file count and no warning at all.
+        root = tmp_path / "plumbing-only"
+        (root / ".git").mkdir(parents=True)
+        (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        report = dump(backup_root, graph_connection, state_root, root)
+        assert report.vault_corpus_files == 0
+        assert report.vault_files == 1
+        _print_report(report)
+        printed = capsys.readouterr().out
+        assert "not one corpus note" in printed
 
 
 class TestGitHead:

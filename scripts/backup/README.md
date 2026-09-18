@@ -11,18 +11,23 @@ Three commands exist:
 Exit codes are the same shape everywhere: `0` it worked, `2` it refused and changed nothing,
 `1` it failed part way and the message says what state that leaves.
 
-WHAT HAS AND HAS NOT BEEN EXERCISED. Three separate statements, because they have three
-different evidence bases:
+WHAT HAS AND HAS NOT BEEN EXERCISED. Four separate statements, because they have four different
+evidence bases:
 
 - The three commands above, and every refusal they can make, are covered by
-  `tests/unit/backup/` (172 tests: `python -m pytest tests/unit/backup -q`), including a full
+  `tests/unit/backup/` (222 tests: `python -m pytest tests/unit/backup -q`), including a full
   synthetic round trip that restores a captured graph and compares embeddings for exact equality.
 - The `backend/` code this runbook also names -- `load_artifact`,
   `restore_graph_from_artifact` and the `graph-stats` helpers -- is NOT covered by that suite. It
   is covered by `tests/unit/knowledge/`, which is a different tier of the same run.
+- Two of the fixes that suite covers are proved only against SIMULATED faults, and in neither case
+  is the simulation the defect: the Neo4j schema-rejection rule is modelled from the Cypher manual
+  and has never been observed against a real server, and the read-only vault handler is exercised
+  on Linux through a read-only DIRECTORY when the defect it exists for is a Windows `WinError 5`
+  on read-only git objects. Section 4.9 says what that leaves unproved.
 - Nothing here has been run against the live stack or the dev-hydration stack on the host from
   this branch. The rehearsal below is therefore a rehearsal, not a replay of something already
-  done.
+  done -- and for the two items above it is the only real gate there is.
 
 ---
 
@@ -68,8 +73,8 @@ Captured, in one artifact directory:
 | `stores/extraction_cache.db` | cached extraction results                                       |
 | `stores/vault_sidecar.db`    | vault chunk index, with its embeddings                          |
 | `graph.json`                 | every node and relationship, all partitions, INCLUDING embeddings |
-| `vault/`                     | a copy of the whole `mist-memory/` tree                          |
-| `manifest.json`              | layout version, `created_at`, per-file sha256, row counts, uncounted tables, graph counts, git HEAD, producer stamps |
+| `vault/`                     | a copy of the whole `mist-memory/` tree, `.git` INCLUDED          |
+| `manifest.json`              | layout version, `created_at`, per-file sha256, row counts, uncounted tables, graph counts, both vault file counts, git HEAD, producer stamps |
 
 The three stores are captured BY NAME, never by glob. The live `./data` also holds
 `event_store.pre-r1.4-backup-2026-07-31.db` and `event_store.pre-reset-backup-2026-06-09.db`; a
@@ -77,6 +82,52 @@ glob would sweep both in, and a hurried restore could then load a months-old eve
 
 Graph embeddings travel as exact `list[float]`, not as strings. A restore returns the same floats,
 which is why the rehearsal in section 4 checks equality rather than similarity.
+
+### The vault leg: two counts, and why `.git` is captured
+
+`.git` IS CAPTURED, AND THAT IS DELIBERATE. `copy_vault` passes no `ignore=` to
+`shutil.copytree` (`scripts/backup/dump.py`, `copy_vault`). The live `mist-memory/` is a git
+repository with NO REMOTE and NO UPSTREAM, so its commits exist nowhere else -- 15 of them when
+last measured on the host, a figure not re-measurable from a worktree because `mist-memory/` is
+gitignored and untracked (`git ls-files mist-memory` -> empty). Excluding `.git` would introduce
+a new data-loss mode inside a tool whose whole job is to remove them.
+
+The cost of keeping it is recurring rather than one-off, and is worth knowing rather than
+discovering: `digest_artifact_files` rglobs the whole artifact, so every git loose object is
+sha256'd at capture -- and re-digested by `verify_artifact_files` at EVERY restore preflight. A
+vault whose git history grows makes every preflight slower, not just every dump.
+
+That is why the vault is counted twice. The `vault` block of `manifest.json` carries both keys,
+and both the dump and the restore print both numbers:
+
+| Manifest key        | What it counts                                                                                          |
+| ------------------- | ------------------------------------------------------------------------------------------------------- |
+| `corpus_file_count` | Files with no `.git` path segment. The notes. The only one of the two that answers "did my notes come back". |
+| `file_count`        | EVERY file in the tree, `.git` plumbing INCLUDED. A measure of the artifact, never of the corpus.         |
+
+Both legs count through one function -- `count_vault_files` in `scripts/backup/dump.py`, which
+`scripts/backup/restore.py` imports rather than reimplementing -- so a capture and a restore
+cannot report the same tree differently.
+
+The reason for two numbers is one specific misreading. The MIS-140 rehearsal reported "117 vault
+files" as though that measured the corpus. Measured on the host, the 117 was 13 notes and 104 git
+objects: 89% plumbing. Neither number is printed bare now. The line reads
+`13 vault corpus file(s) (117 including .git plumbing)`.
+
+#### A layout-2 artifact may or may not carry `corpus_file_count`
+
+`BACKUP_LAYOUT_VERSION` stays at **2**. Adding a manifest key is backward compatible: a reader
+that does not know `corpus_file_count` ignores it, and `file_count` keeps the meaning it has
+always had. REDEFINING `file_count` to mean the corpus would not have been compatible, which is
+why it was not done.
+
+The consequence a reader has to handle: `BackupManifest` has no version field of its own
+(`scripts/backup/manifest.py`), so nothing in a layout-2 manifest distinguishes one written
+before this key from one written after. A layout-2 artifact MAY OR MAY NOT carry
+`corpus_file_count`, depending on when it was taken. Read it with a default rather than by
+subscript:
+
+    manifest["vault"].get("corpus_file_count")   # None on a layout-2 artifact taken before the key
 
 ### How a captured store is verified (layout version 2)
 
@@ -248,22 +299,258 @@ Four gates run, every time, and no flag disables any of them:
    restore does not proceed.
 
 The first line of successful output is the pre-restore artifact path. That directory is your way
-back if you have just restored into the wrong place. Write it down before reading the rest.
+back if you have just restored into the wrong place. Write it down before reading the rest, and
+see 4.7 for what to do with it.
 
-Then, in order. The whole artifact is checked first: every file is re-digested against the
-manifest, AND the graph leg is parsed, version-checked and decoded. Only then is the target
-touched -- stores replaced file by file, vault tree replaced wholesale (not merged), graph written
-last. The graph write is last because it detach-deletes the target as part of the load, so a
-failure in an earlier leg leaves the target with its own graph rather than none.
+#### The six phases
 
-Those two checks are separate on purpose. A file can match its recorded sha256 exactly and still
-be an artifact this build cannot read, because the version it declares is one this build does not
-know. If either check fails you get exit 2 and a target that is byte-for-byte unchanged.
+A restore is stage-then-swap, in six named phases (`run_restore` in `scripts/backup/restore.py`).
+Each has a documented failure state, and
+`tests/unit/backup/test_restore.py::TestAFailureInEachPhaseLeavesExactlyTheDocumentedState` pins
+them.
 
-### 4.5 Verify
+1. PREFLIGHT. Read-only, and it checks BOTH halves. Artifact: every file the manifest names is
+   re-digested (`verify_artifact_files`), then the graph leg is parsed, version-checked, decoded
+   and checked for re-anchorable endpoints (`load_graph_leg`). Target: the target graph answers
+   `SHOW CONSTRAINTS` and `SHOW INDEXES`; every DDL statement in the artifact names an object this
+   build can parse; the volume has room for the staged copies; and no earlier restore left a
+   marker behind (`assert_target_is_restorable`). Any failure here is exit 2 with the target
+   bit-for-bit untouched.
+2. PRE-RESTORE BACKUP. The fourth gate and the first consequential step: a full dump of the
+   target through the same dump leg. If it fails, exit 2 and nothing has been overwritten.
+3. STAGE. Each store is copied to `<name>.db.incoming` and the artifact's vault tree to
+   `vault.incoming/`, each a sibling of the file or directory it will replace. Nothing live is
+   touched, so a failure here costs nothing and needs no recovery.
+4. GRAPH. `restore_graph_from_artifact` detach-deletes the target graph, replaces its schema, and
+   loads nodes and relationships in batches. THE ONE NON-ATOMIC LEG.
+5. COMMIT. Per store: `os.replace` onto the live name, then that store's `-wal`/`-shm` are
+   unlinked, then the next store. Then the vault, as two renames: `vault` -> `vault.previous`,
+   then `vault.incoming` -> `vault`.
+6. CLEANUP. `vault.previous` is removed, then the progress marker is deleted.
 
-Three numbers and one vector. Run all four checks; a restore that gets the counts right and the
-vectors wrong is the failure mode that hides behind every similarity threshold in the codebase.
+#### The ordering guarantee, stated per fault class
+
+THIS ORDERING USED TO BE DESCRIBED MORE BROADLY THAN IT HELD. The old text here said the whole
+artifact was checked first and the graph was written last, and presented that as a general
+guarantee that a failure left the target intact. It held for ARTIFACT faults and it was false for
+TARGET faults: the target was not checked at all, and a graph leg running LAST failed only after
+the stores and the vault had already been replaced. That is how the MIS-140 rehearsal ended with
+a target holding the artifact's stores, the artifact's vault, and an empty graph. What holds now
+is narrower, and is true per fault class rather than in general:
+
+- An ARTIFACT fault -- a missing or altered file, a `format_version` this build cannot read, a
+  relationship endpoint no node provides -- is caught in phase 1. Exit 2, target untouched.
+- A TARGET fault -- graph down, artifact DDL this build cannot name, too little free space, a
+  stale restore marker -- is also caught in phase 1, before the pre-restore backup is spent.
+  Exit 2, target untouched.
+- A GRAPH fault is caught in phase 4, which now runs BEFORE the swap rather than after it. The
+  target's graph is destroyed; its stores and its vault are still its own.
+- A COMMIT fault happens in phase 5. What the target holds then depends on how far the commit
+  got, and the marker records exactly that. See 4.5 and 4.7.
+
+Phase 1 does two artifact checks rather than one because digest validity and decodability are
+different properties: a file can match its recorded sha256 exactly and still be an artifact this
+build cannot read, because the version it declares is one this build does not know.
+
+### 4.5 What is atomic here, and what is not
+
+Read this before you need it. At 3am the useful question is which of the two lists below your
+failure is in.
+
+#### What IS atomic: `os.replace`, per store and per rename
+
+- Each store is committed by one `os.replace` onto its live name. That rename either happened or
+  it did not; there is no half-written store, and the target never sees a truncated `.db`.
+- THREE STORES ARE THREE ATOMIC OPERATIONS, NOT ONE. A failure at store 2 of 3 leaves store 1
+  holding the artifact's copy and stores 2 and 3 holding the target's own, so the target is a
+  mixture of two points in time. `stores_committed` in the marker names exactly which ones moved.
+- The vault swap is TWO RENAMES, not one, because Windows cannot rename a directory onto an
+  existing one. There is therefore a window in which `vault/` DOES NOT EXIST: the target's tree is
+  at `vault.previous/` and the artifact's is at `vault.incoming/`. Both trees are intact in that
+  window; neither is named `vault`. The window is irreducible without transactional NTFS, which is
+  deprecated.
+
+This is atomic PER STORE AND PER RENAME. It is NOT atomic per tree, and nothing in this package
+says that it is. Staging is always a sibling of its destination, which is what makes each
+`os.replace` a same-volume rename and therefore atomic at all; no flag makes the staging location
+configurable, because such a flag would take that guarantee away silently.
+
+#### What is NOT atomic: phase 4, the graph
+
+`restore_graph_from_artifact` detach-deletes the target graph and drops its schema before it
+loads anything (`backend/knowledge/admin.py`). There is no staging step for a graph and no
+rollback.
+
+**A PHASE-4 FAILURE DESTROYS THE TARGET'S GRAPH.** The stores and the vault survive it -- they
+are still the target's own, with the artifact's staged copies sitting beside them uncommitted --
+and the pre-restore artifact is the only route back to the graph that was there. That is a
+property of the design. It is not a statement about how much data the graph happens to hold
+today, and it does not become less true as it holds more.
+
+#### The failure modes that remain open
+
+Named, because a runbook listing only the handled ones reads as a guarantee:
+
+- A RELATIONSHIP-COUNT MISMATCH RAISED AFTER NODES ARE ALREADY LOADED. The batched relationship
+  load checks `created != len(batch)` and raises `GraphArtifactError` when the server creates a
+  different number (`restore_graph_from_artifact` in `backend/knowledge/admin.py`). Every node,
+  the schema, and every earlier relationship batch are already in the target when that fires.
+  The message says the graph is partially loaded; it is.
+- A DRIVER DISCONNECT, A SERVER RESTART OR A FULL DISK DURING ANY LEG. Nothing holds a
+  transaction across phases, so each of these leaves the target wherever the interrupted phase had
+  reached. The marker is the record of which phase that was.
+- A STORE-LEG FAILURE AT STORE 2 OF 3, as above: a target that is a mixture of two points in time
+  rather than either of them. The commonest cause of a failed rename is a backend still running
+  against the target and holding a store open.
+- PHASE 6'S REMOVAL OF `vault.previous` IS NOT A FAILURE MODE OF THE RESTORE. It is the one step
+  whose failure is caught and downgraded to a warning. By the time it runs the restore has
+  SUCCEEDED -- stores, vault and graph are all the artifact's -- and `vault.previous/` is a
+  redundant second copy of the target's old vault, which the pre-restore artifact also holds. So a
+  failed deletion prints a `[restore] WARNING:` line naming the directory, still deletes the
+  marker, and still exits 0. Remove the directory by hand.
+
+  It is written that way deliberately. Left uncaught, `remove_tree`'s `OSError` is neither a
+  `MistError` nor a `GraphArtifactError`, so `main`'s handler tuple would miss it: a restore that
+  did everything right would exit with a traceback instead of 0, AND leave the marker behind --
+  which makes the next restore refuse (4.6). That would turn a failed deletion of a redundant
+  directory into a block on the recovery path, at the moment someone is recovering, which is the
+  shape of MIS-157 itself. A recovery tool must not withhold recovery to make a point.
+
+### 4.6 `restore.in-progress.json`: the file that says what state you are in
+
+Written into the TARGET ROOT as soon as the pre-restore backup succeeds, rewritten after every
+phase transition, and deleted only when the restore completes. Its presence means a restore
+started and did not finish.
+
+    <target-root>/restore.in-progress.json
+
+It is JSON, indented and key-sorted, so `cat` is enough:
+
+    cat ./dev-state/restore.in-progress.json
+
+| Key                                   | What it tells you                                                                                                                              |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `marker_version`                      | The marker's own layout version, currently `1`. A reader that does not know the value prints the file verbatim rather than interpreting it.       |
+| `started_utc`                         | When the consequential sequence began.                                                                                                           |
+| `artifact_dir`                        | The artifact that run was restoring FROM.                                                                                                        |
+| `artifact_label`                      | That artifact's manifest label.                                                                                                                  |
+| `target_root`                         | The resolved target.                                                                                                                             |
+| `pre_restore_artifact`                | THE WAY BACK: the target's own state, captured before phase 3. The first field to read.                                                          |
+| `phases.staged`                       | Phase 3 completed. Staged copies exist and nothing live has been touched.                                                                        |
+| `phases.graph.committed`              | Phase 4 completed. `false` beside `staged: true` means the graph leg is where it died.                                                            |
+| `phases.graph.nodes`, `.relationships`| What phase 4 loaded. `0` until it completes.                                                                                                     |
+| `phases.stores_committed`             | The store filenames already `os.replace`d onto their live names, in commit order. A list rather than a flag, because the commit is atomic per store. |
+| `phases.vault_committed`              | Both vault renames completed.                                                                                                                    |
+| `phases.vault_previous`               | Where the target's previous vault tree was renamed aside, WHILE IT STILL EXISTS. `null` before phase 5; set once the vault is renamed aside. NOT how you learn about a failed cleanup: the marker is deleted at the end of phase 6 whether or not the removal succeeded, so a failure is reported by the `[restore] WARNING:` line instead (4.5). A non-null value here means the run did not reach the end of phase 6 at all. |
+
+The marker is rewritten through its own `.tmp` and an `os.replace`, so a crash during a rewrite
+leaves the PREVIOUS marker intact rather than a truncated one.
+
+A TARGET CARRYING A MARKER IS REFUSED, AND THERE IS NO OVERRIDE FLAG. Preflight's fourth check
+prints the marker's full contents -- `pre_restore_artifact` included, so the way back is on screen
+in the refusal itself -- and exits 2. The only thing that clears it is deleting the file by hand:
+
+    rm ./dev-state/restore.in-progress.json
+
+There is deliberately no `--force`, `--resume`, `--ignore-marker` or `--no-marker`, and none may
+be added; `tests/unit/backup/test_restore.py` asserts the parser rejects all four spellings. A
+flag is a bypass, and a bypass can be put in a schedule by someone who was not there when the
+first restore failed. A manual delete cannot be: the act of deleting the file IS the
+acknowledgement that you read it and decided what to do about the target.
+
+### 4.7 If a restore failed: reading the marker and putting the target back
+
+Exit 1 means a phase after the pre-restore backup failed. You have two things: the message the
+tool printed, and the marker. Use the marker. The message scrolls away; the file does not.
+
+#### Step 1: find out which phase failed
+
+    cat <target-root>/restore.in-progress.json
+
+Read `phases` from the top. The last entry recorded as complete is the last phase that finished,
+so the phase after it is the one that died. `stores_committed` is a list rather than a flag, so a
+SHORT list there is a phase-5 failure part way through the stores.
+
+| Marker state                                                       | What the target holds                                                                             | What to do                                                          |
+| ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| No marker, and the run exited 2                                    | Its own stores, vault and graph. Nothing was overwritten.                                          | Nothing. Fix what the refusal named and re-run.                      |
+| `staged: false`                                                    | Its own stores, vault and graph. Phase 3 failed and removed its own staged copies.                 | Delete the marker, use an intact artifact, re-run. No recovery needed. |
+| `staged: true`, `graph.committed: false`                           | ITS OWN stores and vault. A graph that is empty or partially loaded.                               | Case A.                                                              |
+| `graph.committed: true`, `stores_committed` shorter than the artifact's store list | The artifact's graph. A MIXTURE of the artifact's stores and its own. Its own vault. | Case B.                                                              |
+| `stores_committed` complete, `vault_committed: false`              | The artifact's graph and stores. Its own vault.                                                    | Case B.                                                              |
+| `vault_committed: true`, `vault_previous` non-null                 | The artifact's graph, stores and vault. Phase 5 landed and phase 6 did not run.                     | Case C.                                                              |
+
+CASE A -- THE GRAPH LEG FAILED. The stores and the vault on disk are still the target's own, so
+the loss is confined to the graph. Two routes, and they are not equivalent:
+
+- If the artifact is sound and the failure was transient (server restart, driver disconnect),
+  delete the marker and re-run the SAME restore. Phase 4 clears before it loads, so a partially
+  loaded graph is not an obstacle to re-running it.
+- If the ARTIFACT is the problem, put the target's own graph back from the pre-restore artifact,
+  as in step 2.
+
+CASE B -- THE COMMIT LEG FAILED PART WAY. The target is a mixture of two points in time, which is
+the one state not to leave it in. Stop whatever is running against it first -- a backend holding a
+store open is the usual reason a rename failed -- then do step 2.
+
+CASE C -- ONLY THE CLEANUP IS OUTSTANDING. The restore itself landed. There are two ways you get
+here, and only one of them leaves a marker:
+
+- The run exited 0 and printed `[restore] WARNING: ... could not be removed`. Phase 6 could not
+  delete `vault.previous/`, said so, and finished anyway. There is NO marker -- it is deleted even
+  on this path, so that a directory nobody needs cannot refuse your next restore.
+- The run was killed between phase 5 and phase 6. Then the marker is still there, with
+  `vault_committed: true` and `vault_previous` non-null.
+
+Either way the target is correct. Check `vault/` holds what you expect, then clear what is left:
+
+    rm -rf <target-root>/vault.previous
+    rm -f <target-root>/restore.in-progress.json
+
+#### Step 2: restore the pre-restore artifact back
+
+The pre-restore artifact is an ordinary backup artifact, so putting the target back is this same
+command pointed at it. READ `pre_restore_artifact` OUT OF THE MARKER FIRST: the next run
+overwrites the marker with its own.
+
+    cat <target-root>/restore.in-progress.json        # copy pre_restore_artifact somewhere
+    rm <target-root>/restore.in-progress.json         # preflight refuses until this is gone
+    python -m scripts.backup.restore \
+      --artifact <THE pre_restore_artifact PATH FROM THE MARKER> \
+      --target-root ./dev-state \
+      --target-graph-uri bolt://localhost:7690 \
+      --confirm-target <THE RESOLVED PATH, AS IN 4.3>
+
+Four things to know before running it:
+
+- IT TAKES ANOTHER PRE-RESTORE BACKUP FIRST, of the damaged target. That is not waste: it is the
+  only copy of the half-restored state, and it is what you would want if this recovery is also
+  wrong. All four gates run again; none of them is skipped because the situation is an emergency.
+- LEFTOVER `.incoming` FILES DO NOT BLOCK IT. Phase 3 overwrites a staged store and removes a
+  staged vault tree before copying, so the failed run's staging is reused ground rather than an
+  obstacle.
+- A LEFTOVER `vault.previous/` IS NOT REMOVED BY THE RE-RUN when `vault/` is missing, because the
+  removal sits behind the "target has a vault to rename aside" branch. If the failed run died
+  between the two vault renames, rename the tree you want back into place by hand BEFORE
+  re-running, and delete the other afterwards. Both trees are intact; only the names are wrong.
+
+  CHECK ITS DATE BEFORE YOU REASON ABOUT IT. A `vault.previous/` you find is not necessarily from
+  the run that just failed: phase 6 can decline to remove one (4.5), and a re-run with `vault/`
+  present renames the live tree over that name only after clearing it. An operator who assumes the
+  directory belongs to this run will reconstruct the wrong failure. The marker's `started_utc`, and
+  the directory's own mtime, are what tell you which run left it.
+- IT PUTS BACK ONLY WHAT THE DUMP LEG CAPTURES. `data/vector_store/` is excluded from every
+  artifact (section 2), and a store the manifest records as absent is left as the target's own.
+
+If the graph is the ONLY thing you need back and the stores and vault are intact, the graph-only
+path in 4.11 is faster. It also has none of the four gates, so choose it deliberately rather than
+because it is shorter.
+
+### 4.8 Verify
+
+Three graph numbers, one vector, and the vault count. Run all five checks; a restore that gets
+the counts right and the vectors wrong is the failure mode that hides behind every similarity
+threshold in the codebase.
 
 (a) What the artifact says it holds:
 
@@ -320,11 +607,53 @@ element. It is NOT cosine similarity and must never be relaxed into one: a vecto
 close has been silently rewritten, and every similarity check in this codebase would still pass on
 it.
 
-The rehearsal has passed when: nodes and relationships match between (a) and (c), the embedding
-line prints `True`, and `ls ./dev-state` shows the three stores and a `vault/` tree from the
-artifact.
+(e) THE VAULT, COUNTED THE WAY THE MANIFEST COUNTS IT. The restore's own output line already
+prints both numbers -- `N vault corpus file(s) (M including .git plumbing)` -- and the artifact's
+manifest carries both keys. Compare corpus against corpus:
 
-### 4.6 Clean up
+    python -c "import json;m=json.load(open('/mnt/backup/mist/20260917T030000Z/manifest.json'));print(m['vault'])"
+
+`corpus_file_count` is the number to check against what you expect of your notes. Do NOT read
+`file_count` as a corpus size: on the live tree it is roughly nine parts git plumbing to one part
+note. On an artifact taken before that key existed it is absent altogether -- see section 2.
+
+The rehearsal has passed when: nodes and relationships match between (a) and (c), the embedding
+line prints `True`, the restored `corpus_file_count` equals the artifact's, and `ls ./dev-state`
+shows the three stores and a `vault/` tree from the artifact, with no `restore.in-progress.json`,
+no `*.incoming` and no `vault.previous/` left behind.
+
+### 4.9 What the unit tier cannot prove, and why this rehearsal is the gate
+
+Two of the fixes this section describes are proved only against SIMULATED faults. In neither case
+is the simulation the defect, and the gap is worth carrying into the rehearsal rather than
+discovering after it.
+
+THE NEO4J SCHEMA-REJECTION RULE IS MODELLED, NOT OBSERVED. `replace_graph_schema` drops the
+target's schema and re-applies the artifact's rather than using `CREATE ... IF NOT EXISTS`, and
+the stated reason is the Cypher manual's description of `IF NOT EXISTS`: it creates nothing and
+throws nothing when an object of that name, or an equivalent constraint under another name,
+already exists -- so it is silent in the same-name-DIFFERENT-definition case, which is the one
+case that must not pass unnoticed (`backend/knowledge/admin.py`, `replace_graph_schema`). THAT
+SERVER BEHAVIOUR HAS NEVER BEEN OBSERVED AGAINST A REAL NEO4J FROM THIS BRANCH. The unit tier
+drives a fake connection, so it proves the code takes the drop-and-recreate path; it does not
+prove what a real server would have done with the alternative. Restoring into a dev graph that
+ALREADY carries schema is what would test it, and 4.1 leaves `mist-neo4j-dev` in that state if it
+has been hydrated before.
+
+THE READ-ONLY VAULT HANDLER IS PROVED ON THE WRONG OPERATING SYSTEM. The defect it exists for
+(MIS-157) is a Windows `WinError 5` raised by `shutil.rmtree` on the read-only loose objects git
+writes under `.git/objects`. On Linux a read-only FILE is removable, so THE CONTAINER TIER CANNOT
+REPRODUCE THE DEFECT AT ALL. What the Linux test does instead is make the CONTAINING DIRECTORY
+read-only (`chmod 0o555`), which raises a genuine `PermissionError` through the same handler. That
+proves the handler is wired into `remove_tree` and that the retry succeeds once the attribute is
+cleared. It proves nothing about the Windows read-only-file case.
+
+So the host rehearsal is the only evidence either of these will get. Run 4.4 through 4.8 TWICE
+against a vault that has a real `.git`: the first run finds no `vault/` in a fresh `./dev-state`,
+so phase 6 has nothing to remove, and it is the SECOND run that renames a vault full of read-only
+git objects to `vault.previous/` and then removes it.
+
+### 4.10 Clean up
 
 The dev graph now holds a copy of live. That is fine -- it is the dev instance -- but say so out
 loud to anyone using it for hydration, and either re-hydrate it or drop the volume:
@@ -335,7 +664,7 @@ loud to anyone using it for hydration, and either re-hydrate it or drop the volu
 Leave `./dev-state/MIST_RESTORE_TARGET` in place; the marker is not consumed, and a target that
 stays marked is a rehearsal you can repeat.
 
-### 4.7 The OTHER restore command, and why this is not it
+### 4.11 The OTHER restore command, and why this is not it
 
 `python scripts/mist_admin.py graph-restore ARTIFACT [--confirm]` also exists, and it also
 detach-deletes the graph it is pointed at. Know about it so you do not reach for it by accident at

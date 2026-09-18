@@ -14,11 +14,17 @@ everything here is built in the worktree.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sqlite3
+import stat
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import scripts.backup.restore as restore_module
+from backend.errors import Neo4jQueryError
 from backend.knowledge.eval_isolation import REPO_ROOT, EvalIsolationError
 from backend.knowledge.graph_artifact import GraphArtifactError
 from scripts.backup.destination import BACKUP_ROOT_ENV
@@ -30,13 +36,27 @@ from scripts.backup.errors import (
     RestoreConfirmationError,
     RestorePreflightError,
     RestoreTargetError,
+    RestoreTargetStateError,
 )
 from scripts.backup.manifest import MANIFEST_FILENAME, read_manifest, sha256_file
-from scripts.backup.restore import EXIT_REFUSED, main, restore_vault, run_restore
+from scripts.backup.restore import (
+    EXIT_REFUSED,
+    RESTORE_PROGRESS_FILENAME,
+    STAGING_SUFFIX,
+    VAULT_PREVIOUS_SUFFIX,
+    build_parser,
+    main,
+    parse_ddl_object_name,
+    remove_tree,
+    restore_progress_marker_path,
+    run_restore,
+    stage_vault,
+    staged_peak_bytes,
+)
 from scripts.backup.stores import STORES_DIRNAME
 from scripts.backup.target import RESTORE_MARKER_FILENAME
 
-from .conftest import EMBEDDING, STAMPS
+from .conftest import EMBEDDING, STAMPS, InMemoryGraphConnection
 
 TARGET_URI = "bolt://localhost:7690"
 
@@ -116,6 +136,79 @@ def fingerprint(root):
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
+
+
+def live_fingerprint(root):
+    """`fingerprint` over the target's OWN state only, for failures after phase 2.
+
+    Three exclusions, each for a reason a plain `fingerprint` comparison would
+    otherwise fail on for the wrong cause:
+
+    - staged copies (`*.incoming`), because phase 3 creating them is the correct
+      behaviour and they are not live state;
+    - `restore.in-progress.json` and its `.tmp`, for the same reason;
+    - `-wal`/`-shm` sidecars, because the PRE-RESTORE CAPTURE opens the target's
+      stores and opening a WAL database creates them
+      (`tests/unit/backup/test_dump.py:104-118` asserts exactly that). That is
+      already the documented meaning of "the target was not overwritten".
+
+    What remains is every byte a restore is supposed to replace. Comparing it
+    across a failure is the assertion that caught the MIS-153 ordering bug when
+    `pytest.raises` alone did not.
+    """
+    return {
+        relative: payload
+        for relative, payload in fingerprint(root).items()
+        if STAGING_SUFFIX not in relative
+        and not relative.startswith(RESTORE_PROGRESS_FILENAME)
+        and not relative.endswith(("-wal", "-shm"))
+    }
+
+
+def read_marker(root):
+    """The parsed `restore.in-progress.json` sitting in `root`."""
+    return json.loads(restore_progress_marker_path(root).read_text(encoding="utf-8"))
+
+
+def drop_store_from_artifact(artifact_dir, filename):
+    """Delete one store file and its digest, while the manifest still calls it present.
+
+    A genuine, non-mocked way to fail PHASE 3 at the SECOND store: the digest
+    pass (`verify_artifact_files`) no longer names the file, so it passes, and
+    staging refuses when it reaches a store the `stores` map records as present
+    and the artifact does not hold.
+    """
+    (artifact_dir / STORES_DIRNAME / filename).unlink()
+    manifest_path = artifact_dir / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"].pop(f"{STORES_DIRNAME}/{filename}")
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    return artifact_dir
+
+
+def fail_rename_onto(monkeypatch, filename):
+    """Make `os.replace` fail for one destination NAME and behave normally for the rest.
+
+    Phase 5 is three atomic renames in a row and there is no cross-platform way
+    to make the second one fail for real without root-dependent permission
+    tricks, so this one injection point is a monkeypatch. It is scoped to a
+    single destination name rather than to `os.replace` wholesale, because the
+    progress marker is rewritten through `os.replace` too and breaking that
+    would fail the test for the wrong reason.
+    """
+    real_replace = os.replace
+
+    def fake_replace(source, destination):
+        if Path(destination).name == filename:
+            raise OSError(5, "synthetic rename failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fake_replace)
+
+
+def failing_graph_write(_connection, _artifact):
+    """Phase 4 dying the way the MIS-140 rehearsal's did."""
+    raise GraphArtifactError("synthetic graph load failure")
 
 
 @pytest.fixture
@@ -207,11 +300,14 @@ class TestTheRoundTrip:
         # the union of two vaults and equal to neither.
         assert not (vault / "target-only.md").exists()
 
-    def test_no_restore_temporary_files_are_left_in_the_target(
+    def test_no_staging_or_marker_files_are_left_in_the_target(
         self, artifact, restore_target, target_graph, backup_root
     ):
         restore(artifact, restore_target, target_graph, backup_root)
-        assert not list(restore_target.glob("*.restore-tmp"))
+        assert not list(restore_target.glob(f"*{STAGING_SUFFIX}"))
+        assert not list(restore_target.glob(f"*{VAULT_PREVIOUS_SUFFIX}"))
+        assert not restore_progress_marker_path(restore_target).exists()
+        assert not list(restore_target.glob(f"{RESTORE_PROGRESS_FILENAME}*"))
 
 
 class TestThePreRestoreBackup:
@@ -466,10 +562,11 @@ class TestAbsentLegs:
         restore(report.artifact_dir, restore_target, target_graph, backup_root)
         assert (restore_target / "vault" / "target-only.md").is_file()
 
-    def test_restore_vault_reports_zero_when_the_artifact_has_no_vault_directory(
+    def test_stage_vault_returns_none_when_the_artifact_has_no_vault_directory(
         self, tmp_path, restore_target
     ):
-        assert restore_vault(tmp_path / "empty-artifact", restore_target / "vault") == 0
+        assert stage_vault(tmp_path / "empty-artifact", restore_target / "vault") is None
+        assert not list(restore_target.glob(f"*{STAGING_SUFFIX}"))
 
     def test_a_store_absent_at_capture_time_is_reported_not_silently_skipped(
         self, backup_root, source_graph, state_root, vault_root, restore_target, target_graph
@@ -479,6 +576,509 @@ class TestAbsentLegs:
         restored = restore(report.artifact_dir, restore_target, target_graph, backup_root)
         assert restored.stores_absent_from_artifact == ("extraction_cache.db",)
         assert "extraction_cache.db" not in restored.stores_restored
+
+
+class TestAFailureInEachPhaseLeavesExactlyTheDocumentedState:
+    """The regression suite for the MIS-140 rehearsal, phase by phase.
+
+    The rehearsal failed in the graph leg and left the target with all three
+    stores and the vault replaced and the graph at 0 nodes, because the stage and
+    the commit sat in one loop and the graph ran last. Under stage-then-swap each
+    phase has a documented failure state, and these tests pin all three of them.
+    """
+
+    def test_a_phase_3_staging_failure_leaves_the_target_completely_untouched(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        # Fails at the SECOND store, so the first has already been staged. If
+        # staging committed as it went -- the old behaviour -- event_store.db
+        # would now hold the artifact's three rows.
+        drop_store_from_artifact(artifact, "extraction_cache.db")
+        before = live_fingerprint(restore_target)
+
+        with pytest.raises(BackupError) as failure:
+            restore(artifact, restore_target, target_graph, backup_root)
+
+        assert live_fingerprint(restore_target) == before
+        assert row_counts(restore_target / "event_store.db") == {"conversation_turn_events": 1}
+        assert (restore_target / "vault" / "target-only.md").is_file()
+        assert target_graph.node_by_id("stale")["properties"]["name"] == "stale"
+        assert "Nothing in the target has been replaced" in str(failure.value)
+
+    def test_a_phase_3_failure_leaves_no_orphaned_staged_copies(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        # Staging is consequence-free by design, and megabytes of orphaned
+        # `.incoming` left in the target is the one way it could cost something.
+        drop_store_from_artifact(artifact, "extraction_cache.db")
+        with pytest.raises(BackupError):
+            restore(artifact, restore_target, target_graph, backup_root)
+        assert not list(restore_target.glob(f"*{STAGING_SUFFIX}"))
+
+    def test_a_phase_4_graph_failure_costs_no_store_and_no_vault_file(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        # THE HEADLINE FIX. This is the rehearsal's exact failure, and it must
+        # now leave the stores and the vault byte-for-byte the target's own.
+        before = live_fingerprint(restore_target)
+
+        with pytest.raises(GraphArtifactError):
+            restore(
+                artifact,
+                restore_target,
+                target_graph,
+                backup_root,
+                graph_writer=failing_graph_write,
+            )
+
+        assert live_fingerprint(restore_target) == before
+        assert row_counts(restore_target / "event_store.db") == {"conversation_turn_events": 1}
+        assert (restore_target / "vault" / "target-only.md").is_file()
+
+    def test_a_phase_4_failure_leaves_the_staged_copies_in_place_and_says_so(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        with pytest.raises(GraphArtifactError):
+            restore(
+                artifact,
+                restore_target,
+                target_graph,
+                backup_root,
+                graph_writer=failing_graph_write,
+            )
+        assert (restore_target / f"event_store.db{STAGING_SUFFIX}").is_file()
+        assert (restore_target / f"vault{STAGING_SUFFIX}" / "identity" / "mist.md").is_file()
+        marker = read_marker(restore_target)
+        assert marker["phases"]["staged"] is True
+        assert marker["phases"]["graph"]["committed"] is False
+        assert marker["phases"]["stores_committed"] == []
+        assert marker["phases"]["vault_committed"] is False
+
+    def test_a_phase_5_failure_commits_the_stores_before_it_and_no_others(
+        self, artifact, restore_target, target_graph, backup_root, monkeypatch
+    ):
+        # `os.replace` is atomic PER STORE: three stores are three atomic
+        # operations, not one, so the documented state after a failure at store
+        # two is store one new and stores two and three old.
+        fail_rename_onto(monkeypatch, "extraction_cache.db")
+
+        with pytest.raises(BackupError) as failure:
+            restore(artifact, restore_target, target_graph, backup_root)
+
+        assert row_counts(restore_target / "event_store.db") == {"conversation_turn_events": 3}
+        assert row_counts(restore_target / "vault_sidecar.db") == {"vault_chunks": 1}
+        assert "['event_store.db']" in str(failure.value)
+
+    def test_a_phase_5_failure_leaves_the_vault_untouched_and_the_marker_accurate(
+        self, artifact, restore_target, target_graph, backup_root, monkeypatch
+    ):
+        fail_rename_onto(monkeypatch, "extraction_cache.db")
+        with pytest.raises(BackupError):
+            restore(artifact, restore_target, target_graph, backup_root)
+
+        # The vault swap runs after every store, so it never started.
+        assert (restore_target / "vault" / "target-only.md").is_file()
+        assert not (restore_target / f"vault{VAULT_PREVIOUS_SUFFIX}").exists()
+        marker = read_marker(restore_target)
+        assert marker["phases"]["stores_committed"] == ["event_store.db"]
+        assert marker["phases"]["graph"]["committed"] is True
+        assert marker["phases"]["vault_committed"] is False
+        assert marker["phases"]["vault_previous"] is None
+
+
+class TestTheRestoreMarker:
+    """Today a graph failure leaves nothing on disk saying so. The marker is that record."""
+
+    def test_it_is_deleted_on_success(self, artifact, restore_target, target_graph, backup_root):
+        restore(artifact, restore_target, target_graph, backup_root)
+        assert not restore_progress_marker_path(restore_target).exists()
+
+    def test_it_names_the_artifact_the_target_and_the_way_back(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        with pytest.raises(GraphArtifactError):
+            restore(
+                artifact,
+                restore_target,
+                target_graph,
+                backup_root,
+                graph_writer=failing_graph_write,
+            )
+        marker = read_marker(restore_target)
+        assert marker["marker_version"] == 1
+        assert marker["artifact_dir"] == str(artifact)
+        assert marker["target_root"] == str(Path(restore_target).resolve())
+        assert marker["artifact_label"] == "source-artifact"
+        # The way back, and the first thing an operator reading this needs.
+        assert Path(marker["pre_restore_artifact"]).is_dir()
+        assert marker["started_utc"].endswith("Z")
+
+    def test_it_records_the_graph_counts_once_phase_4_has_committed(
+        self, artifact, restore_target, target_graph, backup_root, monkeypatch
+    ):
+        fail_rename_onto(monkeypatch, "event_store.db")
+        with pytest.raises(BackupError):
+            restore(artifact, restore_target, target_graph, backup_root)
+        marker = read_marker(restore_target)
+        assert marker["phases"]["graph"] == {
+            "committed": True,
+            "nodes": 3,
+            "relationships": 2,
+        }
+
+    def test_its_own_rewrite_goes_through_a_tmp_file_that_never_survives(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        # A crash during a rewrite must leave the PREVIOUS marker intact rather
+        # than a truncated one, which is what the `.tmp` plus `os.replace` buys.
+        restore(artifact, restore_target, target_graph, backup_root)
+        assert not (restore_target / f"{RESTORE_PROGRESS_FILENAME}.tmp").exists()
+
+
+class TestAPhase6CleanupFailureDoesNotFailTheRestore:
+    """The restore committed everything. A redundant directory it could not delete
+    must not turn that into a failure, and must not block the NEXT restore.
+
+    `remove_tree` raises `OSError`, which is neither a `MistError` nor a
+    `GraphArtifactError`. Without the `try`/`except` in phase 6 that exception
+    escapes `run_restore` entirely: `main`'s handler tuple misses it, a wholly
+    successful restore exits with a traceback rather than 0, and the marker --
+    deleted AFTER the cleanup -- survives, so preflight then refuses the next
+    restore. Delete the `except OSError` arm and every test here fails.
+    """
+
+    @staticmethod
+    def _fail_only_on_phase_6_cleanup(monkeypatch):
+        """Make `remove_tree` raise for phase 6's `vault.previous`, and nothing else.
+
+        Narrower than "any `vault.previous`" on purpose. Phase 5 also calls
+        `remove_tree` on that same path, to clear a stale leftover before
+        renaming the live vault aside -- so matching on the name alone fires a
+        phase early and the restore refuses at `commit_vault` instead, which is
+        a different code path than the one under test.
+
+        The two calls are told apart by whether the tree is there: phase 5's
+        pre-clear runs against a path that does not exist, phase 6's runs
+        against the tree it has just created.
+        """
+        real = restore_module.remove_tree
+
+        def fake(path):
+            if path.name.endswith(VAULT_PREVIOUS_SUFFIX) and path.exists():
+                raise OSError(5, "Access is denied")
+            return real(path)
+
+        monkeypatch.setattr(restore_module, "remove_tree", fake)
+
+    def test_the_restore_still_succeeds_and_reports_the_leftover(
+        self, artifact, restore_target, target_graph, backup_root, monkeypatch
+    ):
+        self._fail_only_on_phase_6_cleanup(monkeypatch)
+        report = restore(artifact, restore_target, target_graph, backup_root)
+        assert report.vault_previous_left_behind is not None
+        assert report.vault_previous_left_behind.name.endswith(VAULT_PREVIOUS_SUFFIX)
+        # The data legs all landed; only a redundant directory survived.
+        assert report.stores_restored
+        assert report.graph_nodes == 3
+
+    def test_the_marker_is_still_deleted_so_the_next_restore_is_not_blocked(
+        self, artifact, restore_target, target_graph, backup_root, monkeypatch
+    ):
+        # The point of the whole fix: a failed deletion must not refuse the
+        # operator's next restore, which is the recovery path.
+        self._fail_only_on_phase_6_cleanup(monkeypatch)
+        restore(artifact, restore_target, target_graph, backup_root)
+        assert not restore_progress_marker_path(restore_target).exists()
+
+    def test_a_clean_run_reports_no_leftover(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        # The control. Without it the two tests above would pass against a
+        # `vault_previous_left_behind` that was simply always set.
+        report = restore(artifact, restore_target, target_graph, backup_root)
+        assert report.vault_previous_left_behind is None
+
+
+class TestAStaleMarkerRefuses:
+    """A restore does NOT proceed over a half-applied one, and no flag makes it."""
+
+    def test_it_refuses_at_exit_2_with_the_target_untouched(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        restore_progress_marker_path(restore_target).write_text(
+            json.dumps(
+                {
+                    "marker_version": 1,
+                    "pre_restore_artifact": "/offsite/pre-restore-20260917T030000Z",
+                    "phases": {"staged": True, "graph": {"committed": False}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        before = fingerprint(restore_target)
+
+        with pytest.raises(RestoreTargetStateError) as refusal:
+            restore(artifact, restore_target, target_graph, backup_root)
+
+        # Bit-for-bit, not merely "not overwritten": this refusal is raised
+        # before the pre-restore capture, so not even a `-wal` sidecar appears.
+        assert fingerprint(restore_target) == before
+        assert target_graph.writes == []
+        assert not list(backup_root.glob("pre-restore-*"))
+        # The way back is printed, because it is the next thing the operator needs.
+        assert "/offsite/pre-restore-20260917T030000Z" in str(refusal.value)
+        assert "delete" in str(refusal.value).lower()
+
+    def test_the_refusal_is_already_exit_2_without_the_tuple_in_main_being_edited(self):
+        # `RestoreTargetStateError` subclasses `RestorePreflightError`, which
+        # `main` already catches, so this refusal reached exit 2 without any
+        # guard being widened.
+        assert issubclass(RestoreTargetStateError, RestorePreflightError)
+        assert issubclass(RestoreTargetStateError, BackupError)
+
+    def test_there_is_no_override_flag_on_the_cli(self):
+        # A `--force`-shaped flag would be a new bypass in a tool whose whole
+        # design is that it cannot be run unattended. A manual delete cannot be
+        # scripted into a cron job by accident.
+        help_text = build_parser().format_help()
+        for bypass in ("--force", "--ignore-marker", "--resume", "--no-marker"):
+            assert bypass not in help_text
+
+    def test_deleting_the_marker_by_hand_is_what_unblocks_the_re_run(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        restore_progress_marker_path(restore_target).write_text("{}", encoding="utf-8")
+        with pytest.raises(RestoreTargetStateError):
+            restore(artifact, restore_target, target_graph, backup_root)
+        restore_progress_marker_path(restore_target).unlink()
+        report = restore(artifact, restore_target, target_graph, backup_root)
+        assert report.graph_nodes == 3
+
+    def test_a_marker_this_build_cannot_parse_is_still_printed_in_full(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        restore_progress_marker_path(restore_target).write_text(
+            "marker_version: 99 (not json at all)", encoding="utf-8"
+        )
+        with pytest.raises(RestoreTargetStateError) as refusal:
+            restore(artifact, restore_target, target_graph, backup_root)
+        assert "marker_version: 99 (not json at all)" in str(refusal.value)
+
+
+class TestTheTargetPreflight:
+    """Four read-only checks, all before the pre-restore backup is spent."""
+
+    def test_a_target_graph_that_does_not_answer_refuses_before_any_dump(
+        self, artifact, restore_target, backup_root
+    ):
+        class SilentGraph(InMemoryGraphConnection):
+            def execute_query(self, query, params=None):
+                if "SHOW " in query:
+                    raise Neo4jQueryError("Query execution failed: connection reset")
+                return super().execute_query(query, params)
+
+        before = fingerprint(restore_target)
+        with pytest.raises(RestoreTargetStateError) as refusal:
+            restore(artifact, restore_target, SilentGraph(), backup_root)
+        assert fingerprint(restore_target) == before
+        assert not list(backup_root.glob("pre-restore-*"))
+        assert "did not answer its schema reads" in str(refusal.value)
+
+    def test_an_artifact_ddl_statement_whose_name_does_not_parse_is_refused(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        # An unparseable name is invisible to every name-keyed schema decision,
+        # so it silently becomes "always execute" -- the rehearsal's direct cause.
+        def unnameable(payload):
+            payload["schema"]["constraints"] = ["ALTER CONSTRAINT whatever"]
+
+        rewrite_graph_leg(artifact, unnameable)
+        before = fingerprint(restore_target)
+        with pytest.raises(RestoreTargetStateError) as refusal:
+            restore(artifact, restore_target, target_graph, backup_root)
+        assert fingerprint(restore_target) == before
+        assert target_graph.writes == []
+        assert "ALTER CONSTRAINT whatever" in str(refusal.value)
+
+    def test_too_little_free_space_refuses_before_the_target_is_touched(
+        self, artifact, restore_target, target_graph, backup_root, monkeypatch
+    ):
+        # One byte short of what the manifest says staging needs. The container's
+        # own volume has plenty, so the shortfall has to be injected; the size
+        # itself is the real, manifest-derived figure.
+        required = staged_peak_bytes(read_manifest(artifact))
+        usage = SimpleNamespace(total=required, used=required, free=required - 1)
+        monkeypatch.setattr(restore_module.shutil, "disk_usage", lambda _path: usage)
+
+        before = fingerprint(restore_target)
+        with pytest.raises(RestoreTargetStateError) as refusal:
+            restore(artifact, restore_target, target_graph, backup_root)
+        assert fingerprint(restore_target) == before
+        assert not list(backup_root.glob("pre-restore-*"))
+        assert "staging needs about" in str(refusal.value)
+
+    def test_the_space_requirement_is_sized_from_the_manifest_not_a_constant(self, artifact):
+        manifest = read_manifest(artifact)
+        stores_and_vault = sum(
+            entry["bytes"]
+            for relative, entry in manifest.files.items()
+            if relative.startswith((f"{STORES_DIRNAME}/", "vault/"))
+        )
+        # Twice the artifact's own stores-plus-vault, and the graph leg -- which
+        # is written into Neo4j, not into the target root -- is excluded.
+        assert staged_peak_bytes(manifest) == stores_and_vault * 2
+        assert manifest.files["graph.json"]["bytes"] > 0
+
+    def test_the_real_free_space_check_passes_on_a_normal_target(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        # No monkeypatch: the container's own volume is measured, so the check
+        # is exercised for real rather than only in its refusing direction.
+        assert restore(artifact, restore_target, target_graph, backup_root).graph_nodes == 3
+
+
+class TestDdlObjectNameParsing:
+    def test_it_reads_the_name_at_whichever_token_neo4j_put_it(self):
+        assert parse_ddl_object_name("CREATE CONSTRAINT `c1` FOR (n:X) REQUIRE n.id IS UNIQUE") == (
+            "c1"
+        )
+        # Token 3, not token 2: reading token 2 unconditionally returns the
+        # literal "INDEX" for every index.
+        assert parse_ddl_object_name("CREATE RANGE INDEX `i1` FOR (n:X) ON (n.id)") == "i1"
+        assert parse_ddl_object_name("CREATE VECTOR INDEX `i2` FOR (n:X) ON (n.embedding)") == "i2"
+
+    def test_an_object_actually_named_index_is_not_read_as_the_keyword(self):
+        assert parse_ddl_object_name("CREATE CONSTRAINT `index` FOR (n:X) REQUIRE n.id") == "index"
+
+    def test_a_statement_it_cannot_name_returns_none_rather_than_a_guess(self):
+        assert parse_ddl_object_name("DROP CONSTRAINT c1") is None
+        assert parse_ddl_object_name("") is None
+        assert parse_ddl_object_name("CREATE CONSTRAINT") is None
+
+
+class TestARestoreOverAReadOnlyVault:
+    """MIS-157: the live vault is a git repo, and git marks loose objects read-only."""
+
+    def test_a_vault_holding_a_read_only_entry_restores(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        # Shaped like a git loose object: `-r--r--r--`, inside `.git/objects`.
+        objects = restore_target / "vault" / ".git" / "objects" / "ab"
+        objects.mkdir(parents=True)
+        loose = objects / "cdef0123456789"
+        loose.write_bytes(b"loose object")
+        loose.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+
+        report = restore(artifact, restore_target, target_graph, backup_root)
+
+        assert report.graph_nodes == 3
+        assert (restore_target / "vault" / "identity" / "mist.md").is_file()
+        assert not (restore_target / f"vault{VAULT_PREVIOUS_SUFFIX}").exists()
+
+    def test_remove_tree_clears_a_permission_that_really_does_block_the_unlink(self, tmp_path):
+        """The one genuine non-mocked reproduction this tier can offer, and its limit.
+
+        The MIS-157 defect is Windows-specific: there a read-only FILE raises
+        `WinError 5`. On Linux a read-only file is removable, so that case cannot
+        be reproduced here at all. A read-only containing DIRECTORY can be, and
+        it raises a real `PermissionError` through the same `onerror=` handler.
+
+        So this proves the handler is wired in and that the retry succeeds once
+        the attribute is cleared. It does NOT prove the Windows read-only-file
+        behaviour; only the host rehearsal does.
+        """
+        tree = tmp_path / "vault.previous"
+        locked = tree / "objects"
+        locked.mkdir(parents=True)
+        (locked / "loose").write_bytes(b"x")
+        locked.chmod(0o555)
+
+        # Without the handler this is the failure: plain rmtree cannot unlink an
+        # entry out of a directory that denies write permission.
+        with pytest.raises(PermissionError):
+            shutil.rmtree(tree)
+
+        remove_tree(tree)
+        assert not tree.exists()
+
+
+class TestSidecarsAfterTheCommit:
+    def test_no_wal_or_shm_sits_beside_any_restored_store(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        # The artifact's copies carry no sidecars, because the capture leg
+        # checkpoints and strips them, so the correct post-restore state is a
+        # `.db` with nothing beside it.
+        report = restore(artifact, restore_target, target_graph, backup_root)
+        for filename in report.stores_restored:
+            for suffix in ("-wal", "-shm"):
+                assert not (restore_target / f"{filename}{suffix}").exists()
+
+    def test_a_stale_sidecar_survives_a_phase_4_failure_because_its_store_did(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        # The sidecar clear belongs to the COMMIT phase and not to staging:
+        # deleting the live `-wal` while staging would discard committed frames
+        # from the OLD database, which is damage before this run has committed to
+        # replacing anything.
+        (restore_target / "event_store.db-wal").write_bytes(b"old frames")
+
+        with pytest.raises(GraphArtifactError):
+            restore(
+                artifact,
+                restore_target,
+                target_graph,
+                backup_root,
+                graph_writer=failing_graph_write,
+            )
+
+        assert (restore_target / "event_store.db-wal").read_bytes() == b"old frames"
+
+
+class TestATargetThatAlreadyCarriesSchema:
+    def test_the_targets_own_constraints_and_indexes_are_replaced_by_the_artifacts(
+        self, artifact, restore_target, target_graph_with_schema, backup_root
+    ):
+        # `rt_entity_id` is the name the rehearsal target actually carried over
+        # the same schema as the artifact's `c1` under a different name.
+        report = restore(artifact, restore_target, target_graph_with_schema, backup_root)
+        assert report.graph_nodes == 3
+        assert set(target_graph_with_schema.constraints) == {"c1"}
+        assert set(target_graph_with_schema.indexes) == {"i1"}
+
+    def test_the_drop_statements_are_actually_issued(
+        self, artifact, restore_target, target_graph_with_schema, backup_root
+    ):
+        restore(artifact, restore_target, target_graph_with_schema, backup_root)
+        written = [query for query, _params in target_graph_with_schema.writes]
+        assert any(query.startswith("DROP CONSTRAINT") for query in written)
+        assert any(query.startswith("DROP INDEX") for query in written)
+
+
+class TestTheVaultFileCounts:
+    def test_git_plumbing_is_counted_separately_from_the_corpus(
+        self, backup_root, source_graph, state_root, vault_root, restore_target, target_graph
+    ):
+        # The rehearsal reported "117 vault files" as a corpus measure when it
+        # was 13 notes and 104 git objects. `.git` is captured deliberately --
+        # the live vault has no remote and its commits exist nowhere else -- so
+        # the fix is two numbers, not a narrower capture.
+        objects = vault_root / ".git" / "objects" / "ab"
+        objects.mkdir(parents=True)
+        for index in range(3):
+            (objects / f"obj{index}").write_bytes(b"loose")
+
+        captured = capture(backup_root, source_graph, state_root, vault_root, label="with-git")
+        report = restore(captured.artifact_dir, restore_target, target_graph, backup_root)
+
+        assert report.vault_corpus_files == 2
+        assert report.vault_files == 5
+
+    def test_a_vault_with_no_git_makes_the_two_counts_equal(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        report = restore(artifact, restore_target, target_graph, backup_root)
+        assert report.vault_corpus_files == report.vault_files == 2
 
 
 class TestTheCli:

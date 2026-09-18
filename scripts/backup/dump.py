@@ -15,7 +15,8 @@ WHAT IS CAPTURED
     graph.json                  every node and relationship, all partitions,
                                 embeddings as exact `list[float]`, temporals and
                                 Points tagged rather than stringified
-    vault/                      a copy of the `mist-memory/` tree
+    vault/                      a copy of the `mist-memory/` tree, INCLUDING its
+                                `.git` directory -- see `copy_vault`
     manifest.json               layout version, created_at, per-file sha256,
                                 per-store row counts, graph counts, git HEAD and
                                 the producer stamps
@@ -101,6 +102,12 @@ logger = logging.getLogger(__name__)
 GRAPH_FILENAME = "graph.json"
 VAULT_DIRNAME = "vault"
 
+# The path segment that separates git plumbing from notes when the vault tree is
+# counted. It is a name, not a path: `.git` sits at the root of the live corpus
+# today, and matching on any segment keeps the rule right for a nested
+# repository too.
+GIT_DIRNAME = ".git"
+
 # Both spellings of each live directory are expressed as one path so the same
 # code is correct on the host and inside mist-backend, where the repo is bind
 # mounted at `/app` (`grep -n "/app" docker-compose.yml`).
@@ -118,13 +125,29 @@ EXIT_DESTINATION_REFUSED = 2
 
 @dataclass(frozen=True, slots=True)
 class DumpReport:
-    """What one dump actually captured."""
+    """What one dump actually captured.
+
+    Attributes:
+        artifact_dir: The finished artifact directory, suffix already dropped.
+        stores_present: How many of `LIVE_STORE_FILENAMES` were found and copied.
+        stores_absent: The named stores that were not found under the state root.
+        graph_nodes: Nodes written into the graph leg.
+        graph_relationships: Relationships written into the graph leg.
+        vault_corpus_files: Files in the captured vault tree with no `.git` path
+            segment -- the notes, and the only one of these two numbers that
+            answers "what does this artifact hold of my corpus".
+        vault_files: EVERY file in the captured vault tree, `.git` plumbing
+            INCLUDED. On the live corpus most of this number is git objects: 13
+            notes against 104 objects when it was last measured. It is a measure
+            of the artifact, never of the corpus.
+    """
 
     artifact_dir: Path
     stores_present: int
     stores_absent: tuple[str, ...]
     graph_nodes: int
     graph_relationships: int
+    vault_corpus_files: int
     vault_files: int
     # Empty on a complete count. Non-empty means the affected STORE COPIES
     # passed `integrity_check` and their row counts are partial -- see
@@ -159,19 +182,71 @@ def read_git_head(repo_root: Path = REPO_ROOT) -> str | None:
     return head or None
 
 
-def copy_vault(vault_root: Path, artifact_dir: Path) -> int:
-    """Copy the vault corpus into the artifact; return the file count.
+def count_vault_files(vault_root: Path) -> tuple[int, int]:
+    """Count a vault tree twice: corpus notes, and every file including git plumbing.
 
-    An absent vault root returns 0 rather than raising. It is absent in every
-    fresh clone -- `mist-memory/` is gitignored with zero tracked files -- and a
-    dump that refused to run there would be a dump nobody could test.
+    TWO NUMBERS BECAUSE ONE OF THEM WAS MISLEADING. The MIS-140 rehearsal
+    reported "117 vault files" as though that measured the corpus. Measured on
+    the host it was 13 notes and 104 git objects -- 89% plumbing -- and an
+    operator reading that line after a disaster recovery could not tell whether
+    their notes had come back.
+
+    THE RESTORE LEG IMPORTS THIS ONE rather than carrying its own copy
+    (`grep -n "count_vault_files" scripts/backup/restore.py`). The direction is
+    forced: `restore.py` already imports from this module
+    (`grep -n "from .dump import" scripts/backup/restore.py`), so this module
+    cannot import back from it without a cycle. Both legs must count by the same
+    rule or the capture and the restore would report the same tree differently,
+    which is the ambiguity this function exists to remove.
+
+    Args:
+        vault_root: The tree to count. A path that does not exist counts as
+            `(0, 0)` rather than raising.
+
+    Returns:
+        `(corpus, total)`. `corpus` counts files with no `.git` path segment --
+        the notes. `total` counts every file in the tree, plumbing included.
+    """
+    if not vault_root.is_dir():
+        return (0, 0)
+    corpus = 0
+    total = 0
+    for path in vault_root.rglob("*"):
+        if not path.is_file():
+            continue
+        total += 1
+        if GIT_DIRNAME not in path.relative_to(vault_root).parts:
+            corpus += 1
+    return (corpus, total)
+
+
+def copy_vault(vault_root: Path, artifact_dir: Path) -> tuple[int, int]:
+    """Copy the vault corpus into the artifact; return `(corpus_files, total_files)`.
+
+    An absent vault root returns `(0, 0)` rather than raising. It is absent in
+    every fresh clone -- `mist-memory/` is gitignored with zero tracked files --
+    and a dump that refused to run there would be a dump nobody could test.
+
+    THE WHOLE TREE IS COPIED, `.git` INCLUDED, AND THAT IS DELIBERATE. There is
+    no `ignore=` here on purpose: the live `mist-memory/` is a git repository
+    with no remote and no upstream, so its commits exist nowhere else, and
+    excluding `.git` would introduce a new data-loss mode inside a tool whose
+    whole job is to remove them. The two counts exist so that keeping the
+    plumbing does not also mean reporting it as notes.
+
+    KEEPING `.git` HAS A RECURRING COST, WHICH IS WORTH STATING RATHER THAN
+    DISCOVERING. `digest_artifact_files` rglobs every file in the artifact
+    (`grep -n "def digest_artifact_files" scripts/backup/manifest.py` -> :83),
+    so every git loose object is sha256'd at capture -- and re-digested by
+    `verify_artifact_files` on every restore preflight. The cost is not paid once
+    in bytes; it is paid again on each preflight.
 
     Raises:
         BackupError: When the tree exists but cannot be copied.
     """
     destination = artifact_dir / VAULT_DIRNAME
     if not vault_root.is_dir():
-        return 0
+        return (0, 0)
     try:
         shutil.copytree(vault_root, destination)
     except OSError as exc:
@@ -180,7 +255,7 @@ def copy_vault(vault_root: Path, artifact_dir: Path) -> int:
             "backed up by nothing else -- it is gitignored and untracked -- so the "
             "dump fails rather than completing without it."
         ) from exc
-    return sum(1 for path in destination.rglob("*") if path.is_file())
+    return count_vault_files(destination)
 
 
 def capture_graph(
@@ -285,7 +360,7 @@ def run_dump(
 
     working_dir.mkdir(parents=True)
     captures = capture_stores(state, working_dir)
-    vault_files = copy_vault(vault, working_dir)
+    vault_corpus_files, vault_files = copy_vault(vault, working_dir)
     graph_entry = capture_graph(
         connection,
         working_dir,
@@ -311,9 +386,18 @@ def run_dump(
         files=digest_artifact_files(working_dir),
         stores={c.filename: c.to_manifest_entry() for c in captures},
         graph=graph_entry,
+        # `corpus_file_count` is ADDED beside `file_count` rather than
+        # redefining it. `BackupManifest` carries no version field of its own
+        # (`grep -n "class BackupManifest" scripts/backup/manifest.py` -> :104),
+        # so an old manifest and a new one would disagree about what
+        # `file_count` means with nothing to tell them apart. Adding a key is
+        # backward compatible; redefining one in an unversioned persisted format
+        # is not. `file_count` therefore keeps its original meaning -- every
+        # file, `.git` included -- and the new key carries the corpus measure.
         vault={
             "directory": VAULT_DIRNAME,
             "source_present": vault.is_dir(),
+            "corpus_file_count": vault_corpus_files,
             "file_count": vault_files,
         },
         excluded=list(EXCLUDED_FROM_STATE_ROOT),
@@ -328,6 +412,7 @@ def run_dump(
         stores_absent=absent,
         graph_nodes=graph_entry["nodes"],
         graph_relationships=graph_entry["relationships"],
+        vault_corpus_files=vault_corpus_files,
         vault_files=vault_files,
         stores_uncounted=uncounted_from_captures(captures),
     )
@@ -375,6 +460,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Log at DEBUG level.",
     )
     return parser
+
+
+def _print_report(report: DumpReport) -> None:
+    """Print what one dump captured, with both vault numbers labelled.
+
+    A FUNCTION RATHER THAN A BLOCK INSIDE `main` SO IT CAN BE TESTED. `main`
+    imports the neo4j driver and opens a live connection, so the unit tier
+    cannot reach the lines below through it; the restore leg splits its own
+    printing out for the same reason
+    (`grep -n "def _print_report" scripts/backup/restore.py` -> :1379).
+
+    The two vault numbers are printed side by side and each is labelled with
+    what it counts. A single "N vault file(s)" line read as a corpus measure is
+    how the rehearsal came to report 117 notes when 13 were notes and 104 were
+    git objects, so neither number is printed bare.
+    """
+    print(
+        f"[backup] Wrote {report.artifact_dir} -- "
+        f"{report.stores_present} of {len(LIVE_STORE_FILENAMES)} stores, "
+        f"{report.graph_nodes} nodes, {report.graph_relationships} relationships, "
+        f"{report.vault_corpus_files} vault corpus file(s) "
+        f"({report.vault_files} including .git plumbing)."
+    )
+    for filename in report.stores_absent:
+        print(f"[backup] WARNING: named store {filename} was not found under the state root.")
+    for uncounted in report.stores_uncounted:
+        print(f"[backup] WARNING: {uncounted.warning()}")
+    if report.vault_files == 0:
+        print("[backup] WARNING: the vault leg captured no files at all.")
+    elif report.vault_corpus_files == 0:
+        # A state the single count could not express: the tree WAS copied, and
+        # every file in it is git plumbing, so the artifact restores no notes.
+        print(
+            f"[backup] WARNING: the vault leg captured {report.vault_files} file(s) and "
+            "not one corpus note; all of it is .git plumbing."
+        )
+    if report.graph_nodes == 0:
+        print("[backup] WARNING: the graph is empty; this artifact restores no nodes.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -430,20 +553,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         connection.disconnect()
 
-    print(
-        f"[backup] Wrote {report.artifact_dir} -- "
-        f"{report.stores_present} of {len(LIVE_STORE_FILENAMES)} stores, "
-        f"{report.graph_nodes} nodes, {report.graph_relationships} relationships, "
-        f"{report.vault_files} vault files."
-    )
-    for filename in report.stores_absent:
-        print(f"[backup] WARNING: named store {filename} was not found under the state root.")
-    for uncounted in report.stores_uncounted:
-        print(f"[backup] WARNING: {uncounted.warning()}")
-    if report.vault_files == 0:
-        print("[backup] WARNING: the vault leg captured no files.")
-    if report.graph_nodes == 0:
-        print("[backup] WARNING: the graph is empty; this artifact restores no nodes.")
+    _print_report(report)
     return EXIT_OK
 
 

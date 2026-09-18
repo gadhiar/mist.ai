@@ -981,15 +981,16 @@ def dump_full_graph_artifact(
 
 
 def _quote_graph_ident(name: str) -> str:
-    """Backtick-quote a label or relationship type for a restore statement.
+    """Backtick-quote a graph identifier for a restore statement.
 
-    Labels and relationship types cannot be parameterized in Cypher, so they are
-    interpolated. The values come from an artifact rather than from a live
-    prompt, but a backtick inside one would still break out of the quoting, so
-    it is refused rather than escaped.
+    Labels, relationship types and schema object names cannot be parameterized
+    in Cypher, so they are interpolated. The values come from an artifact or
+    from the target server's own catalogue rather than from a live prompt, but a
+    backtick inside one would still break out of the quoting, so it is refused
+    rather than escaped.
     """
     if not name or "`" in name:
-        raise GraphArtifactError(f"refusing unquotable label or relationship type {name!r}")
+        raise GraphArtifactError(f"refusing unquotable graph identifier {name!r}")
     return f"`{name}`"
 
 
@@ -1059,6 +1060,11 @@ def clear_graph(connection: GraphConnection) -> int:
     delete in a single transaction and can exhaust heap on a graph large enough
     to be worth backing up.
 
+    DATA ONLY. Deleting every node leaves every constraint and index standing --
+    that is exactly how the MIS-140 rehearsal target reached 0 nodes while still
+    holding the constraint that then rejected the artifact's DDL. `replace_graph_schema`
+    is the other half of the clear; `restore_graph_from_artifact` calls both.
+
     Returns:
         The number of nodes deleted.
     """
@@ -1071,6 +1077,67 @@ def clear_graph(connection: GraphConnection) -> int:
         deleted += batch
         if batch == 0:
             return deleted
+
+
+def drop_graph_schema(connection: GraphConnection) -> list[str]:
+    """Drop every constraint and every droppable index the TARGET currently holds.
+
+    The drop set is read from the LIVE server, never derived from the artifact.
+    A target can carry an object the artifact has never heard of, and that is
+    the defect this closes rather than an edge case: the MIS-140 rehearsal
+    target held a constraint named `rt_entity_id` over the same
+    `(:__Entity__ {id})` schema as the artifact's, under a name that appears
+    nowhere in this repository (`grep -rn "rt_entity_id" .` -> no hits). A name
+    the repository does not control cannot be anticipated from the artifact
+    side, so skipping by name is structurally insufficient.
+
+    Two orderings are load-bearing:
+
+    - Constraints are dropped first. Dropping a constraint drops the index it
+      owns, so dropping that index first fails.
+    - The index list is read AFTER the constraints are gone, so what it returns
+      is exactly what is left to drop.
+
+    LOOKUP indexes are excluded, matching the capture filter in
+    `read_schema_ddl` (`grep -n "type <> 'LOOKUP'" backend/knowledge/admin.py`).
+    The server creates and maintains them and no artifact re-creates one, so
+    dropping a LOOKUP index would permanently strip a server-maintained index
+    from the restored graph -- a silent retrieval degradation rather than a
+    failure. `HYDRATION_SCAFFOLDING_INDEX` is NOT excluded: unlike a LOOKUP
+    index it is another tool's leftover scaffolding, so leaving it standing
+    would leave the restored target holding an object the artifact does not
+    describe.
+
+    `DROP ... IF EXISTS` rather than a bare DROP, and note that this is not the
+    mirror of `CREATE ... IF NOT EXISTS`, which is deliberately not used here:
+    `IF NOT EXISTS` is silent when an object of the same name but a DIFFERENT
+    definition already exists, which is precisely the case that must not pass
+    unnoticed. `IF EXISTS` has no definition to be silent about -- it only
+    absorbs the gap between the read and the write.
+
+    Returns:
+        The object names dropped: constraints first, then indexes, each group
+        ordered by name.
+    """
+    dropped: list[str] = []
+
+    constraints = connection.execute_query("SHOW CONSTRAINTS YIELD name RETURN name ORDER BY name")
+    for row in constraints:
+        name = row["name"]
+        connection.execute_write(f"DROP CONSTRAINT {_quote_graph_ident(name)} IF EXISTS")
+        dropped.append(name)
+
+    indexes = connection.execute_query(
+        "SHOW INDEXES YIELD name, type, owningConstraint "
+        "WHERE owningConstraint IS NULL AND type <> 'LOOKUP' "
+        "RETURN name ORDER BY name"
+    )
+    for row in indexes:
+        name = row["name"]
+        connection.execute_write(f"DROP INDEX {_quote_graph_ident(name)} IF EXISTS")
+        dropped.append(name)
+
+    return dropped
 
 
 def _ddl_object_name(statement: str) -> str | None:
@@ -1097,6 +1164,118 @@ def _ddl_object_name(statement: str) -> str | None:
     return None
 
 
+def _schema_ddl_by_name(statements: Sequence[str]) -> dict[str, str]:
+    """Index captured DDL by the object name each statement creates.
+
+    A statement whose name cannot be parsed is dropped from the index rather
+    than keyed on the raw text: it is only used for the divergence REPORT, and a
+    statement that cannot be named cannot be compared against one that can.
+    """
+    indexed: dict[str, str] = {}
+    for statement in statements:
+        name = _ddl_object_name(statement)
+        if name is not None:
+            indexed[name] = statement
+    return indexed
+
+
+def report_schema_divergence(
+    target: dict[str, list[str]], artifact: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    """Log how the target's schema differs from the artifact's, BEFORE it is replaced.
+
+    A restore's contract is that the target BECOMES the artifact, so a
+    divergence is converged rather than refused: refusing would block recovery
+    at exactly the moment someone is recovering. The requirement is that the
+    convergence is not silent. Once `drop_graph_schema` has run, the target's
+    own schema exists nowhere else, so this log is the only record that it did.
+
+    Two kinds are reported separately because they mean different things:
+
+    - `replaced`: the target and the artifact both define an object of that
+      name, with different text. The target's definition is about to be
+      discarded in favour of the artifact's.
+    - `removed`: the target defines an object the artifact does not name at all.
+      This covers the `rt_entity_id` case -- an equivalent constraint under a
+      name the artifact never used -- and it is also the fix for schema
+      accumulating monotonically across restores.
+
+    The comparison is on the server's own `createStatement` text. Two servers
+    rendering one definition differently would be reported as a divergence that
+    is not one; that is acceptable because the report is advisory and the action
+    taken is identical either way.
+
+    Args:
+        target: `read_schema_ddl` output for the live target.
+        artifact: The `schema` block of the artifact being restored.
+
+    Returns:
+        `{"replaced": [<name>, ...], "removed": [<name>, ...]}`, each sorted.
+    """
+    target_ddl = _schema_ddl_by_name(
+        list(target.get("constraints", [])) + list(target.get("indexes", []))
+    )
+    artifact_ddl = _schema_ddl_by_name(
+        list(artifact.get("constraints", [])) + list(artifact.get("indexes", []))
+    )
+
+    replaced = sorted(
+        name
+        for name, statement in target_ddl.items()
+        if name in artifact_ddl and artifact_ddl[name] != statement
+    )
+    removed = sorted(name for name in target_ddl if name not in artifact_ddl)
+
+    if replaced:
+        logger.warning(
+            "[graph-restore] %d schema object(s) exist on the target under the same name "
+            "with a DIFFERENT definition and are being replaced by the artifact's: %s. "
+            "Target definitions discarded: %s",
+            len(replaced),
+            replaced,
+            [target_ddl[name] for name in replaced],
+        )
+    if removed:
+        logger.warning(
+            "[graph-restore] %d schema object(s) on the target are not in the artifact "
+            "and are being dropped: %s. Definitions discarded: %s",
+            len(removed),
+            removed,
+            [target_ddl[name] for name in removed],
+        )
+
+    return {"replaced": replaced, "removed": removed}
+
+
+def replace_graph_schema(connection: GraphConnection, schema: dict[str, list[str]]) -> int:
+    """Make the target's schema EQUAL the artifact's, rather than merged with it.
+
+    Drop-and-recreate, not `CREATE ... IF NOT EXISTS`. The Cypher manual states
+    that `IF NOT EXISTS` throws nothing and creates nothing when an object with
+    the given name, OR another constraint of the same type and schema under any
+    name, already exists -- so it is silent in the same-name-DIFFERENT-definition
+    case too, which is the one case that must not pass unnoticed. A second
+    reason: captured DDL is the server's own `createStatement` and carries no
+    `IF NOT EXISTS`, so adding one means inserting a token at a position that
+    differs between CONSTRAINT, RANGE INDEX and VECTOR INDEX -- the same
+    positional hazard `_ddl_object_name` records as having already bitten once.
+
+    Order: read the target's schema, report how it diverges, drop it, apply the
+    artifact's. The report has to precede the drop because the drop is what
+    destroys the evidence.
+
+    Returns:
+        The number of artifact statements executed. Drops are deliberately NOT
+        counted: this number is surfaced to the operator as "applied N schema
+        statements" (`grep -n "schema statements" scripts/mist_admin.py`), and
+        folding the target's object count into it would make that line describe
+        the target rather than the artifact.
+    """
+    report_schema_divergence(read_schema_ddl(connection), schema)
+    drop_graph_schema(connection)
+    return apply_schema_ddl(connection, schema)
+
+
 def apply_schema_ddl(connection: GraphConnection, schema: dict[str, list[str]]) -> int:
     """Replay captured DDL, skipping anything already present BY NAME.
 
@@ -1104,6 +1283,14 @@ def apply_schema_ddl(connection: GraphConnection, schema: dict[str, list[str]]) 
     exists" error: an exception-swallowing loop here would also swallow a
     genuinely malformed statement and leave the restored graph silently
     unindexed, which shows up as degraded retrieval rather than as a failure.
+    That reasoning is unchanged and is why no `try` appears around the write.
+
+    The skip itself is no longer the restore path's defence. Skipping by name
+    could not see an equivalent constraint under a DIFFERENT name, and it made
+    schema accumulate monotonically because this function only ever adds.
+    `replace_graph_schema` drops the target's schema first, so on that path
+    nothing is ever skipped. The check stays for a caller that replays DDL onto
+    a target it has not cleared.
 
     Returns:
         The number of statements actually executed.
@@ -1127,8 +1314,12 @@ def restore_graph_from_artifact(
 ) -> dict[str, int]:
     """Load a decoded artifact into a graph, replacing whatever is there.
 
-    DESTRUCTIVE: the target is detach-deleted first, so a restore into the wrong
-    instance destroys it. The caller is responsible for the isolation guard --
+    DESTRUCTIVE: the target is detach-deleted AND its schema is dropped first,
+    so a restore into the wrong instance destroys it. The schema drop is not
+    tidiness: node deletion leaves constraints and indexes standing, so a target
+    that already carries schema would otherwise reject the artifact's DDL and
+    accumulate whatever it held on top of it. See `replace_graph_schema`.
+    The caller is responsible for the isolation guard --
     `assert_neo4j_dev_isolated` in `scripts/mist_admin.py` -- because the URI is
     a CLI/config concern and a guard buried here could be bypassed by any other
     caller of this function.
@@ -1144,6 +1335,8 @@ def restore_graph_from_artifact(
 
     Returns:
         `{"deleted": int, "schema_statements": int, "nodes": int, "relationships": int}`.
+        `schema_statements` counts the ARTIFACT's statements executed, not the
+        target's objects dropped; `scripts/backup/restore.py` reads all four keys.
 
     Raises:
         GraphArtifactError: When an endpoint cannot be re-anchored, a label is
@@ -1160,7 +1353,7 @@ def restore_graph_from_artifact(
     assert_artifact_is_relinkable(artifact)
 
     deleted = clear_graph(connection)
-    schema_statements = apply_schema_ddl(connection, artifact.get("schema", {}))
+    schema_statements = replace_graph_schema(connection, artifact.get("schema", {}))
 
     by_labels: dict[tuple[str, ...], list[dict[str, Any]]] = {}
     for node in artifact["nodes"]:
