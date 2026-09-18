@@ -1,6 +1,7 @@
 """Capture and restore around the codec: `admin` and the `graph-restore` guard.
 
-Subjects: `dump_full_graph_artifact`, `read_schema_ddl`,
+Subjects: `dump_full_graph_artifact`, `read_schema_ddl`, `drop_graph_schema`,
+`report_schema_divergence`, `replace_graph_schema`,
 `restore_graph_from_artifact` in `backend/knowledge/admin.py`, and
 `cmd_graph_restore` in `scripts/mist_admin.py`.
 
