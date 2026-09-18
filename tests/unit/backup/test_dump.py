@@ -290,8 +290,9 @@ class TestVaultCounts:
     else.
     """
 
-    # Three files under `.git/`, deliberately spread over a nested directory and
-    # the repository root so the count cannot pass by matching only one depth.
+    # Three files under `.git/`: two directly inside it and one nested two
+    # levels deeper, so a rule that only matched the first level under the vault
+    # root, or only the immediate parent directory, would not pass this.
     GIT_FILES = (".git/HEAD", ".git/config", ".git/objects/ab/cdef01")
 
     @pytest.fixture
