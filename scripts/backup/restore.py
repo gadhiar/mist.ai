@@ -136,7 +136,7 @@ from backend.knowledge.eval_isolation import EvalIsolationError, assert_neo4j_de
 from backend.knowledge.graph_artifact import GraphArtifactError, load_artifact
 
 from .destination import resolve_backup_root
-from .dump import GRAPH_FILENAME, VAULT_DIRNAME, DumpReport, run_dump
+from .dump import GRAPH_FILENAME, VAULT_DIRNAME, DumpReport, count_vault_files, run_dump
 from .errors import (
     BackupDestinationError,
     BackupError,
@@ -579,40 +579,6 @@ def commit_stores(
         if on_commit is not None:
             on_commit(entry.filename)
     return committed
-
-
-def count_vault_files(vault_root: Path) -> tuple[int, int]:
-    """Count a vault tree twice: corpus notes, and every file including git plumbing.
-
-    TWO NUMBERS BECAUSE ONE OF THEM WAS MISLEADING. The rehearsal reported "117
-    vault files" as though that measured the corpus. Measured on the host it was
-    13 notes and 104 git objects -- 89% plumbing -- and an operator reading that
-    line after a recovery could not tell whether their notes had come back.
-
-    `.git` is captured deliberately and must stay captured: the live
-    `mist-memory/` is a git repository with no remote and no upstream, so its
-    commits exist nowhere else and excluding them would introduce a new
-    data-loss mode. It just must not be counted as notes.
-
-    Args:
-        vault_root: The tree to count. A path that does not exist counts as
-            `(0, 0)` rather than raising.
-
-    Returns:
-        `(corpus, total)`. `corpus` counts files with no `.git` path segment --
-        the notes. `total` counts every file in the tree, plumbing included.
-    """
-    if not vault_root.is_dir():
-        return (0, 0)
-    corpus = 0
-    total = 0
-    for path in vault_root.rglob("*"):
-        if not path.is_file():
-            continue
-        total += 1
-        if ".git" not in path.relative_to(vault_root).parts:
-            corpus += 1
-    return (corpus, total)
 
 
 def stage_vault(artifact_dir: Path, target_vault_root: Path) -> Path | None:

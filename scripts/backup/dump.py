@@ -191,14 +191,13 @@ def count_vault_files(vault_root: Path) -> tuple[int, int]:
     operator reading that line after a disaster recovery could not tell whether
     their notes had come back.
 
-    `scripts/backup/restore.py` carries an identical `count_vault_files`
-    (`grep -n "def count_vault_files" scripts/backup/restore.py` -> :584),
-    written by the restore-side task that landed first. The two are not shared
-    because `restore.py` already imports from this module
-    (`grep -n "from .dump import" scripts/backup/restore.py` -> :139), so this
-    module cannot import back from it, and `restore.py` was outside the write
-    zone of the task that added this copy. Collapsing them -- restore importing
-    this one -- is a one-line follow-up, not a behaviour change.
+    THE RESTORE LEG IMPORTS THIS ONE rather than carrying its own copy
+    (`grep -n "count_vault_files" scripts/backup/restore.py`). The direction is
+    forced: `restore.py` already imports from this module
+    (`grep -n "from .dump import" scripts/backup/restore.py`), so this module
+    cannot import back from it without a cycle. Both legs must count by the same
+    rule or the capture and the restore would report the same tree differently,
+    which is the ambiguity this function exists to remove.
 
     Args:
         vault_root: The tree to count. A path that does not exist counts as
