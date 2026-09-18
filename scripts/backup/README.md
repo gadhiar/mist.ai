@@ -402,12 +402,19 @@ Named, because a runbook listing only the handled ones reads as a guarantee:
 - A STORE-LEG FAILURE AT STORE 2 OF 3, as above: a target that is a mixture of two points in time
   rather than either of them. The commonest cause of a failed rename is a backend still running
   against the target and holding a store open.
-- PHASE 6'S REMOVAL OF `vault.previous` IS NOT TRANSLATED INTO THIS PACKAGE'S OWN ERROR TYPE.
-  `remove_tree` raises `OSError`, which is neither `MistError` nor `GraphArtifactError`, and
-  `main`'s handler tuple names neither, so such a failure escapes as a traceback rather than a
-  `[restore] FAILED:` line. The restore has SUCCEEDED by that point -- stores, vault and graph are
-  all the artifact's -- but the marker is left behind and so is `vault.previous/`. Treat it as
-  case C in 4.7.
+- PHASE 6'S REMOVAL OF `vault.previous` IS NOT A FAILURE MODE OF THE RESTORE. It is the one step
+  whose failure is caught and downgraded to a warning. By the time it runs the restore has
+  SUCCEEDED -- stores, vault and graph are all the artifact's -- and `vault.previous/` is a
+  redundant second copy of the target's old vault, which the pre-restore artifact also holds. So a
+  failed deletion prints a `[restore] WARNING:` line naming the directory, still deletes the
+  marker, and still exits 0. Remove the directory by hand.
+
+  It is written that way deliberately. Left uncaught, `remove_tree`'s `OSError` is neither a
+  `MistError` nor a `GraphArtifactError`, so `main`'s handler tuple would miss it: a restore that
+  did everything right would exit with a traceback instead of 0, AND leave the marker behind --
+  which makes the next restore refuse (4.6). That would turn a failed deletion of a redundant
+  directory into a block on the recovery path, at the moment someone is recovering, which is the
+  shape of MIS-157 itself. A recovery tool must not withhold recovery to make a point.
 
 ### 4.6 `restore.in-progress.json`: the file that says what state you are in
 
@@ -434,7 +441,7 @@ It is JSON, indented and key-sorted, so `cat` is enough:
 | `phases.graph.nodes`, `.relationships`| What phase 4 loaded. `0` until it completes.                                                                                                     |
 | `phases.stores_committed`             | The store filenames already `os.replace`d onto their live names, in commit order. A list rather than a flag, because the commit is atomic per store. |
 | `phases.vault_committed`              | Both vault renames completed.                                                                                                                    |
-| `phases.vault_previous`               | Where the target's previous vault tree was renamed aside, WHILE IT STILL EXISTS. `null` before phase 5 and after phase 6. A non-null value names a directory holding the target's own notes. |
+| `phases.vault_previous`               | Where the target's previous vault tree was renamed aside, WHILE IT STILL EXISTS. `null` before phase 5, and cleared after phase 6 only when the removal actually succeeded -- a cleanup that failed leaves the path recorded rather than claiming a deletion that did not happen. A non-null value names a directory holding the target's own notes. |
 
 The marker is rewritten through its own `.tmp` and an `os.replace`, so a crash during a rewrite
 leaves the PREVIOUS marker intact rather than a truncated one.
@@ -471,7 +478,7 @@ SHORT list there is a phase-5 failure part way through the stores.
 | `staged: true`, `graph.committed: false`                           | ITS OWN stores and vault. A graph that is empty or partially loaded.                               | Case A.                                                              |
 | `graph.committed: true`, `stores_committed` shorter than the artifact's store list | The artifact's graph. A MIXTURE of the artifact's stores and its own. Its own vault. | Case B.                                                              |
 | `stores_committed` complete, `vault_committed: false`              | The artifact's graph and stores. Its own vault.                                                    | Case B.                                                              |
-| `vault_committed: true`, `vault_previous` non-null                 | The artifact's graph, stores and vault. The restore landed and cleanup did not.                    | Case C.                                                              |
+| `vault_committed: true`, `vault_previous` non-null                 | The artifact's graph, stores and vault. Phase 5 landed and phase 6 did not run.                     | Case C.                                                              |
 
 CASE A -- THE GRAPH LEG FAILED. The stores and the vault on disk are still the target's own, so
 the loss is confined to the graph. Two routes, and they are not equivalent:
@@ -486,11 +493,19 @@ CASE B -- THE COMMIT LEG FAILED PART WAY. The target is a mixture of two points 
 the one state not to leave it in. Stop whatever is running against it first -- a backend holding a
 store open is the usual reason a rename failed -- then do step 2.
 
-CASE C -- ONLY CLEANUP FAILED. The restore itself landed. Check `vault/` holds what you expect,
-then clear the leftovers by hand:
+CASE C -- ONLY THE CLEANUP IS OUTSTANDING. The restore itself landed. There are two ways you get
+here, and only one of them leaves a marker:
+
+- The run exited 0 and printed `[restore] WARNING: ... could not be removed`. Phase 6 could not
+  delete `vault.previous/`, said so, and finished anyway. There is NO marker -- it is deleted even
+  on this path, so that a directory nobody needs cannot refuse your next restore.
+- The run was killed between phase 5 and phase 6. Then the marker is still there, with
+  `vault_committed: true` and `vault_previous` non-null.
+
+Either way the target is correct. Check `vault/` holds what you expect, then clear what is left:
 
     rm -rf <target-root>/vault.previous
-    rm <target-root>/restore.in-progress.json
+    rm -f <target-root>/restore.in-progress.json
 
 #### Step 2: restore the pre-restore artifact back
 
@@ -518,6 +533,12 @@ Four things to know before running it:
   removal sits behind the "target has a vault to rename aside" branch. If the failed run died
   between the two vault renames, rename the tree you want back into place by hand BEFORE
   re-running, and delete the other afterwards. Both trees are intact; only the names are wrong.
+
+  CHECK ITS DATE BEFORE YOU REASON ABOUT IT. A `vault.previous/` you find is not necessarily from
+  the run that just failed: phase 6 can decline to remove one (4.5), and a re-run with `vault/`
+  present renames the live tree over that name only after clearing it. An operator who assumes the
+  directory belongs to this run will reconstruct the wrong failure. The marker's `started_utc`, and
+  the directory's own mtime, are what tell you which run left it.
 - IT PUTS BACK ONLY WHAT THE DUMP LEG CAPTURES. `data/vector_store/` is excluded from every
   artifact (section 2), and a store the manifest records as absent is left as the target's own.
 

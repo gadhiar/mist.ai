@@ -212,6 +212,9 @@ class RestoreReport:
         graph_nodes: Nodes loaded in phase 4.
         graph_relationships: Relationships loaded in phase 4.
         schema_statements: Artifact DDL statements executed in phase 4.
+        vault_previous_left_behind: Set only when phase 6 could not delete
+            `vault.previous`. The restore SUCCEEDED; this names a redundant
+            directory the operator must remove by hand.
     """
 
     artifact_dir: Path
@@ -225,6 +228,7 @@ class RestoreReport:
     graph_nodes: int
     graph_relationships: int
     schema_statements: int
+    vault_previous_left_behind: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1240,10 +1244,39 @@ def run_restore(
 
     # PHASE 6. The previous tree is redundant once the swap has landed: the
     # pre-restore artifact already holds it.
+    #
+    # A FAILURE HERE DOES NOT FAIL THE RESTORE, and the `except` is the whole
+    # point. `remove_tree` raises `OSError`, which is neither a `MistError` nor a
+    # `GraphArtifactError`, so without this arm `main`'s handler tuple misses it:
+    # a restore that committed every store, swapped the vault and loaded the
+    # graph would exit with a traceback instead of 0, AND leave the marker
+    # behind -- which makes preflight refuse the NEXT restore. That turns a
+    # failed deletion of a redundant directory into a block on the recovery
+    # path, at the moment someone is recovering. It is the shape of MIS-157
+    # itself: the first restore works and every later one does not.
+    #
+    # `vault.previous` is redundant BY CONSTRUCTION -- the pre-restore artifact
+    # taken in phase 2 already holds that tree -- so nothing is at risk when the
+    # deletion fails. The operator is told, loudly, and is not stopped.
+    vault_previous_left_behind: Path | None = None
     if vault_previous is not None:
-        remove_tree(vault_previous)
-        marker = replace(marker, vault_previous=None)
-        marker.write(resolved_target)
+        try:
+            remove_tree(vault_previous)
+        except OSError as exc:
+            vault_previous_left_behind = vault_previous
+            logger.warning(
+                "[restore] the restore SUCCEEDED, but %s could not be removed (%s). "
+                "That tree is a redundant copy of the target's previous vault -- the "
+                "pre-restore artifact holds it too -- so nothing is lost. Remove it by "
+                "hand.",
+                vault_previous,
+                exc,
+            )
+        else:
+            # Only on success: clearing this field on a failed deletion would
+            # make the record claim a cleanup that did not happen.
+            marker = replace(marker, vault_previous=None)
+            marker.write(resolved_target)
 
     restore_progress_marker_path(resolved_target).unlink(missing_ok=True)
 
@@ -1262,6 +1295,7 @@ def run_restore(
         graph_nodes=int(graph["nodes"]),
         graph_relationships=int(graph["relationships"]),
         schema_statements=int(graph["schema_statements"]),
+        vault_previous_left_behind=vault_previous_left_behind,
     )
 
 
@@ -1365,6 +1399,13 @@ def _print_report(report: RestoreReport) -> None:
         print(
             f"[restore] WARNING: {filename} was absent when this artifact was taken, "
             "so the target keeps its own copy of it."
+        )
+    if report.vault_previous_left_behind is not None:
+        print(
+            f"[restore] WARNING: {report.vault_previous_left_behind} could not be "
+            "removed. The restore succeeded and that tree is a redundant copy of the "
+            "target's previous vault, which the pre-restore artifact also holds. "
+            "Remove it by hand."
         )
 
 

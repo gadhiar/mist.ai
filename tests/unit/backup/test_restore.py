@@ -735,6 +735,70 @@ class TestTheRestoreMarker:
         assert not (restore_target / f"{RESTORE_PROGRESS_FILENAME}.tmp").exists()
 
 
+class TestAPhase6CleanupFailureDoesNotFailTheRestore:
+    """The restore committed everything. A redundant directory it could not delete
+    must not turn that into a failure, and must not block the NEXT restore.
+
+    `remove_tree` raises `OSError`, which is neither a `MistError` nor a
+    `GraphArtifactError`. Without the `try`/`except` in phase 6 that exception
+    escapes `run_restore` entirely: `main`'s handler tuple misses it, a wholly
+    successful restore exits with a traceback rather than 0, and the marker --
+    deleted AFTER the cleanup -- survives, so preflight then refuses the next
+    restore. Delete the `except OSError` arm and every test here fails.
+    """
+
+    @staticmethod
+    def _fail_only_on_phase_6_cleanup(monkeypatch):
+        """Make `remove_tree` raise for phase 6's `vault.previous`, and nothing else.
+
+        Narrower than "any `vault.previous`" on purpose. Phase 5 also calls
+        `remove_tree` on that same path, to clear a stale leftover before
+        renaming the live vault aside -- so matching on the name alone fires a
+        phase early and the restore refuses at `commit_vault` instead, which is
+        a different code path than the one under test.
+
+        The two calls are told apart by whether the tree is there: phase 5's
+        pre-clear runs against a path that does not exist, phase 6's runs
+        against the tree it has just created.
+        """
+        real = restore_module.remove_tree
+
+        def fake(path):
+            if path.name.endswith(VAULT_PREVIOUS_SUFFIX) and path.exists():
+                raise OSError(5, "Access is denied")
+            return real(path)
+
+        monkeypatch.setattr(restore_module, "remove_tree", fake)
+
+    def test_the_restore_still_succeeds_and_reports_the_leftover(
+        self, artifact, restore_target, target_graph, backup_root, monkeypatch
+    ):
+        self._fail_only_on_phase_6_cleanup(monkeypatch)
+        report = restore(artifact, restore_target, target_graph, backup_root)
+        assert report.vault_previous_left_behind is not None
+        assert report.vault_previous_left_behind.name.endswith(VAULT_PREVIOUS_SUFFIX)
+        # The data legs all landed; only a redundant directory survived.
+        assert report.stores_restored
+        assert report.graph_nodes == 3
+
+    def test_the_marker_is_still_deleted_so_the_next_restore_is_not_blocked(
+        self, artifact, restore_target, target_graph, backup_root, monkeypatch
+    ):
+        # The point of the whole fix: a failed deletion must not refuse the
+        # operator's next restore, which is the recovery path.
+        self._fail_only_on_phase_6_cleanup(monkeypatch)
+        restore(artifact, restore_target, target_graph, backup_root)
+        assert not restore_progress_marker_path(restore_target).exists()
+
+    def test_a_clean_run_reports_no_leftover(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        # The control. Without it the two tests above would pass against a
+        # `vault_previous_left_behind` that was simply always set.
+        report = restore(artifact, restore_target, target_graph, backup_root)
+        assert report.vault_previous_left_behind is None
+
+
 class TestAStaleMarkerRefuses:
     """A restore does NOT proceed over a half-applied one, and no flag makes it."""
 
