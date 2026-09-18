@@ -69,9 +69,9 @@ class RestoreTargetStateError(RestorePreflightError):
     A subclass of `RestorePreflightError` rather than a sibling, and that is the
     whole point of the choice: `scripts/backup/restore.py`'s `main` already
     catches `RestorePreflightError` in its exit-2 tuple
-    (`grep -n "RestorePreflightError," scripts/backup/restore.py` -> :690), so a
-    new refusal reaches exit 2 without that tuple being edited and without any
-    guard being widened. Every check that raises this reads the target and
+    (`grep -n "Exit 2 is a PROMISE" scripts/backup/restore.py`, and the tuple
+    directly under it), so a new refusal reaches exit 2 without that tuple being
+    edited and without any guard being widened. Every check that raises this reads the target and
     writes nothing, so the exit-2 promise -- "nothing in the target was
     overwritten" -- still holds when it is raised.
 

@@ -15,7 +15,7 @@ WHAT HAS AND HAS NOT BEEN EXERCISED. Four separate statements, because they have
 evidence bases:
 
 - The three commands above, and every refusal they can make, are covered by
-  `tests/unit/backup/` (219 tests: `python -m pytest tests/unit/backup -q`), including a full
+  `tests/unit/backup/` (222 tests: `python -m pytest tests/unit/backup -q`), including a full
   synthetic round trip that restores a captured graph and compares embeddings for exact equality.
 - The `backend/` code this runbook also names -- `load_artifact`,
   `restore_graph_from_artifact` and the `graph-stats` helpers -- is NOT covered by that suite. It
@@ -441,7 +441,7 @@ It is JSON, indented and key-sorted, so `cat` is enough:
 | `phases.graph.nodes`, `.relationships`| What phase 4 loaded. `0` until it completes.                                                                                                     |
 | `phases.stores_committed`             | The store filenames already `os.replace`d onto their live names, in commit order. A list rather than a flag, because the commit is atomic per store. |
 | `phases.vault_committed`              | Both vault renames completed.                                                                                                                    |
-| `phases.vault_previous`               | Where the target's previous vault tree was renamed aside, WHILE IT STILL EXISTS. `null` before phase 5, and cleared after phase 6 only when the removal actually succeeded -- a cleanup that failed leaves the path recorded rather than claiming a deletion that did not happen. A non-null value names a directory holding the target's own notes. |
+| `phases.vault_previous`               | Where the target's previous vault tree was renamed aside, WHILE IT STILL EXISTS. `null` before phase 5; set once the vault is renamed aside. NOT how you learn about a failed cleanup: the marker is deleted at the end of phase 6 whether or not the removal succeeded, so a failure is reported by the `[restore] WARNING:` line instead (4.5). A non-null value here means the run did not reach the end of phase 6 at all. |
 
 The marker is rewritten through its own `.tmp` and an `os.replace`, so a crash during a rewrite
 leaves the PREVIOUS marker intact rather than a truncated one.

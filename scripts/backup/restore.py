@@ -74,10 +74,10 @@ WHAT "ATOMIC" MEANS HERE, EXACTLY
 
     The dump leg already works this way -- it builds under `<label>.partial` and
     renames once the manifest is written
-    (`grep -n "RENAMED once the manifest" scripts/backup/dump.py` -> :245) -- and
-    the retention leg treats a leftover `.partial` as the detectable signature of
-    a dump that died and protects it from pruning
-    (`grep -n "ARE PROTECTED BY ARM 3" scripts/backup/prune.py` -> :32).
+    (`grep -n "RENAMED once the manifest" scripts/backup/dump.py`) -- and the
+    retention leg treats a leftover `.partial` as the detectable signature of a
+    dump that died and protects it from pruning
+    (`grep -n "ARE PROTECTED BY ARM 3" scripts/backup/prune.py`).
 
 WHAT IT DOES NOT DO
     It does not reimplement the graph codec or the graph loader. `load_artifact`
@@ -93,9 +93,10 @@ Exit codes:
        that failed. In every one of these cases nothing in the target was
        OVERWRITTEN. Not quite the same as "nothing was written": the pre-restore
        capture opens the target's stores, and opening a WAL database creates
-       `-shm`/`-wal` sidecars beside it (`tests/unit/backup/test_dump.py:104-118`
-       asserts exactly that). No store contents, vault file or graph node changes
-       on any exit-2 path.
+       `-shm`/`-wal` sidecars beside it
+       (`grep -n "def test_the_only_live_side_effect_is_wal_sidecars"
+       tests/unit/backup/test_dump.py` asserts exactly that). No store contents,
+       vault file or graph node changes on any exit-2 path.
     1  a phase failed after the pre-restore backup succeeded. The pre-restore
        artifact named in the output is the way back, and
        `<target>/restore.in-progress.json` says which phases had completed. A
@@ -435,8 +436,8 @@ def _clear_sqlite_sidecars(db_path: Path) -> None:
     is a database SQLite may open and then apply stale committed frames into --
     a silently wrong store rather than a loud failure. The artifact's copies
     carry no sidecars at all, because `capture_stores` checkpoints and strips
-    them (`grep -n "_strip_sqlite_sidecars" scripts/backup/stores.py` -> :67,187),
-    so the correct post-restore state is a `.db` with no sidecars beside it.
+    them (`grep -n "_strip_sqlite_sidecars" scripts/backup/stores.py`), so the
+    correct post-restore state is a `.db` with no sidecars beside it.
     """
     for suffix in ("-wal", "-shm"):
         Path(f"{db_path}{suffix}").unlink(missing_ok=True)
@@ -551,7 +552,7 @@ def commit_stores(
     window in which a restored `.db` sits beside a stale `-wal` to microseconds.
     The staged files themselves carry no sidecars: the artifact's copies have
     none, because `capture_stores` checkpoints and strips them
-    (`grep -n "_strip_sqlite_sidecars" scripts/backup/stores.py` -> :67,187).
+    (`grep -n "_strip_sqlite_sidecars" scripts/backup/stores.py`).
 
     Args:
         staged: The output of `stage_stores`.
