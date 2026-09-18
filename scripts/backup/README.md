@@ -96,13 +96,29 @@ named in a `[backup] WARNING` line, and the artifact is still written. Install `
 Two consequences worth knowing before reading a manifest:
 
 - `row_counts` may be PARTIAL. A table missing from it is not an empty table; check
-  `uncounted_tables` before reading a gap as a zero.
+  `uncounted_tables`, which maps each uncounted table to SQLite's own message, before reading a gap
+  as a zero. The message is recorded because a missing module is only the commonest cause; where
+  none is named, the tooling says so rather than guessing.
 - sqlite-vec's shadow tables (`vault_chunks_vec_chunks`, `_info`, `_rowids`, `_vector_chunks00`)
   appear in `row_counts` as themselves. They are not filtered, because filtering would mean
   hardcoding one extension's internal naming.
 
 Neither check establishes vec0 SEMANTIC validity: `COUNT(*)` on a `vec0` table counts its rowid
 shadow table, not the vectors.
+
+#### What the version bump does to older artifacts
+
+`read_manifest` requires the layout version to match EXACTLY, so a pre-MIS-153 `layout_version: 1`
+artifact is not readable by this build. Two consequences:
+
+- `restore` refuses it. Recovering from one means checking out a commit from before the bump.
+- `prune` files it under `skipped`, not `delete`. Skipped directories are never deletion
+  candidates, so a v1 artifact is retained forever and does not count toward `--retain`. Remove any
+  such directory by hand once you no longer want it.
+
+This was accepted rather than overlooked: no complete artifact exists anywhere on the deployment
+(`find -name manifest.json` returns nothing; the backup root holds only a `.partial` directory),
+so the bump orphans nothing today. It will matter the first time the version moves again.
 
 ### NOT captured: `data/vector_store/`
 

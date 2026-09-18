@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,8 +61,13 @@ class StoreCapture:
     present: bool
     destination: Path | None = None
     row_counts: dict[str, int] = field(default_factory=dict)
-    uncounted_tables: tuple[str, ...] = ()
-    missing_modules: tuple[str, ...] = ()
+    # Table name -> the message SQLite gave when the count was attempted.
+    uncounted_tables: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def missing_modules(self) -> tuple[str, ...]:
+        """Modules SQLite named in this store's read failures, possibly empty."""
+        return modules_named_in(self.uncounted_tables.values())
 
     def to_manifest_entry(self) -> dict[str, object]:
         """Render this capture as its `stores` entry in the manifest.
@@ -69,13 +75,33 @@ class StoreCapture:
         `uncounted_tables` is what makes `row_counts` honest at layout version
         2: the counts may now be PARTIAL, and a reader that cannot tell a
         zero-row table from an uncounted one would read a gap as an emptiness.
+
+        It carries SQLITE'S OWN MESSAGE per table rather than a bare name.
+        A missing module is only the commonest cause; the manifest is the one
+        durable record of a readback, so the cause has to survive into it or an
+        operator reading the artifact months later has no route back to it.
         """
         return {
             "present": self.present,
             "file": None if self.destination is None else f"{STORES_DIRNAME}/{self.filename}",
             "row_counts": dict(self.row_counts),
-            "uncounted_tables": list(self.uncounted_tables),
+            "uncounted_tables": dict(sorted(self.uncounted_tables.items())),
         }
+
+
+def modules_named_in(reasons: Iterable[str]) -> tuple[str, ...]:
+    """Module names SQLite itself named, first-seen order, deduplicated.
+
+    Empty when no message matched `no such module: X`. Emptiness is meaningful
+    and must not be papered over with a placeholder: it is the difference
+    between a cause this tool established and one it did not.
+    """
+    modules: list[str] = []
+    for reason in reasons:
+        match = _NO_SUCH_MODULE.search(reason)
+        if match is not None and match.group(1) not in modules:
+            modules.append(match.group(1))
+    return tuple(modules)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,34 +116,54 @@ class StoreReadback:
 
     @property
     def missing_modules(self) -> tuple[str, ...]:
-        """Module names named by the read failures, first-seen order, deduplicated."""
-        modules: list[str] = []
-        for reason in self.uncounted.values():
-            match = _NO_SUCH_MODULE.search(reason)
-            if match is not None and match.group(1) not in modules:
-                modules.append(match.group(1))
-        return tuple(modules)
+        """Modules SQLite named in these read failures, possibly empty."""
+        return modules_named_in(self.uncounted.values())
 
 
 @dataclass(frozen=True, slots=True)
 class UncountedTables:
-    """Tables in one captured store this reader could not count, and why."""
+    """Tables in one captured store this reader could not count, and SQLite's words."""
 
     filename: str
-    tables: tuple[str, ...]
-    missing_modules: tuple[str, ...]
+    # Pairs rather than a dict so the record is ordered and immutable.
+    reasons: tuple[tuple[str, str], ...]
 
     def warning(self) -> str:
-        """One operator-facing line: what was not counted, why, and what to install."""
-        modules = ", ".join(self.missing_modules) if self.missing_modules else "an unnamed module"
+        """One operator-facing line that states only what has been established.
+
+        TWO BRANCHES, AND THE SPLIT IS THE POINT. The install advice is a
+        DIAGNOSIS, and it is earned only when SQLite named a module. Any other
+        read failure -- a missing collation, a vec0 constructor error, a btree
+        `integrity_check` does not visit -- gets SQLite's own words and no
+        invented cause. Asserting "this process cannot load X" over a failure
+        that never mentioned a module is the same defect MIS-153 fixed: a
+        confident message about something the code did not check.
+
+        Both branches carry the integrity result, because that one IS
+        established: the copy passed `integrity_check` before any count ran.
+        It is stated at its own scope and no wider -- THIS STORE'S COPY is
+        structurally sound. It is not a claim about the artifact, which is the
+        whole directory and whose vault and graph legs this readback never
+        touched, and not a claim about vec0 semantics, which `read_back_store`
+        records that neither check establishes.
+        """
+        detail = "; ".join(f"{name}: {reason}" for name, reason in self.reasons)
+        head = f"{self.filename}: {len(self.reasons)} table(s) could not be counted -- {detail}."
+        modules = modules_named_in(reason for _, reason in self.reasons)
+        if modules:
+            cause = (
+                f" This process cannot load {', '.join(modules)}. Install it "
+                "(pip install 'sqlite-vec>=0.1.3' supplies vec0) and re-run the "
+                "dump to record their counts."
+            )
+        else:
+            cause = (
+                " No module was named in those messages, so this tool has not "
+                "established why; SQLite's own words are quoted above."
+            )
         return (
-            f"{self.filename}: {len(self.tables)} table(s) could not be counted "
-            f"-- {', '.join(self.tables)}. This process cannot load {modules}. "
-            "The copy passed PRAGMA integrity_check, so the tables are uncounted "
-            "because of what this reader lacks, not because of what the file "
-            "holds; the artifact itself is complete. Install the module "
-            "(pip install 'sqlite-vec>=0.1.3' supplies vec0) and re-run the dump "
-            "to record their counts."
+            f"{head}{cause} The copy passed PRAGMA integrity_check, so this store's "
+            "copy is structurally sound and only these row counts are missing."
         )
 
 
@@ -126,8 +172,7 @@ def uncounted_from_captures(captures: list[StoreCapture]) -> tuple[UncountedTabl
     return tuple(
         UncountedTables(
             filename=capture.filename,
-            tables=capture.uncounted_tables,
-            missing_modules=capture.missing_modules,
+            reasons=tuple(sorted(capture.uncounted_tables.items())),
         )
         for capture in captures
         if capture.uncounted_tables
@@ -191,23 +236,24 @@ def copy_store(source: Path, destination: Path) -> None:
         ) from exc
 
 
-def load_sqlite_vec(conn: sqlite3.Connection) -> bool:
-    """Load the sqlite-vec extension onto `conn`; report whether it is available.
+def load_sqlite_vec(conn: sqlite3.Connection) -> None:
+    """Load the sqlite-vec extension onto `conn` if this process can.
 
     LOADED FOR EVERY STORE, NEVER KEYED ON A FILENAME. `vault_sidecar.db` is
     the store holding `vec0` tables today; gating the load on that name would
     let the next store that gains a virtual table reintroduce MIS-153 with no
     code change to point at.
 
-    Returns:
-        True when `vec0` is usable on this connection, False when the extension
-        is absent or this interpreter cannot load extensions at all. Never
-        raises: a reader's own limits are reported, not imposed on the artifact.
+    Returns nothing, and never raises. It deliberately does NOT report success:
+    a load that succeeded still says nothing about whether a given table can be
+    read, so availability is inferred from the read failures themselves, where
+    SQLite names the module it wanted. A boolean here would be a second, weaker
+    source of truth for the same question.
     """
     try:
         import sqlite_vec
     except ImportError:
-        return False
+        return
     try:
         # A Python built with SQLITE_OMIT_LOAD_EXTENSION has no
         # `enable_load_extension` attribute at all, so this raises
@@ -215,14 +261,13 @@ def load_sqlite_vec(conn: sqlite3.Connection) -> bool:
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
     except (AttributeError, sqlite3.Error):
-        return False
+        return
     finally:
         # Re-closing the door is best effort: on the failure paths above it was
         # never opened, and a store's row counts are not worth an exception
         # raised out of a `finally`.
         with suppress(AttributeError, sqlite3.Error):
             conn.enable_load_extension(False)
-    return True
 
 
 def read_back_store(db_path: Path) -> StoreReadback:
@@ -238,9 +283,12 @@ def read_back_store(db_path: Path) -> StoreReadback:
     the copy already written passed `integrity_check` and held every row.
 
     `integrity_check` gates the corruption classes that matter and needs no
-    loadable extension: it raises `DatabaseError: file is not a database` on
-    garbage and reports `database disk image is malformed` on a truncated
-    store, both verified against this code path rather than assumed.
+    loadable extension. Both classes covered by tests here RAISE rather than
+    return a verdict: `DatabaseError: file is not a database` on garbage, and
+    `DatabaseError: database disk image is malformed` on a store missing its
+    tail. The non-`ok` verdict below is the third shape -- a file SQLite can
+    read but will not certify, such as a row violating a constraint its schema
+    declares -- and it returns rows instead of raising.
 
     The counter-argument, recorded because it is true: neither check
     establishes vec0 SEMANTIC validity. `COUNT(*)` on a `vec0` table counts
@@ -268,6 +316,10 @@ def read_back_store(db_path: Path) -> StoreReadback:
             row = conn.execute("PRAGMA integrity_check").fetchone()
         except sqlite3.Error as exc:
             raise _unsound_copy(db_path, str(exc)) from exc
+        # `row is None` is defensive and has no test: no SQLite build is known
+        # here to return an empty result for this pragma. It is here so an
+        # empty result becomes a refusal rather than an IndexError, and it is
+        # NOT claimed to be reachable.
         verdict = "no result" if row is None else str(row[0])
         if verdict != "ok":
             raise _unsound_copy(db_path, f"PRAGMA integrity_check reported {verdict!r}")
@@ -346,8 +398,7 @@ def capture_stores(state_root: Path, artifact_dir: Path) -> list[StoreCapture]:
                 present=True,
                 destination=destination,
                 row_counts=readback.row_counts,
-                uncounted_tables=tuple(sorted(readback.uncounted)),
-                missing_modules=readback.missing_modules,
+                uncounted_tables=dict(readback.uncounted),
             )
         )
     return captures

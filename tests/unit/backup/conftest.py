@@ -105,7 +105,7 @@ def vec0_state_root(tmp_path: Path) -> Path:
     """A live-state stand-in whose sidecar holds vec0 tables, as the real one does.
 
     SEPARATE FROM `state_root` ON PURPOSE. Three existing assertions pin exact
-    row-count dicts against that fixture (`test_stores.py:114`,
+    row-count dicts against that fixture (`test_stores.py:115`,
     `test_dump.py:154`, `test_restore.py:186`); adding a vec0 table there would
     break them and make them depend on whether the platform has the extension.
     """
