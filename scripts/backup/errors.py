@@ -47,6 +47,22 @@ class RestoreConfirmationError(BackupError):
     """Raised when the typed confirmation token is absent or is not the resolved target."""
 
 
+class RestorePreflightError(BackupError):
+    """Raised when an artifact fails a check made BEFORE the target is touched.
+
+    Its own type because it is what lets the CLI say "nothing was written"
+    truthfully. Digest mismatches, an unreadable graph leg, a `format_version`
+    this build does not read and a relationship endpoint that cannot be
+    re-anchored are all discovered while the target is still intact, and they
+    exit 2 (refused) rather than 1 (failed part way).
+
+    It also wraps `GraphArtifactError`, which is a `RuntimeError` and not a
+    `MistError` (`grep -n "class GraphArtifactError"
+    backend/knowledge/graph_artifact.py` -> :95), so it would otherwise escape
+    every `except MistError` arm in this package as a raw traceback.
+    """
+
+
 class RestoreAbortedError(BackupError):
     """Raised when a pre-restore backup of the target failed, so nothing was overwritten.
 

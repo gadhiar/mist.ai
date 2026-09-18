@@ -11,11 +11,18 @@ Three commands exist:
 Exit codes are the same shape everywhere: `0` it worked, `2` it refused and changed nothing,
 `1` it failed part way and the message says what state that leaves.
 
-WHAT HAS AND HAS NOT BEEN EXERCISED. Every code path named here is covered by
-`tests/unit/backup/` (165 tests: `python -m pytest tests/unit/backup -q`), including a full
-synthetic round trip that restores a captured graph and compares embeddings for exact equality.
-None of it has been run against the live stack or the dev-hydration stack on the host from this
-branch. The rehearsal below is therefore a rehearsal, not a replay of something already done.
+WHAT HAS AND HAS NOT BEEN EXERCISED. Three separate statements, because they have three
+different evidence bases:
+
+- The three commands above, and every refusal they can make, are covered by
+  `tests/unit/backup/` (172 tests: `python -m pytest tests/unit/backup -q`), including a full
+  synthetic round trip that restores a captured graph and compares embeddings for exact equality.
+- The `backend/` code this runbook also names -- `load_artifact`,
+  `restore_graph_from_artifact` and the `graph-stats` helpers -- is NOT covered by that suite. It
+  is covered by `tests/unit/knowledge/`, which is a different tier of the same run.
+- Nothing here has been run against the live stack or the dev-hydration stack on the host from
+  this branch. The rehearsal below is therefore a rehearsal, not a replay of something already
+  done.
 
 ---
 
@@ -166,7 +173,12 @@ absolute path you must type back:
       --target-root ./dev-state \
       --target-graph-uri bolt://localhost:7690
 
-The refusal names the RESOLVED path, for example `/home/raj/mist.ai/dev-state`. Copy it.
+COPY THE PATH THE TOOL PRINTS. Do not type a path from this document, and do not type one from
+memory. The resolved form depends on the machine and the shell you are in: this host is Windows
+(`D:\Users\rajga\mist.ai`), so a run from a native Windows shell resolves to a backslashed drive
+path, while the same directory reached from inside a container resolves to a POSIX path such as
+`/app/dev-state`. The comparison is byte-for-byte and neither form is normalised into the other,
+so the only string guaranteed to be accepted is the one the refusal just printed.
 
 The token is compared against the resolved path and never against the string you passed. Typing
 `--target-root ./dev-state --confirm-target ./dev-state` is REFUSED even though both strings match
@@ -175,11 +187,14 @@ only question that matters. Whitespace around the token is stripped; nothing els
 
 ### 4.4 Run it
 
+The same command again, with the path from 4.3 pasted after `--confirm-target`. The placeholder
+below is NOT a value to type -- substitute the exact string the previous run printed:
+
     python -m scripts.backup.restore \
       --artifact /mnt/backup/mist/20260917T030000Z \
       --target-root ./dev-state \
       --target-graph-uri bolt://localhost:7690 \
-      --confirm-target /home/raj/mist.ai/dev-state
+      --confirm-target <PASTE THE RESOLVED PATH PRINTED IN 4.3>
 
 Four gates run, every time, and no flag disables any of them:
 
@@ -193,10 +208,15 @@ Four gates run, every time, and no flag disables any of them:
 The first line of successful output is the pre-restore artifact path. That directory is your way
 back if you have just restored into the wrong place. Write it down before reading the rest.
 
-Then, in order: the artifact's file digests are re-checked against its manifest, the stores are
-replaced, the vault tree is replaced wholesale (not merged), and the graph is loaded last -- the
-graph leg detach-deletes the target first, so it goes last, and a failure earlier leaves the target
-with its own graph rather than none.
+Then, in order. The whole artifact is checked first: every file is re-digested against the
+manifest, AND the graph leg is parsed, version-checked and decoded. Only then is the target
+touched -- stores replaced file by file, vault tree replaced wholesale (not merged), graph written
+last. The graph write is last because it detach-deletes the target as part of the load, so a
+failure in an earlier leg leaves the target with its own graph rather than none.
+
+Those two checks are separate on purpose. A file can match its recorded sha256 exactly and still
+be an artifact this build cannot read, because the version it declares is one this build does not
+know. If either check fails you get exit 2 and a target that is byte-for-byte unchanged.
 
 ### 4.5 Verify
 
@@ -272,6 +292,22 @@ loud to anyone using it for hydration, and either re-hydrate it or drop the volu
 
 Leave `./dev-state/MIST_RESTORE_TARGET` in place; the marker is not consumed, and a target that
 stays marked is a rehearsal you can repeat.
+
+### 4.7 The OTHER restore command, and why this is not it
+
+`python scripts/mist_admin.py graph-restore ARTIFACT [--confirm]` also exists, and it also
+detach-deletes the graph it is pointed at. Know about it so you do not reach for it by accident at
+3am.
+
+What it is: the GRAPH-ONLY developer path. It restores `graph.json` and nothing else -- no stores,
+no vault -- and its only guard is `assert_neo4j_dev_isolated` on the target URI
+(`scripts/mist_admin.py:474-479`). It has NO handshake marker, NO typed confirmation token and NO
+pre-restore backup: `--confirm` is a bare flag, so a repeated shell command restores again with no
+further question asked.
+
+Use it when you are iterating on a dev graph and want one leg back quickly. Do NOT use it for
+disaster recovery. The four-gate `python -m scripts.backup.restore` is the command for that, and
+the gates are the difference: they are what makes a restore into the wrong target survivable.
 
 ---
 
