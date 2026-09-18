@@ -23,6 +23,7 @@ from backend.knowledge.eval_isolation import REPO_ROOT, EvalIsolationError
 from backend.knowledge.graph_artifact import GraphArtifactError
 from scripts.backup.destination import BACKUP_ROOT_ENV
 from scripts.backup.dump import run_dump
+from backend.errors import Neo4jQueryError
 from scripts.backup.errors import (
     BackupDestinationError,
     BackupError,
@@ -30,13 +31,26 @@ from scripts.backup.errors import (
     RestoreConfirmationError,
     RestorePreflightError,
     RestoreTargetError,
+    RestoreTargetStateError,
 )
 from scripts.backup.manifest import MANIFEST_FILENAME, read_manifest, sha256_file
-from scripts.backup.restore import EXIT_REFUSED, main, restore_vault, run_restore
+from scripts.backup.restore import (
+    EXIT_REFUSED,
+    RESTORE_PROGRESS_FILENAME,
+    STAGING_SUFFIX,
+    VAULT_PREVIOUS_SUFFIX,
+    main,
+    parse_ddl_object_name,
+    remove_tree,
+    restore_progress_marker_path,
+    run_restore,
+    stage_vault,
+    staged_peak_bytes,
+)
 from scripts.backup.stores import STORES_DIRNAME
 from scripts.backup.target import RESTORE_MARKER_FILENAME
 
-from .conftest import EMBEDDING, STAMPS
+from .conftest import EMBEDDING, STAMPS, InMemoryGraphConnection
 
 TARGET_URI = "bolt://localhost:7690"
 
@@ -207,11 +221,14 @@ class TestTheRoundTrip:
         # the union of two vaults and equal to neither.
         assert not (vault / "target-only.md").exists()
 
-    def test_no_restore_temporary_files_are_left_in_the_target(
+    def test_no_staging_or_marker_files_are_left_in_the_target(
         self, artifact, restore_target, target_graph, backup_root
     ):
         restore(artifact, restore_target, target_graph, backup_root)
-        assert not list(restore_target.glob("*.restore-tmp"))
+        assert not list(restore_target.glob(f"*{STAGING_SUFFIX}"))
+        assert not list(restore_target.glob(f"*{VAULT_PREVIOUS_SUFFIX}"))
+        assert not restore_progress_marker_path(restore_target).exists()
+        assert not list(restore_target.glob(f"{RESTORE_PROGRESS_FILENAME}*"))
 
 
 class TestThePreRestoreBackup:
@@ -466,10 +483,11 @@ class TestAbsentLegs:
         restore(report.artifact_dir, restore_target, target_graph, backup_root)
         assert (restore_target / "vault" / "target-only.md").is_file()
 
-    def test_restore_vault_reports_zero_when_the_artifact_has_no_vault_directory(
+    def test_stage_vault_returns_none_when_the_artifact_has_no_vault_directory(
         self, tmp_path, restore_target
     ):
-        assert restore_vault(tmp_path / "empty-artifact", restore_target / "vault") == 0
+        assert stage_vault(tmp_path / "empty-artifact", restore_target / "vault") is None
+        assert not list(restore_target.glob(f"*{STAGING_SUFFIX}"))
 
     def test_a_store_absent_at_capture_time_is_reported_not_silently_skipped(
         self, backup_root, source_graph, state_root, vault_root, restore_target, target_graph

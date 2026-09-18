@@ -63,6 +63,25 @@ class RestorePreflightError(BackupError):
     """
 
 
+class RestoreTargetStateError(RestorePreflightError):
+    """Raised when the TARGET, not the artifact, fails a check made before it is touched.
+
+    A subclass of `RestorePreflightError` rather than a sibling, and that is the
+    whole point of the choice: `scripts/backup/restore.py`'s `main` already
+    catches `RestorePreflightError` in its exit-2 tuple
+    (`grep -n "RestorePreflightError," scripts/backup/restore.py` -> :690), so a
+    new refusal reaches exit 2 without that tuple being edited and without any
+    guard being widened. Every check that raises this reads the target and
+    writes nothing, so the exit-2 promise -- "nothing in the target was
+    overwritten" -- still holds when it is raised.
+
+    Distinct from its parent because the operator's next action differs. A
+    `RestorePreflightError` means reach for a different artifact; this means fix
+    the target: free disk space, start the graph, or deal by hand with the
+    `restore.in-progress.json` a previous run left behind.
+    """
+
+
 class RestoreAbortedError(BackupError):
     """Raised when a pre-restore backup of the target failed, so nothing was overwritten.
 
