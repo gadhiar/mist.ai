@@ -16,12 +16,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import re
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 from neo4j.time import DateTime
 
+from backend.errors import Neo4jQueryError
 from backend.knowledge.eval_isolation import EvalIsolationError
 from backend.knowledge.graph_artifact import (
     GRAPH_ARTIFACT_FORMAT,
@@ -394,3 +398,359 @@ class TestGraphRestoreRefusesANonIsolatedTarget:
         )
 
         assert loaded["stamps"]["extraction_version"] == "1999-01-01-r0"
+
+
+# --- A target that already carries schema -------------------------------------
+#
+# MIS-140's restore leg failed with ConstraintAlreadyExists and left the target
+# half-restored: stores and vault replaced, graph at 0 nodes. The cause was a
+# property of the TARGET, not of the artifact -- it held a constraint named
+# `rt_entity_id` over the same `(:__Entity__ {id})` schema the artifact's
+# constraint covers, under a name that appears nowhere in this repository
+# (`grep -rn "rt_entity_id" .` -> no hits), so skipping by name could not see it.
+
+_ARTIFACT_CONSTRAINT = "CREATE CONSTRAINT `entity_id` FOR (n:__Entity__) REQUIRE n.id IS UNIQUE"
+_ARTIFACT_INDEX = "CREATE VECTOR INDEX `entity_embedding` FOR (n:__Entity__) ON (n.embedding)"
+_ARTIFACT_SCHEMA = {"constraints": [_ARTIFACT_CONSTRAINT], "indexes": [_ARTIFACT_INDEX]}
+
+# Same constraint type, same label, same property -- different name.
+_TARGET_EQUIVALENT_CONSTRAINT = (
+    "CREATE CONSTRAINT `rt_entity_id` FOR (n:__Entity__) REQUIRE n.id IS UNIQUE"
+)
+# Same name as the artifact's, different constraint type.
+_TARGET_DIVERGENT_CONSTRAINT = (
+    "CREATE CONSTRAINT `entity_id` FOR (n:__Entity__) REQUIRE n.id IS NOT NULL"
+)
+# An object the artifact does not name at all.
+_TARGET_ONLY_INDEX = "CREATE RANGE INDEX `legacy_name_idx` FOR (n:__Entity__) ON (n.name)"
+# Server-created and server-maintained; excluded from capture, so dropping one
+# would strip it permanently.
+_TARGET_LOOKUP_INDEX = "CREATE LOOKUP INDEX `index_343aff4e` FOR (n) ON EACH labels(n)"
+
+_CONSTRAINT_DDL = re.compile(
+    r"CREATE CONSTRAINT `(?P<name>[^`]+)` FOR \(n:(?P<label>[^)]+)\) "
+    r"REQUIRE n\.(?P<prop>\w+) IS (?P<type>[A-Z ]+?)\s*$"
+)
+_INDEX_DDL = re.compile(
+    r"CREATE (?P<type>RANGE|VECTOR|TEXT|POINT) INDEX `(?P<name>[^`]+)` "
+    r"FOR \(n:(?P<label>[^)]+)\) ON \(n\.(?P<prop>\w+)\)"
+)
+_LOOKUP_DDL = re.compile(r"CREATE LOOKUP INDEX `(?P<name>[^`]+)` FOR \(n\) ON EACH labels\(n\)")
+_DROP_DDL = re.compile(r"DROP (?P<kind>CONSTRAINT|INDEX) `(?P<name>[^`]+)` IF EXISTS")
+
+
+def _parse_schema_ddl(statement: str) -> dict[str, Any]:
+    """Describe a `createStatement` the way a server catalogue would.
+
+    `signature` is the (type, schema) pair Neo4j compares for equivalence, and
+    it is deliberately independent of `name`: two statements can share a
+    signature and differ in name, which is the whole shape of this defect.
+    """
+    match = _CONSTRAINT_DDL.search(statement)
+    if match is not None:
+        return {
+            "name": match.group("name"),
+            "kind": "CONSTRAINT",
+            "type": match.group("type"),
+            "signature": (match.group("type"), match.group("label"), match.group("prop")),
+            "createStatement": statement,
+            "owning_constraint": None,
+        }
+    match = _INDEX_DDL.search(statement)
+    if match is not None:
+        return {
+            "name": match.group("name"),
+            "kind": "INDEX",
+            "type": match.group("type"),
+            "signature": (match.group("type"), match.group("label"), match.group("prop")),
+            "createStatement": statement,
+            "owning_constraint": None,
+        }
+    match = _LOOKUP_DDL.search(statement)
+    if match is not None:
+        return {
+            "name": match.group("name"),
+            "kind": "INDEX",
+            "type": "LOOKUP",
+            "signature": ("LOOKUP", "", ""),
+            "createStatement": statement,
+            "owning_constraint": None,
+        }
+    raise AssertionError(f"the schema fake cannot parse {statement!r}")
+
+
+class SchemaRejectingConnection(FakeNeo4jConnection):
+    """A target that REFUSES a conflicting DDL statement, the way Neo4j 5 does.
+
+    Every other graph fake in this repository accepts every statement silently.
+    A target-carries-schema test written against one of those passes whether or
+    not the defect is fixed, so it proves nothing -- which is why the rejection
+    is modelled here rather than assumed.
+
+    The rule is the Cypher manual's own, stated in its description of
+    `CREATE ... IF NOT EXISTS`: that clause "will ensure that no error is thrown
+    and that no constraint is created if any other constraint with the given
+    name, or another constraint on the same constraint type and schema, or both,
+    already exists". Inverted, a plain CREATE is rejected when
+
+    - an object of that name already exists, or
+    - an equivalent CONSTRAINT -- same constraint type, same schema -- already
+      exists under any name.
+
+    That the second arm is silent under `IF NOT EXISTS` even when the names
+    differ is exactly why the restore path drops and recreates instead.
+
+    Index-to-index equivalence is NOT modelled: the wording above is about
+    constraints, and inventing a rule the manual does not state here would put a
+    guess inside the thing whose job is to be the reference.
+
+    Error text follows the codes the server emits -- 22N65 for an equivalent
+    constraint, 22N67 for a duplicated name, and
+    `Neo.ClientError.Schema.ConstraintAlreadyExists` on older servers. The code
+    under test matches on none of them (that is deliberate: the code varies by
+    server version), so only the raising is load-bearing.
+    """
+
+    def __init__(self, *, schema: tuple[str, ...] = (), nodes: int = 0) -> None:
+        super().__init__()
+        self.constraints: dict[str, dict[str, Any]] = {}
+        self.indexes: dict[str, dict[str, Any]] = {}
+        self._nodes = nodes
+        for statement in schema:
+            self._install(_parse_schema_ddl(statement))
+
+    def _install(self, descriptor: dict[str, Any]) -> None:
+        if descriptor["kind"] == "CONSTRAINT":
+            self.constraints[descriptor["name"]] = descriptor
+            # A constraint owns a backing index of the same name. Modelled
+            # because it is why constraints must be dropped first.
+            self.indexes[descriptor["name"]] = {
+                **descriptor,
+                "kind": "INDEX",
+                "type": "RANGE",
+                "owning_constraint": descriptor["name"],
+            }
+        else:
+            self.indexes[descriptor["name"]] = descriptor
+
+    def execute_query(self, query, params=None):
+        self.queries.append((query, params))
+        if "SHOW CONSTRAINTS" in query:
+            return [
+                {"name": name, "createStatement": descriptor["createStatement"]}
+                for name, descriptor in sorted(self.constraints.items())
+            ]
+        if "SHOW INDEXES" in query:
+            rows = sorted(self.indexes.items())
+            # The two predicates the production queries carry, evaluated
+            # literally: drop either one from the source and the rows change.
+            if "owningConstraint IS NULL" in query:
+                rows = [(n, d) for n, d in rows if d["owning_constraint"] is None]
+            if "type <> 'LOOKUP'" in query:
+                rows = [(n, d) for n, d in rows if d["type"] != "LOOKUP"]
+            scaffolding = (params or {}).get("scaffolding")
+            if scaffolding is not None:
+                rows = [(n, d) for n, d in rows if n != scaffolding]
+            return [{"name": n, "createStatement": d["createStatement"]} for n, d in rows]
+        return []
+
+    def execute_write(self, query, params=None):
+        self.writes.append((query, params))
+
+        if "DETACH DELETE" in query:
+            deleted, self._nodes = self._nodes, 0
+            return [{"deleted": deleted}]
+
+        drop = _DROP_DDL.search(query)
+        if drop is not None:
+            self._drop(drop.group("kind"), drop.group("name"))
+            return []
+
+        if query.upper().startswith("CREATE "):
+            self._create(query)
+            return []
+
+        if "CREATE (n" in query:
+            return []
+        return [{"created": len((params or {}).get("rows", []))}]
+
+    def _create(self, statement: str) -> None:
+        descriptor = _parse_schema_ddl(statement)
+        name = descriptor["name"]
+        if name in self.constraints or name in self.indexes:
+            raise Neo4jQueryError(
+                f"Write transaction failed: 22N67 duplicated name: an object named {name!r} "
+                "already exists (Neo.ClientError.Schema.ConstraintAlreadyExists on Neo4j 5.x "
+                "before the 22Nxx codes)"
+            )
+        if descriptor["kind"] == "CONSTRAINT":
+            clash = next(
+                (
+                    other
+                    for other in self.constraints.values()
+                    if other["signature"] == descriptor["signature"]
+                ),
+                None,
+            )
+            if clash is not None:
+                raise Neo4jQueryError(
+                    "Write transaction failed: 22N65 an equivalent constraint already exists, "
+                    f"named {clash['name']!r} (Neo.ClientError.Schema.ConstraintAlreadyExists "
+                    "on Neo4j 5.x before the 22Nxx codes)"
+                )
+        self._install(descriptor)
+
+    def _drop(self, kind: str, name: str) -> None:
+        if kind == "CONSTRAINT":
+            if self.constraints.pop(name, None) is not None:
+                self.indexes.pop(name, None)
+            return
+        descriptor = self.indexes.get(name)
+        if descriptor is None:
+            return
+        if descriptor["owning_constraint"] is not None:
+            raise AssertionError(
+                f"tried to drop {name!r}, which a constraint owns. Neo4j refuses this: "
+                "drop the constraint and the index goes with it."
+            )
+        del self.indexes[name]
+
+
+class TestTheFakeModelsNeo4jsRejection:
+    """Negative controls for the fake itself.
+
+    Without these the schema tests below could pass because nothing ever
+    refuses anything.
+    """
+
+    def test_an_equivalent_constraint_under_another_name_is_rejected(self):
+        from backend.knowledge.admin import apply_schema_ddl
+
+        conn = SchemaRejectingConnection(schema=(_TARGET_EQUIVALENT_CONSTRAINT,))
+
+        with pytest.raises(Neo4jQueryError, match="22N65"):
+            apply_schema_ddl(conn, _ARTIFACT_SCHEMA)
+
+    def test_a_duplicated_name_is_rejected(self):
+        """Issued straight at the fake, not through `apply_schema_ddl`.
+
+        That function skips this case by name, so going through it would assert
+        nothing about what the server does with the statement.
+        """
+        conn = SchemaRejectingConnection(schema=(_TARGET_DIVERGENT_CONSTRAINT,))
+
+        with pytest.raises(Neo4jQueryError, match="22N67"):
+            conn.execute_write(_ARTIFACT_CONSTRAINT)
+
+    def test_it_accepts_ddl_a_real_server_would_accept(self):
+        """The other negative control: the fake is not refusing everything."""
+        from backend.knowledge.admin import apply_schema_ddl, read_schema_ddl
+
+        conn = SchemaRejectingConnection()
+
+        assert apply_schema_ddl(conn, _ARTIFACT_SCHEMA) == 2
+        assert read_schema_ddl(conn) == _ARTIFACT_SCHEMA
+
+
+class TestRestoreOntoATargetThatAlreadyCarriesSchema:
+    def test_an_equivalent_constraint_under_another_name_no_longer_fails_the_restore(self):
+        """The MIS-140 failure, reproduced: `rt_entity_id` over `(:__Entity__ {id})`.
+
+        Names are not repo-controlled, so no name-based skip can see this. The
+        target's constraint has to be dropped, and afterwards the target's
+        schema has to EQUAL the artifact's -- not contain it.
+        """
+        from backend.knowledge.admin import read_schema_ddl, restore_graph_from_artifact
+
+        conn = SchemaRejectingConnection(schema=(_TARGET_EQUIVALENT_CONSTRAINT,))
+
+        report = restore_graph_from_artifact(conn, _artifact([], [], _ARTIFACT_SCHEMA))
+
+        assert read_schema_ddl(conn) == _ARTIFACT_SCHEMA
+        assert "rt_entity_id" not in conn.constraints
+        assert report["schema_statements"] == 2
+
+    def test_a_same_name_different_definition_converges_and_is_reported(self, caplog):
+        """Converge on the artifact, loudly. Refusing would block recovery.
+
+        `CREATE CONSTRAINT ... IF NOT EXISTS` is the wrong tool for exactly this
+        case: the manual says it throws nothing when a constraint of the given
+        name already exists, so the target would silently keep its own
+        definition. After the drop the target's definition exists nowhere, so
+        the log is the only record that it differed.
+        """
+        from backend.knowledge.admin import read_schema_ddl, restore_graph_from_artifact
+
+        conn = SchemaRejectingConnection(schema=(_TARGET_DIVERGENT_CONSTRAINT,))
+
+        with caplog.at_level(logging.WARNING, logger="backend.knowledge.admin"):
+            restore_graph_from_artifact(conn, _artifact([], [], _ARTIFACT_SCHEMA))
+
+        assert read_schema_ddl(conn) == _ARTIFACT_SCHEMA
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("entity_id" in message and "IS NOT NULL" in message for message in warnings)
+
+    def test_an_object_the_artifact_does_not_have_is_gone_afterwards(self):
+        """The second, unmeasured defect: `apply_schema_ddl` only ever ADDED.
+
+        Schema accumulated across restores and could never converge back on the
+        artifact, so an index the target happened to hold survived forever.
+        """
+        from backend.knowledge.admin import read_schema_ddl, restore_graph_from_artifact
+
+        conn = SchemaRejectingConnection(schema=(_TARGET_ONLY_INDEX,))
+
+        restore_graph_from_artifact(conn, _artifact([], [], _ARTIFACT_SCHEMA))
+
+        assert "legacy_name_idx" not in conn.indexes
+        assert read_schema_ddl(conn) == _ARTIFACT_SCHEMA
+
+    def test_a_lookup_index_is_not_dropped(self):
+        """Dropping one would strip it permanently: no artifact re-creates it.
+
+        `read_schema_ddl` excludes LOOKUP from capture
+        (`grep -n "type <> 'LOOKUP'" backend/knowledge/admin.py`), so a LOOKUP
+        index dropped here is gone for good and the restored graph loses a
+        server-maintained index -- degraded retrieval, not a failure.
+        """
+        from backend.knowledge.admin import restore_graph_from_artifact
+
+        conn = SchemaRejectingConnection(
+            schema=(_TARGET_LOOKUP_INDEX, _TARGET_EQUIVALENT_CONSTRAINT)
+        )
+
+        restore_graph_from_artifact(conn, _artifact([], [], _ARTIFACT_SCHEMA))
+
+        assert "index_343aff4e" in conn.indexes
+        assert not [query for query, _ in conn.writes if "index_343aff4e" in query]
+
+    def test_constraints_are_dropped_before_indexes(self):
+        """Dropping a constraint drops the index it owns; the other order fails."""
+        from backend.knowledge.admin import restore_graph_from_artifact
+
+        conn = SchemaRejectingConnection(schema=(_TARGET_EQUIVALENT_CONSTRAINT, _TARGET_ONLY_INDEX))
+
+        restore_graph_from_artifact(conn, _artifact([], [], _ARTIFACT_SCHEMA))
+
+        drops = [query for query, _ in conn.writes if query.startswith("DROP ")]
+        assert drops == [
+            "DROP CONSTRAINT `rt_entity_id` IF EXISTS",
+            "DROP INDEX `legacy_name_idx` IF EXISTS",
+        ]
+
+    def test_an_unquotable_object_name_refuses_rather_than_escaping(self):
+        """A backtick in a name would break out of the quoting in a DROP."""
+        from backend.knowledge.admin import drop_graph_schema
+
+        conn = SchemaRejectingConnection()
+        conn.constraints["ba`d"] = {
+            "name": "ba`d",
+            "kind": "CONSTRAINT",
+            "type": "UNIQUE",
+            "signature": ("UNIQUE", "X", "id"),
+            "createStatement": "CREATE CONSTRAINT `ba`d` FOR (n:X) REQUIRE n.id IS UNIQUE",
+            "owning_constraint": None,
+        }
+
+        with pytest.raises(GraphArtifactError, match="unquotable"):
+            drop_graph_schema(conn)
