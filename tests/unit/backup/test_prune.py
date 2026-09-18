@@ -14,7 +14,12 @@ import pytest
 from backend.knowledge.eval_isolation import REPO_ROOT
 from scripts.backup.destination import BACKUP_ROOT_ENV
 from scripts.backup.errors import BackupError
-from scripts.backup.manifest import MANIFEST_FILENAME, PARTIAL_SUFFIX, BackupManifest
+from scripts.backup.manifest import (
+    BACKUP_LAYOUT_VERSION,
+    MANIFEST_FILENAME,
+    PARTIAL_SUFFIX,
+    BackupManifest,
+)
 from scripts.backup.prune import (
     DEFAULT_RETAIN,
     EXIT_DESTINATION_REFUSED,
@@ -36,7 +41,12 @@ def write_artifact(root, label, created_at, *, payload="payload"):
     (artifact / "graph.json").write_text(payload, encoding="utf-8")
     BackupManifest(
         layout="mist.backup",
-        layout_version=1,
+        # Symbolic, not 1. `plan_prune` dates an artifact through
+        # `read_manifest`, which REFUSES a layout version this build does not
+        # read (`scripts/backup/prune.py:127`), so a hardcoded 1 made every
+        # fixture artifact unrecognisable the moment MIS-153 bumped the
+        # constant to 2.
+        layout_version=BACKUP_LAYOUT_VERSION,
         created_at=created_at,
         label=label,
         git_head=None,

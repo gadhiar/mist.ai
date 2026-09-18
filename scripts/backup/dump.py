@@ -89,7 +89,12 @@ from .manifest import (
     digest_artifact_files,
     utc_now_iso,
 )
-from .stores import LIVE_STORE_FILENAMES, capture_stores
+from .stores import (
+    LIVE_STORE_FILENAMES,
+    UncountedTables,
+    capture_stores,
+    uncounted_from_captures,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +126,11 @@ class DumpReport:
     graph_nodes: int
     graph_relationships: int
     vault_files: int
+    # Empty on a complete count. Non-empty means the affected STORE COPIES
+    # passed `integrity_check` and their row counts are partial -- see
+    # `read_back_store`. It says nothing about the vault or graph legs, which
+    # that readback never examines.
+    stores_uncounted: tuple[UncountedTables, ...] = ()
 
 
 def read_git_head(repo_root: Path = REPO_ROOT) -> str | None:
@@ -319,6 +329,7 @@ def run_dump(
         graph_nodes=graph_entry["nodes"],
         graph_relationships=graph_entry["relationships"],
         vault_files=vault_files,
+        stores_uncounted=uncounted_from_captures(captures),
     )
 
 
@@ -427,6 +438,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     for filename in report.stores_absent:
         print(f"[backup] WARNING: named store {filename} was not found under the state root.")
+    for uncounted in report.stores_uncounted:
+        print(f"[backup] WARNING: {uncounted.warning()}")
     if report.vault_files == 0:
         print("[backup] WARNING: the vault leg captured no files.")
     if report.graph_nodes == 0:

@@ -50,7 +50,13 @@ BACKUP_LAYOUT = "mist.backup"
 # Bump when the set of files in an artifact directory changes, or when a
 # manifest key changes meaning. Readers refuse an unknown value rather than
 # guessing at it.
-BACKUP_LAYOUT_VERSION = 1
+#
+# 2 (MIS-153): each `stores` entry gained `uncounted_tables`, and with it
+# `row_counts` changed meaning -- it may now be PARTIAL, because a table whose
+# SQLite module the dumping process could not load is reported as uncounted
+# rather than failing the dump. A version-1 reader would read a missing count
+# as an absent table.
+BACKUP_LAYOUT_VERSION = 2
 
 # Appended to an artifact directory while it is being written. The finished
 # directory is produced by a rename, so a directory carrying this suffix is a

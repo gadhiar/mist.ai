@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import struct
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,26 @@ import pytest
 
 from scripts.backup.target import RESTORE_MARKER_FILENAME
 from tests.mocks.neo4j import FakeNeo4jConnection, FakeNeo4jRecord
+
+_SQLITE_VEC_AVAILABLE = False
+try:
+    import sqlite_vec as _sqlite_vec  # noqa: F401
+
+    _SQLITE_VEC_AVAILABLE = True
+except ImportError:
+    pass
+
+# Same convention as `tests/unit/test_factories_vault.py:45`: a platform without
+# the extension SKIPS these tests rather than erroring in the fixture, because
+# the fixture cannot even BUILD a vec0 store without it.
+requires_sqlite_vec = pytest.mark.skipif(
+    not _SQLITE_VEC_AVAILABLE,
+    reason="sqlite_vec not available on this platform",
+)
+
+# The width `all-MiniLM-L6-v2` produces is 384; 4 is enough to exercise the
+# module boundary and keeps the fixture store small.
+VEC0_DIMENSIONS = 4
 
 # Two files that exist in the LIVE `./data` beside the real stores. They are
 # here to be EXCLUDED: the negative test asserts a backup never sweeps them in.
@@ -38,6 +59,60 @@ def make_store(path: Path, *, table: str, rows: int) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def make_vec0_sidecar(path: Path, *, rows: int) -> None:
+    """Build a `vault_sidecar.db` shaped like the live one: a vec0 virtual table.
+
+    `CREATE VIRTUAL TABLE ... USING vec0` mirrors
+    `backend/vault/sidecar_index.py:849`, and brings four shadow tables with it
+    (`_chunks`, `_info`, `_rowids`, `_vector_chunks00`). Building this needs
+    sqlite_vec, which is why every test that uses it carries
+    `requires_sqlite_vec`.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.enable_load_extension(True)
+        _sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE vault_chunks (chunk_id INTEGER PRIMARY KEY, payload TEXT)")
+        conn.execute(
+            f"CREATE VIRTUAL TABLE vault_chunks_vec USING vec0(embedding float[{VEC0_DIMENSIONS}])"
+        )
+        for index in range(rows):
+            chunk_id = index + 1
+            conn.execute(
+                "INSERT INTO vault_chunks (chunk_id, payload) VALUES (?, ?)",
+                (chunk_id, f"chunk-{index}"),
+            )
+            packed = struct.pack(
+                f"<{VEC0_DIMENSIONS}f",
+                *[float(index + offset) for offset in range(VEC0_DIMENSIONS)],
+            )
+            conn.execute(
+                "INSERT INTO vault_chunks_vec(rowid, embedding) VALUES (?, ?)",
+                (chunk_id, packed),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def vec0_state_root(tmp_path: Path) -> Path:
+    """A live-state stand-in whose sidecar holds vec0 tables, as the real one does.
+
+    SEPARATE FROM `state_root` ON PURPOSE. Three existing assertions pin exact
+    row-count dicts against that fixture (`test_stores.py:120`,
+    `test_dump.py:154`, `test_restore.py:186`); adding a vec0 table there would
+    break them and make them depend on whether the platform has the extension.
+    """
+    root = tmp_path / "live-data-vec0"
+    make_store(root / "event_store.db", table="conversation_turn_events", rows=3)
+    make_vec0_sidecar(root / "vault_sidecar.db", rows=2)
+    return root
 
 
 @pytest.fixture

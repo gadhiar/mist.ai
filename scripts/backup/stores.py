@@ -28,11 +28,18 @@ capture cannot write to live state even by accident.
 
 from __future__ import annotations
 
+import re
 import sqlite3
+from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .errors import BackupError
+
+# Pulled out of SQLite's own wording so a warning can NAME the module a reader
+# is missing ("no such module: vec0") instead of quoting the whole error.
+_NO_SUCH_MODULE = re.compile(r"no such module: (\S+)")
 
 # The three stores that hold state which cannot be rebuilt from anything else.
 # Enumerated, never discovered -- see the module docstring.
@@ -54,14 +61,122 @@ class StoreCapture:
     present: bool
     destination: Path | None = None
     row_counts: dict[str, int] = field(default_factory=dict)
+    # Table name -> the message SQLite gave when the count was attempted.
+    uncounted_tables: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def missing_modules(self) -> tuple[str, ...]:
+        """Modules SQLite named in this store's read failures, possibly empty."""
+        return modules_named_in(self.uncounted_tables.values())
 
     def to_manifest_entry(self) -> dict[str, object]:
-        """Render this capture as its `stores` entry in the manifest."""
+        """Render this capture as its `stores` entry in the manifest.
+
+        `uncounted_tables` is what makes `row_counts` honest at layout version
+        2: the counts may now be PARTIAL, and a reader that cannot tell a
+        zero-row table from an uncounted one would read a gap as an emptiness.
+
+        It carries SQLITE'S OWN MESSAGE per table rather than a bare name.
+        A missing module is only the commonest cause; the manifest is the one
+        durable record of a readback, so the cause has to survive into it or an
+        operator reading the artifact months later has no route back to it.
+        """
         return {
             "present": self.present,
             "file": None if self.destination is None else f"{STORES_DIRNAME}/{self.filename}",
             "row_counts": dict(self.row_counts),
+            "uncounted_tables": dict(sorted(self.uncounted_tables.items())),
         }
+
+
+def modules_named_in(reasons: Iterable[str]) -> tuple[str, ...]:
+    """Module names SQLite itself named, first-seen order, deduplicated.
+
+    Empty when no message matched `no such module: X`. Emptiness is meaningful
+    and must not be papered over with a placeholder: it is the difference
+    between a cause this tool established and one it did not.
+    """
+    modules: list[str] = []
+    for reason in reasons:
+        match = _NO_SUCH_MODULE.search(reason)
+        if match is not None and match.group(1) not in modules:
+            modules.append(match.group(1))
+    return tuple(modules)
+
+
+@dataclass(frozen=True, slots=True)
+class StoreReadback:
+    """What reading one captured store back established, and what it did not."""
+
+    row_counts: dict[str, int]
+    # Table name -> the message SQLite gave when the count was attempted. The
+    # reason is kept rather than discarded because "vec0 is not loaded" and
+    # "this table is broken" are different operator actions.
+    uncounted: dict[str, str]
+
+    @property
+    def missing_modules(self) -> tuple[str, ...]:
+        """Modules SQLite named in these read failures, possibly empty."""
+        return modules_named_in(self.uncounted.values())
+
+
+@dataclass(frozen=True, slots=True)
+class UncountedTables:
+    """Tables in one captured store this reader could not count, and SQLite's words."""
+
+    filename: str
+    # Pairs rather than a dict so the record is ordered and immutable.
+    reasons: tuple[tuple[str, str], ...]
+
+    def warning(self) -> str:
+        """One operator-facing line that states only what has been established.
+
+        TWO BRANCHES, AND THE SPLIT IS THE POINT. The install advice is a
+        DIAGNOSIS, and it is earned only when SQLite named a module. Any other
+        read failure -- a missing collation, a vec0 constructor error, a btree
+        `integrity_check` does not visit -- gets SQLite's own words and no
+        invented cause. Asserting "this process cannot load X" over a failure
+        that never mentioned a module is the same defect MIS-153 fixed: a
+        confident message about something the code did not check.
+
+        Both branches carry the integrity result, because that one IS
+        established: the copy passed `integrity_check` before any count ran.
+        It is stated at its own scope and no wider -- THIS STORE'S COPY is
+        structurally sound. It is not a claim about the artifact, which is the
+        whole directory and whose vault and graph legs this readback never
+        touched, and not a claim about vec0 semantics, which `read_back_store`
+        records that neither check establishes.
+        """
+        detail = "; ".join(f"{name}: {reason}" for name, reason in self.reasons)
+        head = f"{self.filename}: {len(self.reasons)} table(s) could not be counted -- {detail}."
+        modules = modules_named_in(reason for _, reason in self.reasons)
+        if modules:
+            cause = (
+                f" This process cannot load {', '.join(modules)}. Install it "
+                "(pip install 'sqlite-vec>=0.1.3' supplies vec0) and re-run the "
+                "dump to record their counts."
+            )
+        else:
+            cause = (
+                " No module was named in those messages, so this tool has not "
+                "established why; SQLite's own words are quoted above."
+            )
+        return (
+            f"{head}{cause} The copy passed PRAGMA integrity_check, so this store's "
+            "copy is structurally sound and only these row counts are missing."
+        )
+
+
+def uncounted_from_captures(captures: list[StoreCapture]) -> tuple[UncountedTables, ...]:
+    """Collect the captures that left tables uncounted, for the dump's report."""
+    return tuple(
+        UncountedTables(
+            filename=capture.filename,
+            reasons=tuple(sorted(capture.uncounted_tables.items())),
+        )
+        for capture in captures
+        if capture.uncounted_tables
+    )
 
 
 def _strip_sqlite_sidecars(db_path: Path) -> None:
@@ -121,21 +236,95 @@ def copy_store(source: Path, destination: Path) -> None:
         ) from exc
 
 
-def count_rows(db_path: Path) -> dict[str, int]:
-    """Row count for every user table in a store, read from its own schema.
+def load_sqlite_vec(conn: sqlite3.Connection) -> None:
+    """Load the sqlite-vec extension onto `conn` if this process can.
+
+    LOADED FOR EVERY STORE, NEVER KEYED ON A FILENAME. `vault_sidecar.db` is
+    the store holding `vec0` tables today; gating the load on that name would
+    let the next store that gains a virtual table reintroduce MIS-153 with no
+    code change to point at.
+
+    Returns nothing, and never raises. It deliberately does NOT report success:
+    a load that succeeded still says nothing about whether a given table can be
+    read, so availability is inferred from the read failures themselves, where
+    SQLite names the module it wanted. A boolean here would be a second, weaker
+    source of truth for the same question.
+    """
+    try:
+        import sqlite_vec
+    except ImportError:
+        return
+    try:
+        # A Python built with SQLITE_OMIT_LOAD_EXTENSION has no
+        # `enable_load_extension` attribute at all, so this raises
+        # AttributeError rather than any sqlite3.Error.
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+    except (AttributeError, sqlite3.Error):
+        return
+    finally:
+        # Re-closing the door is best effort: on the failure paths above it was
+        # never opened, and a store's row counts are not worth an exception
+        # raised out of a `finally`.
+        with suppress(AttributeError, sqlite3.Error):
+            conn.enable_load_extension(False)
+
+
+def read_back_store(db_path: Path) -> StoreReadback:
+    """Verify one captured store, and count the tables this reader can count.
+
+    `PRAGMA integrity_check` IS THE GATE. The row counts are reporting.
+
+    Those are two different questions and the old row-count loop conflated
+    them. A `SELECT COUNT(*)` that fails on `vault_chunks_vec` establishes that
+    THIS READER lacks the `vec0` module; it establishes nothing about the FILE.
+    Gating on it tied artifact validity to the verifying environment, which is
+    how MIS-153 came to refuse the dump on the machine it was built for while
+    the copy already written passed `integrity_check` and held every row.
+
+    `integrity_check` gates the corruption classes that matter and needs no
+    loadable extension. Both classes covered by tests here RAISE rather than
+    return a verdict: `DatabaseError: file is not a database` on garbage, and
+    `DatabaseError: database disk image is malformed` on a store missing its
+    tail. The non-`ok` verdict below is the third shape -- a file SQLite can
+    read but will not certify, such as a row violating a constraint its schema
+    declares -- and it returns rows instead of raising.
+
+    The counter-argument, recorded because it is true: neither check
+    establishes vec0 SEMANTIC validity. `COUNT(*)` on a `vec0` table counts
+    rows in its rowid shadow table, not vectors, so the row count never bought
+    the property that gating on it implied.
 
     The table list is read from `sqlite_master` rather than enumerated in this
     file. An enumeration would need editing whenever a store gains a table, and
     a backup whose row counts silently stop covering a new table reports a
     completeness it does not have. `sqlite_%` names are SQLite's own internal
-    tables.
+    tables. sqlite-vec's shadow tables are NOT filtered out: filtering them
+    would mean hardcoding one extension's internal naming, the same
+    store-specific knowledge `load_sqlite_vec` exists to avoid.
 
     Raises:
-        BackupError: When the copied store cannot be read back. That means the
-            capture produced a file SQLite itself rejects.
+        BackupError: When the copy cannot be opened, or when it fails
+            `integrity_check`. Both mean the file on disk is unsound.
     """
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise _unsound_copy(db_path, str(exc)) from exc
+    try:
+        try:
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+        except sqlite3.Error as exc:
+            raise _unsound_copy(db_path, str(exc)) from exc
+        # `row is None` is defensive and has no test: no SQLite build is known
+        # here to return an empty result for this pragma. It is here so an
+        # empty result becomes a refusal rather than an IndexError, and it is
+        # NOT claimed to be reachable.
+        verdict = "no result" if row is None else str(row[0])
+        if verdict != "ok":
+            raise _unsound_copy(db_path, f"PRAGMA integrity_check reported {verdict!r}")
+
+        load_sqlite_vec(conn)
         try:
             names = [
                 str(row[0])
@@ -144,18 +333,34 @@ def count_rows(db_path: Path) -> dict[str, int]:
                     "AND name NOT LIKE 'sqlite_%' ORDER BY name"
                 )
             ]
-            counts: dict[str, int] = {}
-            for name in names:
-                quoted = '"' + name.replace('"', '""') + '"'
+        except sqlite3.Error as exc:
+            raise _unsound_copy(db_path, str(exc)) from exc
+
+        counts: dict[str, int] = {}
+        uncounted: dict[str, str] = {}
+        for name in names:
+            quoted = '"' + name.replace('"', '""') + '"'
+            try:
                 counts[name] = int(conn.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0])
-            return counts
-        finally:
-            conn.close()
-    except sqlite3.Error as exc:
-        raise BackupError(
-            f"captured store {db_path} could not be read back: {exc}. A copy SQLite "
-            "cannot open is not a backup of anything."
-        ) from exc
+            except sqlite3.Error as exc:
+                # Degrade, never fail. The gate above has already established
+                # the file is sound, so refusing here would throw away a good
+                # backup over a missing module in the verifying process.
+                uncounted[name] = str(exc)
+        return StoreReadback(row_counts=counts, uncounted=uncounted)
+    finally:
+        conn.close()
+
+
+def _unsound_copy(db_path: Path, detail: str) -> BackupError:
+    """The one readback failure that is about the FILE rather than the reader."""
+    return BackupError(
+        f"captured store {db_path} failed readback: {detail}. This is the "
+        "integrity gate, not a row count: SQLite could not open the copy or "
+        "would not certify it, so the artifact is incomplete and must not be "
+        "relied on. A table this process merely lacks the module to read is "
+        "reported as uncounted instead and never reaches here."
+    )
 
 
 def capture_stores(state_root: Path, artifact_dir: Path) -> list[StoreCapture]:
@@ -170,7 +375,9 @@ def capture_stores(state_root: Path, artifact_dir: Path) -> list[StoreCapture]:
         including the absent ones.
 
     Raises:
-        BackupError: When a store exists but cannot be copied or read back.
+        BackupError: When a store exists but cannot be copied, or when its copy
+            fails the `integrity_check` gate. A table this process cannot read
+            for want of a loadable module is recorded as uncounted instead.
     """
     destination_dir = artifact_dir / STORES_DIRNAME
     captures: list[StoreCapture] = []
@@ -181,16 +388,17 @@ def capture_stores(state_root: Path, artifact_dir: Path) -> list[StoreCapture]:
             continue
         destination = destination_dir / filename
         copy_store(source, destination)
-        row_counts = count_rows(destination)
-        # Strip after the count: `count_rows` reopened the copy and recreated
-        # the sidecars.
+        readback = read_back_store(destination)
+        # Strip after the readback: `read_back_store` reopened the copy and
+        # recreated the sidecars.
         _strip_sqlite_sidecars(destination)
         captures.append(
             StoreCapture(
                 filename=filename,
                 present=True,
                 destination=destination,
-                row_counts=row_counts,
+                row_counts=readback.row_counts,
+                uncounted_tables=dict(readback.uncounted),
             )
         )
     return captures

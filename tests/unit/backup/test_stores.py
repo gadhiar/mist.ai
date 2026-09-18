@@ -19,12 +19,18 @@ from scripts.backup.errors import BackupError
 from scripts.backup.stores import (
     LIVE_STORE_FILENAMES,
     STORES_DIRNAME,
+    UncountedTables,
     capture_stores,
     copy_store,
-    count_rows,
+    read_back_store,
+    uncounted_from_captures,
 )
 
-from .conftest import STALE_BACKUP_FILENAMES, make_store
+from .conftest import STALE_BACKUP_FILENAMES, make_store, requires_sqlite_vec
+
+
+def _no_extension(conn) -> None:
+    """Stand in for `load_sqlite_vec` where the extension cannot be loaded."""
 
 
 class TestNamedNotGlobbed:
@@ -83,7 +89,7 @@ class TestWalConsistency:
 
             destination = tmp_path / "out" / "event_store.db"
             copy_store(source, destination)
-            assert count_rows(destination) == {"events": 4}
+            assert read_back_store(destination).row_counts == {"events": 4}
         finally:
             live.close()
 
@@ -125,6 +131,165 @@ class TestRowCounts:
         artifact.mkdir()
         captures = {c.filename: c for c in capture_stores(state_root, artifact)}
         assert captures["event_store.db"].row_counts["epoch_ledger"] == 1
+
+
+class TestVec0Readback:
+    """MIS-153. The sidecar holds `vec0` virtual tables; the readback must survive them."""
+
+    @requires_sqlite_vec
+    def test_a_vec0_store_is_read_back_and_every_table_counted(self, vec0_state_root, tmp_path):
+        # THE DELETE-THE-RULE TEST. Remove the extension load from
+        # `read_back_store` and this fails on the first assertion, whose
+        # rendering carries SQLite's own words: 'no such module: vec0'.
+        source = vec0_state_root / "vault_sidecar.db"
+        destination = tmp_path / "out" / "vault_sidecar.db"
+        copy_store(source, destination)
+        readback = read_back_store(destination)
+        assert readback.uncounted == {}
+        assert readback.row_counts["vault_chunks"] == 2
+        assert readback.row_counts["vault_chunks_vec"] == 2
+
+    @requires_sqlite_vec
+    def test_a_vec0_store_does_not_fail_the_dump(self, vec0_state_root, tmp_path):
+        artifact = tmp_path / "artifact"
+        artifact.mkdir()
+        captures = {c.filename: c for c in capture_stores(vec0_state_root, artifact)}
+        sidecar = captures["vault_sidecar.db"]
+        assert sidecar.present is True
+        assert sidecar.uncounted_tables == {}
+        assert (artifact / STORES_DIRNAME / "vault_sidecar.db").is_file()
+
+    @requires_sqlite_vec
+    def test_the_shadow_tables_are_reported_unfiltered(self, vec0_state_root, tmp_path):
+        # Decision 5: sqlite-vec's backing tables appear in the manifest as
+        # themselves. Filtering them would mean hardcoding one extension's
+        # internal naming, which is what loading the extension generally avoids.
+        destination = tmp_path / "out" / "vault_sidecar.db"
+        copy_store(vec0_state_root / "vault_sidecar.db", destination)
+        counted = set(read_back_store(destination).row_counts)
+        assert {"vault_chunks", "vault_chunks_vec"} <= counted
+        assert any(name.startswith("vault_chunks_vec_") for name in counted)
+
+    @requires_sqlite_vec
+    def test_a_missing_module_degrades_the_counts_and_keeps_the_backup(
+        self, vec0_state_root, tmp_path, monkeypatch
+    ):
+        # The extension is simulated absent, which is what a deployment without
+        # sqlite-vec installed looks like to this code. The dump must still
+        # produce an artifact: the integrity gate has already proved the copy.
+        monkeypatch.setattr("scripts.backup.stores.load_sqlite_vec", _no_extension)
+        artifact = tmp_path / "artifact"
+        artifact.mkdir()
+        captures = {c.filename: c for c in capture_stores(vec0_state_root, artifact)}
+        sidecar = captures["vault_sidecar.db"]
+
+        assert (artifact / STORES_DIRNAME / "vault_sidecar.db").is_file()
+        assert sidecar.row_counts["vault_chunks"] == 2
+        assert sidecar.uncounted_tables["vault_chunks_vec"] == "no such module: vec0"
+        assert sidecar.missing_modules == ("vec0",)
+
+    @requires_sqlite_vec
+    def test_the_manifest_carries_the_reason_not_just_the_table_name(
+        self, vec0_state_root, tmp_path, monkeypatch
+    ):
+        # The manifest is the only durable record of a readback. A bare table
+        # name would leave an operator reading the artifact later with no route
+        # back to the cause, which is what makes an invented cause dangerous.
+        monkeypatch.setattr("scripts.backup.stores.load_sqlite_vec", _no_extension)
+        artifact = tmp_path / "artifact"
+        artifact.mkdir()
+        captures = {c.filename: c for c in capture_stores(vec0_state_root, artifact)}
+        entry = captures["vault_sidecar.db"].to_manifest_entry()
+        assert entry["uncounted_tables"] == {"vault_chunks_vec": "no such module: vec0"}
+
+    @requires_sqlite_vec
+    def test_the_warning_names_the_module_the_tables_and_the_install(
+        self, vec0_state_root, tmp_path, monkeypatch
+    ):
+        # The old message asserted "A copy SQLite cannot open is not a backup of
+        # anything" about a file that passed `integrity_check`. Nothing here may
+        # say the artifact is unsound.
+        monkeypatch.setattr("scripts.backup.stores.load_sqlite_vec", _no_extension)
+        artifact = tmp_path / "artifact"
+        artifact.mkdir()
+        captures = capture_stores(vec0_state_root, artifact)
+        warnings = [entry.warning() for entry in uncounted_from_captures(captures)]
+
+        assert len(warnings) == 1
+        text = warnings[0]
+        assert "no such module: vec0" in text
+        assert "vault_chunks_vec" in text
+        assert "integrity_check" in text
+        assert "sqlite-vec" in text
+
+    def test_a_failure_that_names_no_module_gets_no_invented_cause(self):
+        # The branch the review caught. Any `sqlite3.Error` degrades to
+        # uncounted, so the message must not assert a missing module over a
+        # failure that never mentioned one.
+        entry = UncountedTables(
+            filename="vault_sidecar.db",
+            reasons=(("vault_chunks", "no such collation sequence: NOCASE_X"),),
+        )
+        text = entry.warning()
+
+        assert "no such collation sequence: NOCASE_X" in text
+        assert "has not established why" in text
+        assert "cannot load" not in text
+        assert "sqlite-vec" not in text
+        assert "integrity_check" in text
+
+    def test_integrity_check_is_the_gate_and_it_still_refuses_a_broken_file(self, tmp_path):
+        # The gate that replaced the row-count loop has to keep catching what
+        # the row-count loop caught: a file that is not a database at all.
+        broken = tmp_path / "broken.db"
+        broken.write_bytes(b"this is not a database" * 64)
+        with pytest.raises(BackupError) as excinfo:
+            read_back_store(broken)
+        assert "file is not a database" in str(excinfo.value)
+
+    def test_a_truncated_store_is_refused_by_the_gate(self, state_root, tmp_path):
+        # The second corruption class `read_back_store` claims to catch: a real
+        # database missing its tail. The message must distinguish it from the
+        # first, so it asserts SQLite's wording rather than the shared prose.
+        destination = tmp_path / "out" / "event_store.db"
+        copy_store(state_root / "event_store.db", destination)
+        whole = destination.read_bytes()
+        destination.write_bytes(whole[: len(whole) // 2])
+        with pytest.raises(BackupError) as excinfo:
+            read_back_store(destination)
+        assert "malformed" in str(excinfo.value)
+
+    def test_a_non_ok_verdict_is_refused_without_raising_inside_sqlite(self, tmp_path):
+        # The third gate shape, and the one the docstring describes: SQLite
+        # READS the file and declines to certify it, returning rows instead of
+        # raising. Built by rewriting the schema under `writable_schema` to
+        # declare a constraint the existing rows violate.
+        store = tmp_path / "event_store.db"
+        make_store(store, table="events", rows=1)
+        conn = sqlite3.connect(str(store))
+        try:
+            conn.execute("INSERT INTO events (payload) VALUES (NULL)")
+            conn.execute("PRAGMA writable_schema=ON")
+            conn.execute(
+                "UPDATE sqlite_master SET sql = ? WHERE type='table' AND name='events'",
+                ("CREATE TABLE events (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)",),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with pytest.raises(BackupError) as excinfo:
+            read_back_store(store)
+        message = str(excinfo.value)
+        assert "integrity_check reported" in message
+        assert "NULL value in events.payload" in message
+
+    def test_a_store_with_no_virtual_tables_reports_nothing_uncounted(self, state_root, tmp_path):
+        destination = tmp_path / "out" / "event_store.db"
+        copy_store(state_root / "event_store.db", destination)
+        readback = read_back_store(destination)
+        assert readback.uncounted == {}
+        assert readback.missing_modules == ()
 
 
 class TestMissingStores:
