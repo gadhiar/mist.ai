@@ -56,7 +56,11 @@ Exit codes:
     0  the target was restored
     2  refused -- target, confirmation, destination, graph URI, an artifact that
        failed preflight, or a pre-restore backup that failed. In every one of
-       these cases NOTHING was written to the target.
+       these cases nothing in the target was OVERWRITTEN. Not quite the same as
+       "nothing was written": the pre-restore capture opens the target's stores,
+       and opening a WAL database creates `-shm`/`-wal` sidecars beside it
+       (`tests/unit/backup/test_dump.py:104-118` asserts exactly that). No
+       store contents, vault file or graph node changes on any exit-2 path.
     1  a leg failed after the pre-restore backup succeeded. The pre-restore
        artifact named in the output is the way back.
 
@@ -480,8 +484,9 @@ def run_restore(
             cannot read.
         RestorePreflightError: The artifact failed a digest, version, decode or
             re-anchoring check. The target is untouched.
-        RestoreAbortedError: The pre-restore backup failed. The target is
-            untouched.
+        RestoreAbortedError: The pre-restore backup failed. Nothing in the
+            target was overwritten, though the capture will have opened its
+            stores -- see the exit-code note in the module docstring.
         BackupError: A leg failed after the pre-restore backup succeeded.
         GraphArtifactError: The graph WRITE failed part way, leaving a partially
             loaded graph. Not translated, because unlike every entry above it,
