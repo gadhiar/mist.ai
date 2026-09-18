@@ -141,6 +141,11 @@ class UncountedTables:
 
         Both branches carry the integrity result, because that one IS
         established: the copy passed `integrity_check` before any count ran.
+        It is stated at its own scope and no wider -- THIS STORE'S COPY is
+        structurally sound. It is not a claim about the artifact, which is the
+        whole directory and whose vault and graph legs this readback never
+        touched, and not a claim about vec0 semantics, which `read_back_store`
+        records that neither check establishes.
         """
         detail = "; ".join(f"{name}: {reason}" for name, reason in self.reasons)
         head = f"{self.filename}: {len(self.reasons)} table(s) could not be counted -- {detail}."
@@ -157,8 +162,8 @@ class UncountedTables:
                 "established why; SQLite's own words are quoted above."
             )
         return (
-            f"{head}{cause} The copy passed PRAGMA integrity_check, so the artifact "
-            "itself is complete and only these row counts are missing."
+            f"{head}{cause} The copy passed PRAGMA integrity_check, so this store's "
+            "copy is structurally sound and only these row counts are missing."
         )
 
 
