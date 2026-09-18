@@ -484,8 +484,10 @@ def target_graph_with_schema() -> InMemoryGraphConnection:
             "rt_entity_id": "CREATE CONSTRAINT `rt_entity_id` FOR (n:__Entity__) "
             "REQUIRE n.id IS UNIQUE"
         },
-        indexes={"rt_embedding": "CREATE VECTOR INDEX `rt_embedding` FOR (n:__Entity__) "
-        "ON (n.embedding)"},
+        indexes={
+            "rt_embedding": "CREATE VECTOR INDEX `rt_embedding` FOR (n:__Entity__) "
+            "ON (n.embedding)"
+        },
     )
 
 
