@@ -83,7 +83,7 @@ WHAT IT DOES NOT DO
     It does not reimplement the graph codec or the graph loader. `load_artifact`
     and `restore_graph_from_artifact` are MIS-140 T3 and are called, not copied
     (`grep -n "def restore_graph_from_artifact" backend/knowledge/admin.py` ->
-    :1125). It does not write a second destination guard: `resolve_backup_root`
+    :1312). It does not write a second destination guard: `resolve_backup_root`
     from T1 decides where the pre-restore backup lands.
 
 Exit codes:
@@ -714,7 +714,7 @@ def load_graph_leg(artifact_dir: Path) -> dict[str, Any]:
     `assert_artifact_is_relinkable` runs here as well, for the same reason. It
     is also the first statement of `restore_graph_from_artifact`
     (`grep -n "assert_artifact_is_relinkable(artifact)"
-    backend/knowledge/admin.py` -> :1160), so calling it here does not replace
+    backend/knowledge/admin.py` -> :1353), so calling it here does not replace
     that check -- it moves the same refusal to before the target is touched
     rather than after.
 
@@ -760,11 +760,14 @@ def load_graph_leg(artifact_dir: Path) -> dict[str, Any]:
 def write_graph(connection: GraphConnection, artifact: dict[str, Any]) -> dict[str, int]:
     """Write an ALREADY-DECODED artifact into `connection`, replacing what is there.
 
-    DESTRUCTIVE, and the last leg of a restore for that reason. Calls MIS-140 T3
-    and adds nothing: `restore_graph_from_artifact` detach-deletes the target and
-    loads. The isolation guard is the CALLER's job by that function's own
+    DESTRUCTIVE, and PHASE 4 rather than the last leg. It clears its target as
+    part of the load, so it is the one leg that cannot be made atomic; it runs
+    before the commit so that a failure in it leaves the stores and the vault
+    still the target's own. Calls MIS-140 T3 and adds nothing:
+    `restore_graph_from_artifact` detach-deletes the target, replaces its schema
+    and loads. The isolation guard is the CALLER's job by that function's own
     docstring (`grep -n "The caller is responsible for the isolation guard"
-    backend/knowledge/admin.py` -> :1131), and `run_restore` is where it runs.
+    backend/knowledge/admin.py` -> :1322), and `run_restore` is where it runs.
 
     Returns:
         `{"deleted", "schema_statements", "nodes", "relationships"}`.
@@ -1161,10 +1164,14 @@ def run_restore(
         RestoreAbortedError: The pre-restore backup failed. Nothing in the
             target was overwritten, though the capture will have opened its
             stores -- see the exit-code note in the module docstring.
-        BackupError: A leg failed after the pre-restore backup succeeded.
-        GraphArtifactError: The graph WRITE failed part way, leaving a partially
-            loaded graph. Not translated, because unlike every entry above it,
-            this one does not mean the target is untouched.
+        BackupError: A phase failed after the pre-restore backup succeeded. Which
+            phase decides what the target holds, and the progress marker records
+            it: a phase-3 failure leaves the target's own stores, vault and graph
+            entirely intact.
+        GraphArtifactError: PHASE 4 failed part way, leaving a partially loaded
+            graph. Not translated, because unlike every entry above it this one
+            does not mean the target is untouched. It does mean the stores and
+            the vault are untouched: the commit had not started.
     """
     resolved_target = assert_restore_target_root(target_root)
     assert_neo4j_dev_isolated(target_graph_uri)
@@ -1184,9 +1191,9 @@ def run_restore(
     source = Path(artifact_dir)
     manifest = read_manifest(source)
     verify_artifact_files(source, manifest)
-    # Decoded here, written at the very end. Both halves of the graph leg used
-    # to happen after the stores were replaced, which made every version and
-    # decode refusal a half-restore.
+    # Decoded here, written in phase 4. Both halves of the graph leg used to
+    # happen after the stores were replaced, which made every version and decode
+    # refusal a half-restore.
     graph_artifact = load_graph_leg(source)
 
     assert_target_is_restorable(
@@ -1310,8 +1317,12 @@ def build_parser() -> argparse.ArgumentParser:
             "--target-root is required; the target must carry the marker file "
             "MIST_RESTORE_TARGET; the resolved target path must be typed back via "
             "--confirm-target; and a pre-restore backup of the target is taken "
-            "first, which must succeed. Exit codes: 0 restored; 2 refused, target "
-            "untouched; 1 a leg failed after the pre-restore backup was taken."
+            "first, which must succeed. The artifact's stores and vault are staged "
+            "beside the live ones and swapped in only after the graph has loaded, so "
+            "a graph failure costs no store and no vault file. Exit codes: 0 "
+            "restored; 2 refused, target untouched; 1 a phase failed after the "
+            "pre-restore backup was taken -- read restore.in-progress.json in the "
+            "target root to see which, then delete it by hand before re-running."
         ),
     )
     parser.add_argument(
@@ -1447,9 +1458,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[restore] REFUSED: {exc}", file=sys.stderr)
         return EXIT_REFUSED
     # `GraphArtifactError` is a `RuntimeError`, not a `MistError`, so it needs
-    # its own name here or it escapes as a traceback. Reaching this arm means
-    # the graph WRITE failed part way; the target is partially restored and the
-    # pre-restore artifact is the way back, which is what exit 1 documents.
+    # its own name here or it escapes as a traceback. Reaching this arm means a
+    # phase after the pre-restore backup failed. What the target holds then
+    # depends on which one, and `restore.in-progress.json` in the target root is
+    # the record of that; the pre-restore artifact is the way back either way,
+    # which is what exit 1 documents.
     except (MistError, GraphArtifactError) as exc:
         print(f"[restore] FAILED: {exc.__class__.__name__}: {exc}", file=sys.stderr)
         return EXIT_FAILED
