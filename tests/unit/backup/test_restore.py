@@ -13,12 +13,14 @@ everything here is built in the worktree.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 from backend.knowledge.eval_isolation import REPO_ROOT, EvalIsolationError
+from backend.knowledge.graph_artifact import GraphArtifactError
 from scripts.backup.destination import BACKUP_ROOT_ENV
 from scripts.backup.dump import run_dump
 from scripts.backup.errors import (
@@ -26,9 +28,10 @@ from scripts.backup.errors import (
     BackupError,
     RestoreAbortedError,
     RestoreConfirmationError,
+    RestorePreflightError,
     RestoreTargetError,
 )
-from scripts.backup.manifest import MANIFEST_FILENAME, read_manifest
+from scripts.backup.manifest import MANIFEST_FILENAME, read_manifest, sha256_file
 from scripts.backup.restore import EXIT_REFUSED, main, restore_vault, run_restore
 from scripts.backup.stores import STORES_DIRNAME
 from scripts.backup.target import RESTORE_MARKER_FILENAME
@@ -82,6 +85,37 @@ def row_counts(db_path):
         }
     finally:
         conn.close()
+
+
+def rewrite_graph_leg(artifact_dir, mutate):
+    """Rewrite `graph.json` through `mutate` and KEEP the manifest digests valid.
+
+    The point of the tests that use this: an artifact can be byte-for-byte
+    intact, pass every sha256 check, and still be unreadable by this build. A
+    tampered file that fails its digest proves nothing about that case.
+    """
+    path = artifact_dir / "graph.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    mutate(payload)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    manifest_path = artifact_dir / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"]["graph.json"] = {
+        "sha256": sha256_file(path),
+        "bytes": path.stat().st_size,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    return artifact_dir
+
+
+def fingerprint(root):
+    """Every file under `root` as {relative path: bytes}, for byte-identity assertions."""
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
 
 
 @pytest.fixture
@@ -216,6 +250,22 @@ class TestThePreRestoreBackup:
         assert (restore_target / "vault" / "target-only.md").is_file()
         assert target_graph.node_by_id("stale")["properties"]["name"] == "stale"
 
+    def test_a_graph_artifact_error_in_the_capture_is_translated_not_leaked(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        # The likeliest real capture failure: the graph leg raises
+        # `GraphArtifactError`, which is a RuntimeError rather than a MistError.
+        # Untranslated it escaped as a traceback and exited with the code that
+        # promises "the pre-restore artifact is the way back", when none existed.
+        def failing_dump(**_kwargs):
+            raise GraphArtifactError("a property value cannot be round-tripped")
+
+        with pytest.raises(RestoreAbortedError) as refusal:
+            restore(artifact, restore_target, target_graph, backup_root, dump=failing_dump)
+        assert "cannot be round-tripped" in str(refusal.value)
+        assert row_counts(restore_target / "event_store.db") == {"conversation_turn_events": 1}
+        assert target_graph.writes == []
+
     def test_an_unset_backup_root_refuses_before_the_target_is_touched(
         self, artifact, restore_target, target_graph, monkeypatch
     ):
@@ -319,6 +369,90 @@ class TestArtifactIntegrity:
         (artifact / MANIFEST_FILENAME).write_text('{"layout": "other", "layout_version": 1}')
         with pytest.raises(BackupError):
             restore(artifact, restore_target, target_graph, backup_root)
+
+
+class TestAnUndecodableArtifactIsRefusedBeforeAnythingIsOverwritten:
+    """The regression suite for the ordering defect this module shipped with.
+
+    `load_artifact` used to run LAST, after the stores and the vault had already
+    been replaced. So an artifact with perfectly valid digests and a
+    `format_version` this build does not read produced a HALF-RESTORED target
+    and a raw traceback. Digest validity and decodability are different
+    properties; these tests assert the target is byte-for-byte unchanged, which
+    is the only assertion that would have failed before the fix -- `raises` alone
+    passed both before and after.
+    """
+
+    def test_an_unreadable_format_version_leaves_the_target_byte_for_byte_unchanged(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        rewrite_graph_leg(artifact, lambda payload: payload.update({"format_version": 2}))
+        before = fingerprint(restore_target)
+
+        with pytest.raises(RestorePreflightError) as refusal:
+            restore(artifact, restore_target, target_graph, backup_root)
+
+        assert fingerprint(restore_target) == before
+        assert target_graph.writes == []
+        assert "format_version 2" in str(refusal.value)
+        assert "Nothing has been written to the target" in str(refusal.value)
+
+    def test_it_refuses_before_the_pre_restore_backup_is_even_taken(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        rewrite_graph_leg(artifact, lambda payload: payload.update({"format_version": 2}))
+        with pytest.raises(RestorePreflightError):
+            restore(artifact, restore_target, target_graph, backup_root)
+        # No capture was needed, because nothing was ever going to be destroyed.
+        assert not list(backup_root.glob("pre-restore-*"))
+
+    def test_a_relationship_endpoint_no_node_provides_is_refused_early(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        def orphan(payload):
+            payload["relationships"][0]["target"] = "no-such-node"
+
+        rewrite_graph_leg(artifact, orphan)
+        before = fingerprint(restore_target)
+        with pytest.raises(RestorePreflightError):
+            restore(artifact, restore_target, target_graph, backup_root)
+        assert fingerprint(restore_target) == before
+        assert target_graph.writes == []
+
+    def test_a_graph_leg_with_no_envelope_is_refused_early(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        rewrite_graph_leg(artifact, lambda payload: payload.pop("format_version"))
+        before = fingerprint(restore_target)
+        with pytest.raises(RestorePreflightError):
+            restore(artifact, restore_target, target_graph, backup_root)
+        assert fingerprint(restore_target) == before
+
+    def test_a_graph_leg_that_is_not_json_is_refused_early(
+        self, artifact, restore_target, target_graph, backup_root
+    ):
+        path = artifact / "graph.json"
+        path.write_text("{not json", encoding="utf-8")
+        manifest_path = artifact / MANIFEST_FILENAME
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["files"]["graph.json"] = {
+            "sha256": sha256_file(path),
+            "bytes": path.stat().st_size,
+        }
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+        before = fingerprint(restore_target)
+        with pytest.raises(RestorePreflightError):
+            restore(artifact, restore_target, target_graph, backup_root)
+        assert fingerprint(restore_target) == before
+
+    def test_the_refusal_is_a_backup_error_so_callers_keep_one_type_to_catch(self):
+        # `GraphArtifactError` is a RuntimeError, not a MistError
+        # (`grep -n "class GraphArtifactError" backend/knowledge/graph_artifact.py`
+        # -> :95), so it escaped every `except MistError` arm in this package as
+        # a traceback. Translating it is what closes that hole.
+        assert issubclass(RestorePreflightError, BackupError)
+        assert not issubclass(GraphArtifactError, BackupError)
 
 
 class TestAbsentLegs:

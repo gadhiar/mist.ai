@@ -23,15 +23,27 @@ no flag disables any of them:
        the wrong target is survivable at all.
 
 WHAT IS DESTRUCTIVE, AND IN WHAT ORDER
-    The artifact's file digests are verified BEFORE anything is touched, so a
-    corrupt artifact cannot take the target down with it. Then, in order: the
-    stores are replaced file by file, the vault tree is replaced wholesale, and
-    the graph leg runs last through
+    THE WHOLE ARTIFACT IS READ AND DECODED BEFORE ANYTHING IS TOUCHED. Two
+    separate checks, and both are preflight:
+
+    - every file the manifest names is re-digested (`verify_artifact_files`);
+    - the graph leg is parsed, version-checked and decoded, and its relationship
+      endpoints resolved (`load_graph_leg`).
+
+    The second check is preflight because of a defect this file used to have:
+    `load_artifact` ran LAST, so an artifact whose digests were all valid but
+    whose `format_version` this build cannot read replaced the stores and the
+    vault and only then refused, leaving a half-restored target. Digest validity
+    and decodability are different properties, and only checking the first one
+    early was a claim this docstring made that the code did not keep.
+
+    Then, in order: the stores are replaced file by file, the vault tree is
+    replaced wholesale, and the already-decoded graph is written last through
     `backend.knowledge.admin.restore_graph_from_artifact`, which detach-deletes
-    the target graph before loading. The graph is last because it is the only
-    leg that clears its target as part of the load; putting it first would mean
-    a failure in the store leg left a target with neither its old graph nor its
-    old stores.
+    the target graph before loading. The graph write is last because it is the
+    only leg that clears its target as part of the load; putting it first would
+    mean a failure in the store leg left a target with neither its old graph nor
+    its old stores.
 
 WHAT IT DOES NOT DO
     It does not reimplement the graph codec or the graph loader. `load_artifact`
@@ -42,10 +54,11 @@ WHAT IT DOES NOT DO
 
 Exit codes:
     0  the target was restored
-    2  refused -- target, confirmation, destination or graph URI. Nothing
-       was written to the target.
-    1  a leg failed. The pre-restore artifact named in the output is the way
-       back.
+    2  refused -- target, confirmation, destination, graph URI, an artifact that
+       failed preflight, or a pre-restore backup that failed. In every one of
+       these cases NOTHING was written to the target.
+    1  a leg failed after the pre-restore backup succeeded. The pre-restore
+       artifact named in the output is the way back.
 
 Usage (see `scripts/backup/README.md` for the rehearsal this belongs to, and run
 it once without `--confirm-target` to be shown the exact token to type):
@@ -71,17 +84,23 @@ from typing import Any
 
 from backend.errors import MistError
 from backend.interfaces import GraphConnection
-from backend.knowledge.admin import graph_version_stamps, restore_graph_from_artifact
+from backend.knowledge.admin import (
+    assert_artifact_is_relinkable,
+    graph_version_stamps,
+    restore_graph_from_artifact,
+)
 from backend.knowledge.eval_isolation import EvalIsolationError, assert_neo4j_dev_isolated
-from backend.knowledge.graph_artifact import load_artifact
+from backend.knowledge.graph_artifact import GraphArtifactError, load_artifact
 
 from .destination import resolve_backup_root
 from .dump import GRAPH_FILENAME, VAULT_DIRNAME, DumpReport, run_dump
 from .errors import (
     BackupDestinationError,
     BackupError,
+    BackupManifestError,
     RestoreAbortedError,
     RestoreConfirmationError,
+    RestorePreflightError,
     RestoreTargetError,
 )
 from .manifest import BackupManifest, read_manifest, sha256_file, utc_now_iso
@@ -124,9 +143,14 @@ def verify_artifact_files(artifact_dir: Path, manifest: BackupManifest) -> None:
     old state nor a complete copy of the new; discovered here, it leaves the
     target untouched and the operator free to reach for an older artifact.
 
+    Digest validity is NOT decodability: a file can match its recorded sha256
+    exactly and still be an artifact this build cannot read, because the version
+    it declares is one this build does not know. `load_graph_leg` is the second
+    preflight check for that reason.
+
     Raises:
-        BackupError: When a named file is missing, or its bytes no longer match
-            the digest recorded at capture time.
+        RestorePreflightError: When a named file is missing, or its bytes no
+            longer match the digest recorded at capture time.
     """
     missing: list[str] = []
     corrupt: list[str] = []
@@ -139,7 +163,7 @@ def verify_artifact_files(artifact_dir: Path, manifest: BackupManifest) -> None:
             corrupt.append(relative)
 
     if missing or corrupt:
-        raise BackupError(
+        raise RestorePreflightError(
             f"refusing to restore from {artifact_dir}: "
             f"{len(missing)} file(s) named by the manifest are absent "
             f"({sorted(missing)[:3]}) and {len(corrupt)} no longer match their "
@@ -251,36 +275,78 @@ def restore_vault(artifact_dir: Path, target_vault_root: Path) -> int:
     return sum(1 for path in target_vault_root.rglob("*") if path.is_file())
 
 
-def restore_graph(artifact_dir: Path, connection: GraphConnection) -> dict[str, int]:
-    """Load the artifact's graph leg into `connection`, replacing what is there.
+def load_graph_leg(artifact_dir: Path) -> dict[str, Any]:
+    """Parse, version-check and decode the graph leg. PREFLIGHT: writes nothing.
 
-    Calls MIS-140 T3 and adds nothing: `load_artifact` validates the envelope
-    and decodes every tagged value back to its driver type, and
-    `restore_graph_from_artifact` detach-deletes the target and writes. The
-    isolation guard is the CALLER's job by that function's own docstring
-    (`grep -n "The caller is responsible for the isolation guard"
+    Runs before the first store is replaced, which is the fix for a defect this
+    module shipped with: the decode used to happen last, so an artifact with
+    valid digests and an unreadable `format_version` took the stores and the
+    vault with it before refusing.
+
+    `assert_artifact_is_relinkable` runs here as well, for the same reason. It
+    is also the first statement of `restore_graph_from_artifact`
+    (`grep -n "assert_artifact_is_relinkable(artifact)"
+    backend/knowledge/admin.py` -> :1160), so calling it here does not replace
+    that check -- it moves the same refusal to before the target is touched
+    rather than after.
+
+    Every failure is translated to `RestorePreflightError` because
+    `GraphArtifactError` is a `RuntimeError`, not a `MistError`, and would
+    otherwise escape this package's `except` arms as a raw traceback.
+
+    Returns:
+        The decoded artifact, ready for `write_graph`.
+
+    Raises:
+        RestorePreflightError: When the graph file is absent, is not JSON,
+            declares a format or version this build does not read, carries a
+            value it cannot reconstruct, or has an endpoint no node provides.
+    """
+    path = artifact_dir / GRAPH_FILENAME
+    if not path.is_file():
+        raise RestorePreflightError(
+            f"artifact {artifact_dir} has no {GRAPH_FILENAME}. The graph is the leg "
+            "that cannot be rebuilt from anything else on disk, so a restore does "
+            "not proceed without it. Nothing has been written to the target."
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RestorePreflightError(
+            f"{path} could not be read as JSON: {exc}. Nothing has been written to " "the target."
+        ) from exc
+    try:
+        artifact = load_artifact(payload)
+        assert_artifact_is_relinkable(artifact)
+    except GraphArtifactError as exc:
+        raise RestorePreflightError(
+            f"refusing to restore from {artifact_dir}: its graph leg cannot be "
+            f"loaded by this build ({exc}). Nothing has been written to the target, "
+            "and its stores, vault and graph are untouched. A digest check alone "
+            "would not have caught this: the file is intact and this build cannot "
+            "read it."
+        ) from exc
+    return artifact
+
+
+def write_graph(connection: GraphConnection, artifact: dict[str, Any]) -> dict[str, int]:
+    """Write an ALREADY-DECODED artifact into `connection`, replacing what is there.
+
+    DESTRUCTIVE, and the last leg of a restore for that reason. Calls MIS-140 T3
+    and adds nothing: `restore_graph_from_artifact` detach-deletes the target and
+    loads. The isolation guard is the CALLER's job by that function's own
+    docstring (`grep -n "The caller is responsible for the isolation guard"
     backend/knowledge/admin.py` -> :1131), and `run_restore` is where it runs.
 
     Returns:
         `{"deleted", "schema_statements", "nodes", "relationships"}`.
 
     Raises:
-        BackupError: When the graph file is absent or is not JSON.
-        GraphArtifactError: When the envelope, a value, or a relationship
-            endpoint fails T3's checks.
+        GraphArtifactError: When the server creates a number of relationships
+            not equal to the batch. That is a genuine part-way failure, so it is
+            NOT translated into a preflight error: the target really is
+            partially loaded at that point, and `main` exits 1.
     """
-    path = artifact_dir / GRAPH_FILENAME
-    if not path.is_file():
-        raise BackupError(
-            f"artifact {artifact_dir} has no {GRAPH_FILENAME}. The graph is the leg "
-            "that cannot be rebuilt from anything else on disk, so a restore does "
-            "not proceed without it."
-        )
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise BackupError(f"{path} could not be read as JSON: {exc}") from exc
-    artifact = load_artifact(payload)
     return restore_graph_from_artifact(connection, artifact)
 
 
@@ -316,10 +382,19 @@ def take_pre_restore_backup(
         The finished pre-restore artifact directory.
 
     Raises:
-        RestoreAbortedError: When the capture fails for any reason this package
+        RestoreAbortedError: When the capture fails for ANY reason the dump leg
             can raise. The restore then does not proceed -- a restore whose
             safety net failed is a one-way door, and the operator has not agreed
             to one.
+
+            Both arms are needed for that "any" to be true. `MistError` covers
+            this package's own failures; `GraphArtifactError` is a `RuntimeError`
+            (`grep -n "class GraphArtifactError"
+            backend/knowledge/graph_artifact.py` -> :95) and is exactly what the
+            graph leg of a capture raises, so without the second arm the
+            commonest capture failure escaped this translation, printed a
+            traceback, and exited with the code documented as "the pre-restore
+            artifact is the way back" -- when no such artifact existed.
     """
     name = label or f"pre-restore-{utc_now_iso().replace(':', '').replace('-', '')}"
     try:
@@ -333,7 +408,7 @@ def take_pre_restore_backup(
             vault_root=target_vault_root,
             label=name,
         )
-    except MistError as exc:
+    except (MistError, GraphArtifactError) as exc:
         raise RestoreAbortedError(
             f"REFUSING TO RESTORE: the pre-restore backup of {target_root} failed "
             f"({exc.__class__.__name__}: {exc}). Nothing has been overwritten. This "
@@ -362,12 +437,17 @@ def run_restore(
     """Restore one artifact into one target, after all four gates pass.
 
     The gate ORDER is chosen so that the cheapest and least reversible checks
-    run before anything is read or written, and so that each refusal is the
-    accurate one:
+    run before anything is read or written, so that each refusal is the accurate
+    one, and so that EVERY check that can refuse an artifact happens before the
+    first byte of the target changes:
 
         target root resolved and not live -> handshake marker -> graph URI ->
-        typed token -> artifact manifest and digests -> pre-restore backup ->
-        stores -> vault -> graph
+        typed token -> backup destination -> artifact manifest and digests ->
+        graph leg decoded and relinkable -> pre-restore backup -> stores ->
+        vault -> graph write
+
+    Everything left of `pre-restore backup` leaves the target bit-for-bit
+    unchanged.
 
     Args:
         artifact_dir: The backup artifact to restore FROM.
@@ -396,8 +476,16 @@ def run_restore(
             its own words.
         RestoreConfirmationError: The token is absent or not the resolved path.
         BackupDestinationError: The pre-restore destination is unset or refused.
-        RestoreAbortedError: The pre-restore backup failed.
+        BackupManifestError: The artifact has no manifest, or one this build
+            cannot read.
+        RestorePreflightError: The artifact failed a digest, version, decode or
+            re-anchoring check. The target is untouched.
+        RestoreAbortedError: The pre-restore backup failed. The target is
+            untouched.
         BackupError: A leg failed after the pre-restore backup succeeded.
+        GraphArtifactError: The graph WRITE failed part way, leaving a partially
+            loaded graph. Not translated, because unlike every entry above it,
+            this one does not mean the target is untouched.
     """
     resolved_target = assert_restore_target_root(target_root)
     assert_neo4j_dev_isolated(target_graph_uri)
@@ -417,6 +505,10 @@ def run_restore(
     source = Path(artifact_dir)
     manifest = read_manifest(source)
     verify_artifact_files(source, manifest)
+    # Decoded here, written at the very end. Both halves of the graph leg used
+    # to happen after the stores were replaced, which made every version and
+    # decode refusal a half-restore.
+    graph_artifact = load_graph_leg(source)
 
     pre_restore = take_pre_restore_backup(
         target_root=resolved_target,
@@ -433,7 +525,7 @@ def run_restore(
 
     stores_written = restore_stores(source, resolved_target, manifest)
     vault_files = restore_vault(source, vault_root)
-    graph = restore_graph(source, connection)
+    graph = write_graph(connection, graph_artifact)
 
     absent = tuple(
         filename for filename, entry in manifest.stores.items() if not entry.get("present")
@@ -581,10 +673,16 @@ def main(argv: list[str] | None = None) -> int:
                 None if args.target_vault_root is None else Path(args.target_vault_root)
             ),
         )
+    # Exit 2 is a PROMISE that the target is untouched, so this tuple holds
+    # exactly the failures raised before the first store is replaced -- which
+    # now includes every artifact check, because the graph leg is decoded during
+    # preflight rather than written first and checked later.
     except (
         RestoreTargetError,
         RestoreConfirmationError,
         BackupDestinationError,
+        BackupManifestError,
+        RestorePreflightError,
         RestoreAbortedError,
     ) as exc:
         print(f"[restore] REFUSED: {exc}", file=sys.stderr)
@@ -592,7 +690,11 @@ def main(argv: list[str] | None = None) -> int:
     except EvalIsolationError as exc:
         print(f"[restore] REFUSED: {exc}", file=sys.stderr)
         return EXIT_REFUSED
-    except MistError as exc:
+    # `GraphArtifactError` is a `RuntimeError`, not a `MistError`, so it needs
+    # its own name here or it escapes as a traceback. Reaching this arm means
+    # the graph WRITE failed part way; the target is partially restored and the
+    # pre-restore artifact is the way back, which is what exit 1 documents.
+    except (MistError, GraphArtifactError) as exc:
         print(f"[restore] FAILED: {exc.__class__.__name__}: {exc}", file=sys.stderr)
         return EXIT_FAILED
     finally:

@@ -77,7 +77,7 @@ from backend.errors import MistError
 from backend.interfaces import GraphConnection
 from backend.knowledge.admin import dump_full_graph_artifact, graph_version_stamps
 from backend.knowledge.eval_isolation import REPO_ROOT
-from backend.knowledge.graph_artifact import dumps_artifact
+from backend.knowledge.graph_artifact import GraphArtifactError, dumps_artifact
 
 from .destination import assert_backup_destination, resolve_backup_root
 from .errors import BackupDestinationError, BackupError
@@ -406,7 +406,14 @@ def main(argv: list[str] | None = None) -> int:
     except BackupDestinationError as exc:
         print(f"[backup] REFUSED: {exc}", file=sys.stderr)
         return EXIT_DESTINATION_REFUSED
-    except MistError as exc:
+    # `GraphArtifactError` is a `RuntimeError` and not a `MistError`
+    # (`grep -n "class GraphArtifactError" backend/knowledge/graph_artifact.py`
+    # -> :95), so it needs naming here. It is exactly what the graph leg raises
+    # on a value that cannot be round-tripped or a non-finite float -- the
+    # commonest way a capture fails -- and without this arm that exits with a
+    # traceback instead of the documented code, leaving the `.partial` directory
+    # unexplained.
+    except (MistError, GraphArtifactError) as exc:
         print(f"[backup] FAILED: {exc.__class__.__name__}: {exc}", file=sys.stderr)
         return EXIT_FAILED
     finally:
