@@ -300,6 +300,33 @@ class TestMountDiscipline:
                 f"whatever is inside."
             )
 
+    def test_bind_mount_set_is_exactly_the_allowlist(self, compose):
+        """Closes the spelling gap the per-directory tests leave open.
+
+        `test_forbidden_host_directory_is_not_mounted` matches host sides as
+        strings, so an ABSOLUTE spelling of the same directory
+        (/home/raj/mist.ai/data rather than ./data) would pass it. An exhaustive
+        allowlist does not care how a new mount is spelled.
+        """
+        expected = {
+            SCRATCH_HOST_DIR,
+            "./backend",
+            "./src",
+            "./dependencies",
+            "./scripts",
+            "./tests",
+            "./voice_profiles",
+        }
+        actual = {host for host, _, _ in _bind_mounts(compose, BACKEND_SERVICE)}
+        assert actual == expected, (
+            f"{BACKEND_SERVICE}'s bind mounts are {sorted(actual)}; the allowlist "
+            f"is {sorted(expected)}. Every host directory mounted here is one the "
+            f"smoke run can see, and the whole containment argument is that the "
+            f"live stores and the hydration fixture are NOT among them. Adding a "
+            f"mount is a containment decision -- make it here, deliberately, "
+            f"rather than by editing the compose file alone."
+        )
+
     def test_no_live_neo4j_volume_is_referenced(self, compose):
         referenced = set()
         for service in compose.get("services", {}):
