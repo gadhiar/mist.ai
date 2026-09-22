@@ -72,6 +72,10 @@ How the top-level status is derived, so a reader can reproduce it
                           or any(c["restart_repairs"] and effective(c) == "down"
                                  and c["consecutive_failures"] >= settled_failures)
 
+An empty `checks` mapping is `unhealthy` with `restart_recommended` false:
+both `any(...)` terms are vacuously false over nothing, and nothing verified is
+not healthy.
+
 `derive_status` implements exactly that, takes no clock and performs no I/O.
 
 Nothing dynamic reaches the response
@@ -99,15 +103,24 @@ logger = logging.getLogger(__name__)
 
 # Closed vocabulary. Membership is enforced structurally in `_coerce_reason`, so
 # the no-leak property holds by construction rather than by discipline.
+#
+# Every term here is either raised by a probe today or is the designated answer
+# for a rule this module commits to. `no_probe_implemented` is the one currently
+# unused term, kept deliberately: the rule is that a dependency we choose not to
+# probe is NAMED in the response rather than omitted, and this is the reason it
+# would carry. `auth_failed` was removed rather than left unused, because no
+# probe can ever raise it -- `Neo4jConnection.health_check` collapses every
+# failure into `{"status": "unhealthy"}` (`neo4j_connection.py:149-155`), so
+# publishing it would advertise a distinction `/health` never makes.
 PROBE_REASONS: frozenset[str] = frozenset(
     {
         "ok",
         "not_probed_yet",
+        "not_started",
         "disabled_by_config",
         "unavailable_at_boot",
         "no_probe_implemented",
         "unreachable",
-        "auth_failed",
         "query_failed",
         "closed",
         "task_dead",
@@ -254,6 +267,13 @@ class Neo4jProbe:
     `is_connected` returns False when `_driver is None`
     (`neo4j_connection.py:65-67`) and short-circuits before any driver call --
     this is a hazard to preserve against, not a live bug.
+
+    What this probe cannot tell you: an authentication rejection is
+    indistinguishable from an unreachable server here, because
+    `Neo4jConnection.health_check` collapses every failure into
+    `{"status": "unhealthy"}` (`neo4j_connection.py:149-155`). Both therefore
+    report `unreachable`. The vocabulary lists no auth reason for exactly that
+    reason -- the contract names only outcomes that can actually occur.
 
     `severity="degrades"` and `restart_repairs=False`: the system's own boot path
     treats Neo4j as non-fatal (`backend/voice_models/model_manager.py:92-95`
@@ -461,8 +481,11 @@ class BroadcasterProbe:
         """Translate the broadcaster state into a probe signal."""
         state = self._get_state()
         if state is None:
-            # Nothing publishes the state yet; null rather than a guess.
-            raise ProbeUnavailable("no_probe_implemented")
+            # The probe ran and found that the task has not reported in yet.
+            # Not `no_probe_implemented` (which would claim we chose not to
+            # look) and not `not_probed_yet` (which means the loop has not
+            # completed a cycle, when in fact this cycle ran).
+            raise ProbeUnavailable("not_started")
         if state == "dead":
             raise ProbeFailed("task_dead")
 
@@ -477,6 +500,13 @@ def derive_status(
     Pure: no I/O, no clock, no registry state. A reader holding only the JSON
     payload can reproduce this exactly, which is the contract in place of an ADR.
 
+    An empty mapping is `unhealthy`, not `healthy`: both `any(...)` calls below
+    are False over an empty iterable, so without this guard a registry that
+    probed nothing would report the system healthy -- the same vacuity this
+    module rejects per check, at the level of the set rather than the member.
+    Nothing verified is not healthy. `restart_recommended` stays False, because
+    a restart does not add probes.
+
     Args:
         rendered_checks: The `checks` mapping from a snapshot.
         probe_loop: `alive` or `dead`.
@@ -485,6 +515,9 @@ def derive_status(
     Returns:
         A `(status, restart_recommended)` pair.
     """
+    if not rendered_checks:
+        return "unhealthy", False
+
     effective: dict[str, str] = {}
     for name, check in rendered_checks.items():
         if check["status"] in ("down", "timeout"):

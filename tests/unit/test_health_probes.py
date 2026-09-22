@@ -477,6 +477,15 @@ def test_top_level_status_is_derivable_from_the_parts(checks, probe_loop):
     assert derive_status(checks, probe_loop) == _recompute(checks, probe_loop)
 
 
+def test_zero_checks_is_not_healthy():
+    """The degenerate row of the matrix above, which `any()` gets wrong.
+
+    Both `any(...)` terms are vacuously false over an empty mapping, so an
+    unguarded derivation calls a registry that probed nothing healthy.
+    """
+    assert derive_status({}, "alive") == ("unhealthy", False)
+
+
 # 12
 @pytest.mark.asyncio
 async def test_the_probe_never_calls_connect(clock, executor):
@@ -546,7 +555,9 @@ async def test_a_fresh_broadcaster_state_is_null_not_alive(clock):
     snapshot = registry.snapshot()
 
     assert snapshot["checks"]["broadcaster"]["status"] is None
-    assert snapshot["checks"]["broadcaster"]["reason"] == "no_probe_implemented"
+    # Not `no_probe_implemented`: the probe is implemented and it ran. What it
+    # found is that the broadcast task has not reported in yet.
+    assert snapshot["checks"]["broadcaster"]["reason"] == "not_started"
     assert snapshot["status"] != "healthy"
 
     state.mark_alive()
