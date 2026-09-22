@@ -18,9 +18,12 @@ instance impossible to set up by following the documented commands:
    lazily, and on `scripts` rather than `backend` (see
    `TestExonerationVerdictFindsScriptsPackage` below).
 
-Pre-fix RED output for all four was captured directly in-container (not
-guessed) before this file's assertions were written; see the worker report
-for this task.
+All five tests here were run against the pre-fix scripts (restored from
+`agent/overnight-2026-09-22` at `8d5ae022`) and observed to fail, then
+against the fixed scripts and observed to pass. The pre-fix failure of the
+first test is a real `TypeError: GraphStore.__init__() missing 1 required
+positional argument: 'embedding_generator'`, raised by the real constructor
+and swallowed into `sys.exit(1)`.
 """
 
 from __future__ import annotations
@@ -81,8 +84,9 @@ class TestMainUsesRealGraphStoreSignature:
     that the call site passed the wrong arguments to the *real*
     constructor. So this patches only the I/O boundary
     (`build_neo4j_connection`, `EmbeddingGenerator`) and lets
-    `GraphStore.__init__` run for real. Today this fails: `main()` catches
-    the `TypeError` from `GraphStore(config)` and calls `sys.exit(1)`.
+    `GraphStore.__init__` run for real. Against the pre-fix script this
+    fails: `main()` catches the `TypeError` from `GraphStore(config)` and
+    calls `sys.exit(1)`.
     """
 
     def test_main_does_not_exit_from_a_swallowed_type_error(self) -> None:
@@ -93,8 +97,19 @@ class TestMainUsesRealGraphStoreSignature:
                 "backend.factories.build_neo4j_connection",
                 return_value=fake_connection,
             ),
+            # Patched at the point of USE, not the point of definition.
+            # `build_graph_store` binds the name via `from
+            # backend.knowledge.embeddings import EmbeddingGenerator`
+            # (`backend/factories.py:184`), so the package attribute is the
+            # name that call site resolves. Patching the defining submodule
+            # (`...embeddings.embedding_generator.EmbeddingGenerator`) also
+            # intercepts today, but only because the package re-exports
+            # lazily through a PEP 562 `__getattr__` that re-resolves on
+            # every access; binding that name eagerly in
+            # `embeddings/__init__.py` would silently stop the fake from
+            # being used and leave this test green against a real generator.
             patch(
-                "backend.knowledge.embeddings.embedding_generator.EmbeddingGenerator",
+                "backend.knowledge.embeddings.EmbeddingGenerator",
                 _FakeEmbeddingGenerator,
             ),
         ):
