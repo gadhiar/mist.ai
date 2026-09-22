@@ -22,6 +22,7 @@ that sets MIST_EVAL_NEO4J_HOSTS does so through `monkeypatch` on purpose, to run
 the compose file's value through the SAME parser the runtime uses.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -111,57 +112,131 @@ def _environment_of(compose: dict, service: str) -> dict[str, str]:
     return env
 
 
+#: `C:/path` or `D:\path` -- a Windows drive letter, which is a COLON that is
+#: not a field separator. This is the native path spelling on the machine this
+#: stack runs on, so it is the likely accidental spelling, not an exotic one.
+_WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
 def _require_short_syntax(entry: object, service: str) -> str:
-    """Refuse a non-string volume entry rather than misclassifying it.
+    """Refuse a volume entry these helpers cannot classify, rather than guess.
 
-    Compose accepts a long mapping syntax (`- type: bind / source: ./data /
-    target: /app/data`). `str()` of that dict begins with `{'type'`, which
-    starts with neither `.` nor `/`, so the leading-character discriminator
-    below would treat it as a NAMED VOLUME: invisible to `_bind_mounts` and
-    counted by `_volume_names`. A long-syntax `./data` mount would then pass
-    `test_bind_mount_set_is_exactly_the_allowlist` while actually mounting the
-    live event store. That is the one known way this module can report a
-    containment property it is not checking, so it fails closed here instead.
+    Two refusals, each closing a way a live path could be mounted while the
+    assertions below still passed.
 
-    Converting the compose file to long syntax is legitimate; doing so
-    silently is not. Teach both helpers the mapping form in the same change.
+    NON-STRING: compose's long mapping syntax (`- type: bind / source: ./data /
+    target: /app/data`). `str()` of that dict is `{'type': 'bind', ...}`, which
+    `_split_volume_spec` cannot parse into a host path.
+
+    INTERPOLATED: a `${VAR}` anywhere in the entry. The host side cannot be
+    resolved without the environment the operator will actually run under, so
+    no static check can show it misses `./data`. `${MIST_DATA:-./data}` is the
+    concrete case: it looks like a named volume to any leading-character test.
+
+    Both fail closed. Legitimately introducing either form is fine; doing it
+    without teaching these helpers is what is refused.
     """
     if not isinstance(entry, str):
         raise AssertionError(
             f"{service} has a non-string volume entry {entry!r}. These helpers "
-            "only understand compose SHORT syntax; the long mapping form would "
-            "be silently misclassified as a named volume and escape the "
-            "forbidden-mount assertions. Extend the helpers before switching."
+            "parse compose SHORT syntax only; the long mapping form cannot be "
+            "resolved to a host path here and would escape the forbidden-mount "
+            "assertions. Extend the helpers before switching."
+        )
+    if "${" in entry:
+        raise AssertionError(
+            f"{service} has an interpolated volume entry {entry!r}. Its host "
+            "side depends on the operator's environment, so this module cannot "
+            "show it does not resolve to ./data, ./mist-memory or ./dev-state. "
+            "Use a literal path in this file."
         )
     return entry
+
+
+def _split_volume_spec(spec: str) -> tuple[str, str, str]:
+    """Split `host:container[:mode]`, keeping a Windows drive letter attached.
+
+    `"C:/Users/rajga/mist.ai/data:/app/data".split(":")` yields `["C", ...]`,
+    which silently renames the live event store to a one-character host. The
+    drive prefix is consumed first so the host side survives intact.
+    """
+    if _WINDOWS_DRIVE.match(spec):
+        drive, rest = spec[:2], spec[2:]
+        parts = rest.split(":")
+        parts[0] = drive + parts[0]
+    else:
+        parts = spec.split(":")
+    host = parts[0]
+    container = parts[1] if len(parts) > 1 else ""
+    mode = parts[2] if len(parts) > 2 else ""
+    return host, container, mode
+
+
+#: Compose's named-volume grammar: `[a-zA-Z0-9]` then word characters, dots
+#: and dashes. Crucially NO `/`, `\`, `:` or `~`. A host side that does not
+#: match this is a PATH, so the entry is a bind mount.
+#:
+#: This is the discriminator because it is a property of THE STRING, needing
+#: neither the base compose file nor an environment. Two alternatives were
+#: tried and are both wrong:
+#:
+#:   - LEADING `.` OR `/`: classifies `C:/Users/rajga/mist.ai/data`,
+#:     `~/mist.ai/data` and `/c/Users/...` as NAMED VOLUMES. All three bind the
+#:     live event store, and all three passed every forbidden-mount assertion
+#:     in this module. The Windows drive-letter form is this machine's native
+#:     path spelling, so it is the likely accidental input, not an exotic one.
+#:
+#:   - MEMBERSHIP OF THE TOP-LEVEL `volumes:` KEY: correct for a whole compose
+#:     PROJECT, wrong for one overlay file. `mist-hf-cache` and
+#:     `mist-torch-cache` are declared at `docker-compose.yml:182-183` and used
+#:     by this stack's backend, so a test parsing only this overlay reports
+#:     both as binds. Measured, not predicted: it turned
+#:     `test_bind_mount_set_is_exactly_the_allowlist`,
+#:     `test_scratch_is_the_only_writable_bind_mount` and
+#:     `test_named_volumes_are_not_reported_as_binds` red. Do not
+#:     reach for it again.
+_VOLUME_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+
+
+def _declared_volume_names(compose: dict) -> set[str]:
+    """The top-level `volumes:` keys of THIS file.
+
+    Deliberately NOT the classifier -- see `_VOLUME_NAME` for why one overlay
+    cannot classify by declaration. Used only to assert that this file
+    declares the volumes it is itself responsible for.
+    """
+    return set((compose.get("volumes") or {}).keys())
 
 
 def _bind_mounts(compose: dict, service: str) -> list[tuple[str, str, str]]:
     """Return (host, container, mode) for every BIND mount on `service`.
 
-    Named volumes are excluded: their host side is an identifier, not a path.
-    The discriminator is the leading `.` or `/`, which is also how compose
-    itself tells the two apart. Non-string entries are refused by
-    `_require_short_syntax` rather than falling through that discriminator.
+    Fail-safe direction: anything that is not a syntactically valid volume
+    NAME is reported as a bind, so an unrecognised entry must then appear in
+    the allowlist to pass rather than vanishing from the assertion.
+
+    Agrees with compose's own semantics including the case that looks odd: a
+    bare `data:/app/data` IS a named volume to compose, and matches
+    `_VOLUME_NAME`, so it is reported as one here too.
     """
     mounts = []
     for entry in compose["services"][service].get("volumes", []):
         spec = _require_short_syntax(entry, service)
-        parts = spec.split(":")
-        host = parts[0]
-        container = parts[1] if len(parts) > 1 else ""
-        mode = parts[2] if len(parts) > 2 else ""
-        if host.startswith(".") or host.startswith("/"):
+        host, container, mode = _split_volume_spec(spec)
+        if not _VOLUME_NAME.match(host):
             mounts.append((host, container, mode))
     return mounts
 
 
 def _volume_names(compose: dict, service: str) -> list[str]:
-    """Return the named-volume side of every non-bind mount on `service`."""
+    """Return the named-volume side of every non-bind mount on `service`.
+
+    Exact complement of `_bind_mounts`: matches `_VOLUME_NAME`.
+    """
     names = []
     for entry in compose["services"][service].get("volumes", []):
-        host = _require_short_syntax(entry, service).split(":")[0]
-        if not host.startswith(".") and not host.startswith("/"):
+        host, _, _ = _split_volume_spec(_require_short_syntax(entry, service))
+        if _VOLUME_NAME.match(host):
             names.append(host)
     return names
 
@@ -556,36 +631,157 @@ class TestHarnessShape:
             f"./smoke-state through the bind mount."
         )
 
-    def test_long_syntax_mount_is_refused_not_misclassified(self):
-        """The helpers fail closed on compose long syntax.
+    def test_unparseable_mount_forms_are_refused(self):
+        """The two forms the helpers cannot resolve fail closed.
 
-        Without `_require_short_syntax`, a long-syntax bind of the LIVE event
-        store stringifies to `{'type': 'bind', ...}`, whose first character is
-        neither `.` nor `/`. `_bind_mounts` would skip it and `_volume_names`
-        would count it as a named volume, so the forbidden-mount assertions
-        would pass with ./data mounted. This test is the standing proof that
-        the guard fires; it is the only reason the eight containment
-        assertions can be trusted against a future syntax change.
+        Long mapping syntax and `${VAR}` interpolation both bind a real host
+        path that no static check here can pin down.
         """
-        smuggled = {
-            "services": {
-                BACKEND_SERVICE: {
-                    "volumes": [
-                        {"type": "bind", "source": "./data", "target": "/app/data"}
-                    ]
-                }
+        cases = [
+            ({"type": "bind", "source": "./data", "target": "/app/data"}, "non-string"),
+            ("${MIST_DATA:-./data}:/app/data", "interpolated"),
+        ]
+        for entry, expected in cases:
+            smuggled = {
+                "volumes": {"mist-hf-cache": None},
+                "services": {BACKEND_SERVICE: {"volumes": [entry]}},
             }
-        }
-        for helper in (_bind_mounts, _volume_names):
-            with pytest.raises(AssertionError, match="non-string volume entry"):
-                helper(smuggled, BACKEND_SERVICE)
+            for helper in (_bind_mounts, _volume_names):
+                with pytest.raises(AssertionError, match=expected):
+                    helper(smuggled, BACKEND_SERVICE)
 
-    def test_real_compose_uses_only_short_syntax(self, compose):
-        """The guard above is not vacuous on the file actually shipped."""
-        entries = compose["services"][BACKEND_SERVICE].get("volumes", [])
-        assert entries, "backend service declares no volumes at all"
-        assert all(isinstance(e, str) for e in entries), (
-            "The shipped compose file now uses long-syntax mounts. Extend "
-            "_bind_mounts and _volume_names to parse the mapping form before "
-            "relaxing this."
+    def test_live_paths_that_defeat_a_spelling_test_are_classified_as_binds(self):
+        """Spellings of the LIVE event store that must register as BINDS.
+
+        Each is a plain string, so `_require_short_syntax` passes it; only the
+        classifier stands between it and a silently-mounted live event store.
+
+        MEASURED against the pre-fix helper at `14ca49d`, by importing it from
+        git rather than reasoning about it -- the first two ESCAPED, the third
+        did not:
+
+            'C:/Users/rajga/mist.ai/data'   OLD binds=[]  ESCAPED
+            '~/mist.ai/data'                OLD binds=[]  ESCAPED
+            '/c/Users/rajga/mist.ai/data'   OLD           CAUGHT
+
+        So this is a regression test for two real escapes plus one
+        non-regression case, NOT three escapes. The Windows drive-letter form
+        is this machine's native spelling and is the one that matters; `/c/...`
+        is kept because it is the Git-Bash rewriting of the same path and must
+        not break when the discriminator changes.
+        """
+        smuggled_hosts = [
+            "C:/Users/rajga/mist.ai/data",
+            "~/mist.ai/data",
+            "/c/Users/rajga/mist.ai/data",
+        ]
+        for host in smuggled_hosts:
+            compose = {
+                "volumes": {"mist-hf-cache": None},
+                "services": {
+                    BACKEND_SERVICE: {
+                        "volumes": [f"{host}:/app/data", "mist-hf-cache:/cache"]
+                    }
+                },
+            }
+            binds = _bind_mounts(compose, BACKEND_SERVICE)
+            names = _volume_names(compose, BACKEND_SERVICE)
+            assert (host, "/app/data", "") in binds, (
+                f"{host!r} binds the live event store but was not reported as a "
+                f"bind mount; got {binds!r}. It would escape every "
+                f"forbidden-mount assertion in this module."
+            )
+            assert host not in names, (
+                f"{host!r} was counted as a NAMED VOLUME; got {names!r}."
+            )
+            assert names == ["mist-hf-cache"], (
+                f"the genuinely named volume was misclassified; got {names!r}"
+            )
+
+    def test_named_volumes_are_not_reported_as_binds(self, compose):
+        """The complement holds on the shipped file: no false positives.
+
+        Without this, a discriminator that called EVERYTHING a bind would pass
+        the test above while making the allowlist assertion fail for the wrong
+        reason -- which is exactly what a declaration-based attempt did.
+
+        `mist-hf-cache` is the load-bearing case: it is declared in the BASE
+        file (`docker-compose.yml:182`), not in this overlay, so any classifier
+        that consults only this file's top-level `volumes:` key misreports it.
+        """
+        names = _volume_names(compose, BACKEND_SERVICE)
+        assert "mist-hf-cache" in names, (
+            f"the shared HF cache is a named volume declared in the base "
+            f"compose file, but was reported as a bind; got {names!r}"
         )
+        bind_hosts = [h for h, _, _ in _bind_mounts(compose, BACKEND_SERVICE)]
+        assert not set(bind_hosts) & set(names), (
+            f"these hosts were reported as BOTH bind and named: "
+            f"{sorted(set(bind_hosts) & set(names))}"
+        )
+
+    def test_this_overlay_declares_the_volumes_it_owns(self, compose):
+        """The smoke Neo4j volumes are this file's responsibility to declare."""
+        declared = _declared_volume_names(compose)
+        for name in ("mist-neo4j-smoke-data", "mist-neo4j-smoke-logs"):
+            assert name in declared, (
+                f"{name} is used by this stack but not declared in its own "
+                f"top-level volumes:; got {sorted(declared)}"
+            )
+
+    def test_no_named_volume_is_bind_backed_via_driver_opts(self, compose):
+        """A named volume can BE a bind, and the name grammar cannot see it.
+
+        `_VOLUME_NAME` classifies by the host side of the mount entry, so a
+        declaration like
+
+            volumes:
+              innocent-name:
+                driver_opts: {type: none, device: ./data, o: bind}
+
+        is reported as a NAMED VOLUME by every helper in this module while
+        docker bind-mounts the live event store into the container. The mount
+        entry reads `innocent-name:/app/data` and is indistinguishable from a
+        real named volume at the point the other tests look.
+
+        This is the last known member of the class the grammar fix closed --
+        found by review, not by the fix -- so it is checked where it is
+        actually visible: the top-level declaration, not the mount entry.
+
+        Any `driver_opts` at all is refused rather than just `o: bind`. A
+        `device:` with `type: none` is the bind spelling, but this stack has no
+        legitimate use for driver_opts of any kind, and an allowlist of safe
+        options is a thing to get wrong later.
+        """
+        volumes = compose.get("volumes") or {}
+        for name, spec in volumes.items():
+            if not isinstance(spec, dict):
+                continue
+            assert "driver_opts" not in spec, (
+                f"top-level volume {name!r} declares driver_opts "
+                f"{spec.get('driver_opts')!r}. A driver_opts volume can be "
+                f"bind-backed, so it would mount a host path while every "
+                f"mount-entry assertion in this module still passes. Nothing "
+                f"in this stack needs driver_opts."
+            )
+
+    def test_the_driver_opts_guard_is_not_vacuous(self):
+        """The guard above fires on the exact evasion it exists to stop."""
+        smuggled = {
+            "volumes": {
+                "innocent-name": {
+                    "driver_opts": {"type": "none", "device": "./data", "o": "bind"}
+                }
+            },
+            "services": {
+                BACKEND_SERVICE: {"volumes": ["innocent-name:/app/data"]}
+            },
+        }
+        # It passes the mount-entry helpers, which is the whole problem.
+        assert _volume_names(smuggled, BACKEND_SERVICE) == ["innocent-name"]
+        assert _bind_mounts(smuggled, BACKEND_SERVICE) == []
+        # The declaration check is what catches it.
+        with pytest.raises(AssertionError, match="driver_opts"):
+            TestHarnessShape().test_no_named_volume_is_bind_backed_via_driver_opts(
+                smuggled
+            )
