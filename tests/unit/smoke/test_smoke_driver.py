@@ -300,9 +300,9 @@ def test_module_import_does_not_require_websockets():
 
     `resolve_websockets` imports it inside the function body for this reason.
 
-    The real check is the module-level import scan below. An earlier revision
     THE SOURCE SCAN BELOW IS THE WHOLE CHECK. Two weaker assertions were tried
-    and removed rather than left sitting beside it looking equivalent:
+    in earlier revisions and removed rather than left sitting beside it looking
+    equivalent:
     `"websockets" not in sys.modules or dt.resolve_websockets is not None`
     (right disjunct always true, so it could not fail), and
     `callable(dt.resolve_websockets)` (a module-level `def` is always callable,

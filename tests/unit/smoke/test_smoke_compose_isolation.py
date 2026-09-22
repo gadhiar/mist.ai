@@ -193,7 +193,7 @@ def _split_volume_spec(spec: str) -> tuple[str, str, str]:
 #:     both as binds. Measured, not predicted: it turned
 #:     `test_bind_mount_set_is_exactly_the_allowlist`,
 #:     `test_scratch_is_the_only_writable_bind_mount` and
-#:     `test_declared_named_volumes_are_not_reported_as_binds` red. Do not
+#:     `test_named_volumes_are_not_reported_as_binds` red. Do not
 #:     reach for it again.
 _VOLUME_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
 
@@ -727,4 +727,61 @@ class TestHarnessShape:
             assert name in declared, (
                 f"{name} is used by this stack but not declared in its own "
                 f"top-level volumes:; got {sorted(declared)}"
+            )
+
+    def test_no_named_volume_is_bind_backed_via_driver_opts(self, compose):
+        """A named volume can BE a bind, and the name grammar cannot see it.
+
+        `_VOLUME_NAME` classifies by the host side of the mount entry, so a
+        declaration like
+
+            volumes:
+              innocent-name:
+                driver_opts: {type: none, device: ./data, o: bind}
+
+        is reported as a NAMED VOLUME by every helper in this module while
+        docker bind-mounts the live event store into the container. The mount
+        entry reads `innocent-name:/app/data` and is indistinguishable from a
+        real named volume at the point the other tests look.
+
+        This is the last known member of the class the grammar fix closed --
+        found by review, not by the fix -- so it is checked where it is
+        actually visible: the top-level declaration, not the mount entry.
+
+        Any `driver_opts` at all is refused rather than just `o: bind`. A
+        `device:` with `type: none` is the bind spelling, but this stack has no
+        legitimate use for driver_opts of any kind, and an allowlist of safe
+        options is a thing to get wrong later.
+        """
+        volumes = compose.get("volumes") or {}
+        for name, spec in volumes.items():
+            if not isinstance(spec, dict):
+                continue
+            assert "driver_opts" not in spec, (
+                f"top-level volume {name!r} declares driver_opts "
+                f"{spec.get('driver_opts')!r}. A driver_opts volume can be "
+                f"bind-backed, so it would mount a host path while every "
+                f"mount-entry assertion in this module still passes. Nothing "
+                f"in this stack needs driver_opts."
+            )
+
+    def test_the_driver_opts_guard_is_not_vacuous(self):
+        """The guard above fires on the exact evasion it exists to stop."""
+        smuggled = {
+            "volumes": {
+                "innocent-name": {
+                    "driver_opts": {"type": "none", "device": "./data", "o": "bind"}
+                }
+            },
+            "services": {
+                BACKEND_SERVICE: {"volumes": ["innocent-name:/app/data"]}
+            },
+        }
+        # It passes the mount-entry helpers, which is the whole problem.
+        assert _volume_names(smuggled, BACKEND_SERVICE) == ["innocent-name"]
+        assert _bind_mounts(smuggled, BACKEND_SERVICE) == []
+        # The declaration check is what catches it.
+        with pytest.raises(AssertionError, match="driver_opts"):
+            TestHarnessShape().test_no_named_volume_is_bind_backed_via_driver_opts(
+                smuggled
             )
