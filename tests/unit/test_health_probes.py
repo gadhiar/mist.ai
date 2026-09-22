@@ -9,6 +9,7 @@ The clock is injected everywhere, so no test sleeps to make time pass.
 
 import asyncio
 import json
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
@@ -22,6 +23,7 @@ from backend.health import (
     LLMProbe,
     Neo4jProbe,
     ProbeFailed,
+    ProbeUnavailable,
     VaultSidecarProbe,
     derive_status,
 )
@@ -253,6 +255,54 @@ async def test_timeout_is_distinguishable_from_failure(clock):
     cancel_stragglers(registry)
 
 
+@pytest.mark.asyncio
+async def test_handled_failures_do_not_claim_a_late_timeout(clock, caplog):
+    """A failure handled inside the timeout must not be reported as a late one.
+
+    `_drain_late_failure` was attached to every probe task at creation, so any
+    probe that raised -- including a `ProbeFailed` or `ProbeUnavailable` caught
+    and recorded well inside its own timeout -- logged `health probe finished
+    after its timeout with an error: ...`. With the loop at 10s in production,
+    an absent vault sidecar or a down Neo4j meant that false claim every ten
+    seconds, forever. The drain now belongs to the timeout branch alone.
+
+    The hanging probe is here so the test cannot pass by the drain having been
+    deleted outright: a genuinely abandoned probe that later fails must still
+    be logged, and must name itself when it is.
+    """
+
+    async def fail():
+        raise ProbeFailed("unreachable")
+
+    async def absent():
+        raise ProbeUnavailable("disabled_by_config")
+
+    async def hang_then_fail():
+        await asyncio.sleep(0.05)
+        raise ProbeFailed("unreachable")
+
+    failing = StubProbe("failing", fail)
+    unavailable = StubProbe("unavailable", absent)
+    late = StubProbe("late", hang_then_fail, timeout_seconds=0.01)
+    registry = build_registry(clock, [failing, unavailable, late])
+
+    with caplog.at_level(logging.WARNING, logger="backend.health"):
+        await registry.run_once()
+        drained = registry._in_flight["late"]
+        with pytest.raises(ProbeFailed):
+            await drained
+        await asyncio.sleep(0)
+
+    messages = [record.getMessage() for record in caplog.records]
+    in_timeout = [m for m in messages if "failing" in m or "unavailable" in m]
+    assert in_timeout == [], f"a handled in-timeout failure was logged as late: {in_timeout}"
+
+    late_lines = [m for m in messages if "abandoned at its" in m]
+    assert len(late_lines) == 1, messages
+    assert "late" in late_lines[0]
+    assert "unreachable" in late_lines[0]
+
+
 # 6
 @pytest.mark.asyncio
 async def test_unprobed_is_null_not_healthy(clock, executor):
@@ -339,7 +389,7 @@ def _leaky_llm(executor):
 
 def _leaky_event_store(executor):
     store = FakeEventStore(raises=RuntimeError(LEAKY_MESSAGE))
-    return EventStoreProbe(lambda: store)
+    return EventStoreProbe(lambda: store, lambda: True)
 
 
 def _leaky_sidecar(executor):
@@ -588,3 +638,69 @@ async def test_broadcaster_death_settles_into_restart_advice(clock):
     settled = registry.snapshot()
     assert settled["checks"]["broadcaster"]["consecutive_failures"] == 5
     assert settled["restart_recommended"] is True
+
+
+# 16
+@pytest.mark.asyncio
+async def test_event_store_none_is_down_when_configured(clock):
+    """Configured plus absent is a failure that happened, so it is `down`.
+
+    `conversation_handler.py:847` only builds the store when
+    `EventStoreConfig.enabled`, and :898 nulls it again when initialize raised.
+    With the flag on, the second is the only explanation left.
+    """
+    registry = build_registry(clock, [EventStoreProbe(lambda: None, lambda: True)])
+
+    await registry.run_once()
+    check = registry.snapshot()["checks"]["event_store"]
+
+    assert check["status"] == "down"
+    assert check["reason"] == "unavailable_at_boot"
+    assert registry.snapshot()["status"] == "degraded"
+
+
+# 17
+@pytest.mark.asyncio
+async def test_event_store_none_is_null_when_not_configured(clock):
+    """Switched off on purpose is not a fault, and must not be reported as one.
+
+    The mirror of `test_neo4j_unavailable_at_boot_is_down_not_null`: the same
+    ambiguity, resolved the same way. Calling a deliberately disabled subsystem
+    `down` claims a failure that did not occur, and does it in exactly the
+    configuration where an operator already knows the thing is off.
+    """
+    registry = build_registry(clock, [EventStoreProbe(lambda: None, lambda: False)])
+
+    await registry.run_once()
+    check = registry.snapshot()["checks"]["event_store"]
+
+    assert check["status"] is None
+    assert check["reason"] == "disabled_by_config"
+    assert check["latency_ms"] is None
+
+
+# 18
+@pytest.mark.asyncio
+async def test_the_event_store_verdict_tracks_the_flag(clock):
+    """Non-vacuity: one store accessor, both answers, inside one test.
+
+    Neither branch above survives a probe that hardcodes its own verdict once
+    the flag is flipped under a single registry.
+    """
+    configured = True
+    registry = build_registry(clock, [EventStoreProbe(lambda: None, lambda: configured)])
+
+    await registry.run_once()
+    assert registry.snapshot()["checks"]["event_store"]["status"] == "down"
+
+    configured = False
+    await registry.run_once()
+    assert registry.snapshot()["checks"]["event_store"]["status"] is None
+
+    # And a store that IS there is `up` regardless of the flag, because the
+    # predicate is consulted only when the accessor returns None.
+    store = FakeEventStore()
+    present = build_registry(clock, [EventStoreProbe(lambda: store, lambda: False)])
+    await present.run_once()
+    assert present.snapshot()["checks"]["event_store"]["status"] == "up"
+    assert store.calls == 1
