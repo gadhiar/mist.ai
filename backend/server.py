@@ -12,8 +12,10 @@ import os
 import sys
 import time
 import uuid
+from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -54,6 +56,16 @@ from backend.factories import (  # isort:skip
     build_phase3_components,
     build_sidecar_index,
     build_vault_writer,
+)
+from backend.health import (  # isort:skip
+    BroadcasterProbe,
+    BroadcasterState,
+    EventStoreProbe,
+    HealthRegistry,
+    LLMProbe,
+    Neo4jProbe,
+    VaultSidecarProbe,
+    derive_status,
 )
 from backend.knowledge.config import KnowledgeConfig  # isort:skip
 from backend.knowledge.eval_isolation import (  # isort:skip
@@ -104,6 +116,28 @@ vault_sidecar = None
 vault_filewatcher = None
 # Phase 5.5: shared InvalidationBus wired from filewatcher to ConversationHandler
 vault_invalidation_bus = None
+
+# `/health` state. `voice_processor` is bound BEFORE `initialize()` is awaited,
+# so `voice_processor is not None` was true throughout the ~120s model load and
+# `models_loaded` claimed a state the process had not reached. This flag is set
+# only once `initialize()` has returned. Kept a plain bool because
+# `tests/unit/hydration/test_health_isolation_flag.py` asserts the field is
+# still present and unchanged in kind. `scripts/hydration/target.py` consumes
+# this response but reads only `hydration_isolation` from it
+# (`target.py:118,126`), so it is that field, not this one, whose type is
+# load-bearing outside the repo's own tests.
+_models_ready: bool = False
+_broadcaster_state: BroadcasterState | None = None
+_health_registry: HealthRegistry | None = None
+_health_probe_executor: Executor | None = None
+
+# `probe_loop` value for "the registry was never constructed", distinct from
+# `health.py`'s `alive` / `dead`, which both describe a loop that ran. It is
+# reachable only before or without `lifespan` -- a direct `server.health()` call
+# in a test, or a lifespan that raised before building the registry. It never
+# reaches `derive_status`'s `probe_loop == "dead"` branch, because the checks
+# mapping is empty in that case and the empty-mapping guard returns first.
+PROBE_LOOP_NOT_STARTED = "not_started"
 
 
 async def broadcast_messages():
@@ -163,19 +197,29 @@ async def system_status_loop(interval_seconds: float = 5.0) -> None:
     straight off the snapshot -- this loop does no psutil call of its own,
     it only serializes what ``collect_metrics()`` already measured.
 
-    Caveat this loop does NOT protect against: the try/except here means a
-    bad tick is logged and skipped, so THIS loop keeps emitting correctly
-    on the next interval. But the payload only reaches clients via
-    ``broadcast_messages()``, which the lifespan starts with no done-callback
-    (``grep -n "create_task(broadcast_messages" backend/server.py``). Cited by
-    symbol, not line: ``KNOWN_ISSUES.md:150-152`` records this same defect
-    against ``server.py:87`` and that number is long stale, and an earlier
-    draft of THIS sentence said 510, which the very hunk that wrote it pushed
-    out of date. If that downstream task dies, this loop keeps
-    emitting into ``message_queue`` while nothing drains it -- the payload,
-    including ``uptime_seconds``, silently stops reaching clients with no
-    error and no unhealthy status. Not fixed here; out of scope for this
-    change.
+    Caveat this loop does NOT protect against, and what now catches it: the
+    try/except here means a bad tick is logged and skipped, so THIS loop keeps
+    emitting correctly on the next interval. But the payload only reaches
+    clients via ``broadcast_messages()``, and if that downstream task dies this
+    loop keeps emitting into ``message_queue`` while nothing drains it -- the
+    payload, including ``uptime_seconds``, stops reaching clients.
+
+    That death is no longer silent. ``broadcast_messages()`` is started with
+    ``_on_broadcaster_done`` attached, which records the death in
+    ``BroadcasterState`` (and logs it with a traceback when it was a raise), and
+    ``BroadcasterProbe`` renders that record in ``/health`` as
+    ``checks.broadcaster.status: "down"`` with ``reason: "task_dead"``. The
+    broadcaster is the one dependency whose severity is fatal AND whose
+    ``restart_repairs`` is true, so a settled failure drives ``status:
+    "unhealthy"`` and ``restart_recommended: true``. What is still NOT fixed:
+    nothing restarts the task, and nothing acts on that flag -- it is advisory,
+    and respawn is out of scope. So this loop's output still stops; it now stops
+    visibly.
+
+    Cited by symbol, not line: ``KNOWN_ISSUES.md:150-152`` records this defect
+    against ``server.py:87`` and that number is long stale, and an earlier draft
+    of THIS sentence said 510, which the very hunk that wrote it pushed out of
+    date.
     """
     from backend import system_metrics
 
@@ -438,11 +482,210 @@ def _resolve_curation_dependencies(voice_processor) -> CurationDependencies:
     )
 
 
+def _on_broadcaster_done(task: "asyncio.Task") -> None:
+    """Done-callback for the WebSocket broadcast task.
+
+    Module-level and named, mirroring `_log_catchup_task_exception`, for the
+    same reason that one was extracted: the behaviour is testable without
+    booting the ASGI lifespan. It is also the single place a future supervisor
+    would hook, so escalating broadcaster death becomes one added call here
+    rather than a search through the lifespan.
+
+    Three outcomes, and they are not interchangeable:
+
+    - Cancelled. Returns early and marks nothing. `lifespan` cancels this task
+      on every orderly shutdown, a cancelled task fires its done-callback like
+      any other, and `task.exception()` RAISES `CancelledError` rather than
+      returning one. What the guard actually buys was measured, by deleting it
+      in a scratch copy and driving a real cancelled task through the callback:
+      `mark_dead` is never reached, because the raise happens above it, so the
+      state stays `alive` and `/health` still answers `healthy` with
+      `restart_recommended: false`. The cost of dropping the guard is one
+      `Exception in callback _on_broadcaster_done(...)` with a `CancelledError`,
+      routed to the event loop's exception handler by
+      `asyncio.events.Handle._run`, on every clean stop -- a server that shut
+      down correctly logging a callback fault. This docstring previously
+      claimed the missing guard would drive `/health` to `unhealthy` with
+      `restart_recommended: true`; that was never executed and is false.
+    - Raised. Logged at ERROR with the traceback, then recorded as dead.
+    - Returned normally. Also recorded as dead. `broadcast_messages` is a
+      `while True` with no `break` and no `return`, so a clean return is itself
+      a bug; treating it as health would hide the same outage as a crash.
+
+    Every outbound event funnels through this task, so its death is silent by
+    construction: producers keep enqueueing onto `message_queue` and nothing
+    drains it. `BroadcasterProbe` renders the recorded state in `/health`.
+    """
+    if task.cancelled():
+        return
+
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Broadcast task died: %s", exc, exc_info=exc)
+    else:
+        logger.error(
+            "Broadcast task returned without an exception; broadcast_messages is a "
+            "`while True` that must never return, so this is a fault, not a clean stop"
+        )
+
+    if _broadcaster_state is not None:
+        _broadcaster_state.mark_dead(exc)
+
+
+def _on_health_probe_loop_done(task: "asyncio.Task") -> None:
+    """Done-callback for the health registry's own probe loop.
+
+    Same cancellation trap as `_on_broadcaster_done`, and the same reasoning:
+    `lifespan` cancels this task on shutdown, so an unguarded `task.exception()`
+    would raise `CancelledError` out of a callback on every clean stop.
+
+    Nothing is marked here, and that is the design rather than an omission.
+    `HealthRegistry.snapshot` already self-reports a stopped loop -- it computes
+    `probe_loop` from how long ago the last cycle COMPLETED, going `dead` once
+    that exceeds `dead_after_seconds`, reading no state this callback writes --
+    so the loop's death is visible in the payload whether or not this callback
+    ever fires. That independence is the point: detection must not depend on the
+    mechanism that may itself have failed, and a done-callback is part of the
+    task machinery whose failure it would be reporting. Adding a marker here
+    would couple the detection path to this callback firing, which is exactly
+    what the elapsed-time test is designed to avoid, so do not add one. What
+    this callback contributes is the log line and the traceback, which an
+    elapsed-time test cannot supply.
+    """
+    if task.cancelled():
+        return
+
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Health probe loop died: %s", exc, exc_info=exc)
+    else:
+        logger.error(
+            "Health probe loop returned without an exception; `run_forever` is a "
+            "`while True`, so /health is now serving a cache nothing refreshes"
+        )
+
+
+def _health_conversation_handler():
+    """Reach the live `ConversationHandler`, or None at any broken hop.
+
+    Every hop is guarded because each one is legitimately None in a running
+    process: `models` until `VoiceProcessor.initialize()` has built it
+    (`voice_processor.py:168`), `knowledge` when knowledge integration is off or
+    Neo4j was unavailable at boot (`voice_models/model_manager.py:85-98`), and
+    `conversation_handler` when `build_conversation_handler` raised
+    (`chat/knowledge_integration.py:74-87`).
+    """
+    models = getattr(voice_processor, "models", None)
+    knowledge = getattr(models, "knowledge", None)
+    return getattr(knowledge, "conversation_handler", None)
+
+
+def _health_graph_connection():
+    """Reach the Neo4j connection `Neo4jProbe` calls `health_check` on.
+
+    `conversation_handler.graph_store` (`chat/conversation_handler.py:785`) ->
+    `graph_store.connection` (`knowledge/storage/graph_store.py:126`).
+    """
+    graph_store = getattr(_health_conversation_handler(), "graph_store", None)
+    return getattr(graph_store, "connection", None)
+
+
+def _health_event_store():
+    """Reach the event store (`chat/conversation_handler.py:845-849`)."""
+    return getattr(_health_conversation_handler(), "event_store", None)
+
+
+def _health_llm_provider():
+    """Reach the LLM provider.
+
+    Read off `VoiceProcessor`, not `ModelManager`: both hold the same object,
+    since `voice_processor.py:171` passes `self._llm_provider` straight into the
+    `ModelManager` constructor, which stores it unchanged
+    (`voice_models/model_manager.py:71`). The `VoiceProcessor` attribute is the
+    shorter chain and is assigned first (`voice_processor.py:162`, before
+    `models` exists at :168), so it is never the later of the two to appear.
+    `getattr` rather than attribute access because it is assigned in
+    `initialize()`, not in `__init__`.
+    """
+    return getattr(voice_processor, "_llm_provider", None)
+
+
+def _knowledge_configured() -> bool:
+    """Whether knowledge integration is switched on, read at call time."""
+    return KnowledgeConfig.from_env().enable_knowledge_integration
+
+
+def _event_store_configured() -> bool:
+    """Whether the event store is switched on, read at call time."""
+    return KnowledgeConfig.from_env().event_store.enabled
+
+
+async def _initialize_voice_processor(processor: VoiceProcessor) -> None:
+    """Load the model stack and only then publish readiness.
+
+    The ordering is the whole point, so it is a function rather than two lines
+    in `lifespan`: `_models_ready` must flip AFTER `initialize()` returns, and
+    that is not assertable without faking the entire model stack unless the
+    sequence is independently callable. See
+    `tests/unit/test_server_health_wiring.py::test_models_loaded_is_false_during_initialize`.
+
+    Args:
+        processor: The already-constructed `VoiceProcessor` to initialize.
+    """
+    global _models_ready
+
+    await processor.initialize()
+    _models_ready = True
+
+
+def _build_health_registry(
+    executor: Executor,
+    broadcaster_state: BroadcasterState,
+) -> HealthRegistry:
+    """Construct the five dependency probes and the registry that runs them.
+
+    Every accessor is a callable that reads module state WHEN THE PROBE RUNS,
+    never a value captured here. `voice_processor`, `vault_sidecar` and the
+    objects reachable through them are rebound during `lifespan`, and this
+    registry is built after that -- but a captured value would still be wrong
+    the moment any of them is replaced, and a captured None would freeze the
+    probe at "absent" for the life of the process, reporting an outage that
+    ended. The laziness is what `tests/unit/test_server_health_wiring.py`
+    pins in `test_accessors_are_lazy`.
+
+    Extracted from `lifespan` for the same testability reason as
+    `_build_session_note_catchup`: WHICH object each probe ends up reading is
+    the entire content of this wiring, and it cannot be asserted without booting
+    the full model stack unless the construction is its own function.
+
+    Args:
+        executor: Single-worker pool for the blocking Neo4j driver call. Owned
+            by the caller, which is also responsible for shutting it down.
+        broadcaster_state: The live record the broadcast task publishes into.
+
+    Returns:
+        A registry whose `run_forever` the caller schedules.
+    """
+    probes = [
+        Neo4jProbe(_health_graph_connection, _knowledge_configured, executor),
+        LLMProbe(_health_llm_provider),
+        EventStoreProbe(_health_event_store, _event_store_configured),
+        VaultSidecarProbe(lambda: vault_sidecar),
+        BroadcasterProbe(broadcaster_state.state),
+    ]
+    return HealthRegistry(
+        probes,
+        monotonic=time.monotonic,
+        wall_clock=lambda: datetime.now(UTC),
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
     global voice_processor, curation_scheduler, log_handler
     global vault_writer, vault_sidecar, vault_filewatcher, vault_invalidation_bus
+    global _broadcaster_state, _health_registry, _health_probe_executor
 
     # Startup
     logger.info("=" * 60)
@@ -524,14 +767,33 @@ async def lifespan(app: FastAPI):
         vault_sidecar=vault_sidecar,
         invalidation_bus=vault_invalidation_bus,
     )
-    await voice_processor.initialize()
+    # Sets `_models_ready` only once initialize() has returned, so
+    # `/health.models_loaded` reports a state the process has actually reached
+    # rather than the mere existence of the object above.
+    await _initialize_voice_processor(voice_processor)
 
-    # Start message broadcaster
-    broadcaster_task = asyncio.create_task(broadcast_messages())
+    # Start message broadcaster. The state record is created and marked alive
+    # here, beside the task it describes: `BroadcasterProbe` renders
+    # `not_started` until something publishes, so a registry wired to a state
+    # nobody marks would report the broadcaster missing forever.
+    _broadcaster_state = BroadcasterState()
+    broadcaster_task = asyncio.create_task(broadcast_messages(), name="broadcast-messages")
+    _broadcaster_state.mark_alive()
+    broadcaster_task.add_done_callback(_on_broadcaster_done)
     # Start heartbeat task (5s interval per ADR-017 Heartbeat semantics)
     heartbeat_task = asyncio.create_task(heartbeat_loop())
     # Start health-status task (30s interval per ADR-017 health_status)
     health_status_task = asyncio.create_task(health_status_loop())
+
+    # Start the dependency probe loop behind `/health`. The executor is
+    # single-worker on purpose: the Neo4j driver is built with no timeouts, and
+    # `asyncio.wait_for` abandons a wedged `run_in_executor` call rather than
+    # stopping it, so an unbounded pool would leak one thread per tick into a
+    # hung dependency. See `backend/health.py`'s module docstring.
+    _health_probe_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="health-probe")
+    _health_registry = _build_health_registry(_health_probe_executor, _broadcaster_state)
+    health_probe_task = asyncio.create_task(_health_registry.run_forever(), name="health-probes")
+    health_probe_task.add_done_callback(_on_health_probe_loop_done)
 
     # Start system-status task (5s interval per ADR-017 system_status).
     # GPU init is best-effort; failure produces placeholder GPU blocks
@@ -672,7 +934,13 @@ async def lifespan(app: FastAPI):
         system_metrics.shutdown_gpu()
     health_status_task.cancel()
     heartbeat_task.cancel()
+    health_probe_task.cancel()
     broadcaster_task.cancel()
+    # `wait=False` deliberately: a probe thread wedged on the timeout-less Neo4j
+    # driver would otherwise hold shutdown for the driver's own 60s acquisition
+    # timeout. The pool has one worker and the process is ending.
+    if _health_probe_executor is not None:
+        _health_probe_executor.shutdown(wait=False)
     if voice_processor and voice_processor.models:
         voice_processor.models.shutdown()
 
@@ -697,20 +965,109 @@ async def root():
 
 
 @app.get("/health")
-async def health():
-    """Detailed health check.
+async def health() -> dict:
+    """Report measured dependency health, never a literal.
 
-    `hydration_isolation` (F4) is the positive handshake the hydrator requires
-    before sending its first turn. The live backend never sets
-    MIST_HYDRATION_ISOLATION, so this field is how a hydrator pointed at the
-    wrong port finds out before it writes anything.
+    Until this wiring landed the endpoint returned `"status": "healthy"` as a
+    constant: it was true the moment the process could answer an HTTP request,
+    including with Neo4j down, llama-server unreachable and the broadcaster
+    dead. The body now renders `HealthRegistry.snapshot()`, which is a cache of
+    probes that actually called their dependencies, plus the three fields that
+    predate it.
+
+    There is deliberately no ADR for this shape -- ADR-017 governs the WebSocket
+    contract, not this HTTP endpoint -- so this docstring and
+    `tests/unit/test_health_probes.py` are the contract. Each claim below is
+    separately checkable against `backend/health.py`.
+
+    Always HTTP 200, in every state, including `unhealthy`
+    ------------------------------------------------------
+    The body is the machine-readable answer; the status code is not. The
+    hydrator fetches this with `urllib` under
+    `except (urllib.error.URLError, OSError)`
+    (`scripts/hydration/target.py:91-100`), and `HTTPError` is a subclass of
+    `URLError`, so any non-2xx would be caught there and reported as
+    `HydrationTargetError("could not be reached")` -- converting a clear
+    refusal into a false "unreachable", against a dev backend that plausibly
+    runs degraded on purpose. The compose healthcheck does the derivation
+    instead, exiting non-zero on `restart_recommended`.
+
+    Fields from the snapshot
+    ------------------------
+    - `status`: `healthy` / `degraded` / `unhealthy`, derived from `checks` by
+      `health.derive_status`, which is pure and reproducible from this payload.
+    - `restart_recommended`: whether restarting the PROCESS would plausibly
+      help, which is a different question from `status`. Advisory only -- Docker
+      restart policies react to container exit, not to healthcheck state, and
+      there is no autoheal sidecar, so nothing acts on this today.
+    - `probe_loop`: `alive`, `dead` (no cycle completed within
+      `dead_after_seconds`, so the cache is unrefreshed), or
+      `PROBE_LOOP_NOT_STARTED` when no registry exists -- reachable only
+      outside a completed `lifespan`, and reported as `unhealthy` with an empty
+      `checks` mapping, because nothing verified is not healthy.
+    - `checks`: one entry per dependency. `status: null` means NOT MEASURED and
+      carries a `reason` from a closed vocabulary; it never means `up`.
+    - `checked_at`: wall time of the last COMPLETED cycle, null before the
+      first.
+
+    Fields that predate the registry, preserved for existing consumers
+    -----------------------------------------------------------------
+    - `models_loaded`: `_models_ready`, set after `VoiceProcessor.initialize()`
+      returns. A plain bool. Two consumers outside this module, not one:
+      `tests/unit/hydration/test_health_isolation_flag.py`, which asserts it is
+      present, and a documented operator wait-loop at
+      `scripts/eval_harness/websocket_gauntlets_runbook.md:96-97`
+      (`until curl ... | grep -q "models_loaded.:true"; do sleep 3; done`).
+      That loop is the point of the fix rather than an incidental reader: the
+      field used to be `voice_processor is not None`, and `lifespan` binds
+      `voice_processor` before awaiting `initialize()`, so the loop exited
+      almost at once and handed the operator a ready signal roughly 120s of
+      model loading early. It now blocks until the models are actually up.
+    - `active_connections`: live WebSocket count.
+    - `hydration_isolation` (F4): the positive handshake the hydrator requires
+      before sending its first turn. The live backend never sets
+      `MIST_HYDRATION_ISOLATION`, so this field is how a hydrator pointed at the
+      wrong port finds out before it writes anything. It must stay a plain bool:
+      `scripts/hydration/target.py:126` tests it with `is not True`, so a
+      truthy string or an int would be refused as a non-isolated target.
+
+    Returns:
+        The snapshot mapping with those three fields added. Returned as a dict
+        so FastAPI serializes it with a 200.
     """
-    return {
-        "status": "healthy",
-        "models_loaded": voice_processor is not None,
-        "active_connections": len(active_connections),
-        "hydration_isolation": _hydration_isolation_for_health(),
-    }
+    payload = _health_snapshot()
+    payload["models_loaded"] = _models_ready
+    payload["active_connections"] = len(active_connections)
+    payload["hydration_isolation"] = _hydration_isolation_for_health()
+    return payload
+
+
+def _health_snapshot() -> dict:
+    """Render the probe cache, or the honest answer when there is no registry.
+
+    `snapshot()` builds a fresh mapping per call and does no I/O, so the caller
+    may add fields to what comes back.
+
+    A missing registry is not an error and not a healthy answer: it means
+    `lifespan` has not built one, so nothing has been measured. That renders as
+    an empty `checks` mapping, which `derive_status` reports `unhealthy` with
+    `restart_recommended` false -- a restart does not add probes.
+
+    Returns:
+        A mapping with the snapshot's keys, always.
+    """
+    registry = _health_registry
+    if registry is None:
+        status, restart_recommended = derive_status({}, PROBE_LOOP_NOT_STARTED)
+        return {
+            "status": status,
+            "restart_recommended": restart_recommended,
+            "probe_loop": PROBE_LOOP_NOT_STARTED,
+            "probe_interval_seconds": None,
+            "checked_at": None,
+            "checks": {},
+        }
+    return registry.snapshot()
 
 
 def _hydration_isolation_for_health() -> bool:

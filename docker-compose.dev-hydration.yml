@@ -251,7 +251,17 @@ services:
     # partial log into a half-built graph.
     restart: "no"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      # Identical to the healthcheck in docker-compose.yml on purpose: two
+      # copies that drift describe two different backends. Derives the verdict
+      # from the body, not the status code -- /health is always 200 so the
+      # hydrator's urllib fetch cannot mistake a degraded backend for an
+      # unreachable one, which matters most here, where running degraded is
+      # plausible. Unreachable or unparseable still raises and exits non-zero.
+      # restart_recommended is advisory: Docker restart policies react to
+      # container exit, not to healthcheck state, and there is no autoheal
+      # sidecar, so this marks the container unhealthy and nothing more.
+      test: ["CMD", "python", "-c",
+             "import json,sys,urllib.request; p=json.load(urllib.request.urlopen('http://localhost:8001/health', timeout=5)); sys.exit(1 if p.get('restart_recommended') else 0)"]
       interval: 30s
       timeout: 10s
       retries: 3
