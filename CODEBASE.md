@@ -111,13 +111,35 @@ Carried from the 2026-09-15 session record and NOT re-measured this pass: unit *
 skipped / 3 xfailed / 0 failed**; integration **52 -> 58 passed**; 21 mutants across the session,
 all killed.
 
-**STALE AS OF 2026-09-22, and deliberately not replaced with a guess.** Four commits landed on
-`main` after that measurement (`2b2e733`, `c93bbea`, `284cd78`, `f62ef6d` -- the backup release,
-which its own PRs describe as adding 172 tests), so **3407 cannot still be right**. A 2026-09-21
-audit reported `3640 passed, 14 failed, 11 errors`, but that was **a worktree run, which fails 25
-node IDs by construction** (MIS-147: `mist-memory/` is gitignored and absent from worktrees), so
-it is not a clean figure either. **The honest state is: unit-test count UNMEASURED since
-2026-09-15.** Measure it before quoting it, in the container and not in a worktree:
+**STALE AS OF 2026-09-22.** Four commits landed on `main` after that measurement (`2b2e733`,
+`c93bbea`, `284cd78`, `f62ef6d` -- the backup release, which its own PRs describe as adding 172
+tests), so **3407 cannot still be right**.
+
+**There is no single unit-test count, and this is the important correction.** An earlier revision
+of this entry called the number "UNMEASURED". That was wrong in a way that matters: the number is
+not unknown, it is **location-dependent**, and a reader who believes it is merely stale will
+measure it once in the wrong place and record a figure that cannot be reproduced.
+
+**The full unit tier is RED in every delegate worktree, by construction.** Measured 2026-09-22 on a
+worktree at `65e7408` with no new code present: **`14 failed, 3862 passed, 7 skipped, 3 xfailed,
+11 errors`**. Every one of the 25 failures and errors has the same cause, and they sit in three
+files:
+
+    backend/knowledge/seed/loader.py:48
+    SeedSourceError: Seed directory does not exist: /work/mist-memory/seed
+
+`mist-memory/` is gitignored (`.gitignore:39`) and untracked (`git ls-files mist-memory` returns
+nothing), so it exists **only in the main checkout**. A git worktree never receives ignored files,
+and the delegate runner mounts only the worktree. Nothing can fix this from inside a worktree.
+
+**Therefore the acceptance bar for any branch is NOT a green tier.** It is **no new failures
+against the worktree baseline**, and the baseline must be re-measured on the branch point rather
+than inherited -- it moves as commits land. A delegate told "the full unit tier must be green" will
+either burn several fix attempts on a defect it cannot reach, or quietly narrow to a subset and
+report that subset as green. Both happened on 2026-09-22 before the cause was found.
+
+**To get a clean number, run it where `mist-memory/` exists** -- the main checkout, in the
+container, never a worktree:
 `MSYS_NO_PATHCONV=1 docker compose exec -T mist-backend python -m pytest tests/unit/ -q`.
 
 **Live-graph incident during `6a5b2c0`.** Mutation-testing the seed applier's live-target guard
