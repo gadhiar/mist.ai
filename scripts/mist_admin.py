@@ -1496,6 +1496,14 @@ def cmd_graph_reset(args: argparse.Namespace) -> int:
 
 
 def cmd_stack_status(args: argparse.Namespace) -> int:
+    """Probe Neo4j, the LLM and the backend, and exit non-zero if any is not healthy.
+
+    The backend verdict is `probe_backend`'s, which reads `/health`'s body
+    rather than its HTTP code -- `/health` answers 200 even when it reports a
+    fault, so an exit code derived from the code would print green over a red
+    body. `_print_status_line` shows the body's own status word and, when the
+    backend asks for one, a restart notice.
+    """
     be = _load_backend()
     config = be.get_config()
     connection = be.Neo4jConnection(config.neo4j)
@@ -2422,6 +2430,10 @@ def _print_status_line(status: dict) -> None:
         details.append(status["uri"])
     if "entity_count" in status:
         details.append(f"entities={status['entity_count']}")
+    # Only surfaced when true. `/health` answers 200 even while advising a
+    # restart, so this is the line an operator would otherwise never see.
+    if status.get("restart_recommended"):
+        details.append("RESTART RECOMMENDED")
     if "error" in status:
         details.append(f"error={status['error']}")
     detail_str = "  ".join(details)
