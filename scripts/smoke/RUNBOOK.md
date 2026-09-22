@@ -217,10 +217,22 @@ the wrong graph.
 
 ### 4.1 Initialise the smoke graph schema
 
-    MSYS_NO_PATHCONV=1 docker exec mist-backend-smoke python scripts/initialize_schema.py
+    MSYS_NO_PATHCONV=1 docker exec mist-backend-smoke python -m scripts.initialize_schema
 
 This creates constraints and indexes only. Every statement it issues is
 `IF NOT EXISTS`, so re-running it is harmless.
+
+Run it as `-m`, not as `python scripts/initialize_schema.py`. The path form is
+what this step used until 2026-09-22, and it is how two defects in that script
+reached a live smoke run: invoked by path, `sys.path[0]` is `scripts/` rather
+than the repo root, so `import backend` raised `ModuleNotFoundError` before
+`main()` ran. `-m` puts the working directory on `sys.path` instead, and
+`docker exec` inherits the image's `WORKDIR /app`
+(`docker/backend/Dockerfile:96`), so the repo root is found by construction.
+The path form works again now -- `scripts/initialize_schema.py:17-19` adds the
+repo root itself, and `tests/unit/scripts/test_initialize_schema.py` pins that
+-- but `-m` does not depend on that bootstrap staying in place, and it is the
+form every other script invocation in this runbook already uses.
 
 ### 4.2 DO NOT run `python scripts/mist_admin.py seed`
 
