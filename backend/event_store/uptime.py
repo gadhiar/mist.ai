@@ -445,15 +445,27 @@ def format_uptime_report(report: UptimeReport, *, now: datetime) -> str:
     Returns:
         Multi-line report text, no trailing newline.
     """
+    # Phrased from the actual count rather than a baked-in literal: an earlier
+    # draft hardcoded the number this derivation happened to produce on the
+    # committed fixture, which would have printed that same number against any
+    # other store. A caveat that misstates the count it is cautioning about is
+    # the defect the caveat exists to prevent.
+    if report.event_count is None:
+        dont_read = "  Do not read the event count below as a failure count."
+    else:
+        dont_read = (
+            f'  Do not read "{report.event_count} events" as "{report.event_count} failures".'
+        )
+
     lines: list[str] = [
         "[uptime] HISTORICAL -- derived from the curation job ledger, not measured directly.",
         "",
         "WHAT THIS CANNOT TELL YOU",
         "  This report cannot distinguish a deliberate shutdown -- `docker compose",
         "  down`, a rebuild, a host reboot -- from a crash or an outage. Every event",
-        "  below is one of those and this report does not know which. The window",
-        "  covers active development, so most of them are probably deliberate. Do",
-        '  not read "27 events" as "27 failures".',
+        "  below is one of those and this report does not know which. Where the",
+        "  window covers active development, most of them are probably deliberate.",
+        dont_read,
         "  A row that failed to write is also indistinguishable from downtime: the",
         "  scheduler swallows a recording error (scheduler.py:241-242), so a dropped",
         "  row appears here as an outage that never happened.",

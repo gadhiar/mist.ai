@@ -311,6 +311,40 @@ class TestEmptyTable:
         assert report.events == ()
 
 
+class TestCaveatNamesTheActualCount:
+    """The deliberate-shutdown caveat quotes this run's count, never a baked-in literal.
+
+    An earlier draft hardcoded the count the derivation produces on the committed
+    fixture, so the caveat would have printed that same number against any other
+    store -- a confident number published without the thing it claims to measure,
+    which is exactly what the caveat exists to prevent.
+    """
+
+    def test_caveat_quotes_the_derived_event_count(self):
+        t0 = datetime(2026, 1, 1, tzinfo=UTC)
+        rows = [
+            (t0.isoformat(), "scheduled"),
+            ((t0 + _seconds(INTERVAL_SECONDS)).isoformat(), "scheduled"),
+            # 1h after the previous row: far below the interval, so one restart.
+            ((t0 + _seconds(INTERVAL_SECONDS + 3600)).isoformat(), "scheduled"),
+        ]
+        report = build_uptime_report(rows, job_name="confidence_decay")
+
+        text = format_uptime_report(report, now=t0 + _seconds(3 * INTERVAL_SECONDS))
+
+        assert report.event_count == 1
+        assert '"1 events" as "1 failures"' in text
+        assert '"27 events"' not in text
+
+    def test_caveat_drops_the_count_when_nothing_was_measured(self):
+        report = build_uptime_report([], job_name="confidence_decay")
+
+        text = format_uptime_report(report, now=datetime(2026, 1, 1, tzinfo=UTC))
+
+        assert "Do not read the event count below as a failure count." in text
+        assert 'events" as "' not in text
+
+
 class TestManualRowsExcluded:
     def test_manual_row_positioned_to_manufacture_false_restarts_is_excluded(self):
         # Two clean 24h-interval scheduled rows.
