@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 
 import pytest
@@ -23,7 +24,7 @@ from backend.system_metrics import (
 )
 
 
-def _fake_snapshot() -> SystemMetrics:
+def _fake_snapshot(*, uptime_seconds: float | None = 3600.0) -> SystemMetrics:
     return SystemMetrics(
         timestamp=1234567890.0,
         cpu=CPUMetrics(percent=12.5, cores=16),
@@ -35,6 +36,7 @@ def _fake_snapshot() -> SystemMetrics:
             vram_total_gb=12.0,
             temperature_c=65.0,
         ),
+        uptime_seconds=uptime_seconds,
     )
 
 
@@ -112,9 +114,14 @@ class TestSystemStatusLoopEmits:
 
     @pytest.mark.asyncio
     async def test_payload_shape_matches_adr017(self, monkeypatch):
-        """Single emit carries the exact ADR-017 system_status shape:
-        type / timestamp / cpu / ram / gpu top-level keys; each block has
-        the documented sub-keys.
+        """Single emit carries the exact ADR-017 v1.2.0 system_status shape:
+        top-level keys are every SystemMetrics field plus the literal
+        extras ("type" and "uptime_source", which is not a dataclass
+        field -- it never varies, per system_metrics.py); each block has
+        the documented sub-keys. Top-level keys are derived from
+        dataclasses.fields(SystemMetrics) rather than hardcoded, so this
+        assertion auto-extends to a future field instead of going stale
+        (tests/CLAUDE.md "derived beats enumerated").
         """
         from backend import server
 
@@ -129,7 +136,11 @@ class TestSystemStatusLoopEmits:
             await task
 
         emit = json.loads(await captured.get())
-        assert set(emit.keys()) == {"type", "timestamp", "cpu", "ram", "gpu"}
+        expected_top_level = {f.name for f in dataclasses.fields(SystemMetrics)} | {
+            "type",
+            "uptime_source",
+        }
+        assert set(emit.keys()) == expected_top_level
         assert set(emit["cpu"].keys()) == {"percent", "cores"}
         assert set(emit["ram"].keys()) == {"used_gb", "total_gb", "percent"}
         assert set(emit["gpu"].keys()) == {
@@ -139,6 +150,64 @@ class TestSystemStatusLoopEmits:
             "vram_total_gb",
             "temperature_c",
         }
+        assert emit["uptime_source"] == "process"
+
+
+class TestUptimeFields:
+    """system_status emits ADR-017 v1.2.0's uptime_seconds / uptime_source
+    as top-level siblings of cpu/ram/gpu, with null (never 0) surviving
+    JSON round-trip when the collector could not measure uptime.
+    """
+
+    @pytest.mark.asyncio
+    async def test_emits_uptime_seconds_and_source_at_top_level(self, monkeypatch):
+        from backend import server
+
+        captured: asyncio.Queue = asyncio.Queue()
+        monkeypatch.setattr(server, "message_queue", captured)
+        monkeypatch.setattr(
+            system_metrics, "collect_metrics", lambda: _fake_snapshot(uptime_seconds=1800.5)
+        )
+
+        task = asyncio.create_task(server.system_status_loop(interval_seconds=0.02))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        emit = json.loads(await captured.get())
+        assert emit["uptime_seconds"] == 1800.5
+        assert emit["uptime_source"] == "process"
+
+    @pytest.mark.asyncio
+    async def test_null_uptime_survives_json_round_trip_as_null_not_zero(self, monkeypatch):
+        """When the collector reports uptime_seconds=None (start time
+        unreadable), the emitted JSON carries a literal null, not 0 --
+        0.0 would misrepresent the absence of a measurement as a reading
+        of zero (ADR-017 v1.2.0 null-never-zero rule).
+        """
+        from backend import server
+
+        captured: asyncio.Queue = asyncio.Queue()
+        monkeypatch.setattr(server, "message_queue", captured)
+        monkeypatch.setattr(
+            system_metrics, "collect_metrics", lambda: _fake_snapshot(uptime_seconds=None)
+        )
+
+        task = asyncio.create_task(server.system_status_loop(interval_seconds=0.02))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        raw = await captured.get()
+        assert '"uptime_seconds": null' in raw or '"uptime_seconds":null' in raw
+        emit = json.loads(raw)
+        assert emit["uptime_seconds"] is None
+        assert emit["uptime_seconds"] != 0
+        # uptime_source names what was attempted even when the measurement
+        # itself came back null.
+        assert emit["uptime_source"] == "process"
 
 
 class TestSystemStatusConfig:

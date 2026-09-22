@@ -158,6 +158,21 @@ async def system_status_loop(interval_seconds: float = 5.0) -> None:
     serialization error) are logged and swallowed so the periodic emit
     survives the next interval. The collector itself emits placeholder GPU
     payloads on NVML failure, so most paths return cleanly.
+
+    ``uptime_seconds`` / ``uptime_source`` (ADR-017 v1.2.0) are read
+    straight off the snapshot -- this loop does no psutil call of its own,
+    it only serializes what ``collect_metrics()`` already measured.
+
+    Caveat this loop does NOT protect against: the try/except here means a
+    bad tick is logged and skipped, so THIS loop keeps emitting correctly
+    on the next interval. But the payload only reaches clients via
+    ``broadcast_messages()`` (started with no done-callback at
+    ``server.py:510``; see ``KNOWN_ISSUES.md:150-152``, which cites this
+    loop's old line number). If that downstream task dies, this loop keeps
+    emitting into ``message_queue`` while nothing drains it -- the payload,
+    including ``uptime_seconds``, silently stops reaching clients with no
+    error and no unhealthy status. Not fixed here; out of scope for this
+    change.
     """
     from backend import system_metrics
 
@@ -185,6 +200,8 @@ async def system_status_loop(interval_seconds: float = 5.0) -> None:
                         "vram_total_gb": snapshot.gpu.vram_total_gb,
                         "temperature_c": snapshot.gpu.temperature_c,
                     },
+                    "uptime_seconds": snapshot.uptime_seconds,
+                    "uptime_source": system_metrics.UPTIME_SOURCE,
                 }
             )
             await message_queue.put(payload)
