@@ -286,9 +286,13 @@ services:
       - WATCHFILES_FORCE_POLLING=1
       #
       # --- the single deliberate exception to the literals rule -------------
-      # MIST_SMOKE_SCHEDULER is a NEW variable name and no other service reads
-      # it: `rg "MIST_SMOKE_SCHEDULER"` over the repo returns only this file
-      # (and the test that asserts this wiring). So the host-shell
+      # MIST_SMOKE_SCHEDULER is a NEW variable name and no other SERVICE reads
+      # it: `rg "MIST_SMOKE_SCHEDULER" -g 'docker-compose*.yml'` returns this
+      # file alone. (A repo-wide `rg` returns five files -- this one plus
+      # scripts/smoke/assert_artifacts.py, scripts/smoke/RUNBOOK.md and the two
+      # smoke test files -- so the narrower glob is the command that actually
+      # establishes the claim. An earlier revision of this comment cited the
+      # repo-wide form, which does not.) So the host-shell
       # interpolation hazard the literals rule exists to prevent -- an exported
       # variable silently retargeting the LIVE backend, which reads the same
       # names -- does not apply to it. Nothing but this service can see it.

@@ -97,8 +97,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TURNS_PATH = Path(__file__).resolve().parent / "turns.json"
 
 #: Bump when the transcript record shape changes. `assert_artifacts.py` reads
-#: this field and refuses a transcript it does not understand rather than
-#: silently counting zero `stream_complete` frames and reporting INCONCLUSIVE.
+#: this field into `TranscriptFacts.schema_version` (`assert_artifacts.py:235`,
+#: `:253`, `:268`, `:285`) and currently COMPARES IT TO NOTHING:
+#: `grep -rn "schema_version" scripts/smoke/` shows no equality test and no
+#: refusal path. So bumping this alone does not make an old reader reject a new
+#: transcript -- a v2 transcript fed to a v1 reader would count zero
+#: `stream_complete` frames and report A1 INCONCLUSIVE for an instrument
+#: reason. Anyone changing the record shape must add the version check at the
+#: same time. Recorded as a known gap rather than described as a guard it is
+#: not: an earlier revision of this comment claimed the refusal already
+#: existed, which would have let exactly that silent misread through.
 TRANSCRIPT_SCHEMA_VERSION = 1
 
 #: The three mutually exclusive per-turn terminals, `backend/voice_processor.py`

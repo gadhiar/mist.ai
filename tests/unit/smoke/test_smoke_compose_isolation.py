@@ -111,16 +111,42 @@ def _environment_of(compose: dict, service: str) -> dict[str, str]:
     return env
 
 
+def _require_short_syntax(entry: object, service: str) -> str:
+    """Refuse a non-string volume entry rather than misclassifying it.
+
+    Compose accepts a long mapping syntax (`- type: bind / source: ./data /
+    target: /app/data`). `str()` of that dict begins with `{'type'`, which
+    starts with neither `.` nor `/`, so the leading-character discriminator
+    below would treat it as a NAMED VOLUME: invisible to `_bind_mounts` and
+    counted by `_volume_names`. A long-syntax `./data` mount would then pass
+    `test_bind_mount_set_is_exactly_the_allowlist` while actually mounting the
+    live event store. That is the one known way this module can report a
+    containment property it is not checking, so it fails closed here instead.
+
+    Converting the compose file to long syntax is legitimate; doing so
+    silently is not. Teach both helpers the mapping form in the same change.
+    """
+    if not isinstance(entry, str):
+        raise AssertionError(
+            f"{service} has a non-string volume entry {entry!r}. These helpers "
+            "only understand compose SHORT syntax; the long mapping form would "
+            "be silently misclassified as a named volume and escape the "
+            "forbidden-mount assertions. Extend the helpers before switching."
+        )
+    return entry
+
+
 def _bind_mounts(compose: dict, service: str) -> list[tuple[str, str, str]]:
     """Return (host, container, mode) for every BIND mount on `service`.
 
     Named volumes are excluded: their host side is an identifier, not a path.
     The discriminator is the leading `.` or `/`, which is also how compose
-    itself tells the two apart.
+    itself tells the two apart. Non-string entries are refused by
+    `_require_short_syntax` rather than falling through that discriminator.
     """
     mounts = []
     for entry in compose["services"][service].get("volumes", []):
-        spec = str(entry)
+        spec = _require_short_syntax(entry, service)
         parts = spec.split(":")
         host = parts[0]
         container = parts[1] if len(parts) > 1 else ""
@@ -134,7 +160,7 @@ def _volume_names(compose: dict, service: str) -> list[str]:
     """Return the named-volume side of every non-bind mount on `service`."""
     names = []
     for entry in compose["services"][service].get("volumes", []):
-        host = str(entry).split(":")[0]
+        host = _require_short_syntax(entry, service).split(":")[0]
         if not host.startswith(".") and not host.startswith("/"):
             names.append(host)
     return names
@@ -528,4 +554,38 @@ class TestHarnessShape:
             f"{BACKEND_SERVICE} runs as {user!r}. docker/backend/Dockerfile:114 "
             f"chowns /app to appuser (uid 1000); any other uid cannot write "
             f"./smoke-state through the bind mount."
+        )
+
+    def test_long_syntax_mount_is_refused_not_misclassified(self):
+        """The helpers fail closed on compose long syntax.
+
+        Without `_require_short_syntax`, a long-syntax bind of the LIVE event
+        store stringifies to `{'type': 'bind', ...}`, whose first character is
+        neither `.` nor `/`. `_bind_mounts` would skip it and `_volume_names`
+        would count it as a named volume, so the forbidden-mount assertions
+        would pass with ./data mounted. This test is the standing proof that
+        the guard fires; it is the only reason the eight containment
+        assertions can be trusted against a future syntax change.
+        """
+        smuggled = {
+            "services": {
+                BACKEND_SERVICE: {
+                    "volumes": [
+                        {"type": "bind", "source": "./data", "target": "/app/data"}
+                    ]
+                }
+            }
+        }
+        for helper in (_bind_mounts, _volume_names):
+            with pytest.raises(AssertionError, match="non-string volume entry"):
+                helper(smuggled, BACKEND_SERVICE)
+
+    def test_real_compose_uses_only_short_syntax(self, compose):
+        """The guard above is not vacuous on the file actually shipped."""
+        entries = compose["services"][BACKEND_SERVICE].get("volumes", [])
+        assert entries, "backend service declares no volumes at all"
+        assert all(isinstance(e, str) for e in entries), (
+            "The shipped compose file now uses long-syntax mounts. Extend "
+            "_bind_mounts and _volume_names to parse the mapping form before "
+            "relaxing this."
         )

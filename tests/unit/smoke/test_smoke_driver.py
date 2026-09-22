@@ -300,8 +300,15 @@ def test_module_import_does_not_require_websockets():
     """The pure logic above must be testable on a host with no `websockets`.
 
     `resolve_websockets` imports it inside the function body for this reason.
+
+    The real check is the module-level import scan below. An earlier revision
+    also asserted `"websockets" not in sys.modules or dt.resolve_websockets is
+    not None`, which was a tautology: `resolve_websockets` is a module-level
+    function object and is never None, so the right disjunct always held and
+    the assertion could not fail. Removed rather than left as a test that
+    cannot fail -- it read exactly like the real one beside it.
     """
-    assert "websockets" not in sys.modules or dt.resolve_websockets is not None
+    assert callable(dt.resolve_websockets)
     source = (REPO_ROOT / "scripts" / "smoke" / "drive_turns.py").read_text(encoding="utf-8")
     module_level_imports = [
         line

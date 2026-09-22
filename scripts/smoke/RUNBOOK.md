@@ -341,6 +341,16 @@ Then capture the Phase 2 log, which is where A4's evidence is:
 Each of A1 to A4 prints PASS, FAIL or INCONCLUSIVE with its evidence. Exit code
 is 1 if anything FAILed, 0 otherwise.
 
+**If your `.env` sets a non-default `NEO4J_PASSWORD`, add `--neo4j-password
+"$NEO4J_PASSWORD"`.** The flag defaults to `password`
+(`assert_artifacts.py:1252`), matching the compose default
+`${NEO4J_PASSWORD:-password}`. If the real credential differs, the A2
+`cypher-shell` call fails authentication and A2 reports INCONCLUSIVE for an
+INSTRUMENT reason rather than a pipeline one. It degrades safely -- it cannot
+produce a false FAIL, and the cypher error is printed verbatim -- but you would
+be reading an inconclusive A2 caused by this line rather than by MIST. Check
+the printed error before concluding anything about extraction.
+
 Read the three verdicts as they are meant:
 
 - **PASS** -- the artifact is there.
