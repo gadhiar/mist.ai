@@ -121,7 +121,11 @@ vault_invalidation_bus = None
 # so `voice_processor is not None` was true throughout the ~120s model load and
 # `models_loaded` claimed a state the process had not reached. This flag is set
 # only once `initialize()` has returned. Kept a plain bool because
-# `scripts/hydration/target.py` and `tests/unit/hydration/` consume the field.
+# `tests/unit/hydration/test_health_isolation_flag.py` asserts the field is
+# still present and unchanged in kind. `scripts/hydration/target.py` consumes
+# this response but reads only `hydration_isolation` from it
+# (`target.py:118,126`), so it is that field, not this one, whose type is
+# load-bearing outside the repo's own tests.
 _models_ready: bool = False
 _broadcaster_state: BroadcasterState | None = None
 _health_registry: HealthRegistry | None = None
@@ -995,13 +999,16 @@ async def health() -> dict:
     Fields that predate the registry, preserved for existing consumers
     -----------------------------------------------------------------
     - `models_loaded`: `_models_ready`, set after `VoiceProcessor.initialize()`
-      returns. A plain bool, because `scripts/hydration/target.py` and the
-      hydration tests read it.
+      returns. A plain bool. Its only consumer outside this module is
+      `tests/unit/hydration/test_health_isolation_flag.py`, which asserts it is
+      present.
     - `active_connections`: live WebSocket count.
     - `hydration_isolation` (F4): the positive handshake the hydrator requires
       before sending its first turn. The live backend never sets
       `MIST_HYDRATION_ISOLATION`, so this field is how a hydrator pointed at the
-      wrong port finds out before it writes anything.
+      wrong port finds out before it writes anything. It must stay a plain bool:
+      `scripts/hydration/target.py:126` tests it with `is not True`, so a
+      truthy string or an int would be refused as a non-isolated target.
 
     Returns:
         The snapshot mapping with those three fields added. Returned as a dict
