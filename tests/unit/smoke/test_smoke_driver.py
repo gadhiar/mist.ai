@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import sys
 from pathlib import Path
 
 import pytest
@@ -301,14 +300,15 @@ def test_module_import_does_not_require_websockets():
 
     `resolve_websockets` imports it inside the function body for this reason.
 
-    The real check is the module-level import scan below. An earlier revision
-    also asserted `"websockets" not in sys.modules or dt.resolve_websockets is
-    not None`, which was a tautology: `resolve_websockets` is a module-level
-    function object and is never None, so the right disjunct always held and
-    the assertion could not fail. Removed rather than left as a test that
-    cannot fail -- it read exactly like the real one beside it.
+    THE SOURCE SCAN BELOW IS THE WHOLE CHECK. Two weaker assertions were tried
+    in earlier revisions and removed rather than left sitting beside it looking
+    equivalent:
+    `"websockets" not in sys.modules or dt.resolve_websockets is not None`
+    (right disjunct always true, so it could not fail), and
+    `callable(dt.resolve_websockets)` (a module-level `def` is always callable,
+    so it could only ever fail as AttributeError). Neither constrained the
+    property this test exists to protect.
     """
-    assert callable(dt.resolve_websockets)
     source = (REPO_ROOT / "scripts" / "smoke" / "drive_turns.py").read_text(encoding="utf-8")
     module_level_imports = [
         line
