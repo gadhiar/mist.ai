@@ -10,6 +10,14 @@ dead socket.
 No test here boots the ASGI lifespan. The pieces `lifespan` calls are module
 level for exactly that reason, so the sequence and the wiring are assertable
 without faking the model stack.
+
+`test_health_is_always_200` uses `fastapi.testclient.TestClient`, and that is
+the first use of it in `tests/` -- `grep -rln TestClient tests/` found nothing
+before this module. It is deliberate, not an import that wandered in: the
+property under test is an HTTP status code, and a test that only calls
+`server.health()` cannot observe one. `TestClient` is constructed WITHOUT the
+`with` block on purpose, because entering it would run the real ASGI lifespan
+and load the model stack.
 """
 
 import asyncio
@@ -19,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
 import pytest
+from fastapi.testclient import TestClient
 
 from backend import server
 from backend.health import (
@@ -200,9 +209,18 @@ async def test_clean_shutdown_does_not_report_death():
     `lifespan` calls `broadcaster_task.cancel()` on every orderly shutdown. A
     cancelled task fires its done-callback like any other, and
     `task.exception()` RAISES `CancelledError` on one rather than returning it.
-    An unguarded callback would therefore mark the broadcaster dead every time
-    the server stopped correctly, and `/health` would report `unhealthy` with
-    `restart_recommended: true` as a consequence of shutting down properly.
+
+    What the guard is worth was measured, not reasoned about. Deleting the
+    `if task.cancelled(): return` block in a scratch copy and driving a real
+    cancelled task through the callback leaves the state `alive` and `/health`
+    `healthy` with `restart_recommended: false`: the raise lands above
+    `mark_dead`, and `asyncio.events.Handle._run` catches it and hands it to the
+    loop's exception handler. The single observable consequence is one
+    `Exception in callback _on_broadcaster_done(...)` per shutdown, so that is
+    what this test pins -- the loop exception handler must never fire. The
+    earlier version of this test asserted only `state()` and the payload, which
+    the unguarded callback satisfies just as well; it passed against that
+    mutant and pinned nothing.
     """
     state = BroadcasterState()
     state.mark_alive()
@@ -211,14 +229,31 @@ async def test_clean_shutdown_does_not_report_death():
     async def forever() -> None:
         await asyncio.sleep(3600)
 
-    task = asyncio.create_task(forever())
-    task.add_done_callback(server._on_broadcaster_done)
-    await settle()
+    loop = asyncio.get_running_loop()
+    routed_to_loop: list[dict] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: routed_to_loop.append(context))
+    try:
+        task = asyncio.create_task(forever())
+        task.add_done_callback(server._on_broadcaster_done)
+        await settle()
 
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    await settle()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await settle()
+        await settle()
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    # The mutation-sensitive assertion. Without the guard this list holds one
+    # context whose `exception` is a `CancelledError` and whose `message` names
+    # `_on_broadcaster_done`.
+    assert routed_to_loop == [], (
+        "a clean shutdown routed "
+        f"{[(c.get('message'), type(c.get('exception')).__name__) for c in routed_to_loop]} "
+        "to the event loop exception handler"
+    )
 
     assert state.state() == "alive"
     assert state.last_exception() is None
@@ -284,7 +319,6 @@ def _unhealthy_registry() -> HealthRegistry:
 
 
 # 5
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("build", "expected_status"),
     [
@@ -296,7 +330,7 @@ def _unhealthy_registry() -> HealthRegistry:
         (None, "unhealthy"),
     ],
 )
-async def test_health_is_always_200(build, expected_status):
+def test_health_is_always_200(build, expected_status):
     """Never a non-2xx, in any state, because the body carries the verdict.
 
     `scripts/hydration/target.py:91-100` fetches this under
@@ -305,13 +339,21 @@ async def test_health_is_always_200(build, expected_status):
     as `HydrationTargetError("could not be reached")` -- a false claim about the
     socket, from a backend that answered. Returning a dict is what makes
     FastAPI serialize it with a 200; raising `HTTPException` is what would not.
+
+    Driven over real HTTP rather than by awaiting `server.health()`: the claim
+    in the name is about a status code, and a direct await never produces one.
+    This test is sync so that the blocking `TestClient` request does not run
+    inside an already-running event loop.
     """
     if build is not None:
         registry = build()
-        await registry.run_once()
+        asyncio.run(registry.run_once())
         server._health_registry = registry
 
-    payload = await server.health()
+    response = TestClient(server.app).get("/health")
+
+    assert response.status_code == 200
+    payload = response.json()
 
     assert isinstance(payload, dict)
     assert payload["status"] == expected_status

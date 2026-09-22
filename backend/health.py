@@ -38,13 +38,16 @@ without anything having run.
 
 The numbers, and why each is what it is
 ---------------------------------------
-- `interval_seconds = 10.0`. Docker reads `/health` every 30s
-  (`docker-compose.yml:92`), so a 10s loop keeps the cache at most 10s old at
-  read time and gives roughly three independent samples per `retries: 3`
-  window. A 30s loop would align with Docker's sampling and let one unlucky
-  probe drive a whole retry cycle. Load is about 0.2 queries/sec against Neo4j,
-  and the neo4j container already self-probes at `interval: 10s`
-  (`docker-compose.yml:105`).
+- `interval_seconds = 10.0`. Docker reads `/health` every 30s (the
+  `mist-backend` healthcheck in `docker-compose.yml`, `interval: 30s`), so a
+  10s loop keeps the cache at most 10s old at read time and gives roughly three
+  independent samples per `retries: 3` window. A 30s loop would align with
+  Docker's sampling and let one unlucky probe drive a whole retry cycle. Load
+  is about 0.2 queries/sec against Neo4j, and the neo4j container already
+  self-probes at `interval: 10s` (the `mist-neo4j` healthcheck in the same
+  file). Cited by service name rather than by line: this module's own branch
+  inserted eight lines above both blocks and invalidated the line numbers that
+  used to stand here.
 - Probe timeouts 2.0s (neo4j, llm) and 0.5s (sqlite-backed). Chosen so that
   every probe timing out at once still leaves the cycle finishing inside its own
   10s interval. These bound the loop, never the request.
@@ -90,6 +93,7 @@ to the log; the payload gets a vocabulary word.
 """
 
 import asyncio
+import functools
 import logging
 from collections.abc import Callable
 from concurrent.futures import Executor
@@ -276,8 +280,10 @@ class Neo4jProbe:
     reason -- the contract names only outcomes that can actually occur.
 
     `severity="degrades"` and `restart_repairs=False`: the system's own boot path
-    treats Neo4j as non-fatal (`backend/voice_models/model_manager.py:92-95`
-    warns and continues), and restarting the backend costs about 120s of model
+    treats Neo4j as non-fatal (`ModelManager.__init__` logs `Knowledge
+    integration disabled (Neo4j unavailable)` and continues --
+    `backend/voice_models/model_manager.py:97-98`), and restarting the backend
+    costs about 120s of model
     reload during which MIST serves nothing, against a memory-only fault where
     conversation still works. The backend also cannot distinguish "our driver is
     dead" (restart would fix it) from "Neo4j is down" (restart is destructive);
@@ -302,8 +308,10 @@ class Neo4jProbe:
         """Run the graph health check in the injected single-worker executor."""
         connection = self._get_connection()
         if connection is None:
-            # The distinction is load-bearing. `model_manager.py:85-98` sets
-            # `self.knowledge = None` when Neo4j is unavailable at boot, so
+            # The distinction is load-bearing. `ModelManager.__init__` sets
+            # `self.knowledge = None` when Neo4j is unavailable at boot
+            # (`backend/voice_models/model_manager.py:96-103`, both the
+            # `is_enabled()` False branch and the `except`), so
             # rendering null there would satisfy the letter of the null rule
             # while hiding exactly the fault it exists to expose.
             if self._knowledge_configured():
@@ -325,7 +333,7 @@ class LLMProbe:
     `restart_repairs=False`: the provider holds a stateless httpx client
     (`backend/llm/llama_server_provider.py:115-122`) and self-heals when
     llama-server returns, and llama-server has its own healthcheck and restart
-    policy at `docker-compose.yml:171-177`.
+    policy (the `mist-llm` service in `docker-compose.yml`).
     """
 
     def __init__(self, get_provider: Callable[[], LLMHealthSource | None]) -> None:
@@ -405,7 +413,8 @@ class VaultSidecarProbe:
     """Probes the sqlite-vec sidecar index (`backend/vault/sidecar_index.py:759`).
 
     A None sidecar renders null: the vault layer is genuinely optional and
-    `backend/server.py:492` warns and continues without it.
+    `backend/server.py`'s `lifespan` logs `Vault layer initialization failed
+    (continuing without vault)` and carries on without it.
 
     `severity="degrades"`, `restart_repairs=False`: vault retrieval stops, the
     conversation does not, and the index is reopened by its own lifecycle rather
@@ -639,7 +648,6 @@ class HealthRegistry:
         started = self._monotonic()
         task = asyncio.create_task(probe.check())
         self._in_flight[probe.name] = task
-        task.add_done_callback(self._drain_late_failure)
         timed_out = False
         try:
             # Shielded so the timeout abandons the probe rather than cancelling
@@ -648,14 +656,20 @@ class HealthRegistry:
             await asyncio.wait_for(asyncio.shield(task), timeout=probe.timeout_seconds)
         except asyncio.TimeoutError:
             timed_out = True
+            # Attached here and nowhere else. Only a probe abandoned by this
+            # branch can still be running, so only this branch can produce a
+            # completion that is genuinely late.
+            task.add_done_callback(functools.partial(self._drain_late_failure, probe))
             self._record(probe, started, status="timeout", reason=None, measured=True)
         except ProbeUnavailable as exc:
             self._record(probe, started, status=None, reason=str(exc), measured=False)
         except ProbeFailed as exc:
             self._record(probe, started, status="down", reason=str(exc), measured=True)
         except Exception as exc:  # noqa: BLE001
-            # The one justified bare catch in this module, mirroring
-            # `backend/server.py:191`. The registry's contract is that ANY probe
+            # The one justified bare catch in this module, mirroring the one in
+            # `system_status_loop` in `backend/server.py`. Cited by symbol: that
+            # line number has moved twice already.
+            # The registry's contract is that ANY probe
             # failure becomes a structured result rather than propagating into
             # the loop and killing it -- a health system that dies on an
             # unexpected exception is the failure it exists to report. The
@@ -671,13 +685,33 @@ class HealthRegistry:
             if not timed_out:
                 self._in_flight.pop(probe.name, None)
 
-    def _drain_late_failure(self, task: asyncio.Task) -> None:
-        """Consume the exception of an abandoned probe so asyncio stays quiet."""
+    def _drain_late_failure(self, probe: Probe, task: asyncio.Task) -> None:
+        """Consume the exception of a probe abandoned at its own timeout.
+
+        Attached only from the `TimeoutError` branch of `_run_probe`, and that
+        placement is what makes the message below true. This callback used to be
+        attached to every probe task at creation, so a `ProbeFailed` or
+        `ProbeUnavailable` raised and fully handled INSIDE the timeout still
+        reached here and logged `health probe finished after its timeout with an
+        error: unreachable`. At the 10s production interval an absent vault
+        sidecar or a down Neo4j therefore produced a false timeout claim every
+        ten seconds for the life of the process.
+
+        A probe that finishes inside its timeout has its exception retrieved by
+        the `await` in `_run_probe` -- `asyncio.shield` calls `.exception()` on
+        the inner task to propagate it -- so it needs no drain and no longer
+        reaches this callback at all.
+        """
         if task.cancelled():
             return
         exc = task.exception()
         if exc is not None:
-            logger.warning("health probe finished after its timeout with an error: %s", exc)
+            logger.warning(
+                "health probe %s was abandoned at its %ss timeout and then failed: %s",
+                probe.name,
+                probe.timeout_seconds,
+                exc,
+            )
 
     def _record(
         self,

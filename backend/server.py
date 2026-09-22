@@ -496,10 +496,17 @@ def _on_broadcaster_done(task: "asyncio.Task") -> None:
     - Cancelled. Returns early and marks nothing. `lifespan` cancels this task
       on every orderly shutdown, a cancelled task fires its done-callback like
       any other, and `task.exception()` RAISES `CancelledError` rather than
-      returning one. Without the `task.cancelled()` guard a clean stop would
-      mark the broadcaster dead and drive `/health` to `unhealthy` with
-      `restart_recommended: true` -- a health endpoint reporting a fault caused
-      by shutting down correctly.
+      returning one. What the guard actually buys was measured, by deleting it
+      in a scratch copy and driving a real cancelled task through the callback:
+      `mark_dead` is never reached, because the raise happens above it, so the
+      state stays `alive` and `/health` still answers `healthy` with
+      `restart_recommended: false`. The cost of dropping the guard is one
+      `Exception in callback _on_broadcaster_done(...)` with a `CancelledError`,
+      routed to the event loop's exception handler by
+      `asyncio.events.Handle._run`, on every clean stop -- a server that shut
+      down correctly logging a callback fault. This docstring previously
+      claimed the missing guard would drive `/health` to `unhealthy` with
+      `restart_recommended: true`; that was never executed and is false.
     - Raised. Logged at ERROR with the traceback, then recorded as dead.
     - Returned normally. Also recorded as dead. `broadcast_messages` is a
       `while True` with no `break` and no `return`, so a clean return is itself
@@ -1006,9 +1013,16 @@ async def health() -> dict:
     Fields that predate the registry, preserved for existing consumers
     -----------------------------------------------------------------
     - `models_loaded`: `_models_ready`, set after `VoiceProcessor.initialize()`
-      returns. A plain bool. Its only consumer outside this module is
+      returns. A plain bool. Two consumers outside this module, not one:
       `tests/unit/hydration/test_health_isolation_flag.py`, which asserts it is
-      present.
+      present, and a documented operator wait-loop at
+      `scripts/eval_harness/websocket_gauntlets_runbook.md:96-97`
+      (`until curl ... | grep -q "models_loaded.:true"; do sleep 3; done`).
+      That loop is the point of the fix rather than an incidental reader: the
+      field used to be `voice_processor is not None`, and `lifespan` binds
+      `voice_processor` before awaiting `initialize()`, so the loop exited
+      almost at once and handed the operator a ready signal roughly 120s of
+      model loading early. It now blocks until the models are actually up.
     - `active_connections`: live WebSocket count.
     - `hydration_isolation` (F4): the positive handshake the hydrator requires
       before sending its first turn. The live backend never sets
