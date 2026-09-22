@@ -532,11 +532,18 @@ def _on_health_probe_loop_done(task: "asyncio.Task") -> None:
     `lifespan` cancels this task on shutdown, so an unguarded `task.exception()`
     would raise `CancelledError` out of a callback on every clean stop.
 
-    Nothing is marked here. `HealthRegistry.snapshot` already self-reports a
-    stopped loop -- `probe_loop` goes `dead` once no cycle has completed within
-    `dead_after_seconds` -- so the loop's death is visible in the payload
-    whether or not this callback ever fires. This adds the log line and the
-    traceback, which the timeout-based detection cannot supply.
+    Nothing is marked here, and that is the design rather than an omission.
+    `HealthRegistry.snapshot` already self-reports a stopped loop -- it computes
+    `probe_loop` from how long ago the last cycle COMPLETED, going `dead` once
+    that exceeds `dead_after_seconds`, reading no state this callback writes --
+    so the loop's death is visible in the payload whether or not this callback
+    ever fires. That independence is the point: detection must not depend on the
+    mechanism that may itself have failed, and a done-callback is part of the
+    task machinery whose failure it would be reporting. Adding a marker here
+    would couple the detection path to this callback firing, which is exactly
+    what the elapsed-time test is designed to avoid, so do not add one. What
+    this callback contributes is the log line and the traceback, which an
+    elapsed-time test cannot supply.
     """
     if task.cancelled():
         return
