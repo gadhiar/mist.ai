@@ -4,10 +4,18 @@ See that module's docstring for the full spec this pins: gap classification
 into continuous/outage/restart, the longest-continuous-run lower bound, and
 the null-not-zero rule for an empty or single-row ledger.
 
-Expected values in TestRealFixture and TestTolerancePlateau are computed by
-an INDEPENDENT route -- direct arithmetic on the CSV's own timestamp strings,
-never by calling the function under test -- per tests/CLAUDE.md's rule that
-expectations must not be circular.
+Per tests/CLAUDE.md's rule that expectations must not be circular, no expected
+value here is produced by calling the function under test. They come from two
+different routes, and the distinction matters when reading a failure:
+
+- `test_longest_continuous_run_matches_independent_boundary_arithmetic`
+  subtracts two timestamp literals taken from the CSV, so it recomputes the
+  answer by an independent route.
+- Every other expectation -- the row count, the event count, the plateau
+  parameters -- is a bare literal, hand-derived from the fixture once and
+  written down. It is non-circular but NOT independently recomputed: if the
+  fixture is ever regenerated, these literals must be re-derived by hand
+  rather than pasted from a run of this module.
 """
 
 from __future__ import annotations
@@ -393,8 +401,13 @@ class TestReadCurationJobRows:
 
         rows = read_curation_job_rows(str(db_path), "confidence_decay")
 
-        assert len(rows) == len(expected)
-        assert {r[1] for r in rows} == {r[1] for r in expected}  # trigger_source values agree
+        # Full tuple equality, not a length plus a set of trigger_source values:
+        # every row in this fixture is 'scheduled', so that set comparison reduced
+        # to {"scheduled"} == {"scheduled"} and never once compared a started_at.
+        # A SELECT that returned the wrong column, or the right columns in the
+        # wrong order, passed it -- while making build_uptime_report filter every
+        # row away and report "nothing measured" for a populated store.
+        assert rows == expected
 
     def test_does_not_create_a_file_at_a_missing_path(self, tmp_path: Path):
         missing = tmp_path / "does-not-exist.db"

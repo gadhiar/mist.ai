@@ -1,8 +1,20 @@
 """Historical uptime, derived from the curation job ledger.
 
-Nothing in the tree measures backend process uptime directly:
-`grep -rniE "uptime|boot_time|process_start" backend/ --include=*.py` returns
-nothing. What exists by accident is `curation_job_runs`: the curation
+Nothing in the tree records uptime HISTORY. The live number is measured --
+`backend/system_metrics.py`'s `process_uptime_seconds()` reads
+`psutil.Process().create_time()` and the `system_status` WS payload carries
+it -- but that only ever answers "how long has this process been up right
+now", and it resets to nothing the moment the process dies. No table, log or
+metric in this repo retains a past restart.
+
+(An earlier draft of this paragraph claimed
+`grep -rniE "uptime|boot_time|process_start" backend/ --include=*.py`
+returned nothing. That was true when this module was written and false by the
+time it merged, because the sibling commit adding the live field landed in the
+same branch: the grep now returns 74 matches across 3 files. The conclusion
+survived; the stated reason did not.)
+
+What exists by accident is `curation_job_runs`: the curation
 scheduler's loop seeds `last_run.get(name, 0.0)` for every job, so every
 enabled job is "due" on the loop's very first pass
 (`backend/knowledge/curation/scheduler.py:305-311`, comment and code agree).
@@ -57,9 +69,12 @@ fixture: 60->27, 120->27, 300->27, 500->27, 600->26, 1800->23, 3600->22.
 300 sits in the middle of the flat part of that curve, not at either edge.
 
 Reproduction: `python -c` loading the fixture CSV and running
-`derive_uptime` at each tolerance reproduces the table above; the same
-computation is pinned as a regression test in
-`tests/unit/event_store/test_uptime.py` (the "tolerance plateau" test class).
+`derive_uptime` at each tolerance reproduces the table above.
+`tests/unit/event_store/test_uptime.py`'s "tolerance plateau" class pins the
+first five rows (60, 120, 300, 500, 600) -- the ones that establish the
+plateau and its right-hand edge. The 1800 and 3600 rows are NOT pinned by any
+test; they were recomputed by hand and are recorded here only to show the
+curve keeps falling away from the flat part.
 
 Module structure
 -----------------

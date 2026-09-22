@@ -166,10 +166,12 @@ async def system_status_loop(interval_seconds: float = 5.0) -> None:
     Caveat this loop does NOT protect against: the try/except here means a
     bad tick is logged and skipped, so THIS loop keeps emitting correctly
     on the next interval. But the payload only reaches clients via
-    ``broadcast_messages()`` (started with no done-callback at
-    ``server.py:510``; see ``KNOWN_ISSUES.md:150-152``, which records the
-    same defect against ``server.py:87``, that call's own stale line
-    number -- not this loop's). If that downstream task dies, this loop keeps
+    ``broadcast_messages()``, which the lifespan starts with no done-callback
+    (``grep -n "create_task(broadcast_messages" backend/server.py``). Cited by
+    symbol, not line: ``KNOWN_ISSUES.md:150-152`` records this same defect
+    against ``server.py:87`` and that number is long stale, and an earlier
+    draft of THIS sentence said 510, which the very hunk that wrote it pushed
+    out of date. If that downstream task dies, this loop keeps
     emitting into ``message_queue`` while nothing drains it -- the payload,
     including ``uptime_seconds``, silently stops reaching clients with no
     error and no unhealthy status. Not fixed here; out of scope for this
