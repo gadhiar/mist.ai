@@ -169,7 +169,8 @@ class TestExonerationVerdictFindsScriptsPackage:
     `ModuleNotFoundError: No module named 'backend'` -- with a nonexistent
     master dir it exits cleanly, printing "master dir does not exist: ...".
     Its real defect is `load_d5_jsonls`'s `from scripts.eval_harness import
-    scorers` at line 90, reached only once the master/D5 dirs exist and
+    scorers` (line 90 before this branch, line 98 after -- the bootstrap
+    added 8 lines above it), reached only once the master/D5 dirs exist and
     contain at least one `*.jsonl`. Invoked as a file path, `sys.path[0]`
     is `scripts/eval_harness/`, not the repo root, so that import raises
     `ModuleNotFoundError: No module named 'scripts'`.
