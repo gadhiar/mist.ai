@@ -27,6 +27,14 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# load_d5_jsonls() below lazily imports scripts.eval_harness.scorers.
+# Running this script by path puts scripts/eval_harness/ on sys.path[0],
+# NOT the repo root -- so that import would fail. Add the repo root first
+# (mirrors scripts/mist_admin.py:81-83; one directory deeper here).
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 CONVERSATIONAL_TESTS = (
     "personality",
     "rag_integration",
@@ -396,7 +404,10 @@ def write_verdict(master_dir: Path, phase_d5_dir: Path) -> Path:
 
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
-        print("Usage: python exoneration_verdict.py <master-dir> [phase-d5-subdir]")
+        print(
+            "Usage: python scripts/eval_harness/exoneration_verdict.py "
+            "<master-dir> [phase-d5-subdir]"
+        )
         return 1
     master_dir = Path(argv[1])
     if not master_dir.exists():
