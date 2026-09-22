@@ -167,8 +167,9 @@ async def system_status_loop(interval_seconds: float = 5.0) -> None:
     bad tick is logged and skipped, so THIS loop keeps emitting correctly
     on the next interval. But the payload only reaches clients via
     ``broadcast_messages()`` (started with no done-callback at
-    ``server.py:510``; see ``KNOWN_ISSUES.md:150-152``, which cites this
-    loop's old line number). If that downstream task dies, this loop keeps
+    ``server.py:510``; see ``KNOWN_ISSUES.md:150-152``, which records the
+    same defect against ``server.py:87``, that call's own stale line
+    number -- not this loop's). If that downstream task dies, this loop keeps
     emitting into ``message_queue`` while nothing drains it -- the payload,
     including ``uptime_seconds``, silently stops reaching clients with no
     error and no unhealthy status. Not fixed here; out of scope for this
