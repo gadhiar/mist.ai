@@ -11,7 +11,6 @@ Spec: ~/.claude/plans/nimble-forage-cinder.md Parts 1-3.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import socket
@@ -1803,26 +1802,79 @@ def probe_llm(base_url: str, timeout: float = 5.0) -> dict[str, Any]:
         return {"service": "llm", "status": "timeout", "url": url}
 
 
+# Read cap for the /health body. The endpoint's payload is about 1.1 KiB today
+# (it was 92 bytes before per-dependency reporting landed), so 64 KiB leaves
+# room for the check set to grow by an order of magnitude while still bounding
+# a hostile or broken responder that never stops writing -- `urlopen` imposes
+# no size limit of its own, and an admin CLI must not be hung by one.
+_HEALTH_BODY_MAX_BYTES = 64 * 1024
+
+
 def probe_backend(base_url: str, timeout: float = 5.0) -> dict[str, Any]:
-    """Probe MIST backend /health endpoint."""
+    """Probe MIST backend /health endpoint.
+
+    The verdict comes from the parsed body's `status` field, not from the HTTP
+    status code. `/health` answers 200 even when it reports a fault, on purpose:
+    a 503 would break the hydration handshake, which reports any `HTTPError` as
+    "could not be reached" (`scripts/hydration/target.py:91-100`). A reader that
+    trusted the code alone would therefore call every fault healthy.
+
+    A body that will not parse, or that carries no top-level string `status`,
+    reports `unreadable_body` or `no_status_field` -- distinct from each other
+    and from a measured failure, and never healthy. An unverified condition is
+    unknown with a reason, which is the rule `/health` itself follows.
+
+    Args:
+        base_url: Backend origin, with or without a trailing slash.
+        timeout: Socket timeout in seconds.
+
+    Returns:
+        A status dict. `status` is the backend's own verdict (`healthy`,
+        `degraded`, `unhealthy`), or one of `http_<code>`, `unreadable_body`,
+        `no_status_field`, `unreachable`, `timeout`. `restart_recommended` is
+        present whenever the body supplied a usable `status`.
+    """
     url = f"{base_url.rstrip('/')}/health"
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310  # nosec B310
-            ok = resp.status == 200
-            body = resp.read().decode("utf-8", errors="replace")[:200]
-        payload: dict[str, Any] = {}
-        with contextlib.suppress(json.JSONDecodeError):
-            payload = json.loads(body)
-        return {
-            "service": "backend",
-            "status": "healthy" if ok else f"http_{resp.status}",
-            "url": url,
-            **({"payload": payload} if payload else {"body": body}),
-        }
+            http_status = resp.status
+            body = resp.read(_HEALTH_BODY_MAX_BYTES).decode("utf-8", errors="replace")
     except urllib.error.URLError as e:
         return {"service": "backend", "status": "unreachable", "url": url, "error": str(e)}
     except TimeoutError:
         return {"service": "backend", "status": "timeout", "url": url}
+
+    result: dict[str, Any] = {"service": "backend", "url": url, "http_status": http_status}
+
+    # `/health` is always 200 today, but a proxy, a crashed worker or an older
+    # backend can still answer otherwise, and the code is the honest answer then.
+    if http_status != 200:
+        result["status"] = f"http_{http_status}"
+        result["body"] = body
+        return result
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as e:
+        result["status"] = "unreadable_body"
+        result["error"] = f"response body is not JSON: {e}"
+        result["body"] = body
+        return result
+
+    if isinstance(payload, dict):
+        result["payload"] = payload
+    else:
+        result["body"] = body
+
+    status_value = payload.get("status") if isinstance(payload, dict) else None
+    if not isinstance(status_value, str):
+        result["status"] = "no_status_field"
+        result["error"] = "response body carries no top-level string 'status'"
+        return result
+
+    result["status"] = status_value
+    result["restart_recommended"] = bool(payload.get("restart_recommended", False))
+    return result
 
 
 def probe_tcp(host: str, port: int, timeout: float = 3.0) -> bool:
