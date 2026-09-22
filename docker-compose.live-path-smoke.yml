@@ -1,0 +1,374 @@
+# docker-compose.live-path-smoke.yml
+# The `smoke` profile: a throwaway stack for ONE real conversation with MIST.
+#
+# WHY IT EXISTS. The live stack's `conversation_turn_events` table was
+# measured empty during planning (a LIVE-database observation, not checkable
+# from this repository), so the per-turn memory pipeline is unverified end to
+# end -- no turn row means nothing downstream of it can have run. This stack
+# exists to hold one real conversation and let an assertion script observe the
+# artifacts it should produce. The conversation is real -- real backend, real
+# Neo4j, real store writes -- which is exactly why every one of those has to be
+# somewhere the LIVE stack cannot see.
+#
+# ----------------------------------------------------------------------------
+# CONTAINMENT MODEL, in the order the layers actually bind
+# ----------------------------------------------------------------------------
+#
+# LAYER 1 -- THE ABSENT MOUNTS. This is the load-bearing one.
+# `mist-backend-smoke` bind-mounts exactly one writable host directory:
+# ./smoke-state. It does not mount ./data, it does not mount ./mist-memory,
+# and it does not mount ./dev-state. So a misconfigured EVENT_STORE_DB_PATH
+# pointing at /app/data/event_store.db does not corrupt the live store -- it
+# writes into the container's throwaway upper layer and dies with the
+# container. The env vars below say where state SHOULD go; the absent mounts
+# make it structurally impossible for it to go anywhere else.
+#
+# ./dev-state is on that list and is the easy one to miss. It is not live
+# state, but it holds the hydration fixture: `ls dev-state/vault/sessions` in
+# the working checkout returns 12 notes dated 2025-09-02 to 2026-07-01 (the
+# directory is gitignored, so it is absent from a fresh clone), and
+# `docker-compose.dev-hydration.yml:21-23` records that a hydrated graph costs
+# 87 LLM turns to reproduce. dev-hydration's own ./data/hydration-snapshots and
+# ./data/golden-log mounts are deliberately NOT carried over either: this stack
+# replays no corpus and snapshots nothing, and the narrowest exception to a
+# mount rule is still an exception.
+#
+# LAYER 2 -- THE LITERAL STORE PATHS. Every store path below is a literal, not
+# a ${VAR:-default} interpolation, for the reason stated at
+# `docker-compose.dev-hydration.yml:115-121`: the base compose reads those same
+# variable names from the HOST shell -- EVENT_STORE_DB_PATH, MIST_VAULT_ROOT
+# and MIST_SIDECAR_DB_PATH are `${VAR:-default}` at `docker-compose.yml:39,45,46`
+# (EVENT_STORE_AUDIO_DIR and VECTOR_STORE_DATA_DIR are already literals there,
+# at `:40-41`) -- so an operator exporting one to steer THIS stack would
+# silently retarget the LIVE backend on its next recreate. All five are
+# hardcoded here rather than only the three, because which of them the base
+# file interpolates is not a property this stack should depend on. Compose
+# `environment` beats `env_file`, so a stale .env cannot override them either.
+# The five store paths all resolve
+# under /app/smoke-state, whose host side ./smoke-state passes
+# `assert_isolated_root` (`backend/knowledge/eval_isolation.py:539-587`): it is
+# neither under nor a container of any entry in `live_state_roots()`
+# (`backend/knowledge/eval_isolation.py:514-536`).
+#
+# OPEN GAP: `smoke-state/` is NOT in .gitignore. `dev-state/` is
+# (`.gitignore:98`), and `grep -n 'smoke-state' .gitignore` returns nothing, so
+# a smoke run leaves its event store, vault and vector store as untracked files
+# in `git status`. Adding the ignore rule was outside the write zone of the
+# task that created this file; it is a one-line follow-up, not a containment
+# defect -- nothing here writes to a TRACKED path.
+#
+# LAYER 3 -- `assert_neo4j_isolated`. This is the one genuinely new guarantee
+# here, so state its mechanism precisely.
+# `backend/knowledge/storage/neo4j_connection.py:40` makes
+# `assert_neo4j_isolated(self.config)` the FIRST statement of `connect()` --
+# before `GraphDatabase.driver(...)` is called at
+# `neo4j_connection.py:45-47`. That guard no-ops unless MIST_EVAL_ISOLATION is
+# truthy (`backend/knowledge/eval_isolation.py:377-378`); when it is active it
+# refuses any (host, port) outside `_allowed_endpoints()`
+# (`eval_isolation.py:264-266`), which MIST_EVAL_NEO4J_HOSTS REPLACES
+# (`eval_isolation.py:391-398`). So with MIST_EVAL_ISOLATION=1 and
+# MIST_EVAL_NEO4J_HOSTS naming only smoke endpoints, this backend cannot open a
+# driver to the live graph at all -- not "is configured not to", cannot.
+#
+# Ports, all five instances distinct so a host-side client cannot confuse them:
+#   live 7474/7687/8001 | eval 7475/7688 | staging 7476/7689
+#   dev 7477/7690/8002  | smoke 7478/7691/8003
+#
+# ----------------------------------------------------------------------------
+# RUNBOOK
+# ----------------------------------------------------------------------------
+# Every command names its services explicitly.
+# `docker-compose.dev-hydration.yml:64-65` explains why: a bare
+# `docker compose up -d` would also reconcile the LIVE services. Pass the
+# override file too, so any live service a command does touch (mist-llm, which
+# this stack borrows) keeps its normal merged definition.
+#
+# PHASE 1 -- conversation, scheduler OFF (MIST_SMOKE_SCHEDULER unset -> 0):
+#   docker compose -f docker-compose.yml -f docker-compose.override.yml \
+#     -f docker-compose.live-path-smoke.yml --profile smoke up -d \
+#     mist-neo4j-smoke mist-backend-smoke
+#   # Drive one conversation over ws://localhost:8003/ws (the client is a
+#   # separate task and is NOT part of this file).
+#
+# PHASE 2 -- recreate the backend with the scheduler ON, so it starts AFTER
+# turns exist. See the MIST_CURATION_SCHEDULER_ENABLED comment for why the
+# ordering is load-bearing:
+#   MIST_SMOKE_SCHEDULER=1 docker compose -f docker-compose.yml \
+#     -f docker-compose.override.yml -f docker-compose.live-path-smoke.yml \
+#     --profile smoke up -d --force-recreate mist-backend-smoke
+#
+# TEARDOWN (stop, not down -- `down` without service names touches live):
+#   docker compose -f docker-compose.yml -f docker-compose.override.yml \
+#     -f docker-compose.live-path-smoke.yml --profile smoke stop \
+#     mist-backend-smoke mist-neo4j-smoke
+#
+# RESET (this is the reset Raj authorised the experiment on):
+#   docker compose -f docker-compose.yml -f docker-compose.override.yml \
+#     -f docker-compose.live-path-smoke.yml --profile smoke rm -fsv \
+#     mist-backend-smoke mist-neo4j-smoke
+#   docker volume rm mist.ai_mist-neo4j-smoke-data mist.ai_mist-neo4j-smoke-logs
+#   rm -rf smoke-state
+#
+# The containment properties asserted above are re-checked by
+# `tests/unit/smoke/test_smoke_compose_isolation.py`, which parses THIS file.
+# `docker compose config` is not available in the unit-test container, so that
+# test is the standing check.
+services:
+  mist-neo4j-smoke:
+    image: neo4j:5
+    container_name: mist-neo4j-smoke
+    profiles: ["smoke"]
+    ports:
+      - "7478:7474"   # HTTP (host 7478; live 7474, eval 7475, staging 7476, dev 7477)
+      - "7691:7687"   # Bolt (host 7691; live 7687, eval 7688, staging 7689, dev 7690)
+    environment:
+      # NEO4J_AUTH follows dev-hydration's treatment
+      # (`docker-compose.dev-hydration.yml:75`): interpolated, because the
+      # credential must match whatever the operator's .env gives the backend,
+      # and a literal here would silently diverge from it.
+      - NEO4J_AUTH=${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-password}
+      - NEO4J_PLUGINS=["apoc"]
+    volumes:
+      # Named volumes, distinct from the live `mist-neo4j-data` /
+      # `mist-neo4j-logs` declared at `docker-compose.yml:180-181`. Named
+      # rather than tmpfs so a crashed assertion pass can be re-run against the
+      # same graph; the RESET block above is the deliberate way to discard it.
+      - mist-neo4j-smoke-data:/data
+      - mist-neo4j-smoke-logs:/logs
+    restart: "no"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  mist-backend-smoke:
+    # RUNS THE LIVE BACKEND'S IMAGE, and declares no build of its own, for the
+    # reason given at `docker-compose.dev-hydration.yml:91-102`: the point of
+    # this run is to exercise `server.py`'s composition root, and a
+    # separately-built image is a second artifact that can drift from the one
+    # production runs. Reusing the tag means the smoke run is produced by the
+    # same binary as production, by construction.
+    #
+    # Build it the normal way if it is missing:
+    #   docker compose build mist-backend
+    image: ${MIST_BACKEND_IMAGE:-mistai-mist-backend:latest}
+    container_name: mist-backend-smoke
+    profiles: ["smoke"]
+    ports:
+      - "8003:8001"   # host 8003; live backend keeps 8001, dev keeps 8002
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # --- isolated stores. Literals, not ${VAR:-default} interpolation. -----
+      # See LAYER 2 in the header. Four entries in this whole block are
+      # interpolated, each with its reason stated beside it: NEO4J_USERNAME and
+      # NEO4J_PASSWORD (credentials, which must agree with NEO4J_AUTH on the
+      # smoke Neo4j), MODEL (must agree with the borrowed mist-llm), and
+      # MIST_CURATION_SCHEDULER_ENABLED at the bottom (the deliberate
+      # exception). Every path and every target is a literal.
+      - NEO4J_URI=bolt://mist-neo4j-smoke:7687
+      # NEO4J_USERNAME / NEO4J_PASSWORD follow dev-hydration's treatment
+      # (`docker-compose.dev-hydration.yml:123-124`): interpolated, because
+      # they must agree with NEO4J_AUTH on `mist-neo4j-smoke` above. They are
+      # credentials, not a target -- they cannot redirect this backend at the
+      # live graph, which is what the literals rule exists to prevent.
+      - NEO4J_USERNAME=${NEO4J_USERNAME:-neo4j}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-password}
+      # Literal, unlike `docker-compose.yml:26`'s ${NEO4J_DATABASE:-neo4j}.
+      - NEO4J_DATABASE=neo4j
+      - EVENT_STORE_DB_PATH=/app/smoke-state/event_store.db
+      - EVENT_STORE_AUDIO_DIR=/app/smoke-state/audio
+      - VECTOR_STORE_DATA_DIR=/app/smoke-state/vector_store
+      - MIST_VAULT_ROOT=/app/smoke-state/vault
+      - MIST_SIDECAR_DB_PATH=/app/smoke-state/vault_sidecar.db
+      # The extraction cache is not separately configurable -- it is derived as
+      # <dirname(EVENT_STORE_DB_PATH)>/extraction_cache.db
+      # (`docker-compose.dev-hydration.yml:131-133` records the same
+      # derivation). Setting the event store path therefore also relocates it.
+      #
+      # --- Neo4j isolation: LAYER 3 in the header --------------------------
+      # These two are what make the live graph UNREACHABLE rather than merely
+      # untargeted. MIST_EVAL_ISOLATION=1 activates `assert_neo4j_isolated`
+      # (`backend/knowledge/eval_isolation.py:377-378`), and
+      # MIST_EVAL_NEO4J_HOSTS REPLACES the allowlist it checks against
+      # (`eval_isolation.py:264-266`) -- so the smoke endpoints here are the
+      # ONLY endpoints `Neo4jConnection.connect()` will build a driver for
+      # (`backend/knowledge/storage/neo4j_connection.py:40,45-47`).
+      #
+      # All three spellings of the smoke instance are listed because host and
+      # service-name spellings are the same database: the header's port table
+      # publishes bolt on host 7691. None of the three is in
+      # `LIVE_NEO4J_ENDPOINTS` (`eval_isolation.py:103-109`), which is the
+      # property `tests/unit/smoke/test_smoke_compose_isolation.py` asserts.
+      - MIST_EVAL_ISOLATION=1
+      - MIST_EVAL_NEO4J_HOSTS=mist-neo4j-smoke:7687,localhost:7691,127.0.0.1:7691
+      #
+      # --- TWO VARIABLES THAT MUST NOT APPEAR HERE --------------------------
+      #
+      # MIST_HYDRATION_ISOLATION. `docker-compose.dev-hydration.yml:136` sets
+      # it; this file must not. It buys nothing and costs the experiment:
+      #   - `backend/knowledge/curation/scheduler.py:260` makes
+      #     `CurationScheduler.start()` return False when it is set, and that
+      #     check sits AHEAD of the enabled-flag check at
+      #     `scheduler.py:271`. One of the four artifacts this run must observe
+      #     is a curation run with examined > 0, which cannot happen if the
+      #     scheduler never starts.
+      #   - `backend/factories.py:364-365` forces `include_internal_derivation`
+      #     to False when it is set. `factories.py:352-362` names that effect
+      #     "Stage 9 OFF" and calls it the safe direction -- safe for a
+      #     hydration gate, wrong for a run that is trying to observe the
+      #     pipeline doing its normal work.
+      # It never provided store isolation: across its five readers --
+      # `scheduler.py:260`, `factories.py:120`, `factories.py:343`,
+      # `server.py:710`, `scripts/hydration/preflight.py:41` -- not one
+      # rewrites a store path. The isolation sometimes credited to it is done
+      # by the literal store paths above plus the absent mounts.
+      #
+      # MIST_HYDRATION_CLOCK. `docker-compose.dev-hydration.yml:151` sets it;
+      # this file must not. With it set, `_record_turn_event`
+      # (`backend/chat/conversation_handler.py:2279`) stamps turns with the
+      # golden log's AUTHORED timestamps (2025-09..2026-07) instead of the wall
+      # clock. `SelfReflectionJob` looks back 24 hours from now
+      # (`backend/knowledge/curation/self_reflection.py:60-61`) via
+      # `get_turns_since`, which is
+      # `SELECT * FROM conversation_turn_events WHERE timestamp >= ?`
+      # (`backend/event_store/store.py:303-322`). Authored-stamped turns fall
+      # outside that window, so the job would report examined = 0 ON A PIPELINE
+      # THAT IS WORKING PERFECTLY -- we would measure the exact symptom we are
+      # investigating and conclude wrongly.
+      # Separately, `backend/factories.py:120-126` raises `HydrationClockError`
+      # if MIST_HYDRATION_CLOCK is set while MIST_HYDRATION_ISOLATION is not,
+      # so the two move together or not at all.
+      #
+      # --- turns must be recorded ------------------------------------------
+      # Load-bearing, not hygiene: at
+      # `backend/voice_models/model_manager.py:494`,
+      # `generate_llm_response` takes the knowledge-augmented path only when
+      # `self.knowledge and self.knowledge.is_enabled()`; the else branch
+      # (`model_manager.py:501-530`) calls the LLM provider directly. Turn
+      # recording lives only on the knowledge path -- `_record_turn_event` is
+      # defined and called in `backend/chat/conversation_handler.py` (2279,
+      # 1631, 1702) and nowhere in `model_manager.py`. With knowledge
+      # integration off, the conversation would produce no turn row at all.
+      - ENABLE_KNOWLEDGE_INTEGRATION=true
+      # Sessions are recorded origin='real' for the reason dev-hydration gives
+      # at `docker-compose.dev-hydration.yml:152-163`: `origin` discriminates
+      # WITHIN one event store, and this store holds nothing but smoke traffic.
+      # Isolation from production is the separate store, not a marker column.
+      - MIST_SESSION_ORIGIN=real
+      #
+      # --- determinism ------------------------------------------------------
+      # Literal 0.0, unlike `docker-compose.yml:32`'s ${LLM_TEMPERATURE:-0.0}.
+      - LLM_TEMPERATURE=0.0
+      #
+      # --- shared, stateless ------------------------------------------------
+      # llama-server holds no per-stack state, so this backend borrows the live
+      # `mist-llm` (`docker-compose.yml:116-177`) rather than loading a second
+      # copy of the model into 12GB of VRAM.
+      - LLM_SERVER_URL=http://mist-llm:8080
+      - LLM_BACKEND=llamacpp
+      # Interpolated, matching `docker-compose.yml:29` and
+      # `docker-compose.dev-hydration.yml:177`: MODEL must name the model the
+      # borrowed mist-llm actually loaded, so pinning it here could only
+      # disagree with it.
+      - MODEL=${MODEL:-gemma-4-e4b}
+      #
+      # --- voice off --------------------------------------------------------
+      # This is a text-path conversation. TTS off skips the Chatterbox load,
+      # which is gated on `self.config.tts_enabled` at
+      # `backend/voice_models/model_manager.py:123`. Whisper STT still loads
+      # unconditionally at `model_manager.py:119-120`, which is why the GPU
+      # reservation below is kept.
+      - TTS_ENABLED=false
+      - WATCHFILES_FORCE_POLLING=1
+      #
+      # --- the single deliberate exception to the literals rule -------------
+      # MIST_SMOKE_SCHEDULER is a NEW variable name and no other service reads
+      # it: `rg "MIST_SMOKE_SCHEDULER"` over the repo returns only this file
+      # (and the test that asserts this wiring). So the host-shell
+      # interpolation hazard the literals rule exists to prevent -- an exported
+      # variable silently retargeting the LIVE backend, which reads the same
+      # names -- does not apply to it. Nothing but this service can see it.
+      #
+      # TWO-PHASE PROTOCOL. The conversation runs with the scheduler OFF
+      # (unset -> 0 -> `curation_scheduler_enabled()` returns False via
+      # `parse_isolation_flag`, `backend/knowledge/curation/scheduler.py:84-98`;
+      # note "" is UNSET and defaults to True at `scheduler.py:85-91`, which is
+      # why the default here is the string "0" and not empty). The backend is
+      # then recreated with MIST_SMOKE_SCHEDULER=1 so the scheduler starts
+      # AFTER turns exist.
+      #
+      # That ordering is load-bearing. `scheduler.py:305-311` reads
+      # `last_run.get(config.name, 0.0)`, which makes every enabled job due on
+      # the loop's FIRST pass. `self_reflection` is registered with
+      # `interval_seconds=86400` (`backend/factories.py:751`), so a scheduler
+      # that starts before any turn exists spends its single daily run on an
+      # empty `conversation_turn_events` table and will not run again for 24
+      # hours.
+      #
+      # This does NOT explain the live stack's 206 zero-`examined` runs. The
+      # live ledger holds 39 `confidence_decay` rows over 48 days, all
+      # trigger_source='scheduled', spread roughly daily rather than
+      # boot-clustered, so boot ordering is not the live explanation; the live
+      # explanation is that `conversation_turn_events` has zero rows. Those
+      # four numbers were measured against the LIVE databases during planning
+      # and are not checkable from this repository -- recorded here so nobody
+      # re-derives the wrong cause from the paragraph above, not as a claim
+      # this file establishes.
+      - MIST_CURATION_SCHEDULER_ENABLED=${MIST_SMOKE_SCHEDULER:-0}
+    user: "1000:1000"
+    volumes:
+      # THE ONLY WRITABLE MOUNT. Read LAYER 1 in the header before adding
+      # another. There is deliberately no /app/logs bind mount (dev-hydration
+      # has one at `docker-compose.dev-hydration.yml:190`): `backend/server.py:75-76`
+      # does `Path("/app/logs").mkdir(parents=True, exist_ok=True)` and
+      # `docker/backend/Dockerfile:114` chowns /app to appuser, so the
+      # directory is created in the container's own layer and its logs die with
+      # the container -- which is the correct lifetime for a throwaway stack.
+      - ./smoke-state:/app/smoke-state
+      # Code, read-only, mirroring `docker-compose.dev-hydration.yml:226-231`
+      # and `docker-compose.override.yml:7-12`. Read-only is not merely
+      # hygiene: it is what keeps a smoke-stack process from editing the tree
+      # the live stack is running from.
+      - ./backend:/app/backend:ro
+      - ./src:/app/src:ro
+      - ./dependencies:/app/dependencies:ro
+      - ./scripts:/app/scripts:ro
+      - ./tests:/app/tests:ro
+      - ./voice_profiles:/app/voice_profiles:ro
+      # Model caches are content-addressed and read-mostly; sharing them avoids
+      # a second 3-4GB download. Same two named volumes the live backend uses
+      # (`docker-compose.yml:74-75`) and dev-hydration shares
+      # (`docker-compose.dev-hydration.yml:234-235`).
+      - mist-hf-cache:/home/appuser/.cache/huggingface
+      - mist-torch-cache:/home/appuser/.cache/torch
+    depends_on:
+      mist-neo4j-smoke:
+        condition: service_healthy
+      mist-llm:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # No `restart: unless-stopped`. The live backend restarts because it is a
+    # service; this one is an experiment harness, and a smoke run that dies
+    # mid-conversation must stay dead rather than silently restart and leave a
+    # half-recorded turn sequence behind the assertions.
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  mist-neo4j-smoke-data:
+  mist-neo4j-smoke-logs:
