@@ -97,3 +97,10 @@ data/*-backup-*
 # SQLite/vault state that must never enter git history.
 dev-state/
 data/hydration-snapshots/
+
+# Live-path smoke test. `smoke-state/` is the throwaway stack's scratch root and
+# the ONLY writable mount of mist-backend-smoke. It holds a real event store, a
+# real vault and real conversation content produced by the smoke run, and the
+# runbook deletes it at teardown. It must never enter git history, and it must
+# never be picked up by a `git add -A` run mid-experiment.
+smoke-state/
