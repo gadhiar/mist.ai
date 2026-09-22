@@ -348,33 +348,50 @@ class LLMProbe:
 class EventStoreProbe:
     """Probes the append-only event store with a `SELECT 1`.
 
-    A None store is reported as a failure, not as config-off. Both paths in
-    `backend/chat/conversation_handler.py:845-898` leave the attribute None: the
-    `if es_config.enabled` guard at :847 (config-off) and the `except` at
-    :896-898 (initialize or epoch write raised). The accessor cannot tell them
-    apart, and `EventStoreConfig.enabled` defaults to True with
-    `EVENT_STORE_ENABLED` defaulting to "true"
-    (`backend/knowledge/config.py:203,218`), so in any default deployment None
-    means the failure path. Reporting null here would hide a boot failure behind
-    an "optional" label.
+    Two accessors, not one, because a None store is genuinely ambiguous. Both
+    paths in `backend/chat/conversation_handler.py` leave the attribute None:
+    :845 initialises it to None, :847 only builds it `if es_config.enabled`
+    (config-off), and :896-898 nulls it again in the `except` (initialize or
+    epoch write raised). The store accessor cannot tell those two apart.
+
+    The flag behind them is independently readable, so the ambiguity is
+    resolvable and is resolved rather than collapsed: `EventStoreConfig.enabled`
+    defaults to True from `EVENT_STORE_ENABLED`, itself defaulting to "true"
+    (`backend/knowledge/config.py:203,218`). Configured plus a None store is
+    `down` / `unavailable_at_boot`; not configured is `null` /
+    `disabled_by_config`. Reporting `down` for a subsystem an operator switched
+    off on purpose would claim a failure that did not occur -- the mirror image
+    of the defect this module exists to remove -- and would fire in exactly the
+    configuration where the operator already knows the thing is off.
+
+    This makes the probe symmetric with `Neo4jProbe`, which takes a `configured`
+    predicate for the same reason. Two probes facing the same ambiguity resolve
+    it the same way, so a reader who has understood one has understood both.
 
     `severity="degrades"`, `restart_repairs=False`: conversation continues
     without Layer 1 recording, and a restart re-runs the same initialize against
     the same file.
     """
 
-    def __init__(self, get_store: Callable[[], EventStoreHealthSource | None]) -> None:
+    def __init__(
+        self,
+        get_store: Callable[[], EventStoreHealthSource | None],
+        event_store_configured: Callable[[], bool],
+    ) -> None:
         self.name = "event_store"
         self.severity: Severity = "degrades"
         self.restart_repairs = False
         self.timeout_seconds = 0.5
         self._get_store = get_store
+        self._event_store_configured = event_store_configured
 
     async def check(self) -> None:
         """Run a `SELECT 1` in a thread, since sqlite3 is blocking."""
         store = self._get_store()
         if store is None:
-            raise ProbeFailed("unavailable_at_boot")
+            if self._event_store_configured():
+                raise ProbeFailed("unavailable_at_boot")
+            raise ProbeUnavailable("disabled_by_config")
 
         await asyncio.to_thread(self._select_one, store)
 

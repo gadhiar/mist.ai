@@ -339,7 +339,7 @@ def _leaky_llm(executor):
 
 def _leaky_event_store(executor):
     store = FakeEventStore(raises=RuntimeError(LEAKY_MESSAGE))
-    return EventStoreProbe(lambda: store)
+    return EventStoreProbe(lambda: store, lambda: True)
 
 
 def _leaky_sidecar(executor):
@@ -588,3 +588,69 @@ async def test_broadcaster_death_settles_into_restart_advice(clock):
     settled = registry.snapshot()
     assert settled["checks"]["broadcaster"]["consecutive_failures"] == 5
     assert settled["restart_recommended"] is True
+
+
+# 16
+@pytest.mark.asyncio
+async def test_event_store_none_is_down_when_configured(clock):
+    """Configured plus absent is a failure that happened, so it is `down`.
+
+    `conversation_handler.py:847` only builds the store when
+    `EventStoreConfig.enabled`, and :898 nulls it again when initialize raised.
+    With the flag on, the second is the only explanation left.
+    """
+    registry = build_registry(clock, [EventStoreProbe(lambda: None, lambda: True)])
+
+    await registry.run_once()
+    check = registry.snapshot()["checks"]["event_store"]
+
+    assert check["status"] == "down"
+    assert check["reason"] == "unavailable_at_boot"
+    assert registry.snapshot()["status"] == "degraded"
+
+
+# 17
+@pytest.mark.asyncio
+async def test_event_store_none_is_null_when_not_configured(clock):
+    """Switched off on purpose is not a fault, and must not be reported as one.
+
+    The mirror of `test_neo4j_unavailable_at_boot_is_down_not_null`: the same
+    ambiguity, resolved the same way. Calling a deliberately disabled subsystem
+    `down` claims a failure that did not occur, and does it in exactly the
+    configuration where an operator already knows the thing is off.
+    """
+    registry = build_registry(clock, [EventStoreProbe(lambda: None, lambda: False)])
+
+    await registry.run_once()
+    check = registry.snapshot()["checks"]["event_store"]
+
+    assert check["status"] is None
+    assert check["reason"] == "disabled_by_config"
+    assert check["latency_ms"] is None
+
+
+# 18
+@pytest.mark.asyncio
+async def test_the_event_store_verdict_tracks_the_flag(clock):
+    """Non-vacuity: one store accessor, both answers, inside one test.
+
+    Neither branch above survives a probe that hardcodes its own verdict once
+    the flag is flipped under a single registry.
+    """
+    configured = True
+    registry = build_registry(clock, [EventStoreProbe(lambda: None, lambda: configured)])
+
+    await registry.run_once()
+    assert registry.snapshot()["checks"]["event_store"]["status"] == "down"
+
+    configured = False
+    await registry.run_once()
+    assert registry.snapshot()["checks"]["event_store"]["status"] is None
+
+    # And a store that IS there is `up` regardless of the flag, because the
+    # predicate is consulted only when the accessor returns None.
+    store = FakeEventStore()
+    present = build_registry(clock, [EventStoreProbe(lambda: store, lambda: False)])
+    await present.run_once()
+    assert present.snapshot()["checks"]["event_store"]["status"] == "up"
+    assert store.calls == 1
