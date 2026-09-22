@@ -699,6 +699,8 @@ async def run_conversation(
     ws_url: str,
     plan: TurnPlan,
     transcript: Transcript,
+    websockets: Any,
+    ws_version: str,
     *,
     connect_timeout: float,
     turn_timeout: float,
@@ -709,13 +711,14 @@ async def run_conversation(
         ws_url: Already guarded by `guard_ws_target`.
         plan: The corpus.
         transcript: Where to record the run.
+        websockets: The resolved `websockets` module.
+        ws_version: Its version string, recorded in the transcript header.
         connect_timeout: Seconds allowed for the TCP+WS handshake.
         turn_timeout: Seconds allowed per turn for a terminal frame.
 
     Returns:
         A process exit code.
     """
-    websockets, ws_version = resolve_websockets()
     transcript.write(
         "header",
         schema_version=TRANSCRIPT_SCHEMA_VERSION,
@@ -784,10 +787,24 @@ async def run_conversation(
         # (backend/server.py:1008-1017) writes the session note on disconnect;
         # closing rather than dropping the process is what lets THIS side record
         # when that happened.
-        await connection.close()
-        await connection.wait_closed()
+        #
+        # The close is itself guarded, because a raise here would skip the
+        # summary record below -- and A1 and A3 both read that record. A failed
+        # close is worth recording; it is not worth losing the transcript over.
+        close_error: str | None = None
+        try:
+            await connection.close()
+            await connection.wait_closed()
+        except Exception as exc:  # noqa: BLE001 -- recorded, not propagated
+            close_error = f"{type(exc).__name__}: {exc}"
+            exit_code = EXIT_CONVERSATION_INCOMPLETE
         disconnected_at = datetime.now(UTC).isoformat()
-        transcript.write("note", event="closed", close_code=connection.close_code)
+        transcript.write(
+            "note",
+            event="closed",
+            close_code=getattr(connection, "close_code", None),
+            close_error=close_error,
+        )
 
     counts = summarise_outcomes(outcomes)
     probe = next(
@@ -905,6 +922,10 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_BAD_CORPUS
 
     guard_ws_target(args.url)
+    # Resolved BEFORE the transcript is opened, so a host without `websockets`
+    # fails with the install instruction instead of leaving a zero-byte
+    # transcript that later reads as "the conversation produced nothing".
+    websockets, ws_version = resolve_websockets()
 
     args.transcript.parent.mkdir(parents=True, exist_ok=True)
     with args.transcript.open("w", encoding="utf-8") as handle:
@@ -914,6 +935,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.url,
                 plan,
                 transcript,
+                websockets,
+                ws_version,
                 connect_timeout=args.connect_timeout,
                 turn_timeout=args.turn_timeout,
             )

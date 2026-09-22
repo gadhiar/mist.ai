@@ -419,6 +419,65 @@ def test_parse_cypher_plain_returns_empty_for_output_with_no_data_rows(recorded)
     assert bl.parse_cypher_plain(recorded) == []
 
 
+def test_file_listing_returns_real_sizes_and_skips_dot_git(tmp_path):
+    (tmp_path / "sessions").mkdir()
+    (tmp_path / "sessions" / "note.md").write_text("hello", encoding="utf-8")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/main", encoding="utf-8")
+
+    result = bl.file_listing(tmp_path)
+
+    assert result["status"] == "ok"
+    assert set(result["files"]) == {"sessions/note.md"}
+    assert result["files"]["sessions/note.md"]["size"] == 5
+    assert result["files"]["sessions/note.md"]["mtime"] > 0
+
+
+def test_file_listing_reports_a_missing_directory(tmp_path):
+    result = bl.file_listing(tmp_path / "nope")
+
+    assert result["status"] == "unavailable"
+    assert "no such directory" in result["error"]
+
+
+def test_git_status_reports_a_missing_directory_as_unavailable(tmp_path):
+    result = bl.git_status(tmp_path / "definitely-absent")
+
+    assert result["status"] == "unavailable"
+    assert "no such directory" in result["error"]
+
+
+def test_git_status_returns_real_porcelain_lines_for_a_repository():
+    """Not asserted empty: the worktree this runs in may have staged work."""
+    result = bl.git_status(REPO_ROOT)
+
+    assert result["status"] == "ok"
+    assert isinstance(result["porcelain"], list)
+    assert all(isinstance(line, str) and line for line in result["porcelain"])
+
+
+def test_newest_curation_rows_returns_real_rows_newest_first(tmp_path):
+    db = tmp_path / "event_store.db"
+    _make_event_store(db)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO curation_job_runs VALUES "
+        "('old', 'self_reflection', 'scheduled', '2026-09-20T00:00:00', 'completed', 0, 0)"
+    )
+    conn.execute(
+        "INSERT INTO curation_job_runs VALUES "
+        "('new', 'confidence_decay', 'scheduled', '2026-09-22T00:00:00', 'completed', 7, 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    result = bl.newest_curation_rows(db, limit=2)
+
+    assert result["status"] == "ok"
+    assert [row["run_id"] for row in result["rows"]] == ["new", "old"]
+    assert result["rows"][0]["examined"] == 7
+
+
 def test_run_command_reports_a_missing_executable_instead_of_raising():
     result = bl.run_command(["definitely-not-a-real-executable-9f3a"])
 
@@ -691,6 +750,21 @@ def test_parse_transcript_falls_back_to_turn_outcomes_when_the_driver_was_killed
     assert "did not finish" in facts.aborted
 
 
+def test_parse_transcript_does_not_call_a_failed_close_clean():
+    """`closed` means CLEANLY closed; drive_turns.py records `close_error`."""
+    lines = _transcript_lines(["stream_complete"] * 5, closed=False)
+    lines = lines.replace(
+        '{"record": "summary"',
+        json.dumps({"record": "note", "event": "closed", "close_error": "ConnectionResetError"})
+        + '\n{"record": "summary"',
+    )
+
+    facts = aa.parse_transcript(lines)
+
+    assert facts.present is True
+    assert facts.closed is False
+
+
 def test_parse_transcript_reports_an_unusable_transcript():
     facts = aa.parse_transcript("not jsonl at all\n{}\n")
 
@@ -834,6 +908,21 @@ def test_a1_fails_on_each_wrong_session_column(overrides, expected_fragment):
 
     assert verdict.status == aa.FAIL
     assert any(expected_fragment in line for line in verdict.evidence)
+
+
+def test_a1_reports_a_null_turn_index_as_a_mismatch_rather_than_raising():
+    rows = _turn_rows(5)
+    rows[2]["turn_index"] = None
+
+    verdict = aa.adjudicate_a1(
+        rows,
+        [_session_row()],
+        aa.parse_transcript(_transcript_lines(["stream_complete"] * 5)),
+        SESSION_ID,
+    )
+
+    assert verdict.status == aa.FAIL
+    assert any("turn_index values are" in line for line in verdict.evidence)
 
 
 def test_a1_ignores_rows_belonging_to_another_session():

@@ -238,7 +238,12 @@ def parse_transcript(text: str) -> TranscriptFacts:
         elif kind == "turn_outcome":
             outcomes.append(record)
         elif kind == "note" and record.get("event") == "closed":
-            closed = True
+            # `closed` means CLEANLY closed. drive_turns.py records the note
+            # even when the close itself raised, carrying `close_error`; A3
+            # reads this field as evidence that the server's disconnect
+            # `finally` (backend/server.py:1008-1017) was reached in good
+            # order, which a failed close does not establish.
+            closed = not record.get("close_error")
         elif kind == "summary":
             summary = record
 
@@ -441,7 +446,13 @@ def adjudicate_a1(
     problems: list[str] = []
     if len(mine) != expected_turns:
         problems.append(f"expected {expected_turns} turn rows, found {len(mine)}")
-    indices = sorted(row.get("turn_index") for row in mine)
+    # Filtered to ints before sorting: a NULL turn_index would make `sorted`
+    # raise on comparing None with int. Dropping it still fails the comparison
+    # below, which is the correct outcome, and it fails as a reported mismatch
+    # rather than as a traceback.
+    indices = sorted(
+        row.get("turn_index") for row in mine if isinstance(row.get("turn_index"), int)
+    )
     if indices != list(range(expected_turns)):
         problems.append(
             f"turn_index values are {indices}, expected {list(range(expected_turns))} "
