@@ -115,10 +115,11 @@ services:
 
   mist-llm:
     # Pinned by digest (goal mist-model-bench, 2026-09-24): llama.cpp build b11151, cuda12 image.
-    # Reason: the unpinned `server-cuda` tag gave no reproducible build; the running container
-    # was b8808. Digest verified on the host against ghcr on 2026-09-24. Build minimums taken
-    # from the goal's plan research, not re-checked here: Gemma 4 12B fixed at b9512, Gemma 4
-    # reasoning budget working from b8744; cuda13 images drop Pascal, so the pin stays on cuda12.
+    # The unpinned `server-cuda` tag gave no reproducible build; the running container was b8808
+    # per the 2026-09-24 model review, not re-checked here. Digest read on the host with
+    # `docker buildx imagetools inspect` against ghcr on 2026-09-24. Build minimums (Gemma 4 12B
+    # fixed at b9512, reasoning budget working from b8744) are from the goal's plan research, not
+    # re-checked here; cuda13 images drop Pascal, so the pin stays on cuda12.
     image: ghcr.io/ggml-org/llama.cpp:server-cuda-b11151@sha256:014f721265464f38ccb247c1338d07d852c4bae7509a4b4734d07a2bbadc765c
     container_name: mist-llm
     ports:

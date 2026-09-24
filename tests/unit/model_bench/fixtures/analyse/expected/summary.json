@@ -25,7 +25,7 @@
         "value": null,
         "wilson": null
       },
-      "errors": [],
+      "error_count": 0,
       "harness_score": {
         "schema_conformance": {
           "bootstrap": [
@@ -102,7 +102,7 @@
         "value": null,
         "wilson": null
       },
-      "errors": [],
+      "error_count": 0,
       "harness_score": {
         "schema_conformance": {
           "bootstrap": [
@@ -179,7 +179,7 @@
         "value": null,
         "wilson": null
       },
-      "errors": [],
+      "error_count": 0,
       "harness_score": {
         "schema_conformance": {
           "bootstrap": [
@@ -259,7 +259,7 @@
         "value": null,
         "wilson": null
       },
-      "errors": [],
+      "error_count": 0,
       "harness_score": {
         "schema_conformance": {
           "bootstrap": [
@@ -336,7 +336,7 @@
         "value": null,
         "wilson": null
       },
-      "errors": [],
+      "error_count": 1,
       "harness_score": {
         "schema_conformance": {
           "bootstrap": [
@@ -412,7 +412,7 @@
         "value": null,
         "wilson": null
       },
-      "errors": [],
+      "error_count": 0,
       "harness_score": {
         "schema_conformance_json_object": {
           "bootstrap": [
@@ -524,7 +524,7 @@
         "value": null,
         "wilson": null
       },
-      "errors": [],
+      "error_count": 0,
       "harness_score": {},
       "layout_acc": {
         "screen": {
@@ -609,7 +609,7 @@
         "value": null,
         "wilson": null
       },
-      "errors": [],
+      "error_count": 0,
       "harness_score": {},
       "layout_acc": {
         "screen": {
@@ -694,7 +694,7 @@
         "value": 40.0,
         "wilson": null
       },
-      "errors": [],
+      "error_count": 0,
       "harness_score": {
         "schema_conformance_json_object": {
           "bootstrap": [
@@ -880,7 +880,7 @@
         "value": null,
         "wilson": null
       },
-      "errors": [],
+      "error_count": 0,
       "harness_score": {},
       "layout_acc": {
         "screen": {
@@ -965,7 +965,7 @@
         "value": 44.0,
         "wilson": null
       },
-      "errors": [],
+      "error_count": 0,
       "harness_score": {
         "schema_conformance": {
           "bootstrap": [
@@ -1218,7 +1218,7 @@
   },
   "coverage": {
     "a1": {
-      "errors": [],
+      "error_count": 0,
       "harness": {
         "schema_conformance": {
           "complete": true,
@@ -1234,7 +1234,7 @@
       ]
     },
     "a2": {
-      "errors": [],
+      "error_count": 0,
       "harness": {
         "schema_conformance": {
           "complete": true,
@@ -1250,7 +1250,7 @@
       ]
     },
     "a3": {
-      "errors": [],
+      "error_count": 0,
       "harness": {
         "schema_conformance": {
           "complete": true,
@@ -1269,7 +1269,7 @@
       "present": false
     },
     "c0": {
-      "errors": [],
+      "error_count": 0,
       "harness": {
         "schema_conformance": {
           "complete": true,
@@ -1285,7 +1285,7 @@
       ]
     },
     "c0-old": {
-      "errors": [],
+      "error_count": 1,
       "harness": {
         "schema_conformance": {
           "complete": true,
@@ -1300,7 +1300,7 @@
       ]
     },
     "c0-prod": {
-      "errors": [],
+      "error_count": 0,
       "harness": {
         "schema_conformance_json_object": {
           "complete": true,
@@ -1320,7 +1320,7 @@
       ]
     },
     "c1-256": {
-      "errors": [],
+      "error_count": 0,
       "harness": {},
       "layout": {
         "screen": {
@@ -1335,7 +1335,7 @@
       ]
     },
     "c1-512": {
-      "errors": [],
+      "error_count": 0,
       "harness": {},
       "layout": {
         "screen": {
@@ -1350,7 +1350,7 @@
       ]
     },
     "c2": {
-      "errors": [],
+      "error_count": 0,
       "harness": {
         "schema_conformance_json_object": {
           "complete": true,
@@ -1378,7 +1378,7 @@
       ]
     },
     "c2-think512": {
-      "errors": [],
+      "error_count": 0,
       "harness": {},
       "layout": {
         "screen": {
@@ -1393,7 +1393,7 @@
       ]
     },
     "c3": {
-      "errors": [],
+      "error_count": 0,
       "harness": {
         "schema_conformance": {
           "complete": true,
@@ -1441,9 +1441,19 @@
       "present": false
     }
   },
-  "decision_rules_sha256": "0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce",
+  "decision_rules_sha256": "f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae",
   "decision_rules_sha256_warnings": [
-    "arm 'c1-256' meta.decision_rules_sha256='deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' differs from the analysed decision_rules.json='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce'"
+    "arm 'c0-old' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
+    "arm 'c0' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
+    "arm 'c0-prod' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
+    "arm 'c1-256' meta.decision_rules_sha256='deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
+    "arm 'c1-512' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
+    "arm 'c2' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
+    "arm 'c2-think512' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
+    "arm 'c3' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
+    "arm 'a1' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
+    "arm 'a2' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
+    "arm 'a3' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'"
   ],
   "finalist_candidates": [
     "c2-think512",
@@ -1858,7 +1868,7 @@
           "id": "base_determinism",
           "margin": "n/a",
           "metric": "correctness_tokens",
-          "note": "base c0 r1 vs r2: identical for all 5 prompts",
+          "note": "base c0 r1 vs r2: identical for all 20 prompts",
           "op": null,
           "threshold": null,
           "value": null,
@@ -1870,7 +1880,7 @@
           "id": "tuned_matches_base",
           "margin": "n/a",
           "metric": "correctness_tokens",
-          "note": "a1 r1 vs base c0 r1: identical for all 5 prompts",
+          "note": "a1 r1 vs base c0 r1: identical for all 20 prompts",
           "op": null,
           "threshold": null,
           "value": null,
@@ -1928,7 +1938,7 @@
           "id": "base_determinism",
           "margin": "n/a",
           "metric": "correctness_tokens",
-          "note": "base c0 r1 vs r2: identical for all 5 prompts",
+          "note": "base c0 r1 vs r2: identical for all 20 prompts",
           "op": null,
           "threshold": null,
           "value": null,
@@ -1940,7 +1950,7 @@
           "id": "tuned_matches_base",
           "margin": "n/a",
           "metric": "correctness_tokens",
-          "note": "a2 r1 vs base c0 r1: identical for all 5 prompts",
+          "note": "a2 r1 vs base c0 r1: identical for all 20 prompts",
           "op": null,
           "threshold": null,
           "value": null,
@@ -1995,7 +2005,7 @@
           "id": "base_determinism",
           "margin": "n/a",
           "metric": "correctness_tokens",
-          "note": "base c3 r1 vs r2: identical for all 5 prompts",
+          "note": "base c3 r1 vs r2: identical for all 20 prompts",
           "op": null,
           "threshold": null,
           "value": null,

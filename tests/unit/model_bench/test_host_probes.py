@@ -65,6 +65,48 @@ def test_cap_target_respects_ctx_minus_predict_minus_margin():
     assert ttft_probe.cap_target(32000, n_ctx=8192, n_predict=256) == 7920
 
 
+# --- ttft filler cycling (finding 4: the filler must reach 32K tokens) --
+
+
+def test_cycle_to_length_reaches_every_ttft_target_exactly():
+    # A "fake tokenizer" that only ever produces 3 ids per call -- if the old
+    # tokenize-once-and-slice approach were used, the filler text would need to
+    # already be long enough; cycling reaches any target regardless.
+    base_ids = [7, 8, 9]
+    for target in ttft_probe.TTFT_TARGETS:
+        cycled = ttft_probe.cycle_to_length(base_ids, target)
+        assert len(cycled) == target
+    assert ttft_probe.cycle_to_length([1, 2, 3], 7) == [1, 2, 3, 1, 2, 3, 1]
+
+
+def test_cycle_to_length_empty_base_refuses_rather_than_shortening():
+    with pytest.raises(ttft_probe.TtftProbeError):
+        ttft_probe.cycle_to_length([], 2048)
+
+
+def test_run_ttft_probe_reaches_all_targets_exactly_with_a_sparse_fake_tokenizer(monkeypatch):
+    """End to end: a fake /tokenize returning only 3 ids per call must still let
+    run_ttft_probe build exact-length prompts at 2048, 8192, and 32000 -- and must
+    call the fake tokenizer exactly once, not once per target."""
+    call_count = 0
+
+    def fake_tokenize(base_url, text, *, timeout=30.0):
+        nonlocal call_count
+        call_count += 1
+        return [7, 8, 9]
+
+    monkeypatch.setattr(ttft_probe, "tokenize", fake_tokenize)
+
+    rows = ttft_probe.run_ttft_probe(
+        "http://127.0.0.1:1", n_ctx=32768, warmup_reps=0, measured_reps=1
+    )
+    by_target = {r["ctx_target"]: r["prompt_tokens"] for r in rows}
+    assert by_target[2048] == 2048
+    assert by_target[8192] == 8192
+    assert by_target[32000] == 32000
+    assert call_count == 1
+
+
 # --- nvidia-smi CSV -----------------------------------------------------
 
 

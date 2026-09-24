@@ -13,6 +13,9 @@ from scripts.model_bench import analyse  # noqa: E402
 
 FIXTURE_RUN = Path(__file__).resolve().parent / "fixtures" / "analyse" / "run"
 SENTINEL = "SENTINEL_DO_NOT_LEAK_9f3a21"
+# Planted in fixtures/analyse/run/c0-old/meta.json's `errors` list (finding 5): a
+# host-absolute path must never reach a public output, only the arm's error_count.
+LEAKED_PATH_FRAGMENT = "D:/Users/rajga/mist-model-bench-results/run1/c0-old"
 
 
 def test_sentinel_present_in_raw_fixture():
@@ -22,10 +25,22 @@ def test_sentinel_present_in_raw_fixture():
     assert SENTINEL in raw
 
 
+def test_absolute_path_present_in_raw_meta_errors():
+    # Sanity: prove the planted absolute path really is in meta.json's errors list.
+    raw = (FIXTURE_RUN / "c0-old" / "meta.json").read_text(encoding="utf-8")
+    assert LEAKED_PATH_FRAGMENT in raw
+
+
 def test_sentinel_absent_from_every_generated_output():
     outputs = analyse.generate_outputs(FIXTURE_RUN)
     for rel_path, content in outputs.files.items():
         assert SENTINEL not in content, f"leaked into {rel_path}"
+
+
+def test_meta_errors_absolute_path_absent_from_every_generated_output():
+    outputs = analyse.generate_outputs(FIXTURE_RUN)
+    for rel_path, content in outputs.files.items():
+        assert LEAKED_PATH_FRAGMENT not in content, f"leaked into {rel_path}"
 
 
 def test_grades_harness_rows_are_allowlisted_keys_only():

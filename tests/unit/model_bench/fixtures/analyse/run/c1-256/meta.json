@@ -3,6 +3,20 @@
   "arm_config": {
     "id": "c1-256"
   },
+  "calls": [
+    {
+      "container_args": [],
+      "errors": [],
+      "finished_utc": "2026-01-01T00:05:00+00:00",
+      "layout_pass": "screen",
+      "props": {},
+      "rep": null,
+      "started_utc": "2026-01-01T00:00:00+00:00",
+      "suites": [
+        "layout"
+      ]
+    }
+  ],
   "container_args": [],
   "decision_rules_sha256": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
   "errors": [],
@@ -16,10 +30,11 @@
   "image_id": "sha256:fixture",
   "image_ref": "fixture:image",
   "layout": {
-    "layouts_per_size": 2,
-    "max_tokens": 4096,
-    "pass": "screen",
-    "thinking": "on"
+    "screen": {
+      "layouts_per_size": 2,
+      "max_tokens": 4096,
+      "thinking": "on"
+    }
   },
   "params": {},
   "props": {},

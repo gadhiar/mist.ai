@@ -1,6 +1,6 @@
 # mist-model-bench analysis report
 
-decision_rules.json sha256: `0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce`
+decision_rules.json sha256: `f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae`
 
 ## Measurement notes
 
@@ -8,7 +8,17 @@ decision_rules.json sha256: `0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e7
 
 ## decision_rules.json mismatch warnings
 
-- [WARN] arm 'c1-256' meta.decision_rules_sha256='deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' differs from the analysed decision_rules.json='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce'
+- [WARN] arm 'c0-old' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
+- [WARN] arm 'c0' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
+- [WARN] arm 'c0-prod' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
+- [WARN] arm 'c1-256' meta.decision_rules_sha256='deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
+- [WARN] arm 'c1-512' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
+- [WARN] arm 'c2' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
+- [WARN] arm 'c2-think512' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
+- [WARN] arm 'c3' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
+- [WARN] arm 'a1' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
+- [WARN] arm 'a2' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
+- [WARN] arm 'a3' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
 
 ## Per-arm metrics
 
@@ -262,8 +272,8 @@ verdict: **pass**
 
 | clause | metric | arm | value | threshold | op | verdict | margin | note |
 |---|---|---|---|---|---|---|---|---|
-| base_determinism | correctness_tokens | n/a | n/a | n/a | n/a | pass | n/a | base c0 r1 vs r2: identical for all 5 prompts |
-| tuned_matches_base | correctness_tokens | n/a | n/a | n/a | n/a | pass | n/a | a1 r1 vs base c0 r1: identical for all 5 prompts |
+| base_determinism | correctness_tokens | n/a | n/a | n/a | n/a | pass | n/a | base c0 r1 vs r2: identical for all 20 prompts |
+| tuned_matches_base | correctness_tokens | n/a | n/a | n/a | n/a | pass | n/a | a1 r1 vs base c0 r1: identical for all 20 prompts |
 | harness_ci_containment | harness_score | a1 | 1.0000 | n/a | n/a | pass | n/a | n/a |
 | manual_clean | manual | a1 | 0 | 0 | == | pass | n/a | n/a |
 
@@ -277,8 +287,8 @@ verdict: **missing**
 
 | clause | metric | arm | value | threshold | op | verdict | margin | note |
 |---|---|---|---|---|---|---|---|---|
-| base_determinism | correctness_tokens | n/a | n/a | n/a | n/a | pass | n/a | base c0 r1 vs r2: identical for all 5 prompts |
-| tuned_matches_base | correctness_tokens | n/a | n/a | n/a | n/a | pass | n/a | a2 r1 vs base c0 r1: identical for all 5 prompts |
+| base_determinism | correctness_tokens | n/a | n/a | n/a | n/a | pass | n/a | base c0 r1 vs r2: identical for all 20 prompts |
+| tuned_matches_base | correctness_tokens | n/a | n/a | n/a | n/a | pass | n/a | a2 r1 vs base c0 r1: identical for all 20 prompts |
 | harness_ci_containment | harness_score | a2 | 1.0000 | n/a | n/a | pass | n/a | n/a |
 | manual_clean | manual | a2 | n/a | 0 | == | missing | n/a | session/manual.json has no entry for 'a2' |
 
@@ -292,7 +302,7 @@ verdict: **fail**
 
 | clause | metric | arm | value | threshold | op | verdict | margin | note |
 |---|---|---|---|---|---|---|---|---|
-| base_determinism | correctness_tokens | n/a | n/a | n/a | n/a | pass | n/a | base c3 r1 vs r2: identical for all 5 prompts |
+| base_determinism | correctness_tokens | n/a | n/a | n/a | n/a | pass | n/a | base c3 r1 vs r2: identical for all 20 prompts |
 | tuned_matches_base | correctness_tokens | n/a | n/a | n/a | n/a | fail | n/a | a3 r1 vs base c3 r1: token mismatch on ['p03'] |
 | harness_ci_containment | harness_score | a3 | 1.0000 | n/a | n/a | pass | n/a | n/a |
 | manual_clean | manual | a3 | 0 | 0 | == | pass | n/a | n/a |
@@ -314,10 +324,12 @@ info: `{"deltas": {"decode_tps": {"missing": true}, "harness_score_schema_confor
 
 ## Coverage per arm
 
+Each arm's `error_count` is the number of entries in its `meta.json`'s `errors` list; the free-text of those errors is not reproduced here (it may embed host paths under `--results-root` or `--layout-dir`) and stays in `meta.json`, which lives outside this repository.
+
 ```
 {
   "a1": {
-    "errors": [],
+    "error_count": 0,
     "harness": {
       "schema_conformance": {
         "complete": true,
@@ -333,7 +345,7 @@ info: `{"deltas": {"decode_tps": {"missing": true}, "harness_score_schema_confor
     ]
   },
   "a2": {
-    "errors": [],
+    "error_count": 0,
     "harness": {
       "schema_conformance": {
         "complete": true,
@@ -349,7 +361,7 @@ info: `{"deltas": {"decode_tps": {"missing": true}, "harness_score_schema_confor
     ]
   },
   "a3": {
-    "errors": [],
+    "error_count": 0,
     "harness": {
       "schema_conformance": {
         "complete": true,
@@ -368,7 +380,7 @@ info: `{"deltas": {"decode_tps": {"missing": true}, "harness_score_schema_confor
     "present": false
   },
   "c0": {
-    "errors": [],
+    "error_count": 0,
     "harness": {
       "schema_conformance": {
         "complete": true,
@@ -384,7 +396,7 @@ info: `{"deltas": {"decode_tps": {"missing": true}, "harness_score_schema_confor
     ]
   },
   "c0-old": {
-    "errors": [],
+    "error_count": 1,
     "harness": {
       "schema_conformance": {
         "complete": true,
@@ -399,7 +411,7 @@ info: `{"deltas": {"decode_tps": {"missing": true}, "harness_score_schema_confor
     ]
   },
   "c0-prod": {
-    "errors": [],
+    "error_count": 0,
     "harness": {
       "schema_conformance_json_object": {
         "complete": true,
@@ -419,7 +431,7 @@ info: `{"deltas": {"decode_tps": {"missing": true}, "harness_score_schema_confor
     ]
   },
   "c1-256": {
-    "errors": [],
+    "error_count": 0,
     "harness": {},
     "layout": {
       "screen": {
@@ -434,7 +446,7 @@ info: `{"deltas": {"decode_tps": {"missing": true}, "harness_score_schema_confor
     ]
   },
   "c1-512": {
-    "errors": [],
+    "error_count": 0,
     "harness": {},
     "layout": {
       "screen": {
@@ -449,7 +461,7 @@ info: `{"deltas": {"decode_tps": {"missing": true}, "harness_score_schema_confor
     ]
   },
   "c2": {
-    "errors": [],
+    "error_count": 0,
     "harness": {
       "schema_conformance_json_object": {
         "complete": true,
@@ -477,7 +489,7 @@ info: `{"deltas": {"decode_tps": {"missing": true}, "harness_score_schema_confor
     ]
   },
   "c2-think512": {
-    "errors": [],
+    "error_count": 0,
     "harness": {},
     "layout": {
       "screen": {
@@ -492,7 +504,7 @@ info: `{"deltas": {"decode_tps": {"missing": true}, "harness_score_schema_confor
     ]
   },
   "c3": {
-    "errors": [],
+    "error_count": 0,
     "harness": {
       "schema_conformance": {
         "complete": true,

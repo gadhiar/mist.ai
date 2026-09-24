@@ -358,8 +358,9 @@ class HarnessClient:
         field to a named attribute instead of `model_extra`. Returns `None`
         if the field is absent either way -- a missing field is not an
         error, since not every llama-server build or request emits it
-        (`timings` requires `--metrics`; `reasoning_content` only appears
-        for a reasoning model with a turn that produced one).
+        (`reasoning_content` only appears for a reasoning model with a turn
+        that produced one; UNVERIFIED whether `timings` requires `--metrics`
+        -- no source or test has confirmed this against a live server).
         """
         extra = getattr(obj, "model_extra", None)
         if extra and name in extra:

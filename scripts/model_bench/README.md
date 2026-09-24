@@ -116,12 +116,17 @@ then override individual keys (used both for the tuning arms a1-a4, which inheri
 server config exactly, and for the thinking-on variants c1-256/c1-512/c2-think512/c3-think512/
 c4-think512).
 
-**UNVERIFIED flag spellings, for b11151** (`ghcr.io/ggml-org/llama.cpp:server-cuda-b11151`): `-rea`,
-`--reasoning-budget`, `-ncmoe`, and the sampling flag names (`--temp`, `--top-p`, `--top-k`,
-`--min-p`, `--repeat-penalty`, `--presence-penalty`). These live in `arms.json` as data, not in
-`bench_host.py`, specifically so the lead can correct a spelling at step L0 without touching code.
-c0-old targets b8808 (`snapshot:mist-llm`, the current production build) and gets no thinking flags
-at all: production's chat template default is thinking-off, and `-rea` may not exist in b8808.
+**Flag spellings for b11151** (`ghcr.io/ggml-org/llama.cpp:server-cuda-b11151`): the lead verified
+`-rea, --reasoning [on|off|auto]`, `--reasoning-budget N`, `-ncmoe, --n-cpu-moe N`, and
+`-cram, --cache-ram N` on the host on 2026-09-24 with `llama-server --help` against the pinned
+digest. `--temp`, `--top-p`, `--top-k`, `--min-p` and `--repeat-penalty` are already passed to
+production mist-llm (`docker-compose.yml`'s mist-llm `command:` block), so their spellings are
+already load-bearing there. Still **UNVERIFIED**: `--presence-penalty` (see the response-field note
+below for `return_tokens` and /props' `model_path`, checked separately). These live in `arms.json`
+as data, not in `bench_host.py`, specifically so the lead can correct a spelling at step L0 without
+touching code. c0-old targets b8808 (`snapshot:mist-llm`, the current production build) and gets no
+thinking flags at all: production's chat template default is thinking-off, and `-rea` may not exist
+in b8808.
 
 **UNVERIFIED response fields**, both flagged loudly rather than guessed at silently:
 `extract_model_path_from_props()` (`bench_host.py`) assumes `/props` carries a top-level
@@ -173,7 +178,8 @@ on the true STT+TTS footprint, not the footprint itself.
   `bench-c0-prod`, `bench-c2`, `bench-c3`, `bench-c4`) are owned by another worker
   (`scripts/eval_harness/models.yaml`); this driver only names them.
 - `run_host.py`'s and `analyse.py`'s exact CLI flags (line ~1700 / ~1307 in
-  `D:/Users/rajga/command-center/spike/layout-perception`, per the brief) were not independently
+  `<command-center>/spike/layout-perception`, i.e. wherever `--layout-dir` /
+  `MODEL_BENCH_LAYOUT_DIR` points on the lead's host, per the brief) were not independently
   re-read against that path from this worker's container (no access to paths outside the repo
   work tree and its git metadata); `cmd_run`'s layout suite invocation follows the brief's
   specified flags verbatim and should be spot-checked against that file before first real use.

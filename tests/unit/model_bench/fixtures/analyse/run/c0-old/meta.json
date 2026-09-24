@@ -3,9 +3,27 @@
   "arm_config": {
     "id": "c0-old"
   },
+  "calls": [
+    {
+      "container_args": [],
+      "errors": [
+        "harness exited 1: see D:/Users/rajga/mist-model-bench-results/run1/c0-old/harness/harness/bench-c0.jsonl for the failing case"
+      ],
+      "finished_utc": "2026-01-01T00:05:00+00:00",
+      "layout_pass": null,
+      "props": {},
+      "rep": null,
+      "started_utc": "2026-01-01T00:00:00+00:00",
+      "suites": [
+        "harness"
+      ]
+    }
+  ],
   "container_args": [],
   "decision_rules_sha256": "0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce",
-  "errors": [],
+  "errors": [
+    "harness exited 1: see D:/Users/rajga/mist-model-bench-results/run1/c0-old/harness/harness/bench-c0.jsonl for the failing case"
+  ],
   "finished_utc": "2026-01-01T00:05:00+00:00",
   "git": {
     "command_center": null,
@@ -21,7 +39,7 @@
   },
   "image_id": "sha256:fixture",
   "image_ref": "fixture:image",
-  "layout": null,
+  "layout": {},
   "params": {},
   "props": {},
   "run": "fixture-run",

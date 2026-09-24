@@ -1168,13 +1168,25 @@ def evaluate_r5(metrics: RunMetrics, rules: dict[str, Any], r2_results: list[Rul
         f_bad = f is not None and f.verdict in ("fail", "needs-review")
         return others_pass and f_bad
 
+    def _r2_has_missing_clause(r: RuleResult) -> bool:
+        return any(c.verdict == "missing" for c in r.clauses)
+
     matching = [r for r in r2_results if _r2_all_pass_except_f(r)]
+    any_r2_inconclusive = any(_r2_has_missing_clause(r) for r in r2_results)
 
     lower_trigger = lower.usable() and lower.value >= thresholds["r5_voice_vram_lower_trigger_mib"]
     upper_trigger = upper.usable() and upper.value >= thresholds["r5_voice_vram_upper_needs_review_mib"]
 
+    note: str | None = None
     if lower_trigger and matching:
         verdict = "triggered"
+    elif lower_trigger and not matching and any_r2_inconclusive:
+        # The lower bound clears the trigger threshold, but not one R2 candidate could be
+        # confirmed as "every other clause pass, F bad" because at least one R2 rule has a
+        # clause reading "missing" -- that candidate might have matched had its data been
+        # complete, so this cannot be reported as a clean not-triggered.
+        verdict = "missing"
+        note = "lower bound triggers, but at least one R2 rule has an incomplete (missing) clause"
     elif (not lower_trigger) and upper_trigger:
         verdict = "needs-review"
     else:
@@ -1184,6 +1196,7 @@ def evaluate_r5(metrics: RunMetrics, rules: dict[str, Any], r2_results: list[Rul
         id="voice_vram_lower_bound", metric="voice_vram_lower_mib", arm=None,
         value=lower.value if lower.usable() else None,
         threshold=thresholds["r5_voice_vram_lower_trigger_mib"], op=">=", verdict=verdict, margin="n/a",
+        note=note,
         extra={
             "voice_vram_upper_mib": upper.value if upper.usable() else None,
             "matching_r2_candidates": [r.info.get("candidate") for r in matching],
@@ -1196,26 +1209,73 @@ def evaluate_r5(metrics: RunMetrics, rules: dict[str, Any], r2_results: list[Rul
     )
 
 
-def _tokens_by_prompt(rows: list[dict[str, Any]]) -> dict[str, list[int]]:
-    out: dict[str, list[int]] = {}
+def _correctness_file_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Reduce one correctness.r<K>.jsonl's raw rows to what a determinism clause needs.
+
+    Unlike the old `_tokens_by_prompt`, an errored row is not silently dropped: it is
+    recorded via `has_error` so the caller can refuse to compare rather than comparing a
+    smaller, error-free subset that happens to still agree (an errored prompt must never
+    make a determinism clause read as `pass`).
+    """
+    tokens_by_prompt: dict[str, list[int]] = {}
+    prompt_ids: set[str] = set()
+    has_error = False
     for r in rows:
+        pid = r.get("prompt_id")
+        if pid is not None:
+            prompt_ids.add(pid)
         if r.get("error"):
+            has_error = True
             continue
-        out[r["prompt_id"]] = list(r.get("tokens") or [])
-    return out
+        tokens_by_prompt[pid] = list(r.get("tokens") or [])
+    return {
+        "tokens_by_prompt": tokens_by_prompt,
+        "has_error": has_error,
+        "prompt_ids": prompt_ids,
+        "n": len(rows),
+    }
 
 
-def _determinism_clause(clause_id: str, a: dict[str, list[int]] | None, b: dict[str, list[int]] | None, note_prefix: str) -> ClauseResult:
-    if a is None or b is None or not a or not b:
+def _determinism_clause(
+    clause_id: str,
+    rows_a: list[dict[str, Any]] | None,
+    rows_b: list[dict[str, Any]] | None,
+    note_prefix: str,
+    expected_prompts: int,
+) -> ClauseResult:
+    """Compare two correctness runs' token ids per prompt.
+
+    `missing` (not `pass`, not `fail`) whenever either file has an errored row, a prompt
+    count other than `expected_prompts`, or a prompt-id set that differs from the other
+    file's -- an errored or incomplete file cannot license either a pass or a fail
+    verdict, and it must never coincidentally read as `pass` just because the errored
+    rows were excluded from the comparison.
+    """
+    if rows_a is None or rows_b is None or not rows_a or not rows_b:
         return ClauseResult(
             id=clause_id, metric="correctness_tokens", arm=None, value=None, threshold=None, op=None,
             verdict="missing", margin="n/a", note=f"{note_prefix}: missing correctness data",
         )
-    if set(a) != set(b):
+    sa = _correctness_file_summary(rows_a)
+    sb = _correctness_file_summary(rows_b)
+    if sa["has_error"] or sb["has_error"]:
         return ClauseResult(
             id=clause_id, metric="correctness_tokens", arm=None, value=None, threshold=None, op=None,
-            verdict="fail", margin="n/a", note=f"{note_prefix}: prompt_id sets differ",
+            verdict="missing", margin="n/a", note=f"{note_prefix}: an errored row is present",
         )
+    if sa["n"] != expected_prompts or sb["n"] != expected_prompts:
+        return ClauseResult(
+            id=clause_id, metric="correctness_tokens", arm=None, value=None, threshold=None, op=None,
+            verdict="missing", margin="n/a",
+            note=f"{note_prefix}: prompt count {sa['n']}/{sb['n']} != expected {expected_prompts}",
+        )
+    if sa["prompt_ids"] != sb["prompt_ids"]:
+        return ClauseResult(
+            id=clause_id, metric="correctness_tokens", arm=None, value=None, threshold=None, op=None,
+            verdict="missing", margin="n/a", note=f"{note_prefix}: prompt_id sets differ",
+        )
+    a = sa["tokens_by_prompt"]
+    b = sb["tokens_by_prompt"]
     mismatched = [pid for pid in a if a[pid] != b[pid]]
     if mismatched:
         return ClauseResult(
@@ -1229,12 +1289,18 @@ def _determinism_clause(clause_id: str, a: dict[str, list[int]] | None, b: dict[
 
 
 def evaluate_r6(arm: str, base: str, metrics: RunMetrics, rules: dict[str, Any]) -> RuleResult:
-    base_r1 = _tokens_by_prompt(metrics.raw_correctness.get(base, {}).get(1, []))
-    base_r2 = _tokens_by_prompt(metrics.raw_correctness.get(base, {}).get(2, []))
-    tuned_r1 = _tokens_by_prompt(metrics.raw_correctness.get(arm, {}).get(1, []))
+    expected_prompts = rules["constants"]["correctness_expected_prompts"]
+    base_rows_r1 = metrics.raw_correctness.get(base, {}).get(1, [])
+    base_rows_r2 = metrics.raw_correctness.get(base, {}).get(2, [])
+    tuned_rows_r1 = metrics.raw_correctness.get(arm, {}).get(1, [])
 
-    base_det = _determinism_clause("base_determinism", base_r1 or None, base_r2 or None, f"base {base} r1 vs r2")
-    tuned_match = _determinism_clause("tuned_matches_base", tuned_r1 or None, base_r1 or None, f"{arm} r1 vs base {base} r1")
+    base_det = _determinism_clause(
+        "base_determinism", base_rows_r1 or None, base_rows_r2 or None, f"base {base} r1 vs r2", expected_prompts
+    )
+    tuned_match = _determinism_clause(
+        "tuned_matches_base", tuned_rows_r1 or None, base_rows_r1 or None,
+        f"{arm} r1 vs base {base} r1", expected_prompts,
+    )
 
     base_am = metrics.arms.get(base)
     tuned_am = metrics.arms.get(arm)
@@ -1405,7 +1471,10 @@ def compute_coverage(metrics: RunMetrics, rules: dict[str, Any]) -> dict[str, An
             coverage[arm_id] = entry
             continue
         entry["suites_completed"] = am.suites_completed
-        entry["errors"] = am.errors
+        # Decision 8 / finding 5: meta.json's `errors` are free-text (may embed absolute
+        # host paths under --results-root or --layout-dir), so only a count crosses into
+        # a public output; the texts stay in meta.json, which lives outside the repo.
+        entry["error_count"] = len(am.errors)
         entry["layout"] = {
             p: {"n": r.n, "n_expected": r.n_expected, "complete": r.complete}
             for p, r in am.layout_acc.items()
@@ -1642,6 +1711,13 @@ def render_report(
 
     lines.append("## Coverage per arm")
     lines.append("")
+    lines.append(
+        "Each arm's `error_count` is the number of entries in its `meta.json`'s `errors` "
+        "list; the free-text of those errors is not reproduced here (it may embed host "
+        "paths under `--results-root` or `--layout-dir`) and stays in `meta.json`, which "
+        "lives outside this repository."
+    )
+    lines.append("")
     lines.append(f"```\n{dumps_stable(coverage).rstrip()}\n```")
     lines.append("")
 
@@ -1690,7 +1766,9 @@ def build_summary(
             "ttft_ms": {str(ctx): r.to_dict() for ctx, r in am.ttft_ms.items()},
             "arm_peak_mib": am.arm_peak_mib.to_dict(),
             "suites_completed": am.suites_completed,
-            "errors": am.errors,
+            # Free-text error strings stay in meta.json (outside the repo, under
+            # --results-root); only the count crosses into this public output (finding 5).
+            "error_count": len(am.errors),
         }
     return {
         "schema": 1,
