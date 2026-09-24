@@ -1,0 +1,36 @@
+{
+  "arm": "a1",
+  "arm_config": {
+    "id": "a1"
+  },
+  "container_args": [],
+  "decision_rules_sha256": "0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce",
+  "errors": [],
+  "finished_utc": "2026-01-01T00:05:00+00:00",
+  "git": {
+    "command_center": null,
+    "mist_ai": "fixture",
+    "mist_ai_dirty": false
+  },
+  "harness": {
+    "candidate": "bench-c0",
+    "iterations": 1,
+    "tests": [
+      "schema_conformance"
+    ]
+  },
+  "image_id": "sha256:fixture",
+  "image_ref": "fixture:image",
+  "layout": null,
+  "params": {},
+  "props": {},
+  "run": "fixture-run",
+  "schema": 1,
+  "server_args": [],
+  "started_utc": "2026-01-01T00:00:00+00:00",
+  "suites_completed": [
+    "correctness",
+    "harness"
+  ],
+  "tuning_label": null
+}

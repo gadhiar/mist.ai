@@ -1,0 +1,12 @@
+{"case_id": "coreference_it", "errored": false, "finish_reason": "stop", "iteration": 1, "passed": true, "score": 1.0, "test_name": "schema_conformance"}
+{"case_id": "dislike_preference", "errored": false, "finish_reason": "stop", "iteration": 1, "passed": true, "score": 1.0, "test_name": "schema_conformance"}
+{"case_id": "empty_smalltalk", "errored": false, "finish_reason": "stop", "iteration": 1, "passed": true, "score": 1.0, "test_name": "schema_conformance"}
+{"case_id": "goal_future_quarter", "errored": false, "finish_reason": "stop", "iteration": 1, "passed": true, "score": 1.0, "test_name": "schema_conformance"}
+{"case_id": "hedging_preference", "errored": false, "finish_reason": "stop", "iteration": 1, "passed": true, "score": 1.0, "test_name": "schema_conformance"}
+{"case_id": "learning_from_person", "errored": false, "finish_reason": "stop", "iteration": 1, "passed": true, "score": 1.0, "test_name": "schema_conformance"}
+{"case_id": "multi_entity_learning_at_work", "errored": false, "finish_reason": "stop", "iteration": 1, "passed": true, "score": 1.0, "test_name": "schema_conformance"}
+{"case_id": "negation_past_tense", "errored": false, "finish_reason": "stop", "iteration": 1, "passed": true, "score": 1.0, "test_name": "schema_conformance"}
+{"case_id": "simple_usage", "errored": false, "finish_reason": "stop", "iteration": 1, "passed": true, "score": 1.0, "test_name": "schema_conformance"}
+{"case_id": "structural_is_a", "errored": false, "finish_reason": "stop", "iteration": 1, "passed": true, "score": 1.0, "test_name": "schema_conformance"}
+{"case_id": "third_party_no_user_claim", "errored": false, "finish_reason": "stop", "iteration": 1, "passed": true, "score": 1.0, "test_name": "schema_conformance"}
+{"case_id": "workplace_org_skill", "errored": false, "finish_reason": "stop", "iteration": 1, "passed": true, "score": 1.0, "test_name": "schema_conformance"}
