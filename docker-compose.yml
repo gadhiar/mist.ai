@@ -161,6 +161,11 @@ services:
       - "1.0"
       - "--seed"
       - "3407"
+      # Cap in-RAM prompt cache: default 8192 MiB filled to 6.3 GiB on
+      # 2026-09-24 and starved worker containers inside a 15.2 GiB Docker
+      # VM. 2048 MiB holds roughly 24 prompt states.
+      - "--cache-ram"
+      - "${LLM_CACHE_RAM_MIB:-2048}"
     deploy:
       resources:
         reservations:
