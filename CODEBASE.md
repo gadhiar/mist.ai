@@ -1109,6 +1109,7 @@ LLM_SERVER_URL=http://mist-llm:8080
 MODELS_DIR=./models                        # Host path; mounted read-only into mist-llm
 LLM_MODEL_FILE=unsloth/gemma-4-E4B-it-Q5_K_M.gguf
 LLM_CTX_SIZE=32768                         # llama-server ctx_size; effective attention ~8K
+LLM_CACHE_RAM_MIB=2048                     # llama-server --cache-ram prompt-cache cap (MiB; default 8192)
 LLM_TEMPERATURE=0.0                        # Extraction default
 LLM_CONVERSATION_TEMPERATURE=0.7           # Conversation default (Cluster 3 split)
 LLM_CONVERSATION_MAX_TOKENS=1024           # Cluster 6 Bug E fix (was hardcoded 400)
