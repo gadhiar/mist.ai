@@ -854,6 +854,39 @@ def arm_dir(results_root: Path, run: str, arm: str) -> Path:
     return run_dir(results_root, run) / arm
 
 
+RUN_SUITE_ORDER: tuple[str, ...] = ("ttft", "correctness", "harness", "layout")
+LAYOUT_COPIED_FILES: tuple[str, ...] = ("calls.jsonl", "graded.jsonl", "manifest.json")
+
+
+def validate_run_suites(
+    arm: dict[str, Any], requested: list[str] | None, layout_dir: Path | None
+) -> list[str]:
+    """Resolve the suites `run` will execute, refusing any it could not actually run.
+
+    A requested suite that is silently skipped would leave a result directory that looks complete
+    but is missing a suite, so every suite named here either runs or the command refuses up front.
+
+    Raises:
+        ArmConfigError: A suite is unknown, not declared for this arm, has no harness candidate,
+            or is `layout` with no `--layout-dir` configured.
+    """
+    suites = list(requested) if requested else list(arm["suites"])
+    for suite in suites:
+        if suite not in RUN_SUITE_ORDER:
+            raise ArmConfigError(f"unknown suite {suite!r}; known: {list(RUN_SUITE_ORDER)}")
+        if suite not in arm["suites"]:
+            raise ArmConfigError(
+                f"suite {suite!r} is not declared for arm {arm['id']!r} (declared: {arm['suites']})"
+            )
+    if "harness" in suites and arm.get("harness") is None:
+        raise ArmConfigError(f"arm {arm['id']!r} requests harness but has no harness candidate")
+    if "layout" in suites and layout_dir is None:
+        raise ArmConfigError(
+            "layout suite requested but --layout-dir / MODEL_BENCH_LAYOUT_DIR is not set"
+        )
+    return [s for s in RUN_SUITE_ORDER if s in suites]
+
+
 def refuse_if_exists(path: Path, what: str) -> None:
     if path.exists():
         raise SuiteOutputExistsError(
@@ -1279,7 +1312,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 1
 
     a_dir = arm_dir(config.results_root, args.run, arm["id"])
-    suites = args.suites if args.suites else arm["suites"]
+    try:
+        suites = validate_run_suites(arm, args.suites, config.layout_dir)
+    except ArmConfigError as exc:
+        print(f"[FAIL] {exc}")
+        return 1
 
     started_utc = datetime.now(UTC).isoformat()
     meta: dict[str, Any] = {
@@ -1336,7 +1373,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             meta["suites_completed"].append("correctness")
             write_meta()
 
-        if "harness" in suites and arm["harness"] is not None:
+        if "harness" in suites:
             harness_dir = a_dir / "harness"
             refuse_if_exists(harness_dir, "harness/")
             tests = resolve_harness_tests(arm["harness"])
@@ -1364,10 +1401,15 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "tests": tests,
                 "iterations": arm["harness"]["iterations"],
             }
-            meta["suites_completed"].append("harness")
+            # Exit 0 is necessary, not sufficient: run_candidate() logs server errors and
+            # returns normally (scripts/eval_harness/run.py, the except blocks in run_candidate),
+            # so analyse.py must still check the JSONL has every case x iteration.
+            if proc.returncode == 0:
+                meta["suites_completed"].append("harness")
             write_meta()
 
-        if "layout" in suites and config.layout_dir is not None:
+        if "layout" in suites:
+            assert config.layout_dir is not None  # validate_run_suites refused otherwise
             layout_pass = args.layout_pass or "screen"
             layout_out_dir = a_dir / "layout" / layout_pass
             refuse_if_exists(layout_out_dir, f"layout/{layout_pass}/")
@@ -1392,33 +1434,44 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "--max-tokens",
                 str(max_tokens),
             ]
-            subprocess.run(run_host_argv, cwd=config.layout_dir, shell=False, check=True)
             analyse_argv = [
                 sys.executable,
                 "analyse.py",
                 "--results",
                 f"results/{result_id}",
             ]
-            subprocess.run(analyse_argv, cwd=config.layout_dir, shell=False, check=True)
-            layout_out_dir.mkdir(parents=True, exist_ok=True)
-            src_dir = config.layout_dir / "results" / result_id
-            for name in ("calls.jsonl", "graded.jsonl", "manifest.json"):
-                src = src_dir / name
-                if src.exists():
-                    (layout_out_dir / name).write_bytes(src.read_bytes())
             meta["layout"] = {
                 "pass": layout_pass,
                 "layouts_per_size": layouts_per_size,
                 "thinking": thinking_mode,
                 "max_tokens": max_tokens,
             }
-            meta["suites_completed"].append("layout")
+            layout_ok = True
+            for step_argv in (run_host_argv, analyse_argv):
+                proc = subprocess.run(step_argv, cwd=config.layout_dir, shell=False)
+                if proc.returncode != 0:
+                    meta["errors"].append(f"layout: {step_argv[1]} exited {proc.returncode}")
+                    layout_ok = False
+                    break
+            if layout_ok:
+                src_dir = config.layout_dir / "results" / result_id
+                missing = [n for n in LAYOUT_COPIED_FILES if not (src_dir / n).is_file()]
+                if missing:
+                    meta["errors"].append(f"layout: missing {missing} in {src_dir}")
+                else:
+                    layout_out_dir.mkdir(parents=True, exist_ok=True)
+                    for name in LAYOUT_COPIED_FILES:
+                        (layout_out_dir / name).write_bytes((src_dir / name).read_bytes())
+                    meta["suites_completed"].append("layout")
             write_meta()
     finally:
         sampler.stop()
         write_meta()
 
     print(f"run complete for arm {arm['id']}: suites_completed={meta['suites_completed']}")
+    if meta["errors"]:
+        print(f"[FAIL] run recorded errors: {meta['errors']}")
+        return 1
     return 0
 
 
