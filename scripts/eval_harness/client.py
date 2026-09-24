@@ -86,13 +86,24 @@ class ToolCall:
 
 @dataclass(frozen=True, slots=True)
 class ChatMetrics:
-    """Per-request timing and token accounting."""
+    """Per-request timing and token accounting.
+
+    `timings` and `reasoning_content` are llama-server-specific fields that
+    the OpenAI chat completion schema does not define. Both default to
+    `None` so existing call sites that build a `ChatMetrics` without them
+    (e.g. `from_usage` before this field pair existed) keep working, and so
+    a response that omits them (a non-llama-server backend, or an older
+    llama-server build without `--metrics`) records `None` rather than
+    raising.
+    """
 
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
     total_time_ms: float
     tokens_per_second: float
+    timings: dict[str, Any] | None = None
+    reasoning_content: str | None = None
 
     @classmethod
     def from_usage(
@@ -100,6 +111,9 @@ class ChatMetrics:
         prompt_tokens: int,
         completion_tokens: int,
         total_time_ms: float,
+        *,
+        timings: dict[str, Any] | None = None,
+        reasoning_content: str | None = None,
     ) -> ChatMetrics:
         """Build a ChatMetrics from raw usage counts and elapsed wall time."""
         total = prompt_tokens + completion_tokens
@@ -110,6 +124,8 @@ class ChatMetrics:
             total_tokens=total,
             total_time_ms=total_time_ms,
             tokens_per_second=tps,
+            timings=timings,
+            reasoning_content=reasoning_content,
         )
 
 
@@ -314,6 +330,8 @@ class HarnessClient:
             prompt_tokens=usage.prompt_tokens if usage else 0,
             completion_tokens=usage.completion_tokens if usage else 0,
             total_time_ms=total_ms,
+            timings=self._extra_field(raw, "timings"),
+            reasoning_content=self._extra_field(message, "reasoning_content"),
         )
         raw_dict = raw.model_dump() if hasattr(raw, "model_dump") else {}
         return ChatResponse(
@@ -323,6 +341,30 @@ class HarnessClient:
             metrics=metrics,
             raw=raw_dict,
         )
+
+    @staticmethod
+    def _extra_field(obj: Any, name: str) -> Any:
+        """Read a non-standard field the OpenAI SDK does not model natively.
+
+        llama-server returns provider-specific fields -- `timings` at the
+        top level of the completion, `reasoning_content` on the message --
+        that are not part of the OpenAI chat completion schema. openai's
+        pydantic response models are `extra="allow"` (verified:
+        `ChatCompletion.model_config` and `ChatCompletionMessage.model_config`
+        both report `{'extra': 'allow', ...}` on openai 2.32.0, the version
+        pinned for this harness), so an unmodeled field lands in
+        `.model_extra` instead of being dropped or raising. Falls back to a
+        plain attribute lookup in case a future SDK version promotes the
+        field to a named attribute instead of `model_extra`. Returns `None`
+        if the field is absent either way -- a missing field is not an
+        error, since not every llama-server build or request emits it
+        (`timings` requires `--metrics`; `reasoning_content` only appears
+        for a reasoning model with a turn that produced one).
+        """
+        extra = getattr(obj, "model_extra", None)
+        if extra and name in extra:
+            return extra[name]
+        return getattr(obj, name, None)
 
     @staticmethod
     def _parse_tool_calls(raw_tool_calls: Any) -> tuple[ToolCall, ...]:

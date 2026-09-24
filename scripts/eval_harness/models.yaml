@@ -1996,3 +1996,229 @@ candidates:
     notes: >-
       MoE Q3_K_XL with temp=1.0 on extraction. Isolates MoE x temp=0
       router-degeneracy effect without other carteakey-full changes.
+
+  # ---------------------------------------------------------------------
+  # MIST MODEL BENCH -- T2 harness arms, added for the mist-model-bench
+  # goal. Five candidates for the 12 GB GPU model bench, all run under
+  # the harness's --external flag: server lifecycle and flags (--fit,
+  # --n-cpu-moe, sampler flags such as --top-k / --presence-penalty, and
+  # so on) are owned by scripts/model_bench/arms.json, a separate task,
+  # not by this file. extra_server_args stays empty and no
+  # shared_server_args_override is set on any of the five, since
+  # --external skips ServerLauncher entirely (run.py:427-428).
+  #
+  # tier: bench keeps these out of the default primary-tier selection
+  # (resolve_candidate_selection, run.py:597-608, returns candidates with
+  # tier == "primary" when --models is empty).
+  #
+  # Request sampling: Gemma entries use temperature 1.0 / top_p 0.95 for
+  # both extraction and conversation (top_k 64 is a server flag, set in
+  # arms.json). The Qwen entry uses the non-thinking profile, temperature
+  # 0.7 / top_p 0.8 for both modes (top_k 20 and presence_penalty 1.5 are
+  # server flags, also in arms.json). bench-c0-prod is the exception: it
+  # uses MIST's live request settings instead -- see its own field
+  # comments for the file:line citations.
+  #
+  # size_gb / total_params_b / active_params_b are filled only where an
+  # existing models.yaml entry already cites the same underlying GGUF
+  # (bench-c0/bench-c0-prod share the exact GGUF used by
+  # gemma-4-e4b-dense-q5km above; bench-c3 shares the exact base model,
+  # 25.2B total / 3.8B active, used by the other gemma-4-26b-a4b-*
+  # entries above, just at a different quant). bench-c2 and bench-c4 are
+  # new GGUFs with no existing citation in this file, and the container
+  # this harness runs in has no network access to verify a model card,
+  # so those numeric fields are left at their run.py defaults rather than
+  # guessed (_parse_candidate, run.py:206-208, defaults each to 0.0).
+  # ---------------------------------------------------------------------
+
+  - id: bench-c0
+    display_name: "Bench C0: Gemma 4 E4B Instruct (Q5_K_M)"
+    tier: bench
+    family: gemma-4-dense
+    vendor: google
+    gguf: "unsloth/gemma-4-E4B-it-Q5_K_M.gguf"
+    quant: Q5_K_M
+    size_gb: 5.48
+    total_params_b: 7.85
+    active_params_b: 4.0
+    architecture: dense
+    context_size: 32768
+    served_model_name: "gemma-4-e4b"
+    temperature:
+      extraction: 1.0
+      conversation: 1.0
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    notes: >-
+      Bench candidate. Harness sampling defaults for the Gemma family
+      (temperature 1.0, top_p 0.95 both modes). Same GGUF as the existing
+      gemma-4-e4b-dense-q5km entry above (this file, id
+      gemma-4-e4b-dense-q5km) -- size_gb, total_params_b, active_params_b
+      and architecture reused from that entry. Run with --external;
+      server args live in scripts/model_bench/arms.json (owned by a
+      separate task).
+
+  - id: bench-c0-prod
+    display_name: "Bench C0-prod: Gemma 4 E4B Instruct (Q5_K_M, MIST live settings)"
+    tier: bench
+    family: gemma-4-dense
+    vendor: google
+    gguf: "unsloth/gemma-4-E4B-it-Q5_K_M.gguf"
+    quant: Q5_K_M
+    size_gb: 5.48
+    total_params_b: 7.85
+    active_params_b: 4.0
+    architecture: dense
+    context_size: 32768
+    served_model_name: "gemma-4-e4b"
+    # MIST's live request settings, as the live provider sends them:
+    #   extraction temperature 0.0: backend/knowledge/config.py:70
+    #     (LLMConfig.temperature default: "Deterministic for extraction"),
+    #     read by backend/knowledge/extraction/ontology_extractor.py:121
+    #     (LLMRequest(temperature=self.config.llm.temperature, ...)).
+    #   conversation temperature 0.7: backend/knowledge/config.py:71
+    #     (LLMConfig.conversation_temperature default), read by
+    #     backend/chat/conversation_handler.py:834, :1480, :1571.
+    #   top_p 0.9 for BOTH modes: backend/llm/models.py:49
+    #     (LLMRequest.top_p default). Confirmed unmodified at both call
+    #     sites -- backend/knowledge/extraction/ontology_extractor.py:115-123
+    #     and backend/chat/conversation_handler.py:1475-1482,1567-1573 --
+    #     construct their LLMRequest without passing top_p, so the
+    #     pydantic default applies.
+    temperature:
+      extraction: 0.0
+      conversation: 0.7
+    top_p:
+      extraction: 0.9
+      conversation: 0.9
+    chat_template: null
+    chat_template_file: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    notes: >-
+      Production-like schema arm. Same GGUF as bench-c0, but uses MIST's
+      live request settings (see field comments above) instead of the
+      harness's Gemma sampling defaults, because the live extraction path
+      sends response_format={"type": "json_object"} with no GBNF grammar
+      (backend/knowledge/extraction/ontology_extractor.py:120 sets
+      json_mode=True; backend/llm/llama_server_provider.py:42-43 maps
+      json_mode only to response_format -- no grammar parameter exists in
+      that call path). Pairs with
+      tests/schema_conformance_json_object.yaml. Run with --external;
+      server args live in scripts/model_bench/arms.json.
+
+  - id: bench-c2
+    display_name: "Bench C2: Gemma 4 12B Instruct (QAT Q4_0)"
+    tier: bench
+    family: gemma-4-dense
+    vendor: google
+    gguf: "google/gemma-4-12b-it-qat-q4_0.gguf"
+    quant: Q4_0
+    architecture: dense
+    context_size: 32768
+    served_model_name: "gemma-4-12b-qat"
+    temperature:
+      extraction: 1.0
+      conversation: 1.0
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    notes: >-
+      Bench candidate. size_gb, total_params_b, active_params_b left at
+      the run.py default (0.0): no existing entry in this file cites
+      this GGUF and the container has no network access to verify the
+      model card, so the numbers are left unset rather than guessed.
+      architecture: dense -- the "qat-q4_0" filename carries no
+      active-param suffix (contrast the "-A4B"/"-A3B" MoE entries below
+      and above), matching the dense convention this file already uses
+      for other single-expert Gemma checkpoints (e.g. gemma-3-12b-q5km
+      above). Run with --external; server args live in
+      scripts/model_bench/arms.json.
+
+  - id: bench-c3
+    display_name: "Bench C3: Gemma 4 26B-A4B MoE (UD-Q4_K_XL)"
+    tier: bench
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
+    quant: Q4_K_XL
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 1.0
+      conversation: 1.0
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    notes: >-
+      Bench candidate. Same base model as the existing
+      gemma-4-26b-a4b-iq4xs entry above (25.2B total / 3.8B active is
+      quant-invariant, reused from that entry's citation), quantized
+      UD-Q4_K_XL instead. size_gb left at the run.py default (0.0): no
+      existing entry in this file uses UD-Q4_K_XL for this model and the
+      container has no network access to verify it. Run with --external;
+      server args live in scripts/model_bench/arms.json.
+
+  - id: bench-c4
+    display_name: "Bench C4: Qwen3.6 35B-A3B MoE (UD-Q4_K_XL)"
+    tier: bench
+    family: qwen-3.6
+    vendor: alibaba
+    gguf: "unsloth/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+    quant: Q4_K_XL
+    architecture: moe
+    context_size: 32768
+    served_model_name: "qwen3.6-35b-a3b"
+    temperature:
+      extraction: 0.7
+      conversation: 0.7
+    top_p:
+      extraction: 0.8
+      conversation: 0.8
+    chat_template: null
+    chat_template_file: null
+    tool_parser: "hermes"
+    gbnf_supported: true
+    stop_sequences:
+      - "<|im_end|>"
+    extra_server_args: []
+    notes: >-
+      Bench candidate. Qwen3.6-without-thinking sampling profile
+      (temperature 0.7, top_p 0.8 both modes; top_k 20 and
+      presence_penalty 1.5 are server flags, set in
+      scripts/model_bench/arms.json). tool_parser follows the hermes
+      convention this file already uses for every other Qwen entry
+      (qwen-3.5-9b-q8, qwen-2.5-14b-q5km, qwen-3.5-27b-iq2m above), not a
+      verified Qwen3.6-specific claim. total_params_b, active_params_b,
+      size_gb left at the run.py default (0.0): this GGUF has no existing
+      citation in this file and the container has no network access to
+      verify the "35B-A3B" naming against a model card. Run with
+      --external; server args live in scripts/model_bench/arms.json.
