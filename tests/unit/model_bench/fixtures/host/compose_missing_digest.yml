@@ -1,0 +1,9 @@
+# Hand-built fixture: mist-llm's image is a tag only, no @sha256 digest --
+# this must make parse_compose_image() raise ImageRefError.
+services:
+  mist-llm:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/models:ro
