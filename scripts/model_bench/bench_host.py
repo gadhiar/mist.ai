@@ -158,6 +158,10 @@ class SuiteOutputExistsError(BenchHostError):
     """A suite's output path already exists; refusing to overwrite it."""
 
 
+class RunMetaConfigMismatchError(BenchHostError):
+    """This call's config differs from the arm dir's existing meta.json."""
+
+
 class MissingParamError(ArmConfigError):
     """An arm's REQUIRED param was not supplied via --param."""
 
@@ -695,12 +699,23 @@ def check_served_arm(
     expected_args: list[str],
     props: dict[str, Any],
     resolved_arm: dict[str, Any],
+    *,
+    image_token: str,
+    image_ref: str,
+    running_config_image: str | None,
+    running_image_id: str | None,
 ) -> None:
     """Refuse if the running mist-bench-llm container is not `resolved_arm`.
 
-    Compares the container's actual `Args` (from `docker inspect`) against
-    the argv this driver would have built for `resolved_arm`, and confirms
-    /props' model path ends with the arm's gguf filename.
+    Compares the container's actual `Args` (from `docker inspect`) against the argv this
+    driver would have built for `resolved_arm`, confirms /props' model path ends with the
+    arm's gguf filename, and confirms the container's image matches `image_ref`
+    (`resolve_image_ref`'s result for `resolved_arm["image"]`): for the `compose:`/literal
+    token case, against the container's `Config.Image` (the exact string `docker run` was
+    given); for the `snapshot:mist-llm` case, against the container's `Image` id, since
+    `image_ref` there already IS the snapshot's recorded Image id, not a repo:tag string.
+    An arg/model-path match with the wrong image running (e.g. a stale `mist-bench-llm`
+    left over from a prior arm after a failed `unserve`) would otherwise go undetected.
     """
     if running_args != expected_args:
         raise ServedArmMismatchError(
@@ -714,6 +729,18 @@ def check_served_arm(
             f"/props model path {model_path!r} does not end with arm "
             f"{resolved_arm['id']!r}'s gguf {gguf!r}"
         )
+    if image_token == "snapshot:mist-llm":
+        if running_image_id != image_ref:
+            raise ServedArmMismatchError(
+                f"mist-bench-llm Image id {running_image_id!r} does not match the "
+                f"snapshot's Image id {image_ref!r} for arm {resolved_arm['id']!r}"
+            )
+    else:
+        if running_config_image != image_ref:
+            raise ServedArmMismatchError(
+                f"mist-bench-llm Config.Image {running_config_image!r} does not match "
+                f"resolved image_ref {image_ref!r} for arm {resolved_arm['id']!r}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -779,10 +806,17 @@ class GpuSampler:
         self._writer = None
 
     def start(self) -> None:
+        # Append, not truncate (finding 1c): a second `run` call on the same arm dir
+        # (--rep 2, a later --layout-pass finalist, ...) must add rows to the existing
+        # vram.csv, not discard the earlier call's samples. The header is written only
+        # once, when the file is new or still empty.
         self._csv_path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = open(self._csv_path, "w", newline="", encoding="utf-8")
+        write_header = not self._csv_path.exists() or self._csv_path.stat().st_size == 0
+        self._file = open(self._csv_path, "a", newline="", encoding="utf-8")
         self._writer = csv.writer(self._file)
-        self._writer.writerow(nvidia_smi_probe.VRAM_CSV_HEADER)
+        if write_header:
+            self._writer.writerow(nvidia_smi_probe.VRAM_CSV_HEADER)
+            self._file.flush()
         argv = nvidia_smi_probe.build_query_args(nvidia_smi_bin=self._bin)
         self._proc = subprocess.Popen(argv, stdout=subprocess.PIPE, text=True, shell=False)
         self._thread = threading.Thread(target=self._pump, daemon=True)
@@ -892,6 +926,131 @@ def refuse_if_exists(path: Path, what: str) -> None:
         raise SuiteOutputExistsError(
             f"{what} already exists at {path}; pick a new run, layout pass, or rep instead of overwriting"
         )
+
+
+def suite_output_paths(
+    a_dir: Path, suites: list[str], *, rep: int, layout_pass: str
+) -> dict[str, Path]:
+    """The on-disk path each requested suite in `suites` would write to.
+
+    Computed purely from `suites` (validate_run_suites' result), before any suite has
+    run and before any file is opened, so `cmd_run` can existence-check every requested
+    suite's path up front (finding 1a) instead of discovering a later suite's path is
+    already taken only after an earlier suite in the same call already wrote its output.
+    """
+    paths: dict[str, Path] = {}
+    if "ttft" in suites:
+        paths["ttft"] = a_dir / "ttft.jsonl"
+    if "correctness" in suites:
+        paths["correctness"] = a_dir / f"correctness.r{rep}.jsonl"
+    if "harness" in suites:
+        paths["harness"] = a_dir / "harness"
+    if "layout" in suites:
+        paths["layout"] = a_dir / "layout" / layout_pass
+    return paths
+
+
+def suite_output_what(suite: str, path: Path, *, layout_pass: str) -> str:
+    """The human-readable 'what' for refuse_if_exists, matching each suite's own message."""
+    if suite == "harness":
+        return "harness/"
+    if suite == "layout":
+        return f"layout/{layout_pass}/"
+    return path.name
+
+
+_META_EQUALITY_KEYS: tuple[str, ...] = (
+    "arm_config",
+    "server_args",
+    "image_ref",
+    "image_id",
+    "params",
+    "tuning_label",
+    "decision_rules_sha256",
+)
+
+
+def merge_run_meta(existing: dict[str, Any] | None, call: dict[str, Any]) -> dict[str, Any]:
+    """Merge one `run` call's results into an arm dir's cumulative meta.json.
+
+    Pure function (no I/O), so it is unit tested directly. `existing` is the meta.json
+    already on disk for this arm dir (or None for the first call), read once by the
+    caller before this call's suites ran -- never re-read mid-call. `call` describes this
+    call in progress: identity fields that must not change between calls on one arm dir
+    (`arm_config`, `server_args`, `image_ref`, `image_id`, `params`, `tuning_label`,
+    `decision_rules_sha256` -- see `_META_EQUALITY_KEYS`; one arm dir holds exactly one
+    configuration, so a changed config is a new run id, not an amendment to this one),
+    plus per-call fields that DO vary (`props`, `container_args`, `git`, `started_utc`,
+    `finished_utc`) and the results this call has produced so far (`suites`,
+    `suites_completed`, `rep`, `layout_pass`, `harness`, `layout_result`, `errors`).
+
+    Raises RunMetaConfigMismatchError, naming the differing keys, if `existing` is not
+    None and any equality-checked field differs from `call`'s. The caller must invoke
+    this (and see the raise) BEFORE opening any file for writing, so a refused call
+    leaves meta.json and vram.csv byte-identical to before the call.
+    """
+    if existing is not None:
+        differing = [k for k in _META_EQUALITY_KEYS if existing.get(k) != call.get(k)]
+        if differing:
+            raise RunMetaConfigMismatchError(
+                f"this call's config differs from the existing meta.json on: {differing}"
+            )
+
+    merged: dict[str, Any] = dict(existing) if existing is not None else {}
+    for key in ("schema", "run", "arm", *_META_EQUALITY_KEYS):
+        merged[key] = call[key]
+    merged["git"] = call["git"]
+    merged["props"] = call["props"]
+    merged["container_args"] = call["container_args"]
+
+    # layout: a dict keyed by pass, not a single last-pass dict -- screen and finalist
+    # are separate calls and both must survive in meta.json.
+    layout = dict(existing.get("layout") or {}) if existing is not None else {}
+    if call.get("layout_pass") and call.get("layout_result") is not None:
+        layout[call["layout_pass"]] = call["layout_result"]
+    merged["layout"] = layout
+
+    # harness: set by whichever call ran it; a call that did not run harness leaves the
+    # existing value (if any) untouched.
+    call_harness = call.get("harness")
+    merged["harness"] = (
+        call_harness
+        if call_harness is not None
+        else (existing.get("harness") if existing is not None else None)
+    )
+
+    existing_completed = set(existing.get("suites_completed", [])) if existing is not None else set()
+    call_completed = set(call.get("suites_completed", []))
+    merged["suites_completed"] = [s for s in RUN_SUITE_ORDER if s in (existing_completed | call_completed)]
+
+    existing_errors = list(existing.get("errors", [])) if existing is not None else []
+    merged["errors"] = existing_errors + list(call.get("errors", []))
+
+    existing_calls = list(existing.get("calls", [])) if existing is not None else []
+    call_entry = {
+        "started_utc": call.get("started_utc"),
+        "finished_utc": call.get("finished_utc"),
+        "suites": list(call.get("suites", [])),
+        "rep": call.get("rep"),
+        "layout_pass": call.get("layout_pass"),
+        "props": call["props"],
+        "container_args": call["container_args"],
+        "errors": list(call.get("errors", [])),
+    }
+    merged["calls"] = existing_calls + [call_entry]
+
+    if existing is not None and existing.get("started_utc"):
+        merged["started_utc"] = min(existing["started_utc"], call["started_utc"])
+    else:
+        merged["started_utc"] = call["started_utc"]
+    existing_finished = existing.get("finished_utc") if existing is not None else None
+    call_finished = call.get("finished_utc")
+    if existing_finished and call_finished:
+        merged["finished_utc"] = max(existing_finished, call_finished)
+    else:
+        merged["finished_utc"] = call_finished or existing_finished
+
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -1289,19 +1448,37 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"[FAIL] {exc}")
         return 1
 
+    # Every check below is preflight: nothing is opened for writing until all of them
+    # pass (finding 1a). A refused call -- wrong served arm, dirty decision_rules.json, an
+    # invalid/undeclared suite, an existing suite output, or a config mismatch against
+    # this arm dir's existing meta.json -- must leave meta.json and vram.csv untouched.
+
+    # (a) served-arm check, including the image (finding 6).
     inspected = docker_inspect([BENCH_LLM_CONTAINER])
     if BENCH_LLM_CONTAINER not in inspected:
         print(f"[FAIL] {BENCH_LLM_CONTAINER} is not running; run `serve {arm['id']}` first")
         return 1
     running_args = inspected[BENCH_LLM_CONTAINER].get("Args", [])
+    running_image_id = inspected[BENCH_LLM_CONTAINER].get("Image")
+    running_config_image = inspected[BENCH_LLM_CONTAINER].get("Config", {}).get("Image")
     base_url = f"http://{BENCH_LLM_HOST_BIND}:{BENCH_LLM_PORT}"
     try:
         props = wait_for_llama_props(base_url)
-        check_served_arm(running_args, expected_args, props, arm)
+        check_served_arm(
+            running_args,
+            expected_args,
+            props,
+            arm,
+            image_token=arm["image"],
+            image_ref=image_ref,
+            running_config_image=running_config_image,
+            running_image_id=running_image_id,
+        )
     except (ServedArmMismatchError, urllib.error.URLError) as exc:
         print(f"[FAIL] served-arm check: {exc}")
         return 1
 
+    # (a) decision_rules.json.
     if not DECISION_RULES_PATH.exists():
         print(f"[FAIL] {DECISION_RULES_PATH} does not exist")
         return 1
@@ -1311,6 +1488,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"[FAIL] {exc}")
         return 1
 
+    # (a) suite validation.
     a_dir = arm_dir(config.results_root, args.run, arm["id"])
     try:
         suites = validate_run_suites(arm, args.suites, config.layout_dir)
@@ -1318,64 +1496,90 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"[FAIL] {exc}")
         return 1
 
+    rep = args.rep if args.rep is not None else 1
+    layout_pass = args.layout_pass or "screen"
+
+    # (a) existence check for every requested suite's output path, computed up front so
+    # a later suite in this same call cannot be found "taken" only after an earlier suite
+    # in the call already wrote its output.
+    try:
+        for suite, path in suite_output_paths(a_dir, suites, rep=rep, layout_pass=layout_pass).items():
+            refuse_if_exists(path, suite_output_what(suite, path, layout_pass=layout_pass))
+    except SuiteOutputExistsError as exc:
+        print(f"[FAIL] {exc}")
+        return 1
+
+    # (b) meta.json is cumulative: this call's identity config must match whatever is
+    # already on disk for this arm dir. Read once, here; never re-read mid-call --
+    # merge_run_meta is always called against this same snapshot plus the growing `call`
+    # dict below, so every write_meta() recomputes the full cumulative document fresh.
+    meta_path = a_dir / "meta.json"
+    existing_meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else None
+
     started_utc = datetime.now(UTC).isoformat()
-    meta: dict[str, Any] = {
+    call: dict[str, Any] = {
         "schema": 1,
         "run": args.run,
         "arm": arm["id"],
         "arm_config": arm,
         "image_ref": image_ref,
-        "image_id": inspected[BENCH_LLM_CONTAINER].get("Image"),
+        "image_id": running_image_id,
         "server_args": expected_args,
-        "container_args": running_args,
-        "props": props,
         "params": params,
         "tuning_label": args.tuning_label,
-        "layout": None,
-        "harness": None,
         "decision_rules_sha256": decision_rules_sha256,
         "git": collect_git_state(REPO_ROOT, config.layout_dir),
+        "container_args": running_args,
+        "props": props,
         "started_utc": started_utc,
-        "finished_utc": None,
+        "finished_utc": started_utc,
+        "suites": suites,
         "suites_completed": [],
+        "rep": rep if "correctness" in suites else None,
+        "layout_pass": layout_pass if "layout" in suites else None,
+        "harness": None,
+        "layout_result": None,
         "errors": [],
     }
+    try:
+        merge_run_meta(existing_meta, call)  # validated here; the result is discarded
+    except RunMetaConfigMismatchError as exc:
+        print(f"[FAIL] {exc}")
+        return 1
+
+    # Every preflight check above has passed. Only now does anything get written.
     a_dir.mkdir(parents=True, exist_ok=True)
-    meta_path = a_dir / "meta.json"
 
     def write_meta() -> None:
-        meta["finished_utc"] = datetime.now(UTC).isoformat()
-        meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        call["finished_utc"] = datetime.now(UTC).isoformat()
+        merged = merge_run_meta(existing_meta, call)
+        meta_path.write_text(json.dumps(merged, indent=2, sort_keys=True, default=str), encoding="utf-8")
 
     sampler = GpuSampler(a_dir / "vram.csv")
     sampler.start()
     try:
         if "ttft" in suites:
             ttft_path = a_dir / "ttft.jsonl"
-            refuse_if_exists(ttft_path, "ttft.jsonl")
             props_now = wait_for_llama_props(base_url)
             n_ctx = props_now.get("default_generation_settings", {}).get("n_ctx", 32768)
             rows = ttft_probe.run_ttft_probe(base_url, n_ctx=n_ctx)
             with open(ttft_path, "w", encoding="utf-8") as fh:
                 for row in rows:
                     fh.write(json.dumps(row) + "\n")
-            meta["suites_completed"].append("ttft")
+            call["suites_completed"].append("ttft")
             write_meta()
 
         if "correctness" in suites:
-            rep = args.rep if args.rep is not None else 1
             correctness_path = a_dir / f"correctness.r{rep}.jsonl"
-            refuse_if_exists(correctness_path, correctness_path.name)
             rows = correctness_probe.run_correctness_probe(base_url)
             with open(correctness_path, "w", encoding="utf-8") as fh:
                 for row in rows:
                     fh.write(json.dumps(row) + "\n")
-            meta["suites_completed"].append("correctness")
+            call["suites_completed"].append("correctness")
             write_meta()
 
         if "harness" in suites:
             harness_dir = a_dir / "harness"
-            refuse_if_exists(harness_dir, "harness/")
             tests = resolve_harness_tests(arm["harness"])
             harness_argv = [
                 sys.executable,
@@ -1395,8 +1599,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             ]
             proc = subprocess.run(harness_argv, cwd=REPO_ROOT, shell=False)
             if proc.returncode != 0:
-                meta["errors"].append(f"harness exited {proc.returncode}")
-            meta["harness"] = {
+                call["errors"].append(f"harness exited {proc.returncode}")
+            call["harness"] = {
                 "candidate": arm["harness"]["candidate"],
                 "tests": tests,
                 "iterations": arm["harness"]["iterations"],
@@ -1405,14 +1609,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             # returns normally (scripts/eval_harness/run.py, the except blocks in run_candidate),
             # so analyse.py must still check the JSONL has every case x iteration.
             if proc.returncode == 0:
-                meta["suites_completed"].append("harness")
+                call["suites_completed"].append("harness")
             write_meta()
 
         if "layout" in suites:
             assert config.layout_dir is not None  # validate_run_suites refused otherwise
-            layout_pass = args.layout_pass or "screen"
             layout_out_dir = a_dir / "layout" / layout_pass
-            refuse_if_exists(layout_out_dir, f"layout/{layout_pass}/")
             thinking_mode = "off" if arm["thinking"] is None else arm["thinking"].get("mode", "off")
             max_tokens = layout_max_tokens(arm["thinking"])
             layouts_per_size = LAYOUT_LAYOUTS_PER_SIZE[layout_pass]
@@ -1440,8 +1642,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "--results",
                 f"results/{result_id}",
             ]
-            meta["layout"] = {
-                "pass": layout_pass,
+            call["layout_result"] = {
                 "layouts_per_size": layouts_per_size,
                 "thinking": thinking_mode,
                 "max_tokens": max_tokens,
@@ -1450,27 +1651,32 @@ def cmd_run(args: argparse.Namespace) -> int:
             for step_argv in (run_host_argv, analyse_argv):
                 proc = subprocess.run(step_argv, cwd=config.layout_dir, shell=False)
                 if proc.returncode != 0:
-                    meta["errors"].append(f"layout: {step_argv[1]} exited {proc.returncode}")
+                    call["errors"].append(f"layout: {step_argv[1]} exited {proc.returncode}")
                     layout_ok = False
                     break
             if layout_ok:
                 src_dir = config.layout_dir / "results" / result_id
                 missing = [n for n in LAYOUT_COPIED_FILES if not (src_dir / n).is_file()]
                 if missing:
-                    meta["errors"].append(f"layout: missing {missing} in {src_dir}")
+                    # finding 5: a path relative to --layout-dir, never the host-absolute
+                    # src_dir, so a public output that later copies meta.errors verbatim
+                    # (which analyse.py must not do either -- see build_summary/
+                    # compute_coverage) cannot leak this machine's directory layout.
+                    rel_src = src_dir.relative_to(config.layout_dir)
+                    call["errors"].append(f"layout: missing {missing} in {rel_src}")
                 else:
                     layout_out_dir.mkdir(parents=True, exist_ok=True)
                     for name in LAYOUT_COPIED_FILES:
                         (layout_out_dir / name).write_bytes((src_dir / name).read_bytes())
-                    meta["suites_completed"].append("layout")
+                    call["suites_completed"].append("layout")
             write_meta()
     finally:
         sampler.stop()
         write_meta()
 
-    print(f"run complete for arm {arm['id']}: suites_completed={meta['suites_completed']}")
-    if meta["errors"]:
-        print(f"[FAIL] run recorded errors: {meta['errors']}")
+    print(f"run complete for arm {arm['id']}: suites_completed (this call)={call['suites_completed']}")
+    if call["errors"]:
+        print(f"[FAIL] run recorded errors (this call): {call['errors']}")
         return 1
     return 0
 
