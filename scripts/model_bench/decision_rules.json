@@ -27,6 +27,7 @@
     "margin_mib": 512,
     "min_ttft_rows": 3,
     "ttft_ctx_target": 2048,
+    "correctness_expected_prompts": 20,
     "layout_n_expected": {
       "screen": 72,
       "finalist": 216

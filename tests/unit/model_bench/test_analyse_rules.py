@@ -22,6 +22,12 @@ FIXTURE_RUN = Path(__file__).resolve().parent / "fixtures" / "analyse" / "run"
 RULES = analyse.load_decision_rules()
 
 
+def test_correctness_expected_prompts_matches_the_probe():
+    from scripts.model_bench.probes import correctness as correctness_probe
+
+    assert RULES["constants"]["correctness_expected_prompts"] == len(correctness_probe.PROMPTS)
+
+
 def _mr(value, *, bootstrap=None, complete=True, missing=False, n=10, n_expected=10):
     return analyse.MetricResult(
         value=value, n=n, n_expected=n_expected, bootstrap=bootstrap, complete=complete, missing=missing
@@ -149,28 +155,117 @@ def test_r5_missing_when_both_voice_metrics_absent():
     assert result.verdict == "missing"
 
 
+def _clause(clause_id: str, verdict: str) -> analyse.ClauseResult:
+    return analyse.ClauseResult(
+        id=clause_id, metric="m", arm=None, value=None, threshold=None, op=None, verdict=verdict, margin="n/a",
+    )
+
+
+def test_r5_missing_not_not_triggered_when_lower_triggers_and_r2_incomplete():
+    # Lower bound clears the trigger threshold, and no R2 rule can be confirmed as
+    # matching ("all-pass-except-F, F bad") because its S1 clause reads "missing" --
+    # that candidate might have matched had the data been complete, so this must not
+    # silently read as a clean not-triggered.
+    r2_incomplete = analyse.RuleResult(
+        id="R2", kind="gate", label="switch_to_incomplete",
+        question="q", verdict="missing",
+        clauses=[
+            _clause("L", "pass"), _clause("S1", "missing"), _clause("S2", "pass"),
+            _clause("D", "pass"), _clause("P", "pass"), _clause("F", "fail"),
+        ],
+        info={"candidate": "incomplete-cand"},
+    )
+    metrics = _run_metrics({}, lower=_mr(4096.0), upper=_mr(4096.0), total_mib=12288.0)
+    result = analyse.evaluate_r5(metrics, RULES, r2_results=[r2_incomplete])
+    assert result.verdict == "missing"
+    assert result.verdict != "not-triggered"
+
+
+def test_r5_not_triggered_stays_clean_when_r2_fully_evaluated_and_none_match():
+    # Same lower-triggers-and-nothing-matches shape, but every R2 clause is
+    # conclusively pass/fail (no "missing") -- this IS a clean not-triggered.
+    r2_clean = analyse.RuleResult(
+        id="R2", kind="gate", label="switch_to_clean",
+        question="q", verdict="fail",
+        clauses=[
+            _clause("L", "fail"), _clause("S1", "pass"), _clause("S2", "pass"),
+            _clause("D", "pass"), _clause("P", "pass"), _clause("F", "pass"),
+        ],
+        info={"candidate": "clean-cand"},
+    )
+    metrics = _run_metrics({}, lower=_mr(4096.0), upper=_mr(4096.0), total_mib=12288.0)
+    result = analyse.evaluate_r5(metrics, RULES, r2_results=[r2_clean])
+    assert result.verdict == "not-triggered"
+
+
 # ---------------------------------------------------------------------------
 # Synthetic: R6 determinism clauses in isolation
 # ---------------------------------------------------------------------------
 
 
+EXPECTED_PROMPTS = RULES["constants"]["correctness_expected_prompts"]
+
+
+def _correctness_rows(n: int, *, mismatch_pid: str | None = None, error_pid: str | None = None) -> list[dict]:
+    """Build n synthetic correctness.jsonl rows, p01..p0n, each with distinct tokens.
+
+    `mismatch_pid` gives that one row different tokens from the "canonical" set (used to
+    build a second, comparison row list); `error_pid` marks that one row as errored.
+    """
+    rows = []
+    for i in range(1, n + 1):
+        pid = f"p{i:02d}"
+        if pid == error_pid:
+            rows.append({"prompt_id": pid, "tokens": None, "error": "server returned 500"})
+            continue
+        tokens = [i, i + 1] if pid != mismatch_pid else [999, 998]
+        rows.append({"prompt_id": pid, "tokens": tokens, "error": None})
+    return rows
+
+
 def test_r6_determinism_clause_missing_when_files_absent():
-    clause = analyse._determinism_clause("x", None, None, "note")
+    clause = analyse._determinism_clause("x", None, None, "note", EXPECTED_PROMPTS)
     assert clause.verdict == "missing"
 
 
 def test_r6_determinism_clause_fail_on_mismatch():
-    a = {"p01": [1, 2, 3]}
-    b = {"p01": [1, 2, 4]}
-    clause = analyse._determinism_clause("x", a, b, "note")
+    a = _correctness_rows(EXPECTED_PROMPTS)
+    b = _correctness_rows(EXPECTED_PROMPTS, mismatch_pid="p01")
+    clause = analyse._determinism_clause("x", a, b, "note", EXPECTED_PROMPTS)
     assert clause.verdict == "fail"
 
 
 def test_r6_determinism_clause_pass_on_match():
-    a = {"p01": [1, 2, 3], "p02": [4]}
-    b = {"p01": [1, 2, 3], "p02": [4]}
-    clause = analyse._determinism_clause("x", a, b, "note")
+    a = _correctness_rows(EXPECTED_PROMPTS)
+    b = _correctness_rows(EXPECTED_PROMPTS)
+    clause = analyse._determinism_clause("x", a, b, "note", EXPECTED_PROMPTS)
     assert clause.verdict == "pass"
+
+
+def test_r6_determinism_clause_missing_when_prompt_count_wrong():
+    a = _correctness_rows(EXPECTED_PROMPTS - 1)
+    b = _correctness_rows(EXPECTED_PROMPTS)
+    clause = analyse._determinism_clause("x", a, b, "note", EXPECTED_PROMPTS)
+    assert clause.verdict == "missing"
+
+
+def test_r6_determinism_clause_missing_when_prompt_id_sets_differ():
+    a = _correctness_rows(EXPECTED_PROMPTS)
+    b = _correctness_rows(EXPECTED_PROMPTS)
+    b[0]["prompt_id"] = "pXX"
+    clause = analyse._determinism_clause("x", a, b, "note", EXPECTED_PROMPTS)
+    assert clause.verdict == "missing"
+
+
+def test_r6_determinism_clause_missing_not_pass_when_p20_errored_in_both_reps():
+    # Regression for the bug where an errored prompt, present in BOTH files, was
+    # simply dropped from the comparison and the clause still read as "pass" because
+    # the remaining prompts happened to agree.
+    a = _correctness_rows(EXPECTED_PROMPTS, error_pid="p20")
+    b = _correctness_rows(EXPECTED_PROMPTS, error_pid="p20")
+    clause = analyse._determinism_clause("x", a, b, "note", EXPECTED_PROMPTS)
+    assert clause.verdict == "missing"
+    assert clause.verdict != "pass"
 
 
 # ---------------------------------------------------------------------------
