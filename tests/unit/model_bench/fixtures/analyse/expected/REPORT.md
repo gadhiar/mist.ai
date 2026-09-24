@@ -2,6 +2,10 @@
 
 decision_rules.json sha256: `0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce`
 
+## Measurement notes
+
+- Layout sampling is fixed by the command-center layout runner (`run_host.py`) at temperature 0.7 and top_p 0.9 for every arm, not at each vendor's recommended settings. This matches how run1 measured layout, so layout accuracy here is comparable to run1. Vendor sampling applies to the harness and the server defaults only (`arms.json`).
+
 ## decision_rules.json mismatch warnings
 
 - [WARN] arm 'c1-256' meta.decision_rules_sha256='deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' differs from the analysed decision_rules.json='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce'

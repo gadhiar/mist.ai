@@ -1542,6 +1542,16 @@ def render_report(
     lines.append("")
     lines.append(f"decision_rules.json sha256: `{decision_rules_sha}`")
     lines.append("")
+    lines.append("## Measurement notes")
+    lines.append("")
+    lines.append(
+        "- Layout sampling is fixed by the command-center layout runner (`run_host.py`) at "
+        "temperature 0.7 and top_p 0.9 for every arm, not at each vendor's recommended "
+        "settings. This matches how run1 measured layout, so layout accuracy here is "
+        "comparable to run1. Vendor sampling applies to the harness and the server defaults "
+        "only (`arms.json`)."
+    )
+    lines.append("")
     if sha_warnings:
         lines.append("## decision_rules.json mismatch warnings")
         lines.append("")
