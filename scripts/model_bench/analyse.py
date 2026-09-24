@@ -1149,11 +1149,20 @@ def evaluate_r5(metrics: RunMetrics, rules: dict[str, Any], r2_results: list[Rul
     lower = metrics.voice_vram_lower_mib
     upper = metrics.voice_vram_upper_mib
 
-    if not lower.usable() and not upper.usable():
+    # Both bounds are required. With only one, the verdict is undecidable: a usable lower bound
+    # below the trigger cannot rule out an upper bound at or above the needs-review threshold,
+    # and a usable upper bound cannot say whether the lower bound triggers. Fail closed.
+    if not lower.usable() or not upper.usable():
+        absent = [
+            name
+            for name, m in (("voice_vram_lower_mib", lower), ("voice_vram_upper_mib", upper))
+            if not m.usable()
+        ]
         clause = ClauseResult(
-            id="voice_vram_lower_bound", metric="voice_vram_lower_mib", arm=None, value=None,
+            id="voice_vram_lower_bound", metric="voice_vram_lower_mib", arm=None,
+            value=lower.value if lower.usable() else None,
             threshold=thresholds["r5_voice_vram_lower_trigger_mib"], op=">=", verdict="missing", margin="n/a",
-            note="voice_vram_lower_mib and voice_vram_upper_mib both missing",
+            note=f"missing: {', '.join(absent)} (R5 needs both voice bounds)",
         )
         return RuleResult(
             id="R5", kind="trigger", label="gtx1070_moves_up",
@@ -1263,11 +1272,23 @@ def _determinism_clause(
             id=clause_id, metric="correctness_tokens", arm=None, value=None, threshold=None, op=None,
             verdict="missing", margin="n/a", note=f"{note_prefix}: an errored row is present",
         )
-    if sa["n"] != expected_prompts or sb["n"] != expected_prompts:
+    # Rows AND distinct prompt ids must both equal the expected count: a duplicated id (p19
+    # twice, no p20) has the right row count but an incomplete prompt set.
+    distinct_a = len(set(sa["prompt_ids"]))
+    distinct_b = len(set(sb["prompt_ids"]))
+    if (
+        sa["n"] != expected_prompts
+        or sb["n"] != expected_prompts
+        or distinct_a != expected_prompts
+        or distinct_b != expected_prompts
+    ):
         return ClauseResult(
             id=clause_id, metric="correctness_tokens", arm=None, value=None, threshold=None, op=None,
             verdict="missing", margin="n/a",
-            note=f"{note_prefix}: prompt count {sa['n']}/{sb['n']} != expected {expected_prompts}",
+            note=(
+                f"{note_prefix}: prompt rows {sa['n']}/{sb['n']}, distinct ids "
+                f"{distinct_a}/{distinct_b}, expected {expected_prompts}"
+            ),
         )
     if sa["prompt_ids"] != sb["prompt_ids"]:
         return ClauseResult(

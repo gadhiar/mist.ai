@@ -92,9 +92,9 @@ class ChatMetrics:
     the OpenAI chat completion schema does not define. Both default to
     `None` so existing call sites that build a `ChatMetrics` without them
     (e.g. `from_usage` before this field pair existed) keep working, and so
-    a response that omits them (a non-llama-server backend, or an older
-    llama-server build without `--metrics`) records `None` rather than
-    raising.
+    a response that omits them (for example a non-llama-server backend)
+    records `None` rather than raising. Which llama-server builds or flags
+    emit `timings` is not verified here.
     """
 
     prompt_tokens: int

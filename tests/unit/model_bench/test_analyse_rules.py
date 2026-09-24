@@ -149,6 +149,19 @@ def test_r5_not_triggered_when_neither_crosses():
     assert result.verdict == "not-triggered"
 
 
+def test_r5_missing_when_only_the_lower_bound_is_usable():
+    # A lower bound below the trigger cannot rule out an upper bound at needs-review level.
+    metrics = _run_metrics({}, lower=_mr(1000.0), total_mib=12288.0)
+    result = analyse.evaluate_r5(metrics, RULES, r2_results=[])
+    assert result.verdict == "missing"
+
+
+def test_r5_missing_when_only_the_upper_bound_is_usable():
+    metrics = _run_metrics({}, upper=_mr(4096.0), total_mib=12288.0)
+    result = analyse.evaluate_r5(metrics, RULES, r2_results=[])
+    assert result.verdict == "missing"
+
+
 def test_r5_missing_when_both_voice_metrics_absent():
     metrics = _run_metrics({}, total_mib=12288.0)
     result = analyse.evaluate_r5(metrics, RULES, r2_results=[])
@@ -245,6 +258,16 @@ def test_r6_determinism_clause_pass_on_match():
 def test_r6_determinism_clause_missing_when_prompt_count_wrong():
     a = _correctness_rows(EXPECTED_PROMPTS - 1)
     b = _correctness_rows(EXPECTED_PROMPTS)
+    clause = analyse._determinism_clause("x", a, b, "note", EXPECTED_PROMPTS)
+    assert clause.verdict == "missing"
+
+
+def test_r6_determinism_clause_missing_when_a_prompt_id_is_duplicated():
+    # Right row count, incomplete prompt set: p19 twice and no p20, identically in both reps.
+    a = _correctness_rows(EXPECTED_PROMPTS)
+    b = _correctness_rows(EXPECTED_PROMPTS)
+    for rows in (a, b):
+        rows[-1] = dict(rows[-2])
     clause = analyse._determinism_clause("x", a, b, "note", EXPECTED_PROMPTS)
     assert clause.verdict == "missing"
 

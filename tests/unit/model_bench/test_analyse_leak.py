@@ -15,7 +15,7 @@ FIXTURE_RUN = Path(__file__).resolve().parent / "fixtures" / "analyse" / "run"
 SENTINEL = "SENTINEL_DO_NOT_LEAK_9f3a21"
 # Planted in fixtures/analyse/run/c0-old/meta.json's `errors` list (finding 5): a
 # host-absolute path must never reach a public output, only the arm's error_count.
-LEAKED_PATH_FRAGMENT = "D:/Users/rajga/mist-model-bench-results/run1/c0-old"
+LEAKED_PATH_FRAGMENT = "Z:/synthetic-host/bench-results/run1/c0-old"
 
 
 def test_sentinel_present_in_raw_fixture():

@@ -8,7 +8,7 @@
       "container_args": [],
       "errors": [],
       "finished_utc": "2026-01-01T00:05:00+00:00",
-      "layout_pass": null,
+      "layout_pass": "screen",
       "props": {},
       "rep": null,
       "started_utc": "2026-01-01T00:00:00+00:00",
@@ -38,7 +38,13 @@
   },
   "image_id": "sha256:fixture",
   "image_ref": "fixture:image",
-  "layout": {},
+  "layout": {
+    "screen": {
+      "layouts_per_size": 2,
+      "max_tokens": 256,
+      "thinking": "off"
+    }
+  },
   "params": {},
   "props": {},
   "run": "fixture-run",
