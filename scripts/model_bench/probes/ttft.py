@@ -1,15 +1,20 @@
 """Time-to-first-token probe against a running llama-server.
 
-For each context target (2048, 8192, 32000, each capped at
-`n_ctx - n_predict - 16` from /props), builds an exact-length prompt by
-tokenizing deterministic filler text via /tokenize and sending the first N
-token ids as the prompt array, then streams /completion and times the first
-non-empty content chunk.
+Deterministic filler text is tokenized via `/tokenize` (no special tokens) exactly once
+per probe run. For each context target (2048, 8192, 32000, each capped at
+`n_ctx - n_predict - 16` from /props), an exact-length prompt is built by cycling that
+same id list end-to-end to the target length (`cycle_to_length`), not by tokenizing a
+longer text and slicing -- slicing left the largest target (32000) unreachable whenever
+FILLER_TEXT itself tokenized to fewer ids than that, which a fixed multiplier could not
+guarantee. Cycling reaches every target exactly regardless of how many ids the filler
+text tokenizes to; an empty tokenize result is refused (`TtftProbeError`) rather than
+silently producing a shorter-than-requested prompt.
 
 The HTTP/SSE plumbing (`run_ttft_probe`) needs a live server and is not unit
 tested; the parsing it is built from (`iter_sse_events`,
 `extract_ttft_row`) is pure and is tested against
-`tests/unit/model_bench/fixtures/host/sse_stream.txt`.
+`tests/unit/model_bench/fixtures/host/sse_stream.txt`. `cycle_to_length` is pure and
+tested directly.
 """
 
 from __future__ import annotations
@@ -49,8 +54,8 @@ def cap_target(target: int, n_ctx: int, n_predict: int = N_PREDICT) -> int:
 
 
 def tokenize(base_url: str, text: str, *, timeout: float = 30.0) -> list[int]:
-    """POST /tokenize and return the token id list."""
-    payload = {"content": text}
+    """POST /tokenize (no special tokens) and return the token id list."""
+    payload = {"content": text, "add_special": False}
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         base_url.rstrip("/") + "/tokenize",
@@ -66,17 +71,30 @@ def tokenize(base_url: str, text: str, *, timeout: float = 30.0) -> list[int]:
     return tokens
 
 
-def build_prompt_tokens(base_url: str, target_len: int, *, timeout: float = 30.0) -> list[int]:
-    """Tokenize FILLER_TEXT and return the first `target_len` token ids.
+def cycle_to_length(base_ids: list[int], length: int) -> list[int]:
+    """Repeat `base_ids` end-to-end until there are exactly `length` ids.
 
-    Raises TtftProbeError if FILLER_TEXT tokenizes shorter than target_len.
+    Cycling (rather than a single tokenize-and-slice) is what lets every ctx target,
+    including the largest (32000), be reached exactly regardless of how many ids
+    FILLER_TEXT itself tokenizes to. Refuses -- rather than silently returning a
+    shorter-than-requested prompt -- if `base_ids` is empty, since an empty list has
+    nothing to cycle.
     """
-    all_tokens = tokenize(base_url, FILLER_TEXT, timeout=timeout)
-    if len(all_tokens) < target_len:
-        raise TtftProbeError(
-            f"FILLER_TEXT tokenizes to {len(all_tokens)} tokens, short of target {target_len}"
-        )
-    return all_tokens[:target_len]
+    if not base_ids:
+        raise TtftProbeError("filler token id list is empty; cannot build a prompt of any length")
+    if length <= 0:
+        return []
+    reps = (length // len(base_ids)) + 1
+    return (base_ids * reps)[:length]
+
+
+def build_prompt_tokens(base_ids: list[int], target_len: int) -> list[int]:
+    """Build one exact-length prompt by cycling the already-tokenized filler ids.
+
+    `base_ids` is tokenized once per probe run (see `run_ttft_probe`), not once per
+    ctx target, and is cycled here to reach `target_len` exactly.
+    """
+    return cycle_to_length(base_ids, target_len)
 
 
 def iter_sse_events(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
@@ -188,11 +206,38 @@ def run_ttft_probe(
     (`"warmup": true`) so the caller can choose to keep or drop them.
     """
     rows: list[dict[str, Any]] = []
+
+    try:
+        base_ids = tokenize(base_url, FILLER_TEXT)
+    except (TtftProbeError, urllib.error.URLError) as exc:
+        # Tokenizing the filler is a one-time, all-targets-shared step; if it fails
+        # outright, every target is unreachable -- record one errored row per target
+        # rather than raising and losing the other targets' rows.
+        for target in TTFT_TARGETS:
+            capped = cap_target(target, n_ctx, n_predict)
+            rows.append(
+                {
+                    "ctx_target": target,
+                    "prompt_tokens": capped,
+                    "rep": 0,
+                    "warmup": True,
+                    "ttft_ms": None,
+                    "total_ms": None,
+                    "prompt_ms": None,
+                    "prompt_per_second": None,
+                    "predicted_n": None,
+                    "predicted_ms": None,
+                    "predicted_per_second": None,
+                    "error": str(exc),
+                }
+            )
+        return rows
+
     for target in TTFT_TARGETS:
         capped = cap_target(target, n_ctx, n_predict)
         try:
-            prompt_tokens = build_prompt_tokens(base_url, capped)
-        except (TtftProbeError, urllib.error.URLError) as exc:
+            prompt_tokens = build_prompt_tokens(base_ids, capped)
+        except TtftProbeError as exc:
             rows.append(
                 {
                     "ctx_target": target,
