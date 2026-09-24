@@ -1,0 +1,274 @@
+{
+  "schema": 1,
+  "frozen_note": "Pre-registered before any mist-model-bench data exists (T3b). Committed as its own change, before analyse.py, so history shows the rules fixed before the analysis code and before a single result lands. A threshold here is never edited to change a verdict on data already collected; a genuine recalibration is a new commit with its own rationale, not an amendment to this one.",
+  "statistics": {
+    "wilson": {
+      "confidence": 0.95,
+      "z": 1.9599639845400545
+    },
+    "bootstrap": {
+      "method": "percentile",
+      "confidence": 0.95,
+      "B": 10000,
+      "seed": 20260924,
+      "clusters": {
+        "layout": "layout_id",
+        "harness": "case_id"
+      }
+    },
+    "percentile_method": "nearest-rank",
+    "margin_definitions": {
+      "clear": "the bootstrap 95% CI for the clause's metric lies entirely on one side of the threshold",
+      "within-noise": "the bootstrap 95% CI for the clause's metric straddles the threshold",
+      "n/a": "the clause is not a proportion (decode_tps, p95 wall time, VRAM fit): no bootstrap CI is computed for it"
+    }
+  },
+  "constants": {
+    "margin_mib": 512,
+    "min_ttft_rows": 3,
+    "ttft_ctx_target": 2048,
+    "layout_n_expected": {
+      "screen": 72,
+      "finalist": 216
+    },
+    "r2_candidates": {
+      "switch_to_c2": {
+        "arm": "c2",
+        "thinking_arm": "c2-think512"
+      },
+      "switch_to_c3": {
+        "arm": "c3",
+        "thinking_arm": "c3-think512"
+      },
+      "switch_to_c4": {
+        "arm": "c4",
+        "thinking_arm": "c4-think512"
+      }
+    },
+    "r2_anchor_arm": "c0-prod",
+    "r6_arms": {
+      "a1": {
+        "base": "c0"
+      },
+      "a2": {
+        "base": "c0"
+      },
+      "a3": {
+        "base": "c3"
+      }
+    },
+    "r7_build_pair": {
+      "old": "c0-old",
+      "new": "c0"
+    },
+    "r7_harness_tests": [
+      "schema_conformance",
+      "schema_conformance_json_object",
+      "tool_selection"
+    ]
+  },
+  "thresholds": {
+    "r1_keep_e4b_layout_acc_min": 0.85,
+    "r2_l_off_layout_acc_min": 0.75,
+    "r2_l_on_layout_acc_min": 0.89,
+    "r2_l_on_mean_completion_tokens_max": 400,
+    "r2_s1_schema_conformance_json_object_min": 0.835,
+    "r2_s2_tool_selection_min": 0.875,
+    "r2_d_decode_tps_min": 35.0,
+    "r2_p_layout_p95_wall_ms_max": 15000,
+    "r3_drop_moe_truncation_rate_min": 0.10,
+    "r4_thinking_lever_layout_acc_max": 0.60,
+    "r5_voice_vram_lower_trigger_mib": 2048,
+    "r5_voice_vram_upper_needs_review_mib": 2048
+  },
+  "metrics": {
+    "layout_acc": {
+      "source": "<results>/<arm>/layout/<screen|finalist>/graded.jsonl",
+      "definition": "Proportion of correct == true over rows with phase == 'accuracy'. correct == false, parse failures, and errored rows all count as incorrect. n_expected is 72 for the screen pass and 216 for the finalist pass (constants.layout_n_expected). Coverage below n_expected makes the metric incomplete: it is never computed on a partial set for a verdict, only reported for information with its actual coverage."
+    },
+    "layout_mean_completion_tokens": {
+      "source": "<results>/<arm>/layout/<screen|finalist>/graded.jsonl, usage.completion_tokens",
+      "definition": "Mean of usage.completion_tokens over all accuracy-phase rows (same denominator as layout_acc, not just correct ones). completion_tokens_per_correct (total completion tokens over accuracy rows / n_correct) is reported alongside as information only, not used in any clause."
+    },
+    "layout_p95_wall_ms": {
+      "source": "<results>/<arm>/layout/<screen|finalist>/graded.jsonl, wall_ms",
+      "definition": "Nearest-rank 95th percentile of wall_ms over all accuracy-phase rows for the arm at its own thinking setting -- end to end per layout call."
+    },
+    "harness_score": {
+      "source": "scripts.eval_harness.scorers.score_run(jsonl_paths=[<results>/<arm>/harness/harness/<candidate>.jsonl], test_files=run.load_test_files([test_name], tests_dir)), TestScores.mean_score for the named test_name",
+      "definition": "score_run does not exclude records with error set: _ingest_record appends a CaseScore with score=0.0, passed=False, examined=None for every errored record (scripts/eval_harness/scorers.py, the `if record.get('error')` branch in _ingest_record), so an HTTP 500 already contributes a 0 to mean_score once its line is present in the JSONL. That leaves one gap score_run cannot see: a case-iteration whose line was never written at all (run_candidate stopped early and the harness still exited 0). Coverage is therefore checked independently here as len(case_scores) for the test against cases_expected * iterations_expected (from meta.json's harness.tests case count via run.load_test_files, and harness.iterations). A test with coverage below the expected count is incomplete: harness_score is never computed on it for a verdict, only reported with its actual coverage."
+    },
+    "truncation_rate": {
+      "source": "<results>/<arm>/harness/harness/<candidate>.jsonl, finish_reason",
+      "definition": "Fraction of records for (arm, test_name) with finish_reason == 'length', over all records present (same coverage rule as harness_score: incomplete coverage is reported but not used for a verdict)."
+    },
+    "decode_tps": {
+      "source": "<results>/<arm>/ttft.jsonl",
+      "definition": "Median of predicted_per_second over rows with ctx_target == constants.ttft_ctx_target, warmup == false, and error == null. Requires at least constants.min_ttft_rows matching rows; fewer is missing."
+    },
+    "ttft_ms": {
+      "source": "<results>/<arm>/ttft.jsonl",
+      "definition": "Median of ttft_ms over the same filter as decode_tps, reported per ctx_target present in the file. Information only, feeds no clause."
+    },
+    "arm_peak_mib": {
+      "source": "<results>/<arm>/vram.csv",
+      "definition": "Max of memory_used_mib over all rows for the arm. Includes the desktop baseline, since the production backend is stopped during bench runs."
+    },
+    "voice_vram_lower_mib": {
+      "source": "<results>/session/vram_steps.json, steps[label=backend_idle].median_mib and steps[label=mist_llm].median_mib",
+      "definition": "backend_idle.median_mib - mist_llm.median_mib. A lower bound on STT+TTS VRAM footprint."
+    },
+    "voice_vram_upper_mib": {
+      "source": "<results>/session/vram_steps.json, steps[label=voice_peak].max_mib and steps[label=mist_llm].median_mib",
+      "definition": "voice_peak.max_mib - mist_llm.median_mib. An upper bound: the voice probe double-counts VRAM the backend already holds resident at startup (README 'Double-counting note'), so this overstates VRAM pressure rather than understating it."
+    },
+    "total_mib": {
+      "source": "<results>/session/vram_steps.json, steps[*].total_mib",
+      "definition": "GPU total memory as reported by nvidia-smi at any sampled step (constant across steps on one host)."
+    }
+  },
+  "rules": [
+    {
+      "id": "R1",
+      "kind": "gate",
+      "question": "Does the current Gemma 4 E4B model, run with a 512-token thinking budget, clear the layout accuracy bar to stay in production?",
+      "clauses": [
+        {
+          "id": "layout_acc_c1_512",
+          "metric": "layout_acc",
+          "arm": "c1-512",
+          "pass": "screen_or_finalist",
+          "op": ">=",
+          "threshold_key": "r1_keep_e4b_layout_acc_min"
+        }
+      ],
+      "informational": [
+        {
+          "id": "layout_acc_c1_256",
+          "metric": "layout_acc",
+          "arm": "c1-256",
+          "pass": "screen_or_finalist",
+          "note": "c1-256 is reported alongside c1-512 for information only; it feeds no clause."
+        }
+      ]
+    },
+    {
+      "id": "R2",
+      "kind": "gate",
+      "question": "Should MIST switch from Gemma 4 E4B to c2 (12B dense QAT)?",
+      "candidate": "c2",
+      "thinking_candidate": "c2-think512",
+      "clauses": ["L", "S1", "S2", "D", "P", "F"]
+    },
+    {
+      "id": "R2",
+      "kind": "gate",
+      "question": "Should MIST switch from Gemma 4 E4B to c3 (26B-A4B MoE)?",
+      "candidate": "c3",
+      "thinking_candidate": "c3-think512",
+      "clauses": ["L", "S1", "S2", "D", "P", "F"]
+    },
+    {
+      "id": "R2",
+      "kind": "gate",
+      "question": "Should MIST switch from Gemma 4 E4B to c4 (Qwen3.6 35B-A3B MoE)?",
+      "candidate": "c4",
+      "thinking_candidate": "c4-think512",
+      "clauses": ["L", "S1", "S2", "D", "P", "F"]
+    },
+    {
+      "id": "R3",
+      "kind": "trigger",
+      "question": "Is c3's MoE output truncated often enough under the production json_object arm to drop the MoE candidates?",
+      "clauses": [
+        {
+          "id": "truncation_json_object",
+          "metric": "truncation_rate",
+          "arm": "c3",
+          "test_name": "schema_conformance_json_object",
+          "op": ">",
+          "threshold_key": "r3_drop_moe_truncation_rate_min"
+        }
+      ],
+      "informational": [
+        {
+          "id": "truncation_grammar",
+          "metric": "truncation_rate",
+          "arm": "c3",
+          "test_name": "schema_conformance",
+          "note": "Grammar-constrained truncation on c3, reported for comparison against the json_object arm. Feeds no clause."
+        }
+      ]
+    },
+    {
+      "id": "R4",
+      "kind": "trigger",
+      "question": "Is thinking mode a large enough lever on layout accuracy at c2 to be load-bearing for the model decision?",
+      "clauses": [
+        {
+          "id": "layout_acc_c2_off",
+          "metric": "layout_acc",
+          "arm": "c2",
+          "pass": "screen_or_finalist",
+          "op": "<",
+          "threshold_key": "r4_thinking_lever_layout_acc_max"
+        }
+      ]
+    },
+    {
+      "id": "R5",
+      "kind": "trigger",
+      "question": "Does the voice VRAM footprint justify moving the GTX 1070 up in priority?",
+      "clauses": [
+        {
+          "id": "voice_vram_lower_bound",
+          "metric": "voice_vram_lower_mib",
+          "op": ">=",
+          "threshold_key": "r5_voice_vram_lower_trigger_mib"
+        },
+        {
+          "id": "some_r2_candidate_f_only_gap",
+          "note": "Triggered requires: voice_vram_lower_bound holds AND at least one R2 candidate (c2, c3, or c4) has every other R2 clause (L, S1, S2, D, P) verdict pass, with F verdict fail or needs-review. needs-review (not triggered) if only voice_vram_upper_mib >= r5_voice_vram_upper_needs_review_mib, i.e. the lower bound does not clear the trigger threshold but the upper (conservative) estimate does."
+        }
+      ]
+    },
+    {
+      "id": "R6",
+      "kind": "gate",
+      "question": "Does GPU tuning arm a1 (memory overclock, base c0) preserve correctness and stability?",
+      "arm": "a1",
+      "base": "c0",
+      "clauses": ["base_determinism", "tuned_matches_base", "harness_ci_containment", "manual_clean"]
+    },
+    {
+      "id": "R6",
+      "kind": "gate",
+      "question": "Does GPU tuning arm a2 (memory overclock plus undervolt, base c0) preserve correctness and stability?",
+      "arm": "a2",
+      "base": "c0",
+      "clauses": ["base_determinism", "tuned_matches_base", "harness_ci_containment", "manual_clean"]
+    },
+    {
+      "id": "R6",
+      "kind": "gate",
+      "question": "Does GPU tuning arm a3 (memory overclock, base c3) preserve correctness and stability?",
+      "arm": "a3",
+      "base": "c3",
+      "clauses": ["base_determinism", "tuned_matches_base", "harness_ci_containment", "manual_clean"]
+    },
+    {
+      "id": "R7",
+      "kind": "informational",
+      "question": "What did the pinned build change (c0 vs c0-old) on layout accuracy, harness scores, and decode speed?",
+      "old_arm": "c0-old",
+      "new_arm": "c0",
+      "deltas": [
+        {"metric": "layout_acc", "pass": "screen_or_finalist"},
+        {"metric": "harness_score", "test_name": "schema_conformance"},
+        {"metric": "harness_score", "test_name": "schema_conformance_json_object"},
+        {"metric": "harness_score", "test_name": "tool_selection"},
+        {"metric": "decode_tps"}
+      ]
+    }
+  ]
+}
