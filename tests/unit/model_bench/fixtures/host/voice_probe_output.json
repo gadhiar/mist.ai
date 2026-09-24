@@ -1,0 +1,7 @@
+{
+  "max_memory_reserved_mib": 4096.5,
+  "max_memory_allocated_mib": 3800.25,
+  "stt_ok": true,
+  "tts_ok": true,
+  "error": null
+}

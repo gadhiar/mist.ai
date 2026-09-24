@@ -1,0 +1,165 @@
+{
+  "schema": 1,
+  "_comment": "Single source of truth for mist-model-bench server configs (T3a bench_host.py). See scripts/model_bench/README.md for the S1-S3 host procedure and scripts/model_bench/bench_host.py for the resolution code.",
+  "common_args": [
+    "--ctx-size", "32768",
+    "--n-gpu-layers", "999",
+    "--flash-attn", "on",
+    "-ctk", "q8_0",
+    "-ctv", "q8_0",
+    "-np", "1",
+    "--jinja",
+    "--no-kv-unified",
+    "--no-webui",
+    "--threads", "10",
+    "--threads-batch", "12",
+    "-b", "1024",
+    "-ub", "512",
+    "--metrics",
+    "--seed", "3407",
+    "--cache-ram", "2048",
+    "--host", "0.0.0.0",
+    "--port", "8080"
+  ],
+  "sampling": {
+    "gemma": [
+      "--temp", "1.0",
+      "--top-p", "0.95",
+      "--top-k", "64",
+      "--min-p", "0.0",
+      "--repeat-penalty", "1.0"
+    ],
+    "qwen": [
+      "--temp", "0.7",
+      "--top-p", "0.8",
+      "--top-k", "20",
+      "--min-p", "0.0",
+      "--presence-penalty", "1.5"
+    ]
+  },
+  "thinking_args": {
+    "off": ["-rea", "off"],
+    "on": ["-rea", "on", "--reasoning-budget", "{budget}"]
+  },
+  "flags_unverified_note": "-rea, --reasoning-budget, -ncmoe and the sampling flag names above are UNVERIFIED for b11151 (ghcr.io/ggml-org/llama.cpp:server-cuda-b11151). Kept as data here, not in bench_host.py, so the lead can correct a spelling at step L0 without a code change. c0-old targets b8808 (snapshot:mist-llm) and gets no thinking flags at all: its template default is off, as in current production, and -rea may not exist in b8808.",
+  "harness_tests_note": "\"tests\": \"default\" resolves at runtime to scripts/eval_harness/run.py:61 DEFAULT_TEST_ORDER plus schema_conformance_json_object (bench_host.py mirrors DEFAULT_TEST_ORDER as a stdlib constant rather than importing run.py, which pulls in PyYAML). \"tests\": \"tuning\" resolves to [\"schema_conformance\"] only.",
+  "arms": {
+    "c0-old": {
+      "gguf": "unsloth/gemma-4-E4B-it-Q5_K_M.gguf",
+      "image": "snapshot:mist-llm",
+      "family": "gemma",
+      "thinking": null,
+      "suites": ["ttft", "correctness", "harness", "layout"],
+      "harness": {"candidate": "bench-c0", "tests": "default", "iterations": 10}
+    },
+    "c0": {
+      "gguf": "unsloth/gemma-4-E4B-it-Q5_K_M.gguf",
+      "image": "compose:mist-llm",
+      "family": "gemma",
+      "thinking": {"mode": "off"},
+      "suites": ["ttft", "correctness", "harness", "layout"],
+      "harness": {"candidate": "bench-c0", "tests": "default", "iterations": 10}
+    },
+    "c0-prod": {
+      "gguf": "unsloth/gemma-4-E4B-it-Q5_K_M.gguf",
+      "image": "compose:mist-llm",
+      "family": "gemma",
+      "thinking": {"mode": "off"},
+      "suites": ["harness"],
+      "harness": {"candidate": "bench-c0-prod", "tests": "default", "iterations": 10}
+    },
+    "c1-256": {
+      "base": "c0",
+      "thinking": {"mode": "on", "budget": 256},
+      "suites": ["layout"],
+      "harness": null
+    },
+    "c1-512": {
+      "base": "c0",
+      "thinking": {"mode": "on", "budget": 512},
+      "suites": ["layout"],
+      "harness": null
+    },
+    "c2": {
+      "gguf": "google/gemma-4-12b-it-qat-q4_0.gguf",
+      "image": "compose:mist-llm",
+      "family": "gemma",
+      "thinking": {"mode": "off"},
+      "suites": ["ttft", "correctness", "harness", "layout"],
+      "harness": {"candidate": "bench-c2", "tests": "default", "iterations": 10}
+    },
+    "c2-think512": {
+      "base": "c2",
+      "thinking": {"mode": "on", "budget": 512},
+      "suites": ["layout"],
+      "harness": null
+    },
+    "c3": {
+      "gguf": "unsloth/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+      "image": "compose:mist-llm",
+      "family": "gemma",
+      "thinking": {"mode": "off"},
+      "suites": ["ttft", "correctness", "harness", "layout"],
+      "harness": {"candidate": "bench-c3", "tests": "default", "iterations": 10},
+      "extra_args": ["--no-mmap", "-ub", "2048"],
+      "params_required": ["ncmoe"],
+      "param_arg_map": {"ncmoe": "-ncmoe"},
+      "stop_neo4j": true
+    },
+    "c3-think512": {
+      "base": "c3",
+      "thinking": {"mode": "on", "budget": 512},
+      "suites": ["layout"],
+      "harness": null
+    },
+    "c4": {
+      "gguf": "unsloth/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+      "image": "compose:mist-llm",
+      "family": "qwen",
+      "thinking": {"mode": "off"},
+      "suites": ["ttft", "correctness", "harness", "layout"],
+      "harness": {"candidate": "bench-c4", "tests": "default", "iterations": 10},
+      "extra_args": ["--no-mmap", "-ub", "2048"],
+      "params_required": ["ncmoe"],
+      "param_arg_map": {"ncmoe": "-ncmoe"},
+      "stop_neo4j": true,
+      "optional": true
+    },
+    "c4-think512": {
+      "base": "c4",
+      "thinking": {"mode": "on", "budget": 512},
+      "suites": ["layout"],
+      "harness": null,
+      "optional": true
+    },
+    "a1": {
+      "base": "c0",
+      "suites": ["ttft", "correctness", "harness"],
+      "harness": {"candidate": "bench-c0", "tests": "tuning", "iterations": 10},
+      "tuning": true,
+      "tuning_note": "memory overclock"
+    },
+    "a2": {
+      "base": "c0",
+      "suites": ["ttft", "correctness", "harness"],
+      "harness": {"candidate": "bench-c0", "tests": "tuning", "iterations": 10},
+      "tuning": true,
+      "tuning_note": "memory overclock plus undervolt"
+    },
+    "a3": {
+      "base": "c3",
+      "suites": ["ttft", "correctness", "harness"],
+      "harness": {"candidate": "bench-c3", "tests": "tuning", "iterations": 10},
+      "tuning": true,
+      "tuning_note": "memory overclock"
+    },
+    "a4": {
+      "base": "c3",
+      "suites": ["ttft"],
+      "harness": null,
+      "tuning": true,
+      "tuning_note": "RAM at stock 4800",
+      "optional": true
+    }
+  }
+}
