@@ -1,0 +1,10 @@
+{
+  "a1": {
+    "memtest_errors": 0,
+    "whea_events": 0
+  },
+  "a3": {
+    "memtest_errors": 0,
+    "whea_events": 0
+  }
+}

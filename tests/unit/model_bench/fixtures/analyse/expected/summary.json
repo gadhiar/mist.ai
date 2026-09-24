@@ -1,0 +1,2120 @@
+{
+  "arms": {
+    "a1": {
+      "arm_peak_mib": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "no vram.csv rows for this arm",
+        "value": null,
+        "wilson": null
+      },
+      "decode_tps": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "only 0 ttft rows at ctx=2048 (need >= 3)",
+        "value": null,
+        "wilson": null
+      },
+      "errors": [],
+      "harness_score": {
+        "schema_conformance": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 12,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 1.0,
+          "wilson": [
+            0.757506,
+            1.0
+          ]
+        }
+      },
+      "layout_acc": {},
+      "layout_completion_tokens_per_correct": {},
+      "layout_mean_completion_tokens": {},
+      "layout_p95_wall_ms": {},
+      "present": true,
+      "suites_completed": [
+        "correctness",
+        "harness"
+      ],
+      "truncation_rate": {
+        "schema_conformance": {
+          "bootstrap": [
+            0.0,
+            0.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 0,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 0.0,
+          "wilson": [
+            0.0,
+            0.242494
+          ]
+        }
+      },
+      "ttft_ms": {}
+    },
+    "a2": {
+      "arm_peak_mib": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "no vram.csv rows for this arm",
+        "value": null,
+        "wilson": null
+      },
+      "decode_tps": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "only 0 ttft rows at ctx=2048 (need >= 3)",
+        "value": null,
+        "wilson": null
+      },
+      "errors": [],
+      "harness_score": {
+        "schema_conformance": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 12,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 1.0,
+          "wilson": [
+            0.757506,
+            1.0
+          ]
+        }
+      },
+      "layout_acc": {},
+      "layout_completion_tokens_per_correct": {},
+      "layout_mean_completion_tokens": {},
+      "layout_p95_wall_ms": {},
+      "present": true,
+      "suites_completed": [
+        "correctness",
+        "harness"
+      ],
+      "truncation_rate": {
+        "schema_conformance": {
+          "bootstrap": [
+            0.0,
+            0.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 0,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 0.0,
+          "wilson": [
+            0.0,
+            0.242494
+          ]
+        }
+      },
+      "ttft_ms": {}
+    },
+    "a3": {
+      "arm_peak_mib": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "no vram.csv rows for this arm",
+        "value": null,
+        "wilson": null
+      },
+      "decode_tps": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "only 0 ttft rows at ctx=2048 (need >= 3)",
+        "value": null,
+        "wilson": null
+      },
+      "errors": [],
+      "harness_score": {
+        "schema_conformance": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 12,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 1.0,
+          "wilson": [
+            0.757506,
+            1.0
+          ]
+        }
+      },
+      "layout_acc": {},
+      "layout_completion_tokens_per_correct": {},
+      "layout_mean_completion_tokens": {},
+      "layout_p95_wall_ms": {},
+      "present": true,
+      "suites_completed": [
+        "correctness",
+        "harness"
+      ],
+      "truncation_rate": {
+        "schema_conformance": {
+          "bootstrap": [
+            0.0,
+            0.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 0,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 0.0,
+          "wilson": [
+            0.0,
+            0.242494
+          ]
+        }
+      },
+      "ttft_ms": {}
+    },
+    "a4": {
+      "present": false
+    },
+    "c0": {
+      "arm_peak_mib": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "no vram.csv rows for this arm",
+        "value": null,
+        "wilson": null
+      },
+      "decode_tps": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "only 0 ttft rows at ctx=2048 (need >= 3)",
+        "value": null,
+        "wilson": null
+      },
+      "errors": [],
+      "harness_score": {
+        "schema_conformance": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 12,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 1.0,
+          "wilson": [
+            0.757506,
+            1.0
+          ]
+        }
+      },
+      "layout_acc": {},
+      "layout_completion_tokens_per_correct": {},
+      "layout_mean_completion_tokens": {},
+      "layout_p95_wall_ms": {},
+      "present": true,
+      "suites_completed": [
+        "correctness",
+        "harness"
+      ],
+      "truncation_rate": {
+        "schema_conformance": {
+          "bootstrap": [
+            0.0,
+            0.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 0,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 0.0,
+          "wilson": [
+            0.0,
+            0.242494
+          ]
+        }
+      },
+      "ttft_ms": {}
+    },
+    "c0-old": {
+      "arm_peak_mib": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "no vram.csv rows for this arm",
+        "value": null,
+        "wilson": null
+      },
+      "decode_tps": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "only 0 ttft rows at ctx=2048 (need >= 3)",
+        "value": null,
+        "wilson": null
+      },
+      "errors": [],
+      "harness_score": {
+        "schema_conformance": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 12,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 1.0,
+          "wilson": [
+            0.757506,
+            1.0
+          ]
+        }
+      },
+      "layout_acc": {},
+      "layout_completion_tokens_per_correct": {},
+      "layout_mean_completion_tokens": {},
+      "layout_p95_wall_ms": {},
+      "present": true,
+      "suites_completed": [
+        "harness"
+      ],
+      "truncation_rate": {
+        "schema_conformance": {
+          "bootstrap": [
+            0.0,
+            0.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 0,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 0.0,
+          "wilson": [
+            0.0,
+            0.242494
+          ]
+        }
+      },
+      "ttft_ms": {}
+    },
+    "c0-prod": {
+      "arm_peak_mib": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "no vram.csv rows for this arm",
+        "value": null,
+        "wilson": null
+      },
+      "decode_tps": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "only 0 ttft rows at ctx=2048 (need >= 3)",
+        "value": null,
+        "wilson": null
+      },
+      "errors": [],
+      "harness_score": {
+        "schema_conformance_json_object": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 12,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 1.0,
+          "wilson": [
+            0.757506,
+            1.0
+          ]
+        },
+        "tool_selection": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 8,
+          "missing": false,
+          "n": 8,
+          "n_expected": 8,
+          "note": null,
+          "value": 1.0,
+          "wilson": [
+            0.675592,
+            1.0
+          ]
+        }
+      },
+      "layout_acc": {},
+      "layout_completion_tokens_per_correct": {},
+      "layout_mean_completion_tokens": {},
+      "layout_p95_wall_ms": {},
+      "present": true,
+      "suites_completed": [
+        "harness"
+      ],
+      "truncation_rate": {
+        "schema_conformance_json_object": {
+          "bootstrap": [
+            0.0,
+            0.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 0,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 0.0,
+          "wilson": [
+            0.0,
+            0.242494
+          ]
+        },
+        "tool_selection": {
+          "bootstrap": [
+            0.0,
+            0.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 0,
+          "missing": false,
+          "n": 8,
+          "n_expected": 8,
+          "note": null,
+          "value": 0.0,
+          "wilson": [
+            0.0,
+            0.324408
+          ]
+        }
+      },
+      "ttft_ms": {}
+    },
+    "c1-256": {
+      "arm_peak_mib": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "no vram.csv rows for this arm",
+        "value": null,
+        "wilson": null
+      },
+      "decode_tps": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "only 0 ttft rows at ctx=2048 (need >= 3)",
+        "value": null,
+        "wilson": null
+      },
+      "errors": [],
+      "harness_score": {},
+      "layout_acc": {
+        "screen": {
+          "bootstrap": [
+            0.25,
+            0.875
+          ],
+          "complete": false,
+          "extra": {},
+          "k": 25,
+          "missing": false,
+          "n": 40,
+          "n_expected": 72,
+          "note": "incomplete coverage: 40/72",
+          "value": 0.625,
+          "wilson": [
+            0.470324,
+            0.75777
+          ]
+        }
+      },
+      "layout_completion_tokens_per_correct": {
+        "screen": 352.0
+      },
+      "layout_mean_completion_tokens": {
+        "screen": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 40,
+          "n_expected": null,
+          "note": null,
+          "value": 220.0,
+          "wilson": null
+        }
+      },
+      "layout_p95_wall_ms": {
+        "screen": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 40,
+          "n_expected": null,
+          "note": null,
+          "value": 7500.0,
+          "wilson": null
+        }
+      },
+      "present": true,
+      "suites_completed": [
+        "layout"
+      ],
+      "truncation_rate": {},
+      "ttft_ms": {}
+    },
+    "c1-512": {
+      "arm_peak_mib": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "no vram.csv rows for this arm",
+        "value": null,
+        "wilson": null
+      },
+      "decode_tps": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "only 0 ttft rows at ctx=2048 (need >= 3)",
+        "value": null,
+        "wilson": null
+      },
+      "errors": [],
+      "harness_score": {},
+      "layout_acc": {
+        "screen": {
+          "bootstrap": [
+            0.736111,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 65,
+          "missing": false,
+          "n": 72,
+          "n_expected": 72,
+          "note": null,
+          "value": 0.902778,
+          "wilson": [
+            0.81265,
+            0.952104
+          ]
+        }
+      },
+      "layout_completion_tokens_per_correct": {
+        "screen": 243.230769
+      },
+      "layout_mean_completion_tokens": {
+        "screen": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 72,
+          "n_expected": null,
+          "note": null,
+          "value": 219.583333,
+          "wilson": null
+        }
+      },
+      "layout_p95_wall_ms": {
+        "screen": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 72,
+          "n_expected": null,
+          "note": null,
+          "value": 7500.0,
+          "wilson": null
+        }
+      },
+      "present": true,
+      "suites_completed": [
+        "layout"
+      ],
+      "truncation_rate": {},
+      "ttft_ms": {}
+    },
+    "c2": {
+      "arm_peak_mib": {
+        "bootstrap": null,
+        "complete": true,
+        "extra": {},
+        "k": null,
+        "missing": false,
+        "n": 5,
+        "n_expected": null,
+        "note": null,
+        "value": 7000.0,
+        "wilson": null
+      },
+      "decode_tps": {
+        "bootstrap": null,
+        "complete": true,
+        "extra": {},
+        "k": null,
+        "missing": false,
+        "n": 3,
+        "n_expected": null,
+        "note": null,
+        "value": 40.0,
+        "wilson": null
+      },
+      "errors": [],
+      "harness_score": {
+        "schema_conformance_json_object": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 12,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 1.0,
+          "wilson": [
+            0.757506,
+            1.0
+          ]
+        },
+        "tool_selection": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 8,
+          "missing": false,
+          "n": 8,
+          "n_expected": 8,
+          "note": null,
+          "value": 1.0,
+          "wilson": [
+            0.675592,
+            1.0
+          ]
+        }
+      },
+      "layout_acc": {
+        "screen": {
+          "bootstrap": [
+            0.166667,
+            0.666667
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 30,
+          "missing": false,
+          "n": 72,
+          "n_expected": 72,
+          "note": null,
+          "value": 0.416667,
+          "wilson": [
+            0.309852,
+            0.531923
+          ]
+        }
+      },
+      "layout_completion_tokens_per_correct": {
+        "screen": 527.0
+      },
+      "layout_mean_completion_tokens": {
+        "screen": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 72,
+          "n_expected": null,
+          "note": null,
+          "value": 219.583333,
+          "wilson": null
+        }
+      },
+      "layout_p95_wall_ms": {
+        "screen": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 72,
+          "n_expected": null,
+          "note": null,
+          "value": 7500.0,
+          "wilson": null
+        }
+      },
+      "present": true,
+      "suites_completed": [
+        "ttft",
+        "harness",
+        "layout"
+      ],
+      "truncation_rate": {
+        "schema_conformance_json_object": {
+          "bootstrap": [
+            0.0,
+            0.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 0,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 0.0,
+          "wilson": [
+            0.0,
+            0.242494
+          ]
+        },
+        "tool_selection": {
+          "bootstrap": [
+            0.0,
+            0.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 0,
+          "missing": false,
+          "n": 8,
+          "n_expected": 8,
+          "note": null,
+          "value": 0.0,
+          "wilson": [
+            0.0,
+            0.324408
+          ]
+        }
+      },
+      "ttft_ms": {
+        "2048": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 3,
+          "n_expected": null,
+          "note": null,
+          "value": 111.0,
+          "wilson": null
+        },
+        "4096": {
+          "bootstrap": null,
+          "complete": false,
+          "extra": {},
+          "k": null,
+          "missing": true,
+          "n": null,
+          "n_expected": null,
+          "note": "only 1 ttft rows at ctx=4096 (need >= 3)",
+          "value": null,
+          "wilson": null
+        }
+      }
+    },
+    "c2-think512": {
+      "arm_peak_mib": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "no vram.csv rows for this arm",
+        "value": null,
+        "wilson": null
+      },
+      "decode_tps": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "only 0 ttft rows at ctx=2048 (need >= 3)",
+        "value": null,
+        "wilson": null
+      },
+      "errors": [],
+      "harness_score": {},
+      "layout_acc": {
+        "screen": {
+          "bootstrap": [
+            0.75,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 66,
+          "missing": false,
+          "n": 72,
+          "n_expected": 72,
+          "note": null,
+          "value": 0.916667,
+          "wilson": [
+            0.829876,
+            0.961248
+          ]
+        }
+      },
+      "layout_completion_tokens_per_correct": {
+        "screen": 370.909091
+      },
+      "layout_mean_completion_tokens": {
+        "screen": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 72,
+          "n_expected": null,
+          "note": null,
+          "value": 340.0,
+          "wilson": null
+        }
+      },
+      "layout_p95_wall_ms": {
+        "screen": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 72,
+          "n_expected": null,
+          "note": null,
+          "value": 7500.0,
+          "wilson": null
+        }
+      },
+      "present": true,
+      "suites_completed": [
+        "layout"
+      ],
+      "truncation_rate": {},
+      "ttft_ms": {}
+    },
+    "c3": {
+      "arm_peak_mib": {
+        "bootstrap": null,
+        "complete": true,
+        "extra": {},
+        "k": null,
+        "missing": false,
+        "n": 5,
+        "n_expected": null,
+        "note": null,
+        "value": 8500.0,
+        "wilson": null
+      },
+      "decode_tps": {
+        "bootstrap": null,
+        "complete": true,
+        "extra": {},
+        "k": null,
+        "missing": false,
+        "n": 3,
+        "n_expected": null,
+        "note": null,
+        "value": 44.0,
+        "wilson": null
+      },
+      "errors": [],
+      "harness_score": {
+        "schema_conformance": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 12,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 1.0,
+          "wilson": [
+            0.757506,
+            1.0
+          ]
+        },
+        "schema_conformance_json_object": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 12,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 1.0,
+          "wilson": [
+            0.757506,
+            1.0
+          ]
+        },
+        "tool_selection": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 8,
+          "missing": false,
+          "n": 8,
+          "n_expected": 8,
+          "note": null,
+          "value": 1.0,
+          "wilson": [
+            0.675592,
+            1.0
+          ]
+        }
+      },
+      "layout_acc": {
+        "finalist": {
+          "bootstrap": [
+            0.833333,
+            0.833333
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 180,
+          "missing": false,
+          "n": 216,
+          "n_expected": 216,
+          "note": null,
+          "value": 0.833333,
+          "wilson": [
+            0.777902,
+            0.877116
+          ]
+        },
+        "screen": {
+          "bootstrap": [
+            0.5,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 54,
+          "missing": false,
+          "n": 72,
+          "n_expected": 72,
+          "note": null,
+          "value": 0.75,
+          "wilson": [
+            0.639065,
+            0.835609
+          ]
+        }
+      },
+      "layout_completion_tokens_per_correct": {
+        "finalist": 263.888889,
+        "screen": 292.777778
+      },
+      "layout_mean_completion_tokens": {
+        "finalist": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 216,
+          "n_expected": null,
+          "note": null,
+          "value": 219.907407,
+          "wilson": null
+        },
+        "screen": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 72,
+          "n_expected": null,
+          "note": null,
+          "value": 219.583333,
+          "wilson": null
+        }
+      },
+      "layout_p95_wall_ms": {
+        "finalist": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 216,
+          "n_expected": null,
+          "note": null,
+          "value": 7500.0,
+          "wilson": null
+        },
+        "screen": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 72,
+          "n_expected": null,
+          "note": null,
+          "value": 7500.0,
+          "wilson": null
+        }
+      },
+      "present": true,
+      "suites_completed": [
+        "ttft",
+        "correctness",
+        "harness",
+        "layout"
+      ],
+      "truncation_rate": {
+        "schema_conformance": {
+          "bootstrap": [
+            0.0,
+            0.25
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 1,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 0.083333,
+          "wilson": [
+            0.014865,
+            0.35388
+          ]
+        },
+        "schema_conformance_json_object": {
+          "bootstrap": [
+            0.0,
+            0.416667
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 2,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 0.166667,
+          "wilson": [
+            0.046965,
+            0.448031
+          ]
+        },
+        "tool_selection": {
+          "bootstrap": [
+            0.0,
+            0.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 0,
+          "missing": false,
+          "n": 8,
+          "n_expected": 8,
+          "note": null,
+          "value": 0.0,
+          "wilson": [
+            0.0,
+            0.324408
+          ]
+        }
+      },
+      "ttft_ms": {
+        "2048": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 3,
+          "n_expected": null,
+          "note": null,
+          "value": 111.0,
+          "wilson": null
+        },
+        "4096": {
+          "bootstrap": null,
+          "complete": false,
+          "extra": {},
+          "k": null,
+          "missing": true,
+          "n": null,
+          "n_expected": null,
+          "note": "only 1 ttft rows at ctx=4096 (need >= 3)",
+          "value": null,
+          "wilson": null
+        }
+      }
+    },
+    "c3-think512": {
+      "present": false
+    },
+    "c4": {
+      "present": false
+    },
+    "c4-think512": {
+      "present": false
+    }
+  },
+  "coverage": {
+    "a1": {
+      "errors": [],
+      "harness": {
+        "schema_conformance": {
+          "complete": true,
+          "n": 12,
+          "n_expected": 12
+        }
+      },
+      "layout": {},
+      "present": true,
+      "suites_completed": [
+        "correctness",
+        "harness"
+      ]
+    },
+    "a2": {
+      "errors": [],
+      "harness": {
+        "schema_conformance": {
+          "complete": true,
+          "n": 12,
+          "n_expected": 12
+        }
+      },
+      "layout": {},
+      "present": true,
+      "suites_completed": [
+        "correctness",
+        "harness"
+      ]
+    },
+    "a3": {
+      "errors": [],
+      "harness": {
+        "schema_conformance": {
+          "complete": true,
+          "n": 12,
+          "n_expected": 12
+        }
+      },
+      "layout": {},
+      "present": true,
+      "suites_completed": [
+        "correctness",
+        "harness"
+      ]
+    },
+    "a4": {
+      "present": false
+    },
+    "c0": {
+      "errors": [],
+      "harness": {
+        "schema_conformance": {
+          "complete": true,
+          "n": 12,
+          "n_expected": 12
+        }
+      },
+      "layout": {},
+      "present": true,
+      "suites_completed": [
+        "correctness",
+        "harness"
+      ]
+    },
+    "c0-old": {
+      "errors": [],
+      "harness": {
+        "schema_conformance": {
+          "complete": true,
+          "n": 12,
+          "n_expected": 12
+        }
+      },
+      "layout": {},
+      "present": true,
+      "suites_completed": [
+        "harness"
+      ]
+    },
+    "c0-prod": {
+      "errors": [],
+      "harness": {
+        "schema_conformance_json_object": {
+          "complete": true,
+          "n": 12,
+          "n_expected": 12
+        },
+        "tool_selection": {
+          "complete": true,
+          "n": 8,
+          "n_expected": 8
+        }
+      },
+      "layout": {},
+      "present": true,
+      "suites_completed": [
+        "harness"
+      ]
+    },
+    "c1-256": {
+      "errors": [],
+      "harness": {},
+      "layout": {
+        "screen": {
+          "complete": false,
+          "n": 40,
+          "n_expected": 72
+        }
+      },
+      "present": true,
+      "suites_completed": [
+        "layout"
+      ]
+    },
+    "c1-512": {
+      "errors": [],
+      "harness": {},
+      "layout": {
+        "screen": {
+          "complete": true,
+          "n": 72,
+          "n_expected": 72
+        }
+      },
+      "present": true,
+      "suites_completed": [
+        "layout"
+      ]
+    },
+    "c2": {
+      "errors": [],
+      "harness": {
+        "schema_conformance_json_object": {
+          "complete": true,
+          "n": 12,
+          "n_expected": 12
+        },
+        "tool_selection": {
+          "complete": true,
+          "n": 8,
+          "n_expected": 8
+        }
+      },
+      "layout": {
+        "screen": {
+          "complete": true,
+          "n": 72,
+          "n_expected": 72
+        }
+      },
+      "present": true,
+      "suites_completed": [
+        "ttft",
+        "harness",
+        "layout"
+      ]
+    },
+    "c2-think512": {
+      "errors": [],
+      "harness": {},
+      "layout": {
+        "screen": {
+          "complete": true,
+          "n": 72,
+          "n_expected": 72
+        }
+      },
+      "present": true,
+      "suites_completed": [
+        "layout"
+      ]
+    },
+    "c3": {
+      "errors": [],
+      "harness": {
+        "schema_conformance": {
+          "complete": true,
+          "n": 12,
+          "n_expected": 12
+        },
+        "schema_conformance_json_object": {
+          "complete": true,
+          "n": 12,
+          "n_expected": 12
+        },
+        "tool_selection": {
+          "complete": true,
+          "n": 8,
+          "n_expected": 8
+        }
+      },
+      "layout": {
+        "finalist": {
+          "complete": true,
+          "n": 216,
+          "n_expected": 216
+        },
+        "screen": {
+          "complete": true,
+          "n": 72,
+          "n_expected": 72
+        }
+      },
+      "present": true,
+      "suites_completed": [
+        "ttft",
+        "correctness",
+        "harness",
+        "layout"
+      ]
+    },
+    "c3-think512": {
+      "present": false
+    },
+    "c4": {
+      "present": false
+    },
+    "c4-think512": {
+      "present": false
+    }
+  },
+  "decision_rules_sha256": "0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce",
+  "decision_rules_sha256_warnings": [
+    "arm 'c1-256' meta.decision_rules_sha256='deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' differs from the analysed decision_rules.json='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce'"
+  ],
+  "finalist_candidates": [
+    "c2-think512",
+    "c3"
+  ],
+  "missing_inputs": [
+    "R2/switch_to_c4/D: no ttft.jsonl for this arm",
+    "R2/switch_to_c4/F: missing inputs: ['arm_peak_mib(c4)']",
+    "R2/switch_to_c4/L: insufficient data to evaluate L on either branch",
+    "R2/switch_to_c4/P: no layout_p95_wall_ms available on the arm used for P",
+    "R2/switch_to_c4/S1: no usable harness_score for c4/schema_conformance_json_object",
+    "R2/switch_to_c4/S2: no usable harness_score for c4/tool_selection",
+    "R6/tuning_gate_a2/manual_clean: session/manual.json has no entry for 'a2'"
+  ],
+  "rules": [
+    {
+      "clauses": [
+        {
+          "arm": "c1-512",
+          "extra": {
+            "pass_used": "screen"
+          },
+          "id": "layout_acc_c1_512",
+          "margin": "within-noise",
+          "metric": "layout_acc",
+          "note": null,
+          "op": ">=",
+          "threshold": 0.85,
+          "value": 0.902778,
+          "verdict": "pass"
+        }
+      ],
+      "id": "R1",
+      "info": {
+        "c1_256_layout_acc": {
+          "complete": false,
+          "n": 40,
+          "n_expected": 72,
+          "pass_used": "screen",
+          "value": 0.625
+        }
+      },
+      "kind": "gate",
+      "label": "keep_e4b_budget",
+      "question": "Does Gemma 4 E4B with a thinking budget clear the layout accuracy bar?",
+      "verdict": "pass"
+    },
+    {
+      "clauses": [
+        {
+          "arm": "c2-think512",
+          "extra": {
+            "branch": "on",
+            "mean_completion_tokens": 340.0,
+            "mean_completion_tokens_threshold": 400,
+            "pass_used": "screen"
+          },
+          "id": "L",
+          "margin": "within-noise",
+          "metric": "layout_acc",
+          "note": null,
+          "op": ">=",
+          "threshold": 0.89,
+          "value": 0.916667,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c2",
+          "extra": {},
+          "id": "S1",
+          "margin": "clear",
+          "metric": "harness_score",
+          "note": null,
+          "op": ">=",
+          "threshold": 0.835,
+          "value": 1.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c2",
+          "extra": {},
+          "id": "S2",
+          "margin": "clear",
+          "metric": "harness_score",
+          "note": null,
+          "op": ">=",
+          "threshold": 0.875,
+          "value": 1.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c2",
+          "extra": {},
+          "id": "D",
+          "margin": "n/a",
+          "metric": "decode_tps",
+          "note": null,
+          "op": ">=",
+          "threshold": 35.0,
+          "value": 40.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c2-think512",
+          "extra": {
+            "pass_used": "screen"
+          },
+          "id": "P",
+          "margin": "n/a",
+          "metric": "layout_p95_wall_ms",
+          "note": null,
+          "op": "<=",
+          "threshold": 15000,
+          "value": 7500.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c2",
+          "extra": {
+            "margin_mib": 512,
+            "total_mib": 12288.0,
+            "voice_vram_lower_mib": 2500.0,
+            "voice_vram_upper_mib": 3700.0
+          },
+          "id": "F",
+          "margin": "n/a",
+          "metric": "arm_peak_mib",
+          "note": null,
+          "op": "<=",
+          "threshold": 12288.0,
+          "value": 7000.0,
+          "verdict": "pass"
+        }
+      ],
+      "id": "R2",
+      "info": {
+        "candidate": "c2",
+        "thinking_candidate": "c2-think512"
+      },
+      "kind": "gate",
+      "label": "switch_to_c2",
+      "question": "Should MIST switch from Gemma 4 E4B to c2?",
+      "verdict": "pass"
+    },
+    {
+      "clauses": [
+        {
+          "arm": "c3",
+          "extra": {
+            "branch": "off",
+            "pass_used": "finalist"
+          },
+          "id": "L",
+          "margin": "clear",
+          "metric": "layout_acc",
+          "note": null,
+          "op": ">=",
+          "threshold": 0.75,
+          "value": 0.833333,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c3",
+          "extra": {},
+          "id": "S1",
+          "margin": "clear",
+          "metric": "harness_score",
+          "note": null,
+          "op": ">=",
+          "threshold": 0.835,
+          "value": 1.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c3",
+          "extra": {},
+          "id": "S2",
+          "margin": "clear",
+          "metric": "harness_score",
+          "note": null,
+          "op": ">=",
+          "threshold": 0.875,
+          "value": 1.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c3",
+          "extra": {},
+          "id": "D",
+          "margin": "n/a",
+          "metric": "decode_tps",
+          "note": null,
+          "op": ">=",
+          "threshold": 35.0,
+          "value": 44.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c3",
+          "extra": {
+            "pass_used": "finalist"
+          },
+          "id": "P",
+          "margin": "n/a",
+          "metric": "layout_p95_wall_ms",
+          "note": null,
+          "op": "<=",
+          "threshold": 15000,
+          "value": 7500.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c3",
+          "extra": {
+            "margin_mib": 512,
+            "total_mib": 12288.0,
+            "voice_vram_lower_mib": 2500.0,
+            "voice_vram_upper_mib": 3700.0
+          },
+          "id": "F",
+          "margin": "n/a",
+          "metric": "arm_peak_mib",
+          "note": null,
+          "op": "<=",
+          "threshold": 12288.0,
+          "value": 8500.0,
+          "verdict": "needs-review"
+        }
+      ],
+      "id": "R2",
+      "info": {
+        "candidate": "c3",
+        "thinking_candidate": "c3-think512"
+      },
+      "kind": "gate",
+      "label": "switch_to_c3",
+      "question": "Should MIST switch from Gemma 4 E4B to c3?",
+      "verdict": "needs-review"
+    },
+    {
+      "clauses": [
+        {
+          "arm": "c4",
+          "extra": {
+            "branch": null
+          },
+          "id": "L",
+          "margin": "n/a",
+          "metric": "layout_acc",
+          "note": "insufficient data to evaluate L on either branch",
+          "op": ">=",
+          "threshold": 0.75,
+          "value": null,
+          "verdict": "missing"
+        },
+        {
+          "arm": "c4",
+          "extra": {},
+          "id": "S1",
+          "margin": "n/a",
+          "metric": "harness_score",
+          "note": "no usable harness_score for c4/schema_conformance_json_object",
+          "op": ">=",
+          "threshold": 0.835,
+          "value": null,
+          "verdict": "missing"
+        },
+        {
+          "arm": "c4",
+          "extra": {},
+          "id": "S2",
+          "margin": "n/a",
+          "metric": "harness_score",
+          "note": "no usable harness_score for c4/tool_selection",
+          "op": ">=",
+          "threshold": 0.875,
+          "value": null,
+          "verdict": "missing"
+        },
+        {
+          "arm": "c4",
+          "extra": {},
+          "id": "D",
+          "margin": "n/a",
+          "metric": "decode_tps",
+          "note": "no ttft.jsonl for this arm",
+          "op": ">=",
+          "threshold": 35.0,
+          "value": null,
+          "verdict": "missing"
+        },
+        {
+          "arm": "c4",
+          "extra": {},
+          "id": "P",
+          "margin": "n/a",
+          "metric": "layout_p95_wall_ms",
+          "note": "no layout_p95_wall_ms available on the arm used for P",
+          "op": "<=",
+          "threshold": 15000,
+          "value": null,
+          "verdict": "missing"
+        },
+        {
+          "arm": "c4",
+          "extra": {},
+          "id": "F",
+          "margin": "n/a",
+          "metric": "arm_peak_mib",
+          "note": "missing inputs: ['arm_peak_mib(c4)']",
+          "op": null,
+          "threshold": null,
+          "value": null,
+          "verdict": "missing"
+        }
+      ],
+      "id": "R2",
+      "info": {
+        "candidate": "c4",
+        "thinking_candidate": "c4-think512"
+      },
+      "kind": "gate",
+      "label": "switch_to_c4",
+      "question": "Should MIST switch from Gemma 4 E4B to c4?",
+      "verdict": "missing"
+    },
+    {
+      "clauses": [
+        {
+          "arm": "c3",
+          "extra": {},
+          "id": "truncation_json_object",
+          "margin": "within-noise",
+          "metric": "truncation_rate",
+          "note": null,
+          "op": ">",
+          "threshold": 0.1,
+          "value": 0.166667,
+          "verdict": "triggered"
+        }
+      ],
+      "id": "R3",
+      "info": {
+        "truncation_grammar_schema_conformance": {
+          "complete": true,
+          "n": 12,
+          "n_expected": 12,
+          "value": 0.083333
+        }
+      },
+      "kind": "trigger",
+      "label": "drop_moe",
+      "question": "Is c3's MoE output truncated often enough to drop the MoE candidates?",
+      "verdict": "triggered"
+    },
+    {
+      "clauses": [
+        {
+          "arm": "c2",
+          "extra": {
+            "pass_used": "screen"
+          },
+          "id": "layout_acc_c2_off",
+          "margin": "within-noise",
+          "metric": "layout_acc",
+          "note": null,
+          "op": "<",
+          "threshold": 0.6,
+          "value": 0.416667,
+          "verdict": "triggered"
+        }
+      ],
+      "id": "R4",
+      "info": {},
+      "kind": "trigger",
+      "label": "thinking_is_lever",
+      "question": "Is thinking mode a large enough lever on layout accuracy at c2 to be load-bearing?",
+      "verdict": "triggered"
+    },
+    {
+      "clauses": [
+        {
+          "arm": null,
+          "extra": {
+            "matching_r2_candidates": [
+              "c3"
+            ],
+            "voice_vram_upper_mib": 3700.0
+          },
+          "id": "voice_vram_lower_bound",
+          "margin": "n/a",
+          "metric": "voice_vram_lower_mib",
+          "note": null,
+          "op": ">=",
+          "threshold": 2048,
+          "value": 2500.0,
+          "verdict": "triggered"
+        }
+      ],
+      "id": "R5",
+      "info": {},
+      "kind": "trigger",
+      "label": "gtx1070_moves_up",
+      "question": "Does the voice VRAM footprint justify moving the GTX 1070 up in priority?",
+      "verdict": "triggered"
+    },
+    {
+      "clauses": [
+        {
+          "arm": null,
+          "extra": {},
+          "id": "base_determinism",
+          "margin": "n/a",
+          "metric": "correctness_tokens",
+          "note": "base c0 r1 vs r2: identical for all 5 prompts",
+          "op": null,
+          "threshold": null,
+          "value": null,
+          "verdict": "pass"
+        },
+        {
+          "arm": null,
+          "extra": {},
+          "id": "tuned_matches_base",
+          "margin": "n/a",
+          "metric": "correctness_tokens",
+          "note": "a1 r1 vs base c0 r1: identical for all 5 prompts",
+          "op": null,
+          "threshold": null,
+          "value": null,
+          "verdict": "pass"
+        },
+        {
+          "arm": "a1",
+          "extra": {
+            "base_arm": "c0",
+            "base_ci": [
+              1.0,
+              1.0
+            ]
+          },
+          "id": "harness_ci_containment",
+          "margin": "n/a",
+          "metric": "harness_score",
+          "note": null,
+          "op": null,
+          "threshold": null,
+          "value": 1.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "a1",
+          "extra": {
+            "memtest_errors": 0,
+            "whea_events": 0
+          },
+          "id": "manual_clean",
+          "margin": "n/a",
+          "metric": "manual",
+          "note": null,
+          "op": "==",
+          "threshold": 0,
+          "value": 0,
+          "verdict": "pass"
+        }
+      ],
+      "id": "R6",
+      "info": {
+        "arm": "a1",
+        "base": "c0"
+      },
+      "kind": "gate",
+      "label": "tuning_gate_a1",
+      "question": "Does GPU tuning arm a1 (base c0) preserve correctness and stability?",
+      "verdict": "pass"
+    },
+    {
+      "clauses": [
+        {
+          "arm": null,
+          "extra": {},
+          "id": "base_determinism",
+          "margin": "n/a",
+          "metric": "correctness_tokens",
+          "note": "base c0 r1 vs r2: identical for all 5 prompts",
+          "op": null,
+          "threshold": null,
+          "value": null,
+          "verdict": "pass"
+        },
+        {
+          "arm": null,
+          "extra": {},
+          "id": "tuned_matches_base",
+          "margin": "n/a",
+          "metric": "correctness_tokens",
+          "note": "a2 r1 vs base c0 r1: identical for all 5 prompts",
+          "op": null,
+          "threshold": null,
+          "value": null,
+          "verdict": "pass"
+        },
+        {
+          "arm": "a2",
+          "extra": {
+            "base_arm": "c0",
+            "base_ci": [
+              1.0,
+              1.0
+            ]
+          },
+          "id": "harness_ci_containment",
+          "margin": "n/a",
+          "metric": "harness_score",
+          "note": null,
+          "op": null,
+          "threshold": null,
+          "value": 1.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "a2",
+          "extra": {},
+          "id": "manual_clean",
+          "margin": "n/a",
+          "metric": "manual",
+          "note": "session/manual.json has no entry for 'a2'",
+          "op": "==",
+          "threshold": 0,
+          "value": null,
+          "verdict": "missing"
+        }
+      ],
+      "id": "R6",
+      "info": {
+        "arm": "a2",
+        "base": "c0"
+      },
+      "kind": "gate",
+      "label": "tuning_gate_a2",
+      "question": "Does GPU tuning arm a2 (base c0) preserve correctness and stability?",
+      "verdict": "missing"
+    },
+    {
+      "clauses": [
+        {
+          "arm": null,
+          "extra": {},
+          "id": "base_determinism",
+          "margin": "n/a",
+          "metric": "correctness_tokens",
+          "note": "base c3 r1 vs r2: identical for all 5 prompts",
+          "op": null,
+          "threshold": null,
+          "value": null,
+          "verdict": "pass"
+        },
+        {
+          "arm": null,
+          "extra": {},
+          "id": "tuned_matches_base",
+          "margin": "n/a",
+          "metric": "correctness_tokens",
+          "note": "a3 r1 vs base c3 r1: token mismatch on ['p03']",
+          "op": null,
+          "threshold": null,
+          "value": null,
+          "verdict": "fail"
+        },
+        {
+          "arm": "a3",
+          "extra": {
+            "base_arm": "c3",
+            "base_ci": [
+              1.0,
+              1.0
+            ]
+          },
+          "id": "harness_ci_containment",
+          "margin": "n/a",
+          "metric": "harness_score",
+          "note": null,
+          "op": null,
+          "threshold": null,
+          "value": 1.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "a3",
+          "extra": {
+            "memtest_errors": 0,
+            "whea_events": 0
+          },
+          "id": "manual_clean",
+          "margin": "n/a",
+          "metric": "manual",
+          "note": null,
+          "op": "==",
+          "threshold": 0,
+          "value": 0,
+          "verdict": "pass"
+        }
+      ],
+      "id": "R6",
+      "info": {
+        "arm": "a3",
+        "base": "c3"
+      },
+      "kind": "gate",
+      "label": "tuning_gate_a3",
+      "question": "Does GPU tuning arm a3 (base c3) preserve correctness and stability?",
+      "verdict": "fail"
+    },
+    {
+      "clauses": [],
+      "id": "R7",
+      "info": {
+        "deltas": {
+          "decode_tps": {
+            "missing": true
+          },
+          "harness_score_schema_conformance": {
+            "delta": 0.0,
+            "new": 1.0,
+            "old": 1.0
+          },
+          "harness_score_schema_conformance_json_object": {
+            "missing": true
+          },
+          "harness_score_tool_selection": {
+            "missing": true
+          },
+          "layout_acc": {
+            "missing": true
+          }
+        },
+        "new_arm": "c0",
+        "old_arm": "c0-old"
+      },
+      "kind": "informational",
+      "label": "build_effect",
+      "question": "What did the pinned build change (c0 vs c0-old)?",
+      "verdict": "n/a"
+    }
+  ],
+  "schema": 1,
+  "session": {
+    "total_mib": 12288.0,
+    "voice_vram_lower_mib": {
+      "bootstrap": null,
+      "complete": true,
+      "extra": {},
+      "k": null,
+      "missing": false,
+      "n": null,
+      "n_expected": null,
+      "note": null,
+      "value": 2500.0,
+      "wilson": null
+    },
+    "voice_vram_upper_mib": {
+      "bootstrap": null,
+      "complete": true,
+      "extra": {},
+      "k": null,
+      "missing": false,
+      "n": null,
+      "n_expected": null,
+      "note": null,
+      "value": 3700.0,
+      "wilson": null
+    }
+  }
+}
