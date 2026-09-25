@@ -331,6 +331,91 @@ logic via module-level helpers (`_l_clause`, `_anchored_harness_clause`) that ar
 duplicated rather than shared by refactoring `evaluate_r2` itself, so no exploratory-rule change can
 ever alter a v1 R2 verdict.
 
+### Plan v3 / T5 (2026-09-25): c1-2048, c5 (Qwen3.5), c6 (E4B Q8_0), c3 lower quants
+
+Per plan v3's delta (`2026-09-25-mist-model-bench-plan-v3-delta.md`), T5 adds these arms
+additively -- no existing arm, `common_args`, `sampling`, `thinking_args` or
+`decision_rules.json` changes; every base-commit (`61f4822`) arm still resolves
+byte-for-byte identically (`test_t5_arms_additive_only.py`,
+`test_t5_models_yaml_additive_only.py`).
+
+- **`c1-2048`** (`base: c0`, thinking on, budget 2048) -- a fourth E4B thinking-budget
+  point alongside the existing 256/512/1024. Runs `layout` and `ttft` (like c1-1024,
+  not the layout-only c1-256/c1-512); `tokens_vs_c0: differs-by-design` -- a
+  thinking-budget change is expected to change completion tokens by construction.
+  **`c1-unbudgeted` (budget -1, "unrestricted" per
+  `llama_server_help_b11151.txt:644`) is NOT shipped.** `--reasoning-budget -1` puts a
+  bare `-1` argv token next to the flag, which trips
+  `scripts/model_bench/probes/help_flags.py`'s `unknown_flags()`: its own docstring
+  states the invariant it relies on -- "llama-server's built argv -- never places a
+  bare `-`-prefixed value next to a flag, so this is unambiguous here" -- and this is
+  the first arm to break it, so `-1` is misread as an unknown flag by both
+  `test_every_pinned_build_arm_flag_is_found_in_the_real_capture` and
+  `test_check_all_arm_flags_passes_on_the_real_capture` (existing tests, not new
+  ones). Fixing the checker (e.g. tracking which argv positions are a flag's value
+  rather than classifying every `-`-prefixed token) means editing
+  `scripts/model_bench/probes/help_flags.py`, outside this task's write zone (arms.json,
+  this README, models.yaml, tests). Reported blocked rather than worked around; a
+  follow-up task can add `c1-unbudgeted` once the checker handles a negative-number
+  flag value.
+- **`c5`** -- Qwen3.5-9B Q8_0 (`unsloth/Qwen3.5-9B-Q8_0.gguf`), full card: no `-ncmoe`,
+  32768 ctx like the other arms, thinking off, family `qwen` (the existing qwen
+  sampling). `tokens_vs_c0: differs-by-design` -- a different model entirely, not a
+  variant of c0. Suites `ttft`/`correctness`/`harness` (`bench-c5`, `default` tests, 10
+  iterations)/`layout`. **`c5-think1024`** (`base: c5`, thinking on, budget 1024,
+  `layout` suite only) carries no `tokens_vs_c0` label, matching the existing
+  thinking-budget siblings (c1-256/c1-512/c2-think512/c3-think512/c4-think512), none of
+  which carry one either.
+- **`c6`** -- `base: c0` with only `gguf` overridden to
+  `unsloth/gemma-4-E4B-it-Q8_0.gguf` (same publisher as c0's Q5_K_M); everything else
+  (suites, sampling, thinking) is inherited unchanged. `tokens_vs_c0: may-differ` -- a
+  different quant of the same model, the same label c0-ctx128k-q4kv uses for a
+  compute-path change. `bench-c6` mirrors `bench-c0` except for the `gguf`.
+- **`c3-q3`** and **`c3-iq4`** -- `base: c3` with only `gguf` overridden, to
+  `unsloth/gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf` and
+  `unsloth/gemma-4-26B-A4B-it-UD-IQ4_XS.gguf` respectively (both already on disk).
+  Base inheritance overriding only `gguf` (confirmed here, not assumed, by reading
+  `resolve_arm`: the `for key, value in raw.items(): merged[key] = value` loop replaces
+  a single key in the inherited dict, so a child naming only `gguf` leaves every other
+  inherited field -- including `params_required`, `param_arg_map`, `extra_args`,
+  `arg_overrides`, `stop_neo4j` -- exactly as `c3` resolved them; no `bench_host.py`
+  change was needed). `ncmoe` stays REQUIRED (`test_required_param_refusal`,
+  `REQUIRED_PARAM_ARMS`), `-lm none` and `-b/-ub 2048` stay in place, same suites as c3.
+  `bench-c3-q3`/`bench-c3-iq4` mirror `bench-c3` except for the `gguf`. `tokens_vs_c0:
+  differs-by-design` -- a materially lower quant than c3's Q4_K_XL.
+
+**Qwen3.5 thinking flags: UNVERIFIED.** `-rea on|off|auto` and `--reasoning-budget N`
+exist on the pinned b11151 build (`llama_server_help_b11151.txt:636,644`), and c5/c5-
+think1024 pass them exactly as c0/c1-* do. Whether Qwen3.5's bundled chat template
+actually honours them cannot be checked without running the real server -- no live
+b11151 llama-server has been started from this worker's container (no docker, no GPU,
+no network; see "Fixtures are hand-built, not recorded" below). No chat-template
+override is added here: nothing in the files available to this worker (arms.json,
+this README, the help capture) says Qwen3.5's GGUF-bundled template needs one, and the
+brief is explicit that a chat-template override needs a citable reason, not a guess.
+
+**One-request check for the lead to run at first serve** (`c5`, `-rea on` vs `-rea
+off`): `POST /v1/chat/completions` with a short prompt (e.g. `{"messages": [{"role":
+"user", "content": "What is 2+2?"}], "max_tokens": 64}`) against the served `c5`
+container, once with `-rea off` and once with `-rea on` (`--param` not needed --
+`thinking.mode` is set per-arm in arms.json, so this is two separate `serve` calls, one
+per arm variant, or a manual flag edit for a quick check). Confirm the response's
+`choices[0].message.reasoning_content` is empty or absent under `-rea off` and
+non-empty under `-rea on`. If it is empty under both, the bundled template is not
+honouring `-rea`/`--reasoning-budget` for this model, and `c5-think1024`'s results
+should be read as no-op runs rather than budgeted-thinking ones.
+
+### Leaving room for scan picks
+
+Every T5 arm above follows the same two patterns already used by c1-*/c2-think512/c3-
+think512/c4-think512 (a `base` arm with one or two keys overridden) and by c0/c2/c3/c4
+(a full root arm with its own `gguf`/`image`/`family`/`thinking`/`suites`/`harness`).
+Adding one or two more scan-picked models later is the same shape: a new root arm
+(`gguf`, `image: "compose:mist-llm"`, `family`, `thinking`, `suites`, a `harness`
+block naming a new `bench-cN` candidate in `models.yaml`) plus, optionally, a
+`base`-inheriting thinking-budget or lower-quant sibling. No `bench_host.py` change is
+needed for either shape.
+
 ## Fixtures are hand-built, not recorded
 
 `tests/unit/model_bench/fixtures/host/` (`sse_stream.txt`, `nvidia_smi_sample.csv`,

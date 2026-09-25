@@ -301,3 +301,46 @@ def test_bench_candidates_load_with_specified_fields_and_primary_tier_unchanged(
         "qwen-2.5-14b-q5km",
     }
     assert all(c.tier == "primary" for c in primary_selection)
+
+
+def test_t5_bench_candidates_load_with_specified_fields_and_primary_tier_unchanged():
+    # T5 (plan v3): bench-c5, bench-c6, bench-c3-q3, bench-c3-iq4.
+    defaults, candidates = run.load_models_config(run.DEFAULT_CONFIG_PATH)
+    by_id = {c.id: c for c in candidates}
+
+    bench_ids = ["bench-c5", "bench-c6", "bench-c3-q3", "bench-c3-iq4"]
+    for candidate_id in bench_ids:
+        assert candidate_id in by_id, f"{candidate_id} missing from models.yaml"
+        assert by_id[candidate_id].tier == "bench"
+
+    expected_gguf = {
+        "bench-c5": "unsloth/Qwen3.5-9B-Q8_0.gguf",
+        "bench-c6": "unsloth/gemma-4-E4B-it-Q8_0.gguf",
+        "bench-c3-q3": "unsloth/gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf",
+        "bench-c3-iq4": "unsloth/gemma-4-26B-A4B-it-UD-IQ4_XS.gguf",
+    }
+    for candidate_id, gguf in expected_gguf.items():
+        assert by_id[candidate_id].gguf == gguf
+
+    # bench-c5: qwen non-thinking sampling, same profile as bench-c4.
+    c5 = by_id["bench-c5"]
+    assert c5.temperature == {"extraction": 0.7, "conversation": 0.7}
+    assert c5.top_p == {"extraction": 0.8, "conversation": 0.8}
+
+    # bench-c6, bench-c3-q3, bench-c3-iq4: gemma family sampling, same
+    # profile as bench-c0/bench-c3.
+    for candidate_id in ("bench-c6", "bench-c3-q3", "bench-c3-iq4"):
+        candidate = by_id[candidate_id]
+        assert candidate.temperature == {"extraction": 1.0, "conversation": 1.0}
+        assert candidate.top_p == {"extraction": 0.95, "conversation": 0.95}
+
+    # qwen-3.5-9b-q8 (the existing primary candidate bench-c5 shares a gguf
+    # with) is untouched, and primary-tier selection is still unchanged.
+    primary_selection = run.resolve_candidate_selection("", candidates)
+    assert {c.id for c in primary_selection} == {
+        "gemma-4-26b-a4b-iq4xs",
+        "qwen-3.5-9b-q8",
+        "gemma-3-12b-q5km",
+        "qwen-2.5-14b-q5km",
+    }
+    assert all(c.tier == "primary" for c in primary_selection)

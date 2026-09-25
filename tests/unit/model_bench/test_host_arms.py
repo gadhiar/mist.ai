@@ -34,7 +34,7 @@ ARMS_DOC = load_arms_doc()
 
 ALL_ARM_IDS = list(ARMS_DOC["arms"])
 
-REQUIRED_PARAM_ARMS = {"c3", "c3-think512", "c4", "c4-think512"}
+REQUIRED_PARAM_ARMS = {"c3", "c3-think512", "c4", "c4-think512", "c3-q3", "c3-iq4"}
 
 
 def test_all_arms_resolve():
@@ -324,3 +324,104 @@ def test_unknown_tokens_vs_c0_raises():
     }
     with pytest.raises(ArmConfigError):
         resolve_arm(doc, "bad")
+
+
+# --- T5 (plan v3, 2026-09-25): c1-2048/c1-unbudgeted, c5/c5-think1024, c6, -----
+# --- c3-q3/c3-iq4 ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "arm_id,expected_budget",
+    [("c1-2048", 2048)],
+)
+def test_c1_2048_thinking_budget_and_suites(arm_id, expected_budget):
+    arm = resolve_arm(ARMS_DOC, arm_id)
+    assert arm["thinking"] == {"mode": "on", "budget": expected_budget}
+    assert arm["suites"] == ["layout", "ttft"]
+    assert arm["harness"] is None
+    assert arm["tokens_vs_c0"] == "differs-by-design"
+    args = build_server_args(ARMS_DOC, arm, {})
+    idx = args.index("--reasoning-budget")
+    assert args[idx + 1] == str(expected_budget)
+    assert args.count("--reasoning-budget") == 1
+    assert args.count("-rea") == 1
+
+
+def test_c6_is_c0_with_only_gguf_and_harness_overridden():
+    base = resolve_arm(ARMS_DOC, "c0")
+    c6 = resolve_arm(ARMS_DOC, "c6")
+    assert c6["gguf"] == "unsloth/gemma-4-E4B-it-Q8_0.gguf"
+    assert c6["gguf"] != base["gguf"]
+    assert c6["image"] == base["image"]
+    assert c6["family"] == base["family"]
+    assert c6["thinking"] == base["thinking"]
+    assert c6["suites"] == base["suites"]
+    assert c6["harness"] == {"candidate": "bench-c6", "tests": "default", "iterations": 10}
+    assert c6["tokens_vs_c0"] == "may-differ"
+    args = build_server_args(ARMS_DOC, c6, {})
+    assert "-rea" in args and args[args.index("-rea") + 1] == "off"
+
+
+def test_c5_full_card_thinking_off_family_qwen():
+    arm = resolve_arm(ARMS_DOC, "c5")
+    assert arm["gguf"] == "unsloth/Qwen3.5-9B-Q8_0.gguf"
+    assert arm["family"] == "qwen"
+    assert arm["thinking"] == {"mode": "off"}
+    assert arm["suites"] == ["ttft", "correctness", "harness", "layout"]
+    assert arm["harness"] == {"candidate": "bench-c5", "tests": "default", "iterations": 10}
+    assert arm["params_required"] == []
+    assert arm["tokens_vs_c0"] == "differs-by-design"
+    args = build_server_args(ARMS_DOC, arm, {})
+    assert "-ncmoe" not in args
+    assert args.count("--ctx-size") == 1
+    assert args[args.index("--ctx-size") + 1] == "32768"
+    assert "-rea" in args and args[args.index("-rea") + 1] == "off"
+    # Qwen sampling, not gemma's.
+    assert "--presence-penalty" in args
+    assert args[args.index("--top-k") + 1] == "20"
+
+
+def test_c5_think1024_inherits_c5_and_sets_budget():
+    base = resolve_arm(ARMS_DOC, "c5")
+    arm = resolve_arm(ARMS_DOC, "c5-think1024")
+    assert arm["gguf"] == base["gguf"]
+    assert arm["family"] == base["family"]
+    assert arm["thinking"] == {"mode": "on", "budget": 1024}
+    assert arm["suites"] == ["layout"]
+    assert arm["harness"] is None
+    args = build_server_args(ARMS_DOC, arm, {})
+    idx = args.index("--reasoning-budget")
+    assert args[idx + 1] == "1024"
+
+
+@pytest.mark.parametrize(
+    "arm_id,expected_gguf,expected_candidate",
+    [
+        ("c3-q3", "unsloth/gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf", "bench-c3-q3"),
+        ("c3-iq4", "unsloth/gemma-4-26B-A4B-it-UD-IQ4_XS.gguf", "bench-c3-iq4"),
+    ],
+)
+def test_c3_lower_quants_override_only_gguf_and_harness(arm_id, expected_gguf, expected_candidate):
+    base = resolve_arm(ARMS_DOC, "c3")
+    arm = resolve_arm(ARMS_DOC, arm_id)
+    assert arm["gguf"] == expected_gguf
+    assert arm["gguf"] != base["gguf"]
+    assert arm["image"] == base["image"]
+    assert arm["family"] == base["family"]
+    assert arm["suites"] == base["suites"]
+    assert arm["params_required"] == ["ncmoe"]
+    assert arm["param_arg_map"] == {"ncmoe": "-ncmoe"}
+    assert arm["stop_neo4j"] is True
+    assert arm["harness"] == {"candidate": expected_candidate, "tests": "default", "iterations": 10}
+    assert arm["tokens_vs_c0"] == "differs-by-design"
+
+    with pytest.raises(MissingParamError):
+        build_server_args(ARMS_DOC, arm, {})
+
+    args = build_server_args(ARMS_DOC, arm, {"ncmoe": "12"})
+    idx = args.index("-ncmoe")
+    assert args[idx + 1] == "12"
+    assert "--no-mmap" not in args
+    assert args[args.index("-lm") + 1] == "none"
+    assert args.count("-b") == 1 and args[args.index("-b") + 1] == "2048"
+    assert args.count("-ub") == 1 and args[args.index("-ub") + 1] == "2048"
