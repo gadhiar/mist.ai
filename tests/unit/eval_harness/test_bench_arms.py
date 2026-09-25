@@ -18,6 +18,7 @@ Three things this file proves, matching the mist-model-bench T2 acceptance crite
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -26,6 +27,8 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+import pytest  # noqa: E402
 
 from scripts.eval_harness import run  # noqa: E402
 
@@ -344,3 +347,103 @@ def test_t5_bench_candidates_load_with_specified_fields_and_primary_tier_unchang
         "qwen-2.5-14b-q5km",
     }
     assert all(c.tier == "primary" for c in primary_selection)
+
+
+# ---------------------------------------------------------------------------
+# T7 (plan v3 scan): bench-c7 (Granite 4.2 8B), bench-c8 (Spark-X2.5-4B),
+# bench-c9 (gpt-oss-20b)
+# ---------------------------------------------------------------------------
+
+
+def test_t7_bench_candidates_load_with_specified_fields_and_primary_tier_unchanged():
+    defaults, candidates = run.load_models_config(run.DEFAULT_CONFIG_PATH)
+    by_id = {c.id: c for c in candidates}
+
+    bench_ids = ["bench-c7", "bench-c8", "bench-c9"]
+    for candidate_id in bench_ids:
+        assert candidate_id in by_id, f"{candidate_id} missing from models.yaml"
+        assert by_id[candidate_id].tier == "bench"
+
+    expected_gguf = {
+        "bench-c7": "ibm-granite/granite-4.2-8b-Q6_K.gguf",
+        "bench-c8": "XHToken/Spark-X2.5-4B-Q8_0.gguf",
+        "bench-c9": "ggml-org/gpt-oss-20b-MXFP4.gguf",
+    }
+    for candidate_id, gguf in expected_gguf.items():
+        assert by_id[candidate_id].gguf == gguf
+
+    # bench-c7/bench-c8: no citable model-card sampling (no network access from
+    # this worker's container) -- the gemma-style defaults arms.json's "granite"
+    # and "spark" sampling families mirror (temperature 1.0/top_p 0.95, both
+    # modes), per the T7 brief's fallback instruction.
+    for candidate_id in ("bench-c7", "bench-c8"):
+        candidate = by_id[candidate_id]
+        assert candidate.temperature == {"extraction": 1.0, "conversation": 1.0}
+        assert candidate.top_p == {"extraction": 0.95, "conversation": 0.95}
+
+    # bench-c9: OpenAI's gpt-oss guidance (temperature 1.0, top_p 1.0), not a
+    # citable model-card value fetched from a live source (no network access).
+    c9 = by_id["bench-c9"]
+    assert c9.temperature == {"extraction": 1.0, "conversation": 1.0}
+    assert c9.top_p == {"extraction": 1.0, "conversation": 1.0}
+    assert c9.architecture == "moe"
+
+    primary_selection = run.resolve_candidate_selection("", candidates)
+    assert {c.id for c in primary_selection} == {
+        "gemma-4-26b-a4b-iq4xs",
+        "qwen-3.5-9b-q8",
+        "gemma-3-12b-q5km",
+        "qwen-2.5-14b-q5km",
+    }
+    assert all(c.tier == "primary" for c in primary_selection)
+
+
+# ---------------------------------------------------------------------------
+# T5+T7 additive-only guarantee for models.yaml, extended to the base commit
+# T7 branched from (044699b, which already contains T5's own bench-c5/c6/
+# c3-q3/c3-iq4 candidates). tests/unit/eval_harness/test_t5_models_yaml_
+# additive_only.py already covers this against T5's own original base
+# (61f4822); that file is outside this task's write zone
+# (tests/unit/eval_harness/test_bench_arms.py is the only eval_harness test
+# file T7 may edit), so this extends the same guarantee here instead of
+# there.
+# ---------------------------------------------------------------------------
+
+_T7_BASE_COMMIT = "044699b6b9d4f3f1759d1f67df65012eff56699d"
+
+
+def _git_show_at_t7_base(rel_path: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(_REPO_ROOT), "show", f"{_T7_BASE_COMMIT}:{rel_path}"],
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+    if proc.returncode != 0:
+        pytest.skip(
+            f"cannot read {rel_path} at {_T7_BASE_COMMIT} via `git show` "
+            f"(exit {proc.returncode}): {proc.stderr.strip()}"
+        )
+    return proc.stdout
+
+
+def test_every_044699b_candidate_id_still_present_and_unchanged(tmp_path):
+    text = _git_show_at_t7_base("scripts/eval_harness/models.yaml")
+    base_path = tmp_path / "models_base.yaml"
+    base_path.write_text(text, encoding="utf-8")
+    base_defaults, base_candidates = run.load_models_config(base_path)
+    current_defaults, current_candidates = run.load_models_config(run.DEFAULT_CONFIG_PATH)
+
+    assert current_defaults == base_defaults
+
+    current_by_id = {c.id: c for c in current_candidates}
+    base_ids = {c.id for c in base_candidates}
+    current_ids = {c.id for c in current_candidates}
+    missing = base_ids - current_ids
+    assert not missing, f"T7 removed candidate id(s): {sorted(missing)}"
+
+    for base_candidate in base_candidates:
+        assert current_by_id[base_candidate.id] == base_candidate, (
+            f"candidate {base_candidate.id!r} parsed differently under the current "
+            f"models.yaml -- T7 must be additive-only"
+        )

@@ -34,7 +34,18 @@ ARMS_DOC = load_arms_doc()
 
 ALL_ARM_IDS = list(ARMS_DOC["arms"])
 
-REQUIRED_PARAM_ARMS = {"c3", "c3-think512", "c4", "c4-think512", "c3-q3", "c3-iq4"}
+REQUIRED_PARAM_ARMS = {
+    "c3",
+    "c3-think512",
+    "c4",
+    "c4-think512",
+    "c3-q3",
+    "c3-iq4",
+    # T7 (plan v3 scan pick): c9 (gpt-oss-20b) is MoE and needs -ncmoe, the
+    # same as c3/c4; c9-medium inherits it via base: c9.
+    "c9",
+    "c9-medium",
+}
 
 
 def test_all_arms_resolve():

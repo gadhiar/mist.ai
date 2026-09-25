@@ -1,10 +1,19 @@
-"""T5 (plan v3) additive-only guarantee for scripts/model_bench/arms.json.
+"""T5/T7 (plan v3) additive-only guarantee for scripts/model_bench/arms.json.
 
-Every arm id present at the integration base commit (61f4822, the commit this task's
-worktree branched from) must resolve to the EXACT SAME config under the current
-arms.json -- T5 only adds new arms; it never edits an existing one. A running driver
-(host session S4b) compares `arm_config` and the decision_rules sha on every
-`merge_run_meta` call, so an edit to an existing arm would make it refuse later calls.
+Every arm id present at the base commit must resolve to the EXACT SAME config under
+the current arms.json -- T5 and T7 only add new arms; neither ever edits an existing
+one. A running driver (host session S4b) compares `arm_config` and the decision_rules
+sha on every `merge_run_meta` call, so an edit to an existing arm would make it refuse
+later calls.
+
+BASE_COMMIT was originally 61f48221b50321bbd18374dc88e3ab4313b3881a (T5's own base,
+before T5 landed). T7 (the scan-picked c7/c8/c9 arms) branched from
+044699b6b9d4f3f1759d1f67df65012eff56699d, which already contains every T5 arm
+(c1-2048, c1-unbudgeted, c5, c5-think1024, c6, c3-q3, c3-iq4) committed -- moving
+BASE_COMMIT to that commit extends this same additive-only guarantee to cover all of
+T5's arms too, not just the pre-T5 set, exactly as the T7 brief's acceptance criterion
+1 asks for ("every arm present at 044699b resolves identically"). Every base-commit
+arm is still checked byte-for-byte; nothing about the comparison itself changed.
 
 Loads the base file via `git show <base commit>:scripts/model_bench/arms.json`
 (subprocess git against this repo's own history -- read-only, no network needed, per
@@ -32,9 +41,11 @@ from scripts.model_bench.bench_host import (  # noqa: E402
     resolve_all_arms,
 )
 
-# agent/mist-model-bench/integration's HEAD when this task's (t5-arms-v3) worktree
-# was created -- the last commit before this task's additive-only changes.
-BASE_COMMIT = "61f48221b50321bbd18374dc88e3ab4313b3881a"
+# agent/mist-model-bench/integration's HEAD when the T7 (scan-arms) worktree was
+# created -- the last commit before T7's additive-only changes, and already the
+# commit T5 itself landed on. See the module docstring for why this moved from
+# T5's own original base (61f48221b50321bbd18374dc88e3ab4313b3881a).
+BASE_COMMIT = "044699b6b9d4f3f1759d1f67df65012eff56699d"
 
 DECISION_RULES_PATH = ARMS_JSON_PATH.parent / "decision_rules.json"
 DECISION_RULES_EXPECTED_SHA256 = (
