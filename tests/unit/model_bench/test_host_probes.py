@@ -107,6 +107,89 @@ def test_run_ttft_probe_reaches_all_targets_exactly_with_a_sparse_fake_tokenizer
     assert call_count == 1
 
 
+# --- plan v2 (2026-09-25): 65000/130000 targets, skip-only, timeout ------
+
+
+def test_resolve_targets_to_run_skips_new_targets_outright_at_ctx_32768():
+    # ceiling = 32768 - 256 - 16 = 32496; both 65000 and 130000 exceed it and must be
+    # skipped entirely (no row, capped or otherwise) -- not clamped to the ceiling.
+    resolved = ttft_probe.resolve_targets_to_run(n_ctx=32768)
+    assert resolved == [(2048, 2048), (8192, 8192), (32000, 32000)]
+
+
+def test_resolve_targets_to_run_includes_65000_at_ctx_65536():
+    resolved = dict(ttft_probe.resolve_targets_to_run(n_ctx=65536))
+    assert resolved[65000] == 65000  # raw target, not capped -- it fits under the ceiling
+    assert 130000 not in resolved  # 131072's own arm reaches this; 65536 does not
+
+
+def test_resolve_targets_to_run_includes_130000_at_ctx_131072():
+    resolved = dict(ttft_probe.resolve_targets_to_run(n_ctx=131072))
+    assert resolved[65000] == 65000
+    assert resolved[130000] == 130000
+    # The original targets are still present and still capped the old way.
+    assert resolved[2048] == 2048
+    assert resolved[32000] == 32000
+
+
+def test_resolve_targets_to_run_original_targets_stay_capped_never_skipped():
+    # Legacy behavior, pinned: an original target is never dropped, only shortened.
+    resolved = dict(ttft_probe.resolve_targets_to_run(n_ctx=8192))
+    assert resolved[32000] == 7920  # cap_target(32000, n_ctx=8192, n_predict=256)
+    assert 65000 not in resolved
+    assert 130000 not in resolved
+
+
+def test_run_ttft_probe_request_sequence_is_byte_identical_at_ctx_32768(monkeypatch):
+    """Recorded request list from a fake server: adding the 65000/130000 targets must
+    not change a single byte of the request sequence an existing 32768-ctx arm makes --
+    same targets, same order, same prompt lengths, same count of requests.
+    """
+    monkeypatch.setattr(ttft_probe, "tokenize", lambda base_url, text, *, timeout=30.0: [1, 2, 3])
+
+    recorded: list[tuple[int, int]] = []  # (ctx_target, len(prompt_tokens)) per request
+
+    def fake_run_one_request(base_url, prompt_tokens, *, n_predict=ttft_probe.N_PREDICT, timeout=None):
+        recorded.append((len(prompt_tokens),))
+        return {
+            "ttft_ms": 1.0, "total_ms": 1.0, "prompt_ms": 1.0, "prompt_per_second": 1.0,
+            "predicted_n": 1, "predicted_ms": 1.0, "predicted_per_second": 1.0,
+        }
+
+    monkeypatch.setattr(ttft_probe, "run_one_request", fake_run_one_request)
+
+    rows = ttft_probe.run_ttft_probe("http://127.0.0.1:1", n_ctx=32768, warmup_reps=1, measured_reps=5)
+
+    # Exactly the legacy sequence: 3 targets x (1 warmup + 5 measured) = 18 requests,
+    # in order, at exactly the capped lengths -- 65000/130000 contribute nothing.
+    expected_targets = [t for t in (2048, 8192, 32000) for _ in range(6)]
+    assert [r["ctx_target"] for r in rows] == expected_targets
+    assert [r["prompt_tokens"] for r in rows] == [
+        ttft_probe.cap_target(t, n_ctx=32768) for t in expected_targets
+    ]
+    assert recorded == [(ttft_probe.cap_target(t, n_ctx=32768),) for t in expected_targets]
+
+
+def test_cycle_to_length_reaches_130000_exactly_with_a_fake_tokenizer():
+    # A sparse fake tokenizer (3 ids) must still let cycle_to_length reach the new,
+    # largest target exactly.
+    base_ids = [11, 22, 33]
+    cycled = ttft_probe.cycle_to_length(base_ids, 130000)
+    assert len(cycled) == 130000
+    assert cycled[:6] == [11, 22, 33, 11, 22, 33]
+
+
+def test_http_timeout_covers_130k_prefill_plus_256_decode():
+    # At least 600s per the brief; TTFT_HTTP_TIMEOUT_S is the default run_one_request
+    # (and therefore run_ttft_probe) uses for every request.
+    assert ttft_probe.TTFT_HTTP_TIMEOUT_S >= 600.0
+    import inspect
+
+    assert inspect.signature(ttft_probe.run_one_request).parameters["timeout"].default == (
+        ttft_probe.TTFT_HTTP_TIMEOUT_S
+    )
+
+
 # --- nvidia-smi CSV -----------------------------------------------------
 
 

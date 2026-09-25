@@ -1,14 +1,19 @@
 """Time-to-first-token probe against a running llama-server.
 
 Deterministic filler text is tokenized via `/tokenize` (no special tokens) exactly once
-per probe run. For each context target (2048, 8192, 32000, each capped at
-`n_ctx - n_predict - 16` from /props), an exact-length prompt is built by cycling that
-same id list end-to-end to the target length (`cycle_to_length`), not by tokenizing a
-longer text and slicing -- slicing left the largest target (32000) unreachable whenever
-FILLER_TEXT itself tokenized to fewer ids than that, which a fixed multiplier could not
-guarantee. Cycling reaches every target exactly regardless of how many ids the filler
-text tokenizes to; an empty tokenize result is refused (`TtftProbeError`) rather than
-silently producing a shorter-than-requested prompt.
+per probe run. For each context target -- the original 2048, 8192, 32000 (`TTFT_TARGETS`,
+each CAPPED, never skipped, at `n_ctx - n_predict - 16` from /props: frozen legacy
+behavior) plus, since plan v2 (2026-09-25), 65000 and 130000
+(`TTFT_EXTRA_TARGETS_SKIP_IF_EXCEEDED`, so an arm's own context -- 64K/128K -- is
+reached; these are SKIPPED ENTIRELY rather than capped when they exceed the ceiling, so
+adding them cannot change an existing smaller-context arm's request sequence) -- an
+exact-length prompt is built by cycling that same id list end-to-end to the target
+length (`cycle_to_length`), not by tokenizing a longer text and slicing -- slicing left
+the largest target unreachable whenever FILLER_TEXT itself tokenized to fewer ids than
+that, which a fixed multiplier could not guarantee. Cycling reaches every target exactly
+regardless of how many ids the filler text tokenizes to; an empty tokenize result is
+refused (`TtftProbeError`) rather than silently producing a shorter-than-requested
+prompt. See `resolve_targets_to_run` for the cap-vs-skip split.
 
 The HTTP/SSE plumbing (`run_ttft_probe`) needs a live server and is not unit
 tested; the parsing it is built from (`iter_sse_events`,
@@ -37,10 +42,33 @@ FILLER_TEXT = (
 ) * 400
 
 TTFT_TARGETS: tuple[int, ...] = (2048, 8192, 32000)
+"""Original ctx targets. Always CAPPED (never skipped) at `n_ctx - n_predict -
+CTX_SAFETY_MARGIN` via `cap_target` -- this is frozen legacy behavior. An arm with a
+smaller n_ctx than a target still gets a request at that target, just shortened to fit;
+changing this would change the exact request sequence an existing 32768-ctx arm makes,
+byte-for-byte, which `test_run_ttft_probe_request_sequence_is_byte_identical_at_ctx_32768`
+in tests/unit/model_bench/test_host_probes.py pins."""
+
+TTFT_EXTRA_TARGETS_SKIP_IF_EXCEEDED: tuple[int, ...] = (65000, 130000)
+"""Plan v2 (2026-09-25): ctx targets added so the E4B context arms (c0-ctx64k, ctx 65536;
+c0-ctx128k / c0-ctx128k-q4kv, ctx 131072 -- gemma4.context_length, per the lead) reach
+their own context. Unlike TTFT_TARGETS, a target here is SKIPPED ENTIRELY -- no row at
+all, not even a capped/shortened one -- whenever it exceeds `n_ctx - n_predict -
+CTX_SAFETY_MARGIN`, so adding these targets does not add any request, capped or
+otherwise, to a smaller-context arm's probe sequence (e.g. the existing 32768-ctx arms:
+both 65000 and 130000 exceed their ceiling and are skipped outright)."""
+
 N_PREDICT = 256
 WARMUP_REPS = 1
 MEASURED_REPS = 5
 CTX_SAFETY_MARGIN = 16
+
+TTFT_HTTP_TIMEOUT_S = 900.0
+"""Per-request HTTP timeout for `run_one_request`, used by `run_ttft_probe` for every
+target. Must comfortably cover a 130K-token prefill plus N_PREDICT=256 tokens of decode
+(at least 600s); 900s matches `wait_for_llama_health`'s default timeout for the slowest
+loads elsewhere in this package. A larger timeout does not slow down a fast request --
+it is only an upper bound on how long this probe waits before giving up."""
 
 
 class TtftProbeError(RuntimeError):
@@ -51,6 +79,24 @@ def cap_target(target: int, n_ctx: int, n_predict: int = N_PREDICT) -> int:
     """Cap a raw ctx target at `n_ctx - n_predict - CTX_SAFETY_MARGIN`."""
     ceiling = n_ctx - n_predict - CTX_SAFETY_MARGIN
     return min(target, max(ceiling, 0))
+
+
+def resolve_targets_to_run(n_ctx: int, n_predict: int = N_PREDICT) -> list[tuple[int, int]]:
+    """Ordered `(ctx_target, prompt_len)` pairs this probe run will actually request.
+
+    `TTFT_TARGETS` are always included, capped (never skipped) via `cap_target` --
+    frozen legacy behavior, so an existing arm's request sequence is unaffected by
+    anything below. `TTFT_EXTRA_TARGETS_SKIP_IF_EXCEEDED` are included, at their raw
+    (uncapped) length, only when that raw target itself is <= `n_ctx - n_predict -
+    CTX_SAFETY_MARGIN`; otherwise the target is omitted entirely -- no row, capped or
+    otherwise -- rather than silently shortened to a length that was never requested.
+    """
+    resolved = [(target, cap_target(target, n_ctx, n_predict)) for target in TTFT_TARGETS]
+    ceiling = n_ctx - n_predict - CTX_SAFETY_MARGIN
+    for target in TTFT_EXTRA_TARGETS_SKIP_IF_EXCEEDED:
+        if target <= ceiling:
+            resolved.append((target, target))
+    return resolved
 
 
 def tokenize(base_url: str, text: str, *, timeout: float = 30.0) -> list[int]:
@@ -157,7 +203,7 @@ def run_one_request(
     prompt_tokens: list[int],
     *,
     n_predict: int = N_PREDICT,
-    timeout: float = 300.0,
+    timeout: float = TTFT_HTTP_TIMEOUT_S,
 ) -> dict[str, Any]:
     """Stream one /completion request and return an extract_ttft_row() dict.
 
@@ -206,6 +252,7 @@ def run_ttft_probe(
     (`"warmup": true`) so the caller can choose to keep or drop them.
     """
     rows: list[dict[str, Any]] = []
+    targets_to_run = resolve_targets_to_run(n_ctx, n_predict)
 
     try:
         base_ids = tokenize(base_url, FILLER_TEXT)
@@ -213,8 +260,7 @@ def run_ttft_probe(
         # Tokenizing the filler is a one-time, all-targets-shared step; if it fails
         # outright, every target is unreachable -- record one errored row per target
         # rather than raising and losing the other targets' rows.
-        for target in TTFT_TARGETS:
-            capped = cap_target(target, n_ctx, n_predict)
+        for target, capped in targets_to_run:
             rows.append(
                 {
                     "ctx_target": target,
@@ -233,8 +279,7 @@ def run_ttft_probe(
             )
         return rows
 
-    for target in TTFT_TARGETS:
-        capped = cap_target(target, n_ctx, n_predict)
+    for target, capped in targets_to_run:
         try:
             prompt_tokens = build_prompt_tokens(base_ids, capped)
         except TtftProbeError as exc:
