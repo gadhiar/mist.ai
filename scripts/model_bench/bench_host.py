@@ -171,17 +171,44 @@ class MissingParamError(ArmConfigError):
 
 
 class ContainerExitedError(BenchHostError):
-    """The container exited while `serve` was waiting for /health.
+    """The container exited, or was removed, while `serve` was waiting for /health.
 
     Distinct from a plain health-check TimeoutError: the container is gone,
     not merely slow, so there is nothing further to wait for and the caller
     should stop immediately rather than let the full --timeout elapse.
+
+    `absent=True` means `docker inspect` reported "no such object" (the
+    container no longer exists at all, e.g. something else already removed
+    it) rather than a parsed `State.Status` of `exited`/`dead`. The two are
+    kept distinct in the message -- "exited (code=N)" vs "no longer
+    exists" -- since callers (`cmd_serve`) also use `absent` to skip a
+    `docker rm` that would otherwise fail on a container that is not there.
     """
 
-    def __init__(self, name: str, exit_code: int | None):
+    def __init__(self, name: str, exit_code: int | None, *, absent: bool = False):
         self.name = name
         self.exit_code = exit_code
-        super().__init__(f"{name} exited (code={exit_code}) while waiting for /health")
+        self.absent = absent
+        detail = "no longer exists" if absent else f"exited (code={exit_code})"
+        super().__init__(f"{name} {detail} while waiting for /health")
+
+
+class ContainerStateUnknownError(BenchHostError):
+    """The container's docker state could not be determined for too long.
+
+    Raised by `wait_for_llama_health` when repeated `probe_container_state`
+    calls return `unknown` (a slow or failing `docker inspect`, e.g. the S2
+    incident's low-free-memory host) for longer than `unknown_limit_s`,
+    with no known reading in between. This says nothing about whether the
+    container exited -- it may well be healthy -- so the message never
+    claims that, and callers must not stop or remove the container on the
+    strength of this error alone.
+    """
+
+    def __init__(self, name: str, unknown_for_s: float):
+        self.name = name
+        self.unknown_for_s = unknown_for_s
+        super().__init__(f"{name} state could not be determined for {unknown_for_s:.0f}s")
 
 
 # ---------------------------------------------------------------------------
@@ -669,12 +696,119 @@ def docker_container_exists(name: str) -> bool:
     removes it, and `docker run --name` refuses to reuse a taken name --
     `serve` must check this itself and refuse with a clear message rather
     than let that `docker run` failure surface as an opaque DockerError.
+
+    NOT used by `cmd_serve`'s or `cmd_restore`'s own pre-flight checks --
+    any `docker inspect` failure here, for any reason, reads as "no
+    container", which fails OPEN on a slow or misbehaving docker CLI (the
+    S2 host-checks review's "mirror flaw"). Those call sites use
+    `probe_container_state` instead, which keeps a probe that could not be
+    classified in its own `unknown` bucket rather than folding it into
+    `False`. Retained here only in case some other caller wants the
+    two-state simplification; do not add a new caller that needs the
+    exists-vs-not distinction to be safe.
     """
     try:
         docker_inspect([name])
     except DockerError:
         return False
     return True
+
+
+CONTAINER_PROBE_TIMEOUT_S = 15.0
+"""Default per-call timeout for `probe_container_state`'s `docker inspect`.
+
+15s: generous enough for a docker CLI/daemon under host memory pressure
+(the S2 incident's 2.5 GB free RAM made ordinary `docker inspect` calls
+slow) while still short enough that one hung call cannot, by itself,
+consume a large share of `wait_for_llama_health`'s `unknown_limit_s`
+budget (default 180s -- see `wait_for_llama_health`).
+"""
+
+_ABSENT_STDERR_MARKERS = ("no such object", "no such container")
+
+
+class ContainerProbe:
+    """One `probe_container_state` result.
+
+    `state` is one of `"running"`, `"exited"`, `"absent"`, `"unknown"`; see
+    `probe_container_state` for exactly what puts a probe in each bucket.
+    `detail` is a short, always-printable human-readable reason. `exit_code`
+    is only meaningful when `state == "exited"`.
+    """
+
+    def __init__(self, state: str, detail: str, *, exit_code: int | None = None):
+        self.state = state
+        self.detail = detail
+        self.exit_code = exit_code
+
+
+def probe_container_state(
+    name: str, *, timeout_s: float = CONTAINER_PROBE_TIMEOUT_S
+) -> ContainerProbe:
+    """Classify `name`'s docker state without ever raising on a docker failure.
+
+    Runs `docker inspect -f '{{json .State}}' <name>` through
+    `subprocess.run(..., timeout=timeout_s)` and buckets the result into
+    four states, in order of how positive the signal is:
+
+    - `"exited"`: the call succeeded and parsed `State.Status` is `exited`
+      or `dead`. `exit_code` carries `State.ExitCode`.
+    - `"absent"`: the call failed (non-zero exit) AND its stderr contains
+      "no such object" or "no such container" (case-insensitive) -- docker
+      prints `Error: No such object: <name>` for `inspect`; both spellings
+      are accepted since other docker subcommands use the other one.
+    - `"running"`: the call succeeded and parsed `State.Status` is any
+      other non-empty string (`running`, `created`, `restarting`, ...).
+      Not exited, so treated as still alive.
+    - `"unknown"`: everything else -- a non-zero exit without either
+      "no such" phrase (including one with empty stderr, the exact S2
+      failure shape), `subprocess.TimeoutExpired`, an `OSError` (e.g. the
+      `docker` binary itself is missing), empty stdout, or stdout that does
+      not parse as a JSON object with a usable `Status` field.
+
+    Never raises `DockerError` or lets a docker-side exception escape --
+    every failure mode above is folded into a `ContainerProbe`, which is
+    what lets a caller (`wait_for_llama_health`) tell "docker inspect could
+    not answer" apart from "docker inspect answered: the container is
+    gone" instead of collapsing both into a single exception.
+    """
+    try:
+        proc = subprocess.run(
+            ["docker", "inspect", "-f", "{{json .State}}", name],
+            capture_output=True,
+            text=True,
+            shell=False,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return ContainerProbe("unknown", f"docker inspect {name!r} timed out after {timeout_s}s")
+    except OSError as exc:
+        return ContainerProbe("unknown", f"docker inspect {name!r} raised {exc}")
+
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        if any(marker in stderr.lower() for marker in _ABSENT_STDERR_MARKERS):
+            return ContainerProbe("absent", f"{name!r} does not exist: {stderr}")
+        return ContainerProbe(
+            "unknown", f"docker inspect {name!r} failed (exit {proc.returncode}): {stderr}"
+        )
+
+    stdout = (proc.stdout or "").strip()
+    if not stdout:
+        return ContainerProbe("unknown", f"docker inspect {name!r} returned empty output")
+    try:
+        state = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        return ContainerProbe("unknown", f"docker inspect {name!r} returned unparseable JSON: {exc}")
+    if not isinstance(state, dict):
+        return ContainerProbe("unknown", f"docker inspect {name!r} State was not a JSON object")
+
+    status = state.get("Status")
+    if status in ("exited", "dead"):
+        return ContainerProbe("exited", f"{name!r} state is {status!r}", exit_code=state.get("ExitCode"))
+    if isinstance(status, str) and status:
+        return ContainerProbe("running", f"{name!r} state is {status!r}")
+    return ContainerProbe("unknown", f"docker inspect {name!r} returned no usable Status field")
 
 
 def docker_stop(names: list[str]) -> None:
@@ -848,27 +982,68 @@ def http_get_json(url: str, *, timeout: float = 5.0) -> dict[str, Any]:
         return json.loads(resp.read().decode("utf-8"))
 
 
+UNKNOWN_STATE_LIMIT_S = 180.0
+"""Default `unknown_limit_s` for `wait_for_llama_health`.
+
+How long a container's docker state may stay unresolved -- repeated
+`probe_container_state` calls returning `"unknown"`, with no known reading
+in between -- before this driver gives up trying to tell "healthy but
+slow" apart from "something is wrong" and raises
+`ContainerStateUnknownError` rather than silently waiting out the full
+`--timeout` (900s by default). Must be >= 120s: the S2 incident's slow
+`docker inspect` episode was resolved within well under a minute once
+identified, so a shorter limit risks flagging an ordinary transient CLI/API
+slowdown as unknown-for-too-long and printing a false failure exactly like
+the one this fix responds to.
+"""
+
+_UNKNOWN_WARN_INTERVAL_S = 30.0
+"""Minimum gap between `[WARN]` prints for a sustained-unknown probe state."""
+
+
 def wait_for_llama_health(
     base_url: str,
     *,
     timeout: float = 900.0,
     poll_interval: float = 2.0,
     container_name: str | None = None,
+    unknown_limit_s: float = UNKNOWN_STATE_LIMIT_S,
 ) -> None:
     """Poll GET /health until it responds 200, or raise TimeoutError.
 
     900s default because CPU-MoE loads (c3/c4) are slow.
 
-    If `container_name` is given, `docker inspect`s it on every poll that
-    /health did not answer: a container that has exited (State.Running is
-    False) will never answer /health, so waiting out the full `timeout` only
-    delays discovering a startup failure (e.g. a flag the pinned build
-    rejects) that is already final after well under a second. Raises
-    ContainerExitedError as soon as that is observed, instead of TimeoutError
-    after `timeout` elapses.
+    If `container_name` is given, `probe_container_state`s it on every poll
+    that /health did not answer:
+
+    - `"exited"` or `"absent"` raises `ContainerExitedError` immediately --
+      a container that has exited, or been removed, will never answer
+      /health, so waiting out the full `timeout` only delays discovering a
+      startup failure (e.g. a flag the pinned build rejects) that is
+      already final after well under a second.
+    - `"running"` means keep waiting.
+    - `"unknown"` (docker inspect itself failed, timed out, or returned
+      something unparseable -- e.g. a slow docker CLI/daemon under host
+      memory pressure, the exact S2 incident) is printed as a `[WARN]`, at
+      most once per `_UNKNOWN_WARN_INTERVAL_S`, and the wait continues.
+      Time spent unknown, with no known reading in between, is tracked; if
+      it exceeds `unknown_limit_s` this raises `ContainerStateUnknownError`
+      instead of either silently waiting out `timeout` or (the S2 bug)
+      treating the first inspect failure as a positive "it exited" signal.
+      That error says nothing about whether the container exited -- it may
+      be healthy -- so the caller must not stop or remove it on the
+      strength of this error alone.
+
+    Each `probe_container_state` call's own timeout is capped at the time
+    remaining before `timeout` elapses, so a single hung `docker inspect`
+    cannot itself stall this loop past the overall deadline.
     """
+    if unknown_limit_s < 120.0:
+        raise ValueError(f"unknown_limit_s must be >= 120, got {unknown_limit_s}")
     deadline = time.monotonic() + timeout
     last_error: Exception | None = None
+    unknown_since: float | None = None
+    last_unknown_warn_at: float | None = None
     while time.monotonic() < deadline:
         try:
             http_get_json(base_url.rstrip("/") + "/health", timeout=5.0)
@@ -876,10 +1051,28 @@ def wait_for_llama_health(
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             last_error = exc
         if container_name is not None:
-            inspected = docker_inspect([container_name])
-            state = inspected.get(container_name, {}).get("State", {})
-            if state.get("Running") is False:
-                raise ContainerExitedError(container_name, state.get("ExitCode"))
+            remaining = deadline - time.monotonic()
+            probe_timeout = max(0.1, min(CONTAINER_PROBE_TIMEOUT_S, remaining))
+            probe = probe_container_state(container_name, timeout_s=probe_timeout)
+            now = time.monotonic()
+            if probe.state == "exited":
+                raise ContainerExitedError(container_name, probe.exit_code)
+            if probe.state == "absent":
+                raise ContainerExitedError(container_name, None, absent=True)
+            if probe.state == "unknown":
+                if unknown_since is None:
+                    unknown_since = now
+                unknown_for = now - unknown_since
+                if (
+                    last_unknown_warn_at is None
+                    or now - last_unknown_warn_at >= _UNKNOWN_WARN_INTERVAL_S
+                ):
+                    print(f"[WARN] {container_name} state unknown: {probe.detail}")
+                    last_unknown_warn_at = now
+                if unknown_for > unknown_limit_s:
+                    raise ContainerStateUnknownError(container_name, unknown_for)
+            else:
+                unknown_since = None
         time.sleep(poll_interval)
     raise TimeoutError(f"{base_url}/health did not become healthy within {timeout}s: {last_error}")
 
@@ -1517,8 +1710,15 @@ def cmd_restore(args: argparse.Namespace) -> int:
         print(f"[FAIL] no snapshot at {snap_path}; run `snapshot` first")
         return 1
 
-    if docker_container_exists(BENCH_LLM_CONTAINER):
+    probe = probe_container_state(BENCH_LLM_CONTAINER)
+    if probe.state in ("running", "exited"):
         print(f"[FAIL] {BENCH_LLM_CONTAINER} exists (running or exited); run `unserve` first")
+        return 1
+    if probe.state == "unknown":
+        print(
+            f"[FAIL] could not determine whether {BENCH_LLM_CONTAINER} exists; retry "
+            f"({probe.detail})"
+        )
         return 1
 
     docker_start(list(SNAPSHOT_CONTAINERS))
@@ -1588,8 +1788,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # function itself did not clean up -- keeps `docker run --name` from
     # succeeding. Refuse up front with a clear message rather than let that
     # surface as an opaque DockerError.
-    if docker_container_exists(BENCH_LLM_CONTAINER):
+    probe = probe_container_state(BENCH_LLM_CONTAINER)
+    if probe.state in ("running", "exited"):
         print(f"[FAIL] {BENCH_LLM_CONTAINER} already exists (running or exited); run `unserve` first")
+        return 1
+    if probe.state == "unknown":
+        print(
+            f"[FAIL] could not determine whether {BENCH_LLM_CONTAINER} exists; retry "
+            f"({probe.detail})"
+        )
         return 1
 
     params = _parse_param_args(args.param)
@@ -1614,7 +1821,30 @@ def cmd_serve(args: argparse.Namespace) -> int:
     except ContainerExitedError as exc:
         log_path = save_serve_failed_log(config.results_root, args.run, arm["id"])
         print(f"[FAIL] {exc}; log saved to {log_path}")
-        docker_rm([BENCH_LLM_CONTAINER])
+        # `absent` means docker inspect already reports no such container --
+        # nothing left to remove, and a docker_rm here would itself fail.
+        if not exc.absent:
+            docker_rm([BENCH_LLM_CONTAINER])
+        return 1
+    except ContainerStateUnknownError as exc:
+        # Unlike ContainerExitedError, this is NOT a positive signal that
+        # anything is wrong -- mist-bench-llm may be loading normally (the
+        # exact S2 false positive: a slow docker CLI under low host memory
+        # was misread as the container having exited). Save what evidence
+        # we can, but never stop or remove a container we could not
+        # actually confirm is unhealthy.
+        print(f"[FAIL] {exc}")
+        try:
+            log_path = save_serve_failed_log(config.results_root, args.run, arm["id"])
+            print(f"log saved to {log_path}")
+        except (DockerError, OSError) as log_exc:
+            print(f"[WARN] could not save docker logs: {log_exc}")
+        print(
+            f"{BENCH_LLM_CONTAINER} was NOT stopped or removed -- its state could not be "
+            f"confirmed and it may still be loading normally. Check it yourself with "
+            f"`docker ps -a --filter name={BENCH_LLM_CONTAINER}`, then run `unserve` if "
+            f"you want it gone."
+        )
         return 1
     except TimeoutError:
         # The container is still running (ContainerExitedError above is
@@ -1642,11 +1872,17 @@ def cmd_unserve(args: argparse.Namespace) -> int:
     log_path = arm_dir(config.results_root, args.run, args.arm) / "server.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(f"=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}\n", encoding="utf-8")
-    # Handles both a running container and one that already exited on its
-    # own (e.g. left behind by a `serve` failure this driver's caller did
-    # not clean up) -- docker_stop only on the former, docker_rm always:
+    # Handles a running container, one that already exited on its own (e.g.
+    # left behind by a `serve` failure this driver's caller did not clean
+    # up), and one whose state could not be confirmed (a slow or failing
+    # docker inspect) -- docker_stop is skipped only when the container is
+    # confirmed already exited; an `unknown` probe still attempts
+    # docker_stop rather than silently skipping it (that would risk
+    # leaving an actually-running container behind), so any real failure
+    # there surfaces as this call's own DockerError. docker_rm always runs:
     # without --rm (build_docker_run_args), nothing else removes it.
-    if docker_is_running(BENCH_LLM_CONTAINER):
+    probe = probe_container_state(BENCH_LLM_CONTAINER)
+    if probe.state in ("running", "unknown"):
         docker_stop([BENCH_LLM_CONTAINER])
     docker_rm([BENCH_LLM_CONTAINER])
     print(f"unserved; log at {log_path}")

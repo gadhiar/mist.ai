@@ -28,16 +28,28 @@ is an argv list, `shell=False` (the `subprocess` default).
 3. **`serve <arm> --run R [--param k=v ...]`** -- requires `--results-root`. Refuses if `mist-llm`
    is running, if a REQUIRED param (e.g. c3/c4's `ncmoe`) is missing, if the arm needs `stop_neo4j`
    and `mist-neo4j` is still running, or if a `mist-bench-llm` container already exists -- running
-   OR exited (run `unserve` first). Starts `mist-bench-llm` via
+   OR exited (run `unserve` first). A pre-flight check that could not determine whether
+   `mist-bench-llm` exists (see "Container state: three positive results, one honest unknown"
+   below) refuses too, with a message to retry, rather than either assuming it is clear or assuming
+   it is taken.
+
+   Starts `mist-bench-llm` via
    `docker run -d --name mist-bench-llm ... -p 127.0.0.1:8080:8080` (no `--rm`: the driver needs to
-   `docker logs` a container that fails to start before removing it itself) and waits for `/health`
-   (default timeout 900s -- CPU-MoE loads, c3/c4, are slow), polling `docker inspect`
-   `State.Running` alongside `/health` on every poll. If the container has exited (e.g. the pinned
+   `docker logs` a container that fails to start before removing it itself) and waits for `/health`,
+   polling the container's docker state alongside `/health` on every poll (default timeout 900s --
+   CPU-MoE loads, c3/c4, are slow). If the container has exited or been removed (e.g. the pinned
    build rejected a flag -- the exact S2 failure), `serve` does not wait out the timeout: it prints
-   `[FAIL]` with the exit code, saves `docker logs` to
-   `<results>/<run>/<arm>/serve_failed_<UTC>.log`, removes the container, and exits non-zero within
-   a few seconds. A `/health` timeout with the container still running keeps its prior behaviour
-   (propagates uncaught, non-zero exit) but now saves the same `serve_failed_<UTC>.log` first.
+   `[FAIL]` with the exit code (or "no longer exists"), saves `docker logs` to
+   `<results>/<run>/<arm>/serve_failed_<UTC>.log`, removes the container (skipped if it no longer
+   exists), and exits non-zero within a few seconds. If the container's state instead cannot be
+   determined (docker inspect failing, timing out, or returning something unparseable -- e.g. a
+   slow docker CLI/daemon under low host memory, the exact S2 false positive this replaced) for
+   longer than 180s with no confirmed reading in between, `serve` prints `[FAIL]` with a "could not
+   be determined" message, tries to save `docker logs` (a `[WARN]` if that itself fails), and
+   deliberately does NOT stop or remove the container, since it may be loading normally -- check it
+   with `docker ps -a --filter name=mist-bench-llm` and run `unserve` yourself if you want it gone.
+   A `/health` timeout with the container confirmed still running keeps its prior behaviour
+   (propagates uncaught, non-zero exit) but saves the same `serve_failed_<UTC>.log` first.
 4. **`run <arm> --run R [--suites ...] [--layout-pass screen|finalist] [--tuning-label X] [--rep K]
    [--param k=v]`** -- before running anything, confirms the served `mist-bench-llm` container IS
    `<arm>` (its `docker inspect` `Args` match what this driver would have built, and `/props`'
@@ -49,17 +61,56 @@ is an argv list, `shell=False` (the `subprocess` default).
    suite, and stops the sampler in a `finally` block. Refuses to overwrite any existing suite
    output -- pick a new `--run`, `--layout-pass`, or `--rep` instead.
 5. **`unserve --run R --arm A`** -- saves `docker logs mist-bench-llm` (stdout and stderr) to
-   `<arm>/server.log`, `docker stop`s `mist-bench-llm` if it is still running, then always
-   `docker rm`s it (needed now that `serve` no longer passes `--rm`) -- this handles both a running
-   and an already-exited `mist-bench-llm`.
+   `<arm>/server.log`, `docker stop`s `mist-bench-llm` unless its state is confirmed already
+   exited, then always `docker rm`s it (needed now that `serve` no longer passes `--rm`) -- this
+   handles a running container, an already-exited one, and one whose state could not be confirmed
+   (attempts `docker stop` anyway rather than silently skipping it; a real failure there is
+   reported, not swallowed).
 6. **`restore --run R`** -- refuses if a `mist-bench-llm` container exists at all -- running OR
-   exited (run `unserve` first; the name is taken either way). `docker start`s all three
+   exited (run `unserve` first; the name is taken either way) -- or if that check could not
+   determine whether it exists (retry). `docker start`s all three
    production containers, waits for `mist-llm`'s `/health` and `/props` and for `mist-backend`'s
    `State.Health.Status == healthy`, re-inspects, and diffs against the snapshot on `Id`, `Image`,
    `Config.Cmd`, `Config.Env`, and `HostConfig`. Writes
    `session/restore_diff_<UTC>.json`, prints `restore diff: empty` or the diff, and exits non-zero
    on any difference (an `Id` change means Docker recreated the container -- always a failure) or
    an unhealthy service.
+
+### Container state: three positive results, one honest unknown
+
+`probe_container_state(name)` (`bench_host.py`) is how `serve`, `unserve`, and `restore` all ask
+"what is `mist-bench-llm` doing" -- it runs `docker inspect -f '{{json .State}}' <name>` with its
+own 15s subprocess timeout and classifies the result into exactly one of four states, never raising
+on a docker failure:
+
+- **`running`** -- inspect succeeded and parsed `State.Status` is anything other than
+  `exited`/`dead` (`running`, `created`, `restarting`, ...).
+- **`exited`** -- inspect succeeded and `State.Status` is `exited` or `dead`; carries `ExitCode`.
+- **`absent`** -- inspect failed and its stderr says "no such object" or "no such container"
+  (case-insensitive; docker uses both spellings across subcommands) -- the container is confirmed
+  gone.
+- **`unknown`** -- everything else: a non-zero exit without either "no such" phrase (including one
+  with empty stderr -- the exact S2 failure: a slow docker CLI/daemon under low host memory printed
+  nothing distinguishing), a `subprocess.TimeoutExpired`, a missing `docker` binary, empty stdout,
+  or output that does not parse as JSON with a usable `Status` field.
+
+`running`, `exited`, and `absent` are all positive results -- the driver knows what happened.
+`unknown` is not: it means docker itself could not answer, which S2 mistook for "the container
+exited" and, with `--rm` implied by removing it, deleted the evidence for a container that was
+actually 55 seconds into a slow 16 GB model load.
+
+`wait_for_llama_health`'s handling of each state during `serve`'s /health wait:
+
+- `running` -- keep waiting.
+- `exited` or `absent` -- raise immediately (`ContainerExitedError`); waiting further cannot help.
+- `unknown` -- print a rate-limited `[WARN]` (at most once per 30s) and keep waiting, UNLESS the
+  state has been unknown continuously, with no confirmed reading in between, for more than 180s
+  (`unknown_limit_s`, minimum 120s), in which case `serve` raises `ContainerStateUnknownError`,
+  prints `[FAIL] <container> state could not be determined for <N>s`, tries to save `docker logs`
+  (a `[WARN]` if that itself fails), and -- unlike a confirmed exit -- does NOT stop or remove the
+  container, because it may be healthy. If this happens: check the container's real state yourself
+  with `docker ps -a --filter name=mist-bench-llm`, and run `unserve` only if you actually want it
+  gone.
 
 Two more subcommands sit outside this per-arm loop: `vram-step --run R --label L [--seconds 10]`
 (sample nvidia-smi for a labeled step -- the lead's labels are `desktop`, `mist_llm`,
@@ -127,7 +178,7 @@ git work tree.
 <root>/<run>/<arm>/vram.csv
 <root>/<run>/<arm>/correctness.r<K>.jsonl
 <root>/<run>/<arm>/server.log
-<root>/<run>/<arm>/serve_failed_<UTC>.log      docker logs of a serve that failed (container exited, or /health timed out)
+<root>/<run>/<arm>/serve_failed_<UTC>.log      docker logs of a serve that failed (container exited/absent, its state was undetermined, or /health timed out)
 <root>/<run>/session/llama_server_help_<UTC>.txt   lead-saved `llama-server --help` output for --host-checks (not committed)
 ```
 
@@ -138,9 +189,12 @@ under `--results-root`, which the guard above forces outside the git work tree. 
 `decision_rules.json` (another worker's, referenced by path and sha256 only) are tracked.
 
 **After a failed `serve`,** read `<results-root>/<run>/<arm>/serve_failed_<UTC>.log` -- it holds
-`docker logs`' stdout and stderr from the container `serve` just removed. `mist-bench-llm` no
-longer exists after that failure (a container-exited failure removes it; run `unserve` first if
-serve instead refused because a stale one from an earlier attempt is still present).
+`docker logs`' stdout and stderr from `mist-bench-llm`. Whether the container still exists depends
+on why `serve` failed: a confirmed exit removes it (an already-absent one has nothing to remove
+either way), but a "state could not be determined" failure leaves it exactly as it was -- it may
+still be loading normally. Check `docker ps -a --filter name=mist-bench-llm` yourself in that case,
+and run `unserve` if you want it gone (also the fix if `serve` instead refused up front because a
+stale container from an earlier attempt is still present).
 
 ## arms.json
 
