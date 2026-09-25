@@ -228,3 +228,37 @@ def test_serve_preflight_refuses_when_existence_cannot_be_determined(monkeypatch
     assert rc == 1, out
     assert "could not determine whether" in out
     assert run_detached_calls == []
+
+
+def test_health_wait_survives_the_s2_inspect_failure_at_the_subprocess_boundary(monkeypatch):
+    """End to end through the real inspect wrapper, with only `subprocess.run` stubbed.
+
+    Reproduces the S2 host failure shape exactly: `docker inspect` exits 1 with EMPTY
+    stderr (a slow docker API under memory pressure) on two polls while the model is still
+    loading, then /health answers. The wait must return normally. On 0d3aa54 this fails on
+    behaviour, not on a missing symbol: `docker_inspect` raised `DockerError` out of the
+    wait. Nothing above the subprocess boundary is stubbed, so whichever inspect wrapper
+    `wait_for_llama_health` uses is exercised for real.
+    """
+    import subprocess as real_subprocess
+
+    health_calls = {"n": 0}
+
+    def _fake_health(url, timeout=5.0):
+        health_calls["n"] += 1
+        if health_calls["n"] < 3:
+            raise urllib.error.URLError("connection refused")
+        return {"status": "ok"}
+
+    def _fake_run(argv, *args, **kwargs):
+        assert argv[:2] == ["docker", "inspect"], argv
+        return real_subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+
+    monkeypatch.setattr(bench_host, "http_get_json", _fake_health)
+    monkeypatch.setattr(bench_host.subprocess, "run", _fake_run)
+    monkeypatch.setattr(bench_host.time, "sleep", lambda seconds: None)
+
+    bench_host.wait_for_llama_health(
+        "http://127.0.0.1:8080", timeout=60.0, container_name=bench_host.BENCH_LLM_CONTAINER
+    )
+    assert health_calls["n"] == 3
