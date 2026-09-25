@@ -84,6 +84,14 @@ decision_rules.json sha256: `ad181060e24727e4ffedcf899e8999941561df3b4ea6f344828
 | ttft_ms[ctx=2048] | 111.0000 | 3 | n/a | n/a | n/a | n/a |
 | arm_peak_mib | n/a | n/a | n/a | n/a | n/a | n/a |
 
+### c1-2048
+
+no meta.json / arm absent
+
+### c1-unbudgeted
+
+no meta.json / arm absent
+
 ### c0-ctx64k
 
 | metric | value | n | n_expected | complete | wilson | bootstrap |
@@ -102,6 +110,10 @@ no meta.json / arm absent
 no meta.json / arm absent
 
 ### c0-ub1024
+
+no meta.json / arm absent
+
+### c6
 
 no meta.json / arm absent
 
@@ -156,11 +168,27 @@ no meta.json / arm absent
 
 no meta.json / arm absent
 
+### c3-q3
+
+no meta.json / arm absent
+
+### c3-iq4
+
+no meta.json / arm absent
+
 ### c4
 
 no meta.json / arm absent
 
 ### c4-think512
+
+no meta.json / arm absent
+
+### c5
+
+no meta.json / arm absent
+
+### c5-think1024
 
 no meta.json / arm absent
 
@@ -574,6 +602,9 @@ Each arm's `error_count` is the number of entries in its `meta.json`'s `errors` 
       "ttft"
     ]
   },
+  "c1-2048": {
+    "present": false
+  },
   "c1-256": {
     "error_count": 0,
     "harness": {},
@@ -603,6 +634,9 @@ Each arm's `error_count` is the number of entries in its `meta.json`'s `errors` 
     "suites_completed": [
       "layout"
     ]
+  },
+  "c1-unbudgeted": {
+    "present": false
   },
   "c2": {
     "error_count": 0,
@@ -686,6 +720,12 @@ Each arm's `error_count` is the number of entries in its `meta.json`'s `errors` 
       "layout"
     ]
   },
+  "c3-iq4": {
+    "present": false
+  },
+  "c3-q3": {
+    "present": false
+  },
   "c3-think512": {
     "present": false
   },
@@ -693,6 +733,15 @@ Each arm's `error_count` is the number of entries in its `meta.json`'s `errors` 
     "present": false
   },
   "c4-think512": {
+    "present": false
+  },
+  "c5": {
+    "present": false
+  },
+  "c5-think1024": {
+    "present": false
+  },
+  "c6": {
     "present": false
   }
 }

@@ -671,6 +671,9 @@
         }
       }
     },
+    "c1-2048": {
+      "present": false
+    },
     "c1-256": {
       "arm_peak_mib": {
         "bootstrap": null,
@@ -840,6 +843,9 @@
       ],
       "truncation_rate": {},
       "ttft_ms": {}
+    },
+    "c1-unbudgeted": {
+      "present": false
     },
     "c2": {
       "arm_peak_mib": {
@@ -1378,6 +1384,12 @@
         }
       }
     },
+    "c3-iq4": {
+      "present": false
+    },
+    "c3-q3": {
+      "present": false
+    },
     "c3-think512": {
       "present": false
     },
@@ -1385,6 +1397,15 @@
       "present": false
     },
     "c4-think512": {
+      "present": false
+    },
+    "c5": {
+      "present": false
+    },
+    "c5-think1024": {
+      "present": false
+    },
+    "c6": {
       "present": false
     }
   },
@@ -1526,6 +1547,9 @@
         "ttft"
       ]
     },
+    "c1-2048": {
+      "present": false
+    },
     "c1-256": {
       "error_count": 0,
       "harness": {},
@@ -1555,6 +1579,9 @@
       "suites_completed": [
         "layout"
       ]
+    },
+    "c1-unbudgeted": {
+      "present": false
     },
     "c2": {
       "error_count": 0,
@@ -1638,6 +1665,12 @@
         "layout"
       ]
     },
+    "c3-iq4": {
+      "present": false
+    },
+    "c3-q3": {
+      "present": false
+    },
     "c3-think512": {
       "present": false
     },
@@ -1645,6 +1678,15 @@
       "present": false
     },
     "c4-think512": {
+      "present": false
+    },
+    "c5": {
+      "present": false
+    },
+    "c5-think1024": {
+      "present": false
+    },
+    "c6": {
       "present": false
     }
   },

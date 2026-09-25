@@ -184,6 +184,13 @@ def test_unknown_flags_is_order_preserving_and_deduplicated():
     assert unknown_flags(argv, help_flags) == ["-b", "-c"]
 
 
+def test_unknown_flags_treats_negative_numbers_as_values_not_flags():
+    # `--reasoning-budget -1` is b11151's documented "unrestricted" budget (help line 644).
+    help_flags = {"--reasoning-budget", "--temp"}
+    argv = ["--reasoning-budget", "-1", "--temp", "-0.5", "--bogus", "-x1"]
+    assert unknown_flags(argv, help_flags) == ["--bogus", "-x1"]
+
+
 def test_build_model_args_used_by_checker_includes_model_flag():
     arms_doc = load_arms_doc()
     arm = resolve_all_arms(arms_doc)["c3"]

@@ -343,21 +343,12 @@ byte-for-byte identically (`test_t5_arms_additive_only.py`,
   point alongside the existing 256/512/1024. Runs `layout` and `ttft` (like c1-1024,
   not the layout-only c1-256/c1-512); `tokens_vs_c0: differs-by-design` -- a
   thinking-budget change is expected to change completion tokens by construction.
-  **`c1-unbudgeted` (budget -1, "unrestricted" per
-  `llama_server_help_b11151.txt:644`) is NOT shipped.** `--reasoning-budget -1` puts a
-  bare `-1` argv token next to the flag, which trips
-  `scripts/model_bench/probes/help_flags.py`'s `unknown_flags()`: its own docstring
-  states the invariant it relies on -- "llama-server's built argv -- never places a
-  bare `-`-prefixed value next to a flag, so this is unambiguous here" -- and this is
-  the first arm to break it, so `-1` is misread as an unknown flag by both
-  `test_every_pinned_build_arm_flag_is_found_in_the_real_capture` and
-  `test_check_all_arm_flags_passes_on_the_real_capture` (existing tests, not new
-  ones). Fixing the checker (e.g. tracking which argv positions are a flag's value
-  rather than classifying every `-`-prefixed token) means editing
-  `scripts/model_bench/probes/help_flags.py`, outside this task's write zone (arms.json,
-  this README, models.yaml, tests). Reported blocked rather than worked around; a
-  follow-up task can add `c1-unbudgeted` once the checker handles a negative-number
-  flag value.
+- **`c1-unbudgeted`** (`base: c0`, thinking on, budget -1: "unrestricted" per
+  `llama_server_help_b11151.txt:644`), `layout` and `ttft`, `differs-by-design`. It first
+  shipped blocked: `--reasoning-budget -1` puts a bare `-1` token in argv, which the help
+  flag checker (`probes/help_flags.py`, `unknown_flags()`) read as an unknown flag. The
+  checker now skips numeric tokens (`-1`, `2048`, `0.95`), so a negative value is not
+  mistaken for a flag; a real unknown flag is still reported.
 - **`c5`** -- Qwen3.5-9B Q8_0 (`unsloth/Qwen3.5-9B-Q8_0.gguf`), full card: no `-ncmoe`,
   32768 ctx like the other arms, thinking off, family `qwen` (the existing qwen
   sampling). `tokens_vs_c0: differs-by-design` -- a different model entirely, not a

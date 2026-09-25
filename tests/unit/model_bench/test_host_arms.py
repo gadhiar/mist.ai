@@ -332,7 +332,7 @@ def test_unknown_tokens_vs_c0_raises():
 
 @pytest.mark.parametrize(
     "arm_id,expected_budget",
-    [("c1-2048", 2048)],
+    [("c1-2048", 2048), ("c1-unbudgeted", -1)],
 )
 def test_c1_2048_thinking_budget_and_suites(arm_id, expected_budget):
     arm = resolve_arm(ARMS_DOC, arm_id)

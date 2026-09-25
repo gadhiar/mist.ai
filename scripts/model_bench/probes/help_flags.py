@@ -49,15 +49,21 @@ def parse_help_flags(text: str) -> set[str]:
     return flags
 
 
+_NUMERIC_VALUE_RE = re.compile(r"^-?\d+(\.\d+)?$")
+
+
 def unknown_flags(argv: list[str], help_flags: set[str]) -> list[str]:
     """Flag-shaped tokens in `argv` that `help_flags` does not list.
 
-    A token counts as flag-shaped if it starts with `-` (this argv space --
-    llama-server's built argv -- never places a bare `-`-prefixed value next
-    to a flag, so this is unambiguous here). Order-preserving, deduplicated.
+    A token counts as flag-shaped if it starts with `-` and is not a numeric
+    value. Numeric values can be negative: `--reasoning-budget -1` is the
+    documented "unrestricted" budget (b11151 help: "-1 for unrestricted"), and
+    `-1` is a value, not a flag. Order-preserving, deduplicated.
     """
     seen: list[str] = []
     for tok in argv:
-        if tok.startswith("-") and tok not in help_flags and tok not in seen:
+        if not tok.startswith("-") or _NUMERIC_VALUE_RE.match(tok):
+            continue
+        if tok not in help_flags and tok not in seen:
             seen.append(tok)
     return seen
