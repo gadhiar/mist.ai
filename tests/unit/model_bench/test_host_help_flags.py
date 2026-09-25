@@ -6,7 +6,9 @@ hand-built, the one exception in fixtures/host/ -- see README.md's "Fixtures are
 recorded"). The lead ran `docker run --rm <pinned compose:mist-llm image> --help` against the
 pinned digest `ghcr.io/ggml-org/llama.cpp:server-cuda-b11151@sha256:014f7212...dc765c` on the host
 on 2026-09-24 and saved the raw output verbatim (730 lines, scanned for personal data, none found).
-It confirms the parser's column-0 assumption (258 option lines start with `-` at column 0) and
+It confirms the parser's column-0 assumption: 254 option lines start with `-` or `--` plus a letter
+at column 0 (`grep -c -E '^--?[A-Za-z]'`; 258 lines start with `-` once the 4 `-----` section
+headers are counted), and it
 contains no `--no-mmap`.
 """
 
@@ -92,7 +94,7 @@ def test_deeply_indented_continuation_lines_never_contribute_flags():
 def test_parser_accepts_column_0_option_lines():
     # llama.cpp's own common/arg.cpp (common_arg::to_string()) prints each
     # option starting at column 0, no leading indent -- confirmed by the real
-    # capture (258 option lines start this way); this test isolates it.
+    # capture (254 option lines start this way); this test isolates it.
     flags = parse_help_flags("-lm,   --load-mode {auto|none|mmap}\n")
     assert flags == {"-lm", "--load-mode"}
 
@@ -152,6 +154,28 @@ def test_c0_old_does_not_target_the_pinned_build():
     arms_doc = load_arms_doc()
     resolved = resolve_all_arms(arms_doc)
     assert arm_targets_pinned_build(resolved["c0-old"]) is False
+
+
+def test_check_all_arm_flags_passes_on_the_real_capture():
+    from scripts.model_bench.bench_host import check_all_arm_flags
+
+    assert check_all_arm_flags(HELP_TEXT, "pinned") is True
+
+
+def test_check_all_arm_flags_fails_when_help_parses_to_nothing():
+    from scripts.model_bench.bench_host import check_all_arm_flags
+
+    assert check_all_arm_flags("no flags here\n", "pinned") is False
+
+
+def test_check_all_arm_flags_fails_when_an_arm_flag_is_missing_from_help():
+    # Drop the load-mode option line: c3/c4 then carry a flag the "build" does not list.
+    from scripts.model_bench.bench_host import check_all_arm_flags
+
+    stripped = "\n".join(
+        line for line in HELP_TEXT.splitlines() if not line.startswith("-lm,")
+    )
+    assert check_all_arm_flags(stripped, "pinned") is False
 
 
 def test_unknown_flags_is_order_preserving_and_deduplicated():

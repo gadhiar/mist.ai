@@ -156,8 +156,8 @@ An arm may also set `"arg_overrides"`, a `{flag: value}` map applied in place ov
 prompt processing) instead of appending a second occurrence of the flag -- `build_server_args`
 refuses an override naming a flag `common_args` does not have. `arg_overrides` is inherited through
 `base` the same way `extra_args` is, so c3-think512/c4-think512/a3/a4 (all `base: c3` or `base: c4`)
-carry it too. No arm's built argv may contain any flag twice (`bench_host` selftest and the unit
-tests both check this).
+carry it too. No arm's built argv may contain any flag twice (the unit tests check this;
+`selftest` does not).
 
 **Flag spellings for b11151** (`ghcr.io/ggml-org/llama.cpp:server-cuda-b11151`): the lead verified
 `-rea, --reasoning [on|off|auto]`, `--reasoning-budget N`, `-ncmoe, --n-cpu-moe N`, and

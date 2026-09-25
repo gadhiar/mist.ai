@@ -17,10 +17,10 @@ import re
 # `----- common params -----` (whose dashes are not followed by a letter).
 _FLAG_TOKEN = r"-{1,2}[A-Za-z][\w-]*"
 
-# An option line: 0-8 leading spaces/tabs -- as read from memory of llama.cpp's
-# common/arg.cpp, each option's own line starts at column 0 (UNVERIFIED against
-# a captured b11151 --help; the lead's --host-checks run is the first real
-# parse). A small indent is accepted as well, but not
+# An option line: 0-8 leading spaces/tabs. Verified against the real b11151
+# capture (tests/unit/model_bench/fixtures/host/llama_server_help_b11151.txt):
+# option lines start at column 0, e.g. `-lm,   --load-mode MODE`. A small
+# indent is accepted as well, but not
 # as far as a wrapped description continuation line, which --help indents
 # well past the flag column (40+ spaces) -- then one or more comma-separated
 # flag tokens, then either whitespace (an argument placeholder or the
@@ -32,8 +32,8 @@ def parse_help_flags(text: str) -> set[str]:
     """Extract every flag spelling (short and long form) from `--help` text.
 
     Matches option lines of the shape `-x, --long-name [ARG]  description`,
-    with 0-8 leading spaces (column 0 is the layout expected from llama.cpp's
-    `common/arg.cpp`, unverified against a real capture), including options with only a long form
+    with 0-8 leading spaces (column 0 is the b11151 layout, verified against the
+    committed capture), including options with only a long form
     (`--no-webui`) or only a short one, and options with more than two
     comma-separated forms (`-h, --help, --usage`). Section headers
     (`----- common params -----`), the usage line, and indented

@@ -292,9 +292,9 @@ def build_server_args(
 
     # arg_overrides replaces a common_args flag's value IN PLACE rather than
     # appending a second occurrence of the flag (which would leave argv
-    # carrying it twice; llama.cpp's sequential parser applies the last one,
-    # but a duplicated flag is confusing and this driver's own invariant is
-    # that no flag appears twice). Only common_args flags may be overridden
+    # carrying it twice; which occurrence llama.cpp applies is not verified
+    # here, and this driver's own invariant is that no flag appears twice).
+    # Only common_args flags may be overridden
     # -- an arg_overrides entry naming a flag common_args does not have is a
     # config error, not a silent no-op.
     overrides: dict[str, str] = resolved_arm["arg_overrides"]
@@ -1231,14 +1231,19 @@ def cmd_plan(args: argparse.Namespace) -> int:
             tests = resolve_harness_tests(arm["harness"])
             print(f"  harness: candidate={arm['harness']['candidate']} tests={tests}")
 
-    if args.host_checks:
-        _run_host_checks()
+    if args.host_checks and not _run_host_checks():
+        # Exit non-zero on any [fail]: a scripted gate reads the exit code, and a failed flag
+        # check (the class of defect that blocked S2) must not read as success.
+        print("[FAIL] plan: one or more host checks failed")
+        return 1
 
     print("plan ok")
     return 0
 
 
-def _run_host_checks() -> None:
+def _run_host_checks() -> bool:
+    """Run the host-only checks, printing ok/fail per check. Returns True only if all pass."""
+    all_ok = True
     checks: list[tuple[str, list[str]]] = [
         ("docker version", ["docker", "version"]),
         ("nvidia-smi query", nvidia_smi_probe.build_query_args(interval_ms=1)),
@@ -1260,22 +1265,26 @@ def _run_host_checks() -> None:
             except OSError:
                 ok = False
         print(f"[{'ok' if ok else 'fail'}] {label}")
+        all_ok = all_ok and ok
 
-    _run_flag_checks()
+    return _run_flag_checks() and all_ok
 
 
-def _run_flag_checks() -> None:
+def _run_flag_checks() -> bool:
     """`docker run --rm <pinned image> --help`, then check every arm's argv against it.
 
     c0-old is skipped (see `arm_targets_pinned_build`): it targets the b8808
     snapshot build, not the pinned b11151 image this check fetches `--help`
     from. A missing snapshot for c0-old therefore never blocks this check.
+
+    Returns True only if `--help` was fetched, parsed to a non-empty flag set,
+    and every checked arm's flags are all known.
     """
     try:
         image_ref = parse_compose_image(DEFAULT_COMPOSE_PATH)
     except ImageRefError as exc:
         print(f"[fail] resolve pinned image from compose for --host-checks: {exc}")
-        return
+        return False
 
     try:
         proc = subprocess.run(
@@ -1287,19 +1296,29 @@ def _run_flag_checks() -> None:
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
         print(f"[fail] docker run {image_ref} --help: {exc}")
-        return
+        return False
     if proc.returncode != 0:
         print(f"[fail] docker run {image_ref} --help exited {proc.returncode}: {proc.stderr.strip()}")
-        return
+        return False
 
-    help_flags = help_flags_probe.parse_help_flags(proc.stdout + "\n" + proc.stderr)
+    return check_all_arm_flags(proc.stdout + "\n" + proc.stderr, image_ref)
+
+
+def check_all_arm_flags(help_text: str, image_ref: str) -> bool:
+    """Check every pinned-build arm's argv against parsed `--help` text, printing per arm.
+
+    Split out of `_run_flag_checks` so its verdict is testable without docker. Returns
+    False when the help text parses to no flags or any arm uses an unknown flag.
+    """
+    help_flags = help_flags_probe.parse_help_flags(help_text)
     if not help_flags:
         print(f"[fail] llama-server --help produced no parseable flags (image {image_ref})")
-        return
+        return False
     print(f"[ok] llama-server --help parsed {len(help_flags)} flags (image {image_ref})")
 
     arms_doc = load_arms_doc()
     resolved = resolve_all_arms(arms_doc)
+    all_known = True
     for arm_id, arm in resolved.items():
         if not arm_targets_pinned_build(arm):
             print(f"[skip] arm {arm_id}: image {arm['image']!r} is not the pinned build")
@@ -1308,8 +1327,10 @@ def _run_flag_checks() -> None:
         unknown = check_arm_flags(help_flags, arms_doc, arm, params)
         if unknown:
             print(f"[fail] arm {arm_id}: unknown flags: {unknown}")
+            all_known = False
         else:
             print(f"[ok] arm {arm_id}: flags known")
+    return all_known
 
 
 # ---------------------------------------------------------------------------
