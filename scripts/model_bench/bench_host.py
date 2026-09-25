@@ -40,8 +40,10 @@ if __package__ in (None, ""):
     # Allow `python scripts/model_bench/bench_host.py` in addition to the
     # documented `python -m scripts.model_bench.bench_host` invocation.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.model_bench.probes import help_flags as help_flags_probe
     from scripts.model_bench.probes import nvidia_smi as nvidia_smi_probe
 else:
+    from .probes import help_flags as help_flags_probe
     from .probes import nvidia_smi as nvidia_smi_probe
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -93,6 +95,7 @@ KNOWN_ARM_KEYS = frozenset(
         "suites",
         "harness",
         "extra_args",
+        "arg_overrides",
         "params_required",
         "param_arg_map",
         "stop_neo4j",
@@ -108,6 +111,7 @@ ARM_DEFAULTS: dict[str, Any] = {
     "suites": [],
     "harness": None,
     "extra_args": [],
+    "arg_overrides": {},
     "params_required": [],
     "param_arg_map": {},
     "stop_neo4j": False,
@@ -164,6 +168,20 @@ class RunMetaConfigMismatchError(BenchHostError):
 
 class MissingParamError(ArmConfigError):
     """An arm's REQUIRED param was not supplied via --param."""
+
+
+class ContainerExitedError(BenchHostError):
+    """The container exited while `serve` was waiting for /health.
+
+    Distinct from a plain health-check TimeoutError: the container is gone,
+    not merely slow, so there is nothing further to wait for and the caller
+    should stop immediately rather than let the full --timeout elapse.
+    """
+
+    def __init__(self, name: str, exit_code: int | None):
+        self.name = name
+        self.exit_code = exit_code
+        super().__init__(f"{name} exited (code={exit_code}) while waiting for /health")
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +289,23 @@ def build_server_args(
         )
 
     args: list[str] = list(arms_doc["common_args"])
+
+    # arg_overrides replaces a common_args flag's value IN PLACE rather than
+    # appending a second occurrence of the flag (which would leave argv
+    # carrying it twice; llama.cpp's sequential parser applies the last one,
+    # but a duplicated flag is confusing and this driver's own invariant is
+    # that no flag appears twice). Only common_args flags may be overridden
+    # -- an arg_overrides entry naming a flag common_args does not have is a
+    # config error, not a silent no-op.
+    overrides: dict[str, str] = resolved_arm["arg_overrides"]
+    for flag, value in overrides.items():
+        if flag not in args:
+            raise ArmConfigError(
+                f"arm {resolved_arm['id']!r} arg_overrides names {flag!r}, "
+                f"which is not in common_args"
+            )
+        args[args.index(flag) + 1] = str(value)
+
     family = resolved_arm["family"]
     if family not in arms_doc["sampling"]:
         raise ArmConfigError(f"arm {resolved_arm['id']!r} has unknown family {family!r}")
@@ -312,13 +347,17 @@ def build_docker_run_args(
     models_dir: str,
     params: dict[str, str] | None = None,
 ) -> list[str]:
-    """Full `docker run` argv for serving `resolved_arm`, argv-list, shell=False."""
+    """Full `docker run` argv for serving `resolved_arm`, argv-list, shell=False.
+
+    No `--rm`: `serve` must be able to `docker logs` the container after it
+    exits (a failed start, e.g. a rejected flag) before removing it itself.
+    An auto-removed container's logs are gone before anything could read them.
+    """
     params = params or {}
     return [
         "docker",
         "run",
         "-d",
-        "--rm",
         "--name",
         BENCH_LLM_CONTAINER,
         "--gpus",
@@ -330,6 +369,39 @@ def build_docker_run_args(
         image_ref,
         *build_model_args(resolved_arm, arms_doc, params),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Flag check against the pinned build's `llama-server --help`
+# ---------------------------------------------------------------------------
+
+
+def arm_targets_pinned_build(resolved_arm: dict[str, Any]) -> bool:
+    """True if `resolved_arm`'s image token is the pinned compose build.
+
+    c0-old targets `snapshot:mist-llm`, the current production b8808 snapshot
+    -- a different llama.cpp build than the pinned b11151 `compose:mist-llm`
+    image `plan --host-checks` fetches `--help` from. Checking c0-old's argv
+    against b11151's flag list would check the wrong binary.
+    """
+    return resolved_arm["image"] == "compose:mist-llm"
+
+
+def check_arm_flags(
+    help_flags: set[str],
+    arms_doc: dict[str, Any],
+    resolved_arm: dict[str, Any],
+    params: dict[str, str],
+) -> list[str]:
+    """Flags in `resolved_arm`'s built argv that `help_flags` does not list.
+
+    Builds the arm's full argv (`-m <path>` plus every server flag) the same
+    way `serve` would, with `params` filled in (the caller supplies a dummy
+    value per REQUIRED param), then defers to
+    `probes.help_flags.unknown_flags`.
+    """
+    argv = build_model_args(resolved_arm, arms_doc, params)
+    return help_flags_probe.unknown_flags(argv, help_flags)
 
 
 # ---------------------------------------------------------------------------
@@ -589,10 +661,32 @@ def docker_is_running(name: str) -> bool:
     return proc.returncode == 0 and proc.stdout.strip() == "true"
 
 
+def docker_container_exists(name: str) -> bool:
+    """True if `name` names any container, running or exited.
+
+    Without `--rm` (see `build_docker_run_args`), a failed or stopped
+    `mist-bench-llm` container lingers under its name until `unserve`
+    removes it, and `docker run --name` refuses to reuse a taken name --
+    `serve` must check this itself and refuse with a clear message rather
+    than let that `docker run` failure surface as an opaque DockerError.
+    """
+    try:
+        docker_inspect([name])
+    except DockerError:
+        return False
+    return True
+
+
 def docker_stop(names: list[str]) -> None:
     proc = subprocess.run(["docker", "stop", *names], capture_output=True, text=True, shell=False)
     if proc.returncode != 0:
         raise DockerError(f"docker stop {names} failed: {proc.stderr.strip()}")
+
+
+def docker_rm(names: list[str]) -> None:
+    proc = subprocess.run(["docker", "rm", *names], capture_output=True, text=True, shell=False)
+    if proc.returncode != 0:
+        raise DockerError(f"docker rm {names} failed: {proc.stderr.strip()}")
 
 
 def docker_start(names: list[str]) -> None:
@@ -754,10 +848,24 @@ def http_get_json(url: str, *, timeout: float = 5.0) -> dict[str, Any]:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def wait_for_llama_health(base_url: str, *, timeout: float = 900.0, poll_interval: float = 2.0) -> None:
+def wait_for_llama_health(
+    base_url: str,
+    *,
+    timeout: float = 900.0,
+    poll_interval: float = 2.0,
+    container_name: str | None = None,
+) -> None:
     """Poll GET /health until it responds 200, or raise TimeoutError.
 
-    900s default because --no-mmap MoE loads (c3/c4) are slow.
+    900s default because CPU-MoE loads (c3/c4) are slow.
+
+    If `container_name` is given, `docker inspect`s it on every poll that
+    /health did not answer: a container that has exited (State.Running is
+    False) will never answer /health, so waiting out the full `timeout` only
+    delays discovering a startup failure (e.g. a flag the pinned build
+    rejects) that is already final after well under a second. Raises
+    ContainerExitedError as soon as that is observed, instead of TimeoutError
+    after `timeout` elapses.
     """
     deadline = time.monotonic() + timeout
     last_error: Exception | None = None
@@ -767,7 +875,12 @@ def wait_for_llama_health(base_url: str, *, timeout: float = 900.0, poll_interva
             return
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             last_error = exc
-            time.sleep(poll_interval)
+        if container_name is not None:
+            inspected = docker_inspect([container_name])
+            state = inspected.get(container_name, {}).get("State", {})
+            if state.get("Running") is False:
+                raise ContainerExitedError(container_name, state.get("ExitCode"))
+        time.sleep(poll_interval)
     raise TimeoutError(f"{base_url}/health did not become healthy within {timeout}s: {last_error}")
 
 
@@ -886,6 +999,26 @@ def run_dir(results_root: Path, run: str) -> Path:
 
 def arm_dir(results_root: Path, run: str, arm: str) -> Path:
     return run_dir(results_root, run) / arm
+
+
+def save_serve_failed_log(
+    results_root: Path, run: str, arm_id: str, *, container: str = BENCH_LLM_CONTAINER
+) -> Path:
+    """`docker logs` the failed `mist-bench-llm` container to a timestamped log.
+
+    Writes `<results>/<run>/<arm>/serve_failed_<UTC>.log` (stdout then
+    stderr, matching `unserve`'s server.log shape) and returns its path.
+    Called before the container is removed, since without `--rm` its logs
+    would otherwise survive on disk until the next `unserve` -- but a
+    failed `serve` never reaches `unserve`, so this is the only chance to
+    keep them.
+    """
+    stdout, stderr = docker_logs(container)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    log_path = arm_dir(results_root, run, arm_id) / f"serve_failed_{stamp}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(f"=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}\n", encoding="utf-8")
+    return log_path
 
 
 RUN_SUITE_ORDER: tuple[str, ...] = ("ttft", "correctness", "harness", "layout")
@@ -1128,6 +1261,56 @@ def _run_host_checks() -> None:
                 ok = False
         print(f"[{'ok' if ok else 'fail'}] {label}")
 
+    _run_flag_checks()
+
+
+def _run_flag_checks() -> None:
+    """`docker run --rm <pinned image> --help`, then check every arm's argv against it.
+
+    c0-old is skipped (see `arm_targets_pinned_build`): it targets the b8808
+    snapshot build, not the pinned b11151 image this check fetches `--help`
+    from. A missing snapshot for c0-old therefore never blocks this check.
+    """
+    try:
+        image_ref = parse_compose_image(DEFAULT_COMPOSE_PATH)
+    except ImageRefError as exc:
+        print(f"[fail] resolve pinned image from compose for --host-checks: {exc}")
+        return
+
+    try:
+        proc = subprocess.run(
+            ["docker", "run", "--rm", image_ref, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            shell=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        print(f"[fail] docker run {image_ref} --help: {exc}")
+        return
+    if proc.returncode != 0:
+        print(f"[fail] docker run {image_ref} --help exited {proc.returncode}: {proc.stderr.strip()}")
+        return
+
+    help_flags = help_flags_probe.parse_help_flags(proc.stdout + "\n" + proc.stderr)
+    if not help_flags:
+        print(f"[fail] llama-server --help produced no parseable flags (image {image_ref})")
+        return
+    print(f"[ok] llama-server --help parsed {len(help_flags)} flags (image {image_ref})")
+
+    arms_doc = load_arms_doc()
+    resolved = resolve_all_arms(arms_doc)
+    for arm_id, arm in resolved.items():
+        if not arm_targets_pinned_build(arm):
+            print(f"[skip] arm {arm_id}: image {arm['image']!r} is not the pinned build")
+            continue
+        params = {p: "1" for p in arm["params_required"]}
+        unknown = check_arm_flags(help_flags, arms_doc, arm, params)
+        if unknown:
+            print(f"[fail] arm {arm_id}: unknown flags: {unknown}")
+        else:
+            print(f"[ok] arm {arm_id}: flags known")
+
 
 # ---------------------------------------------------------------------------
 # Subcommand: selftest
@@ -1313,8 +1496,8 @@ def cmd_restore(args: argparse.Namespace) -> int:
         print(f"[FAIL] no snapshot at {snap_path}; run `snapshot` first")
         return 1
 
-    if docker_is_running(BENCH_LLM_CONTAINER):
-        print(f"[FAIL] {BENCH_LLM_CONTAINER} is still running; run `unserve` first")
+    if docker_container_exists(BENCH_LLM_CONTAINER):
+        print(f"[FAIL] {BENCH_LLM_CONTAINER} exists (running or exited); run `unserve` first")
         return 1
 
     docker_start(list(SNAPSHOT_CONTAINERS))
@@ -1362,6 +1545,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if config.models_dir is None:
         print("[FAIL] --models-dir / MODELS_DIR is required")
         return 1
+    if config.results_root is None:
+        print("[FAIL] --results-root / MODEL_BENCH_RESULTS_ROOT is required")
+        return 1
 
     arms_doc = load_arms_doc()
     try:
@@ -1376,13 +1562,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if arm["stop_neo4j"] and docker_is_running("mist-neo4j"):
         print(f"[FAIL] arm {arm['id']} requires mist-neo4j stopped, but it is running")
         return 1
+    # Without --rm (build_docker_run_args), a container left over from a
+    # prior arm -- running or exited, e.g. after a failed serve this
+    # function itself did not clean up -- keeps `docker run --name` from
+    # succeeding. Refuse up front with a clear message rather than let that
+    # surface as an opaque DockerError.
+    if docker_container_exists(BENCH_LLM_CONTAINER):
+        print(f"[FAIL] {BENCH_LLM_CONTAINER} already exists (running or exited); run `unserve` first")
+        return 1
 
     params = _parse_param_args(args.param)
-    snapshot_path = (
-        run_dir(config.results_root, args.run) / "session" / "snapshot.json"
-        if config.results_root
-        else Path("session/snapshot.json")
-    )
+    snapshot_path = run_dir(config.results_root, args.run) / "session" / "snapshot.json"
     try:
         image_ref = resolve_image_ref(arm["image"], snapshot_path=snapshot_path)
         argv = build_docker_run_args(
@@ -1394,7 +1584,25 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     docker_run_detached(argv)
     timeout = args.timeout if args.timeout else 900.0
-    wait_for_llama_health(f"http://{BENCH_LLM_HOST_BIND}:{BENCH_LLM_PORT}", timeout=timeout)
+    try:
+        wait_for_llama_health(
+            f"http://{BENCH_LLM_HOST_BIND}:{BENCH_LLM_PORT}",
+            timeout=timeout,
+            container_name=BENCH_LLM_CONTAINER,
+        )
+    except ContainerExitedError as exc:
+        log_path = save_serve_failed_log(config.results_root, args.run, arm["id"])
+        print(f"[FAIL] {exc}; log saved to {log_path}")
+        docker_rm([BENCH_LLM_CONTAINER])
+        return 1
+    except TimeoutError:
+        # The container is still running (ContainerExitedError above is
+        # what fires when it is not) -- current behaviour is to propagate
+        # this uncaught (main() only catches BenchHostError), but the logs
+        # are worth keeping either way.
+        save_serve_failed_log(config.results_root, args.run, arm["id"])
+        raise
+
     print(f"serving arm {arm['id']} as {BENCH_LLM_CONTAINER}")
     return 0
 
@@ -1413,7 +1621,13 @@ def cmd_unserve(args: argparse.Namespace) -> int:
     log_path = arm_dir(config.results_root, args.run, args.arm) / "server.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(f"=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}\n", encoding="utf-8")
-    docker_stop([BENCH_LLM_CONTAINER])
+    # Handles both a running container and one that already exited on its
+    # own (e.g. left behind by a `serve` failure this driver's caller did
+    # not clean up) -- docker_stop only on the former, docker_rm always:
+    # without --rm (build_docker_run_args), nothing else removes it.
+    if docker_is_running(BENCH_LLM_CONTAINER):
+        docker_stop([BENCH_LLM_CONTAINER])
+    docker_rm([BENCH_LLM_CONTAINER])
     print(f"unserved; log at {log_path}")
     return 0
 
