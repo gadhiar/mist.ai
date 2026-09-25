@@ -54,6 +54,19 @@ def test_help_fixture_omits_no_mmap():
     assert "--no-mmap" not in flags
 
 
+def test_parser_accepts_column_0_option_lines():
+    # llama.cpp's own common/arg.cpp (common_arg::to_string()) prints each
+    # option starting at column 0, no leading indent -- the fixture's own
+    # option lines are mostly this shape; this test isolates it.
+    flags = parse_help_flags("-lm,   --load-mode {auto|none|mmap}\n")
+    assert flags == {"-lm", "--load-mode"}
+
+
+def test_parser_accepts_three_comma_separated_forms():
+    flags = parse_help_flags("-h,    --help, --usage        print usage and exit\n")
+    assert flags == {"-h", "--help", "--usage"}
+
+
 def test_checker_flags_no_mmap_on_the_old_c3_argv():
     old_c3_argv = [
         "-m", "/models/x.gguf",

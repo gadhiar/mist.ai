@@ -3,52 +3,58 @@
 # run from this worker's container (no docker, no GPU, no network). It carries every
 # flag spelling scripts/model_bench/arms.json's common_args, sampling, thinking_args,
 # extra_args and param_arg_map reference, plus a few unrelated lines (section headers,
-# a wrapped description line, an options with no short form) to exercise the parser's
-# line-shape filtering. `-lm, --load-mode` is present; `--no-mmap` is deliberately
-# absent -- that is the flag b11151 actually dropped (see README.md and arms.json's
-# flags_unverified_note).
+# a wrapped description line, an option with no short form, one with three forms) to
+# exercise the parser's line-shape filtering. `-lm, --load-mode` is present;
+# `--no-mmap` is deliberately absent -- that is the flag b11151 actually dropped (see
+# README.md and arms.json's flags_unverified_note).
+#
+# Most option lines below start at column 0 -- llama.cpp's common/arg.cpp
+# (common_arg::to_string()) prints each option's own line with no leading indent, per
+# memory of that source, UNVERIFIED until the lead runs --host-checks against the real
+# pinned build. One line (--jinja) is kept indented instead, so the parser's 0-8
+# leading-whitespace acceptance is exercised on both shapes.
 
 usage: llama-server [options]
 
 ----- common params -----
 
-  -h,    --help, --usage        print usage and exit
-  -m,    --model FNAME          model path (default: models/$filename)
-  --ctx-size N                  size of the prompt context (default: 4096)
-  --n-gpu-layers N               number of layers to store in VRAM
-  --flash-attn {on|off|auto}    enable/disable Flash Attention
-  -ctk,  --cache-type-k TYPE    KV cache data type for K
-  -ctv,  --cache-type-v TYPE    KV cache data type for V
-  -np,   --parallel N           number of parallel sequences
+-h,    --help, --usage        print usage and exit
+-m,    --model FNAME          model path (default: models/$filename)
+--ctx-size N                  size of the prompt context (default: 4096)
+--n-gpu-layers N               number of layers to store in VRAM
+--flash-attn {on|off|auto}    enable/disable Flash Attention
+-ctk,  --cache-type-k TYPE    KV cache data type for K
+-ctv,  --cache-type-v TYPE    KV cache data type for V
+-np,   --parallel N           number of parallel sequences
   --jinja                       enable jinja chat template parsing
-  --no-kv-unified               disable unified KV cache
-  --no-webui                    disable the built-in web UI
-  -t,    --threads N            number of threads to use during generation
-  -tb,   --threads-batch N      number of threads to use during batch/prompt processing
-  -b,    --batch-size N         logical maximum batch size
-  -ub,   --ubatch-size N        physical maximum batch size
-  --metrics                     enable prometheus compatible metrics endpoint
-  -s,    --seed N                RNG seed
-  -cram, --cache-ram N          set the maximum cache size in MiB (default: 8192)
-  --host HOST                   ip address to listen (default: 127.0.0.1)
-  --port PORT                   port to listen (default: 8080)
-  -lm,   --load-mode {auto|none|mmap|mlock|mmap+mlock|dio}
+--no-kv-unified               disable unified KV cache
+--no-webui                    disable the built-in web UI
+-t,    --threads N            number of threads to use during generation
+-tb,   --threads-batch N      number of threads to use during batch/prompt processing
+-b,    --batch-size N         logical maximum batch size
+-ub,   --ubatch-size N        physical maximum batch size
+--metrics                     enable prometheus compatible metrics endpoint
+-s,    --seed N                RNG seed
+-cram, --cache-ram N          set the maximum cache size in MiB (default: 8192)
+--host HOST                   ip address to listen (default: 127.0.0.1)
+--port PORT                   port to listen (default: 8080)
+-lm,   --load-mode {auto|none|mmap|mlock|mmap+mlock|dio}
                                  model weight load mode (default: auto)
-  -ncmoe, --n-cpu-moe N         keep the Mixture of Experts weights of the
+-ncmoe, --n-cpu-moe N         keep the Mixture of Experts weights of the
                                  first N layers in the CPU
 
 ----- sampling params -----
 
-  --temp N                      temperature
-  --top-p N                     top-p sampling
-  --top-k N                     top-k sampling
-  --min-p N                     min-p sampling
-  --repeat-penalty N            penalize repeat sequence of tokens
-  --presence-penalty N          repeat alpha presence penalty
+--temp N                      temperature
+--top-p N                     top-p sampling
+--top-k N                     top-k sampling
+--min-p N                     min-p sampling
+--repeat-penalty N            penalize repeat sequence of tokens
+--presence-penalty N          repeat alpha presence penalty
 
 ----- reasoning params -----
 
-  -rea,  --reasoning [on|off|auto]
+-rea,  --reasoning [on|off|auto]
                                  controls whether the model's reasoning/thinking
                                  output is parsed and streamed separately
-  --reasoning-budget N          number of tokens allotted to reasoning (-1 = no limit)
+--reasoning-budget N          number of tokens allotted to reasoning (-1 = no limit)
