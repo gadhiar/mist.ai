@@ -2301,3 +2301,73 @@ candidates:
       entry in this file cites the Q8_0 quant of this GGUF, and the
       container has no network access to verify it. Run with --external;
       server args live in scripts/model_bench/arms.json.
+
+  - id: bench-c3-q3
+    display_name: "Bench C3-Q3: Gemma 4 26B-A4B MoE (UD-Q3_K_XL)"
+    tier: bench
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf"
+    quant: Q3_K_XL
+    size_gb: 12.88
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 1.0
+      conversation: 1.0
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    notes: >-
+      Bench candidate, lower-quant sibling of bench-c3 (arms.json's c3-q3
+      is c3 with only the gguf overridden -- same -ncmoe REQUIRED param,
+      -lm none, -b/-ub 2048). Same base model as the existing
+      gemma-4-26b-a4b-q3xl-fit entry above -- size_gb (12.88) and the
+      quant-invariant total_params_b/active_params_b (25.2/3.8) reused
+      from that entry's citation. Run with --external; server args live in
+      scripts/model_bench/arms.json.
+
+  - id: bench-c3-iq4
+    display_name: "Bench C3-IQ4: Gemma 4 26B-A4B MoE (UD-IQ4_XS)"
+    tier: bench
+    family: gemma-4
+    vendor: google
+    gguf: "unsloth/gemma-4-26B-A4B-it-UD-IQ4_XS.gguf"
+    quant: IQ4_XS
+    size_gb: 13.4
+    total_params_b: 25.2
+    active_params_b: 3.8
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gemma-4-26b-a4b"
+    temperature:
+      extraction: 1.0
+      conversation: 1.0
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    notes: >-
+      Bench candidate, lower-quant sibling of bench-c3 (arms.json's
+      c3-iq4 is c3 with only the gguf overridden -- same -ncmoe REQUIRED
+      param, -lm none, -b/-ub 2048). Same base model as the existing
+      gemma-4-26b-a4b-iq4xs primary entry above -- size_gb (13.4) and the
+      quant-invariant total_params_b/active_params_b (25.2/3.8) reused
+      from that entry's citation. Run with --external; server args live in
+      scripts/model_bench/arms.json.

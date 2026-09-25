@@ -169,6 +169,18 @@
       "suites": ["layout"],
       "harness": null
     },
+    "c3-q3": {
+      "base": "c3",
+      "gguf": "unsloth/gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf",
+      "harness": {"candidate": "bench-c3-q3", "tests": "default", "iterations": 10},
+      "tokens_vs_c0": "differs-by-design"
+    },
+    "c3-iq4": {
+      "base": "c3",
+      "gguf": "unsloth/gemma-4-26B-A4B-it-UD-IQ4_XS.gguf",
+      "harness": {"candidate": "bench-c3-iq4", "tests": "default", "iterations": 10},
+      "tokens_vs_c0": "differs-by-design"
+    },
     "c4": {
       "gguf": "unsloth/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
       "image": "compose:mist-llm",
