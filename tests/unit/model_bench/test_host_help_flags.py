@@ -67,6 +67,16 @@ def test_parser_accepts_three_comma_separated_forms():
     assert flags == {"-h", "--help", "--usage"}
 
 
+def test_parser_ignores_deeply_indented_continuation_lines_with_dashes():
+    # Description prose can contain dash-prefixed words; a continuation line indented
+    # past 8 columns must never contribute flags.
+    text = (
+        "-rea,  --reasoning [on|off|auto]\n"
+        "                                        -1 disables; --foo is prose here\n"
+    )
+    assert parse_help_flags(text) == {"-rea", "--reasoning"}
+
+
 def test_checker_flags_no_mmap_on_the_old_c3_argv():
     old_c3_argv = [
         "-m", "/models/x.gguf",
