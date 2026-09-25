@@ -95,13 +95,6 @@
       "harness": null,
       "tokens_vs_c0": "differs-by-design"
     },
-    "c1-unbudgeted": {
-      "base": "c0",
-      "thinking": {"mode": "on", "budget": -1},
-      "suites": ["layout", "ttft"],
-      "harness": null,
-      "tokens_vs_c0": "differs-by-design"
-    },
     "c0-ctx64k": {
       "base": "c0",
       "suites": ["ttft", "correctness", "harness"],
