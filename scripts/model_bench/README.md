@@ -25,10 +25,19 @@ is an argv list, `shell=False` (the `subprocess` default).
    and `mist-llm` via `docker stop` (never `docker compose`); add `--with-neo4j` to also stop
    `mist-neo4j` (required before serving arms that declare `"stop_neo4j": true`, e.g. c3/c4 --
    their MoE loads need the VRAM Neo4j's own container would otherwise hold onto).
-3. **`serve <arm> --run R [--param k=v ...]`** -- refuses if `mist-llm` is running, if a REQUIRED
-   param (e.g. c3/c4's `ncmoe`) is missing, or if the arm needs `stop_neo4j` and `mist-neo4j` is
-   still running. Starts `mist-bench-llm` via `docker run -d --rm ... -p 127.0.0.1:8080:8080`, and
-   waits for `/health` (default timeout 900s -- `--no-mmap` MoE loads are slow).
+3. **`serve <arm> --run R [--param k=v ...]`** -- requires `--results-root`. Refuses if `mist-llm`
+   is running, if a REQUIRED param (e.g. c3/c4's `ncmoe`) is missing, if the arm needs `stop_neo4j`
+   and `mist-neo4j` is still running, or if a `mist-bench-llm` container already exists -- running
+   OR exited (run `unserve` first). Starts `mist-bench-llm` via
+   `docker run -d --name mist-bench-llm ... -p 127.0.0.1:8080:8080` (no `--rm`: the driver needs to
+   `docker logs` a container that fails to start before removing it itself) and waits for `/health`
+   (default timeout 900s -- CPU-MoE loads, c3/c4, are slow), polling `docker inspect`
+   `State.Running` alongside `/health` on every poll. If the container has exited (e.g. the pinned
+   build rejected a flag -- the exact S2 failure), `serve` does not wait out the timeout: it prints
+   `[FAIL]` with the exit code, saves `docker logs` to
+   `<results>/<run>/<arm>/serve_failed_<UTC>.log`, removes the container, and exits non-zero within
+   a few seconds. A `/health` timeout with the container still running keeps its prior behaviour
+   (propagates uncaught, non-zero exit) but now saves the same `serve_failed_<UTC>.log` first.
 4. **`run <arm> --run R [--suites ...] [--layout-pass screen|finalist] [--tuning-label X] [--rep K]
    [--param k=v]`** -- before running anything, confirms the served `mist-bench-llm` container IS
    `<arm>` (its `docker inspect` `Args` match what this driver would have built, and `/props`'
@@ -40,8 +49,11 @@ is an argv list, `shell=False` (the `subprocess` default).
    suite, and stops the sampler in a `finally` block. Refuses to overwrite any existing suite
    output -- pick a new `--run`, `--layout-pass`, or `--rep` instead.
 5. **`unserve --run R --arm A`** -- saves `docker logs mist-bench-llm` (stdout and stderr) to
-   `<arm>/server.log`, then `docker stop mist-bench-llm`.
-6. **`restore --run R`** -- refuses if `mist-bench-llm` is still running. `docker start`s all three
+   `<arm>/server.log`, `docker stop`s `mist-bench-llm` if it is still running, then always
+   `docker rm`s it (needed now that `serve` no longer passes `--rm`) -- this handles both a running
+   and an already-exited `mist-bench-llm`.
+6. **`restore --run R`** -- refuses if a `mist-bench-llm` container exists at all -- running OR
+   exited (run `unserve` first; the name is taken either way). `docker start`s all three
    production containers, waits for `mist-llm`'s `/health` and `/props` and for `mist-backend`'s
    `State.Health.Status == healthy`, re-inspects, and diffs against the snapshot on `Id`, `Image`,
    `Config.Cmd`, `Config.Env`, and `HostConfig`. Writes
@@ -64,8 +76,20 @@ CI/dev-loop, not on the host:
   `docker-compose.yml`'s mist-llm digest pin is being added on a separate task branch, an
   unresolvable `compose:mist-llm`/`snapshot:mist-llm` image ref is also only a `[WARN]` here, never
   a `plan` failure. `--host-checks` (lead-only, on the host) additionally runs `docker version`, one
-  `nvidia-smi` query through this driver's parser, and
-  `python -c "import yaml, openai, httpx"`, printing ok/fail per check.
+  `nvidia-smi` query through this driver's parser, `python -c "import yaml, openai, httpx"`, and a
+  flag check against the pinned build: it runs `docker run --rm <pinned compose:mist-llm image>
+  --help`, parses every flag spelling (`probes/help_flags.py`) out of that text, then checks every
+  arm's built argv (every REQUIRED param filled with a dummy value) against it, printing `[ok]` or
+  `[fail] arm <id>: unknown flags: [...]` per arm. If the help text parses to zero flags, that is
+  itself a `[fail]`, not a silent pass. c0-old is skipped there with `[skip]`: it targets the b8808
+  snapshot build (`snapshot:mist-llm`), a different llama.cpp build than the pinned image this check
+  fetches `--help` from, and checking its argv against the wrong build's flags would be meaningless.
+  Before running `--host-checks`, save the real `--help` output for the record (it is not committed
+  -- raw host output belongs under `--results-root`, like everything else in "Results layout"
+  below), e.g.:
+  ```
+  docker run --rm <pinned compose:mist-llm image ref> --help > <results-root>/<run>/session/llama_server_help_<UTC>.txt
+  ```
 - **`selftest`** -- no docker, no network. Exercises argument building for every arm (including
   inheritance and the REQUIRED-param refusal), the restore diff (empty, non-empty, Id-changed), the
   compose image parser (including the missing-digest refusal), the results-root-inside-repo
@@ -99,13 +123,20 @@ git work tree.
 <root>/<run>/<arm>/vram.csv
 <root>/<run>/<arm>/correctness.r<K>.jsonl
 <root>/<run>/<arm>/server.log
+<root>/<run>/<arm>/serve_failed_<UTC>.log      docker logs of a serve that failed (container exited, or /health timed out)
+<root>/<run>/session/llama_server_help_<UTC>.txt   lead-saved `llama-server --help` output for --host-checks (not committed)
 ```
 
-**Raw outputs are never committed.** `server.log`, the harness's per-candidate JSONL, `calls.jsonl`,
-`vram.csv`, `ttft.jsonl`, and `correctness.r<K>.jsonl` all live under `--results-root`, which the
-guard above forces outside the git work tree. Nothing under `<results-root>` is part of this
-repository; only `arms.json` (server configs) and `decision_rules.json` (another worker's, referenced
-by path and sha256 only) are tracked.
+**Raw outputs are never committed.** `server.log`, `serve_failed_<UTC>.log`, the harness's
+per-candidate JSONL, `calls.jsonl`, `vram.csv`, `ttft.jsonl`, and `correctness.r<K>.jsonl` all live
+under `--results-root`, which the guard above forces outside the git work tree. Nothing under
+`<results-root>` is part of this repository; only `arms.json` (server configs) and
+`decision_rules.json` (another worker's, referenced by path and sha256 only) are tracked.
+
+**After a failed `serve`,** read `<results-root>/<run>/<arm>/serve_failed_<UTC>.log` -- it holds
+`docker logs`' stdout and stderr from the container `serve` just removed. `mist-bench-llm` no
+longer exists after that failure (a container-exited failure removes it; run `unserve` first if
+serve instead refused because a stale one from an earlier attempt is still present).
 
 ## arms.json
 
@@ -116,17 +147,27 @@ then override individual keys (used both for the tuning arms a1-a4, which inheri
 server config exactly, and for the thinking-on variants c1-256/c1-512/c2-think512/c3-think512/
 c4-think512).
 
+An arm may also set `"arg_overrides"`, a `{flag: value}` map applied in place over `common_args`
+(e.g. c3/c4's `{"-b": "2048", "-ub": "2048"}`, overriding the common `-b 1024 -ub 512` for CPU-MoE
+prompt processing) instead of appending a second occurrence of the flag -- `build_server_args`
+refuses an override naming a flag `common_args` does not have. `arg_overrides` is inherited through
+`base` the same way `extra_args` is, so c3-think512/c4-think512/a3/a4 (all `base: c3` or `base: c4`)
+carry it too. No arm's built argv may contain any flag twice (`bench_host` selftest and the unit
+tests both check this).
+
 **Flag spellings for b11151** (`ghcr.io/ggml-org/llama.cpp:server-cuda-b11151`): the lead verified
 `-rea, --reasoning [on|off|auto]`, `--reasoning-budget N`, `-ncmoe, --n-cpu-moe N`, and
 `-cram, --cache-ram N` on the host on 2026-09-24 with `llama-server --help` against the pinned
-digest. `--temp`, `--top-p`, `--top-k`, `--min-p` and `--repeat-penalty` are already passed to
-production mist-llm (`docker-compose.yml`'s mist-llm `command:` block), so their spellings are
-already load-bearing there. Still **UNVERIFIED**: `--presence-penalty` (see the response-field note
-below for `return_tokens` and /props' `model_path`, checked separately). These live in `arms.json`
-as data, not in `bench_host.py`, specifically so the lead can correct a spelling at step L0 without
-touching code. c0-old targets b8808 (`snapshot:mist-llm`, the current production build) and gets no
-thinking flags at all: production's chat template default is thinking-off, and `-rea` may not exist
-in b8808.
+digest. The lead also confirmed b11151 replaced `--mmap`/`--no-mmap` with `-lm, --load-mode
+{auto|none|mmap|mlock|mmap+mlock|dio}` (`none` is the old `--no-mmap`); c3/c4 pass `-lm none` via
+`extra_args` accordingly. `--temp`, `--top-p`, `--top-k`, `--min-p` and `--repeat-penalty` are
+already passed to production mist-llm (`docker-compose.yml`'s mist-llm `command:` block), so their
+spellings are already load-bearing there. Still **UNVERIFIED**: `--presence-penalty` (see the
+response-field note below for `return_tokens` and /props' `model_path`, checked separately). These
+live in `arms.json` as data, not in `bench_host.py`, specifically so the lead can correct a spelling
+at step L0 without touching code. c0-old targets b8808 (`snapshot:mist-llm`, the current production
+build) and gets no thinking flags at all: production's chat template default is thinking-off, and
+`-rea` may not exist in b8808.
 
 **UNVERIFIED response fields**, both flagged loudly rather than guessed at silently:
 `extract_model_path_from_props()` (`bench_host.py`) assumes `/props` carries a top-level
@@ -140,12 +181,15 @@ the response keys it actually saw, rather than recording an empty/wrong token li
 
 `tests/unit/model_bench/fixtures/host/` (`sse_stream.txt`, `nvidia_smi_sample.csv`,
 `voice_probe_output.json`, `correctness_response.json`, `compose_with_digest.yml`,
-`compose_missing_digest.yml`) are all hand-built from documented formats. No live b11151
-llama-server, real nvidia-smi output, or real voice-probe run has been recorded yet -- there is
-no live stack in this worker's container (no docker, no GPU, no network). Once the lead runs `plan
---host-checks`, `serve`, and `run` against the real stack, a follow-up should replace these with
-real recordings (or add them alongside) and re-verify the parsers against actual server output,
-particularly the two UNVERIFIED response-field assumptions above.
+`compose_missing_digest.yml`, `llama_server_help_excerpt.txt`) are all hand-built from documented
+formats. No live b11151 llama-server, real nvidia-smi output, or real voice-probe run has been
+recorded yet -- there is no live stack in this worker's container (no docker, no GPU, no network).
+`llama_server_help_excerpt.txt` in particular is labelled in its own header comment as a
+hand-written excerpt, not a capture -- it is NOT the real `--help` output the lead should save per
+the `--host-checks` note above. Once the lead runs `plan --host-checks`, `serve`, and `run` against
+the real stack, a follow-up should replace these with real recordings (or add them alongside) and
+re-verify the parsers against actual server output, particularly the two UNVERIFIED response-field
+assumptions above and the real `--help` text against `probes/help_flags.py`.
 
 ## Voice probe (`voice --run R`)
 

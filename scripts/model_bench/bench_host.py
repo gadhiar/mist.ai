@@ -170,6 +170,20 @@ class MissingParamError(ArmConfigError):
     """An arm's REQUIRED param was not supplied via --param."""
 
 
+class ContainerExitedError(BenchHostError):
+    """The container exited while `serve` was waiting for /health.
+
+    Distinct from a plain health-check TimeoutError: the container is gone,
+    not merely slow, so there is nothing further to wait for and the caller
+    should stop immediately rather than let the full --timeout elapse.
+    """
+
+    def __init__(self, name: str, exit_code: int | None):
+        self.name = name
+        self.exit_code = exit_code
+        super().__init__(f"{name} exited (code={exit_code}) while waiting for /health")
+
+
 # ---------------------------------------------------------------------------
 # arms.json loading and resolution
 # ---------------------------------------------------------------------------
@@ -333,13 +347,17 @@ def build_docker_run_args(
     models_dir: str,
     params: dict[str, str] | None = None,
 ) -> list[str]:
-    """Full `docker run` argv for serving `resolved_arm`, argv-list, shell=False."""
+    """Full `docker run` argv for serving `resolved_arm`, argv-list, shell=False.
+
+    No `--rm`: `serve` must be able to `docker logs` the container after it
+    exits (a failed start, e.g. a rejected flag) before removing it itself.
+    An auto-removed container's logs are gone before anything could read them.
+    """
     params = params or {}
     return [
         "docker",
         "run",
         "-d",
-        "--rm",
         "--name",
         BENCH_LLM_CONTAINER,
         "--gpus",
@@ -643,10 +661,32 @@ def docker_is_running(name: str) -> bool:
     return proc.returncode == 0 and proc.stdout.strip() == "true"
 
 
+def docker_container_exists(name: str) -> bool:
+    """True if `name` names any container, running or exited.
+
+    Without `--rm` (see `build_docker_run_args`), a failed or stopped
+    `mist-bench-llm` container lingers under its name until `unserve`
+    removes it, and `docker run --name` refuses to reuse a taken name --
+    `serve` must check this itself and refuse with a clear message rather
+    than let that `docker run` failure surface as an opaque DockerError.
+    """
+    try:
+        docker_inspect([name])
+    except DockerError:
+        return False
+    return True
+
+
 def docker_stop(names: list[str]) -> None:
     proc = subprocess.run(["docker", "stop", *names], capture_output=True, text=True, shell=False)
     if proc.returncode != 0:
         raise DockerError(f"docker stop {names} failed: {proc.stderr.strip()}")
+
+
+def docker_rm(names: list[str]) -> None:
+    proc = subprocess.run(["docker", "rm", *names], capture_output=True, text=True, shell=False)
+    if proc.returncode != 0:
+        raise DockerError(f"docker rm {names} failed: {proc.stderr.strip()}")
 
 
 def docker_start(names: list[str]) -> None:
@@ -808,10 +848,24 @@ def http_get_json(url: str, *, timeout: float = 5.0) -> dict[str, Any]:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def wait_for_llama_health(base_url: str, *, timeout: float = 900.0, poll_interval: float = 2.0) -> None:
+def wait_for_llama_health(
+    base_url: str,
+    *,
+    timeout: float = 900.0,
+    poll_interval: float = 2.0,
+    container_name: str | None = None,
+) -> None:
     """Poll GET /health until it responds 200, or raise TimeoutError.
 
-    900s default because --no-mmap MoE loads (c3/c4) are slow.
+    900s default because CPU-MoE loads (c3/c4) are slow.
+
+    If `container_name` is given, `docker inspect`s it on every poll that
+    /health did not answer: a container that has exited (State.Running is
+    False) will never answer /health, so waiting out the full `timeout` only
+    delays discovering a startup failure (e.g. a flag the pinned build
+    rejects) that is already final after well under a second. Raises
+    ContainerExitedError as soon as that is observed, instead of TimeoutError
+    after `timeout` elapses.
     """
     deadline = time.monotonic() + timeout
     last_error: Exception | None = None
@@ -821,7 +875,12 @@ def wait_for_llama_health(base_url: str, *, timeout: float = 900.0, poll_interva
             return
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             last_error = exc
-            time.sleep(poll_interval)
+        if container_name is not None:
+            inspected = docker_inspect([container_name])
+            state = inspected.get(container_name, {}).get("State", {})
+            if state.get("Running") is False:
+                raise ContainerExitedError(container_name, state.get("ExitCode"))
+        time.sleep(poll_interval)
     raise TimeoutError(f"{base_url}/health did not become healthy within {timeout}s: {last_error}")
 
 
@@ -940,6 +999,26 @@ def run_dir(results_root: Path, run: str) -> Path:
 
 def arm_dir(results_root: Path, run: str, arm: str) -> Path:
     return run_dir(results_root, run) / arm
+
+
+def save_serve_failed_log(
+    results_root: Path, run: str, arm_id: str, *, container: str = BENCH_LLM_CONTAINER
+) -> Path:
+    """`docker logs` the failed `mist-bench-llm` container to a timestamped log.
+
+    Writes `<results>/<run>/<arm>/serve_failed_<UTC>.log` (stdout then
+    stderr, matching `unserve`'s server.log shape) and returns its path.
+    Called before the container is removed, since without `--rm` its logs
+    would otherwise survive on disk until the next `unserve` -- but a
+    failed `serve` never reaches `unserve`, so this is the only chance to
+    keep them.
+    """
+    stdout, stderr = docker_logs(container)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    log_path = arm_dir(results_root, run, arm_id) / f"serve_failed_{stamp}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(f"=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}\n", encoding="utf-8")
+    return log_path
 
 
 RUN_SUITE_ORDER: tuple[str, ...] = ("ttft", "correctness", "harness", "layout")
@@ -1417,8 +1496,8 @@ def cmd_restore(args: argparse.Namespace) -> int:
         print(f"[FAIL] no snapshot at {snap_path}; run `snapshot` first")
         return 1
 
-    if docker_is_running(BENCH_LLM_CONTAINER):
-        print(f"[FAIL] {BENCH_LLM_CONTAINER} is still running; run `unserve` first")
+    if docker_container_exists(BENCH_LLM_CONTAINER):
+        print(f"[FAIL] {BENCH_LLM_CONTAINER} exists (running or exited); run `unserve` first")
         return 1
 
     docker_start(list(SNAPSHOT_CONTAINERS))
@@ -1466,6 +1545,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if config.models_dir is None:
         print("[FAIL] --models-dir / MODELS_DIR is required")
         return 1
+    if config.results_root is None:
+        print("[FAIL] --results-root / MODEL_BENCH_RESULTS_ROOT is required")
+        return 1
 
     arms_doc = load_arms_doc()
     try:
@@ -1480,13 +1562,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if arm["stop_neo4j"] and docker_is_running("mist-neo4j"):
         print(f"[FAIL] arm {arm['id']} requires mist-neo4j stopped, but it is running")
         return 1
+    # Without --rm (build_docker_run_args), a container left over from a
+    # prior arm -- running or exited, e.g. after a failed serve this
+    # function itself did not clean up -- keeps `docker run --name` from
+    # succeeding. Refuse up front with a clear message rather than let that
+    # surface as an opaque DockerError.
+    if docker_container_exists(BENCH_LLM_CONTAINER):
+        print(f"[FAIL] {BENCH_LLM_CONTAINER} already exists (running or exited); run `unserve` first")
+        return 1
 
     params = _parse_param_args(args.param)
-    snapshot_path = (
-        run_dir(config.results_root, args.run) / "session" / "snapshot.json"
-        if config.results_root
-        else Path("session/snapshot.json")
-    )
+    snapshot_path = run_dir(config.results_root, args.run) / "session" / "snapshot.json"
     try:
         image_ref = resolve_image_ref(arm["image"], snapshot_path=snapshot_path)
         argv = build_docker_run_args(
@@ -1498,7 +1584,25 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     docker_run_detached(argv)
     timeout = args.timeout if args.timeout else 900.0
-    wait_for_llama_health(f"http://{BENCH_LLM_HOST_BIND}:{BENCH_LLM_PORT}", timeout=timeout)
+    try:
+        wait_for_llama_health(
+            f"http://{BENCH_LLM_HOST_BIND}:{BENCH_LLM_PORT}",
+            timeout=timeout,
+            container_name=BENCH_LLM_CONTAINER,
+        )
+    except ContainerExitedError as exc:
+        log_path = save_serve_failed_log(config.results_root, args.run, arm["id"])
+        print(f"[FAIL] {exc}; log saved to {log_path}")
+        docker_rm([BENCH_LLM_CONTAINER])
+        return 1
+    except TimeoutError:
+        # The container is still running (ContainerExitedError above is
+        # what fires when it is not) -- current behaviour is to propagate
+        # this uncaught (main() only catches BenchHostError), but the logs
+        # are worth keeping either way.
+        save_serve_failed_log(config.results_root, args.run, arm["id"])
+        raise
+
     print(f"serving arm {arm['id']} as {BENCH_LLM_CONTAINER}")
     return 0
 
@@ -1517,7 +1621,13 @@ def cmd_unserve(args: argparse.Namespace) -> int:
     log_path = arm_dir(config.results_root, args.run, args.arm) / "server.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(f"=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}\n", encoding="utf-8")
-    docker_stop([BENCH_LLM_CONTAINER])
+    # Handles both a running container and one that already exited on its
+    # own (e.g. left behind by a `serve` failure this driver's caller did
+    # not clean up) -- docker_stop only on the former, docker_rm always:
+    # without --rm (build_docker_run_args), nothing else removes it.
+    if docker_is_running(BENCH_LLM_CONTAINER):
+        docker_stop([BENCH_LLM_CONTAINER])
+    docker_rm([BENCH_LLM_CONTAINER])
     print(f"unserved; log at {log_path}")
     return 0
 
