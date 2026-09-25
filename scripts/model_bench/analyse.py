@@ -229,6 +229,19 @@ def load_decision_rules(path: Path = DECISION_RULES_PATH) -> dict[str, Any]:
     return load_json_file(path)
 
 
+def load_extraction_summary(results_dir: Path, arm_id: str) -> dict[str, Any] | None:
+    """Read `<arm>/extraction_summary.json` (T6 universal `extraction` suite), if present.
+
+    Report-only input: an arm run without `--suites extraction` simply has no
+    file here, and this returns None (rendered as "no extraction_summary.json
+    for this arm in this run", never a [FAIL]).
+    """
+    path = results_dir / arm_id / "extraction_summary.json"
+    if not path.is_file():
+        return None
+    return load_json_file(path)
+
+
 def load_arms(path: Path = ARMS_JSON_PATH) -> dict[str, Any]:
     doc = load_json_file(path)
     return doc["arms"]
@@ -1984,6 +1997,13 @@ def _fmt_ci(ci: tuple[float, float] | None) -> str:
     return f"[{ci[0]:.4f}, {ci[1]:.4f}]"
 
 
+def _fmt_extraction_ci(ci: list[float] | tuple[float, float] | None) -> str:
+    if ci is None:
+        return "n/a"
+    lo, hi = ci
+    return f"[{lo:.3f}, {hi:.3f}]"
+
+
 def render_report(
     *,
     metrics: RunMetrics,
@@ -1995,6 +2015,7 @@ def render_report(
     sha_warnings: list[str],
     sha_infos: list[str],
     decision_rules_sha: str,
+    extraction_summaries: dict[str, dict[str, Any] | None] | None = None,
 ) -> str:
     lines: list[str] = []
     lines.append("# mist-model-bench analysis report")
@@ -2122,6 +2143,54 @@ def render_report(
             lines.append(f"info: `{dumps_line(r.info)}`")
             lines.append("")
 
+    lines.append("## Extraction quality (report-only, not a pre-registered rule)")
+    lines.append("")
+    lines.append(
+        "T6 universal `extraction` suite: MIST's own gold-labelled extraction gauntlet "
+        "(entity typing accuracy, relation precision/recall), driven through the SAME "
+        "production extraction path `mist_admin.py replay --extraction-only` uses and "
+        "scored by `scripts/eval_harness/score_extraction_run.py` unchanged. No verdict "
+        "is rendered here -- this section never gates a finalist decision, and it is not "
+        "part of the v1 `Rules` section or the `Exploratory` section above."
+    )
+    lines.append("")
+    extraction_summaries = extraction_summaries or {}
+    c0_extraction = extraction_summaries.get("c0")
+    for arm_id in metrics.arm_order:
+        summ = extraction_summaries.get(arm_id)
+        lines.append(f"### {arm_id}")
+        lines.append("")
+        if summ is None:
+            lines.append("no extraction_summary.json for this arm in this run")
+            lines.append("")
+            continue
+        lines.append("| metric | value | wilson 95% | bootstrap 95% (by probe id) | delta vs c0 |")
+        lines.append("|---|---|---|---|---|")
+        wilson = summ.get("wilson", {})
+        bootstrap = summ.get("bootstrap", {})
+        for key, label in (
+            ("entity_precision", "entity_precision"),
+            ("entity_recall", "entity_recall"),
+            ("rel_precision", "rel_precision"),
+            ("rel_recall", "rel_recall"),
+            ("rel_f1", "rel_f1"),
+            ("typing_accuracy", "typing_accuracy"),
+        ):
+            value = summ.get(key)
+            delta = "n/a"
+            if arm_id != "c0" and c0_extraction is not None and c0_extraction.get(key) is not None and value is not None:
+                delta = f"{value - c0_extraction[key]:+.3f}"
+            lines.append(
+                f"| {label} | {_fmt(value)} | {_fmt_extraction_ci(wilson.get(key))} | "
+                f"{_fmt_extraction_ci(bootstrap.get(key))} | {delta} |"
+            )
+        lines.append(
+            f"- ontology_version: {summ.get('ontology_version')}, "
+            f"gold_corpus_sha256: `{summ.get('gold_corpus_sha256')}`, "
+            f"matched_probes: {summ.get('matched_probes')}/{summ.get('total_probes')}"
+        )
+        lines.append("")
+
     lines.append("## Finalist candidates")
     lines.append("")
     if finalist_candidates:
@@ -2171,6 +2240,7 @@ def build_summary(
     sha_warnings: list[str],
     sha_infos: list[str],
     decision_rules_sha: str,
+    extraction_summaries: dict[str, dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     arms_out: dict[str, Any] = {}
     for arm_id in metrics.arm_order:
@@ -2210,6 +2280,10 @@ def build_summary(
         "finalist_candidates": finalist_candidates,
         "coverage": coverage,
         "missing_inputs": missing_inputs,
+        # T6 report-only section: raw arm extraction_summary.json contents,
+        # keyed by arm id, None when the arm has no extraction results in
+        # this run. Never used by `rules` / `exploratory_rules` above.
+        "extraction_quality": extraction_summaries or {},
     }
 
 
@@ -2242,16 +2316,21 @@ def generate_outputs(results_dir: Path, rules_path: Path = DECISION_RULES_PATH) 
         e["sha256"] for e in rules.get("supersedes", []) if isinstance(e, dict) and "sha256" in e
     )
     sha_warnings, sha_infos = compute_sha_warnings(metrics, sha, superseded_shas)
+    extraction_summaries = {
+        arm_id: load_extraction_summary(results_dir, arm_id) for arm_id in arm_ids
+    }
 
     report = render_report(
         metrics=metrics, rule_results=rule_results, exploratory_results=exploratory_results,
         finalist_candidates=finalist_candidates, coverage=coverage, missing_inputs=missing_inputs,
         sha_warnings=sha_warnings, sha_infos=sha_infos, decision_rules_sha=sha,
+        extraction_summaries=extraction_summaries,
     )
     summary = build_summary(
         metrics=metrics, rule_results=rule_results, exploratory_results=exploratory_results,
         finalist_candidates=finalist_candidates, coverage=coverage, missing_inputs=missing_inputs,
         sha_warnings=sha_warnings, sha_infos=sha_infos, decision_rules_sha=sha,
+        extraction_summaries=extraction_summaries,
     )
 
     files: dict[str, str] = {"REPORT.md": report, "summary.json": dumps_stable(summary)}

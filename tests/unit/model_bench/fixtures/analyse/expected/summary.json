@@ -2141,6 +2141,155 @@
       "verdict": "missing"
     }
   ],
+  "extraction_quality": {
+    "a1": null,
+    "a2": null,
+    "a3": null,
+    "a4": null,
+    "c0": {
+      "bootstrap": {
+        "B": 10000,
+        "confidence": 0.95,
+        "entity_precision": [
+          0.667,
+          1.0
+        ],
+        "entity_recall": [
+          0.5,
+          1.0
+        ],
+        "method": "cluster-by-probe-id",
+        "rel_precision": [
+          0.6,
+          1.0
+        ],
+        "rel_recall": [
+          0.5,
+          1.0
+        ],
+        "seed": 20260924
+      },
+      "entity_precision": 0.9,
+      "entity_recall": 0.8,
+      "gold_corpus": "data/ingest/extraction-gold-2026-06-14.jsonl",
+      "gold_corpus_sha256": "handbuilt0000000000000000000000000000000000000000000000000000",
+      "matched_probes": 5,
+      "negative_violations": 0,
+      "ontology_version": "1.4.0",
+      "rel_f1": 0.824675,
+      "rel_precision": 0.85,
+      "rel_recall": 0.8,
+      "related_to_rate": 0.0,
+      "schema": 1,
+      "total_probes": 5,
+      "typing_accuracy": 0.9,
+      "valid_time_accuracy": 1.0,
+      "wilson": {
+        "entity_precision": [
+          0.554,
+          0.997
+        ],
+        "entity_recall": [
+          0.376,
+          0.964
+        ],
+        "rel_precision": [
+          0.554,
+          0.982
+        ],
+        "rel_recall": [
+          0.376,
+          0.964
+        ],
+        "typing_accuracy": [
+          0.554,
+          0.997
+        ]
+      }
+    },
+    "c0-ctx128k": null,
+    "c0-ctx128k-q4kv": null,
+    "c0-ctx64k": null,
+    "c0-old": null,
+    "c0-prod": null,
+    "c0-ub1024": null,
+    "c1-1024": null,
+    "c1-2048": null,
+    "c1-256": null,
+    "c1-512": {
+      "bootstrap": {
+        "B": 10000,
+        "confidence": 0.95,
+        "entity_precision": [
+          0.4,
+          1.0
+        ],
+        "entity_recall": [
+          0.4,
+          1.0
+        ],
+        "method": "cluster-by-probe-id",
+        "rel_precision": [
+          0.286,
+          0.875
+        ],
+        "rel_recall": [
+          0.333,
+          0.909
+        ],
+        "seed": 20260924
+      },
+      "entity_precision": 0.7,
+      "entity_recall": 0.7,
+      "gold_corpus": "data/ingest/extraction-gold-2026-06-14.jsonl",
+      "gold_corpus_sha256": "handbuilt0000000000000000000000000000000000000000000000000000",
+      "matched_probes": 5,
+      "negative_violations": 0,
+      "ontology_version": "1.4.0",
+      "rel_f1": 0.62381,
+      "rel_precision": 0.6,
+      "rel_recall": 0.65,
+      "related_to_rate": 0.05,
+      "schema": 1,
+      "total_probes": 5,
+      "typing_accuracy": 0.75,
+      "valid_time_accuracy": 0.9,
+      "wilson": {
+        "entity_precision": [
+          0.351,
+          0.933
+        ],
+        "entity_recall": [
+          0.351,
+          0.933
+        ],
+        "rel_precision": [
+          0.231,
+          0.883
+        ],
+        "rel_recall": [
+          0.309,
+          0.902
+        ],
+        "typing_accuracy": [
+          0.301,
+          0.954
+        ]
+      }
+    },
+    "c1-unbudgeted": null,
+    "c2": null,
+    "c2-think512": null,
+    "c3": null,
+    "c3-iq4": null,
+    "c3-q3": null,
+    "c3-think512": null,
+    "c4": null,
+    "c4-think512": null,
+    "c5": null,
+    "c5-think1024": null,
+    "c6": null
+  },
   "finalist_candidates": [
     "c2-think512",
     "c3"

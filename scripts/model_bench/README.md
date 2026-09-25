@@ -57,9 +57,50 @@ is an argv list, `shell=False` (the `subprocess` default).
    `scripts/model_bench/decision_rules.json` to exist, be tracked in git, and be clean (another
    worker adds that file; this driver only checks the path and records its sha256). Starts the 5 Hz
    nvidia-smi sampler into `vram.csv`, runs the requested suites (default: the arm's own suite
-   list) in the fixed order ttft -> correctness -> harness -> layout, writes `meta.json` after each
-   suite, and stops the sampler in a `finally` block. Refuses to overwrite any existing suite
-   output -- pick a new `--run`, `--layout-pass`, or `--rep` instead.
+   list) in the fixed order ttft -> correctness -> harness -> layout -> extraction, writes
+   `meta.json` after each suite, and stops the sampler in a `finally` block. Refuses to overwrite
+   any existing suite output -- pick a new `--run`, `--layout-pass`, or `--rep` instead.
+
+   **`extraction` (T6, universal).** MIST's only heavy workload is semantic NLP extraction
+   quality, so every arm is also measurable on MIST's own gold-labelled extraction gauntlet --
+   entity typing accuracy, relation precision/recall -- regardless of whether that arm declares
+   `extraction` in `arms.json`'s `suites` list (`UNIVERSAL_SUITES = ("extraction",)` in
+   `validate_run_suites`; `run <arm> --run R --suites extraction` always works). A `run` with no
+   `--suites` still runs exactly the arm's own declared suites -- `extraction` is an allowance, not
+   a default addition. The suite runs in a FRESH `docker run --rm` container of the mist-backend
+   image (resolved from `session/snapshot.json`'s `mist-backend` `Image` id, written by
+   `snapshot`), sharing `mist-bench-llm`'s network namespace (`--network
+   container:mist-bench-llm`, so `127.0.0.1:8080` inside that container reaches the served arm),
+   the repo mounted read-only at `/work`, and the arm's results directory mounted writable at
+   `/out` (`build_extraction_container_argv`). It never touches the production `mist-backend`
+   container: no `exec`, no `start`, and the network/image targets are always the bench container
+   and a resolved image id, never the literal `mist-backend` name.
+
+   Inside that container, `python -m scripts.model_bench.probes.extraction` drives MIST's
+   PRODUCTION extraction path -- the exact code `scripts/mist_admin.py replay --extraction-only`
+   uses (`run_extraction_only_replay`, imported unchanged), through
+   `backend.factories.build_conversation_handler` wired with the real `LlamaServerProvider`
+   pointed at `--base-url` and the unit tier's injectable fakes for `graph_store` /
+   `vector_store` (`tests/mocks/neo4j.FakeNeo4jConnection`,
+   `tests/unit/knowledge/conftest.FakeVectorStore` / `FakeEmbeddingProvider`) -- no Neo4j. The gold
+   corpus is `data/ingest/extraction-gold-2026-06-14.jsonl` (60 probes, adjudicated against
+   ontology v1.4.0; see `scripts/eval_harness/extraction_probe_set_design.md`). Scoring is
+   `scripts/eval_harness/score_extraction_run.py`, imported and called unchanged -- this suite
+   never reimplements or edits the scorer. Outputs, written under the arm's results directory
+   (never overwritten -- pick a new `--run` instead):
+   - `<arm>/extraction.jsonl` -- one row per gold probe: id, matched/errored flag, per-item
+     entity/relationship FP/FN counts.
+   - `<arm>/extraction_summary.json` -- the scorer's own aggregate metrics (entity P/R, relation
+     P/R, typing accuracy, RELATED_TO rate, valid-time accuracy) plus a Wilson interval per metric
+     and a cluster-by-probe-id bootstrap CI (seed/B/confidence read from `decision_rules.json`'s
+     `statistics.bootstrap` block, read-only), the ontology version, and the gold corpus's
+     sha256.
+
+   `analyse.py`'s "Extraction quality (report-only, not a pre-registered rule)" section (after
+   `Exploratory`, before `Finalist candidates`) renders each arm's `extraction_summary.json` with
+   its CIs and a delta against `c0` in the same run, when both are present. It renders NO verdict
+   and never feeds `rules` / `exploratory_rules` -- an arm's `extraction_summary.json` absence
+   renders as "no extraction_summary.json for this arm in this run", not a `[FAIL]`.
 5. **`unserve --run R --arm A`** -- saves `docker logs mist-bench-llm` (stdout and stderr) to
    `<arm>/server.log`, `docker stop`s `mist-bench-llm` unless its state is confirmed already
    exited, then always `docker rm`s it (needed now that `serve` no longer passes `--rm`) -- this

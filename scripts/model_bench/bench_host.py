@@ -426,6 +426,72 @@ def build_docker_run_args(
 
 
 # ---------------------------------------------------------------------------
+# T6: universal `extraction` suite -- fresh mist-backend container, sharing
+# mist-bench-llm's network namespace. Never touches the production
+# mist-backend container (no `exec`, no `start`, and the image is a snapshot
+# image id/ref, never the literal container name).
+# ---------------------------------------------------------------------------
+
+
+def resolve_backend_image_ref(snapshot_path: Path) -> str:
+    """Read the `mist-backend` image id recorded in `session/snapshot.json` (S1)."""
+    doc = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    entry = doc.get("mist-backend")
+    image = entry.get("Image") if entry else None
+    if not image:
+        raise ImageRefError(
+            f"{snapshot_path} has no mist-backend Image id; run `snapshot` before `run --suites extraction`"
+        )
+    return image
+
+
+def build_extraction_container_argv(
+    *,
+    backend_image: str,
+    repo_root: Path,
+    out_dir: Path,
+    base_url: str,
+    network_container: str = BENCH_LLM_CONTAINER,
+    gold_corpus: str = "data/ingest/extraction-gold-2026-06-14.jsonl",
+) -> list[str]:
+    """`docker run` argv for the extraction suite probe.
+
+    A FRESH `--rm` container of the mist-backend image, sharing
+    `mist-bench-llm`'s network namespace (so `--base-url` reaches the served
+    arm at 127.0.0.1:8080 inside the probe container), repo mounted read-only
+    at `/work`, and the arm's results directory mounted writable at `/out`.
+    Never `docker exec`/`docker start` into anything, and never names the
+    production `mist-backend` container -- `backend_image` is an image id/ref
+    (from `resolve_backend_image_ref`), and `network_container` targets only
+    `mist-bench-llm` (the bench server, already stopped-and-replaced per S2,
+    never the production container).
+    """
+    return [
+        "docker",
+        "run",
+        "--rm",
+        "--network",
+        f"container:{network_container}",
+        "-v",
+        f"{repo_root}:/work:ro",
+        "-v",
+        f"{out_dir}:/out",
+        "-w",
+        "/work",
+        backend_image,
+        "python",
+        "-m",
+        "scripts.model_bench.probes.extraction",
+        "--base-url",
+        base_url,
+        "--gold",
+        gold_corpus,
+        "--out",
+        "/out",
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Flag check against the pinned build's `llama-server --help`
 # ---------------------------------------------------------------------------
 
@@ -1278,8 +1344,17 @@ def save_serve_failed_log(
     return log_path
 
 
-RUN_SUITE_ORDER: tuple[str, ...] = ("ttft", "correctness", "harness", "layout")
+RUN_SUITE_ORDER: tuple[str, ...] = ("ttft", "correctness", "harness", "layout", "extraction")
 LAYOUT_COPIED_FILES: tuple[str, ...] = ("calls.jsonl", "graded.jsonl", "manifest.json")
+
+# T6: suites in this tuple run for EVERY arm regardless of that arm's declared
+# `suites` list. `extraction` is MIST's own gold-labelled extraction gauntlet
+# (entity typing, relation P/R) -- it measures the production extraction path,
+# not any one arm's chat suite, so `run <arm> --run R --suites extraction`
+# must work even when `extraction` is absent from `arm["suites"]`. A `run`
+# with no `--suites` still defaults to `arm["suites"]` only (see below), so
+# this allowance never changes the DEFAULT suites for any arm.
+UNIVERSAL_SUITES: tuple[str, ...] = ("extraction",)
 
 
 def validate_run_suites(
@@ -1291,14 +1366,15 @@ def validate_run_suites(
     but is missing a suite, so every suite named here either runs or the command refuses up front.
 
     Raises:
-        ArmConfigError: A suite is unknown, not declared for this arm, has no harness candidate,
-            or is `layout` with no `--layout-dir` configured.
+        ArmConfigError: A suite is unknown, not declared for this arm (and not in
+            `UNIVERSAL_SUITES`), has no harness candidate, or is `layout` with no
+            `--layout-dir` configured.
     """
     suites = list(requested) if requested else list(arm["suites"])
     for suite in suites:
         if suite not in RUN_SUITE_ORDER:
             raise ArmConfigError(f"unknown suite {suite!r}; known: {list(RUN_SUITE_ORDER)}")
-        if suite not in arm["suites"]:
+        if suite not in arm["suites"] and suite not in UNIVERSAL_SUITES:
             raise ArmConfigError(
                 f"suite {suite!r} is not declared for arm {arm['id']!r} (declared: {arm['suites']})"
             )
@@ -1337,6 +1413,9 @@ def suite_output_paths(
         paths["harness"] = a_dir / "harness"
     if "layout" in suites:
         paths["layout"] = a_dir / "layout" / layout_pass
+    if "extraction" in suites:
+        paths["extraction"] = a_dir / "extraction.jsonl"
+        paths["extraction_summary"] = a_dir / "extraction_summary.json"
     return paths
 
 
@@ -2231,6 +2310,21 @@ def cmd_run(args: argparse.Namespace) -> int:
                     for name in LAYOUT_COPIED_FILES:
                         (layout_out_dir / name).write_bytes((src_dir / name).read_bytes())
                     call["suites_completed"].append("layout")
+            write_meta()
+
+        if "extraction" in suites:
+            backend_image = resolve_backend_image_ref(snapshot_path)
+            extraction_argv = build_extraction_container_argv(
+                backend_image=backend_image,
+                repo_root=REPO_ROOT,
+                out_dir=a_dir,
+                base_url=base_url,
+            )
+            proc = subprocess.run(extraction_argv, cwd=REPO_ROOT, shell=False)
+            if proc.returncode != 0:
+                call["errors"].append(f"extraction exited {proc.returncode}")
+            else:
+                call["suites_completed"].append("extraction")
             write_meta()
     finally:
         sampler.stop()

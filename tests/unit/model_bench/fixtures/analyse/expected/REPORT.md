@@ -454,6 +454,134 @@ verdict: **missing**
 
 info: `{"candidate": "c4", "compares_against": "v1 R2/switch_to_c4", "thinking_candidate": "c4-think512"}`
 
+## Extraction quality (report-only, not a pre-registered rule)
+
+T6 universal `extraction` suite: MIST's own gold-labelled extraction gauntlet (entity typing accuracy, relation precision/recall), driven through the SAME production extraction path `mist_admin.py replay --extraction-only` uses and scored by `scripts/eval_harness/score_extraction_run.py` unchanged. No verdict is rendered here -- this section never gates a finalist decision, and it is not part of the v1 `Rules` section or the `Exploratory` section above.
+
+### c0-old
+
+no extraction_summary.json for this arm in this run
+
+### c0
+
+| metric | value | wilson 95% | bootstrap 95% (by probe id) | delta vs c0 |
+|---|---|---|---|---|
+| entity_precision | 0.9000 | [0.554, 0.997] | [0.667, 1.000] | n/a |
+| entity_recall | 0.8000 | [0.376, 0.964] | [0.500, 1.000] | n/a |
+| rel_precision | 0.8500 | [0.554, 0.982] | [0.600, 1.000] | n/a |
+| rel_recall | 0.8000 | [0.376, 0.964] | [0.500, 1.000] | n/a |
+| rel_f1 | 0.8247 | n/a | n/a | n/a |
+| typing_accuracy | 0.9000 | [0.554, 0.997] | n/a | n/a |
+- ontology_version: 1.4.0, gold_corpus_sha256: `handbuilt0000000000000000000000000000000000000000000000000000`, matched_probes: 5/5
+
+### c0-prod
+
+no extraction_summary.json for this arm in this run
+
+### c1-256
+
+no extraction_summary.json for this arm in this run
+
+### c1-512
+
+| metric | value | wilson 95% | bootstrap 95% (by probe id) | delta vs c0 |
+|---|---|---|---|---|
+| entity_precision | 0.7000 | [0.351, 0.933] | [0.400, 1.000] | -0.200 |
+| entity_recall | 0.7000 | [0.351, 0.933] | [0.400, 1.000] | -0.100 |
+| rel_precision | 0.6000 | [0.231, 0.883] | [0.286, 0.875] | -0.250 |
+| rel_recall | 0.6500 | [0.309, 0.902] | [0.333, 0.909] | -0.150 |
+| rel_f1 | 0.6238 | n/a | n/a | -0.201 |
+| typing_accuracy | 0.7500 | [0.301, 0.954] | n/a | -0.150 |
+- ontology_version: 1.4.0, gold_corpus_sha256: `handbuilt0000000000000000000000000000000000000000000000000000`, matched_probes: 5/5
+
+### c1-1024
+
+no extraction_summary.json for this arm in this run
+
+### c1-2048
+
+no extraction_summary.json for this arm in this run
+
+### c1-unbudgeted
+
+no extraction_summary.json for this arm in this run
+
+### c0-ctx64k
+
+no extraction_summary.json for this arm in this run
+
+### c0-ctx128k
+
+no extraction_summary.json for this arm in this run
+
+### c0-ctx128k-q4kv
+
+no extraction_summary.json for this arm in this run
+
+### c0-ub1024
+
+no extraction_summary.json for this arm in this run
+
+### c6
+
+no extraction_summary.json for this arm in this run
+
+### c2
+
+no extraction_summary.json for this arm in this run
+
+### c2-think512
+
+no extraction_summary.json for this arm in this run
+
+### c3
+
+no extraction_summary.json for this arm in this run
+
+### c3-think512
+
+no extraction_summary.json for this arm in this run
+
+### c3-q3
+
+no extraction_summary.json for this arm in this run
+
+### c3-iq4
+
+no extraction_summary.json for this arm in this run
+
+### c4
+
+no extraction_summary.json for this arm in this run
+
+### c4-think512
+
+no extraction_summary.json for this arm in this run
+
+### c5
+
+no extraction_summary.json for this arm in this run
+
+### c5-think1024
+
+no extraction_summary.json for this arm in this run
+
+### a1
+
+no extraction_summary.json for this arm in this run
+
+### a2
+
+no extraction_summary.json for this arm in this run
+
+### a3
+
+no extraction_summary.json for this arm in this run
+
+### a4
+
+no extraction_summary.json for this arm in this run
+
 ## Finalist candidates
 
 - c2-think512
