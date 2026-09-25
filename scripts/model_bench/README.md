@@ -235,6 +235,97 @@ build) and gets no thinking flags at all: production's chat template default is 
 omits it, uses a different key, or nests it elsewhere, this raises `CorrectnessProbeError` naming
 the response keys it actually saw, rather than recording an empty/wrong token list silently.
 
+### Plan v2 (2026-09-25): c1-1024, the E4B context arms, and tokens_vs_c0
+
+Raj moved voice to the GTX 1070 overnight, so the LLM gets the whole RTX 4070 SUPER (12 GB); the
+lead's plan v2 delta (`2026-09-25-mist-model-bench-plan-v2-delta.md`) adds these arms on top of v1:
+
+- **`c1-1024`** -- `base: c0`, thinking on with a 1024-token budget. Suites: `layout` AND `ttft`
+  (unlike c1-256/c1-512, which are layout-only) -- the plan text says "layout suite", but `ttft` is
+  added here so decision_rules.json's exploratory X1 can measure its P (`layout_p95_wall_ms`) and D
+  (`decode_tps`) clauses on c1-1024 itself rather than borrowing another arm's speed numbers.
+- **The E4B context arms**, all `base: c0` (thinking off), suites `ttft`/`correctness`/`harness`:
+  `c0-ctx64k` (`--ctx-size 65536`, q8_0 KV, unchanged from c0), `c0-ctx128k` (`--ctx-size 131072`,
+  q8_0 KV -- `gemma4.context_length` is 131072, per the lead), and `c0-ctx128k-q4kv` (`--ctx-size
+  131072`, `-ctk q4_0 -ctv q4_0`). Their harness suite uses a new named test set,
+  `"tests": "context"` (`resolve_harness_tests`, `HARNESS_CONTEXT_TESTS`) --
+  `["schema_conformance", "schema_conformance_json_object", "tool_selection"]` at 10 iterations, not
+  the full `default` set: these arms are report-only (decision_rules.json's exploratory X2) and the
+  night's time budget does not cover a full harness pass at 64K/128K context on top of the full-card
+  C4/c3 work.
+- **`c0-ub1024`** (optional, at most one such arm) -- `base: c0`, `arg_overrides: {"-b": "2048",
+  "-ub": "1024"}`, `suites: ["ttft"]`. A server-setting arm likely to move prefill speed/VRAM
+  without necessarily changing tokens, per the plan's "server-setting arms likely to move speed or
+  VRAM without changing tokens" allowance.
+- **`tokens_vs_c0`** -- every arm added under plan v2 carries this field (schema-validated in
+  `resolve_arm`, `TOKENS_VS_C0_VALUES`); analyse.py's exploratory X2 surfaces it per context arm.
+  `"expected-identical-unverified"` for a context-window-only change with the same q8_0 KV and
+  sampling as c0 (c0-ctx64k, c0-ctx128k -- no live run has confirmed this yet); `"may-differ"` for
+  anything that changes the compute path -- q4_0 KV quantization (c0-ctx128k-q4kv) or the
+  batch/ubatch sizes, which can select different GEMM kernels (c0-ub1024); `"differs-by-design"` for
+  a thinking-budget change (c1-1024), expected to change completion tokens by construction.
+
+### Plan v2: the TTFT probe reaches an arm's own context
+
+`probes/ttft.py`'s `TTFT_TARGETS` (2048, 8192, 32000) are unchanged and keep their legacy behavior
+exactly: each is CAPPED (via `cap_target`), never skipped, at `n_ctx - n_predict - 16`, so an
+existing 32768-ctx arm's request sequence is byte-for-byte unchanged
+(`test_run_ttft_probe_request_sequence_is_byte_identical_at_ctx_32768`). Two new targets,
+`TTFT_EXTRA_TARGETS_SKIP_IF_EXCEEDED` (65000, 130000), let the 64K/128K context arms reach their own
+context: a target here is used, at its raw (uncapped) length, only when it is at most `n_ctx -
+n_predict - 16`; otherwise it is skipped entirely -- no row, capped or otherwise. `run_one_request`'s
+default HTTP timeout is now `TTFT_HTTP_TIMEOUT_S` (900s, >= the 600s the brief requires) so a 130K-
+token prefill plus 256 tokens of decode has room to finish; a larger timeout does not slow down a
+fast request, it is only an upper bound on how long the probe waits before giving up.
+
+### Plan v2: rules-sha continuity across the v1 -> v2 amendment
+
+S4 (the lead's unattended host session) resumes the finalist layout pass for c1-512 inside the
+existing run `mb1`, whose `c1-512/meta.json` was written under the v1 `decision_rules.json` sha256.
+Plan v2's rule changes move that sha, and `run`'s cumulative `meta.json` (`merge_run_meta`) normally
+refuses any call whose `decision_rules_sha256` differs from what is already on disk for that arm
+dir. `decision_rules.json` now carries a top-level `"supersedes"` list naming the sha256(es) it
+supersedes (`{"sha256": ..., "label": ...}`); `merge_run_meta` (still a pure, no-I/O function) takes
+an explicit `superseded_rules_shas` set from its caller and allows the stored sha to differ from the
+new call's sha only when the *stored* value appears in that set -- any other difference is still
+refused, exactly as before. `cmd_run` reads `decision_rules.json`'s own `supersedes` list once
+(`load_decision_rules_supersedes_shas`) and passes it through. Each entry in `meta.json`'s `calls`
+list now also records its own `decision_rules_sha256`, so the full per-call history survives even
+though the top-level `decision_rules_sha256` field only ever shows the latest call's value.
+`analyse.py` reports, per arm, which rules sha its stored `meta.json` ran under: a sha equal to the
+currently-analysed `decision_rules.json` produces nothing; a differing sha that is listed in
+`supersedes` is an `[INFO]`, not a mismatch `[WARN]`; any other differing (unlisted) sha stays a
+`[WARN]`, exactly as before this change (`compute_sha_warnings`, now returning
+`(warnings, infos)`).
+
+### Plan v2: decision_rules.json's exploratory_rules (NOT pre-registered)
+
+`decision_rules.json` gained a top-level `"exploratory_rules"` section, entirely separate from
+`"rules"` -- the pre-registered v1 rules, their `thresholds`, and `constants` are unchanged in
+content (a test loads the v1 file, committed as a fixture, and asserts `rules`/`constants` compare
+equal before and after). Each exploratory rule carries `"pre_registered": false` and a `"basis"`
+string ("post hoc, added 2026-09-25 after S1/S2 data; plan v2"):
+
+- **X1 `c1_1024_budget`** -- c1-1024 against R1's 85% layout bar (`r1_keep_e4b_layout_acc_min`,
+  referenced by threshold key, not duplicated) plus R2's P (`layout_p95_wall_ms`) and D
+  (`decode_tps`) thresholds, finalist-supersedes-screen exactly as R1/R2 do.
+- **X2 `context_arms_report`** -- report-only (verdict `"n/a"`, no clauses): per context arm, ttft
+  at every measured ctx target, decode_tps, arm_peak_mib, harness scores with CIs plus a
+  bootstrap-CI'd delta against c0 on the same tests, the arm's `tokens_vs_c0` label, and whether its
+  `correctness.r1` token ids are `identical`/`differ`/`missing` versus c0's.
+- **X3 `switch_to_c2_sepvoice`/`switch_to_c3_sepvoice`/`switch_to_c4_sepvoice`** -- the same L/S1/S2/D/P
+  clauses as the corresponding v1 R2 rule, with F replaced by F_sep: `arm_peak_mib(candidate) + 512
+  <= total_mib`, voice excluded entirely (no lower/upper split, so no needs-review branch) --
+  "voice on a separate card (GTX 1070), Raj 2026-09-25". Evaluated and reported next to the
+  matching v1 R2 verdict; it never replaces or overrides it.
+
+`analyse.py` renders these in `REPORT.md` under a separately headed `## Exploratory (NOT
+pre-registered)` section, placed after the v1 `## Rules` section, and in `summary.json` under a
+top-level `"exploratory_rules"` key (never mixed into `"rules"`). X1/X3 reuse `evaluate_r2`'s L/S1/S2/P
+logic via module-level helpers (`_l_clause`, `_anchored_harness_clause`) that are deliberately
+duplicated rather than shared by refactoring `evaluate_r2` itself, so no exploratory-rule change can
+ever alter a v1 R2 verdict.
+
 ## Fixtures are hand-built, not recorded
 
 `tests/unit/model_bench/fixtures/host/` (`sse_stream.txt`, `nvidia_smi_sample.csv`,
