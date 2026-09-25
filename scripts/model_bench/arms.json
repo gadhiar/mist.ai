@@ -130,6 +130,12 @@
       "arg_overrides": {"-b": "2048", "-ub": "1024"},
       "tokens_vs_c0": "may-differ"
     },
+    "c6": {
+      "base": "c0",
+      "gguf": "unsloth/gemma-4-E4B-it-Q8_0.gguf",
+      "harness": {"candidate": "bench-c6", "tests": "default", "iterations": 10},
+      "tokens_vs_c0": "may-differ"
+    },
     "c2": {
       "gguf": "google/gemma-4-12b-it-qat-q4_0.gguf",
       "image": "compose:mist-llm",

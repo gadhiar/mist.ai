@@ -2267,3 +2267,37 @@ candidates:
       template honours -rea/--reasoning-budget is UNVERIFIED -- see
       README.md's "Qwen3.5 thinking flags" note. Run with --external;
       server args live in scripts/model_bench/arms.json.
+
+  - id: bench-c6
+    display_name: "Bench C6: Gemma 4 E4B Instruct (Q8_0)"
+    tier: bench
+    family: gemma-4-dense
+    vendor: google
+    gguf: "unsloth/gemma-4-E4B-it-Q8_0.gguf"
+    quant: Q8_0
+    total_params_b: 7.85
+    active_params_b: 4.0
+    architecture: dense
+    context_size: 32768
+    served_model_name: "gemma-4-e4b"
+    temperature:
+      extraction: 1.0
+      conversation: 1.0
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences:
+      - "<end_of_turn>"
+    extra_server_args: []
+    notes: >-
+      Bench candidate. Same base model as bench-c0 (arms.json's c6 is c0
+      with only the gguf overridden) -- total_params_b/active_params_b
+      (7.85/4.0) are quant-invariant, reused from the gemma-4-e4b-dense-q5km
+      citation above. size_gb left at the run.py default (0.0): no existing
+      entry in this file cites the Q8_0 quant of this GGUF, and the
+      container has no network access to verify it. Run with --external;
+      server args live in scripts/model_bench/arms.json.
