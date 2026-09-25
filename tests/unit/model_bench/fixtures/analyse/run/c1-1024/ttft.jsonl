@@ -1,0 +1,4 @@
+{"ctx_target": 2048, "prompt_tokens": 2048, "rep": 0, "warmup": true, "ttft_ms": 90.0, "total_ms": 500.0, "prompt_ms": 40.0, "prompt_per_second": 800.0, "predicted_n": 10, "predicted_ms": 400.0, "predicted_per_second": 10.0, "error": null}
+{"ctx_target": 2048, "prompt_tokens": 2048, "rep": 1, "warmup": false, "ttft_ms": 110.0, "total_ms": 900.0, "prompt_ms": 50.0, "prompt_per_second": 800.0, "predicted_n": 40, "predicted_ms": 800.0, "predicted_per_second": 40.0, "error": null}
+{"ctx_target": 2048, "prompt_tokens": 2048, "rep": 2, "warmup": false, "ttft_ms": 111.0, "total_ms": 901.0, "prompt_ms": 50.0, "prompt_per_second": 800.0, "predicted_n": 42, "predicted_ms": 800.0, "predicted_per_second": 42.0, "error": null}
+{"ctx_target": 2048, "prompt_tokens": 2048, "rep": 3, "warmup": false, "ttft_ms": 112.0, "total_ms": 902.0, "prompt_ms": 50.0, "prompt_per_second": 800.0, "predicted_n": 38, "predicted_ms": 800.0, "predicted_per_second": 38.0, "error": null}

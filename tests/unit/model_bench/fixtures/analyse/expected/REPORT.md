@@ -1,6 +1,6 @@
 # mist-model-bench analysis report
 
-decision_rules.json sha256: `f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae`
+decision_rules.json sha256: `ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e`
 
 ## Measurement notes
 
@@ -8,17 +8,19 @@ decision_rules.json sha256: `f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f
 
 ## decision_rules.json mismatch warnings
 
-- [WARN] arm 'c0-old' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
-- [WARN] arm 'c0' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
-- [WARN] arm 'c0-prod' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
-- [WARN] arm 'c1-256' meta.decision_rules_sha256='deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
-- [WARN] arm 'c1-512' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
-- [WARN] arm 'c2' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
-- [WARN] arm 'c2-think512' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
-- [WARN] arm 'c3' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
-- [WARN] arm 'a1' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
-- [WARN] arm 'a2' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
-- [WARN] arm 'a3' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'
+- [WARN] arm 'c0-old' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
+- [WARN] arm 'c0' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
+- [WARN] arm 'c0-prod' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
+- [WARN] arm 'c1-256' meta.decision_rules_sha256='deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
+- [WARN] arm 'c1-512' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
+- [WARN] arm 'c0-ctx64k' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
+- [WARN] arm 'c2' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
+- [WARN] arm 'c2-think512' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
+- [WARN] arm 'c3' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
+- [WARN] arm 'a1' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
+- [WARN] arm 'a2' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
+- [WARN] arm 'a3' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
+- [INFO] arm 'c1-1024' meta.decision_rules_sha256='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e' (superseded: listed in decision_rules.json's supersedes)
 
 ## Per-arm metrics
 
@@ -70,6 +72,38 @@ decision_rules.json sha256: `f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f
 | layout_p95_wall_ms[screen] | 7500.0000 | 72 | n/a | n/a | n/a | n/a |
 | decode_tps | n/a | n/a | n/a | n/a | n/a | n/a |
 | arm_peak_mib | n/a | n/a | n/a | n/a | n/a | n/a |
+
+### c1-1024
+
+| metric | value | n | n_expected | complete | wilson | bootstrap |
+|---|---|---|---|---|---|---|
+| layout_acc[screen] | 0.9028 | 72 | 72 | True | [0.8126, 0.9521] | [0.7361, 1.0000] |
+| layout_mean_completion_tokens[screen] | 219.5833 | 72 | n/a | n/a | n/a | n/a | (per_correct=243.2308) |
+| layout_p95_wall_ms[screen] | 7500.0000 | 72 | n/a | n/a | n/a | n/a |
+| decode_tps | 40.0000 | 3 | n/a | n/a | n/a | n/a |
+| ttft_ms[ctx=2048] | 111.0000 | 3 | n/a | n/a | n/a | n/a |
+| arm_peak_mib | n/a | n/a | n/a | n/a | n/a | n/a |
+
+### c0-ctx64k
+
+| metric | value | n | n_expected | complete | wilson | bootstrap |
+|---|---|---|---|---|---|---|
+| decode_tps | 39.0000 | 3 | n/a | n/a | n/a | n/a |
+| ttft_ms[ctx=2048] | 106.0000 | 3 | n/a | n/a | n/a | n/a |
+| ttft_ms[ctx=65000] | 3520.0000 | 3 | n/a | n/a | n/a | n/a |
+| arm_peak_mib | 7600.0000 | 5 | n/a | n/a | n/a | n/a |
+
+### c0-ctx128k
+
+no meta.json / arm absent
+
+### c0-ctx128k-q4kv
+
+no meta.json / arm absent
+
+### c0-ub1024
+
+no meta.json / arm absent
 
 ### c2
 
@@ -317,6 +351,81 @@ verdict: **n/a**
 
 info: `{"deltas": {"decode_tps": {"missing": true}, "harness_score_schema_conformance": {"delta": 0.0, "new": 1.0, "old": 1.0}, "harness_score_schema_conformance_json_object": {"missing": true}, "harness_score_tool_selection": {"missing": true}, "layout_acc": {"missing": true}}, "new_arm": "c0", "old_arm": "c0-old"}`
 
+## Exploratory (NOT pre-registered)
+
+Plan v2 (2026-09-25): every rule below was written after seeing S1/S2 data, so a within-noise margin here carries none of the pre-registration guarantee the `Rules` section above does. None of these changes, overrides, or supersedes a v1 verdict above -- X3's F_sep variants are reported next to the corresponding v1 R2 verdict, never in place of it.
+
+### X1 `c1_1024_budget` -- gate (NOT pre-registered: post hoc, added 2026-09-25 after S1/S2 data; plan v2)
+
+Does Gemma 4 E4B with a 1024-token thinking budget clear R1's layout accuracy bar and R2's P/D speed bars?
+
+verdict: **pass**
+
+| clause | metric | arm | value | threshold | op | verdict | margin | note |
+|---|---|---|---|---|---|---|---|---|
+| layout_acc_c1_1024 | layout_acc | c1-1024 | 0.9028 | 0.8500 | >= | pass | within-noise | n/a |
+| P | layout_p95_wall_ms | c1-1024 | 7500.0000 | 15000 | <= | pass | n/a | n/a |
+| D | decode_tps | c1-1024 | 40.0000 | 35.0000 | >= | pass | n/a | n/a |
+
+### X2 `context_arms_report` -- informational (NOT pre-registered: post hoc, added 2026-09-25 after S1/S2 data; plan v2)
+
+How do the E4B context arms (64K/128K, q8_0 vs q4_0 KV) compare to c0 on ttft, decode speed, VRAM, and harness quality at context, and do their correctness-probe token ids match c0's?
+
+verdict: **n/a**
+
+info: `{"anchor_arm": "c0", "arms": {"c0-ctx128k": {"present": false}, "c0-ctx128k-q4kv": {"present": false}, "c0-ctx64k": {"arm_peak_mib": {"bootstrap": null, "complete": true, "extra": {}, "k": null, "missing": false, "n": 5, "n_expected": null, "note": null, "value": 7600.0, "wilson": null}, "correctness_tokens_vs_c0": "identical", "decode_tps": {"bootstrap": null, "complete": true, "extra": {}, "k": null, "missing": false, "n": 3, "n_expected": null, "note": null, "value": 39.0, "wilson": null}, "harness_vs_c0": {"schema_conformance": {"delta_bootstrap_ci": null, "delta_vs_anchor": null, "value": null}, "schema_conformance_json_object": {"delta_bootstrap_ci": null, "delta_vs_anchor": null, "value": null}, "tool_selection": {"delta_bootstrap_ci": null, "delta_vs_anchor": null, "value": null}}, "present": true, "tokens_vs_c0": "expected-identical-unverified", "ttft_ms": {"2048": {"bootstrap": null, "complete": true, "extra": {}, "k": null, "missing": false, "n": 3, "n_expected": null, "note": null, "value": 106.0, "wilson": null}, "65000": {"bootstrap": null, "complete": true, "extra": {}, "k": null, "missing": false, "n": 3, "n_expected": null, "note": null, "value": 3520.0, "wilson": null}}}}}`
+
+### X3 `switch_to_c2_sepvoice` -- gate (NOT pre-registered: post hoc, added 2026-09-25 after S1/S2 data; plan v2 -- voice on a separate card (GTX 1070), Raj 2026-09-25)
+
+Should MIST switch from Gemma 4 E4B to c2, with voice on a separate card so it no longer shares the candidate's VRAM budget?
+
+verdict: **pass**
+
+| clause | metric | arm | value | threshold | op | verdict | margin | note |
+|---|---|---|---|---|---|---|---|---|
+| L | layout_acc | c2-think512 | 0.9167 | 0.8900 | >= | pass | within-noise | n/a |
+| S1 | harness_score | c2 | 1.0000 | 0.8350 | >= | pass | clear | n/a |
+| S2 | harness_score | c2 | 1.0000 | 0.8750 | >= | pass | clear | n/a |
+| D | decode_tps | c2 | 40.0000 | 35.0000 | >= | pass | n/a | n/a |
+| P | layout_p95_wall_ms | c2-think512 | 7500.0000 | 15000 | <= | pass | n/a | n/a |
+| F_sep | arm_peak_mib | c2 | 7000.0000 | 12288.0000 | <= | pass | n/a | n/a |
+
+info: `{"candidate": "c2", "compares_against": "v1 R2/switch_to_c2", "thinking_candidate": "c2-think512"}`
+
+### X3 `switch_to_c3_sepvoice` -- gate (NOT pre-registered: post hoc, added 2026-09-25 after S1/S2 data; plan v2 -- voice on a separate card (GTX 1070), Raj 2026-09-25)
+
+Should MIST switch from Gemma 4 E4B to c3, with voice on a separate card so it no longer shares the candidate's VRAM budget?
+
+verdict: **pass**
+
+| clause | metric | arm | value | threshold | op | verdict | margin | note |
+|---|---|---|---|---|---|---|---|---|
+| L | layout_acc | c3 | 0.8333 | 0.7500 | >= | pass | clear | n/a |
+| S1 | harness_score | c3 | 1.0000 | 0.8350 | >= | pass | clear | n/a |
+| S2 | harness_score | c3 | 1.0000 | 0.8750 | >= | pass | clear | n/a |
+| D | decode_tps | c3 | 44.0000 | 35.0000 | >= | pass | n/a | n/a |
+| P | layout_p95_wall_ms | c3 | 7500.0000 | 15000 | <= | pass | n/a | n/a |
+| F_sep | arm_peak_mib | c3 | 8500.0000 | 12288.0000 | <= | pass | n/a | n/a |
+
+info: `{"candidate": "c3", "compares_against": "v1 R2/switch_to_c3", "thinking_candidate": "c3-think512"}`
+
+### X3 `switch_to_c4_sepvoice` -- gate (NOT pre-registered: post hoc, added 2026-09-25 after S1/S2 data; plan v2 -- voice on a separate card (GTX 1070), Raj 2026-09-25)
+
+Should MIST switch from Gemma 4 E4B to c4, with voice on a separate card so it no longer shares the candidate's VRAM budget?
+
+verdict: **missing**
+
+| clause | metric | arm | value | threshold | op | verdict | margin | note |
+|---|---|---|---|---|---|---|---|---|
+| L | layout_acc | c4 | n/a | 0.7500 | >= | missing | n/a | insufficient data to evaluate L on either branch |
+| S1 | harness_score | c4 | n/a | 0.8350 | >= | missing | n/a | no usable harness_score for c4/schema_conformance_json_object |
+| S2 | harness_score | c4 | n/a | 0.8750 | >= | missing | n/a | no usable harness_score for c4/tool_selection |
+| D | decode_tps | c4 | n/a | 35.0000 | >= | missing | n/a | no ttft.jsonl for this arm |
+| P | layout_p95_wall_ms | c4 | n/a | 15000 | <= | missing | n/a | no layout_p95_wall_ms available on the arm used for P |
+| F_sep | arm_peak_mib | c4 | n/a | n/a | n/a | missing | n/a | missing inputs: ['arm_peak_mib(c4)'] |
+
+info: `{"candidate": "c4", "compares_against": "v1 R2/switch_to_c4", "thinking_candidate": "c4-think512"}`
+
 ## Finalist candidates
 
 - c2-think512
@@ -395,6 +504,22 @@ Each arm's `error_count` is the number of entries in its `meta.json`'s `errors` 
       "harness"
     ]
   },
+  "c0-ctx128k": {
+    "present": false
+  },
+  "c0-ctx128k-q4kv": {
+    "present": false
+  },
+  "c0-ctx64k": {
+    "error_count": 0,
+    "harness": {},
+    "layout": {},
+    "present": true,
+    "suites_completed": [
+      "ttft",
+      "correctness"
+    ]
+  },
   "c0-old": {
     "error_count": 1,
     "harness": {
@@ -428,6 +553,25 @@ Each arm's `error_count` is the number of entries in its `meta.json`'s `errors` 
     "present": true,
     "suites_completed": [
       "harness"
+    ]
+  },
+  "c0-ub1024": {
+    "present": false
+  },
+  "c1-1024": {
+    "error_count": 0,
+    "harness": {},
+    "layout": {
+      "screen": {
+        "complete": true,
+        "n": 72,
+        "n_expected": 72
+      }
+    },
+    "present": true,
+    "suites_completed": [
+      "layout",
+      "ttft"
     ]
   },
   "c1-256": {

@@ -311,6 +311,76 @@
       },
       "ttft_ms": {}
     },
+    "c0-ctx128k": {
+      "present": false
+    },
+    "c0-ctx128k-q4kv": {
+      "present": false
+    },
+    "c0-ctx64k": {
+      "arm_peak_mib": {
+        "bootstrap": null,
+        "complete": true,
+        "extra": {},
+        "k": null,
+        "missing": false,
+        "n": 5,
+        "n_expected": null,
+        "note": null,
+        "value": 7600.0,
+        "wilson": null
+      },
+      "decode_tps": {
+        "bootstrap": null,
+        "complete": true,
+        "extra": {},
+        "k": null,
+        "missing": false,
+        "n": 3,
+        "n_expected": null,
+        "note": null,
+        "value": 39.0,
+        "wilson": null
+      },
+      "error_count": 0,
+      "harness_score": {},
+      "layout_acc": {},
+      "layout_completion_tokens_per_correct": {},
+      "layout_mean_completion_tokens": {},
+      "layout_p95_wall_ms": {},
+      "present": true,
+      "suites_completed": [
+        "ttft",
+        "correctness"
+      ],
+      "truncation_rate": {},
+      "ttft_ms": {
+        "2048": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 3,
+          "n_expected": null,
+          "note": null,
+          "value": 106.0,
+          "wilson": null
+        },
+        "65000": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 3,
+          "n_expected": null,
+          "note": null,
+          "value": 3520.0,
+          "wilson": null
+        }
+      }
+    },
     "c0-old": {
       "arm_peak_mib": {
         "bootstrap": null,
@@ -498,6 +568,108 @@
         }
       },
       "ttft_ms": {}
+    },
+    "c0-ub1024": {
+      "present": false
+    },
+    "c1-1024": {
+      "arm_peak_mib": {
+        "bootstrap": null,
+        "complete": false,
+        "extra": {},
+        "k": null,
+        "missing": true,
+        "n": null,
+        "n_expected": null,
+        "note": "no vram.csv rows for this arm",
+        "value": null,
+        "wilson": null
+      },
+      "decode_tps": {
+        "bootstrap": null,
+        "complete": true,
+        "extra": {},
+        "k": null,
+        "missing": false,
+        "n": 3,
+        "n_expected": null,
+        "note": null,
+        "value": 40.0,
+        "wilson": null
+      },
+      "error_count": 0,
+      "harness_score": {},
+      "layout_acc": {
+        "screen": {
+          "bootstrap": [
+            0.736111,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 65,
+          "missing": false,
+          "n": 72,
+          "n_expected": 72,
+          "note": null,
+          "value": 0.902778,
+          "wilson": [
+            0.81265,
+            0.952104
+          ]
+        }
+      },
+      "layout_completion_tokens_per_correct": {
+        "screen": 243.230769
+      },
+      "layout_mean_completion_tokens": {
+        "screen": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 72,
+          "n_expected": null,
+          "note": null,
+          "value": 219.583333,
+          "wilson": null
+        }
+      },
+      "layout_p95_wall_ms": {
+        "screen": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 72,
+          "n_expected": null,
+          "note": null,
+          "value": 7500.0,
+          "wilson": null
+        }
+      },
+      "present": true,
+      "suites_completed": [
+        "layout",
+        "ttft"
+      ],
+      "truncation_rate": {},
+      "ttft_ms": {
+        "2048": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": null,
+          "missing": false,
+          "n": 3,
+          "n_expected": null,
+          "note": null,
+          "value": 111.0,
+          "wilson": null
+        }
+      }
     },
     "c1-256": {
       "arm_peak_mib": {
@@ -1284,6 +1456,22 @@
         "harness"
       ]
     },
+    "c0-ctx128k": {
+      "present": false
+    },
+    "c0-ctx128k-q4kv": {
+      "present": false
+    },
+    "c0-ctx64k": {
+      "error_count": 0,
+      "harness": {},
+      "layout": {},
+      "present": true,
+      "suites_completed": [
+        "ttft",
+        "correctness"
+      ]
+    },
     "c0-old": {
       "error_count": 1,
       "harness": {
@@ -1317,6 +1505,25 @@
       "present": true,
       "suites_completed": [
         "harness"
+      ]
+    },
+    "c0-ub1024": {
+      "present": false
+    },
+    "c1-1024": {
+      "error_count": 0,
+      "harness": {},
+      "layout": {
+        "screen": {
+          "complete": true,
+          "n": 72,
+          "n_expected": 72
+        }
+      },
+      "present": true,
+      "suites_completed": [
+        "layout",
+        "ttft"
       ]
     },
     "c1-256": {
@@ -1441,19 +1648,456 @@
       "present": false
     }
   },
-  "decision_rules_sha256": "f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae",
+  "decision_rules_sha256": "ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e",
+  "decision_rules_sha256_info": [
+    "arm 'c1-1024' meta.decision_rules_sha256='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e' (superseded: listed in decision_rules.json's supersedes)"
+  ],
   "decision_rules_sha256_warnings": [
-    "arm 'c0-old' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
-    "arm 'c0' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
-    "arm 'c0-prod' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
-    "arm 'c1-256' meta.decision_rules_sha256='deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
-    "arm 'c1-512' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
-    "arm 'c2' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
-    "arm 'c2-think512' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
-    "arm 'c3' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
-    "arm 'a1' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
-    "arm 'a2' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'",
-    "arm 'a3' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae'"
+    "arm 'c0-old' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'",
+    "arm 'c0' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'",
+    "arm 'c0-prod' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'",
+    "arm 'c1-256' meta.decision_rules_sha256='deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'",
+    "arm 'c1-512' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'",
+    "arm 'c0-ctx64k' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'",
+    "arm 'c2' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'",
+    "arm 'c2-think512' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'",
+    "arm 'c3' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'",
+    "arm 'a1' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'",
+    "arm 'a2' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'",
+    "arm 'a3' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'"
+  ],
+  "exploratory_rules": [
+    {
+      "basis": "post hoc, added 2026-09-25 after S1/S2 data; plan v2",
+      "clauses": [
+        {
+          "arm": "c1-1024",
+          "extra": {
+            "pass_used": "screen"
+          },
+          "id": "layout_acc_c1_1024",
+          "margin": "within-noise",
+          "metric": "layout_acc",
+          "note": null,
+          "op": ">=",
+          "threshold": 0.85,
+          "value": 0.902778,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c1-1024",
+          "extra": {
+            "pass_used": "screen"
+          },
+          "id": "P",
+          "margin": "n/a",
+          "metric": "layout_p95_wall_ms",
+          "note": null,
+          "op": "<=",
+          "threshold": 15000,
+          "value": 7500.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c1-1024",
+          "extra": {},
+          "id": "D",
+          "margin": "n/a",
+          "metric": "decode_tps",
+          "note": null,
+          "op": ">=",
+          "threshold": 35.0,
+          "value": 40.0,
+          "verdict": "pass"
+        }
+      ],
+      "id": "X1",
+      "info": {},
+      "kind": "gate",
+      "label": "c1_1024_budget",
+      "pre_registered": false,
+      "question": "Does Gemma 4 E4B with a 1024-token thinking budget clear R1's layout accuracy bar and R2's P/D speed bars?",
+      "verdict": "pass"
+    },
+    {
+      "basis": "post hoc, added 2026-09-25 after S1/S2 data; plan v2",
+      "clauses": [],
+      "id": "X2",
+      "info": {
+        "anchor_arm": "c0",
+        "arms": {
+          "c0-ctx128k": {
+            "present": false
+          },
+          "c0-ctx128k-q4kv": {
+            "present": false
+          },
+          "c0-ctx64k": {
+            "arm_peak_mib": {
+              "bootstrap": null,
+              "complete": true,
+              "extra": {},
+              "k": null,
+              "missing": false,
+              "n": 5,
+              "n_expected": null,
+              "note": null,
+              "value": 7600.0,
+              "wilson": null
+            },
+            "correctness_tokens_vs_c0": "identical",
+            "decode_tps": {
+              "bootstrap": null,
+              "complete": true,
+              "extra": {},
+              "k": null,
+              "missing": false,
+              "n": 3,
+              "n_expected": null,
+              "note": null,
+              "value": 39.0,
+              "wilson": null
+            },
+            "harness_vs_c0": {
+              "schema_conformance": {
+                "delta_bootstrap_ci": null,
+                "delta_vs_anchor": null,
+                "value": null
+              },
+              "schema_conformance_json_object": {
+                "delta_bootstrap_ci": null,
+                "delta_vs_anchor": null,
+                "value": null
+              },
+              "tool_selection": {
+                "delta_bootstrap_ci": null,
+                "delta_vs_anchor": null,
+                "value": null
+              }
+            },
+            "present": true,
+            "tokens_vs_c0": "expected-identical-unverified",
+            "ttft_ms": {
+              "2048": {
+                "bootstrap": null,
+                "complete": true,
+                "extra": {},
+                "k": null,
+                "missing": false,
+                "n": 3,
+                "n_expected": null,
+                "note": null,
+                "value": 106.0,
+                "wilson": null
+              },
+              "65000": {
+                "bootstrap": null,
+                "complete": true,
+                "extra": {},
+                "k": null,
+                "missing": false,
+                "n": 3,
+                "n_expected": null,
+                "note": null,
+                "value": 3520.0,
+                "wilson": null
+              }
+            }
+          }
+        }
+      },
+      "kind": "informational",
+      "label": "context_arms_report",
+      "pre_registered": false,
+      "question": "How do the E4B context arms (64K/128K, q8_0 vs q4_0 KV) compare to c0 on ttft, decode speed, VRAM, and harness quality at context, and do their correctness-probe token ids match c0's?",
+      "verdict": "n/a"
+    },
+    {
+      "basis": "post hoc, added 2026-09-25 after S1/S2 data; plan v2 -- voice on a separate card (GTX 1070), Raj 2026-09-25",
+      "clauses": [
+        {
+          "arm": "c2-think512",
+          "extra": {
+            "branch": "on",
+            "mean_completion_tokens": 340.0,
+            "mean_completion_tokens_threshold": 400,
+            "pass_used": "screen"
+          },
+          "id": "L",
+          "margin": "within-noise",
+          "metric": "layout_acc",
+          "note": null,
+          "op": ">=",
+          "threshold": 0.89,
+          "value": 0.916667,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c2",
+          "extra": {},
+          "id": "S1",
+          "margin": "clear",
+          "metric": "harness_score",
+          "note": null,
+          "op": ">=",
+          "threshold": 0.835,
+          "value": 1.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c2",
+          "extra": {},
+          "id": "S2",
+          "margin": "clear",
+          "metric": "harness_score",
+          "note": null,
+          "op": ">=",
+          "threshold": 0.875,
+          "value": 1.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c2",
+          "extra": {},
+          "id": "D",
+          "margin": "n/a",
+          "metric": "decode_tps",
+          "note": null,
+          "op": ">=",
+          "threshold": 35.0,
+          "value": 40.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c2-think512",
+          "extra": {
+            "pass_used": "screen"
+          },
+          "id": "P",
+          "margin": "n/a",
+          "metric": "layout_p95_wall_ms",
+          "note": null,
+          "op": "<=",
+          "threshold": 15000,
+          "value": 7500.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c2",
+          "extra": {
+            "margin_mib": 512,
+            "total_mib": 12288.0,
+            "voice_excluded": true
+          },
+          "id": "F_sep",
+          "margin": "n/a",
+          "metric": "arm_peak_mib",
+          "note": null,
+          "op": "<=",
+          "threshold": 12288.0,
+          "value": 7000.0,
+          "verdict": "pass"
+        }
+      ],
+      "id": "X3",
+      "info": {
+        "candidate": "c2",
+        "compares_against": "v1 R2/switch_to_c2",
+        "thinking_candidate": "c2-think512"
+      },
+      "kind": "gate",
+      "label": "switch_to_c2_sepvoice",
+      "pre_registered": false,
+      "question": "Should MIST switch from Gemma 4 E4B to c2, with voice on a separate card so it no longer shares the candidate's VRAM budget?",
+      "verdict": "pass"
+    },
+    {
+      "basis": "post hoc, added 2026-09-25 after S1/S2 data; plan v2 -- voice on a separate card (GTX 1070), Raj 2026-09-25",
+      "clauses": [
+        {
+          "arm": "c3",
+          "extra": {
+            "branch": "off",
+            "pass_used": "finalist"
+          },
+          "id": "L",
+          "margin": "clear",
+          "metric": "layout_acc",
+          "note": null,
+          "op": ">=",
+          "threshold": 0.75,
+          "value": 0.833333,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c3",
+          "extra": {},
+          "id": "S1",
+          "margin": "clear",
+          "metric": "harness_score",
+          "note": null,
+          "op": ">=",
+          "threshold": 0.835,
+          "value": 1.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c3",
+          "extra": {},
+          "id": "S2",
+          "margin": "clear",
+          "metric": "harness_score",
+          "note": null,
+          "op": ">=",
+          "threshold": 0.875,
+          "value": 1.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c3",
+          "extra": {},
+          "id": "D",
+          "margin": "n/a",
+          "metric": "decode_tps",
+          "note": null,
+          "op": ">=",
+          "threshold": 35.0,
+          "value": 44.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c3",
+          "extra": {
+            "pass_used": "finalist"
+          },
+          "id": "P",
+          "margin": "n/a",
+          "metric": "layout_p95_wall_ms",
+          "note": null,
+          "op": "<=",
+          "threshold": 15000,
+          "value": 7500.0,
+          "verdict": "pass"
+        },
+        {
+          "arm": "c3",
+          "extra": {
+            "margin_mib": 512,
+            "total_mib": 12288.0,
+            "voice_excluded": true
+          },
+          "id": "F_sep",
+          "margin": "n/a",
+          "metric": "arm_peak_mib",
+          "note": null,
+          "op": "<=",
+          "threshold": 12288.0,
+          "value": 8500.0,
+          "verdict": "pass"
+        }
+      ],
+      "id": "X3",
+      "info": {
+        "candidate": "c3",
+        "compares_against": "v1 R2/switch_to_c3",
+        "thinking_candidate": "c3-think512"
+      },
+      "kind": "gate",
+      "label": "switch_to_c3_sepvoice",
+      "pre_registered": false,
+      "question": "Should MIST switch from Gemma 4 E4B to c3, with voice on a separate card so it no longer shares the candidate's VRAM budget?",
+      "verdict": "pass"
+    },
+    {
+      "basis": "post hoc, added 2026-09-25 after S1/S2 data; plan v2 -- voice on a separate card (GTX 1070), Raj 2026-09-25",
+      "clauses": [
+        {
+          "arm": "c4",
+          "extra": {
+            "branch": null
+          },
+          "id": "L",
+          "margin": "n/a",
+          "metric": "layout_acc",
+          "note": "insufficient data to evaluate L on either branch",
+          "op": ">=",
+          "threshold": 0.75,
+          "value": null,
+          "verdict": "missing"
+        },
+        {
+          "arm": "c4",
+          "extra": {},
+          "id": "S1",
+          "margin": "n/a",
+          "metric": "harness_score",
+          "note": "no usable harness_score for c4/schema_conformance_json_object",
+          "op": ">=",
+          "threshold": 0.835,
+          "value": null,
+          "verdict": "missing"
+        },
+        {
+          "arm": "c4",
+          "extra": {},
+          "id": "S2",
+          "margin": "n/a",
+          "metric": "harness_score",
+          "note": "no usable harness_score for c4/tool_selection",
+          "op": ">=",
+          "threshold": 0.875,
+          "value": null,
+          "verdict": "missing"
+        },
+        {
+          "arm": "c4",
+          "extra": {},
+          "id": "D",
+          "margin": "n/a",
+          "metric": "decode_tps",
+          "note": "no ttft.jsonl for this arm",
+          "op": ">=",
+          "threshold": 35.0,
+          "value": null,
+          "verdict": "missing"
+        },
+        {
+          "arm": "c4",
+          "extra": {},
+          "id": "P",
+          "margin": "n/a",
+          "metric": "layout_p95_wall_ms",
+          "note": "no layout_p95_wall_ms available on the arm used for P",
+          "op": "<=",
+          "threshold": 15000,
+          "value": null,
+          "verdict": "missing"
+        },
+        {
+          "arm": "c4",
+          "extra": {},
+          "id": "F_sep",
+          "margin": "n/a",
+          "metric": "arm_peak_mib",
+          "note": "missing inputs: ['arm_peak_mib(c4)']",
+          "op": null,
+          "threshold": null,
+          "value": null,
+          "verdict": "missing"
+        }
+      ],
+      "id": "X3",
+      "info": {
+        "candidate": "c4",
+        "compares_against": "v1 R2/switch_to_c4",
+        "thinking_candidate": "c4-think512"
+      },
+      "kind": "gate",
+      "label": "switch_to_c4_sepvoice",
+      "pre_registered": false,
+      "question": "Should MIST switch from Gemma 4 E4B to c4, with voice on a separate card so it no longer shares the candidate's VRAM budget?",
+      "verdict": "missing"
+    }
   ],
   "finalist_candidates": [
     "c2-think512",

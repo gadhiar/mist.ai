@@ -818,6 +818,42 @@ class RuleResult:
         }
 
 
+@dataclass
+class ExploratoryRuleResult:
+    """An exploratory (NOT pre-registered) rule result -- X1/X2/X3, plan v2 (2026-09-25).
+
+    Deliberately a separate dataclass from RuleResult, not an extension of it: RuleResult
+    and its to_dict() feed the v1 `rules` section of REPORT.md/summary.json, which must
+    stay byte-for-byte unchanged for the same inputs. Adding `pre_registered`/`basis`
+    fields to RuleResult itself would change every v1 rule's to_dict() shape even though
+    its content is otherwise identical; keeping this as its own type means the v1 path is
+    never touched by exploratory-rule code.
+    """
+
+    id: str
+    label: str
+    pre_registered: bool
+    basis: str
+    kind: str
+    question: str
+    verdict: str
+    clauses: list[ClauseResult]
+    info: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "pre_registered": self.pre_registered,
+            "basis": self.basis,
+            "kind": self.kind,
+            "question": self.question,
+            "verdict": self.verdict,
+            "clauses": [c.to_dict() for c in self.clauses],
+            "info": self.info,
+        }
+
+
 def _op_compare(value: float, threshold: float, op: str) -> bool:
     if op == ">=":
         return value >= threshold
@@ -1429,6 +1465,320 @@ def evaluate_r7(metrics: RunMetrics, rules: dict[str, Any]) -> RuleResult:
     )
 
 
+# ---------------------------------------------------------------------------
+# Exploratory rules (X1/X2/X3, NOT pre-registered -- plan v2, 2026-09-25)
+#
+# None of this touches RuleResult, evaluate_r1..evaluate_r7, or evaluate_all_rules:
+# X3's S1/S2/P clauses deliberately duplicate evaluate_r2's anchored-harness and P-clause
+# logic below (`_anchored_harness_clause`, the P computation inside evaluate_x3) rather
+# than refactoring evaluate_r2 to share it, so a v1 R2 verdict can never be affected by an
+# exploratory-rule change (and the risk that a refactor slips a byte-for-byte-identical
+# duplication is confined to X3, never the v1 rules section itself).
+# ---------------------------------------------------------------------------
+
+
+def _anchored_harness_clause(
+    clause_id: str, candidate: str, anchor_arm: str, test_name: str, threshold: float, metrics: RunMetrics
+) -> ClauseResult:
+    """Same anchor-demotion logic as evaluate_r2's nested `_anchored_clause` (S1/S2),
+    duplicated at module level so X3 can reuse it without evaluate_r2 depending on
+    anything outside its own body."""
+    candidate_result = metrics.arms.get(candidate)
+    cand_metric = candidate_result.harness_score.get(test_name) if candidate_result is not None else None
+    anchor_arm_metrics = metrics.arms.get(anchor_arm)
+    anchor_metric = anchor_arm_metrics.harness_score.get(test_name) if anchor_arm_metrics is not None else None
+
+    if anchor_arm_metrics is None or anchor_metric is None or not anchor_metric.usable():
+        return ClauseResult(
+            id=clause_id, metric="harness_score", arm=candidate, value=(cand_metric.value if cand_metric else None),
+            threshold=threshold, op=">=", verdict="missing", margin="n/a",
+            note=f"anchor arm {anchor_arm!r} harness_score for {test_name!r} is missing",
+        )
+    if cand_metric is None or not cand_metric.usable():
+        return ClauseResult(
+            id=clause_id, metric="harness_score", arm=candidate, value=None, threshold=threshold, op=">=",
+            verdict="missing", margin="n/a", note=f"no usable harness_score for {candidate}/{test_name}",
+        )
+    if anchor_metric.value < threshold:
+        return ClauseResult(
+            id=clause_id, metric="harness_score", arm=candidate, value=cand_metric.value, threshold=threshold,
+            op=">=", verdict="needs-review", margin="n/a", note="anchor_below_threshold",
+            extra={"anchor_arm": anchor_arm, "anchor_value": anchor_metric.value},
+        )
+    ok = cand_metric.value >= threshold
+    margin = margin_for(cand_metric.value, cand_metric.bootstrap, threshold, ">=")
+    return ClauseResult(
+        id=clause_id, metric="harness_score", arm=candidate, value=cand_metric.value, threshold=threshold,
+        op=">=", verdict="pass" if ok else "fail", margin=margin,
+    )
+
+
+def _f_sep_clause(candidate: str, metrics: RunMetrics, margin_mib: float) -> ClauseResult:
+    """X3's F_sep: `arm_peak_mib(candidate) + margin_mib <= total_mib`, voice excluded
+    entirely -- 'voice on a separate card (GTX 1070), Raj 2026-09-25'. Unlike v1's F,
+    this never reads voice_vram_lower_mib/voice_vram_upper_mib, so it never has a
+    needs-review branch: it is a single value+margin comparison against total_mib.
+    """
+    am = metrics.arms.get(candidate)
+    peak = am.arm_peak_mib if am is not None else missing_metric("arm absent")
+    total = metrics.total_mib
+
+    if not peak.usable() or total is None:
+        missing_bits = []
+        if not peak.usable():
+            missing_bits.append(f"arm_peak_mib({candidate})")
+        if total is None:
+            missing_bits.append("total_mib")
+        return ClauseResult(
+            id="F_sep", metric="arm_peak_mib", arm=candidate, value=peak.value, threshold=None, op=None,
+            verdict="missing", margin="n/a", note=f"missing inputs: {missing_bits}",
+        )
+    ok = peak.value + margin_mib <= total
+    return ClauseResult(
+        id="F_sep", metric="arm_peak_mib", arm=candidate, value=peak.value, threshold=total, op="<=",
+        verdict="pass" if ok else "fail", margin="n/a",
+        extra={"total_mib": total, "margin_mib": margin_mib, "voice_excluded": True},
+    )
+
+
+def evaluate_x1(metrics: RunMetrics, rules: dict[str, Any], rule_doc: dict[str, Any]) -> ExploratoryRuleResult:
+    """X1 `c1_1024_budget`: c1-1024 against R1's layout bar and R2's P/D bars."""
+    thresholds = rules["thresholds"]
+    arm_id = rule_doc["arm"]
+    am = metrics.arms.get(arm_id)
+    pass_used, acc_result = (None, None)
+    if am is not None:
+        pass_used, acc_result = pick_layout_pass(am.layout_acc)
+
+    clauses: list[ClauseResult] = []
+    for clause_doc in rule_doc["clauses"]:
+        cid = clause_doc["id"]
+        metric_name = clause_doc["metric"]
+        op = clause_doc["op"]
+        threshold = thresholds[clause_doc["threshold_key"]]
+
+        if metric_name == "layout_acc":
+            if acc_result is None:
+                clauses.append(ClauseResult(
+                    id=cid, metric=metric_name, arm=arm_id, value=None, threshold=threshold, op=op,
+                    verdict="missing", margin="n/a", note=f"no layout data for {arm_id}",
+                ))
+            else:
+                c = evaluate_simple_clause(cid, metric_name, arm_id, acc_result, op, threshold)
+                c.extra["pass_used"] = pass_used
+                clauses.append(c)
+        elif metric_name == "layout_p95_wall_ms":
+            p_result = am.layout_p95_wall_ms.get(pass_used) if am is not None and pass_used else None
+            if p_result is None:
+                clauses.append(ClauseResult(
+                    id=cid, metric=metric_name, arm=arm_id, value=None, threshold=threshold, op=op,
+                    verdict="missing", margin="n/a", note=f"no layout_p95_wall_ms available for {arm_id}",
+                ))
+            else:
+                c = evaluate_simple_clause(cid, metric_name, arm_id, p_result, op, threshold)
+                c.margin = "n/a"
+                c.extra["pass_used"] = pass_used
+                clauses.append(c)
+        elif metric_name == "decode_tps":
+            d_result = am.decode_tps if am is not None else missing_metric("arm absent")
+            clauses.append(evaluate_simple_clause(cid, metric_name, arm_id, d_result, op, threshold))
+        else:
+            raise ValueError(f"X1: unknown clause metric {metric_name!r}")
+
+    verdict = combine_gate_verdicts([c.verdict for c in clauses])
+    return ExploratoryRuleResult(
+        id="X1", label=rule_doc["label"], pre_registered=False, basis=rule_doc["basis"], kind="gate",
+        question=rule_doc["question"], verdict=verdict, clauses=clauses,
+    )
+
+
+def _harness_delta_bootstrap_ci(
+    arm_raw: harness_scorers.TestScores | None,
+    anchor_raw: harness_scorers.TestScores | None,
+    stats_cfg: dict[str, Any],
+) -> tuple[float, float] | None:
+    """Bootstrap CI for (arm's mean score - anchor's mean score) per shared case_id,
+    clustered by case_id -- the same cluster_bootstrap_ci machinery compute_harness_scores_for_arm
+    uses, applied to the paired delta instead of a single arm's raw scores."""
+    if arm_raw is None or anchor_raw is None:
+        return None
+    arm_by_case: dict[str, list[float]] = {}
+    for cs in arm_raw.case_scores:
+        arm_by_case.setdefault(cs.case_id, []).append(cs.score)
+    anchor_by_case: dict[str, list[float]] = {}
+    for cs in anchor_raw.case_scores:
+        anchor_by_case.setdefault(cs.case_id, []).append(cs.score)
+    shared = sorted(set(arm_by_case) & set(anchor_by_case))
+    if not shared:
+        return None
+    values_by_cluster = {
+        case_id: [statistics.mean(arm_by_case[case_id]) - statistics.mean(anchor_by_case[case_id])]
+        for case_id in shared
+    }
+    return cluster_bootstrap_ci(
+        values_by_cluster, B=stats_cfg["B"], seed=stats_cfg["seed"], confidence=stats_cfg["confidence"]
+    )
+
+
+def _correctness_identity_vs_anchor(
+    rows: list[dict[str, Any]] | None, anchor_rows: list[dict[str, Any]] | None
+) -> str:
+    """'identical' / 'differ' / 'missing' -- whether `rows`' correctness-probe token ids
+    match `anchor_rows`' exactly, prompt for prompt. 'missing' whenever either side is
+    empty/absent, carries an errored row, or the prompt_id sets differ -- never guessed."""
+    if not rows or not anchor_rows:
+        return "missing"
+    s = _correctness_file_summary(rows)
+    sa = _correctness_file_summary(anchor_rows)
+    if s["has_error"] or sa["has_error"]:
+        return "missing"
+    if not s["prompt_ids"] or s["prompt_ids"] != sa["prompt_ids"]:
+        return "missing"
+    a, b = s["tokens_by_prompt"], sa["tokens_by_prompt"]
+    return "identical" if all(a[pid] == b[pid] for pid in a) else "differ"
+
+
+def evaluate_x2(
+    metrics: RunMetrics, rules: dict[str, Any], rule_doc: dict[str, Any], arms_doc: dict[str, Any]
+) -> ExploratoryRuleResult:
+    """X2 `context_arms_report`: report-only -- no verdict, no pass/fail clauses."""
+    stats_cfg = {
+        "wilson_z": rules["statistics"]["wilson"]["z"],
+        "B": rules["statistics"]["bootstrap"]["B"],
+        "seed": rules["statistics"]["bootstrap"]["seed"],
+        "confidence": rules["statistics"]["bootstrap"]["confidence"],
+    }
+    anchor_arm = rule_doc["anchor_arm"]
+    anchor_am = metrics.arms.get(anchor_arm)
+    anchor_rep = rule_doc.get("correctness_rep_compared", 1)
+    anchor_correctness = metrics.raw_correctness.get(anchor_arm, {}).get(anchor_rep)
+
+    arms_rows: dict[str, Any] = {}
+    for arm_id in rule_doc["arms"]:
+        am = metrics.arms.get(arm_id)
+        entry: dict[str, Any] = {"present": am.present if am is not None else False}
+        if am is None or not am.present:
+            arms_rows[arm_id] = entry
+            continue
+
+        entry["ttft_ms"] = {str(ctx): r.to_dict() for ctx, r in am.ttft_ms.items()}
+        entry["decode_tps"] = am.decode_tps.to_dict()
+        entry["arm_peak_mib"] = am.arm_peak_mib.to_dict()
+        entry["tokens_vs_c0"] = (arms_doc.get(arm_id) or {}).get("tokens_vs_c0")
+
+        harness_rows: dict[str, Any] = {}
+        for test_name in rule_doc["harness_tests"]:
+            arm_score = am.harness_score.get(test_name)
+            anchor_score = anchor_am.harness_score.get(test_name) if anchor_am is not None else None
+            harness_entry: dict[str, Any] = {
+                "value": arm_score.to_dict() if arm_score is not None else None,
+                "delta_vs_anchor": None,
+                "delta_bootstrap_ci": None,
+            }
+            if arm_score is not None and arm_score.usable() and anchor_score is not None and anchor_score.usable():
+                harness_entry["delta_vs_anchor"] = arm_score.value - anchor_score.value
+                arm_raw = metrics.raw_test_scores.get(arm_id, {}).get(test_name)
+                anchor_raw = metrics.raw_test_scores.get(anchor_arm, {}).get(test_name)
+                ci = _harness_delta_bootstrap_ci(arm_raw, anchor_raw, stats_cfg)
+                harness_entry["delta_bootstrap_ci"] = list(ci) if ci else None
+            harness_rows[test_name] = harness_entry
+        entry["harness_vs_c0"] = harness_rows
+
+        arm_correctness = metrics.raw_correctness.get(arm_id, {}).get(anchor_rep)
+        entry["correctness_tokens_vs_c0"] = _correctness_identity_vs_anchor(arm_correctness, anchor_correctness)
+
+        arms_rows[arm_id] = entry
+
+    return ExploratoryRuleResult(
+        id="X2", label=rule_doc["label"], pre_registered=False, basis=rule_doc["basis"], kind="informational",
+        question=rule_doc["question"], verdict="n/a", clauses=[],
+        info={"anchor_arm": anchor_arm, "arms": arms_rows},
+    )
+
+
+def evaluate_x3(rule_doc: dict[str, Any], metrics: RunMetrics, rules: dict[str, Any]) -> ExploratoryRuleResult:
+    """X3: an R2 candidate's L/S1/S2/D/P clauses (identical logic to evaluate_r2, per-clause
+    duplicated -- see the module note above) with F replaced by F_sep (voice excluded)."""
+    thresholds = rules["thresholds"]
+    constants = rules["constants"]
+    cfg = constants["r2_candidates"][rule_doc["r2_candidate_key"]]
+    candidate = cfg["arm"]
+    thinking_candidate = cfg["thinking_arm"]
+    anchor_arm = constants["r2_anchor_arm"]
+    margin_mib = constants["margin_mib"]
+
+    l_clause, arm_for_p, pass_for_p = _l_clause(candidate, thinking_candidate, metrics, thresholds)
+
+    s1 = _anchored_harness_clause(
+        "S1", candidate, anchor_arm, "schema_conformance_json_object",
+        thresholds["r2_s1_schema_conformance_json_object_min"], metrics,
+    )
+    s2 = _anchored_harness_clause(
+        "S2", candidate, anchor_arm, "tool_selection", thresholds["r2_s2_tool_selection_min"], metrics,
+    )
+
+    candidate_am = metrics.arms.get(candidate)
+    d_result = candidate_am.decode_tps if candidate_am is not None else missing_metric("arm absent")
+    d_clause = evaluate_simple_clause("D", "decode_tps", candidate, d_result, ">=", thresholds["r2_d_decode_tps_min"])
+
+    if arm_for_p is None:
+        arm_for_p = candidate
+        p_am = metrics.arms.get(candidate)
+        pass_for_p, p_result = (None, None)
+        if p_am is not None:
+            pass_for_p, _ = pick_layout_pass(p_am.layout_acc)
+            p_result = p_am.layout_p95_wall_ms.get(pass_for_p) if pass_for_p else None
+    else:
+        p_am = metrics.arms.get(arm_for_p)
+        p_result = p_am.layout_p95_wall_ms.get(pass_for_p) if p_am is not None and pass_for_p else None
+
+    if p_result is None:
+        p_clause = ClauseResult(
+            id="P", metric="layout_p95_wall_ms", arm=arm_for_p, value=None,
+            threshold=thresholds["r2_p_layout_p95_wall_ms_max"], op="<=", verdict="missing", margin="n/a",
+            note="no layout_p95_wall_ms available on the arm used for P",
+        )
+    else:
+        p_clause = evaluate_simple_clause(
+            "P", "layout_p95_wall_ms", arm_for_p, p_result, "<=", thresholds["r2_p_layout_p95_wall_ms_max"]
+        )
+        p_clause.margin = "n/a"
+        p_clause.extra["pass_used"] = pass_for_p
+
+    f_sep_clause = _f_sep_clause(candidate, metrics, margin_mib)
+
+    clauses = [l_clause, s1, s2, d_clause, p_clause, f_sep_clause]
+    verdict = combine_gate_verdicts([c.verdict for c in clauses])
+    return ExploratoryRuleResult(
+        id="X3", label=rule_doc["label"], pre_registered=False, basis=rule_doc["basis"], kind="gate",
+        question=rule_doc["question"], verdict=verdict, clauses=clauses,
+        info={
+            "candidate": candidate, "thinking_candidate": thinking_candidate,
+            "compares_against": f"v1 R2/{rule_doc['r2_candidate_key']}",
+        },
+    )
+
+
+def evaluate_all_exploratory_rules(
+    metrics: RunMetrics, rules: dict[str, Any], arms_doc: dict[str, Any]
+) -> list[ExploratoryRuleResult]:
+    exploratory = rules.get("exploratory_rules")
+    if not exploratory:
+        return []
+    results: list[ExploratoryRuleResult] = []
+    for rule_doc in exploratory.get("rules", []):
+        rid = rule_doc["id"]
+        if rid == "X1":
+            results.append(evaluate_x1(metrics, rules, rule_doc))
+        elif rid == "X2":
+            results.append(evaluate_x2(metrics, rules, rule_doc, arms_doc))
+        elif rid == "X3":
+            results.append(evaluate_x3(rule_doc, metrics, rules))
+        else:
+            raise ValueError(f"exploratory_rules: unknown rule id {rid!r}")
+    return results
+
+
 def evaluate_all_rules(metrics: RunMetrics, rules: dict[str, Any]) -> list[RuleResult]:
     results: list[RuleResult] = []
     results.append(evaluate_r1(metrics, rules))
@@ -1517,18 +1867,35 @@ def compute_missing_inputs(metrics: RunMetrics, rule_results: list[RuleResult]) 
     return sorted(set(missing))
 
 
-def compute_sha_warnings(metrics: RunMetrics, expected_sha: str) -> list[str]:
+def compute_sha_warnings(
+    metrics: RunMetrics, expected_sha: str, superseded_shas: frozenset[str] = frozenset()
+) -> tuple[list[str], list[str]]:
+    """Returns (warnings, infos) for each arm's stored meta.decision_rules_sha256.
+
+    A stored sha equal to `expected_sha` produces neither. A stored sha that differs is
+    an [INFO] -- not a mismatch [WARN] -- when it appears in `superseded_shas`
+    (decision_rules.json's own `supersedes` list; see bench_host.py's merge_run_meta,
+    which is what allows such a run to have merged in the first place). Any other
+    (unlisted) differing sha is still a [WARN], exactly as before this function grew a
+    `superseded_shas` parameter.
+    """
     warnings: list[str] = []
+    infos: list[str] = []
     for arm_id in metrics.arm_order:
         am = metrics.arms.get(arm_id)
         if am is None or not am.present or am.decision_rules_sha256 is None:
             continue
-        if am.decision_rules_sha256 != expected_sha:
-            warnings.append(
-                f"arm {arm_id!r} meta.decision_rules_sha256={am.decision_rules_sha256!r} "
-                f"differs from the analysed decision_rules.json={expected_sha!r}"
-            )
-    return warnings
+        if am.decision_rules_sha256 == expected_sha:
+            continue
+        msg = (
+            f"arm {arm_id!r} meta.decision_rules_sha256={am.decision_rules_sha256!r} "
+            f"differs from the analysed decision_rules.json={expected_sha!r}"
+        )
+        if am.decision_rules_sha256 in superseded_shas:
+            infos.append(f"{msg} (superseded: listed in decision_rules.json's supersedes)")
+        else:
+            warnings.append(msg)
+    return warnings, infos
 
 
 # ---------------------------------------------------------------------------
@@ -1621,10 +1988,12 @@ def render_report(
     *,
     metrics: RunMetrics,
     rule_results: list[RuleResult],
+    exploratory_results: list[ExploratoryRuleResult],
     finalist_candidates: list[str],
     coverage: dict[str, Any],
     missing_inputs: list[str],
     sha_warnings: list[str],
+    sha_infos: list[str],
     decision_rules_sha: str,
 ) -> str:
     lines: list[str] = []
@@ -1642,11 +2011,13 @@ def render_report(
         "only (`arms.json`)."
     )
     lines.append("")
-    if sha_warnings:
+    if sha_warnings or sha_infos:
         lines.append("## decision_rules.json mismatch warnings")
         lines.append("")
         for w in sha_warnings:
             lines.append(f"- [WARN] {w}")
+        for i in sha_infos:
+            lines.append(f"- [INFO] {i}")
         lines.append("")
 
     lines.append("## Per-arm metrics")
@@ -1721,6 +2092,36 @@ def render_report(
             lines.append(f"info: `{dumps_line(r.info)}`")
             lines.append("")
 
+    lines.append("## Exploratory (NOT pre-registered)")
+    lines.append("")
+    lines.append(
+        "Plan v2 (2026-09-25): every rule below was written after seeing S1/S2 data, so a "
+        "within-noise margin here carries none of the pre-registration guarantee the "
+        "`Rules` section above does. None of these changes, overrides, or supersedes a v1 "
+        "verdict above -- X3's F_sep variants are reported next to the corresponding v1 R2 "
+        "verdict, never in place of it."
+    )
+    lines.append("")
+    for r in exploratory_results:
+        lines.append(f"### {r.id} `{r.label}` -- {r.kind} (NOT pre-registered: {r.basis})")
+        lines.append("")
+        lines.append(f"{r.question}")
+        lines.append("")
+        lines.append(f"verdict: **{r.verdict}**")
+        lines.append("")
+        if r.clauses:
+            lines.append("| clause | metric | arm | value | threshold | op | verdict | margin | note |")
+            lines.append("|---|---|---|---|---|---|---|---|---|")
+            for c in r.clauses:
+                lines.append(
+                    f"| {c.id} | {c.metric} | {_fmt(c.arm)} | {_fmt(c.value)} | {_fmt(c.threshold)} | "
+                    f"{_fmt(c.op)} | {c.verdict} | {c.margin} | {_fmt(c.note)} |"
+                )
+            lines.append("")
+        if r.info:
+            lines.append(f"info: `{dumps_line(r.info)}`")
+            lines.append("")
+
     lines.append("## Finalist candidates")
     lines.append("")
     if finalist_candidates:
@@ -1763,10 +2164,12 @@ def build_summary(
     *,
     metrics: RunMetrics,
     rule_results: list[RuleResult],
+    exploratory_results: list[ExploratoryRuleResult],
     finalist_candidates: list[str],
     coverage: dict[str, Any],
     missing_inputs: list[str],
     sha_warnings: list[str],
+    sha_infos: list[str],
     decision_rules_sha: str,
 ) -> dict[str, Any]:
     arms_out: dict[str, Any] = {}
@@ -1795,6 +2198,7 @@ def build_summary(
         "schema": 1,
         "decision_rules_sha256": decision_rules_sha,
         "decision_rules_sha256_warnings": sha_warnings,
+        "decision_rules_sha256_info": sha_infos,
         "arms": arms_out,
         "session": {
             "voice_vram_lower_mib": metrics.voice_vram_lower_mib.to_dict(),
@@ -1802,6 +2206,7 @@ def build_summary(
             "total_mib": metrics.total_mib,
         },
         "rules": [r.to_dict() for r in rule_results],
+        "exploratory_rules": [r.to_dict() for r in exploratory_results],
         "finalist_candidates": finalist_candidates,
         "coverage": coverage,
         "missing_inputs": missing_inputs,
@@ -1828,21 +2233,25 @@ def generate_outputs(results_dir: Path, rules_path: Path = DECISION_RULES_PATH) 
     arm_ids = list(arms_doc)
     metrics = compute_all_metrics(results_dir, arm_ids, rules)
     rule_results = evaluate_all_rules(metrics, rules)
+    exploratory_results = evaluate_all_exploratory_rules(metrics, rules, arms_doc)
     finalist_candidates = compute_finalist_candidates(metrics, rules)
     coverage = compute_coverage(metrics, rules)
     missing_inputs = compute_missing_inputs(metrics, rule_results)
     sha = decision_rules_sha256(rules_path)
-    sha_warnings = compute_sha_warnings(metrics, sha)
+    superseded_shas = frozenset(
+        e["sha256"] for e in rules.get("supersedes", []) if isinstance(e, dict) and "sha256" in e
+    )
+    sha_warnings, sha_infos = compute_sha_warnings(metrics, sha, superseded_shas)
 
     report = render_report(
-        metrics=metrics, rule_results=rule_results, finalist_candidates=finalist_candidates,
-        coverage=coverage, missing_inputs=missing_inputs, sha_warnings=sha_warnings,
-        decision_rules_sha=sha,
+        metrics=metrics, rule_results=rule_results, exploratory_results=exploratory_results,
+        finalist_candidates=finalist_candidates, coverage=coverage, missing_inputs=missing_inputs,
+        sha_warnings=sha_warnings, sha_infos=sha_infos, decision_rules_sha=sha,
     )
     summary = build_summary(
-        metrics=metrics, rule_results=rule_results, finalist_candidates=finalist_candidates,
-        coverage=coverage, missing_inputs=missing_inputs, sha_warnings=sha_warnings,
-        decision_rules_sha=sha,
+        metrics=metrics, rule_results=rule_results, exploratory_results=exploratory_results,
+        finalist_candidates=finalist_candidates, coverage=coverage, missing_inputs=missing_inputs,
+        sha_warnings=sha_warnings, sha_infos=sha_infos, decision_rules_sha=sha,
     )
 
     files: dict[str, str] = {"REPORT.md": report, "summary.json": dumps_stable(summary)}

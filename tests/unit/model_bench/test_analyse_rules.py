@@ -133,6 +133,93 @@ def test_f_clause_missing_when_voice_metrics_absent():
 
 
 # ---------------------------------------------------------------------------
+# Synthetic: exploratory X1/X3 (NOT pre-registered, plan v2 2026-09-25) -- hand-built,
+# a single fixture run cannot exercise X1's pass/fail/missing branches simultaneously
+# since X1 evaluates exactly one arm (c1-1024). See fixtures/analyse/run/README.md.
+# ---------------------------------------------------------------------------
+
+
+def _exploratory_rule_doc(rule_id: str, label: str) -> dict:
+    matches = [
+        r for r in RULES["exploratory_rules"]["rules"] if r["id"] == rule_id and r["label"] == label
+    ]
+    assert len(matches) == 1, f"expected exactly one exploratory rule {rule_id}/{label}"
+    return matches[0]
+
+
+def test_x1_pass_when_layout_p_and_d_all_clear():
+    arm = _empty_arm_metrics("c1-1024")
+    arm.layout_acc = {"screen": _mr(0.90, bootstrap=(0.85, 0.95))}
+    arm.layout_p95_wall_ms = {"screen": _mr(5000.0)}
+    arm.decode_tps = _mr(40.0)
+    metrics = _run_metrics({"c1-1024": arm})
+    result = analyse.evaluate_x1(metrics, RULES, _exploratory_rule_doc("X1", "c1_1024_budget"))
+    assert result.pre_registered is False
+    assert result.basis
+    assert result.verdict == "pass"
+    for c in result.clauses:
+        assert c.verdict == "pass", f"{c.id}: {c}"
+
+
+def test_x1_fail_when_decode_tps_too_low():
+    arm = _empty_arm_metrics("c1-1024")
+    arm.layout_acc = {"screen": _mr(0.90, bootstrap=(0.85, 0.95))}
+    arm.layout_p95_wall_ms = {"screen": _mr(5000.0)}
+    arm.decode_tps = _mr(10.0)  # below R2's D threshold (35)
+    metrics = _run_metrics({"c1-1024": arm})
+    result = analyse.evaluate_x1(metrics, RULES, _exploratory_rule_doc("X1", "c1_1024_budget"))
+    d_clause = next(c for c in result.clauses if c.id == "D")
+    assert d_clause.verdict == "fail"
+    assert result.verdict == "fail"
+
+
+def test_x1_missing_when_arm_absent():
+    metrics = _run_metrics({})
+    result = analyse.evaluate_x1(metrics, RULES, _exploratory_rule_doc("X1", "c1_1024_budget"))
+    assert result.verdict == "missing"
+    for c in result.clauses:
+        assert c.verdict == "missing"
+
+
+def test_x3_f_sep_passes_where_v1_f_fails_outright():
+    # A peak large enough that v1's F fails even the LOWER voice estimate (not merely
+    # needs-review), so F_sep passing here is a genuine "F failed, F_sep did not" case.
+    cand = _empty_arm_metrics("c2")
+    cand.harness_score = {"schema_conformance_json_object": _mr(0.9), "tool_selection": _mr(0.95)}
+    cand.decode_tps = _mr(40.0)
+    cand.layout_acc = {"screen": _mr(0.80, bootstrap=(0.75, 0.85))}
+    cand.layout_p95_wall_ms = {"screen": _mr(5000.0)}
+    cand.arm_peak_mib = _mr(15000.0)
+
+    anchor = _empty_arm_metrics("c0-prod")
+    anchor.harness_score = {"schema_conformance_json_object": _mr(0.9), "tool_selection": _mr(0.95)}
+
+    metrics = _run_metrics(
+        {"c2": cand, "c0-prod": anchor}, lower=_mr(1000.0), upper=_mr(2000.0), total_mib=16000.0,
+    )
+
+    f_v1 = analyse._f_clause("c2", metrics, RULES["constants"]["margin_mib"])
+    assert f_v1.verdict == "fail"  # 15000 + 1000 (lower) + 512 > 16000
+
+    rule_doc = _exploratory_rule_doc("X3", "switch_to_c2_sepvoice")
+    result = analyse.evaluate_x3(rule_doc, metrics, RULES)
+    assert result.pre_registered is False
+    f_sep = next(c for c in result.clauses if c.id == "F_sep")
+    assert f_sep.verdict == "pass"  # 15000 + 512 <= 16000, voice excluded
+    for c in result.clauses:
+        assert c.verdict == "pass", f"{c.id}: {c}"
+    assert result.verdict == "pass"
+    assert result.info["compares_against"] == "v1 R2/switch_to_c2"
+
+
+def test_x3_missing_when_candidate_arm_absent():
+    metrics = _run_metrics({}, lower=_mr(1000.0), upper=_mr(2000.0), total_mib=16000.0)
+    rule_doc = _exploratory_rule_doc("X3", "switch_to_c4_sepvoice")
+    result = analyse.evaluate_x3(rule_doc, metrics, RULES)
+    assert result.verdict == "missing"
+
+
+# ---------------------------------------------------------------------------
 # Synthetic: R5 needs-review-only branch (upper crosses, lower does not)
 # ---------------------------------------------------------------------------
 
@@ -429,3 +516,76 @@ def test_decision_rules_sha_mismatch_warning_for_c1_256(summary):
 
 def test_missing_inputs_lists_switch_to_c4(summary):
     assert any("switch_to_c4" in m for m in summary["missing_inputs"])
+
+
+# ---------------------------------------------------------------------------
+# Exploratory rules (X1/X2/X3), end to end against the fixture directory --
+# plan v2 (2026-09-25). See fixtures/analyse/run/README.md for c1-1024/c0-ctx64k.
+# ---------------------------------------------------------------------------
+
+
+def _exploratory(summary_doc: dict, rule_id: str, label: str) -> dict:
+    matches = [
+        r for r in summary_doc["exploratory_rules"] if r["id"] == rule_id and r["label"] == label
+    ]
+    assert len(matches) == 1, f"expected exactly one exploratory rule {rule_id}/{label}"
+    return matches[0]
+
+
+def test_v1_rules_key_excludes_exploratory_rules(summary):
+    v1_ids = {r["id"] for r in summary["rules"]}
+    assert v1_ids == {"R1", "R2", "R3", "R4", "R5", "R6", "R7"}
+    for r in summary["rules"]:
+        assert "pre_registered" not in r
+        assert "basis" not in r
+
+
+def test_x1_c1_1024_budget_passes_from_fixture_data(summary):
+    x1 = _exploratory(summary, "X1", "c1_1024_budget")
+    assert x1["pre_registered"] is False
+    assert x1["verdict"] == "pass"
+    for clause in x1["clauses"]:
+        assert clause["verdict"] == "pass", f"{clause['id']}: {clause}"
+
+
+def test_sha_info_not_warn_for_c1_1024_superseded_sha(summary):
+    # c1-1024's fixture meta.json deliberately stores the v1 sha, which the current
+    # decision_rules.json lists in its own `supersedes` -- an [INFO], never a [WARN].
+    assert any("c1-1024" in i for i in summary["decision_rules_sha256_info"])
+    assert not any("c1-1024" in w for w in summary["decision_rules_sha256_warnings"])
+
+
+def test_x2_context_arms_report_rows(summary):
+    x2 = _exploratory(summary, "X2", "context_arms_report")
+    assert x2["verdict"] == "n/a"
+    assert x2["clauses"] == []
+    arms = x2["info"]["arms"]
+    assert set(arms) == {"c0-ctx64k", "c0-ctx128k", "c0-ctx128k-q4kv"}
+    # c0-ctx64k has real fixture data.
+    ctx64k = arms["c0-ctx64k"]
+    assert ctx64k["present"] is True
+    assert ctx64k["tokens_vs_c0"] == "expected-identical-unverified"
+    assert ctx64k["correctness_tokens_vs_c0"] == "identical"
+    assert ctx64k["decode_tps"]["value"] == pytest.approx(39.0, abs=1e-5)
+    assert "65000" in ctx64k["ttft_ms"]
+    # The other two context arms have no fixture directory at all.
+    assert arms["c0-ctx128k"]["present"] is False
+    assert arms["c0-ctx128k-q4kv"]["present"] is False
+
+
+def test_x3_switch_to_c3_sepvoice_passes_where_v1_f_was_needs_review(summary):
+    r_c3 = _rule(summary, "switch_to_c3")
+    f_v1 = next(c for c in r_c3["clauses"] if c["id"] == "F")
+    assert f_v1["verdict"] == "needs-review"
+
+    x3 = _exploratory(summary, "X3", "switch_to_c3_sepvoice")
+    f_sep = next(c for c in x3["clauses"] if c["id"] == "F_sep")
+    assert f_sep["verdict"] == "pass"
+    assert x3["info"]["compares_against"] == "v1 R2/switch_to_c3"
+
+
+def test_x3_switch_to_c4_sepvoice_entirely_missing(summary):
+    x3 = _exploratory(summary, "X3", "switch_to_c4_sepvoice")
+    assert x3["verdict"] == "missing"
+    for clause in x3["clauses"]:
+        assert clause["verdict"] == "missing"

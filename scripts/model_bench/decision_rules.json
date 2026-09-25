@@ -1,6 +1,13 @@
 {
   "schema": 1,
   "frozen_note": "Pre-registered before any mist-model-bench data exists (T3b). Committed as its own change, before analyse.py, so history shows the rules fixed before the analysis code and before a single result lands. A threshold here is never edited to change a verdict on data already collected; a genuine recalibration is a new commit with its own rationale, not an amendment to this one.",
+  "supersedes": [
+    {
+      "sha256": "f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae",
+      "label": "v1 pre-registered (2026-09-24)"
+    }
+  ],
+  "supersedes_note": "Plan v2 (2026-09-25) adds the exploratory_rules section below; `rules`, `thresholds`, `constants`, `metrics`, and `statistics` above are byte-for-byte unchanged in content from v1 (pinned by a test against a committed copy of the v1 file). This change nonetheless moves decision_rules.json's own sha256, and S4 resumes the finalist pass for c1-512 inside run mb1, whose c1-512/meta.json was written under the v1 sha listed here. bench_host.py's merge_run_meta allows a stored decision_rules_sha256 to differ from the current one only when the stored value appears in this list; analyse.py reports a stored sha listed here as [INFO], not a mismatch [WARN]. An unlisted sha is refused by merge_run_meta and reported as [WARN] by analyse.py, exactly as before.",
   "statistics": {
     "wilson": {
       "confidence": 0.95,
@@ -271,5 +278,93 @@
         {"metric": "decode_tps"}
       ]
     }
-  ]
+  ],
+  "exploratory_rules": {
+    "note": "Plan v2 (2026-09-25, https://claude.ai/code -- the lead's overnight delta after S1/S2 data). Every rule in this section is NOT pre-registered: it was written after seeing S1/S2 results, so a within-noise margin here carries none of the pre-registration guarantee `rules` above does. None of these rules changes, overrides, or supersedes a v1 `rules` verdict -- X3's F_sep variants are evaluated and reported next to the corresponding v1 R2 verdict, never in place of it. analyse.py renders this section separately, headed 'Exploratory (NOT pre-registered)', after the v1 Rules section, and keeps it out of summary.json's `rules` list (it is under `exploratory_rules` there too).",
+    "rules": [
+      {
+        "id": "X1",
+        "label": "c1_1024_budget",
+        "pre_registered": false,
+        "basis": "post hoc, added 2026-09-25 after S1/S2 data; plan v2",
+        "kind": "gate",
+        "question": "Does Gemma 4 E4B with a 1024-token thinking budget clear R1's layout accuracy bar and R2's P/D speed bars?",
+        "arm": "c1-1024",
+        "clauses": [
+          {
+            "id": "layout_acc_c1_1024",
+            "metric": "layout_acc",
+            "arm": "c1-1024",
+            "pass": "screen_or_finalist",
+            "op": ">=",
+            "threshold_key": "r1_keep_e4b_layout_acc_min"
+          },
+          {
+            "id": "P",
+            "metric": "layout_p95_wall_ms",
+            "arm": "c1-1024",
+            "pass": "screen_or_finalist",
+            "op": "<=",
+            "threshold_key": "r2_p_layout_p95_wall_ms_max"
+          },
+          {
+            "id": "D",
+            "metric": "decode_tps",
+            "arm": "c1-1024",
+            "op": ">=",
+            "threshold_key": "r2_d_decode_tps_min"
+          }
+        ]
+      },
+      {
+        "id": "X2",
+        "label": "context_arms_report",
+        "pre_registered": false,
+        "basis": "post hoc, added 2026-09-25 after S1/S2 data; plan v2",
+        "kind": "informational",
+        "question": "How do the E4B context arms (64K/128K, q8_0 vs q4_0 KV) compare to c0 on ttft, decode speed, VRAM, and harness quality at context, and do their correctness-probe token ids match c0's?",
+        "arms": ["c0-ctx64k", "c0-ctx128k", "c0-ctx128k-q4kv"],
+        "anchor_arm": "c0",
+        "harness_tests": ["schema_conformance", "schema_conformance_json_object", "tool_selection"],
+        "correctness_rep_compared": 1,
+        "report_only_note": "X2 emits no verdict -- ttft per measured ctx target, decode_tps, arm_peak_mib, harness scores with CIs and a bootstrap-CI delta against anchor_arm on the same tests, the arm's tokens_vs_c0 label from arms.json, and whether its correctness.r1 token ids are identical/differ/missing versus c0's r1."
+      },
+      {
+        "id": "X3",
+        "label": "switch_to_c2_sepvoice",
+        "pre_registered": false,
+        "basis": "post hoc, added 2026-09-25 after S1/S2 data; plan v2 -- voice on a separate card (GTX 1070), Raj 2026-09-25",
+        "kind": "gate",
+        "question": "Should MIST switch from Gemma 4 E4B to c2, with voice on a separate card so it no longer shares the candidate's VRAM budget?",
+        "r2_candidate_key": "switch_to_c2",
+        "clauses": ["L", "S1", "S2", "D", "P", "F_sep"],
+        "f_sep_definition": "arm_peak_mib(candidate) + constants.margin_mib <= total_mib; voice_vram_lower_mib/voice_vram_upper_mib are not consulted at all (voice excluded). Unlike v1's F, F_sep never reads needs-review from a lower/upper split -- it is a single value+margin comparison against total_mib.",
+        "compared_against": "the v1 R2 switch_to_c2 verdict, reported alongside, never in place of it"
+      },
+      {
+        "id": "X3",
+        "label": "switch_to_c3_sepvoice",
+        "pre_registered": false,
+        "basis": "post hoc, added 2026-09-25 after S1/S2 data; plan v2 -- voice on a separate card (GTX 1070), Raj 2026-09-25",
+        "kind": "gate",
+        "question": "Should MIST switch from Gemma 4 E4B to c3, with voice on a separate card so it no longer shares the candidate's VRAM budget?",
+        "r2_candidate_key": "switch_to_c3",
+        "clauses": ["L", "S1", "S2", "D", "P", "F_sep"],
+        "f_sep_definition": "arm_peak_mib(candidate) + constants.margin_mib <= total_mib; voice_vram_lower_mib/voice_vram_upper_mib are not consulted at all (voice excluded). Unlike v1's F, F_sep never reads needs-review from a lower/upper split -- it is a single value+margin comparison against total_mib.",
+        "compared_against": "the v1 R2 switch_to_c3 verdict, reported alongside, never in place of it"
+      },
+      {
+        "id": "X3",
+        "label": "switch_to_c4_sepvoice",
+        "pre_registered": false,
+        "basis": "post hoc, added 2026-09-25 after S1/S2 data; plan v2 -- voice on a separate card (GTX 1070), Raj 2026-09-25",
+        "kind": "gate",
+        "question": "Should MIST switch from Gemma 4 E4B to c4, with voice on a separate card so it no longer shares the candidate's VRAM budget?",
+        "r2_candidate_key": "switch_to_c4",
+        "clauses": ["L", "S1", "S2", "D", "P", "F_sep"],
+        "f_sep_definition": "arm_peak_mib(candidate) + constants.margin_mib <= total_mib; voice_vram_lower_mib/voice_vram_upper_mib are not consulted at all (voice excluded). Unlike v1's F, F_sep never reads needs-review from a lower/upper split -- it is a single value+margin comparison against total_mib.",
+        "compared_against": "the v1 R2 switch_to_c4 verdict, reported alongside, never in place of it"
+      }
+    ]
+  }
 }
