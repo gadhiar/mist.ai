@@ -155,6 +155,38 @@ def test_resolve_backend_image_ref_missing_raises(tmp_path):
         bench_host.resolve_backend_image_ref(snap)
 
 
+def test_resolve_backend_image_ref_missing_snapshot_file_raises_cleanly(tmp_path):
+    """T6 reviewer finding 4: a missing snapshot file must not surface as an
+    uncaught FileNotFoundError -- cmd_run's preflight needs an ImageRefError
+    it can catch and turn into a clean [FAIL]."""
+    with pytest.raises(bench_host.ImageRefError):
+        bench_host.resolve_backend_image_ref(tmp_path / "does-not-exist.json")
+
+
+# ---------------------------------------------------------------------------
+# T6 reviewer finding 3: PYTHONHASHSEED / MIST_FIXED_CLOCK are docker run -e
+# flags, not in-process env (setting them after interpreter start has no
+# effect on PYTHONHASHSEED).
+# ---------------------------------------------------------------------------
+
+
+def test_argv_sets_pythonhashseed_via_docker_run_e():
+    argv = _argv()
+    idx = argv.index("-e")
+    assert argv[idx + 1] == "PYTHONHASHSEED=0"
+
+
+def test_argv_sets_mist_fixed_clock_via_docker_run_e():
+    argv = _argv()
+    assert "-e" in argv
+    assert "MIST_FIXED_CLOCK=2026-06-13T00:00:00+00:00" in argv
+    # Both -e flags precede the image ref (docker run positional argument
+    # ordering: options first, then image, then command).
+    image_idx = argv.index("sha256:deadbeefcafe")
+    e_positions = [i for i, tok in enumerate(argv) if tok == "-e"]
+    assert e_positions and all(i < image_idx for i in e_positions)
+
+
 # ---------------------------------------------------------------------------
 # suite_output_paths: refuses to overwrite either output file
 # ---------------------------------------------------------------------------
@@ -218,6 +250,11 @@ class _CapturingLLMProvider:
     def __init__(self, response_content: str) -> None:
         self.calls = []
         self._response_content = response_content
+        # ConversationHandler.__init__ logs llm_provider.model -- only needed
+        # by the (T6 finding 2) full-handler ext-11 gate tests below, which
+        # go through build_conversation_handler rather than calling
+        # OntologyConstrainedExtractor directly.
+        self.model = "fake-model"
 
     async def invoke(self, request):
         from backend.llm.models import LLMResponse
@@ -260,6 +297,72 @@ def test_ontology_extractor_request_matches_production_shape():
     assert request.max_tokens == 2048
     assert request.temperature == config.llm.temperature
     assert "I use Rust" in request.messages[-1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# T6 reviewer finding 2: the significance gate must not spuriously skip
+# ext-11-smalltalk-negative because of the fake embedding provider's
+# collisions. Runs the REAL ExtractionPipeline (via build_conversation_handler
+# + run_extraction_only_replay, the same production path probes/extraction.py
+# drives) over the gold corpus's first 11 probes, in order, so the dedup
+# cache accumulates exactly as it would in a full 60-probe replay.
+# ---------------------------------------------------------------------------
+
+
+def _gold_inputs_through_ext11() -> list[dict[str, str]]:
+    inputs: list[dict[str, str]] = []
+    gold_path = _REPO_ROOT / extraction_probe.DEFAULT_GOLD_CORPUS
+    for line in gold_path.read_text(encoding="utf-8").splitlines():
+        rec = json.loads(line)
+        inputs.append({"utterance": rec["utterance"], "tag": rec["tag"]})
+        if rec["tag"] == "ext-11-smalltalk-negative":
+            break
+    return inputs
+
+
+def _ext11_llm_call_count(embedding_provider) -> int:
+    from backend.factories import build_conversation_handler
+    from backend.knowledge.config import KnowledgeConfig
+    from backend.knowledge.storage.graph_store import GraphStore
+    from tests.mocks.neo4j import FakeNeo4jConnection
+    from tests.unit.knowledge.conftest import FakeVectorStore
+
+    provider = _CapturingLLMProvider('{"entities": [], "relationships": []}')
+    config = KnowledgeConfig.from_env()
+    graph_store = GraphStore(connection=FakeNeo4jConnection(), embedding_generator=embedding_provider)
+    handler = build_conversation_handler(
+        config, llm_provider=provider, graph_store=graph_store, vector_store=FakeVectorStore()
+    )
+    inputs = _gold_inputs_through_ext11()
+    asyncio.run(_run_replay(handler, inputs))
+    ext11_utterance = next(i["utterance"] for i in inputs if i["tag"] == "ext-11-smalltalk-negative")
+    return sum(
+        1
+        for call in provider.calls
+        if any(ext11_utterance in (m.get("content") or "") for m in call.messages)
+    )
+
+
+async def _run_replay(handler, inputs):
+    from scripts.mist_admin import run_extraction_only_replay
+
+    await run_extraction_only_replay(handler, inputs, "test-ext11-gate")
+
+
+def test_ext11_is_gated_out_by_the_old_conftest_fake_embedding_provider():
+    """Documents the bug: tests.unit.knowledge.conftest.FakeEmbeddingProvider's
+    tiled, all-positive vectors spuriously collide, so the significance gate
+    (pipeline.py:673-674) skips ext-11-smalltalk-negative before it ever
+    reaches the LLM."""
+    from tests.unit.knowledge.conftest import FakeEmbeddingProvider as OldFakeEmbeddingProvider
+
+    assert _ext11_llm_call_count(OldFakeEmbeddingProvider()) == 0
+
+
+def test_ext11_reaches_the_llm_with_the_near_orthogonal_fake_embedding_provider():
+    """The fix: probes/extraction.py's HashSeededUnitEmbeddingProvider does
+    not spuriously collide, so ext-11-smalltalk-negative reaches the LLM."""
+    assert _ext11_llm_call_count(extraction_probe.HashSeededUnitEmbeddingProvider()) >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +523,85 @@ def test_build_summary_rel_f1_is_harmonic_mean():
     assert summary["bootstrap"]["rel_precision"] is not None
 
 
+def test_build_summary_complete_true_when_matched_equals_total():
+    """T6 reviewer finding 1b: `complete` mirrors the SAME invariant
+    score_extraction_run.py:812 checks (`matched_probes == total_probes`),
+    computed from `report.per_probe`'s own `matched` flags."""
+    report = _FakeReport()
+    report.per_probe[1]["matched"] = True  # make both probes matched
+    report.matched_probes = 2
+    summary = extraction_probe.build_summary(
+        report,
+        gold_path=Path(_REPO_ROOT / extraction_probe.DEFAULT_GOLD_CORPUS),
+        ontology_version="1.4.0",
+        bootstrap_seed=1,
+        bootstrap_b=50,
+        bootstrap_confidence=0.95,
+        wilson_z=1.96,
+    )
+    assert summary["complete"] is True
+    assert summary["unmatched_probe_ids"] == []
+
+
+def test_build_summary_incomplete_when_a_probe_is_unmatched():
+    """The `_FakeReport` fixture's p2 is unmatched by construction -- this is
+    the "fewer probes matched than exist" scenario the fail-closed check
+    (probes/extraction.py's `main`) must catch."""
+    report = _FakeReport()
+    summary = extraction_probe.build_summary(
+        report,
+        gold_path=Path(_REPO_ROOT / extraction_probe.DEFAULT_GOLD_CORPUS),
+        ontology_version="1.4.0",
+        bootstrap_seed=1,
+        bootstrap_b=50,
+        bootstrap_confidence=0.95,
+        wilson_z=1.96,
+    )
+    assert summary["complete"] is False
+    assert summary["unmatched_probe_ids"] == ["p2"]
+
+
+def test_build_summary_empty_corpus_never_complete():
+    """Mirrors score_extraction_run.py:804-810's guard: on an empty corpus,
+    matched_probes == total_probes is a vacuous 0 == 0 -- must not read as
+    complete."""
+    report = _FakeReport()
+    report.per_probe = []
+    report.total_probes = 0
+    report.matched_probes = 0
+    summary = extraction_probe.build_summary(
+        report,
+        gold_path=Path(_REPO_ROOT / extraction_probe.DEFAULT_GOLD_CORPUS),
+        ontology_version="1.4.0",
+        bootstrap_seed=1,
+        bootstrap_b=50,
+        bootstrap_confidence=0.95,
+        wilson_z=1.96,
+    )
+    assert summary["complete"] is False
+
+
+def test_build_summary_records_env_values():
+    report = _FakeReport()
+    summary = extraction_probe.build_summary(
+        report,
+        gold_path=Path(_REPO_ROOT / extraction_probe.DEFAULT_GOLD_CORPUS),
+        ontology_version="1.4.0",
+        bootstrap_seed=1,
+        bootstrap_b=50,
+        bootstrap_confidence=0.95,
+        wilson_z=1.96,
+        rate_limit_max_per_minute=61,
+        pythonhashseed="0",
+        mist_fixed_clock="2026-06-13T00:00:00+00:00",
+    )
+    assert summary["env"] == {
+        "rate_limit_max_per_minute": 61,
+        "pythonhashseed": "0",
+        "mist_fixed_clock": "2026-06-13T00:00:00+00:00",
+    }
+
+
 def test_refuse_if_exists_raises_file_exists_error(tmp_path):
     p = tmp_path / "extraction.jsonl"
     p.write_text("x", encoding="utf-8")
@@ -492,6 +674,36 @@ def test_extraction_quality_section_c0_and_c1_512_present():
     assert "### c0" in section
     assert "### c1-512" in section
     assert "rel_precision" in section
+
+
+def test_extraction_quality_section_renders_incomplete_arm_with_no_metrics_row(monkeypatch):
+    """T6 reviewer finding 1b: an arm whose extraction_summary.json has
+    `complete: false` (a partial match) must render as incomplete, with no
+    metrics table row -- not silently scored on a partial run."""
+    real_load = analyse.load_extraction_summary
+
+    def fake_load(results_dir, arm_id):
+        if arm_id == "c1-512":
+            return {
+                "schema": 1,
+                "total_probes": 60,
+                "matched_probes": 30,
+                "complete": False,
+                "unmatched_probe_ids": ["ext-31-x", "ext-32-x"],
+            }
+        return real_load(results_dir, arm_id)
+
+    monkeypatch.setattr(analyse, "load_extraction_summary", fake_load)
+    outputs = analyse.generate_outputs(FIXTURE_RUN)
+    report = outputs.files["REPORT.md"]
+    section = _section(report, "## Extraction quality", "## Finalist candidates")
+    c1_idx = section.index("### c1-512")
+    next_idx = section.index("###", c1_idx + 1) if "###" in section[c1_idx + 1 :] else len(section)
+    c1_block = section[c1_idx:next_idx]
+    assert "incomplete" in c1_block
+    assert "30/60" in c1_block
+    assert "ext-31-x" in c1_block
+    assert "| metric | value |" not in c1_block
 
 
 def test_summary_json_extraction_quality_key_present():
