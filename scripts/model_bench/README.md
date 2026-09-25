@@ -476,6 +476,135 @@ block naming a new `bench-cN` candidate in `models.yaml`) plus, optionally, a
 `base`-inheriting thinking-budget or lower-quant sibling. No `bench_host.py` change is
 needed for either shape.
 
+### T7 (plan v3 scan picks, 2026-09-25): c7 (Granite 4.2 8B), c8 (Spark-X2.5-4B),
+### c9 (gpt-oss-20b)
+
+Per the T7 brief, the lead's candidate scan selected three public Apache-2.0 models the
+lead is downloading into `D:\Users\rajga\models\`. Same additive-only discipline as T5:
+no existing arm, `common_args`, `thinking_args`, or `decision_rules.json` change; every
+arm present at `044699b` (the commit this task branched from, which already contains
+every T5 arm) still resolves byte-for-byte identically
+(`test_t5_arms_additive_only.py`, now pointed at `044699b` instead of T5's own original
+base -- see that file's module docstring). Two new `sampling` family keys are ADDED
+(`granite`, `spark`), plus a third (`gptoss`); every existing family key
+(`gemma`, `qwen`) stays byte-identical
+(`test_common_args_sampling_and_thinking_args_are_byte_for_byte_unchanged`, updated to
+check per-key equality on the keys the base commit already had, since T7 legitimately
+adds new keys where T5 did not need to).
+
+- **`c7`** -- Granite 4.2 8B (`ibm-granite/granite-4.2-8b-Q6_K.gguf`), dense 8.8B, full
+  card (no `-ncmoe`), `family: granite`, thinking off (`-rea off`, the same spelling
+  every other full-card arm uses), suites `ttft`/`correctness`/`harness`
+  (`bench-c7`, `default` tests, 10 iterations)/`layout`. `tokens_vs_c0:
+  differs-by-design` -- a different model. **`c7-think`** (`base: c7`, thinking on,
+  budget 1024 -- comparable to `c5-think1024`), `layout` suite only.
+
+  Granite 4.2's template reportedly reads `enable_thinking` and also has a `low_effort`
+  option, per the brief. `low_effort` is NOT wired here: `--chat-template-kwargs
+  STRING` exists on the pinned b11151 build
+  (`llama_server_help_b11151.txt:590-592`, confirming llama-server has a generic
+  mechanism that forwards an arbitrary JSON object to the jinja template parser), so
+  the *mechanism* is citable -- but whether Granite's bundled template actually reads a
+  `low_effort` key is UNVERIFIED (no live b11151 llama-server in this worker's
+  container -- no docker, no GPU, no network), and the brief only asks for two arms
+  here (`c7`, `c7-think`), neither of which needs it. Adding an unverified
+  template-specific flag to satisfy a param the two required arms do not use would be
+  guessing at behavior with no test to catch a wrong guess; left out.
+
+  **Sampling (`bench-c7`, `granite` family): UNVERIFIED, gemma-style default.** No
+  citable Granite-4.2-specific model card is available to this worker's no-network
+  container. Per the brief's own fallback instruction, `granite`'s array is a byte-for-
+  byte copy of `gemma`'s (temperature 1.0, top-p 0.95, top-k 64, min-p 0.0,
+  repeat-penalty 1.0) under a distinct family name (not literally reusing `"family":
+  "gemma"` on `c7`, so the arm's own family field states what model it targets rather
+  than borrowing gemma's identity). Tool calls use `<tool_call>` tags per the brief;
+  the bundled llama-server template handles them, so no chat-template override or
+  parser change was needed; `models.yaml`'s `bench-c7.tool_parser: "hermes"` follows
+  this file's existing naming convention for `<tool_call>`-tag models (Qwen/Hermes
+  entries), which is descriptive metadata only, not independently verified against a
+  live Granite response.
+
+- **`c8`** -- Spark-X2.5-4B (`XHToken/Spark-X2.5-4B-Q8_0.gguf`), llama.cpp architecture
+  `spark2_5` (supported since b10828; b11151 is newer), dense, full card. `family:
+  spark` (also a gemma-style default, UNVERIFIED, same reasoning as `c7`'s `granite`
+  family -- no citable Spark model card either). Thinking off (`-rea off`); thinking is
+  reportedly on by default for this model, and whether `-rea off` actually maps to the
+  template's `enable_thinking=false` is UNVERIFIED (same class of gap as the existing
+  "Qwen3.5 thinking flags: UNVERIFIED" note above -- no live server to check the
+  response's `reasoning_content` against). Suites `ttft`/`correctness`/`harness`
+  (`bench-c8`, `default`, 10 iterations)/`layout`. **`c8-think`** (`base: c8`, thinking
+  on, budget 1024), `layout` suite only. `tokens_vs_c0: differs-by-design`.
+
+  `models.yaml`'s `bench-c8.tool_parser` is left `null`, not `"hermes"`: the brief
+  labels this arm's tool calling higher risk than `c7`'s, since it relies on the
+  harness's generic tool-call handling rather than the named `<tool_call>`-tag
+  convention `c7`/Qwen/Hermes already use in this file.
+
+- **`c9`** -- gpt-oss-20b (`ggml-org/gpt-oss-20b-MXFP4.gguf`), 12.1 GB, MoE with 3.6B
+  active parameters and a Harmony chat template. Modeled on `c3`'s pattern exactly:
+  `-lm none` and `-b`/`-ub` 2048 via `arg_overrides` (CPU-MoE prompt processing),
+  `params_required: ["ncmoe"]` / `param_arg_map: {"ncmoe": "-ncmoe"}` (REQUIRED, same
+  refusal `c3`/`c4` get from `build_server_args` when `--param ncmoe=N` is missing),
+  and `stop_neo4j: true`. `family: gptoss` -- a new sampling key, `--temp 1.0 --top-p
+  1.0` only (see below).
+
+  **Reasoning effort, not a thinking budget.** gpt-oss's reasoning is always on;
+  effort is set via the server flag `--reasoning-effort LEVEL`
+  (`llama_server_help_b11151.txt:639-642`, one of `minimal`/`low`/`medium`/`high`/
+  `xhigh`/`max`), passed through `extra_args` -- `c9`: `["-lm", "none",
+  "--reasoning-effort", "low"]`; `c9-medium` (`base: c9`): the same list with
+  `"medium"` in place of `"low"` (a full replacement, not a merge -- `extra_args` is a
+  flat list, not itemized by flag the way `arg_overrides` is, so a child arm that needs
+  a different effort value must repeat the whole list). Neither arm touches the system
+  prompt or any harness/layout-runner code, so no change was needed outside
+  `arms.json`.
+
+  **Thinking mode: `null` (no `-rea` flag), the same choice `c0-old` makes.**
+  Justification: `-rea` is a generic toggle designed for template-detected reasoning
+  (deepseek-style `<think>` tags, per its own help text: "detect from template"), not
+  specific to Harmony's channel-based reasoning structure, which is already fully
+  controlled by `--reasoning-effort` regardless of `-rea`'s setting. Passing `-rea on`
+  would also require a `--reasoning-budget` value with no citable Harmony-specific
+  meaning (gpt-oss's effort levels are discrete, not a token count), adding an
+  unverified claim for no behavioral benefit over leaving `thinking` unset. **Known
+  side effect of this choice:** `layout_max_tokens()` keys off `thinking`'s mode only
+  (`"on"` -> 4096, anything else -> 256), so `c9`/`c9-medium`'s layout suite gets the
+  256-token budget even though gpt-oss reasons by default -- the lead should treat this
+  as a known limitation to weigh at S4c, not a bug; raising it needs either a `thinking:
+  {"mode": "on", "budget": ...}` value (which would also add a possibly-redundant
+  `--reasoning-budget` flag) or a `bench_host.py` change, both out of scope for this
+  additive-only task.
+
+  Suites: `c9`: `ttft`/`correctness`/`harness` (`bench-c9`, `default`, 10
+  iterations)/`layout`. `c9-medium`: `layout` only, `harness: null`. `tokens_vs_c0:
+  differs-by-design` on `c9`; `c9-medium` does not set its own `tokens_vs_c0` and so
+  *inherits* `c9`'s resolved `"differs-by-design"` (verified, not assumed --
+  `resolve_arm`'s merge starts from a copy of the resolved base arm, so an unset key on
+  the child carries the base's resolved value forward; this is also true of the
+  existing `c5-think1024`, which likewise inherits `"differs-by-design"` from `c5`
+  despite not setting the key itself -- see
+  `test_thinking_budget_siblings_inherit_tokens_vs_c0_from_their_root`, which corrects
+  the record: this file previously described `c5-think1024` as carrying "no
+  `tokens_vs_c0` label", which is not what `resolve_arm` actually produces).
+
+  **Sampling (`bench-c9`, `gptoss` family): UNVERIFIED, per OpenAI's published
+  guidance, not independently re-verified.** No citable gpt-oss-specific model card
+  fetch was possible from this worker's no-network container; `--temp 1.0 --top-p 1.0`
+  (both modes, `bench-c9` in `models.yaml`) is OpenAI's stated gpt-oss recommendation
+  as relayed by the T7 brief, taken as given rather than re-derived from a primary
+  source this worker could reach. `models.yaml`'s `bench-c9.tool_parser` is left
+  `null`: Harmony structures tool calls through dedicated channels, not the
+  `<tool_call>`-tag convention this file's `"hermes"` id names, and no dedicated
+  Harmony parser id exists in this file's schema.
+
+**Every new T7 arm passes the real-capture flag check.**
+`test_every_pinned_build_arm_flag_is_found_in_the_real_capture` and
+`check_all_arm_flags` (`test_host_help_flags.py`) already iterate every arm in
+`arms.json` generically, so `c7`/`c7-think`/`c8`/`c8-think`/`c9`/`c9-medium` are
+checked against the real `llama_server_help_b11151.txt` capture automatically;
+`test_t7_scan_arms.py` additionally pins each of the six arm ids by name so a
+regression here fails with a narrower, arm-named test too.
+
 ## Fixtures are hand-built, not recorded
 
 `tests/unit/model_bench/fixtures/host/` (`sse_stream.txt`, `nvidia_smi_sample.csv`,

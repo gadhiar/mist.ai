@@ -192,6 +192,30 @@ no meta.json / arm absent
 
 no meta.json / arm absent
 
+### c7
+
+no meta.json / arm absent
+
+### c7-think
+
+no meta.json / arm absent
+
+### c8
+
+no meta.json / arm absent
+
+### c8-think
+
+no meta.json / arm absent
+
+### c9
+
+no meta.json / arm absent
+
+### c9-medium
+
+no meta.json / arm absent
+
 ### a1
 
 | metric | value | n | n_expected | complete | wilson | bootstrap |
@@ -566,6 +590,30 @@ no extraction_summary.json for this arm in this run
 
 no extraction_summary.json for this arm in this run
 
+### c7
+
+no extraction_summary.json for this arm in this run
+
+### c7-think
+
+no extraction_summary.json for this arm in this run
+
+### c8
+
+no extraction_summary.json for this arm in this run
+
+### c8-think
+
+no extraction_summary.json for this arm in this run
+
+### c9
+
+no extraction_summary.json for this arm in this run
+
+### c9-medium
+
+no extraction_summary.json for this arm in this run
+
 ### a1
 
 no extraction_summary.json for this arm in this run
@@ -870,6 +918,24 @@ Each arm's `error_count` is the number of entries in its `meta.json`'s `errors` 
     "present": false
   },
   "c6": {
+    "present": false
+  },
+  "c7": {
+    "present": false
+  },
+  "c7-think": {
+    "present": false
+  },
+  "c8": {
+    "present": false
+  },
+  "c8-think": {
+    "present": false
+  },
+  "c9": {
+    "present": false
+  },
+  "c9-medium": {
     "present": false
   }
 }

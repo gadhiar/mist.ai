@@ -1407,6 +1407,24 @@
     },
     "c6": {
       "present": false
+    },
+    "c7": {
+      "present": false
+    },
+    "c7-think": {
+      "present": false
+    },
+    "c8": {
+      "present": false
+    },
+    "c8-think": {
+      "present": false
+    },
+    "c9": {
+      "present": false
+    },
+    "c9-medium": {
+      "present": false
     }
   },
   "coverage": {
@@ -1687,6 +1705,24 @@
       "present": false
     },
     "c6": {
+      "present": false
+    },
+    "c7": {
+      "present": false
+    },
+    "c7-think": {
+      "present": false
+    },
+    "c8": {
+      "present": false
+    },
+    "c8-think": {
+      "present": false
+    },
+    "c9": {
+      "present": false
+    },
+    "c9-medium": {
       "present": false
     }
   },
@@ -2288,7 +2324,13 @@
     "c4-think512": null,
     "c5": null,
     "c5-think1024": null,
-    "c6": null
+    "c6": null,
+    "c7": null,
+    "c7-think": null,
+    "c8": null,
+    "c8-think": null,
+    "c9": null,
+    "c9-medium": null
   },
   "finalist_candidates": [
     "c2-think512",
