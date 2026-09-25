@@ -3,15 +3,11 @@ the /health wait -- the exact S2 shape: the pinned build rejected a flag and
 exited in under a second, but `serve` kept polling /health for the full
 900s timeout, then `--rm` deleted the container's stdout/stderr along with it.
 
-Red before green: on the base commit (before this fix), `wait_for_llama_health`
-has no way to notice the container already exited, so this test's stub server
-(`/health` always unreachable, the container reporting State.Running=False on
-every `docker inspect`) makes `serve` spin until its --timeout and then raise
-an uncaught `TimeoutError` out of `main()` -- this test fails on that commit.
-After the fix, `serve` notices the exited container on the first poll (well
-under --timeout), returns non-zero, has written
-`<results>/<run>/<arm>/serve_failed_*.log` with `docker logs`' stderr, and has
-called `docker rm`.
+This is scenario (b) from the fix-serve-inspect brief: a REAL exited state
+(`State.Status == "exited"`, `ExitCode == 1`), which must still fail fast even
+after the fix that stops the driver from treating an inspect FAILURE (empty
+stderr, a timeout, ...) as a positive "exited" signal -- see
+`test_host_serve_inspect_states.py` for that distinction (scenarios a/c).
 
 Docker and /health are stubbed throughout; no docker, no network.
 """
@@ -48,9 +44,9 @@ FAKE_ARMS_DOC = {
 FAKE_STDERR = "error: invalid argument: --no-mmap\n"
 
 
-def _fake_docker_inspect(names):
-    assert names == [bench_host.BENCH_LLM_CONTAINER]
-    return {bench_host.BENCH_LLM_CONTAINER: {"State": {"Running": False, "ExitCode": 1}}}
+def _fake_probe_exited(name, *, timeout_s=None):
+    assert name == bench_host.BENCH_LLM_CONTAINER
+    return bench_host.ContainerProbe("exited", "'mist-bench-llm' state is 'exited'", exit_code=1)
 
 
 def _always_unreachable_health(url, timeout=5.0):
@@ -65,13 +61,22 @@ def test_serve_fails_fast_and_saves_logs_when_container_exits_during_health_wait
     def _fake_docker_rm(names):
         rm_calls.append(list(names))
 
+    probe_calls = {"n": 0}
+
+    def _preflight_then_exited(name, *, timeout_s=None):
+        # First call is cmd_serve's own pre-flight existence check (must see
+        # "absent" so serve proceeds); every call after that is from inside
+        # wait_for_llama_health's poll loop, where the container has since
+        # actually exited.
+        probe_calls["n"] += 1
+        if probe_calls["n"] == 1:
+            return bench_host.ContainerProbe("absent", "no mist-bench-llm yet")
+        return _fake_probe_exited(name, timeout_s=timeout_s)
+
     monkeypatch.setattr(bench_host, "load_arms_doc", lambda path=bench_host.ARMS_JSON_PATH: FAKE_ARMS_DOC)
     monkeypatch.setattr(bench_host, "docker_is_running", lambda name: False)
-    # Forward-compatible: does not exist on the base commit this test is red
-    # against, only after the fix.
-    monkeypatch.setattr(bench_host, "docker_container_exists", lambda name: False, raising=False)
     monkeypatch.setattr(bench_host, "docker_run_detached", lambda argv: "fake-container-id")
-    monkeypatch.setattr(bench_host, "docker_inspect", _fake_docker_inspect)
+    monkeypatch.setattr(bench_host, "probe_container_state", _preflight_then_exited)
     monkeypatch.setattr(bench_host, "http_get_json", _always_unreachable_health)
     monkeypatch.setattr(bench_host, "docker_logs", lambda name: ("", FAKE_STDERR))
     monkeypatch.setattr(bench_host, "docker_rm", _fake_docker_rm, raising=False)
