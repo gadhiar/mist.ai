@@ -118,8 +118,9 @@ is an argv list, `shell=False` (the `subprocess` default).
    `_gates_pass` checks at line ~812), `extraction_summary.json` is still written -- with
    `complete: false` and `unmatched_probe_ids` -- but `python -m
    scripts.model_bench.probes.extraction` exits non-zero. `cmd_run` then records an `errors` entry
-   and does NOT add `extraction` to `suites_completed`, so a subsequent call can retry it; the
-   suite is never silently recorded as done on a partial run.
+   and does NOT add `extraction` to `suites_completed`; the suite is never silently recorded as
+   done on a partial run. The failed run's `extraction.jsonl` stays on disk, and `run` refuses to
+   overwrite it, so a retry needs a new `--run` id.
 
    `analyse.py`'s "Extraction quality (report-only, not a pre-registered rule)" section (after
    `Exploratory`, before `Finalist candidates`) renders each arm's `extraction_summary.json` with
@@ -480,7 +481,7 @@ needed for either shape.
 ### c9 (gpt-oss-20b)
 
 Per the T7 brief, the lead's candidate scan selected three public Apache-2.0 models the
-lead is downloading into `D:\Users\rajga\models\`. Same additive-only discipline as T5:
+lead is downloading into the models dir (`MODELS_DIR`). Same additive-only discipline as T5:
 no existing arm, `common_args`, `thinking_args`, or `decision_rules.json` change; every
 arm present at `044699b` (the commit this task branched from, which already contains
 every T5 arm) still resolves byte-for-byte identically
@@ -559,12 +560,20 @@ adds new keys where T5 did not need to).
   prompt or any harness/layout-runner code, so no change was needed outside
   `arms.json`.
 
+  **Harness caveat:** the default harness tests cap max_tokens at 128-512 (speed_minimal,
+  speed, tool_selection, rag), and the harness client sends no thinking control. A reasoning
+  arm can spend that whole budget on reasoning and return empty `content`, so c9's harness
+  scores would be invalid. Run c9 and c9-medium without the `harness` suite
+  (`--suites ttft correctness layout`, plus `extraction` if wanted).
+
   **Thinking mode: `{"mode": "on", "budget": -1}` -- always-on, unrestricted.**
-  gpt-oss always reasons; leaving `thinking` unset (as `c0-old` does) would have left
+  gpt-oss is expected to reason on every turn (per the lead's scan notes; UNVERIFIED on
+  b11151 until the first c9 serve shows `reasoning_content`); leaving `thinking` unset (as
+  `c0-old` does) would have left
   `layout_max_tokens()` -- which keys off `thinking`'s mode only (`"on"` -> 4096,
   anything else -> 256) -- at the 256-token budget every non-thinking arm gets. Every
-  `c9`/`c9-medium` layout answer would then be truncated mid-reasoning, since the model
-  reasons regardless of what `-rea` is told, making the layout suite's accuracy invalid
+  `c9`/`c9-medium` layout answer would then risk being truncated mid-reasoning, making the
+  layout suite's accuracy invalid
   for this arm rather than merely conservative. `budget: -1` (`--reasoning-budget -1`,
   "unrestricted", `llama_server_help_b11151.txt:644`) sets no cap -- gpt-oss's own
   reasoning length is effort-controlled (see below), so no other budget value has any
