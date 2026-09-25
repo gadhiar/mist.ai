@@ -87,16 +87,44 @@ def test_required_param_refusal(arm_id):
     assert args[idx + 1] == "12"
 
 
-def test_c3_and_c4_extra_args_present():
-    for arm_id in ("c3", "c4"):
+def test_c3_and_c4_load_mode_and_batch_overrides():
+    # c3/c4 and every arm that inherits from them (think512, a3, a4) must carry
+    # `-lm none` (b11151's replacement for `--no-mmap`) and the CPU-MoE prompt
+    # processing batch sizes `-b 2048 -ub 2048`, applied in place over
+    # common_args' `-b 1024 -ub 512` rather than appended as a duplicate.
+    for arm_id in ("c3", "c4", "c3-think512", "c4-think512", "a3", "a4"):
         arm = resolve_arm(ARMS_DOC, arm_id)
         args = build_server_args(ARMS_DOC, arm, {"ncmoe": "12"})
-        assert "--no-mmap" in args
-        # -ub 2048 must win over common_args' -ub 512 (last occurrence wins
-        # in llama.cpp's sequential arg parser) -- both appear, in order.
-        ub_indices = [i for i, tok in enumerate(args) if tok == "-ub"]
-        assert args[ub_indices[-1] + 1] == "2048"
+        assert "--no-mmap" not in args, arm_id
+        assert "-lm" in args, arm_id
+        assert args[args.index("-lm") + 1] == "none", arm_id
+        assert args.count("-b") == 1, arm_id
+        assert args[args.index("-b") + 1] == "2048", arm_id
+        assert args.count("-ub") == 1, arm_id
+        assert args[args.index("-ub") + 1] == "2048", arm_id
+    for arm_id in ("c3", "c4"):
+        arm = resolve_arm(ARMS_DOC, arm_id)
         assert arm["stop_neo4j"] is True
+
+
+def test_c0_and_c2_keep_default_batch_sizes():
+    for arm_id in ("c0", "c0-old", "c0-prod", "c2", "c1-256", "c2-think512", "a1", "a2"):
+        arm = resolve_arm(ARMS_DOC, arm_id)
+        args = build_server_args(ARMS_DOC, arm, {})
+        assert "-lm" not in args, arm_id
+        assert args.count("-b") == 1, arm_id
+        assert args[args.index("-b") + 1] == "1024", arm_id
+        assert args.count("-ub") == 1, arm_id
+        assert args[args.index("-ub") + 1] == "512", arm_id
+
+
+@pytest.mark.parametrize("arm_id", ALL_ARM_IDS)
+def test_no_arm_argv_has_a_duplicated_flag(arm_id):
+    arm = resolve_arm(ARMS_DOC, arm_id)
+    params = {p: "12" for p in arm["params_required"]}
+    args = build_server_args(ARMS_DOC, arm, params)
+    flags = [tok for tok in args if tok.startswith("-")]
+    assert len(flags) == len(set(flags)), f"{arm_id}: duplicated flag(s) in {flags}"
 
 
 def test_c0_old_has_no_thinking_flags():

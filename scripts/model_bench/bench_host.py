@@ -40,8 +40,10 @@ if __package__ in (None, ""):
     # Allow `python scripts/model_bench/bench_host.py` in addition to the
     # documented `python -m scripts.model_bench.bench_host` invocation.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.model_bench.probes import help_flags as help_flags_probe
     from scripts.model_bench.probes import nvidia_smi as nvidia_smi_probe
 else:
+    from .probes import help_flags as help_flags_probe
     from .probes import nvidia_smi as nvidia_smi_probe
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -93,6 +95,7 @@ KNOWN_ARM_KEYS = frozenset(
         "suites",
         "harness",
         "extra_args",
+        "arg_overrides",
         "params_required",
         "param_arg_map",
         "stop_neo4j",
@@ -108,6 +111,7 @@ ARM_DEFAULTS: dict[str, Any] = {
     "suites": [],
     "harness": None,
     "extra_args": [],
+    "arg_overrides": {},
     "params_required": [],
     "param_arg_map": {},
     "stop_neo4j": False,
@@ -271,6 +275,23 @@ def build_server_args(
         )
 
     args: list[str] = list(arms_doc["common_args"])
+
+    # arg_overrides replaces a common_args flag's value IN PLACE rather than
+    # appending a second occurrence of the flag (which would leave argv
+    # carrying it twice; llama.cpp's sequential parser applies the last one,
+    # but a duplicated flag is confusing and this driver's own invariant is
+    # that no flag appears twice). Only common_args flags may be overridden
+    # -- an arg_overrides entry naming a flag common_args does not have is a
+    # config error, not a silent no-op.
+    overrides: dict[str, str] = resolved_arm["arg_overrides"]
+    for flag, value in overrides.items():
+        if flag not in args:
+            raise ArmConfigError(
+                f"arm {resolved_arm['id']!r} arg_overrides names {flag!r}, "
+                f"which is not in common_args"
+            )
+        args[args.index(flag) + 1] = str(value)
+
     family = resolved_arm["family"]
     if family not in arms_doc["sampling"]:
         raise ArmConfigError(f"arm {resolved_arm['id']!r} has unknown family {family!r}")
@@ -330,6 +351,39 @@ def build_docker_run_args(
         image_ref,
         *build_model_args(resolved_arm, arms_doc, params),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Flag check against the pinned build's `llama-server --help`
+# ---------------------------------------------------------------------------
+
+
+def arm_targets_pinned_build(resolved_arm: dict[str, Any]) -> bool:
+    """True if `resolved_arm`'s image token is the pinned compose build.
+
+    c0-old targets `snapshot:mist-llm`, the current production b8808 snapshot
+    -- a different llama.cpp build than the pinned b11151 `compose:mist-llm`
+    image `plan --host-checks` fetches `--help` from. Checking c0-old's argv
+    against b11151's flag list would check the wrong binary.
+    """
+    return resolved_arm["image"] == "compose:mist-llm"
+
+
+def check_arm_flags(
+    help_flags: set[str],
+    arms_doc: dict[str, Any],
+    resolved_arm: dict[str, Any],
+    params: dict[str, str],
+) -> list[str]:
+    """Flags in `resolved_arm`'s built argv that `help_flags` does not list.
+
+    Builds the arm's full argv (`-m <path>` plus every server flag) the same
+    way `serve` would, with `params` filled in (the caller supplies a dummy
+    value per REQUIRED param), then defers to
+    `probes.help_flags.unknown_flags`.
+    """
+    argv = build_model_args(resolved_arm, arms_doc, params)
+    return help_flags_probe.unknown_flags(argv, help_flags)
 
 
 # ---------------------------------------------------------------------------
@@ -1127,6 +1181,56 @@ def _run_host_checks() -> None:
             except OSError:
                 ok = False
         print(f"[{'ok' if ok else 'fail'}] {label}")
+
+    _run_flag_checks()
+
+
+def _run_flag_checks() -> None:
+    """`docker run --rm <pinned image> --help`, then check every arm's argv against it.
+
+    c0-old is skipped (see `arm_targets_pinned_build`): it targets the b8808
+    snapshot build, not the pinned b11151 image this check fetches `--help`
+    from. A missing snapshot for c0-old therefore never blocks this check.
+    """
+    try:
+        image_ref = parse_compose_image(DEFAULT_COMPOSE_PATH)
+    except ImageRefError as exc:
+        print(f"[fail] resolve pinned image from compose for --host-checks: {exc}")
+        return
+
+    try:
+        proc = subprocess.run(
+            ["docker", "run", "--rm", image_ref, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            shell=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        print(f"[fail] docker run {image_ref} --help: {exc}")
+        return
+    if proc.returncode != 0:
+        print(f"[fail] docker run {image_ref} --help exited {proc.returncode}: {proc.stderr.strip()}")
+        return
+
+    help_flags = help_flags_probe.parse_help_flags(proc.stdout + "\n" + proc.stderr)
+    if not help_flags:
+        print(f"[fail] llama-server --help produced no parseable flags (image {image_ref})")
+        return
+    print(f"[ok] llama-server --help parsed {len(help_flags)} flags (image {image_ref})")
+
+    arms_doc = load_arms_doc()
+    resolved = resolve_all_arms(arms_doc)
+    for arm_id, arm in resolved.items():
+        if not arm_targets_pinned_build(arm):
+            print(f"[skip] arm {arm_id}: image {arm['image']!r} is not the pinned build")
+            continue
+        params = {p: "1" for p in arm["params_required"]}
+        unknown = check_arm_flags(help_flags, arms_doc, arm, params)
+        if unknown:
+            print(f"[fail] arm {arm_id}: unknown flags: {unknown}")
+        else:
+            print(f"[ok] arm {arm_id}: flags known")
 
 
 # ---------------------------------------------------------------------------
