@@ -253,10 +253,10 @@ lead's plan v2 delta (`2026-09-25-mist-model-bench-plan-v2-delta.md`) adds these
   the full `default` set: these arms are report-only (decision_rules.json's exploratory X2) and the
   night's time budget does not cover a full harness pass at 64K/128K context on top of the full-card
   C4/c3 work.
-- **`c0-ub1024`** (optional, at most one such arm) -- `base: c0`, `arg_overrides: {"-b": "2048",
-  "-ub": "1024"}`, `suites: ["ttft"]`. A server-setting arm likely to move prefill speed/VRAM
-  without necessarily changing tokens, per the plan's "server-setting arms likely to move speed or
-  VRAM without changing tokens" allowance.
+- **`c0-ub1024`** -- `base: c0`, `arg_overrides: {"-b": "2048", "-ub": "1024"}`,
+  `suites: ["ttft"]`. arms.json does not mark it optional (`optional` is false); the plan allowed
+  at most one such server-setting arm, and running it is the lead's choice. It is expected to move
+  prefill speed or VRAM; whether it does is unmeasured, and its tokens may differ (see below).
 - **`tokens_vs_c0`** -- every arm added under plan v2 carries this field (schema-validated in
   `resolve_arm`, `TOKENS_VS_C0_VALUES`); analyse.py's exploratory X2 surfaces it per context arm.
   `"expected-identical-unverified"` for a context-window-only change with the same q8_0 KV and
@@ -280,11 +280,16 @@ fast request, it is only an upper bound on how long the probe waits before givin
 
 ### Plan v2: rules-sha continuity across the v1 -> v2 amendment
 
-S4 (the lead's unattended host session) resumes the finalist layout pass for c1-512 inside the
-existing run `mb1`, whose `c1-512/meta.json` was written under the v1 `decision_rules.json` sha256.
-Plan v2's rule changes move that sha, and `run`'s cumulative `meta.json` (`merge_run_meta`) normally
-refuses any call whose `decision_rules_sha256` differs from what is already on disk for that arm
-dir. `decision_rules.json` now carries a top-level `"supersedes"` list naming the sha256(es) it
+Plan v2's rule changes move the `decision_rules.json` sha256, and `run`'s cumulative `meta.json`
+(`merge_run_meta`) refuses any call whose `decision_rules_sha256` differs from what is already on
+disk for that arm dir.
+
+**Limit, found in review:** `supersedes` only relaxes the rules-sha check. It does NOT let an arm
+dir written by an earlier driver version take new calls when that dir's stored `arm_config`
+differs from the current one -- and every S1/S2 arm dir in `mb1` differs (plan v2 adds
+`tokens_vs_c0` to every resolved arm, and those metas also predate `arg_overrides`). Those calls
+are refused on `arm_config`, as S4a's c1-512 finalist in `mb1` was. New arm dirs in an existing run
+are accepted. analyse reads ONE run dir, so an arm's anchors (c0, c0-prod) must be in the same run. `decision_rules.json` now carries a top-level `"supersedes"` list naming the sha256(es) it
 supersedes (`{"sha256": ..., "label": ...}`); `merge_run_meta` (still a pure, no-I/O function) takes
 an explicit `superseded_rules_shas` set from its caller and allows the stored sha to differ from the
 new call's sha only when the *stored* value appears in that set -- any other difference is still
