@@ -2156,12 +2156,28 @@ def render_report(
     lines.append("")
     extraction_summaries = extraction_summaries or {}
     c0_extraction = extraction_summaries.get("c0")
+    if c0_extraction is not None and c0_extraction.get("complete") is False:
+        # An incomplete c0 is not a comparable delta baseline either.
+        c0_extraction = None
     for arm_id in metrics.arm_order:
         summ = extraction_summaries.get(arm_id)
         lines.append(f"### {arm_id}")
         lines.append("")
         if summ is None:
             lines.append("no extraction_summary.json for this arm in this run")
+            lines.append("")
+            continue
+        if summ.get("complete") is False:
+            # T6 reviewer finding 1b: a partial match (broken join, throttled
+            # probe, a gate) still writes extraction_summary.json, but with
+            # `complete: false` -- render this arm as incomplete, with no
+            # metrics row (a partial run's precision/recall are not a
+            # comparable measurement).
+            unmatched = summ.get("unmatched_probe_ids") or []
+            lines.append(
+                f"incomplete: {summ.get('matched_probes')}/{summ.get('total_probes')} "
+                f"probes matched; unmatched: {unmatched}"
+            )
             lines.append("")
             continue
         lines.append("| metric | value | wilson 95% | bootstrap 95% (by probe id) | delta vs c0 |")

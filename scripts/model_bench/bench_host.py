@@ -434,8 +434,22 @@ def build_docker_run_args(
 
 
 def resolve_backend_image_ref(snapshot_path: Path) -> str:
-    """Read the `mist-backend` image id recorded in `session/snapshot.json` (S1)."""
-    doc = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    """Read the `mist-backend` image id recorded in `session/snapshot.json` (S1).
+
+    Raises `ImageRefError` -- never lets a missing file or malformed JSON
+    propagate as an uncaught exception -- so `cmd_run`'s preflight (T6
+    reviewer finding 4) can print a clean `[FAIL]` and return before any
+    file is written, the same pattern `resolve_image_ref`'s
+    `snapshot:mist-llm` branch already uses for the arm image.
+    """
+    if not snapshot_path.exists():
+        raise ImageRefError(
+            f"no snapshot at {snapshot_path}; run `snapshot` before `run --suites extraction`"
+        )
+    try:
+        doc = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ImageRefError(f"cannot read snapshot at {snapshot_path}: {exc}") from exc
     entry = doc.get("mist-backend")
     image = entry.get("Image") if entry else None
     if not image:
@@ -443,6 +457,10 @@ def resolve_backend_image_ref(snapshot_path: Path) -> str:
             f"{snapshot_path} has no mist-backend Image id; run `snapshot` before `run --suites extraction`"
         )
     return image
+
+
+EXTRACTION_PYTHONHASHSEED = "0"
+EXTRACTION_MIST_FIXED_CLOCK = "2026-06-13T00:00:00+00:00"
 
 
 def build_extraction_container_argv(
@@ -453,6 +471,8 @@ def build_extraction_container_argv(
     base_url: str,
     network_container: str = BENCH_LLM_CONTAINER,
     gold_corpus: str = "data/ingest/extraction-gold-2026-06-14.jsonl",
+    pythonhashseed: str = EXTRACTION_PYTHONHASHSEED,
+    mist_fixed_clock: str = EXTRACTION_MIST_FIXED_CLOCK,
 ) -> list[str]:
     """`docker run` argv for the extraction suite probe.
 
@@ -465,6 +485,15 @@ def build_extraction_container_argv(
     (from `resolve_backend_image_ref`), and `network_container` targets only
     `mist-bench-llm` (the bench server, already stopped-and-replaced per S2,
     never the production container).
+
+    `PYTHONHASHSEED` (T6 reviewer finding 3) is read by the interpreter only
+    at startup, so it must be a `docker run -e` on THIS argv -- setting it
+    inside `probes/extraction.py` after the interpreter is already running
+    has no effect. `MIST_FIXED_CLOCK` pins the replay's reference date to
+    `scripts/eval_harness/extraction_probe_set_design.md:136`'s value; it IS
+    effective if set in-process too (`probes/extraction.py` also sets it as a
+    fallback default), but is passed here as well so the pin is visible and
+    testable on the argv the same way `PYTHONHASHSEED` is.
     """
     return [
         "docker",
@@ -472,6 +501,10 @@ def build_extraction_container_argv(
         "--rm",
         "--network",
         f"container:{network_container}",
+        "-e",
+        f"PYTHONHASHSEED={pythonhashseed}",
+        "-e",
+        f"MIST_FIXED_CLOCK={mist_fixed_clock}",
         "-v",
         f"{repo_root}:/work:ro",
         "-v",
@@ -2135,6 +2168,23 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"[FAIL] {exc}")
         return 1
 
+    # (a) extraction suite image preflight (finding 4): resolve and validate
+    # the snapshot's mist-backend image BEFORE any suite runs and before any
+    # file is written. A missing/incomplete snapshot must print a clean
+    # [FAIL] and leave meta.json / vram.csv untouched -- previously this was
+    # only resolved once the suites loop reached "extraction", after
+    # a_dir.mkdir(), the GpuSampler start (which writes vram.csv), and any
+    # earlier suite's write_meta() in the same call. The resolved image is
+    # reused below (extraction_backend_image) instead of re-reading the
+    # snapshot a second time.
+    extraction_backend_image: str | None = None
+    if "extraction" in suites:
+        try:
+            extraction_backend_image = resolve_backend_image_ref(snapshot_path)
+        except ImageRefError as exc:
+            print(f"[FAIL] {exc}")
+            return 1
+
     rep = args.rep if args.rep is not None else 1
     layout_pass = args.layout_pass or "screen"
 
@@ -2313,9 +2363,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             write_meta()
 
         if "extraction" in suites:
-            backend_image = resolve_backend_image_ref(snapshot_path)
+            assert extraction_backend_image is not None  # resolved in preflight above
             extraction_argv = build_extraction_container_argv(
-                backend_image=backend_image,
+                backend_image=extraction_backend_image,
                 repo_root=REPO_ROOT,
                 out_dir=a_dir,
                 base_url=base_url,
