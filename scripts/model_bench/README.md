@@ -559,21 +559,19 @@ adds new keys where T5 did not need to).
   prompt or any harness/layout-runner code, so no change was needed outside
   `arms.json`.
 
-  **Thinking mode: `null` (no `-rea` flag), the same choice `c0-old` makes.**
-  Justification: `-rea` is a generic toggle designed for template-detected reasoning
-  (deepseek-style `<think>` tags, per its own help text: "detect from template"), not
-  specific to Harmony's channel-based reasoning structure, which is already fully
-  controlled by `--reasoning-effort` regardless of `-rea`'s setting. Passing `-rea on`
-  would also require a `--reasoning-budget` value with no citable Harmony-specific
-  meaning (gpt-oss's effort levels are discrete, not a token count), adding an
-  unverified claim for no behavioral benefit over leaving `thinking` unset. **Known
-  side effect of this choice:** `layout_max_tokens()` keys off `thinking`'s mode only
-  (`"on"` -> 4096, anything else -> 256), so `c9`/`c9-medium`'s layout suite gets the
-  256-token budget even though gpt-oss reasons by default -- the lead should treat this
-  as a known limitation to weigh at S4c, not a bug; raising it needs either a `thinking:
-  {"mode": "on", "budget": ...}` value (which would also add a possibly-redundant
-  `--reasoning-budget` flag) or a `bench_host.py` change, both out of scope for this
-  additive-only task.
+  **Thinking mode: `{"mode": "on", "budget": -1}` -- always-on, unrestricted.**
+  gpt-oss always reasons; leaving `thinking` unset (as `c0-old` does) would have left
+  `layout_max_tokens()` -- which keys off `thinking`'s mode only (`"on"` -> 4096,
+  anything else -> 256) -- at the 256-token budget every non-thinking arm gets. Every
+  `c9`/`c9-medium` layout answer would then be truncated mid-reasoning, since the model
+  reasons regardless of what `-rea` is told, making the layout suite's accuracy invalid
+  for this arm rather than merely conservative. `budget: -1` (`--reasoning-budget -1`,
+  "unrestricted", `llama_server_help_b11151.txt:644`) sets no cap -- gpt-oss's own
+  reasoning length is effort-controlled (see below), so no other budget value has any
+  more citable a meaning here, and an unrestricted budget imposes no artificial ceiling
+  of its own. `-rea on` (as opposed to `-rea off`/`auto`) also avoids relying on
+  `auto`'s "detect from template" behavior for a template this worker cannot run live
+  to confirm.
 
   Suites: `c9`: `ttft`/`correctness`/`harness` (`bench-c9`, `default`, 10
   iterations)/`layout`. `c9-medium`: `layout` only, `harness: null`. `tokens_vs_c0:

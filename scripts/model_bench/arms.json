@@ -269,7 +269,7 @@
       "gguf": "ggml-org/gpt-oss-20b-MXFP4.gguf",
       "image": "compose:mist-llm",
       "family": "gptoss",
-      "thinking": null,
+      "thinking": {"mode": "on", "budget": -1},
       "suites": ["ttft", "correctness", "harness", "layout"],
       "harness": {"candidate": "bench-c9", "tests": "default", "iterations": 10},
       "extra_args": ["-lm", "none", "--reasoning-effort", "low"],

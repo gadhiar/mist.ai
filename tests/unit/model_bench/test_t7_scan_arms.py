@@ -128,16 +128,20 @@ def test_c9_required_ncmoe_and_cpu_moe_batch_overrides():
     assert args.count("-ub") == 1 and args[args.index("-ub") + 1] == "2048"
 
 
-def test_c9_reasoning_effort_low_no_rea_flag():
-    # Thinking is left unset (thinking: null, as c0-old does) -- gpt-oss's
-    # Harmony reasoning is structurally always-on and controlled by
-    # --reasoning-effort, not the generic -rea toggle designed for
-    # template-detected <think>-tag reasoning. See README.md's c9 note.
+def test_c9_reasoning_always_on_unbudgeted_plus_effort_low():
+    # thinking: {"mode": "on", "budget": -1} -- gpt-oss always reasons, so
+    # -rea on --reasoning-budget -1 (unrestricted) matches that, and also
+    # gives the layout suite the 4096-token budget every other thinking-on
+    # arm gets (layout_max_tokens keys off thinking's mode). Effort is a
+    # separate axis, set via --reasoning-effort in extra_args. See
+    # README.md's c9 note.
     arm = resolve_arm(ARMS_DOC, "c9")
-    assert arm["thinking"] is None
+    assert arm["thinking"] == {"mode": "on", "budget": -1}
     args = build_server_args(ARMS_DOC, arm, {"ncmoe": "12"})
-    assert "-rea" not in args
-    assert "--reasoning-budget" not in args
+    assert args.count("-rea") == 1
+    assert args[args.index("-rea") + 1] == "on"
+    assert args.count("--reasoning-budget") == 1
+    assert args[args.index("--reasoning-budget") + 1] == "-1"
     idx = args.index("--reasoning-effort")
     assert args[idx + 1] == "low"
 
@@ -149,7 +153,7 @@ def test_c9_suites_and_harness_and_label():
     assert arm["tokens_vs_c0"] == "differs-by-design"
 
 
-def test_c9_medium_inherits_ncmoe_and_overrides_effort():
+def test_c9_medium_inherits_ncmoe_thinking_and_overrides_effort():
     base = resolve_arm(ARMS_DOC, "c9")
     arm = resolve_arm(ARMS_DOC, "c9-medium")
     assert arm["gguf"] == base["gguf"]
@@ -157,7 +161,13 @@ def test_c9_medium_inherits_ncmoe_and_overrides_effort():
     assert arm["stop_neo4j"] is True
     assert arm["suites"] == ["layout"]
     assert arm["harness"] is None
+    # thinking is inherited unchanged from c9 (not overridden by c9-medium).
+    assert arm["thinking"] == {"mode": "on", "budget": -1}
     args = build_server_args(ARMS_DOC, arm, {"ncmoe": "12"})
+    assert args.count("-rea") == 1
+    assert args[args.index("-rea") + 1] == "on"
+    assert args.count("--reasoning-budget") == 1
+    assert args[args.index("--reasoning-budget") + 1] == "-1"
     idx = args.index("--reasoning-effort")
     assert args[idx + 1] == "medium"
     assert "low" not in args
