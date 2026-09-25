@@ -49,6 +49,68 @@ DEFAULT_GOLD_CORPUS = "data/ingest/extraction-gold-2026-06-14.jsonl"
 # module -- its sha256 must stay pinned, see the task's write-zone rules).
 _DECISION_RULES_PATH = Path(__file__).resolve().parents[1] / "decision_rules.json"
 
+# Determinism pins (T6 reviewer finding 3), matching
+# scripts/eval_harness/extraction_probe_set_design.md:136's "How to run"
+# recipe for the extraction-only replay this probe drives. MIST_FIXED_CLOCK
+# is read from os.environ at runtime (backend/factories.py's
+# resolve_fixed_rendered_at, ~line 64-83), so setting it in-process here is
+# effective -- unlike PYTHONHASHSEED (below).
+MIST_FIXED_CLOCK_PIN = "2026-06-13T00:00:00+00:00"
+
+
+class HashSeededUnitEmbeddingProvider:
+    """Deterministic fake embedding provider whose vectors are NEAR-ORTHOGONAL
+    for distinct texts, mimicking a real embedding model's separation of
+    unrelated inputs (T6 reviewer finding 2).
+
+    `tests.unit.knowledge.conftest.FakeEmbeddingProvider` tiles SHA-256 bytes
+    (each in [0, 1]) to fill 384 dims -- an all-positive, low-entropy,
+    periodic vector. Two such vectors' cosine similarity is spuriously high
+    (all-positive coordinates bias the dot product upward), which collapses
+    the novelty term the significance gate reads
+    (`backend/knowledge/extraction/pipeline.py:386-399`,
+    `_compute_significance`'s `novelty_score = 1.0 - max_sim` against
+    `self._dedup_cache`). On the full 60-probe corpus that collision pushes
+    `ext-11-smalltalk-negative` below `ExtractionConfig.significance_threshold`
+    (`backend/knowledge/extraction/pipeline.py:673`-674, threshold default
+    0.3 at `backend/knowledge/config.py:151`) for EVERY arm, so the LLM never
+    sees that negative control.
+
+    This provider draws each dimension from an independent hash-seeded
+    standard-normal sample (mean 0) instead of tiled uniform-[0, 1] bytes,
+    then normalizes to a unit vector. Independent Gaussian coordinates make
+    two distinct texts' vectors near-orthogonal in expectation in 384
+    dimensions -- the same near-orthogonality distinct utterances have under
+    the REAL embedding model (`all-MiniLM-L6-v2`) the original gauntlet
+    replay used (see extraction_probe_set_design.md's "How to run", which
+    never substitutes a fake embedding provider). Same input always yields
+    the same output (hash-seeded), so the probe stays deterministic.
+
+    This is the fix closest to production: it does not change WHEN the
+    dedup cache is read or reset (the original gauntlet replay runs the
+    whole 60-probe corpus through ONE continuous `ExtractionPipeline`
+    instance, so the cache accumulates across probes there too -- resetting
+    it per-probe here, the reviewer's alternative candidate, would diverge
+    from that behavior). It only replaces a badly-distributed fake vector
+    with one that behaves like a real embedding's separation of unrelated
+    text.
+    """
+
+    def __init__(self, *, dimension: int = 384) -> None:
+        self._dimension = dimension
+
+    def generate_embedding(self, text: str) -> list[float]:
+        seed = int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:8], "big")
+        rng = random.Random(seed)
+        vec = [rng.gauss(0.0, 1.0) for _ in range(self._dimension)]
+        norm = math.sqrt(sum(v * v for v in vec))
+        if norm > 0:
+            vec = [v / norm for v in vec]
+        return vec
+
+    def generate_embeddings(self, texts: list[str]) -> list[list[float]]:
+        return [self.generate_embedding(t) for t in texts]
+
 
 def load_bootstrap_params(path: Path = _DECISION_RULES_PATH) -> tuple[int, int, float, float]:
     """Return (seed, B, confidence, wilson_z) from decision_rules.json's statistics block.
@@ -171,16 +233,37 @@ def build_summary(
     bootstrap_b: int,
     bootstrap_confidence: float,
     wilson_z: float,
+    rate_limit_max_per_minute: int | None = None,
+    pythonhashseed: str | None = None,
+    mist_fixed_clock: str | None = None,
 ) -> dict[str, Any]:
     """The aggregate `extraction_summary.json` document: the scorer's own metrics
     plus Wilson intervals and a probe-id cluster bootstrap CI, unchanged from
     what `score_extraction_run.Report` computes.
+
+    Also computes `complete` / `unmatched_probe_ids` (T6 reviewer finding 1b):
+    the SAME invariant `score_extraction_run._gates_pass` checks at
+    score_extraction_run.py:812 (`matched_probes == total_probes`, "a broken
+    join must not pass"), reused here rather than reimplemented -- but as a
+    standalone completeness check, not via `_gates_pass` itself, since that
+    function also enforces precision/recall/typing quality gates this probe
+    does not (and must not: this suite is report-only, see analyse.py's
+    "Extraction quality" section). An empty corpus (`total_probes == 0`) is
+    never complete, mirroring `_gates_pass`'s own guard against the vacuous
+    `0 == 0` pass (score_extraction_run.py:804-810).
     """
     entity_counts = per_probe_entity_counts(report.per_probe)
     rel_counts = per_probe_rel_counts(report.per_probe)
 
     rel_p, rel_r = report.rel_precision, report.rel_recall
     rel_f1 = (2 * rel_p * rel_r / (rel_p + rel_r)) if (rel_p + rel_r) else 0.0
+
+    unmatched_probe_ids = sorted(p["tag"] for p in report.per_probe if not p["matched"])
+    complete = (
+        report.total_probes > 0
+        and report.matched_probes == report.total_probes
+        and not unmatched_probe_ids
+    )
 
     return {
         "schema": 1,
@@ -189,6 +272,13 @@ def build_summary(
         "ontology_version": ontology_version,
         "total_probes": report.total_probes,
         "matched_probes": report.matched_probes,
+        "complete": complete,
+        "unmatched_probe_ids": unmatched_probe_ids,
+        "env": {
+            "rate_limit_max_per_minute": rate_limit_max_per_minute,
+            "pythonhashseed": pythonhashseed,
+            "mist_fixed_clock": mist_fixed_clock,
+        },
         "entity_precision": report.entity_precision,
         "entity_recall": report.entity_recall,
         "rel_precision": rel_p,
@@ -291,6 +381,27 @@ def run_probe(
     debug_path = out_dir / "extraction_debug.jsonl"
     refuse_if_exists(debug_path)
 
+    # Gold probes are loaded FIRST so the rate-limit override below (T6
+    # reviewer finding 1a) can size itself to this run's actual probe count,
+    # before the pipeline (which reads the override at construction time via
+    # KnowledgeConfig.from_env() -> ExtractionConfig.from_env()) is built.
+    gold_probes = iter_gold_probes(gold_path)
+    inputs = [{"utterance": p.utterance, "tag": p.tag} for p in gold_probes]
+
+    # -- Rate limit override (finding 1a) --
+    # backend/knowledge/extraction/pipeline.py:648's Gate 1 rejects an
+    # extraction once `ExtractionConfig.rate_limit_max_per_minute` (default
+    # 30, backend/knowledge/config.py:154/170, env RATE_LIMIT_MAX_PER_MINUTE)
+    # extractions have proceeded in the trailing 60s. A 60-probe replay runs
+    # in well under a minute, so unset that protects a live conversational
+    # session throttles a benchmark replay instead. `len(gold_probes) + 1` is
+    # the tightest override that cannot trip: the gate blocks only once
+    # `self._extraction_timestamps` (one append per extraction that clears
+    # this gate, pipeline.py:713) reaches the configured max, and at most
+    # `len(gold_probes)` extractions can ever proceed in one replay.
+    rate_limit_max_per_minute = len(gold_probes) + 1
+    os.environ["RATE_LIMIT_MAX_PER_MINUTE"] = str(rate_limit_max_per_minute)
+
     # Isolation env: no Neo4j (graph_store/vector_store are the unit-tier
     # fakes, injected below), event store / vault sidecar / vault root
     # redirected to a writable location inside the (otherwise read-only
@@ -302,7 +413,13 @@ def run_probe(
     os.environ.setdefault("MIST_VAULT_ROOT", str(out_dir / "vault"))
     os.environ.setdefault("LLM_SERVER_URL", base_url)
     os.environ.setdefault("LLM_TEMPERATURE", "0.0")
-    os.environ.setdefault("PYTHONHASHSEED", "0")
+    # PYTHONHASHSEED is read only at interpreter startup -- setting it here,
+    # mid-process, has no effect (T6 reviewer finding 3). The effective pin
+    # is `docker run -e PYTHONHASHSEED=...` in
+    # scripts.model_bench.bench_host.build_extraction_container_argv, which
+    # applies before THIS process starts. Recorded below from whatever value
+    # the environment actually carries, for the summary.
+    os.environ.setdefault("MIST_FIXED_CLOCK", MIST_FIXED_CLOCK_PIN)
     os.environ["MIST_DEBUG_JSONL"] = str(debug_path)
     os.environ["MIST_DEBUG_LLM_JSONL"] = "1"
     os.environ.setdefault("MIST_SESSION_ORIGIN", "test")
@@ -312,18 +429,20 @@ def run_probe(
     from backend.knowledge.storage.graph_store import GraphStore
     from backend.knowledge.version_stamps import ONTOLOGY_VERSION
     from tests.mocks.neo4j import FakeNeo4jConnection
-    from tests.unit.knowledge.conftest import FakeEmbeddingProvider, FakeVectorStore
+    from tests.unit.knowledge.conftest import FakeVectorStore
 
     config = KnowledgeConfig.from_env()
+    # HashSeededUnitEmbeddingProvider, not
+    # tests.unit.knowledge.conftest.FakeEmbeddingProvider (finding 2): see
+    # its docstring for why the latter spuriously gates
+    # ext-11-smalltalk-negative below the significance threshold.
     graph_store = GraphStore(
-        connection=FakeNeo4jConnection(), embedding_generator=FakeEmbeddingProvider()
+        connection=FakeNeo4jConnection(), embedding_generator=HashSeededUnitEmbeddingProvider()
     )
     handler = build_conversation_handler(
         config, graph_store=graph_store, vector_store=FakeVectorStore()
     )
 
-    gold_probes = iter_gold_probes(gold_path)
-    inputs = [{"utterance": p.utterance, "tag": p.tag} for p in gold_probes]
     asyncio.run(run_extraction_only_replay(handler, inputs, session_id))
 
     debug_records = iter_debug_records(debug_path, session_id=session_id)
@@ -338,8 +457,16 @@ def run_probe(
         bootstrap_b=b,
         bootstrap_confidence=confidence,
         wilson_z=z,
+        rate_limit_max_per_minute=rate_limit_max_per_minute,
+        pythonhashseed=os.environ.get("PYTHONHASHSEED"),
+        mist_fixed_clock=os.environ.get("MIST_FIXED_CLOCK"),
     )
 
+    # Fail closed (finding 1b): a partial match (broken join, throttled
+    # probe, or a gate the fix above missed) still writes both files -- with
+    # `complete: false` and the unmatched tag list -- but `main()` returns
+    # non-zero so bench_host records an error instead of "extraction"
+    # completing, and analyse.py shows the arm as incomplete.
     with open(extraction_jsonl_path, "w", encoding="utf-8") as fh:
         for row in build_per_item_rows(report):
             fh.write(json.dumps(row) + "\n")
@@ -369,6 +496,14 @@ def main(argv: list[str] | None = None) -> int:
         )
     except FileExistsError as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)
+        return 1
+    if not summary["complete"]:
+        print(
+            f"[FAIL] extraction suite incomplete: {summary['matched_probes']}/"
+            f"{summary['total_probes']} probes matched; unmatched: "
+            f"{summary['unmatched_probe_ids']}",
+            file=sys.stderr,
+        )
         return 1
     print(json.dumps({"rel_precision": summary["rel_precision"], "typing_accuracy": summary["typing_accuracy"]}))
     return 0

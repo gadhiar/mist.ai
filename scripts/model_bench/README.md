@@ -67,14 +67,21 @@ is an argv list, `shell=False` (the `subprocess` default).
    `extraction` in `arms.json`'s `suites` list (`UNIVERSAL_SUITES = ("extraction",)` in
    `validate_run_suites`; `run <arm> --run R --suites extraction` always works). A `run` with no
    `--suites` still runs exactly the arm's own declared suites -- `extraction` is an allowance, not
-   a default addition. The suite runs in a FRESH `docker run --rm` container of the mist-backend
-   image (resolved from `session/snapshot.json`'s `mist-backend` `Image` id, written by
-   `snapshot`), sharing `mist-bench-llm`'s network namespace (`--network
+   a default addition. `cmd_run`'s PREFLIGHT resolves and validates the snapshot's `mist-backend`
+   image (`resolve_backend_image_ref`) before any suite runs and before any file is written when
+   `extraction` is among the requested suites -- a missing or incomplete `session/snapshot.json`
+   prints a clean `[FAIL]` and leaves `meta.json` / `vram.csv` untouched, the same as every other
+   preflight refusal. The suite then runs in a FRESH `docker run --rm` container of the resolved
+   mist-backend image, sharing `mist-bench-llm`'s network namespace (`--network
    container:mist-bench-llm`, so `127.0.0.1:8080` inside that container reaches the served arm),
-   the repo mounted read-only at `/work`, and the arm's results directory mounted writable at
-   `/out` (`build_extraction_container_argv`). It never touches the production `mist-backend`
-   container: no `exec`, no `start`, and the network/image targets are always the bench container
-   and a resolved image id, never the literal `mist-backend` name.
+   `-e PYTHONHASHSEED=0 -e MIST_FIXED_CLOCK=2026-06-13T00:00:00+00:00` (determinism pins --
+   `PYTHONHASHSEED` is read only at interpreter startup, so it MUST be a `docker run -e`, not an
+   in-process env write; `MIST_FIXED_CLOCK` matches
+   `scripts/eval_harness/extraction_probe_set_design.md:136`'s pin), the repo mounted read-only at
+   `/work`, and the arm's results directory mounted writable at `/out`
+   (`build_extraction_container_argv`). It never touches the production `mist-backend` container:
+   no `exec`, no `start`, and the network/image targets are always the bench container and a
+   resolved image id, never the literal `mist-backend` name.
 
    Inside that container, `python -m scripts.model_bench.probes.extraction` drives MIST's
    PRODUCTION extraction path -- the exact code `scripts/mist_admin.py replay --extraction-only`
@@ -82,9 +89,17 @@ is an argv list, `shell=False` (the `subprocess` default).
    `backend.factories.build_conversation_handler` wired with the real `LlamaServerProvider`
    pointed at `--base-url` and the unit tier's injectable fakes for `graph_store` /
    `vector_store` (`tests/mocks/neo4j.FakeNeo4jConnection`,
-   `tests/unit/knowledge/conftest.FakeVectorStore` / `FakeEmbeddingProvider`) -- no Neo4j. The gold
-   corpus is `data/ingest/extraction-gold-2026-06-14.jsonl` (60 probes, adjudicated against
-   ontology v1.4.0; see `scripts/eval_harness/extraction_probe_set_design.md`). Scoring is
+   `tests/unit/knowledge/conftest.FakeVectorStore`) -- no Neo4j. The embedding provider is this
+   module's own `HashSeededUnitEmbeddingProvider`, not
+   `tests/unit/knowledge/conftest.FakeEmbeddingProvider`: the latter's tiled, all-positive vectors
+   spuriously collide under cosine similarity, which silently gates a negative control
+   (`ext-11-smalltalk-negative`) below the significance threshold before it ever reaches the LLM,
+   for every arm (see the class docstring). Before Stage 2's LLM call, `run_probe` also overrides
+   `RATE_LIMIT_MAX_PER_MINUTE` to `len(gold_probes) + 1` -- the production default (30,
+   `backend/knowledge/config.py:154`) exists to protect a live conversational session's request
+   budget, not a bulk gold-corpus replay, and would otherwise silently drop probes past the 30th.
+   The gold corpus is `data/ingest/extraction-gold-2026-06-14.jsonl` (60 probes, adjudicated
+   against ontology v1.4.0; see `scripts/eval_harness/extraction_probe_set_design.md`). Scoring is
    `scripts/eval_harness/score_extraction_run.py`, imported and called unchanged -- this suite
    never reimplements or edits the scorer. Outputs, written under the arm's results directory
    (never overwritten -- pick a new `--run` instead):
@@ -93,14 +108,27 @@ is an argv list, `shell=False` (the `subprocess` default).
    - `<arm>/extraction_summary.json` -- the scorer's own aggregate metrics (entity P/R, relation
      P/R, typing accuracy, RELATED_TO rate, valid-time accuracy) plus a Wilson interval per metric
      and a cluster-by-probe-id bootstrap CI (seed/B/confidence read from `decision_rules.json`'s
-     `statistics.bootstrap` block, read-only), the ontology version, and the gold corpus's
-     sha256.
+     `statistics.bootstrap` block, read-only), the ontology version, the gold corpus's sha256,
+     `complete` / `unmatched_probe_ids`, and the effective `env` values (rate limit,
+     `PYTHONHASHSEED`, `MIST_FIXED_CLOCK`).
+
+   **Fail closed on a partial match.** If fewer probes are matched than exist in the gold corpus
+   (`matched_probes != total_probes` -- a broken join, a throttled probe, anything the scorer
+   could not join to a debug record; the same invariant `score_extraction_run.py`'s
+   `_gates_pass` checks at line ~812), `extraction_summary.json` is still written -- with
+   `complete: false` and `unmatched_probe_ids` -- but `python -m
+   scripts.model_bench.probes.extraction` exits non-zero. `cmd_run` then records an `errors` entry
+   and does NOT add `extraction` to `suites_completed`, so a subsequent call can retry it; the
+   suite is never silently recorded as done on a partial run.
 
    `analyse.py`'s "Extraction quality (report-only, not a pre-registered rule)" section (after
    `Exploratory`, before `Finalist candidates`) renders each arm's `extraction_summary.json` with
-   its CIs and a delta against `c0` in the same run, when both are present. It renders NO verdict
-   and never feeds `rules` / `exploratory_rules` -- an arm's `extraction_summary.json` absence
-   renders as "no extraction_summary.json for this arm in this run", not a `[FAIL]`.
+   its CIs and a delta against `c0` in the same run, when both are present and complete. It
+   renders NO verdict and never feeds `rules` / `exploratory_rules` -- an arm's
+   `extraction_summary.json` absence renders as "no extraction_summary.json for this arm in this
+   run", not a `[FAIL]"; an incomplete one (`complete: false`) renders as "incomplete: M/N probes
+   matched; unmatched: [...]", with no metrics row (a partial run's precision/recall are not a
+   comparable measurement, and an incomplete `c0` is not used as a delta baseline either).
 5. **`unserve --run R --arm A`** -- saves `docker logs mist-bench-llm` (stdout and stderr) to
    `<arm>/server.log`, `docker stop`s `mist-bench-llm` unless its state is confirmed already
    exited, then always `docker rm`s it (needed now that `serve` no longer passes `--rm`) -- this
