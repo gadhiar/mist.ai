@@ -53,9 +53,13 @@ def test_build_server_args_argv_is_all_strings(arm_id):
     params = {p: "12" for p in arm["params_required"]}
     args = build_server_args(ARMS_DOC, arm, params)
     assert all(isinstance(tok, str) for tok in args)
-    # Common args must always be present verbatim.
+    # Common args must always be present verbatim, except where arg_overrides
+    # deliberately replaces a value in place (plan v2's context arms override
+    # --ctx-size away from the common 32768 -- that override is itself checked by
+    # test_context_arms_ctx_size_and_kv_quant).
     assert "--ctx-size" in args
-    assert "32768" in args
+    expected_ctx_size = arm["arg_overrides"].get("--ctx-size", "32768")
+    assert args[args.index("--ctx-size") + 1] == expected_ctx_size
     assert "--no-kv-unified" in args
 
 
@@ -241,3 +245,82 @@ def test_build_model_args_includes_model_flag_before_server_args():
     argv = build_model_args(arm, ARMS_DOC, {})
     assert argv[0] == "-m"
     assert argv[1] == f"/models/{arm['gguf']}"
+
+
+# --- plan v2 (2026-09-25): c1-1024 and the E4B context arms --------------
+
+
+def test_c1_1024_thinking_budget_and_suites():
+    arm = resolve_arm(ARMS_DOC, "c1-1024")
+    assert arm["thinking"] == {"mode": "on", "budget": 1024}
+    assert arm["suites"] == ["layout", "ttft"]
+    assert arm["harness"] is None
+    assert arm["tokens_vs_c0"] == "differs-by-design"
+    args = build_server_args(ARMS_DOC, arm, {})
+    idx = args.index("--reasoning-budget")
+    assert args[idx + 1] == "1024"
+
+
+@pytest.mark.parametrize(
+    "arm_id,expected_ctx,expect_q4_kv",
+    [
+        ("c0-ctx64k", "65536", False),
+        ("c0-ctx128k", "131072", False),
+        ("c0-ctx128k-q4kv", "131072", True),
+    ],
+)
+def test_context_arms_ctx_size_and_kv_quant(arm_id, expected_ctx, expect_q4_kv):
+    arm = resolve_arm(ARMS_DOC, arm_id)
+    assert arm["suites"] == ["ttft", "correctness", "harness"]
+    assert arm["harness"] == {"candidate": "bench-c0", "tests": "context", "iterations": 10}
+    args = build_server_args(ARMS_DOC, arm, {})
+    assert args.count("--ctx-size") == 1
+    assert args[args.index("--ctx-size") + 1] == expected_ctx
+    ctk = args[args.index("-ctk") + 1]
+    ctv = args[args.index("-ctv") + 1]
+    if expect_q4_kv:
+        assert (ctk, ctv) == ("q4_0", "q4_0")
+    else:
+        assert (ctk, ctv) == ("q8_0", "q8_0")
+
+
+def test_context_arms_tokens_vs_c0_labels():
+    assert resolve_arm(ARMS_DOC, "c0-ctx64k")["tokens_vs_c0"] == "expected-identical-unverified"
+    assert resolve_arm(ARMS_DOC, "c0-ctx128k")["tokens_vs_c0"] == "expected-identical-unverified"
+    assert resolve_arm(ARMS_DOC, "c0-ctx128k-q4kv")["tokens_vs_c0"] == "may-differ"
+
+
+def test_context_harness_tests_sentinel():
+    tests = resolve_harness_tests({"tests": "context", "candidate": "bench-c0", "iterations": 10})
+    assert tests == ["schema_conformance", "schema_conformance_json_object", "tool_selection"]
+
+
+def test_c0_ub1024_batch_override_and_label():
+    arm = resolve_arm(ARMS_DOC, "c0-ub1024")
+    assert arm["tokens_vs_c0"] == "may-differ"
+    args = build_server_args(ARMS_DOC, arm, {})
+    assert args.count("-b") == 1
+    assert args[args.index("-b") + 1] == "2048"
+    assert args.count("-ub") == 1
+    assert args[args.index("-ub") + 1] == "1024"
+
+
+def test_default_arms_have_no_tokens_vs_c0_label():
+    # Pre-plan-v2 arms make no tokens_vs_c0 claim; the key is None, not one of the
+    # allowed labels.
+    for arm_id in ("c0", "c2", "c3", "c1-256", "c1-512"):
+        assert resolve_arm(ARMS_DOC, arm_id)["tokens_vs_c0"] is None
+
+
+def test_unknown_tokens_vs_c0_raises():
+    doc = {
+        "arms": {
+            "bad": {
+                "gguf": "x.gguf",
+                "image": "compose:mist-llm",
+                "tokens_vs_c0": "not-a-real-label",
+            }
+        }
+    }
+    with pytest.raises(ArmConfigError):
+        resolve_arm(doc, "bad")

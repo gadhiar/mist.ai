@@ -78,6 +78,15 @@ HARNESS_DEFAULT_TEST_ORDER: tuple[str, ...] = (
 )
 HARNESS_SCHEMA_JSON_OBJECT_TEST = "schema_conformance_json_object"
 HARNESS_TUNING_TESTS: tuple[str, ...] = ("schema_conformance",)
+HARNESS_CONTEXT_TESTS: tuple[str, ...] = (
+    "schema_conformance",
+    "schema_conformance_json_object",
+    "tool_selection",
+)
+"""Plan v2 (2026-09-25): the E4B context arms are report-only and the night's time
+budget does not cover a full `default` harness pass at 64K/128K context; quality-at-
+context only needs the schema and tool tests (see arms.json's context_arms_note and
+README.md)."""
 
 LAYOUT_MAX_TOKENS_OFF = 256
 LAYOUT_MAX_TOKENS_ON = 4096
@@ -102,6 +111,7 @@ KNOWN_ARM_KEYS = frozenset(
         "optional",
         "tuning",
         "tuning_note",
+        "tokens_vs_c0",
     }
 )
 
@@ -118,7 +128,16 @@ ARM_DEFAULTS: dict[str, Any] = {
     "optional": False,
     "tuning": False,
     "tuning_note": None,
+    "tokens_vs_c0": None,
 }
+
+TOKENS_VS_C0_VALUES = frozenset(
+    {"expected-identical-unverified", "may-differ", "differs-by-design"}
+)
+"""Allowed `tokens_vs_c0` labels (plan v2, 2026-09-25): whether a server-setting arm
+added alongside c0 is expected to produce the same completion tokens as c0 given the
+same prompt and sampling settings. `None` (the default) means the arm predates this
+label and makes no claim either way -- it is not itself a claim of identity."""
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +290,12 @@ def resolve_arm(arms_doc: dict[str, Any], arm_id: str, _stack: tuple[str, ...] =
             f"entry: {missing_templates}"
         )
 
+    if merged["tokens_vs_c0"] is not None and merged["tokens_vs_c0"] not in TOKENS_VS_C0_VALUES:
+        raise ArmConfigError(
+            f"arm {arm_id!r} has unknown tokens_vs_c0 {merged['tokens_vs_c0']!r}; "
+            f"known: {sorted(TOKENS_VS_C0_VALUES)}"
+        )
+
     merged["id"] = arm_id
     return merged
 
@@ -286,6 +311,8 @@ def resolve_harness_tests(harness_cfg: dict[str, Any]) -> list[str]:
         return [*HARNESS_DEFAULT_TEST_ORDER, HARNESS_SCHEMA_JSON_OBJECT_TEST]
     if tests == "tuning":
         return list(HARNESS_TUNING_TESTS)
+    if tests == "context":
+        return list(HARNESS_CONTEXT_TESTS)
     if isinstance(tests, list):
         return list(tests)
     raise ArmConfigError(f"unknown harness 'tests' sentinel: {tests!r}")
@@ -635,6 +662,29 @@ def collect_git_state(repo_root: Path, layout_dir: Path | None) -> dict[str, Any
         "mist_ai_dirty": git_is_dirty(repo_root),
         "command_center": git_head(layout_dir) if layout_dir is not None else None,
     }
+
+
+def load_decision_rules_supersedes_shas(path: Path) -> frozenset[str]:
+    """The sha256 values decision_rules.json's own `supersedes` list names.
+
+    Read once by `cmd_run` and passed into `merge_run_meta` (which stays pure/no-I/O)
+    so a rules edit that lists its predecessor's sha256 there can still merge into a run
+    id whose meta.json was written under that predecessor -- see `merge_run_meta`'s
+    docstring. Any read/parse failure, or a missing/malformed `supersedes` key, yields an
+    empty set rather than raising: an unreadable rules file is caught earlier, by
+    `check_decision_rules_clean`, and `run` will already have refused before this is
+    reached.
+    """
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return frozenset()
+    entries = doc.get("supersedes")
+    if not isinstance(entries, list):
+        return frozenset()
+    return frozenset(
+        e["sha256"] for e in entries if isinstance(e, dict) and isinstance(e.get("sha256"), str)
+    )
 
 
 def check_decision_rules_clean(path: Path, repo_root: Path) -> str:
@@ -1310,7 +1360,12 @@ _META_EQUALITY_KEYS: tuple[str, ...] = (
 )
 
 
-def merge_run_meta(existing: dict[str, Any] | None, call: dict[str, Any]) -> dict[str, Any]:
+def merge_run_meta(
+    existing: dict[str, Any] | None,
+    call: dict[str, Any],
+    *,
+    superseded_rules_shas: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     """Merge one `run` call's results into an arm dir's cumulative meta.json.
 
     Pure function (no I/O), so it is unit tested directly. `existing` is the meta.json
@@ -1324,13 +1379,31 @@ def merge_run_meta(existing: dict[str, Any] | None, call: dict[str, Any]) -> dic
     `finished_utc`) and the results this call has produced so far (`suites`,
     `suites_completed`, `rep`, `layout_pass`, `harness`, `layout_result`, `errors`).
 
+    `decision_rules_sha256` is a special case of the equality check: a rules edit (e.g.
+    the v1 -> v2 amendment on 2026-09-25) changes decision_rules.json's sha256, and S4
+    resumes the finalist pass for c1-512 inside run `mb1`, whose meta.json was written
+    under the v1 sha. The stored (existing) sha is allowed to differ from this call's
+    sha ONLY when it appears in `superseded_rules_shas` (the caller reads the current
+    decision_rules.json's own `supersedes` list and passes the sha256 values through
+    here -- this function stays pure/no-I/O, so it does not read that file itself). Any
+    other difference -- an unlisted sha, or any of the other identity fields -- is still
+    refused. The merged document's top-level `decision_rules_sha256` becomes this call's
+    (the latest) value; each entry in `calls` separately records the sha it ran under, so
+    the full history survives even though the top-level field only ever shows the latest.
+
     Raises RunMetaConfigMismatchError, naming the differing keys, if `existing` is not
     None and any equality-checked field differs from `call`'s. The caller must invoke
     this (and see the raise) BEFORE opening any file for writing, so a refused call
     leaves meta.json and vram.csv byte-identical to before the call.
     """
     if existing is not None:
-        differing = [k for k in _META_EQUALITY_KEYS if existing.get(k) != call.get(k)]
+        differing = []
+        for k in _META_EQUALITY_KEYS:
+            if existing.get(k) == call.get(k):
+                continue
+            if k == "decision_rules_sha256" and existing.get(k) in superseded_rules_shas:
+                continue
+            differing.append(k)
         if differing:
             raise RunMetaConfigMismatchError(
                 f"this call's config differs from the existing meta.json on: {differing}"
@@ -1376,6 +1449,7 @@ def merge_run_meta(existing: dict[str, Any] | None, call: dict[str, Any]) -> dic
         "props": call["props"],
         "container_args": call["container_args"],
         "errors": list(call.get("errors", [])),
+        "decision_rules_sha256": call.get("decision_rules_sha256"),
     }
     merged["calls"] = existing_calls + [call_entry]
 
@@ -1972,6 +2046,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     except DecisionRulesError as exc:
         print(f"[FAIL] {exc}")
         return 1
+    superseded_rules_shas = load_decision_rules_supersedes_shas(DECISION_RULES_PATH)
 
     # (a) suite validation.
     a_dir = arm_dir(config.results_root, args.run, arm["id"])
@@ -2027,7 +2102,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         "errors": [],
     }
     try:
-        merge_run_meta(existing_meta, call)  # validated here; the result is discarded
+        merge_run_meta(  # validated here; the result is discarded
+            existing_meta, call, superseded_rules_shas=superseded_rules_shas
+        )
     except RunMetaConfigMismatchError as exc:
         print(f"[FAIL] {exc}")
         return 1
@@ -2037,7 +2114,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     def write_meta() -> None:
         call["finished_utc"] = datetime.now(UTC).isoformat()
-        merged = merge_run_meta(existing_meta, call)
+        merged = merge_run_meta(existing_meta, call, superseded_rules_shas=superseded_rules_shas)
         meta_path.write_text(json.dumps(merged, indent=2, sort_keys=True, default=str), encoding="utf-8")
 
     sampler = GpuSampler(a_dir / "vram.csv")

@@ -135,8 +135,9 @@ def test_calls_list_records_the_documented_per_call_fields():
     entry = merged["calls"][0]
     assert set(entry) == {
         "started_utc", "finished_utc", "suites", "rep", "layout_pass", "props",
-        "container_args", "errors",
+        "container_args", "errors", "decision_rules_sha256",
     }
+    assert entry["decision_rules_sha256"] == "deadbeef"
     assert entry["rep"] == 2
     assert entry["layout_pass"] == "finalist"
 
@@ -157,6 +158,43 @@ def test_a_changed_identity_field_refuses_with_the_differing_key_named(key, new_
     existing = merge_run_meta(None, _base_call())
     with pytest.raises(RunMetaConfigMismatchError, match=key):
         merge_run_meta(existing, _base_call(**{key: new_value}))
+
+
+def test_unlisted_decision_rules_sha_is_still_refused():
+    """A differing decision_rules_sha256 is refused unless the OLD (stored) sha is named
+    in the caller-supplied `superseded_rules_shas` set -- an arbitrary unlisted sha must
+    still be refused exactly like every other identity-field mismatch. This must hold
+    both with the default (empty) `superseded_rules_shas` and with a non-empty set that
+    simply does not name the stored sha.
+    """
+    existing = merge_run_meta(None, _base_call(decision_rules_sha256="v1sha"))
+    with pytest.raises(RunMetaConfigMismatchError, match="decision_rules_sha256"):
+        merge_run_meta(existing, _base_call(decision_rules_sha256="v2sha"))
+    with pytest.raises(RunMetaConfigMismatchError, match="decision_rules_sha256"):
+        merge_run_meta(
+            existing,
+            _base_call(decision_rules_sha256="v2sha"),
+            superseded_rules_shas=frozenset({"some-other-sha"}),
+        )
+
+
+def test_superseded_decision_rules_sha_merges_and_latest_wins():
+    """S4 resumes c1-512 inside run mb1, whose meta.json was written under the v1 rules
+    sha. A v2 decision_rules.json that lists the v1 sha in its own `supersedes` must let
+    that call merge: the top-level decision_rules_sha256 becomes v2's (the latest call's)
+    value, and each call entry keeps its own sha, so the full history survives.
+    """
+    existing = merge_run_meta(None, _base_call(decision_rules_sha256="v1sha"))
+    merged = merge_run_meta(
+        existing,
+        _base_call(
+            suites=["correctness"], suites_completed=["correctness"],
+            decision_rules_sha256="v2sha",
+        ),
+        superseded_rules_shas=frozenset({"v1sha"}),
+    )  # must not raise
+    assert merged["decision_rules_sha256"] == "v2sha"
+    assert [c["decision_rules_sha256"] for c in merged["calls"]] == ["v1sha", "v2sha"]
 
 
 def test_non_identity_fields_are_allowed_to_differ_between_calls():

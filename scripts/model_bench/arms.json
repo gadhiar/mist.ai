@@ -42,7 +42,8 @@
     "on": ["-rea", "on", "--reasoning-budget", "{budget}"]
   },
   "flags_unverified_note": "Verified on the host 2026-09-24 with `llama-server --help` against the pinned b11151 digest (ghcr.io/ggml-org/llama.cpp:server-cuda-b11151): `-rea, --reasoning [on|off|auto]`, `--reasoning-budget N`, `-ncmoe, --n-cpu-moe N`, `-cram, --cache-ram N`. b11151 replaced `--mmap`/`--no-mmap` with `-lm, --load-mode {auto|none|mmap|mlock|mmap+mlock|dio}`; `none` is the old `--no-mmap`, and c3/c4 (and their think512/a3/a4 descendants) now pass `-lm none` via `extra_args` instead. `--temp`, `--top-p`, `--top-k`, `--min-p` and `--repeat-penalty` are already passed to production mist-llm (docker-compose.yml's mist-llm `command:` block), so their spellings are already load-bearing there. Still UNVERIFIED: `--presence-penalty` and, separately from the flags above, `return_tokens` and /props' `model_path` field -- the lead checks these at step L0. Kept as data here, not in bench_host.py, so the lead can correct a spelling at step L0 without a code change. c0-old targets b8808 (snapshot:mist-llm) and gets no thinking flags at all: its template default is off, as in current production, and -rea may not exist in b8808.",
-  "harness_tests_note": "\"tests\": \"default\" resolves at runtime to scripts/eval_harness/run.py:61 DEFAULT_TEST_ORDER plus schema_conformance_json_object (bench_host.py mirrors DEFAULT_TEST_ORDER as a stdlib constant rather than importing run.py, which pulls in PyYAML). \"tests\": \"tuning\" resolves to [\"schema_conformance\"] only.",
+  "harness_tests_note": "\"tests\": \"default\" resolves at runtime to scripts/eval_harness/run.py:61 DEFAULT_TEST_ORDER plus schema_conformance_json_object (bench_host.py mirrors DEFAULT_TEST_ORDER as a stdlib constant rather than importing run.py, which pulls in PyYAML). \"tests\": \"tuning\" resolves to [\"schema_conformance\"] only. \"tests\": \"context\" (added plan v2, 2026-09-25, for the E4B context arms) resolves to [\"schema_conformance\", \"schema_conformance_json_object\", \"tool_selection\"] only -- the context arms are report-only (decision_rules.json's exploratory X2), and the night's time budget does not cover a full `default` harness pass at 64K/128K context on top of the full-card C4/c3 work; quality-at-context only needs the schema and tool tests.",
+  "context_arms_note": "Plan v2 (2026-09-25): Raj moved voice to the GTX 1070, so the LLM gets the whole RTX 4070 SUPER; the E4B context arms (c0-ctx64k, c0-ctx128k, c0-ctx128k-q4kv) measure how ttft/decode/harness quality move as the context window grows toward gemma4.context_length=131072, per the lead. c1-1024 adds a second E4B thinking-budget point (256/512 already existed) and also runs the ttft suite -- unlike c1-256/c1-512 (layout-only) -- so decision_rules.json's exploratory X1 can measure its P/D clauses on this arm itself rather than borrowing another arm's speed numbers; the plan text says 'layout suite' only, so this is called out here and in README.md. tokens_vs_c0 on every new arm: 'expected-identical-unverified' for a context-window-only change (c0-ctx64k, c0-ctx128k -- same q8_0 KV, same sampling, unverified because no live run has confirmed it), 'may-differ' for anything that changes the compute path (q4_0 KV quantization on c0-ctx128k-q4kv; the batch/ubatch sizes on c0-ub1024, which can select different GEMM kernels), and 'differs-by-design' for a thinking-budget change (c1-1024), which is expected to change the completion tokens by construction.",
   "arms": {
     "c0-old": {
       "gguf": "unsloth/gemma-4-E4B-it-Q5_K_M.gguf",
@@ -79,6 +80,41 @@
       "thinking": {"mode": "on", "budget": 512},
       "suites": ["layout"],
       "harness": null
+    },
+    "c1-1024": {
+      "base": "c0",
+      "thinking": {"mode": "on", "budget": 1024},
+      "suites": ["layout", "ttft"],
+      "harness": null,
+      "tokens_vs_c0": "differs-by-design"
+    },
+    "c0-ctx64k": {
+      "base": "c0",
+      "suites": ["ttft", "correctness", "harness"],
+      "harness": {"candidate": "bench-c0", "tests": "context", "iterations": 10},
+      "arg_overrides": {"--ctx-size": "65536"},
+      "tokens_vs_c0": "expected-identical-unverified"
+    },
+    "c0-ctx128k": {
+      "base": "c0",
+      "suites": ["ttft", "correctness", "harness"],
+      "harness": {"candidate": "bench-c0", "tests": "context", "iterations": 10},
+      "arg_overrides": {"--ctx-size": "131072"},
+      "tokens_vs_c0": "expected-identical-unverified"
+    },
+    "c0-ctx128k-q4kv": {
+      "base": "c0",
+      "suites": ["ttft", "correctness", "harness"],
+      "harness": {"candidate": "bench-c0", "tests": "context", "iterations": 10},
+      "arg_overrides": {"--ctx-size": "131072", "-ctk": "q4_0", "-ctv": "q4_0"},
+      "tokens_vs_c0": "may-differ"
+    },
+    "c0-ub1024": {
+      "base": "c0",
+      "suites": ["ttft"],
+      "harness": null,
+      "arg_overrides": {"-b": "2048", "-ub": "1024"},
+      "tokens_vs_c0": "may-differ"
     },
     "c2": {
       "gguf": "google/gemma-4-12b-it-qat-q4_0.gguf",
