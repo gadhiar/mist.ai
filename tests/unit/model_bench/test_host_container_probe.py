@@ -151,3 +151,22 @@ def test_probe_passes_timeout_through_to_subprocess_run(monkeypatch):
     monkeypatch.setattr(bench_host.subprocess, "run", _fake_run)
     bench_host.probe_container_state(CONTAINER, timeout_s=7.5)
     assert seen["timeout"] == 7.5
+
+
+def test_docker_logs_is_bounded_and_a_timeout_raises_docker_error(monkeypatch):
+    # The unknown-state path of serve saves logs best-effort and catches DockerError; an
+    # unbounded `docker logs` there could hang on the same slow CLI that caused the unknown.
+    seen = {}
+
+    def _fake_run(argv, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+    monkeypatch.setattr(bench_host.subprocess, "run", _fake_run)
+    try:
+        bench_host.docker_logs(CONTAINER)
+    except bench_host.DockerError as exc:
+        assert "timed out" in str(exc)
+    else:
+        raise AssertionError("docker_logs did not raise DockerError on timeout")
+    assert seen["timeout"] == bench_host.DOCKER_LOGS_TIMEOUT_S

@@ -95,9 +95,9 @@ on a docker failure:
   or output that does not parse as JSON with a usable `Status` field.
 
 `running`, `exited`, and `absent` are all positive results -- the driver knows what happened.
-`unknown` is not: it means docker itself could not answer, which S2 mistook for "the container
-exited" and, with `--rm` implied by removing it, deleted the evidence for a container that was
-actually 55 seconds into a slow 16 GB model load.
+`unknown` is not: it means docker itself could not answer. At 0d3aa54 that failure escaped
+`serve` as a `DockerError` and was reported as a failed serve, for a container that was actually
+55 seconds into a slow 16 GB model load. The driver itself did not remove that container.
 
 `wait_for_llama_health`'s handling of each state during `serve`'s /health wait:
 

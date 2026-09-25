@@ -836,8 +836,22 @@ def docker_run_detached(argv: list[str]) -> str:
     return proc.stdout.strip()
 
 
-def docker_logs(name: str) -> tuple[str, str]:
-    proc = subprocess.run(["docker", "logs", name], capture_output=True, text=True, shell=False)
+DOCKER_LOGS_TIMEOUT_S = 60.0
+
+
+def docker_logs(name: str, *, timeout_s: float = DOCKER_LOGS_TIMEOUT_S) -> tuple[str, str]:
+    """`docker logs <name>` as (stdout, stderr), bounded by `timeout_s`.
+
+    The timeout matters on the unknown-state path of `serve`: that path exists because the
+    docker CLI is slow or unresponsive, so an unbounded `docker logs` there could hang the
+    driver. A timeout raises `DockerError`, which that path already reports as a `[WARN]`.
+    """
+    try:
+        proc = subprocess.run(
+            ["docker", "logs", name], capture_output=True, text=True, shell=False, timeout=timeout_s
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise DockerError(f"docker logs {name!r} timed out after {timeout_s}s") from exc
     return proc.stdout, proc.stderr
 
 
