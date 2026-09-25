@@ -57,3 +57,17 @@ X1's fail/missing branches, and X3's F_sep evaluated against a genuinely `fail` 
 `test_analyse_rules.py` rather than by more fixture directories here -- the existing convention in
 this file (see "hand-built synthetic metric bundles" in that test module's docstring) for branches
 a single fixture run cannot exercise simultaneously.
+
+## T6: c0/extraction_summary.json and c1-512/extraction_summary.json, hand-built
+
+Two more files, added by hand, to exercise the report-only "Extraction quality" section
+(`render_report` / `build_summary` in `analyse.py`) added for the universal `extraction` suite.
+NOT a real `score_extraction_run.py` output -- no live corpus, no real llama-server, no real
+extraction run. `gold_corpus_sha256` is the literal placeholder string
+`handbuilt0000...` (64 hex-shaped characters, not a real SHA-256 of any file) so it cannot be
+mistaken for a genuine corpus digest. The Wilson/bootstrap interval values were computed by hand
+from each file's own `k`/`n`-shaped precision/recall values with `decision_rules.json`'s pinned
+`z`/seed/B (see `scripts/model_bench/probes/extraction.py`'s `wilson_interval` /
+`cluster_bootstrap_ratio_ci`), not sampled from a real per-probe distribution. `c1-512` is
+deliberately lower on every metric than `c0` so the section's per-metric delta-vs-c0 column
+renders both a negative and (implicitly, from c0's own row) a self-delta-free baseline.
