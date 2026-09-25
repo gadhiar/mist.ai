@@ -96,8 +96,17 @@ def test_common_args_sampling_and_thinking_args_are_byte_for_byte_unchanged():
     base_doc = _load_base_arms_doc()
     current_doc = load_arms_doc()
     assert current_doc["common_args"] == base_doc["common_args"]
-    assert current_doc["sampling"] == base_doc["sampling"]
     assert current_doc["thinking_args"] == base_doc["thinking_args"]
+    # sampling: every key already present at the base commit stays byte-identical
+    # (T7's brief explicitly permits ADDING a new family key -- e.g. "granite",
+    # "spark", "gptoss" -- so this checks per-key equality on the base's own
+    # keys, not whole-dict equality).
+    for family, values in base_doc["sampling"].items():
+        assert family in current_doc["sampling"], f"sampling family {family!r} was removed"
+        assert current_doc["sampling"][family] == values, (
+            f"sampling family {family!r} changed -- existing families must stay "
+            f"byte-identical"
+        )
 
 
 def test_decision_rules_json_sha256_unchanged():

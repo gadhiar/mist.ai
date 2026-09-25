@@ -35,6 +35,24 @@
       "--top-k", "20",
       "--min-p", "0.0",
       "--presence-penalty", "1.5"
+    ],
+    "granite": [
+      "--temp", "1.0",
+      "--top-p", "0.95",
+      "--top-k", "64",
+      "--min-p", "0.0",
+      "--repeat-penalty", "1.0"
+    ],
+    "spark": [
+      "--temp", "1.0",
+      "--top-p", "0.95",
+      "--top-k", "64",
+      "--min-p", "0.0",
+      "--repeat-penalty", "1.0"
+    ],
+    "gptoss": [
+      "--temp", "1.0",
+      "--top-p", "1.0"
     ]
   },
   "thinking_args": {
@@ -214,6 +232,56 @@
     "c5-think1024": {
       "base": "c5",
       "thinking": {"mode": "on", "budget": 1024},
+      "suites": ["layout"],
+      "harness": null
+    },
+    "c7": {
+      "gguf": "ibm-granite/granite-4.2-8b-Q6_K.gguf",
+      "image": "compose:mist-llm",
+      "family": "granite",
+      "thinking": {"mode": "off"},
+      "suites": ["ttft", "correctness", "harness", "layout"],
+      "harness": {"candidate": "bench-c7", "tests": "default", "iterations": 10},
+      "tokens_vs_c0": "differs-by-design"
+    },
+    "c7-think": {
+      "base": "c7",
+      "thinking": {"mode": "on", "budget": 1024},
+      "suites": ["layout"],
+      "harness": null
+    },
+    "c8": {
+      "gguf": "XHToken/Spark-X2.5-4B-Q8_0.gguf",
+      "image": "compose:mist-llm",
+      "family": "spark",
+      "thinking": {"mode": "off"},
+      "suites": ["ttft", "correctness", "harness", "layout"],
+      "harness": {"candidate": "bench-c8", "tests": "default", "iterations": 10},
+      "tokens_vs_c0": "differs-by-design"
+    },
+    "c8-think": {
+      "base": "c8",
+      "thinking": {"mode": "on", "budget": 1024},
+      "suites": ["layout"],
+      "harness": null
+    },
+    "c9": {
+      "gguf": "ggml-org/gpt-oss-20b-MXFP4.gguf",
+      "image": "compose:mist-llm",
+      "family": "gptoss",
+      "thinking": null,
+      "suites": ["ttft", "correctness", "harness", "layout"],
+      "harness": {"candidate": "bench-c9", "tests": "default", "iterations": 10},
+      "extra_args": ["-lm", "none", "--reasoning-effort", "low"],
+      "arg_overrides": {"-b": "2048", "-ub": "2048"},
+      "params_required": ["ncmoe"],
+      "param_arg_map": {"ncmoe": "-ncmoe"},
+      "stop_neo4j": true,
+      "tokens_vs_c0": "differs-by-design"
+    },
+    "c9-medium": {
+      "base": "c9",
+      "extra_args": ["-lm", "none", "--reasoning-effort", "medium"],
       "suites": ["layout"],
       "harness": null
     },

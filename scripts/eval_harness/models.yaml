@@ -2371,3 +2371,149 @@ candidates:
       quant-invariant total_params_b/active_params_b (25.2/3.8) reused
       from that entry's citation. Run with --external; server args live in
       scripts/model_bench/arms.json.
+
+  # ---------------------------------------------------------------------
+  # MIST MODEL BENCH -- T7 (plan v3 open-ended scan) harness candidates.
+  # Same conventions as the T2/T5 blocks above: run with --external, server
+  # flags live in scripts/model_bench/arms.json, extra_server_args stays
+  # empty and no shared_server_args_override is set. The container this
+  # harness runs in has no network access, so none of size_gb/vendor/
+  # architecture below is fetched from a live model card; each is either
+  # given directly by the T7 brief (cited as such) or left at the run.py
+  # default (0.0 / "dense") with an UNVERIFIED note, exactly as bench-c2/
+  # bench-c4 already do above for uncited GGUFs.
+  # ---------------------------------------------------------------------
+
+  - id: bench-c7
+    display_name: "Bench C7: Granite 4.2 8B Instruct (Q6_K)"
+    tier: bench
+    family: granite-4.2
+    vendor: ibm
+    gguf: "ibm-granite/granite-4.2-8b-Q6_K.gguf"
+    quant: Q6_K
+    total_params_b: 8.8
+    active_params_b: 8.8
+    architecture: dense
+    context_size: 32768
+    served_model_name: "granite-4.2-8b"
+    temperature:
+      extraction: 1.0
+      conversation: 1.0
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: null
+    tool_parser: "hermes"
+    gbnf_supported: true
+    stop_sequences: []
+    extra_server_args: []
+    notes: >-
+      Bench candidate, full card (arms.json's c7: no -ncmoe, 32768 ctx).
+      total_params_b/active_params_b (8.8, dense) taken directly from the
+      T7 brief's task description, not a fetched model card -- this
+      container has no network access to verify IBM's own Granite 4.2
+      card. Sampling: no citable Granite-specific model card is available
+      either, so arms.json's "granite" family mirrors the gemma-style
+      defaults already used by bench-c0 (temperature 1.0, top_p 0.95 both
+      modes), per the T7 brief's explicit fallback instruction -- UNVERIFIED
+      as a Granite-specific recommendation. tool_parser: "hermes" follows
+      this file's existing convention for models whose tool calls use
+      <tool_call> tags (Qwen/Hermes entries above); the brief states
+      Granite's bundled template emits <tool_call> tags too, and the
+      bundled llama-server template handles them with no parser change,
+      but this file's tool_parser id itself is descriptive metadata, not
+      independently verified against a live Granite response. size_gb
+      left at the run.py default (0.0): not given by the brief and no
+      network access to check the quantized file size. Run with
+      --external; server args live in scripts/model_bench/arms.json.
+
+  - id: bench-c8
+    display_name: "Bench C8: Spark-X2.5-4B Instruct (Q8_0)"
+    tier: bench
+    family: spark-x2.5
+    vendor: xhtoken
+    gguf: "XHToken/Spark-X2.5-4B-Q8_0.gguf"
+    quant: Q8_0
+    total_params_b: 4.0
+    active_params_b: 4.0
+    architecture: dense
+    context_size: 32768
+    served_model_name: "spark-x2.5-4b"
+    temperature:
+      extraction: 1.0
+      conversation: 1.0
+    top_p:
+      extraction: 0.95
+      conversation: 0.95
+    chat_template: null
+    chat_template_file: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences: []
+    extra_server_args: []
+    notes: >-
+      Bench candidate, full card (arms.json's c8: no -ncmoe, 32768 ctx).
+      total_params_b/active_params_b (4.0, dense) inferred from the "4B"
+      in the model name per the T7 brief's task description; not an
+      independently fetched model card (no network access). vendor:
+      "xhtoken" is the GGUF repo's publisher on the T7 brief's cited path,
+      not a verified claim about the original model author/org -- flagged
+      UNVERIFIED. Sampling: no citable model card, so arms.json's "spark"
+      family mirrors the gemma-style defaults (temperature 1.0, top_p 0.95
+      both modes), same fallback as bench-c7 -- UNVERIFIED. tool_parser:
+      null (not "hermes") -- the T7 brief labels this arm's tool calling
+      higher risk than bench-c7's, since it relies on the harness's
+      generic (non-hermes) tool-call handling rather than a named parser
+      convention already established in this file; llama.cpp's spark2_5
+      architecture support (b10828+) is orthogonal to this field and lives
+      in arms.json/the pinned b11151 image, not here. size_gb left at the
+      run.py default (0.0): not given by the brief. Run with --external;
+      server args live in scripts/model_bench/arms.json.
+
+  - id: bench-c9
+    display_name: "Bench C9: gpt-oss-20b (MXFP4)"
+    tier: bench
+    family: gpt-oss
+    vendor: openai
+    gguf: "ggml-org/gpt-oss-20b-MXFP4.gguf"
+    quant: MXFP4
+    size_gb: 12.1
+    total_params_b: 20.0
+    active_params_b: 3.6
+    architecture: moe
+    context_size: 32768
+    served_model_name: "gpt-oss-20b"
+    temperature:
+      extraction: 1.0
+      conversation: 1.0
+    top_p:
+      extraction: 1.0
+      conversation: 1.0
+    chat_template: null
+    chat_template_file: null
+    tool_parser: null
+    gbnf_supported: true
+    stop_sequences: []
+    extra_server_args: []
+    notes: >-
+      Bench candidate, MoE with -ncmoe REQUIRED (arms.json's c9: -lm none,
+      -b/-ub 2048, same pattern as bench-c3/bench-c4). size_gb (12.1 GB),
+      total_params_b (20) and active_params_b (3.6) are taken directly from
+      the T7 brief's task description, not a fetched model card. Sampling:
+      no citable gpt-oss model-card sampling was available to this
+      worker's no-network container, so temperature 1.0 / top_p 1.0 (both
+      modes) is OpenAI's published gpt-oss guidance as relayed by the T7
+      brief itself, not independently re-verified against a live source --
+      UNVERIFIED. context_size 32768 matches every other bench-cN entry's
+      served ctx-size (arms.json's common_args), not gpt-oss's native
+      context window. Reasoning effort (low for c9, medium for c9-medium)
+      is set via the server flag --reasoning-effort in arms.json's
+      extra_args, not via this file's temperature/top_p or any harness
+      request field -- see README.md's c9 note. tool_parser: null --
+      gpt-oss's Harmony response format structures tool calls through
+      dedicated channels (not the <tool_call>-tag convention this file's
+      "hermes" id already names), and this file defines no dedicated
+      Harmony parser id, so the field is left unset rather than mislabeled
+      -- UNVERIFIED / not directly comparable to the hermes convention.
+      Run with --external; server args live in scripts/model_bench/arms.json.
