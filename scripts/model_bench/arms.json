@@ -184,6 +184,21 @@
       "harness": null,
       "optional": true
     },
+    "c5": {
+      "gguf": "unsloth/Qwen3.5-9B-Q8_0.gguf",
+      "image": "compose:mist-llm",
+      "family": "qwen",
+      "thinking": {"mode": "off"},
+      "suites": ["ttft", "correctness", "harness", "layout"],
+      "harness": {"candidate": "bench-c5", "tests": "default", "iterations": 10},
+      "tokens_vs_c0": "differs-by-design"
+    },
+    "c5-think1024": {
+      "base": "c5",
+      "thinking": {"mode": "on", "budget": 1024},
+      "suites": ["layout"],
+      "harness": null
+    },
     "a1": {
       "base": "c0",
       "suites": ["ttft", "correctness", "harness"],
