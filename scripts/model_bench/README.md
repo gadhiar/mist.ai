@@ -90,6 +90,10 @@ CI/dev-loop, not on the host:
   ```
   docker run --rm <pinned compose:mist-llm image ref> --help > <results-root>/<run>/session/llama_server_help_<UTC>.txt
   ```
+  The lead captured this on 2026-09-24 against the pinned digest
+  `ghcr.io/ggml-org/llama.cpp:server-cuda-b11151@sha256:014f7212...dc765c` (730 lines). A copy is
+  committed as a *test* fixture, `tests/unit/model_bench/fixtures/host/llama_server_help_b11151.txt`
+  -- see "Fixtures are hand-built, not recorded" below for why that one fixture is an exception.
 - **`selftest`** -- no docker, no network. Exercises argument building for every arm (including
   inheritance and the REQUIRED-param refusal), the restore diff (empty, non-empty, Id-changed), the
   compose image parser (including the missing-digest refusal), the results-root-inside-repo
@@ -181,15 +185,24 @@ the response keys it actually saw, rather than recording an empty/wrong token li
 
 `tests/unit/model_bench/fixtures/host/` (`sse_stream.txt`, `nvidia_smi_sample.csv`,
 `voice_probe_output.json`, `correctness_response.json`, `compose_with_digest.yml`,
-`compose_missing_digest.yml`, `llama_server_help_excerpt.txt`) are all hand-built from documented
-formats. No live b11151 llama-server, real nvidia-smi output, or real voice-probe run has been
-recorded yet -- there is no live stack in this worker's container (no docker, no GPU, no network).
-`llama_server_help_excerpt.txt` in particular is labelled in its own header comment as a
-hand-written excerpt, not a capture -- it is NOT the real `--help` output the lead should save per
-the `--host-checks` note above. Once the lead runs `plan --host-checks`, `serve`, and `run` against
-the real stack, a follow-up should replace these with real recordings (or add them alongside) and
-re-verify the parsers against actual server output, particularly the two UNVERIFIED response-field
-assumptions above and the real `--help` text against `probes/help_flags.py`.
+`compose_missing_digest.yml`) are all hand-built from documented formats. No live b11151
+llama-server, real nvidia-smi output, or real voice-probe run has been recorded yet -- there is no
+live stack in this worker's container (no docker, no GPU, no network). Once the lead runs `serve`
+and `run` against the real stack, a follow-up should replace these with real recordings (or add
+them alongside) and re-verify the parsers against actual server output, particularly the two
+UNVERIFIED response-field assumptions above.
+
+**One exception:** `llama_server_help_b11151.txt` IS a real capture, not hand-built -- the lead ran
+`docker run --rm <pinned compose:mist-llm image> --help` against the pinned
+`ghcr.io/ggml-org/llama.cpp:server-cuda-b11151@sha256:014f7212...dc765c` digest on the host on
+2026-09-24 and saved the raw output (730 lines, scanned for personal data, none found). It is
+committed here verbatim, byte-for-byte, because `probes/help_flags.py`'s parser needs a real
+capture to be tested against, not a guess at the format -- an earlier hand-written excerpt
+(`llama_server_help_excerpt.txt`, since removed) got the leading-indent column wrong (it assumed a
+small indent; the real build's `common/arg.cpp` prints each option starting at column 0) and would
+have passed its own unit tests while still finding zero flags against the real `--help` output,
+which `--host-checks` already treats as a hard failure. `test_host_help_flags.py` parses this real
+capture and pins its sha256, so a later accidental edit to the fixture is caught.
 
 ## Voice probe (`voice --run R`)
 
