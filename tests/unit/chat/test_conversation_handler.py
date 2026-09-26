@@ -384,8 +384,15 @@ class TestAutoInjectVaultOnly:
     @staticmethod
     def _spy_handler(call_order: list[str], retrieve_calls: list[dict]):
         """Build a ConversationHandler with spies on retriever.retrieve
-        (capturing kwargs into retrieve_calls) and llm_provider.invoke
+        (capturing kwargs into retrieve_calls) and llm_provider.generate
         (recording call sequence into call_order).
+
+        T3/v2: the streaming pipeline calls `generate(..., stream=True)`,
+        not `invoke()`, for its conversation passes. The spy wraps
+        `generate` and records into `call_order` at call time (function
+        invocation), not at first iteration, so the count reflects how
+        many times the pipeline asked the provider for a pass regardless
+        of async-generator laziness.
         """
         config = build_test_config()  # auto_inject_docs default True
         conn = FakeNeo4jConnection()
@@ -394,13 +401,13 @@ class TestAutoInjectVaultOnly:
         retriever = _make_retriever(config, gs)
         fake_llm = FakeLLM()
 
-        original_invoke = fake_llm.invoke
+        original_generate = fake_llm.generate
 
-        async def spy_invoke(request):
+        def spy_generate(request, *, stream=False):
             call_order.append("provider")
-            return await original_invoke(request)
+            return original_generate(request, stream=stream)
 
-        fake_llm.invoke = spy_invoke  # type: ignore[method-assign]
+        fake_llm.generate = spy_generate  # type: ignore[method-assign]
 
         original_retrieve = retriever.retrieve
 
@@ -477,6 +484,11 @@ class TestAutoInjectVaultOnly:
         result. Tool-decision pass + final-answer pass = 2 provider
         invocations. Unchanged from prior behavior; the architectural
         change is on the no-tool path only.
+
+        T3/v2: the pipeline streams both passes via `generate(...,
+        stream=True)`. The scripted double below replays each queued
+        result as a compliant stream (content chunk(s), if any, then the
+        terminal partial=False chunk carrying tool_calls).
         """
         from backend.llm.models import LLMResponse, ToolCall
 
@@ -499,12 +511,26 @@ class TestAutoInjectVaultOnly:
             LLMResponse(content="You have intermediate Rust experience.", partial=False),
         ]
 
-        async def queued_invoke(request):
+        def queued_generate(request, *, stream=False):
             call_order.append("provider")
             fake_llm.calls.append(request)
-            return queued.pop(0)
+            response = queued.pop(0)
 
-        fake_llm.invoke = queued_invoke  # type: ignore[method-assign]
+            async def _replay():
+                if response.content:
+                    yield LLMResponse(content=response.content, partial=True)
+                yield LLMResponse(
+                    content=None,
+                    tool_calls=response.tool_calls,
+                    finish_reason=response.finish_reason,
+                    usage=response.usage,
+                    reasoning_content=response.reasoning_content,
+                    partial=False,
+                )
+
+            return _replay()
+
+        fake_llm.generate = queued_generate  # type: ignore[method-assign]
 
         await handler.handle_message(
             user_message="What's my experience level with Rust?",
@@ -704,20 +730,29 @@ class TestConversationTemperature:
 
     @pytest.mark.asyncio
     async def test_invoke_uses_conversation_temperature_default(self, conversation_handler):
-        """First-turn invoke must carry conversation_temperature (0.7), not extraction temp (0.0)."""
+        """First-turn pass must carry conversation_temperature (0.7), not extraction temp (0.0).
+
+        T3/v2: the pipeline streams via `generate(..., stream=True)`, not
+        `invoke()`.
+        """
         from backend.llm.models import LLMResponse
 
         captured = []
 
-        async def capture(request):
+        def capture(request, *, stream=False):
             captured.append(request)
-            return LLMResponse(content="plain response", tool_calls=None)
 
-        conversation_handler._provider.invoke = capture
+            async def _replay():
+                yield LLMResponse(content="plain response", partial=True)
+                yield LLMResponse(content=None, tool_calls=None, partial=False)
+
+            return _replay()
+
+        conversation_handler._provider.generate = capture
 
         await conversation_handler.handle_message(user_message="hello", session_id="temp-s1")
 
-        assert len(captured) >= 1, "invoke was not called"
+        assert len(captured) >= 1, "generate was not called"
         assert (
             captured[0].temperature == 0.7
         ), f"Expected conversation_temperature 0.7, got {captured[0].temperature}"
@@ -726,18 +761,23 @@ class TestConversationTemperature:
 
     @pytest.mark.asyncio
     async def test_invoke_honors_config_override(self, conversation_handler):
-        """Overriding config.llm.conversation_temperature flows through to invoke."""
+        """Overriding config.llm.conversation_temperature flows through to the streamed pass."""
         from backend.llm.models import LLMResponse
 
         conversation_handler.config.llm.conversation_temperature = 0.5
 
         captured = []
 
-        async def capture(request):
+        def capture(request, *, stream=False):
             captured.append(request)
-            return LLMResponse(content="plain response", tool_calls=None)
 
-        conversation_handler._provider.invoke = capture
+            async def _replay():
+                yield LLMResponse(content="plain response", partial=True)
+                yield LLMResponse(content=None, tool_calls=None, partial=False)
+
+            return _replay()
+
+        conversation_handler._provider.generate = capture
 
         await conversation_handler.handle_message(user_message="hello", session_id="temp-s2")
         assert captured[0].temperature == 0.5
@@ -749,11 +789,28 @@ class TestConversationTemperature:
 
 
 class TestPostFilterRegeneration:
-    """Cluster 3: response with critical slop triggers regeneration; fallback strips on cap."""
+    """Cluster 3: response with critical slop triggers regeneration; fallback strips on cap.
+
+    T3/v2: `_post_filter_response` (the whole-response regen loop) is no
+    longer called from `handle_message` / `handle_message_streaming` --
+    the streaming pipeline gates slop per sentence instead (see
+    `TestStreamingSlopGate` in test_handle_message_streaming.py). The
+    method is kept for callers that still want whole-response
+    regeneration, and these tests now exercise it directly rather than
+    through `handle_message`, preserving their original intent (regen on
+    critical slop, cap-then-strip fallback, rider content, temperature).
+    """
 
     @pytest.fixture
     def handler_with_queued_responses(self, conversation_handler):
-        """Patch the fake provider's invoke to return a scripted queue."""
+        """Patch the fake provider's invoke to return a scripted queue.
+
+        `_post_filter_response` still calls `self._provider.invoke(...)`
+        for each regen attempt (unchanged method); this fixture only feeds
+        that call, since the initial (pre-filter) response is now passed
+        to `_post_filter_response` directly as `initial_response` instead
+        of coming from a first `invoke()` call inside `handle_message`.
+        """
 
         def _builder(responses: list[str]):
             # Make a shallow shared queue on the provider
@@ -774,9 +831,14 @@ class TestPostFilterRegeneration:
     @pytest.mark.asyncio
     async def test_clean_response_not_regenerated(self, handler_with_queued_responses):
         handler = handler_with_queued_responses(["This is a plain response with no slop."])
-        result = await handler.handle_message(user_message="hello", session_id="pf-s1")
+        initial = handler._provider._scripted_queue.pop(0)
+        result = await handler._post_filter_response(
+            initial_response=initial,
+            messages=[{"role": "user", "content": "hello"}],
+            session_id="pf-s1",
+        )
         assert result == "This is a plain response with no slop."
-        # Queue fully consumed — exactly 1 invoke happened for this turn.
+        # No regen call was needed -- the queue is untouched beyond the pop above.
         assert handler._provider._scripted_queue == []
 
     @pytest.mark.asyncio
@@ -788,7 +850,12 @@ class TestPostFilterRegeneration:
                 "Ship it.",  # attempt 2 (first regen): clean
             ]
         )
-        result = await handler.handle_message(user_message="hello", session_id="pf-s2")
+        initial = handler._provider._scripted_queue.pop(0)
+        result = await handler._post_filter_response(
+            initial_response=initial,
+            messages=[{"role": "user", "content": "hello"}],
+            session_id="pf-s2",
+        )
         assert "\U0001f389" not in result
         assert "Ship it" in result
 
@@ -802,7 +869,12 @@ class TestPostFilterRegeneration:
                 "never consumed",  # should not be popped
             ]
         )
-        result = await handler.handle_message(user_message="hello", session_id="pf-s3")
+        initial = handler._provider._scripted_queue.pop(0)
+        result = await handler._post_filter_response(
+            initial_response=initial,
+            messages=[{"role": "user", "content": "hello"}],
+            session_id="pf-s3",
+        )
         # After cap, strip_fixable runs on the last response; emojis removed.
         assert "\U0001f389" not in result
         assert "\U0001f680" not in result
@@ -828,11 +900,17 @@ class TestPostFilterRegeneration:
 
         handler._provider.invoke = capture
 
-        await handler.handle_message(user_message="hello", session_id="pf-s4")
+        initial = handler._provider._scripted_queue.pop(0)
+        await handler._post_filter_response(
+            initial_response=initial,
+            messages=[{"role": "user", "content": "hello"}],
+            session_id="pf-s4",
+        )
 
-        # At least one of the requests must be the regen request.
-        assert len(captured_requests) >= 2
-        regen_request = captured_requests[1]
+        # The regen call is captured (there is no pass-1 invoke() anymore --
+        # _post_filter_response is called directly with initial_response).
+        assert len(captured_requests) >= 1
+        regen_request = captured_requests[0]
         # Rider is appended as role=user (Fix H: role=system is non-standard after
         # an assistant turn per OpenAI spec). Check both roles for the violation text
         # so the test remains unambiguous about what it's asserting.
@@ -860,13 +938,16 @@ class TestPostFilterRegeneration:
 
         handler._provider.invoke = capture
 
-        await handler.handle_message(user_message="hello", session_id="pf-s5")
+        initial = handler._provider._scripted_queue.pop(0)
+        await handler._post_filter_response(
+            initial_response=initial,
+            messages=[{"role": "user", "content": "hello"}],
+            session_id="pf-s5",
+        )
 
-        # First request: conversation_temperature (0.7 default)
-        assert captured[0].temperature == 0.7
-        # Second request (regen): conversation_temperature - 0.2 = 0.5
-        assert captured[1].temperature == 0.5
-        assert captured[1].temperature >= 0.3  # floor
+        # Regen request: conversation_temperature - 0.2 = 0.5
+        assert captured[0].temperature == 0.5
+        assert captured[0].temperature >= 0.3  # floor
 
 
 class TestBuildRequestPreValidationDump:
@@ -1281,30 +1362,46 @@ class TestToolCallObservability:
 
     @pytest.mark.asyncio
     async def test_buffer_drained_by_streaming(self):
-        """handle_message_streaming yields WSEvent for each buffered event
-        and clears the buffer for the next turn.
+        """handle_message_streaming yields WSEvent for each tool dispatch
+        as it happens (T3/v2: inline drain right after
+        `_dispatch_tool_with_observability`, not batched at end of turn),
+        and clears the buffer once the turn completes.
         """
         from backend.chat.stream_events import WSEvent
+        from backend.llm.models import ToolCall as LLMToolCall
+        from tests.mocks.streaming_llm import FakeStreamingLLMProvider, ScriptedPass
 
-        handler = self._build_handler()
-        # Pre-populate the buffer as if a prior dispatch had run.
-        handler._turn_ws_events = [
-            {"type": "tool_call_started", "tool_call_id": "abc", "name": "x", "args_summary": ""},
-            {
-                "type": "tool_call_completed",
-                "tool_call_id": "abc",
-                "name": "x",
-                "duration_ms": 1,
-                "result_summary": "ok",
-                "error": None,
-            },
-        ]
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        config = build_test_config()
+        provider = FakeStreamingLLMProvider(
+            [
+                ScriptedPass(
+                    chunks=[],
+                    tool_calls=[
+                        LLMToolCall(
+                            id="call_1", name="query_knowledge_graph", arguments={"query": "x"}
+                        )
+                    ],
+                ),
+                ScriptedPass(chunks=["hello there."]),
+            ]
+        )
+        handler = ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=FakeExtractionPipeline(),
+            retriever=_make_retriever(config, gs),
+            llm_provider=provider,
+            conventions_loader=make_test_conventions_loader(),
+        )
 
-        # Patch handle_message to return immediately so streaming runs.
-        async def stub_handle(**kwargs):
-            return "hello"
+        # Stub the raw dispatch so this test isolates the WSEvent drain
+        # timing from the real query_knowledge_graph tool's behavior.
+        async def stub_dispatch(tc):
+            return "test result"
 
-        handler.handle_message = stub_handle
+        handler._dispatch_tool = stub_dispatch
 
         emitted_events: list[dict] = []
         emitted_tokens: list[str] = []
@@ -1317,9 +1414,9 @@ class TestToolCallObservability:
         assert len(emitted_events) == 2
         assert emitted_events[0]["type"] == "tool_call_started"
         assert emitted_events[1]["type"] == "tool_call_completed"
-        # WS events must appear BEFORE Token chars (FE sees observability
-        # before / alongside the response prose).
-        assert "".join(emitted_tokens) == "hello"
+        # WS events must appear BEFORE the pass-2 Token stream (FE sees
+        # observability before / alongside the response prose).
+        assert "".join(emitted_tokens).strip() == "hello there."
         # Buffer cleared after drain.
         assert handler._turn_ws_events == []
 
