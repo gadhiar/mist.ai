@@ -281,3 +281,37 @@ class LlamaServerProvider(StreamingLLMProvider):
                 return r.status_code == 200
         except Exception:
             return False
+
+    async def server_context_size(self) -> int | None:
+        """Query llama-server's GET /props for the active n_ctx.
+
+        Field path `default_generation_settings.n_ctx` matches the one
+        existing repo call site that already parses this endpoint --
+        `scripts/model_bench/bench_host.py:2257`:
+        `props_now.get("default_generation_settings", {}).get("n_ctx", 32768)`
+        (`grep -n 'default_generation_settings' scripts/model_bench/bench_host.py`).
+
+        Returns None (rather than raising) on a connection failure, a
+        non-200 status, a non-JSON body, or a JSON body that does not carry
+        an int at that path -- callers fall back to their own default
+        (`backend.factories.resolve_context_budget_window` falls back to
+        `LLM_CTX_SIZE` or 32768).
+        """
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(f"{self._base_url}/props")
+        except httpx.HTTPError:
+            return None
+        if r.status_code != 200:
+            return None
+        try:
+            data = r.json()
+        except ValueError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        generation_settings = data.get("default_generation_settings")
+        if not isinstance(generation_settings, dict):
+            return None
+        n_ctx = generation_settings.get("n_ctx")
+        return n_ctx if isinstance(n_ctx, int) else None

@@ -264,6 +264,19 @@ def _default_config(**overrides) -> ContextBudgetConfig:
     return ContextBudgetConfig(**defaults)
 
 
+class TestContextBudgetPlannerRejectsUnresolvedWindow:
+    """MIS-171 T4: an unresolved 'auto' sentinel must never reach plan() arithmetic."""
+
+    def test_string_auto_context_window_raises_value_error(self):
+        config = _default_config(context_window="auto")
+        with pytest.raises(ValueError, match="resolved int"):
+            ContextBudgetPlanner(config=config)
+
+    def test_int_context_window_constructs_fine(self):
+        config = _default_config(context_window=1000)
+        ContextBudgetPlanner(config=config)  # must not raise
+
+
 class TestContextBudgetPlanner:
     def test_fits_with_retrieval_and_history_inside_budget(self):
         planner = ContextBudgetPlanner(config=_default_config())

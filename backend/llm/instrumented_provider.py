@@ -153,3 +153,7 @@ class InstrumentedStreamingLLMProvider(StreamingLLMProvider):
     async def health_check(self) -> bool:
         """Pass-through. Health checks are not instrumented."""
         return await self._inner.health_check()
+
+    async def server_context_size(self) -> int | None:
+        """Pass-through. Not instrumented -- this is a startup-time probe, not a call."""
+        return await self._inner.server_context_size()

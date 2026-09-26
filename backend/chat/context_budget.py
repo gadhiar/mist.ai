@@ -282,7 +282,23 @@ class ContextBudgetPlanner:
         counter: TokenCounter | None = None,
         history_strategy: HistoryStrategy | None = None,
     ) -> None:
-        """Initialize the planner with config and optional counter/strategy injections."""
+        """Initialize the planner with config and optional counter/strategy injections.
+
+        Raises:
+            ValueError: `config.context_window` is not a resolved int. This
+                catches an unresolved `"auto"` sentinel (MIS-171 T4) reaching
+                the arithmetic in `plan()` -- callers building from
+                `ContextBudgetConfig.from_env()` must resolve `"auto"` to a
+                concrete window first, e.g. via
+                `backend.factories.resolve_context_budget_window`.
+        """
+        if not isinstance(config.context_window, int):
+            raise ValueError(
+                f"ContextBudgetPlanner requires config.context_window to be a "
+                f"resolved int, got {config.context_window!r}. Resolve the "
+                f"'auto' sentinel before constructing the planner (see "
+                f"backend.factories.resolve_context_budget_window)."
+            )
         self._config = config
         self._counter = counter or ApproximateTokenCounter()
         self._history_strategy = history_strategy or get_history_strategy(config.history_strategy)
