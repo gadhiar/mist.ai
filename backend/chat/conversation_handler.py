@@ -2007,10 +2007,12 @@ class ConversationHandler:
         tasks still running after the bound are cancelled (their writes are
         MERGE-idempotent and replay convergently on a later re-extraction).
 
-        With an extraction dispatcher attached, also waits (within the same
-        `timeout`) for the backlog to drain. The backlog is one ordered queue,
-        not per-session, so `session_id` does not narrow that wait. It returns
-        at once when the dispatcher cannot progress (service unreachable,
+        With an extraction dispatcher attached, first waits up to `timeout` for
+        the backlog to drain (once attached, no new in-process tasks are
+        created, so the task wait below normally returns at once). The backlog
+        is one ordered queue, not per-session, so `session_id` does not narrow
+        that wait. It returns at once when the dispatcher cannot progress
+        (service unreachable,
         stalled, epoch mismatch, disabled): nothing is lost by not waiting,
         because every pending turn stays durable in the log.
         """
