@@ -4,6 +4,7 @@ import os
 from contextlib import contextmanager
 
 from backend.knowledge.config import (
+    ContextBudgetConfig,
     FilewatcherConfig,
     KnowledgeConfig,
     LLMConfig,
@@ -58,6 +59,63 @@ class TestLLMConfigTemperatureSplit:
             config = LLMConfig.from_env()
         assert config.temperature == 0.2
         assert config.conversation_temperature == 0.9
+
+
+class TestLLMConfigToolThinkingBudget:
+    """MIS-171 T4 decision 6: LLMConfig.tool_thinking_budget_tokens."""
+
+    def test_default_is_1024(self):
+        config = LLMConfig()
+        assert config.tool_thinking_budget_tokens == 1024
+
+    def test_from_env_default_when_unset(self):
+        with _env(MIST_TOOL_THINKING_BUDGET=None):
+            config = LLMConfig.from_env()
+        assert config.tool_thinking_budget_tokens == 1024
+
+    def test_from_env_reads_explicit_int(self):
+        with _env(MIST_TOOL_THINKING_BUDGET="2048"):
+            config = LLMConfig.from_env()
+        assert config.tool_thinking_budget_tokens == 2048
+
+    def test_from_env_off_disables(self):
+        with _env(MIST_TOOL_THINKING_BUDGET="off"):
+            config = LLMConfig.from_env()
+        assert config.tool_thinking_budget_tokens is None
+
+    def test_from_env_off_is_case_insensitive(self):
+        with _env(MIST_TOOL_THINKING_BUDGET="OFF"):
+            config = LLMConfig.from_env()
+        assert config.tool_thinking_budget_tokens is None
+
+
+class TestContextBudgetConfigWindowSentinel:
+    """MIS-171 T4 decision A: context_window "auto" resolution sentinel."""
+
+    def test_default_raw_construction_is_int_8192(self):
+        """Direct construction (tests, eval harness) keeps the concrete int default."""
+        config = ContextBudgetConfig()
+        assert config.context_window == 8192
+
+    def test_from_env_default_is_auto_sentinel(self):
+        with _env(MIST_CTX_BUDGET_WINDOW=None):
+            config = ContextBudgetConfig.from_env()
+        assert config.context_window == "auto"
+
+    def test_from_env_literal_auto_is_auto_sentinel(self):
+        with _env(MIST_CTX_BUDGET_WINDOW="auto"):
+            config = ContextBudgetConfig.from_env()
+        assert config.context_window == "auto"
+
+    def test_from_env_auto_is_case_insensitive(self):
+        with _env(MIST_CTX_BUDGET_WINDOW="AUTO"):
+            config = ContextBudgetConfig.from_env()
+        assert config.context_window == "auto"
+
+    def test_from_env_explicit_int_wins(self):
+        with _env(MIST_CTX_BUDGET_WINDOW="8192"):
+            config = ContextBudgetConfig.from_env()
+        assert config.context_window == 8192
 
 
 _VAULT_ENV_KEYS = (

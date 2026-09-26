@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
@@ -755,3 +756,101 @@ class TestHealthCheck:
             result = await provider.health_check()
 
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# server_context_size
+# ---------------------------------------------------------------------------
+
+
+def _mock_async_client(*, get_return=None, get_side_effect=None) -> AsyncMock:
+    """Build an AsyncMock standing in for httpx.AsyncClient's `async with` usage."""
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    if get_side_effect is not None:
+        mock_client.get = AsyncMock(side_effect=get_side_effect)
+    else:
+        mock_client.get = AsyncMock(return_value=get_return)
+    return mock_client
+
+
+class TestServerContextSize:
+    """MIS-171 T4 (A): GET /props -> default_generation_settings.n_ctx."""
+
+    @pytest.mark.asyncio
+    async def test_parses_n_ctx_from_default_generation_settings(
+        self, provider: LlamaServerProvider
+    ):
+        mock_response = MagicMock(status_code=200)
+        mock_response.json.return_value = {"default_generation_settings": {"n_ctx": 32768}}
+        mock_client = _mock_async_client(get_return=mock_response)
+
+        with patch(f"{MODULE}.httpx.AsyncClient", return_value=mock_client):
+            result = await provider.server_context_size()
+
+        assert result == 32768
+        mock_client.get.assert_called_once_with("http://localhost:8080/props")
+
+    @pytest.mark.asyncio
+    async def test_non_200_status_returns_none(self, provider: LlamaServerProvider):
+        mock_response = MagicMock(status_code=503)
+        mock_client = _mock_async_client(get_return=mock_response)
+
+        with patch(f"{MODULE}.httpx.AsyncClient", return_value=mock_client):
+            result = await provider.server_context_size()
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_body_returns_none(self, provider: LlamaServerProvider):
+        mock_response = MagicMock(status_code=200)
+        mock_response.json.side_effect = ValueError("not json")
+        mock_client = _mock_async_client(get_return=mock_response)
+
+        with patch(f"{MODULE}.httpx.AsyncClient", return_value=mock_client):
+            result = await provider.server_context_size()
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_non_dict_json_body_returns_none(self, provider: LlamaServerProvider):
+        mock_response = MagicMock(status_code=200)
+        mock_response.json.return_value = ["not", "a", "dict"]
+        mock_client = _mock_async_client(get_return=mock_response)
+
+        with patch(f"{MODULE}.httpx.AsyncClient", return_value=mock_client):
+            result = await provider.server_context_size()
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_missing_n_ctx_returns_none(self, provider: LlamaServerProvider):
+        mock_response = MagicMock(status_code=200)
+        mock_response.json.return_value = {"default_generation_settings": {}}
+        mock_client = _mock_async_client(get_return=mock_response)
+
+        with patch(f"{MODULE}.httpx.AsyncClient", return_value=mock_client):
+            result = await provider.server_context_size()
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_non_int_n_ctx_returns_none(self, provider: LlamaServerProvider):
+        mock_response = MagicMock(status_code=200)
+        mock_response.json.return_value = {"default_generation_settings": {"n_ctx": "not-a-number"}}
+        mock_client = _mock_async_client(get_return=mock_response)
+
+        with patch(f"{MODULE}.httpx.AsyncClient", return_value=mock_client):
+            result = await provider.server_context_size()
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_connection_error_returns_none(self, provider: LlamaServerProvider):
+        mock_client = _mock_async_client(get_side_effect=httpx.ConnectError("refused"))
+
+        with patch(f"{MODULE}.httpx.AsyncClient", return_value=mock_client):
+            result = await provider.server_context_size()
+
+        assert result is None

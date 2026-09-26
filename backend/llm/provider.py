@@ -75,3 +75,15 @@ class StreamingLLMProvider(ABC):
     async def health_check(self) -> bool:
         """Check if the LLM backend is reachable. Default returns True."""
         return True
+
+    async def server_context_size(self) -> int | None:
+        """Return the backend's configured context window (n_ctx), if known.
+
+        MIS-171 T4: used by `backend.factories.resolve_context_budget_window`
+        to derive `ContextBudgetConfig.context_window` from the real server
+        rather than a hand-set default. Default implementation returns None
+        (unknown) so any provider that does not override this -- OllamaProvider,
+        test fakes -- degrades to the caller's fallback window rather than
+        raising.
+        """
+        return None

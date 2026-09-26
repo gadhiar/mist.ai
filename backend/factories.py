@@ -15,9 +15,11 @@ import logging
 import os
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
+
+import httpx
 
 from backend.interfaces import (
     EmbeddingProvider,
@@ -30,7 +32,7 @@ if TYPE_CHECKING:
     from backend.vault import VaultFilewatcher, VaultWriter
     from backend.vault.invalidation_bus import InvalidationBus
     from backend.vault.sidecar_index import VaultSidecarIndex
-from backend.knowledge.config import KnowledgeConfig
+from backend.knowledge.config import ContextBudgetConfig, KnowledgeConfig, LLMConfig
 from backend.knowledge.curation.confidence import ConfidenceManager
 from backend.knowledge.curation.deduplication import EntityDeduplicator
 from backend.knowledge.curation.graph_writer import CurationGraphWriter
@@ -204,20 +206,33 @@ def build_llm_provider(
 
     Returns:
         StreamingLLMProvider instance (LlamaServerProvider or OllamaProvider),
-        optionally wrapped by InstrumentedStreamingLLMProvider.
+        optionally wrapped by InstrumentedStreamingLLMProvider, then by
+        AdaptiveThinkingProvider (MIS-171 T4 decision 6) when
+        `config.llm.tool_thinking_budget_tokens` is not None. The adaptive
+        wrapper sits OUTERMOST so both its budgeted attempt and any
+        unbudgeted retry each pass through the instrumented wrapper and emit
+        their own `llm_call` record. This function is also the extraction
+        pipeline's provider factory (`build_extraction_pipeline` calls it
+        too) -- harmless there because the wrapper only ever acts on
+        requests that carry `tools`, which extraction/scope-classifier calls
+        do not (`grep -n 'tools=' backend/knowledge/extraction/*.py` has no
+        hits). The out-of-process extraction microservice
+        (`backend/extraction_service/`) has its own settings and never calls
+        this function at all (`grep -rn build_llm_provider
+        backend/extraction_service` has no hits).
     """
     llm_config = config.llm
     if llm_config.backend == "llamacpp":
         from backend.llm.llama_server_provider import LlamaServerProvider
 
-        inner: StreamingLLMProvider = LlamaServerProvider(
+        provider: StreamingLLMProvider = LlamaServerProvider(
             base_url=llm_config.base_url,
             model=llm_config.model,
         )
     elif llm_config.backend == "ollama":
         from backend.llm.ollama_provider import OllamaProvider
 
-        inner = OllamaProvider(
+        provider = OllamaProvider(
             base_url=llm_config.base_url,
             model=llm_config.model,
         )
@@ -228,9 +243,92 @@ def build_llm_provider(
         from backend.llm.instrumented_provider import InstrumentedStreamingLLMProvider
 
         logger.info("LLM provider wrapped with observability instrumentation")
-        return InstrumentedStreamingLLMProvider(inner, debug_logger)
+        provider = InstrumentedStreamingLLMProvider(provider, debug_logger)
 
-    return inner
+    if llm_config.tool_thinking_budget_tokens is not None:
+        from backend.llm.adaptive_thinking import AdaptiveThinkingProvider
+
+        provider = AdaptiveThinkingProvider(
+            provider, budget_tokens=llm_config.tool_thinking_budget_tokens
+        )
+
+    return provider
+
+
+def _probe_llama_server_n_ctx(base_url: str, timeout: float = 2.0) -> int | None:
+    """Synchronous GET `base_url/props`, returning `default_generation_settings.n_ctx`.
+
+    A plain synchronous `httpx.Client`, not
+    `LlamaServerProvider.server_context_size()` (which is async) --
+    `build_conversation_handler` is a sync function that may itself run
+    inside the server's already-running event loop (the FastAPI lifespan),
+    where `asyncio.run(...)` would raise "cannot run event loop while
+    another loop is running". A bare sync call has no such hazard, at the
+    cost of duplicating the parse logic in `LlamaServerProvider.server_context_size`
+    (both anchor to the same field path, verified there).
+
+    Returns None (never raises) on a connection failure, a non-200 status, a
+    non-JSON body, or a JSON body missing an int at that path.
+    """
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            r = client.get(f"{base_url}/props")
+    except httpx.HTTPError:
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        data = r.json()
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    generation_settings = data.get("default_generation_settings")
+    if not isinstance(generation_settings, dict):
+        return None
+    n_ctx = generation_settings.get("n_ctx")
+    return n_ctx if isinstance(n_ctx, int) else None
+
+
+def resolve_context_budget_window(
+    context_budget: ContextBudgetConfig,
+    llm_config: LLMConfig,
+    timeout: float = 2.0,
+) -> int:
+    """Resolve `ContextBudgetConfig.context_window` to a concrete int.
+
+    MIS-171 T4 decision (A): an explicit int always wins (tests, the eval
+    harness, an operator override) -- returned as-is with no I/O. The
+    unresolved `"auto"` sentinel (the new `from_env()` default when
+    `MIST_CTX_BUDGET_WINDOW` is unset or literal `"auto"`) triggers a
+    startup-time GET to llama-server's `/props`, reading
+    `default_generation_settings.n_ctx` -- the same field path
+    `scripts/model_bench/bench_host.py:2257` already parses from that
+    endpoint (`props_now.get("default_generation_settings", {}).get("n_ctx",
+    32768)`), the one existing repo call site for this response shape.
+
+    Never blocks startup and never raises: any httpx error, non-200 status,
+    or malformed `/props` body falls back to `LLM_CTX_SIZE` (matching
+    `docker-compose.yml`'s `LLAMA_ARG_CTX_SIZE=${LLM_CTX_SIZE:-32768}`), else
+    the literal 32768 when that env var is also unset -- logging a WARNING
+    naming the fallback either way.
+    """
+    if isinstance(context_budget.context_window, int):
+        return context_budget.context_window
+
+    n_ctx = _probe_llama_server_n_ctx(llm_config.base_url, timeout=timeout)
+    if n_ctx is not None:
+        return n_ctx
+
+    fallback = int(os.getenv("LLM_CTX_SIZE", "32768"))
+    logger.warning(
+        "ContextBudgetConfig.context_window=auto but llama-server /props at "
+        "%s/props was unreachable or returned no usable n_ctx; falling back "
+        "to LLM_CTX_SIZE=%d",
+        llm_config.base_url,
+        fallback,
+    )
+    return fallback
 
 
 def build_curation_pipeline(
@@ -719,6 +817,22 @@ def build_conversation_handler(
     # ADR-014: vault-root MIST.md auto-load into every turn's prompt.
     conventions_loader = ConventionsLoader(vault_root=Path(config.vault.root))
 
+    # MIS-171 T4 decision (A): resolve ContextBudgetConfig.context_window
+    # ("auto" or an explicit int) to a concrete int and build the planner
+    # here, rather than letting ConversationHandler's own fallback
+    # (`config.context_budget.enabled` -> `ContextBudgetPlanner(config.context_budget)`)
+    # construct one from a possibly-unresolved config. Passing an explicit
+    # `budget_planner` short-circuits that fallback entirely (see
+    # `ConversationHandler.__init__`). Disabled budgeting (`enabled=False`)
+    # keeps `budget_planner=None`, matching pre-existing legacy behavior.
+    budget_planner = None
+    if config.context_budget.enabled:
+        from backend.chat.context_budget import ContextBudgetPlanner
+
+        resolved_window = resolve_context_budget_window(config.context_budget, config.llm)
+        resolved_context_budget = replace(config.context_budget, context_window=resolved_window)
+        budget_planner = ContextBudgetPlanner(resolved_context_budget)
+
     # Cluster 8 Phase 5: vault_writer is caller-provided (or None). Auto-build
     # removed to avoid two writers racing on the same vault root -- the
     # server lifespan owns the single VaultWriter and plumbs it through
@@ -733,6 +847,7 @@ def build_conversation_handler(
         conventions_loader=conventions_loader,
         tool_usage_tracker=tracker,
         debug_logger=debug_logger,
+        budget_planner=budget_planner,
         vault_writer=vault_writer,
         invalidation_bus=invalidation_bus,
         # Replay-determinism clock seam: wall-clock in production (env unset),
