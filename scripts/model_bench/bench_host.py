@@ -1500,9 +1500,10 @@ def merge_run_meta(
     that file itself). Any other difference -- an unlisted sha, or any of the other
     identity fields -- is still refused: a listed sha does not let an arm dir whose
     stored `arm_config` differs take new calls (S4a's c1-512 finalist call into run `mb1`
-    was refused on `arm_config` and ran in a separate run). The merged document's top-level `decision_rules_sha256` becomes this call's
-    (the latest) value; each entry in `calls` separately records the sha it ran under, so
-    the full history survives even though the top-level field only ever shows the latest.
+    was refused on `arm_config` and ran in a separate run). The merged document's
+    top-level `decision_rules_sha256` becomes this call's (the latest) value; each entry
+    in `calls` separately records the sha it ran under, so the full history survives even
+    though the top-level field only ever shows the latest.
 
     Raises RunMetaConfigMismatchError, naming the differing keys, if `existing` is not
     None and any equality-checked field differs from `call`'s. The caller must invoke

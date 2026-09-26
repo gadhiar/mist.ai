@@ -381,9 +381,10 @@ A pre-PR fixes pass (i64) moved decision_rules.json's own sha256 a second time, 
 fields (this section's own note text and `exploratory_rules.note`) and the `supersedes` list; the
 rule definitions themselves are unchanged. `supersedes` now names two sha256 values: v1
 (`f6a42ba8...`, 2026-09-24, pre-registered) and v2 (`ad181060...`, 2026-09-25, exploratory rules
-added) -- both stay `[INFO]`, not `[WARN]`, under the current file. Recorded runs `mb1` and `mb2`
-were written under the v2 sha, so listing it is what keeps those runs off the `[WARN]` list once
-this edit lands.
+added) -- both stay `[INFO]`, not `[WARN]`, under the current file. In the recorded runs, `mb1`'s
+S1/S2 arm dirs and `mb2`'s `c1-512` were written under the v1 sha; `mb1`'s `c4` and every other
+`mb2` arm dir were written under the v2 sha. Listing v2 is what keeps that second group off the
+`[WARN]` list once this edit lands.
 
 ### Plan v2: decision_rules.json's exploratory_rules (NOT pre-registered)
 
@@ -670,13 +671,26 @@ VRAM reading double-counts whatever the backend already holds resident. The `voi
 VRAM pressure, i.e. understate headroom), not exact -- the lead should read them as an upper bound
 on the true STT+TTS footprint, not the footprint itself.
 
+## Analysing a run (`analyse.py`)
+
+Results never live in this repository: `bench_host.py` refuses a `--results-root` that resolves
+inside the git work tree (`check_results_root_outside_repo`). To render, or re-check, one run's analysis:
+
+```
+python -m scripts.model_bench.analyse --results <results-root>/<run> --out <results-root>/<run>/analysis
+python -m scripts.model_bench.analyse --check --results <results-root>/<run> --out <results-root>/<run>/analysis
+python -m scripts.model_bench.analyse --check
+```
+
+The first writes `REPORT.md`, `summary.json` and `grades/`. The second regenerates the same files
+in memory and exits non-zero on any byte difference, or on any file present on disk but not
+generated. The third validates `decision_rules.json` against `arms.json` only and prints
+`decision_rules.json ok`. analyse reads ONE run dir. `REPORT.md` records the `decision_rules.json`
+sha256 it was rendered with, so re-rendering a recorded run after an edit to that file changes the
+header sha and the per-arm sha `[INFO]`/`[WARN]` lines even when every metric is identical.
+
 ## Known gaps / next steps
 
-- `decision_rules.json` does not exist yet in this worktree (another worker's task); `run` will
-  refuse with a clear `[FAIL]` until it lands.
-- The harness's own `--models`/`--tests` candidate ids referenced in `arms.json` (`bench-c0`,
-  `bench-c0-prod`, `bench-c2`, `bench-c3`, `bench-c4`) are owned by another worker
-  (`scripts/eval_harness/models.yaml`); this driver only names them.
 - `run_host.py`'s and `analyse.py`'s exact CLI flags (line ~1700 / ~1307 in
   `<command-center>/spike/layout-perception`, i.e. wherever `--layout-dir` /
   `MODEL_BENCH_LAYOUT_DIR` points on the lead's host, per the brief) were not independently
