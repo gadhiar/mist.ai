@@ -45,8 +45,9 @@ from backend.vault.conventions import ConventionsLoader
 if TYPE_CHECKING:
     from backend.chat.hydration_clock import HydrationClock
     from backend.debug_jsonl_logger import DebugJSONLLogger, TurnRecord
+    from backend.extraction_backlog.dispatcher import ExtractionDispatcher
     from backend.interfaces import VaultWriterProtocol
-    from backend.knowledge.extraction.pipeline import ExtractionPipeline
+    from backend.knowledge.extraction.pipeline import ApplyReport, ExtractionPipeline
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
     from backend.vault.invalidation_bus import InvalidationBus, VaultChangeEvent
 
@@ -721,6 +722,7 @@ class ConversationHandler:
         now_fn: Callable[[], datetime] | None = None,
         hydration_clock: HydrationClock | None = None,
         session_origin: str = "real",
+        extraction_dispatcher: ExtractionDispatcher | None = None,
     ) -> None:
         """Initialize conversation handler.
 
@@ -771,6 +773,13 @@ class ConversationHandler:
                 "test" via `MIST_SESSION_ORIGIN`, wired in
                 `KnowledgeConfig.event_store.session_origin` ->
                 `backend.factories.build_conversation_handler`.
+            extraction_dispatcher: Optional T2a extraction-backlog dispatcher.
+                When set, a recorded turn only WAKES the dispatcher, which
+                extracts it out of process in log order; no in-process
+                extraction task is created. When None (admin scripts, benches,
+                most tests), the in-process `_extract_knowledge_async` path runs
+                exactly as before. May also be attached after construction with
+                `attach_extraction_dispatcher`.
         """
         self.config = config
         # Injectable clock (DI seam). Default = real wall-clock so production
@@ -811,6 +820,11 @@ class ConversationHandler:
         # Always-on extraction-failure counter (independent of the
         # MIST_DEBUG_JSONL gate) so a persistent failure is countable.
         self._extraction_failures: int = 0
+        # T2a: when attached, recorded turns go to the extraction backlog
+        # instead of an in-process task. See `attach_extraction_dispatcher`.
+        self._extraction_dispatcher: ExtractionDispatcher | None = None
+        if extraction_dispatcher is not None:
+            self.attach_extraction_dispatcher(extraction_dispatcher)
 
         # Cluster 6: budget-aware context assembly. Planner constructed from
         # config when not injected; legacy behavior preserved when disabled.
@@ -1659,7 +1673,15 @@ class ConversationHandler:
 
             # Fire-and-forget background extraction. Tracked so end_session/
             # aclose can drain instead of abandoning to GC.
-            if event_id:
+            #
+            # T2a: with an extraction dispatcher attached, the turn is already
+            # durable in the event log, which IS the backlog -- waking the
+            # dispatcher is all that is needed, and extraction runs out of
+            # process, in log order. The in-process task below (main chat
+            # model) is the path only when no dispatcher is attached.
+            if event_id and self._extraction_dispatcher is not None:
+                self._extraction_dispatcher.wake()
+            elif event_id:
                 task = asyncio.create_task(
                     self._extract_knowledge_async(
                         utterance=user_message,
@@ -1984,7 +2006,22 @@ class ConversationHandler:
         Bounded by `timeout` so a hung llama-server cannot block shutdown;
         tasks still running after the bound are cancelled (their writes are
         MERGE-idempotent and replay convergently on a later re-extraction).
+
+        With an extraction dispatcher attached, also waits (within the same
+        `timeout`) for the backlog to drain. The backlog is one ordered queue,
+        not per-session, so `session_id` does not narrow that wait. It returns
+        at once when the dispatcher cannot progress (service unreachable,
+        stalled, epoch mismatch, disabled): nothing is lost by not waiting,
+        because every pending turn stays durable in the log.
         """
+        if self._extraction_dispatcher is not None:
+            drained = await self._extraction_dispatcher.drain(timeout)
+            if not drained:
+                logger.info(
+                    "Extraction backlog not drained (state=%s); pending turns stay "
+                    "in the log for the dispatcher",
+                    self._extraction_dispatcher.state,
+                )
         tasks = [
             t
             for t, sid in list(self._extraction_tasks.items())
@@ -2001,6 +2038,27 @@ class ConversationHandler:
                 len(pending),
                 timeout,
             )
+
+    def attach_extraction_dispatcher(self, dispatcher: ExtractionDispatcher) -> None:
+        """Route recorded turns to the T2a extraction backlog from now on.
+
+        Late binding exists because the dispatcher needs this handler's
+        extraction pipeline and event store, which `build_conversation_handler`
+        builds inside the handler chain; the server attaches it after the
+        handler exists (`backend/server.py`). The dispatcher's lifecycle
+        (start/stop) belongs to the caller, not to this handler.
+
+        Registers `_on_extraction_applied` so the ADR-011 bucket-1 user-note
+        refresh that `_extract_knowledge_async` performs after in-process
+        extraction also runs after a backlog apply.
+        """
+        self._extraction_dispatcher = dispatcher
+        dispatcher.add_apply_listener(self._on_extraction_applied)
+
+    async def _on_extraction_applied(self, report: ApplyReport) -> None:
+        """Backlog apply listener: refresh the user note from the curation result."""
+        if report.curation_result is not None:
+            await self._maybe_refresh_user_vault(report.curation_result)
 
     async def aclose(self) -> None:
         """Drain all in-flight extraction tasks (server shutdown hook).

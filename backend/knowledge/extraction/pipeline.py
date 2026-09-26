@@ -1085,6 +1085,16 @@ class ExtractionPipeline:
             self._add_to_dedup_cache(utterance, embedding)
 
     @property
+    def extraction_cache(self) -> ExtractionCache | None:
+        """The cache this pipeline records into (None when built without one).
+
+        Exposed so `backend.factories.build_extraction_dispatcher` hands the
+        dispatcher the SAME cache instance, and so the same SQLite connection,
+        the in-process path writes through.
+        """
+        return self._extraction_cache
+
+    @property
     def derivation_enabled(self) -> bool:
         """True when Stage 9 is wired (`resolve_internal_derivation` allowed it)."""
         return self._internal_deriver is not None

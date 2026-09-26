@@ -176,6 +176,7 @@ class ExtractionDispatcher:
         settings: DispatcherSettings,
         embedding_model_name: str,
         clock: Callable[[], datetime] | None = None,
+        on_stop: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Initialize the dispatcher. Nothing runs until `start()`.
 
@@ -189,6 +190,8 @@ class ExtractionDispatcher:
             embedding_model_name: The backend's embedding model identity, folded
                 into the service's bare model hash for the epoch comparison.
             clock: Wall clock (tz-aware). Defaults to `datetime.now(UTC)`.
+            on_stop: Awaited once at the end of `stop()`, e.g. to close an
+                HTTP client the factory built for this dispatcher.
 
         Raises:
             ValueError: `inference` is None while `settings.mode` is `service`.
@@ -201,6 +204,7 @@ class ExtractionDispatcher:
         self._settings = settings
         self._embedding_model_name = embedding_model_name
         self._clock: Callable[[], datetime] = clock or (lambda: datetime.now(UTC))
+        self._on_stop = on_stop
 
         self._state = STATE_DISABLED if settings.mode == "off" else STATE_IDLE
         self._task: asyncio.Task | None = None
@@ -295,6 +299,7 @@ class ExtractionDispatcher:
         self._wake_event.set()
         task = self._task
         if task is None:
+            await self._run_on_stop()
             return
         if self._phase == "inference":
             task.cancel()
@@ -309,7 +314,14 @@ class ExtractionDispatcher:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         self._task = None
+        await self._run_on_stop()
         logger.info("Extraction dispatcher stopped")
+
+    async def _run_on_stop(self) -> None:
+        if self._on_stop is None:
+            return
+        on_stop, self._on_stop = self._on_stop, None
+        await on_stop()
 
     def wake(self) -> None:
         """Tell the loop a turn was logged. Cheap; safe to call on every turn."""

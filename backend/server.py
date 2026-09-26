@@ -9,6 +9,7 @@ import functools
 import json
 import logging
 import os
+import sqlite3
 import sys
 import time
 import uuid
@@ -48,9 +49,11 @@ sys.path.insert(0, str(project_root))
 # "import config BEFORE voice_processor" ordering existed to work around. The
 # qualified name removes both hazards outright.
 from backend.config import DEFAULT_CONFIG  # isort:skip
+from backend.errors import MistError  # isort:skip
 from backend.voice_processor import VoiceProcessor  # isort:skip
 from backend.factories import (  # isort:skip
     build_curation_scheduler,
+    build_extraction_dispatcher,
     build_phase3_components,
     build_sidecar_index,
     build_vault_writer,
@@ -95,6 +98,8 @@ log_subscribers: set[WebSocket] = set()
 message_queue: asyncio.Queue[str | bytes] = asyncio.Queue()
 voice_processor: VoiceProcessor | None = None
 curation_scheduler = None
+# T2a extraction backlog dispatcher (started/stopped in lifespan).
+extraction_dispatcher = None
 log_handler: WebSocketLogHandler | None = None
 config = DEFAULT_CONFIG
 
@@ -418,10 +423,65 @@ def _resolve_curation_dependencies(voice_processor) -> CurationDependencies:
     )
 
 
+async def _start_extraction_dispatcher(voice_processor, knowledge_config: KnowledgeConfig):
+    """Build, attach and start the T2a extraction-backlog dispatcher.
+
+    Reaches the live ConversationHandler through the same
+    voice_processor -> models -> knowledge -> conversation_handler chain the
+    curation wiring uses, builds the dispatcher over that handler's OWN
+    pipeline and event store (so the backlog reads the log live traffic writes),
+    starts it, and attaches it, so from here on a recorded turn wakes the
+    backlog instead of spawning in-process extraction on the chat model.
+
+    `MIST_EXTRACTION_INFERENCE=off` still attaches and starts it: `start()` in
+    `off` mode only records the first-activation floor and sets state
+    `disabled`, and runs no loop. Attaching is what keeps extraction off the
+    chat model in that mode; recording the floor is what keeps turns logged
+    while it is off eligible once it is turned back on.
+
+    Returns:
+        The started dispatcher, or None when no handler or event store is
+        reachable (extraction then stays on the in-process path, as before T2a).
+
+    Raises:
+        ValueError: A `MIST_EXTRACTION_*` variable is malformed
+            (`DispatcherSettings.from_env`).
+    """
+    from backend.extraction_backlog.settings import DispatcherSettings
+
+    handler = (
+        voice_processor.models.knowledge.conversation_handler
+        if voice_processor and voice_processor.models and voice_processor.models.knowledge
+        else None
+    )
+    if handler is None or handler.event_store is None:
+        logger.warning(
+            "Extraction dispatcher not started: no ConversationHandler or event store "
+            "reachable -- extraction stays on the in-process path for this process"
+        )
+        return None
+    dispatcher = build_extraction_dispatcher(
+        knowledge_config,
+        pipeline=handler._extraction_pipeline,
+        event_store=handler.event_store,
+        settings=DispatcherSettings.from_env(),
+        extraction_cache=handler._extraction_pipeline.extraction_cache,
+        http_client=None,
+    )
+    # Started BEFORE attaching: if `start()` raises (e.g. the activation write
+    # fails), the handler is left on the in-process path rather than attached
+    # to a dispatcher that is not running, which would silently stop
+    # extraction. No turn can arrive in between -- this runs before the server
+    # accepts connections.
+    await dispatcher.start()
+    handler.attach_extraction_dispatcher(dispatcher)
+    return dispatcher
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
-    global voice_processor, curation_scheduler, log_handler
+    global voice_processor, curation_scheduler, log_handler, extraction_dispatcher
     global vault_writer, vault_sidecar, vault_filewatcher, vault_invalidation_bus
 
     # Startup
@@ -573,6 +633,17 @@ async def lifespan(app: FastAPI):
         logger.warning("Curation scheduler failed to start: %s", e)
         curation_scheduler = None
 
+    # T2a: extraction backlog. After voice_processor.initialize() so the
+    # handler it attaches to is the live one.
+    extraction_dispatcher = None
+    try:
+        extraction_dispatcher = await _start_extraction_dispatcher(
+            voice_processor, knowledge_config
+        )
+    except (MistError, sqlite3.Error, OSError, ValueError) as e:
+        logger.error("Extraction dispatcher failed to start: %s", e, exc_info=True)
+        extraction_dispatcher = None
+
     # R1.3.1: synthesize vault notes for sessions that crashed before session
     # end (process kill, container restart) and so never reached
     # ConversationHandler.end_session. Background and deferential -- boot is
@@ -632,6 +703,15 @@ async def lifespan(app: FastAPI):
             await ch.aclose()
     except Exception as e:  # noqa: BLE001
         logger.warning("ConversationHandler aclose error (non-fatal): %s", e)
+
+    # T2a: stop the extraction dispatcher AFTER the handler drain above (which
+    # waits on the backlog). A job still waiting on the service is abandoned
+    # and re-dispatched next start; an apply in progress finishes first.
+    if extraction_dispatcher is not None:
+        try:
+            await extraction_dispatcher.stop()
+        except (MistError, sqlite3.Error, OSError) as e:
+            logger.warning("Extraction dispatcher stop error (non-fatal): %s", e)
 
     if vault_writer is not None:
         try:

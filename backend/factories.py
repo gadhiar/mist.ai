@@ -516,6 +516,74 @@ def build_extraction_pipeline(
     )
 
 
+def build_extraction_dispatcher(
+    config: KnowledgeConfig,
+    *,
+    pipeline: ExtractionPipeline,
+    event_store: "EventStore",  # noqa: F821
+    settings: "DispatcherSettings | None" = None,  # noqa: F821
+    extraction_cache: "ExtractionCache | None" = None,  # noqa: F821
+    http_client: "httpx.AsyncClient | None" = None,  # noqa: F821
+):
+    """Build (but do NOT start) the T2a extraction-backlog dispatcher.
+
+    Not starting it is deliberate: admin scripts and benches that build a
+    conversation handler must keep the in-process extraction path, and a
+    dispatcher that is built, attached and never started would silently stop
+    their extraction. The server starts it (`backend/server.py`).
+
+    Args:
+        config: Knowledge configuration; supplies the embedding model identity
+            the dispatcher folds into the service's model hash.
+        pipeline: The handler's extraction pipeline (gates, Stage 9 context,
+            apply step). Its own LLM stages are never called by the dispatcher.
+        event_store: The handler's event store -- the log the backlog reads.
+        settings: Dispatcher settings; `DispatcherSettings.from_env()` when None.
+        extraction_cache: The cache to read and write. Defaults to the
+            pipeline's own cache instance, then to a fresh one at
+            `production_cache_path(config)`.
+        http_client: Client for the extraction service. Built (and closed on
+            `stop()`) here when None, with `settings.request_timeout_s` as the
+            read timeout.
+
+    Returns:
+        An `ExtractionDispatcher`, not started.
+    """
+    import httpx
+
+    from backend.extraction_backlog.dispatcher import ExtractionDispatcher
+    from backend.extraction_backlog.inference import RemoteExtractionInference
+    from backend.extraction_backlog.settings import DispatcherSettings
+    from backend.extraction_backlog.store import BacklogStore
+    from backend.knowledge.extraction_cache import ExtractionCache
+
+    resolved_settings = settings or DispatcherSettings.from_env()
+    cache = extraction_cache or pipeline.extraction_cache
+    if cache is None:
+        cache = ExtractionCache(production_cache_path(config))
+        cache.initialize()
+
+    inference = None
+    on_stop = None
+    if resolved_settings.mode == "service":
+        client = http_client
+        if client is None:
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(resolved_settings.request_timeout_s, connect=5.0)
+            )
+            on_stop = client.aclose
+        inference = RemoteExtractionInference(client, resolved_settings.service_url)
+
+    return ExtractionDispatcher(
+        store=BacklogStore(event_store, cache),
+        pipeline=pipeline,
+        inference=inference,
+        settings=resolved_settings,
+        embedding_model_name=config.embedding.model_name,
+        on_stop=on_stop,
+    )
+
+
 def build_conversation_handler(
     config: KnowledgeConfig,
     llm_provider: StreamingLLMProvider | None = None,
@@ -524,6 +592,7 @@ def build_conversation_handler(
     invalidation_bus: "InvalidationBus | None" = None,
     graph_store: GraphStore | None = None,
     vector_store: "VectorStoreProvider | None" = None,  # noqa: F821
+    with_extraction_dispatcher: bool = False,
 ):
     """Create a fully wired ConversationHandler.
 
@@ -578,6 +647,16 @@ def build_conversation_handler(
             constructed via `build_vector_store(config)` with the existing
             graceful fallback to graph-only retrieval on failure. Tests
             inject a fake vector store to avoid touching LanceDB.
+        with_extraction_dispatcher: T2a. When True and the handler has an
+            event store, build an extraction-backlog dispatcher over the
+            handler's own pipeline and event store (`build_extraction_dispatcher`)
+            and attach it, so recorded turns wake the backlog instead of
+            spawning in-process extraction. The dispatcher is NOT started; the
+            caller owns `start()`/`stop()`. Default False keeps every existing
+            caller (admin scripts, benches) on the in-process path. The server
+            does not use this flag: its handler is built inside the
+            VoiceProcessor chain, so `backend/server.py` attaches one after the
+            fact via `ConversationHandler.attach_extraction_dispatcher`.
     """
     from pathlib import Path
 
@@ -645,7 +724,7 @@ def build_conversation_handler(
     # server lifespan owns the single VaultWriter and plumbs it through
     # VoiceProcessor -> ModelManager -> KnowledgeIntegration -> here. Unit
     # tests that want wiring coverage pass an explicit writer or None.
-    return ConversationHandler(
+    handler = ConversationHandler(
         config=config,
         graph_store=gs,
         extraction_pipeline=pipeline,
@@ -665,6 +744,11 @@ def build_conversation_handler(
         # excludable from an R1.6 rebuild.
         session_origin=config.event_store.session_origin,
     )
+    if with_extraction_dispatcher and handler.event_store is not None:
+        handler.attach_extraction_dispatcher(
+            build_extraction_dispatcher(config, pipeline=pipeline, event_store=handler.event_store)
+        )
+    return handler
 
 
 def build_curation_scheduler(
