@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from backend.llm.models import LLMRequest, LLMResponse
+from backend.llm.models import LLMRequest, LLMResponse, ThinkingConfig
 from backend.llm.ollama_provider import OllamaProvider
 
 MODULE = "backend.llm.ollama_provider"
@@ -266,6 +266,70 @@ class TestGenerateAsyncStreaming:
         assert len(results) == 2
         assert results[0].content == "a"
         assert results[1].content == "b"
+
+
+# ---------------------------------------------------------------------------
+# Unsupported controls (thinking / response_schema) -- ignored, logged
+# ---------------------------------------------------------------------------
+
+
+class TestUnsupportedControlsIgnored:
+    def test_sync_ignores_thinking_and_logs_debug(self, caplog):
+        provider = OllamaProvider(base_url="http://localhost:11434", model="m")
+        mock_client = MagicMock()
+        mock_client.chat.return_value = _make_chat_response("ok")
+        request = _make_request(thinking=ThinkingConfig(effort="high"))
+
+        with (
+            caplog.at_level("DEBUG", logger=MODULE),
+            patch(f"{MODULE}.ollama.Client", return_value=mock_client),
+        ):
+            results = list(provider.generate_sync(request, stream=False))
+
+        assert results[0].content == "ok"
+        assert any("thinking" in r.message for r in caplog.records)
+
+    def test_sync_ignores_response_schema_and_logs_debug(self, caplog):
+        provider = OllamaProvider(base_url="http://localhost:11434", model="m")
+        mock_client = MagicMock()
+        mock_client.chat.return_value = _make_chat_response("ok")
+        request = _make_request(response_schema={"type": "object"})
+
+        with (
+            caplog.at_level("DEBUG", logger=MODULE),
+            patch(f"{MODULE}.ollama.Client", return_value=mock_client),
+        ):
+            list(provider.generate_sync(request, stream=False))
+
+        assert any("response_schema" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_async_ignores_thinking_and_logs_debug(self, caplog):
+        provider = OllamaProvider(base_url="http://localhost:11434", model="m")
+        mock_client = AsyncMock()
+        mock_client.chat.return_value = _make_chat_response("ok")
+        request = _make_request(thinking=ThinkingConfig(budget_tokens=10))
+
+        with (
+            caplog.at_level("DEBUG", logger=MODULE),
+            patch(f"{MODULE}.ollama.AsyncClient", return_value=mock_client),
+        ):
+            [r async for r in provider.generate(request, stream=False)]
+
+        assert any("thinking" in r.message for r in caplog.records)
+
+    def test_no_log_when_controls_unset(self, caplog):
+        provider = OllamaProvider(base_url="http://localhost:11434", model="m")
+        mock_client = MagicMock()
+        mock_client.chat.return_value = _make_chat_response("ok")
+
+        with (
+            caplog.at_level("DEBUG", logger=MODULE),
+            patch(f"{MODULE}.ollama.Client", return_value=mock_client),
+        ):
+            list(provider.generate_sync(_make_request(), stream=False))
+
+        assert caplog.records == []
 
 
 # ---------------------------------------------------------------------------

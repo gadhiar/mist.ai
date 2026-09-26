@@ -29,10 +29,21 @@ class StreamingLLMProvider(ABC):
     ) -> AsyncGenerator[LLMResponse, None]:
         """Generate a response (async).
 
-        When stream=True, yields partial LLMResponse chunks (partial=True)
-        followed by a final chunk (partial=False) with aggregated content.
+        When stream=True, yields a sequence of partial LLMResponse chunks
+        (partial=True) followed by exactly one final chunk (partial=False).
+        Partial chunks carry `content` deltas only -- concatenate them for
+        the streamed reply text. The final chunk carries everything the
+        partials do NOT: `tool_calls` (reassembled from delta fragments),
+        `reasoning_content` (joined from any reasoning deltas),
+        `finish_reason`, and `usage`. Its `content` is always None on
+        purpose -- callers that append every chunk's `content` to build the
+        reply (e.g. `backend/voice_models/model_manager.py`) would
+        otherwise duplicate the final text if the aggregated content were
+        repeated there.
 
-        When stream=False, yields a single LLMResponse (partial=False).
+        When stream=False, yields a single LLMResponse (partial=False)
+        carrying content, tool_calls, reasoning_content, finish_reason,
+        and usage together.
         """
         ...
 

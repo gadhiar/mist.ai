@@ -3,8 +3,9 @@
 import json
 
 import pytest
+from pydantic import ValidationError
 
-from backend.llm.models import LLMRequest, LLMResponse, ToolCall, UsageMetadata
+from backend.llm.models import LLMRequest, LLMResponse, ThinkingConfig, ToolCall, UsageMetadata
 
 
 class TestLLMRequest:
@@ -18,6 +19,8 @@ class TestLLMRequest:
         assert request.top_p == 0.9
         assert request.json_mode is False
         assert request.tools is None
+        assert request.thinking is None
+        assert request.response_schema is None
 
     def test_explicit_values(self):
         tools = [{"type": "function", "function": {"name": "test"}}]
@@ -34,6 +37,50 @@ class TestLLMRequest:
         assert request.json_mode is True
         assert request.tools == tools
 
+    def test_thinking_and_response_schema_accepted(self):
+        schema = {"type": "object", "properties": {"a": {"type": "string"}}}
+        request = LLMRequest(
+            messages=[{"role": "user", "content": "hello"}],
+            thinking=ThinkingConfig(budget_tokens=100, effort="high", enabled=True),
+            response_schema=schema,
+        )
+
+        assert request.thinking.budget_tokens == 100
+        assert request.thinking.effort == "high"
+        assert request.thinking.enabled is True
+        assert request.response_schema == schema
+
+
+class TestThinkingConfig:
+    def test_defaults_are_unset(self):
+        config = ThinkingConfig()
+
+        assert config.budget_tokens is None
+        assert config.effort is None
+        assert config.enabled is None
+
+    def test_budget_tokens_zero_is_valid(self):
+        config = ThinkingConfig(budget_tokens=0)
+
+        assert config.budget_tokens == 0
+
+    def test_budget_tokens_positive_is_valid(self):
+        config = ThinkingConfig(budget_tokens=512)
+
+        assert config.budget_tokens == 512
+
+    def test_budget_tokens_negative_one_raises(self):
+        with pytest.raises(ValidationError):
+            ThinkingConfig(budget_tokens=-1)
+
+    def test_budget_tokens_other_negative_raises(self):
+        with pytest.raises(ValidationError):
+            ThinkingConfig(budget_tokens=-42)
+
+    def test_invalid_effort_literal_raises(self):
+        with pytest.raises(ValidationError):
+            ThinkingConfig(effort="extreme")
+
 
 class TestLLMResponse:
     def test_partial_response(self):
@@ -43,6 +90,19 @@ class TestLLMResponse:
         assert response.partial is True
         assert response.tool_calls is None
         assert response.usage is None
+        assert response.reasoning_content is None
+        assert response.finish_reason is None
+
+    def test_reasoning_content_and_finish_reason(self):
+        response = LLMResponse(
+            content=None,
+            partial=False,
+            reasoning_content="thinking...",
+            finish_reason="stop",
+        )
+
+        assert response.reasoning_content == "thinking..."
+        assert response.finish_reason == "stop"
 
     def test_complete_response_with_tool_calls(self):
         tc = ToolCall(id="call_1", name="search", arguments={"query": "test"})

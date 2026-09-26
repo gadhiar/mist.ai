@@ -32,10 +32,25 @@ class OllamaProvider(StreamingLLMProvider):
             "top_p": request.top_p,
         }
 
+    def _warn_unsupported_controls(self, request: LLMRequest) -> None:
+        """Log at DEBUG when a request asks for controls this provider ignores.
+
+        OllamaProvider is the fallback path; it does not implement
+        llama.cpp's thinking-budget or JSON-schema constrained decoding.
+        Silently dropping these fields (rather than raising) keeps a
+        request built for LlamaServerProvider usable here too, at reduced
+        fidelity.
+        """
+        if request.thinking is not None:
+            logger.debug("OllamaProvider ignores LLMRequest.thinking: %r", request.thinking)
+        if request.response_schema is not None:
+            logger.debug("OllamaProvider ignores LLMRequest.response_schema")
+
     async def generate(
         self, request: LLMRequest, *, stream: bool = False
     ) -> AsyncGenerator[LLMResponse, None]:
         """Generate a response via ollama AsyncClient."""
+        self._warn_unsupported_controls(request)
         client = ollama.AsyncClient(host=self._base_url)
         kwargs: dict = {
             "model": self.model,
@@ -62,6 +77,7 @@ class OllamaProvider(StreamingLLMProvider):
         self, request: LLMRequest, *, stream: bool = False
     ) -> Generator[LLMResponse, None, None]:
         """Generate a response via ollama sync Client."""
+        self._warn_unsupported_controls(request)
         client = ollama.Client(host=self._base_url)
         kwargs: dict = {
             "model": self.model,
