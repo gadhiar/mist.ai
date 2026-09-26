@@ -8,10 +8,10 @@
 # GTX 1070 remote host); only docker-compose.extraction.yml's env vars
 # differ per profile.
 #
-# TODO(lead): pin python:3.11-slim by digest once a build has been run and
-# `docker buildx imagetools inspect python:3.11-slim` is available (this
-# worker's container has no network to resolve it).
-FROM python:3.11-slim
+# Pinned by digest: tag `python:3.11-slim` (Python 3.11.16), resolved on the
+# host by the lead on 2026-09-26. tests/unit/test_compose_extraction.py pins
+# this exact string.
+FROM python@sha256:e41613d42d4891e4930f79523f93f81bbc7632584ec65e36ab055f41a800b41e
 
 # First-run memory reservation for claude-worker containers (see
 # ~/.claude CLAUDE.md "Running commands"). This image installs a short,

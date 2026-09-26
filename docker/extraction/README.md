@@ -185,9 +185,9 @@ Tailscale exposure model (host profile only)
 
 The extraction-host profile publishes **no host ports on any service**.
 Exposure is entirely through a Tailscale sidecar
-(`mist-extraction-ts`, image `tailscale/tailscale:stable` --
-**TODO(lead): pin by digest**; no digest was resolvable from this worker's
-no-network container):
+(`mist-extraction-ts`, image `tailscale/tailscale`, tag `stable` pinned by
+digest `sha256:c507f3a2a6ab1cabd8d809b98edeb41edbd5c3fb6ad9632ffd098b4c7d0b4065`,
+resolved 2026-09-26):
 
 - `mist-extraction-host` (the FastAPI service) sets `network_mode:
   service:mist-extraction-ts`, sharing the sidecar's entire network

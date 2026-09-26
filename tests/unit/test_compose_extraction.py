@@ -24,6 +24,15 @@ DOCKERFILE_PATH = REPO_ROOT / "docker" / "extraction" / "Dockerfile"
 REQUIREMENTS_PATH = REPO_ROOT / "docker" / "extraction" / "requirements.txt"
 SETTINGS_PATH = REPO_ROOT / "backend" / "extraction_service" / "settings.py"
 
+# Resolved on the host by the lead on 2026-09-26 (tags kept in the file comments).
+TAILSCALE_PINNED_IMAGE = (
+    "tailscale/tailscale@sha256:c507f3a2a6ab1cabd8d809b98edeb41edbd5c3fb6ad9632ffd098b4c7d0b4065"
+)
+PYTHON_PINNED_IMAGE = (
+    "python@sha256:e41613d42d4891e4930f79523f93f81bbc7632584ec65e36ab055f41a800b41e"
+)
+DIGEST_REF_PATTERN = re.compile(r"^[a-z0-9./_-]+@sha256:[0-9a-f]{64}$")
+
 LOCAL_PROFILE = "extraction-local"
 HOST_PROFILE = "extraction-host"
 VALID_PROFILES = {LOCAL_PROFILE, HOST_PROFILE}
@@ -134,19 +143,26 @@ class TestTailscaleAuthKey:
         ), f"TS_AUTHKEY must use the required ${{VAR:?msg}} form, got {value!r}"
         assert ":-" not in value, f"TS_AUTHKEY must not have a default, got {value!r}"
 
-    def test_tailscale_image_has_a_todo_digest_marker(self) -> None:
-        """No digest was resolvable from this worker's no-network container.
-
-        `docker/extraction/README.md` documents the same gap; this test just
-        keeps the compose-file TODO from being silently dropped before the
-        lead pins it.
-        """
-        text = COMPOSE_PATH.read_text(encoding="utf-8")
-        assert "TODO(lead)" in text and "digest" in text.lower()
-        assert "tailscale/tailscale" in text
-        # And NOT already digest-pinned (the TODO would then be stale).
+    def test_tailscale_image_is_pinned_by_digest(self) -> None:
+        """The sidecar image is the digest the lead resolved on the host, not a moving tag."""
         sidecar = next(svc for svc in _services().values() if "tailscale" in svc.get("image", ""))
-        assert "@sha256:" not in sidecar["image"]
+        assert sidecar["image"] == TAILSCALE_PINNED_IMAGE
+        assert DIGEST_REF_PATTERN.match(sidecar["image"])
+
+
+class TestPythonBaseImagePin:
+    def test_dockerfile_base_is_pinned_by_digest(self) -> None:
+        from_lines = [
+            line.split(None, 1)[1].strip()
+            for line in DOCKERFILE_PATH.read_text(encoding="utf-8").splitlines()
+            if line.upper().startswith("FROM ")
+        ]
+        assert from_lines == [PYTHON_PINNED_IMAGE]
+
+    def test_digest_ref_pattern_rejects_a_moving_tag(self) -> None:
+        assert not DIGEST_REF_PATTERN.match("tailscale/tailscale:stable")
+        assert not DIGEST_REF_PATTERN.match("python:3.11-slim")
+        assert not DIGEST_REF_PATTERN.match("python@sha256:abc")
 
 
 class TestModelHashRequired:
