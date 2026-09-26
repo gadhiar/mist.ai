@@ -958,9 +958,7 @@ def probe_container_state(
     try:
         state = json.loads(stdout)
     except json.JSONDecodeError as exc:
-        return ContainerProbe(
-            "unknown", f"docker inspect {name!r} returned unparseable JSON: {exc}"
-        )
+        return ContainerProbe("unknown", f"docker inspect {name!r} returned unparsable JSON: {exc}")
     if not isinstance(state, dict):
         return ContainerProbe("unknown", f"docker inspect {name!r} State was not a JSON object")
 
@@ -1200,7 +1198,7 @@ def wait_for_llama_health(
       already final after well under a second.
     - `"running"` means keep waiting.
     - `"unknown"` (docker inspect itself failed, timed out, or returned
-      something unparseable -- e.g. a slow docker CLI/daemon under host
+      something unparsable -- e.g. a slow docker CLI/daemon under host
       memory pressure, the exact S2 incident) is printed as a `[WARN]`, at
       most once per `_UNKNOWN_WARN_INTERVAL_S`, and the wait continues.
       Time spent unknown, with no known reading in between, is tracked; if
