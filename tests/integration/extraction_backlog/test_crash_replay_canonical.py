@@ -10,13 +10,14 @@ with the production `CurationPipeline` (`build_curation_pipeline`):
 Both runs must yield the same `canonical_graph_form`, and run B must not call
 the extraction service again for the crashed turn (the cached result survives).
 
-A second test pins a KNOWN divergence the canonical form cannot see: the
-re-applied turn's newly created entity gets `ON MATCH` confidence reinforcement
-(`curation/graph_writer.py`, `_upsert_entity`), so its node `confidence` ends
-higher than after one apply. Node `confidence` is excluded from the canonical
-form (`canonical_serialize.NODE_ONLY_EXCLUDED_FIELDS`). That test asserts the
-divergence EXISTS; when a guard lands it will fail, and should then be flipped
-to assert equality.
+A second test checks what the canonical form cannot see: node `confidence`,
+excluded from it (`canonical_serialize.NODE_ONLY_EXCLUDED_FIELDS`). Before the
+MIS-171 replay guard, the re-applied turn's newly created entity took the
+upsert's `ON MATCH` reinforce (`curation/graph_writer.py`, `_upsert_entity`) and
+ended higher than after one apply. The guard skips the reinforce when this
+event's EXTRACTED_FROM edge already exists, so the crashed run's confidences now
+equal the uninterrupted run's, and turn 1 still reinforces the entity both
+turns mention.
 
 Only this test's own nodes are written and cleaned up (every id and session id
 carries `_PREFIX`); anything else in the eval instance appears identically in
@@ -328,23 +329,29 @@ async def test_crash_after_graph_write_then_restart_equals_one_uninterrupted_app
 
 
 @pytest.mark.asyncio
-async def test_known_divergence_reapplied_turn_reinforces_new_node_confidence(eval_conn, tmp_path):
-    """Pins the finding reported with T2a: NOT a desired property.
+async def test_reapplied_turn_leaves_node_confidence_as_one_apply(eval_conn, tmp_path):
+    """Flipped from T2a's known-divergence pin once the replay guard landed.
 
-    Re-running curation for a turn whose entities it already created takes the
-    `ON MATCH` branch of `_upsert_entity`, which raises `confidence` to
-    `reinforced_confidence(...)`. One uninterrupted apply leaves the ON CREATE
-    value. Invisible to `canonical_graph_form` (node confidence excluded).
-    When a guard makes re-apply idempotent here, this test fails -- flip it to
-    `==` then.
+    Re-running curation for turn 0, whose entities the crashed run already
+    created, takes the `ON MATCH` branch of `_upsert_entity`. Turn 0's
+    EXTRACTED_FROM edges already carry `source_utterance_id = evt-0`, so the
+    guard leaves `confidence` at the ON CREATE value, as one apply does.
+
+    `dev` is in both turns: turn 1 is a genuinely new event for it, so run A
+    reinforces it there, and a guard that wrongly blocked that reinforce in
+    run B (whose `dev` edge was just re-stamped by the replay) would show up as
+    a lower `dev` in run B. `rust` is in turn 0 only. Every node is compared,
+    which also checks that Neo4j evaluates the guard's `OPTIONAL MATCH` /
+    `WITH count(...)` form; the unit tier's fake cannot.
     """
+    ids = [f"{_PREFIX}dev", f"{_PREFIX}rust", f"{_PREFIX}zig"]
     run_a = await _uninterrupted(tmp_path, eval_conn)
-    single = _node_confidence(eval_conn, f"{_PREFIX}rust")
+    single = {i: _node_confidence(eval_conn, i) for i in ids}
     await run_a.close()
     _cleanup(eval_conn)
 
     run_b = await _crashed_then_restarted(tmp_path, eval_conn)
-    reapplied = _node_confidence(eval_conn, f"{_PREFIX}rust")
+    reapplied = {i: _node_confidence(eval_conn, i) for i in ids}
     await run_b.close()
 
-    assert reapplied > single
+    assert reapplied == single

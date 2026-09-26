@@ -167,7 +167,9 @@ class CurationGraphWriter:
         for entity in entities:
             entity_id = entity.get("id", "")
             is_update = entity_id in merge_lookup
-            await self._upsert_entity(entity, merge_lookup.get(entity_id), now, event_id)
+            await self._upsert_entity(
+                entity, merge_lookup.get(entity_id), now, event_id, session_id
+            )
             if is_update:
                 result.entities_updated += 1
             else:
@@ -216,9 +218,75 @@ class CurationGraphWriter:
         )
 
     async def _upsert_entity(
-        self, entity: dict, merge_action: MergeAction | None, now: str, event_id: str
+        self,
+        entity: dict,
+        merge_action: MergeAction | None,
+        now: str,
+        event_id: str,
+        session_id: str,
     ) -> None:
-        """MERGE an entity into the graph."""
+        """MERGE an entity into the graph, reinforcing confidence once per event.
+
+        Replay guard (MIS-171, plan v2). The extraction backlog re-applies a
+        turn whose curation a crash interrupted, so this statement can run
+        twice for one event. Without a guard the second run takes the
+        `ON MATCH` branch and raises `confidence` to `$reinforced` on an entity
+        the first run CREATED at `$confidence`, which one apply never does.
+        The statement therefore first looks for THIS event's EXTRACTED_FROM
+        edge from this entity to this session's ConversationContext
+        (`source_utterance_id = $event_id`) and, when it exists, leaves
+        `e.confidence` unchanged: this event has already reinforced (or
+        created) the entity. The lookup is an `OPTIONAL MATCH` in the same
+        statement as the MERGE, not a separate read.
+
+        Why `source_utterance_id` identifies "this event". The edge carries no
+        append-only per-event record -- its properties are
+        `source_utterance_id`, `created_at`/`updated_at`, `status`, the three
+        epoch stamps and `derived_at` (`_create_provenance_edge`) -- and
+        `source_utterance_id` is last-writer-wins: it is set on both ON CREATE
+        and ON MATCH, so a later turn overwrites it. Matching on it is still
+        sound for crash replay because the backlog re-applies turn N before any
+        turn that sorts after N:
+        - the dispatcher processes only the backlog head:
+          `grep -n 'head = scan.head' backend/extraction_backlog/dispatcher.py`
+          -> 466;
+        - the head is the first pending turn in replay order:
+          `grep -n 'return self.pending.0. if' backend/extraction_backlog/store.py`
+          -> 217 (`BacklogScan.head`);
+        - only an `applied` marker takes a turn out of the pending list, so a
+          crashed turn N stays pending and ahead of every later turn:
+          `grep -n 'if stage == STAGE_APPLIED' backend/extraction_backlog/store.py`
+          -> 475.
+
+        What the guard does NOT cover:
+        - A crash between this statement and the same entity's
+          `_create_provenance_edge` statement in `write()`. The edge does not
+          exist yet, so a replay reinforces an entity the crashed run created.
+          Closing that needs the edge MERGE in this statement.
+        - A turn that sorts BEFORE N but is logged after N crashed becomes the
+          head first and overwrites `source_utterance_id` before N replays.
+        - Document ingest (`source_metadata` set): it writes SOURCED_FROM, not
+          EXTRACTED_FROM, so the guard never matches and behaviour is
+          unchanged there.
+        For an entity that already existed before this event, a second
+        reinforce is harmless anyway: `$reinforced` is computed from the
+        incoming `confidence` param alone
+        (`ConfidenceManager.reinforced_confidence(confidence, domain)` below),
+        and `max(max(c, r), r) == max(c, r)`. Only the create-then-match
+        transition diverges, and that is what the guard closes.
+
+        Only the confidence reinforce is guarded. `updated_at`, `display_name`
+        and `description` keep their semantics on every `ON MATCH`:
+        `display_name` and `description` are longest-wins, which is already
+        idempotent for the same input, and `updated_at` is an audit timestamp
+        that differs on every run regardless. `canonical_graph_form` compares
+        neither: `updated_at` is an audit field
+        (`grep -n '"updated_at",' backend/knowledge/canonical_serialize.py` -> 29,
+        inside `AUDIT_FIELDS`), and node `confidence` is excluded
+        (`grep -n 'NODE_ONLY_EXCLUDED_FIELDS = ' backend/knowledge/canonical_serialize.py`
+        -> 71). That exclusion is why the canonical-form crash test cannot see
+        this defect and a direct confidence assertion is needed.
+        """
         entity_id = entity.get("id", "")
         entity_type = entity.get("type", "")
         display_name = entity.get("name", entity_id)
@@ -241,6 +309,12 @@ class CurationGraphWriter:
         # seed/rebuild (deep review cypher-data-integrity-2a). Idempotent.
         user_label_set = " SET e:User" if entity_id == "user" else ""
         await self._executor.execute_write(
+            # Replay guard: evaluated BEFORE the MERGE, in the same statement.
+            # count() makes exactly one row whether or not the edge exists.
+            "OPTIONAL MATCH (:__Entity__ {id: $entity_id})-[seen:EXTRACTED_FROM]->"
+            "(:ConversationContext {conversation_id: $session_id}) "
+            "WHERE seen.source_utterance_id = $event_id "
+            "WITH count(seen) > 0 AS event_already_applied "
             "MERGE (e:__Entity__ {id: $entity_id}) "
             "ON CREATE SET e.entity_type = $entity_type, e.display_name = $display_name, "
             "e.knowledge_domain = $domain, e.confidence = $confidence, "
@@ -248,8 +322,8 @@ class CurationGraphWriter:
             "e.ontology_version = $ontology_version, e.embedding = $embedding, "
             "e.description = $description, e.aliases = $aliases, e.status = 'active', "
             "e.provenance = 'extraction' "
-            "ON MATCH SET e.confidence = CASE WHEN e.confidence < $reinforced "
-            "THEN $reinforced ELSE e.confidence END, "
+            "ON MATCH SET e.confidence = CASE WHEN event_already_applied THEN e.confidence "
+            "WHEN e.confidence < $reinforced THEN $reinforced ELSE e.confidence END, "
             "e.updated_at = $now, "
             "e.display_name = CASE WHEN size(e.display_name) < size($display_name) "
             "THEN $display_name ELSE e.display_name END, "
@@ -257,6 +331,8 @@ class CurationGraphWriter:
             "THEN $description ELSE e.description END" + user_label_set,
             {
                 "entity_id": entity_id,
+                "event_id": event_id,
+                "session_id": session_id,
                 "entity_type": entity_type,
                 "display_name": display_name,
                 "domain": domain.value,
