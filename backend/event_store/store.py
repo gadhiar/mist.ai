@@ -874,6 +874,245 @@ class EventStore:
         ).fetchone()
         return dict(row) if row is not None else None
 
+    # ------------------------------------------------------------------
+    # Extraction backlog (T2a)
+    # ------------------------------------------------------------------
+
+    def list_turn_keys_in_replay_order(self) -> list[dict[str, Any]]:
+        """Every logged turn's identity, in replay order, without its payload.
+
+        The backlog's ordering source. Same ORDER BY as
+        `get_all_turns_for_reextraction` (`timestamp, session_id, turn_index` --
+        see the MIS-138 comment there for why content order and not rowid), so
+        the live dispatcher applies turns in the order a rebuild replays them.
+
+        Deliberately unfiltered: EVERY turn the live path records is eligible,
+        whatever its session's `origin` and whatever `ontology_version` it was
+        logged under. That matches what the pre-T2a live path did -- it fired
+        extraction for every recorded turn (`conversation_handler.py`, the
+        `if event_id:` branch after `_record_turn_event`) with no origin or
+        ontology check. A rebuild still scopes itself (`LogRegenerator.rebuild`
+        passes `origins=CANONICAL_ORIGINS`); that is the rebuild's policy, not
+        the backlog's.
+
+        Returns:
+            Dicts with `event_id`, `session_id`, `turn_index` and `timestamp`
+            only -- the full row (context window, retrieval context) is read per
+            turn by `get_turn` when the turn reaches the head.
+        """
+        conn = self._get_connection()
+        cursor = conn.execute(
+            """
+            SELECT event_id, session_id, turn_index, timestamp
+            FROM conversation_turn_events
+            ORDER BY timestamp ASC, session_id ASC, turn_index ASC
+            """
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_turn(self, event_id: str) -> dict[str, Any] | None:
+        """One turn row with its JSON fields decoded, or None if absent."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM conversation_turn_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        return self._decode_turn_row(dict(row)) if row is not None else None
+
+    def get_extraction_activation(self, epoch_id: int) -> dict[str, Any] | None:
+        """The first-activation record for an epoch, or None before activation."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM extraction_activation WHERE epoch_id = ?", (epoch_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def record_extraction_activation(
+        self,
+        *,
+        epoch_id: int,
+        activated_at: str,
+        turns_at_activation: int,
+        applied_event_ids: list[str],
+        legacy_event_ids: list[str],
+    ) -> bool:
+        """Write the first-activation floor for an epoch, in ONE transaction.
+
+        One transaction so a crash cannot leave a floor row without its markers
+        (the next start would then treat the floor as done and dispatch the
+        legacy turns it failed to list) or markers without the floor row (the
+        next start would re-run activation over them -- harmless, but the count
+        in the floor row would be wrong).
+
+        Idempotent: returns False and writes nothing when the epoch already has
+        a floor, so a restart never moves it.
+
+        Returns:
+            True when the floor was written by this call.
+        """
+        conn = self._get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT 1 FROM extraction_activation WHERE epoch_id = ?", (epoch_id,)
+            ).fetchone()
+            if existing is not None:
+                conn.execute("COMMIT")
+                return False
+            conn.execute(
+                "INSERT INTO extraction_activation (epoch_id, activated_at, turns_at_activation, "
+                "marked_applied, legacy_unextracted) VALUES (?, ?, ?, ?, ?)",
+                (
+                    epoch_id,
+                    activated_at,
+                    turns_at_activation,
+                    len(applied_event_ids),
+                    len(legacy_event_ids),
+                ),
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO extraction_applied "
+                "(event_id, epoch_id, stage, source, updated_at) "
+                "VALUES (?, ?, 'applied', 'activation', ?)",
+                [(eid, epoch_id, activated_at) for eid in applied_event_ids],
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO extraction_legacy_turns (event_id, epoch_id) VALUES (?, ?)",
+                [(eid, epoch_id) for eid in legacy_event_ids],
+            )
+            conn.execute("COMMIT")
+        except sqlite3.Error:
+            conn.execute("ROLLBACK")
+            raise
+        return True
+
+    def get_extraction_legacy_turns(self, epoch_id: int) -> set[str]:
+        """Event ids logged before first activation with no cache row (never dispatched)."""
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT event_id FROM extraction_legacy_turns WHERE epoch_id = ?", (epoch_id,)
+        ).fetchall()
+        return {row[0] for row in rows}
+
+    def get_extraction_applied(self, epoch_id: int) -> dict[str, str]:
+        """Map event_id -> apply stage ('curated' or 'applied') for an epoch."""
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT event_id, stage FROM extraction_applied WHERE epoch_id = ?", (epoch_id,)
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
+
+    def mark_extraction_stage(
+        self, *, event_id: str, epoch_id: int, stage: str, updated_at: str
+    ) -> None:
+        """Upsert a turn's apply stage for an epoch ('curated' then 'applied').
+
+        Raises:
+            ValueError: `stage` is not 'curated' or 'applied'.
+        """
+        if stage not in ("curated", "applied"):
+            raise ValueError(f"unknown extraction apply stage {stage!r}")
+        conn = self._get_connection()
+        conn.execute(
+            "INSERT INTO extraction_applied (event_id, epoch_id, stage, source, updated_at) "
+            "VALUES (?, ?, ?, 'dispatcher', ?) "
+            "ON CONFLICT(event_id, epoch_id) DO UPDATE SET stage = excluded.stage, "
+            "source = excluded.source, updated_at = excluded.updated_at",
+            (event_id, epoch_id, stage, updated_at),
+        )
+
+    def delete_extraction_applied(self, event_id: str, epoch_id: int) -> bool:
+        """Remove a turn's apply marker for an epoch. True when a row was deleted."""
+        conn = self._get_connection()
+        cursor = conn.execute(
+            "DELETE FROM extraction_applied WHERE event_id = ? AND epoch_id = ?",
+            (event_id, epoch_id),
+        )
+        return cursor.rowcount > 0
+
+    def append_extraction_attempt(
+        self,
+        *,
+        event_id: str,
+        epoch_id: int,
+        attempt: int,
+        job_id: str,
+        request_id: str,
+        turn_id: str,
+        started_at: str,
+        finished_at: str,
+        duration_ms: float,
+        error_code: str | None,
+        outcome: str,
+        counted: bool,
+    ) -> None:
+        """Record one extraction-service call for a turn. Append-only."""
+        conn = self._get_connection()
+        conn.execute(
+            "INSERT INTO extraction_attempts (event_id, epoch_id, attempt, job_id, request_id, "
+            "turn_id, started_at, finished_at, duration_ms, error_code, outcome, counted) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event_id,
+                epoch_id,
+                attempt,
+                job_id,
+                request_id,
+                turn_id,
+                started_at,
+                finished_at,
+                duration_ms,
+                error_code,
+                outcome,
+                1 if counted else 0,
+            ),
+        )
+
+    def count_extraction_attempts(self, event_id: str, epoch_id: int) -> int:
+        """All recorded service calls for a turn and epoch, retired ones included."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM extraction_attempts WHERE event_id = ? AND epoch_id = ?",
+            (event_id, epoch_id),
+        ).fetchone()
+        return int(row[0])
+
+    def count_counted_extraction_failures(self, event_id: str, epoch_id: int) -> int:
+        """Job-attributable failures since the turn last (re-)entered the backlog."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM extraction_attempts "
+            "WHERE event_id = ? AND epoch_id = ? AND counted = 1 AND retired = 0",
+            (event_id, epoch_id),
+        ).fetchone()
+        return int(row[0])
+
+    def retire_extraction_attempts(self, event_id: str, epoch_id: int) -> int:
+        """Mark a turn's attempts retired so its failure count restarts at zero."""
+        conn = self._get_connection()
+        cursor = conn.execute(
+            "UPDATE extraction_attempts SET retired = 1 "
+            "WHERE event_id = ? AND epoch_id = ? AND retired = 0",
+            (event_id, epoch_id),
+        )
+        return cursor.rowcount
+
+    def list_extraction_attempts(
+        self, *, event_id: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Recorded service calls, oldest first, optionally for one turn."""
+        conn = self._get_connection()
+        if event_id is None:
+            cursor = conn.execute(
+                "SELECT * FROM extraction_attempts ORDER BY attempt_row ASC LIMIT ?", (limit,)
+            )
+        else:
+            cursor = conn.execute(
+                "SELECT * FROM extraction_attempts WHERE event_id = ? "
+                "ORDER BY attempt_row ASC LIMIT ?",
+                (event_id, limit),
+            )
+        return [dict(row) for row in cursor.fetchall()]
+
     def close(self) -> None:
         """Close the database connection."""
         if self._conn is not None:

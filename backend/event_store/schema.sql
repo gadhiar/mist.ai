@@ -141,3 +141,71 @@ CREATE TABLE IF NOT EXISTS epoch_ledger (
     provisional INTEGER NOT NULL DEFAULT 0  -- R1.4 Task 7 (spec O2): 1 = bootstrap
                                              -- placeholder, may be superseded by R1.6
 );
+
+-- ---------------------------------------------------------------------------
+-- Extraction backlog (T2a). The backlog itself is NOT a table: a turn is
+-- inference-pending when the extraction cache has no row for it under the
+-- active epoch, and apply-pending when it has a row but no `applied` marker
+-- below. These tables hold only what the log and the cache cannot say.
+-- All four are new tables, so `CREATE TABLE IF NOT EXISTS` is the whole
+-- migration: `EventStore.initialize()` runs this script on every open, and a
+-- database created before T2a gains them on its next open with every existing
+-- row untouched.
+-- ---------------------------------------------------------------------------
+
+-- Per-(turn, epoch) apply progress. stage='curated' means Stages 3-8 finished
+-- for this turn and only the Stage 9 operations remain; stage='applied' means
+-- the turn is done. source='activation' marks turns the pre-T2a live path had
+-- already applied when the backlog first activated for this epoch.
+CREATE TABLE IF NOT EXISTS extraction_applied (
+    event_id TEXT NOT NULL,
+    epoch_id INTEGER NOT NULL,
+    stage TEXT NOT NULL,                      -- 'curated', 'applied'
+    source TEXT NOT NULL,                     -- 'dispatcher', 'activation'
+    updated_at TEXT NOT NULL,                 -- ISO-8601, wall clock (audit only)
+    PRIMARY KEY (event_id, epoch_id)
+);
+
+-- One row per extraction-service call the dispatcher made for a turn.
+-- `counted` = 1 only for job-attributable failures (retryable upstream_llm,
+-- timeout, a reply that failed validation): those, and only those, count
+-- toward the dead-letter limit. `retired` = 1 once `retry-dead-letters` has put
+-- the turn back into the backlog, so the count restarts without deleting audit
+-- history.
+CREATE TABLE IF NOT EXISTS extraction_attempts (
+    attempt_row INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL,
+    epoch_id INTEGER NOT NULL,
+    attempt INTEGER NOT NULL,                 -- 1-based, per (event_id, epoch_id)
+    job_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,                    -- "{session_id}:{turn_index}"
+    started_at TEXT NOT NULL,                 -- ISO-8601
+    finished_at TEXT NOT NULL,                -- ISO-8601
+    duration_ms REAL NOT NULL,
+    error_code TEXT,                          -- ErrorCode value, 'unreachable', 'invalid_response'
+    outcome TEXT NOT NULL,                    -- 'extracted', 'failed', 'dead_lettered', 'deferred'
+    counted INTEGER NOT NULL DEFAULT 0,
+    retired INTEGER NOT NULL DEFAULT 0
+);
+
+-- The first-activation floor, one row per epoch, written once. Turns logged
+-- before it that had a cache row were applied by the pre-T2a live path; turns
+-- logged before it that had none are listed in extraction_legacy_turns and are
+-- never dispatched (applying them now would violate log order).
+CREATE TABLE IF NOT EXISTS extraction_activation (
+    epoch_id INTEGER PRIMARY KEY,
+    activated_at TEXT NOT NULL,               -- ISO-8601
+    turns_at_activation INTEGER NOT NULL,
+    marked_applied INTEGER NOT NULL,
+    legacy_unextracted INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS extraction_legacy_turns (
+    event_id TEXT NOT NULL,
+    epoch_id INTEGER NOT NULL,
+    PRIMARY KEY (event_id, epoch_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_extraction_attempts_turn
+    ON extraction_attempts(event_id, epoch_id);
