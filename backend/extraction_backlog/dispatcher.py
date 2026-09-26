@@ -105,6 +105,7 @@ from backend.knowledge.extraction.pipeline import (
 from backend.knowledge.extraction_cache import SKIP_EXTRACTION_FAILED
 from backend.knowledge.version_stamps import compose_model_hash
 
+from . import telemetry
 from .errors import (
     ExtractionInferenceError,
     InferenceResponseInvalidError,
@@ -118,6 +119,10 @@ from .store import BacklogStore, Epoch, PendingTurn, age_ms
 logger = logging.getLogger(__name__)
 
 ApplyListener = Callable[[ApplyReport], Awaitable[None]]
+# Called synchronously, on the event loop, as `listener(previous, current)`
+# after every state transition (and after every cutover transition, with
+# previous == current). Must not block and must not raise.
+StateListener = Callable[[str, str], None]
 
 STATE_IDLE = "idle"
 STATE_WORKING = "working"
@@ -214,6 +219,7 @@ class ExtractionDispatcher:
         self._changed = asyncio.Event()
         self._phase = "idle"  # 'idle' | 'inference' | 'apply'
         self._listeners: list[ApplyListener] = []
+        self._state_listeners: list[StateListener] = []
         self._consecutive_unreachable = 0
         self._consecutive_step_errors = 0
         self._activated_epoch_id: int | None = None
@@ -263,6 +269,16 @@ class ExtractionDispatcher:
         swallowed so one listener cannot stop the backlog.
         """
         self._listeners.append(listener)
+
+    def add_state_listener(self, listener: StateListener) -> None:
+        """Register a callback run on every state (and cutover) transition.
+
+        Called synchronously from the loop as `listener(previous, current)`;
+        the server uses it to push `extraction_status` on a transition rather
+        than only on its timer. A `MistError`, `sqlite3.Error`, `OSError` or
+        `ValueError` it raises is logged and swallowed.
+        """
+        self._state_listeners.append(listener)
 
     async def start(self) -> None:
         """Activate the backlog for the current epoch and, in `service` mode, run it.
@@ -369,7 +385,7 @@ class ExtractionDispatcher:
             apply_pending=apply_pending,
             dead_lettered=dead_lettered,
             oldest_pending_age_ms=oldest,
-            unrecorded_turns=0,
+            unrecorded_turns=telemetry.unrecorded_turns(),
             service=self._service,
             last_job=self._last_job,
         )
@@ -871,6 +887,14 @@ class ExtractionDispatcher:
         else:
             logger.info("Extraction dispatcher %s -> %s", previous, state)
         self._notify()
+        self._emit_state(previous, state)
+
+    def _emit_state(self, previous: str, current: str) -> None:
+        for listener in self._state_listeners:
+            try:
+                listener(previous, current)
+            except (MistError, sqlite3.Error, OSError, ValueError) as exc:
+                logger.warning("Extraction state listener failed (ignored): %s", exc)
 
     def _notify(self) -> None:
         self._changed.set()

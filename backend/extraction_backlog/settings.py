@@ -101,3 +101,22 @@ class DispatcherSettings:
         if failures < 1:
             return 0.0
         return min(self.backoff_cap_s, self.backoff_base_s * (2 ** (failures - 1)))
+
+
+DEFAULT_STATUS_INTERVAL_S = 5.0
+
+
+def status_interval_s() -> float:
+    """Cadence of the periodic `extraction_status` WebSocket push.
+
+    Read from `MIST_EXTRACTION_STATUS_INTERVAL_S` (default 5 s, the same
+    default `system_status` uses). Separate from `DispatcherSettings` because
+    the push runs with no dispatcher at all (it then reports `disabled`).
+
+    Raises:
+        ValueError: The variable is set to a non-number or a value <= 0.
+    """
+    value = _float_env("MIST_EXTRACTION_STATUS_INTERVAL_S", DEFAULT_STATUS_INTERVAL_S)
+    if value <= 0:
+        raise ValueError(f"MIST_EXTRACTION_STATUS_INTERVAL_S must be > 0, got {value}")
+    return value
