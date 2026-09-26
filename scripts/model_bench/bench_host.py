@@ -823,7 +823,7 @@ def check_decision_rules_clean(path: Path, repo_root: Path) -> str:
 
 
 def docker_inspect(names: list[str]) -> dict[str, dict[str, Any]]:
-    """docker inspect the given container names; returns {name: inspect_dict}."""
+    """Docker inspect the given container names; returns {name: inspect_dict}."""
     proc = subprocess.run(
         ["docker", "inspect", *names], capture_output=True, text=True, shell=False
     )
@@ -1293,13 +1293,16 @@ class GpuSampler:
         self._writer = None
 
     def start(self) -> None:
+        """Open the CSV (append mode) and launch the background nvidia-smi sampler."""
         # Append, not truncate (finding 1c): a second `run` call on the same arm dir
         # (--rep 2, a later --layout-pass finalist, ...) must add rows to the existing
         # vram.csv, not discard the earlier call's samples. The header is written only
         # once, when the file is new or still empty.
         self._csv_path.parent.mkdir(parents=True, exist_ok=True)
         write_header = not self._csv_path.exists() or self._csv_path.stat().st_size == 0
-        self._file = open(self._csv_path, "a", newline="", encoding="utf-8")
+        self._file = open(  # noqa: SIM115 -- lifetime spans start()/stop(), closed in stop()
+            self._csv_path, "a", newline="", encoding="utf-8"
+        )
         self._writer = csv.writer(self._file)
         if write_header:
             self._writer.writerow(nvidia_smi_probe.VRAM_CSV_HEADER)
@@ -1322,6 +1325,7 @@ class GpuSampler:
             self._file.flush()
 
     def stop(self) -> None:
+        """Stop the sampler thread and process, then close the CSV file handle."""
         self._stop.set()
         if self._proc is not None:
             self._proc.terminate()

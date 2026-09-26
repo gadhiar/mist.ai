@@ -125,7 +125,7 @@ def nearest_rank_percentile(values: list[float], p: float) -> float | None:
 
 
 def cluster_bootstrap_ci(
-    values_by_cluster: dict[str, list[float]], *, B: int, seed: int, confidence: float
+    values_by_cluster: dict[str, list[float]], *, n_replicates: int, seed: int, confidence: float
 ) -> tuple[float, float] | None:
     """Percentile cluster bootstrap CI: resample cluster ids with replacement.
 
@@ -133,8 +133,8 @@ def cluster_bootstrap_ci(
     original data (with replacement), keeps every row-level value in a
     resampled cluster, and takes the mean over the pooled values. The CI
     bounds are the nearest-rank (100*alpha/2) and (100*(1-alpha/2))
-    percentiles of the B replicate means, so this is deterministic for a
-    fixed seed and a fixed input dict.
+    percentiles of the n_replicates replicate means, so this is deterministic
+    for a fixed seed and a fixed input dict.
     """
     clusters = sorted(values_by_cluster)
     if not clusters:
@@ -142,7 +142,7 @@ def cluster_bootstrap_ci(
     rng = random.Random(seed)
     n_clusters = len(clusters)
     replicate_means: list[float] = []
-    for _ in range(B):
+    for _ in range(n_replicates):
         pooled: list[float] = []
         for _ in range(n_clusters):
             cluster = clusters[rng.randrange(n_clusters)]
@@ -184,6 +184,8 @@ def margin_for(
 
 @dataclass
 class MetricResult:
+    """A single metric's value together with its coverage, CIs, and completeness flags."""
+
     value: float | None
     n: int | None = None
     n_expected: int | None = None
@@ -200,6 +202,7 @@ class MetricResult:
         return not self.missing and self.complete and self.value is not None
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize to the plain-dict shape written into summary.json."""
         return {
             "value": self.value,
             "n": self.n,
@@ -331,6 +334,8 @@ def validate_decision_rules(rules: dict[str, Any], arms: dict[str, Any]) -> list
 
 @dataclass
 class ArmInputs:
+    """One arm's raw loaded inputs from its results directory, pre-aggregation."""
+
     arm_id: str
     dir: Path
     meta: dict[str, Any] | None
@@ -356,7 +361,7 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
-    with open(path, "r", encoding="utf-8", newline="") as fh:
+    with open(path, encoding="utf-8", newline="") as fh:
         reader = csv.DictReader(fh)
         return [dict(row) for row in reader]
 
@@ -405,6 +410,8 @@ def load_arm_inputs(results_dir: Path, arm_id: str) -> ArmInputs:
 
 @dataclass
 class SessionInputs:
+    """The run's session-level (cross-arm) VRAM and manual-observation inputs."""
+
     vram_steps: dict[str, dict[str, Any]]  # label -> step dict
     manual: dict[str, dict[str, Any]]  # arm_id -> {memtest_errors, whea_events}
     total_mib: float | None
@@ -459,7 +466,7 @@ def compute_layout_acc(
         values_by_cluster.setdefault(cluster, []).append(1.0 if r.get("correct") is True else 0.0)
     bootstrap = cluster_bootstrap_ci(
         values_by_cluster,
-        B=stats_cfg["B"],
+        n_replicates=stats_cfg["B"],
         seed=stats_cfg["seed"],
         confidence=stats_cfg["confidence"],
     )
@@ -548,7 +555,7 @@ def compute_harness_scores_for_arm(
         bootstrap = (
             cluster_bootstrap_ci(
                 values_by_cluster,
-                B=stats_cfg["B"],
+                n_replicates=stats_cfg["B"],
                 seed=stats_cfg["seed"],
                 confidence=stats_cfg["confidence"],
             )
@@ -597,7 +604,7 @@ def compute_truncation_rate(
         )
     bootstrap = cluster_bootstrap_ci(
         values_by_cluster,
-        B=stats_cfg["B"],
+        n_replicates=stats_cfg["B"],
         seed=stats_cfg["seed"],
         confidence=stats_cfg["confidence"],
     )
@@ -685,6 +692,8 @@ def compute_voice_metrics(
 
 @dataclass
 class ArmMetrics:
+    """One arm's aggregated metrics across all suites it ran."""
+
     arm_id: str
     layout_acc: dict[str, MetricResult] = field(default_factory=dict)  # pass -> result
     layout_mean_completion_tokens: dict[str, MetricResult] = field(default_factory=dict)
@@ -724,6 +733,8 @@ def pick_layout_pass(
 
 @dataclass
 class RunMetrics:
+    """The full run's per-arm metrics plus the raw rows they were derived from."""
+
     arms: dict[str, ArmMetrics]
     raw_test_scores: dict[
         str, dict[str, harness_scorers.TestScores]
@@ -821,6 +832,8 @@ def combine_gate_verdicts(verdicts: list[str]) -> str:
 
 @dataclass
 class ClauseResult:
+    """One evaluated clause of a decision rule: its metric, threshold, and verdict."""
+
     id: str
     metric: str
     arm: str | None
@@ -833,6 +846,7 @@ class ClauseResult:
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize to the plain-dict shape written into summary.json."""
         return {
             "id": self.id,
             "metric": self.metric,
@@ -849,6 +863,8 @@ class ClauseResult:
 
 @dataclass
 class RuleResult:
+    """A pre-registered (v1) decision rule's overall verdict and its component clauses."""
+
     id: str
     kind: str
     question: str
@@ -858,6 +874,7 @@ class RuleResult:
     info: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize to the plain-dict shape written into summary.json."""
         return {
             "id": self.id,
             "kind": self.kind,
@@ -892,6 +909,7 @@ class ExploratoryRuleResult:
     info: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize to the plain-dict shape written into summary.json."""
         return {
             "id": self.id,
             "label": self.label,
@@ -1840,7 +1858,8 @@ def _anchored_harness_clause(
 ) -> ClauseResult:
     """Same anchor-demotion logic as evaluate_r2's nested `_anchored_clause` (S1/S2),
     duplicated at module level so X3 can reuse it without evaluate_r2 depending on
-    anything outside its own body."""
+    anything outside its own body.
+    """
     candidate_result = metrics.arms.get(candidate)
     cand_metric = (
         candidate_result.harness_score.get(test_name) if candidate_result is not None else None
@@ -2030,7 +2049,8 @@ def _harness_delta_bootstrap_ci(
 ) -> tuple[float, float] | None:
     """Bootstrap CI for (arm's mean score - anchor's mean score) per shared case_id,
     clustered by case_id -- the same cluster_bootstrap_ci machinery compute_harness_scores_for_arm
-    uses, applied to the paired delta instead of a single arm's raw scores."""
+    uses, applied to the paired delta instead of a single arm's raw scores.
+    """
     if arm_raw is None or anchor_raw is None:
         return None
     arm_by_case: dict[str, list[float]] = {}
@@ -2048,7 +2068,7 @@ def _harness_delta_bootstrap_ci(
     }
     return cluster_bootstrap_ci(
         values_by_cluster,
-        B=stats_cfg["B"],
+        n_replicates=stats_cfg["B"],
         seed=stats_cfg["seed"],
         confidence=stats_cfg["confidence"],
     )
@@ -2059,7 +2079,8 @@ def _correctness_identity_vs_anchor(
 ) -> str:
     """'identical' / 'differ' / 'missing' -- whether `rows`' correctness-probe token ids
     match `anchor_rows`' exactly, prompt for prompt. 'missing' whenever either side is
-    empty/absent, carries an errored row, or the prompt_id sets differ -- never guessed."""
+    empty/absent, carries an errored row, or the prompt_id sets differ -- never guessed.
+    """
     if not rows or not anchor_rows:
         return "missing"
     s = _correctness_file_summary(rows)
@@ -2147,7 +2168,8 @@ def evaluate_x3(
     rule_doc: dict[str, Any], metrics: RunMetrics, rules: dict[str, Any]
 ) -> ExploratoryRuleResult:
     """X3: an R2 candidate's L/S1/S2/D/P clauses (identical logic to evaluate_r2, per-clause
-    duplicated -- see the module note above) with F replaced by F_sep (voice excluded)."""
+    duplicated -- see the module note above) with F replaced by F_sep (voice excluded).
+    """
     thresholds = rules["thresholds"]
     constants = rules["constants"]
     cfg = constants["r2_candidates"][rule_doc["r2_candidate_key"]]
@@ -2406,7 +2428,6 @@ def build_grades_harness_with_finish_reason(
     for arm_id, per_test in metrics.raw_test_scores.items():
         if not per_test:
             continue
-        am = metrics.arms.get(arm_id)
         meta = None
         inputs_meta_path = results_dir / arm_id / "meta.json"
         if inputs_meta_path.exists():
@@ -2825,6 +2846,8 @@ def build_summary(
 
 @dataclass
 class GeneratedOutputs:
+    """The full set of files an analysis run produces, keyed by relative output path."""
+
     files: dict[str, str]  # relative path (posix, forward slashes) -> file content
 
 

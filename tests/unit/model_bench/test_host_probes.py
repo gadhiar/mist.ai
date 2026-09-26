@@ -17,8 +17,8 @@ if str(_REPO_ROOT) not in sys.path:
 
 import pytest  # noqa: E402
 
-from scripts.model_bench.probes import nvidia_smi as nvidia_smi_probe  # noqa: E402
 from scripts.model_bench.probes import correctness as correctness_probe  # noqa: E402
+from scripts.model_bench.probes import nvidia_smi as nvidia_smi_probe  # noqa: E402
 from scripts.model_bench.probes import ttft as ttft_probe  # noqa: E402
 
 FIXTURES = _REPO_ROOT / "tests" / "unit" / "model_bench" / "fixtures" / "host"
@@ -89,7 +89,8 @@ def test_cycle_to_length_empty_base_refuses_rather_than_shortening():
 def test_run_ttft_probe_reaches_all_targets_exactly_with_a_sparse_fake_tokenizer(monkeypatch):
     """End to end: a fake /tokenize returning only 3 ids per call must still let
     run_ttft_probe build exact-length prompts at 2048, 8192, and 32000 -- and must
-    call the fake tokenizer exactly once, not once per target."""
+    call the fake tokenizer exactly once, not once per target.
+    """
     call_count = 0
 
     def fake_tokenize(base_url, text, *, timeout=30.0):

@@ -57,7 +57,8 @@ def test_extraction_with_valid_snapshot_passes_preflight_and_invokes_container(
     stubbed, monkeypatch
 ):
     """Control case: a valid snapshot lets preflight pass, meta.json/vram.csv
-    ARE written, and the container argv is built with the resolved image."""
+    ARE written, and the container argv is built with the resolved image.
+    """
     session_dir = stubbed["results_root"] / "run1" / "session"
     session_dir.mkdir(parents=True, exist_ok=True)
     (session_dir / "snapshot.json").write_text(

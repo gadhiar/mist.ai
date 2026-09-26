@@ -1,5 +1,4 @@
-"""
-Pins on the mist-llm service in docker-compose.yml.
+"""Pins on the mist-llm service in docker-compose.yml.
 
 Hermetic: parses the committed compose file only; no docker, no network. Guards two things a
 compose edit could silently undo:

@@ -33,7 +33,6 @@ import json
 import math
 import os
 import random
-import statistics
 import sys
 import uuid
 from pathlib import Path
@@ -100,6 +99,7 @@ class HashSeededUnitEmbeddingProvider:
         self._dimension = dimension
 
     def generate_embedding(self, text: str) -> list[float]:
+        """Return a deterministic, near-orthogonal unit vector hash-seeded from `text`."""
         seed = int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:8], "big")
         rng = random.Random(seed)
         vec = [rng.gauss(0.0, 1.0) for _ in range(self._dimension)]
@@ -109,6 +109,7 @@ class HashSeededUnitEmbeddingProvider:
         return vec
 
     def generate_embeddings(self, texts: list[str]) -> list[list[float]]:
+        """Return one deterministic embedding per input text, in order."""
         return [self.generate_embedding(t) for t in texts]
 
 
@@ -155,7 +156,7 @@ def _nearest_rank_percentile(values: list[float], p: float) -> float:
 def cluster_bootstrap_ratio_ci(
     per_probe_counts: dict[str, tuple[int, int, int]],
     *,
-    B: int,
+    n_replicates: int,
     seed: int,
     confidence: float,
     kind: str,
@@ -179,7 +180,7 @@ def cluster_bootstrap_ratio_ci(
     rng = random.Random(seed)
     n_tags = len(tags)
     replicate_values: list[float] = []
-    for _ in range(B):
+    for _ in range(n_replicates):
         tp = fp = fn = 0
         for _ in range(n_tags):
             tag = tags[rng.randrange(n_tags)]
@@ -308,28 +309,28 @@ def build_summary(
             "confidence": bootstrap_confidence,
             "entity_precision": cluster_bootstrap_ratio_ci(
                 entity_counts,
-                B=bootstrap_b,
+                n_replicates=bootstrap_b,
                 seed=bootstrap_seed,
                 confidence=bootstrap_confidence,
                 kind="precision",
             ),
             "entity_recall": cluster_bootstrap_ratio_ci(
                 entity_counts,
-                B=bootstrap_b,
+                n_replicates=bootstrap_b,
                 seed=bootstrap_seed,
                 confidence=bootstrap_confidence,
                 kind="recall",
             ),
             "rel_precision": cluster_bootstrap_ratio_ci(
                 rel_counts,
-                B=bootstrap_b,
+                n_replicates=bootstrap_b,
                 seed=bootstrap_seed,
                 confidence=bootstrap_confidence,
                 kind="precision",
             ),
             "rel_recall": cluster_bootstrap_ratio_ci(
                 rel_counts,
-                B=bootstrap_b,
+                n_replicates=bootstrap_b,
                 seed=bootstrap_seed,
                 confidence=bootstrap_confidence,
                 kind="recall",

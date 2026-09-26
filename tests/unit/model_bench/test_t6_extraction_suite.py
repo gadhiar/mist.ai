@@ -34,8 +34,10 @@ if str(_REPO_ROOT) not in sys.path:
 
 import pytest  # noqa: E402
 
-from scripts.model_bench import analyse  # noqa: E402
-from scripts.model_bench import bench_host  # noqa: E402
+from scripts.model_bench import (
+    analyse,  # noqa: E402
+    bench_host,  # noqa: E402
+)
 from scripts.model_bench.probes import extraction as extraction_probe  # noqa: E402
 
 FIXTURE_RUN = Path(__file__).resolve().parent / "fixtures" / "analyse" / "run"
@@ -74,7 +76,8 @@ def test_default_suites_unaffected_by_universal_extraction():
 
 def test_arm_still_declaring_extraction_would_also_work(monkeypatch):
     """UNIVERSAL_SUITES is an allowance, not exclusive: an arm that DID declare
-    extraction (hypothetically) would still resolve it via the normal branch."""
+    extraction (hypothetically) would still resolve it via the normal branch.
+    """
     arms_doc = bench_host.load_arms_doc()
     arm = dict(bench_host.resolve_arm(arms_doc, "c1-512"))
     arm["suites"] = [*arm["suites"], "extraction"]
@@ -158,7 +161,8 @@ def test_resolve_backend_image_ref_missing_raises(tmp_path):
 def test_resolve_backend_image_ref_missing_snapshot_file_raises_cleanly(tmp_path):
     """T6 reviewer finding 4: a missing snapshot file must not surface as an
     uncaught FileNotFoundError -- cmd_run's preflight needs an ImageRefError
-    it can catch and turn into a clean [FAIL]."""
+    it can catch and turn into a clean [FAIL].
+    """
     with pytest.raises(bench_host.ImageRefError):
         bench_host.resolve_backend_image_ref(tmp_path / "does-not-exist.json")
 
@@ -219,7 +223,8 @@ def test_probe_module_does_not_define_its_own_scorer():
     """The scorer is imported and called, never copied: `score_run` /
     `iter_gold_probes` / `build_produced_index` are not redefined at module
     scope in probes/extraction.py (they are local-imported inside
-    `run_probe`, from `scripts.eval_harness.score_extraction_run`)."""
+    `run_probe`, from `scripts.eval_harness.score_extraction_run`).
+    """
     for name in ("score_run", "iter_gold_probes", "build_produced_index", "iter_debug_records"):
         assert not hasattr(
             extraction_probe, name
@@ -228,7 +233,8 @@ def test_probe_module_does_not_define_its_own_scorer():
 
 def test_probe_module_does_not_build_its_own_llm_request():
     """probes/extraction.py never constructs `backend.llm.models.LLMRequest`
-    itself -- it delegates entirely to `run_extraction_only_replay`."""
+    itself -- it delegates entirely to `run_extraction_only_replay`.
+    """
     source = inspect.getsource(extraction_probe)
     assert "LLMRequest(" not in source
     assert "run_extraction_only_replay" in source
@@ -247,7 +253,8 @@ def test_default_gold_corpus_matches_the_v1_4_0_adjudicated_corpus():
 
 class _CapturingLLMProvider:
     """Captures every `LLMRequest` the ontology extractor builds. Satisfies
-    just enough of `LLMProvider` for `OntologyConstrainedExtractor.invoke`."""
+    just enough of `LLMProvider` for `OntologyConstrainedExtractor.invoke`.
+    """
 
     def __init__(self, response_content: str) -> None:
         self.calls = []
@@ -274,10 +281,11 @@ def test_ontology_extractor_request_matches_production_shape():
     by this SAME production code, so asserting its shape here is what
     "the probe's request build equals the production extractor's own" means.
     """
+    from datetime import UTC, datetime
+
     from backend.knowledge.config import KnowledgeConfig
     from backend.knowledge.extraction.ontology_extractor import OntologyConstrainedExtractor
     from backend.knowledge.extraction.preprocessor import PreProcessedInput
-    from datetime import UTC, datetime
 
     config = KnowledgeConfig.from_env()
     provider = _CapturingLLMProvider('{"entities": [], "relationships": []}')
@@ -359,7 +367,8 @@ def test_ext11_is_gated_out_by_the_old_conftest_fake_embedding_provider():
     """Documents the bug: tests.unit.knowledge.conftest.FakeEmbeddingProvider's
     tiled, all-positive vectors spuriously collide, so the significance gate
     (pipeline.py:673-674) skips ext-11-smalltalk-negative before it ever
-    reaches the LLM."""
+    reaches the LLM.
+    """
     from tests.unit.knowledge.conftest import FakeEmbeddingProvider as OldFakeEmbeddingProvider
 
     assert _ext11_llm_call_count(OldFakeEmbeddingProvider()) == 0
@@ -367,7 +376,8 @@ def test_ext11_is_gated_out_by_the_old_conftest_fake_embedding_provider():
 
 def test_ext11_reaches_the_llm_with_the_near_orthogonal_fake_embedding_provider():
     """The fix: probes/extraction.py's HashSeededUnitEmbeddingProvider does
-    not spuriously collide, so ext-11-smalltalk-negative reaches the LLM."""
+    not spuriously collide, so ext-11-smalltalk-negative reaches the LLM.
+    """
     assert _ext11_llm_call_count(extraction_probe.HashSeededUnitEmbeddingProvider()) >= 1
 
 
@@ -378,7 +388,8 @@ def test_ext11_reaches_the_llm_with_the_near_orthogonal_fake_embedding_provider(
 
 def test_wilson_interval_matches_analyse_py_formula():
     """Duplicated formula (see the module docstring) -- pinned against
-    `analyse.py`'s own `wilson_interval` for a spread of k/n."""
+    `analyse.py`'s own `wilson_interval` for a spread of k/n.
+    """
     z = 1.9599639845400545
     for k, n in [(9, 10), (1, 1), (0, 5), (3, 3), (27, 60)]:
         assert extraction_probe.wilson_interval(k, n, z) == analyse.wilson_interval(k, n, z)
@@ -391,7 +402,7 @@ def test_wilson_interval_none_on_zero_denominator():
 def test_cluster_bootstrap_ratio_ci_precision_is_between_0_and_1():
     counts = {"p1": (2, 0, 0), "p2": (1, 1, 0), "p3": (0, 0, 1)}
     ci = extraction_probe.cluster_bootstrap_ratio_ci(
-        counts, B=200, seed=1, confidence=0.95, kind="precision"
+        counts, n_replicates=200, seed=1, confidence=0.95, kind="precision"
     )
     assert ci is not None
     lo, hi = ci
@@ -401,10 +412,10 @@ def test_cluster_bootstrap_ratio_ci_precision_is_between_0_and_1():
 def test_cluster_bootstrap_ratio_ci_deterministic_for_fixed_seed():
     counts = {"p1": (2, 0, 0), "p2": (1, 1, 0), "p3": (0, 0, 1)}
     ci_a = extraction_probe.cluster_bootstrap_ratio_ci(
-        counts, B=500, seed=42, confidence=0.95, kind="recall"
+        counts, n_replicates=500, seed=42, confidence=0.95, kind="recall"
     )
     ci_b = extraction_probe.cluster_bootstrap_ratio_ci(
-        counts, B=500, seed=42, confidence=0.95, kind="recall"
+        counts, n_replicates=500, seed=42, confidence=0.95, kind="recall"
     )
     assert ci_a == ci_b
 
@@ -412,7 +423,7 @@ def test_cluster_bootstrap_ratio_ci_deterministic_for_fixed_seed():
 def test_cluster_bootstrap_ratio_ci_empty_returns_none():
     assert (
         extraction_probe.cluster_bootstrap_ratio_ci(
-            {}, B=10, seed=1, confidence=0.95, kind="precision"
+            {}, n_replicates=10, seed=1, confidence=0.95, kind="precision"
         )
         is None
     )
@@ -440,7 +451,8 @@ def test_per_probe_entity_counts_derives_tp_from_gold_minus_fn():
 
 class _FakeReport:
     """Minimal stand-in for score_extraction_run.Report's public surface
-    that build_summary/build_per_item_rows reads."""
+    that build_summary/build_per_item_rows reads.
+    """
 
     def __init__(self):
         self.per_probe = [
@@ -539,7 +551,8 @@ def test_build_summary_rel_f1_is_harmonic_mean():
 def test_build_summary_complete_true_when_matched_equals_total():
     """T6 reviewer finding 1b: `complete` mirrors the SAME invariant
     score_extraction_run.py:812 checks (`matched_probes == total_probes`),
-    computed from `report.per_probe`'s own `matched` flags."""
+    computed from `report.per_probe`'s own `matched` flags.
+    """
     report = _FakeReport()
     report.per_probe[1]["matched"] = True  # make both probes matched
     report.matched_probes = 2
@@ -559,7 +572,8 @@ def test_build_summary_complete_true_when_matched_equals_total():
 def test_build_summary_incomplete_when_a_probe_is_unmatched():
     """The `_FakeReport` fixture's p2 is unmatched by construction -- this is
     the "fewer probes matched than exist" scenario the fail-closed check
-    (probes/extraction.py's `main`) must catch."""
+    (probes/extraction.py's `main`) must catch.
+    """
     report = _FakeReport()
     summary = extraction_probe.build_summary(
         report,
@@ -577,7 +591,8 @@ def test_build_summary_incomplete_when_a_probe_is_unmatched():
 def test_build_summary_empty_corpus_never_complete():
     """Mirrors score_extraction_run.py:804-810's guard: on an empty corpus,
     matched_probes == total_probes is a vacuous 0 == 0 -- must not read as
-    complete."""
+    complete.
+    """
     report = _FakeReport()
     report.per_probe = []
     report.total_probes = 0
@@ -638,7 +653,8 @@ def test_v1_rules_and_exploratory_sections_unchanged_by_t6():
     makes for decision_rules.json's content, applied to render_report's output:
     everything from '## Rules' up to (not including) the new 'Extraction
     quality' section must be byte-identical to the pre-T6 committed fixture
-    (agent/mist-model-bench/integration @ 1fbf995, the merge base for this task)."""
+    (agent/mist-model-bench/integration @ 1fbf995, the merge base for this task).
+    """
     proc = subprocess.run(
         [
             "git",
@@ -698,7 +714,8 @@ def test_extraction_quality_section_c0_and_c1_512_present():
 def test_extraction_quality_section_renders_incomplete_arm_with_no_metrics_row(monkeypatch):
     """T6 reviewer finding 1b: an arm whose extraction_summary.json has
     `complete: false` (a partial match) must render as incomplete, with no
-    metrics table row -- not silently scored on a partial run."""
+    metrics table row -- not silently scored on a partial run.
+    """
     real_load = analyse.load_extraction_summary
 
     def fake_load(results_dir, arm_id):

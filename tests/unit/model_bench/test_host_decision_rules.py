@@ -19,7 +19,7 @@ import pytest  # noqa: E402
 from scripts.model_bench.bench_host import (
     DecisionRulesError,
     check_decision_rules_clean,
-)  # noqa: E402
+)
 
 
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
