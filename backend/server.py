@@ -87,7 +87,10 @@ logger = logging.getLogger(__name__)
 # WebSocket protocol version sent on session_started per ADR-017. Bump
 # minor on additive event/field additions, major on breaking changes.
 # v1.1.0 (2026-05-25): documents vault_results + system_status (shipped 2026-05-11).
-PROTOCOL_VERSION = "1.1.0"
+# v1.2.0 (2026-09-22): uptime_* fields in the ADR; this constant was not bumped then.
+# v1.3.0 (2026-09-26, MIS-171): additive `extraction_status` outbound message.
+# Pinned by tests/unit/test_server_protocol_version.py.
+PROTOCOL_VERSION = "1.3.0"
 
 # Global state
 active_connections: set[WebSocket] = set()

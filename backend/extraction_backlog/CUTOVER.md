@@ -199,15 +199,18 @@ not loosen or bypass either guard:
   "the live state root will never carry" (`scripts/backup/README.md` section 4.2)
   and also runs `assert_neo4j_dev_isolated` on the graph URI.
 
-So the method for this step is a decision for Raj and the lead. Candidates, none
-verified:
+Recommended method (lead, 2026-09-26): the volume swap below. Restore into a fresh
+allowlisted instance, repoint `mist-neo4j` at that instance's volume, and keep the
+old live volume untouched as the rollback. It is a host operation that Raj confirms
+when a cutover actually runs; nothing in this repository performs it. Both
+candidates are still unverified:
 
 - [UNVERIFIED] Neo4j offline copy: stop `mist-neo4j`, then load a
   `neo4j-admin database dump` of the checked graph into the live data volume with
   `neo4j-admin database load --overwrite-destination=true`. The staging instance
   is on tmpfs, so the dump would have to come from a non-tmpfs instance the
   staging artifact (5.2) was restored into.
-- [UNVERIFIED] Volume swap: restore the staging artifact (5.2) into a fresh,
+- [UNVERIFIED, RECOMMENDED] Volume swap: restore the staging artifact (5.2) into a fresh,
   dev-allowlisted Neo4j instance with the existing `graph-restore`, stop it, and
   re-point the live `mist-neo4j` service at that instance's data volume.
 
