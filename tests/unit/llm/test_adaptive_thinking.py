@@ -388,6 +388,66 @@ class TestRetryCounter:
 
 
 # ---------------------------------------------------------------------------
+# A server that ignores `reasoning_budget_tokens` (e.g. live mist-llm at b8808,
+# reasoning_format none). It answers the budgeted request exactly as if no
+# budget had been sent: no reasoning_content, a normal tool call or reply.
+# The wrapper must pass that through with ONE call, no retry, no error.
+# ---------------------------------------------------------------------------
+
+
+def _ignored_budget_tool_call() -> LLMResponse:
+    return LLMResponse(
+        content="",
+        tool_calls=[ToolCall(id="c1", name="query_knowledge_graph", arguments={"q": "x"})],
+        partial=False,
+        finish_reason="tool_calls",
+        reasoning_content=None,
+    )
+
+
+class TestServerIgnoresBudgetField:
+    @pytest.mark.asyncio
+    async def test_nonstream_tool_call_passes_through_without_retry(self):
+        inner = ScriptedProvider([[_ignored_budget_tool_call()]])
+        provider = AdaptiveThinkingProvider(inner, budget_tokens=1024)
+
+        out = await _collect_async(provider.generate(_request(tools=TOOLS), stream=False))
+
+        assert inner.call_count == 1
+        assert get_adaptive_thinking_retry_count() == 0
+        assert [r.tool_calls[0].name for r in out if r.tool_calls] == ["query_knowledge_graph"]
+
+    @pytest.mark.asyncio
+    async def test_stream_plain_reply_passes_through_without_retry(self):
+        inner = ScriptedProvider(
+            [
+                [
+                    LLMResponse(content="Hello ", partial=True),
+                    LLMResponse(content="there.", partial=True),
+                    LLMResponse(content=None, partial=False, finish_reason="stop"),
+                ]
+            ]
+        )
+        provider = AdaptiveThinkingProvider(inner, budget_tokens=1024)
+
+        out = await _collect_async(provider.generate(_request(tools=TOOLS), stream=True))
+
+        assert inner.call_count == 1
+        assert get_adaptive_thinking_retry_count() == 0
+        assert "".join(r.content for r in out if r.partial and r.content) == "Hello there."
+
+    def test_sync_invoke_passes_through_without_retry(self):
+        inner = ScriptedProvider([[_ignored_budget_tool_call()]])
+        provider = AdaptiveThinkingProvider(inner, budget_tokens=1024)
+
+        response = provider.invoke_sync(_request(tools=TOOLS))
+
+        assert inner.call_count == 1
+        assert get_adaptive_thinking_retry_count() == 0
+        assert response.tool_calls[0].name == "query_knowledge_graph"
+
+
+# ---------------------------------------------------------------------------
 # model attribute and passthrough methods
 # ---------------------------------------------------------------------------
 

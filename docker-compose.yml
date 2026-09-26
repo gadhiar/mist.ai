@@ -155,6 +155,15 @@ services:
     command:
       - "--no-kv-unified"
       - "--no-webui"
+      # Reasoning goes to `message.reasoning_content`, never into `content`
+      # (llama_server_help_b11151.txt:628-634). Tool-dispatch turns send a
+      # per-request `reasoning_budget_tokens` (backend/llm/adaptive_thinking.py,
+      # MIS-171 decision 6), so NO `--reasoning-budget` flag here: a request
+      # value of -1 falls back to that server flag, and a server cap would
+      # silently clip the unbudgeted retry. Pinned by
+      # tests/unit/test_compose_mist_llm_reasoning.py.
+      - "--reasoning-format"
+      - "deepseek"
       - "--temp"
       - "1.0"
       - "--top-p"
