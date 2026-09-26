@@ -11,7 +11,10 @@ if str(_REPO_ROOT) not in sys.path:
 
 import pytest  # noqa: E402
 
-from scripts.model_bench.bench_host import ResultsRootError, check_results_root_outside_repo  # noqa: E402
+from scripts.model_bench.bench_host import (
+    ResultsRootError,
+    check_results_root_outside_repo,
+)  # noqa: E402
 
 
 def test_results_root_inside_repo_refused():

@@ -47,7 +47,10 @@ def test_restore_diff_id_changed_flags_recreate():
     assert diff["empty"] is False
     assert diff["id_changed"] is True
     assert diff["containers"]["mist-llm"]["id_changed"] is True
-    assert diff["containers"]["mist-llm"]["diffs"]["Id"] == {"before": "sha256:aaa", "after": "sha256:zzz"}
+    assert diff["containers"]["mist-llm"]["diffs"]["Id"] == {
+        "before": "sha256:aaa",
+        "after": "sha256:zzz",
+    }
 
 
 def test_restore_diff_missing_container_counts_as_id_changed():

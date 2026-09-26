@@ -61,7 +61,14 @@ def test_v1_file_sha256_matches_the_supersedes_entry():
     import hashlib
 
     proc = subprocess.run(
-        ["git", "-C", str(_REPO_ROOT), "cat-file", "-p", f"{V1_COMMIT}:scripts/model_bench/decision_rules.json"],
+        [
+            "git",
+            "-C",
+            str(_REPO_ROOT),
+            "cat-file",
+            "-p",
+            f"{V1_COMMIT}:scripts/model_bench/decision_rules.json",
+        ],
         capture_output=True,
         text=True,
         shell=False,

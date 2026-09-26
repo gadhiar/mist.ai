@@ -307,20 +307,32 @@ def build_summary(
             "B": bootstrap_b,
             "confidence": bootstrap_confidence,
             "entity_precision": cluster_bootstrap_ratio_ci(
-                entity_counts, B=bootstrap_b, seed=bootstrap_seed,
-                confidence=bootstrap_confidence, kind="precision",
+                entity_counts,
+                B=bootstrap_b,
+                seed=bootstrap_seed,
+                confidence=bootstrap_confidence,
+                kind="precision",
             ),
             "entity_recall": cluster_bootstrap_ratio_ci(
-                entity_counts, B=bootstrap_b, seed=bootstrap_seed,
-                confidence=bootstrap_confidence, kind="recall",
+                entity_counts,
+                B=bootstrap_b,
+                seed=bootstrap_seed,
+                confidence=bootstrap_confidence,
+                kind="recall",
             ),
             "rel_precision": cluster_bootstrap_ratio_ci(
-                rel_counts, B=bootstrap_b, seed=bootstrap_seed,
-                confidence=bootstrap_confidence, kind="precision",
+                rel_counts,
+                B=bootstrap_b,
+                seed=bootstrap_seed,
+                confidence=bootstrap_confidence,
+                kind="precision",
             ),
             "rel_recall": cluster_bootstrap_ratio_ci(
-                rel_counts, B=bootstrap_b, seed=bootstrap_seed,
-                confidence=bootstrap_confidence, kind="recall",
+                rel_counts,
+                B=bootstrap_b,
+                seed=bootstrap_seed,
+                confidence=bootstrap_confidence,
+                kind="recall",
             ),
         },
     }
@@ -476,9 +488,17 @@ def run_probe(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="T6 universal extraction suite probe.")
-    p.add_argument("--base-url", required=True, help="llama-server base URL, e.g. http://127.0.0.1:8080")
-    p.add_argument("--gold", default=DEFAULT_GOLD_CORPUS, help="Gold corpus JSONL, relative to repo root.")
-    p.add_argument("--out", required=True, help="Output directory (extraction.jsonl + extraction_summary.json).")
+    p.add_argument(
+        "--base-url", required=True, help="llama-server base URL, e.g. http://127.0.0.1:8080"
+    )
+    p.add_argument(
+        "--gold", default=DEFAULT_GOLD_CORPUS, help="Gold corpus JSONL, relative to repo root."
+    )
+    p.add_argument(
+        "--out",
+        required=True,
+        help="Output directory (extraction.jsonl + extraction_summary.json).",
+    )
     p.add_argument("--session-id", default=None)
     return p.parse_args(argv)
 
@@ -505,7 +525,14 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    print(json.dumps({"rel_precision": summary["rel_precision"], "typing_accuracy": summary["typing_accuracy"]}))
+    print(
+        json.dumps(
+            {
+                "rel_precision": summary["rel_precision"],
+                "typing_accuracy": summary["typing_accuracy"],
+            }
+        )
+    )
     return 0
 
 

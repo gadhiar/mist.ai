@@ -25,7 +25,9 @@ _FLAG_TOKEN = r"-{1,2}[A-Za-z][\w-]*"
 # well past the flag column (40+ spaces) -- then one or more comma-separated
 # flag tokens, then either whitespace (an argument placeholder or the
 # description) or end of line.
-_OPTION_LINE_RE = re.compile(rf"^[ \t]{{0,8}}(?P<flags>{_FLAG_TOKEN}(?:,\s*{_FLAG_TOKEN})*)(?=[ \t]|$)")
+_OPTION_LINE_RE = re.compile(
+    rf"^[ \t]{{0,8}}(?P<flags>{_FLAG_TOKEN}(?:,\s*{_FLAG_TOKEN})*)(?=[ \t]|$)"
+)
 
 
 def parse_help_flags(text: str) -> set[str]:

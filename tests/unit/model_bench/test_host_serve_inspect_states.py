@@ -87,7 +87,9 @@ class FakeClock:
 
 
 def _common_stubs(monkeypatch, *, docker_rm_calls, docker_stop_calls):
-    monkeypatch.setattr(bench_host, "load_arms_doc", lambda path=bench_host.ARMS_JSON_PATH: FAKE_ARMS_DOC)
+    monkeypatch.setattr(
+        bench_host, "load_arms_doc", lambda path=bench_host.ARMS_JSON_PATH: FAKE_ARMS_DOC
+    )
     monkeypatch.setattr(bench_host, "docker_is_running", lambda name: False)
     monkeypatch.setattr(bench_host, "docker_run_detached", lambda argv: "fake-container-id")
     monkeypatch.setattr(bench_host, "docker_logs", lambda name: ("stdout stub", "stderr stub"))
@@ -95,7 +97,10 @@ def _common_stubs(monkeypatch, *, docker_rm_calls, docker_stop_calls):
         bench_host, "docker_rm", lambda names: docker_rm_calls.append(list(names)), raising=False
     )
     monkeypatch.setattr(
-        bench_host, "docker_stop", lambda names: docker_stop_calls.append(list(names)), raising=False
+        bench_host,
+        "docker_stop",
+        lambda names: docker_stop_calls.append(list(names)),
+        raising=False,
     )
 
 
@@ -205,7 +210,9 @@ def test_serve_preflight_refuses_when_existence_cannot_be_determined(monkeypatch
     serve must refuse rather than assume the name is free."""
     run_detached_calls: list[list[str]] = []
 
-    monkeypatch.setattr(bench_host, "load_arms_doc", lambda path=bench_host.ARMS_JSON_PATH: FAKE_ARMS_DOC)
+    monkeypatch.setattr(
+        bench_host, "load_arms_doc", lambda path=bench_host.ARMS_JSON_PATH: FAKE_ARMS_DOC
+    )
     monkeypatch.setattr(bench_host, "docker_is_running", lambda name: False)
     monkeypatch.setattr(
         bench_host,

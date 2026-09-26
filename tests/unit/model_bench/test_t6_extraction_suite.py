@@ -221,7 +221,9 @@ def test_probe_module_does_not_define_its_own_scorer():
     scope in probes/extraction.py (they are local-imported inside
     `run_probe`, from `scripts.eval_harness.score_extraction_run`)."""
     for name in ("score_run", "iter_gold_probes", "build_produced_index", "iter_debug_records"):
-        assert not hasattr(extraction_probe, name), f"{name} must not be redefined in probes/extraction.py"
+        assert not hasattr(
+            extraction_probe, name
+        ), f"{name} must not be redefined in probes/extraction.py"
 
 
 def test_probe_module_does_not_build_its_own_llm_request():
@@ -329,13 +331,17 @@ def _ext11_llm_call_count(embedding_provider) -> int:
 
     provider = _CapturingLLMProvider('{"entities": [], "relationships": []}')
     config = KnowledgeConfig.from_env()
-    graph_store = GraphStore(connection=FakeNeo4jConnection(), embedding_generator=embedding_provider)
+    graph_store = GraphStore(
+        connection=FakeNeo4jConnection(), embedding_generator=embedding_provider
+    )
     handler = build_conversation_handler(
         config, llm_provider=provider, graph_store=graph_store, vector_store=FakeVectorStore()
     )
     inputs = _gold_inputs_through_ext11()
     asyncio.run(_run_replay(handler, inputs))
-    ext11_utterance = next(i["utterance"] for i in inputs if i["tag"] == "ext-11-smalltalk-negative")
+    ext11_utterance = next(
+        i["utterance"] for i in inputs if i["tag"] == "ext-11-smalltalk-negative"
+    )
     return sum(
         1
         for call in provider.calls
@@ -405,14 +411,21 @@ def test_cluster_bootstrap_ratio_ci_deterministic_for_fixed_seed():
 
 def test_cluster_bootstrap_ratio_ci_empty_returns_none():
     assert (
-        extraction_probe.cluster_bootstrap_ratio_ci({}, B=10, seed=1, confidence=0.95, kind="precision")
+        extraction_probe.cluster_bootstrap_ratio_ci(
+            {}, B=10, seed=1, confidence=0.95, kind="precision"
+        )
         is None
     )
 
 
 def test_per_probe_rel_counts_derives_tp_from_gold_minus_fn():
     per_probe = [
-        {"tag": "p1", "gold_relationships": 3, "rel_fps": [["a", "USES", "b"]], "rel_fns": [["c", "USES", "d"]]}
+        {
+            "tag": "p1",
+            "gold_relationships": 3,
+            "rel_fps": [["a", "USES", "b"]],
+            "rel_fns": [["c", "USES", "d"]],
+        }
     ]
     counts = extraction_probe.per_probe_rel_counts(per_probe)
     # tp = gold_relationships - fn = 3 - 1 = 2; fp = 1; fn = 1
@@ -627,7 +640,13 @@ def test_v1_rules_and_exploratory_sections_unchanged_by_t6():
     quality' section must be byte-identical to the pre-T6 committed fixture
     (agent/mist-model-bench/integration @ 1fbf995, the merge base for this task)."""
     proc = subprocess.run(
-        ["git", "-C", str(_REPO_ROOT), "show", "1fbf995:tests/unit/model_bench/fixtures/analyse/expected/REPORT.md"],
+        [
+            "git",
+            "-C",
+            str(_REPO_ROOT),
+            "show",
+            "1fbf995:tests/unit/model_bench/fixtures/analyse/expected/REPORT.md",
+        ],
         capture_output=True,
         text=True,
         shell=False,

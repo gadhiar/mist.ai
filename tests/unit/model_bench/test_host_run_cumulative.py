@@ -30,7 +30,13 @@ from scripts.model_bench.probes import ttft as ttft_probe  # noqa: E402
 
 HARNESS_FIXTURE = (
     Path(__file__).resolve().parent
-    / "fixtures" / "analyse" / "run" / "a1" / "harness" / "harness" / "bench-c0.jsonl"
+    / "fixtures"
+    / "analyse"
+    / "run"
+    / "a1"
+    / "harness"
+    / "harness"
+    / "bench-c0.jsonl"
 )
 
 FAKE_ARMS_DOC = {
@@ -51,7 +57,10 @@ FAKE_ARMS_DOC = {
 }
 
 EXPECTED_ARGS = ["-m", "/models/fake/model.gguf"]
-FAKE_PROPS = {"model_path": "/models/fake/model.gguf", "default_generation_settings": {"n_ctx": 8192}}
+FAKE_PROPS = {
+    "model_path": "/models/fake/model.gguf",
+    "default_generation_settings": {"n_ctx": 8192},
+}
 FAKE_VRAM_LINE = "3200, 12288, 45.23, 1800, 9500, 60, 0x0000000000000000, 4, 16\n"
 
 
@@ -90,14 +99,30 @@ def _fake_subprocess_run(argv, cwd=None, shell=False, **kwargs):
         result_dir.mkdir(parents=True, exist_ok=True)
         graded_rows = [
             {
-                "id": "L001", "layout_id": "L001", "task": "t", "correct": True, "parse_ok": True,
-                "status": "ok", "finish_reason": "stop", "wall_ms": 500.0, "phase": "accuracy",
-                "model": "fake", "usage": {"completion_tokens": 40, "prompt_tokens": 10, "total_tokens": 50},
+                "id": "L001",
+                "layout_id": "L001",
+                "task": "t",
+                "correct": True,
+                "parse_ok": True,
+                "status": "ok",
+                "finish_reason": "stop",
+                "wall_ms": 500.0,
+                "phase": "accuracy",
+                "model": "fake",
+                "usage": {"completion_tokens": 40, "prompt_tokens": 10, "total_tokens": 50},
             },
             {
-                "id": "L002", "layout_id": "L002", "task": "t", "correct": False, "parse_ok": True,
-                "status": "ok", "finish_reason": "stop", "wall_ms": 600.0, "phase": "accuracy",
-                "model": "fake", "usage": {"completion_tokens": 42, "prompt_tokens": 10, "total_tokens": 52},
+                "id": "L002",
+                "layout_id": "L002",
+                "task": "t",
+                "correct": False,
+                "parse_ok": True,
+                "status": "ok",
+                "finish_reason": "stop",
+                "wall_ms": 600.0,
+                "phase": "accuracy",
+                "model": "fake",
+                "usage": {"completion_tokens": 42, "prompt_tokens": 10, "total_tokens": 52},
             },
         ]
         (result_dir / "graded.jsonl").write_text(
@@ -136,7 +161,9 @@ def _fake_collect_git_state(repo_root, layout_dir):
 
 @pytest.fixture
 def stubbed(monkeypatch, tmp_path):
-    monkeypatch.setattr(bench_host, "load_arms_doc", lambda path=bench_host.ARMS_JSON_PATH: FAKE_ARMS_DOC)
+    monkeypatch.setattr(
+        bench_host, "load_arms_doc", lambda path=bench_host.ARMS_JSON_PATH: FAKE_ARMS_DOC
+    )
     monkeypatch.setattr(bench_host, "docker_inspect", _fake_docker_inspect)
     monkeypatch.setattr(bench_host, "wait_for_llama_props", _fake_wait_for_llama_props)
     monkeypatch.setattr(bench_host, "check_decision_rules_clean", _fake_check_decision_rules_clean)
@@ -148,8 +175,13 @@ def stubbed(monkeypatch, tmp_path):
         "run_ttft_probe",
         lambda base_url, **kw: [
             {
-                "ctx_target": 2048, "prompt_tokens": 2048, "rep": 0, "warmup": False,
-                "ttft_ms": 100.0, "error": None, "predicted_per_second": 20.0,
+                "ctx_target": 2048,
+                "prompt_tokens": 2048,
+                "rep": 0,
+                "warmup": False,
+                "ttft_ms": 100.0,
+                "error": None,
+                "predicted_per_second": 20.0,
             }
         ],
     )
@@ -168,11 +200,25 @@ def stubbed(monkeypatch, tmp_path):
     return {"results_root": results_root, "layout_dir": layout_dir}
 
 
-def _run(stubbed, *, suites=None, rep=None, layout_pass=None, tuning_label=None, arm="test-arm", run="run1"):
+def _run(
+    stubbed,
+    *,
+    suites=None,
+    rep=None,
+    layout_pass=None,
+    tuning_label=None,
+    arm="test-arm",
+    run="run1",
+):
     argv = [
-        "run", arm, "--run", run,
-        "--results-root", str(stubbed["results_root"]),
-        "--layout-dir", str(stubbed["layout_dir"]),
+        "run",
+        arm,
+        "--run",
+        run,
+        "--results-root",
+        str(stubbed["results_root"]),
+        "--layout-dir",
+        str(stubbed["layout_dir"]),
     ]
     if suites is not None:
         argv += ["--suites", *suites]
@@ -252,7 +298,9 @@ def test_cumulative_sequence_across_four_calls(stubbed, capsys):
     assert harness_scores["schema_conformance"].usable(), harness_scores["schema_conformance"]
 
     for layout_pass in ("screen", "finalist"):
-        acc = analyse_mod.compute_layout_acc(inputs.layout_rows.get(layout_pass), n_expected=999, stats_cfg=stats_cfg)
+        acc = analyse_mod.compute_layout_acc(
+            inputs.layout_rows.get(layout_pass), n_expected=999, stats_cfg=stats_cfg
+        )
         assert acc.missing is False, f"{layout_pass}: {acc}"
 
 

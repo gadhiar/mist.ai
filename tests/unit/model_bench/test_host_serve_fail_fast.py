@@ -73,7 +73,9 @@ def test_serve_fails_fast_and_saves_logs_when_container_exits_during_health_wait
             return bench_host.ContainerProbe("absent", "no mist-bench-llm yet")
         return _fake_probe_exited(name, timeout_s=timeout_s)
 
-    monkeypatch.setattr(bench_host, "load_arms_doc", lambda path=bench_host.ARMS_JSON_PATH: FAKE_ARMS_DOC)
+    monkeypatch.setattr(
+        bench_host, "load_arms_doc", lambda path=bench_host.ARMS_JSON_PATH: FAKE_ARMS_DOC
+    )
     monkeypatch.setattr(bench_host, "docker_is_running", lambda name: False)
     monkeypatch.setattr(bench_host, "docker_run_detached", lambda argv: "fake-container-id")
     monkeypatch.setattr(bench_host, "probe_container_state", _preflight_then_exited)

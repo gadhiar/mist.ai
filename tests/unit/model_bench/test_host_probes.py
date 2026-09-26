@@ -56,7 +56,9 @@ def test_extract_ttft_row_no_first_content_gives_none_ttft():
 
 def test_extract_ttft_row_without_stop_event_raises():
     with pytest.raises(ttft_probe.TtftProbeError):
-        ttft_probe.extract_ttft_row([{"content": "x", "stop": False}], first_content_t=1.0, start_t=0.5)
+        ttft_probe.extract_ttft_row(
+            [{"content": "x", "stop": False}], first_content_t=1.0, start_t=0.5
+        )
 
 
 def test_cap_target_respects_ctx_minus_predict_minus_margin():
@@ -149,16 +151,25 @@ def test_run_ttft_probe_request_sequence_is_byte_identical_at_ctx_32768(monkeypa
 
     recorded: list[tuple[int, int]] = []  # (ctx_target, len(prompt_tokens)) per request
 
-    def fake_run_one_request(base_url, prompt_tokens, *, n_predict=ttft_probe.N_PREDICT, timeout=None):
+    def fake_run_one_request(
+        base_url, prompt_tokens, *, n_predict=ttft_probe.N_PREDICT, timeout=None
+    ):
         recorded.append((len(prompt_tokens),))
         return {
-            "ttft_ms": 1.0, "total_ms": 1.0, "prompt_ms": 1.0, "prompt_per_second": 1.0,
-            "predicted_n": 1, "predicted_ms": 1.0, "predicted_per_second": 1.0,
+            "ttft_ms": 1.0,
+            "total_ms": 1.0,
+            "prompt_ms": 1.0,
+            "prompt_per_second": 1.0,
+            "predicted_n": 1,
+            "predicted_ms": 1.0,
+            "predicted_per_second": 1.0,
         }
 
     monkeypatch.setattr(ttft_probe, "run_one_request", fake_run_one_request)
 
-    rows = ttft_probe.run_ttft_probe("http://127.0.0.1:1", n_ctx=32768, warmup_reps=1, measured_reps=5)
+    rows = ttft_probe.run_ttft_probe(
+        "http://127.0.0.1:1", n_ctx=32768, warmup_reps=1, measured_reps=5
+    )
 
     # Exactly the legacy sequence: 3 targets x (1 warmup + 5 measured) = 18 requests,
     # in order, at exactly the capped lengths -- 65000/130000 contribute nothing.

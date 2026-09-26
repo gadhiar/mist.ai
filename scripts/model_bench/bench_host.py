@@ -249,7 +249,9 @@ def load_arms_doc(path: Path = ARMS_JSON_PATH) -> dict[str, Any]:
     return doc
 
 
-def resolve_arm(arms_doc: dict[str, Any], arm_id: str, _stack: tuple[str, ...] = ()) -> dict[str, Any]:
+def resolve_arm(
+    arms_doc: dict[str, Any], arm_id: str, _stack: tuple[str, ...] = ()
+) -> dict[str, Any]:
     """Resolve one arm's full config, following `base` inheritance.
 
     Raises ArmConfigError on: unknown arm id, unknown keys on any arm in the
@@ -338,9 +340,7 @@ def build_server_args(
     """
     missing = [p for p in resolved_arm["params_required"] if p not in params]
     if missing:
-        raise MissingParamError(
-            f"arm {resolved_arm['id']!r} requires --param for: {missing}"
-        )
+        raise MissingParamError(f"arm {resolved_arm['id']!r} requires --param for: {missing}")
 
     args: list[str] = list(arms_doc["common_args"])
 
@@ -374,7 +374,9 @@ def build_server_args(
         if mode == "on":
             budget = thinking.get("budget")
             if budget is None:
-                raise ArmConfigError(f"arm {resolved_arm['id']!r} has thinking mode 'on' without a budget")
+                raise ArmConfigError(
+                    f"arm {resolved_arm['id']!r} has thinking mode 'on' without a budget"
+                )
             template = [tok.replace("{budget}", str(budget)) for tok in template]
         args.extend(template)
 
@@ -387,7 +389,9 @@ def build_server_args(
     return args
 
 
-def build_model_args(resolved_arm: dict[str, Any], arms_doc: dict[str, Any], params: dict[str, str]) -> list[str]:
+def build_model_args(
+    resolved_arm: dict[str, Any], arms_doc: dict[str, Any], params: dict[str, str]
+) -> list[str]:
     """Full argv tail passed to the container's entrypoint (llama-server)."""
     gguf = resolved_arm["gguf"]
     return ["-m", f"/models/{gguf}", *build_server_args(arms_doc, resolved_arm, params)]
@@ -598,8 +602,10 @@ def parse_compose_image(compose_path: Path, service: str = "mist-llm") -> str:
             break
 
         is_service_header = (
-            current_service_indent is None or indent <= current_service_indent
-        ) and stripped.endswith(":") and not stripped.startswith("- ")
+            (current_service_indent is None or indent <= current_service_indent)
+            and stripped.endswith(":")
+            and not stripped.startswith("- ")
+        )
         if is_service_header:
             if current_service == service and image_line is not None:
                 break
@@ -697,7 +703,9 @@ class HostConfig:
         self.results_root = results_root
 
 
-def resolve_host_config(args: argparse.Namespace, *, enforce_results_root: bool = True) -> HostConfig:
+def resolve_host_config(
+    args: argparse.Namespace, *, enforce_results_root: bool = True
+) -> HostConfig:
     warnings: list[str] = []
 
     models_dir_raw = args.models_dir or os.environ.get("MODELS_DIR")
@@ -801,7 +809,9 @@ def check_decision_rules_clean(path: Path, repo_root: Path) -> str:
 
     status = _run_git(["status", "--porcelain", "--", str(rel)], cwd=repo_root)
     if status.stdout.strip():
-        raise DecisionRulesError(f"decision_rules.json at {path} has uncommitted changes: {status.stdout.strip()}")
+        raise DecisionRulesError(
+            f"decision_rules.json at {path} has uncommitted changes: {status.stdout.strip()}"
+        )
 
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     return digest
@@ -948,13 +958,17 @@ def probe_container_state(
     try:
         state = json.loads(stdout)
     except json.JSONDecodeError as exc:
-        return ContainerProbe("unknown", f"docker inspect {name!r} returned unparseable JSON: {exc}")
+        return ContainerProbe(
+            "unknown", f"docker inspect {name!r} returned unparseable JSON: {exc}"
+        )
     if not isinstance(state, dict):
         return ContainerProbe("unknown", f"docker inspect {name!r} State was not a JSON object")
 
     status = state.get("Status")
     if status in ("exited", "dead"):
-        return ContainerProbe("exited", f"{name!r} state is {status!r}", exit_code=state.get("ExitCode"))
+        return ContainerProbe(
+            "exited", f"{name!r} state is {status!r}", exit_code=state.get("ExitCode")
+        )
     if isinstance(status, str) and status:
         return ContainerProbe("running", f"{name!r} state is {status!r}")
     return ContainerProbe("unknown", f"docker inspect {name!r} returned no usable Status field")
@@ -1244,7 +1258,9 @@ def wait_for_llama_props(base_url: str, *, timeout: float = 30.0) -> dict[str, A
     return http_get_json(base_url.rstrip("/") + "/props", timeout=timeout)
 
 
-def wait_for_container_healthy(name: str, *, timeout: float = 180.0, poll_interval: float = 2.0) -> None:
+def wait_for_container_healthy(
+    name: str, *, timeout: float = 180.0, poll_interval: float = 2.0
+) -> None:
     deadline = time.monotonic() + timeout
     last_status = None
     while time.monotonic() < deadline:
@@ -1254,7 +1270,9 @@ def wait_for_container_healthy(name: str, *, timeout: float = 180.0, poll_interv
         if last_status == "healthy":
             return
         time.sleep(poll_interval)
-    raise TimeoutError(f"{name} did not report State.Health.Status=healthy within {timeout}s (last: {last_status})")
+    raise TimeoutError(
+        f"{name} did not report State.Health.Status=healthy within {timeout}s (last: {last_status})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1300,9 +1318,7 @@ class GpuSampler:
                 row = nvidia_smi_probe.parse_csv_line(line)
             except nvidia_smi_probe.NvidiaSmiParseError:
                 continue
-            self._writer.writerow(
-                [time.time(), *[row[key] for key in nvidia_smi_probe.ROW_KEYS]]
-            )
+            self._writer.writerow([time.time(), *[row[key] for key in nvidia_smi_probe.ROW_KEYS]])
             self._file.flush()
 
     def stop(self) -> None:
@@ -1546,9 +1562,13 @@ def merge_run_meta(
         else (existing.get("harness") if existing is not None else None)
     )
 
-    existing_completed = set(existing.get("suites_completed", [])) if existing is not None else set()
+    existing_completed = (
+        set(existing.get("suites_completed", [])) if existing is not None else set()
+    )
     call_completed = set(call.get("suites_completed", []))
-    merged["suites_completed"] = [s for s in RUN_SUITE_ORDER if s in (existing_completed | call_completed)]
+    merged["suites_completed"] = [
+        s for s in RUN_SUITE_ORDER if s in (existing_completed | call_completed)
+    ]
 
     existing_errors = list(existing.get("errors", [])) if existing is not None else []
     merged["errors"] = existing_errors + list(call.get("errors", []))
@@ -1642,14 +1662,19 @@ def _run_host_checks() -> bool:
     checks: list[tuple[str, list[str]]] = [
         ("docker version", ["docker", "version"]),
         ("nvidia-smi query", nvidia_smi_probe.build_query_args(interval_ms=1)),
-        ("python imports (yaml, openai, httpx)", [sys.executable, "-c", "import yaml, openai, httpx"]),
+        (
+            "python imports (yaml, openai, httpx)",
+            [sys.executable, "-c", "import yaml, openai, httpx"],
+        ),
     ]
     for label, argv in checks:
         if label == "nvidia-smi query":
             # Single-shot: strip -lms continuous mode down to one row via a
             # short timeout instead of letting it stream forever.
             try:
-                proc = subprocess.run(argv[:-2], capture_output=True, text=True, timeout=5, shell=False)
+                proc = subprocess.run(
+                    argv[:-2], capture_output=True, text=True, timeout=5, shell=False
+                )
                 ok = proc.returncode == 0
             except (subprocess.TimeoutExpired, OSError):
                 ok = False
@@ -1693,7 +1718,9 @@ def _run_flag_checks() -> bool:
         print(f"[fail] docker run {image_ref} --help: {exc}")
         return False
     if proc.returncode != 0:
-        print(f"[fail] docker run {image_ref} --help exited {proc.returncode}: {proc.stderr.strip()}")
+        print(
+            f"[fail] docker run {image_ref} --help exited {proc.returncode}: {proc.stderr.strip()}"
+        )
         return False
 
     return check_all_arm_flags(proc.stdout + "\n" + proc.stderr, image_ref)
@@ -1992,7 +2019,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # surface as an opaque DockerError.
     probe = probe_container_state(BENCH_LLM_CONTAINER)
     if probe.state in ("running", "exited"):
-        print(f"[FAIL] {BENCH_LLM_CONTAINER} already exists (running or exited); run `unserve` first")
+        print(
+            f"[FAIL] {BENCH_LLM_CONTAINER} already exists (running or exited); run `unserve` first"
+        )
         return 1
     if probe.state == "unknown":
         print(
@@ -2194,7 +2223,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     # a later suite in this same call cannot be found "taken" only after an earlier suite
     # in the call already wrote its output.
     try:
-        for suite, path in suite_output_paths(a_dir, suites, rep=rep, layout_pass=layout_pass).items():
+        for suite, path in suite_output_paths(
+            a_dir, suites, rep=rep, layout_pass=layout_pass
+        ).items():
             refuse_if_exists(path, suite_output_what(suite, path, layout_pass=layout_pass))
     except SuiteOutputExistsError as exc:
         print(f"[FAIL] {exc}")
@@ -2205,7 +2236,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     # merge_run_meta is always called against this same snapshot plus the growing `call`
     # dict below, so every write_meta() recomputes the full cumulative document fresh.
     meta_path = a_dir / "meta.json"
-    existing_meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else None
+    existing_meta = (
+        json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else None
+    )
 
     started_utc = datetime.now(UTC).isoformat()
     call: dict[str, Any] = {
@@ -2246,7 +2279,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     def write_meta() -> None:
         call["finished_utc"] = datetime.now(UTC).isoformat()
         merged = merge_run_meta(existing_meta, call, superseded_rules_shas=superseded_rules_shas)
-        meta_path.write_text(json.dumps(merged, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        meta_path.write_text(
+            json.dumps(merged, indent=2, sort_keys=True, default=str), encoding="utf-8"
+        )
 
     sampler = GpuSampler(a_dir / "vram.csv")
     sampler.start()
@@ -2382,7 +2417,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         sampler.stop()
         write_meta()
 
-    print(f"run complete for arm {arm['id']}: suites_completed (this call)={call['suites_completed']}")
+    print(
+        f"run complete for arm {arm['id']}: suites_completed (this call)={call['suites_completed']}"
+    )
     if call["errors"]:
         print(f"[FAIL] run recorded errors (this call): {call['errors']}")
         return 1
@@ -2513,7 +2550,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_plan.add_argument("--host-checks", action="store_true")
     p_plan.set_defaults(func=cmd_plan)
 
-    p_selftest = sub.add_parser("selftest", help="No docker, no network; exercises parsers and guards.")
+    p_selftest = sub.add_parser(
+        "selftest", help="No docker, no network; exercises parsers and guards."
+    )
     p_selftest.set_defaults(func=cmd_selftest)
 
     p_snapshot = sub.add_parser("snapshot", help="docker inspect the 3 MIST containers.")
@@ -2527,7 +2566,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_stop.add_argument("--with-neo4j", action="store_true")
     p_stop.set_defaults(func=cmd_stop)
 
-    p_restore = sub.add_parser("restore", help="Start the 3 containers back up and diff against the snapshot.")
+    p_restore = sub.add_parser(
+        "restore", help="Start the 3 containers back up and diff against the snapshot."
+    )
     _add_common_config_args(p_restore)
     p_restore.add_argument("--run", required=True)
     p_restore.set_defaults(func=cmd_restore)

@@ -121,11 +121,15 @@ def test_capture_omits_no_mmap():
 
 def test_checker_flags_no_mmap_on_the_old_c3_argv():
     old_c3_argv = [
-        "-m", "/models/x.gguf",
-        "--ctx-size", "32768",
+        "-m",
+        "/models/x.gguf",
+        "--ctx-size",
+        "32768",
         "--no-mmap",
-        "-ub", "2048",
-        "-ncmoe", "12",
+        "-ub",
+        "2048",
+        "-ncmoe",
+        "12",
     ]
     help_flags = parse_help_flags(HELP_TEXT)
     unknown = unknown_flags(old_c3_argv, help_flags)
@@ -172,9 +176,7 @@ def test_check_all_arm_flags_fails_when_an_arm_flag_is_missing_from_help():
     # Drop the load-mode option line: c3/c4 then carry a flag the "build" does not list.
     from scripts.model_bench.bench_host import check_all_arm_flags
 
-    stripped = "\n".join(
-        line for line in HELP_TEXT.splitlines() if not line.startswith("-lm,")
-    )
+    stripped = "\n".join(line for line in HELP_TEXT.splitlines() if not line.startswith("-lm,"))
     assert check_all_arm_flags(stripped, "pinned") is False
 
 
