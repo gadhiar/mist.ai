@@ -37,6 +37,14 @@ FAILURES
   so the next turn proceeds. `python -m backend.extraction_backlog.admin
   retry-dead-letters` puts it back.
 
+EPOCH CUTOVER (T2b)
+-------------------
+While an `epoch_cutover` row is open (`BacklogStore.open_cutover`), each step
+is a FILL step (`_fill_step`) instead: the target is the candidate's stamps,
+every logged turn without a candidate cache row is gated, inferred and cached
+in log order, and nothing is applied to the live graph. See `cutover.py` for
+the lifecycle and `CUTOVER.md` for the runbook.
+
 CRASH SAFETY
 ------------
 The service result is written to the extraction cache (entities,
@@ -67,7 +75,9 @@ OBSERVABILITY
 Every job logs one INFO line with `request_id`, `job_id`, `turn_id`,
 `event_id`, `attempt`, `duration_ms`, `error_code` and `outcome`, and every
 service call is recorded in the `extraction_attempts` table. `snapshot()`
-returns the contract's `ExtractionStatus`.
+returns the contract's `ExtractionStatus`, with its `cutover` block filled
+while a cutover is open. `add_state_listener` callbacks run on every state
+transition and every cutover transition the dispatcher makes.
 """
 
 from __future__ import annotations
@@ -85,6 +95,7 @@ from datetime import UTC, datetime
 from backend.errors import MistError
 from backend.extraction_contract.models import (
     CONTRACT_VERSION,
+    CutoverStatus,
     DerivationInput,
     ErrorCode,
     ExpectStamps,
@@ -103,8 +114,9 @@ from backend.knowledge.extraction.pipeline import (
     TurnToApply,
 )
 from backend.knowledge.extraction_cache import SKIP_EXTRACTION_FAILED
-from backend.knowledge.version_stamps import compose_model_hash
 
+from . import telemetry
+from .cutover import log_transition
 from .errors import (
     ExtractionInferenceError,
     InferenceResponseInvalidError,
@@ -113,11 +125,22 @@ from .errors import (
 )
 from .inference import ExtractionInference
 from .settings import DispatcherSettings
-from .store import BacklogStore, Epoch, PendingTurn, age_ms
+from .store import (
+    BacklogStore,
+    Cutover,
+    Epoch,
+    PendingTurn,
+    age_ms,
+    compose_epoch_model_hash,
+)
 
 logger = logging.getLogger(__name__)
 
 ApplyListener = Callable[[ApplyReport], Awaitable[None]]
+# Called synchronously, on the event loop, as `listener(previous, current)`
+# after every state transition (and after every cutover transition, with
+# previous == current). Must not block and must not raise.
+StateListener = Callable[[str, str], None]
 
 STATE_IDLE = "idle"
 STATE_WORKING = "working"
@@ -131,25 +154,6 @@ STATE_DISABLED = "disabled"
 # is a bug, propagates, and ends the loop with state `stalled` (see
 # `_on_loop_done`).
 _CONTAINED_ERRORS = (MistError, sqlite3.Error, OSError)
-
-
-@dataclass(frozen=True, slots=True)
-class _EmbeddingIdentity:
-    model_name: str
-
-
-@dataclass(frozen=True, slots=True)
-class _StampIdentity:
-    """The two attributes `compose_model_hash` reads, for a service-reported hash.
-
-    `compose_model_hash` takes a `KnowledgeConfig`-shaped object; this shim lets
-    the dispatcher compose the SERVICE's bare model hash with the BACKEND's
-    embedding model exactly as the epoch row was composed, without re-building
-    the string inline (the function's docstring explains why callers must not).
-    """
-
-    model_hash: str
-    embedding: _EmbeddingIdentity
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +218,7 @@ class ExtractionDispatcher:
         self._changed = asyncio.Event()
         self._phase = "idle"  # 'idle' | 'inference' | 'apply'
         self._listeners: list[ApplyListener] = []
+        self._state_listeners: list[StateListener] = []
         self._consecutive_unreachable = 0
         self._consecutive_step_errors = 0
         self._activated_epoch_id: int | None = None
@@ -263,6 +268,16 @@ class ExtractionDispatcher:
         swallowed so one listener cannot stop the backlog.
         """
         self._listeners.append(listener)
+
+    def add_state_listener(self, listener: StateListener) -> None:
+        """Register a callback run on every state (and cutover) transition.
+
+        Called synchronously from the loop as `listener(previous, current)`;
+        the server uses it to push `extraction_status` on a transition rather
+        than only on its timer. A `MistError`, `sqlite3.Error`, `OSError` or
+        `ValueError` it raises is logged and swallowed.
+        """
+        self._state_listeners.append(listener)
 
     async def start(self) -> None:
         """Activate the backlog for the current epoch and, in `service` mode, run it.
@@ -333,7 +348,10 @@ class ExtractionDispatcher:
         Returns True when nothing is pending (inference- or apply-pending).
         Returns False at `timeout`, or at once when the loop is not running or
         its state is not `working`/`idle` (unreachable, stalled,
-        epoch_mismatch, disabled) -- waiting would not help.
+        epoch_mismatch, disabled) -- waiting would not help. Also at once while
+        a cutover is open: the dispatcher is filling the candidate and applies
+        nothing for the active epoch until promotion, so the active backlog
+        cannot drain.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -342,6 +360,8 @@ class ExtractionDispatcher:
             empty = self._backlog_empty()
             if empty:
                 return True
+            if self._store.open_cutover() is not None:
+                return False
             if not self.running or self._state not in (STATE_WORKING, STATE_IDLE):
                 return False
             remaining = deadline - loop.time()
@@ -363,15 +383,30 @@ class ExtractionDispatcher:
             apply_pending = scan.apply_pending
             dead_lettered = scan.dead_lettered
             oldest = age_ms(scan.oldest_pending_timestamp, self._clock())
+        cutover_status = None
+        cutover = self._store.open_cutover()
+        if cutover is not None:
+            fill = self._store.fill_scan(cutover)
+            cutover_status = CutoverStatus(
+                # The contract's `CutoverStatus.state` has no 'checked': a
+                # checked cutover is still fully covered, which is what
+                # 'ready' reports. The admin CLI shows the exact state.
+                state="ready" if cutover.state == "checked" else cutover.state,  # type: ignore[arg-type]
+                target_extraction_version=cutover.extraction_version,
+                target_model_hash=cutover.model_hash,
+                covered=fill.covered,
+                total=fill.total,
+            )
         return ExtractionStatus(
             state=self._state,  # type: ignore[arg-type]
             backlog_depth=backlog_depth,
             apply_pending=apply_pending,
             dead_lettered=dead_lettered,
             oldest_pending_age_ms=oldest,
-            unrecorded_turns=0,
+            unrecorded_turns=telemetry.unrecorded_turns(),
             service=self._service,
             last_job=self._last_job,
+            cutover=cutover_status,
         )
 
     # ------------------------------------------------------------------
@@ -423,6 +458,10 @@ class ExtractionDispatcher:
             return _Wait(self._settings.stall_recheck_s, True)
         self._ensure_activation(epoch)
 
+        cutover = self._store.open_cutover()
+        if cutover is not None:
+            return await self._fill_step(cutover)
+
         scan = self._store.scan(epoch)
         head = scan.head
         if head is None:
@@ -441,17 +480,52 @@ class ExtractionDispatcher:
         self._set_state(STATE_WORKING)
         return await self._dispatch(head, epoch, info_or_wait)
 
+    async def _fill_step(self, cutover: Cutover) -> _Wait | None:
+        """One step of an open cutover: infer the next uncovered turn under the candidate.
+
+        The inference target is the CANDIDATE's stamps (`cutover.target`): the
+        dispatcher sends a job only when `/v1/info` matches them, runs Gates
+        0/2/3 and inference for every logged turn in log order from the
+        beginning, and caches the result under the candidate's key. It applies
+        NOTHING -- no curation, no Stage 9 operations, no `applied` marker --
+        so the live graph stays exactly as it was. The active epoch's
+        apply-pending turns therefore stay pending for the life of the
+        cutover; the service is serving the candidate model and could not
+        extract for the active epoch anyway.
+
+        When every logged turn has a candidate row the cutover moves
+        'filling' -> 'ready'. It keeps filling after that: a turn logged later
+        is uncovered again, and is inferred in its place in the log.
+        """
+        candidate = cutover.target
+        fill = self._store.fill_scan(cutover)
+        head = fill.head
+        if head is None:
+            if cutover.state == "filling" and self._store.transition_cutover(
+                cutover,
+                from_states=("filling",),
+                to_state="ready",
+                updated_at=self._clock().isoformat(),
+            ):
+                log_transition(cutover, "filling", "ready", covered=fill.covered, total=fill.total)
+                self._notify()
+                self._emit_state(self._state, self._state)
+            self._set_state(STATE_IDLE)
+            return _Wait(self._settings.idle_poll_s, True)
+
+        self._phase = "inference"
+        info_or_wait = await self._check_service(candidate)
+        if isinstance(info_or_wait, _Wait):
+            return info_or_wait
+        self._set_state(STATE_WORKING)
+        return await self._dispatch(head, candidate, info_or_wait, apply=False)
+
     # ------------------------------------------------------------------
     # Service / epoch checks
     # ------------------------------------------------------------------
 
     def _composed(self, bare_model_hash: str) -> str:
-        return compose_model_hash(
-            _StampIdentity(
-                model_hash=bare_model_hash,
-                embedding=_EmbeddingIdentity(model_name=self._embedding_model_name),
-            )
-        )
+        return compose_epoch_model_hash(bare_model_hash, self._embedding_model_name)
 
     def _epoch_matches(self, extraction_version: str, bare_model_hash: str, epoch: Epoch) -> bool:
         return (
@@ -493,8 +567,8 @@ class ExtractionDispatcher:
                 STATE_EPOCH_MISMATCH,
                 reason=(
                     f"service (extraction_version={info.extraction_version!r}, "
-                    f"model_hash={self._composed(info.model_hash)!r}) != epoch "
-                    f"{epoch.epoch_id} (extraction_version={epoch.extraction_version!r}, "
+                    f"model_hash={self._composed(info.model_hash)!r}) != "
+                    f"{epoch.label} (extraction_version={epoch.extraction_version!r}, "
                     f"model_hash={epoch.model_hash!r})"
                 ),
             )
@@ -511,7 +585,17 @@ class ExtractionDispatcher:
     # One job
     # ------------------------------------------------------------------
 
-    async def _dispatch(self, head: PendingTurn, epoch: Epoch, info: InfoResponse) -> _Wait | None:
+    async def _dispatch(
+        self, head: PendingTurn, epoch: Epoch, info: InfoResponse, *, apply: bool = True
+    ) -> _Wait | None:
+        """Gate, infer and cache one turn under `epoch`; apply it when `apply`.
+
+        `apply=False` is the cutover fill: the result is cached under the
+        candidate's stamps and nothing touches the graph. `last_job` is not
+        updated for such a job -- `LastJob.outcome` has no value for "cached,
+        not applied" -- and its log line says `outcome=extracted` (or
+        `skipped`).
+        """
         assert self._inference is not None
         started = time.perf_counter()
         turn = self._store.get_turn(head.event_id)
@@ -524,7 +608,18 @@ class ExtractionDispatcher:
             self._store.put_skip(
                 head.event_id, epoch, skip_reason=decision.skip_reason, created_at=head.timestamp
             )
-            await self._apply(head, epoch, request_id="", attempt=0, started=started)
+            if apply:
+                await self._apply(head, epoch, request_id="", attempt=0, started=started)
+            else:
+                self._log_job(
+                    head,
+                    request_id="-",
+                    job_id="-",
+                    attempt=0,
+                    duration_ms=(time.perf_counter() - started) * 1000,
+                    error_code=decision.skip_reason,
+                    outcome="skipped",
+                )
             return None
 
         derivation_ctx = await self._pipeline.build_derivation_context(utterance)
@@ -629,6 +724,17 @@ class ExtractionDispatcher:
             counted=False,
         )
         self._pipeline.note_extraction_completed(utterance, decision.embedding)
+        if not apply:
+            self._log_job(
+                head,
+                request_id=request_id,
+                job_id=job_id,
+                attempt=attempt,
+                duration_ms=duration_ms,
+                error_code=None,
+                outcome="extracted",
+            )
+            return None
         await self._apply(
             head,
             epoch,
@@ -663,7 +769,7 @@ class ExtractionDispatcher:
         if not self._epoch_matches(stamps.extraction_version, stamps.model_hash, epoch):
             raise InferenceServiceError(
                 f"reply stamps (extraction_version={stamps.extraction_version!r}, "
-                f"model_hash={stamps.model_hash!r}) do not match epoch {epoch.epoch_id}",
+                f"model_hash={stamps.model_hash!r}) do not match {epoch.label}",
                 code=ErrorCode.EPOCH_MISMATCH,
                 retryable=False,
                 http_status=200,
@@ -871,6 +977,14 @@ class ExtractionDispatcher:
         else:
             logger.info("Extraction dispatcher %s -> %s", previous, state)
         self._notify()
+        self._emit_state(previous, state)
+
+    def _emit_state(self, previous: str, current: str) -> None:
+        for listener in self._state_listeners:
+            try:
+                listener(previous, current)
+            except (MistError, sqlite3.Error, OSError, ValueError) as exc:
+                logger.warning("Extraction state listener failed (ignored): %s", exc)
 
     def _notify(self) -> None:
         self._changed.set()

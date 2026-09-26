@@ -25,6 +25,7 @@ one stamp-filtered id scan of the cache per call.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -36,19 +37,63 @@ from backend.knowledge.extraction_cache import (
     SKIP_EXTRACTION_FAILED,
     ExtractionCache,
 )
+from backend.knowledge.version_stamps import compose_model_hash
 
 STAGE_CURATED = "curated"
 STAGE_APPLIED = "applied"
 
 
 @dataclass(frozen=True, slots=True)
+class _EmbeddingIdentity:
+    model_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class _StampIdentity:
+    """The two attributes `compose_model_hash` reads, for a service-reported hash.
+
+    `compose_model_hash` takes a `KnowledgeConfig`-shaped object; this shim lets
+    the backlog compose the SERVICE's bare model hash with the BACKEND's
+    embedding model exactly as the epoch row was composed, without re-building
+    the string inline (the function's docstring explains why callers must not).
+    """
+
+    model_hash: str
+    embedding: _EmbeddingIdentity
+
+
+def compose_epoch_model_hash(bare_model_hash: str, embedding_model_name: str) -> str:
+    """The epoch-side (composed) model hash for a bare service model hash."""
+    return compose_model_hash(
+        _StampIdentity(
+            model_hash=bare_model_hash,
+            embedding=_EmbeddingIdentity(model_name=embedding_model_name),
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class Epoch:
-    """The stamp triple the backlog reads and writes the cache under."""
+    """The stamp triple the backlog reads and writes the cache under.
+
+    Either a ledger epoch, or a cutover CANDIDATE (`cutover_id` set). A
+    candidate's `epoch_id` is `-cutover_id`: the id its service attempts are
+    recorded under in `extraction_attempts`, a namespace no ledger row can
+    occupy because ledger ids are AUTOINCREMENT and start at 1.
+    """
 
     epoch_id: int
     ontology_version: str
     extraction_version: str
     model_hash: str
+    cutover_id: int | None = None
+
+    @property
+    def label(self) -> str:
+        """`epoch N` or `cutover N candidate`, for log lines."""
+        if self.cutover_id is not None:
+            return f"cutover {self.cutover_id} candidate"
+        return f"epoch {self.epoch_id}"
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> Epoch:
@@ -59,6 +104,84 @@ class Epoch:
             extraction_version=str(row["extraction_version"]),
             model_hash=str(row["model_hash"]),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class Cutover:
+    """One `epoch_cutover` row: a candidate epoch and where it is in its lifecycle."""
+
+    cutover_id: int
+    ontology_version: str
+    extraction_version: str
+    model_hash: str
+    bare_model_hash: str
+    requested_at: str
+    state: str
+    source_epoch_id: int | None
+    rebuild_job_id: str | None
+    rebuilt_through_event_id: str | None
+    check_report: dict[str, Any] | None
+    promoted_epoch_id: int | None
+    updated_at: str
+
+    @property
+    def target(self) -> Epoch:
+        """The candidate's stamps as an `Epoch` (epoch_id = -cutover_id)."""
+        return Epoch(
+            epoch_id=-self.cutover_id,
+            ontology_version=self.ontology_version,
+            extraction_version=self.extraction_version,
+            model_hash=self.model_hash,
+            cutover_id=self.cutover_id,
+        )
+
+    def epoch_dict(self) -> dict[str, Any]:
+        """The candidate as the epoch dict `LogRegenerator.rebuild` takes.
+
+        `activated_at` is the cutover's `requested_at`, a constant: the
+        regenerator stamps the seed-apply with it, and two rebuilds must stamp
+        identically or the rebuild-twice gate fails on clock noise.
+        """
+        return {
+            "epoch_id": -self.cutover_id,
+            "ontology_version": self.ontology_version,
+            "extraction_version": self.extraction_version,
+            "model_hash": self.model_hash,
+            "activated_at": self.requested_at,
+        }
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> Cutover:
+        """Build from an `epoch_cutover` row dict."""
+        report = row.get("check_report")
+        return cls(
+            cutover_id=int(row["cutover_id"]),
+            ontology_version=str(row["ontology_version"]),
+            extraction_version=str(row["extraction_version"]),
+            model_hash=str(row["model_hash"]),
+            bare_model_hash=str(row["bare_model_hash"]),
+            requested_at=str(row["requested_at"]),
+            state=str(row["state"]),
+            source_epoch_id=(
+                None if row.get("source_epoch_id") is None else int(row["source_epoch_id"])
+            ),
+            rebuild_job_id=row.get("rebuild_job_id"),
+            rebuilt_through_event_id=row.get("rebuilt_through_event_id"),
+            check_report=None if report is None else json.loads(report),
+            promoted_epoch_id=(
+                None if row.get("promoted_epoch_id") is None else int(row["promoted_epoch_id"])
+            ),
+            updated_at=str(row["updated_at"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FillScan:
+    """How far a cutover candidate's re-extraction of the log has got."""
+
+    head: PendingTurn | None
+    covered: int
+    total: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +348,113 @@ class BacklogStore:
             marked_applied=stored.marked_applied,
             legacy_unextracted=stored.legacy_unextracted,
             created_now=True,
+        )
+
+    # -- epoch cutover ---------------------------------------------------------
+
+    def open_cutover(self) -> Cutover | None:
+        """The open cutover (filling, ready or checked), or None."""
+        row = self._events.get_open_epoch_cutover()
+        return Cutover.from_row(row) if row is not None else None
+
+    def get_cutover(self, cutover_id: int) -> Cutover | None:
+        """One cutover by id, or None."""
+        row = self._events.get_epoch_cutover(cutover_id)
+        return Cutover.from_row(row) if row is not None else None
+
+    def list_cutovers(self) -> list[Cutover]:
+        """Every cutover, oldest first."""
+        return [Cutover.from_row(row) for row in self._events.list_epoch_cutovers()]
+
+    def fill_scan(self, cutover: Cutover) -> FillScan:
+        """The candidate's coverage of the log: the first uncovered turn, and counts.
+
+        A turn is covered when the extraction cache has a row for it under the
+        candidate's stamps -- extracted, gate-skipped or dead-lettered. The
+        head is the first uncovered turn in replay order (the same
+        `list_turn_keys_in_replay_order` the active backlog uses), so the
+        candidate re-extracts the whole log from the beginning, in log order,
+        and a turn logged mid-fill is reached in its place.
+        """
+        keys = self._events.list_turn_keys_in_replay_order()
+        cached = self._cache.event_ids_for(cutover.extraction_version, cutover.model_hash)
+        head: PendingTurn | None = None
+        covered = 0
+        for key in keys:
+            if key["event_id"] in cached:
+                covered += 1
+            elif head is None:
+                head = PendingTurn(
+                    event_id=str(key["event_id"]),
+                    session_id=str(key["session_id"]),
+                    turn_index=int(key["turn_index"]),
+                    timestamp=str(key["timestamp"]),
+                    cached=False,
+                    curated=False,
+                )
+        return FillScan(head=head, covered=covered, total=len(keys))
+
+    def begin_cutover(
+        self,
+        *,
+        ontology_version: str,
+        extraction_version: str,
+        model_hash: str,
+        bare_model_hash: str,
+        source_epoch_id: int,
+        requested_at: str,
+    ) -> Cutover | None:
+        """Open a candidate in state 'filling'. None when one is already open."""
+        cutover_id = self._events.begin_epoch_cutover(
+            ontology_version=ontology_version,
+            extraction_version=extraction_version,
+            model_hash=model_hash,
+            bare_model_hash=bare_model_hash,
+            source_epoch_id=source_epoch_id,
+            requested_at=requested_at,
+        )
+        return None if cutover_id is None else self.get_cutover(cutover_id)
+
+    def transition_cutover(
+        self,
+        cutover: Cutover,
+        *,
+        from_states: tuple[str, ...],
+        to_state: str,
+        updated_at: str,
+        rebuild_job_id: str | None = None,
+        rebuilt_through_event_id: str | None = None,
+        check_report: dict[str, Any] | None = None,
+        write_check: bool = False,
+    ) -> bool:
+        """Compare-and-set the cutover's state.
+
+        With `write_check`, the three check columns are written too (None ->
+        NULL), which is how a failed re-check clears a stale
+        `rebuilt_through_event_id`.
+        """
+        fields = None
+        if write_check:
+            fields = {
+                "rebuild_job_id": rebuild_job_id,
+                "rebuilt_through_event_id": rebuilt_through_event_id,
+                "check_report": None if check_report is None else json.dumps(check_report),
+            }
+        return self._events.transition_epoch_cutover(
+            cutover.cutover_id,
+            from_states=from_states,
+            to_state=to_state,
+            updated_at=updated_at,
+            fields=fields,
+        )
+
+    def promote_cutover(self, cutover: Cutover, *, activated_at: str) -> dict[str, Any]:
+        """Append the candidate to the ledger with a first-hand activation (one transaction).
+
+        See `EventStore.promote_epoch_cutover`.
+        """
+        return self._events.promote_epoch_cutover(
+            cutover_id=cutover.cutover_id, activated_at=activated_at
         )
 
     # -- scanning --------------------------------------------------------------
