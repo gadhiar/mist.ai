@@ -1,11 +1,20 @@
-"""Operator CLI for the extraction backlog.
+"""Operator CLI for the extraction backlog and the epoch cutover.
 
     python -m backend.extraction_backlog.admin status
     python -m backend.extraction_backlog.admin retry-dead-letters [--event-id ID]
+    python -m backend.extraction_backlog.admin cutover begin --model-hash BARE \
+        [--extraction-version V] [--ontology-version O]
+    python -m backend.extraction_backlog.admin cutover status
+    python -m backend.extraction_backlog.admin cutover rebuild --staging-uri URI \
+        --min-seed-nodes N --expect-turns N --min-replay-edges N
+    python -m backend.extraction_backlog.admin cutover promote --graph-swapped
+    python -m backend.extraction_backlog.admin cutover abandon
 
 `status` reads the event store and extraction cache directly (it does not call
 the extraction service or need the backend running) and prints the backlog for
-the active epoch.
+the active epoch, including `legacy_unextracted` (turns logged before the
+backlog first activated that had no cache row; never dispatched, and covered by
+the next cutover's re-extraction), and any open cutover.
 
 `retry-dead-letters` puts dead-lettered turns (`extraction_failed` skips) back
 into the backlog: it deletes the skip row and the turn's applied marker for the
@@ -17,19 +26,26 @@ already been applied, and graph outcomes that depend on order (which duplicate
 wins dedup, which belief supersedes which) can then differ from a rebuild of
 the same log until the next epoch cutover re-extracts it. The command says so
 when it runs.
+
+`cutover ...` drives the epoch cutover (`cutover.py`; runbook in `CUTOVER.md`).
+Exit codes: 0 done, 2 refused (nothing changed). `cutover rebuild` also exits
+1 (rebuild-twice disagreed) or 4 (a non-vacuity or self-model gate failed), and
+records its report on the cutover either way.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from typing import TextIO
 
 from backend.event_store.store import EventStore
 from backend.knowledge.extraction_cache import ExtractionCache
 
-from .store import BacklogStore
+from .store import BacklogStore, Cutover
 
 OUT_OF_ORDER_WARNING = (
     "[WARNING] A retried turn is applied OUT OF LOG ORDER: turns logged after it are "
@@ -49,6 +65,43 @@ def build_store_from_env() -> BacklogStore:
     cache = ExtractionCache(production_cache_path(config))
     cache.initialize()
     return BacklogStore(event_store, cache)
+
+
+def _embedding_model_from_env() -> str:
+    from backend.knowledge.config import KnowledgeConfig
+
+    return KnowledgeConfig.from_env().embedding.model_name
+
+
+def _print_cutover(store: BacklogStore, cutover: Cutover, out: TextIO) -> None:
+    fill = store.fill_scan(cutover)
+    print(
+        f"cutover {cutover.cutover_id}: state={cutover.state} "
+        f"(from epoch {cutover.source_epoch_id}, requested {cutover.requested_at})",
+        file=out,
+    )
+    print(
+        f"  target: ontology_version={cutover.ontology_version} "
+        f"extraction_version={cutover.extraction_version} model_hash={cutover.model_hash} "
+        f"(service model_hash={cutover.bare_model_hash})",
+        file=out,
+    )
+    print(f"  covered={fill.covered} total={fill.total}", file=out)
+    if cutover.rebuilt_through_event_id:
+        print(
+            f"  rebuilt_through_event_id={cutover.rebuilt_through_event_id} "
+            f"rebuild_job_id={cutover.rebuild_job_id}",
+            file=out,
+        )
+    if cutover.check_report is not None:
+        report = cutover.check_report
+        print(
+            f"  last check: passed={report.get('passed')} exit_code={report.get('exit_code')} "
+            f"at {report.get('checked_at') or report.get('started_at')}",
+            file=out,
+        )
+        if report.get("failure"):
+            print(f"  failure: {str(report['failure']).splitlines()[0]}", file=out)
 
 
 def _status(store: BacklogStore, out: TextIO) -> int:
@@ -80,6 +133,9 @@ def _status(store: BacklogStore, out: TextIO) -> int:
     print(f"oldest_pending={scan.oldest_pending_timestamp or '-'}", file=out)
     for event_id in store.list_dead_letters(epoch):
         print(f"dead_letter event_id={event_id}", file=out)
+    cutover = store.open_cutover()
+    if cutover is not None:
+        _print_cutover(store, cutover, out)
     return 0
 
 
@@ -104,17 +160,198 @@ def _retry(store: BacklogStore, event_id: str | None, out: TextIO) -> int:
     return 0 if retried == len(targets) else 2
 
 
+# ---------------------------------------------------------------------------
+# cutover
+# ---------------------------------------------------------------------------
+
+
+def _cutover_begin(
+    store: BacklogStore, args: argparse.Namespace, embedding_model_name: str, now_iso: str, out
+) -> int:
+    from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
+
+    from .cutover import CutoverRefusedError, begin_cutover
+
+    try:
+        cutover = begin_cutover(
+            store,
+            bare_model_hash=args.model_hash,
+            extraction_version=args.extraction_version or EXTRACTION_VERSION,
+            ontology_version=args.ontology_version or ONTOLOGY_VERSION,
+            embedding_model_name=embedding_model_name,
+            now_iso=now_iso,
+        )
+    except CutoverRefusedError as exc:
+        print(f"[cutover] REFUSED: {exc}", file=out)
+        return 2
+    print(f"[cutover] began cutover {cutover.cutover_id} (state=filling)", file=out)
+    _print_cutover(store, cutover, out)
+    print(
+        "[cutover] Next: point the extraction service at the candidate model (its /v1/info "
+        f"must report extraction_version={cutover.extraction_version} and "
+        f"model_hash={cutover.bare_model_hash}); the dispatcher fills while it matches.",
+        file=out,
+    )
+    return 0
+
+
+def _cutover_status(store: BacklogStore, out: TextIO) -> int:
+    cutover = store.open_cutover()
+    if cutover is not None:
+        _print_cutover(store, cutover, out)
+        return 0
+    history = store.list_cutovers()
+    if not history:
+        print("No cutover has been started.", file=out)
+        return 0
+    last = history[-1]
+    print(
+        f"No cutover is open. Last: cutover {last.cutover_id} state={last.state} "
+        f"(updated {last.updated_at}, promoted_epoch_id={last.promoted_epoch_id})",
+        file=out,
+    )
+    return 0
+
+
+def _cutover_abandon(store: BacklogStore, now_iso: str, out: TextIO) -> int:
+    from .cutover import CutoverRefusedError, abandon_cutover
+
+    try:
+        cutover = abandon_cutover(store, now_iso=now_iso)
+    except CutoverRefusedError as exc:
+        print(f"[cutover] REFUSED: {exc}", file=out)
+        return 2
+    print(
+        f"[cutover] abandoned cutover {cutover.cutover_id}; nothing was deleted. Point the "
+        "extraction service back at the active epoch's model.",
+        file=out,
+    )
+    return 0
+
+
+def _cutover_promote(store: BacklogStore, graph_swapped: bool, now_iso: str, out) -> int:
+    from backend.knowledge.version_stamps import EXTRACTION_VERSION
+
+    from .cutover import CutoverRefusedError, promote_cutover
+
+    try:
+        promotion = promote_cutover(store, graph_swapped=graph_swapped, now_iso=now_iso)
+    except CutoverRefusedError as exc:
+        print(f"[cutover] REFUSED: {exc}", file=out)
+        return 2
+    cutover = promotion.cutover
+    print(
+        f"[cutover] promoted cutover {cutover.cutover_id} to epoch {promotion.epoch_id}: "
+        f"{promotion.marked_applied} of {promotion.turns_at_activation} logged turn(s) marked "
+        f"applied through {cutover.rebuilt_through_event_id}; later turns stay apply-pending "
+        "for the dispatcher.",
+        file=out,
+    )
+    print(
+        f"[cutover] Before starting the backend, set MIST_MODEL_HASH={cutover.bare_model_hash} "
+        "in its environment: live graph writes are stamped from KnowledgeConfig, not from "
+        "the epoch ledger.",
+        file=out,
+    )
+    if cutover.extraction_version != EXTRACTION_VERSION:
+        print(
+            f"[WARNING] The new epoch's extraction_version is {cutover.extraction_version!r}, "
+            f"but this code's EXTRACTION_VERSION is {EXTRACTION_VERSION!r}; live writes will "
+            "be stamped with the code's value.",
+            file=out,
+        )
+    return 0
+
+
+def _cutover_rebuild(
+    store: BacklogStore,
+    args: argparse.Namespace,
+    deps_factory: Callable,
+    now_iso: str,
+    out: TextIO,
+) -> int:
+    from .cutover import check_cutover, format_report
+
+    result = asyncio.run(
+        check_cutover(
+            store,
+            deps_factory,
+            staging_uri=args.staging_uri,
+            min_seed_nodes=args.min_seed_nodes,
+            expect_turns=args.expect_turns,
+            min_replay_edges=args.min_replay_edges,
+            now_iso=now_iso,
+        )
+    )
+    print(format_report(result.report), file=out)
+    verdict = "PASSED -> checked" if result.exit_code == 0 else "did not pass"
+    print(f"[cutover] rebuild check {verdict} (exit {result.exit_code})", file=out)
+    return result.exit_code
+
+
+def _add_cutover_parser(sub) -> None:
+    cutover = sub.add_parser("cutover", help="epoch cutover: begin, status, rebuild, promote")
+    csub = cutover.add_subparsers(dest="cutover_command", required=True)
+
+    begin = csub.add_parser("begin", help="open a candidate epoch; the dispatcher starts filling")
+    begin.add_argument(
+        "--model-hash",
+        required=True,
+        help="the candidate model's BARE hash, as the extraction service's /v1/info reports it",
+    )
+    begin.add_argument(
+        "--extraction-version",
+        default=None,
+        help="default: this code's EXTRACTION_VERSION (backend/knowledge/version_stamps.py)",
+    )
+    begin.add_argument(
+        "--ontology-version",
+        default=None,
+        help="default: this code's ONTOLOGY_VERSION (backend/knowledge/version_stamps.py)",
+    )
+
+    csub.add_parser("status", help="print the open cutover, or the last one")
+
+    rebuild = csub.add_parser(
+        "rebuild", help="build the staging graph twice under the candidate and gate it"
+    )
+    rebuild.add_argument("--staging-uri", required=True, help="disposable staging bolt URI")
+    rebuild.add_argument("--min-seed-nodes", type=int, required=True)
+    rebuild.add_argument("--expect-turns", type=int, required=True)
+    rebuild.add_argument("--min-replay-edges", type=int, required=True)
+
+    promote = csub.add_parser("promote", help="make the checked candidate the active epoch")
+    promote.add_argument(
+        "--graph-swapped",
+        action="store_true",
+        help="REQUIRED: the live graph has been replaced by the checked staging graph",
+    )
+
+    csub.add_parser("abandon", help="close the open cutover; deletes nothing")
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
     store: BacklogStore | None = None,
     out: TextIO | None = None,
+    embedding_model_name: str | None = None,
+    rebuild_deps_factory: Callable | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> int:
-    """Run the CLI. `store` and `out` are injectable for tests.
+    """Run the CLI. `store`, `out` and the cutover dependencies are injectable for tests.
+
+    Args:
+        embedding_model_name: For `cutover begin`; defaults to the environment's
+            `KnowledgeConfig.embedding.model_name`.
+        rebuild_deps_factory: For `cutover rebuild`, `Cutover -> RebuildDeps`;
+            defaults to the real Neo4j wiring (`build_rebuild_deps_from_env`).
+        clock: Wall clock (tz-aware) for the timestamps cutover rows record.
 
     Returns:
-        Process exit code: 0 success, 1 no epoch, 2 some requested turn was not
-        dead-lettered.
+        Process exit code: 0 success, 1 no epoch, 2 refused or some requested
+        turn was not dead-lettered; `cutover rebuild` adds 1 and 4 (see module
+        docstring).
     """
     parser = argparse.ArgumentParser(prog="python -m backend.extraction_backlog.admin")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -123,13 +360,35 @@ def main(
         "retry-dead-letters", help="put dead-lettered turns back into the backlog"
     )
     retry.add_argument("--event-id", default=None, help="retry only this turn")
+    _add_cutover_parser(sub)
     args = parser.parse_args(argv)
 
     stream = out if out is not None else sys.stdout
     backlog = store if store is not None else build_store_from_env()
+    now_iso = (clock or (lambda: datetime.now(UTC)))().isoformat()
     if args.command == "status":
         return _status(backlog, stream)
-    return _retry(backlog, args.event_id, stream)
+    if args.command == "retry-dead-letters":
+        return _retry(backlog, args.event_id, stream)
+
+    command = args.cutover_command
+    if command == "begin":
+        model = embedding_model_name or _embedding_model_from_env()
+        return _cutover_begin(backlog, args, model, now_iso, stream)
+    if command == "status":
+        return _cutover_status(backlog, stream)
+    if command == "abandon":
+        return _cutover_abandon(backlog, now_iso, stream)
+    if command == "promote":
+        return _cutover_promote(backlog, bool(args.graph_swapped), now_iso, stream)
+    # rebuild
+    if rebuild_deps_factory is None:
+        from .cutover import build_rebuild_deps_from_env
+
+        def rebuild_deps_factory(cutover: Cutover):
+            return build_rebuild_deps_from_env(backlog, args.staging_uri, cutover)
+
+    return _cutover_rebuild(backlog, args, rebuild_deps_factory, now_iso, stream)
 
 
 if __name__ == "__main__":

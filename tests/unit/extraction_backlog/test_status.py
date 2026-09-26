@@ -197,9 +197,7 @@ class TestWebSocketPush:
 
 class TestHttp:
     @pytest.mark.asyncio
-    async def test_get_extraction_status_returns_the_snapshot(
-        self, monkeypatch, backlog_world, ts
-    ):
+    async def test_get_extraction_status_returns_the_snapshot(self, monkeypatch, backlog_world, ts):
         world = backlog_world
         world.log_turn(session_id="s1", turn_index=0, timestamp=ts(0), utterance="I use rust")
         monkeypatch.setattr(server, "extraction_dispatcher", world.build_dispatcher())
