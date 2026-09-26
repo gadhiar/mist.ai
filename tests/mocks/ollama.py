@@ -40,22 +40,44 @@ class FakeLLM(StreamingLLMProvider):
     async def generate(
         self, request: LLMRequest, *, stream: bool = False
     ) -> AsyncGenerator[LLMResponse, None]:
-        """Async generate -- yields partial chunks when streaming."""
+        """Async generate -- yields partial chunks when streaming.
+
+        `stream=True` with `streaming_chunks` explicitly configured yields
+        exactly those chunks and nothing else (existing contract, relied on
+        by tests/unit/llm/test_instrumented_provider.py to exercise the
+        no-final-chunk case). `stream=True` with no `streaming_chunks`
+        configured is the T3 default-fallback case: the pattern-matched
+        response streams as a single partial chunk followed by the
+        contract-mandated terminal non-partial chunk (content=None), so
+        callers that only gate on `chunk.partial` (backend/chat/
+        conversation_handler.py's `_stream_llm_pass`) see the same text
+        they would have gotten from `invoke()`.
+        """
         self.calls.append(request)
         if stream and self._streaming_chunks is not None:
             for chunk in self._streaming_chunks:
                 yield LLMResponse(content=chunk, partial=True)
+        elif stream:
+            content = self._resolve(request)
+            if content:
+                yield LLMResponse(content=content, partial=True)
+            yield LLMResponse(content=None, partial=False)
         else:
             yield LLMResponse(content=self._resolve(request), partial=False)
 
     def generate_sync(
         self, request: LLMRequest, *, stream: bool = False
     ) -> Generator[LLMResponse, None, None]:
-        """Sync generate -- yields partial chunks when streaming."""
+        """Sync generate -- yields partial chunks when streaming. See `generate`."""
         self.calls.append(request)
         if stream and self._streaming_chunks is not None:
             for chunk in self._streaming_chunks:
                 yield LLMResponse(content=chunk, partial=True)
+        elif stream:
+            content = self._resolve(request)
+            if content:
+                yield LLMResponse(content=content, partial=True)
+            yield LLMResponse(content=None, partial=False)
         else:
             yield LLMResponse(content=self._resolve(request), partial=False)
 

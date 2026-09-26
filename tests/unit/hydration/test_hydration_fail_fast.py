@@ -49,10 +49,19 @@ _AUTHORED = datetime(2025, 9, 2, 8, 0, tzinfo=UTC)
 
 
 class _BoomLLM(FakeLLM):
-    """Fails the way llama-server does under load: the first invoke raises."""
+    """Fails the way llama-server does under load: the first pass raises.
+
+    T3/v2: the streaming pipeline calls `generate(..., stream=True)`, not
+    `invoke()`, for its conversation passes -- overriding both keeps this
+    fake failing regardless of which path a caller takes.
+    """
 
     async def invoke(self, request):  # noqa: ARG002
         raise TimeoutError("llama-server did not respond")
+
+    async def generate(self, request, *, stream: bool = False):  # noqa: ARG002
+        raise TimeoutError("llama-server did not respond")
+        yield  # pragma: no cover -- unreachable; makes this an async generator
 
 
 class _FakeExtractionPipeline:
