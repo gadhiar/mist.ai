@@ -2004,6 +2004,33 @@ def _fmt_extraction_ci(ci: list[float] | tuple[float, float] | None) -> str:
     return f"[{lo:.3f}, {hi:.3f}]"
 
 
+def _extraction_is_complete(summary: dict[str, Any] | None) -> bool:
+    """Whether an `extraction_summary.json` dict represents a complete run.
+
+    Uses the explicit `complete` key when present, whatever the probe counts say. When
+    the key is absent -- older summaries, and the hand-built fixtures under
+    fixtures/analyse/run/, predate this field -- falls back to comparing
+    `matched_probes` to `total_probes`; both must be present and int (bool excluded,
+    since JSON bool is not a probe count) for that comparison to run. A missing key, a
+    missing count, or a non-int count means incomplete: this never defaults to a silent
+    pass.
+    """
+    if summary is None:
+        return False
+    if "complete" in summary:
+        return bool(summary["complete"])
+    matched = summary.get("matched_probes")
+    total = summary.get("total_probes")
+    if (
+        isinstance(matched, int)
+        and not isinstance(matched, bool)
+        and isinstance(total, int)
+        and not isinstance(total, bool)
+    ):
+        return matched == total
+    return False
+
+
 def render_report(
     *,
     metrics: RunMetrics,
@@ -2156,7 +2183,7 @@ def render_report(
     lines.append("")
     extraction_summaries = extraction_summaries or {}
     c0_extraction = extraction_summaries.get("c0")
-    if c0_extraction is not None and c0_extraction.get("complete") is False:
+    if c0_extraction is not None and not _extraction_is_complete(c0_extraction):
         # An incomplete c0 is not a comparable delta baseline either.
         c0_extraction = None
     for arm_id in metrics.arm_order:
@@ -2167,7 +2194,7 @@ def render_report(
             lines.append("no extraction_summary.json for this arm in this run")
             lines.append("")
             continue
-        if summ.get("complete") is False:
+        if not _extraction_is_complete(summ):
             # T6 reviewer finding 1b: a partial match (broken join, throttled
             # probe, a gate) still writes extraction_summary.json, but with
             # `complete: false` -- render this arm as incomplete, with no
