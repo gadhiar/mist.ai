@@ -33,9 +33,7 @@ EXTRACTED = 0.8
 # Derived the way the writer derives `$reinforced`, not hardcoded, so a change
 # to the ontology's boost policy does not break these tests for the wrong reason.
 _MANAGER = ConfidenceManager()
-REINFORCED = _MANAGER.reinforced_confidence(
-    EXTRACTED, _MANAGER.determine_domain("Technology")
-)
+REINFORCED = _MANAGER.reinforced_confidence(EXTRACTED, _MANAGER.determine_domain("Technology"))
 
 
 def _entity(entity_id: str) -> dict:
