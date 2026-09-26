@@ -1492,14 +1492,15 @@ def merge_run_meta(
     `suites_completed`, `rep`, `layout_pass`, `harness`, `layout_result`, `errors`).
 
     `decision_rules_sha256` is a special case of the equality check: a rules edit (e.g.
-    the v1 -> v2 amendment on 2026-09-25) changes decision_rules.json's sha256, and S4
-    resumes the finalist pass for c1-512 inside run `mb1`, whose meta.json was written
-    under the v1 sha. The stored (existing) sha is allowed to differ from this call's
-    sha ONLY when it appears in `superseded_rules_shas` (the caller reads the current
-    decision_rules.json's own `supersedes` list and passes the sha256 values through
-    here -- this function stays pure/no-I/O, so it does not read that file itself). Any
-    other difference -- an unlisted sha, or any of the other identity fields -- is still
-    refused. The merged document's top-level `decision_rules_sha256` becomes this call's
+    the v1 -> v2 amendment on 2026-09-25) changes decision_rules.json's sha256 while arm
+    dirs written under the earlier sha still exist. The stored (existing) sha is allowed
+    to differ from this call's sha ONLY when it appears in `superseded_rules_shas` (the
+    caller reads the current decision_rules.json's own `supersedes` list and passes the
+    sha256 values through here -- this function stays pure/no-I/O, so it does not read
+    that file itself). Any other difference -- an unlisted sha, or any of the other
+    identity fields -- is still refused: a listed sha does not let an arm dir whose
+    stored `arm_config` differs take new calls (S4a's c1-512 finalist call into run `mb1`
+    was refused on `arm_config` and ran in a separate run). The merged document's top-level `decision_rules_sha256` becomes this call's
     (the latest) value; each entry in `calls` separately records the sha it ran under, so
     the full history survives even though the top-level field only ever shows the latest.
 
