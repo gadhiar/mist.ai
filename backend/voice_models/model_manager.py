@@ -502,6 +502,16 @@ class ModelManager:
             # Fallback to standard LLM (original implementation)
             logger.debug("Using standard LLM response (no knowledge integration)")
 
+            # This turn is answered but never logged: the event store is owned
+            # by the knowledge subsystem that is off here, so it cannot be
+            # recorded from this branch (evidence in
+            # `backend/extraction_backlog/telemetry.py`). Count and warn, once
+            # per turn, so `ExtractionStatus.unrecorded_turns` shows the loss.
+            from backend.extraction_backlog.telemetry import record_unrecorded_turn
+            from backend.request_context import current_request_id
+
+            record_unrecorded_turn(current_request_id.get())
+
             system_prompt = """You are M.I.S.T, a helpful voice assistant and friend to your creator, Raj Gadhia.
 
 Response Guidelines:
