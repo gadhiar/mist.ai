@@ -61,7 +61,8 @@ def _clear_probe_env(monkeypatch):
 
 class _StubLLMHandler(http.server.BaseHTTPRequestHandler):
     """Minimal OpenAI-chat-completions-shaped stub: always returns an empty
-    extraction (`{"entities": [], "relationships": []}`), instantly."""
+    extraction (`{"entities": [], "relationships": []}`), instantly.
+    """
 
     def do_POST(self):  # noqa: N802 (http.server's naming convention)
         length = int(self.headers.get("Content-Length", 0))
@@ -158,7 +159,8 @@ def test_fail_closed_when_a_probe_never_reaches_the_llm(tmp_path, stub_llm_serve
     """Forces a partial match by dropping one input before it ever reaches
     the pipeline (standing in for "rate-limited" / "gated" / any cause the
     scorer sees as an unmatched probe) -- main() must exit non-zero, and the
-    summary must still be written, with complete: false and the tag."""
+    summary must still be written, with complete: false and the tag.
+    """
     import scripts.mist_admin as mist_admin
 
     real_replay = mist_admin.run_extraction_only_replay

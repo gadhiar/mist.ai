@@ -38,9 +38,14 @@ def _check(
     running_image_id="sha256:" + "ef" * 32,
 ):
     check_served_arm(
-        running_args, expected_args, props, arm,
-        image_token=image_token, image_ref=image_ref,
-        running_config_image=running_config_image, running_image_id=running_image_id,
+        running_args,
+        expected_args,
+        props,
+        arm,
+        image_token=image_token,
+        image_ref=image_ref,
+        running_config_image=running_config_image,
+        running_image_id=running_image_id,
     )
 
 
@@ -76,8 +81,12 @@ def test_compose_image_matches_passes():
     expected = build_model_args(arm, ARMS_DOC, {})
     props = {"model_path": f"/models/{arm['gguf']}"}
     _check(
-        expected, expected, props, arm,
-        image_token="compose:mist-llm", image_ref=COMPOSE_IMAGE_REF,
+        expected,
+        expected,
+        props,
+        arm,
+        image_token="compose:mist-llm",
+        image_ref=COMPOSE_IMAGE_REF,
         running_config_image=COMPOSE_IMAGE_REF,
     )  # must not raise
 
@@ -88,9 +97,14 @@ def test_compose_image_mismatch_raises():
     props = {"model_path": f"/models/{arm['gguf']}"}
     with pytest.raises(ServedArmMismatchError):
         _check(
-            expected, expected, props, arm,
-            image_token="compose:mist-llm", image_ref=COMPOSE_IMAGE_REF,
-            running_config_image="ghcr.io/ggml-org/llama.cpp:server-cuda-b99999@sha256:" + "00" * 32,
+            expected,
+            expected,
+            props,
+            arm,
+            image_token="compose:mist-llm",
+            image_ref=COMPOSE_IMAGE_REF,
+            running_config_image="ghcr.io/ggml-org/llama.cpp:server-cuda-b99999@sha256:"
+            + "00" * 32,
         )
 
 
@@ -99,8 +113,12 @@ def test_snapshot_image_id_matches_passes():
     expected = build_model_args(arm, ARMS_DOC, {})
     props = {"model_path": f"/models/{arm['gguf']}"}
     _check(
-        expected, expected, props, arm,
-        image_token="snapshot:mist-llm", image_ref=SNAPSHOT_IMAGE_ID,
+        expected,
+        expected,
+        props,
+        arm,
+        image_token="snapshot:mist-llm",
+        image_ref=SNAPSHOT_IMAGE_ID,
         running_image_id=SNAPSHOT_IMAGE_ID,
     )  # must not raise
 
@@ -111,8 +129,12 @@ def test_snapshot_image_id_mismatch_raises():
     props = {"model_path": f"/models/{arm['gguf']}"}
     with pytest.raises(ServedArmMismatchError):
         _check(
-            expected, expected, props, arm,
-            image_token="snapshot:mist-llm", image_ref=SNAPSHOT_IMAGE_ID,
+            expected,
+            expected,
+            props,
+            arm,
+            image_token="snapshot:mist-llm",
+            image_ref=SNAPSHOT_IMAGE_ID,
             running_image_id="sha256:" + "99" * 32,
         )
 

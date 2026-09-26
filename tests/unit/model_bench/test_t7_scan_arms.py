@@ -203,9 +203,7 @@ def test_thinking_budget_siblings_inherit_tokens_vs_c0_from_their_root():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "arm_id", ["c7", "c7-think", "c8", "c8-think", "c9", "c9-medium"]
-)
+@pytest.mark.parametrize("arm_id", ["c7", "c7-think", "c8", "c8-think", "c9", "c9-medium"])
 def test_new_arm_flags_are_all_known_to_the_real_capture(arm_id):
     help_flags = parse_help_flags(HELP_TEXT)
     arm = resolve_all_arms(ARMS_DOC)[arm_id]

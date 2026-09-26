@@ -42,7 +42,9 @@ def test_extraction_refused_with_snapshot_missing_backend_key_writes_nothing(stu
     a_dir = _a_dir(stubbed)
     session_dir = stubbed["results_root"] / "run1" / "session"
     session_dir.mkdir(parents=True, exist_ok=True)
-    (session_dir / "snapshot.json").write_text('{"mist-llm": {"Image": "sha256:aa"}}', encoding="utf-8")
+    (session_dir / "snapshot.json").write_text(
+        '{"mist-llm": {"Image": "sha256:aa"}}', encoding="utf-8"
+    )
 
     rc = _run(stubbed, suites=["extraction"])
 
@@ -51,9 +53,12 @@ def test_extraction_refused_with_snapshot_missing_backend_key_writes_nothing(stu
     assert not (a_dir / "vram.csv").exists()
 
 
-def test_extraction_with_valid_snapshot_passes_preflight_and_invokes_container(stubbed, monkeypatch):
+def test_extraction_with_valid_snapshot_passes_preflight_and_invokes_container(
+    stubbed, monkeypatch
+):
     """Control case: a valid snapshot lets preflight pass, meta.json/vram.csv
-    ARE written, and the container argv is built with the resolved image."""
+    ARE written, and the container argv is built with the resolved image.
+    """
     session_dir = stubbed["results_root"] / "run1" / "session"
     session_dir.mkdir(parents=True, exist_ok=True)
     (session_dir / "snapshot.json").write_text(
