@@ -5,9 +5,13 @@
     {
       "sha256": "f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae",
       "label": "v1 pre-registered (2026-09-24)"
+    },
+    {
+      "sha256": "ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e",
+      "label": "v2 exploratory rules added (2026-09-25)"
     }
   ],
-  "supersedes_note": "Plan v2 (2026-09-25) adds the exploratory_rules section below; `rules`, `thresholds`, `constants`, `metrics`, and `statistics` above are byte-for-byte unchanged in content from v1 (pinned by a test against a committed copy of the v1 file). This change nonetheless moves decision_rules.json's own sha256, and S4 resumes the finalist pass for c1-512 inside run mb1, whose c1-512/meta.json was written under the v1 sha listed here. bench_host.py's merge_run_meta allows a stored decision_rules_sha256 to differ from the current one only when the stored value appears in this list; analyse.py reports a stored sha listed here as [INFO], not a mismatch [WARN]. An unlisted sha is refused by merge_run_meta and reported as [WARN] by analyse.py, exactly as before.",
+  "supersedes_note": "This list lets a stored decision_rules_sha256 that no longer matches the current file still be treated as compatible for reporting purposes, and ONLY for that: bench_host.py's merge_run_meta allows a stored decision_rules_sha256 to differ from the current call's sha only when the stored value is listed here, and analyse.py reports such a stored sha as [INFO], not a mismatch [WARN]. Listing a sha here does not relax any of merge_run_meta's other identity checks on an arm dir (arm_config, server_args, image_ref, image_id, params, tuning_label -- see bench_host.py's _META_EQUALITY_KEYS); a call whose arm_config differs from what is already stored is refused regardless of what is listed here, and must run in a new run dir. S4a's c1-512 finalist call into run mb1 was refused this way, on arm_config, and ran in a separate run instead, even though the v1 entry below already covered its stored (v1) decision_rules_sha256 (see README.md, 'Plan v2: rules-sha continuity across the v1 -> v2 amendment'). The v1 entry covers arm dirs written while decision_rules.json still held v1's content, including mb1's S1/S2 dirs before that amendment landed; the v2 entry covers arm dirs in mb1 and mb2 written under v2's (this pre-PR edit's predecessor) content -- both must keep reporting [INFO], not [WARN], now that this edit moves decision_rules.json's own sha256 again. This pre-PR edit changes only prose fields (this note and exploratory_rules.note) and the supersedes list; `rules`, `thresholds`, `constants`, `metrics`, `statistics`, and the exploratory rule definitions (exploratory_rules.rules) are unchanged in content from v2.",
   "statistics": {
     "wilson": {
       "confidence": 0.95,
@@ -280,7 +284,7 @@
     }
   ],
   "exploratory_rules": {
-    "note": "Plan v2 (2026-09-25, https://claude.ai/code -- the lead's overnight delta after S1/S2 data). Every rule in this section is NOT pre-registered: it was written after seeing S1/S2 results, so a within-noise margin here carries none of the pre-registration guarantee `rules` above does. None of these rules changes, overrides, or supersedes a v1 `rules` verdict -- X3's F_sep variants are evaluated and reported next to the corresponding v1 R2 verdict, never in place of it. analyse.py renders this section separately, headed 'Exploratory (NOT pre-registered)', after the v1 Rules section, and keeps it out of summary.json's `rules` list (it is under `exploratory_rules` there too).",
+    "note": "Plan v2 (2026-09-25, the lead's overnight delta after S1/S2 data). Every rule in this section is NOT pre-registered: it was written after seeing S1/S2 results, so a within-noise margin here carries none of the pre-registration guarantee `rules` above does. None of these rules changes, overrides, or supersedes a v1 `rules` verdict -- X3's F_sep variants are evaluated and reported next to the corresponding v1 R2 verdict, never in place of it. analyse.py renders this section separately, headed 'Exploratory (NOT pre-registered)', after the v1 Rules section, and keeps it out of summary.json's `rules` list (it is under `exploratory_rules` there too).",
     "rules": [
       {
         "id": "X1",

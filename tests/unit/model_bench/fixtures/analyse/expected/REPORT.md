@@ -1,6 +1,6 @@
 # mist-model-bench analysis report
 
-decision_rules.json sha256: `ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e`
+decision_rules.json sha256: `e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3ef618bb268db2`
 
 ## Measurement notes
 
@@ -8,19 +8,19 @@ decision_rules.json sha256: `ad181060e24727e4ffedcf899e8999941561df3b4ea6f344828
 
 ## decision_rules.json mismatch warnings
 
-- [WARN] arm 'c0-old' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
-- [WARN] arm 'c0' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
-- [WARN] arm 'c0-prod' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
-- [WARN] arm 'c1-256' meta.decision_rules_sha256='deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
-- [WARN] arm 'c1-512' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
-- [WARN] arm 'c0-ctx64k' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
-- [WARN] arm 'c2' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
-- [WARN] arm 'c2-think512' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
-- [WARN] arm 'c3' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
-- [WARN] arm 'a1' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
-- [WARN] arm 'a2' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
-- [WARN] arm 'a3' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e'
-- [INFO] arm 'c1-1024' meta.decision_rules_sha256='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae' differs from the analysed decision_rules.json='ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e' (superseded: listed in decision_rules.json's supersedes)
+- [WARN] arm 'c0-old' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3ef618bb268db2'
+- [WARN] arm 'c0' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3ef618bb268db2'
+- [WARN] arm 'c0-prod' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3ef618bb268db2'
+- [WARN] arm 'c1-256' meta.decision_rules_sha256='deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' differs from the analysed decision_rules.json='e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3ef618bb268db2'
+- [WARN] arm 'c1-512' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3ef618bb268db2'
+- [WARN] arm 'c0-ctx64k' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3ef618bb268db2'
+- [WARN] arm 'c2' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3ef618bb268db2'
+- [WARN] arm 'c2-think512' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3ef618bb268db2'
+- [WARN] arm 'c3' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3ef618bb268db2'
+- [WARN] arm 'a1' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3ef618bb268db2'
+- [WARN] arm 'a2' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3ef618bb268db2'
+- [WARN] arm 'a3' meta.decision_rules_sha256='0cb9a05be5b05e184bdbc85add56f559179d6593b60671df0e772cde9cda21ce' differs from the analysed decision_rules.json='e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3ef618bb268db2'
+- [INFO] arm 'c1-1024' meta.decision_rules_sha256='f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae' differs from the analysed decision_rules.json='e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3ef618bb268db2' (superseded: listed in decision_rules.json's supersedes)
 
 ## Per-arm metrics
 

@@ -15,6 +15,12 @@ T5's arms too, not just the pre-T5 set, exactly as the T7 brief's acceptance cri
 1 asks for ("every arm present at 044699b resolves identically"). Every base-commit
 arm is still checked byte-for-byte; nothing about the comparison itself changed.
 
+Pre-PR fixes (i64) add one narrow, named exception to that byte-for-byte guarantee:
+`c0-ub1024` gains `"optional": true` (the plan allowed at most one such server-setting
+arm, and running it was the lead's choice -- see scripts/model_bench/README.md). Every
+other arm, including every other field of c0-ub1024 itself, is still required to be
+byte-identical to its BASE_COMMIT resolution.
+
 Loads the base file via `git show <base commit>:scripts/model_bench/arms.json`
 (subprocess git against this repo's own history -- read-only, no network needed, per
 the worker container's git-metadata access), the same pattern
@@ -48,7 +54,14 @@ from scripts.model_bench.bench_host import (  # noqa: E402
 BASE_COMMIT = "044699b6b9d4f3f1759d1f67df65012eff56699d"
 
 DECISION_RULES_PATH = ARMS_JSON_PATH.parent / "decision_rules.json"
+# Pre-PR fixes (i64) edited only prose fields (supersedes_note, exploratory_rules.note)
+# and appended a second `supersedes` entry, moving decision_rules.json's own sha256 from
+# the plan v2 value (ad181060...) to this one. The superseded value is pinned below too,
+# so a future edit cannot drop it from `supersedes` without failing a test.
 DECISION_RULES_EXPECTED_SHA256 = (
+    "e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3ef618bb268db2"
+)
+DECISION_RULES_SUPERSEDED_V2_SHA256 = (
     "ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e"
 )
 
@@ -79,6 +92,11 @@ def test_every_base_arm_id_still_present():
     assert not missing, f"T5 removed arm id(s): {sorted(missing)}"
 
 
+# Pre-PR fixes (i64): c0-ub1024 gained `optional: true` (see module docstring). This is
+# the ONLY arm, and the ONLY field, this test allows to differ from BASE_COMMIT.
+_OPTIONAL_FLAG_EXEMPT_ARM = "c0-ub1024"
+
+
 def test_every_base_arm_resolves_identically_under_current_arms_json():
     base_doc = _load_base_arms_doc()
     current_doc = load_arms_doc()
@@ -86,7 +104,23 @@ def test_every_base_arm_resolves_identically_under_current_arms_json():
     current_resolved = resolve_all_arms(current_doc)
     for arm_id, base_arm in base_resolved.items():
         assert arm_id in current_resolved, f"{arm_id} missing from current arms.json"
-        assert current_resolved[arm_id] == base_arm, (
+        current_arm = current_resolved[arm_id]
+        if arm_id == _OPTIONAL_FLAG_EXEMPT_ARM:
+            assert base_arm["optional"] is False, (
+                f"{arm_id!r} was expected to start with optional=False at BASE_COMMIT"
+            )
+            assert current_arm["optional"] is True, (
+                f"{arm_id!r} was expected to resolve with optional=True after the "
+                f"pre-PR edit"
+            )
+            base_without_optional = {k: v for k, v in base_arm.items() if k != "optional"}
+            current_without_optional = {k: v for k, v in current_arm.items() if k != "optional"}
+            assert current_without_optional == base_without_optional, (
+                f"arm {arm_id!r} resolved differently under the current arms.json on "
+                f"a field other than 'optional' -- only the optional flag may differ"
+            )
+            continue
+        assert current_arm == base_arm, (
             f"arm {arm_id!r} resolved differently under the current arms.json -- "
             f"T5 must be additive-only"
         )
@@ -112,3 +146,12 @@ def test_common_args_sampling_and_thinking_args_are_byte_for_byte_unchanged():
 def test_decision_rules_json_sha256_unchanged():
     digest = hashlib.sha256(DECISION_RULES_PATH.read_bytes()).hexdigest()
     assert digest == DECISION_RULES_EXPECTED_SHA256
+
+
+def test_decision_rules_json_supersedes_lists_the_previous_sha():
+    # The pre-PR edit (i64) moved decision_rules.json's own sha256 away from the plan v2
+    # value; that value must still be listed in `supersedes` so recorded runs (mb1, mb2)
+    # written under it keep reporting [INFO], not [WARN].
+    doc = json.loads(DECISION_RULES_PATH.read_text(encoding="utf-8"))
+    listed = {e["sha256"] for e in doc.get("supersedes", [])}
+    assert DECISION_RULES_SUPERSEDED_V2_SHA256 in listed

@@ -30,20 +30,31 @@ from scripts.model_bench import analyse  # noqa: E402
 V1_COMMIT = "dced3d69831f5dcacb438c4024537c997056d885"
 V1_SHA256 = "f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae"
 
+# agent/mist-model-bench/integration's HEAD when the pre-PR-fixes (i64) worktree was
+# created -- the last commit before the i64 edit, which touched only prose fields
+# (supersedes_note, exploratory_rules.note) and the supersedes list. Used to pin that
+# exploratory_rules.rules itself (the actual rule definitions, not the prose describing
+# them) is unchanged in content by that edit.
+PRE_PR_FIXES_BASE_COMMIT = "300677f"
 
-def _load_v1_decision_rules() -> dict:
+
+def _load_decision_rules_at(commit: str) -> dict:
     proc = subprocess.run(
-        ["git", "-C", str(_REPO_ROOT), "show", f"{V1_COMMIT}:scripts/model_bench/decision_rules.json"],
+        ["git", "-C", str(_REPO_ROOT), "show", f"{commit}:scripts/model_bench/decision_rules.json"],
         capture_output=True,
         text=True,
         shell=False,
     )
     if proc.returncode != 0:
         pytest.skip(
-            f"cannot read v1 decision_rules.json via `git show {V1_COMMIT}:...` "
+            f"cannot read decision_rules.json via `git show {commit}:...` "
             f"(exit {proc.returncode}): {proc.stderr.strip()}"
         )
     return json.loads(proc.stdout)
+
+
+def _load_v1_decision_rules() -> dict:
+    return _load_decision_rules_at(V1_COMMIT)
 
 
 def test_v1_file_sha256_matches_the_supersedes_entry():
@@ -75,6 +86,16 @@ def test_v1_sha_is_listed_in_current_supersedes():
     current = analyse.load_decision_rules()
     listed = {e["sha256"] for e in current.get("supersedes", [])}
     assert V1_SHA256 in listed
+
+
+def test_exploratory_rules_rule_definitions_unchanged_by_pre_pr_fixes():
+    # i64 (pre-PR fixes) is documented as changing only prose fields (supersedes_note,
+    # exploratory_rules.note) and the supersedes list -- the actual exploratory rule
+    # definitions (exploratory_rules.rules: X1/X2/X3's clauses, thresholds, arms, etc.)
+    # must be byte-for-byte unchanged in content from the pre-i64 commit.
+    pre_pr_fixes_base = _load_decision_rules_at(PRE_PR_FIXES_BASE_COMMIT)
+    current = analyse.load_decision_rules()
+    assert current["exploratory_rules"]["rules"] == pre_pr_fixes_base["exploratory_rules"]["rules"]
 
 
 def test_exploratory_rules_are_all_marked_not_pre_registered():

@@ -146,7 +146,8 @@
       "suites": ["ttft"],
       "harness": null,
       "arg_overrides": {"-b": "2048", "-ub": "1024"},
-      "tokens_vs_c0": "may-differ"
+      "tokens_vs_c0": "may-differ",
+      "optional": true
     },
     "c6": {
       "base": "c0",

@@ -324,9 +324,11 @@ lead's plan v2 delta (`2026-09-25-mist-model-bench-plan-v2-delta.md`) adds these
   night's time budget does not cover a full harness pass at 64K/128K context on top of the full-card
   C4/c3 work.
 - **`c0-ub1024`** -- `base: c0`, `arg_overrides: {"-b": "2048", "-ub": "1024"}`,
-  `suites: ["ttft"]`. arms.json does not mark it optional (`optional` is false); the plan allowed
-  at most one such server-setting arm, and running it is the lead's choice. It is expected to move
-  prefill speed or VRAM; whether it does is unmeasured, and its tokens may differ (see below).
+  `suites: ["ttft"]`. arms.json marks it `"optional": true`; the plan allowed at most one such
+  server-setting arm, and running it is the lead's choice. It is expected to move prefill speed or
+  VRAM; whether it does is unmeasured, and its tokens may differ (see below). mb2's `c0-ub1024`
+  `meta.json` was recorded with `optional` false (before the pre-PR fixes edit added the flag), so a
+  future call into that same arm dir is refused on `arm_config`, and a new run dir is needed.
 - **`tokens_vs_c0`** -- every arm added under plan v2 carries this field (schema-validated in
   `resolve_arm`, `TOKENS_VS_C0_VALUES`); analyse.py's exploratory X2 surfaces it per context arm.
   `"expected-identical-unverified"` for a context-window-only change with the same q8_0 KV and
@@ -359,7 +361,9 @@ dir written by an earlier driver version take new calls when that dir's stored `
 differs from the current one -- and every S1/S2 arm dir in `mb1` differs (plan v2 adds
 `tokens_vs_c0` to every resolved arm, and those metas also predate `arg_overrides`). Those calls
 are refused on `arm_config`, as S4a's c1-512 finalist in `mb1` was. New arm dirs in an existing run
-are accepted. analyse reads ONE run dir, so an arm's anchors (c0, c0-prod) must be in the same run. `decision_rules.json` now carries a top-level `"supersedes"` list naming the sha256(es) it
+are accepted. analyse reads ONE run dir, so an arm's anchors (c0, c0-prod) must be in the same run.
+
+`decision_rules.json` now carries a top-level `"supersedes"` list naming the sha256(es) it
 supersedes (`{"sha256": ..., "label": ...}`); `merge_run_meta` (still a pure, no-I/O function) takes
 an explicit `superseded_rules_shas` set from its caller and allows the stored sha to differ from the
 new call's sha only when the *stored* value appears in that set -- any other difference is still
@@ -372,6 +376,14 @@ currently-analysed `decision_rules.json` produces nothing; a differing sha that 
 `supersedes` is an `[INFO]`, not a mismatch `[WARN]`; any other differing (unlisted) sha stays a
 `[WARN]`, exactly as before this change (`compute_sha_warnings`, now returning
 `(warnings, infos)`).
+
+A pre-PR fixes pass (i64) moved decision_rules.json's own sha256 a second time, editing only prose
+fields (this section's own note text and `exploratory_rules.note`) and the `supersedes` list; the
+rule definitions themselves are unchanged. `supersedes` now names two sha256 values: v1
+(`f6a42ba8...`, 2026-09-24, pre-registered) and v2 (`ad181060...`, 2026-09-25, exploratory rules
+added) -- both stay `[INFO]`, not `[WARN]`, under the current file. Recorded runs `mb1` and `mb2`
+were written under the v2 sha, so listing it is what keeps those runs off the `[WARN]` list once
+this edit lands.
 
 ### Plan v2: decision_rules.json's exploratory_rules (NOT pre-registered)
 
