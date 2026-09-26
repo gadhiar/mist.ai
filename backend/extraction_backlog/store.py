@@ -52,6 +52,7 @@ class Epoch:
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> Epoch:
+        """Build from an `epoch_ledger` row dict."""
         return cls(
             epoch_id=int(row["epoch_id"]),
             ontology_version=str(row["ontology_version"]),
@@ -124,9 +125,11 @@ class TurnProgress:
 
     @property
     def curated(self) -> bool:
+        """True when the turn's marker already says `curated`."""
         return self._curated
 
     def mark_curated(self) -> None:
+        """Write the `curated` marker."""
         self._store.mark_extraction_stage(
             event_id=self._event_id,
             epoch_id=self._epoch_id,
@@ -136,6 +139,7 @@ class TurnProgress:
         self._curated = True
 
     def mark_applied(self) -> None:
+        """Write the `applied` marker."""
         self._store.mark_extraction_stage(
             event_id=self._event_id,
             epoch_id=self._epoch_id,
@@ -153,10 +157,12 @@ class BacklogStore:
 
     @property
     def event_store(self) -> EventStore:
+        """The event store (the log) this backlog reads."""
         return self._events
 
     @property
     def cache(self) -> ExtractionCache:
+        """The extraction cache this backlog reads and writes."""
         return self._cache
 
     # -- epoch / activation ----------------------------------------------------
@@ -167,6 +173,7 @@ class BacklogStore:
         return Epoch.from_row(row) if row is not None else None
 
     def get_activation(self, epoch: Epoch) -> Activation | None:
+        """The stored first-activation floor for `epoch`, or None before activation."""
         row = self._events.get_extraction_activation(epoch.epoch_id)
         if row is None:
             return None
@@ -264,6 +271,7 @@ class BacklogStore:
     # -- per-turn reads / writes -----------------------------------------------
 
     def get_turn(self, event_id: str) -> dict[str, Any] | None:
+        """The full logged turn row, or None."""
         return self._events.get_turn(event_id)
 
     def session_history(self, session_id: str, *, through_turn_index: int, limit: int) -> list:
@@ -287,6 +295,7 @@ class BacklogStore:
         return messages[-limit:] if limit > 0 else []
 
     def get_cached(self, turn_event_id: str, epoch: Epoch) -> dict[str, Any] | None:
+        """The turn's cached decision under the epoch's stamps, or None."""
         return self._cache.get(turn_event_id, epoch.extraction_version, epoch.model_hash)
 
     def put_skip(self, event_id: str, epoch: Epoch, *, skip_reason: str, created_at: str) -> None:
@@ -331,6 +340,7 @@ class BacklogStore:
         )
 
     def progress(self, turn: PendingTurn, epoch: Epoch, *, now_iso) -> TurnProgress:
+        """The turn's durable apply markers (`ApplyProgress`)."""
         return TurnProgress(
             self._events,
             event_id=turn.event_id,
@@ -342,9 +352,11 @@ class BacklogStore:
     # -- attempts --------------------------------------------------------------
 
     def next_attempt_number(self, event_id: str, epoch: Epoch) -> int:
+        """1-based number for the next service call (retired attempts included)."""
         return self._events.count_extraction_attempts(event_id, epoch.epoch_id) + 1
 
     def counted_failures(self, event_id: str, epoch: Epoch) -> int:
+        """Job-attributable failures since the turn last (re-)entered the backlog."""
         return self._events.count_counted_extraction_failures(event_id, epoch.epoch_id)
 
     def record_attempt(
@@ -362,6 +374,7 @@ class BacklogStore:
         outcome: str,
         counted: bool,
     ) -> None:
+        """Append one service call to `extraction_attempts`."""
         self._events.append_extraction_attempt(
             event_id=turn.event_id,
             epoch_id=epoch.epoch_id,

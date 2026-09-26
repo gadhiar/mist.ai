@@ -465,7 +465,9 @@ class ExtractionPipeline:
         test_pipeline_significance_threshold.py and KNOWN_ISSUES.md, still finds
         the one place the threshold is resolved.
         """
-        sig_threshold = _SOURCE_THRESHOLDS.get(extraction_source, self._config.significance_threshold)
+        sig_threshold = _SOURCE_THRESHOLDS.get(
+            extraction_source, self._config.significance_threshold
+        )
         return sig_threshold
 
     def _embed(self, utterance: str) -> list[float] | None:
@@ -1130,7 +1132,7 @@ class ExtractionPipeline:
         cached: Mapping[str, Any],
         progress: ApplyProgress,
     ) -> ApplyReport:
-        """Apply one turn's cached extraction decision to the graph.
+        r"""Apply one turn's cached extraction decision to the graph.
 
         THE apply step of the extraction backlog: the dispatcher calls this for
         every turn, both for a result that just arrived from the service and
@@ -1155,7 +1157,7 @@ class ExtractionPipeline:
         Then, beyond the rebuild: Stage 9 operations persisted on the cache row
         (`cached["derivation"]["operations"]`) are applied through
         `InternalKnowledgeDeriver.apply_operations`. The rebuild does not do
-        this (it has no Stage 9 at all -- `grep -c "apply_operations\\|derive("
+        this (it has no Stage 9 at all -- `grep -c "apply_operations\|derive("
         backend/knowledge/regeneration/log_regenerator.py` is 0); the
         operations land in the `:__SelfModel__` partition, which
         `canonical_graph_form` does not compare by default

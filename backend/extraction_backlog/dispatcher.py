@@ -789,7 +789,9 @@ class ExtractionDispatcher:
 
         if report.skipped:
             outcome = (
-                "dead_lettered" if cached.get("skip_reason") == SKIP_EXTRACTION_FAILED else "skipped"
+                "dead_lettered"
+                if cached.get("skip_reason") == SKIP_EXTRACTION_FAILED
+                else "skipped"
             )
         elif report.stage_errors:
             outcome = "failed"
