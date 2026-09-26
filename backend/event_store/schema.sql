@@ -156,12 +156,14 @@ CREATE TABLE IF NOT EXISTS epoch_ledger (
 -- Per-(turn, epoch) apply progress. stage='curated' means Stages 3-8 finished
 -- for this turn and only the Stage 9 operations remain; stage='applied' means
 -- the turn is done. source='activation' marks turns the pre-T2a live path had
--- already applied when the backlog first activated for this epoch.
+-- already applied when the backlog first activated for this epoch;
+-- source='cutover' marks turns a promoted epoch cutover's swapped-in graph
+-- already contains (`EventStore.promote_epoch_cutover`).
 CREATE TABLE IF NOT EXISTS extraction_applied (
     event_id TEXT NOT NULL,
     epoch_id INTEGER NOT NULL,
     stage TEXT NOT NULL,                      -- 'curated', 'applied'
-    source TEXT NOT NULL,                     -- 'dispatcher', 'activation'
+    source TEXT NOT NULL,                     -- 'dispatcher', 'activation', 'cutover'
     updated_at TEXT NOT NULL,                 -- ISO-8601, wall clock (audit only)
     PRIMARY KEY (event_id, epoch_id)
 );
@@ -209,3 +211,40 @@ CREATE TABLE IF NOT EXISTS extraction_legacy_turns (
 
 CREATE INDEX IF NOT EXISTS idx_extraction_attempts_turn
     ON extraction_attempts(event_id, epoch_id);
+
+-- ---------------------------------------------------------------------------
+-- Epoch cutover (T2b). A CANDIDATE epoch, not a ledger row: `epoch_ledger`'s
+-- latest row IS the active epoch (`EventStore.get_current_epoch`), so writing
+-- the candidate there would make it live at once. The candidate is appended to
+-- the ledger only by `EventStore.promote_epoch_cutover`, in the same
+-- transaction that writes the new epoch's backlog activation.
+--
+-- state: 'filling' (the dispatcher is re-extracting the whole log under the
+-- candidate stamps), 'ready' (every logged turn has a candidate cache row),
+-- 'checked' (a staging rebuild under the candidate passed its gates),
+-- 'promoted', 'abandoned'. At most one row is open (filling/ready/checked);
+-- `begin_epoch_cutover` enforces it inside BEGIN IMMEDIATE.
+--
+-- model_hash is the COMPOSED stamp (`compose_model_hash`), the value the
+-- extraction cache is keyed under; bare_model_hash is the service's own
+-- identity, the value `/v1/info` reports. Service attempts made while filling
+-- are recorded in `extraction_attempts` under epoch_id = -cutover_id, a
+-- namespace no ledger row can occupy (ledger ids are AUTOINCREMENT, >= 1).
+--
+-- A new table, so `CREATE TABLE IF NOT EXISTS` is the whole migration.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS epoch_cutover (
+    cutover_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ontology_version TEXT NOT NULL,
+    extraction_version TEXT NOT NULL,
+    model_hash TEXT NOT NULL,                 -- composed, via compose_model_hash
+    bare_model_hash TEXT NOT NULL,            -- what the service's /v1/info reports
+    requested_at TEXT NOT NULL,               -- ISO-8601
+    state TEXT NOT NULL,                      -- filling, ready, checked, promoted, abandoned
+    source_epoch_id INTEGER,                  -- the active epoch when the cutover began
+    rebuild_job_id TEXT,                      -- LogRegenerator job id of the passing check
+    rebuilt_through_event_id TEXT,            -- last turn the passing check replayed
+    check_report TEXT,                        -- JSON, the latest check (pass or fail)
+    promoted_epoch_id INTEGER,                -- the ledger row promotion appended
+    updated_at TEXT NOT NULL                  -- ISO-8601
+);
