@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from backend.errors import ExtractionValidationError
 from backend.interfaces import LLMProvider
 from backend.llm.models import LLMRequest
 
@@ -33,6 +34,130 @@ from backend.knowledge.ontologies import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def render_extraction_messages(pre_processed: PreProcessedInput) -> list[dict]:
+    """Render the Stage 2 chat messages for a pre-processed utterance.
+
+    Pure function -- no I/O, no LLM call. Shared by the in-process
+    `OntologyConstrainedExtractor` and the extraction service.
+
+    Args:
+        pre_processed: Output from Stage 1 PreProcessor, with Stage 1.5's
+            `subject_scope` already written into `metadata` when enabled.
+
+    Returns:
+        A two-message list: system prompt (with reference date substituted),
+        then the user message (context, subject scope, utterance).
+    """
+    context_str = (
+        "\n".join(pre_processed.conversation_context)
+        if pre_processed.conversation_context
+        else "(no prior context)"
+    )
+
+    system_prompt = EXTRACTION_SYSTEM_PROMPT.format(
+        reference_date=pre_processed.reference_date.strftime("%Y-%m-%d"),
+    )
+
+    # `subject_scope` is written by Stage 1.5 SubjectScopeClassifier into
+    # pre_processed.metadata["subject_scope"]. Falls back to "unknown" so
+    # the template substitution never fails closed when Stage 1.5 is
+    # disabled or missing.
+    subject_scope = pre_processed.metadata.get("subject_scope", "unknown")
+    user_message = EXTRACTION_USER_TEMPLATE.format(
+        context=context_str,
+        utterance=pre_processed.original_text,
+        subject_scope=subject_scope,
+    )
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+
+
+def _try_parse_json_object(raw: str) -> dict | None:
+    """Direct JSON parse, then regex-extract-first-object fallback.
+
+    Returns None (never raises) when both strategies fail.
+    """
+    try:
+        result = json.loads(raw)
+        if isinstance(result, dict):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        try:
+            result = json.loads(match.group())
+            if isinstance(result, dict):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+def _is_well_shaped_extraction(result: dict) -> bool:
+    """True iff `result` has list-typed `entities` and `relationships` keys."""
+    return isinstance(result.get("entities"), list) and isinstance(
+        result.get("relationships"), list
+    )
+
+
+def parse_extraction_output(raw: str, *, strict: bool) -> dict:
+    """Parse Stage 2 LLM output into `{"entities": [...], "relationships": [...]}`.
+
+    Non-strict (`strict=False`, the in-process pipeline's historical
+    behavior): falls back to an empty result -- `{"entities": [],
+    "relationships": []}` -- on empty input, unparseable JSON, or a parsed
+    value that is not well-shaped. The pipeline never raises on bad LLM
+    output; Stage 2 already logs and degrades to "nothing extracted".
+
+    Strict (`strict=True`, the extraction service): raises instead of
+    degrading, so a caller can tell "valid output with zero entities"
+    apart from "unparseable output" and report a typed failure -- never
+    silently cache an empty extraction as a real "nothing found" decision.
+
+    Args:
+        raw: Raw string output from the LLM.
+        strict: When True, raise on empty/unparseable/malformed input
+            instead of returning an empty result.
+
+    Returns:
+        Parsed dict with "entities" and "relationships" keys (non-strict
+        may return other keys the model emitted; strict enforces list
+        typing on the two required keys).
+
+    Raises:
+        ExtractionValidationError: `strict=True` and `raw` is empty, not
+            parseable as a JSON object, or missing list-typed `entities`/
+            `relationships` keys.
+    """
+    if not raw or not raw.strip():
+        if strict:
+            raise ExtractionValidationError("Empty extraction output from LLM")
+        logger.warning("Empty LLM output, returning empty result")
+        return {"entities": [], "relationships": []}
+
+    result = _try_parse_json_object(raw)
+    if result is None:
+        if strict:
+            raise ExtractionValidationError(
+                f"Could not parse extraction output as a JSON object: {raw[:200]!r}"
+            )
+        logger.warning("Failed to parse LLM output as JSON: %s", raw[:200])
+        return {"entities": [], "relationships": []}
+
+    if strict and not _is_well_shaped_extraction(result):
+        raise ExtractionValidationError(
+            f"Extraction output missing list-typed entities/relationships: {raw[:200]!r}"
+        )
+
+    return result
 
 
 @dataclass
@@ -87,36 +212,12 @@ class OntologyConstrainedExtractor:
         Returns:
             ExtractionResult with parsed entities and relationships.
         """
-        # Build context string from conversation history
-        context_str = (
-            "\n".join(pre_processed.conversation_context)
-            if pre_processed.conversation_context
-            else "(no prior context)"
-        )
-
-        # Format the system prompt with reference date
-        system_prompt = EXTRACTION_SYSTEM_PROMPT.format(
-            reference_date=pre_processed.reference_date.strftime("%Y-%m-%d"),
-        )
-
-        # Format the user message. `subject_scope` is written by Stage 1.5
-        # SubjectScopeClassifier into pre_processed.metadata["subject_scope"].
-        # Falls back to "unknown" when Stage 1.5 is disabled or missing so
-        # the template substitution never fails closed.
-        subject_scope = pre_processed.metadata.get("subject_scope", "unknown")
-        user_message = EXTRACTION_USER_TEMPLATE.format(
-            context=context_str,
-            utterance=pre_processed.original_text,
-            subject_scope=subject_scope,
-        )
+        messages = render_extraction_messages(pre_processed)
 
         start_time = time.perf_counter()
         try:
             request = LLMRequest(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
+                messages=messages,
                 json_mode=True,
                 temperature=self.config.llm.temperature,
                 max_tokens=2048,
@@ -138,8 +239,10 @@ class OntologyConstrainedExtractor:
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         logger.info("LLM extraction completed in %.1fms", elapsed_ms)
 
-        # Parse the JSON output
-        parsed = self._parse_json_output(raw_output)
+        # Parse the JSON output. Non-strict: falls back to an empty result
+        # on unparseable/malformed output rather than raising -- the
+        # in-process pipeline's historical behavior.
+        parsed = parse_extraction_output(raw_output, strict=False)
 
         entities = parsed.get("entities", [])
         relationships = parsed.get("relationships", [])
@@ -158,44 +261,3 @@ class OntologyConstrainedExtractor:
             extraction_time_ms=elapsed_ms,
             source_utterance=pre_processed.original_text,
         )
-
-    def _parse_json_output(self, raw: str) -> dict:
-        """Parse LLM output as JSON with fallback strategies.
-
-        Attempts:
-        1. Direct JSON parse of the full string.
-        2. Regex extraction of the first JSON object.
-        3. Returns empty result on total failure.
-
-        Args:
-            raw: Raw string output from the LLM.
-
-        Returns:
-            Parsed dict with "entities" and "relationships" keys.
-        """
-        if not raw or not raw.strip():
-            logger.warning("Empty LLM output, returning empty result")
-            return {"entities": [], "relationships": []}
-
-        # Strategy 1: Direct parse
-        try:
-            result = json.loads(raw)
-            if isinstance(result, dict):
-                return result
-        except json.JSONDecodeError:
-            pass
-
-        # Strategy 2: Find JSON object via regex (handles leading/trailing text)
-        try:
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
-                result = json.loads(match.group())
-                if isinstance(result, dict):
-                    logger.debug("Parsed JSON via regex fallback")
-                    return result
-        except json.JSONDecodeError:
-            pass
-
-        # Strategy 3: Give up
-        logger.warning("Failed to parse LLM output as JSON: %s", raw[:200])
-        return {"entities": [], "relationships": []}

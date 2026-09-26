@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from backend.errors import ExtractionError
+from backend.errors import ExtractionError, ExtractionValidationError
 from backend.knowledge.extraction.internal_prompts import (
     INTERNAL_DERIVATION_SYSTEM_PROMPT,
     INTERNAL_DERIVATION_USER_TEMPLATE,
@@ -43,6 +43,99 @@ OP_TO_ENTITY_TYPE = {
 }
 
 SAFE_KEY = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def render_derivation_messages(
+    utterance: str,
+    assistant_response: str,
+    signal_types: list[str] | frozenset[str],
+    matched_patterns: list[str] | tuple[str, ...],
+    existing_internal_entities: str,
+) -> list[dict]:
+    """Render the Stage 9 chat messages for internal knowledge derivation.
+
+    Pure function -- no I/O, no LLM call. Shared by the in-process
+    `InternalKnowledgeDeriver` and the extraction service, which receives
+    `signal_types`/`matched_patterns`/`existing_internal_entities` from the
+    backend's `DerivationInput` (the service cannot read the graph itself).
+
+    Args:
+        utterance: The user's message.
+        assistant_response: MIST's response to the user.
+        signal_types: Detected signal type names (e.g. "feedback").
+        matched_patterns: Human-readable matched-pattern strings.
+        existing_internal_entities: Pre-rendered summary of existing
+            self-model entities, as produced by
+            `InternalKnowledgeDeriver.fetch_existing_internal_entities`.
+
+    Returns:
+        A two-message list: system prompt, then the rendered user template.
+    """
+    user_message = INTERNAL_DERIVATION_USER_TEMPLATE.format(
+        utterance=utterance,
+        assistant_response=assistant_response,
+        signal_types=", ".join(signal_types),
+        matched_patterns=", ".join(matched_patterns),
+        existing_internal_entities=existing_internal_entities,
+    )
+    return [
+        {"role": "system", "content": INTERNAL_DERIVATION_SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+
+def parse_derivation_output(raw: str | None, *, strict: bool) -> list[dict]:
+    """Parse Stage 9 LLM output into a list of self-model operations.
+
+    Non-strict (`strict=False`, the in-process pipeline's historical
+    behavior): returns `[]` on missing/unparseable JSON rather than
+    raising -- `derive()` already logs and degrades to "no operations".
+
+    Strict (`strict=True`, the extraction service): raises so the caller
+    can distinguish "valid output with zero operations" from
+    "unparseable output" instead of silently treating both as "nothing to
+    derive".
+
+    Args:
+        raw: Raw string output from the LLM (may be None).
+        strict: When True, raise on unparseable/malformed input instead of
+            returning an empty list.
+
+    Returns:
+        The `operations` list from the parsed JSON object (possibly empty).
+
+    Raises:
+        ExtractionValidationError: `strict=True` and `raw` is empty/None,
+            not parseable as a JSON object, or its `operations` key (when
+            present) is not a list.
+    """
+    if not raw or not raw.strip():
+        if strict:
+            raise ExtractionValidationError("Empty internal-derivation output from LLM")
+        return []
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        if strict:
+            raise ExtractionValidationError(
+                f"Could not parse internal-derivation output as JSON: {raw[:200]!r}"
+            ) from exc
+        return []
+
+    if not isinstance(parsed, dict):
+        if strict:
+            raise ExtractionValidationError(
+                f"Internal-derivation output is not a JSON object: {raw[:200]!r}"
+            )
+        return []
+
+    operations = parsed.get("operations", [])
+    if strict and not isinstance(operations, list):
+        raise ExtractionValidationError(
+            f"Internal-derivation 'operations' is not a list: {raw[:200]!r}"
+        )
+    return operations if isinstance(operations, list) else []
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,21 +196,15 @@ class InternalKnowledgeDeriver:
         start = time.perf_counter()
 
         # Fetch existing internal entities for context
-        existing = await self._fetch_existing_internal_entities()
+        existing = await self.fetch_existing_internal_entities()
 
-        # Build prompt
-        user_message = INTERNAL_DERIVATION_USER_TEMPLATE.format(
+        messages = render_derivation_messages(
             utterance=utterance,
             assistant_response=assistant_response,
-            signal_types=", ".join(signals.signal_types),
-            matched_patterns=", ".join(signals.matched_patterns),
+            signal_types=signals.signal_types,
+            matched_patterns=signals.matched_patterns,
             existing_internal_entities=existing,
         )
-
-        messages = [
-            {"role": "system", "content": INTERNAL_DERIVATION_SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ]
 
         # LLM call
         try:
@@ -136,16 +223,46 @@ class InternalKnowledgeDeriver:
             elapsed = (time.perf_counter() - start) * 1000
             return InternalDerivationResult(derivation_time_ms=elapsed, llm_called=True)
 
-        # Parse response
-        try:
-            parsed = json.loads(raw)
-            operations = parsed.get("operations", [])
-        except (json.JSONDecodeError, AttributeError) as e:
-            logger.warning("Internal derivation JSON parse failed: %s", e)
-            elapsed = (time.perf_counter() - start) * 1000
-            return InternalDerivationResult(derivation_time_ms=elapsed, llm_called=True)
+        # Parse response. Non-strict: falls back to [] on unparseable output
+        # rather than raising -- this method's historical behavior.
+        operations = parse_derivation_output(raw, strict=False)
 
-        # Validate and apply operations
+        valid_ops = await self.apply_operations(
+            operations, session_id=session_id, event_id=event_id
+        )
+
+        elapsed = (time.perf_counter() - start) * 1000
+        logger.debug("Internal derivation: %d operations in %.1fms", len(valid_ops), elapsed)
+
+        return InternalDerivationResult(
+            operations=valid_ops,
+            derivation_time_ms=elapsed,
+            llm_called=True,
+        )
+
+    async def apply_operations(
+        self, operations: list[dict], *, session_id: str, event_id: str
+    ) -> tuple[dict, ...]:
+        """Validate and apply a list of self-model operations to the graph.
+
+        Each operation's `op` type is checked against `VALID_OPS`; an
+        invalid type is skipped and logged. A valid op that fails to apply
+        (graph write error) is also skipped and logged -- one bad operation
+        never aborts the batch. This is the single apply path: `derive()`
+        calls this method rather than looping over `_apply_operation` itself,
+        and the extraction service's caller (the backend dispatcher) calls
+        it directly with operations parsed from `DerivationOut.operations`.
+
+        Args:
+            operations: Candidate operations, e.g. from
+                `parse_derivation_output`.
+            session_id: Conversation session ID.
+            event_id: Event store turn ID.
+
+        Returns:
+            The operations that were validated and successfully applied, in
+            input order.
+        """
         valid_ops = []
         for op in operations:
             op_type = op.get("op", "")
@@ -159,16 +276,9 @@ class InternalKnowledgeDeriver:
             except Exception as e:
                 logger.error("Failed to apply operation %s: %s", op_type, e)
 
-        elapsed = (time.perf_counter() - start) * 1000
-        logger.debug("Internal derivation: %d operations in %.1fms", len(valid_ops), elapsed)
+        return tuple(valid_ops)
 
-        return InternalDerivationResult(
-            operations=tuple(valid_ops),
-            derivation_time_ms=elapsed,
-            llm_called=True,
-        )
-
-    async def _fetch_existing_internal_entities(self) -> str:
+    async def fetch_existing_internal_entities(self) -> str:
         """Fetch existing internal entities for LLM context."""
         try:
             results = await self._executor.execute_query(
@@ -188,6 +298,11 @@ class InternalKnowledgeDeriver:
             return "\n".join(lines)
         except Exception:
             return "Could not fetch existing internal entities."
+
+    # Kept as an alias: the leading-underscore name predates the public
+    # `fetch_existing_internal_entities` method the extraction service
+    # (T1a) and any other external caller now use.
+    _fetch_existing_internal_entities = fetch_existing_internal_entities
 
     async def _apply_operation(self, op: dict, session_id: str, event_id: str) -> None:
         """Apply a single internal entity operation to the graph."""
