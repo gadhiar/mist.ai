@@ -1,0 +1,43 @@
+{
+  "steps": [
+    {
+      "label": "desktop",
+      "max_mib": 2200,
+      "median_mib": 2000,
+      "samples": 50,
+      "t_utc": "2026-01-01T00:00:00+00:00",
+      "total_mib": 12288
+    },
+    {
+      "label": "mist_llm",
+      "max_mib": 6700,
+      "median_mib": 6500,
+      "samples": 50,
+      "t_utc": "2026-01-01T00:01:00+00:00",
+      "total_mib": 12288
+    },
+    {
+      "label": "backend_idle",
+      "max_mib": 9200,
+      "median_mib": 9000,
+      "samples": 50,
+      "t_utc": "2026-01-01T00:02:00+00:00",
+      "total_mib": 12288
+    },
+    {
+      "label": "voice_peak",
+      "max_mib": 10200,
+      "median_mib": 10000,
+      "samples": 50,
+      "t_utc": "2026-01-01T00:03:00+00:00",
+      "total_mib": 12288
+    }
+  ],
+  "voice_probe": {
+    "error": null,
+    "max_memory_allocated_mib": 3800.0,
+    "max_memory_reserved_mib": 4000.0,
+    "stt_ok": true,
+    "tts_ok": true
+  }
+}

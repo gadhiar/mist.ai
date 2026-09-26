@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "gold_corpus": "data/ingest/extraction-gold-2026-06-14.jsonl",
+  "gold_corpus_sha256": "handbuilt0000000000000000000000000000000000000000000000000000",
+  "ontology_version": "1.4.0",
+  "total_probes": 5,
+  "matched_probes": 5,
+  "entity_precision": 0.9,
+  "entity_recall": 0.8,
+  "rel_precision": 0.85,
+  "rel_recall": 0.8,
+  "rel_f1": 0.8246753246753247,
+  "typing_accuracy": 0.9,
+  "related_to_rate": 0.0,
+  "valid_time_accuracy": 1.0,
+  "negative_violations": 0,
+  "wilson": {
+    "entity_precision": [0.554, 0.997],
+    "entity_recall": [0.376, 0.964],
+    "rel_precision": [0.554, 0.982],
+    "rel_recall": [0.376, 0.964],
+    "typing_accuracy": [0.554, 0.997]
+  },
+  "bootstrap": {
+    "method": "cluster-by-probe-id",
+    "seed": 20260924,
+    "B": 10000,
+    "confidence": 0.95,
+    "entity_precision": [0.667, 1.0],
+    "entity_recall": [0.5, 1.0],
+    "rel_precision": [0.6, 1.0],
+    "rel_recall": [0.5, 1.0]
+  }
+}

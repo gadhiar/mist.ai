@@ -1,0 +1,12 @@
+# Hand-built fixture (no live b11151 server recording exists yet -- see
+# README.md). Shape follows llama-server's documented /completion stream
+# events: incremental "content" chunks, then one final event with
+# "stop": true carrying "timings". Non-"data:" lines (this one included)
+# are skipped by iter_sse_events().
+data: {"content": "", "stop": false}
+
+data: {"content": "Hello", "stop": false}
+
+data: {"content": " world", "stop": false}
+
+data: {"content": "", "stop": true, "tokens_predicted": 3, "timings": {"prompt_n": 5, "prompt_ms": 12.5, "prompt_per_second": 400.0, "predicted_n": 3, "predicted_ms": 150.0, "predicted_per_second": 20.0}}

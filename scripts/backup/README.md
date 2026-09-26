@@ -203,7 +203,8 @@ They live on different storage and fail independently.
 - The SQLite stores and `mist-memory/` are on the bind mount: they are files under the repository
   working tree on this disk.
 - Neo4j is on DOCKER NAMED VOLUMES: `mist-neo4j-data` and `mist-neo4j-logs`
-  (`docker-compose.yml:105-107`, declared at `docker-compose.yml:179-181`). They are NOT under
+  (mounted by service mist-neo4j, `grep -n "mist-neo4j-data" docker-compose.yml`; declared in the
+  top-level block, `grep -n "^volumes:" docker-compose.yml`). They are NOT under
   `./data`.
 
 Consequences, each one separately true:

@@ -1,0 +1,8 @@
+{
+  "content": "Paris",
+  "tokens_predicted": 3,
+  "tokens": [1, 22145, 8],
+  "stop": true,
+  "stopped_eos": true,
+  "model": "gemma-4-e4b"
+}

@@ -1,0 +1,52 @@
+{
+  "arm": "c1-1024",
+  "arm_config": {
+    "id": "c1-1024"
+  },
+  "calls": [
+    {
+      "container_args": [],
+      "decision_rules_sha256": "f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae",
+      "errors": [],
+      "finished_utc": "2026-01-01T00:05:00+00:00",
+      "layout_pass": "screen",
+      "props": {},
+      "rep": null,
+      "started_utc": "2026-01-01T00:00:00+00:00",
+      "suites": [
+        "layout",
+        "ttft"
+      ]
+    }
+  ],
+  "container_args": [],
+  "decision_rules_sha256": "f6a42ba8d36084fd5c893ac430294493cd4d1f7cb8da2d40a8f29add49aa3fae",
+  "errors": [],
+  "finished_utc": "2026-01-01T00:05:00+00:00",
+  "git": {
+    "command_center": null,
+    "mist_ai": "fixture",
+    "mist_ai_dirty": false
+  },
+  "harness": null,
+  "image_id": "sha256:fixture",
+  "image_ref": "fixture:image",
+  "layout": {
+    "screen": {
+      "layouts_per_size": 2,
+      "max_tokens": 4096,
+      "thinking": "on"
+    }
+  },
+  "params": {},
+  "props": {},
+  "run": "fixture-run",
+  "schema": 1,
+  "server_args": [],
+  "started_utc": "2026-01-01T00:00:00+00:00",
+  "suites_completed": [
+    "layout",
+    "ttft"
+  ],
+  "tuning_label": null
+}

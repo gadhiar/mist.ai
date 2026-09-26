@@ -2,7 +2,8 @@
 
 MIS-140 T1. Losing `./data` and losing the graph are SEPARATE failures: Neo4j
 lives on the named volumes `mist-neo4j-data` / `mist-neo4j-logs`
-(`grep -n "mist-neo4j-data" docker-compose.yml` -> :105-107,179-181), not on the
+(mounted and declared in docker-compose.yml: `grep -n "mist-neo4j-data" docker-compose.yml`,
+and the top-level block `grep -n "^volumes:" docker-compose.yml`), not on the
 `./data` bind mount. `mist-memory/` is covered by nothing at all today: it is
 gitignored (`grep -n "mist-memory" .gitignore` -> :39) and `git ls-files
 mist-memory` returns zero files, so the corpus exists only on the operator's
