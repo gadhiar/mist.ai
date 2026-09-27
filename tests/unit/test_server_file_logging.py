@@ -33,19 +33,19 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # root logger are observable, and so a write cannot leak into pytest's own
 # process the way it could if some other already-collected test module had
 # imported backend.server first (import is cached in sys.modules).
-_IMPORT_PROBE = """
+_IMPORT_PROBE = f"""
 import json
 import logging
 import sys
 
-sys.path.insert(0, {repo_root!r})
+sys.path.insert(0, {str(REPO_ROOT)!r})
 
 import backend.server  # noqa: F401
 
 root = logging.getLogger()
 file_handlers = [h for h in root.handlers if isinstance(h, logging.FileHandler)]
 print(json.dumps({{"file_handler_count": len(file_handlers)}}))
-""".format(repo_root=str(REPO_ROOT))
+"""
 
 
 def test_import_backend_server_has_no_filesystem_side_effects(tmp_path):
