@@ -622,7 +622,8 @@ class TestRetryRacesARunningDispatcher:
         self, backlog_world, ts, monkeypatch
     ):
         """The stale `applied` marker must be gone before the new row lands:
-        with both present, `scan` would read the turn as done."""
+        with both present, `scan` would read the turn as done.
+        """
         # Arrange: a retried dead letter, and a process that dies right after
         # the new extraction is cached.
         world = backlog_world

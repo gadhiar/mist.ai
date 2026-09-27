@@ -191,9 +191,7 @@ def _strict_derivation(raw: str) -> DerivationOut:
         ExtractionValidationError: Any of those fails, including the
             derivation model rejecting the parsed value.
     """
-    operations = _require_object_items(
-        "operations", parse_derivation_output(raw, strict=True)
-    )
+    operations = _require_object_items("operations", parse_derivation_output(raw, strict=True))
     try:
         return DerivationOut(operations=operations)
     except ValidationError as exc:
