@@ -402,6 +402,71 @@ class TestDeadLetter:
         assert world.store.next_attempt_number(bad, epoch) == 7  # history kept, count reset
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("crash_at", [1, 2, 3])
+    async def test_a_crash_inside_retry_never_strands_the_turn(
+        self, backlog_world, ts, monkeypatch, crash_at
+    ):
+        """`retry_dead_letter` makes three writes across two SQLite files. A
+        crash after any prefix of them must leave the turn either pending in
+        `scan` or still listed as a dead letter -- never marked applied with
+        no cache row, where the scan skips it and a retry refuses it.
+
+        Order-independent on purpose: the crash is injected at the N-th write
+        in whatever order the method performs them.
+        """
+        # Arrange: dead-letter one turn, then heal the service.
+        world = backlog_world
+        bad = world.log_turn(
+            session_id="s1", turn_index=0, timestamp=ts(0), utterance="I really use cobol"
+        )
+        world.service.fail_script["I really use cobol"] = [(ErrorCode.TIMEOUT, True)] * 5
+        dispatcher = world.build_dispatcher()
+        await dispatcher.start()
+        assert await dispatcher.drain(timeout=5.0)
+        epoch = world.store.active_epoch()
+        assert world.store.list_dead_letters(epoch) == [bad]
+
+        writes = 0
+
+        def _crashing(original):
+            def wrapper(*args, **kwargs):
+                nonlocal writes
+                writes += 1
+                if writes == crash_at:
+                    raise SimulatedCrashError(f"crash at retry write {crash_at}")
+                return original(*args, **kwargs)
+
+            return wrapper
+
+        for target, name in [
+            (world.cache, "delete"),
+            (world.event_store, "delete_extraction_applied"),
+            (world.event_store, "retire_extraction_attempts"),
+        ]:
+            monkeypatch.setattr(target, name, _crashing(getattr(target, name)))
+
+        # Act: the crash.
+        with pytest.raises(SimulatedCrashError):
+            world.store.retry_dead_letter(bad, epoch)
+        monkeypatch.undo()
+
+        # Assert: the turn is still reachable by one of the two recovery paths.
+        pending = {p.event_id for p in world.store.scan(epoch).pending}
+        dead = world.store.list_dead_letters(epoch)
+        assert bad in pending or bad in dead, (
+            f"crash at write {crash_at} stranded {bad}: not pending in scan and "
+            "not listed as a dead letter"
+        )
+
+        # And the operator's retry completes it.
+        if bad in dead:
+            assert world.store.retry_dead_letter(bad, epoch) is True
+        dispatcher.wake()
+        assert await dispatcher.drain(timeout=5.0)
+        assert world.curation.event_ids == [bad]
+        assert dispatcher.snapshot().dead_lettered == 0
+
+    @pytest.mark.asyncio
     async def test_a_non_retryable_upstream_failure_dead_letters_at_once(self, backlog_world, ts):
         world = backlog_world
         world.log_turn(
