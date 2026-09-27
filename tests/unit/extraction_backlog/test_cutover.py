@@ -315,15 +315,32 @@ class TestFill:
         assert "filling" in seen
 
     @pytest.mark.asyncio
-    async def test_a_checked_cutover_reports_ready_on_the_wire(self, backlog_world, ts):
+    async def test_a_checked_cutover_reports_checked_on_the_wire(self, backlog_world, ts):
+        # The contract's CutoverStatus.state now has 'checked' (ADR-017 1.3.0),
+        # so the wire value matches the internal state exactly.
         world = backlog_world
         ids = await _filled(world, ts)
         _mark_checked(world, ids[-1])
 
         status = world.build_dispatcher().snapshot()
 
-        assert status.cutover.state == "ready"
+        assert status.cutover.state == "checked"
         assert world.store.open_cutover().state == "checked"
+
+    @pytest.mark.asyncio
+    async def test_a_checked_cutover_reports_checked_over_get_extraction_status(
+        self, backlog_world, ts, monkeypatch
+    ):
+        from backend import server
+
+        world = backlog_world
+        ids = await _filled(world, ts)
+        _mark_checked(world, ids[-1])
+        monkeypatch.setattr(server, "extraction_dispatcher", world.build_dispatcher())
+
+        body = await server.get_extraction_status()
+
+        assert body["cutover"]["state"] == "checked"
 
 
 class TestPromote:

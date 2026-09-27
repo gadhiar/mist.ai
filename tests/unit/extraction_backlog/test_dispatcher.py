@@ -525,6 +525,7 @@ class TestFirstActivation:
         assert world.curation.calls == []
         status = dispatcher.snapshot()
         assert (status.backlog_depth, status.apply_pending) == (0, 0)
+        assert status.legacy_unextracted == 1
         assert "1 legacy-unextracted" in caplog.text
 
     @pytest.mark.asyncio

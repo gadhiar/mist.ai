@@ -48,6 +48,7 @@ def _empty(state: str) -> ExtractionStatus:
         dead_lettered=0,
         oldest_pending_age_ms=None,
         unrecorded_turns=telemetry.unrecorded_turns(),
+        legacy_unextracted=0,
         service=_UNKNOWN_SERVICE,
         last_job=None,
         cutover=None,
