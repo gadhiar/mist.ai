@@ -4,12 +4,15 @@ Analyzes conversation turns for self-model signals and creates/updates
 internal entities (MistTrait, MistCapability, MistPreference, MistUncertainty).
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from backend.errors import ExtractionError, ExtractionValidationError
 from backend.knowledge.extraction.internal_prompts import (
@@ -17,10 +20,21 @@ from backend.knowledge.extraction.internal_prompts import (
     INTERNAL_DERIVATION_USER_TEMPLATE,
 )
 from backend.knowledge.extraction.signal_detector import SignalDetectionResult, SignalDetector
-from backend.knowledge.storage.graph_executor import GraphExecutor
 from backend.knowledge.storage.partitions import SELF_MODEL_LABEL, SELF_MODEL_TYPES
 from backend.knowledge.version_stamps import ONTOLOGY_VERSION
 from backend.llm.models import LLMRequest
+
+if TYPE_CHECKING:
+    # GraphExecutor is used only as a constructor parameter annotation
+    # (InternalKnowledgeDeriver.__init__ below) -- never constructed,
+    # isinstance-checked, or otherwise touched at runtime in this module
+    # (`grep -n "GraphExecutor" backend/knowledge/extraction/internal_derivation.py`
+    # -> the import and the one annotation, nothing else). `from __future__
+    # import annotations` above makes that annotation a string at runtime,
+    # so nothing evaluates it; the real import is needed only by type
+    # checkers, and moving it here keeps `import backend.knowledge.storage`
+    # (neo4j, and pandas/pyarrow behind it) off this module's runtime path.
+    from backend.knowledge.storage.graph_executor import GraphExecutor
 
 logger = logging.getLogger(__name__)
 

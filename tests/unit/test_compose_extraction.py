@@ -274,38 +274,45 @@ class TestDockerfile:
 # Module (as actually imported by `backend.extraction_service.app` at process
 # start, per T1a) -> distribution (as pinned in requirements.txt). Verified
 # 2026-09-26 by hooking `builtins.__import__` and importing
-# `backend.extraction_service.app` inside the worker container; see
-# requirements.txt's own header comment for the full explanation of why
-# neo4j/pandas/pyarrow appear despite no extraction code path using them.
+# `backend.extraction_service.app` inside the worker container.
+#
+# neo4j/pandas/pyarrow/numpy/pytz/dateutil/six dropped out of this closure
+# 2026-09-26 (goal mist-two-loop v2-lazy-imports, MIS-171) when
+# `backend/knowledge/extraction/__init__.py` and
+# `backend/knowledge/storage/__init__.py` became PEP 562 lazy -- see
+# requirements.txt's own header comment for the full chain that used to pull
+# them in despite no extraction code path using them.
 MODULE_TO_DISTRIBUTION = {
+    "annotated_doc": "annotated-doc",
     "annotated_types": "annotated-types",
     "anyio": "anyio",
     "brotli": "brotli",
     "click": "click",
-    "dateutil": "python-dateutil",
     "distro": "distro",
     "dotenv": "python-dotenv",
     "fastapi": "fastapi",
     "httpx": "httpx",
     "idna": "idna",
-    "neo4j": "neo4j",
-    "numpy": "numpy",
     "openai": "openai",
     "orjson": "orjson",
-    "pandas": "pandas",
-    "pyarrow": "pyarrow",
     "pydantic": "pydantic",
     "pydantic_core": "pydantic-core",
     "pygments": "pygments",
     "python_multipart": "python-multipart",
-    "pytz": "pytz",
     "rich": "rich",
-    "six": "six",
     "sniffio": "sniffio",
     "starlette": "starlette",
     "typing_extensions": "typing-extensions",
     "typing_inspection": "typing-inspection",
 }
+
+# Distributions that must NEVER be pinned in this file -- their absence from
+# the deploy image is the point of the v2-lazy-imports change (see
+# requirements.txt's header comment for the full trace of how they used to
+# get pulled in as an __init__ side effect, and
+# tests/unit/extraction_service/test_import_closure.py for the corresponding
+# runtime assertion against sys.modules).
+FORBIDDEN_DISTRIBUTIONS = {"neo4j", "pandas", "pyarrow"}
 
 
 class TestRequirementsCoverTheMeasuredClosure:
@@ -339,3 +346,12 @@ class TestRequirementsCoverTheMeasuredClosure:
 
     def test_uvicorn_is_present(self) -> None:
         assert "uvicorn" in self._pinned_distributions()
+
+    def test_forbidden_distributions_are_absent(self) -> None:
+        pinned = self._pinned_distributions()
+        present = FORBIDDEN_DISTRIBUTIONS & pinned
+        assert not present, (
+            f"{present} must not be pinned in docker/extraction/requirements.txt -- "
+            "the lazy __init__ change (MIS-171 v2-lazy-imports) removed the only "
+            "code path that pulled them in"
+        )
