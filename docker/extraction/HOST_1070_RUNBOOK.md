@@ -6,13 +6,16 @@ and nothing here has been executed yet. Every step marked [UNVERIFIED] is a
 reasoned instruction that has not been checked on the real machine; replace the
 marker with what was observed when you run it.
 
-What the host is for: it runs the `extraction-host` profile of
-`docker-compose.extraction.yml` -- the stateless extraction service
+What the host is for: it runs the standalone compose file
+`docker/extraction/compose.host.yml` -- ONLY the stateless extraction service
 (`mist-extraction-host`), its own llama-server (`mist-extraction-llm-host`), and a
-Tailscale sidecar (`mist-extraction-ts`). The MIST backend on the main machine
-reaches it over the tailnet and is the only client. The host holds no graph, no
-event store and no MIST address: it can be wiped and rebuilt at any time, and a
-backlog simply accumulates on the main machine while it is down.
+Tailscale sidecar (`mist-extraction-ts`). This file needs no other compose file to
+resolve, and in particular it never starts the repo root `docker-compose.yml`'s main
+stack (mist-llm, mist-neo4j, mist-backend) -- that stack has no business running on
+this machine. The MIST backend on the main machine reaches this host over the
+tailnet and is the only client. The host holds no graph, no event store and no MIST
+address: it can be wiped and rebuilt at any time, and a backlog simply accumulates
+on the main machine while it is down.
 
 Open inputs, needed before step 4:
 - Host RAM, CPU and OS (Raj's specs). The expert-offload setting and prompt
@@ -52,7 +55,7 @@ to `python@sha256:e41613d42d4891e4930f79523f93f81bbc7632584ec65e36ab055f41a800b4
 Build it on the main machine and transfer it, or build it on the host from a
 checkout of the same commit:
 
-    docker compose -f docker-compose.extraction.yml --profile extraction-host build
+    docker compose -f docker/extraction/compose.host.yml build
 
 3. Model file
 -------------
@@ -66,7 +69,9 @@ exact file, and it defines the extraction epoch.
 4. Environment
 --------------
 
-Create `.env` beside the compose file on the host (never commit it):
+Create `.env` beside `docker/extraction/compose.host.yml` on the host (never commit
+it) -- compose loads `.env` from the directory of the compose file you pass with
+`-f`, not the invoking shell's working directory:
 
     EXTRACTION_MODEL_HASH=<the epoch name for this file, e.g. gpt-oss-20b-mxfp4-<sha8>>
     TS_AUTHKEY=<a tailnet auth key, see step 6>
@@ -80,8 +85,8 @@ section "Environment variables" lists them.
 
 5.1 First start (PTX JIT). Start only the llama-server first and time it:
 
-    docker compose -f docker-compose.extraction.yml --profile extraction-host up -d mist-extraction-llm-host
-    docker compose -f docker-compose.extraction.yml --profile extraction-host logs -f mist-extraction-llm-host
+    docker compose -f docker/extraction/compose.host.yml up -d mist-extraction-llm-host
+    docker compose -f docker/extraction/compose.host.yml logs -f mist-extraction-llm-host
 
 The first start JIT-compiles every kernel and can take several minutes. The
 compiled cache lands on the named volume `mist-extraction-cuda-cache`
@@ -92,7 +97,7 @@ the volume mount before going further. [UNVERIFIED: first-start duration]
 5.2 Pascal check. The llama-server log must list the GTX 1070 as a CUDA device
 with compute capability 6.1 and offload layers to it. Then:
 
-    docker compose -f docker-compose.extraction.yml --profile extraction-host exec mist-extraction-llm-host curl -s localhost:8080/health
+    docker compose -f docker/extraction/compose.host.yml exec mist-extraction-llm-host curl -s localhost:8080/health
 
 must return status ok. (curl is in the server image: the compose healthcheck
 for this service and for `mist-llm` both call it.)
@@ -123,7 +128,7 @@ port 8090. The llama-server is reachable only inside the compose network.
   this host on tcp/8090. [UNVERIFIED: ACL syntax against your tailnet policy]
 - Start the rest of the profile:
 
-      docker compose -f docker-compose.extraction.yml --profile extraction-host up -d
+      docker compose -f docker/extraction/compose.host.yml up -d
 
 - From the MIST machine, check the contract endpoints:
 

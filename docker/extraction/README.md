@@ -3,15 +3,33 @@ MIST.AI extraction service -- deploy guide (T1b, goal mist-two-loop / MIS-171)
 
 This directory builds the image for the stateless extraction service
 (`backend/extraction_service/`). The service and its dedicated llama-server
-deploy identically in two places, via one overlay compose file,
-`docker-compose.extraction.yml`, at the repo root:
+deploy identically in two places, but via two SEPARATE compose files -- one
+per deployment, not one file with two profiles, because interpolation and
+"what starts on this machine" differ between them:
 
-- **extraction-local**: RTX 4070 SUPER (12 GB), beside the main stack
-  (`docker-compose.yml`), voice off, switched on manually.
+- **extraction-local**: RTX 4070 SUPER (12 GB), beside the main stack, voice
+  off, switched on manually. Overlay file `docker-compose.extraction.yml` at
+  the repo root, always used alongside `docker-compose.yml`.
 - **extraction-host**: GTX 1070 (8 GB, Pascal), a separate machine reached
-  over Tailscale.
+  over Tailscale, running nothing else from this repo. Standalone file
+  `docker/extraction/compose.host.yml`, used alone -- `docker-compose.yml`
+  is never deployed there.
 
-Both profiles run the SAME pinned llama.cpp build as the main stack's
+The two files used to be one, with the host services gated behind an
+`extraction-host` profile. That broke two ways: compose interpolates every
+service in a file regardless of the active profile, so the host sidecar's
+required `TS_AUTHKEY` failed `docker compose config` for
+`--profile extraction-local` even though no Tailscale service was active;
+and the documented host command
+(`-f docker-compose.yml -f docker-compose.extraction.yml --profile
+extraction-host`) started `docker-compose.yml`'s whole main stack (mist-llm,
+mist-neo4j, mist-backend) on the remote GTX 1070 machine as well as the
+extraction services. Splitting by deployment target fixes both:
+`docker-compose.extraction.yml` now holds only the local services and needs
+no Tailscale key at all, and `compose.host.yml` is a standalone file that
+starts ONLY its own three services.
+
+Both deployments run the SAME pinned llama.cpp build as the main stack's
 `mist-llm` service: `ghcr.io/ggml-org/llama.cpp:server-cuda-b11151@sha256:
 014f721265464f38ccb247c1338d07d852c4bae7509a4b4734d07a2bbadc765c`. This is
 not a second build to track -- one pin, three services (`mist-llm`,
@@ -20,18 +38,18 @@ not a second build to track -- one pin, three services (`mist-llm`,
 Running it
 ----------
 
-This file is an OVERLAY: `docker compose config`/`up` needs `-f
-docker-compose.yml -f docker-compose.extraction.yml` for the local profile
-(it joins the main stack's network). The host profile does not need the
-main `docker-compose.yml` at all -- it runs standalone on the remote
-machine.
+`docker-compose.extraction.yml` is an OVERLAY: `docker compose config`/`up`
+needs `-f docker-compose.yml -f docker-compose.extraction.yml` (it joins the
+main stack's network) plus `--profile extraction-local` to switch it on.
+`compose.host.yml` is STANDALONE: it needs no other compose file and no
+profile flag -- all three of its services start on a plain `up`.
 
-    # Local, alongside the main stack:
+    # Local, alongside the main stack (needs no TS_AUTHKEY):
     docker compose -f docker-compose.yml -f docker-compose.extraction.yml \
       --profile extraction-local up -d
 
     # Host, standalone on the GTX 1070 machine:
-    docker compose -f docker-compose.extraction.yml --profile extraction-host up -d
+    docker compose -f docker/extraction/compose.host.yml up -d
 
 `docker compose config` and the smoke test against a running container are
 the lead's job, not this worker's (no docker, no GPU, no network in this
@@ -40,7 +58,7 @@ worktree's container).
 Model
 -----
 
-Both profiles ship **gpt-oss-20b** (`ggml-org/gpt-oss-20b-MXFP4.gguf`, 12.1
+Both deployments ship **gpt-oss-20b** (`ggml-org/gpt-oss-20b-MXFP4.gguf`, 12.1
 GB, MoE with 3.6B active parameters, Harmony chat template), the same file
 `scripts/model_bench/arms.json`'s `c9` arm benchmarks. Reasoning is always
 on for this model; `EXTRACTION_REASONING_EFFORT` controls how much
@@ -68,18 +86,18 @@ Environment variables
 Every variable below maps 1:1 to a `backend/extraction_service/settings.py`
 field via `ServiceSettings.from_env()`. Three fields have NO default in the
 dataclass itself (`llm_base_url`, `model_hash`, `model_file`) -- compose
-sets all three explicitly for both profiles regardless of whether
+sets all three explicitly for both deployments regardless of whether
 `from_env()`'s own `os.environ.get(..., "fallback")` would otherwise supply
 one, so a deploy never silently runs on a `from_env()` fallback value.
 
 | Variable | Local default | Host default | Notes |
 |---|---|---|---|
-| `EXTRACTION_LLM_BASE_URL` | `http://mist-extraction-llm-local:8080` | `http://mist-extraction-llm-host:8080` | Hardcoded per profile -- never the backend's own LLM. |
+| `EXTRACTION_LLM_BASE_URL` | `http://mist-extraction-llm-local:8080` | `http://mist-extraction-llm-host:8080` | Hardcoded per deployment -- never the backend's own LLM. |
 | `EXTRACTION_MODEL_HASH` | **required, no default** (`:?`) | **required, no default** (`:?`) | Defines the epoch. Set explicitly every deploy; see EPOCH_MISMATCH in `backend/extraction_service/app.py`. |
 | `EXTRACTION_MODEL_FILE` | `ggml-org/gpt-oss-20b-MXFP4.gguf` | same | Passed to `LlamaServerProvider` as the OpenAI-API `model` field. |
 | `EXTRACTION_ADAPTER` | `gptoss` | same | `gptoss` / `qwen` / `gemma` -- see `backend/extraction_service/adapters.py`. |
 | `EXTRACTION_REASONING_EFFORT` | `low` | same | Only meaningful for `gptoss`. |
-| `EXTRACTION_LOCATION_LABEL` | `local-4070` | `host-1070` | Reported in `/v1/info`; hardcoded per profile, not overridable via `.env`. |
+| `EXTRACTION_LOCATION_LABEL` | `local-4070` | `host-1070` | Reported in `/v1/info`; hardcoded per deployment, not overridable via `.env`. |
 | `LLAMA_CPP_BUILD` | `b11151` | same | Reported in `ResultStamps`/`/v1/info`; shared with the compose image pin. |
 | `EXTRACTION_DEBUG_PORT` | `8090` | n/a (no ports published) | Local-only, `127.0.0.1` loopback; see Tailscale exposure below. |
 
@@ -134,8 +152,9 @@ entirely (see that field's docstring), so llama-server's OWN default
 governs. That default is already `-1` (unrestricted,
 `llama_server_help_b11151.txt:644-645`), so a request-level `-1` and the
 server's own unset-flag default resolve to the same unbudgeted behavior.
-`tests/unit/test_compose_extraction.py` asserts `--reasoning-budget` is
-absent from both llama-server commands.
+`tests/unit/test_compose_extraction.py` (local) and
+`tests/unit/test_compose_extraction_host.py` (host) each assert
+`--reasoning-budget` is absent from their own llama-server command.
 
 Local ncmoe sizing (`EXTRACTION_LOCAL_NCMOE`, default `999`)
 --------------------------------------------------------------
@@ -180,10 +199,10 @@ starting point (host RAM being enough for a 20B model's CPU-held experts)
 is unverified, not just the exact fitting number. The lead measures on the
 actual host once it is reachable and updates this default.
 
-Tailscale exposure model (host profile only)
------------------------------------------------
+Tailscale exposure model (host deployment only, `compose.host.yml`)
+-----------------------------------------------------------------------
 
-The extraction-host profile publishes **no host ports on any service**.
+The host deployment publishes **no host ports on any service**.
 Exposure is entirely through a Tailscale sidecar
 (`mist-extraction-ts`, image `tailscale/tailscale`, tag `stable` pinned by
 digest `sha256:c507f3a2a6ab1cabd8d809b98edeb41edbd5c3fb6ad9632ffd098b4c7d0b4065`,
@@ -208,8 +227,8 @@ resolved 2026-09-26):
   `network_mode` override on the sidecar itself). llama-server never gets
   a Tailscale identity of its own.
 
-CUDA JIT cache (host profile only)
--------------------------------------
+CUDA JIT cache (host deployment only, `compose.host.yml`)
+---------------------------------------------------------
 
 The pinned image is a cuda12 build; Pascal (sm_61, the GTX 1070's
 architecture) ships PTX-only in it, so the driver JIT-compiles the SASS on
