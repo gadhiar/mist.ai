@@ -1572,7 +1572,9 @@ def dump_graph_json(
         # under EVERY switch combination -- not merely off by default, but
         # unreachable. The ontology permits three such edges from a `MistIdentity`
         # source: `LEARNED_SELF` -> `LearningEvent` (written
-        # `:__Provenance__:LearningEvent`, `curation/graph_writer.py:456,489`, and
+        # `:__Provenance__:LearningEvent`, `curation/graph_writer.py`
+        # `create_belief_change_learning_event` and the `new_fact` write in
+        # `_upsert_entity` / `_create_new_fact_learning_event`, and
         # emitted on a belief change on the live path), `DERIVED_FROM` ->
         # VectorChunk / ExternalSource / VaultNote, and `RELATED_TO` to any
         # provenance target.

@@ -17,7 +17,8 @@ together -- not merely off by default, but unreachable by any combination.
 
 The ontology permits three, all with a `MistIdentity` source: `LEARNED_SELF` ->
 `LearningEvent` (written `MERGE (le:__Provenance__:LearningEvent ...)`,
-`curation/graph_writer.py:456,489`), `DERIVED_FROM` -> VectorChunk /
+`curation/graph_writer.py` `create_belief_change_learning_event` and the `new_fact`
+write in `_upsert_entity` / `_create_new_fact_learning_event`), `DERIVED_FROM` -> VectorChunk /
 ExternalSource / VaultNote, and `RELATED_TO` to any provenance target.
 `LEARNED_SELF` is emitted on a belief change on the live path. A rebuild drops
 it and no canonical form could report the drop.

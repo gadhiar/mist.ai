@@ -370,7 +370,7 @@ class LogRegenerator:
         #   seed      `ON MATCH SET n += $properties`      (seed/applier.py:62)
         #               -- unconditional clobber of every authored property
         #   extraction `display_name = CASE WHEN size(existing) < size(new) ...`
-        #               (curation/graph_writer.py:251-256) -- longest-wins
+        #               (curation/graph_writer.py `_upsert_entity`) -- longest-wins
         #
         # Live applies seed FIRST (`mist_admin seed` then `mist_admin hydrate`, per
         # docker-compose.dev-hydration.yml), so replayed facts reconcile ONTO seeded
@@ -473,7 +473,7 @@ class LogRegenerator:
         # position is retired (MIS-130 step A), and its replacement does not belong
         # on this side of the loop: a seed-apply must run BEFORE the replay, because
         # seed's `ON MATCH SET n += $properties` (seed/applier.py:62) and
-        # extraction's longest-wins `display_name` CASE (graph_writer.py:251-256) do
+        # extraction's longest-wins `display_name` CASE (graph_writer.py `_upsert_entity`) do
         # not commute. The ordering rationale in full sits above the replay loop,
         # deliberately at the position the step must take rather than at the position
         # the retired one had.

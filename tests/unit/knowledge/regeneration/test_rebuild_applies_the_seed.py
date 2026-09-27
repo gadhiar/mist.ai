@@ -6,7 +6,7 @@
 not commute. Seed does `ON MATCH SET n += $properties` (`seed/applier.py:62`) --
 an unconditional clobber of every authored property. Extraction does
 `display_name = CASE WHEN size(e.display_name) < size($display_name) ...`
-(`curation/graph_writer.py:251-256`) -- longest-wins. Live applies seed first
+(`curation/graph_writer.py` `_upsert_entity`) -- longest-wins. Live applies seed first
 (`mist_admin seed` then `mist_admin hydrate`), so replayed facts reconcile ONTO
 seeded nodes. Seeding after the loop would let `n += $properties` overwrite
 values the replay resolved by the longest-wins rule, producing a different graph
