@@ -1,0 +1,195 @@
+# MIST.AI extraction service -- STANDALONE host compose file (T1b/MIS-171
+# compose-split, goal mist-two-loop).
+#
+# Deploys ONLY the three services the GTX 1070 host runs: its own
+# llama-server, the stateless extraction service (backend/extraction_service/),
+# and the Tailscale sidecar that exposes it over the tailnet. This file is
+# STANDALONE -- it needs no other compose file to resolve. It does NOT
+# depend on the repo root docker-compose.yml, and running it never starts
+# mist-llm, mist-neo4j or mist-backend: those belong to the main stack, which
+# has no business running on the remote host. That is the defect this file
+# fixes -- the previously documented host command
+# (`-f docker-compose.yml -f docker-compose.extraction.yml --profile
+# extraction-host`) started the whole main stack on the 1070 as well.
+#
+# No `profiles:` on any service here, unlike docker-compose.extraction.yml's
+# local services. That file's profile is a manual on/off switch for running
+# extraction ALONGSIDE the main stack; this file has no "alongside" case --
+# it is the host's entire deployment, so all three services start on a plain
+# `up`.
+#
+# Run standalone on the GTX 1070 machine, from a checkout of this repo:
+#
+#     docker compose -f docker/extraction/compose.host.yml up -d
+#
+# Build context is `../..` (this file lives at docker/extraction/, so `../..`
+# resolves to the repo root) -- compose resolves a relative build `context`
+# against the compose file's own directory, and the extraction image's build
+# (docker/extraction/Dockerfile) needs the repo root to COPY backend/. The
+# `dockerfile:` path stays `docker/extraction/Dockerfile`, resolved against
+# that context root, same as the local file's `context: .` from the repo
+# root.
+#
+# The models bind mount is likewise resolved against this file's own
+# directory, not the repo root -- its default is `../../models` rather than
+# the local file's `./models`, so it lands on the same repo-root `models/`
+# directory by default. Override with `MODELS_DIR` (an absolute host path is
+# simplest for a standalone host deploy; a path relative to this file's
+# directory also works).
+#
+# See docker/extraction/README.md for every EXTRACTION_* / LLAMA_ARG_* env
+# var and the -ncmoe sizing evidence for this profile, and
+# docker/extraction/HOST_1070_RUNBOOK.md for the full host setup sequence.
+#
+# The llama.cpp image is the SAME digest as mist-llm in the repo root
+# docker-compose.yml and mist-extraction-llm-local in
+# docker-compose.extraction.yml (goal mist-model-bench pin, b11151/cuda12)
+# -- one pinned build across the whole deployment, not a second moving tag.
+# tests/unit/test_compose_extraction_host.py asserts this exact string.
+services:
+  # Tailscale sidecar. mist-extraction-host shares this container's network
+  # namespace (network_mode: service:), so whatever port the extraction
+  # service binds is reachable over Tailscale via this node -- and nothing
+  # else needs its own Tailscale identity. This sidecar ALSO joins this
+  # file's own default compose network (no network_mode override here), so
+  # mist-extraction-host, via the shared namespace, can still resolve
+  # mist-extraction-llm-host by compose DNS; the llm itself never gets a
+  # Tailscale interface, so it is unreachable from outside the compose
+  # network even though the extraction service sharing this sidecar is.
+  mist-extraction-ts:
+    # Pinned by digest: tag `stable`, resolved on the host by the lead on
+    # 2026-09-26. tests/unit/test_compose_extraction_host.py pins this exact
+    # string.
+    image: tailscale/tailscale@sha256:c507f3a2a6ab1cabd8d809b98edeb41edbd5c3fb6ad9632ffd098b4c7d0b4065
+    container_name: mist-extraction-ts
+    hostname: ${TS_HOSTNAME:-mist-extraction-gtx1070}
+    environment:
+      # No default -- a host sidecar with no auth key would either refuse
+      # to start or (worse) sit unauthenticated. Required, same as
+      # EXTRACTION_MODEL_HASH. tests/unit/test_compose_extraction_host.py
+      # asserts this has no `:-` default.
+      - TS_AUTHKEY=${TS_AUTHKEY:?TS_AUTHKEY is required for the host Tailscale sidecar; generate a reusable/ephemeral key in the Tailscale admin console.}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSTATE_DIR=/var/lib/tailscale
+    volumes:
+      - mist-extraction-ts-state:/var/lib/tailscale
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - "/dev/net/tun:/dev/net/tun"
+    # No `ports`: this container's whole purpose is exposure over the
+    # Tailscale interface, not a published host port.
+    restart: unless-stopped
+
+  mist-extraction-llm-host:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda-b11151@sha256:014f721265464f38ccb247c1338d07d852c4bae7509a4b4734d07a2bbadc765c
+    container_name: mist-extraction-llm-host
+    # No `ports`: reachable only on the internal compose network, by
+    # mist-extraction-host (which reaches it through the shared
+    # mist-extraction-ts network namespace, not by its own interface).
+    volumes:
+      # Resolved against this file's own directory (docker/extraction/), not
+      # the repo root -- ../../models lands on the repo-root models/
+      # directory by default. Override with MODELS_DIR for a host-specific
+      # models path.
+      - ${MODELS_DIR:-../../models}:/models:ro
+      # Pascal (sm_61) has no native SASS for this cuda12 image's compiled
+      # kernels -- it ships PTX only, so the driver JIT-compiles on first
+      # load. CUDA_CACHE_PATH on a named volume makes that compile happen
+      # once across container restarts rather than on every `up`.
+      - mist-extraction-cuda-cache:/root/.nv/ComputeCache
+    environment:
+      - LLAMA_ARG_MODEL=/models/${EXTRACTION_MODEL_FILE:-ggml-org/gpt-oss-20b-MXFP4.gguf}
+      - LLAMA_ARG_N_GPU_LAYERS=999
+      - LLAMA_ARG_CTX_SIZE=${EXTRACTION_LLM_CTX_SIZE:-8192}
+      - LLAMA_ARG_HOST=0.0.0.0
+      - LLAMA_ARG_PORT=8080
+      - LLAMA_ARG_N_PARALLEL=1
+      - LLAMA_ARG_METRICS=1
+      - LLAMA_ARG_JINJA=1
+      - LLAMA_ARG_REASONING=on
+      - LLAMA_ARG_THINK=deepseek
+      - CUDA_CACHE_PATH=/root/.nv/ComputeCache
+      # Generous cap (2 GiB) so the one-time PTX JIT compile for this model
+      # never gets silently evicted mid-build by a default cache size.
+      - CUDA_CACHE_MAXSIZE=2147483648
+    command:
+      - "--no-webui"
+      # Host RAM/CPU are not known yet -- this default is PROVISIONAL, same
+      # reasoning as extraction-local's (all experts on CPU, 999 as a
+      # saturating sentinel; see docker-compose.extraction.yml's -ncmoe
+      # comment). The lead re-measures once the host's actual RAM/CPU and
+      # the model's real fit are known.
+      - "-ncmoe"
+      - "${EXTRACTION_HOST_NCMOE:-999}"
+      - "-b"
+      - "2048"
+      - "-ub"
+      - "2048"
+      - "-lm"
+      - "none"
+      # No --reasoning-budget: same reasoning as the local llama-server in
+      # docker-compose.extraction.yml -- the service sends a per-request
+      # budget, and the server's own unset-flag default is already
+      # unrestricted (-1). test_compose_extraction_host.py asserts it is
+      # absent.
+      - "--cache-ram"
+      - "${LLM_CACHE_RAM_MIB:-2048}"
+      - "--temp"
+      - "1.0"
+      - "--top-p"
+      - "1.0"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      # Pascal's first-load PTX JIT compile is slow and untimed by this
+      # worker (no GPU, no docker) -- generous start_period so the health
+      # check does not fail the container out from under a still-compiling
+      # first boot. mist-llm's own start_period (docker-compose.yml, no JIT
+      # concern there) is 60s; this is 5x that.
+      start_period: 300s
+    restart: unless-stopped
+
+  mist-extraction-host:
+    build:
+      context: ../..
+      dockerfile: docker/extraction/Dockerfile
+    container_name: mist-extraction-host
+    # Shares mist-extraction-ts's network namespace: this service has no
+    # ports/hostname/networks of its own -- whatever it binds (EXTRACTION_PORT,
+    # default 8090) is reached over the sidecar's Tailscale interface.
+    network_mode: service:mist-extraction-ts
+    environment:
+      - EXTRACTION_LLM_BASE_URL=http://mist-extraction-llm-host:8080
+      - "EXTRACTION_MODEL_HASH=${EXTRACTION_MODEL_HASH:?EXTRACTION_MODEL_HASH is required, no default -- it stamps every extraction result's epoch. Set it to the deployed model file + adapter identity, e.g. gpt-oss-20b-mxfp4-gptoss-v1.}"
+      - EXTRACTION_MODEL_FILE=${EXTRACTION_MODEL_FILE:-ggml-org/gpt-oss-20b-MXFP4.gguf}
+      - EXTRACTION_ADAPTER=${EXTRACTION_ADAPTER:-gptoss}
+      - EXTRACTION_REASONING_EFFORT=${EXTRACTION_REASONING_EFFORT:-low}
+      - EXTRACTION_LOCATION_LABEL=host-1070
+      - LLAMA_CPP_BUILD=b11151
+    depends_on:
+      mist-extraction-ts:
+        condition: service_started
+      mist-extraction-llm-host:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/v1/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  mist-extraction-ts-state:
+  mist-extraction-cuda-cache:

@@ -37,9 +37,10 @@ While a cutover is open (filling, ready or checked):
 - The active epoch's pending turns stay pending. The extraction service now serves
   the candidate model, so the active epoch cannot progress. This is expected.
 - `extraction_status` (WebSocket), `GET /extraction/status` and `cutover status`
-  show progress. The WebSocket `cutover` block reports `checked` as `ready`, because
-  the contract's `CutoverStatus.state` has no `checked` value; the CLI shows the
-  exact state.
+  show progress. The WebSocket `cutover` block reports the exact state, including
+  `checked` -- `backend/extraction_contract/models.py`'s `CutoverStatus.state` now
+  carries a `checked` value (v2 (2), MIS-171), so a checked cutover no longer needs
+  to be reported as `ready`; the CLI shows the same state.
 
 Every transition logs one INFO line: `epoch_cutover transition cutover_id=... from=... to=...`.
 
