@@ -303,23 +303,29 @@ async def _graph_after(
 
 
 async def _replays_after_every_kill(history: list[Turn], turn: Turn):
-    """(single apply, [(kill_at, replayed graph)] for every write of the turn).
+    """(single apply, [(kill point, replayed graph)]) for a kill before every
+    write of the turn and one after its last write.
 
     The kill points are counted from an uninterrupted apply, not hardcoded, so
-    they follow the writer if its statement count changes.
+    they follow the writer if its statement count changes. "after-last" is a
+    kill after the whole curation write and before the `curated` marker: the
+    replay re-runs every statement of the turn.
     """
     once, turn_writes = await _graph_after(history, turn, kill_at=None)
-    replays = []
+    replays: list[tuple[int | str, ReplayGraphConnection]] = []
     for kill_at in range(1, turn_writes + 1):
         crashed, killed_at = await _graph_after(history, turn, kill_at=kill_at)
         assert killed_at == kill_at, "the kill must land inside the turn"
         replays.append((kill_at, crashed))
+    after_last, _ = await _graph_after(history, turn, kill_at=None)
+    await _apply(after_last, *turn)
+    replays.append(("after-last", after_last))
     return once, replays
 
 
 class TestKillAtAnyStatementThenReplay:
-    """A kill before ANY statement of a turn's curation, then a replay, leaves
-    the graph a single apply leaves.
+    """A kill before ANY statement of a turn's curation, or after its last one,
+    then a replay, leaves the graph a single apply leaves.
 
     Before the EXTRACTED_FROM and `new_fact` LearningEvent MERGEs moved into
     the entity statement, a kill before the separate edge write left the entity
