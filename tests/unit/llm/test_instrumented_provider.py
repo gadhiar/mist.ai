@@ -107,6 +107,52 @@ class TestTransparentDelegation:
 
 
 # ---------------------------------------------------------------------------
+# Real streaming provider -- confirms the new final-chunk contract still
+# yields exactly one llm_call record (T0: LlamaServerProvider now emits a
+# final non-partial chunk after streaming; recording must not double-fire).
+# ---------------------------------------------------------------------------
+
+
+class TestRealStreamingRecordsOnce:
+    @pytest.mark.asyncio
+    async def test_streamed_call_emits_exactly_one_llm_call_record(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        from backend.llm.llama_server_provider import LlamaServerProvider
+
+        monkeypatch.setenv("MIST_DEBUG_LLM_JSONL", "1")
+        path = tmp_path / "d.jsonl"
+        logger = DebugJSONLLogger(path)
+        provider = LlamaServerProvider(base_url="http://localhost:8080", model="test-model")
+        wrapped = InstrumentedStreamingLLMProvider(provider, logger)
+
+        chunks = [
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content="hi"))],
+            ),
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content=" there"))],
+            ),
+        ]
+
+        async def mock_stream(**kwargs):
+            for c in chunks:
+                yield c
+
+        provider._async_client.chat.completions.create = AsyncMock(side_effect=mock_stream)
+
+        collected = []
+        async for r in wrapped.generate(_basic_request(), stream=True):
+            collected.append(r)
+
+        assert len(collected) == 3  # 2 partial + 1 final aggregated
+        lines = _read_jsonl(path)
+        assert len(lines) == 1
+        assert lines[0]["phase"] == "llm_call"
+
+
+# ---------------------------------------------------------------------------
 # Recording behavior (emits records when gate is open)
 # ---------------------------------------------------------------------------
 

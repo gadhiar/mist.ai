@@ -18,9 +18,20 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from backend.errors import MistError
 from backend.event_store.models import ConversationSession, ConversationTurnEvent
 
 logger = logging.getLogger(__name__)
+
+# Epoch cutover lifecycle (T2b). See the `epoch_cutover` table in schema.sql.
+CUTOVER_STATES = ("filling", "ready", "checked", "promoted", "abandoned")
+OPEN_CUTOVER_STATES = ("filling", "ready", "checked")
+_CUTOVER_CHECK_COLUMNS = frozenset({"rebuild_job_id", "rebuilt_through_event_id", "check_report"})
+
+
+class EpochCutoverStateError(MistError):
+    """A cutover operation was refused because of the cutover's or the ledger's state."""
+
 
 # Default paths under ~/.mist/
 _DEFAULT_DB_DIR = Path.home() / ".mist"
@@ -873,6 +884,500 @@ class EventStore:
             "SELECT * FROM re_extraction_jobs WHERE job_id = ?", (job_id,)
         ).fetchone()
         return dict(row) if row is not None else None
+
+    # ------------------------------------------------------------------
+    # Extraction backlog (T2a)
+    # ------------------------------------------------------------------
+
+    def list_turn_keys_in_replay_order(self) -> list[dict[str, Any]]:
+        """Every logged turn's identity, in replay order, without its payload.
+
+        The backlog's ordering source. Same ORDER BY as
+        `get_all_turns_for_reextraction` (`timestamp, session_id, turn_index` --
+        see the MIS-138 comment there for why content order and not rowid), so
+        the live dispatcher applies turns in the order a rebuild replays them.
+
+        Deliberately unfiltered: EVERY turn the live path records is eligible,
+        whatever its session's `origin` and whatever `ontology_version` it was
+        logged under. That matches what the pre-T2a live path did -- it fired
+        extraction for every recorded turn (`conversation_handler.py`, the
+        `if event_id:` branch after `_record_turn_event`) with no origin or
+        ontology check. A rebuild still scopes itself (`LogRegenerator.rebuild`
+        passes `origins=CANONICAL_ORIGINS`); that is the rebuild's policy, not
+        the backlog's.
+
+        Returns:
+            Dicts with `event_id`, `session_id`, `turn_index` and `timestamp`
+            only -- the full row (context window, retrieval context) is read per
+            turn by `get_turn` when the turn reaches the head.
+        """
+        conn = self._get_connection()
+        cursor = conn.execute(
+            """
+            SELECT event_id, session_id, turn_index, timestamp
+            FROM conversation_turn_events
+            ORDER BY timestamp ASC, session_id ASC, turn_index ASC
+            """
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_turn(self, event_id: str) -> dict[str, Any] | None:
+        """One turn row with its JSON fields decoded, or None if absent."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM conversation_turn_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        return self._decode_turn_row(dict(row)) if row is not None else None
+
+    def get_extraction_activation(self, epoch_id: int) -> dict[str, Any] | None:
+        """The first-activation record for an epoch, or None before activation."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM extraction_activation WHERE epoch_id = ?", (epoch_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def record_extraction_activation(
+        self,
+        *,
+        epoch_id: int,
+        activated_at: str,
+        turns_at_activation: int,
+        applied_event_ids: list[str],
+        legacy_event_ids: list[str],
+    ) -> bool:
+        """Write the first-activation floor for an epoch, in ONE transaction.
+
+        One transaction so a crash cannot leave a floor row without its markers
+        (the next start would then treat the floor as done and dispatch the
+        legacy turns it failed to list) or markers without the floor row (the
+        next start would re-run activation over them -- harmless, but the count
+        in the floor row would be wrong).
+
+        Idempotent: returns False and writes nothing when the epoch already has
+        a floor, so a restart never moves it.
+
+        Returns:
+            True when the floor was written by this call.
+        """
+        conn = self._get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT 1 FROM extraction_activation WHERE epoch_id = ?", (epoch_id,)
+            ).fetchone()
+            if existing is not None:
+                conn.execute("COMMIT")
+                return False
+            conn.execute(
+                "INSERT INTO extraction_activation (epoch_id, activated_at, turns_at_activation, "
+                "marked_applied, legacy_unextracted) VALUES (?, ?, ?, ?, ?)",
+                (
+                    epoch_id,
+                    activated_at,
+                    turns_at_activation,
+                    len(applied_event_ids),
+                    len(legacy_event_ids),
+                ),
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO extraction_applied "
+                "(event_id, epoch_id, stage, source, updated_at) "
+                "VALUES (?, ?, 'applied', 'activation', ?)",
+                [(eid, epoch_id, activated_at) for eid in applied_event_ids],
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO extraction_legacy_turns (event_id, epoch_id) VALUES (?, ?)",
+                [(eid, epoch_id) for eid in legacy_event_ids],
+            )
+            conn.execute("COMMIT")
+        except sqlite3.Error:
+            conn.execute("ROLLBACK")
+            raise
+        return True
+
+    def get_extraction_legacy_turns(self, epoch_id: int) -> set[str]:
+        """Event ids logged before first activation with no cache row (never dispatched)."""
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT event_id FROM extraction_legacy_turns WHERE epoch_id = ?", (epoch_id,)
+        ).fetchall()
+        return {row[0] for row in rows}
+
+    def get_extraction_applied(self, epoch_id: int) -> dict[str, str]:
+        """Map event_id -> apply stage ('curated' or 'applied') for an epoch."""
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT event_id, stage FROM extraction_applied WHERE epoch_id = ?", (epoch_id,)
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
+
+    def mark_extraction_stage(
+        self, *, event_id: str, epoch_id: int, stage: str, updated_at: str
+    ) -> None:
+        """Upsert a turn's apply stage for an epoch ('curated' then 'applied').
+
+        Raises:
+            ValueError: `stage` is not 'curated' or 'applied'.
+        """
+        if stage not in ("curated", "applied"):
+            raise ValueError(f"unknown extraction apply stage {stage!r}")
+        conn = self._get_connection()
+        conn.execute(
+            "INSERT INTO extraction_applied (event_id, epoch_id, stage, source, updated_at) "
+            "VALUES (?, ?, ?, 'dispatcher', ?) "
+            "ON CONFLICT(event_id, epoch_id) DO UPDATE SET stage = excluded.stage, "
+            "source = excluded.source, updated_at = excluded.updated_at",
+            (event_id, epoch_id, stage, updated_at),
+        )
+
+    def delete_extraction_applied(self, event_id: str, epoch_id: int) -> bool:
+        """Remove a turn's apply marker for an epoch. True when a row was deleted."""
+        conn = self._get_connection()
+        cursor = conn.execute(
+            "DELETE FROM extraction_applied WHERE event_id = ? AND epoch_id = ?",
+            (event_id, epoch_id),
+        )
+        return cursor.rowcount > 0
+
+    def append_extraction_attempt(
+        self,
+        *,
+        event_id: str,
+        epoch_id: int,
+        attempt: int,
+        job_id: str,
+        request_id: str,
+        turn_id: str,
+        started_at: str,
+        finished_at: str,
+        duration_ms: float,
+        error_code: str | None,
+        outcome: str,
+        counted: bool,
+    ) -> None:
+        """Record one extraction-service call for a turn. Append-only."""
+        conn = self._get_connection()
+        conn.execute(
+            "INSERT INTO extraction_attempts (event_id, epoch_id, attempt, job_id, request_id, "
+            "turn_id, started_at, finished_at, duration_ms, error_code, outcome, counted) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event_id,
+                epoch_id,
+                attempt,
+                job_id,
+                request_id,
+                turn_id,
+                started_at,
+                finished_at,
+                duration_ms,
+                error_code,
+                outcome,
+                1 if counted else 0,
+            ),
+        )
+
+    def count_extraction_attempts(self, event_id: str, epoch_id: int) -> int:
+        """All recorded service calls for a turn and epoch, retired ones included."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM extraction_attempts WHERE event_id = ? AND epoch_id = ?",
+            (event_id, epoch_id),
+        ).fetchone()
+        return int(row[0])
+
+    def count_counted_extraction_failures(self, event_id: str, epoch_id: int) -> int:
+        """Job-attributable failures since the turn last (re-)entered the backlog."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM extraction_attempts "
+            "WHERE event_id = ? AND epoch_id = ? AND counted = 1 AND retired = 0",
+            (event_id, epoch_id),
+        ).fetchone()
+        return int(row[0])
+
+    def retire_extraction_attempts(self, event_id: str, epoch_id: int) -> int:
+        """Mark a turn's attempts retired so its failure count restarts at zero."""
+        conn = self._get_connection()
+        cursor = conn.execute(
+            "UPDATE extraction_attempts SET retired = 1 "
+            "WHERE event_id = ? AND epoch_id = ? AND retired = 0",
+            (event_id, epoch_id),
+        )
+        return cursor.rowcount
+
+    def list_extraction_attempts(
+        self, *, event_id: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Recorded service calls, oldest first, optionally for one turn."""
+        conn = self._get_connection()
+        if event_id is None:
+            cursor = conn.execute(
+                "SELECT * FROM extraction_attempts ORDER BY attempt_row ASC LIMIT ?", (limit,)
+            )
+        else:
+            cursor = conn.execute(
+                "SELECT * FROM extraction_attempts WHERE event_id = ? "
+                "ORDER BY attempt_row ASC LIMIT ?",
+                (event_id, limit),
+            )
+        return [dict(row) for row in cursor.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Epoch cutover (T2b)
+    # ------------------------------------------------------------------
+
+    def begin_epoch_cutover(
+        self,
+        *,
+        ontology_version: str,
+        extraction_version: str,
+        model_hash: str,
+        bare_model_hash: str,
+        source_epoch_id: int,
+        requested_at: str,
+    ) -> int | None:
+        """Open a cutover candidate in state 'filling', unless one is already open.
+
+        The candidate goes into `epoch_cutover`, NOT `epoch_ledger`: the latest
+        ledger row is the active epoch (`get_current_epoch`), so a ledger row
+        here would make the candidate live before it was filled or checked.
+
+        The at-most-one-open rule is checked and written inside one
+        `BEGIN IMMEDIATE` transaction, so two concurrent callers cannot both
+        open one.
+
+        Args:
+            model_hash: The COMPOSED stamp (`compose_model_hash`), the value the
+                extraction cache is keyed under.
+            bare_model_hash: The service's own model identity (`/v1/info`).
+            source_epoch_id: The active epoch the cutover starts from;
+                promotion refuses if the ledger has moved on since.
+
+        Returns:
+            The new `cutover_id`, or None when a cutover is already open.
+        """
+        conn = self._get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            placeholders = ", ".join("?" * len(OPEN_CUTOVER_STATES))
+            existing = conn.execute(
+                f"SELECT 1 FROM epoch_cutover WHERE state IN ({placeholders})",  # nosec B608
+                OPEN_CUTOVER_STATES,
+            ).fetchone()
+            if existing is not None:
+                conn.execute("COMMIT")
+                return None
+            cursor = conn.execute(
+                "INSERT INTO epoch_cutover (ontology_version, extraction_version, model_hash, "
+                "bare_model_hash, requested_at, state, source_epoch_id, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'filling', ?, ?)",
+                (
+                    ontology_version,
+                    extraction_version,
+                    model_hash,
+                    bare_model_hash,
+                    requested_at,
+                    source_epoch_id,
+                    requested_at,
+                ),
+            )
+            conn.execute("COMMIT")
+        except sqlite3.Error:
+            conn.execute("ROLLBACK")
+            raise
+        return int(cursor.lastrowid)
+
+    def get_open_epoch_cutover(self) -> dict[str, Any] | None:
+        """The open cutover (filling, ready or checked), or None."""
+        conn = self._get_connection()
+        placeholders = ", ".join("?" * len(OPEN_CUTOVER_STATES))
+        row = conn.execute(
+            f"SELECT * FROM epoch_cutover WHERE state IN ({placeholders}) "  # nosec B608
+            "ORDER BY cutover_id DESC LIMIT 1",
+            OPEN_CUTOVER_STATES,
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_epoch_cutover(self, cutover_id: int) -> dict[str, Any] | None:
+        """One cutover row by id, or None."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM epoch_cutover WHERE cutover_id = ?", (cutover_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_epoch_cutovers(self) -> list[dict[str, Any]]:
+        """Every cutover, oldest first."""
+        conn = self._get_connection()
+        rows = conn.execute("SELECT * FROM epoch_cutover ORDER BY cutover_id ASC").fetchall()
+        return [dict(r) for r in rows]
+
+    def transition_epoch_cutover(
+        self,
+        cutover_id: int,
+        *,
+        from_states: tuple[str, ...],
+        to_state: str,
+        updated_at: str,
+        fields: dict[str, Any] | None = None,
+    ) -> bool:
+        """Compare-and-set a cutover's state, optionally writing check columns.
+
+        Refuses 'promoted': only `promote_epoch_cutover` may set it, because
+        promotion must be atomic with the ledger append and the activation.
+
+        Args:
+            from_states: The update applies only while the row is in one of these.
+            to_state: The new state.
+            fields: Optional values for `rebuild_job_id`,
+                `rebuilt_through_event_id` and `check_report` (a JSON string).
+                A None value writes SQL NULL.
+
+        Returns:
+            True when the row was in one of `from_states` and was updated.
+
+        Raises:
+            ValueError: `to_state` is unknown or 'promoted', or `fields` names a
+                column this method does not write.
+        """
+        if to_state not in CUTOVER_STATES or to_state == "promoted":
+            raise ValueError(f"cannot transition a cutover to {to_state!r} here")
+        values = dict(fields or {})
+        unknown = set(values) - _CUTOVER_CHECK_COLUMNS
+        if unknown:
+            raise ValueError(f"not a writable cutover column: {sorted(unknown)}")
+        assignments = ["state = ?", "updated_at = ?"] + [f"{name} = ?" for name in values]
+        params: list[Any] = [to_state, updated_at, *values.values(), cutover_id, *from_states]
+        placeholders = ", ".join("?" * len(from_states))
+        conn = self._get_connection()
+        cursor = conn.execute(
+            f"UPDATE epoch_cutover SET {', '.join(assignments)} "  # nosec B608 -- names allowlisted
+            f"WHERE cutover_id = ? AND state IN ({placeholders})",
+            params,
+        )
+        return cursor.rowcount > 0
+
+    def promote_epoch_cutover(self, *, cutover_id: int, activated_at: str) -> dict[str, Any]:
+        """Make a checked cutover the active epoch, in ONE transaction.
+
+        Inside a single `BEGIN IMMEDIATE`:
+
+        1. append the candidate's stamp triple to `epoch_ledger` (prev = the
+           cutover's source epoch), which makes it the active epoch;
+        2. write the new epoch's `extraction_activation` row FIRST-HAND, with
+           `legacy_unextracted = 0`;
+        3. mark `applied` (source 'cutover') exactly the logged turns up to and
+           including `rebuilt_through_event_id` in replay order -- the swapped-in
+           graph already contains them -- and nothing after it, so the
+           dispatcher applies the later turns to the new live graph in order;
+        4. set the cutover to 'promoted'.
+
+        Step 2 is what bypasses T2a's automatic first activation
+        (`BacklogStore.ensure_activation`), which would otherwise run on the
+        dispatcher's next step, find no activation row for the new epoch, and
+        mark EVERY turn with a candidate cache row applied (including the ones
+        after `rebuilt_through_event_id`, which the swapped graph lacks) and
+        call every uncached turn legacy. With the row present it returns the
+        stored floor unchanged.
+
+        Atomic because steps 1 and 2 must not be separable: a ledger row with
+        no activation is exactly the state in which the automatic rule would
+        fire. A crash anywhere before COMMIT leaves none of the four written.
+
+        Raises:
+            EpochCutoverStateError: The cutover is not 'checked', has no
+                `rebuilt_through_event_id`, that turn is not in the log, or the
+                active epoch is no longer the cutover's source epoch.
+        """
+        conn = self._get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM epoch_cutover WHERE cutover_id = ?", (cutover_id,)
+            ).fetchone()
+            if row is None or row["state"] != "checked":
+                state = None if row is None else row["state"]
+                raise EpochCutoverStateError(
+                    f"cutover {cutover_id} is {state!r}; only a 'checked' cutover can be promoted"
+                )
+            through = row["rebuilt_through_event_id"]
+            if not through:
+                raise EpochCutoverStateError(
+                    f"cutover {cutover_id} has no rebuilt_through_event_id; re-run the check"
+                )
+            current = conn.execute(
+                "SELECT * FROM epoch_ledger ORDER BY epoch_id DESC LIMIT 1"
+            ).fetchone()
+            if current is None or int(current["epoch_id"]) != row["source_epoch_id"]:
+                raise EpochCutoverStateError(
+                    f"the active epoch is "
+                    f"{None if current is None else int(current['epoch_id'])}, but cutover "
+                    f"{cutover_id} began from epoch {row['source_epoch_id']}; abandon it and "
+                    "begin again"
+                )
+            keys = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT event_id FROM conversation_turn_events "
+                    "ORDER BY timestamp ASC, session_id ASC, turn_index ASC"
+                ).fetchall()
+            ]
+            if through not in keys:
+                raise EpochCutoverStateError(
+                    f"rebuilt_through_event_id {through!r} is not in the event log"
+                )
+            applied = keys[: keys.index(through) + 1]
+
+            cursor = conn.execute(
+                "INSERT INTO epoch_ledger (ontology_version, extraction_version, model_hash, "
+                "activated_at, prev_epoch_id, provisional) VALUES (?, ?, ?, ?, ?, 0)",
+                (
+                    row["ontology_version"],
+                    row["extraction_version"],
+                    row["model_hash"],
+                    activated_at,
+                    int(current["epoch_id"]),
+                ),
+            )
+            epoch_id = int(cursor.lastrowid)
+            self._promotion_fault_point("ledger_appended")
+            conn.execute(
+                "INSERT INTO extraction_activation (epoch_id, activated_at, turns_at_activation, "
+                "marked_applied, legacy_unextracted) VALUES (?, ?, ?, ?, 0)",
+                (epoch_id, activated_at, len(keys), len(applied)),
+            )
+            conn.executemany(
+                "INSERT INTO extraction_applied (event_id, epoch_id, stage, source, updated_at) "
+                "VALUES (?, ?, 'applied', 'cutover', ?)",
+                [(event_id, epoch_id, activated_at) for event_id in applied],
+            )
+            conn.execute(
+                "UPDATE epoch_cutover SET state = 'promoted', promoted_epoch_id = ?, "
+                "updated_at = ? WHERE cutover_id = ?",
+                (epoch_id, activated_at, cutover_id),
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            # BaseException, not Exception: a KeyboardInterrupt (or any abort)
+            # between the ledger append and the activation must not leave the
+            # connection holding a half-written transaction a later statement
+            # on this shared connection could COMMIT.
+            conn.execute("ROLLBACK")
+            raise
+        return {
+            "epoch_id": epoch_id,
+            "turns_at_activation": len(keys),
+            "marked_applied": len(applied),
+        }
+
+    def _promotion_fault_point(self, step: str) -> None:
+        """No-op seam between promotion's ledger append and its activation write.
+
+        Tests replace it to inject a crash at exactly that point and prove the
+        transaction leaves neither written. Production never overrides it.
+        """
 
     def close(self) -> None:
         """Close the database connection."""

@@ -19,8 +19,10 @@ import logging
 import sqlite3
 import time
 from collections import OrderedDict
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
 
@@ -35,6 +37,7 @@ from backend.knowledge.extraction.ontology_extractor import (
 )
 from backend.knowledge.extraction.preprocessor import PreProcessor
 from backend.knowledge.extraction.scope_classifier import SubjectScopeClassifier
+from backend.knowledge.extraction.signal_detector import SignalDetector
 from backend.knowledge.extraction.temporal import TemporalResolver
 from backend.knowledge.extraction.validator import ExtractionValidator, ValidationResult
 from backend.knowledge.extraction_cache import (
@@ -212,6 +215,103 @@ _STOPWORDS: frozenset[str] = frozenset(
 )
 
 
+# ----------------------------------------------------------------------
+# Backlog dispatch surface (T2a). The extraction-backlog dispatcher
+# (`backend/extraction_backlog/dispatcher.py`) sends Stages 1.5 / 2 / 9 to the
+# out-of-process extraction service and uses the pieces below for everything
+# the backend still owns: gates 0/2/3, the Stage 9 context, and the apply step.
+# ----------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchGateDecision:
+    """Outcome of the dispatch-time gates (0, 2, 3) for one turn.
+
+    `skip_reason` is one of the `SKIP_*` constants when a gate declined the
+    turn, None when it may be dispatched. `embedding` is the utterance
+    embedding the gates computed (None when there is no embedding provider or
+    Gate 0 fired first); the caller hands it back to
+    `note_extraction_completed` so Gate 3's dedup cache learns the turn.
+    """
+
+    skip_reason: str | None
+    embedding: list[float] | None
+
+
+@dataclass(frozen=True, slots=True)
+class DerivationContext:
+    """Stage 9 context the backend gathers because the service cannot.
+
+    Mirrors the fields of `backend.extraction_contract.models.DerivationInput`
+    except `assistant_response`, which the dispatcher takes from the logged
+    turn.
+    """
+
+    signal_types: tuple[str, ...]
+    matched_patterns: tuple[str, ...]
+    existing_internal_entities: str
+
+
+@dataclass(frozen=True, slots=True)
+class TurnToApply:
+    """The logged-turn fields the apply step reads.
+
+    `recorded_at` is the turn's LOGGED timestamp (`conversation_turn_events.
+    timestamp`, UTC-normalised by `ConversationTurnEvent.to_dict`), the value
+    `LogRegenerator.rebuild` passes as both reference date and fact-time.
+    """
+
+    event_id: str
+    session_id: str
+    user_utterance: str
+    recorded_at: str
+
+
+class ApplyProgress(Protocol):
+    """Durable per-turn apply progress, owned by the caller of `apply_cached_turn`.
+
+    Two markers rather than one. The graph write (Stages 7-8) and the Stage 9
+    operations are separate Neo4j writes, and neither is atomic with the SQLite
+    marker, so a crash can land between any two of them. Recording `curated`
+    between the two lets a restart skip a curation that already landed and
+    re-run only the Stage 9 operations, which are MERGE/SET-idempotent
+    (`internal_derivation.py`, `_apply_operation`). The window that remains --
+    a crash inside `curate_and_store` or between its return and
+    `mark_curated` -- re-runs curation; see the dispatcher module docstring for
+    what that does and does not reproduce.
+    """
+
+    @property
+    def curated(self) -> bool:
+        """True when Stages 3-8 already completed for this turn."""
+        ...
+
+    def mark_curated(self) -> None:
+        """Durably record that Stages 3-8 completed."""
+        ...
+
+    def mark_applied(self) -> None:
+        """Durably record that the turn is fully applied."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyReport:
+    """What `apply_cached_turn` did for one turn."""
+
+    skipped: bool
+    curation_result: Any
+    curation_resumed: bool
+    derivation_operations_applied: int
+
+    @property
+    def stage_errors(self) -> list[str]:
+        """Curation stage errors, empty when curation did not run or was clean."""
+        if self.curation_result is None:
+            return []
+        return list(getattr(self.curation_result, "stage_errors", []) or [])
+
+
 class ExtractionPipeline:
     """Orchestrates the full extraction pipeline (stages 1-8).
 
@@ -346,6 +446,35 @@ class ExtractionPipeline:
             )
             return False
         return True
+
+    # The three helpers below are the gate logic shared by the in-process entry
+    # point (`extract_from_utterance`) and the backlog dispatcher
+    # (`evaluate_dispatch_gates`). One definition each, so the two paths cannot
+    # drift on what "too short", "significant" or "embedded" means.
+
+    @staticmethod
+    def _is_too_short(utterance: str) -> bool:
+        """Gate 0: fewer than three words cannot carry a fact."""
+        return len(utterance.split()) < 3
+
+    def _significance_threshold(self, extraction_source: str) -> float:
+        """Gate 2 threshold for a source (see `_SOURCE_THRESHOLDS`).
+
+        Kept as a named assignment so `grep -n "sig_threshold = _SOURCE_THRESHOLDS.get"
+        backend/knowledge/extraction/pipeline.py`, cited by
+        test_pipeline_significance_threshold.py and KNOWN_ISSUES.md, still finds
+        the one place the threshold is resolved.
+        """
+        sig_threshold = _SOURCE_THRESHOLDS.get(
+            extraction_source, self._config.significance_threshold
+        )
+        return sig_threshold
+
+    def _embed(self, utterance: str) -> list[float] | None:
+        """Utterance embedding for Gates 2/3, None when no provider is wired."""
+        if self._embedding_provider is None:
+            return None
+        return self._embedding_provider.generate_embedding(utterance)
 
     def _compute_significance(
         self,
@@ -637,7 +766,7 @@ class ExtractionPipeline:
         # too short and rate-limited records "too_short", not
         # "rate_limited" -- the utterance carries no fact either way, so the
         # more specific, cheaper-to-check reason wins.
-        if len(utterance.split()) < 3:
+        if self._is_too_short(utterance):
             self._record_skip(event_id, SKIP_TOO_SHORT, recorded_at)
             logger.info("Extraction skipped (too short) for '%s'", utterance[:60])
             return ValidationResult(valid=True)
@@ -661,15 +790,10 @@ class ExtractionPipeline:
         logger.debug("Stage 1 (pre-processing): %.1fms", stage_1_ms)
 
         # -- Generate embedding for significance + dedup gates --
-        embedding: list[float] | None = None
-        if self._embedding_provider is not None:
-            embedding = self._embedding_provider.generate_embedding(utterance)
+        embedding = self._embed(utterance)
 
         # -- Gate 2: Significance scoring --
-        sig_threshold = _SOURCE_THRESHOLDS.get(
-            extraction_source,
-            self._config.significance_threshold,
-        )
+        sig_threshold = self._significance_threshold(extraction_source)
         significance = self._compute_significance(utterance, embedding)
         if significance < sig_threshold:
             self._record_skip(event_id, SKIP_BELOW_SIGNIFICANCE, recorded_at)
@@ -897,4 +1021,212 @@ class ExtractionPipeline:
             session_id=event.session_id,
             reference_date=reference_date,
             recorded_at=recorded_at,
+        )
+
+    # ------------------------------------------------------------------
+    # Backlog dispatch surface (T2a)
+    # ------------------------------------------------------------------
+
+    def evaluate_dispatch_gates(
+        self, utterance: str, extraction_source: str = "conversation"
+    ) -> DispatchGateDecision:
+        """Run Gates 0, 2 and 3 for a turn the backlog is about to dispatch.
+
+        The same gate logic as `extract_from_utterance` (shared through
+        `_is_too_short`, `_significance_threshold`, `_embed`,
+        `_compute_significance` and `_check_dedup`), minus Gate 1. The queued
+        rate limit is retired on the dispatcher path because a queue does not
+        rate-limit: the backlog dispatches one job at a time, so there is no
+        burst to shed, and a turn Gate 1 declined would be lost from the graph
+        rather than merely delayed. `extract_from_utterance` keeps Gate 1.
+
+        Pure decision: nothing is written here. The dispatcher records the skip
+        in the extraction cache under the ACTIVE EPOCH's stamps, which is what
+        a rebuild looks the row up by (`LogRegenerator.rebuild` keys the cache
+        off the epoch row).
+
+        Args:
+            utterance: The logged user utterance.
+            extraction_source: Source for the Gate 2 threshold lookup.
+
+        Returns:
+            The decision, carrying the embedding for `note_extraction_completed`.
+        """
+        if self._is_too_short(utterance):
+            logger.info("Extraction skipped (too short) for '%s'", utterance[:60])
+            return DispatchGateDecision(skip_reason=SKIP_TOO_SHORT, embedding=None)
+
+        embedding = self._embed(utterance)
+
+        sig_threshold = self._significance_threshold(extraction_source)
+        significance = self._compute_significance(utterance, embedding)
+        if significance < sig_threshold:
+            logger.info(
+                "Extraction skipped (significance %.3f < %.3f) for '%s'",
+                significance,
+                sig_threshold,
+                utterance[:60],
+            )
+            return DispatchGateDecision(skip_reason=SKIP_BELOW_SIGNIFICANCE, embedding=embedding)
+
+        if embedding is not None and self._check_dedup(utterance, embedding):
+            logger.info("Extraction skipped (duplicate) for '%s'", utterance[:60])
+            return DispatchGateDecision(skip_reason=SKIP_DUPLICATE, embedding=embedding)
+
+        return DispatchGateDecision(skip_reason=None, embedding=embedding)
+
+    def note_extraction_completed(self, utterance: str, embedding: list[float] | None) -> None:
+        """Teach Gate 3 about a turn whose Stage 2 completed (empty result or not).
+
+        `extract_from_utterance` adds to the dedup cache on both the empty
+        short-circuit and the full path; the dispatcher calls this once the
+        service's result is durably cached, so the two paths feed Gate 3 the
+        same turns.
+        """
+        if embedding is not None:
+            self._add_to_dedup_cache(utterance, embedding)
+
+    @property
+    def extraction_cache(self) -> ExtractionCache | None:
+        """The cache this pipeline records into (None when built without one).
+
+        Exposed so `backend.factories.build_extraction_dispatcher` hands the
+        dispatcher the SAME cache instance, and so the same SQLite connection,
+        the in-process path writes through.
+        """
+        return self._extraction_cache
+
+    @property
+    def derivation_enabled(self) -> bool:
+        """True when Stage 9 is wired (`resolve_internal_derivation` allowed it)."""
+        return self._internal_deriver is not None
+
+    async def build_derivation_context(self, utterance: str) -> DerivationContext | None:
+        """Gather the Stage 9 context for a turn, or None when Stage 9 will not run.
+
+        None when Stage 9 is not wired, or when `SignalDetector` finds no signal
+        in the utterance -- the same gate `_run_internal_derivation` applies on
+        the in-process path (`detect(utterance)` with no tool calls), so both
+        paths send derivation for the same turns.
+
+        `existing_internal_entities` is read from the graph HERE, at dispatch
+        time, which is why the dispatcher must not dispatch turn N+1 before turn
+        N's operations are applied: the next turn's prompt context depends on
+        them.
+        """
+        if self._internal_deriver is None:
+            return None
+        signals = SignalDetector().detect(utterance)
+        if not signals.has_signals:
+            return None
+        existing = await self._internal_deriver.fetch_existing_internal_entities()
+        return DerivationContext(
+            signal_types=tuple(sorted(signals.signal_types)),
+            matched_patterns=tuple(signals.matched_patterns),
+            existing_internal_entities=existing,
+        )
+
+    async def apply_cached_turn(
+        self,
+        turn: TurnToApply,
+        cached: Mapping[str, Any],
+        progress: ApplyProgress,
+    ) -> ApplyReport:
+        r"""Apply one turn's cached extraction decision to the graph.
+
+        THE apply step of the extraction backlog: the dispatcher calls this for
+        every turn, both for a result that just arrived from the service and
+        for a turn a crashed process cached but never finished applying. One
+        code path for live and for recovery.
+
+        Stages 3-8 are the per-turn body of `LogRegenerator.rebuild`'s replay
+        loop (`log_regenerator.py`, the `for turn in turns:` block), kept
+        semantically identical so the live graph equals a rebuild:
+
+        - a `skipped` row is a recorded decision and applies as a no-op;
+        - an `extracted` row becomes `ExtractionResult(entities, relationships,
+          source_utterance=<logged utterance>)`, Stages 3-6 run with
+          `reference_date = <logged timestamp>`, and `curate_and_store` runs
+          UNCONDITIONALLY with `event_id`, `session_id` and
+          `recorded_at=<logged timestamp>` -- even when validation left no
+          entities, because the rebuild does too. (The in-process path skips
+          curation when `result.entities` is empty; see
+          `extract_from_utterance`. That is a live-vs-rebuild difference this
+          function deliberately resolves toward the rebuild.)
+
+        Then, beyond the rebuild: Stage 9 operations persisted on the cache row
+        (`cached["derivation"]["operations"]`) are applied through
+        `InternalKnowledgeDeriver.apply_operations`. The rebuild does not do
+        this (it has no Stage 9 at all -- `grep -c "apply_operations\|derive("
+        backend/knowledge/regeneration/log_regenerator.py` is 0); the
+        operations land in the `:__SelfModel__` partition, which
+        `canonical_graph_form` does not compare by default
+        (`include_self_model=False`).
+
+        Markers: `progress.mark_curated()` after Stages 3-8, then
+        `progress.mark_applied()` after the operations. A turn whose progress
+        already says `curated` skips straight to the operations.
+
+        Args:
+            turn: The logged turn.
+            cached: The row `ExtractionCache.get` returned for this turn under
+                the active epoch.
+            progress: The turn's durable apply markers.
+
+        Returns:
+            What was done.
+        """
+        if cached["outcome"] == OUTCOME_SKIPPED:
+            progress.mark_applied()
+            return ApplyReport(
+                skipped=True,
+                curation_result=None,
+                curation_resumed=False,
+                derivation_operations_applied=0,
+            )
+
+        curation_result = None
+        curation_resumed = progress.curated
+        if not curation_resumed:
+            extraction = ExtractionResult(
+                entities=cached["entities"],
+                relationships=cached["relationships"],
+                source_utterance=turn.user_utterance,
+            )
+            reference_date = datetime.fromisoformat(turn.recorded_at)
+            extraction = self._confidence_scorer.adjust_confidence(extraction)
+            extraction = self._temporal_resolver.resolve(extraction, reference_date)
+            extraction = await self._normalizer.normalize(extraction)
+            validation = self._validator.validate(extraction)
+            if self._curation_pipeline is not None:
+                curation_result = await self._curation_pipeline.curate_and_store(
+                    validation,
+                    event_id=turn.event_id,
+                    session_id=turn.session_id,
+                    recorded_at=turn.recorded_at,
+                )
+            progress.mark_curated()
+
+        operations = list((cached.get("derivation") or {}).get("operations") or [])
+        applied_ops = 0
+        if operations:
+            if self._internal_deriver is None:
+                logger.warning(
+                    "Stage 9 is disabled; not applying %d cached derivation operation(s) "
+                    "for event %s",
+                    len(operations),
+                    turn.event_id,
+                )
+            else:
+                applied = await self._internal_deriver.apply_operations(
+                    operations, session_id=turn.session_id, event_id=turn.event_id
+                )
+                applied_ops = len(applied)
+
+        progress.mark_applied()
+        return ApplyReport(
+            skipped=False,
+            curation_result=curation_result,
+            curation_resumed=curation_resumed,
+            derivation_operations_applied=applied_ops,
         )

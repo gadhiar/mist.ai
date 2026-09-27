@@ -56,8 +56,8 @@ DERIVED_ARTIFACT_FIELDS = frozenset({"embedding"})
 
 # Excluded on NODES only; the same property on an edge is compared.
 #
-# Edge `confidence` is reinforce-only -- `graph_writer.py:251` takes a monotonic
-# max on write -- and therefore log-deterministic. Node `confidence` is
+# Edge `confidence` is reinforce-only -- `curation/reconciliation.py:663,754` take a
+# monotonic max on write -- and therefore log-deterministic. Node `confidence` is
 # additionally written by `ConfidenceDecayJob` (`confidence_decay.py:34,39`)
 # off the wall clock, which is the entire reason for the asymmetry.
 #

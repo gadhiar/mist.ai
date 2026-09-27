@@ -76,12 +76,24 @@ class LLMConfig:
     # 1024 gives tool-call emission room to complete.
     conversation_max_tokens: int = 1024
     backend: str = "llamacpp"  # "llamacpp" or "ollama"
+    # MIS-171 T4 decision 6: tool-dispatch turns (LLMRequest.tools set, no
+    # caller-set thinking) get a bounded reasoning_budget_tokens on the first
+    # attempt, consumed by backend.llm.adaptive_thinking.AdaptiveThinkingProvider
+    # (wired outermost in backend.factories.build_llm_provider). `None` means
+    # "off" -- the wrapper is not installed at all. A non-None value is only
+    # ever sent when the caller left `LLMRequest.thinking` unset; it never
+    # overrides an explicit thinking config.
+    tool_thinking_budget_tokens: int | None = 1024
 
     @classmethod
     def from_env(cls) -> "LLMConfig":
         """Load configuration from environment variables."""
         backend = os.getenv("LLM_BACKEND", "llamacpp")
         default_url = "http://localhost:11434" if backend == "ollama" else "http://localhost:8080"
+        raw_thinking_budget = os.getenv("MIST_TOOL_THINKING_BUDGET", "1024").strip()
+        tool_thinking_budget_tokens = (
+            None if raw_thinking_budget.lower() == "off" else int(raw_thinking_budget)
+        )
         return cls(
             model=os.getenv("MODEL", "gemma-4-e4b"),
             base_url=os.getenv("LLM_SERVER_URL", default_url),
@@ -89,6 +101,7 @@ class LLMConfig:
             conversation_temperature=float(os.getenv("LLM_CONVERSATION_TEMPERATURE", "0.7")),
             conversation_max_tokens=int(os.getenv("LLM_CONVERSATION_MAX_TOKENS", "1024")),
             backend=backend,
+            tool_thinking_budget_tokens=tool_thinking_budget_tokens,
         )
 
 
@@ -311,6 +324,16 @@ class ContextBudgetConfig:
     and history via weight-based allocation.
 
     - `context_window` is the hard ceiling; output `max_tokens` is subtracted.
+      MIS-171 T4: this may be the literal string `"auto"` after `from_env()`
+      (the new default when `MIST_CTX_BUDGET_WINDOW` is unset or `"auto"`) --
+      an unresolved sentinel meaning "read the server's real n_ctx at
+      startup". A raw `ContextBudgetConfig(...)` construction (tests, the
+      eval harness) still defaults to and accepts a concrete int directly, and
+      an explicit `MIST_CTX_BUDGET_WINDOW` integer always wins over "auto".
+      `backend.factories.resolve_context_budget_window` performs the "auto"
+      -> int resolution; `ContextBudgetPlanner.__init__` refuses a
+      non-int `context_window` so an unresolved config can never silently
+      reach the arithmetic in `plan()`.
     - `output_reserve_tokens` additionally reserves headroom for the completion.
     - `safety_margin_tokens` is extra headroom for tokenizer inaccuracy.
     - `retrieval_budget_ratio` allocates share of the remaining budget to
@@ -319,7 +342,9 @@ class ContextBudgetConfig:
       `backend.chat.context_budget` (defaults to sliding-window).
     """
 
-    context_window: int = 8192  # Effective usable window for Gemma 4 E4B
+    context_window: int | str = (
+        8192  # Effective usable window; "auto" after from_env() means unresolved
+    )
     output_reserve_tokens: int = 512  # Headroom for completion output
     safety_margin_tokens: int = 256  # Absorbs tokenizer estimation error
     retrieval_budget_ratio: float = 0.4  # 40% of flex budget to retrieval
@@ -328,9 +353,17 @@ class ContextBudgetConfig:
 
     @classmethod
     def from_env(cls) -> "ContextBudgetConfig":
-        """Load context-budget configuration from environment variables."""
+        """Load context-budget configuration from environment variables.
+
+        `MIST_CTX_BUDGET_WINDOW` unset or literal `"auto"` (case-insensitive,
+        the new default) yields the unresolved `"auto"` sentinel -- see the
+        class docstring. Any other value must parse as an int and wins over
+        auto-detection.
+        """
+        raw_window = os.getenv("MIST_CTX_BUDGET_WINDOW", "auto").strip()
+        context_window: int | str = "auto" if raw_window.lower() == "auto" else int(raw_window)
         return cls(
-            context_window=int(os.getenv("MIST_CTX_BUDGET_WINDOW", "8192")),
+            context_window=context_window,
             output_reserve_tokens=int(os.getenv("MIST_CTX_BUDGET_OUTPUT_RESERVE", "512")),
             safety_margin_tokens=int(os.getenv("MIST_CTX_BUDGET_SAFETY", "256")),
             retrieval_budget_ratio=float(os.getenv("MIST_CTX_BUDGET_RETRIEVAL_RATIO", "0.4")),

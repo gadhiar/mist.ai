@@ -31,18 +31,29 @@ CREATE TABLE IF NOT EXISTS extraction_cache (
     scope TEXT,
     scope_confidence REAL,
     payload TEXT NOT NULL,
-    created_at TEXT
+    created_at TEXT,
+    derivation TEXT,
+    service_stamps TEXT
 );
 """
 
 # SQLite has no ADD COLUMN IF NOT EXISTS. `initialize()` reads PRAGMA
 # table_info and adds only what is missing, mirroring the conditional
 # ALTER TABLE the event store already uses.
+#
+# `derivation` and `service_stamps` (T2a, extraction backlog) are nullable JSON
+# columns and are NOT part of `cache_key()`. `derivation` holds the Stage 9
+# operations the extraction service returned, persisted BEFORE the backend
+# applies them, so a crash between the service reply and the graph write
+# re-applies from this row instead of re-running inference. `service_stamps` is
+# audit only: which service build, prompt hash and adapter produced the row.
 _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("outcome", "TEXT NOT NULL DEFAULT 'extracted'"),
     ("skip_reason", "TEXT"),
     ("scope", "TEXT"),
     ("scope_confidence", "REAL"),
+    ("derivation", "TEXT"),
+    ("service_stamps", "TEXT"),
 )
 
 OUTCOME_EXTRACTED = "extracted"
@@ -52,9 +63,21 @@ SKIP_TOO_SHORT = "too_short"
 SKIP_RATE_LIMITED = "rate_limited"
 SKIP_BELOW_SIGNIFICANCE = "below_significance"
 SKIP_DUPLICATE = "duplicate"
+# T2a dead-letter: the extraction service failed this turn on every allowed
+# attempt (retryable `upstream_llm`, `timeout`, or a reply that failed
+# validation). Recorded as a skip so the turn never blocks the backlog head, and
+# deletable by `python -m backend.extraction_backlog.admin retry-dead-letters`,
+# which puts the turn back into the backlog.
+SKIP_EXTRACTION_FAILED = "extraction_failed"
 
 VALID_SKIP_REASONS = frozenset(
-    {SKIP_TOO_SHORT, SKIP_RATE_LIMITED, SKIP_BELOW_SIGNIFICANCE, SKIP_DUPLICATE}
+    {
+        SKIP_TOO_SHORT,
+        SKIP_RATE_LIMITED,
+        SKIP_BELOW_SIGNIFICANCE,
+        SKIP_DUPLICATE,
+        SKIP_EXTRACTION_FAILED,
+    }
 )
 
 
@@ -133,7 +156,8 @@ class ExtractionCache:
             self._get_connection()
             .execute(
                 "SELECT ontology_version, outcome, skip_reason, scope, "
-                "scope_confidence, payload FROM extraction_cache WHERE cache_key = ?",
+                "scope_confidence, payload, derivation, service_stamps "
+                "FROM extraction_cache WHERE cache_key = ?",
                 (key,),
             )
             .fetchone()
@@ -149,7 +173,84 @@ class ExtractionCache:
             "scope_confidence": row["scope_confidence"],
             "entities": payload.get("entities", []),
             "relationships": payload.get("relationships", []),
+            "derivation": _loads_or_none(row["derivation"]),
+            "service_stamps": _loads_or_none(row["service_stamps"]),
         }
+
+    def event_ids_for(self, extraction_version: str, model_hash: str) -> dict[str, str | None]:
+        """Map every cached event_id under this stamp pair to its skip_reason.
+
+        The backlog reads this once per scan instead of issuing one `get()` per
+        logged turn. The value is the row's `skip_reason` (None for an
+        'extracted' row), which is what lets a caller count dead-lettered turns
+        (`SKIP_EXTRACTION_FAILED`) without a second query.
+
+        Filtered on the two stamp COLUMNS rather than on `cache_key`: the key is
+        a hash of `event_id|extraction_version|model_hash` (`cache_key()`), so
+        both select exactly the rows `get()` would hit for the same stamps.
+
+        Args:
+            extraction_version: The epoch's extraction_version stamp.
+            model_hash: The epoch's (composed) model_hash stamp.
+
+        Returns:
+            A dict of event_id -> skip_reason (None when outcome='extracted').
+        """
+        rows = (
+            self._get_connection()
+            .execute(
+                "SELECT event_id, skip_reason FROM extraction_cache "
+                "WHERE extraction_version = ? AND model_hash = ?",
+                (extraction_version, model_hash),
+            )
+            .fetchall()
+        )
+        return {row["event_id"]: row["skip_reason"] for row in rows}
+
+    def delete(
+        self,
+        event_id: str,
+        extraction_version: str,
+        model_hash: str,
+        *,
+        only_skip_reason: str | None = None,
+    ) -> bool:
+        """Delete the cached decision for one turn under one stamp pair.
+
+        Exists for exactly one caller: `retry-dead-letters`
+        (`backend/extraction_backlog/admin.py`), which removes an
+        `extraction_failed` row so the turn re-enters the backlog as
+        inference-pending. Deleting any other row makes that turn look never
+        recorded, so a rebuild raises `ColdCacheError` on it until it is
+        re-extracted -- which is the intended effect of a retry and nothing
+        else.
+
+        Args:
+            event_id: The turn whose row to delete.
+            extraction_version: Stamp half of the cache key.
+            model_hash: Stamp half of the cache key.
+            only_skip_reason: When given, the row is deleted only if its
+                `skip_reason` still equals this value, checked in the same
+                `DELETE` statement. The retry passes `extraction_failed`, so a
+                real extraction that replaced the dead letter between the
+                caller's read and this delete (a concurrent retry freed the
+                turn and the dispatcher re-extracted it) is left alone.
+
+        Returns:
+            True when a row was deleted, False when there was none (or it no
+            longer matched `only_skip_reason`).
+        """
+        key = cache_key(event_id, extraction_version, model_hash)
+        if only_skip_reason is None:
+            cursor = self._get_connection().execute(
+                "DELETE FROM extraction_cache WHERE cache_key = ?", (key,)
+            )
+        else:
+            cursor = self._get_connection().execute(
+                "DELETE FROM extraction_cache WHERE cache_key = ? AND skip_reason = ?",
+                (key, only_skip_reason),
+            )
+        return cursor.rowcount > 0
 
     def put(
         self,
@@ -165,6 +266,8 @@ class ExtractionCache:
         skip_reason: str | None = None,
         scope: str | None = None,
         scope_confidence: float | None = None,
+        derivation: dict[str, Any] | None = None,
+        service_stamps: dict[str, Any] | None = None,
     ) -> None:
         """Record what the live pipeline DECIDED for this turn.
 
@@ -172,6 +275,10 @@ class ExtractionCache:
         that says 'skipped' with no reason, or 'extracted' with one, is a
         decision nobody can replay -- and a rebuild reading it would produce a
         graph whose provenance is unexplainable.
+
+        `derivation` and `service_stamps` are optional JSON objects written by
+        the extraction-backlog dispatcher (see `_MIGRATION_COLUMNS`); None
+        stores SQL NULL, which is what every in-process caller writes.
         """
         if outcome not in (OUTCOME_EXTRACTED, OUTCOME_SKIPPED):
             raise ValueError(f"unknown outcome {outcome!r}")
@@ -191,8 +298,9 @@ class ExtractionCache:
         self._get_connection().execute(
             "INSERT OR REPLACE INTO extraction_cache "
             "(cache_key, event_id, ontology_version, extraction_version, model_hash, "
-            "outcome, skip_reason, scope, scope_confidence, payload, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "outcome, skip_reason, scope, scope_confidence, payload, created_at, "
+            "derivation, service_stamps) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 key,
                 event_id,
@@ -205,6 +313,8 @@ class ExtractionCache:
                 scope_confidence,
                 payload,
                 created_at,
+                None if derivation is None else json.dumps(derivation, sort_keys=True),
+                None if service_stamps is None else json.dumps(service_stamps, sort_keys=True),
             ),
         )
 
@@ -213,3 +323,8 @@ class ExtractionCache:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+
+def _loads_or_none(value: str | None) -> Any:
+    """Decode a nullable JSON column; SQL NULL stays None."""
+    return None if value is None else json.loads(value)

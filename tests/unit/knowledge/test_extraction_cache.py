@@ -7,7 +7,9 @@ import pytest
 from backend.knowledge.extraction_cache import (
     OUTCOME_EXTRACTED,
     OUTCOME_SKIPPED,
+    SKIP_EXTRACTION_FAILED,
     SKIP_RATE_LIMITED,
+    VALID_SKIP_REASONS,
     ExtractionCache,
     cache_key,
 )
@@ -320,3 +322,136 @@ def test_a_freshly_created_table_and_a_migrated_one_have_the_same_columns(tmp_pa
     }
 
     assert fresh_cols == migrated_cols
+
+
+# ---------------------------------------------------------------------------
+# T2a extraction backlog additions
+# ---------------------------------------------------------------------------
+
+
+def test_extraction_failed_is_a_valid_skip_reason():
+    assert SKIP_EXTRACTION_FAILED == "extraction_failed"
+    assert SKIP_EXTRACTION_FAILED in VALID_SKIP_REASONS
+
+
+def test_derivation_and_service_stamps_round_trip_and_default_to_none():
+    cache = ExtractionCache(":memory:")
+    cache.initialize()
+    ops = {"operations": [{"op": "CREATE_TRAIT", "id": "trait-x"}]}
+    stamps = {"stamps": {"adapter": "gptoss"}, "request_id": "req-1"}
+    cache.put(
+        "evt-d",
+        "1.4.0",
+        "2026-06-14-r5",
+        "model-abc",
+        outcome=OUTCOME_EXTRACTED,
+        entities=[],
+        relationships=[],
+        derivation=ops,
+        service_stamps=stamps,
+        created_at="2026-08-18T00:00:00+00:00",
+    )
+    cache.put(
+        "evt-plain",
+        "1.4.0",
+        "2026-06-14-r5",
+        "model-abc",
+        outcome=OUTCOME_EXTRACTED,
+        entities=[],
+        relationships=[],
+        created_at="2026-08-18T00:00:00+00:00",
+    )
+
+    hit = cache.get("evt-d", "2026-06-14-r5", "model-abc")
+    plain = cache.get("evt-plain", "2026-06-14-r5", "model-abc")
+
+    assert (hit["derivation"], hit["service_stamps"]) == (ops, stamps)
+    assert (plain["derivation"], plain["service_stamps"]) == (None, None)
+
+
+def test_derivation_is_not_part_of_the_key():
+    """Two puts differing only in `derivation` are one row -- the key is unchanged."""
+    cache = ExtractionCache(":memory:")
+    cache.initialize()
+    for ops in (None, {"operations": []}):
+        cache.put(
+            "evt-k",
+            "1.4.0",
+            "2026-06-14-r5",
+            "model-abc",
+            outcome=OUTCOME_EXTRACTED,
+            entities=[],
+            relationships=[],
+            derivation=ops,
+            created_at="2026-08-18T00:00:00+00:00",
+        )
+
+    count = cache._get_connection().execute("SELECT COUNT(*) FROM extraction_cache").fetchone()[0]
+
+    assert count == 1
+
+
+def test_migration_adds_the_derivation_and_service_stamps_columns(tmp_path):
+    db = tmp_path / "old.db"
+    _create_pre_phase_1_table(db)
+
+    cache = ExtractionCache(str(db))
+    cache.initialize()
+
+    cols = {
+        row[1] for row in cache._get_connection().execute("PRAGMA table_info(extraction_cache)")
+    }
+    assert {"derivation", "service_stamps"} <= cols
+
+
+def test_event_ids_for_maps_ids_to_skip_reasons_under_one_stamp_pair():
+    cache = ExtractionCache(":memory:")
+    cache.initialize()
+    common = {"created_at": "2026-08-18T00:00:00+00:00"}
+    cache.put("e1", "1.4.0", "v1", "m1", outcome=OUTCOME_EXTRACTED, **common)
+    cache.put(
+        "e2",
+        "1.4.0",
+        "v1",
+        "m1",
+        outcome=OUTCOME_SKIPPED,
+        skip_reason=SKIP_EXTRACTION_FAILED,
+        **common,
+    )
+    cache.put("e3", "1.4.0", "v2", "m1", outcome=OUTCOME_EXTRACTED, **common)
+
+    assert cache.event_ids_for("v1", "m1") == {"e1": None, "e2": SKIP_EXTRACTION_FAILED}
+
+
+def test_delete_removes_exactly_one_row():
+    cache = ExtractionCache(":memory:")
+    cache.initialize()
+    common = {"created_at": "2026-08-18T00:00:00+00:00"}
+    cache.put("e1", "1.4.0", "v1", "m1", outcome=OUTCOME_EXTRACTED, **common)
+    cache.put("e1", "1.4.0", "v2", "m1", outcome=OUTCOME_EXTRACTED, **common)
+
+    assert cache.delete("e1", "v1", "m1") is True
+    assert cache.delete("e1", "v1", "m1") is False
+    assert cache.get("e1", "v1", "m1") is None
+    assert cache.get("e1", "v2", "m1") is not None
+
+
+def test_conditional_delete_leaves_a_row_whose_skip_reason_no_longer_matches():
+    cache = ExtractionCache(":memory:")
+    cache.initialize()
+    common = {"created_at": "2026-08-18T00:00:00+00:00"}
+    cache.put("e1", "1.4.0", "v1", "m1", outcome=OUTCOME_EXTRACTED, **common)
+    cache.put(
+        "e2",
+        "1.4.0",
+        "v1",
+        "m1",
+        outcome=OUTCOME_SKIPPED,
+        skip_reason=SKIP_EXTRACTION_FAILED,
+        **common,
+    )
+
+    assert cache.delete("e1", "v1", "m1", only_skip_reason=SKIP_EXTRACTION_FAILED) is False
+    assert cache.get("e1", "v1", "m1") is not None
+    assert cache.delete("e2", "v1", "m1", only_skip_reason=SKIP_EXTRACTION_FAILED) is True
+    assert cache.get("e2", "v1", "m1") is None

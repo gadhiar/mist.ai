@@ -9,6 +9,7 @@ import functools
 import json
 import logging
 import os
+import sqlite3
 import sys
 import time
 import uuid
@@ -48,9 +49,11 @@ sys.path.insert(0, str(project_root))
 # "import config BEFORE voice_processor" ordering existed to work around. The
 # qualified name removes both hazards outright.
 from backend.config import DEFAULT_CONFIG  # isort:skip
+from backend.errors import MistError  # isort:skip
 from backend.voice_processor import VoiceProcessor  # isort:skip
 from backend.factories import (  # isort:skip
     build_curation_scheduler,
+    build_extraction_dispatcher,
     build_phase3_components,
     build_sidecar_index,
     build_vault_writer,
@@ -131,7 +134,10 @@ logger = logging.getLogger(__name__)
 # WebSocket protocol version sent on session_started per ADR-017. Bump
 # minor on additive event/field additions, major on breaking changes.
 # v1.1.0 (2026-05-25): documents vault_results + system_status (shipped 2026-05-11).
-PROTOCOL_VERSION = "1.1.0"
+# v1.2.0 (2026-09-22): uptime_* fields in the ADR; this constant was not bumped then.
+# v1.3.0 (2026-09-26, MIS-171): additive `extraction_status` outbound message.
+# Pinned by tests/unit/test_server_protocol_version.py.
+PROTOCOL_VERSION = "1.3.0"
 
 # Global state
 active_connections: set[WebSocket] = set()
@@ -142,6 +148,8 @@ log_subscribers: set[WebSocket] = set()
 message_queue: asyncio.Queue[str | bytes] = asyncio.Queue()
 voice_processor: VoiceProcessor | None = None
 curation_scheduler = None
+# T2a extraction backlog dispatcher (started/stopped in lifespan).
+extraction_dispatcher = None
 log_handler: WebSocketLogHandler | None = None
 config = DEFAULT_CONFIG
 
@@ -276,6 +284,51 @@ async def health_status_loop(interval_seconds: float = 30.0) -> None:
             await message_queue.put(payload)
         except Exception as e:  # noqa: BLE001
             logger.error("Health status emit failed: %s", e)
+
+
+def _extraction_status_payload(dispatcher) -> str:
+    """The `extraction_status` message as JSON: flat `ExtractionStatus.model_dump`.
+
+    Built by `backend.extraction_backlog.status.extraction_status`, which never
+    raises and reports `disabled` when `dispatcher` is None.
+    """
+    from backend.extraction_backlog.status import extraction_status
+
+    return json.dumps(extraction_status(dispatcher).model_dump(mode="json"))
+
+
+def push_extraction_status(dispatcher) -> None:
+    """Enqueue one `extraction_status` message for `dispatcher` now (a transition push).
+
+    Registered as the dispatcher's state listener in
+    `_start_extraction_dispatcher`, so it runs synchronously on the event loop
+    inside `ExtractionDispatcher._set_state`; `put_nowait` on the unbounded
+    `message_queue` does not block. Takes the dispatcher explicitly rather than
+    reading the module global, because the first transitions happen inside
+    `start()`, before `lifespan` has assigned `extraction_dispatcher`.
+    """
+    message_queue.put_nowait(_extraction_status_payload(dispatcher))
+
+
+async def extraction_status_loop(interval_seconds: float = 5.0) -> None:
+    """Emit ADR-017 `extraction_status` events every `interval_seconds`.
+
+    The periodic half of the extraction status push; the other half is
+    `push_extraction_status` on every dispatcher state transition. Runs with
+    or without a dispatcher: with none, the message reports `disabled` and the
+    process's `unrecorded_turns`. Cadence defaults to 5 s, overridable via
+    `MIST_EXTRACTION_STATUS_INTERVAL_S`
+    (`backend.extraction_backlog.settings.status_interval_s`).
+
+    Same failure policy as `system_status_loop`: a failed tick is logged and
+    the loop survives to the next one.
+    """
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await message_queue.put(_extraction_status_payload(extraction_dispatcher))
+        except Exception as e:  # noqa: BLE001 -- the periodic push must outlive one bad tick
+            logger.error("extraction_status emit failed: %s", e)
 
 
 def _log_catchup_task_exception(task: "asyncio.Task") -> None:
@@ -465,12 +518,70 @@ def _resolve_curation_dependencies(voice_processor) -> CurationDependencies:
     )
 
 
+async def _start_extraction_dispatcher(voice_processor, knowledge_config: KnowledgeConfig):
+    """Build, attach and start the T2a extraction-backlog dispatcher.
+
+    Reaches the live ConversationHandler through the same
+    voice_processor -> models -> knowledge -> conversation_handler chain the
+    curation wiring uses, builds the dispatcher over that handler's OWN
+    pipeline and event store (so the backlog reads the log live traffic writes),
+    starts it, and attaches it, so from here on a recorded turn wakes the
+    backlog instead of spawning in-process extraction on the chat model.
+
+    `MIST_EXTRACTION_INFERENCE=off` still attaches and starts it: `start()` in
+    `off` mode only records the first-activation floor and sets state
+    `disabled`, and runs no loop. Attaching is what keeps extraction off the
+    chat model in that mode; recording the floor is what keeps turns logged
+    while it is off eligible once it is turned back on.
+
+    Returns:
+        The started dispatcher, or None when no handler or event store is
+        reachable (extraction then stays on the in-process path, as before T2a).
+
+    Raises:
+        ValueError: A `MIST_EXTRACTION_*` variable is malformed
+            (`DispatcherSettings.from_env`).
+    """
+    from backend.extraction_backlog.settings import DispatcherSettings
+
+    handler = (
+        voice_processor.models.knowledge.conversation_handler
+        if voice_processor and voice_processor.models and voice_processor.models.knowledge
+        else None
+    )
+    if handler is None or handler.event_store is None:
+        logger.warning(
+            "Extraction dispatcher not started: no ConversationHandler or event store "
+            "reachable -- extraction stays on the in-process path for this process"
+        )
+        return None
+    dispatcher = build_extraction_dispatcher(
+        knowledge_config,
+        pipeline=handler._extraction_pipeline,
+        event_store=handler.event_store,
+        settings=DispatcherSettings.from_env(),
+        extraction_cache=handler._extraction_pipeline.extraction_cache,
+        http_client=None,
+    )
+    # Registered before `start()` so the transitions start() itself makes
+    # (e.g. -> disabled in `off` mode) are pushed too.
+    dispatcher.add_state_listener(lambda _previous, _current: push_extraction_status(dispatcher))
+    # Started BEFORE attaching: if `start()` raises (e.g. the activation write
+    # fails), the handler is left on the in-process path rather than attached
+    # to a dispatcher that is not running, which would silently stop
+    # extraction. No turn can arrive in between -- this runs before the server
+    # accepts connections.
+    await dispatcher.start()
+    handler.attach_extraction_dispatcher(dispatcher)
+    return dispatcher
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
     configure_file_logging(_resolve_log_dir())
 
-    global voice_processor, curation_scheduler, log_handler
+    global voice_processor, curation_scheduler, log_handler, extraction_dispatcher
     global vault_writer, vault_sidecar, vault_filewatcher, vault_invalidation_bus
 
     # Startup
@@ -622,6 +733,31 @@ async def lifespan(app: FastAPI):
         logger.warning("Curation scheduler failed to start: %s", e)
         curation_scheduler = None
 
+    # T2a: extraction backlog. After voice_processor.initialize() so the
+    # handler it attaches to is the live one.
+    extraction_dispatcher = None
+    try:
+        extraction_dispatcher = await _start_extraction_dispatcher(
+            voice_processor, knowledge_config
+        )
+    except (MistError, sqlite3.Error, OSError, ValueError) as e:
+        logger.error("Extraction dispatcher failed to start: %s", e, exc_info=True)
+        extraction_dispatcher = None
+
+    # ADR-017 additive `extraction_status`: periodic push, with or without a
+    # dispatcher (none -> `disabled` plus `unrecorded_turns`). Transitions are
+    # pushed by the state listener `_start_extraction_dispatcher` registered.
+    from backend.extraction_backlog.settings import status_interval_s
+
+    try:
+        extraction_status_interval = status_interval_s()
+    except ValueError as e:
+        logger.error("MIST_EXTRACTION_STATUS_INTERVAL_S invalid, using 5s: %s", e)
+        extraction_status_interval = 5.0
+    extraction_status_task = asyncio.create_task(
+        extraction_status_loop(interval_seconds=extraction_status_interval)
+    )
+
     # R1.3.1: synthesize vault notes for sessions that crashed before session
     # end (process kill, container restart) and so never reached
     # ConversationHandler.end_session. Background and deferential -- boot is
@@ -682,6 +818,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:  # noqa: BLE001
         logger.warning("ConversationHandler aclose error (non-fatal): %s", e)
 
+    # T2a: stop the extraction dispatcher AFTER the handler drain above (which
+    # waits on the backlog). A job still waiting on the service is abandoned
+    # and re-dispatched next start; an apply in progress finishes first.
+    if extraction_dispatcher is not None:
+        try:
+            await extraction_dispatcher.stop()
+        except (MistError, sqlite3.Error, OSError) as e:
+            logger.warning("Extraction dispatcher stop error (non-fatal): %s", e)
+
     if vault_writer is not None:
         try:
             await vault_writer.stop()
@@ -699,6 +844,7 @@ async def lifespan(app: FastAPI):
         from backend import system_metrics
 
         system_metrics.shutdown_gpu()
+    extraction_status_task.cancel()
     health_status_task.cancel()
     heartbeat_task.cancel()
     broadcaster_task.cancel()
@@ -733,13 +879,32 @@ async def health():
     before sending its first turn. The live backend never sets
     MIST_HYDRATION_ISOLATION, so this field is how a hydrator pointed at the
     wrong port finds out before it writes anything.
+
+    `extraction` is a subset of `GET /extraction/status` (state, backlog depth,
+    dead letters, unrecorded turns, service reachability), from the same
+    producer, so the two cannot disagree.
     """
+    from backend.extraction_backlog.status import extraction_status, health_block
+
     return {
         "status": "healthy",
         "models_loaded": voice_processor is not None,
         "active_connections": len(active_connections),
         "hydration_isolation": _hydration_isolation_for_health(),
+        "extraction": health_block(extraction_status(extraction_dispatcher)),
     }
+
+
+@app.get("/extraction/status")
+async def get_extraction_status():
+    """The extraction backlog's `ExtractionStatus`, the same object the WS pushes.
+
+    Never errors: with no dispatcher the state is `disabled` with zero counts
+    and the process's `unrecorded_turns`.
+    """
+    from backend.extraction_backlog.status import extraction_status
+
+    return extraction_status(extraction_dispatcher).model_dump(mode="json")
 
 
 def _hydration_isolation_for_health() -> bool:

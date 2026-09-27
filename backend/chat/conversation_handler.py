@@ -15,6 +15,7 @@ import random
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -38,15 +39,17 @@ from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from backend.knowledge.storage.graph_store import GraphStore
 from backend.llm import LLMRequest, StreamingLLMProvider
 from backend.llm.instrumented_provider import llm_call_context
-from backend.llm.models import LLMResponse
+from backend.llm.models import LLMResponse, UsageMetadata
 from backend.llm.models import ToolCall as LLMToolCall
+from backend.sentence_detector import SentenceBoundaryDetector
 from backend.vault.conventions import ConventionsLoader
 
 if TYPE_CHECKING:
     from backend.chat.hydration_clock import HydrationClock
     from backend.debug_jsonl_logger import DebugJSONLLogger, TurnRecord
+    from backend.extraction_backlog.dispatcher import ExtractionDispatcher
     from backend.interfaces import VaultWriterProtocol
-    from backend.knowledge.extraction.pipeline import ExtractionPipeline
+    from backend.knowledge.extraction.pipeline import ApplyReport, ExtractionPipeline
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
     from backend.vault.invalidation_bus import InvalidationBus, VaultChangeEvent
 
@@ -696,6 +699,36 @@ def _format_user_profile_block(body: str) -> str:
     return f"=== WHAT YOU KNOW ABOUT THE USER (user profile) ===\n\n{body.strip()}\n"
 
 
+@dataclass
+class _StreamTurnState:
+    """Mutable accumulator threaded through both LLM passes of one streaming turn.
+
+    Async generators cannot `return` a value (PEP 525 forbids `return expr`
+    inside one), so `ConversationHandler._stream_llm_pass` communicates its
+    result by mutating an instance of this class rather than returning one.
+
+    `emitted` is the turn-wide concatenation of every Token piece yielded so
+    far, across both passes -- it becomes `Complete.final_response` verbatim
+    (T3/v2 contract: final_response is exactly what was streamed, not a
+    separately post-filtered copy of it).
+
+    The `pass_*` dicts are keyed by pass_num (1 or 2) and reconstruct what
+    the pre-streaming code carried in a single `LLMResponse` per pass, built
+    from what actually streamed and passed the slop gate. This lets the
+    tool-call correlation message and the debug-logger turn record stay
+    byte-for-byte compatible with the pre-v2 shape.
+    """
+
+    emitted: str = ""
+    pass_text: dict[int, str] = field(default_factory=dict)
+    pass_tool_calls: dict[int, list[LLMToolCall] | None] = field(default_factory=dict)
+    pass_finish_reason: dict[int, str | None] = field(default_factory=dict)
+    pass_usage: dict[int, UsageMetadata | None] = field(default_factory=dict)
+    pass_reasoning: dict[int, str | None] = field(default_factory=dict)
+    pass_ttft_ms: dict[int, float | None] = field(default_factory=dict)
+    pass_duration_ms: dict[int, float] = field(default_factory=dict)
+
+
 class ConversationHandler:
     """Handles conversations with knowledge graph integration.
 
@@ -721,6 +754,7 @@ class ConversationHandler:
         now_fn: Callable[[], datetime] | None = None,
         hydration_clock: HydrationClock | None = None,
         session_origin: str = "real",
+        extraction_dispatcher: ExtractionDispatcher | None = None,
     ) -> None:
         """Initialize conversation handler.
 
@@ -771,6 +805,13 @@ class ConversationHandler:
                 "test" via `MIST_SESSION_ORIGIN`, wired in
                 `KnowledgeConfig.event_store.session_origin` ->
                 `backend.factories.build_conversation_handler`.
+            extraction_dispatcher: Optional T2a extraction-backlog dispatcher.
+                When set, a recorded turn only WAKES the dispatcher, which
+                extracts it out of process in log order; no in-process
+                extraction task is created. When None (admin scripts, benches,
+                most tests), the in-process `_extract_knowledge_async` path runs
+                exactly as before. May also be attached after construction with
+                `attach_extraction_dispatcher`.
         """
         self.config = config
         # Injectable clock (DI seam). Default = real wall-clock so production
@@ -811,6 +852,11 @@ class ConversationHandler:
         # Always-on extraction-failure counter (independent of the
         # MIST_DEBUG_JSONL gate) so a persistent failure is countable.
         self._extraction_failures: int = 0
+        # T2a: when attached, recorded turns go to the extraction backlog
+        # instead of an in-process task. See `attach_extraction_dispatcher`.
+        self._extraction_dispatcher: ExtractionDispatcher | None = None
+        if extraction_dispatcher is not None:
+            self.attach_extraction_dispatcher(extraction_dispatcher)
 
         # Cluster 6: budget-aware context assembly. Planner constructed from
         # config when not injected; legacy behavior preserved when disabled.
@@ -1385,10 +1431,206 @@ class ConversationHandler:
         )
         return self._slop_detector.strip_fixable(current_response)
 
+    def _gate_sentence_text(self, sentence: str, *, session_id: str) -> str:
+        """Enforce the critical slop floor on one sentence-gated chunk.
+
+        Streaming counterpart to `_post_filter_response`'s regenerate-the-
+        whole-response loop: once a sentence has already been yielded to
+        the caller (and, on the voice path, possibly already spoken),
+        there is no "regenerate and try again" option left. A critical
+        finding is mechanically stripped in place
+        (`SlopDetector.strip_fixable`) and logged at WARNING with the
+        matched pattern names; a clean sentence passes through unchanged.
+        """
+        findings = self._slop_detector.detect(sentence, severity_floor="critical")
+        if not findings:
+            return sentence
+        violation_names = sorted({f.pattern_name for f in findings})
+        logger.warning(
+            "Streaming slop gate: critical pattern(s) %s stripped (session=%s)",
+            violation_names,
+            session_id,
+        )
+        return self._slop_detector.strip_fixable(sentence)
+
+    def _pop_turn_ws_events(self) -> list[dict[str, Any]]:
+        """Atomically drain the per-turn ADR-017 WS event buffer.
+
+        Used both for the inline drain right after each tool dispatch (so
+        tool_call_started/completed reach the caller as they happen rather
+        than batched at end of turn, T3/v2) and for the top-level `finally`
+        safety net in `handle_message_streaming` that guarantees no
+        `tool_call_started` is ever left unpaired even if something raises
+        between the two.
+        """
+        events = self._turn_ws_events
+        self._turn_ws_events = []
+        return events
+
+    async def _stream_llm_pass(
+        self,
+        request: LLMRequest,
+        *,
+        session_id: str,
+        call_site: str,
+        pass_num: int,
+        state: _StreamTurnState,
+    ) -> AsyncIterator[StreamEvent]:
+        """Stream one LLM pass, sentence-gating content through the slop filter.
+
+        Consumes `self._provider.generate(request, stream=True)`: partial
+        chunks carry content deltas only, and the terminal chunk
+        (partial=False) carries tool_calls/finish_reason/usage/
+        reasoning_content per the StreamingLLMProvider contract
+        (backend/llm/provider.py). v1 fake-streamed the finished reply one
+        character at a time; v2 streams the provider's real SSE and gates
+        content on sentence boundaries (`SentenceBoundaryDetector`) so
+        `SlopDetector` always inspects a complete sentence before anything
+        reaches the caller, then runs it through `_gate_sentence_text`.
+        The detector's `feed_segments` API is used rather than `feed`, so
+        the whitespace the model wrote between sentences (newlines, blank
+        lines before a list) is carried through as each Token's leading
+        separator instead of being collapsed to one space.
+
+        Pass-1 content that streams in before a tool-call decision is
+        surfaced live, exactly like any other content -- it is not held
+        back pending the final chunk. The pre-streaming code silently
+        dropped this text from the user-visible reply (it went into the
+        tool-call correlation message only); once the LLM can stream a
+        token before it decides to call a tool, holding that token back
+        would mean buffering the entire pass just to find out whether a
+        tool call follows, which defeats the point of streaming and the
+        provider's own content/tool_calls separation (tool-call fragments
+        arrive via the delta's `tool_calls` field, never `content`, so what
+        streams here is always human-directed text). This is pinned by
+        `tests/unit/chat/test_handle_message_streaming.py`.
+
+        Mutates `state` in place (async generators cannot `return` a
+        value) with the pass's emitted text, tool_calls, finish_reason,
+        usage, reasoning_content, time-to-first-token, and total duration.
+        The caller reads `state` after this generator is exhausted.
+
+        Yields:
+            Token events, `pass_num=pass_num`, for each gated sentence
+            (including the trailing partial sentence flushed at end of
+            stream).
+        """
+        gate = SentenceBoundaryDetector()
+        emitted_text = ""
+        # Whitespace the model wrote after the last emitted sentence. It is
+        # held back, not emitted with that sentence, so it becomes the
+        # separator in front of the NEXT emitted sentence -- and a trailing
+        # run of whitespace at the end of the turn is never streamed at all.
+        pending_sep = ""
+        tool_calls: list[LLMToolCall] | None = None
+        finish_reason: str | None = None
+        usage: UsageMetadata | None = None
+        reasoning_content: str | None = None
+        t_start = time.monotonic()
+        first_token_at: float | None = None
+
+        def _gate_and_emit(segment: str) -> Token | None:
+            """Run one raw segment's sentence through the slop filter and
+            account for it on both the turn-wide and pass-local accumulators.
+
+            `segment` comes from `SentenceBoundaryDetector.feed_segments`, so
+            it still carries the model's own whitespace around the sentence.
+            Only the sentence itself (whitespace trimmed) goes through the
+            gate; the whitespace in front of it is emitted as the separator,
+            so paragraph breaks and list lines survive into the Token stream
+            and `final_response`. Returns None (and emits nothing) when the
+            segment is whitespace only or its sentence stripped down to
+            nothing.
+            """
+            nonlocal emitted_text, pending_sep
+            core = segment.strip()
+            lead = segment[: len(segment) - len(segment.lstrip())]
+            piece_text = (
+                self._gate_sentence_text(core, session_id=session_id).strip() if core else ""
+            )
+            if not piece_text:
+                # Whitespace-only segment, or a fully-stripped sentence (e.g.
+                # pure emoji): nothing left worth speaking or displaying. Keep
+                # the separator that preceded it (plus this segment's leading
+                # whitespace) for the next sentence; drop the dropped
+                # sentence's own trailing whitespace so separators don't double.
+                pending_sep += lead
+                return None
+            sep = pending_sep + lead
+            pending_sep = segment[len(segment.rstrip()) :]
+            if not state.emitted:
+                # First text of the turn: no leading whitespace.
+                sep = ""
+            elif not emitted_text and not sep:
+                # First text of pass 2, which the model began without any
+                # whitespace: keep the pre-existing single-space pass joint.
+                sep = " "
+            text = sep + piece_text
+            state.emitted += text
+            emitted_text += text if emitted_text else piece_text
+            return Token(text=text, pass_num=pass_num)
+
+        with llm_call_context(session_id=session_id, call_site=call_site, pass_num=pass_num):
+            async for chunk in self._provider.generate(request, stream=True):
+                if chunk.partial:
+                    if not chunk.content:
+                        continue
+                    if first_token_at is None:
+                        first_token_at = time.monotonic()
+                    for segment in gate.feed_segments(chunk.content):
+                        token = _gate_and_emit(segment)
+                        if token is not None:
+                            yield token
+                    continue
+                # Terminal chunk: content is always None by contract; everything
+                # else the partials did NOT carry lives here.
+                tool_calls = chunk.tool_calls
+                finish_reason = chunk.finish_reason
+                usage = chunk.usage
+                reasoning_content = chunk.reasoning_content
+
+        for segment in gate.flush_segments():
+            token = _gate_and_emit(segment)
+            if token is not None:
+                yield token
+
+        duration_ms = (time.monotonic() - t_start) * 1000
+        ttft_ms = (first_token_at - t_start) * 1000 if first_token_at is not None else None
+        logger.info(
+            "[STREAM] pass=%d session=%s ttft_ms=%s duration_ms=%.1f",
+            pass_num,
+            session_id,
+            f"{ttft_ms:.1f}" if ttft_ms is not None else "n/a",
+            duration_ms,
+        )
+        state.pass_text[pass_num] = emitted_text
+        state.pass_tool_calls[pass_num] = tool_calls
+        state.pass_finish_reason[pass_num] = finish_reason
+        state.pass_usage[pass_num] = usage
+        state.pass_reasoning[pass_num] = reasoning_content
+        state.pass_ttft_ms[pass_num] = ttft_ms
+        state.pass_duration_ms[pass_num] = duration_ms
+
     async def handle_message(
         self, user_message: str, session_id: str, user_id: str = "User", max_history: int = 10
     ) -> str:
         """Handle a user message with autonomous tool use.
+
+        T3/v2: thin consumer of `handle_message_streaming`, the canonical
+        pipeline as of this change. Drains the stream and returns the
+        terminal `Complete` event's `final_response`. Admin, bench, and
+        hydration callers see identical behavior to the pre-v2
+        implementation:
+
+        - The hydration re-raise is unchanged in effect: when a hydration
+          clock is attached, `handle_message_streaming` re-raises instead of
+          catching, and that exception propagates out of the `async for`
+          below exactly as it would out of any other iteration -- this
+          method adds no try/except of its own.
+        - The error-turn recording on any other exception happens inside
+          `handle_message_streaming`'s own except block (session message,
+          event-store record); this method never sees or handles that
+          exception, it just receives the resulting Complete.
 
         LLM decides autonomously whether to:
         1. Query knowledge graph for context
@@ -1405,9 +1647,104 @@ class ConversationHandler:
         Returns:
             Assistant's response
         """
+        final_response = ""
+        async for event in self.handle_message_streaming(
+            user_message=user_message,
+            session_id=session_id,
+            user_id=user_id,
+            max_history=max_history,
+        ):
+            if isinstance(event, Complete):
+                final_response = event.final_response
+        return final_response
+
+    async def handle_message_streaming(
+        self,
+        user_message: str,
+        session_id: str,
+        user_id: str = "User",
+        max_history: int = 10,
+    ) -> AsyncIterator[StreamEvent]:
+        """Streaming canonical conversation pipeline.
+
+        T3/v2: this is now the canonical pipeline; `handle_message` is a
+        thin consumer that joins this generator's output (see its
+        docstring). v1 wrapped `handle_message` and fake-streamed the
+        finished reply one character at a time, discarding the ~5s
+        LLM-side streaming benefit the provider already offers
+        (`StreamingLLMProvider.generate(..., stream=True)`,
+        backend/llm/provider.py). v2 streams the provider's real SSE
+        through `_stream_llm_pass`, gated to sentence boundaries so the
+        slop filter always inspects a complete sentence.
+
+        Retrieval, mist context injection, and message assembly are
+        unchanged from pre-v2 `handle_message` (copied verbatim below).
+        Tool dispatch is unchanged from pre-v2 too
+        (`_dispatch_tool_with_observability`, tool usage tracking, message
+        correlation) except that the resulting `tool_call_started` /
+        `tool_call_completed` WS events are now yielded immediately after
+        each dispatch instead of being buffered for one drain at the end
+        of the turn -- the `finally` drain below is now a safety net
+        against an orphaned `tool_call_started`, not the primary delivery
+        path.
+
+        Slop filtering is the one materially different piece. Pre-v2
+        `_post_filter_response` could regenerate the entire response (up
+        to `_slop_max_regen_attempts` times) when a critical pattern
+        appeared, because nothing had left the process yet.
+        `_stream_llm_pass` gates content into complete sentences and
+        checks each one with `SlopDetector.detect(..., severity_floor=
+        "critical")` as it streams; once a sentence has been yielded to
+        the caller (and, on the voice path, possibly already spoken),
+        whole-response regeneration is no longer an option. A clean
+        sentence streams through unchanged; a sentence with a critical
+        finding is stripped in place (`SlopDetector.strip_fixable`) with a
+        WARNING logged naming the pattern(s). `_post_filter_response` (the
+        regen loop) is kept as a method -- unused by this pipeline now, but
+        still exercised directly by its own test coverage and available to
+        any other caller that wants whole-response regeneration.
+        `Complete.final_response` is exactly the concatenation of every
+        Token piece this generator yields (both passes, and the error Token
+        on the error path); that same string is what gets stored in session
+        history and the event log -- there is no separate post-filter pass
+        reconciling a different value. Token pieces carry the model's own
+        inter-sentence whitespace (see `_stream_llm_pass`), so paragraph
+        and list line breaks survive into all three. On a non-hydration
+        exception the text "I encountered an error: ..." is streamed as a
+        Token (after any sentences that already streamed, separated by a
+        blank line) before Complete, so the user sees what is recorded.
+
+        Pass-1 content streamed before a tool-call decision is surfaced to
+        the caller live, pass_num=1, as it arrives -- see
+        `_stream_llm_pass`'s docstring for why (briefly: the provider
+        never mixes tool-call fragments into `content`, so anything that
+        streams there is always human-directed text, and holding it back
+        would mean buffering the whole pass just to find out whether a
+        tool call follows). This is a deliberate behavior change from the
+        pre-v2 code, which silently dropped pass-1 content from the
+        user-visible reply on the tool-call path (kept only for the
+        tool-call correlation message). Pinned by
+        `tests/unit/chat/test_handle_message_streaming.py::TestPass1ContentBeforeToolCall`.
+
+        Thinking and Filler events are reserved for future iterations and
+        are not emitted here.
+
+        Args:
+            user_message: User's message.
+            session_id: Session identifier.
+            user_id: User identifier.
+            max_history: Maximum conversation history to include.
+
+        Yields:
+            WSEvent events (tool_call_started/completed etc., as they
+            happen), Token events (one per gated sentence, pass_num 1 or
+            2, plus one error Token on the error path), and a single
+            terminal Complete event.
+        """
         # ADR-017 Wave 2: clear per-turn FE-bound event buffer. Events
         # (tool_call_*, cards_*, graph_subgraph) accumulate here during this
-        # turn and are drained by handle_message_streaming as WSEvent yields.
+        # turn and are drained as WSEvent yields, inline after each tool
+        # dispatch and as a safety net in the top-level `finally` below.
         self._turn_ws_events = []
         self._current_session_id = session_id
         self._current_turn_index += 1
@@ -1468,6 +1805,16 @@ class ConversationHandler:
             max_output_tokens=self.config.llm.conversation_max_tokens,
         )
 
+        start = time.monotonic()
+        state = _StreamTurnState()
+        tool_calls_used = 0
+        final_text = ""
+        # Pass in flight, so an error Token carries the pass it interrupted.
+        current_pass = 1
+        # Set on the error path; yielded after the `finally` drain, not from
+        # inside the except block (see the comment there).
+        error_token: Token | None = None
+
         try:
             # LLM autonomously decides to use tools
             logger.info(f"Processing message in session {session_id}")
@@ -1480,34 +1827,47 @@ class ConversationHandler:
                 temperature=self.config.llm.conversation_temperature,
                 max_tokens=self.config.llm.conversation_max_tokens,
             )
-            _llm_start_1 = time.time()
-            with llm_call_context(
+            async for stream_event in self._stream_llm_pass(
+                request,
                 session_id=session_id,
                 call_site="chat.initial",
                 pass_num=1,
+                state=state,
             ):
-                response = await self._provider.invoke(request)
-            _llm_duration_1_ms = (time.time() - _llm_start_1) * 1000
+                yield stream_event
+
+            pass1_response = LLMResponse(
+                content=state.pass_text.get(1) or None,
+                tool_calls=state.pass_tool_calls.get(1),
+                reasoning_content=state.pass_reasoning.get(1),
+                finish_reason=state.pass_finish_reason.get(1),
+                usage=state.pass_usage.get(1),
+                partial=False,
+            )
 
             # Check if LLM made tool calls
             tool_calls = []
             tool_results = []
-            final_response: LLMResponse | None = None
-            _llm_duration_2_ms: float = 0.0
+            pass2_response: LLMResponse | None = None
 
-            if response.tool_calls:
-                logger.info("[TOOLS] LLM made %d tool calls", len(response.tool_calls))
+            if pass1_response.tool_calls:
+                logger.info("[TOOLS] LLM made %d tool calls", len(pass1_response.tool_calls))
 
                 # Execute tool calls
-                for tc in response.tool_calls:
+                for tc in pass1_response.tool_calls:
                     logger.info("[TOOLS] Executing tool: %s", tc.name)
                     logger.info("[TOOLS]   Args: %s", tc.arguments)
 
                     # ADR-017 Wave 2: dispatch with observability wrap. Emits
                     # tool_call_started before _dispatch_tool runs and
                     # tool_call_completed after (success or failure) into the
-                    # per-turn buffer drained by handle_message_streaming.
+                    # per-turn buffer. T3/v2: drained immediately below so the
+                    # pair reaches the caller as it happens.
                     tool_result = await self._dispatch_tool_with_observability(tc)
+                    for payload in self._pop_turn_ws_events():
+                        if payload.get("type") == "tool_call_started":
+                            tool_calls_used += 1
+                        yield WSEvent(payload=payload)
 
                     # Log the result (truncated if too long)
                     result_preview = (
@@ -1548,8 +1908,8 @@ class ConversationHandler:
                 # Build assistant message with tool_calls for correlation
                 assistant_msg = {
                     "role": "assistant",
-                    "content": response.content or "",
-                    "tool_calls": [tc.to_openai_dict() for tc in response.tool_calls],
+                    "content": pass1_response.content or "",
+                    "tool_calls": [tc.to_openai_dict() for tc in pass1_response.tool_calls],
                 }
                 messages.append(assistant_msg)
 
@@ -1571,36 +1931,41 @@ class ConversationHandler:
                     temperature=self.config.llm.conversation_temperature,
                     max_tokens=self.config.llm.conversation_max_tokens,
                 )
-                _llm_start_2 = time.time()
-                with llm_call_context(
+                current_pass = 2
+                async for stream_event in self._stream_llm_pass(
+                    final_request,
                     session_id=session_id,
                     call_site="chat.final",
                     pass_num=2,
+                    state=state,
                 ):
-                    final_response = await self._provider.invoke(final_request)
-                _llm_duration_2_ms = (time.time() - _llm_start_2) * 1000
-                assistant_message = final_response.content
+                    yield stream_event
+
+                pass2_response = LLMResponse(
+                    content=state.pass_text.get(2) or None,
+                    tool_calls=state.pass_tool_calls.get(2),
+                    reasoning_content=state.pass_reasoning.get(2),
+                    finish_reason=state.pass_finish_reason.get(2),
+                    usage=state.pass_usage.get(2),
+                    partial=False,
+                )
                 logger.info(
                     "[TOOLS] Final response: %s...",
-                    assistant_message[:100],
+                    (pass2_response.content or "")[:100],
                 )
 
-            else:
-                # No-tool path: pass 1 declined to tool-call, the response
-                # content is the final answer. Vault-only auto-inject was
-                # already provided in pass 1's context; graph access is
-                # reserved for the tool path that pass 1 declined to take.
-                # Single LLM call — no pass 2 on this branch.
-                assistant_message = response.content
+            # else: no-tool path -- pass 1 declined to tool-call, its
+            # streamed content (already in state.emitted) is the final
+            # answer. Vault-only auto-inject was already provided in pass
+            # 1's context; graph access is reserved for the tool path that
+            # pass 1 declined to take. Single LLM call — no pass 2.
 
-            # Cluster 3: slop post-filter before storing/returning.
-            # Uses the current messages list as context for any regeneration.
-            if assistant_message is not None:
-                assistant_message = await self._post_filter_response(
-                    initial_response=assistant_message,
-                    messages=messages,
-                    session_id=session_id,
-                )
+            # T3/v2: slop filtering already happened inline, per gated
+            # sentence, inside _stream_llm_pass -- state.emitted IS the
+            # post-filter text. No separate post-filter call here (see the
+            # docstring above for why whole-response regeneration is no
+            # longer available once content has streamed).
+            assistant_message = state.emitted
 
             # Add assistant response to history
             session.add_message(
@@ -1650,16 +2015,26 @@ class ConversationHandler:
                 )
                 if retrieval_result is not None:
                     turn_record.record_retrieval(retrieval_result)
-                turn_record.record_llm_response(response, pass_num=1, timing_ms=_llm_duration_1_ms)
-                if final_response is not None:
+                turn_record.record_llm_response(
+                    pass1_response, pass_num=1, timing_ms=state.pass_duration_ms.get(1, 0.0)
+                )
+                if pass2_response is not None:
                     turn_record.record_llm_response(
-                        final_response, pass_num=2, timing_ms=_llm_duration_2_ms
+                        pass2_response, pass_num=2, timing_ms=state.pass_duration_ms.get(2, 0.0)
                     )
                 turn_record.flush_turn()
 
             # Fire-and-forget background extraction. Tracked so end_session/
             # aclose can drain instead of abandoning to GC.
-            if event_id:
+            #
+            # T2a: with an extraction dispatcher attached, the turn is already
+            # durable in the event log, which IS the backlog -- waking the
+            # dispatcher is all that is needed, and extraction runs out of
+            # process, in log order. The in-process task below (main chat
+            # model) is the path only when no dispatcher is attached.
+            if event_id and self._extraction_dispatcher is not None:
+                self._extraction_dispatcher.wake()
+            elif event_id:
                 task = asyncio.create_task(
                     self._extract_knowledge_async(
                         utterance=user_message,
@@ -1673,12 +2048,14 @@ class ConversationHandler:
                 self._extraction_tasks[task] = session_id
                 task.add_done_callback(lambda t: self._extraction_tasks.pop(t, None))
 
-            return assistant_message
+            final_text = assistant_message
 
         except Exception as e:
             # HYDRATION ABORTS; live recovers. Recording an error turn is right
-            # when a human is on the other end -- it is what they saw, and the
-            # transcript stays honest. During hydration it is contamination: the
+            # when a human is on the other end: the error text is streamed to
+            # them as a Token below, so the recorded turn is exactly what they
+            # saw, and the transcript stays honest. During hydration it is
+            # contamination: the
             # turn below would be written with the corpus's AUTHORED timestamp
             # and origin='real', making a fabricated "I encountered an error"
             # turn structurally indistinguishable from a genuine one, and the
@@ -1697,87 +2074,46 @@ class ConversationHandler:
                 raise
             logger.error(f"Error handling message: {e}", exc_info=True)
             error_msg = f"I encountered an error: {str(e)}"
-            session.add_message("assistant", error_msg)
+            # Sentences that streamed before the failure have already reached
+            # the user, so the error text is appended after them (as its own
+            # paragraph) rather than replacing them. The recorded turn is the
+            # full concatenation of every Token, error included -- the same
+            # string `Complete.final_response` carries.
+            error_text = ("\n\n" if state.emitted else "") + error_msg
+            state.emitted += error_text
+            error_token = Token(text=error_text, pass_num=current_pass)
+            final_text = state.emitted
+            session.add_message("assistant", final_text)
             # Record the error turn to event store
             self._record_turn_event(
                 session_id=session_id,
                 user_message=user_message,
-                assistant_message=error_msg,
+                assistant_message=final_text,
             )
-            return error_msg
 
-    async def handle_message_streaming(
-        self,
-        user_message: str,
-        session_id: str,
-        user_id: str = "User",
-        max_history: int = 10,
-    ) -> AsyncIterator[StreamEvent]:
-        """Streaming canonical conversation pipeline.
-
-        v1: wraps handle_message and fake-streams the result character-by-character.
-        All canonical pipeline behavior (retrieval, mist context injection, tool
-        dispatch, slop filter, vault append, EventStore record, fire-and-forget
-        extraction) is inherited unchanged from handle_message.
-
-        Yields Token events for each character of the final response, then a
-        single terminal Complete event carrying the full final_response and a
-        duration_ms metric. Pattern matches Claude's per-turn shape: input goes
-        in, the LLM executes whatever it needs, response streams out, Complete
-        terminates. Caller (text client / voice TTS layer) decides presentation.
-
-        Thinking and Filler events are reserved for future iterations and are
-        not emitted by v1.
-
-        v2 plan: invert relationship — make handle_message_streaming the
-        canonical generator and have handle_message join its output to a string.
-        Add provider-level streaming with tool_calls support to recover the
-        ~5s LLM-side streaming benefit currently lost in v1's fake-stream
-        approach.
-
-        Args:
-            user_message: User's message.
-            session_id: Session identifier.
-            user_id: User identifier.
-            max_history: Maximum conversation history to include.
-
-        Yields:
-            Token events (one per character) followed by a terminal Complete event.
-        """
-        start = time.monotonic()
-        response: str = ""
-        try:
-            response = await self.handle_message(
-                user_message=user_message,
-                session_id=session_id,
-                user_id=user_id,
-                max_history=max_history,
-            )
         finally:
-            # ADR-017 Wave 2: drain per-turn FE-bound events. The drain runs
-            # under finally so it fires even if handle_message is ever
-            # refactored to raise (current handle_message catches internally,
-            # but this guards against regression). FE always sees the events
-            # that were buffered before the failure point so tool_call_started
-            # never orphans a missing tool_call_completed.
-            # Count dispatched tools BEFORE clearing the heterogeneous buffer
-            # (graph_subgraph / vault / cards events accumulate here too) so
-            # stream_complete.tool_calls_used reflects reality instead of the
-            # dataclass default 0 (deep review febe-observability-1).
-            tool_calls_used = sum(
-                1 for p in self._turn_ws_events if p.get("type") == "tool_call_started"
-            )
-            for event_payload in self._turn_ws_events:
-                yield WSEvent(payload=event_payload)
-            self._turn_ws_events = []
+            # ADR-017 Wave 2 safety net: any WS event not already drained
+            # inline above (normally none -- see the per-dispatch drain in
+            # the tool loop) is drained here so tool_call_started never
+            # orphans a missing tool_call_completed, even across an
+            # exception raised between the two.
+            for payload in self._pop_turn_ws_events():
+                if payload.get("type") == "tool_call_started":
+                    tool_calls_used += 1
+                yield WSEvent(payload=payload)
+
+        # The error Token is yielded here, after the `finally` drain, rather
+        # than from inside the except block, so a consumer's `aclose()` at
+        # this yield raises GeneratorExit outside the exception handler (not
+        # chained to the provider error as its __context__). The error turn is
+        # already recorded by this point either way.
+        if error_token is not None:
+            yield error_token
 
         duration_ms = (time.monotonic() - start) * 1000
 
-        for char in response:
-            yield Token(text=char)
-
         yield Complete(
-            final_response=response,
+            final_response=final_text,
             tool_calls_used=tool_calls_used,
             duration_ms=duration_ms,
         )
@@ -1984,7 +2320,24 @@ class ConversationHandler:
         Bounded by `timeout` so a hung llama-server cannot block shutdown;
         tasks still running after the bound are cancelled (their writes are
         MERGE-idempotent and replay convergently on a later re-extraction).
+
+        With an extraction dispatcher attached, first waits up to `timeout` for
+        the backlog to drain (once attached, no new in-process tasks are
+        created, so the task wait below normally returns at once). The backlog
+        is one ordered queue, not per-session, so `session_id` does not narrow
+        that wait. It returns at once when the dispatcher cannot progress
+        (service unreachable,
+        stalled, epoch mismatch, disabled): nothing is lost by not waiting,
+        because every pending turn stays durable in the log.
         """
+        if self._extraction_dispatcher is not None:
+            drained = await self._extraction_dispatcher.drain(timeout)
+            if not drained:
+                logger.info(
+                    "Extraction backlog not drained (state=%s); pending turns stay "
+                    "in the log for the dispatcher",
+                    self._extraction_dispatcher.state,
+                )
         tasks = [
             t
             for t, sid in list(self._extraction_tasks.items())
@@ -2001,6 +2354,27 @@ class ConversationHandler:
                 len(pending),
                 timeout,
             )
+
+    def attach_extraction_dispatcher(self, dispatcher: ExtractionDispatcher) -> None:
+        """Route recorded turns to the T2a extraction backlog from now on.
+
+        Late binding exists because the dispatcher needs this handler's
+        extraction pipeline and event store, which `build_conversation_handler`
+        builds inside the handler chain; the server attaches it after the
+        handler exists (`backend/server.py`). The dispatcher's lifecycle
+        (start/stop) belongs to the caller, not to this handler.
+
+        Registers `_on_extraction_applied` so the ADR-011 bucket-1 user-note
+        refresh that `_extract_knowledge_async` performs after in-process
+        extraction also runs after a backlog apply.
+        """
+        self._extraction_dispatcher = dispatcher
+        dispatcher.add_apply_listener(self._on_extraction_applied)
+
+    async def _on_extraction_applied(self, report: ApplyReport) -> None:
+        """Backlog apply listener: refresh the user note from the curation result."""
+        if report.curation_result is not None:
+            await self._maybe_refresh_user_vault(report.curation_result)
 
     async def aclose(self) -> None:
         """Drain all in-flight extraction tasks (server shutdown hook).

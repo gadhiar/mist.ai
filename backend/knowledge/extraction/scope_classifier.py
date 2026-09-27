@@ -43,6 +43,85 @@ ScopeLabel = Literal["user-scope", "system-scope", "third-party", "unknown"]
 
 _VALID_SCOPES: frozenset[str] = frozenset({"user-scope", "system-scope", "third-party", "unknown"})
 
+# The Stage 1.5 user message around the utterance. A named constant rather
+# than an inline f-string so the extraction service can fold it into its
+# `prompt_sha256` stamp (`backend/extraction_service/engine.py`
+# `_compute_prompt_sha256`), the per-result provenance record of what the
+# model was asked. That stamp is NOT the epoch's identity: an epoch is
+# identified by `extraction_version` plus the composed `model_hash` (the
+# dispatcher's `_epoch_matches`). Rendering is byte-identical to the inline
+# form it replaced.
+SCOPE_USER_TEMPLATE = 'Utterance: "{utterance}"\n\nOutput:'
+
+
+def render_scope_messages(pre_processed: PreProcessedInput) -> list[dict]:
+    """Render the Stage 1.5 chat messages for a pre-processed utterance.
+
+    Pure function -- no I/O, no LLM call. Shared by the in-process
+    `SubjectScopeClassifier` and the extraction service, which sends the
+    same messages through its own model-family adapter.
+
+    Args:
+        pre_processed: Output from Stage 1 PreProcessor. Reads
+            ``original_text``; ignores ``conversation_context`` so the
+            classification is stable across turn position.
+
+    Returns:
+        A two-message list: system prompt, then the user utterance.
+    """
+    user_message = SCOPE_USER_TEMPLATE.format(utterance=pre_processed.original_text)
+    return [
+        {"role": "system", "content": SCOPE_CLASSIFIER_SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+
+def parse_scope_output(raw: str) -> tuple[ScopeLabel, float, str | None]:
+    """Parse the classifier's JSON output.
+
+    Attempts direct JSON parse, then falls back to regex-extracting the
+    first JSON object from the string. Returns ``("unknown", 0.0,
+    "classification_failed")`` on any parse failure or invalid schema.
+    Never raises -- Stage 1.5 never gates the pipeline on a parse error.
+    """
+    if not raw or not raw.strip():
+        return "unknown", 0.0, "classification_failed"
+
+    data: dict | None = None
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            data = parsed
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group())
+                if isinstance(parsed, dict):
+                    data = parsed
+            except json.JSONDecodeError:
+                data = None
+
+    if data is None:
+        return "unknown", 0.0, "classification_failed"
+
+    scope_raw = data.get("scope")
+    if not isinstance(scope_raw, str) or scope_raw not in _VALID_SCOPES:
+        return "unknown", 0.0, "classification_failed"
+
+    confidence_raw = data.get("confidence", 0.0)
+    try:
+        confidence = float(confidence_raw)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    reasoning_raw = data.get("reasoning")
+    reasoning = reasoning_raw if isinstance(reasoning_raw, str) else None
+
+    # Literal-narrowing: scope_raw is one of the four valid literals.
+    return scope_raw, confidence, reasoning  # type: ignore[return-value]
+
 
 SCOPE_CLASSIFIER_SYSTEM_PROMPT = """You are a subject-scope classifier for a knowledge extraction pipeline. Your only job is to label each utterance by WHO the claim is about.
 
@@ -126,12 +205,8 @@ class SubjectScopeClassifier:
         """
         start = time.perf_counter()
 
-        user_message = f'Utterance: "{pre_processed.original_text}"\n\nOutput:'
         request = LLMRequest(
-            messages=[
-                {"role": "system", "content": SCOPE_CLASSIFIER_SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
+            messages=render_scope_messages(pre_processed),
             json_mode=True,
             temperature=self._config.temperature,
             max_tokens=self._config.max_tokens,
@@ -185,7 +260,7 @@ class SubjectScopeClassifier:
                 elapsed_ms=elapsed,
             )
 
-        scope, confidence, reasoning = self._parse_output(raw)
+        scope, confidence, reasoning = parse_scope_output(raw)
         elapsed = (time.perf_counter() - start) * 1000
 
         if scope == "unknown":
@@ -204,49 +279,3 @@ class SubjectScopeClassifier:
             reasoning=reasoning,
             elapsed_ms=elapsed,
         )
-
-    @staticmethod
-    def _parse_output(raw: str) -> tuple[ScopeLabel, float, str | None]:
-        """Parse the classifier's JSON output.
-
-        Attempts direct JSON parse, then falls back to regex-extracting the
-        first JSON object from the string. Returns ``("unknown", 0.0,
-        "classification_failed")`` on any parse failure or invalid schema.
-        """
-        if not raw or not raw.strip():
-            return "unknown", 0.0, "classification_failed"
-
-        data: dict | None = None
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                data = parsed
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
-                try:
-                    parsed = json.loads(match.group())
-                    if isinstance(parsed, dict):
-                        data = parsed
-                except json.JSONDecodeError:
-                    data = None
-
-        if data is None:
-            return "unknown", 0.0, "classification_failed"
-
-        scope_raw = data.get("scope")
-        if not isinstance(scope_raw, str) or scope_raw not in _VALID_SCOPES:
-            return "unknown", 0.0, "classification_failed"
-
-        confidence_raw = data.get("confidence", 0.0)
-        try:
-            confidence = float(confidence_raw)
-        except (TypeError, ValueError):
-            confidence = 0.0
-        confidence = max(0.0, min(1.0, confidence))
-
-        reasoning_raw = data.get("reasoning")
-        reasoning = reasoning_raw if isinstance(reasoning_raw, str) else None
-
-        # Literal-narrowing: scope_raw is one of the four valid literals.
-        return scope_raw, confidence, reasoning  # type: ignore[return-value]

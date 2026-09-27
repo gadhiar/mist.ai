@@ -141,3 +141,110 @@ CREATE TABLE IF NOT EXISTS epoch_ledger (
     provisional INTEGER NOT NULL DEFAULT 0  -- R1.4 Task 7 (spec O2): 1 = bootstrap
                                              -- placeholder, may be superseded by R1.6
 );
+
+-- ---------------------------------------------------------------------------
+-- Extraction backlog (T2a). The backlog itself is NOT a table: a turn is
+-- inference-pending when the extraction cache has no row for it under the
+-- active epoch, and apply-pending when it has a row but no `applied` marker
+-- below. These tables hold only what the log and the cache cannot say.
+-- All four are new tables, so `CREATE TABLE IF NOT EXISTS` is the whole
+-- migration: `EventStore.initialize()` runs this script on every open, and a
+-- database created before T2a gains them on its next open with every existing
+-- row untouched.
+-- ---------------------------------------------------------------------------
+
+-- Per-(turn, epoch) apply progress. stage='curated' means Stages 3-8 finished
+-- for this turn and only the Stage 9 operations remain; stage='applied' means
+-- the turn is done. source='activation' marks turns the pre-T2a live path had
+-- already applied when the backlog first activated for this epoch;
+-- source='cutover' marks turns a promoted epoch cutover's swapped-in graph
+-- already contains (`EventStore.promote_epoch_cutover`).
+CREATE TABLE IF NOT EXISTS extraction_applied (
+    event_id TEXT NOT NULL,
+    epoch_id INTEGER NOT NULL,
+    stage TEXT NOT NULL,                      -- 'curated', 'applied'
+    source TEXT NOT NULL,                     -- 'dispatcher', 'activation', 'cutover'
+    updated_at TEXT NOT NULL,                 -- ISO-8601, wall clock (audit only)
+    PRIMARY KEY (event_id, epoch_id)
+);
+
+-- One row per extraction-service call the dispatcher made for a turn.
+-- `counted` = 1 only for job-attributable failures (retryable upstream_llm,
+-- timeout, a reply that failed validation): those, and only those, count
+-- toward the dead-letter limit. `retired` = 1 once `retry-dead-letters` has put
+-- the turn back into the backlog, so the count restarts without deleting audit
+-- history.
+CREATE TABLE IF NOT EXISTS extraction_attempts (
+    attempt_row INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL,
+    epoch_id INTEGER NOT NULL,
+    attempt INTEGER NOT NULL,                 -- 1-based, per (event_id, epoch_id)
+    job_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,                    -- "{session_id}:{turn_index}"
+    started_at TEXT NOT NULL,                 -- ISO-8601
+    finished_at TEXT NOT NULL,                -- ISO-8601
+    duration_ms REAL NOT NULL,
+    error_code TEXT,                          -- ErrorCode value, 'unreachable', 'invalid_response'
+    outcome TEXT NOT NULL,                    -- 'extracted', 'failed', 'dead_lettered', 'deferred'
+    counted INTEGER NOT NULL DEFAULT 0,
+    retired INTEGER NOT NULL DEFAULT 0
+);
+
+-- The first-activation floor, one row per epoch, written once. Turns logged
+-- before it that had a cache row were applied by the pre-T2a live path; turns
+-- logged before it that had none are listed in extraction_legacy_turns and are
+-- never dispatched (applying them now would violate log order).
+CREATE TABLE IF NOT EXISTS extraction_activation (
+    epoch_id INTEGER PRIMARY KEY,
+    activated_at TEXT NOT NULL,               -- ISO-8601
+    turns_at_activation INTEGER NOT NULL,
+    marked_applied INTEGER NOT NULL,
+    legacy_unextracted INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS extraction_legacy_turns (
+    event_id TEXT NOT NULL,
+    epoch_id INTEGER NOT NULL,
+    PRIMARY KEY (event_id, epoch_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_extraction_attempts_turn
+    ON extraction_attempts(event_id, epoch_id);
+
+-- ---------------------------------------------------------------------------
+-- Epoch cutover (T2b). A CANDIDATE epoch, not a ledger row: `epoch_ledger`'s
+-- latest row IS the active epoch (`EventStore.get_current_epoch`), so writing
+-- the candidate there would make it live at once. The candidate is appended to
+-- the ledger only by `EventStore.promote_epoch_cutover`, in the same
+-- transaction that writes the new epoch's backlog activation.
+--
+-- state: 'filling' (the dispatcher is re-extracting the whole log under the
+-- candidate stamps), 'ready' (every logged turn has a candidate cache row),
+-- 'checked' (a staging rebuild under the candidate passed its gates),
+-- 'promoted', 'abandoned'. At most one row is open (filling/ready/checked);
+-- `begin_epoch_cutover` enforces it inside BEGIN IMMEDIATE.
+--
+-- model_hash is the COMPOSED stamp (`compose_model_hash`), the value the
+-- extraction cache is keyed under; bare_model_hash is the service's own
+-- identity, the value `/v1/info` reports. Service attempts made while filling
+-- are recorded in `extraction_attempts` under epoch_id = -cutover_id, a
+-- namespace no ledger row can occupy (ledger ids are AUTOINCREMENT, >= 1).
+--
+-- A new table, so `CREATE TABLE IF NOT EXISTS` is the whole migration.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS epoch_cutover (
+    cutover_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ontology_version TEXT NOT NULL,
+    extraction_version TEXT NOT NULL,
+    model_hash TEXT NOT NULL,                 -- composed, via compose_model_hash
+    bare_model_hash TEXT NOT NULL,            -- what the service's /v1/info reports
+    requested_at TEXT NOT NULL,               -- ISO-8601
+    state TEXT NOT NULL,                      -- filling, ready, checked, promoted, abandoned
+    source_epoch_id INTEGER,                  -- the active epoch when the cutover began
+    rebuild_job_id TEXT,                      -- LogRegenerator job id of the passing check
+    rebuilt_through_event_id TEXT,            -- last turn the passing check replayed
+    check_report TEXT,                        -- JSON, the latest check (pass or fail)
+    promoted_epoch_id INTEGER,                -- the ledger row promotion appended
+    updated_at TEXT NOT NULL                  -- ISO-8601
+);
