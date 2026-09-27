@@ -19,6 +19,7 @@ import pytest
 
 from backend.chat.conversation_handler import ConversationHandler
 from backend.chat.stream_events import Complete, StreamEvent, Token, WSEvent
+from backend.errors import LLMConnectionError
 from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from backend.knowledge.storage.graph_store import GraphStore
 from backend.llm.models import ToolCall as LLMToolCall
@@ -353,6 +354,170 @@ class TestStreamingSlopGate:
         # final_response is exactly the concatenation of what was emitted --
         # not a separately post-filtered copy of it.
         assert complete.final_response == joined
+
+
+def _capture_recorded_turns(handler: ConversationHandler) -> list[str]:
+    """Wrap `_record_turn_event` so a test can read every recorded
+    assistant_message (the event-log write) without a real event store.
+    """
+    recorded: list[str] = []
+    original = handler._record_turn_event
+
+    def _capture(*args, **kwargs):
+        recorded.append(kwargs["assistant_message"])
+        return original(*args, **kwargs)
+
+    handler._record_turn_event = _capture
+    return recorded
+
+
+async def _drain(handler: ConversationHandler, session_id: str, message: str = "hello"):
+    tokens: list[Token] = []
+    complete: Complete | None = None
+    async for event in handler.handle_message_streaming(
+        user_message=message, session_id=session_id
+    ):
+        if isinstance(event, Token):
+            tokens.append(event)
+        elif isinstance(event, Complete):
+            complete = event
+    assert complete is not None
+    return tokens, complete
+
+
+class TestErrorTurnIsStreamed:
+    """Review finding 1: on a provider failure the user must SEE the error
+    text that session history and the event log record. Before the fix the
+    except path set `final_text` but yielded no Token, and the sync bridge
+    forwards only Tokens to the socket, so the user saw nothing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_provider_error_before_first_token_streams_error_text(self):
+        provider = FakeStreamingLLMProvider(
+            [ScriptedPass(chunks=[], error=LLMConnectionError("llama-server unreachable"))]
+        )
+        handler = _make_streaming_handler(provider)
+        recorded = _capture_recorded_turns(handler)
+
+        tokens, complete = await _drain(handler, "s-err-1")
+
+        streamed = "".join(t.text for t in tokens)
+        assert streamed == "I encountered an error: llama-server unreachable"
+        assert complete.final_response == streamed
+        assert recorded == [streamed]
+        history = handler.sessions["s-err-1"].messages
+        assert history[-1].role == "assistant"
+        assert history[-1].content == streamed
+
+    @pytest.mark.asyncio
+    async def test_provider_error_mid_stream_appends_error_after_streamed_text(self):
+        provider = FakeStreamingLLMProvider(
+            [
+                ScriptedPass(
+                    chunks=["The first sentence made it out. And then"],
+                    error=LLMConnectionError("connection reset"),
+                )
+            ]
+        )
+        handler = _make_streaming_handler(provider)
+        recorded = _capture_recorded_turns(handler)
+
+        tokens, complete = await _drain(handler, "s-err-2")
+
+        streamed = "".join(t.text for t in tokens)
+        assert streamed == (
+            "The first sentence made it out.\n\nI encountered an error: connection reset"
+        )
+        assert complete.final_response == streamed
+        assert recorded == [streamed]
+        assert handler.sessions["s-err-2"].messages[-1].content == streamed
+
+
+class TestWhitespacePreserved:
+    """Review finding 2: paragraph and list newlines must survive into the
+    Token stream, `final_response`, session history and the event log. Before
+    the fix `SentenceBoundaryDetector.feed` stripped the whitespace at each
+    boundary and `_gate_and_emit` re-joined sentences with a single space.
+    """
+
+    TEXT = "First paragraph here.\n\nSecond paragraph here.\n1. item one.\n2. item two."
+
+    @staticmethod
+    def _awkward_chunks(text: str) -> list[list[str]]:
+        # Splits that land inside the separator run, right after the period,
+        # right before the list marker, and one character at a time.
+        return [
+            [text],
+            [
+                "First paragraph here.\n",
+                "\nSecond paragraph here.",
+                "\n1",
+                ". item one.\n2. item two.",
+            ],
+            [
+                "First paragraph here",
+                ".",
+                "\n\nSecond paragraph here.\n",
+                "1. item one.\n",
+                "2. item two.",
+            ],
+            list(text),
+            [text[i : i + 3] for i in range(0, len(text), 3)],
+        ]
+
+    @pytest.mark.asyncio
+    async def test_paragraph_and_list_newlines_survive_any_chunking(self):
+        for i, chunks in enumerate(self._awkward_chunks(self.TEXT)):
+            provider = FakeStreamingLLMProvider([ScriptedPass(chunks=chunks)])
+            handler = _make_streaming_handler(provider)
+            recorded = _capture_recorded_turns(handler)
+            sid = f"s-ws-{i}"
+
+            tokens, complete = await _drain(handler, sid)
+
+            streamed = "".join(t.text for t in tokens)
+            assert streamed == self.TEXT, f"chunking {i}: {chunks!r} -> {streamed!r}"
+            assert complete.final_response == self.TEXT
+            assert recorded == [self.TEXT]
+            assert handler.sessions[sid].messages[-1].content == self.TEXT
+
+    @pytest.mark.asyncio
+    async def test_slop_stripped_sentence_keeps_surrounding_separators(self):
+        text = "Opening line here.\n\nGreat work \U0001f389 on shipping this.\n- next point here."
+        provider = FakeStreamingLLMProvider(
+            [ScriptedPass(chunks=[text[i : i + 5] for i in range(0, len(text), 5)])]
+        )
+        handler = _make_streaming_handler(provider)
+
+        tokens, complete = await _drain(handler, "s-ws-slop")
+
+        streamed = "".join(t.text for t in tokens)
+        assert "\U0001f389" not in streamed
+        assert streamed.startswith("Opening line here.\n\nGreat work")
+        assert streamed.endswith("on shipping this.\n- next point here.")
+        assert complete.final_response == streamed
+
+    @pytest.mark.asyncio
+    async def test_pass2_text_keeps_its_newlines(self):
+        provider = FakeStreamingLLMProvider(
+            [
+                ScriptedPass(
+                    chunks=[],
+                    tool_calls=[
+                        LLMToolCall(id="call_1", name="query_knowledge_graph", arguments={})
+                    ],
+                ),
+                ScriptedPass(chunks=["Here is the list.\n", "1. alpha one.\n2. beta two."]),
+            ]
+        )
+        handler = _make_streaming_handler(provider)
+        handler._dispatch_tool = _StubDispatch()
+
+        tokens, complete = await _drain(handler, "s-ws-pass2")
+
+        assert complete.final_response == "Here is the list.\n1. alpha one.\n2. beta two."
+        assert "".join(t.text for t in tokens) == complete.final_response
 
 
 class _StubDispatch:

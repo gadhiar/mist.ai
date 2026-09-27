@@ -642,13 +642,24 @@ class BacklogStore:
         been applied, and this one lands after them. Graph state that depends on
         order (dedup winners, supersession) can therefore differ from a rebuild
         until the next epoch cutover re-extracts the log.
+
+        Crash ordering: the cache row and the markers live in different SQLite
+        files (`ExtractionCache(production_cache_path(config))` beside
+        `EventStore(db_path=...)`, see `backend/factories.py`), so the three
+        writes cannot share one transaction. The `extraction_failed` cache row
+        is therefore deleted LAST, as the commit point. A crash before it
+        leaves the row in place, so the turn is still visible to
+        `list_dead_letters` and this method accepts it again; once its applied
+        marker is gone, `scan` also lists it as pending. Deleting the row
+        first (the earlier order) could strand a turn: marked applied, so
+        `scan` skips it, and with no cache row, so this method refuses it.
         """
         cached = self.get_cached(event_id, epoch)
         if cached is None or cached.get("skip_reason") != SKIP_EXTRACTION_FAILED:
             return False
-        self._cache.delete(event_id, epoch.extraction_version, epoch.model_hash)
         self._events.delete_extraction_applied(event_id, epoch.epoch_id)
         self._events.retire_extraction_attempts(event_id, epoch.epoch_id)
+        self._cache.delete(event_id, epoch.extraction_version, epoch.model_hash)
         return True
 
 

@@ -30,6 +30,10 @@ class ScriptedPass:
     or sleep. After every chunk is played, the contract-mandated terminal
     `partial=False` chunk is emitted, carrying `tool_calls` /
     `finish_reason` / `usage` / `reasoning_content` and `content=None`.
+
+    `error`, when set, is raised after every chunk is played and before the
+    terminal chunk -- a provider that fails mid-stream (or, with no chunks,
+    before its first token).
     """
 
     chunks: list[str | asyncio.Event] = field(default_factory=list)
@@ -37,6 +41,7 @@ class ScriptedPass:
     finish_reason: str | None = None
     usage: UsageMetadata | None = None
     reasoning_content: str | None = None
+    error: Exception | None = None
 
 
 class FakeStreamingLLMProvider(StreamingLLMProvider):
@@ -76,6 +81,8 @@ class FakeStreamingLLMProvider(StreamingLLMProvider):
                 await chunk.wait()
                 continue
             yield LLMResponse(content=chunk, partial=True)
+        if step.error is not None:
+            raise step.error
         yield LLMResponse(
             content=None,
             tool_calls=step.tool_calls,

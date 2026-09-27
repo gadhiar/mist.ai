@@ -1487,6 +1487,10 @@ class ConversationHandler:
         content on sentence boundaries (`SentenceBoundaryDetector`) so
         `SlopDetector` always inspects a complete sentence before anything
         reaches the caller, then runs it through `_gate_sentence_text`.
+        The detector's `feed_segments` API is used rather than `feed`, so
+        the whitespace the model wrote between sentences (newlines, blank
+        lines before a list) is carried through as each Token's leading
+        separator instead of being collapsed to one space.
 
         Pass-1 content that streams in before a tool-call decision is
         surfaced live, exactly like any other content -- it is not held
@@ -1513,6 +1517,11 @@ class ConversationHandler:
         """
         gate = SentenceBoundaryDetector()
         emitted_text = ""
+        # Whitespace the model wrote after the last emitted sentence. It is
+        # held back, not emitted with that sentence, so it becomes the
+        # separator in front of the NEXT emitted sentence -- and a trailing
+        # run of whitespace at the end of the turn is never streamed at all.
+        pending_sep = ""
         tool_calls: list[LLMToolCall] | None = None
         finish_reason: str | None = None
         usage: UsageMetadata | None = None
@@ -1520,22 +1529,46 @@ class ConversationHandler:
         t_start = time.monotonic()
         first_token_at: float | None = None
 
-        def _gate_and_emit(sentence: str) -> Token | None:
-            """Run one gated sentence through the slop filter and account
-            for it on both the turn-wide and pass-local accumulators.
-            Returns None (and emits nothing) when the sentence stripped
-            down to nothing.
+        def _gate_and_emit(segment: str) -> Token | None:
+            """Run one raw segment's sentence through the slop filter and
+            account for it on both the turn-wide and pass-local accumulators.
+
+            `segment` comes from `SentenceBoundaryDetector.feed_segments`, so
+            it still carries the model's own whitespace around the sentence.
+            Only the sentence itself (whitespace trimmed) goes through the
+            gate; the whitespace in front of it is emitted as the separator,
+            so paragraph breaks and list lines survive into the Token stream
+            and `final_response`. Returns None (and emits nothing) when the
+            segment is whitespace only or its sentence stripped down to
+            nothing.
             """
-            nonlocal emitted_text
-            piece_text = self._gate_sentence_text(sentence, session_id=session_id)
+            nonlocal emitted_text, pending_sep
+            core = segment.strip()
+            lead = segment[: len(segment) - len(segment.lstrip())]
+            piece_text = (
+                self._gate_sentence_text(core, session_id=session_id).strip() if core else ""
+            )
             if not piece_text:
-                # Fully-stripped sentence (e.g. pure emoji) — nothing left
-                # worth speaking or displaying.
+                # Whitespace-only segment, or a fully-stripped sentence (e.g.
+                # pure emoji): nothing left worth speaking or displaying. Keep
+                # the separator that preceded it (plus this segment's leading
+                # whitespace) for the next sentence; drop the dropped
+                # sentence's own trailing whitespace so separators don't double.
+                pending_sep += lead
                 return None
-            lead = " " if state.emitted else ""
-            state.emitted += lead + piece_text
-            emitted_text += (" " if emitted_text else "") + piece_text
-            return Token(text=lead + piece_text, pass_num=pass_num)
+            sep = pending_sep + lead
+            pending_sep = segment[len(segment.rstrip()) :]
+            if not state.emitted:
+                # First text of the turn: no leading whitespace.
+                sep = ""
+            elif not emitted_text and not sep:
+                # First text of pass 2, which the model began without any
+                # whitespace: keep the pre-existing single-space pass joint.
+                sep = " "
+            text = sep + piece_text
+            state.emitted += text
+            emitted_text += text if emitted_text else piece_text
+            return Token(text=text, pass_num=pass_num)
 
         with llm_call_context(session_id=session_id, call_site=call_site, pass_num=pass_num):
             async for chunk in self._provider.generate(request, stream=True):
@@ -1544,8 +1577,8 @@ class ConversationHandler:
                         continue
                     if first_token_at is None:
                         first_token_at = time.monotonic()
-                    for sentence in gate.feed(chunk.content):
-                        token = _gate_and_emit(sentence)
+                    for segment in gate.feed_segments(chunk.content):
+                        token = _gate_and_emit(segment)
                         if token is not None:
                             yield token
                     continue
@@ -1556,8 +1589,8 @@ class ConversationHandler:
                 usage = chunk.usage
                 reasoning_content = chunk.reasoning_content
 
-        for sentence in gate.flush():
-            token = _gate_and_emit(sentence)
+        for segment in gate.flush_segments():
+            token = _gate_and_emit(segment)
             if token is not None:
                 yield token
 
@@ -1671,9 +1704,15 @@ class ConversationHandler:
         still exercised directly by its own test coverage and available to
         any other caller that wants whole-response regeneration.
         `Complete.final_response` is exactly the concatenation of every
-        Token piece this generator yields (both passes); that same string
-        is what gets stored in session history and the event log -- there
-        is no separate post-filter pass reconciling a different value.
+        Token piece this generator yields (both passes, and the error Token
+        on the error path); that same string is what gets stored in session
+        history and the event log -- there is no separate post-filter pass
+        reconciling a different value. Token pieces carry the model's own
+        inter-sentence whitespace (see `_stream_llm_pass`), so paragraph
+        and list line breaks survive into all three. On a non-hydration
+        exception the text "I encountered an error: ..." is streamed as a
+        Token (after any sentences that already streamed, separated by a
+        blank line) before Complete, so the user sees what is recorded.
 
         Pass-1 content streamed before a tool-call decision is surfaced to
         the caller live, pass_num=1, as it arrives -- see
@@ -1699,7 +1738,8 @@ class ConversationHandler:
         Yields:
             WSEvent events (tool_call_started/completed etc., as they
             happen), Token events (one per gated sentence, pass_num 1 or
-            2), and a single terminal Complete event.
+            2, plus one error Token on the error path), and a single
+            terminal Complete event.
         """
         # ADR-017 Wave 2: clear per-turn FE-bound event buffer. Events
         # (tool_call_*, cards_*, graph_subgraph) accumulate here during this
@@ -1769,6 +1809,11 @@ class ConversationHandler:
         state = _StreamTurnState()
         tool_calls_used = 0
         final_text = ""
+        # Pass in flight, so an error Token carries the pass it interrupted.
+        current_pass = 1
+        # Set on the error path; yielded after the `finally` drain, not from
+        # inside the except block (see the comment there).
+        error_token: Token | None = None
 
         try:
             # LLM autonomously decides to use tools
@@ -1886,6 +1931,7 @@ class ConversationHandler:
                     temperature=self.config.llm.conversation_temperature,
                     max_tokens=self.config.llm.conversation_max_tokens,
                 )
+                current_pass = 2
                 async for stream_event in self._stream_llm_pass(
                     final_request,
                     session_id=session_id,
@@ -2006,8 +2052,10 @@ class ConversationHandler:
 
         except Exception as e:
             # HYDRATION ABORTS; live recovers. Recording an error turn is right
-            # when a human is on the other end -- it is what they saw, and the
-            # transcript stays honest. During hydration it is contamination: the
+            # when a human is on the other end: the error text is streamed to
+            # them as a Token below, so the recorded turn is exactly what they
+            # saw, and the transcript stays honest. During hydration it is
+            # contamination: the
             # turn below would be written with the corpus's AUTHORED timestamp
             # and origin='real', making a fabricated "I encountered an error"
             # turn structurally indistinguishable from a genuine one, and the
@@ -2026,14 +2074,22 @@ class ConversationHandler:
                 raise
             logger.error(f"Error handling message: {e}", exc_info=True)
             error_msg = f"I encountered an error: {str(e)}"
-            session.add_message("assistant", error_msg)
+            # Sentences that streamed before the failure have already reached
+            # the user, so the error text is appended after them (as its own
+            # paragraph) rather than replacing them. The recorded turn is the
+            # full concatenation of every Token, error included -- the same
+            # string `Complete.final_response` carries.
+            error_text = ("\n\n" if state.emitted else "") + error_msg
+            state.emitted += error_text
+            error_token = Token(text=error_text, pass_num=current_pass)
+            final_text = state.emitted
+            session.add_message("assistant", final_text)
             # Record the error turn to event store
             self._record_turn_event(
                 session_id=session_id,
                 user_message=user_message,
-                assistant_message=error_msg,
+                assistant_message=final_text,
             )
-            final_text = error_msg
 
         finally:
             # ADR-017 Wave 2 safety net: any WS event not already drained
@@ -2045,6 +2101,14 @@ class ConversationHandler:
                 if payload.get("type") == "tool_call_started":
                     tool_calls_used += 1
                 yield WSEvent(payload=payload)
+
+        # The error Token is yielded here, after the `finally` drain, rather
+        # than from inside the except block, so a consumer's `aclose()` at
+        # this yield raises GeneratorExit outside the exception handler (not
+        # chained to the provider error as its __context__). The error turn is
+        # already recorded by this point either way.
+        if error_token is not None:
+            yield error_token
 
         duration_ms = (time.monotonic() - start) * 1000
 

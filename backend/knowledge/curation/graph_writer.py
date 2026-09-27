@@ -287,9 +287,9 @@ class CurationGraphWriter:
         statement alone, unchanged; `write()` then writes its SOURCED_FROM /
         chunk edges and `new_fact` LearningEvent as separate statements. That
         path is not replayed by the extraction backlog. The dispatcher applies
-        through `apply_cached_turn`
-        (`grep -n 'self._pipeline.apply_cached_turn' backend/extraction_backlog/dispatcher.py`
-        -> 890), whose `curate_and_store` call passes event, session and
+        through `apply_cached_turn`, called from `ExtractionDispatcher._apply`
+        (`grep -n 'self._pipeline.apply_cached_turn' backend/extraction_backlog/dispatcher.py`),
+        whose `curate_and_store` call passes event, session and
         `recorded_at` and no `source_metadata`
         (`grep -n 'recorded_at=turn.recorded_at' backend/knowledge/extraction/pipeline.py`
         -> 1206; the call opens at 1202).
@@ -314,9 +314,9 @@ class CurationGraphWriter:
         and ON MATCH, so a later turn overwrites it. Matching on it is still
         sound for crash replay because the backlog re-applies turn N before any
         turn that sorts after N:
-        - the dispatcher processes only the backlog head:
-          `grep -n 'head = scan.head' backend/extraction_backlog/dispatcher.py`
-          -> 472;
+        - the dispatcher processes only the backlog head, taken in
+          `ExtractionDispatcher._step`:
+          `grep -n 'head = scan.head' backend/extraction_backlog/dispatcher.py`;
         - the head is the first pending turn in replay order:
           `grep -n 'return self.pending.0. if' backend/extraction_backlog/store.py`
           -> 217 (`BacklogScan.head`);
