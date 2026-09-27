@@ -43,7 +43,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         )
     )
     for item in items:
-        if "requires_vault" in item.keywords:
+        if item.get_closest_marker("requires_vault") is not None:
             item.add_marker(skip_reason)
 
 
