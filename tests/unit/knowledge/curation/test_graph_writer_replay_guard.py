@@ -171,8 +171,8 @@ class TestProvenanceFoldedIntoUpsert:
         assert ENTITY_MERGE in query
         assert query.index(ENTITY_MERGE) < query.index(LEARNING_EVENT_MERGE)
         assert "le.learning_type = 'new_fact'" in query
-        assert "MERGE (le)-[:ABOUT]->(e)" in query
-        assert query.endswith(" MERGE (le)-[:LEARNED_FROM]->(ctx)")
+        # Both edges follow the context MATCH, as in the old separate statement.
+        assert query.endswith(" MERGE (le)-[:LEARNED_FROM]->(ctx) MERGE (le)-[:ABOUT]->(e)")
         assert params["learning_id"] == "learning-evt-7-new_fact-rust"
         assert params["learning_display_name"] == "new_fact: rust"
         assert result.learning_events_created == 1

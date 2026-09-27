@@ -261,24 +261,27 @@ class CurationGraphWriter:
         statement also MERGEs the entity's EXTRACTED_FROM edge to this session's
         ConversationContext (`_extracted_from_clause`), and with
         `with_new_fact_learning_event` the entity's `new_fact` LearningEvent
-        with its ABOUT and LEARNED_FROM edges (`_NEW_FACT_ON_CREATE`). One Cypher
-        statement is one transaction, so entity, reinforce, edge and
-        LearningEvent commit together or not at all. The statement order:
+        with its LEARNED_FROM and ABOUT edges (`_NEW_FACT_ON_CREATE`). Each
+        `execute_write` runs one statement in its own managed write transaction
+        (`grep -n 'session.execute_write' backend/knowledge/storage/neo4j_connection.py`
+        -> 116), so entity, reinforce, edge and LearningEvent commit together or
+        not at all. The statement order:
 
         1. the replay guard (`OPTIONAL MATCH` + `count`), before anything is
            written, so it sees the graph as the previous statement left it;
         2. the entity MERGE with its ON CREATE / ON MATCH;
-        3. the LearningEvent MERGE and its ABOUT edge;
+        3. the LearningEvent node MERGE;
         4. `MATCH` the ConversationContext, then the EXTRACTED_FROM MERGE and
-           the LearningEvent's LEARNED_FROM edge.
+           the LearningEvent's LEARNED_FROM and ABOUT edges.
 
         The ConversationContext `MATCH` sits AFTER the entity and LearningEvent
-        MERGEs on purpose. `write()` ensures the context one statement earlier,
-        but were it absent, a `MATCH` ahead of the entity MERGE would yield no
-        row and silently drop the entity. After them, a missing context drops
-        only the edges that need it, which is what the separate statements this
-        fold replaced did: each `MATCH`ed the context and wrote nothing without
-        it.
+        node MERGEs on purpose. `write()` ensures the context one statement
+        earlier, but were it absent, a `MATCH` ahead of the entity MERGE would
+        yield no row and silently drop the entity. Placed after them, a missing
+        context leaves what the separate statements this fold replaced left: the
+        entity and the LearningEvent node, with no EXTRACTED_FROM, LEARNED_FROM
+        or ABOUT edge (the old LearningEvent statement also `MATCH`ed the
+        context before its ABOUT edge).
 
         Document ingest (`with_conversation_provenance` False) issues the entity
         statement alone, unchanged; `write()` then writes its SOURCED_FROM /
@@ -435,7 +438,7 @@ class CurationGraphWriter:
                     " WITH e "
                     "MERGE (le:__Provenance__:LearningEvent {id: $learning_id}) "
                     + _NEW_FACT_ON_CREATE
-                    + " MERGE (le)-[:ABOUT]->(e) WITH e, le"
+                    + " WITH e, le"
                 )
                 params["learning_id"] = _new_fact_learning_id(event_id, entity_id)
                 params["learning_display_name"] = f"new_fact: {entity_id}"
@@ -447,7 +450,8 @@ class CurationGraphWriter:
             )
             params.update(edge_params)
             if with_new_fact_learning_event:
-                query += " MERGE (le)-[:LEARNED_FROM]->(ctx)"
+                # Same order as `_create_new_fact_learning_event`.
+                query += " MERGE (le)-[:LEARNED_FROM]->(ctx) MERGE (le)-[:ABOUT]->(e)"
         await self._executor.execute_write(query, params)
 
     def _extracted_from_clause(self) -> tuple[str, dict[str, str]]:
