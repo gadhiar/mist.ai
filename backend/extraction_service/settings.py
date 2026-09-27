@@ -55,7 +55,8 @@ class ServiceSettings:
             plus repair retries on unparsable output. Default 2 (one
             repair retry).
         idempotency_cache_size: Max entries in the job_id -> ExtractResponse
-            LRU cache.
+            LRU cache. Must be >= 0; 0 retains nothing (concurrent duplicates
+            of an in-flight job still share one run).
         scope_enabled: Master switch for Stage 1.5. When False, scope is
             always reported as "unknown" with confidence 0.0 and no LLM
             call is made for it.
@@ -81,6 +82,18 @@ class ServiceSettings:
     temperature: float = 0.0
     llama_cpp_build: str = "b11151"
     port: int = 8090
+
+    def __post_init__(self) -> None:
+        """Refuse values the service cannot run with.
+
+        Raises:
+            ValueError: `idempotency_cache_size` is negative.
+        """
+        if self.idempotency_cache_size < 0:
+            raise ValueError(
+                f"idempotency_cache_size must be >= 0 (0 disables retention), "
+                f"got {self.idempotency_cache_size}"
+            )
 
     @classmethod
     def from_env(cls) -> ServiceSettings:

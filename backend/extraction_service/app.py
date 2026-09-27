@@ -22,6 +22,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
 from backend.extraction_contract.models import (
     CONTRACT_MAJOR,
@@ -38,7 +39,9 @@ from backend.extraction_service.adapters import get_adapter
 from backend.extraction_service.engine import (
     ExtractionEngine,
     ExtractionTimeoutError,
+    InvalidRequestError,
     UpstreamLLMError,
+    parse_recorded_at,
 )
 from backend.extraction_service.settings import ServiceSettings
 from backend.knowledge.version_stamps import EXTRACTION_VERSION
@@ -100,47 +103,76 @@ class _IdempotencyCache:
     """LRU of completed `ExtractResponse`s, keyed on `job_id`, with single-flight.
 
     A `job_id` already in the LRU returns the stored response without
-    re-running `factory`. A `job_id` currently being computed by another
-    caller is awaited rather than re-run -- concurrent duplicate requests
-    for the same job produce exactly one underlying run. A run that
-    raises is never cached, so a resubmitted job_id after a failure tries
-    again rather than replaying the failure forever.
+    re-running `factory`. A `job_id` currently being computed is joined
+    rather than re-run -- concurrent duplicate requests for the same job
+    produce exactly one underlying run. A run that raises is never cached,
+    so a resubmitted job_id after a failure tries again rather than
+    replaying the failure forever. `maxsize=0` retains nothing: duplicates
+    still share an in-flight run, but a finished job runs again.
+
+    Concurrency relies on the event loop, not a lock: `get_or_run` does its
+    lookups and registers a new run with no `await` in between, and the run
+    task's done callback stores the result and THEN un-registers the run,
+    also synchronously. So at every point a duplicate can observe, the job
+    is either in flight or stored -- never neither, which would start a
+    second run.
+
+    Each caller awaits the shared run through `asyncio.shield`: a caller
+    cancelled mid-run (its client disconnected) stops waiting, but the run
+    carries on for the other callers and is still stored when it finishes.
     """
 
     def __init__(self, maxsize: int) -> None:
+        """Create an empty cache.
+
+        Raises:
+            ValueError: `maxsize` is negative.
+        """
+        if maxsize < 0:
+            raise ValueError(f"maxsize must be >= 0, got {maxsize}")
         self._maxsize = maxsize
         self._results: OrderedDict[str, ExtractResponse] = OrderedDict()
-        self._in_flight: dict[str, asyncio.Future[ExtractResponse]] = {}
-        self._lock = asyncio.Lock()
+        self._in_flight: dict[str, asyncio.Task[ExtractResponse]] = {}
+
+    def knows(self, job_id: str) -> bool:
+        """True when `job_id` has a stored result or a run in flight."""
+        return job_id in self._results or job_id in self._in_flight
 
     async def get_or_run(
         self, job_id: str, factory: Callable[[], Awaitable[ExtractResponse]]
     ) -> ExtractResponse:
-        async with self._lock:
-            cached = self._results.get(job_id)
-            if cached is not None:
-                self._results.move_to_end(job_id)
-                return cached
+        """Return the job's response, running `factory` only if nothing has it.
 
-            future = self._in_flight.get(job_id)
-            owns = future is None
-            if owns:
-                future = asyncio.ensure_future(factory())
-                self._in_flight[job_id] = future
-
-        try:
-            result = await future
-        finally:
-            if owns:
-                async with self._lock:
-                    self._in_flight.pop(job_id, None)
-
-        async with self._lock:
-            self._results[job_id] = result
+        Raises:
+            Whatever the shared run raised (every joined caller sees it), or
+            `asyncio.CancelledError` when THIS caller is cancelled.
+        """
+        cached = self._results.get(job_id)
+        if cached is not None:
             self._results.move_to_end(job_id)
-            while len(self._results) > self._maxsize:
-                self._results.popitem(last=False)
-        return result
+            return cached
+
+        run = self._in_flight.get(job_id)
+        if run is None:
+            run = asyncio.ensure_future(factory())
+            self._in_flight[job_id] = run
+            run.add_done_callback(lambda done: self._on_run_done(job_id, done))
+        return await asyncio.shield(run)
+
+    def _on_run_done(self, job_id: str, run: asyncio.Task[ExtractResponse]) -> None:
+        # Synchronous: store, then un-register, with no await in between.
+        if not run.cancelled() and run.exception() is None:
+            self._store(job_id, run.result())
+        if self._in_flight.get(job_id) is run:
+            del self._in_flight[job_id]
+
+    def _store(self, job_id: str, result: ExtractResponse) -> None:
+        if self._maxsize == 0:
+            return
+        self._results[job_id] = result
+        self._results.move_to_end(job_id)
+        while len(self._results) > self._maxsize:
+            self._results.popitem(last=False)
 
 
 def _error_response(code: ErrorCode, message: str) -> JSONResponse:
@@ -190,16 +222,28 @@ def create_app(
                 f"model_hash={settings.model_hash!r})",
             )
 
-        probe_result = await health_probe.check()
-        if probe_result.status != "ok":
-            return _error_response(
-                ErrorCode.MODEL_LOADING,
-                f"llama-server not ready (status={probe_result.status})",
-            )
+        try:
+            parse_recorded_at(req.recorded_at)
+        except InvalidRequestError as exc:
+            return _error_response(ErrorCode.CONTRACT_MISMATCH, str(exc))
+
+        # A job already stored or in flight needs no model: answer it (or
+        # join it) even while llama-server reloads, rather than 503 a result
+        # this process already holds or is about to have.
+        if not cache.knows(req.job_id):
+            probe_result = await health_probe.check()
+            if probe_result.status != "ok":
+                return _error_response(
+                    ErrorCode.MODEL_LOADING,
+                    f"llama-server not ready (status={probe_result.status})",
+                )
 
         request_start = time.perf_counter()
         try:
             response = await cache.get_or_run(req.job_id, lambda: engine.run(req))
+        except InvalidRequestError as exc:
+            # Checked above; kept so the engine's own refusal is never a 500.
+            return _error_response(ErrorCode.CONTRACT_MISMATCH, str(exc))
         except ExtractionTimeoutError as exc:
             logger.info(
                 "job failed request_id=%s job_id=%s event_id=%s turn_id=%s outcome=timeout: %s",
@@ -221,6 +265,24 @@ def create_app(
                 exc,
             )
             return _error_response(ErrorCode.UPSTREAM_LLM, str(exc))
+        except ValidationError as exc:
+            # Defence in depth: the engine's strict parse rejects bad model
+            # output before any contract model sees it, so this means a
+            # response model rejected a value the parse let through. Report
+            # it as the model's failure, in the envelope, never a bare 500.
+            logger.error(
+                "job failed request_id=%s job_id=%s event_id=%s turn_id=%s "
+                "outcome=upstream_llm (response model rejected the result): %s",
+                req.request_id,
+                req.job_id,
+                req.event_id,
+                req.turn_id,
+                exc,
+            )
+            return _error_response(
+                ErrorCode.UPSTREAM_LLM,
+                f"The model's output could not be built into a response: {exc}",
+            )
 
         duration_ms = (time.perf_counter() - request_start) * 1000
         logger.info(
