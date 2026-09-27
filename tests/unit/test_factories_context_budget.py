@@ -41,6 +41,12 @@ requires_sentence_transformers = pytest.mark.skipif(
 )
 
 
+# A /props n_ctx deliberately distinct from every fallback value (the literal
+# 32768 and any LLM_CTX_SIZE these tests set), so a probe-success assertion
+# cannot pass on the fallback path.
+PROBED_N_CTX = 24576
+
+
 def _mock_sync_client_returning(response: httpx.Response):
     """Build a MagicMock standing in for `with httpx.Client(...) as client:`."""
     from unittest.mock import MagicMock
@@ -88,19 +94,20 @@ class TestResolveContextBudgetWindow:
 
         response = httpx.Response(
             200,
-            json={"default_generation_settings": {"n_ctx": 32768}},
+            json={"default_generation_settings": {"n_ctx": PROBED_N_CTX}},
             request=httpx.Request("GET", "http://llm/props"),
         )
         monkeypatch.setattr(
             factories.httpx, "Client", lambda **kw: _mock_sync_client_returning(response)
         )
+        monkeypatch.delenv("LLM_CTX_SIZE", raising=False)
 
         context_budget = ContextBudgetConfig(context_window="auto")
         llm_config = LLMConfig(base_url="http://llm")
 
         result = factories.resolve_context_budget_window(context_budget, llm_config)
 
-        assert result == 32768
+        assert result == PROBED_N_CTX
 
     def test_auto_falls_back_on_connection_error(self, monkeypatch, caplog):
         from backend import factories
@@ -251,10 +258,11 @@ class TestBuildConversationHandlerContextWindowWiring:
         from tests.unit.knowledge.conftest import FakeVectorStore
 
         monkeypatch.delenv("MIST_HYDRATION_ISOLATION", raising=False)
+        monkeypatch.delenv("LLM_CTX_SIZE", raising=False)
 
         response = httpx.Response(
             200,
-            json={"default_generation_settings": {"n_ctx": 32768}},
+            json={"default_generation_settings": {"n_ctx": PROBED_N_CTX}},
             request=httpx.Request("GET", "http://llm/props"),
         )
         monkeypatch.setattr(
@@ -279,7 +287,64 @@ class TestBuildConversationHandlerContextWindowWiring:
         )
 
         assert handler._budget_planner is not None
-        assert handler._budget_planner._config.context_window == 32768
+        assert handler._budget_planner._config.context_window == PROBED_N_CTX
+
+    @requires_sentence_transformers
+    def test_probed_window_sets_planner_total_budget_end_to_end(self, monkeypatch):
+        """The probed n_ctx reaches the planner's arithmetic, not just its
+        config: with no output tokens requested, `plan().total_budget` is
+        n_ctx - output_reserve - safety_margin; each requested output token
+        comes off that too.
+        """
+        from backend import factories
+        from backend.factories import build_conversation_handler
+        from backend.knowledge.storage.graph_store import GraphStore
+        from tests.mocks.embeddings import FakeEmbeddingGenerator
+        from tests.mocks.neo4j import FakeNeo4jConnection
+        from tests.mocks.ollama import FakeLLM
+        from tests.unit.knowledge.conftest import FakeVectorStore
+
+        monkeypatch.delenv("MIST_HYDRATION_ISOLATION", raising=False)
+        monkeypatch.delenv("LLM_CTX_SIZE", raising=False)
+
+        response = httpx.Response(
+            200,
+            json={"default_generation_settings": {"n_ctx": PROBED_N_CTX}},
+            request=httpx.Request("GET", "http://llm/props"),
+        )
+        monkeypatch.setattr(
+            factories.httpx, "Client", lambda **kw: _mock_sync_client_returning(response)
+        )
+
+        output_reserve, safety_margin = 512, 256
+        config = build_test_config()
+        config.context_budget = ContextBudgetConfig(
+            context_window="auto",
+            output_reserve_tokens=output_reserve,
+            safety_margin_tokens=safety_margin,
+            enabled=True,
+        )
+
+        handler = build_conversation_handler(
+            config=config,
+            graph_store=GraphStore(FakeNeo4jConnection(), FakeEmbeddingGenerator()),
+            vector_store=FakeVectorStore(),
+            llm_provider=FakeLLM(),
+        )
+
+        def _total_budget(max_output_tokens: int) -> int:
+            return handler._budget_planner.plan(
+                persona_text=None,
+                static_text="system",
+                retrieval_result=None,
+                live_advisory_text=None,
+                history=[],
+                tools=None,
+                max_output_tokens=max_output_tokens,
+            ).total_budget
+
+        assert _total_budget(0) == PROBED_N_CTX - output_reserve - safety_margin
+        assert _total_budget(1000) == PROBED_N_CTX - 1000 - output_reserve - safety_margin
 
     @requires_sentence_transformers
     def test_explicit_int_window_wins_no_http_call(self, monkeypatch):
