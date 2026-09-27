@@ -80,11 +80,11 @@ jobs:
 
       # The install steps below mirror docker/backend/Dockerfile step for step, in
       # the same order, because the image -- not requirements.txt alone -- is what
-      # the suite runs against: the image gets fastapi and uvicorn only
-      # transitively (through chatterbox-tts), so a requirements-only install
-      # fails collection with ModuleNotFoundError. The deliberate differences are
-      # CPU wheels instead of CUDA 12.4 ones, and no flash-attn (CUDA-only and
-      # optional in the image too, Dockerfile:87-90).
+      # the suite runs against: chatterbox-tts and its transitive dependencies
+      # come only from the Dockerfile's step 2, and the audio shared libraries
+      # only from its apt step. The deliberate differences are CPU wheels instead
+      # of CUDA 12.4 ones, and no flash-attn (CUDA-only and optional in the image
+      # too, Dockerfile:87-90).
 
       # Dockerfile:8-11, minus the interpreter packages setup-python provides.
       # `sounddevice` loads libportaudio at import, and src/multimodal/stt.py
@@ -130,7 +130,7 @@ jobs:
             echo "PyTorch 2.6.0+cpu intact -- skipping re-pin"
           fi
 
-      # Mirrors the image's step 6 (Dockerfile:93), which installs the same quoted
+      # Mirrors the image's step 6 (Dockerfile:96), which installs the same quoted
       # pins: `pip install "pytest==7.4.4" "pytest-asyncio==0.23.8"`. Both versions
       # also now match requirements.txt directly, so this step is a re-affirmation
       # of what "Install backend requirements" above already installed, kept
