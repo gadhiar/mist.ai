@@ -9,7 +9,10 @@ import pytest
 
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
-from tests.unit.knowledge.curation._graph_writer_fakes import TEST_REBUILD_STAMPS
+from tests.unit.knowledge.curation._graph_writer_fakes import (
+    PROVENANCE_EDGE_MERGE,
+    TEST_REBUILD_STAMPS,
+)
 from tests.unit.knowledge.curation.conftest import make_entity_dict
 
 
@@ -116,7 +119,9 @@ class TestProvenance:
         )
 
         conn.assert_write_executed("ConversationContext")
-        conn.assert_write_executed("EXTRACTED_FROM")
+        # The edge MERGE itself, not a bare "EXTRACTED_FROM": the entity upsert's
+        # replay guard also names the relationship type (it reads the edge).
+        conn.assert_write_executed(PROVENANCE_EDGE_MERGE)
 
 
 class TestBeliefChangeLearningEvent:

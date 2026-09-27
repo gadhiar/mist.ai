@@ -23,6 +23,7 @@ from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
 
 # Reuse the fake connection helpers from the file this replaces.
 from tests.unit.knowledge.curation._graph_writer_fakes import (
+    PROVENANCE_EDGE_MERGE,
     make_writer,
     writes_matching,
 )
@@ -75,7 +76,7 @@ class TestUtteranceAnchor:
             event_id="evt-42",
             session_id="sess-1",
         )
-        edges = writes_matching(conn, "EXTRACTED_FROM")
+        edges = writes_matching(conn, PROVENANCE_EDGE_MERGE)
         assert len(edges) == 1, "exactly one entity-provenance edge per entity"
         query, params = edges[0]
         assert "r.source_utterance_id = $event_id" in query
@@ -110,7 +111,7 @@ class TestUtteranceAnchor:
             event_id="evt-1",
             session_id="sess-1",
         )
-        query, params = writes_matching(conn, "EXTRACTED_FROM")[0]
+        query, params = writes_matching(conn, PROVENANCE_EDGE_MERGE)[0]
         create_clause, match_clause = query.split("ON MATCH SET")
         for clause in (create_clause, match_clause):
             assert "r.ontology_version = $ontology_version" in clause
