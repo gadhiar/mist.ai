@@ -71,13 +71,59 @@ if TYPE_CHECKING:
 _log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 logging.basicConfig(level=logging.INFO, format=_log_format)
 
-# Persistent file log (survives container removal via bind mount)
-_log_dir = Path("/app/logs")
-_log_dir.mkdir(parents=True, exist_ok=True)
-_file_handler = logging.FileHandler(_log_dir / "mist-backend.log")
-_file_handler.setFormatter(logging.Formatter(_log_format))
-_file_handler.setLevel(logging.DEBUG)  # Capture everything to disk
-logging.getLogger().addHandler(_file_handler)
+# Persistent file log (survives container removal via bind mount). Attaching
+# the FileHandler is deferred to configure_file_logging(), called from
+# lifespan() rather than here at import time -- see that function's
+# docstring for why.
+
+
+def _resolve_log_dir() -> Path:
+    """Resolve the directory for the persistent backend log file.
+
+    Read at call time, not import time, so the resolution reflects whatever
+    `MIST_LOG_DIR` is set to when `lifespan()` actually runs.
+
+    Returns:
+        The path named by the `MIST_LOG_DIR` environment variable if set,
+        otherwise the repository-relative `logs/` directory.
+    """
+    env_value = os.environ.get("MIST_LOG_DIR")
+    if env_value:
+        return Path(env_value)
+    return Path(__file__).resolve().parents[1] / "logs"
+
+
+def configure_file_logging(log_dir: Path) -> logging.Handler:
+    """Attach a persistent file handler for the backend log to the root logger.
+
+    Creates `log_dir` if it does not already exist and installs a
+    `FileHandler` for `log_dir / "mist-backend.log"` at DEBUG level, using
+    the same formatter as the console handler `logging.basicConfig` installs
+    at import time. Idempotent: if a `FileHandler` for that same file is
+    already on the root logger, that handler is returned instead of adding
+    a duplicate.
+
+    Only records emitted after this function runs reach the file. Records
+    logged during module import, before `lifespan()` calls this, reach the
+    console handler only.
+
+    Args:
+        log_dir: Directory to hold `mist-backend.log`. Created if absent.
+
+    Returns:
+        The `FileHandler` attached to the root logger, new or pre-existing.
+    """
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = (log_dir / "mist-backend.log").resolve()
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == log_file:
+            return handler
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(logging.Formatter(_log_format))
+    file_handler.setLevel(logging.DEBUG)  # Capture everything to disk
+    root_logger.addHandler(file_handler)
+    return file_handler
 
 logger = logging.getLogger(__name__)
 
@@ -421,6 +467,8 @@ def _resolve_curation_dependencies(voice_processor) -> CurationDependencies:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
+    configure_file_logging(_resolve_log_dir())
+
     global voice_processor, curation_scheduler, log_handler
     global vault_writer, vault_sidecar, vault_filewatcher, vault_invalidation_bus
 
