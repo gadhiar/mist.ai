@@ -43,6 +43,14 @@ ScopeLabel = Literal["user-scope", "system-scope", "third-party", "unknown"]
 
 _VALID_SCOPES: frozenset[str] = frozenset({"user-scope", "system-scope", "third-party", "unknown"})
 
+# The Stage 1.5 user message around the utterance. A named constant rather
+# than an inline f-string so the extraction service can fold it into its
+# `prompt_sha256` stamp (`backend/extraction_service/engine.py`
+# `_compute_prompt_sha256`): every prompt text that shapes a stage's output is
+# part of the epoch's identity. Rendering is byte-identical to the inline form
+# it replaced.
+SCOPE_USER_TEMPLATE = 'Utterance: "{utterance}"\n\nOutput:'
+
 
 def render_scope_messages(pre_processed: PreProcessedInput) -> list[dict]:
     """Render the Stage 1.5 chat messages for a pre-processed utterance.
@@ -59,7 +67,7 @@ def render_scope_messages(pre_processed: PreProcessedInput) -> list[dict]:
     Returns:
         A two-message list: system prompt, then the user utterance.
     """
-    user_message = f'Utterance: "{pre_processed.original_text}"\n\nOutput:'
+    user_message = SCOPE_USER_TEMPLATE.format(utterance=pre_processed.original_text)
     return [
         {"role": "system", "content": SCOPE_CLASSIFIER_SYSTEM_PROMPT},
         {"role": "user", "content": user_message},

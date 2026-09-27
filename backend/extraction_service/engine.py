@@ -59,6 +59,7 @@ from backend.knowledge.extraction.preprocessor import PreProcessedInput, PreProc
 from backend.knowledge.extraction.prompts import EXTRACTION_SYSTEM_PROMPT, EXTRACTION_USER_TEMPLATE
 from backend.knowledge.extraction.scope_classifier import (
     SCOPE_CLASSIFIER_SYSTEM_PROMPT,
+    SCOPE_USER_TEMPLATE,
     parse_scope_output,
     render_scope_messages,
 )
@@ -199,19 +200,31 @@ def _strict_derivation(raw: str) -> DerivationOut:
 
 
 def _compute_prompt_sha256(adapter: ModelFamilyAdapter) -> str:
-    """Hash the scope/extraction/derivation prompt templates plus the adapter identity.
+    """Hash every prompt text that shapes a stage's output, plus the adapter identity.
 
-    Computed once at engine construction (not per request) since none of
-    its inputs vary per job -- the raw, unformatted prompt templates and
-    the adapter's own name/version.
+    The inputs are the raw, unformatted templates of all three stages -- the
+    scope system prompt and user template, the extraction system prompt and
+    user template, the derivation system prompt and user template -- plus the
+    Stage 2 repair instruction sent on a retry, and the adapter's own
+    name/version. A change to any of them changes what the model is asked, so
+    it changes the stamp.
+
+    Components are joined with a unit separator (0x1F) rather than
+    concatenated, so moving text from one template to its neighbour cannot
+    produce the same hash.
+
+    Computed once at engine construction (not per request): none of its
+    inputs vary per job.
     """
-    material = "".join(
+    material = "\x1f".join(
         [
             SCOPE_CLASSIFIER_SYSTEM_PROMPT,
+            SCOPE_USER_TEMPLATE,
             EXTRACTION_SYSTEM_PROMPT,
             EXTRACTION_USER_TEMPLATE,
             INTERNAL_DERIVATION_SYSTEM_PROMPT,
             INTERNAL_DERIVATION_USER_TEMPLATE,
+            _REPAIR_INSTRUCTION,
             adapter.name,
             adapter.version,
         ]
