@@ -17,9 +17,14 @@ backlog first activated that had no cache row; never dispatched, and covered by
 the next cutover's re-extraction), and any open cutover.
 
 `retry-dead-letters` puts dead-lettered turns (`extraction_failed` skips) back
-into the backlog: it deletes the skip row and the turn's applied marker for the
-active epoch and restarts its failure count. A running dispatcher picks the
-turn up on its next scan (at most `MIST_EXTRACTION_IDLE_POLL_S` later).
+into the backlog: it restarts the turn's failure count and deletes the skip row
+for the active epoch. It leaves the turn's applied marker alone: a turn with no
+cache row is inference-pending whatever its marker says, and the dispatcher
+clears the stale marker itself before re-caching, so the CLI can run beside a
+running dispatcher at any moment (`BacklogStore.retry_dead_letter` explains
+the race this avoids). A running dispatcher picks the turn up on its next scan
+(at most `MIST_EXTRACTION_IDLE_POLL_S` later); `retry-dead-letters` does not
+wake it.
 
 A retried turn is applied OUT OF LOG ORDER. Every turn logged after it has
 already been applied, and graph outcomes that depend on order (which duplicate

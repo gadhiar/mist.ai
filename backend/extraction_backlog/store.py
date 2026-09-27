@@ -3,10 +3,10 @@
 There is no queue table. For the ACTIVE epoch (the latest `epoch_ledger` row):
 
 - a turn is INFERENCE-PENDING when the extraction cache has no row for
-  `cache_key(event_id, epoch.extraction_version, epoch.model_hash)`;
+  `cache_key(event_id, epoch.extraction_version, epoch.model_hash)`, marker or not;
 - a turn is APPLY-PENDING when it has a cache row but no `applied` marker in
   `extraction_applied`;
-- a turn is DONE when its marker says `applied`;
+- a turn is DONE when it has a cache row AND its marker says `applied`;
 - a turn is LEGACY when it was logged before the backlog first activated for
   this epoch and had no cache row then. Legacy turns are never dispatched:
   applying them after later turns would violate log order. The epoch cutover
@@ -460,7 +460,7 @@ class BacklogStore:
     # -- scanning --------------------------------------------------------------
 
     def scan(self, epoch: Epoch) -> BacklogScan:
-        """Compute the backlog for `epoch` from the log, the cache and the markers."""
+        """The backlog for `epoch`; a marker counts only beside a cache row (see retry)."""
         keys = self._events.list_turn_keys_in_replay_order()
         cached = self._cache.event_ids_for(epoch.extraction_version, epoch.model_hash)
         applied = self._events.get_extraction_applied(epoch.epoch_id)
@@ -471,7 +471,7 @@ class BacklogStore:
         apply_pending = 0
         for key in keys:
             event_id = key["event_id"]
-            stage = applied.get(event_id)
+            stage = applied.get(event_id) if event_id in cached else None
             if stage == STAGE_APPLIED or event_id in legacy:
                 continue
             is_cached = event_id in cached
@@ -631,33 +631,91 @@ class BacklogStore:
             if cached.get(k["event_id"]) == SKIP_EXTRACTION_FAILED
         ]
 
-    def retry_dead_letter(self, event_id: str, epoch: Epoch) -> bool:
-        """Put a dead-lettered turn back into the backlog.
+    def clear_stale_marker(self, turn: PendingTurn, epoch: Epoch) -> bool:
+        """Delete the apply marker of a turn that has no cache row under `epoch`.
 
-        Deletes its `extraction_failed` cache row and its applied marker for the
-        epoch, and retires its attempts so the failure count restarts. Refuses
-        (returns False, changes nothing) for a turn that is not dead-lettered.
+        The dispatcher calls this for every inference-pending head before it
+        caches a new result; a marker there can only be stale. Otherwise a
+        crash between that cache write and the apply would leave a cache row
+        beside the old `applied` marker, which `scan` reads as done, and the
+        turn would never be applied. True when a marker was deleted.
+        """
+        return self._events.delete_extraction_applied(turn.event_id, epoch.epoch_id)
+
+    def retry_dead_letter(self, event_id: str, epoch: Epoch) -> bool:
+        r"""Put a dead-lettered turn back into the backlog.
+
+        Retires its attempts so the failure count restarts, then deletes its
+        `extraction_failed` cache row. It does NOT touch the turn's apply
+        marker. Refuses (returns False, changes nothing) for a turn that is
+        not dead-lettered.
 
         The turn is then applied OUT OF LOG ORDER: every later turn has already
         been applied, and this one lands after them. Graph state that depends on
         order (dedup winners, supersession) can therefore differ from a rebuild
         until the next epoch cutover re-extracts the log.
 
-        Crash ordering: the cache row and the markers live in different SQLite
-        files (`ExtractionCache(production_cache_path(config))` beside
-        `EventStore(db_path=...)`, see `backend/factories.py`), so the three
-        writes cannot share one transaction. The `extraction_failed` cache row
-        is therefore deleted LAST, as the commit point. A crash before it
-        leaves the row in place, so the turn is still visible to
-        `list_dead_letters` and this method accepts it again; once its applied
-        marker is gone, `scan` also lists it as pending. Deleting the row
-        first (the earlier order) could strand a turn: marked applied, so
-        `scan` skips it, and with no cache row, so this method refuses it.
+        WHY THE MARKER IS LEFT ALONE. This runs in the operator's CLI process,
+        usually while the dispatcher runs in the backend. The cache row and the
+        markers live in different SQLite files (`ExtractionCache(
+        production_cache_path(config))` beside `EventStore(db_path=...)`, see
+        `backend/factories.py`), so no transaction can cover both, and a
+        dispatcher step can land between any two writes made here. Deleting
+        the marker first and the row last (the previous order) was crash-safe
+        but not race-safe: a scan between the two saw a skip row with no
+        marker, applied it as a no-op and wrote `applied`; the row delete then
+        left the turn marked applied with no row -- skipped by the old `scan`,
+        refused by this method, stranded.
+
+        So the rule moved into `scan`: a turn with no cache row is
+        inference-pending whatever its marker says, and the dispatcher -- the
+        only writer of markers after activation -- deletes the stale marker
+        (`clear_stale_marker`) before it caches the new result. That is sound
+        because an `applied` marker always has a cache row beside it, except
+        after this method. Every writer of `applied`:
+
+        - first activation marks only turns with a row:
+          `grep -nF 'in cached]' backend/extraction_backlog/store.py` ->
+          `ensure_activation`'s `applied` list;
+        - the dispatcher marks only after reading the row it applies:
+          `ExtractionDispatcher._apply` returns before `apply_cached_turn`
+          when `get_cached` is None;
+        - cutover promotion marks turns through `rebuilt_through_event_id`,
+          and `check_cutover` refuses unless every logged turn has a
+          candidate row: `grep -n 'if fill.head is not None'
+          backend/extraction_backlog/cutover.py`;
+        - dead-lettering writes the `extraction_failed` row, then applies it
+          (`ExtractionDispatcher._on_job_error`, `put_skip` then return None).
+
+        And nothing but this method deletes a cache row:
+        `grep -rn 'cache.delete(\|DELETE FROM extraction_cache' backend/` ->
+        this method and `ExtractionCache.delete` itself.
+
+        The alternative, a durable retry-request record the dispatcher
+        consumes, needs a new table in the event store or the cache, both
+        outside this package; the record would change who writes, not what
+        the scan must tolerate.
+
+        Every interleaving with a running dispatcher then ends with the turn
+        re-dispatched and applied once. Before the row delete the turn is
+        still a dead letter (marker present or re-written as a no-op); after
+        it the turn is inference-pending. The dispatcher never writes a row
+        for a turn that has one, and this method only deletes an
+        `extraction_failed` row, so neither undoes the other's write.
+
+        Crash ordering: attempts are retired FIRST and the row deleted LAST,
+        as the commit point. A crash before the row delete leaves a dead
+        letter this method accepts again (retiring is idempotent); a crash
+        after it leaves an inference-pending turn.
+
+        Consequence: if cache rows ever went missing for another reason (a
+        lost or replaced cache file), their turns become inference-pending
+        and are re-extracted in log order; the dispatcher logs each stale
+        marker it clears.
         """
         cached = self.get_cached(event_id, epoch)
         if cached is None or cached.get("skip_reason") != SKIP_EXTRACTION_FAILED:
             return False
-        self._events.delete_extraction_applied(event_id, epoch.epoch_id)
         self._events.retire_extraction_attempts(event_id, epoch.epoch_id)
         self._cache.delete(event_id, epoch.extraction_version, epoch.model_hash)
         return True

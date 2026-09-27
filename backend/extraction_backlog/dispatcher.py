@@ -35,7 +35,9 @@ FAILURES
   once, for a NON-retryable `upstream_llm`/`timeout`) the turn is
   dead-lettered: cached as an `extraction_failed` skip and applied as a no-op,
   so the next turn proceeds. `python -m backend.extraction_backlog.admin
-  retry-dead-letters` puts it back.
+  retry-dead-letters` puts it back: it deletes the row and leaves the
+  `applied` marker, and `_dispatch` clears that stale marker before it caches
+  the new result (`BacklogStore.retry_dead_letter`).
 
 EPOCH CUTOVER (T2b)
 -------------------
@@ -604,6 +606,18 @@ class ExtractionDispatcher:
             raise MistError(f"turn {head.event_id} vanished from the event log")
         utterance = str(turn["user_utterance"])
 
+        if apply and self._store.clear_stale_marker(head, epoch):
+            # The head has no cache row, so any marker it has is stale (a
+            # retried dead letter, or a lost cache row). It must go before the
+            # new row is cached, or a crash in between reads as done.
+            logger.info(
+                "Cleared a stale apply marker for %s (event %s, no cache row under %s); "
+                "re-extracting it",
+                head.turn_id,
+                head.event_id,
+                epoch.label,
+            )
+
         decision = self._pipeline.evaluate_dispatch_gates(utterance)
         if decision.skip_reason is not None:
             self._store.put_skip(
@@ -870,11 +884,25 @@ class ExtractionDispatcher:
         attempt: int,
         started: float,
         job_id: str = "",
-    ) -> ApplyReport:
+    ) -> ApplyReport | None:
+        """Apply the turn's cache row under `epoch`; None when the row is gone.
+
+        The row can vanish between the scan and this read: `retry-dead-letters`
+        deletes an `extraction_failed` row from another process. Nothing is
+        marked then, and the next scan finds the turn inference-pending.
+        """
         turn = self._store.get_turn(head.event_id)
+        if turn is None:  # pragma: no cover -- the scan just listed it
+            raise MistError(f"turn {head.event_id} vanished from the event log")
         cached = self._store.get_cached(head.event_id, epoch)
-        if turn is None or cached is None:  # pragma: no cover -- the scan just listed it
-            raise MistError(f"turn {head.event_id} has no log row or no cache row to apply")
+        if cached is None:
+            logger.info(
+                "Cache row for %s (event %s) was removed before its apply (a dead-letter "
+                "retry); rescanning",
+                head.turn_id,
+                head.event_id,
+            )
+            return None
         if not request_id:
             stamps = cached.get("service_stamps") or {}
             request_id = str(stamps.get("request_id") or "")

@@ -445,10 +445,14 @@ class TestDeadLetter:
         ]:
             monkeypatch.setattr(target, name, _crashing(getattr(target, name)))
 
-        # Act: the crash.
-        with pytest.raises(SimulatedCrashError):
+        # Act: the crash (none when the method makes fewer than `crash_at` writes).
+        try:
             world.store.retry_dead_letter(bad, epoch)
+            crashed = False
+        except SimulatedCrashError:
+            crashed = True
         monkeypatch.undo()
+        assert crashed or writes < crash_at
 
         # Assert: the turn is still reachable by one of the two recovery paths.
         pending = {p.event_id for p in world.store.scan(epoch).pending}
@@ -465,6 +469,207 @@ class TestDeadLetter:
         assert await dispatcher.drain(timeout=5.0)
         assert world.curation.event_ids == [bad]
         assert dispatcher.snapshot().dead_lettered == 0
+
+
+async def _settle(dispatcher, limit: int = 50) -> None:
+    """Run dispatcher steps on this task until one would sleep (idle or backoff).
+
+    Drives `_step` directly, without `start()`, so a test controls exactly
+    where a step runs relative to another writer. A step that raises fails
+    the test: the interleavings below must be handled, not survived by the
+    loop's error backoff.
+    """
+    for _ in range(limit):
+        if await dispatcher._step() is not None:
+            return
+    raise AssertionError("dispatcher did not settle")
+
+
+async def _dead_letter_one(world, ts) -> str:
+    """Log one turn and let a started dispatcher dead-letter it, then stop it."""
+    bad = world.log_turn(
+        session_id="s1", turn_index=0, timestamp=ts(0), utterance="I really use cobol"
+    )
+    world.service.fail_script["I really use cobol"] = [(ErrorCode.TIMEOUT, True)] * 5
+    first = world.build_dispatcher()
+    await first.start()
+    assert await first.drain(timeout=5.0)
+    await first.stop()
+    epoch = world.store.active_epoch()
+    assert world.store.list_dead_letters(epoch) == [bad]
+    assert world.curation.event_ids == []
+    return bad
+
+
+def _assert_applied_once(world, dispatcher, event_id: str) -> None:
+    epoch = world.store.active_epoch()
+    assert world.curation.event_ids == [event_id], (
+        f"{event_id} was curated {world.curation.event_ids.count(event_id)} time(s); "
+        "the retry must re-dispatch and apply it exactly once"
+    )
+    row = world.cache.get(event_id, epoch.extraction_version, epoch.model_hash)
+    assert row is not None and row["outcome"] == OUTCOME_EXTRACTED
+    assert world.event_store.get_extraction_applied(epoch.epoch_id)[event_id] == "applied"
+    status = dispatcher.snapshot()
+    assert (status.backlog_depth, status.apply_pending, status.dead_lettered) == (0, 0, 0)
+
+
+class TestRetryRacesARunningDispatcher:
+    """`retry-dead-letters` runs in another process while the dispatcher runs.
+
+    The event store and the cache are separate SQLite files, so the retry's
+    writes cannot share a transaction, and a dispatcher step can land between
+    any two of them. Each test fires the dispatcher's scan-and-apply at one
+    such point and then requires the turn to be re-dispatched and applied
+    exactly once.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("pause_before_write", [1, 2, 3])
+    async def test_a_dispatcher_step_between_retry_writes_does_not_strand_the_turn(
+        self, backlog_world, ts, monkeypatch, pause_before_write
+    ):
+        # Arrange: a dead-lettered turn, a healed service, a dispatcher we step by hand.
+        world = backlog_world
+        bad = await _dead_letter_one(world, ts)
+        epoch = world.store.active_epoch()
+        dispatcher = world.build_dispatcher()
+        loop = asyncio.get_running_loop()
+        writes = 0
+        fired = False
+
+        def _pausing(original):
+            def wrapper(*args, **kwargs):
+                nonlocal writes, fired
+                writes += 1
+                if writes == pause_before_write:
+                    fired = True
+                    # Block the CLI thread while the dispatcher scans and applies.
+                    asyncio.run_coroutine_threadsafe(_settle(dispatcher), loop).result(10)
+                return original(*args, **kwargs)
+
+            return wrapper
+
+        for target, name in [
+            (world.cache, "delete"),
+            (world.event_store, "delete_extraction_applied"),
+            (world.event_store, "retire_extraction_attempts"),
+        ]:
+            monkeypatch.setattr(target, name, _pausing(getattr(target, name)))
+
+        # Act: the CLI's retry on another thread, the dispatcher on this loop.
+        retried = await asyncio.to_thread(world.store.retry_dead_letter, bad, epoch)
+        monkeypatch.undo()
+        if not fired:  # fewer writes than `pause_before_write`: the step runs after
+            await _settle(dispatcher)
+        await _settle(dispatcher)
+
+        # Assert
+        assert retried is True
+        _assert_applied_once(world, dispatcher, bad)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("retry_before", ["cache_read", "applied_marker"])
+    async def test_a_retry_inside_the_dispatchers_dead_letter_apply_does_not_strand_the_turn(
+        self, backlog_world, ts, monkeypatch, retry_before
+    ):
+        # Arrange: step a dispatcher until the turn is dead-lettered (cached as an
+        # `extraction_failed` skip) but not yet applied.
+        world = backlog_world
+        bad = world.log_turn(
+            session_id="s1", turn_index=0, timestamp=ts(0), utterance="I really use cobol"
+        )
+        world.service.fail_script["I really use cobol"] = [(ErrorCode.TIMEOUT, True)] * 5
+        dispatcher = world.build_dispatcher()
+        epoch = world.store.active_epoch()
+        for _ in range(5):
+            await dispatcher._step()
+        assert world.store.list_dead_letters(epoch) == [bad]
+        assert bad not in world.event_store.get_extraction_applied(epoch.epoch_id)
+
+        fired = False
+
+        def _retry_first(original):
+            def wrapper(*args, **kwargs):
+                nonlocal fired
+                if not fired:
+                    fired = True
+                    assert world.store.retry_dead_letter(bad, epoch) is True
+                return original(*args, **kwargs)
+
+            return wrapper
+
+        if retry_before == "cache_read":
+            monkeypatch.setattr(world.cache, "get", _retry_first(world.cache.get))
+        else:
+            monkeypatch.setattr(
+                world.event_store,
+                "mark_extraction_stage",
+                _retry_first(world.event_store.mark_extraction_stage),
+            )
+
+        # Act: the next step applies the dead letter; the retry lands inside it.
+        await _settle(dispatcher)
+        monkeypatch.undo()
+        await _settle(dispatcher)
+
+        # Assert
+        assert fired
+        _assert_applied_once(world, dispatcher, bad)
+
+    @pytest.mark.asyncio
+    async def test_a_crash_after_re_caching_a_retried_turn_still_applies_it(
+        self, backlog_world, ts, monkeypatch
+    ):
+        """The stale `applied` marker must be gone before the new row lands:
+        with both present, `scan` would read the turn as done."""
+        # Arrange: a retried dead letter, and a process that dies right after
+        # the new extraction is cached.
+        world = backlog_world
+        bad = await _dead_letter_one(world, ts)
+        epoch = world.store.active_epoch()
+        assert world.store.retry_dead_letter(bad, epoch) is True
+        original_put = world.cache.put
+
+        def _put_then_crash(event_id, *args, **kwargs):
+            original_put(event_id, *args, **kwargs)
+            if event_id == bad:
+                raise SimulatedCrashError("crash after caching the re-extraction")
+
+        monkeypatch.setattr(world.cache, "put", _put_then_crash)
+        dispatcher = world.build_dispatcher()
+
+        # Act: the crash, then a restarted dispatcher.
+        with pytest.raises(SimulatedCrashError):
+            await _settle(dispatcher)
+        monkeypatch.undo()
+        restarted = world.build_dispatcher()
+        await _settle(restarted)
+
+        # Assert
+        _assert_applied_once(world, restarted, bad)
+
+    def test_retry_never_touches_the_apply_markers(self, ts):
+        """The dispatcher is the only writer of `extraction_applied` after activation."""
+        from tests.unit.extraction_backlog.conftest import _build_world
+
+        world = _build_world(with_deriver=False)
+        store = world.store
+        epoch = store.active_epoch()
+        event_id = world.log_turn(
+            session_id="s1", turn_index=0, timestamp=ts(0), utterance="I use cobol daily"
+        )
+        store.put_skip(event_id, epoch, skip_reason=SKIP_EXTRACTION_FAILED, created_at=ts(0))
+        store.progress(store.scan(epoch).head, epoch, now_iso=lambda: ts(1)).mark_applied()
+
+        assert store.retry_dead_letter(event_id, epoch) is True
+
+        assert world.event_store.get_extraction_applied(epoch.epoch_id) == {event_id: "applied"}
+        assert store.get_cached(event_id, epoch) is None
+        scan = store.scan(epoch)
+        assert scan.head is not None and scan.head.event_id == event_id
+        assert (scan.head.cached, scan.head.curated) == (False, False)
+        assert (scan.backlog_depth, scan.apply_pending, scan.dead_lettered) == (1, 0, 0)
 
     @pytest.mark.asyncio
     async def test_a_non_retryable_upstream_failure_dead_letters_at_once(self, backlog_world, ts):
