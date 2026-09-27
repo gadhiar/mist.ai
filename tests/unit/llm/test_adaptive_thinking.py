@@ -448,6 +448,87 @@ class TestServerIgnoresBudgetField:
 
 
 # ---------------------------------------------------------------------------
+# Generator lifecycle: the first attempt is closed before the retry starts
+# ---------------------------------------------------------------------------
+
+
+class LifecycleProvider(StreamingLLMProvider):
+    """Records when each call's generator starts and when it is closed.
+
+    The first call yields a failing final chunk (length exhausted, no output)
+    and would then yield more -- so the wrapper's `break` leaves it suspended
+    at a `yield`, not finished. Its `finally` records the close. The second
+    call succeeds.
+    """
+
+    def __init__(self) -> None:
+        self.model = "fake-model"
+        self.log: list[str] = []
+        self._calls = 0
+
+    def _script(self) -> tuple[int, list[LLMResponse]]:
+        self._calls += 1
+        n = self._calls
+        if n == 1:
+            failing = LLMResponse(content=None, partial=False, finish_reason="length")
+            return n, [failing, _success_response("never reached")]
+        return n, [_success_response("retried")]
+
+    async def generate(
+        self, request: LLMRequest, *, stream: bool = False
+    ) -> AsyncGenerator[LLMResponse, None]:
+        n, steps = self._script()
+        self.log.append(f"start-{n}")
+        try:
+            for step in steps:
+                yield step
+        finally:
+            self.log.append(f"closed-{n}")
+
+    def generate_sync(
+        self, request: LLMRequest, *, stream: bool = False
+    ) -> Generator[LLMResponse, None, None]:
+        n, steps = self._script()
+        self.log.append(f"start-{n}")
+        try:
+            yield from steps
+        finally:
+            self.log.append(f"closed-{n}")
+
+    async def health_check(self) -> bool:
+        return True
+
+    async def server_context_size(self) -> int | None:
+        return None
+
+
+class TestFirstAttemptClosedBeforeRetry:
+    """Review finding 6: breaking out of an `async for` does not close the
+    async generator; before the fix the first attempt was only finalized
+    later by the event loop's asyncgen hook, after the retry had started.
+    """
+
+    @pytest.mark.asyncio
+    async def test_async_first_attempt_closed_before_retry_starts(self):
+        inner = LifecycleProvider()
+        provider = AdaptiveThinkingProvider(inner, budget_tokens=1024)
+
+        responses = await _collect_async(provider.generate(_request(tools=TOOLS), stream=True))
+
+        assert [r.content for r in responses] == ["retried"]
+        assert inner.log[:3] == ["start-1", "closed-1", "start-2"], inner.log
+
+    def test_sync_first_attempt_closed_before_retry_starts(self):
+        inner = LifecycleProvider()
+        provider = AdaptiveThinkingProvider(inner, budget_tokens=1024)
+
+        responses = list(provider.generate_sync(_request(tools=TOOLS), stream=True))
+
+        assert [r.content for r in responses] == ["retried"]
+        assert inner.log[:3] == ["start-1", "closed-1", "start-2"], inner.log
+
+
+# ---------------------------------------------------------------------------
 # model attribute and passthrough methods
 # ---------------------------------------------------------------------------
 

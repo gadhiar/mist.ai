@@ -45,6 +45,7 @@ has reached the caller:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 from collections.abc import AsyncGenerator, Generator
@@ -160,10 +161,20 @@ class AdaptiveThinkingProvider(StreamingLLMProvider):
     async def generate(
         self, request: LLMRequest, *, stream: bool = False
     ) -> AsyncGenerator[LLMResponse, None]:
-        """Delegate to inner.generate, retrying once unbudgeted on failure."""
+        """Delegate to inner.generate, retrying once unbudgeted on failure.
+
+        Every inner generator is closed explicitly (`contextlib.aclosing`)
+        when this method leaves it -- in particular the first attempt's,
+        BEFORE the retry request is sent. Breaking out of an `async for`
+        does not close an async generator; it is only finalized later, when
+        the event loop's asyncgen finalizer hook schedules its `aclose()`,
+        so without this the first attempt's HTTP stream could still be open
+        while the retry runs.
+        """
         if not self._applies(request):
-            async for response in self._inner.generate(request, stream=stream):
-                yield response
+            async with contextlib.aclosing(self._inner.generate(request, stream=stream)) as inner:
+                async for response in inner:
+                    yield response
             return
 
         allowed_tool_names = _allowed_tool_names(request)
@@ -172,18 +183,21 @@ class AdaptiveThinkingProvider(StreamingLLMProvider):
         retry_reason: str | None = None
 
         try:
-            async for response in self._inner.generate(budgeted_request, stream=stream):
-                if response.partial:
-                    if response.content:
-                        content_yielded = True
+            async with contextlib.aclosing(
+                self._inner.generate(budgeted_request, stream=stream)
+            ) as first:
+                async for response in first:
+                    if response.partial:
+                        if response.content:
+                            content_yielded = True
+                        yield response
+                        continue
+                    reason = _failure_reason(response, allowed_tool_names)
+                    if reason is not None and not content_yielded:
+                        retry_reason = reason
+                        break
                     yield response
-                    continue
-                reason = _failure_reason(response, allowed_tool_names)
-                if reason is not None and not content_yielded:
-                    retry_reason = reason
-                    break
-                yield response
-                return
+                    return
         except LLMResponseError:
             if content_yielded:
                 raise
@@ -197,13 +211,23 @@ class AdaptiveThinkingProvider(StreamingLLMProvider):
         # unchanged, not trigger a second retry.
         _record_retry(reason=retry_reason, budget=self._budget_tokens, attempt=1)
         unbudgeted_request = self._unbudgeted(request)
-        async for retry_response in self._inner.generate(unbudgeted_request, stream=stream):
-            yield retry_response
+        async with contextlib.aclosing(
+            self._inner.generate(unbudgeted_request, stream=stream)
+        ) as retry:
+            async for retry_response in retry:
+                yield retry_response
 
     def generate_sync(
         self, request: LLMRequest, *, stream: bool = False
     ) -> Generator[LLMResponse, None, None]:
-        """Delegate to inner.generate_sync, retrying once unbudgeted on failure."""
+        """Delegate to inner.generate_sync, retrying once unbudgeted on failure.
+
+        The first attempt's generator is closed explicitly
+        (`contextlib.closing`) before the retry request is sent, rather than
+        left to garbage collection. CPython's reference counting happens to
+        close it at the `break` already; the explicit close makes that
+        ordering part of the code instead of an interpreter detail.
+        """
         if not self._applies(request):
             yield from self._inner.generate_sync(request, stream=stream)
             return
@@ -214,18 +238,21 @@ class AdaptiveThinkingProvider(StreamingLLMProvider):
         retry_reason: str | None = None
 
         try:
-            for response in self._inner.generate_sync(budgeted_request, stream=stream):
-                if response.partial:
-                    if response.content:
-                        content_yielded = True
+            with contextlib.closing(
+                self._inner.generate_sync(budgeted_request, stream=stream)
+            ) as first:
+                for response in first:
+                    if response.partial:
+                        if response.content:
+                            content_yielded = True
+                        yield response
+                        continue
+                    reason = _failure_reason(response, allowed_tool_names)
+                    if reason is not None and not content_yielded:
+                        retry_reason = reason
+                        break
                     yield response
-                    continue
-                reason = _failure_reason(response, allowed_tool_names)
-                if reason is not None and not content_yielded:
-                    retry_reason = reason
-                    break
-                yield response
-                return
+                    return
         except LLMResponseError:
             if content_yielded:
                 raise
