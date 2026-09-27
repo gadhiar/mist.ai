@@ -18,31 +18,25 @@
 # unpinned (`>=`), so there is no in-repo exact pin to copy.
 #
 # Module (as imported) -> distribution (as installed) -> why it's here:
+#   annotated_doc     -> annotated-doc      fastapi dependency (Annotated[..., Doc(...)])
 #   annotated_types   -> annotated-types    pydantic dependency
 #   anyio             -> anyio              httpx/starlette async backend
 #   brotli            -> brotli             httpx optional content-encoding
 #   click             -> click              uvicorn dependency
-#   dateutil          -> python-dateutil    pandas dependency (see NEO4J/PANDAS/PYARROW note)
 #   distro            -> distro             openai client OS fingerprint for its User-Agent
 #   dotenv            -> python-dotenv      backend.knowledge.config calls load_dotenv()
 #   fastapi           -> fastapi            backend.extraction_service.app
 #   httpx             -> httpx              LlamaHealthProbe + openai client transport
 #   idna              -> idna               httpx dependency
-#   neo4j             -> neo4j              see NEO4J/PANDAS/PYARROW note -- never queried
-#   numpy             -> numpy              backend.knowledge.extraction.pipeline
 #   openai            -> openai             backend.llm.llama_server_provider.LlamaServerProvider
 #   orjson            -> orjson             fastapi/pydantic fast JSON path
-#   pandas            -> pandas             see NEO4J/PANDAS/PYARROW note -- never used
-#   pyarrow           -> pyarrow            see NEO4J/PANDAS/PYARROW note -- never used
 #   pydantic          -> pydantic           backend.extraction_contract.models, FastAPI
 #   pydantic_core     -> pydantic-core      pydantic dependency
 #   pygments          -> pygments           rich dependency
 #   python_multipart  -> python-multipart   FastAPI form/multipart parsing (unused by this
 #                                            service's JSON-only routes, but imported at
 #                                            FastAPI app construction time regardless)
-#   pytz              -> pytz               neo4j driver's own dependency
 #   rich              -> rich               transitive; see requirements.txt (root)
-#   six               -> six                python-dateutil dependency
 #   sniffio           -> sniffio            anyio/httpx dependency
 #   starlette         -> starlette          fastapi dependency
 #   typing_extensions -> typing-extensions  pydantic/fastapi/starlette dependency
@@ -52,37 +46,34 @@
 # list because that list names modules `app.py`/`engine.py` import, and
 # uvicorn is imported one level up, by `backend/extraction_service/__main__.py`).
 #
-# NEO4J/PANDAS/PYARROW: none of the three is called by any code path this
-# service executes -- there is no graph query and no DataFrame anywhere in
-# backend/extraction_service/. All three load anyway, as a chain of package
-# __init__ side effects, traced 2026-09-26 by hooking builtins.__import__
-# and importing backend.extraction_service.app:
-#   1. backend.knowledge.extraction's package __init__ eagerly imports
-#      pipeline.py (backend/knowledge/extraction/pipeline.py), which imports
-#      GraphStore -- and importing ANY submodule of backend.knowledge.extraction
-#      (engine.py imports several) runs that __init__ first. This executes
-#      even though engine.py/app.py never import pipeline.py or GraphStore
-#      by name.
-#   2. GraphStore lives under backend.knowledge.storage. Importing ANY of
-#      its submodules (graph_store, graph_executor -- normalizer.py and
-#      internal_derivation.py both import graph_executor) runs
-#      backend/knowledge/storage/__init__.py first, which unconditionally
-#      imports Neo4jConnection from neo4j_connection.py.
-#   3. neo4j_connection.py does `from neo4j import Driver, GraphDatabase` --
-#      this is the actual `import neo4j`.
-#   4. The neo4j driver's own `neo4j/_optional_deps/__init__.py` runs
-#      `try: import pandas as pd except ImportError: pass` at module level
-#      (an optional helper for `Result.to_df()`, which this service never
-#      calls). pandas IS installed (it is a dependency of this repo's main
-#      backend, per requirements.txt's lancedb/sentence-transformers), so
-#      the try succeeds and pandas loads unconditionally.
-#   5. pandas' own `pandas/compat/pyarrow.py` submodule does an
-#      unconditional `import pyarrow` as part of pandas's own init chain
-#      (a version-compat probe, not guarded the way neo4j's pandas probe is).
-# Net effect: omitting these three would raise no ImportError today (step 4's
-# probe is guarded), but it changes the measured closure this file exists to
-# reproduce, and neo4j/pandas/pyarrow's own absence is untested here. They
-# stay pinned.
+# NEO4J/PANDAS/PYARROW/NUMPY removed 2026-09-26 (goal mist-two-loop v2-lazy-imports,
+# MIS-171): these previously appeared solely as a side effect of two eager
+# package `__init__` imports, never because any extraction-service code path
+# called Neo4j or built a DataFrame:
+#   1. `backend/knowledge/extraction/__init__.py` eagerly imported
+#      `pipeline.py` (which imports `numpy` for embedding math and
+#      `GraphStore`) -- running that `__init__` on ANY import of a
+#      `backend.knowledge.extraction` submodule, even one `engine.py`/
+#      `app.py` import directly by name (e.g. `internal_derivation`,
+#      `ontology_extractor`, `preprocessor`), because importing a submodule
+#      always runs its package `__init__` first.
+#   2. `backend/knowledge/storage/__init__.py` eagerly imported `GraphStore`
+#      and `Neo4jConnection`, the latter doing `from neo4j import Driver,
+#      GraphDatabase`. neo4j's own `neo4j/_optional_deps/__init__.py` then
+#      unconditionally imports `pandas` (installed in this repo as a
+#      lancedb/sentence-transformers dependency, so the optional import
+#      always succeeded), and pandas' own `pandas/compat/pyarrow.py` does an
+#      unconditional `import pyarrow` as part of pandas's own init chain.
+# Both `__init__` modules are now PEP 562 lazy (`__getattr__`): every name
+# they previously imported eagerly is still importable by name, just no
+# longer imported as a side effect of importing the package or any of its
+# submodules. `backend/knowledge/extraction/internal_derivation.py`'s
+# `GraphExecutor` import (a type-only annotation) moved under
+# `TYPE_CHECKING` for the same reason -- it is the only other path into
+# `backend.knowledge.storage` this service's import graph had.
+# Re-measured 2026-09-26 the same way as above, after both changes: the
+# closure no longer contains `neo4j`, `pandas`, `pyarrow`, `numpy`, `pytz`,
+# `dateutil`, or `six`.
 
 fastapi==0.136.1
 uvicorn==0.46.0
@@ -90,6 +81,7 @@ starlette==0.52.1
 pydantic==2.13.3
 pydantic-core==2.46.3
 annotated-types==0.7.0
+annotated-doc==0.0.4
 typing-extensions==4.15.0
 typing-inspection==0.4.2
 python-multipart==0.0.27
@@ -103,15 +95,6 @@ brotli==1.2.0
 
 openai==2.32.0
 distro==1.9.0
-
-neo4j==5.24.0
-pytz==2026.1.post1
-
-numpy==2.4.3
-pandas==3.0.2
-pyarrow==24.0.0
-python-dateutil==2.9.0.post0
-six==1.17.0
 
 python-dotenv==1.0.1
 rich==13.7.0
