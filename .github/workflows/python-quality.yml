@@ -78,29 +78,68 @@ jobs:
           cache: 'pip'
           cache-dependency-path: requirements.txt
 
-      # Mirrors docker/backend/Dockerfile's step 1 (CPU wheels instead of the
-      # production image's CUDA 12.4 wheels -- this runner has no GPU).
+      # The install steps below mirror docker/backend/Dockerfile step for step, in
+      # the same order, because the image -- not requirements.txt alone -- is what
+      # the suite runs against: the image gets fastapi and uvicorn only
+      # transitively (through chatterbox-tts), so a requirements-only install
+      # fails collection with ModuleNotFoundError. The deliberate differences are
+      # CPU wheels instead of CUDA 12.4 ones, and no flash-attn (CUDA-only and
+      # optional in the image too, Dockerfile:87-90).
+
+      # Dockerfile:8-11, minus the interpreter packages setup-python provides.
+      # `sounddevice` loads libportaudio at import, and src/multimodal/stt.py
+      # imports it at module level; unit tests reach that import through
+      # backend/voice_processor.py -> backend/voice_models/model_manager.py, so
+      # without the library collection fails with "OSError: PortAudio library not
+      # found".
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsndfile1 libportaudio2 ffmpeg
+
+      # Dockerfile step 1 (lines 39-41), from the CPU index.
       - name: Install PyTorch (CPU)
         run: |
           pip install torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 \
             --index-url https://download.pytorch.org/whl/cpu
 
-      # requirements.txt pins torch==2.4.0, which docker/backend/Dockerfile
-      # re-pins to 2.6.0 at its step 4 (lines 53-58) because chatterbox-tts or an
-      # earlier requirements install can overwrite the step-1 pin. A plain
-      # `pip install -r requirements.txt` here would downgrade the CPU wheels
-      # just installed above and pull the multi-GB CUDA wheels from PyPI instead
-      # (no --index-url override in requirements.txt itself), so the three torch
-      # lines are filtered out before installing the rest.
+      # Dockerfile step 2 (line 44).
+      - name: Install Chatterbox TTS
+        run: pip install chatterbox-tts soundfile
+
+      # Dockerfile step 3 (line 48) plus its safety net (line 51). requirements.txt
+      # pins torch==2.4.0, which the image re-pins at step 4; installing that line
+      # here would replace the CPU wheels with PyPI's multi-GB CUDA build, so the
+      # three torch lines are filtered out and step 4 below re-checks the pin.
       - name: Install backend requirements (torch lines filtered)
         run: |
           grep -vE '^(torch|torchaudio|torchvision)==' requirements.txt > "$RUNNER_TEMP/requirements-cpu.txt"
           pip install -r "$RUNNER_TEMP/requirements-cpu.txt"
+          pip install "openai>=1.30" "httpx>=0.27"
 
-      # Matches docker/backend/Dockerfile's step 6 (line 93), which installs
-      # these as a separate layer on top of requirements.txt.
+      # Dockerfile step 4 (lines 53-61): re-pin PyTorch only if an earlier step
+      # replaced it, here against the CPU build.
+      - name: Re-pin PyTorch (CPU) if overwritten
+        run: |
+          TORCH_VER=$(python -c "import torch; print(torch.__version__)")
+          if [ "$TORCH_VER" != "2.6.0+cpu" ]; then
+            echo "PyTorch was overwritten to $TORCH_VER -- re-pinning to 2.6.0+cpu"
+            pip install --force-reinstall torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 \
+              --index-url https://download.pytorch.org/whl/cpu
+          else
+            echo "PyTorch 2.6.0+cpu intact -- skipping re-pin"
+          fi
+
+      # Pins the test runner to the versions the backend image actually runs:
+      # pytest 7.4.4 and pytest-asyncio 0.23.8 (`pip list` in the image). The
+      # image's step 6 (Dockerfile:93) reads `pip install pytest>=8.0
+      # pytest-asyncio>=0.24` unquoted, so the shell treats each `>=` as an output
+      # redirect and the requirements.txt versions stay. requirements.txt alone
+      # would pin pytest but float pytest-asyncio (>=0.23.0) to its latest
+      # release, so both are pinned here to keep CI on the combination the
+      # suite is verified against.
       - name: Install test dependencies
-        run: pip install "pytest>=8.0" "pytest-asyncio>=0.24"
+        run: pip install "pytest==7.4.4" "pytest-asyncio==0.23.8"
 
       - name: Run unit tests
         run: python -m pytest tests/unit -q -p no:cacheprovider
