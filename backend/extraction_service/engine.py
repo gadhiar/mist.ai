@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import time
 from datetime import datetime
@@ -52,6 +53,7 @@ from backend.knowledge.extraction.internal_prompts import (
     INTERNAL_DERIVATION_USER_TEMPLATE,
 )
 from backend.knowledge.extraction.ontology_extractor import (
+    NO_PRIOR_CONTEXT,
     parse_extraction_output,
     render_extraction_messages,
 )
@@ -200,17 +202,28 @@ def _strict_derivation(raw: str) -> DerivationOut:
 
 
 def _compute_prompt_sha256(adapter: ModelFamilyAdapter) -> str:
-    """Hash every prompt text that shapes a stage's output, plus the adapter identity.
+    """Hash the prompt text and output schemas sent to the model, plus the adapter identity.
 
-    The inputs are the raw, unformatted templates of all three stages -- the
-    scope system prompt and user template, the extraction system prompt and
-    user template, the derivation system prompt and user template -- plus the
-    Stage 2 repair instruction sent on a retry, and the adapter's own
-    name/version. A change to any of them changes what the model is asked, so
-    it changes the stamp.
+    `prompt_sha256` is a per-result provenance stamp: the record of what the
+    model was asked. It is not the epoch's identity, which is
+    `extraction_version` plus the composed `model_hash`
+    (`ExtractionDispatcher._epoch_matches`).
+
+    Covered: the raw, unformatted templates of all three stages (the scope
+    system prompt and user template, the extraction system prompt and user
+    template, the derivation system prompt and user template), the Stage 2
+    empty-context placeholder, the Stage 2 repair instruction sent on a
+    retry, the three constrained-decoding output schemas (serialised with
+    sorted keys; hashed whether or not the active mode sends them, which
+    only makes the stamp stricter), and the adapter's own name/version.
+
+    Not covered: the PreProcessor's context formatting (code, not a
+    template) and request parameters (temperature, max_tokens, reasoning
+    effort and budget, constrained mode), which are configuration and change
+    no prompt text.
 
     Components are joined with a unit separator (0x1F) rather than
-    concatenated, so moving text from one template to its neighbour cannot
+    concatenated, so moving text from one component to its neighbour cannot
     produce the same hash.
 
     Computed once at engine construction (not per request): none of its
@@ -222,9 +235,13 @@ def _compute_prompt_sha256(adapter: ModelFamilyAdapter) -> str:
             SCOPE_USER_TEMPLATE,
             EXTRACTION_SYSTEM_PROMPT,
             EXTRACTION_USER_TEMPLATE,
+            NO_PRIOR_CONTEXT,
             INTERNAL_DERIVATION_SYSTEM_PROMPT,
             INTERNAL_DERIVATION_USER_TEMPLATE,
             _REPAIR_INSTRUCTION,
+            json.dumps(SCOPE_OUTPUT_SCHEMA, sort_keys=True),
+            json.dumps(EXTRACTION_OUTPUT_SCHEMA, sort_keys=True),
+            json.dumps(DERIVATION_OUTPUT_SCHEMA, sort_keys=True),
             adapter.name,
             adapter.version,
         ]

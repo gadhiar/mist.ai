@@ -46,9 +46,11 @@ _VALID_SCOPES: frozenset[str] = frozenset({"user-scope", "system-scope", "third-
 # The Stage 1.5 user message around the utterance. A named constant rather
 # than an inline f-string so the extraction service can fold it into its
 # `prompt_sha256` stamp (`backend/extraction_service/engine.py`
-# `_compute_prompt_sha256`): every prompt text that shapes a stage's output is
-# part of the epoch's identity. Rendering is byte-identical to the inline form
-# it replaced.
+# `_compute_prompt_sha256`), the per-result provenance record of what the
+# model was asked. That stamp is NOT the epoch's identity: an epoch is
+# identified by `extraction_version` plus the composed `model_hash` (the
+# dispatcher's `_epoch_matches`). Rendering is byte-identical to the inline
+# form it replaced.
 SCOPE_USER_TEMPLATE = 'Utterance: "{utterance}"\n\nOutput:'
 
 

@@ -35,6 +35,11 @@ from backend.knowledge.ontologies import (
 
 logger = logging.getLogger(__name__)
 
+# Stage 2 context placeholder when there is no prior conversation. A named
+# constant so the extraction service folds it into `prompt_sha256`
+# (`backend/extraction_service/engine.py` `_compute_prompt_sha256`).
+NO_PRIOR_CONTEXT = "(no prior context)"
+
 
 def render_extraction_messages(pre_processed: PreProcessedInput) -> list[dict]:
     """Render the Stage 2 chat messages for a pre-processed utterance.
@@ -53,7 +58,7 @@ def render_extraction_messages(pre_processed: PreProcessedInput) -> list[dict]:
     context_str = (
         "\n".join(pre_processed.conversation_context)
         if pre_processed.conversation_context
-        else "(no prior context)"
+        else NO_PRIOR_CONTEXT
     )
 
     system_prompt = EXTRACTION_SYSTEM_PROMPT.format(

@@ -1,10 +1,12 @@
-"""The `prompt_sha256` stamp covers every prompt text that shapes a stage's output.
+"""The `prompt_sha256` stamp covers the prompt text and schemas sent to the model.
 
-`ExtractResponse.stamps.prompt_sha256` is the audit record of what the model was
-asked. A prompt edit that leaves the stamp unchanged would let two different
-extraction behaviours share one identity, so each prompt component must move
-the hash on its own: the scope, extraction and derivation templates, the Stage 2
-repair instruction sent on a retry, and the adapter identity.
+`ExtractResponse.stamps.prompt_sha256` is the per-result provenance record of
+what the model was asked (not the epoch's identity, which is extraction_version
+plus the composed model_hash). A prompt edit that left it unchanged would make
+two different requests look identical in the audit trail, so each component
+must move the hash on its own: the scope, extraction and derivation templates,
+the Stage 2 empty-context placeholder and repair instruction, the three output
+schemas, and the adapter identity.
 """
 
 from __future__ import annotations
@@ -24,7 +26,10 @@ _COMPONENTS = (
     "INTERNAL_DERIVATION_SYSTEM_PROMPT",
     "INTERNAL_DERIVATION_USER_TEMPLATE",
     "_REPAIR_INSTRUCTION",
+    "NO_PRIOR_CONTEXT",
 )
+
+_SCHEMAS = ("SCOPE_OUTPUT_SCHEMA", "EXTRACTION_OUTPUT_SCHEMA", "DERIVATION_OUTPUT_SCHEMA")
 
 
 def _hash() -> str:
@@ -39,6 +44,14 @@ def test_hash_is_deterministic() -> None:
 def test_each_prompt_component_moves_the_hash(monkeypatch, name) -> None:
     before = _hash()
     monkeypatch.setattr(engine, name, getattr(engine, name) + " (edited)")
+    assert _hash() != before, f"editing {name} left prompt_sha256 unchanged"
+
+
+@pytest.mark.parametrize("name", _SCHEMAS)
+def test_each_output_schema_moves_the_hash(monkeypatch, name) -> None:
+    before = _hash()
+    edited = {**getattr(engine, name), "description": "edited"}
+    monkeypatch.setattr(engine, name, edited)
     assert _hash() != before, f"editing {name} left prompt_sha256 unchanged"
 
 
