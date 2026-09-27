@@ -125,6 +125,7 @@ def configure_file_logging(log_dir: Path) -> logging.Handler:
     root_logger.addHandler(file_handler)
     return file_handler
 
+
 logger = logging.getLogger(__name__)
 
 # WebSocket protocol version sent on session_started per ADR-017. Bump
