@@ -65,8 +65,12 @@ from backend.knowledge.storage.graph_executor import GraphExecutor
 from backend.knowledge.storage.graph_store import GraphStore
 from backend.knowledge.storage.neo4j_connection import Neo4jConnection
 from backend.knowledge.version_stamps import compose_model_hash
+from tests.integration.extraction_backlog.harness import PREFIX as _PREFIX
+from tests.integration.extraction_backlog.harness import SESSION as _SESSION
+from tests.integration.extraction_backlog.harness import TURNS as _TURNS
+from tests.integration.extraction_backlog.harness import make_embeddings
+from tests.integration.extraction_backlog.harness import payload as _payload
 from tests.mocks.config import build_test_config
-from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.ollama import FakeLLM
 from tests.unit.extraction_backlog.fakes import (
     SERVICE_URL,
@@ -105,28 +109,12 @@ pytestmark = [
     ),
 ]
 
-_PREFIX = "t2acrash-"
 _EMBEDDING_MODEL = "test-emb"
 _ONTOLOGY_VERSION = "1.4.0"
-_SESSION = f"{_PREFIX}session"
-_TURNS = [
-    (f"{_PREFIX}evt-0", 0, "2026-09-01T10:00:00+00:00", "I really use rust"),
-    (f"{_PREFIX}evt-1", 1, "2026-09-01T10:05:00+00:00", "I really use zig"),
-]
-
-
-def _payload(req):
-    """Turn 0 -> dev USES rust; turn 1 -> dev USES zig. All ids prefixed."""
-    word = req.utterance.split()[-1]
-    dev = {"id": f"{_PREFIX}dev", "type": "Person", "name": f"{_PREFIX}Dev"}
-    tech = {"id": f"{_PREFIX}{word}", "type": "Technology", "name": f"{_PREFIX}{word}"}
-    rel = {
-        "source": dev["id"],
-        "target": tech["id"],
-        "type": "USES",
-        "properties": {"confidence": 0.9},
-    }
-    return [dev, tech], [rel]
+# The turns, payload and embeddings live in `harness.py`: the embeddings must
+# keep this test's entities apart under curation's cosine dedup on real Neo4j,
+# which the unit tier checks there (see that module's docstring for the
+# 2026-09-27 failure this prevents).
 
 
 @pytest.fixture
@@ -136,7 +124,7 @@ def eval_conn():
         Neo4jConfig(uri=f"bolt://{host}:{port}", username="neo4j", password="password")
     )
     conn.connect()
-    GraphStore(connection=conn, embedding_generator=FakeEmbeddingGenerator()).initialize_schema()
+    GraphStore(connection=conn, embedding_generator=make_embeddings()).initialize_schema()
     _cleanup(conn)
     yield conn
     _cleanup(conn)
@@ -193,7 +181,7 @@ class _Run:
         self.cache.initialize()
         self.store = BacklogStore(self.events, self.cache)
         self.store.ensure_activation(self.store.active_epoch(), now_iso="2026-09-01T00:00:00+00:00")
-        self.embeddings = FakeEmbeddingGenerator()
+        self.embeddings = make_embeddings()
         self.curation = build_curation_pipeline(
             build_test_config(embedding_model=_EMBEDDING_MODEL),
             GraphExecutor(conn),
@@ -284,17 +272,14 @@ async def _wait_until_stopped(dispatcher: ExtractionDispatcher, timeout: float =
         await asyncio.sleep(0.01)
 
 
-async def _uninterrupted(tmp_path: Path, conn: Neo4jConnection) -> _Run:
-    run = _Run(tmp_path / "a", conn)
+async def _uninterrupted(run: _Run) -> None:
     run.log_turns()
     dispatcher = run.dispatcher(crash_for=None)
     await dispatcher.start()
     assert await dispatcher.drain(timeout=30.0)
-    return run
 
 
-async def _crashed_then_restarted(tmp_path: Path, conn: Neo4jConnection) -> _Run:
-    run = _Run(tmp_path / "b", conn)
+async def _crashed_then_restarted(run: _Run) -> None:
     run.log_turns()
     first = run.dispatcher(crash_for=_TURNS[0][0])
     await first.start()
@@ -304,13 +289,13 @@ async def _crashed_then_restarted(tmp_path: Path, conn: Neo4jConnection) -> _Run
     restarted = run.dispatcher(crash_for=None)
     await restarted.start()
     assert await restarted.drain(timeout=30.0)
-    return run
 
 
 def _node_confidence(conn: Neo4jConnection, node_id: str) -> float:
     rows = conn.execute_query(
         "MATCH (n:__Entity__ {id: $id}) RETURN n.confidence AS c", {"id": node_id}
     )
+    assert rows, f"no node {node_id} in the graph (merged into another entity?)"
     return float(rows[0]["c"])
 
 
@@ -320,19 +305,28 @@ async def test_crash_after_graph_write_then_restart_equals_one_uninterrupted_app
 ):
     from backend.knowledge.canonical_serialize import canonical_graph_form
 
-    # Arrange + Act: run A
-    run_a = await _uninterrupted(tmp_path, eval_conn)
-    form_a = canonical_graph_form(eval_conn, include_provenance=True)
-    await run_a.close()
+    # Arrange + Act: run A. Every run is closed in `finally`, so a failed step
+    # cannot leave its dispatcher task pending past the test.
+    run_a = _Run(tmp_path / "a", eval_conn)
+    try:
+        await _uninterrupted(run_a)
+        form_a = canonical_graph_form(eval_conn, include_provenance=True)
+    finally:
+        await run_a.close()
     _cleanup(eval_conn)
 
     # Act: run B
-    run_b = await _crashed_then_restarted(tmp_path, eval_conn)
-    form_b = canonical_graph_form(eval_conn, include_provenance=True)
-    await run_b.close()
+    run_b = _Run(tmp_path / "b", eval_conn)
+    try:
+        await _crashed_then_restarted(run_b)
+        form_b = canonical_graph_form(eval_conn, include_provenance=True)
+    finally:
+        await run_b.close()
 
-    # Assert
-    assert f"{_PREFIX}rust" in form_a and f"{_PREFIX}zig" in form_a, "run A wrote nothing"
+    # Assert: run A wrote BOTH turns' technologies as separate nodes (a merge
+    # of zig into rust would leave only rust; see harness.py).
+    assert f'"{_PREFIX}rust"' in form_a, "run A wrote no rust node"
+    assert f'"{_PREFIX}zig"' in form_a, "run A wrote no zig node (merged into rust?)"
     assert run_b.service.received_utterances == [t[3] for t in _TURNS]
     assert form_b == form_a
 
@@ -354,13 +348,19 @@ async def test_reapplied_turn_leaves_node_confidence_as_one_apply(eval_conn, tmp
     `WITH count(...)` form; the unit tier's fake cannot.
     """
     ids = [f"{_PREFIX}dev", f"{_PREFIX}rust", f"{_PREFIX}zig"]
-    run_a = await _uninterrupted(tmp_path, eval_conn)
-    single = {i: _node_confidence(eval_conn, i) for i in ids}
-    await run_a.close()
+    run_a = _Run(tmp_path / "a", eval_conn)
+    try:
+        await _uninterrupted(run_a)
+        single = {i: _node_confidence(eval_conn, i) for i in ids}
+    finally:
+        await run_a.close()
     _cleanup(eval_conn)
 
-    run_b = await _crashed_then_restarted(tmp_path, eval_conn)
-    reapplied = {i: _node_confidence(eval_conn, i) for i in ids}
-    await run_b.close()
+    run_b = _Run(tmp_path / "b", eval_conn)
+    try:
+        await _crashed_then_restarted(run_b)
+        reapplied = {i: _node_confidence(eval_conn, i) for i in ids}
+    finally:
+        await run_b.close()
 
     assert reapplied == single
