@@ -27,10 +27,17 @@ TEST_REBUILD_STAMPS = RebuildStamps(
 )
 
 
-# The EXTRACTED_FROM edge MERGE in `_create_provenance_edge`. Tests that look
-# for the edge write match on this, not on the bare relationship type: the
-# entity upsert's replay guard also names EXTRACTED_FROM (it reads the edge).
+# The EXTRACTED_FROM edge MERGE (`_extracted_from_clause`), which the writer
+# issues inside the entity upsert statement. Tests that look for the edge write
+# match on this, not on the bare relationship type: the upsert's replay guard
+# also names EXTRACTED_FROM (it reads the edge).
 PROVENANCE_EDGE_MERGE = "MERGE (e)-[r:EXTRACTED_FROM]->(ctx)"
+
+# The `new_fact` / belief-change LearningEvent MERGE, wherever it is issued.
+LEARNING_EVENT_MERGE = "MERGE (le:__Provenance__:LearningEvent {id: $learning_id})"
+
+# The entity upsert's MERGE.
+ENTITY_MERGE = "MERGE (e:__Entity__ {id: $entity_id})"
 
 # The replay guard's text in `_upsert_entity`, as `ReplayGraphConnection`
 # recognises it. All three fragments must be present for the fake to apply the
@@ -44,7 +51,6 @@ UPSERT_REPLAY_GUARD_FRAGMENTS = (
 )
 
 _CONTEXT_MERGE = "MERGE (ctx:__Provenance__:ConversationContext"
-_ENTITY_MERGE = "MERGE (e:__Entity__ {id: $entity_id})"
 
 
 class SimulatedCrashError(RuntimeError):
@@ -55,8 +61,8 @@ class ReplayGraphConnection(FakeNeo4jConnection):
     """A stateful fake that evaluates the writer's confidence-relevant Cypher.
 
     Models exactly what the entity-confidence replay guard depends on, keyed on
-    the statements `CurationGraphWriter.write` issues on the conversational
-    path:
+    the fragments of each statement `CurationGraphWriter.write` issues on the
+    conversational path, in the order they appear in the statement:
 
     - the ConversationContext MERGE (records the session);
     - the entity upsert: ON CREATE sets `confidence = $confidence`; ON MATCH
@@ -64,13 +70,18 @@ class ReplayGraphConnection(FakeNeo4jConnection):
       (`UPSERT_REPLAY_GUARD_FRAGMENTS`) is present AND an EXTRACTED_FROM edge
       from this entity to `$session_id`'s context has
       `source_utterance_id == $event_id`;
-    - the EXTRACTED_FROM MERGE: MATCH entity, MATCH context, then set
-      `source_utterance_id = $event_id` on both branches (last-writer-wins).
+    - the EXTRACTED_FROM MERGE, in the upsert statement or on its own: with the
+      entity and context present, set `source_utterance_id = $event_id` on both
+      branches (last-writer-wins). In the upsert statement it is applied AFTER
+      the guard, as Neo4j evaluates the guard's aggregation first;
+    - the LearningEvent MERGE, in the upsert statement or on its own: records
+      `$learning_id` in `learning_events`.
 
-    Every other write (LearningEvent) is recorded and otherwise ignored. It does
-    NOT evaluate Cypher: whether Neo4j itself evaluates the guard as intended is
-    what `tests/integration/extraction_backlog/test_crash_replay_canonical.py`
-    checks against the eval instance.
+    A statement's fragments are applied together, so a kill never splits one.
+    It does NOT evaluate Cypher: whether Neo4j itself evaluates the statement as
+    intended is what
+    `tests/integration/extraction_backlog/test_crash_replay_canonical.py` checks
+    against the eval instance.
 
     `crash_on_write`: 1-based index of a write that raises `SimulatedCrashError`
     BEFORE it takes effect (a kill between two statements); None never crashes.
@@ -82,6 +93,7 @@ class ReplayGraphConnection(FakeNeo4jConnection):
         self.node_confidence: dict[str, float] = {}
         # (entity_id, session_id) -> source_utterance_id
         self.extracted_from: dict[tuple[str, str], str] = {}
+        self.learning_events: set[str] = set()
         self.crash_on_write = crash_on_write
 
     def execute_write(self, query, params=None):
@@ -92,9 +104,12 @@ class ReplayGraphConnection(FakeNeo4jConnection):
         p = params or {}
         if _CONTEXT_MERGE in query:
             self.contexts.add(p["session_id"])
-        elif _ENTITY_MERGE in query:
+            return []
+        if ENTITY_MERGE in query:
             self._upsert(query, p)
-        elif PROVENANCE_EDGE_MERGE in query:
+        if LEARNING_EVENT_MERGE in query:
+            self.learning_events.add(p["learning_id"])
+        if PROVENANCE_EDGE_MERGE in query:
             key = (p["entity_id"], p["session_id"])
             if p["entity_id"] in self.node_confidence and p["session_id"] in self.contexts:
                 self.extracted_from[key] = p["event_id"]

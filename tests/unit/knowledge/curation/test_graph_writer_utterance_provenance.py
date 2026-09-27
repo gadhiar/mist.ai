@@ -112,7 +112,9 @@ class TestUtteranceAnchor:
             session_id="sess-1",
         )
         query, params = writes_matching(conn, PROVENANCE_EDGE_MERGE)[0]
-        create_clause, match_clause = query.split("ON MATCH SET")
+        # The edge shares its statement with the entity MERGE, whose own ON MATCH SET precedes it.
+        edge = query[query.index(PROVENANCE_EDGE_MERGE) :]
+        create_clause, match_clause = edge.split("ON MATCH SET")
         for clause in (create_clause, match_clause):
             assert "r.ontology_version = $ontology_version" in clause
             assert "r.extraction_version = $extraction_version" in clause
