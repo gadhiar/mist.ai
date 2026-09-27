@@ -61,12 +61,16 @@ turns a replayed edge into a no-op (`curation/reconciliation.py`,
 (`curation/graph_writer.py`, `_upsert_entity`). The `ON MATCH` confidence
 reinforcement is skipped when this event's EXTRACTED_FROM edge to the entity
 already exists (plan v2, `graph_writer.py` `_upsert_entity`), so a replayed
-turn does not reinforce twice. One window remains: a kill between an entity's
-upsert and its EXTRACTED_FROM write still reinforces on replay, pinned by a
-strict xfail in `tests/unit/knowledge/curation/test_graph_writer_replay_guard.py`.
+turn does not reinforce twice. The window where a kill between an entity's
+upsert and its EXTRACTED_FROM write still reinforced on replay is closed: one
+Cypher statement per entity writes the entity, its guarded reinforce, the
+EXTRACTED_FROM edge and, for a new entity, its `new_fact` LearningEvent, so a
+kill leaves all of them or none. `TestKillAtAnyStatementThenReplay` in
+`tests/unit/knowledge/curation/test_graph_writer_replay_guard.py` kills before
+every statement of a turn and checks the replay against a single apply.
 Node `confidence` is excluded from `canonical_graph_form`
 (`canonical_serialize.NODE_ONLY_EXCLUDED_FIELDS`), so a canonical comparison
-cannot see either case.
+cannot see a double reinforce.
 
 `stop()` is graceful: a job still waiting on the service is abandoned (nothing
 was cached, so the turn stays inference-pending and is re-dispatched with a new

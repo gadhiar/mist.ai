@@ -19,6 +19,15 @@ event's EXTRACTED_FROM edge already exists, so the crashed run's confidences now
 equal the uninterrupted run's, and turn 1 still reinforces the entity both
 turns mention.
 
+The EXTRACTED_FROM edge and a new entity's `new_fact` LearningEvent are written
+by the entity's own upsert statement, so every entity write in both runs goes
+through that one statement on real Neo4j, and the canonical form (built with
+`include_provenance=True`) compares the edges and LearningEvents it writes. The
+injected crash here lands after the whole curation write; kills between the
+writer's statements are covered in the unit tier
+(`tests/unit/knowledge/curation/test_graph_writer_replay_guard.py`,
+`TestKillAtAnyStatementThenReplay`).
+
 Only this test's own nodes are written and cleaned up (every id and session id
 carries `_PREFIX`); anything else in the eval instance appears identically in
 both canonical forms. Start the target first:

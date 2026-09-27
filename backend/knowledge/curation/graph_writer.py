@@ -21,6 +21,22 @@ logger = logging.getLogger(__name__)
 
 PROPERTY_KEY_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
+# ON CREATE properties of a `new_fact` LearningEvent, shared by the
+# conversational path (inside the `_upsert_entity` statement) and document
+# ingest (`_create_new_fact_learning_event`), so the two cannot drift. Expects
+# `le` bound by `MERGE (le:__Provenance__:LearningEvent {id: $learning_id})`.
+_NEW_FACT_ON_CREATE = (
+    "ON CREATE SET le.entity_type = 'LearningEvent', "
+    "le.display_name = $learning_display_name, le.knowledge_domain = 'bridging', "
+    "le.learning_type = 'new_fact', le.source_type = $source_type, "
+    "le.created_at = $now, le.status = 'active'"
+)
+
+
+def _new_fact_learning_id(event_id: str, entity_id: str) -> str:
+    """Deterministic id of the `new_fact` LearningEvent for one entity and event."""
+    return f"learning-{event_id}-new_fact-{entity_id}"
+
 
 @dataclass(frozen=True, slots=True)
 class RebuildStamps:
@@ -164,28 +180,40 @@ class CurationGraphWriter:
 
         # Upsert entities
         merge_lookup = {a.existing_entity_id: a for a in merge_actions}
+        conversational = source_metadata is None
         for entity in entities:
             entity_id = entity.get("id", "")
             is_update = entity_id in merge_lookup
+            # LearningEvent for new facts (first-time entity creation)
+            new_fact = not is_update and (
+                entity.get("source_type", "extracted") in ("stated", "corrected", "extracted")
+            )
+            # Conversational path: ONE statement per entity writes the entity,
+            # its guarded reinforce, its EXTRACTED_FROM edge and (for a new
+            # fact) its LearningEvent, so a kill cannot land between them.
             await self._upsert_entity(
-                entity, merge_lookup.get(entity_id), now, event_id, session_id
+                entity,
+                now,
+                event_id,
+                session_id,
+                with_conversation_provenance=conversational,
+                with_new_fact_learning_event=new_fact and conversational,
             )
             if is_update:
                 result.entities_updated += 1
             else:
                 result.entities_created += 1
-                # LearningEvent for new facts (first-time entity creation)
-                source_type = entity.get("source_type", "extracted")
-                if source_type in ("stated", "corrected", "extracted"):
+            if new_fact:
+                if not conversational:
                     await self._create_new_fact_learning_event(
                         entity_id,
                         session_id,
                         event_id,
                         now,
-                        source_type,
+                        entity.get("source_type", "extracted"),
                         source_metadata=source_metadata,
                     )
-                    result.learning_events_created += 1
+                result.learning_events_created += 1
 
             # Provenance edges
             if source_metadata is not None:
@@ -194,7 +222,7 @@ class CurationGraphWriter:
                 )
                 result.document_provenance_edges += edges
             else:
-                await self._create_provenance_edge(entity_id, session_id, event_id, now)
+                # Written by the `_upsert_entity` statement above.
                 result.provenance_edges_created += 1
 
         if source_metadata is not None and result.document_provenance_edges > 0:
@@ -220,12 +248,51 @@ class CurationGraphWriter:
     async def _upsert_entity(
         self,
         entity: dict,
-        merge_action: MergeAction | None,
         now: str,
         event_id: str,
         session_id: str,
+        *,
+        with_conversation_provenance: bool,
+        with_new_fact_learning_event: bool,
     ) -> None:
         """MERGE an entity into the graph, reinforcing confidence once per event.
+
+        With `with_conversation_provenance` (the conversational path), the same
+        statement also MERGEs the entity's EXTRACTED_FROM edge to this session's
+        ConversationContext (`_extracted_from_clause`), and with
+        `with_new_fact_learning_event` the entity's `new_fact` LearningEvent
+        with its LEARNED_FROM and ABOUT edges (`_NEW_FACT_ON_CREATE`). Each
+        `execute_write` runs one statement in its own managed write transaction
+        (`grep -n 'session.execute_write' backend/knowledge/storage/neo4j_connection.py`
+        -> 116), so entity, reinforce, edge and LearningEvent commit together or
+        not at all. The statement order:
+
+        1. the replay guard (`OPTIONAL MATCH` + `count`), before anything is
+           written, so it sees the graph as the previous statement left it;
+        2. the entity MERGE with its ON CREATE / ON MATCH;
+        3. the LearningEvent node MERGE;
+        4. `MATCH` the ConversationContext, then the EXTRACTED_FROM MERGE and
+           the LearningEvent's LEARNED_FROM and ABOUT edges.
+
+        The ConversationContext `MATCH` sits AFTER the entity and LearningEvent
+        node MERGEs on purpose. `write()` ensures the context one statement
+        earlier, but were it absent, a `MATCH` ahead of the entity MERGE would
+        yield no row and silently drop the entity. Placed after them, a missing
+        context leaves what the separate statements this fold replaced left: the
+        entity and the LearningEvent node, with no EXTRACTED_FROM, LEARNED_FROM
+        or ABOUT edge (the old LearningEvent statement also `MATCH`ed the
+        context before its ABOUT edge).
+
+        Document ingest (`with_conversation_provenance` False) issues the entity
+        statement alone, unchanged; `write()` then writes its SOURCED_FROM /
+        chunk edges and `new_fact` LearningEvent as separate statements. That
+        path is not replayed by the extraction backlog. The dispatcher applies
+        through `apply_cached_turn`
+        (`grep -n 'self._pipeline.apply_cached_turn' backend/extraction_backlog/dispatcher.py`
+        -> 890), whose `curate_and_store` call passes event, session and
+        `recorded_at` and no `source_metadata`
+        (`grep -n 'recorded_at=turn.recorded_at' backend/knowledge/extraction/pipeline.py`
+        -> 1206; the call opens at 1202).
 
         Replay guard (MIS-171, plan v2). The extraction backlog re-applies a
         turn whose curation a crash interrupted, so this statement can run
@@ -242,14 +309,14 @@ class CurationGraphWriter:
         Why `source_utterance_id` identifies "this event". The edge carries no
         append-only per-event record -- its properties are
         `source_utterance_id`, `created_at`/`updated_at`, `status`, the three
-        epoch stamps and `derived_at` (`_create_provenance_edge`) -- and
+        epoch stamps and `derived_at` (`_extracted_from_clause`) -- and
         `source_utterance_id` is last-writer-wins: it is set on both ON CREATE
         and ON MATCH, so a later turn overwrites it. Matching on it is still
         sound for crash replay because the backlog re-applies turn N before any
         turn that sorts after N:
         - the dispatcher processes only the backlog head:
           `grep -n 'head = scan.head' backend/extraction_backlog/dispatcher.py`
-          -> 466;
+          -> 472;
         - the head is the first pending turn in replay order:
           `grep -n 'return self.pending.0. if' backend/extraction_backlog/store.py`
           -> 217 (`BacklogScan.head`);
@@ -258,16 +325,31 @@ class CurationGraphWriter:
           `grep -n 'if stage == STAGE_APPLIED' backend/extraction_backlog/store.py`
           -> 475.
 
+        Why the edge MERGE is in this statement (plan v2 follow-up). When the
+        edge was a separate statement after this one, a kill between the two
+        left the entity reinforced (or created) with no edge for this event, so
+        the replay's guard found nothing and reinforced again. Now the guard's
+        evidence (the edge) commits in the same transaction as the reinforce it
+        suppresses: after any kill, either both are in the graph or neither is.
+
+        Why the `new_fact` LearningEvent is in this statement too. `write()`
+        writes it only for an entity dedup did NOT map onto an existing node
+        (`grep -n 'is_update = entity_id in merge_lookup' backend/knowledge/curation/graph_writer.py`
+        -> 186, plus this citation's own line). On a replay, dedup finds the entity the crashed run created,
+        by exact id first
+        (`grep -n 'existing = await self._find_existing' backend/knowledge/curation/deduplication.py`
+        -> 84), and emits a MergeAction for it, so the replay never writes the
+        LearningEvent. As a separate statement, a kill after the entity and
+        before the LearningEvent therefore lost it for good. In this statement,
+        the LearningEvent exists whenever the entity this event created does.
+
         What the guard does NOT cover:
-        - A crash between this statement and the same entity's
-          `_create_provenance_edge` statement in `write()`. The edge does not
-          exist yet, so a replay reinforces an entity the crashed run created.
-          Closing that needs the edge MERGE in this statement.
         - A turn that sorts BEFORE N but is logged after N crashed becomes the
           head first and overwrites `source_utterance_id` before N replays.
         - Document ingest (`source_metadata` set): it writes SOURCED_FROM, not
           EXTRACTED_FROM, so the guard never matches and behaviour is
-          unchanged there.
+          unchanged there. Its separate statements keep the kill windows this
+          fold closes on the conversational path.
         For an entity that already existed before this event, a second
         reinforce is harmless anyway: `$reinforced` is computed from the
         incoming `confidence` param alone
@@ -308,7 +390,7 @@ class CurationGraphWriter:
         # reads anchor on it); the extraction path must stamp it, not just
         # seed/rebuild (deep review cypher-data-integrity-2a). Idempotent.
         user_label_set = " SET e:User" if entity_id == "user" else ""
-        await self._executor.execute_write(
+        query = (
             # Replay guard: evaluated BEFORE the MERGE, in the same statement.
             # count() makes exactly one row whether or not the edge exists.
             "OPTIONAL MATCH (:__Entity__ {id: $entity_id})-[seen:EXTRACTED_FROM]->"
@@ -328,31 +410,59 @@ class CurationGraphWriter:
             "e.display_name = CASE WHEN size(e.display_name) < size($display_name) "
             "THEN $display_name ELSE e.display_name END, "
             "e.description = CASE WHEN size(coalesce(e.description, '')) < size($description) "
-            "THEN $description ELSE e.description END" + user_label_set,
-            {
-                "entity_id": entity_id,
-                "event_id": event_id,
-                "session_id": session_id,
-                "entity_type": entity_type,
-                "display_name": display_name,
-                "domain": domain.value,
-                "confidence": confidence,
-                "reinforced": self._confidence_manager.reinforced_confidence(confidence, domain),
-                "source_type": source_type,
-                "now": now,
-                "embedding": embedding,
-                "description": description,
-                "aliases": aliases,
-                # 4.7 drift fix: stamped from config via RebuildStamps, no
-                # hardcoded version literal.
-                "ontology_version": self._rebuild_stamps.ontology_version,
-            },
+            "THEN $description ELSE e.description END" + user_label_set
         )
+        params: dict = {
+            "entity_id": entity_id,
+            "event_id": event_id,
+            "session_id": session_id,
+            "entity_type": entity_type,
+            "display_name": display_name,
+            "domain": domain.value,
+            "confidence": confidence,
+            "reinforced": self._confidence_manager.reinforced_confidence(confidence, domain),
+            "source_type": source_type,
+            "now": now,
+            "embedding": embedding,
+            "description": description,
+            "aliases": aliases,
+            # 4.7 drift fix: stamped from config via RebuildStamps, no
+            # hardcoded version literal.
+            "ontology_version": self._rebuild_stamps.ontology_version,
+        }
+        if with_conversation_provenance:
+            if with_new_fact_learning_event:
+                # The entity's own source_type is the LearningEvent's
+                # ($source_type), as in `_create_new_fact_learning_event`.
+                query += (
+                    " WITH e "
+                    "MERGE (le:__Provenance__:LearningEvent {id: $learning_id}) "
+                    + _NEW_FACT_ON_CREATE
+                    + " WITH e, le"
+                )
+                params["learning_id"] = _new_fact_learning_id(event_id, entity_id)
+                params["learning_display_name"] = f"new_fact: {entity_id}"
+            else:
+                query += " WITH e"
+            edge_clause, edge_params = self._extracted_from_clause()
+            query += " MATCH (ctx:ConversationContext {conversation_id: $session_id}) " + (
+                edge_clause
+            )
+            params.update(edge_params)
+            if with_new_fact_learning_event:
+                # Same order as `_create_new_fact_learning_event`.
+                query += " MERGE (le)-[:LEARNED_FROM]->(ctx) MERGE (le)-[:ABOUT]->(e)"
+        await self._executor.execute_write(query, params)
 
-    async def _create_provenance_edge(
-        self, entity_id: str, session_id: str, event_id: str, now: str
-    ) -> None:
-        """Anchor an entity to the utterance it was extracted from.
+    def _extracted_from_clause(self) -> tuple[str, dict[str, str]]:
+        """Build the EXTRACTED_FROM MERGE that anchors an entity to its utterance.
+
+        Returns a (cypher_fragment, params) pair. The fragment expects `e` (the
+        entity) and `ctx` (this session's ConversationContext) bound, and uses
+        `$event_id` and `$now` from the enclosing `_upsert_entity` statement;
+        the params are the epoch stamps. It is written inside that statement,
+        not on its own, so the edge commits atomically with the entity and its
+        guarded reinforce (see `_upsert_entity`).
 
         R1.3: this is the sole entity-level provenance anchor on the
         conversational path. `source_utterance_id` names the MOST RECENT
@@ -376,14 +486,10 @@ class CurationGraphWriter:
         used to carry them is retired.
         """
         params: dict[str, str] = {
-            "entity_id": entity_id,
-            "session_id": session_id,
-            "event_id": event_id,
-            "now": now,
+            "ontology_version": self._rebuild_stamps.ontology_version,
+            "extraction_version": self._rebuild_stamps.extraction_version,
+            "model_hash": self._rebuild_stamps.model_hash,
         }
-        params["ontology_version"] = self._rebuild_stamps.ontology_version
-        params["extraction_version"] = self._rebuild_stamps.extraction_version
-        params["model_hash"] = self._rebuild_stamps.model_hash
         stamp_clause = (
             ", r.ontology_version = $ontology_version"
             ", r.extraction_version = $extraction_version"
@@ -399,9 +505,7 @@ class CurationGraphWriter:
             "r.status = 'active'" + stamp_clause
         )
 
-        await self._executor.execute_write(
-            "MATCH (e:__Entity__ {id: $entity_id}) "
-            "MATCH (ctx:ConversationContext {conversation_id: $session_id}) "
+        return (
             "MERGE (e)-[r:EXTRACTED_FROM]->(ctx) "
             f"ON CREATE SET {create_set} "
             f"ON MATCH SET {match_set}",
@@ -558,21 +662,25 @@ class CurationGraphWriter:
         source_type: str,
         source_metadata: SourceMetadata | None = None,
     ) -> None:
-        """Create a LearningEvent for a newly created entity (new_fact)."""
-        learning_id = f"learning-{event_id}-new_fact-{entity_id}"
+        """Create a LearningEvent for a newly created entity (new_fact).
+
+        Document ingest only. On the conversational path `_upsert_entity`
+        writes the same LearningEvent (`_NEW_FACT_ON_CREATE`) inside the
+        entity statement.
+        """
+        learning_id = _new_fact_learning_id(event_id, entity_id)
         learned_clause, learned_params = self._learned_from_clause(source_metadata, session_id)
         await self._executor.execute_write(
             "MERGE (le:__Provenance__:LearningEvent {id: $learning_id}) "
-            "ON CREATE SET le.entity_type = 'LearningEvent', "
-            "le.display_name = $display_name, le.knowledge_domain = 'bridging', "
-            "le.learning_type = 'new_fact', le.source_type = $source_type, "
-            "le.created_at = $now, le.status = 'active' "
-            "WITH le " + learned_clause + "WITH le "
+            + _NEW_FACT_ON_CREATE
+            + " WITH le "
+            + learned_clause
+            + "WITH le "
             "MATCH (target:__Entity__ {id: $entity_id}) "
             "MERGE (le)-[:ABOUT]->(target)",
             {
                 "learning_id": learning_id,
-                "display_name": f"new_fact: {entity_id}",
+                "learning_display_name": f"new_fact: {entity_id}",
                 "source_type": source_type,
                 "now": now,
                 "entity_id": entity_id,
