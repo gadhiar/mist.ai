@@ -1496,6 +1496,14 @@ def cmd_graph_reset(args: argparse.Namespace) -> int:
 
 
 def cmd_stack_status(args: argparse.Namespace) -> int:
+    """Probe Neo4j, the LLM and the backend, and exit non-zero if any is not healthy.
+
+    The backend verdict is `probe_backend`'s, which reads `/health`'s body
+    rather than its HTTP code -- `/health` answers 200 even when it reports a
+    fault, so an exit code derived from the code would print green over a red
+    body. `_print_status_line` shows the body's own status word and, when the
+    backend asks for one, a restart notice.
+    """
     be = _load_backend()
     config = be.get_config()
     connection = be.Neo4jConnection(config.neo4j)
@@ -2422,10 +2430,56 @@ def _print_status_line(status: dict) -> None:
         details.append(status["uri"])
     if "entity_count" in status:
         details.append(f"entities={status['entity_count']}")
+    # Only surfaced when true. `/health` answers 200 even while advising a
+    # restart, so this is the line an operator would otherwise never see.
+    if status.get("restart_recommended"):
+        details.append("RESTART RECOMMENDED")
     if "error" in status:
         details.append(f"error={status['error']}")
     detail_str = "  ".join(details)
     print(f"  [{indicator}] {service:<8} {state:<16} {detail_str}")
+
+
+# ---------------------------------------------------------------------------
+# Historical uptime report (derived from the curation job ledger)
+# ---------------------------------------------------------------------------
+
+
+def cmd_uptime(args: argparse.Namespace) -> int:
+    """Print a historical uptime report derived from `curation_job_runs`.
+
+    Read-only end to end: opens the event store through a `mode=ro` URI
+    connection (`backend/event_store/uptime.py:read_curation_job_rows`), never
+    through `EventStore`, and never calls `EventStore.initialize()`. See
+    `backend/event_store/uptime.py`'s module docstring for the full
+    derivation spec -- what a gap classifies as, why the tolerance is 300s,
+    and why the window's trailing span is reported as unmeasured rather than
+    as an outage.
+    """
+    be = _load_backend()
+    config = be.get_config()
+
+    from backend.event_store.uptime import (
+        build_uptime_report,
+        format_uptime_report,
+        read_curation_job_rows,
+    )
+    from backend.knowledge.regeneration.log_regenerator import ColdCacheError
+
+    db_path = (
+        args.db_path or config.event_store.db_path or str(Path.home() / ".mist" / "event_store.db")
+    )
+
+    try:
+        _assert_replay_source_exists(db_path, "event store", ("curation_job_runs",))
+    except ColdCacheError as exc:
+        print(f"[uptime] REFUSED: {exc}")
+        return 2
+
+    rows = read_curation_job_rows(db_path, args.job)
+    report = build_uptime_report(rows, job_name=args.job)
+    print(format_uptime_report(report, now=datetime.now(UTC)))
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -2824,6 +2878,29 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_rebuild.set_defaults(func=cmd_graph_rebuild_from_log)
+
+    # ---- Historical uptime report (curation job ledger) --------------------
+    p_uptime = sub.add_parser(
+        "uptime",
+        help=(
+            "Historical uptime report derived from the curation job ledger "
+            "(curation_job_runs) -- read-only, an inference, not a measurement."
+        ),
+    )
+    p_uptime.add_argument(
+        "--job",
+        default="confidence_decay",
+        help="Curation job_name to derive uptime from (default: confidence_decay).",
+    )
+    p_uptime.add_argument(
+        "--db-path",
+        default=None,
+        help=(
+            "Path to the event store SQLite file (default: config.event_store.db_path, "
+            "falling back to ~/.mist/event_store.db)."
+        ),
+    )
+    p_uptime.set_defaults(func=cmd_uptime)
 
     return parser
 

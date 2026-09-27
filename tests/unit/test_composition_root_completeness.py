@@ -143,6 +143,7 @@ EXPECTED_BUILDER_CALL_SITES: frozenset[str] = frozenset(
         "build_phase3_components",
         "build_curation_scheduler",
         "_build_session_note_catchup",
+        "_build_health_registry",
     }
 )
 

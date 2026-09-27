@@ -4,14 +4,22 @@ Creates indexes and constraints for the knowledge graph,
 including the vector index for semantic search.
 
 Usage:
-    python initialize_schema.py
+    python scripts/initialize_schema.py
 """
 
 import logging
 import sys
+from pathlib import Path
 
-from backend.knowledge.config import get_config
-from backend.knowledge.storage import GraphStore
+# Running this script by path puts scripts/ on sys.path[0], NOT the repo
+# root -- so `import backend` would fail. Add the repo root first (mirrors
+# scripts/mist_admin.py:81-83).
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from backend.factories import build_graph_store  # noqa: E402
+from backend.knowledge.config import get_config  # noqa: E402
 
 # Configure logging
 logging.basicConfig(
@@ -39,8 +47,15 @@ def main():
         config = get_config()
         logger.info("Configuration loaded")
 
-        # Initialize graph store
-        graph_store = GraphStore(config)
+        # Initialize graph store. build_graph_store wires the real
+        # connection and embedding generator the same way the production
+        # backend does (backend/factories.py:176-187). The embedding
+        # generator it constructs is lazy -- EmbeddingGenerator.__init__
+        # never loads the model (backend/knowledge/embeddings/
+        # embedding_generator.py:30-41) -- and initialize_schema() below
+        # never calls generate_embedding/generate_embeddings, so this does
+        # no network I/O even on a cold model cache.
+        graph_store = build_graph_store(config)
         logger.info("GraphStore initialized")
 
         # Initialize schema
