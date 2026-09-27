@@ -119,6 +119,69 @@ class SentenceBoundaryDetector:
             return [remaining]
         return []
 
+    def feed_segments(self, token: str) -> list[str]:
+        """Feed a token, return complete raw segments (0 or more).
+
+        Same boundaries as `feed`, but nothing is stripped or re-joined: each
+        segment is the exact slice of the input it covers, including the
+        whitespace that follows its terminal punctuation. A short sentence is
+        merged into the previous segment with its original whitespace intact
+        (`feed` joins it with a single space instead). Concatenating every
+        segment returned by `feed_segments` and `flush_segments` reproduces
+        the fed input exactly, so a caller that must preserve formatting
+        (paragraph breaks, list lines) can recover it.
+
+        `feed` is left untouched because the voice TTS path
+        (`backend/voice_processor.py`) consumes its stripped sentences. Do
+        not mix `feed` and `feed_segments` on one detector instance: `feed`
+        discards leading whitespace from the buffer.
+
+        Args:
+            token: Next token from the LLM stream.
+
+        Returns:
+            List of raw segments. May be empty.
+        """
+        self._buffer += token
+        segments: list[str] = []
+        search_start = 0
+
+        while True:
+            boundary = self._find_boundary(search_start)
+            if boundary is None:
+                break
+
+            raw = self._buffer[:boundary]
+            if len(raw.strip()) < self.MIN_SENTENCE_LENGTH:
+                if segments:
+                    segments[-1] += raw
+                    self._buffer = self._buffer[boundary:]
+                    search_start = 0
+                else:
+                    # Mirrors `feed`: skip this boundary so the short fragment
+                    # merges forward into a larger segment.
+                    search_start = boundary
+                    continue
+            else:
+                segments.append(raw)
+                self._buffer = self._buffer[boundary:]
+                search_start = 0
+
+        return segments
+
+    def flush_segments(self) -> list[str]:
+        """Flush the remaining buffer verbatim as the final raw segment.
+
+        Returns:
+            List containing the remaining text (whitespace included), or empty
+            if the buffer is empty.
+        """
+        remaining = self._buffer
+        self._buffer = ""
+        if remaining:
+            return [remaining]
+        return []
+
     def _find_boundary(self, search_start: int = 0) -> int | None:
         """Find first sentence boundary position in buffer.
 
