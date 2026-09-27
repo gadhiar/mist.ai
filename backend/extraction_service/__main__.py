@@ -16,10 +16,12 @@ def main() -> None:
     settings = ServiceSettings.from_env()
     app = build_app_from_env()
     # All interfaces inside the container: the backend reaches the service over
-    # the compose network (local profile) or through the Tailscale sidecar's
-    # shared network namespace (host profile). Exposure is decided by
-    # docker-compose.extraction.yml, which publishes no host port in the host
-    # profile and only 127.0.0.1 in the local one.
+    # the compose network on the workstation (docker-compose.extraction.yml,
+    # `extraction-local` profile) or, on the remote host, through the Tailscale
+    # sidecar's shared network namespace (docker/extraction/compose.host.yml,
+    # `network_mode: service:mist-extraction-ts`). Exposure is decided by
+    # those compose files: the host file publishes no host port, and the local
+    # one publishes 127.0.0.1 only.
     uvicorn.run(app, host="0.0.0.0", port=settings.port)  # nosec B104
 
 

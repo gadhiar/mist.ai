@@ -4,9 +4,11 @@
 # (`backend/extraction_service/`) and the backend subpackages its import
 # closure pulls in -- never the voice pipeline, Neo4j write path, or vault
 # layer that `docker/backend/Dockerfile` builds for the main stack. It is
-# built and run identically on both deploy targets (RTX 4070 SUPER local,
-# GTX 1070 remote host); only docker-compose.extraction.yml's env vars
-# differ per profile.
+# built and run identically on both deploy targets; only the compose file
+# that runs it differs: docker-compose.extraction.yml's `extraction-local`
+# profile on the RTX 4070 SUPER workstation, and the standalone
+# docker/extraction/compose.host.yml (no profiles) on the GTX 1070 remote
+# host. They differ in env vars and network exposure, not in this image.
 #
 # Pinned by digest: tag `python:3.11-slim` (Python 3.11.16), resolved on the
 # host by the lead on 2026-09-26. tests/unit/test_compose_extraction.py pins
