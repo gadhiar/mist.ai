@@ -23,12 +23,18 @@ loudly rather than silently, which is exactly what did NOT happen.
 
 from pathlib import Path
 
+import pytest
+
 from backend.knowledge.seed.loader import load_seed_documents
 from backend.knowledge.storage.partitions import SELF_MODEL_LABEL
 
 # Resolve path relative to repo root regardless of pytest invocation directory.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 SEED_DIR = _REPO_ROOT / "mist-memory" / "seed"
+
+# Reads the private, gitignored mist-memory/ vault (tests/unit/conftest.py
+# skips this module when it is absent from the checkout).
+pytestmark = pytest.mark.requires_vault
 
 
 def _load_identity_document():

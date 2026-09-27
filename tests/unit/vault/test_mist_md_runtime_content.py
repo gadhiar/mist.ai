@@ -19,6 +19,10 @@ import pytest
 _VAULT_ROOT = Path(__file__).parent.parent.parent.parent / "mist-memory"
 _MIST_MD = _VAULT_ROOT / "MIST.md"
 
+# Reads the private, gitignored mist-memory/ vault (tests/unit/conftest.py
+# skips this module when it is absent from the checkout).
+pytestmark = pytest.mark.requires_vault
+
 
 @pytest.fixture(scope="module")
 def mist_md_content() -> str:
