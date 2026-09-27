@@ -15,8 +15,10 @@ import hashlib
 import logging
 import time
 from datetime import datetime
+from typing import Any
 
 from openai import APIError
+from pydantic import ValidationError
 
 from backend.errors import (
     ExtractionValidationError,
@@ -75,8 +77,9 @@ logger = logging.getLogger(__name__)
 _LLM_TRANSPORT_ERRORS = (APIError, LLMConnectionError, LLMResponseError)
 
 _REPAIR_INSTRUCTION = (
-    "Your previous output was not valid JSON, or was missing the required "
-    '"entities"/"relationships" list fields. Return ONLY a JSON object '
+    "Your previous output was not valid JSON, was missing the required "
+    '"entities"/"relationships" list fields, or had list items that were not '
+    "JSON objects. Return ONLY a JSON object "
     'matching {"entities": [...], "relationships": [...]}. No prose, no '
     "markdown code fences, no explanation."
 )
@@ -102,6 +105,73 @@ class ExtractionTimeoutError(ExtractionServiceError):
 
     Maps to HTTP 504 / `ErrorCode.TIMEOUT`.
     """
+
+
+def _require_object_items(field: str, items: list[Any]) -> list[dict[str, Any]]:
+    """Return `items` when every element is a JSON object, else raise.
+
+    The strict parsers (`parse_extraction_output`, `parse_derivation_output`)
+    check that `entities`/`relationships`/`operations` are lists, not what the
+    lists hold; the contract models type them `list[dict[str, Any]]`. A model
+    that answers `{"entities": ["Alice"], ...}` must count as unparsable
+    output here -- repaired, or reported -- not fail later inside a pydantic
+    constructor as an unhandled error.
+
+    Raises:
+        ExtractionValidationError: An element is not a JSON object.
+    """
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ExtractionValidationError(
+                f"{field}[{index}] is a JSON {_json_type(item)}, not an object"
+            )
+    return items
+
+
+def _json_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int | float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    return type(value).__name__
+
+
+def _strict_extraction_payload(raw: str) -> ExtractionPayload:
+    """Stage 2 strict parse: well-formed JSON, list fields, object items.
+
+    Raises:
+        ExtractionValidationError: Any of those fails, including the payload
+            model rejecting the parsed value.
+    """
+    parsed = parse_extraction_output(raw, strict=True)
+    entities = _require_object_items("entities", parsed["entities"])
+    relationships = _require_object_items("relationships", parsed["relationships"])
+    try:
+        return ExtractionPayload(entities=entities, relationships=relationships)
+    except ValidationError as exc:
+        raise ExtractionValidationError(f"Extraction payload rejected: {exc}") from exc
+
+
+def _strict_derivation(raw: str) -> DerivationOut:
+    """Stage 9 strict parse: well-formed JSON, a list of object operations.
+
+    Raises:
+        ExtractionValidationError: Any of those fails, including the
+            derivation model rejecting the parsed value.
+    """
+    operations = _require_object_items(
+        "operations", parse_derivation_output(raw, strict=True)
+    )
+    try:
+        return DerivationOut(operations=operations)
+    except ValidationError as exc:
+        raise ExtractionValidationError(f"Derivation output rejected: {exc}") from exc
 
 
 def _compute_prompt_sha256(adapter: ModelFamilyAdapter) -> str:
@@ -309,7 +379,7 @@ class ExtractionEngine:
 
             raw = self._adapter.final_text(response)
             try:
-                parsed = parse_extraction_output(raw, strict=True)
+                payload = _strict_extraction_payload(raw)
             except ExtractionValidationError as exc:
                 last_error = exc
                 logger.warning(
@@ -326,13 +396,7 @@ class ExtractionEngine:
                 continue
 
             elapsed = (time.perf_counter() - start) * 1000
-            return (
-                ExtractionPayload(
-                    entities=parsed["entities"], relationships=parsed["relationships"]
-                ),
-                elapsed,
-                attempt,
-            )
+            return payload, elapsed, attempt
 
         raise UpstreamLLMError(
             f"Extraction output unparsable after {self._settings.max_attempts} attempts"
@@ -362,7 +426,7 @@ class ExtractionEngine:
         try:
             response = await self._invoke(request)
             raw = self._adapter.final_text(response)
-            operations = parse_derivation_output(raw, strict=True)
+            derivation = _strict_derivation(raw)
         except (TimeoutError, ExtractionValidationError, *_LLM_TRANSPORT_ERRORS) as exc:
             elapsed = (time.perf_counter() - start) * 1000
             logger.warning("Derivation failed (%s): %s", type(exc).__name__, exc)
@@ -370,4 +434,4 @@ class ExtractionEngine:
             return None, elapsed
 
         elapsed = (time.perf_counter() - start) * 1000
-        return DerivationOut(operations=operations), elapsed
+        return derivation, elapsed

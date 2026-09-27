@@ -22,6 +22,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
 from backend.extraction_contract.models import (
     CONTRACT_MAJOR,
@@ -221,6 +222,24 @@ def create_app(
                 exc,
             )
             return _error_response(ErrorCode.UPSTREAM_LLM, str(exc))
+        except ValidationError as exc:
+            # Defence in depth: the engine's strict parse rejects bad model
+            # output before any contract model sees it, so this means a
+            # response model rejected a value the parse let through. Report
+            # it as the model's failure, in the envelope, never a bare 500.
+            logger.error(
+                "job failed request_id=%s job_id=%s event_id=%s turn_id=%s "
+                "outcome=upstream_llm (response model rejected the result): %s",
+                req.request_id,
+                req.job_id,
+                req.event_id,
+                req.turn_id,
+                exc,
+            )
+            return _error_response(
+                ErrorCode.UPSTREAM_LLM,
+                f"The model's output could not be built into a response: {exc}",
+            )
 
         duration_ms = (time.perf_counter() - request_start) * 1000
         logger.info(
