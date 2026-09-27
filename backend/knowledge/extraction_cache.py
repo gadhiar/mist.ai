@@ -207,7 +207,14 @@ class ExtractionCache:
         )
         return {row["event_id"]: row["skip_reason"] for row in rows}
 
-    def delete(self, event_id: str, extraction_version: str, model_hash: str) -> bool:
+    def delete(
+        self,
+        event_id: str,
+        extraction_version: str,
+        model_hash: str,
+        *,
+        only_skip_reason: str | None = None,
+    ) -> bool:
         """Delete the cached decision for one turn under one stamp pair.
 
         Exists for exactly one caller: `retry-dead-letters`
@@ -218,13 +225,31 @@ class ExtractionCache:
         re-extracted -- which is the intended effect of a retry and nothing
         else.
 
+        Args:
+            event_id: The turn whose row to delete.
+            extraction_version: Stamp half of the cache key.
+            model_hash: Stamp half of the cache key.
+            only_skip_reason: When given, the row is deleted only if its
+                `skip_reason` still equals this value, checked in the same
+                `DELETE` statement. The retry passes `extraction_failed`, so a
+                real extraction that replaced the dead letter between the
+                caller's read and this delete (a concurrent retry freed the
+                turn and the dispatcher re-extracted it) is left alone.
+
         Returns:
-            True when a row was deleted, False when there was none.
+            True when a row was deleted, False when there was none (or it no
+            longer matched `only_skip_reason`).
         """
         key = cache_key(event_id, extraction_version, model_hash)
-        cursor = self._get_connection().execute(
-            "DELETE FROM extraction_cache WHERE cache_key = ?", (key,)
-        )
+        if only_skip_reason is None:
+            cursor = self._get_connection().execute(
+                "DELETE FROM extraction_cache WHERE cache_key = ?", (key,)
+            )
+        else:
+            cursor = self._get_connection().execute(
+                "DELETE FROM extraction_cache WHERE cache_key = ? AND skip_reason = ?",
+                (key, only_skip_reason),
+            )
         return cursor.rowcount > 0
 
     def put(

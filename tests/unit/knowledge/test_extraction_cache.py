@@ -434,3 +434,24 @@ def test_delete_removes_exactly_one_row():
     assert cache.delete("e1", "v1", "m1") is False
     assert cache.get("e1", "v1", "m1") is None
     assert cache.get("e1", "v2", "m1") is not None
+
+
+def test_conditional_delete_leaves_a_row_whose_skip_reason_no_longer_matches():
+    cache = ExtractionCache(":memory:")
+    cache.initialize()
+    common = {"created_at": "2026-08-18T00:00:00+00:00"}
+    cache.put("e1", "1.4.0", "v1", "m1", outcome=OUTCOME_EXTRACTED, **common)
+    cache.put(
+        "e2",
+        "1.4.0",
+        "v1",
+        "m1",
+        outcome=OUTCOME_SKIPPED,
+        skip_reason=SKIP_EXTRACTION_FAILED,
+        **common,
+    )
+
+    assert cache.delete("e1", "v1", "m1", only_skip_reason=SKIP_EXTRACTION_FAILED) is False
+    assert cache.get("e1", "v1", "m1") is not None
+    assert cache.delete("e2", "v1", "m1", only_skip_reason=SKIP_EXTRACTION_FAILED) is True
+    assert cache.get("e2", "v1", "m1") is None

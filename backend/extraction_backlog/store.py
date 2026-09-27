@@ -701,7 +701,13 @@ class BacklogStore:
         still a dead letter (marker present or re-written as a no-op); after
         it the turn is inference-pending. The dispatcher never writes a row
         for a turn that has one, and this method only deletes an
-        `extraction_failed` row, so neither undoes the other's write.
+        `extraction_failed` row, so neither undoes the other's write. The
+        "only" is enforced in the delete itself, not just by the read above
+        (`ExtractionCache.delete(..., only_skip_reason=...)` is one
+        conditional `DELETE`): with two retries of one turn racing, the first
+        can free the turn and the dispatcher re-extract it before the second
+        deletes, and an unconditional delete would then remove the real row
+        and cause a second extraction and apply.
 
         Crash ordering: attempts are retired FIRST and the row deleted LAST,
         as the commit point. A crash before the row delete leaves a dead
@@ -717,8 +723,12 @@ class BacklogStore:
         if cached is None or cached.get("skip_reason") != SKIP_EXTRACTION_FAILED:
             return False
         self._events.retire_extraction_attempts(event_id, epoch.epoch_id)
-        self._cache.delete(event_id, epoch.extraction_version, epoch.model_hash)
-        return True
+        return self._cache.delete(
+            event_id,
+            epoch.extraction_version,
+            epoch.model_hash,
+            only_skip_reason=SKIP_EXTRACTION_FAILED,
+        )
 
 
 def age_ms(timestamp_iso: str | None, now: datetime) -> int | None:

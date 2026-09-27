@@ -618,6 +618,45 @@ class TestRetryRacesARunningDispatcher:
         _assert_applied_once(world, dispatcher, bad)
 
     @pytest.mark.asyncio
+    async def test_two_racing_retries_of_one_turn_extract_and_apply_it_once(
+        self, backlog_world, ts, monkeypatch
+    ):
+        """Retry B reads the dead letter; before B deletes, retry A frees the turn
+        and the dispatcher re-extracts and applies it. B's delete must then find
+        no `extraction_failed` row and leave the real extraction alone.
+        """
+        # Arrange
+        world = backlog_world
+        bad = await _dead_letter_one(world, ts)
+        epoch = world.store.active_epoch()
+        dispatcher = world.build_dispatcher()
+        loop = asyncio.get_running_loop()
+        original_retire = world.event_store.retire_extraction_attempts
+        interleaved = False
+
+        def _retire(*args, **kwargs):
+            nonlocal interleaved
+            if not interleaved:
+                interleaved = True
+                # Retry A runs to completion, then the dispatcher re-extracts and
+                # applies, all between retry B's read and retry B's delete.
+                assert world.store.retry_dead_letter(bad, epoch) is True
+                asyncio.run_coroutine_threadsafe(_settle(dispatcher), loop).result(10)
+            return original_retire(*args, **kwargs)
+
+        monkeypatch.setattr(world.event_store, "retire_extraction_attempts", _retire)
+
+        # Act: retry B on another thread.
+        retried_b = await asyncio.to_thread(world.store.retry_dead_letter, bad, epoch)
+        monkeypatch.undo()
+        await _settle(dispatcher)
+
+        # Assert: B lost the race and deleted nothing; A's re-extraction stands.
+        assert interleaved
+        assert retried_b is False
+        _assert_applied_once(world, dispatcher, bad)
+
+    @pytest.mark.asyncio
     async def test_a_crash_after_re_caching_a_retried_turn_still_applies_it(
         self, backlog_world, ts, monkeypatch
     ):
