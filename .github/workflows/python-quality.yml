@@ -138,8 +138,35 @@ jobs:
       - name: Install test dependencies
         run: pip install "pytest==7.4.4" "pytest-asyncio==0.23.8"
 
+      # -X faulthandler dumps every thread's Python stack on a fatal signal
+      # (SIGSEGV and the like), including crashes during interpreter teardown
+      # after pytest's own faulthandler plugin has been disabled. The output is
+      # also written to a file so the failure step below can surface it: job
+      # logs need repository admin rights to read, check-run annotations do not.
+      # `shell: bash` makes the step run with -o pipefail, so pytest's exit code
+      # (not tee's) decides the step.
       - name: Run unit tests
-        run: python -m pytest tests/unit -q -p no:cacheprovider
+        shell: bash
+        run: |
+          python -X faulthandler -m pytest tests/unit -q -p no:cacheprovider 2>&1 \
+            | tee "$RUNNER_TEMP/pytest-unit.log"
+
+      # On failure, publish the last 80 lines of the test output as a single
+      # error annotation, readable through the public check-runs annotations
+      # API. Lines are cut to 300 characters to stay inside the annotation size
+      # limit; `%`, CR and LF are percent-encoded as workflow commands require.
+      - name: Annotate unit test failure
+        if: failure()
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/pytest-unit.log"
+          if [ ! -s "$log" ]; then
+            echo "::error title=unit tests::no pytest output was captured"
+            exit 0
+          fi
+          body=$(tail -n 80 "$log" | cut -c1-300 \
+            | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN { ORS = "%0A" } { print }')
+          echo "::error title=unit tests (last 80 lines)::${body}"
 
   # mypy is NOT a pre-commit hook and is advisory only, exactly as it was before this
   # file was rewritten. It is kept as its own non-blocking job so its findings stay
