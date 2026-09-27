@@ -59,6 +59,52 @@ jobs:
       - name: Run all hooks
         run: pre-commit run --all-files --show-diff-on-failure
 
+  # Blocking unit-test gate (MIS-172). CPU-only: no GPU, no Neo4j -- the unit tier
+  # itself enforces that via tests/unit/conftest.py's live-write guard, and the
+  # vault-backed tests skip (tests/unit/conftest.py's pytest_collection_modifyitems)
+  # because mist-memory/ is a private, gitignored directory that does not exist here.
+  unit:
+    name: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      # Mirrors docker/backend/Dockerfile's step 1 (CPU wheels instead of the
+      # production image's CUDA 12.4 wheels -- this runner has no GPU).
+      - name: Install PyTorch (CPU)
+        run: |
+          pip install torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 \
+            --index-url https://download.pytorch.org/whl/cpu
+
+      # requirements.txt pins torch==2.4.0, which docker/backend/Dockerfile
+      # re-pins to 2.6.0 at its step 4 (lines 53-58) because chatterbox-tts or an
+      # earlier requirements install can overwrite the step-1 pin. A plain
+      # `pip install -r requirements.txt` here would downgrade the CPU wheels
+      # just installed above and pull the multi-GB CUDA wheels from PyPI instead
+      # (no --index-url override in requirements.txt itself), so the three torch
+      # lines are filtered out before installing the rest.
+      - name: Install backend requirements (torch lines filtered)
+        run: |
+          grep -vE '^(torch|torchaudio|torchvision)==' requirements.txt > "$RUNNER_TEMP/requirements-cpu.txt"
+          pip install -r "$RUNNER_TEMP/requirements-cpu.txt"
+
+      # Matches docker/backend/Dockerfile's step 6 (line 93), which installs
+      # these as a separate layer on top of requirements.txt.
+      - name: Install test dependencies
+        run: pip install "pytest>=8.0" "pytest-asyncio>=0.24"
+
+      - name: Run unit tests
+        run: python -m pytest tests/unit -q -p no:cacheprovider
+
   # mypy is NOT a pre-commit hook and is advisory only, exactly as it was before this
   # file was rewritten. It is kept as its own non-blocking job so its findings stay
   # visible without gating a merge -- dropping it would have silently narrowed coverage.
