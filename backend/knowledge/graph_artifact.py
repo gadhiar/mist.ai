@@ -126,12 +126,12 @@ def _resolve_zone(name: str) -> Any | None:
     `zoneinfo` extension's `utcoffset()` is contracted to accept. Handing it a
     `neo4j.time.DateTime` anyway is not a theoretical concern -- measured
     directly against this codec on Python 3.11.0rc1, calling `.utc_offset()` on
-    a value decoded with a `ZoneInfo` attached segfaults the interpreter
-    outright. `pytz` is safe here for the same reason it is already the
-    correct choice: the neo4j driver hydrates its own temporals with `pytz`
-    (`neo4j/_codec/hydration/v1/temporal.py`), so every zoned value this codec
-    restores is exercised against the library the driver itself uses, never a
-    second, incompatible one.
+    a value decoded with a `ZoneInfo` attached segfaults or returns wrong
+    offsets (undefined behaviour). `pytz` is safe here for the same reason it
+    is already the correct choice: the neo4j driver hydrates its own
+    temporals with `pytz` (`neo4j/_codec/hydration/v1/temporal.py`), so every
+    zoned value this codec restores is exercised against the library the
+    driver itself uses, never a second, incompatible one.
 
     Returning None rather than raising is deliberate, and it is not a
     best-effort load: the zone NAME is extra fidelity, not part of the value's

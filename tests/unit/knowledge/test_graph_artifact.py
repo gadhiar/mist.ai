@@ -116,7 +116,7 @@ class TestExactRoundTrip:
 
         assert "zone" not in encoded
 
-    def test_zoned_datetime_resolves_through_pytz_never_zoneinfo(self, monkeypatch):
+    def test_zoned_datetime_resolves_through_pytz_never_zoneinfo(self):
         """On a host with a real tz database, `_resolve_zone` must never hand
         back a `zoneinfo.ZoneInfo`, and the restored UTC offset must be exactly
         `+01:00`, deterministically.
@@ -128,7 +128,7 @@ class TestExactRoundTrip:
         a real `zoneinfo.ZoneInfo` for `Europe/London` (via `zoneinfo.TZPATH`
         pointed at the IANA data `pytz` already bundles, standing in for a host
         tz database, since this container has no `tzdata` package) and calling
-        `.utc_offset()` on the decoded value through the CURRENT
+        `.utc_offset()` on the decoded value through the OLD
         (`zoneinfo`-first) `_resolve_zone` segfaults the interpreter outright
         (exit 139) rather than returning a wrong value -- worse than the 90%
         wrong-offset rate this bug produces on other builds. The
