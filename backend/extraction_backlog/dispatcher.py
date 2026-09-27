@@ -58,13 +58,15 @@ turn converges on the canonical surface -- relationship appends MERGE on
 `version_key` and the reconciliation engine's `turn_already_applied` probe
 turns a replayed edge into a no-op (`curation/reconciliation.py`,
 `_fetch_existing`), entity writes MERGE on id with longest-wins text fields
-(`curation/graph_writer.py`, `_upsert_entity`) -- with one known exception:
-an entity the turn CREATED gets `ON MATCH` confidence reinforcement on the
-second pass (`graph_writer.py`, the `ON MATCH SET e.confidence = CASE ...
-$reinforced` clause), so its node `confidence` ends higher than after a single
-apply. Node `confidence` is excluded from `canonical_graph_form`
+(`curation/graph_writer.py`, `_upsert_entity`). The `ON MATCH` confidence
+reinforcement is skipped when this event's EXTRACTED_FROM edge to the entity
+already exists (plan v2, `graph_writer.py` `_upsert_entity`), so a replayed
+turn does not reinforce twice. One window remains: a kill between an entity's
+upsert and its EXTRACTED_FROM write still reinforces on replay, pinned by a
+strict xfail in `tests/unit/knowledge/curation/test_graph_writer_replay_guard.py`.
+Node `confidence` is excluded from `canonical_graph_form`
 (`canonical_serialize.NODE_ONLY_EXCLUDED_FIELDS`), so a canonical comparison
-cannot see this.
+cannot see either case.
 
 `stop()` is graceful: a job still waiting on the service is abandoned (nothing
 was cached, so the turn stays inference-pending and is re-dispatched with a new

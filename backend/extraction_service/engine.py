@@ -285,7 +285,7 @@ class ExtractionEngine:
         Raises:
             ExtractionTimeoutError: An attempt exceeded the LLM timeout.
             UpstreamLLMError: The LLM call failed, or every attempt's
-                output stayed unparseable.
+                output stayed unparsable.
         """
         start = time.perf_counter()
         messages = render_extraction_messages(pre_processed)
@@ -313,7 +313,7 @@ class ExtractionEngine:
             except ExtractionValidationError as exc:
                 last_error = exc
                 logger.warning(
-                    "Extraction attempt %d/%d unparseable: %s",
+                    "Extraction attempt %d/%d unparsable: %s",
                     attempt,
                     self._settings.max_attempts,
                     exc,
@@ -335,7 +335,7 @@ class ExtractionEngine:
             )
 
         raise UpstreamLLMError(
-            f"Extraction output unparseable after {self._settings.max_attempts} attempts"
+            f"Extraction output unparsable after {self._settings.max_attempts} attempts"
         ) from last_error
 
     async def _run_derivation(

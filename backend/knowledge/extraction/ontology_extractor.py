@@ -113,18 +113,18 @@ def parse_extraction_output(raw: str, *, strict: bool) -> dict:
 
     Non-strict (`strict=False`, the in-process pipeline's historical
     behavior): falls back to an empty result -- `{"entities": [],
-    "relationships": []}` -- on empty input, unparseable JSON, or a parsed
+    "relationships": []}` -- on empty input, unparsable JSON, or a parsed
     value that is not well-shaped. The pipeline never raises on bad LLM
     output; Stage 2 already logs and degrades to "nothing extracted".
 
     Strict (`strict=True`, the extraction service): raises instead of
     degrading, so a caller can tell "valid output with zero entities"
-    apart from "unparseable output" and report a typed failure -- never
+    apart from "unparsable output" and report a typed failure -- never
     silently cache an empty extraction as a real "nothing found" decision.
 
     Args:
         raw: Raw string output from the LLM.
-        strict: When True, raise on empty/unparseable/malformed input
+        strict: When True, raise on empty/unparsable/malformed input
             instead of returning an empty result.
 
     Returns:
@@ -240,7 +240,7 @@ class OntologyConstrainedExtractor:
         logger.info("LLM extraction completed in %.1fms", elapsed_ms)
 
         # Parse the JSON output. Non-strict: falls back to an empty result
-        # on unparseable/malformed output rather than raising -- the
+        # on unparsable/malformed output rather than raising -- the
         # in-process pipeline's historical behavior.
         parsed = parse_extraction_output(raw_output, strict=False)
 

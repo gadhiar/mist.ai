@@ -52,7 +52,7 @@ class ServiceSettings:
         llm_timeout_seconds: Per-LLM-call timeout. A call exceeding this
             maps to the service's 504 `timeout` error code.
         max_attempts: Maximum extraction attempts per job -- the first call
-            plus repair retries on unparseable output. Default 2 (one
+            plus repair retries on unparsable output. Default 2 (one
             repair retry).
         idempotency_cache_size: Max entries in the job_id -> ExtractResponse
             LRU cache.

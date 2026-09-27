@@ -1512,7 +1512,7 @@ class ConversationHandler:
             stream).
         """
         gate = SentenceBoundaryDetector()
-        pass_text = ""
+        emitted_text = ""
         tool_calls: list[LLMToolCall] | None = None
         finish_reason: str | None = None
         usage: UsageMetadata | None = None
@@ -1526,7 +1526,7 @@ class ConversationHandler:
             Returns None (and emits nothing) when the sentence stripped
             down to nothing.
             """
-            nonlocal pass_text
+            nonlocal emitted_text
             piece_text = self._gate_sentence_text(sentence, session_id=session_id)
             if not piece_text:
                 # Fully-stripped sentence (e.g. pure emoji) — nothing left
@@ -1534,7 +1534,7 @@ class ConversationHandler:
                 return None
             lead = " " if state.emitted else ""
             state.emitted += lead + piece_text
-            pass_text += (" " if pass_text else "") + piece_text
+            emitted_text += (" " if emitted_text else "") + piece_text
             return Token(text=lead + piece_text, pass_num=pass_num)
 
         with llm_call_context(session_id=session_id, call_site=call_site, pass_num=pass_num):
@@ -1570,7 +1570,7 @@ class ConversationHandler:
             f"{ttft_ms:.1f}" if ttft_ms is not None else "n/a",
             duration_ms,
         )
-        state.pass_text[pass_num] = pass_text
+        state.pass_text[pass_num] = emitted_text
         state.pass_tool_calls[pass_num] = tool_calls
         state.pass_finish_reason[pass_num] = finish_reason
         state.pass_usage[pass_num] = usage
