@@ -57,7 +57,13 @@ repos:
     rev: v4.5.0
     hooks:
       - id: trailing-whitespace
-        exclude: \.md$
+        # tests/unit/model_bench/fixtures/host/llama_server_help_b<build>.txt is a
+        # byte-verbatim `llama-server --help` capture, pinned by sha256 and line count
+        # in tests/unit/model_bench/test_host_help_flags.py:38-47. Stripping trailing
+        # whitespace from it changes those bytes and breaks that pin, so it is excluded
+        # alongside the existing markdown exclude (pre-commit takes one `exclude` per
+        # hook, so both patterns are combined into a single regex).
+        exclude: (\.md$|^tests/unit/model_bench/fixtures/host/llama_server_help_b\d+\.txt$)
       - id: end-of-file-fixer
         exclude: \.md$
       - id: check-yaml

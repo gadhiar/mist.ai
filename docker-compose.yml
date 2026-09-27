@@ -44,6 +44,10 @@ services:
       # (resolves to inotify on this Linux container).
       - MIST_VAULT_ROOT=${MIST_VAULT_ROOT:-/app/mist-memory}
       - MIST_SIDECAR_DB_PATH=${MIST_SIDECAR_DB_PATH:-/app/data/vault_sidecar.db}
+      # backend/server.py's lifespan() resolves the persistent file-log
+      # directory from this var, defaulting to repo-relative logs/ when
+      # unset. The container needs the bind-mounted /app/logs explicitly.
+      - MIST_LOG_DIR=/app/logs
       - TTS_ENABLED=${TTS_ENABLED:-true}
       - TTS_ENGINE=${TTS_ENGINE:-chatterbox}
       - TTS_EXAGGERATION=${TTS_EXAGGERATION:-0.5}

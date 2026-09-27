@@ -30,7 +30,12 @@ LAYOUT_DIR = Path("/nonexistent/layout-perception")
 
 def test_default_suites_come_back_in_run_order():
     arm = resolve_arm(ARMS_DOC, "c0")
-    assert validate_run_suites(arm, None, LAYOUT_DIR) == ["ttft", "correctness", "harness", "layout"]
+    assert validate_run_suites(arm, None, LAYOUT_DIR) == [
+        "ttft",
+        "correctness",
+        "harness",
+        "layout",
+    ]
 
 
 def test_requested_subset_is_reordered_to_run_order():

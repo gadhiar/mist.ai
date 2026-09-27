@@ -21,7 +21,9 @@ LEAKED_PATH_FRAGMENT = "Z:/synthetic-host/bench-results/run1/c0-old"
 def test_sentinel_present_in_raw_fixture():
     # Sanity: prove the sentinel really is in the raw input, so the absence
     # check below is meaningful rather than vacuous.
-    raw = (FIXTURE_RUN / "c0" / "harness" / "harness" / "bench-c0.jsonl").read_text(encoding="utf-8")
+    raw = (FIXTURE_RUN / "c0" / "harness" / "harness" / "bench-c0.jsonl").read_text(
+        encoding="utf-8"
+    )
     assert SENTINEL in raw
 
 

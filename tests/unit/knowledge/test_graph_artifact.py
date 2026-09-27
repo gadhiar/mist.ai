@@ -21,7 +21,10 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import zoneinfo
 from datetime import datetime as stdlib_datetime
+from datetime import timedelta
 
 import pytest
 import pytz
@@ -90,13 +93,15 @@ class TestExactRoundTrip:
         assert encoded["zone"] == "Europe/London"
 
     def test_zoned_datetime_restores_the_named_zone_when_the_host_resolves_it(self):
-        """Equality is the acceptance; the name is restored where tz data allows.
+        """Equality is the acceptance; the name is restored where pytz resolves it.
 
-        The backend image has `pytz` but no `tzdata`, so `ZoneInfo` cannot
-        resolve any name there and `pytz` can -- `_resolve_zone` tries both. A
-        host that resolves neither still restores an EQUAL value from the fixed
-        offset, which is why this asserts equality unconditionally and the name
-        only when it came back.
+        `_resolve_zone` resolves an IANA name through `pytz` only -- the same
+        library the neo4j driver itself uses to hydrate temporals -- and `pytz`
+        is a driver dependency present on every host that can import this
+        module, backend image included. A host whose installed `pytz` release
+        does not carry a given name still restores an EQUAL value from the
+        fixed offset, which is why this asserts equality unconditionally and
+        the name only when it came back.
         """
         decoded = _round_trip(_ZONED)
 
@@ -110,6 +115,49 @@ class TestExactRoundTrip:
         )
 
         assert "zone" not in encoded
+
+    def test_zoned_datetime_resolves_through_pytz_never_zoneinfo(self):
+        """On a host with a real tz database, `_resolve_zone` must never hand
+        back a `zoneinfo.ZoneInfo`, and the restored UTC offset must be exactly
+        `+01:00`, deterministically.
+
+        `neo4j.time.DateTime` is not a `datetime.datetime` subclass
+        (`neo4j.time.DateTime.__mro__` is `(DateTime, object)`, measured on
+        5.24.0), so it is not the shape the C `zoneinfo` extension's
+        `utcoffset()` is contracted to accept. Confirmed directly: constructing
+        a real `zoneinfo.ZoneInfo` for `Europe/London` (via `zoneinfo.TZPATH`
+        pointed at the IANA data `pytz` already bundles, standing in for a host
+        tz database, since this container has no `tzdata` package) and calling
+        `.utc_offset()` on the decoded value through the OLD
+        (`zoneinfo`-first) `_resolve_zone` segfaults the interpreter outright
+        (exit 139) rather than returning a wrong value -- worse than the 90%
+        wrong-offset rate this bug produces on other builds. The
+        `not isinstance(..., ZoneInfo)` assertion below is checked BEFORE
+        `.utc_offset()` is ever called, specifically so this test fails with a
+        plain `AssertionError` under the current code instead of crashing the
+        test run.
+
+        The neo4j driver hydrates its own temporals with `pytz`
+        (`neo4j/_codec/hydration/v1/temporal.py`), never `zoneinfo`, which is
+        why `pytz` -- not `zoneinfo` -- is the library a restored zone name must
+        resolve through here.
+        """
+        tzdata_dir = os.path.join(os.path.dirname(pytz.__file__), "zoneinfo")
+        original_tzpath = zoneinfo.TZPATH
+        zoneinfo.reset_tzpath(to=[tzdata_dir])
+        zoneinfo.ZoneInfo.clear_cache()
+        try:
+            # Sanity check: this host (simulated) can in fact resolve the name
+            # through zoneinfo, so a pass below is not just an absent tzdata.
+            assert zoneinfo.ZoneInfo("Europe/London") is not None
+
+            decoded = _round_trip(_ZONED)
+        finally:
+            zoneinfo.reset_tzpath(to=list(original_tzpath))
+            zoneinfo.ZoneInfo.clear_cache()
+
+        assert not isinstance(decoded.tzinfo, zoneinfo.ZoneInfo)
+        assert decoded.utc_offset() == timedelta(hours=1)
 
     @pytest.mark.parametrize(
         "value",

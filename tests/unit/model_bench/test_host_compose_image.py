@@ -64,7 +64,9 @@ def test_resolve_image_ref_snapshot_token(tmp_path):
     snapshot_path = tmp_path / "snapshot.json"
     snapshot_path.write_text(json.dumps({"mist-llm": {"Image": "sha256:" + "b" * 64}}))
     ref = resolve_image_ref(
-        "snapshot:mist-llm", compose_path=FIXTURES / "compose_with_digest.yml", snapshot_path=snapshot_path
+        "snapshot:mist-llm",
+        compose_path=FIXTURES / "compose_with_digest.yml",
+        snapshot_path=snapshot_path,
     )
     assert ref == "sha256:" + "b" * 64
 

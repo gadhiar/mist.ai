@@ -1,5 +1,6 @@
-"""`serve`'s handling of a docker inspect FAILURE during the /health wait, as
-distinct from a confirmed exited/absent container (see `test_host_serve_fail_fast.py`
+"""`serve`'s handling of a docker inspect FAILURE during the /health wait.
+
+As distinct from a confirmed exited/absent container (see `test_host_serve_fail_fast.py`
 for that case). This is the exact defect host session S2 attempt 2 hit at 0d3aa54:
 
     `serve c3 --run mb1-fit30 --param ncmoe=30` printed
@@ -87,7 +88,9 @@ class FakeClock:
 
 
 def _common_stubs(monkeypatch, *, docker_rm_calls, docker_stop_calls):
-    monkeypatch.setattr(bench_host, "load_arms_doc", lambda path=bench_host.ARMS_JSON_PATH: FAKE_ARMS_DOC)
+    monkeypatch.setattr(
+        bench_host, "load_arms_doc", lambda path=bench_host.ARMS_JSON_PATH: FAKE_ARMS_DOC
+    )
     monkeypatch.setattr(bench_host, "docker_is_running", lambda name: False)
     monkeypatch.setattr(bench_host, "docker_run_detached", lambda argv: "fake-container-id")
     monkeypatch.setattr(bench_host, "docker_logs", lambda name: ("stdout stub", "stderr stub"))
@@ -95,7 +98,10 @@ def _common_stubs(monkeypatch, *, docker_rm_calls, docker_stop_calls):
         bench_host, "docker_rm", lambda names: docker_rm_calls.append(list(names)), raising=False
     )
     monkeypatch.setattr(
-        bench_host, "docker_stop", lambda names: docker_stop_calls.append(list(names)), raising=False
+        bench_host,
+        "docker_stop",
+        lambda names: docker_stop_calls.append(list(names)),
+        raising=False,
     )
 
 
@@ -116,7 +122,8 @@ def _serve_argv(results_root, models_dir, *, timeout="5"):
 
 def test_transient_inspect_failure_does_not_block_a_successful_serve(monkeypatch, tmp_path, capsys):
     """(a): inspect fails twice with empty stderr while /health is not up yet, then
-    /health answers. serve must return 0 -- no rm, no stop."""
+    /health answers. serve must return 0 -- no rm, no stop.
+    """
     rm_calls: list[list[str]] = []
     stop_calls: list[list[str]] = []
     _common_stubs(monkeypatch, docker_rm_calls=rm_calls, docker_stop_calls=stop_calls)
@@ -162,7 +169,8 @@ def test_transient_inspect_failure_does_not_block_a_successful_serve(monkeypatch
 def test_sustained_inspect_failure_raises_state_unknown_not_exited(monkeypatch, tmp_path, capsys):
     """(c): docker inspect stays unresolvable past unknown_limit_s (180s default).
     serve must fail with a "could not be determined" message, must NOT say
-    "exited", and must NOT docker rm the container."""
+    "exited", and must NOT docker rm the container.
+    """
     rm_calls: list[list[str]] = []
     stop_calls: list[list[str]] = []
     _common_stubs(monkeypatch, docker_rm_calls=rm_calls, docker_stop_calls=stop_calls)
@@ -202,10 +210,13 @@ def test_sustained_inspect_failure_raises_state_unknown_not_exited(monkeypatch, 
 
 def test_serve_preflight_refuses_when_existence_cannot_be_determined(monkeypatch, tmp_path, capsys):
     """(e): if the pre-flight probe of mist-bench-llm itself comes back unknown,
-    serve must refuse rather than assume the name is free."""
+    serve must refuse rather than assume the name is free.
+    """
     run_detached_calls: list[list[str]] = []
 
-    monkeypatch.setattr(bench_host, "load_arms_doc", lambda path=bench_host.ARMS_JSON_PATH: FAKE_ARMS_DOC)
+    monkeypatch.setattr(
+        bench_host, "load_arms_doc", lambda path=bench_host.ARMS_JSON_PATH: FAKE_ARMS_DOC
+    )
     monkeypatch.setattr(bench_host, "docker_is_running", lambda name: False)
     monkeypatch.setattr(
         bench_host,

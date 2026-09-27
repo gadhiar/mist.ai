@@ -150,7 +150,7 @@ class BackupManifest:
         The retention leg compares an artifact's age against a cutoff, and a
         naive datetime silently compares as local time. A value this cannot
         parse raises rather than defaulting to now, because defaulting to now
-        would make an unparseable artifact look new and immortal -- or, with the
+        would make an unparsable artifact look new and immortal -- or, with the
         opposite default, delete it.
 
         Raises:

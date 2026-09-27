@@ -887,7 +887,7 @@ class TestTheTargetPreflight:
     def test_an_artifact_ddl_statement_whose_name_does_not_parse_is_refused(
         self, artifact, restore_target, target_graph, backup_root
     ):
-        # An unparseable name is invisible to every name-keyed schema decision,
+        # An unparsable name is invisible to every name-keyed schema decision,
         # so it silently becomes "always execute" -- the rehearsal's direct cause.
         def unnameable(payload):
             payload["schema"]["constraints"] = ["ALTER CONSTRAINT whatever"]

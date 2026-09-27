@@ -187,9 +187,11 @@ def extract_ttft_row(
     ttft_ms = None if first_content_t is None else (first_content_t - start_t) * 1000.0
     return {
         "ttft_ms": ttft_ms,
-        "total_ms": final_timings.get("predicted_ms", 0) + final_timings.get("prompt_ms", 0)
-        if "predicted_ms" in final_timings and "prompt_ms" in final_timings
-        else None,
+        "total_ms": (
+            final_timings.get("predicted_ms", 0) + final_timings.get("prompt_ms", 0)
+            if "predicted_ms" in final_timings and "prompt_ms" in final_timings
+            else None
+        ),
         "prompt_ms": final_timings.get("prompt_ms"),
         "prompt_per_second": final_timings.get("prompt_per_second"),
         "predicted_n": predicted_n,

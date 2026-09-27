@@ -30,7 +30,12 @@ def test_correctness_expected_prompts_matches_the_probe():
 
 def _mr(value, *, bootstrap=None, complete=True, missing=False, n=10, n_expected=10):
     return analyse.MetricResult(
-        value=value, n=n, n_expected=n_expected, bootstrap=bootstrap, complete=complete, missing=missing
+        value=value,
+        n=n,
+        n_expected=n_expected,
+        bootstrap=bootstrap,
+        complete=complete,
+        missing=missing,
     )
 
 
@@ -38,7 +43,9 @@ def _empty_arm_metrics(arm_id: str) -> analyse.ArmMetrics:
     return analyse.ArmMetrics(arm_id=arm_id)
 
 
-def _run_metrics(arms: dict[str, analyse.ArmMetrics], *, lower=None, upper=None, total_mib=None) -> analyse.RunMetrics:
+def _run_metrics(
+    arms: dict[str, analyse.ArmMetrics], *, lower=None, upper=None, total_mib=None
+) -> analyse.RunMetrics:
     return analyse.RunMetrics(
         arms=arms,
         raw_test_scores={a: {} for a in arms},
@@ -70,9 +77,13 @@ def test_r2_anchor_below_threshold_forces_needs_review():
 
     metrics = _run_metrics(
         {"test-cand": cand, "c0-prod": prod},
-        lower=_mr(1000.0), upper=_mr(2000.0), total_mib=20000.0,
+        lower=_mr(1000.0),
+        upper=_mr(2000.0),
+        total_mib=20000.0,
     )
-    result = analyse.evaluate_r2("switch_to_test", "test-cand", "test-cand-think512", metrics, RULES)
+    result = analyse.evaluate_r2(
+        "switch_to_test", "test-cand", "test-cand-think512", metrics, RULES
+    )
     s1 = next(c for c in result.clauses if c.id == "S1")
     s2 = next(c for c in result.clauses if c.id == "S2")
     assert s1.verdict == "needs-review"
@@ -86,15 +97,21 @@ def test_r2_anchor_below_threshold_forces_needs_review():
 def test_r2_missing_when_anchor_arm_absent():
     cand = _empty_arm_metrics("test-cand")
     cand.harness_score = {"schema_conformance_json_object": _mr(0.9)}
-    metrics = _run_metrics({"test-cand": cand}, lower=_mr(1000.0), upper=_mr(2000.0), total_mib=20000.0)
-    result = analyse.evaluate_r2("switch_to_test", "test-cand", "test-cand-think512", metrics, RULES)
+    metrics = _run_metrics(
+        {"test-cand": cand}, lower=_mr(1000.0), upper=_mr(2000.0), total_mib=20000.0
+    )
+    result = analyse.evaluate_r2(
+        "switch_to_test", "test-cand", "test-cand-think512", metrics, RULES
+    )
     s1 = next(c for c in result.clauses if c.id == "S1")
     assert s1.verdict == "missing"
 
 
 def test_r2_fully_missing_when_candidate_arm_absent():
     metrics = _run_metrics({}, lower=_mr(3000.0), upper=_mr(4000.0), total_mib=20000.0)
-    result = analyse.evaluate_r2("switch_to_ghost", "ghost-arm", "ghost-arm-think512", metrics, RULES)
+    result = analyse.evaluate_r2(
+        "switch_to_ghost", "ghost-arm", "ghost-arm-think512", metrics, RULES
+    )
     assert result.verdict == "missing"
     for clause in result.clauses:
         assert clause.verdict == "missing"
@@ -103,7 +120,9 @@ def test_r2_fully_missing_when_candidate_arm_absent():
 def test_f_clause_fail_when_even_the_lower_estimate_does_not_fit():
     cand = _empty_arm_metrics("test-cand")
     cand.arm_peak_mib = _mr(15000.0)
-    metrics = _run_metrics({"test-cand": cand}, lower=_mr(1000.0), upper=_mr(2000.0), total_mib=16000.0)
+    metrics = _run_metrics(
+        {"test-cand": cand}, lower=_mr(1000.0), upper=_mr(2000.0), total_mib=16000.0
+    )
     clause = analyse._f_clause("test-cand", metrics, RULES["constants"]["margin_mib"])
     assert clause.verdict == "fail"
 
@@ -111,7 +130,9 @@ def test_f_clause_fail_when_even_the_lower_estimate_does_not_fit():
 def test_f_clause_pass_when_upper_estimate_fits():
     cand = _empty_arm_metrics("test-cand")
     cand.arm_peak_mib = _mr(1000.0)
-    metrics = _run_metrics({"test-cand": cand}, lower=_mr(500.0), upper=_mr(1000.0), total_mib=10000.0)
+    metrics = _run_metrics(
+        {"test-cand": cand}, lower=_mr(500.0), upper=_mr(1000.0), total_mib=10000.0
+    )
     clause = analyse._f_clause("test-cand", metrics, RULES["constants"]["margin_mib"])
     assert clause.verdict == "pass"
 
@@ -119,7 +140,9 @@ def test_f_clause_pass_when_upper_estimate_fits():
 def test_f_clause_needs_review_between_lower_and_upper():
     cand = _empty_arm_metrics("test-cand")
     cand.arm_peak_mib = _mr(8500.0)
-    metrics = _run_metrics({"test-cand": cand}, lower=_mr(2500.0), upper=_mr(3700.0), total_mib=12288.0)
+    metrics = _run_metrics(
+        {"test-cand": cand}, lower=_mr(2500.0), upper=_mr(3700.0), total_mib=12288.0
+    )
     clause = analyse._f_clause("test-cand", metrics, RULES["constants"]["margin_mib"])
     assert clause.verdict == "needs-review"
 
@@ -195,7 +218,10 @@ def test_x3_f_sep_passes_where_v1_f_fails_outright():
     anchor.harness_score = {"schema_conformance_json_object": _mr(0.9), "tool_selection": _mr(0.95)}
 
     metrics = _run_metrics(
-        {"c2": cand, "c0-prod": anchor}, lower=_mr(1000.0), upper=_mr(2000.0), total_mib=16000.0,
+        {"c2": cand, "c0-prod": anchor},
+        lower=_mr(1000.0),
+        upper=_mr(2000.0),
+        total_mib=16000.0,
     )
 
     f_v1 = analyse._f_clause("c2", metrics, RULES["constants"]["margin_mib"])
@@ -257,7 +283,14 @@ def test_r5_missing_when_both_voice_metrics_absent():
 
 def _clause(clause_id: str, verdict: str) -> analyse.ClauseResult:
     return analyse.ClauseResult(
-        id=clause_id, metric="m", arm=None, value=None, threshold=None, op=None, verdict=verdict, margin="n/a",
+        id=clause_id,
+        metric="m",
+        arm=None,
+        value=None,
+        threshold=None,
+        op=None,
+        verdict=verdict,
+        margin="n/a",
     )
 
 
@@ -267,11 +300,18 @@ def test_r5_missing_not_not_triggered_when_lower_triggers_and_r2_incomplete():
     # that candidate might have matched had the data been complete, so this must not
     # silently read as a clean not-triggered.
     r2_incomplete = analyse.RuleResult(
-        id="R2", kind="gate", label="switch_to_incomplete",
-        question="q", verdict="missing",
+        id="R2",
+        kind="gate",
+        label="switch_to_incomplete",
+        question="q",
+        verdict="missing",
         clauses=[
-            _clause("L", "pass"), _clause("S1", "missing"), _clause("S2", "pass"),
-            _clause("D", "pass"), _clause("P", "pass"), _clause("F", "fail"),
+            _clause("L", "pass"),
+            _clause("S1", "missing"),
+            _clause("S2", "pass"),
+            _clause("D", "pass"),
+            _clause("P", "pass"),
+            _clause("F", "fail"),
         ],
         info={"candidate": "incomplete-cand"},
     )
@@ -285,11 +325,18 @@ def test_r5_not_triggered_stays_clean_when_r2_fully_evaluated_and_none_match():
     # Same lower-triggers-and-nothing-matches shape, but every R2 clause is
     # conclusively pass/fail (no "missing") -- this IS a clean not-triggered.
     r2_clean = analyse.RuleResult(
-        id="R2", kind="gate", label="switch_to_clean",
-        question="q", verdict="fail",
+        id="R2",
+        kind="gate",
+        label="switch_to_clean",
+        question="q",
+        verdict="fail",
         clauses=[
-            _clause("L", "fail"), _clause("S1", "pass"), _clause("S2", "pass"),
-            _clause("D", "pass"), _clause("P", "pass"), _clause("F", "pass"),
+            _clause("L", "fail"),
+            _clause("S1", "pass"),
+            _clause("S2", "pass"),
+            _clause("D", "pass"),
+            _clause("P", "pass"),
+            _clause("F", "pass"),
         ],
         info={"candidate": "clean-cand"},
     )
@@ -306,7 +353,9 @@ def test_r5_not_triggered_stays_clean_when_r2_fully_evaluated_and_none_match():
 EXPECTED_PROMPTS = RULES["constants"]["correctness_expected_prompts"]
 
 
-def _correctness_rows(n: int, *, mismatch_pid: str | None = None, error_pid: str | None = None) -> list[dict]:
+def _correctness_rows(
+    n: int, *, mismatch_pid: str | None = None, error_pid: str | None = None
+) -> list[dict]:
     """Build n synthetic correctness.jsonl rows, p01..p0n, each with distinct tokens.
 
     `mismatch_pid` gives that one row different tokens from the "canonical" set (used to

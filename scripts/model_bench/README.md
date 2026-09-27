@@ -42,7 +42,7 @@ is an argv list, `shell=False` (the `subprocess` default).
    `[FAIL]` with the exit code (or "no longer exists"), saves `docker logs` to
    `<results>/<run>/<arm>/serve_failed_<UTC>.log`, removes the container (skipped if it no longer
    exists), and exits non-zero within a few seconds. If the container's state instead cannot be
-   determined (docker inspect failing, timing out, or returning something unparseable -- e.g. a
+   determined (docker inspect failing, timing out, or returning something unparsable -- e.g. a
    slow docker CLI/daemon under low host memory, the exact S2 false positive this replaced) for
    longer than 180s with no confirmed reading in between, `serve` prints `[FAIL]` with a "could not
    be determined" message, tries to save `docker logs` (a `[WARN]` if that itself fails), and
