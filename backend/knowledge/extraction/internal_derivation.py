@@ -102,17 +102,17 @@ def parse_derivation_output(raw: str | None, *, strict: bool) -> list[dict]:
     """Parse Stage 9 LLM output into a list of self-model operations.
 
     Non-strict (`strict=False`, the in-process pipeline's historical
-    behavior): returns `[]` on missing/unparseable JSON rather than
+    behavior): returns `[]` on missing/unparsable JSON rather than
     raising -- `derive()` already logs and degrades to "no operations".
 
     Strict (`strict=True`, the extraction service): raises so the caller
     can distinguish "valid output with zero operations" from
-    "unparseable output" instead of silently treating both as "nothing to
+    "unparsable output" instead of silently treating both as "nothing to
     derive".
 
     Args:
         raw: Raw string output from the LLM (may be None).
-        strict: When True, raise on unparseable/malformed input instead of
+        strict: When True, raise on unparsable/malformed input instead of
             returning an empty list.
 
     Returns:
@@ -237,7 +237,7 @@ class InternalKnowledgeDeriver:
             elapsed = (time.perf_counter() - start) * 1000
             return InternalDerivationResult(derivation_time_ms=elapsed, llm_called=True)
 
-        # Parse response. Non-strict: falls back to [] on unparseable output
+        # Parse response. Non-strict: falls back to [] on unparsable output
         # rather than raising -- this method's historical behavior.
         operations = parse_derivation_output(raw, strict=False)
 
