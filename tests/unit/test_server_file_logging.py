@@ -130,8 +130,15 @@ def test_configure_file_logging_creates_file_logs_and_is_idempotent(tmp_path, cl
     second_handler = configure_file_logging(log_dir)
     assert second_handler is first_handler
 
-    file_handlers = [h for h in clean_root_logger.handlers if isinstance(h, logging.FileHandler)]
-    assert len(file_handlers) == 1
+    # Scoped to handlers pointing at *this* log file: the root logger may
+    # carry unrelated FileHandlers (for example pytest's own logging setup),
+    # and this test only asserts configure_file_logging's own idempotency.
+    matching_handlers = [
+        h
+        for h in clean_root_logger.handlers
+        if isinstance(h, logging.FileHandler) and Path(h.baseFilename) == log_file.resolve()
+    ]
+    assert len(matching_handlers) == 1
 
 
 def test_resolve_log_dir_prefers_env_var(monkeypatch, tmp_path):
