@@ -317,13 +317,14 @@ class CurationGraphWriter:
         - the dispatcher processes only the backlog head, taken in
           `ExtractionDispatcher._step`:
           `grep -n 'head = scan.head' backend/extraction_backlog/dispatcher.py`;
-        - the head is the first pending turn in replay order:
-          `grep -n 'return self.pending.0. if' backend/extraction_backlog/store.py`
-          -> 217 (`BacklogScan.head`);
-        - only an `applied` marker takes a turn out of the pending list, so a
-          crashed turn N stays pending and ahead of every later turn:
-          `grep -n 'if stage == STAGE_APPLIED' backend/extraction_backlog/store.py`
-          -> 475.
+        - the head is the first pending turn in replay order (`BacklogScan.head`
+          in `backend/extraction_backlog/store.py`):
+          `grep -n 'return self.pending.0. if' backend/extraction_backlog/store.py`;
+        - `BacklogStore.scan` drops a turn from the pending list only when it
+          has an `applied` marker beside a cache row for the epoch, or is a
+          legacy turn, so a crashed turn N (no `applied` marker yet) stays
+          pending and ahead of every later turn:
+          `grep -n 'if stage == STAGE_APPLIED' backend/extraction_backlog/store.py`.
 
         Why the edge MERGE is in this statement (plan v2 follow-up). When the
         edge was a separate statement after this one, a kill between the two
