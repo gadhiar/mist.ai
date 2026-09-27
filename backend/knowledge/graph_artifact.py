@@ -117,32 +117,35 @@ def _zone_name(tzinfo: Any) -> str | None:
 
 
 def _resolve_zone(name: str) -> Any | None:
-    """Resolve an IANA zone name to a tzinfo, or None when this host cannot.
+    """Resolve an IANA zone name to a tzinfo through `pytz`, or None when this
+    host cannot.
 
-    Both spellings are tried because neither is guaranteed: the backend image
-    has `pytz` 2026.1.post1 but no `tzdata`, so `ZoneInfo("Europe/London")`
-    raises `ZoneInfoNotFoundError` there while `pytz.timezone("Europe/London")`
-    succeeds (measured in the backend container).
+    `pytz` only, deliberately, never `zoneinfo.ZoneInfo`: `neo4j.time.DateTime`
+    is not a `datetime.datetime` subclass (its `__mro__` is
+    `(DateTime, object)`, measured on 5.24.0), so it is not the shape the C
+    `zoneinfo` extension's `utcoffset()` is contracted to accept. Handing it a
+    `neo4j.time.DateTime` anyway is not a theoretical concern -- measured
+    directly against this codec on Python 3.11.0rc1, calling `.utc_offset()` on
+    a value decoded with a `ZoneInfo` attached segfaults or returns wrong
+    offsets (undefined behaviour). `pytz` is safe here for the same reason it
+    is already the correct choice: the neo4j driver hydrates its own
+    temporals with `pytz` (`neo4j/_codec/hydration/v1/temporal.py`), so every
+    zoned value this codec restores is exercised against the library the
+    driver itself uses, never a second, incompatible one.
 
     Returning None rather than raising is deliberate, and it is not a
     best-effort load: the zone NAME is extra fidelity, not part of the value's
     identity. A zoned DateTime stringifies to a fixed offset
     (`...T12:00:00.000000000+01:00`), and the value decoded from that offset
     compares EQUAL to the original zoned value -- measured `True` on 5.24.0. So
-    a host whose tz database lacks the name still restores an equal value, and
-    refusing the whole artifact over a cosmetic tzinfo difference would turn a
-    tzdata mismatch into a failed disaster recovery.
+    a host whose `pytz` release lacks the name still restores an equal value,
+    and refusing the whole artifact over a cosmetic tzinfo difference would
+    turn a tz-database mismatch into a failed disaster recovery.
     """
-    # Both lookups raise a KeyError subclass for an unknown name --
-    # `zoneinfo.ZoneInfoNotFoundError` and `pytz.exceptions.UnknownTimeZoneError`
-    # -- and ImportError when the library itself is absent. Neither is bare
-    # `Exception`: a different failure here is a bug and must not be swallowed.
-    try:
-        from zoneinfo import ZoneInfo
-
-        return ZoneInfo(name)
-    except (ImportError, KeyError, ValueError):
-        pass
+    # `pytz.exceptions.UnknownTimeZoneError` is a KeyError subclass, raised for
+    # an unknown name; ImportError covers the library itself being absent.
+    # Neither is bare `Exception`: a different failure here is a bug and must
+    # not be swallowed.
     try:
         import pytz
 

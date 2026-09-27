@@ -89,8 +89,11 @@ RUN pip install --no-deps "$FLASH_ATTN_WHEEL" \
 RUN python -c "import flash_attn; print('[FLASH-ATTN IMPORT OK]', flash_attn.__version__)" \
     || echo "[FLASH-ATTN IMPORT FAILED at build time] symbol mismatch with torch's ABI -- voice attention will fall back to PyTorch SDPA at runtime"
 
-# 6. Test dependencies
-RUN pip install pytest>=8.0 pytest-asyncio>=0.24
+# 6. Test dependencies. Quoted and pinned to the versions requirements.txt already
+# installs (step 3): the previous unquoted `pytest>=8.0 pytest-asyncio>=0.24` let the
+# shell treat each `>=` as an output redirect, so it installed nothing and silently
+# ran on whatever pytest/pytest-asyncio requirements.txt had already put in place.
+RUN pip install "pytest==7.4.4" "pytest-asyncio==0.23.8"
 
 # --- Application code ---
 WORKDIR /app

@@ -13,6 +13,39 @@ from tests.mocks.config import build_test_config
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
 
+# Resolve path relative to repo root regardless of pytest invocation directory,
+# matching the convention in tests/unit/knowledge/test_seed_data.py and
+# tests/unit/knowledge/seed/test_seed_gates.py.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_VAULT_ROOT = _REPO_ROOT / "mist-memory"
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Skip `requires_vault` items when the private vault is absent.
+
+    `mist-memory/` is gitignored (`.gitignore:39`) and absent from CI, fresh
+    clones and delegate worktrees, so the tests it backs cannot load real
+    seed/runtime content there. Skipping here -- rather than each test
+    checking for itself -- keeps the skip reason and the marker registration
+    (`pyproject.toml`'s `markers`) in one place.
+
+    Only the vault directory's presence gates the skip. A test that reaches
+    the vault and finds a file missing inside it still runs and fails: that
+    is a real regression on a machine where the vault is checked out, not a
+    reason to skip.
+    """
+    if _VAULT_ROOT.is_dir():
+        return
+    skip_reason = pytest.mark.skip(
+        reason=(
+            f"requires the private mist-memory/ vault at {_VAULT_ROOT}, "
+            "which is gitignored and absent from this checkout"
+        )
+    )
+    for item in items:
+        if item.get_closest_marker("requires_vault") is not None:
+            item.add_marker(skip_reason)
+
 
 @pytest.fixture(autouse=True)
 def _guard_unit_tier_against_live_neo4j(monkeypatch):

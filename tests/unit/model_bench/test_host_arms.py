@@ -79,7 +79,11 @@ def test_build_docker_run_args_argv_is_all_strings(arm_id):
     arm = resolve_arm(ARMS_DOC, arm_id)
     params = {p: "12" for p in arm["params_required"]}
     argv = build_docker_run_args(
-        arm, ARMS_DOC, image_ref="dummy:image@sha256:" + "a" * 64, models_dir="/models", params=params
+        arm,
+        ARMS_DOC,
+        image_ref="dummy:image@sha256:" + "a" * 64,
+        models_dir="/models",
+        params=params,
     )
     assert all(isinstance(tok, str) for tok in argv)
     assert argv[0] == "docker"

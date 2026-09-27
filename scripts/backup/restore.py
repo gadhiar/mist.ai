@@ -832,15 +832,15 @@ def assert_artifact_ddl_names_parse(schema: dict[str, list[str]]) -> None:
     Raises:
         RestoreTargetStateError: When any statement's object name does not parse.
     """
-    unparseable = [
+    unparsable = [
         statement
         for statement in list(schema.get("constraints") or []) + list(schema.get("indexes") or [])
         if parse_ddl_object_name(statement) is None
     ]
-    if unparseable:
+    if unparsable:
         raise RestoreTargetStateError(
-            f"refusing to restore: {len(unparseable)} schema statement(s) in this "
-            f"artifact name no object this build can parse: {unparseable[:3]}. A "
+            f"refusing to restore: {len(unparsable)} schema statement(s) in this "
+            f"artifact name no object this build can parse: {unparsable[:3]}. A "
             "statement that cannot be named cannot be compared against anything on "
             "the target, so it would be executed unconditionally and rejected part "
             "way through the graph leg. The target is still bit-for-bit untouched. "

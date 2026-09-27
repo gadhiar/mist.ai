@@ -61,7 +61,9 @@ def test_run_writes_expected_files(tmp_path):
 
 
 def test_threshold_change_flips_r1_verdict(tmp_path):
-    rules = json.loads((_REPO_ROOT / "scripts" / "model_bench" / "decision_rules.json").read_text(encoding="utf-8"))
+    rules = json.loads(
+        (_REPO_ROOT / "scripts" / "model_bench" / "decision_rules.json").read_text(encoding="utf-8")
+    )
     outputs_before = analyse.generate_outputs(FIXTURE_RUN)
     summary_before = json.loads(outputs_before.files["summary.json"])
     r1_before = next(r for r in summary_before["rules"] if r["id"] == "R1")
@@ -79,7 +81,9 @@ def test_threshold_change_flips_r1_verdict(tmp_path):
 
 
 def test_validate_decision_rules_flags_unknown_arm(tmp_path):
-    rules = json.loads((_REPO_ROOT / "scripts" / "model_bench" / "decision_rules.json").read_text(encoding="utf-8"))
+    rules = json.loads(
+        (_REPO_ROOT / "scripts" / "model_bench" / "decision_rules.json").read_text(encoding="utf-8")
+    )
     arms = analyse.load_arms()
     rules["constants"]["r7_build_pair"]["new"] = "does-not-exist"
     problems = analyse.validate_decision_rules(rules, arms)

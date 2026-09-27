@@ -68,19 +68,26 @@ def test_first_call_with_no_existing_meta_builds_the_full_document():
 def test_suites_completed_is_the_union_kept_in_run_order():
     first = merge_run_meta(None, _base_call(suites=["ttft"], suites_completed=["ttft"]))
     second_call = _base_call(
-        suites=["correctness"], suites_completed=["correctness"], rep=1,
-        started_utc="2026-01-01T00:05:00+00:00", finished_utc="2026-01-01T00:06:00+00:00",
+        suites=["correctness"],
+        suites_completed=["correctness"],
+        rep=1,
+        started_utc="2026-01-01T00:05:00+00:00",
+        finished_utc="2026-01-01T00:06:00+00:00",
     )
     merged = merge_run_meta(first, second_call)
     # RUN_SUITE_ORDER = ttft, correctness, harness, layout -- union kept in that order
     # regardless of the order the two calls happened in.
-    assert merged["suites_completed"] == [s for s in RUN_SUITE_ORDER if s in ("ttft", "correctness")]
+    assert merged["suites_completed"] == [
+        s for s in RUN_SUITE_ORDER if s in ("ttft", "correctness")
+    ]
     assert len(merged["calls"]) == 2
 
 
 def test_errors_accumulate_across_calls():
     first = merge_run_meta(None, _base_call(errors=["harness exited 1"]))
-    second = merge_run_meta(first, _base_call(suites=["correctness"], errors=["correctness: timeout"]))
+    second = merge_run_meta(
+        first, _base_call(suites=["correctness"], errors=["correctness: timeout"])
+    )
     assert second["errors"] == ["harness exited 1", "correctness: timeout"]
 
 
@@ -88,14 +95,18 @@ def test_layout_becomes_a_dict_keyed_by_pass_not_a_single_last_pass_dict():
     first = merge_run_meta(
         None,
         _base_call(
-            suites=["layout"], suites_completed=["layout"], layout_pass="screen",
+            suites=["layout"],
+            suites_completed=["layout"],
+            layout_pass="screen",
             layout_result={"layouts_per_size": 2, "thinking": "off", "max_tokens": 256},
         ),
     )
     second = merge_run_meta(
         first,
         _base_call(
-            suites=["layout"], suites_completed=["layout"], layout_pass="finalist",
+            suites=["layout"],
+            suites_completed=["layout"],
+            layout_pass="finalist",
             layout_result={"layouts_per_size": 6, "thinking": "off", "max_tokens": 256},
         ),
     )
@@ -111,19 +122,26 @@ def test_harness_is_set_by_whichever_call_ran_it_and_persists_after():
     )
     assert first["harness"] == harness_cfg
     # A later call that does NOT run harness must leave the existing value untouched.
-    second = merge_run_meta(first, _base_call(suites=["correctness"], suites_completed=["correctness"]))
+    second = merge_run_meta(
+        first, _base_call(suites=["correctness"], suites_completed=["correctness"])
+    )
     assert second["harness"] == harness_cfg
 
 
 def test_started_utc_is_the_first_calls_start_finished_utc_is_the_latest():
     first = merge_run_meta(
-        None, _base_call(started_utc="2026-01-01T00:00:00+00:00", finished_utc="2026-01-01T00:01:00+00:00")
+        None,
+        _base_call(
+            started_utc="2026-01-01T00:00:00+00:00", finished_utc="2026-01-01T00:01:00+00:00"
+        ),
     )
     second = merge_run_meta(
         first,
         _base_call(
-            suites=["correctness"], suites_completed=["correctness"],
-            started_utc="2026-01-01T05:00:00+00:00", finished_utc="2026-01-01T05:02:00+00:00",
+            suites=["correctness"],
+            suites_completed=["correctness"],
+            started_utc="2026-01-01T05:00:00+00:00",
+            finished_utc="2026-01-01T05:02:00+00:00",
         ),
     )
     assert second["started_utc"] == "2026-01-01T00:00:00+00:00"
@@ -134,8 +152,15 @@ def test_calls_list_records_the_documented_per_call_fields():
     merged = merge_run_meta(None, _base_call(rep=2, layout_pass="finalist"))
     entry = merged["calls"][0]
     assert set(entry) == {
-        "started_utc", "finished_utc", "suites", "rep", "layout_pass", "props",
-        "container_args", "errors", "decision_rules_sha256",
+        "started_utc",
+        "finished_utc",
+        "suites",
+        "rep",
+        "layout_pass",
+        "props",
+        "container_args",
+        "errors",
+        "decision_rules_sha256",
     }
     assert entry["decision_rules_sha256"] == "deadbeef"
     assert entry["rep"] == 2
@@ -188,7 +213,8 @@ def test_superseded_decision_rules_sha_merges_and_latest_wins():
     merged = merge_run_meta(
         existing,
         _base_call(
-            suites=["correctness"], suites_completed=["correctness"],
+            suites=["correctness"],
+            suites_completed=["correctness"],
             decision_rules_sha256="v2sha",
         ),
         superseded_rules_shas=frozenset({"v1sha"}),
@@ -204,7 +230,8 @@ def test_non_identity_fields_are_allowed_to_differ_between_calls():
     merge_run_meta(
         existing,
         _base_call(
-            suites=["correctness"], suites_completed=["correctness"],
+            suites=["correctness"],
+            suites_completed=["correctness"],
             props={"model_path": "/models/x.gguf", "extra": "field"},
             container_args=["-m", "/models/x.gguf", "--extra-flag"],
             git={"mist_ai": "def456", "mist_ai_dirty": True, "command_center": "abc"},

@@ -101,7 +101,7 @@ def _make_fake_server(responses: list[dict]) -> HTTPServer:
         def log_message(self, fmt, *args):  # noqa: A002 - stdlib signature
             pass  # silence per-request stderr logging during tests
 
-        def do_GET(self):
+        def do_GET(self):  # noqa: N802 -- http.server's BaseHTTPRequestHandler mandates this name
             if self.path == "/health":
                 body = b"{}"
                 self.send_response(200)
@@ -113,7 +113,7 @@ def _make_fake_server(responses: list[dict]) -> HTTPServer:
                 self.send_response(404)
                 self.end_headers()
 
-        def do_POST(self):
+        def do_POST(self):  # noqa: N802 -- http.server's BaseHTTPRequestHandler mandates this name
             length = int(self.headers.get("Content-Length", 0))
             self.rfile.read(length)  # drain the request body, unused by the fake
             index = self.server.call_index  # type: ignore[attr-defined]

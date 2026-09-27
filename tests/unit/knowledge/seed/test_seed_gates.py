@@ -12,6 +12,8 @@ that a token like `seed_version` appears somewhere in the query.
 
 from pathlib import Path
 
+import pytest
+
 from backend.knowledge.embeddings.embedding_text import embedding_text_for
 from backend.knowledge.seed.gates import (
     _node_by_id,
@@ -575,6 +577,7 @@ class TestNegationProximity:
         assert not check_negation_proximity(docs).passed
 
 
+@pytest.mark.requires_vault
 class TestNegationProximityRealSource:
     """C1 (R1.4 whole-branch review): a gate exercised only by fixtures where
     the guarded thing is reachable proves nothing about whether it is
@@ -1287,6 +1290,7 @@ def _consistent_graph_rows(documents: list[SeedDocument]) -> dict[str, list[dict
     return rows
 
 
+@pytest.mark.requires_vault
 class TestEmbeddingGateRealSource:
     """The same discipline `TestNegationProximityRealSource` established, for
     the embedding gate: fixtures prove a gate CAN fire, only real source

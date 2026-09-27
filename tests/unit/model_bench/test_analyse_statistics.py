@@ -63,15 +63,23 @@ def test_bootstrap_reproducible_with_seed():
         "c": [1.0],
         "d": [1.0, 1.0, 1.0, 0.0],
     }
-    ci1 = analyse.cluster_bootstrap_ci(values_by_cluster, B=2000, seed=20260924, confidence=0.95)
-    ci2 = analyse.cluster_bootstrap_ci(values_by_cluster, B=2000, seed=20260924, confidence=0.95)
+    ci1 = analyse.cluster_bootstrap_ci(
+        values_by_cluster, n_replicates=2000, seed=20260924, confidence=0.95
+    )
+    ci2 = analyse.cluster_bootstrap_ci(
+        values_by_cluster, n_replicates=2000, seed=20260924, confidence=0.95
+    )
     assert ci1 == ci2  # exact equality: same seed, same data, same algorithm
 
 
 def test_bootstrap_different_seed_can_differ():
     values_by_cluster = {"a": [1.0, 0.0], "b": [1.0], "c": [0.0, 0.0, 1.0]}
-    ci_a = analyse.cluster_bootstrap_ci(values_by_cluster, B=500, seed=1, confidence=0.95)
-    ci_b = analyse.cluster_bootstrap_ci(values_by_cluster, B=500, seed=2, confidence=0.95)
+    ci_a = analyse.cluster_bootstrap_ci(
+        values_by_cluster, n_replicates=500, seed=1, confidence=0.95
+    )
+    ci_b = analyse.cluster_bootstrap_ci(
+        values_by_cluster, n_replicates=500, seed=2, confidence=0.95
+    )
     assert ci_a is not None and ci_b is not None
     # Not asserting inequality (they could coincide), only that both are valid CIs.
     for lo, hi in (ci_a, ci_b):
@@ -79,13 +87,15 @@ def test_bootstrap_different_seed_can_differ():
 
 
 def test_bootstrap_empty_clusters_returns_none():
-    assert analyse.cluster_bootstrap_ci({}, B=100, seed=1, confidence=0.95) is None
+    assert analyse.cluster_bootstrap_ci({}, n_replicates=100, seed=1, confidence=0.95) is None
 
 
 def test_bootstrap_ci_contains_sample_mean_for_homogeneous_data():
     # All clusters identical value -> CI collapses to a point at that value.
     values_by_cluster = {"a": [1.0, 1.0], "b": [1.0], "c": [1.0, 1.0, 1.0]}
-    lo, hi = analyse.cluster_bootstrap_ci(values_by_cluster, B=1000, seed=42, confidence=0.95)
+    lo, hi = analyse.cluster_bootstrap_ci(
+        values_by_cluster, n_replicates=1000, seed=42, confidence=0.95
+    )
     assert lo == pytest.approx(1.0)
     assert hi == pytest.approx(1.0)
 

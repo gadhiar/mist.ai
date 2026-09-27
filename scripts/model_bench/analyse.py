@@ -125,7 +125,7 @@ def nearest_rank_percentile(values: list[float], p: float) -> float | None:
 
 
 def cluster_bootstrap_ci(
-    values_by_cluster: dict[str, list[float]], *, B: int, seed: int, confidence: float
+    values_by_cluster: dict[str, list[float]], *, n_replicates: int, seed: int, confidence: float
 ) -> tuple[float, float] | None:
     """Percentile cluster bootstrap CI: resample cluster ids with replacement.
 
@@ -133,8 +133,8 @@ def cluster_bootstrap_ci(
     original data (with replacement), keeps every row-level value in a
     resampled cluster, and takes the mean over the pooled values. The CI
     bounds are the nearest-rank (100*alpha/2) and (100*(1-alpha/2))
-    percentiles of the B replicate means, so this is deterministic for a
-    fixed seed and a fixed input dict.
+    percentiles of the n_replicates replicate means, so this is deterministic
+    for a fixed seed and a fixed input dict.
     """
     clusters = sorted(values_by_cluster)
     if not clusters:
@@ -142,7 +142,7 @@ def cluster_bootstrap_ci(
     rng = random.Random(seed)
     n_clusters = len(clusters)
     replicate_means: list[float] = []
-    for _ in range(B):
+    for _ in range(n_replicates):
         pooled: list[float] = []
         for _ in range(n_clusters):
             cluster = clusters[rng.randrange(n_clusters)]
@@ -155,7 +155,9 @@ def cluster_bootstrap_ci(
     return (lo, hi)
 
 
-def margin_for(value: float | None, ci: tuple[float, float] | None, threshold: float, op: str) -> str:
+def margin_for(
+    value: float | None, ci: tuple[float, float] | None, threshold: float, op: str
+) -> str:
     """Clause margin: clear if the bootstrap CI lies entirely on one side of the threshold."""
     if ci is None:
         return "n/a"
@@ -182,6 +184,8 @@ def margin_for(value: float | None, ci: tuple[float, float] | None, threshold: f
 
 @dataclass
 class MetricResult:
+    """A single metric's value together with its coverage, CIs, and completeness flags."""
+
     value: float | None
     n: int | None = None
     n_expected: int | None = None
@@ -198,6 +202,7 @@ class MetricResult:
         return not self.missing and self.complete and self.value is not None
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize to the plain-dict shape written into summary.json."""
         return {
             "value": self.value,
             "n": self.n,
@@ -315,7 +320,9 @@ def validate_decision_rules(rules: dict[str, Any], arms: dict[str, Any]) -> list
     stats = rules.get("statistics", {})
     bootstrap = stats.get("bootstrap", {})
     if bootstrap.get("B") != 10000 or bootstrap.get("seed") != 20260924:
-        problems.append("statistics.bootstrap.B/seed do not match the pre-registered B=10000, seed=20260924")
+        problems.append(
+            "statistics.bootstrap.B/seed do not match the pre-registered B=10000, seed=20260924"
+        )
 
     return problems
 
@@ -327,6 +334,8 @@ def validate_decision_rules(rules: dict[str, Any], arms: dict[str, Any]) -> list
 
 @dataclass
 class ArmInputs:
+    """One arm's raw loaded inputs from its results directory, pre-aggregation."""
+
     arm_id: str
     dir: Path
     meta: dict[str, Any] | None
@@ -352,7 +361,7 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
-    with open(path, "r", encoding="utf-8", newline="") as fh:
+    with open(path, encoding="utf-8", newline="") as fh:
         reader = csv.DictReader(fh)
         return [dict(row) for row in reader]
 
@@ -401,6 +410,8 @@ def load_arm_inputs(results_dir: Path, arm_id: str) -> ArmInputs:
 
 @dataclass
 class SessionInputs:
+    """The run's session-level (cross-arm) VRAM and manual-observation inputs."""
+
     vram_steps: dict[str, dict[str, Any]]  # label -> step dict
     manual: dict[str, dict[str, Any]]  # arm_id -> {memtest_errors, whea_events}
     total_mib: float | None
@@ -436,7 +447,9 @@ BOOTSTRAP_CONFIDENCE_DEFAULT = 0.95
 WILSON_Z_DEFAULT = 1.9599639845400545
 
 
-def compute_layout_acc(rows: list[dict[str, Any]] | None, n_expected: int, stats_cfg: dict[str, Any]) -> MetricResult:
+def compute_layout_acc(
+    rows: list[dict[str, Any]] | None, n_expected: int, stats_cfg: dict[str, Any]
+) -> MetricResult:
     if not rows:
         return missing_metric("no layout rows for this pass")
     accuracy_rows = [r for r in rows if r.get("phase") == "accuracy"]
@@ -453,7 +466,7 @@ def compute_layout_acc(rows: list[dict[str, Any]] | None, n_expected: int, stats
         values_by_cluster.setdefault(cluster, []).append(1.0 if r.get("correct") is True else 0.0)
     bootstrap = cluster_bootstrap_ci(
         values_by_cluster,
-        B=stats_cfg["B"],
+        n_replicates=stats_cfg["B"],
         seed=stats_cfg["seed"],
         confidence=stats_cfg["confidence"],
     )
@@ -542,7 +555,7 @@ def compute_harness_scores_for_arm(
         bootstrap = (
             cluster_bootstrap_ci(
                 values_by_cluster,
-                B=stats_cfg["B"],
+                n_replicates=stats_cfg["B"],
                 seed=stats_cfg["seed"],
                 confidence=stats_cfg["confidence"],
             )
@@ -586,24 +599,38 @@ def compute_truncation_rate(
     values_by_cluster: dict[str, list[float]] = {}
     for r in records:
         cluster = str(r.get("case_id"))
-        values_by_cluster.setdefault(cluster, []).append(1.0 if r.get("finish_reason") == "length" else 0.0)
+        values_by_cluster.setdefault(cluster, []).append(
+            1.0 if r.get("finish_reason") == "length" else 0.0
+        )
     bootstrap = cluster_bootstrap_ci(
-        values_by_cluster, B=stats_cfg["B"], seed=stats_cfg["seed"], confidence=stats_cfg["confidence"]
+        values_by_cluster,
+        n_replicates=stats_cfg["B"],
+        seed=stats_cfg["seed"],
+        confidence=stats_cfg["confidence"],
     )
     note = None if complete else f"incomplete coverage: {n}/{cases_expected}"
     return MetricResult(
-        value=value, n=n, n_expected=cases_expected, k=k, wilson=wilson, bootstrap=bootstrap,
-        complete=complete, note=note,
+        value=value,
+        n=n,
+        n_expected=cases_expected,
+        k=k,
+        wilson=wilson,
+        bootstrap=bootstrap,
+        complete=complete,
+        note=note,
     )
 
 
 def compute_decode_tps(rows: list[dict[str, Any]], ctx_target: int, min_rows: int) -> MetricResult:
     filtered = [
-        r for r in rows
+        r
+        for r in rows
         if r.get("ctx_target") == ctx_target and r.get("warmup") is False and r.get("error") is None
     ]
     if len(filtered) < min_rows:
-        return missing_metric(f"only {len(filtered)} ttft rows at ctx={ctx_target} (need >= {min_rows})")
+        return missing_metric(
+            f"only {len(filtered)} ttft rows at ctx={ctx_target} (need >= {min_rows})"
+        )
     values = [float(r["predicted_per_second"]) for r in filtered]
     return MetricResult(value=statistics.median(values), n=len(values))
 
@@ -616,7 +643,9 @@ def compute_ttft_ms_by_ctx(rows: list[dict[str, Any]], min_rows: int) -> dict[in
     out: dict[int, MetricResult] = {}
     for ctx, group in by_ctx.items():
         if len(group) < min_rows:
-            out[ctx] = missing_metric(f"only {len(group)} ttft rows at ctx={ctx} (need >= {min_rows})")
+            out[ctx] = missing_metric(
+                f"only {len(group)} ttft rows at ctx={ctx} (need >= {min_rows})"
+            )
             continue
         values = [float(r["ttft_ms"]) for r in group]
         out[ctx] = MetricResult(value=statistics.median(values), n=len(values))
@@ -626,13 +655,17 @@ def compute_ttft_ms_by_ctx(rows: list[dict[str, Any]], min_rows: int) -> dict[in
 def compute_arm_peak_mib(vram_rows: list[dict[str, Any]]) -> MetricResult:
     if not vram_rows:
         return missing_metric("no vram.csv rows for this arm")
-    values = [float(r["memory_used_mib"]) for r in vram_rows if r.get("memory_used_mib") not in (None, "")]
+    values = [
+        float(r["memory_used_mib"]) for r in vram_rows if r.get("memory_used_mib") not in (None, "")
+    ]
     if not values:
         return missing_metric("no memory_used_mib values in vram.csv")
     return MetricResult(value=max(values), n=len(values))
 
 
-def compute_voice_metrics(session: SessionInputs) -> tuple[MetricResult, MetricResult, float | None]:
+def compute_voice_metrics(
+    session: SessionInputs,
+) -> tuple[MetricResult, MetricResult, float | None]:
     backend_idle = session.vram_steps.get("backend_idle")
     mist_llm = session.vram_steps.get("mist_llm")
     voice_peak = session.vram_steps.get("voice_peak")
@@ -640,7 +673,9 @@ def compute_voice_metrics(session: SessionInputs) -> tuple[MetricResult, MetricR
     if backend_idle is None or mist_llm is None:
         lower = missing_metric("session/vram_steps.json missing backend_idle or mist_llm step")
     else:
-        lower = MetricResult(value=float(backend_idle["median_mib"]) - float(mist_llm["median_mib"]))
+        lower = MetricResult(
+            value=float(backend_idle["median_mib"]) - float(mist_llm["median_mib"])
+        )
 
     if voice_peak is None or mist_llm is None:
         upper = missing_metric("session/vram_steps.json missing voice_peak or mist_llm step")
@@ -657,6 +692,8 @@ def compute_voice_metrics(session: SessionInputs) -> tuple[MetricResult, MetricR
 
 @dataclass
 class ArmMetrics:
+    """One arm's aggregated metrics across all suites it ran."""
+
     arm_id: str
     layout_acc: dict[str, MetricResult] = field(default_factory=dict)  # pass -> result
     layout_mean_completion_tokens: dict[str, MetricResult] = field(default_factory=dict)
@@ -664,16 +701,22 @@ class ArmMetrics:
     layout_p95_wall_ms: dict[str, MetricResult] = field(default_factory=dict)
     harness_score: dict[str, MetricResult] = field(default_factory=dict)  # test_name -> result
     truncation_rate: dict[str, MetricResult] = field(default_factory=dict)
-    decode_tps: MetricResult = field(default_factory=lambda: missing_metric("no ttft.jsonl for this arm"))
+    decode_tps: MetricResult = field(
+        default_factory=lambda: missing_metric("no ttft.jsonl for this arm")
+    )
     ttft_ms: dict[int, MetricResult] = field(default_factory=dict)
-    arm_peak_mib: MetricResult = field(default_factory=lambda: missing_metric("no vram.csv for this arm"))
+    arm_peak_mib: MetricResult = field(
+        default_factory=lambda: missing_metric("no vram.csv for this arm")
+    )
     suites_completed: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     decision_rules_sha256: str | None = None
     present: bool = True
 
 
-def pick_layout_pass(acc_by_pass: dict[str, MetricResult]) -> tuple[str | None, MetricResult | None]:
+def pick_layout_pass(
+    acc_by_pass: dict[str, MetricResult]
+) -> tuple[str | None, MetricResult | None]:
     """Finalist supersedes screen when complete; never pooled."""
     finalist = acc_by_pass.get("finalist")
     screen = acc_by_pass.get("screen")
@@ -690,8 +733,12 @@ def pick_layout_pass(acc_by_pass: dict[str, MetricResult]) -> tuple[str | None, 
 
 @dataclass
 class RunMetrics:
+    """The full run's per-arm metrics plus the raw rows they were derived from."""
+
     arms: dict[str, ArmMetrics]
-    raw_test_scores: dict[str, dict[str, harness_scorers.TestScores]]  # arm -> test_name -> TestScores
+    raw_test_scores: dict[
+        str, dict[str, harness_scorers.TestScores]
+    ]  # arm -> test_name -> TestScores
     raw_layout_rows: dict[str, dict[str, list[dict[str, Any]]]]  # arm -> pass -> rows
     raw_correctness: dict[str, dict[int, list[dict[str, Any]]]]  # arm -> rep -> rows
     voice_vram_lower_mib: MetricResult
@@ -733,7 +780,9 @@ def compute_all_metrics(results_dir: Path, arm_ids: list[str], rules: dict[str, 
         am.decision_rules_sha256 = inputs.meta.get("decision_rules_sha256")
 
         for layout_pass, rows in inputs.layout_rows.items():
-            am.layout_acc[layout_pass] = compute_layout_acc(rows, n_expected[layout_pass], stats_cfg)
+            am.layout_acc[layout_pass] = compute_layout_acc(
+                rows, n_expected[layout_pass], stats_cfg
+            )
             tokens_result, per_correct = compute_layout_completion_tokens(rows)
             am.layout_mean_completion_tokens[layout_pass] = tokens_result
             am.layout_completion_tokens_per_correct[layout_pass] = per_correct
@@ -783,6 +832,8 @@ def combine_gate_verdicts(verdicts: list[str]) -> str:
 
 @dataclass
 class ClauseResult:
+    """One evaluated clause of a decision rule: its metric, threshold, and verdict."""
+
     id: str
     metric: str
     arm: str | None
@@ -795,6 +846,7 @@ class ClauseResult:
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize to the plain-dict shape written into summary.json."""
         return {
             "id": self.id,
             "metric": self.metric,
@@ -811,6 +863,8 @@ class ClauseResult:
 
 @dataclass
 class RuleResult:
+    """A pre-registered (v1) decision rule's overall verdict and its component clauses."""
+
     id: str
     kind: str
     question: str
@@ -820,6 +874,7 @@ class RuleResult:
     info: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize to the plain-dict shape written into summary.json."""
         return {
             "id": self.id,
             "kind": self.kind,
@@ -854,6 +909,7 @@ class ExploratoryRuleResult:
     info: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize to the plain-dict shape written into summary.json."""
         return {
             "id": self.id,
             "label": self.label,
@@ -880,18 +936,36 @@ def _op_compare(value: float, threshold: float, op: str) -> bool:
 
 
 def evaluate_simple_clause(
-    clause_id: str, metric_name: str, arm: str | None, result: MetricResult, op: str, threshold: float
+    clause_id: str,
+    metric_name: str,
+    arm: str | None,
+    result: MetricResult,
+    op: str,
+    threshold: float,
 ) -> ClauseResult:
     if not result.usable():
         return ClauseResult(
-            id=clause_id, metric=metric_name, arm=arm, value=result.value, threshold=threshold, op=op,
-            verdict="missing", margin="n/a", note=result.note or "missing or incomplete coverage",
+            id=clause_id,
+            metric=metric_name,
+            arm=arm,
+            value=result.value,
+            threshold=threshold,
+            op=op,
+            verdict="missing",
+            margin="n/a",
+            note=result.note or "missing or incomplete coverage",
         )
     ok = _op_compare(result.value, threshold, op)
     margin = margin_for(result.value, result.bootstrap, threshold, op)
     return ClauseResult(
-        id=clause_id, metric=metric_name, arm=arm, value=result.value, threshold=threshold, op=op,
-        verdict="pass" if ok else "fail", margin=margin,
+        id=clause_id,
+        metric=metric_name,
+        arm=arm,
+        value=result.value,
+        threshold=threshold,
+        op=op,
+        verdict="pass" if ok else "fail",
+        margin=margin,
     )
 
 
@@ -903,13 +977,24 @@ def evaluate_r1(metrics: RunMetrics, rules: dict[str, Any]) -> RuleResult:
         pass_used, result = pick_layout_pass(c1_512.layout_acc)
     if result is None:
         clause = ClauseResult(
-            id="layout_acc_c1_512", metric="layout_acc", arm="c1-512", value=None,
-            threshold=thresholds["r1_keep_e4b_layout_acc_min"], op=">=", verdict="missing", margin="n/a",
+            id="layout_acc_c1_512",
+            metric="layout_acc",
+            arm="c1-512",
+            value=None,
+            threshold=thresholds["r1_keep_e4b_layout_acc_min"],
+            op=">=",
+            verdict="missing",
+            margin="n/a",
             note="no layout data for c1-512",
         )
     else:
         clause = evaluate_simple_clause(
-            "layout_acc_c1_512", "layout_acc", "c1-512", result, ">=", thresholds["r1_keep_e4b_layout_acc_min"]
+            "layout_acc_c1_512",
+            "layout_acc",
+            "c1-512",
+            result,
+            ">=",
+            thresholds["r1_keep_e4b_layout_acc_min"],
         )
         clause.extra["pass_used"] = pass_used
 
@@ -926,9 +1011,13 @@ def evaluate_r1(metrics: RunMetrics, rules: dict[str, Any]) -> RuleResult:
                 "complete": result_256.complete,
             }
     return RuleResult(
-        id="R1", kind="gate", label="keep_e4b_budget",
+        id="R1",
+        kind="gate",
+        label="keep_e4b_budget",
         question="Does Gemma 4 E4B with a thinking budget clear the layout accuracy bar?",
-        verdict=combine_gate_verdicts([clause.verdict]), clauses=[clause], info=info,
+        verdict=combine_gate_verdicts([clause.verdict]),
+        clauses=[clause],
+        info=info,
     )
 
 
@@ -949,40 +1038,67 @@ def _l_clause(
         if on_pass is not None:
             on_tokens_result = on_arm.layout_mean_completion_tokens.get(on_pass)
 
-    off_holds = off_result is not None and off_result.usable() and off_result.value >= thresholds["r2_l_off_layout_acc_min"]
+    off_holds = (
+        off_result is not None
+        and off_result.usable()
+        and off_result.value >= thresholds["r2_l_off_layout_acc_min"]
+    )
     on_holds = (
-        on_result is not None and on_result.usable()
-        and on_tokens_result is not None and on_tokens_result.usable()
+        on_result is not None
+        and on_result.usable()
+        and on_tokens_result is not None
+        and on_tokens_result.usable()
         and on_result.value >= thresholds["r2_l_on_layout_acc_min"]
         and on_tokens_result.value <= thresholds["r2_l_on_mean_completion_tokens_max"]
     )
 
     if off_holds:
-        margin = margin_for(off_result.value, off_result.bootstrap, thresholds["r2_l_off_layout_acc_min"], ">=")
+        margin = margin_for(
+            off_result.value, off_result.bootstrap, thresholds["r2_l_off_layout_acc_min"], ">="
+        )
         clause = ClauseResult(
-            id="L", metric="layout_acc", arm=candidate, value=off_result.value,
-            threshold=thresholds["r2_l_off_layout_acc_min"], op=">=", verdict="pass", margin=margin,
+            id="L",
+            metric="layout_acc",
+            arm=candidate,
+            value=off_result.value,
+            threshold=thresholds["r2_l_off_layout_acc_min"],
+            op=">=",
+            verdict="pass",
+            margin=margin,
             extra={"branch": "off", "pass_used": off_pass},
         )
         return clause, candidate, off_pass
 
     if on_holds:
-        margin = margin_for(on_result.value, on_result.bootstrap, thresholds["r2_l_on_layout_acc_min"], ">=")
+        margin = margin_for(
+            on_result.value, on_result.bootstrap, thresholds["r2_l_on_layout_acc_min"], ">="
+        )
         clause = ClauseResult(
-            id="L", metric="layout_acc", arm=thinking_candidate, value=on_result.value,
-            threshold=thresholds["r2_l_on_layout_acc_min"], op=">=", verdict="pass", margin=margin,
+            id="L",
+            metric="layout_acc",
+            arm=thinking_candidate,
+            value=on_result.value,
+            threshold=thresholds["r2_l_on_layout_acc_min"],
+            op=">=",
+            verdict="pass",
+            margin=margin,
             extra={
-                "branch": "on", "pass_used": on_pass,
+                "branch": "on",
+                "pass_used": on_pass,
                 "mean_completion_tokens": on_tokens_result.value,
-                "mean_completion_tokens_threshold": thresholds["r2_l_on_mean_completion_tokens_max"],
+                "mean_completion_tokens_threshold": thresholds[
+                    "r2_l_on_mean_completion_tokens_max"
+                ],
             },
         )
         return clause, thinking_candidate, on_pass
 
     off_conclusive = off_result is not None and off_result.usable()
     on_conclusive = (
-        on_result is not None and on_result.usable()
-        and on_tokens_result is not None and on_tokens_result.usable()
+        on_result is not None
+        and on_result.usable()
+        and on_tokens_result is not None
+        and on_tokens_result.usable()
     )
     if off_conclusive and on_conclusive:
         verdict = "fail"
@@ -991,16 +1107,21 @@ def _l_clause(
         verdict = "missing"
         note = "insufficient data to evaluate L on either branch"
     clause = ClauseResult(
-        id="L", metric="layout_acc", arm=candidate, value=off_result.value if off_result else None,
-        threshold=thresholds["r2_l_off_layout_acc_min"], op=">=", verdict=verdict, margin="n/a", note=note,
+        id="L",
+        metric="layout_acc",
+        arm=candidate,
+        value=off_result.value if off_result else None,
+        threshold=thresholds["r2_l_off_layout_acc_min"],
+        op=">=",
+        verdict=verdict,
+        margin="n/a",
+        note=note,
         extra={"branch": None},
     )
     return clause, None, None
 
 
-def _f_clause(
-    candidate: str, metrics: RunMetrics, margin_mib: float
-) -> ClauseResult:
+def _f_clause(candidate: str, metrics: RunMetrics, margin_mib: float) -> ClauseResult:
     am = metrics.arms.get(candidate)
     peak = am.arm_peak_mib if am is not None else missing_metric("arm absent")
     lower = metrics.voice_vram_lower_mib
@@ -1018,8 +1139,15 @@ def _f_clause(
         if total is None:
             missing_bits.append("total_mib")
         return ClauseResult(
-            id="F", metric="arm_peak_mib", arm=candidate, value=peak.value, threshold=None, op=None,
-            verdict="missing", margin="n/a", note=f"missing inputs: {missing_bits}",
+            id="F",
+            metric="arm_peak_mib",
+            arm=candidate,
+            value=peak.value,
+            threshold=None,
+            op=None,
+            verdict="missing",
+            margin="n/a",
+            note=f"missing inputs: {missing_bits}",
         )
 
     fits_upper = peak.value + upper.value + margin_mib <= total
@@ -1031,17 +1159,29 @@ def _f_clause(
     else:
         verdict = "needs-review"
     return ClauseResult(
-        id="F", metric="arm_peak_mib", arm=candidate, value=peak.value, threshold=total, op="<=",
-        verdict=verdict, margin="n/a",
+        id="F",
+        metric="arm_peak_mib",
+        arm=candidate,
+        value=peak.value,
+        threshold=total,
+        op="<=",
+        verdict=verdict,
+        margin="n/a",
         extra={
-            "voice_vram_lower_mib": lower.value, "voice_vram_upper_mib": upper.value,
-            "total_mib": total, "margin_mib": margin_mib,
+            "voice_vram_lower_mib": lower.value,
+            "voice_vram_upper_mib": upper.value,
+            "total_mib": total,
+            "margin_mib": margin_mib,
         },
     )
 
 
 def evaluate_r2(
-    rule_key: str, candidate: str, thinking_candidate: str, metrics: RunMetrics, rules: dict[str, Any]
+    rule_key: str,
+    candidate: str,
+    thinking_candidate: str,
+    metrics: RunMetrics,
+    rules: dict[str, Any],
 ) -> RuleResult:
     thresholds = rules["thresholds"]
     constants = rules["constants"]
@@ -1056,40 +1196,73 @@ def evaluate_r2(
             candidate_result.harness_score.get(test_name) if candidate_result is not None else None
         )
         anchor_arm_metrics = metrics.arms.get(anchor_arm)
-        anchor_metric = anchor_arm_metrics.harness_score.get(test_name) if anchor_arm_metrics is not None else None
+        anchor_metric = (
+            anchor_arm_metrics.harness_score.get(test_name)
+            if anchor_arm_metrics is not None
+            else None
+        )
         threshold = thresholds[threshold_key]
 
         if anchor_arm_metrics is None or anchor_metric is None or not anchor_metric.usable():
             return ClauseResult(
-                id=clause_id, metric="harness_score", arm=candidate, value=(cand_metric.value if cand_metric else None),
-                threshold=threshold, op=">=", verdict="missing", margin="n/a",
+                id=clause_id,
+                metric="harness_score",
+                arm=candidate,
+                value=(cand_metric.value if cand_metric else None),
+                threshold=threshold,
+                op=">=",
+                verdict="missing",
+                margin="n/a",
                 note=f"anchor arm {anchor_arm!r} harness_score for {test_name!r} is missing",
             )
         if cand_metric is None or not cand_metric.usable():
             return ClauseResult(
-                id=clause_id, metric="harness_score", arm=candidate, value=None, threshold=threshold, op=">=",
-                verdict="missing", margin="n/a", note=f"no usable harness_score for {candidate}/{test_name}",
+                id=clause_id,
+                metric="harness_score",
+                arm=candidate,
+                value=None,
+                threshold=threshold,
+                op=">=",
+                verdict="missing",
+                margin="n/a",
+                note=f"no usable harness_score for {candidate}/{test_name}",
             )
         if anchor_metric.value < threshold:
             return ClauseResult(
-                id=clause_id, metric="harness_score", arm=candidate, value=cand_metric.value, threshold=threshold,
-                op=">=", verdict="needs-review", margin="n/a",
+                id=clause_id,
+                metric="harness_score",
+                arm=candidate,
+                value=cand_metric.value,
+                threshold=threshold,
+                op=">=",
+                verdict="needs-review",
+                margin="n/a",
                 note="anchor_below_threshold",
                 extra={"anchor_arm": anchor_arm, "anchor_value": anchor_metric.value},
             )
         ok = cand_metric.value >= threshold
         margin = margin_for(cand_metric.value, cand_metric.bootstrap, threshold, ">=")
         return ClauseResult(
-            id=clause_id, metric="harness_score", arm=candidate, value=cand_metric.value, threshold=threshold,
-            op=">=", verdict="pass" if ok else "fail", margin=margin,
+            id=clause_id,
+            metric="harness_score",
+            arm=candidate,
+            value=cand_metric.value,
+            threshold=threshold,
+            op=">=",
+            verdict="pass" if ok else "fail",
+            margin=margin,
         )
 
-    s1 = _anchored_clause("S1", "schema_conformance_json_object", "r2_s1_schema_conformance_json_object_min")
+    s1 = _anchored_clause(
+        "S1", "schema_conformance_json_object", "r2_s1_schema_conformance_json_object_min"
+    )
     s2 = _anchored_clause("S2", "tool_selection", "r2_s2_tool_selection_min")
 
     candidate_am = metrics.arms.get(candidate)
     d_result = candidate_am.decode_tps if candidate_am is not None else missing_metric("arm absent")
-    d_clause = evaluate_simple_clause("D", "decode_tps", candidate, d_result, ">=", thresholds["r2_d_decode_tps_min"])
+    d_clause = evaluate_simple_clause(
+        "D", "decode_tps", candidate, d_result, ">=", thresholds["r2_d_decode_tps_min"]
+    )
     if d_clause.margin == "n/a" and d_clause.verdict in ("pass", "fail"):
         d_clause.margin = "n/a"  # decode_tps carries no bootstrap CI by design
 
@@ -1102,17 +1275,30 @@ def evaluate_r2(
             p_result = p_am.layout_p95_wall_ms.get(pass_for_p) if pass_for_p else None
     else:
         p_am = metrics.arms.get(arm_for_p)
-        p_result = p_am.layout_p95_wall_ms.get(pass_for_p) if p_am is not None and pass_for_p else None
+        p_result = (
+            p_am.layout_p95_wall_ms.get(pass_for_p) if p_am is not None and pass_for_p else None
+        )
 
     if p_result is None:
         p_clause = ClauseResult(
-            id="P", metric="layout_p95_wall_ms", arm=arm_for_p, value=None,
-            threshold=thresholds["r2_p_layout_p95_wall_ms_max"], op="<=", verdict="missing", margin="n/a",
+            id="P",
+            metric="layout_p95_wall_ms",
+            arm=arm_for_p,
+            value=None,
+            threshold=thresholds["r2_p_layout_p95_wall_ms_max"],
+            op="<=",
+            verdict="missing",
+            margin="n/a",
             note="no layout_p95_wall_ms available on the arm used for P",
         )
     else:
         p_clause = evaluate_simple_clause(
-            "P", "layout_p95_wall_ms", arm_for_p, p_result, "<=", thresholds["r2_p_layout_p95_wall_ms_max"]
+            "P",
+            "layout_p95_wall_ms",
+            arm_for_p,
+            p_result,
+            "<=",
+            thresholds["r2_p_layout_p95_wall_ms_max"],
         )
         p_clause.margin = "n/a"
         p_clause.extra["pass_used"] = pass_for_p
@@ -1122,9 +1308,12 @@ def evaluate_r2(
     clauses = [l_clause, s1, s2, d_clause, p_clause, f_clause]
     verdict = combine_gate_verdicts([c.verdict for c in clauses])
     return RuleResult(
-        id="R2", kind="gate", label=rule_key,
+        id="R2",
+        kind="gate",
+        label=rule_key,
         question=f"Should MIST switch from Gemma 4 E4B to {candidate}?",
-        verdict=verdict, clauses=clauses,
+        verdict=verdict,
+        clauses=clauses,
         info={"candidate": candidate, "thinking_candidate": thinking_candidate},
     )
 
@@ -1135,18 +1324,31 @@ def evaluate_r3(metrics: RunMetrics, rules: dict[str, Any]) -> RuleResult:
     result = c3.truncation_rate.get("schema_conformance_json_object") if c3 is not None else None
     if result is None or not result.usable():
         clause = ClauseResult(
-            id="truncation_json_object", metric="truncation_rate", arm="c3", value=(result.value if result else None),
-            threshold=thresholds["r3_drop_moe_truncation_rate_min"], op=">", verdict="missing", margin="n/a",
+            id="truncation_json_object",
+            metric="truncation_rate",
+            arm="c3",
+            value=(result.value if result else None),
+            threshold=thresholds["r3_drop_moe_truncation_rate_min"],
+            op=">",
+            verdict="missing",
+            margin="n/a",
             note="no usable truncation_rate for c3/schema_conformance_json_object",
         )
         verdict = "missing"
     else:
         triggered = result.value > thresholds["r3_drop_moe_truncation_rate_min"]
-        margin = margin_for(result.value, result.bootstrap, thresholds["r3_drop_moe_truncation_rate_min"], ">")
+        margin = margin_for(
+            result.value, result.bootstrap, thresholds["r3_drop_moe_truncation_rate_min"], ">"
+        )
         clause = ClauseResult(
-            id="truncation_json_object", metric="truncation_rate", arm="c3", value=result.value,
-            threshold=thresholds["r3_drop_moe_truncation_rate_min"], op=">",
-            verdict="triggered" if triggered else "not-triggered", margin=margin,
+            id="truncation_json_object",
+            metric="truncation_rate",
+            arm="c3",
+            value=result.value,
+            threshold=thresholds["r3_drop_moe_truncation_rate_min"],
+            op=">",
+            verdict="triggered" if triggered else "not-triggered",
+            margin=margin,
         )
         verdict = clause.verdict
 
@@ -1154,12 +1356,19 @@ def evaluate_r3(metrics: RunMetrics, rules: dict[str, Any]) -> RuleResult:
     grammar = c3.truncation_rate.get("schema_conformance") if c3 is not None else None
     if grammar is not None and grammar.usable():
         info["truncation_grammar_schema_conformance"] = {
-            "value": grammar.value, "n": grammar.n, "n_expected": grammar.n_expected, "complete": grammar.complete,
+            "value": grammar.value,
+            "n": grammar.n,
+            "n_expected": grammar.n_expected,
+            "complete": grammar.complete,
         }
     return RuleResult(
-        id="R3", kind="trigger", label="drop_moe",
+        id="R3",
+        kind="trigger",
+        label="drop_moe",
         question="Is c3's MoE output truncated often enough to drop the MoE candidates?",
-        verdict=verdict, clauses=[clause], info=info,
+        verdict=verdict,
+        clauses=[clause],
+        info=info,
     )
 
 
@@ -1171,29 +1380,47 @@ def evaluate_r4(metrics: RunMetrics, rules: dict[str, Any]) -> RuleResult:
         pass_used, result = pick_layout_pass(c2.layout_acc)
     if result is None or not result.usable():
         clause = ClauseResult(
-            id="layout_acc_c2_off", metric="layout_acc", arm="c2", value=(result.value if result else None),
-            threshold=thresholds["r4_thinking_lever_layout_acc_max"], op="<", verdict="missing", margin="n/a",
+            id="layout_acc_c2_off",
+            metric="layout_acc",
+            arm="c2",
+            value=(result.value if result else None),
+            threshold=thresholds["r4_thinking_lever_layout_acc_max"],
+            op="<",
+            verdict="missing",
+            margin="n/a",
             note="no usable layout_acc for c2",
         )
         verdict = "missing"
     else:
         triggered = result.value < thresholds["r4_thinking_lever_layout_acc_max"]
-        margin = margin_for(result.value, result.bootstrap, thresholds["r4_thinking_lever_layout_acc_max"], "<")
+        margin = margin_for(
+            result.value, result.bootstrap, thresholds["r4_thinking_lever_layout_acc_max"], "<"
+        )
         clause = ClauseResult(
-            id="layout_acc_c2_off", metric="layout_acc", arm="c2", value=result.value,
-            threshold=thresholds["r4_thinking_lever_layout_acc_max"], op="<",
-            verdict="triggered" if triggered else "not-triggered", margin=margin,
+            id="layout_acc_c2_off",
+            metric="layout_acc",
+            arm="c2",
+            value=result.value,
+            threshold=thresholds["r4_thinking_lever_layout_acc_max"],
+            op="<",
+            verdict="triggered" if triggered else "not-triggered",
+            margin=margin,
             extra={"pass_used": pass_used},
         )
         verdict = clause.verdict
     return RuleResult(
-        id="R4", kind="trigger", label="thinking_is_lever",
+        id="R4",
+        kind="trigger",
+        label="thinking_is_lever",
         question="Is thinking mode a large enough lever on layout accuracy at c2 to be load-bearing?",
-        verdict=verdict, clauses=[clause],
+        verdict=verdict,
+        clauses=[clause],
     )
 
 
-def evaluate_r5(metrics: RunMetrics, rules: dict[str, Any], r2_results: list[RuleResult]) -> RuleResult:
+def evaluate_r5(
+    metrics: RunMetrics, rules: dict[str, Any], r2_results: list[RuleResult]
+) -> RuleResult:
     thresholds = rules["thresholds"]
     lower = metrics.voice_vram_lower_mib
     upper = metrics.voice_vram_upper_mib
@@ -1208,15 +1435,23 @@ def evaluate_r5(metrics: RunMetrics, rules: dict[str, Any], r2_results: list[Rul
             if not m.usable()
         ]
         clause = ClauseResult(
-            id="voice_vram_lower_bound", metric="voice_vram_lower_mib", arm=None,
+            id="voice_vram_lower_bound",
+            metric="voice_vram_lower_mib",
+            arm=None,
             value=lower.value if lower.usable() else None,
-            threshold=thresholds["r5_voice_vram_lower_trigger_mib"], op=">=", verdict="missing", margin="n/a",
+            threshold=thresholds["r5_voice_vram_lower_trigger_mib"],
+            op=">=",
+            verdict="missing",
+            margin="n/a",
             note=f"missing: {', '.join(absent)} (R5 needs both voice bounds)",
         )
         return RuleResult(
-            id="R5", kind="trigger", label="gtx1070_moves_up",
+            id="R5",
+            kind="trigger",
+            label="gtx1070_moves_up",
             question="Does the voice VRAM footprint justify moving the GTX 1070 up in priority?",
-            verdict="missing", clauses=[clause],
+            verdict="missing",
+            clauses=[clause],
         )
 
     def _r2_all_pass_except_f(r: RuleResult) -> bool:
@@ -1233,7 +1468,9 @@ def evaluate_r5(metrics: RunMetrics, rules: dict[str, Any], r2_results: list[Rul
     any_r2_inconclusive = any(_r2_has_missing_clause(r) for r in r2_results)
 
     lower_trigger = lower.usable() and lower.value >= thresholds["r5_voice_vram_lower_trigger_mib"]
-    upper_trigger = upper.usable() and upper.value >= thresholds["r5_voice_vram_upper_needs_review_mib"]
+    upper_trigger = (
+        upper.usable() and upper.value >= thresholds["r5_voice_vram_upper_needs_review_mib"]
+    )
 
     note: str | None = None
     if lower_trigger and matching:
@@ -1251,9 +1488,14 @@ def evaluate_r5(metrics: RunMetrics, rules: dict[str, Any], r2_results: list[Rul
         verdict = "not-triggered"
 
     clause = ClauseResult(
-        id="voice_vram_lower_bound", metric="voice_vram_lower_mib", arm=None,
+        id="voice_vram_lower_bound",
+        metric="voice_vram_lower_mib",
+        arm=None,
         value=lower.value if lower.usable() else None,
-        threshold=thresholds["r5_voice_vram_lower_trigger_mib"], op=">=", verdict=verdict, margin="n/a",
+        threshold=thresholds["r5_voice_vram_lower_trigger_mib"],
+        op=">=",
+        verdict=verdict,
+        margin="n/a",
         note=note,
         extra={
             "voice_vram_upper_mib": upper.value if upper.usable() else None,
@@ -1261,9 +1503,12 @@ def evaluate_r5(metrics: RunMetrics, rules: dict[str, Any], r2_results: list[Rul
         },
     )
     return RuleResult(
-        id="R5", kind="trigger", label="gtx1070_moves_up",
+        id="R5",
+        kind="trigger",
+        label="gtx1070_moves_up",
         question="Does the voice VRAM footprint justify moving the GTX 1070 up in priority?",
-        verdict=verdict, clauses=[clause],
+        verdict=verdict,
+        clauses=[clause],
     )
 
 
@@ -1311,15 +1556,29 @@ def _determinism_clause(
     """
     if rows_a is None or rows_b is None or not rows_a or not rows_b:
         return ClauseResult(
-            id=clause_id, metric="correctness_tokens", arm=None, value=None, threshold=None, op=None,
-            verdict="missing", margin="n/a", note=f"{note_prefix}: missing correctness data",
+            id=clause_id,
+            metric="correctness_tokens",
+            arm=None,
+            value=None,
+            threshold=None,
+            op=None,
+            verdict="missing",
+            margin="n/a",
+            note=f"{note_prefix}: missing correctness data",
         )
     sa = _correctness_file_summary(rows_a)
     sb = _correctness_file_summary(rows_b)
     if sa["has_error"] or sb["has_error"]:
         return ClauseResult(
-            id=clause_id, metric="correctness_tokens", arm=None, value=None, threshold=None, op=None,
-            verdict="missing", margin="n/a", note=f"{note_prefix}: an errored row is present",
+            id=clause_id,
+            metric="correctness_tokens",
+            arm=None,
+            value=None,
+            threshold=None,
+            op=None,
+            verdict="missing",
+            margin="n/a",
+            note=f"{note_prefix}: an errored row is present",
         )
     # Rows AND distinct prompt ids must both equal the expected count: a duplicated id (p19
     # twice, no p20) has the right row count but an incomplete prompt set.
@@ -1332,8 +1591,14 @@ def _determinism_clause(
         or distinct_b != expected_prompts
     ):
         return ClauseResult(
-            id=clause_id, metric="correctness_tokens", arm=None, value=None, threshold=None, op=None,
-            verdict="missing", margin="n/a",
+            id=clause_id,
+            metric="correctness_tokens",
+            arm=None,
+            value=None,
+            threshold=None,
+            op=None,
+            verdict="missing",
+            margin="n/a",
             note=(
                 f"{note_prefix}: prompt rows {sa['n']}/{sb['n']}, distinct ids "
                 f"{distinct_a}/{distinct_b}, expected {expected_prompts}"
@@ -1341,20 +1606,41 @@ def _determinism_clause(
         )
     if sa["prompt_ids"] != sb["prompt_ids"]:
         return ClauseResult(
-            id=clause_id, metric="correctness_tokens", arm=None, value=None, threshold=None, op=None,
-            verdict="missing", margin="n/a", note=f"{note_prefix}: prompt_id sets differ",
+            id=clause_id,
+            metric="correctness_tokens",
+            arm=None,
+            value=None,
+            threshold=None,
+            op=None,
+            verdict="missing",
+            margin="n/a",
+            note=f"{note_prefix}: prompt_id sets differ",
         )
     a = sa["tokens_by_prompt"]
     b = sb["tokens_by_prompt"]
     mismatched = [pid for pid in a if a[pid] != b[pid]]
     if mismatched:
         return ClauseResult(
-            id=clause_id, metric="correctness_tokens", arm=None, value=None, threshold=None, op=None,
-            verdict="fail", margin="n/a", note=f"{note_prefix}: token mismatch on {sorted(mismatched)}",
+            id=clause_id,
+            metric="correctness_tokens",
+            arm=None,
+            value=None,
+            threshold=None,
+            op=None,
+            verdict="fail",
+            margin="n/a",
+            note=f"{note_prefix}: token mismatch on {sorted(mismatched)}",
         )
     return ClauseResult(
-        id=clause_id, metric="correctness_tokens", arm=None, value=None, threshold=None, op=None,
-        verdict="pass", margin="n/a", note=f"{note_prefix}: identical for all {len(a)} prompts",
+        id=clause_id,
+        metric="correctness_tokens",
+        arm=None,
+        value=None,
+        threshold=None,
+        op=None,
+        verdict="pass",
+        margin="n/a",
+        note=f"{note_prefix}: identical for all {len(a)} prompts",
     )
 
 
@@ -1365,59 +1651,107 @@ def evaluate_r6(arm: str, base: str, metrics: RunMetrics, rules: dict[str, Any])
     tuned_rows_r1 = metrics.raw_correctness.get(arm, {}).get(1, [])
 
     base_det = _determinism_clause(
-        "base_determinism", base_rows_r1 or None, base_rows_r2 or None, f"base {base} r1 vs r2", expected_prompts
+        "base_determinism",
+        base_rows_r1 or None,
+        base_rows_r2 or None,
+        f"base {base} r1 vs r2",
+        expected_prompts,
     )
     tuned_match = _determinism_clause(
-        "tuned_matches_base", tuned_rows_r1 or None, base_rows_r1 or None,
-        f"{arm} r1 vs base {base} r1", expected_prompts,
+        "tuned_matches_base",
+        tuned_rows_r1 or None,
+        base_rows_r1 or None,
+        f"{arm} r1 vs base {base} r1",
+        expected_prompts,
     )
 
     base_am = metrics.arms.get(base)
     tuned_am = metrics.arms.get(arm)
     base_score = base_am.harness_score.get("schema_conformance") if base_am is not None else None
     tuned_score = tuned_am.harness_score.get("schema_conformance") if tuned_am is not None else None
-    if base_score is None or not base_score.usable() or tuned_score is None or not tuned_score.usable():
+    if (
+        base_score is None
+        or not base_score.usable()
+        or tuned_score is None
+        or not tuned_score.usable()
+    ):
         ci_clause = ClauseResult(
-            id="harness_ci_containment", metric="harness_score", arm=arm, value=(tuned_score.value if tuned_score else None),
-            threshold=None, op=None, verdict="missing", margin="n/a",
+            id="harness_ci_containment",
+            metric="harness_score",
+            arm=arm,
+            value=(tuned_score.value if tuned_score else None),
+            threshold=None,
+            op=None,
+            verdict="missing",
+            margin="n/a",
             note="missing or incomplete schema_conformance harness_score for base or tuned arm",
         )
     elif base_score.bootstrap is None:
         ci_clause = ClauseResult(
-            id="harness_ci_containment", metric="harness_score", arm=arm, value=tuned_score.value,
-            threshold=None, op=None, verdict="missing", margin="n/a", note="base has no bootstrap CI (no clusters)",
+            id="harness_ci_containment",
+            metric="harness_score",
+            arm=arm,
+            value=tuned_score.value,
+            threshold=None,
+            op=None,
+            verdict="missing",
+            margin="n/a",
+            note="base has no bootstrap CI (no clusters)",
         )
     else:
         lo, hi = base_score.bootstrap
         within = lo <= tuned_score.value <= hi
         ci_clause = ClauseResult(
-            id="harness_ci_containment", metric="harness_score", arm=arm, value=tuned_score.value,
-            threshold=None, op=None, verdict="pass" if within else "fail", margin="n/a",
+            id="harness_ci_containment",
+            metric="harness_score",
+            arm=arm,
+            value=tuned_score.value,
+            threshold=None,
+            op=None,
+            verdict="pass" if within else "fail",
+            margin="n/a",
             extra={"base_ci": [lo, hi], "base_arm": base},
         )
 
     manual_entry = metrics.manual.get(arm)
     if manual_entry is None:
         manual_clause = ClauseResult(
-            id="manual_clean", metric="manual", arm=arm, value=None, threshold=0, op="==",
-            verdict="missing", margin="n/a", note=f"session/manual.json has no entry for {arm!r}",
+            id="manual_clean",
+            metric="manual",
+            arm=arm,
+            value=None,
+            threshold=0,
+            op="==",
+            verdict="missing",
+            margin="n/a",
+            note=f"session/manual.json has no entry for {arm!r}",
         )
     else:
         memtest = manual_entry.get("memtest_errors")
         whea = manual_entry.get("whea_events")
         ok = memtest == 0 and whea == 0
         manual_clause = ClauseResult(
-            id="manual_clean", metric="manual", arm=arm, value=memtest, threshold=0, op="==",
-            verdict="pass" if ok else "fail", margin="n/a",
+            id="manual_clean",
+            metric="manual",
+            arm=arm,
+            value=memtest,
+            threshold=0,
+            op="==",
+            verdict="pass" if ok else "fail",
+            margin="n/a",
             extra={"memtest_errors": memtest, "whea_events": whea},
         )
 
     clauses = [base_det, tuned_match, ci_clause, manual_clause]
     verdict = combine_gate_verdicts([c.verdict for c in clauses])
     return RuleResult(
-        id="R6", kind="gate", label=f"tuning_gate_{arm}",
+        id="R6",
+        kind="gate",
+        label=f"tuning_gate_{arm}",
         question=f"Does GPU tuning arm {arm} (base {base}) preserve correctness and stability?",
-        verdict=verdict, clauses=clauses, info={"arm": arm, "base": base},
+        verdict=verdict,
+        clauses=clauses,
+        info={"arm": arm, "base": base},
     )
 
 
@@ -1436,11 +1770,18 @@ def evaluate_r7(metrics: RunMetrics, rules: dict[str, Any]) -> RuleResult:
             return
         _, old_result = pick_layout_pass(old_am.layout_acc)
         _, new_result = pick_layout_pass(new_am.layout_acc)
-        if old_result is None or not old_result.usable() or new_result is None or not new_result.usable():
+        if (
+            old_result is None
+            or not old_result.usable()
+            or new_result is None
+            or not new_result.usable()
+        ):
             deltas["layout_acc"] = {"missing": True}
             return
         deltas["layout_acc"] = {
-            "old": old_result.value, "new": new_result.value, "delta": new_result.value - old_result.value,
+            "old": old_result.value,
+            "new": new_result.value,
+            "delta": new_result.value - old_result.value,
         }
 
     def _harness_delta(test_name: str) -> None:
@@ -1450,19 +1791,32 @@ def evaluate_r7(metrics: RunMetrics, rules: dict[str, Any]) -> RuleResult:
             return
         old_result = old_am.harness_score.get(test_name)
         new_result = new_am.harness_score.get(test_name)
-        if old_result is None or not old_result.usable() or new_result is None or not new_result.usable():
+        if (
+            old_result is None
+            or not old_result.usable()
+            or new_result is None
+            or not new_result.usable()
+        ):
             deltas[key] = {"missing": True}
             return
         deltas[key] = {
-            "old": old_result.value, "new": new_result.value, "delta": new_result.value - old_result.value,
+            "old": old_result.value,
+            "new": new_result.value,
+            "delta": new_result.value - old_result.value,
         }
 
     def _decode_delta() -> None:
-        if old_am is None or new_am is None or not old_am.decode_tps.usable() or not new_am.decode_tps.usable():
+        if (
+            old_am is None
+            or new_am is None
+            or not old_am.decode_tps.usable()
+            or not new_am.decode_tps.usable()
+        ):
             deltas["decode_tps"] = {"missing": True}
             return
         deltas["decode_tps"] = {
-            "old": old_am.decode_tps.value, "new": new_am.decode_tps.value,
+            "old": old_am.decode_tps.value,
+            "new": new_am.decode_tps.value,
             "delta": new_am.decode_tps.value - old_am.decode_tps.value,
         }
 
@@ -1472,9 +1826,13 @@ def evaluate_r7(metrics: RunMetrics, rules: dict[str, Any]) -> RuleResult:
     _decode_delta()
 
     return RuleResult(
-        id="R7", kind="informational", label="build_effect",
+        id="R7",
+        kind="informational",
+        label="build_effect",
         question=f"What did the pinned build change ({new_arm} vs {old_arm})?",
-        verdict="n/a", clauses=[], info={"old_arm": old_arm, "new_arm": new_arm, "deltas": deltas},
+        verdict="n/a",
+        clauses=[],
+        info={"old_arm": old_arm, "new_arm": new_arm, "deltas": deltas},
     )
 
 
@@ -1491,38 +1849,74 @@ def evaluate_r7(metrics: RunMetrics, rules: dict[str, Any]) -> RuleResult:
 
 
 def _anchored_harness_clause(
-    clause_id: str, candidate: str, anchor_arm: str, test_name: str, threshold: float, metrics: RunMetrics
+    clause_id: str,
+    candidate: str,
+    anchor_arm: str,
+    test_name: str,
+    threshold: float,
+    metrics: RunMetrics,
 ) -> ClauseResult:
     """Same anchor-demotion logic as evaluate_r2's nested `_anchored_clause` (S1/S2),
     duplicated at module level so X3 can reuse it without evaluate_r2 depending on
-    anything outside its own body."""
+    anything outside its own body.
+    """
     candidate_result = metrics.arms.get(candidate)
-    cand_metric = candidate_result.harness_score.get(test_name) if candidate_result is not None else None
+    cand_metric = (
+        candidate_result.harness_score.get(test_name) if candidate_result is not None else None
+    )
     anchor_arm_metrics = metrics.arms.get(anchor_arm)
-    anchor_metric = anchor_arm_metrics.harness_score.get(test_name) if anchor_arm_metrics is not None else None
+    anchor_metric = (
+        anchor_arm_metrics.harness_score.get(test_name) if anchor_arm_metrics is not None else None
+    )
 
     if anchor_arm_metrics is None or anchor_metric is None or not anchor_metric.usable():
         return ClauseResult(
-            id=clause_id, metric="harness_score", arm=candidate, value=(cand_metric.value if cand_metric else None),
-            threshold=threshold, op=">=", verdict="missing", margin="n/a",
+            id=clause_id,
+            metric="harness_score",
+            arm=candidate,
+            value=(cand_metric.value if cand_metric else None),
+            threshold=threshold,
+            op=">=",
+            verdict="missing",
+            margin="n/a",
             note=f"anchor arm {anchor_arm!r} harness_score for {test_name!r} is missing",
         )
     if cand_metric is None or not cand_metric.usable():
         return ClauseResult(
-            id=clause_id, metric="harness_score", arm=candidate, value=None, threshold=threshold, op=">=",
-            verdict="missing", margin="n/a", note=f"no usable harness_score for {candidate}/{test_name}",
+            id=clause_id,
+            metric="harness_score",
+            arm=candidate,
+            value=None,
+            threshold=threshold,
+            op=">=",
+            verdict="missing",
+            margin="n/a",
+            note=f"no usable harness_score for {candidate}/{test_name}",
         )
     if anchor_metric.value < threshold:
         return ClauseResult(
-            id=clause_id, metric="harness_score", arm=candidate, value=cand_metric.value, threshold=threshold,
-            op=">=", verdict="needs-review", margin="n/a", note="anchor_below_threshold",
+            id=clause_id,
+            metric="harness_score",
+            arm=candidate,
+            value=cand_metric.value,
+            threshold=threshold,
+            op=">=",
+            verdict="needs-review",
+            margin="n/a",
+            note="anchor_below_threshold",
             extra={"anchor_arm": anchor_arm, "anchor_value": anchor_metric.value},
         )
     ok = cand_metric.value >= threshold
     margin = margin_for(cand_metric.value, cand_metric.bootstrap, threshold, ">=")
     return ClauseResult(
-        id=clause_id, metric="harness_score", arm=candidate, value=cand_metric.value, threshold=threshold,
-        op=">=", verdict="pass" if ok else "fail", margin=margin,
+        id=clause_id,
+        metric="harness_score",
+        arm=candidate,
+        value=cand_metric.value,
+        threshold=threshold,
+        op=">=",
+        verdict="pass" if ok else "fail",
+        margin=margin,
     )
 
 
@@ -1543,18 +1937,33 @@ def _f_sep_clause(candidate: str, metrics: RunMetrics, margin_mib: float) -> Cla
         if total is None:
             missing_bits.append("total_mib")
         return ClauseResult(
-            id="F_sep", metric="arm_peak_mib", arm=candidate, value=peak.value, threshold=None, op=None,
-            verdict="missing", margin="n/a", note=f"missing inputs: {missing_bits}",
+            id="F_sep",
+            metric="arm_peak_mib",
+            arm=candidate,
+            value=peak.value,
+            threshold=None,
+            op=None,
+            verdict="missing",
+            margin="n/a",
+            note=f"missing inputs: {missing_bits}",
         )
     ok = peak.value + margin_mib <= total
     return ClauseResult(
-        id="F_sep", metric="arm_peak_mib", arm=candidate, value=peak.value, threshold=total, op="<=",
-        verdict="pass" if ok else "fail", margin="n/a",
+        id="F_sep",
+        metric="arm_peak_mib",
+        arm=candidate,
+        value=peak.value,
+        threshold=total,
+        op="<=",
+        verdict="pass" if ok else "fail",
+        margin="n/a",
         extra={"total_mib": total, "margin_mib": margin_mib, "voice_excluded": True},
     )
 
 
-def evaluate_x1(metrics: RunMetrics, rules: dict[str, Any], rule_doc: dict[str, Any]) -> ExploratoryRuleResult:
+def evaluate_x1(
+    metrics: RunMetrics, rules: dict[str, Any], rule_doc: dict[str, Any]
+) -> ExploratoryRuleResult:
     """X1 `c1_1024_budget`: c1-1024 against R1's layout bar and R2's P/D bars."""
     thresholds = rules["thresholds"]
     arm_id = rule_doc["arm"]
@@ -1572,21 +1981,41 @@ def evaluate_x1(metrics: RunMetrics, rules: dict[str, Any], rule_doc: dict[str, 
 
         if metric_name == "layout_acc":
             if acc_result is None:
-                clauses.append(ClauseResult(
-                    id=cid, metric=metric_name, arm=arm_id, value=None, threshold=threshold, op=op,
-                    verdict="missing", margin="n/a", note=f"no layout data for {arm_id}",
-                ))
+                clauses.append(
+                    ClauseResult(
+                        id=cid,
+                        metric=metric_name,
+                        arm=arm_id,
+                        value=None,
+                        threshold=threshold,
+                        op=op,
+                        verdict="missing",
+                        margin="n/a",
+                        note=f"no layout data for {arm_id}",
+                    )
+                )
             else:
                 c = evaluate_simple_clause(cid, metric_name, arm_id, acc_result, op, threshold)
                 c.extra["pass_used"] = pass_used
                 clauses.append(c)
         elif metric_name == "layout_p95_wall_ms":
-            p_result = am.layout_p95_wall_ms.get(pass_used) if am is not None and pass_used else None
+            p_result = (
+                am.layout_p95_wall_ms.get(pass_used) if am is not None and pass_used else None
+            )
             if p_result is None:
-                clauses.append(ClauseResult(
-                    id=cid, metric=metric_name, arm=arm_id, value=None, threshold=threshold, op=op,
-                    verdict="missing", margin="n/a", note=f"no layout_p95_wall_ms available for {arm_id}",
-                ))
+                clauses.append(
+                    ClauseResult(
+                        id=cid,
+                        metric=metric_name,
+                        arm=arm_id,
+                        value=None,
+                        threshold=threshold,
+                        op=op,
+                        verdict="missing",
+                        margin="n/a",
+                        note=f"no layout_p95_wall_ms available for {arm_id}",
+                    )
+                )
             else:
                 c = evaluate_simple_clause(cid, metric_name, arm_id, p_result, op, threshold)
                 c.margin = "n/a"
@@ -1594,14 +2023,22 @@ def evaluate_x1(metrics: RunMetrics, rules: dict[str, Any], rule_doc: dict[str, 
                 clauses.append(c)
         elif metric_name == "decode_tps":
             d_result = am.decode_tps if am is not None else missing_metric("arm absent")
-            clauses.append(evaluate_simple_clause(cid, metric_name, arm_id, d_result, op, threshold))
+            clauses.append(
+                evaluate_simple_clause(cid, metric_name, arm_id, d_result, op, threshold)
+            )
         else:
             raise ValueError(f"X1: unknown clause metric {metric_name!r}")
 
     verdict = combine_gate_verdicts([c.verdict for c in clauses])
     return ExploratoryRuleResult(
-        id="X1", label=rule_doc["label"], pre_registered=False, basis=rule_doc["basis"], kind="gate",
-        question=rule_doc["question"], verdict=verdict, clauses=clauses,
+        id="X1",
+        label=rule_doc["label"],
+        pre_registered=False,
+        basis=rule_doc["basis"],
+        kind="gate",
+        question=rule_doc["question"],
+        verdict=verdict,
+        clauses=clauses,
     )
 
 
@@ -1612,7 +2049,8 @@ def _harness_delta_bootstrap_ci(
 ) -> tuple[float, float] | None:
     """Bootstrap CI for (arm's mean score - anchor's mean score) per shared case_id,
     clustered by case_id -- the same cluster_bootstrap_ci machinery compute_harness_scores_for_arm
-    uses, applied to the paired delta instead of a single arm's raw scores."""
+    uses, applied to the paired delta instead of a single arm's raw scores.
+    """
     if arm_raw is None or anchor_raw is None:
         return None
     arm_by_case: dict[str, list[float]] = {}
@@ -1629,7 +2067,10 @@ def _harness_delta_bootstrap_ci(
         for case_id in shared
     }
     return cluster_bootstrap_ci(
-        values_by_cluster, B=stats_cfg["B"], seed=stats_cfg["seed"], confidence=stats_cfg["confidence"]
+        values_by_cluster,
+        n_replicates=stats_cfg["B"],
+        seed=stats_cfg["seed"],
+        confidence=stats_cfg["confidence"],
     )
 
 
@@ -1638,7 +2079,8 @@ def _correctness_identity_vs_anchor(
 ) -> str:
     """'identical' / 'differ' / 'missing' -- whether `rows`' correctness-probe token ids
     match `anchor_rows`' exactly, prompt for prompt. 'missing' whenever either side is
-    empty/absent, carries an errored row, or the prompt_id sets differ -- never guessed."""
+    empty/absent, carries an errored row, or the prompt_id sets differ -- never guessed.
+    """
     if not rows or not anchor_rows:
         return "missing"
     s = _correctness_file_summary(rows)
@@ -1688,7 +2130,12 @@ def evaluate_x2(
                 "delta_vs_anchor": None,
                 "delta_bootstrap_ci": None,
             }
-            if arm_score is not None and arm_score.usable() and anchor_score is not None and anchor_score.usable():
+            if (
+                arm_score is not None
+                and arm_score.usable()
+                and anchor_score is not None
+                and anchor_score.usable()
+            ):
                 harness_entry["delta_vs_anchor"] = arm_score.value - anchor_score.value
                 arm_raw = metrics.raw_test_scores.get(arm_id, {}).get(test_name)
                 anchor_raw = metrics.raw_test_scores.get(anchor_arm, {}).get(test_name)
@@ -1698,20 +2145,31 @@ def evaluate_x2(
         entry["harness_vs_c0"] = harness_rows
 
         arm_correctness = metrics.raw_correctness.get(arm_id, {}).get(anchor_rep)
-        entry["correctness_tokens_vs_c0"] = _correctness_identity_vs_anchor(arm_correctness, anchor_correctness)
+        entry["correctness_tokens_vs_c0"] = _correctness_identity_vs_anchor(
+            arm_correctness, anchor_correctness
+        )
 
         arms_rows[arm_id] = entry
 
     return ExploratoryRuleResult(
-        id="X2", label=rule_doc["label"], pre_registered=False, basis=rule_doc["basis"], kind="informational",
-        question=rule_doc["question"], verdict="n/a", clauses=[],
+        id="X2",
+        label=rule_doc["label"],
+        pre_registered=False,
+        basis=rule_doc["basis"],
+        kind="informational",
+        question=rule_doc["question"],
+        verdict="n/a",
+        clauses=[],
         info={"anchor_arm": anchor_arm, "arms": arms_rows},
     )
 
 
-def evaluate_x3(rule_doc: dict[str, Any], metrics: RunMetrics, rules: dict[str, Any]) -> ExploratoryRuleResult:
+def evaluate_x3(
+    rule_doc: dict[str, Any], metrics: RunMetrics, rules: dict[str, Any]
+) -> ExploratoryRuleResult:
     """X3: an R2 candidate's L/S1/S2/D/P clauses (identical logic to evaluate_r2, per-clause
-    duplicated -- see the module note above) with F replaced by F_sep (voice excluded)."""
+    duplicated -- see the module note above) with F replaced by F_sep (voice excluded).
+    """
     thresholds = rules["thresholds"]
     constants = rules["constants"]
     cfg = constants["r2_candidates"][rule_doc["r2_candidate_key"]]
@@ -1723,16 +2181,27 @@ def evaluate_x3(rule_doc: dict[str, Any], metrics: RunMetrics, rules: dict[str, 
     l_clause, arm_for_p, pass_for_p = _l_clause(candidate, thinking_candidate, metrics, thresholds)
 
     s1 = _anchored_harness_clause(
-        "S1", candidate, anchor_arm, "schema_conformance_json_object",
-        thresholds["r2_s1_schema_conformance_json_object_min"], metrics,
+        "S1",
+        candidate,
+        anchor_arm,
+        "schema_conformance_json_object",
+        thresholds["r2_s1_schema_conformance_json_object_min"],
+        metrics,
     )
     s2 = _anchored_harness_clause(
-        "S2", candidate, anchor_arm, "tool_selection", thresholds["r2_s2_tool_selection_min"], metrics,
+        "S2",
+        candidate,
+        anchor_arm,
+        "tool_selection",
+        thresholds["r2_s2_tool_selection_min"],
+        metrics,
     )
 
     candidate_am = metrics.arms.get(candidate)
     d_result = candidate_am.decode_tps if candidate_am is not None else missing_metric("arm absent")
-    d_clause = evaluate_simple_clause("D", "decode_tps", candidate, d_result, ">=", thresholds["r2_d_decode_tps_min"])
+    d_clause = evaluate_simple_clause(
+        "D", "decode_tps", candidate, d_result, ">=", thresholds["r2_d_decode_tps_min"]
+    )
 
     if arm_for_p is None:
         arm_for_p = candidate
@@ -1743,17 +2212,30 @@ def evaluate_x3(rule_doc: dict[str, Any], metrics: RunMetrics, rules: dict[str, 
             p_result = p_am.layout_p95_wall_ms.get(pass_for_p) if pass_for_p else None
     else:
         p_am = metrics.arms.get(arm_for_p)
-        p_result = p_am.layout_p95_wall_ms.get(pass_for_p) if p_am is not None and pass_for_p else None
+        p_result = (
+            p_am.layout_p95_wall_ms.get(pass_for_p) if p_am is not None and pass_for_p else None
+        )
 
     if p_result is None:
         p_clause = ClauseResult(
-            id="P", metric="layout_p95_wall_ms", arm=arm_for_p, value=None,
-            threshold=thresholds["r2_p_layout_p95_wall_ms_max"], op="<=", verdict="missing", margin="n/a",
+            id="P",
+            metric="layout_p95_wall_ms",
+            arm=arm_for_p,
+            value=None,
+            threshold=thresholds["r2_p_layout_p95_wall_ms_max"],
+            op="<=",
+            verdict="missing",
+            margin="n/a",
             note="no layout_p95_wall_ms available on the arm used for P",
         )
     else:
         p_clause = evaluate_simple_clause(
-            "P", "layout_p95_wall_ms", arm_for_p, p_result, "<=", thresholds["r2_p_layout_p95_wall_ms_max"]
+            "P",
+            "layout_p95_wall_ms",
+            arm_for_p,
+            p_result,
+            "<=",
+            thresholds["r2_p_layout_p95_wall_ms_max"],
         )
         p_clause.margin = "n/a"
         p_clause.extra["pass_used"] = pass_for_p
@@ -1763,10 +2245,17 @@ def evaluate_x3(rule_doc: dict[str, Any], metrics: RunMetrics, rules: dict[str, 
     clauses = [l_clause, s1, s2, d_clause, p_clause, f_sep_clause]
     verdict = combine_gate_verdicts([c.verdict for c in clauses])
     return ExploratoryRuleResult(
-        id="X3", label=rule_doc["label"], pre_registered=False, basis=rule_doc["basis"], kind="gate",
-        question=rule_doc["question"], verdict=verdict, clauses=clauses,
+        id="X3",
+        label=rule_doc["label"],
+        pre_registered=False,
+        basis=rule_doc["basis"],
+        kind="gate",
+        question=rule_doc["question"],
+        verdict=verdict,
+        clauses=clauses,
         info={
-            "candidate": candidate, "thinking_candidate": thinking_candidate,
+            "candidate": candidate,
+            "thinking_candidate": thinking_candidate,
             "compares_against": f"v1 R2/{rule_doc['r2_candidate_key']}",
         },
     )
@@ -1834,7 +2323,9 @@ def compute_finalist_candidates(metrics: RunMetrics, rules: dict[str, Any]) -> l
             screen_result = am.layout_acc.get("screen")
             if screen_result is None or not screen_result.usable():
                 continue
-            margin = margin_for(screen_result.value, screen_result.bootstrap, thresholds[threshold_key], op)
+            margin = margin_for(
+                screen_result.value, screen_result.bootstrap, thresholds[threshold_key], op
+            )
             if margin == "within-noise":
                 candidates.append(arm_id)
                 seen.add(arm_id)
@@ -1916,7 +2407,9 @@ def compute_sha_warnings(
 # ---------------------------------------------------------------------------
 
 
-def _finish_reason_lookup(results_dir: Path, arm_id: str, meta: dict[str, Any] | None) -> dict[tuple[str, str, int], str | None]:
+def _finish_reason_lookup(
+    results_dir: Path, arm_id: str, meta: dict[str, Any] | None
+) -> dict[tuple[str, str, int], str | None]:
     if meta is None or not meta.get("harness"):
         return {}
     candidate = meta["harness"]["candidate"]
@@ -1935,7 +2428,6 @@ def build_grades_harness_with_finish_reason(
     for arm_id, per_test in metrics.raw_test_scores.items():
         if not per_test:
             continue
-        am = metrics.arms.get(arm_id)
         meta = None
         inputs_meta_path = results_dir / arm_id / "meta.json"
         if inputs_meta_path.exists():
@@ -2105,10 +2597,16 @@ def render_report(
                 f"| truncation_rate[{test_name}] | {_fmt(r.value)} | {_fmt(r.n)} | {_fmt(r.n_expected)} | "
                 f"{r.complete} | {_fmt_ci(r.wilson)} | {_fmt_ci(r.bootstrap)} |"
             )
-        lines.append(f"| decode_tps | {_fmt(am.decode_tps.value)} | {_fmt(am.decode_tps.n)} | n/a | n/a | n/a | n/a |")
+        lines.append(
+            f"| decode_tps | {_fmt(am.decode_tps.value)} | {_fmt(am.decode_tps.n)} | n/a | n/a | n/a | n/a |"
+        )
         for ctx, r in sorted(am.ttft_ms.items()):
-            lines.append(f"| ttft_ms[ctx={ctx}] | {_fmt(r.value)} | {_fmt(r.n)} | n/a | n/a | n/a | n/a |")
-        lines.append(f"| arm_peak_mib | {_fmt(am.arm_peak_mib.value)} | {_fmt(am.arm_peak_mib.n)} | n/a | n/a | n/a | n/a |")
+            lines.append(
+                f"| ttft_ms[ctx={ctx}] | {_fmt(r.value)} | {_fmt(r.n)} | n/a | n/a | n/a | n/a |"
+            )
+        lines.append(
+            f"| arm_peak_mib | {_fmt(am.arm_peak_mib.value)} | {_fmt(am.arm_peak_mib.n)} | n/a | n/a | n/a | n/a |"
+        )
         lines.append("")
 
     lines.append("## Session (voice VRAM)")
@@ -2128,7 +2626,9 @@ def render_report(
         lines.append(f"verdict: **{r.verdict}**")
         lines.append("")
         if r.clauses:
-            lines.append("| clause | metric | arm | value | threshold | op | verdict | margin | note |")
+            lines.append(
+                "| clause | metric | arm | value | threshold | op | verdict | margin | note |"
+            )
             lines.append("|---|---|---|---|---|---|---|---|---|")
             for c in r.clauses:
                 lines.append(
@@ -2158,7 +2658,9 @@ def render_report(
         lines.append(f"verdict: **{r.verdict}**")
         lines.append("")
         if r.clauses:
-            lines.append("| clause | metric | arm | value | threshold | op | verdict | margin | note |")
+            lines.append(
+                "| clause | metric | arm | value | threshold | op | verdict | margin | note |"
+            )
             lines.append("|---|---|---|---|---|---|---|---|---|")
             for c in r.clauses:
                 lines.append(
@@ -2221,7 +2723,12 @@ def render_report(
         ):
             value = summ.get(key)
             delta = "n/a"
-            if arm_id != "c0" and c0_extraction is not None and c0_extraction.get(key) is not None and value is not None:
+            if (
+                arm_id != "c0"
+                and c0_extraction is not None
+                and c0_extraction.get(key) is not None
+                and value is not None
+            ):
                 delta = f"{value - c0_extraction[key]:+.3f}"
             lines.append(
                 f"| {label} | {_fmt(value)} | {_fmt_extraction_ci(wilson.get(key))} | "
@@ -2294,7 +2801,9 @@ def build_summary(
         arms_out[arm_id] = {
             "present": True,
             "layout_acc": {p: r.to_dict() for p, r in am.layout_acc.items()},
-            "layout_mean_completion_tokens": {p: r.to_dict() for p, r in am.layout_mean_completion_tokens.items()},
+            "layout_mean_completion_tokens": {
+                p: r.to_dict() for p, r in am.layout_mean_completion_tokens.items()
+            },
             "layout_completion_tokens_per_correct": dict(am.layout_completion_tokens_per_correct),
             "layout_p95_wall_ms": {p: r.to_dict() for p, r in am.layout_p95_wall_ms.items()},
             "harness_score": {t: r.to_dict() for t, r in am.harness_score.items()},
@@ -2337,6 +2846,8 @@ def build_summary(
 
 @dataclass
 class GeneratedOutputs:
+    """The full set of files an analysis run produces, keyed by relative output path."""
+
     files: dict[str, str]  # relative path (posix, forward slashes) -> file content
 
 
@@ -2364,15 +2875,27 @@ def generate_outputs(results_dir: Path, rules_path: Path = DECISION_RULES_PATH) 
     }
 
     report = render_report(
-        metrics=metrics, rule_results=rule_results, exploratory_results=exploratory_results,
-        finalist_candidates=finalist_candidates, coverage=coverage, missing_inputs=missing_inputs,
-        sha_warnings=sha_warnings, sha_infos=sha_infos, decision_rules_sha=sha,
+        metrics=metrics,
+        rule_results=rule_results,
+        exploratory_results=exploratory_results,
+        finalist_candidates=finalist_candidates,
+        coverage=coverage,
+        missing_inputs=missing_inputs,
+        sha_warnings=sha_warnings,
+        sha_infos=sha_infos,
+        decision_rules_sha=sha,
         extraction_summaries=extraction_summaries,
     )
     summary = build_summary(
-        metrics=metrics, rule_results=rule_results, exploratory_results=exploratory_results,
-        finalist_candidates=finalist_candidates, coverage=coverage, missing_inputs=missing_inputs,
-        sha_warnings=sha_warnings, sha_infos=sha_infos, decision_rules_sha=sha,
+        metrics=metrics,
+        rule_results=rule_results,
+        exploratory_results=exploratory_results,
+        finalist_candidates=finalist_candidates,
+        coverage=coverage,
+        missing_inputs=missing_inputs,
+        sha_warnings=sha_warnings,
+        sha_infos=sha_infos,
+        decision_rules_sha=sha,
         extraction_summaries=extraction_summaries,
     )
 
@@ -2425,9 +2948,17 @@ def diff_outputs(outputs: GeneratedOutputs, out_dir: Path) -> list[str]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m scripts.model_bench.analyse")
-    parser.add_argument("--results", type=Path, default=None, help="bench_host.py results directory for one run")
-    parser.add_argument("--out", type=Path, default=None, help="output directory for REPORT.md/summary.json/grades")
-    parser.add_argument("--check", action="store_true", help="regenerate in memory and diff against --out; exits non-zero on any difference")
+    parser.add_argument(
+        "--results", type=Path, default=None, help="bench_host.py results directory for one run"
+    )
+    parser.add_argument(
+        "--out", type=Path, default=None, help="output directory for REPORT.md/summary.json/grades"
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="regenerate in memory and diff against --out; exits non-zero on any difference",
+    )
     return parser
 
 

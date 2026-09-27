@@ -58,9 +58,7 @@ DECISION_RULES_PATH = ARMS_JSON_PATH.parent / "decision_rules.json"
 # and appended a second `supersedes` entry, moving decision_rules.json's own sha256 from
 # the plan v2 value (ad181060...) to this one. The superseded value is pinned below too,
 # so a future edit cannot drop it from `supersedes` without failing a test.
-DECISION_RULES_EXPECTED_SHA256 = (
-    "e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3ef618bb268db2"
-)
+DECISION_RULES_EXPECTED_SHA256 = "e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3ef618bb268db2"
 DECISION_RULES_SUPERSEDED_V2_SHA256 = (
     "ad181060e24727e4ffedcf899e8999941561df3b4ea6f34482878c8cbbac8c0e"
 )
@@ -106,12 +104,11 @@ def test_every_base_arm_resolves_identically_under_current_arms_json():
         assert arm_id in current_resolved, f"{arm_id} missing from current arms.json"
         current_arm = current_resolved[arm_id]
         if arm_id == _OPTIONAL_FLAG_EXEMPT_ARM:
-            assert base_arm["optional"] is False, (
-                f"{arm_id!r} was expected to start with optional=False at BASE_COMMIT"
-            )
+            assert (
+                base_arm["optional"] is False
+            ), f"{arm_id!r} was expected to start with optional=False at BASE_COMMIT"
             assert current_arm["optional"] is True, (
-                f"{arm_id!r} was expected to resolve with optional=True after the "
-                f"pre-PR edit"
+                f"{arm_id!r} was expected to resolve with optional=True after the " f"pre-PR edit"
             )
             base_without_optional = {k: v for k, v in base_arm.items() if k != "optional"}
             current_without_optional = {k: v for k, v in current_arm.items() if k != "optional"}
@@ -138,8 +135,7 @@ def test_common_args_sampling_and_thinking_args_are_byte_for_byte_unchanged():
     for family, values in base_doc["sampling"].items():
         assert family in current_doc["sampling"], f"sampling family {family!r} was removed"
         assert current_doc["sampling"][family] == values, (
-            f"sampling family {family!r} changed -- existing families must stay "
-            f"byte-identical"
+            f"sampling family {family!r} changed -- existing families must stay " f"byte-identical"
         )
 
 
