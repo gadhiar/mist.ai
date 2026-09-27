@@ -43,6 +43,7 @@ class TestProducer:
         assert status.state == "disabled"
         assert (status.backlog_depth, status.apply_pending, status.dead_lettered) == (0, 0, 0)
         assert status.unrecorded_turns == 2
+        assert status.legacy_unextracted == 0
         assert status.service.reachable is False
         assert status.model_dump(mode="json")["type"] == "extraction_status"
 
@@ -67,6 +68,21 @@ class TestProducer:
         assert status.state == "idle"
         assert status.backlog_depth == 1
         assert status.unrecorded_turns == 1
+
+    @pytest.mark.asyncio
+    async def test_a_running_dispatcher_reports_its_legacy_unextracted_count(
+        self, unactivated_backlog_world, ts
+    ):
+        world = unactivated_backlog_world
+        world.log_turn(session_id="s1", turn_index=0, timestamp=ts(0), utterance="I use rust")
+        world.log_turn(session_id="s1", turn_index=1, timestamp=ts(1), utterance="I use zig")
+        dispatcher = world.build_dispatcher()
+        await dispatcher.start()
+        assert await dispatcher.drain(timeout=5.0)
+
+        status = extraction_status(dispatcher)
+
+        assert status.legacy_unextracted == dispatcher.legacy_unextracted == 2
 
     def test_a_snapshot_storage_failure_reports_the_state_with_zero_counts(self):
         class _Broken:

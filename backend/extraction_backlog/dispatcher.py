@@ -260,11 +260,7 @@ class ExtractionDispatcher:
 
     @property
     def legacy_unextracted(self) -> int:
-        """Turns logged before first activation with no cache row (never dispatched).
-
-        Not part of `ExtractionStatus`: the contract has no field for it, and
-        `unrecorded_turns` means something else (turns the log never recorded).
-        """
+        """Turns logged before first activation with no cache row (never dispatched)."""
         return self._legacy_unextracted
 
     def add_apply_listener(self, listener: ApplyListener) -> None:
@@ -381,23 +377,21 @@ class ExtractionDispatcher:
     def snapshot(self) -> ExtractionStatus:
         """The contract's `ExtractionStatus` for this dispatcher, computed now."""
         epoch = self._store.active_epoch()
-        backlog_depth = apply_pending = dead_lettered = 0
+        backlog_depth = apply_pending = dead_lettered = legacy_unextracted = 0
         oldest: int | None = None
         if epoch is not None:
             scan = self._store.scan(epoch)
             backlog_depth = scan.backlog_depth
             apply_pending = scan.apply_pending
             dead_lettered = scan.dead_lettered
+            legacy_unextracted = scan.legacy_unextracted
             oldest = age_ms(scan.oldest_pending_timestamp, self._clock())
         cutover_status = None
         cutover = self._store.open_cutover()
         if cutover is not None:
             fill = self._store.fill_scan(cutover)
             cutover_status = CutoverStatus(
-                # The contract's `CutoverStatus.state` has no 'checked': a
-                # checked cutover is still fully covered, which is what
-                # 'ready' reports. The admin CLI shows the exact state.
-                state="ready" if cutover.state == "checked" else cutover.state,  # type: ignore[arg-type]
+                state=cutover.state,  # type: ignore[arg-type]
                 target_extraction_version=cutover.extraction_version,
                 target_model_hash=cutover.model_hash,
                 covered=fill.covered,
@@ -410,6 +404,7 @@ class ExtractionDispatcher:
             dead_lettered=dead_lettered,
             oldest_pending_age_ms=oldest,
             unrecorded_turns=telemetry.unrecorded_turns(),
+            legacy_unextracted=legacy_unextracted,
             service=self._service,
             last_job=self._last_job,
             cutover=cutover_status,

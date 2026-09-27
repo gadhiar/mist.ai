@@ -298,7 +298,7 @@ class LastJob(BaseModel):
 class CutoverStatus(BaseModel):
     """Progress of a model/version cutover in flight, when one is running."""
 
-    state: Literal["filling", "ready", "promoted", "abandoned"]
+    state: Literal["filling", "ready", "checked", "promoted", "abandoned"]
     target_extraction_version: str
     target_model_hash: str
     covered: int
@@ -321,6 +321,7 @@ class ExtractionStatus(BaseModel):
     dead_lettered: int
     oldest_pending_age_ms: int | None
     unrecorded_turns: int = 0
+    legacy_unextracted: int = 0
     service: ServiceStatus
     last_job: LastJob | None
     cutover: CutoverStatus | None = None

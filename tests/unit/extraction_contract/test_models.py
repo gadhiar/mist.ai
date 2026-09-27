@@ -183,9 +183,20 @@ def _extraction_status() -> ExtractionStatus:
         dead_lettered=0,
         oldest_pending_age_ms=500,
         unrecorded_turns=0,
+        legacy_unextracted=3,
         service=_service_status(),
         last_job=_last_job(),
         cutover=_cutover_status(),
+    )
+
+
+def _checked_cutover_status() -> CutoverStatus:
+    return CutoverStatus(
+        state="checked",
+        target_extraction_version="2026-07-01-r6",
+        target_model_hash="def456",
+        covered=10,
+        total=10,
     )
 
 
@@ -207,6 +218,7 @@ ROUND_TRIP_FIXTURES = [
     _service_status,
     _last_job,
     _cutover_status,
+    _checked_cutover_status,
     _extraction_status,
 ]
 
@@ -262,6 +274,16 @@ class TestExtractionStatus:
         assert status.type == "extraction_status"
         assert status.cutover is None
         assert status.unrecorded_turns == 0
+        assert status.legacy_unextracted == 0
+
+    def test_legacy_unextracted_defaults_to_zero_when_omitted_from_the_payload(self):
+        """A pre-existing payload with no `legacy_unextracted` key still validates."""
+        payload = _extraction_status().model_dump(mode="json")
+        del payload["legacy_unextracted"]
+
+        restored = ExtractionStatus.model_validate(payload)
+
+        assert restored.legacy_unextracted == 0
 
     def test_last_job_and_cutover_optional_none(self):
         status = ExtractionStatus(
@@ -279,6 +301,23 @@ class TestExtractionStatus:
 
         assert restored.last_job is None
         assert restored.cutover is None
+
+
+class TestCutoverStatusChecked:
+    def test_checked_state_round_trips(self):
+        status = _checked_cutover_status()
+
+        restored = CutoverStatus.model_validate(status.model_dump(mode="json"))
+
+        assert restored.state == "checked"
+
+    def test_checked_state_survives_inside_extraction_status(self):
+        status = _extraction_status().model_copy(update={"cutover": _checked_cutover_status()})
+
+        restored = ExtractionStatus.model_validate(status.model_dump(mode="json"))
+
+        assert restored.cutover is not None
+        assert restored.cutover.state == "checked"
 
 
 class TestScopeOutConfidenceBounds:
