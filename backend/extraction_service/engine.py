@@ -107,6 +107,32 @@ class ExtractionTimeoutError(ExtractionServiceError):
     """
 
 
+class InvalidRequestError(ExtractionServiceError):
+    """The request passed the contract model but carries an unusable value.
+
+    Maps to HTTP 422 / `ErrorCode.CONTRACT_MISMATCH`: the caller must fix the
+    request, not retry it unchanged.
+    """
+
+
+def parse_recorded_at(recorded_at: str) -> datetime:
+    """Parse `ExtractRequest.recorded_at`, the turn's reference date.
+
+    The contract types it as a plain `str` (an ISO-8601 timestamp by
+    convention), so the model accepts any string; this is where a value that
+    is not ISO-8601 is refused.
+
+    Raises:
+        InvalidRequestError: `recorded_at` is not an ISO-8601 timestamp.
+    """
+    try:
+        return datetime.fromisoformat(recorded_at)
+    except ValueError as exc:
+        raise InvalidRequestError(
+            f"recorded_at {recorded_at!r} is not an ISO-8601 timestamp: {exc}"
+        ) from exc
+
+
 def _require_object_items(field: str, items: list[Any]) -> list[dict[str, Any]]:
     """Return `items` when every element is a JSON object, else raise.
 
@@ -230,6 +256,8 @@ class ExtractionEngine:
         """Run the full stage sequence for one job and build its response.
 
         Raises:
+            InvalidRequestError: `req.recorded_at` is not ISO-8601; raised
+                before any LLM call.
             UpstreamLLMError: The extraction LLM call failed, or the model
                 never produced parseable output within `max_attempts`.
             ExtractionTimeoutError: An LLM call exceeded
@@ -238,7 +266,7 @@ class ExtractionEngine:
         total_start = time.perf_counter()
         warnings: list[str] = []
 
-        reference_date = datetime.fromisoformat(req.recorded_at)
+        reference_date = parse_recorded_at(req.recorded_at)
         conversation_history = [
             {"role": m.role, "content": m.content} for m in req.conversation_history
         ]

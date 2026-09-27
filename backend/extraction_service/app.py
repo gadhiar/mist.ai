@@ -39,7 +39,9 @@ from backend.extraction_service.adapters import get_adapter
 from backend.extraction_service.engine import (
     ExtractionEngine,
     ExtractionTimeoutError,
+    InvalidRequestError,
     UpstreamLLMError,
+    parse_recorded_at,
 )
 from backend.extraction_service.settings import ServiceSettings
 from backend.knowledge.version_stamps import EXTRACTION_VERSION
@@ -191,6 +193,11 @@ def create_app(
                 f"model_hash={settings.model_hash!r})",
             )
 
+        try:
+            parse_recorded_at(req.recorded_at)
+        except InvalidRequestError as exc:
+            return _error_response(ErrorCode.CONTRACT_MISMATCH, str(exc))
+
         probe_result = await health_probe.check()
         if probe_result.status != "ok":
             return _error_response(
@@ -201,6 +208,9 @@ def create_app(
         request_start = time.perf_counter()
         try:
             response = await cache.get_or_run(req.job_id, lambda: engine.run(req))
+        except InvalidRequestError as exc:
+            # Checked above; kept so the engine's own refusal is never a 500.
+            return _error_response(ErrorCode.CONTRACT_MISMATCH, str(exc))
         except ExtractionTimeoutError as exc:
             logger.info(
                 "job failed request_id=%s job_id=%s event_id=%s turn_id=%s outcome=timeout: %s",
