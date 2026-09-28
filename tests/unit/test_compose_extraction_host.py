@@ -190,6 +190,35 @@ class TestLlamaServerPins:
         ]
 
 
+class TestServiceEnvPassthrough:
+    """Pins the compose passthrough for three vars that were previously
+    silently unreachable inside the container (compose never forwarded
+    them, even though README.md documented them as operator-settable).
+    """
+
+    def test_llm_timeout_seconds_is_forwarded_with_120_default(self) -> None:
+        env = _env_dict(_host_extraction())
+        assert (
+            env["EXTRACTION_LLM_TIMEOUT_SECONDS"] == "${EXTRACTION_LLM_TIMEOUT_SECONDS:-120}"
+        ), env["EXTRACTION_LLM_TIMEOUT_SECONDS"]
+
+    def test_max_attempts_is_forwarded_with_2_default(self) -> None:
+        env = _env_dict(_host_extraction())
+        assert env["EXTRACTION_MAX_ATTEMPTS"] == "${EXTRACTION_MAX_ATTEMPTS:-2}", env[
+            "EXTRACTION_MAX_ATTEMPTS"
+        ]
+
+    def test_constrained_mode_is_forwarded_with_empty_default(self) -> None:
+        # Empty default, not a literal mode name -- an empty string is
+        # falsy, so `constrained_mode or adapter.default_constrained_mode`
+        # (engine.py) falls through to the adapter's own default exactly
+        # like the unset/None case did before this var was reachable.
+        env = _env_dict(_host_extraction())
+        assert env["EXTRACTION_CONSTRAINED_MODE"] == "${EXTRACTION_CONSTRAINED_MODE:-}", env[
+            "EXTRACTION_CONSTRAINED_MODE"
+        ]
+
+
 class TestHostPublishesNoPorts:
     def test_no_service_publishes_ports(self) -> None:
         for name, service in _services().items():
