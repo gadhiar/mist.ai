@@ -1,8 +1,9 @@
 """The dispatcher's writer-stamp guard.
 
-The graph writer stamps edges from `KnowledgeConfig`, not from the epoch
-ledger, so a backend whose writer stamps differ from the active epoch's must
-neither dispatch nor apply: it stalls with a reason naming both triples.
+Curation stamps reconciled relationship edges and EXTRACTED_FROM edges with a
+triple from `KnowledgeConfig`, not from the epoch ledger, so a backend whose
+writer stamps differ from the active epoch's must neither dispatch nor apply:
+it stalls with a reason naming both triples.
 """
 
 from __future__ import annotations
