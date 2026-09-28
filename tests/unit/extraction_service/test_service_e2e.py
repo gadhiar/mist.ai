@@ -11,6 +11,11 @@ import asyncio
 
 import pytest
 
+from backend.extraction_service.schemas import (
+    DERIVATION_OUTPUT_SCHEMA,
+    EXTRACTION_OUTPUT_SCHEMA,
+    SCOPE_OUTPUT_SCHEMA,
+)
 from backend.knowledge.version_stamps import EXTRACTION_VERSION
 from tests.unit.extraction_service.conftest import make_extract_request
 
@@ -76,6 +81,51 @@ class TestHappyPath:
         assert data["derivation"] is None
         assert data["timings_ms"]["derive"] is None
         assert len(fake_llama_state.chat_requests) == 2
+
+
+@pytest.mark.asyncio
+class TestGptOssDefaultConstrainedMode:
+    """Pins the outgoing request body each stage builds under the gpt-oss default.
+
+    With `EXTRACTION_CONSTRAINED_MODE` unset, the engine falls through to
+    `GptOssAdapter.default_constrained_mode` ("schema"). Each stage must then
+    send llama-server a `json_schema` response_format carrying that stage's
+    own output schema -- never an empty schema, and never plain `json_object`.
+    """
+
+    async def test_scope_extract_derive_each_send_their_own_json_schema(
+        self, client, fake_llama_state, service_settings
+    ):
+        assert service_settings.constrained_mode is None
+        fake_llama_state.chat_responses = [
+            '{"scope": "user-scope", "confidence": 0.9}',
+            '{"entities": [], "relationships": []}',
+            '{"operations": []}',
+        ]
+        body = make_extract_request(
+            derivation={
+                "signal_types": ["feedback"],
+                "matched_patterns": ["feedback:stop"],
+                "existing_internal_entities": "No existing internal entities.",
+                "assistant_response": "Got it.",
+            }
+        )
+
+        response = await client.post("/v1/extract", json=body)
+
+        assert response.status_code == 200
+        requests = fake_llama_state.chat_requests
+        assert len(requests) == 3
+        expected_schemas = [
+            SCOPE_OUTPUT_SCHEMA,
+            EXTRACTION_OUTPUT_SCHEMA,
+            DERIVATION_OUTPUT_SCHEMA,
+        ]
+        for request, schema in zip(requests, expected_schemas, strict=True):
+            assert request["response_format"] == {
+                "type": "json_schema",
+                "json_schema": {"name": "response", "schema": schema, "strict": True},
+            }
 
 
 @pytest.mark.asyncio

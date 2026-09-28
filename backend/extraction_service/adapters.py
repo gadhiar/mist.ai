@@ -78,16 +78,23 @@ class GptOssAdapter:
 
     Reasoning is always on for gpt-oss (the T0 brief's extraction model
     choice); `reasoning_effort` controls how much. Constrained decoding
-    defaults to "none": grammar-constrained decoding alongside Harmony
-    reasoning is unverified on llama.cpp b11151, so the engine relies on
-    parse-and-repair instead.
+    defaults to "schema". An A/B run on the extraction host (llama.cpp
+    b11151, gpt-oss-20b) found that "none" breaks the scope call: the model
+    wraps its answer as `<|channel|>final <|constrain|>JSON<|message|>{...}`,
+    llama-server's peg parser rejects that wrapper, and the call returns
+    HTTP 500 on every retry, so scope degrades to "unknown" with
+    `scope_classification_failed`. "schema" and "json_object" both return
+    HTTP 200 on the same call, and the extraction payload's entities and
+    relationships were identical under all three modes. "schema" is the
+    stricter of the two working modes and matches `QwenAdapter` and
+    `GemmaAdapter`.
     """
 
     reasoning_effort: ReasoningEffort = "low"
     reasoning_budget_tokens: int | None = None
     name: str = "gptoss"
     version: str = "1"
-    default_constrained_mode: ConstrainedMode = "none"
+    default_constrained_mode: ConstrainedMode = "schema"
 
     def prepare(self, request: LLMRequest, stage: str) -> LLMRequest:
         """Set gpt-oss reasoning-effort/budget thinking controls on `request`."""

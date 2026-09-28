@@ -121,6 +121,16 @@ it) -- compose loads `.env` from the directory of the compose file you pass with
 Every other `EXTRACTION_*` variable has a default; `docker/extraction/README.md`
 section "Environment variables" lists them.
 
+**`EXTRACTION_CONSTRAINED_MODE` may stay unset.** The `gptoss` adapter's
+default constrained mode is now `schema`. It used to be `none`, which on
+llama.cpp b11151 makes llama-server's peg parser reject gpt-oss's
+`<|constrain|>JSON` Harmony wrapper and fail the scope call with HTTP 500, so
+a working host needed an explicit `EXTRACTION_CONSTRAINED_MODE=schema` (or
+`json_object`) in `.env`. With `schema` as the adapter default, leaving the
+variable out of `.env` (or empty) selects the working mode. See
+`docker/extraction/README.md`'s "`EXTRACTION_CONSTRAINED_MODE` and the
+`gptoss` default" note for the A/B result.
+
 **Out-of-repo timeout override, retirement.** Before this compose passthrough
 landed, `compose.host.yml` had no way to forward `EXTRACTION_LLM_TIMEOUT_SECONDS`
 at all, so the live host set it to `300` via an out-of-repo override file
