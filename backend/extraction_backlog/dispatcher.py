@@ -21,16 +21,26 @@ build_derivation_context`).
 FAILURES
 --------
 - The backend's WRITER stamps disagree with the active epoch: state
-  `stalled`, nothing applied or dispatched. The graph writer stamps every
-  edge from `KnowledgeConfig` (`ontology_version`, `extraction_version`,
-  `compose_model_hash(config)`), not from the epoch ledger, and the
-  dispatcher receives those same stamps as `writer_stamps`. Outside an open
-  cutover, each step compares all three fields with the active epoch before
-  it scans the backlog. On any difference the step returns without calling
-  `/v1/info`, sending a job, writing the cache, curating or writing a marker,
-  and the reason (both stamp triples) is logged. The fix is to set
+  `stalled`, nothing applied or dispatched. Curation writes a stamp triple
+  taken from `KnowledgeConfig` (`ontology_version`, `extraction_version`,
+  `compose_model_hash(config)`), not from the epoch ledger, onto the
+  relationship edges reconciliation writes (`curation/reconciliation.py`)
+  and onto each EXTRACTED_FROM edge (`curation/graph_writer.py`,
+  `_extracted_from_clause`). Other edges curation writes, such as
+  LEARNED_FROM and ABOUT, carry no stamps. `build_extraction_dispatcher`
+  derives `writer_stamps` with the same function `build_curation_pipeline`
+  uses (`factories.writer_stamps_from_config`). Outside an open cutover,
+  each step compares all three fields with the active epoch before it scans
+  the backlog. On any difference the step returns without calling
+  `/v1/info`, sending a job, writing the cache, curating or writing an apply
+  marker, and the reason (both stamp triples) is logged. The epoch's first
+  activation (`_ensure_activation`) runs before the guard and is not
+  guarded: when the epoch has no activation row yet, it records the floor
+  and marks the turns already cached under the epoch applied
+  (`BacklogStore.ensure_activation`). It writes nothing to the graph. The fix is to set
   `MIST_MODEL_HASH` (or deploy the code whose versions match the epoch) and
-  restart the backend. The cutover fill is not guarded: it applies nothing.
+  restart the backend. The cutover fill is not guarded: it writes candidate
+  cache rows and applies nothing to the live graph.
 - Service unreachable, or `model_loading`: not the job's fault. State
   `unreachable`, exponential reconnect backoff, no attempt counted.
 - `/v1/info` (or a reply's stamps) disagree with the active epoch, or an
@@ -214,10 +224,12 @@ class ExtractionDispatcher:
             settings: Mode, retry and backoff configuration.
             embedding_model_name: The backend's embedding model identity, folded
                 into the service's bare model hash for the epoch comparison.
-            writer_stamps: The stamps the graph writer applies with (built
-                from `KnowledgeConfig` in `backend/factories.py`). Outside a
-                cutover the dispatcher stalls rather than apply or dispatch
-                while they differ from the active epoch's stamps.
+            writer_stamps: The stamp triple curation writes onto the edges
+                it stamps. `build_extraction_dispatcher` derives it from
+                `KnowledgeConfig` with `writer_stamps_from_config`, the
+                function `build_curation_pipeline` uses. Outside a cutover
+                the dispatcher stalls rather than apply or dispatch while it
+                differs from the active epoch's stamps.
             clock: Wall clock (tz-aware). Defaults to `datetime.now(UTC)`.
             on_stop: Awaited once at the end of `stop()`, e.g. to close an
                 HTTP client the factory built for this dispatcher.
@@ -484,9 +496,10 @@ class ExtractionDispatcher:
         if cutover is not None:
             return await self._fill_step(cutover)
 
-        # Writer-stamp guard: everything below can apply to the live graph,
-        # which is stamped from `self._writer_stamps`, so it runs only when
-        # those equal the active epoch's stamps.
+        # Writer-stamp guard: everything below can apply to the live graph.
+        # Curation stamps what it writes with its own config-derived triple,
+        # which `self._writer_stamps` stands for, so the steps below run only
+        # when that triple equals the active epoch's stamps.
         mismatch = self._writer_stamp_mismatch(epoch)
         if mismatch is not None:
             if self._writer_mismatch_logged_epoch != epoch.epoch_id:

@@ -332,13 +332,18 @@ def resolve_context_budget_window(
 
 
 def writer_stamps_from_config(config: KnowledgeConfig) -> RebuildStamps:
-    """The stamps the curation graph writer applies with, from `config`.
+    """The curation stamp triple for `config`.
 
-    `build_curation_pipeline` stamps the graph with these, and
-    `build_extraction_dispatcher` hands the same value to the dispatcher's
-    writer-stamp guard. One function builds both, so the two cannot drift.
-    The model hash is `compose_model_hash(config)`, never the bare
-    `config.model_hash`.
+    `build_curation_pipeline` passes the result to its graph writer and
+    reconciliation engine, and `build_extraction_dispatcher` passes it to the
+    dispatcher's writer-stamp guard. Both derive the triple through this one
+    function, so for one config the two values cannot differ in how they are
+    derived. They are equal only when the two callers get equal configs: in
+    the server each reads its own `KnowledgeConfig.from_env()`
+    (`backend/server.py`, `_start_extraction_dispatcher`'s caller;
+    `backend/voice_models/model_manager.py` for the curation pipeline), and
+    the two agree because both read the same environment. The model hash is
+    `compose_model_hash(config)`, never the bare `config.model_hash`.
     """
     from backend.knowledge.version_stamps import compose_model_hash
 
@@ -377,7 +382,8 @@ def build_curation_pipeline(
     # consumer can detect when the ontology, extraction prompt, or model
     # binary has drifted from the values active at extraction time -- no
     # command reads them for that purpose today. The extraction dispatcher's
-    # writer-stamp guard compares the same value with the active epoch.
+    # writer-stamp guard compares a triple derived by the same function (from
+    # its own config) with the active epoch.
     rebuild_stamps = writer_stamps_from_config(config)
     return CurationPipeline(
         deduplicator=EntityDeduplicator(executor, embedding_provider, confidence_mgr),
@@ -651,9 +657,9 @@ def build_extraction_dispatcher(
     Args:
         config: Knowledge configuration; supplies the embedding model identity
             the dispatcher folds into the service's model hash, and the writer
-            stamps (`writer_stamps_from_config`, the value
-            `build_curation_pipeline` stamps the graph with) that the
-            dispatcher compares with the active epoch before it applies.
+            stamps the dispatcher compares with the active epoch before it
+            applies (`writer_stamps_from_config`, the function
+            `build_curation_pipeline` derives its stamps with).
         pipeline: The handler's extraction pipeline (gates, Stage 9 context,
             apply step). Its own LLM stages are never called by the dispatcher.
         event_store: The handler's event store -- the log the backlog reads.
