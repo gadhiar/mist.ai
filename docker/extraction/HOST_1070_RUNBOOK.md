@@ -222,6 +222,16 @@ throughput across the sweep is approximately 500 t/s (the earlier recorded
 ~155 t/s figure was measured at the old ctx-8192/406-token setup and is
 superseded by this table).
 
+**Recommended `ncmoe` for this host: 13, not the bare-minimum 12.** Step
+5.3's general "pick the lowest value that fits" guidance above assumes VRAM
+is otherwise idle; this GPU also drives the host's own display, so `ncmoe=12`
+leaves only 560 MiB headroom -- tighter than is comfortable when the same
+card is also rendering a desktop. `ncmoe=13` leaves 948 MiB headroom for a
+small, predictable decode-speed cost (16.4 vs 17.7 t/s). Set
+`EXTRACTION_HOST_NCMOE=13` in the host's own `.env` (`docker/extraction/compose.host.yml`'s
+own committed default stays `24`, all-experts-on-CPU, until an operator
+opts into a tighter value this way).
+
 **Recommended operator setting: `ncmoe=13`, not the bare minimum `ncmoe=12`.**
 This GPU also drives the host's own display -- `12` fits with only 560 MiB
 spare, which is tighter than desirable when the same card is also rendering

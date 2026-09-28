@@ -105,6 +105,19 @@ one, so a deploy never silently runs on a `from_env()` fallback value.
 | `EXTRACTION_MAX_ATTEMPTS` | `2` | same | Maximum extraction attempts per job (first call plus repair retries on unparsable output), matching `ServiceSettings.max_attempts`'s own default. |
 | `EXTRACTION_CONSTRAINED_MODE` | empty | same | Overrides the adapter's `default_constrained_mode` when set. Empty is falsy in `engine.py`'s `constrained_mode or adapter.default_constrained_mode`, so it falls through to the adapter's default -- the same effective behavior as unset. |
 
+**`EXTRACTION_LLM_TIMEOUT_SECONDS` caveat for the host.** 120s covers the
+measured end-to-end `/v1/extract` figures above, but `llm_timeout_seconds`
+bounds each individual LLM call, and the extraction stage alone asks for
+`max_tokens=2048` (`backend/extraction_service/engine.py`). At the host's
+`ncmoe=13` re-fit (16.4 decode t/s, 483 prompt t/s), a call that used the
+full 2048-token budget would take roughly 145s (about 19s prompt processing
+plus about 125s decode) -- over the 120s generic default. The host's own
+`.env` should keep `EXTRACTION_LLM_TIMEOUT_SECONDS=300` (see
+`docker/extraction/HOST_1070_RUNBOOK.md`'s "Out-of-repo timeout override,
+retirement" note) rather than relying on this compose-file fallback;
+120 is sized for the common case and for the local (4070) deployment, whose
+much faster decode keeps it well clear of this worst case.
+
 Every other `ServiceSettings` field (`reasoning_budget_tokens`,
 `idempotency_cache_size`, `scope_enabled`, `temperature`, `port`) has a
 tested default in `settings.py` and is left unset here deliberately --
@@ -112,14 +125,17 @@ tested default in `settings.py` and is left unset here deliberately --
 "No reasoning-budget cap" below).
 
 **Idempotency-cache trap (operator note).** `ServiceSettings.idempotency_cache_size`
-(default 256) backs a `job_id` -> `ExtractResponse` LRU cache. Reusing the
-same `job_id`/`request_id` across repeated `/v1/extract` calls -- for
+(default 256) backs a `job_id` -> `ExtractResponse` LRU cache
+(`backend/extraction_service/app.py`'s `_ResultCache`, keyed on `job_id`
+alone -- `cache.knows(req.job_id)` / `cache.get_or_run(req.job_id, ...)`).
+Reusing the same `job_id` across repeated `/v1/extract` calls -- for
 example while manually timing something, or re-running a probe script
 without regenerating IDs -- returns the CACHED result instead of
-re-invoking the LLM, silently. Always use fresh `job_id`/`request_id`
-values when timing or re-testing the service; a live measurement session
-has already been thrown off this way (numbers looked too fast because
-later calls were cache hits, not real inference runs).
+re-invoking the LLM, silently. `request_id` is not part of the cache key;
+it is used only for log correlation (the "job complete"/"job failed" log
+lines), so reusing it alone has no effect on caching. Always use a fresh
+`job_id` when timing or re-testing the service, and regenerate `request_id`
+alongside it for clean log correlation.
 
 ### llama-server (`mist-extraction-llm-local` / `mist-extraction-llm-host`)
 
