@@ -8,6 +8,7 @@
     python -m backend.extraction_backlog.admin cutover rebuild --staging-uri URI \
         --min-seed-nodes N --expect-turns N --min-replay-edges N
     python -m backend.extraction_backlog.admin cutover promote --graph-swapped
+    python -m backend.extraction_backlog.admin cutover promote --seed-only-graph
     python -m backend.extraction_backlog.admin cutover abandon
 
 `status` reads the event store and extraction cache directly (it does not call
@@ -33,6 +34,8 @@ the same log until the next epoch cutover re-extracts it. The command says so
 when it runs.
 
 `cutover ...` drives the epoch cutover (`cutover.py`; runbook in `CUTOVER.md`).
+`cutover promote` takes `--graph-swapped` or `--seed-only-graph`, never both
+(argparse refuses the pair with exit 2 before anything is opened).
 Exit codes: 0 done, 2 refused (nothing changed). `cutover rebuild` also exits
 1 (rebuild-twice disagreed) or 4 (a non-vacuity or self-model gate failed), and
 records its report on the cutover either way.
@@ -234,24 +237,56 @@ def _cutover_abandon(store: BacklogStore, now_iso: str, out: TextIO) -> int:
     return 0
 
 
-def _cutover_promote(store: BacklogStore, graph_swapped: bool, now_iso: str, out) -> int:
+def _cutover_promote(
+    store: BacklogStore,
+    args: argparse.Namespace,
+    graph_probe: Callable | None,
+    now_iso: str,
+    out: TextIO,
+) -> int:
     from backend.knowledge.version_stamps import EXTRACTION_VERSION
 
-    from .cutover import CutoverRefusedError, promote_cutover
+    from .cutover import (
+        CutoverRefusedError,
+        probe_live_graph_from_env,
+        promote_cutover,
+        promote_seed_only_cutover,
+    )
 
     try:
-        promotion = promote_cutover(store, graph_swapped=graph_swapped, now_iso=now_iso)
+        if args.seed_only_graph:
+            promotion = promote_seed_only_cutover(
+                store,
+                graph_probe=graph_probe if graph_probe is not None else probe_live_graph_from_env,
+                now_iso=now_iso,
+            )
+        else:
+            promotion = promote_cutover(
+                store, graph_swapped=bool(args.graph_swapped), now_iso=now_iso
+            )
     except CutoverRefusedError as exc:
         print(f"[cutover] REFUSED: {exc}", file=out)
         return 2
     cutover = promotion.cutover
-    print(
-        f"[cutover] promoted cutover {cutover.cutover_id} to epoch {promotion.epoch_id}: "
-        f"{promotion.marked_applied} of {promotion.turns_at_activation} logged turn(s) marked "
-        f"applied through {cutover.rebuilt_through_event_id}; later turns stay apply-pending "
-        "for the dispatcher.",
-        file=out,
-    )
+    if promotion.graph_probe is not None:
+        probe = promotion.graph_probe
+        print(
+            f"[cutover] promoted cutover {cutover.cutover_id} to epoch {promotion.epoch_id} "
+            f"over a seed-only live graph ({probe.node_count} node(s), "
+            f"{probe.relationship_count} relationship(s), all seed-stamped): "
+            f"{promotion.marked_applied} of {promotion.turns_at_activation} logged turn(s) "
+            "marked applied; every logged turn stays apply-pending and the dispatcher applies "
+            "them in log order from the candidate cache.",
+            file=out,
+        )
+    else:
+        print(
+            f"[cutover] promoted cutover {cutover.cutover_id} to epoch {promotion.epoch_id}: "
+            f"{promotion.marked_applied} of {promotion.turns_at_activation} logged turn(s) "
+            f"marked applied through {cutover.rebuilt_through_event_id}; later turns stay "
+            "apply-pending for the dispatcher.",
+            file=out,
+        )
     print(
         f"[cutover] Before starting the backend, set MIST_MODEL_HASH={cutover.bare_model_hash} "
         "in its environment: live graph writes are stamped from KnowledgeConfig, not from "
@@ -325,11 +360,22 @@ def _add_cutover_parser(sub) -> None:
     rebuild.add_argument("--expect-turns", type=int, required=True)
     rebuild.add_argument("--min-replay-edges", type=int, required=True)
 
-    promote = csub.add_parser("promote", help="make the checked candidate the active epoch")
-    promote.add_argument(
+    promote = csub.add_parser("promote", help="make the candidate the active epoch")
+    how = promote.add_mutually_exclusive_group()
+    how.add_argument(
         "--graph-swapped",
         action="store_true",
-        help="REQUIRED: the live graph has been replaced by the checked staging graph",
+        help="the live graph has been replaced by the checked staging graph",
+    )
+    how.add_argument(
+        "--seed-only-graph",
+        action="store_true",
+        help=(
+            "no extraction has ever run against this live graph, so it holds seed data "
+            "only (operator precondition, CUTOVER.md 6A; an empty log does not show it if "
+            "the log was reset; a read-only probe checks for stamped and unseeded elements "
+            "first); promotes a 'ready' or 'checked' candidate without a swap"
+        ),
     )
 
     csub.add_parser("abandon", help="close the open cutover; deletes nothing")
@@ -342,6 +388,7 @@ def main(
     out: TextIO | None = None,
     embedding_model_name: str | None = None,
     rebuild_deps_factory: Callable | None = None,
+    graph_probe: Callable | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> int:
     """Run the CLI. `store`, `out` and the cutover dependencies are injectable for tests.
@@ -351,6 +398,10 @@ def main(
             `KnowledgeConfig.embedding.model_name`.
         rebuild_deps_factory: For `cutover rebuild`, `Cutover -> RebuildDeps`;
             defaults to the real Neo4j wiring (`build_rebuild_deps_from_env`).
+        graph_probe: For `cutover promote --seed-only-graph`, a `GraphProbe`
+            (`() -> GraphProbeReport`), called at most once and only after the
+            cutover's state, fill and markers have passed; defaults to the real
+            read-only live-graph probe (`probe_live_graph_from_env`).
         clock: Wall clock (tz-aware) for the timestamps cutover rows record.
 
     Returns:
@@ -385,7 +436,7 @@ def main(
     if command == "abandon":
         return _cutover_abandon(backlog, now_iso, stream)
     if command == "promote":
-        return _cutover_promote(backlog, bool(args.graph_swapped), now_iso, stream)
+        return _cutover_promote(backlog, args, graph_probe, now_iso, stream)
     # rebuild
     if rebuild_deps_factory is None:
         from .cutover import build_rebuild_deps_from_env

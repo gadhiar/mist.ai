@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 from backend.knowledge.config import ContextBudgetConfig, KnowledgeConfig, LLMConfig
 from backend.knowledge.curation.confidence import ConfidenceManager
 from backend.knowledge.curation.deduplication import EntityDeduplicator
-from backend.knowledge.curation.graph_writer import CurationGraphWriter
+from backend.knowledge.curation.graph_writer import CurationGraphWriter, RebuildStamps
 from backend.knowledge.curation.pipeline import CurationPipeline
 from backend.knowledge.curation.reconciliation import ReconciliationEngine
 from backend.knowledge.extraction.confidence import ConfidenceScorer
@@ -331,6 +331,33 @@ def resolve_context_budget_window(
     return fallback
 
 
+def writer_stamps_from_config(config: KnowledgeConfig) -> RebuildStamps:
+    """The curation stamp triple for `config`.
+
+    `build_curation_pipeline` passes the result to its graph writer and
+    reconciliation engine, and `build_extraction_dispatcher` passes it to the
+    dispatcher's writer-stamp guard. Both derive the triple through this one
+    function, so for one config the two values cannot differ in how they are
+    derived. They are equal only when the two callers get equal configs: in
+    the server each reads its own `KnowledgeConfig.from_env()`
+    (`backend/server.py`, `_start_extraction_dispatcher`'s caller;
+    `backend/voice_models/model_manager.py` for the curation pipeline), and
+    the two agree because both read the same environment. The model hash is
+    `compose_model_hash(config)`, never the bare `config.model_hash`.
+    """
+    from backend.knowledge.version_stamps import compose_model_hash
+
+    # Assigned rather than returned inline so the construction-site grep cited
+    # in `build_extraction_pipeline` and tests/unit/test_factories_rebuild_stamps.py
+    # still counts this site.
+    rebuild_stamps = RebuildStamps(
+        ontology_version=config.ontology_version,
+        extraction_version=config.extraction_version,
+        model_hash=compose_model_hash(config),
+    )
+    return rebuild_stamps
+
+
 def build_curation_pipeline(
     config: KnowledgeConfig,
     executor: GraphExecutor,
@@ -344,9 +371,7 @@ def build_curation_pipeline(
     turn reaching tier-3 dedup or a new-entity write lazy-loads a
     SentenceTransformer ON the event loop UNDER the curation lock.
     """
-    from backend.knowledge.curation.graph_writer import RebuildStamps
     from backend.knowledge.embeddings import EmbeddingGenerator
-    from backend.knowledge.version_stamps import compose_model_hash
 
     if embedding_provider is None:
         embedding_provider = EmbeddingGenerator(config.embedding.model_name)
@@ -356,12 +381,10 @@ def build_curation_pipeline(
     # edge (R1.3 moved this anchor off DERIVED_FROM->VaultNote) so a future
     # consumer can detect when the ontology, extraction prompt, or model
     # binary has drifted from the values active at extraction time -- no
-    # command reads them for that purpose today.
-    rebuild_stamps = RebuildStamps(
-        ontology_version=config.ontology_version,
-        extraction_version=config.extraction_version,
-        model_hash=compose_model_hash(config),
-    )
+    # command reads them for that purpose today. The extraction dispatcher's
+    # writer-stamp guard compares a triple derived by the same function (from
+    # its own config) with the active epoch.
+    rebuild_stamps = writer_stamps_from_config(config)
     return CurationPipeline(
         deduplicator=EntityDeduplicator(executor, embedding_provider, confidence_mgr),
         reconciliation_engine=ReconciliationEngine(
@@ -556,10 +579,11 @@ def build_extraction_pipeline(
         extraction_cache = None
 
     # Constructed here, from the same KnowledgeConfig that
-    # build_curation_pipeline constructs its own RebuildStamps from -- both
+    # build_curation_pipeline builds its own RebuildStamps from (through
+    # writer_stamps_from_config) -- both
     # real construction sites, and only those two, are found by `grep -nE
     # "^\s+(rebuild_stamps = )?RebuildStamps\(" backend/factories.py`
-    # (build_curation_pipeline's assignment, and this function's own
+    # (writer_stamps_from_config's assignment, and this function's own
     # RebuildStamps(...) call below; the plain `rebuild_stamps =
     # RebuildStamps(` substring this replaced also matched THIS comment once
     # the second site became a conditional expression in I1's fix, which is
@@ -632,7 +656,10 @@ def build_extraction_dispatcher(
 
     Args:
         config: Knowledge configuration; supplies the embedding model identity
-            the dispatcher folds into the service's model hash.
+            the dispatcher folds into the service's model hash, and the writer
+            stamps the dispatcher compares with the active epoch before it
+            applies (`writer_stamps_from_config`, the function
+            `build_curation_pipeline` derives its stamps with).
         pipeline: The handler's extraction pipeline (gates, Stage 9 context,
             apply step). Its own LLM stages are never called by the dispatcher.
         event_store: The handler's event store -- the log the backlog reads.
@@ -678,6 +705,7 @@ def build_extraction_dispatcher(
         inference=inference,
         settings=resolved_settings,
         embedding_model_name=config.embedding.model_name,
+        writer_stamps=writer_stamps_from_config(config),
         on_stop=on_stop,
     )
 

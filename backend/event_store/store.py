@@ -1372,11 +1372,167 @@ class EventStore:
             "marked_applied": len(applied),
         }
 
+    def count_extraction_applied_by_stage(self) -> dict[str, int]:
+        """Apply markers across EVERY epoch, counted by stage ('curated', 'applied').
+
+        An empty dict means no turn has a recorded apply marker under any epoch,
+        one of the conditions seed-only promotion requires. It does not mean no
+        turn was ever applied: the in-process extraction path
+        (`backend/chat/conversation_handler.py:2035-2049`, used when no
+        dispatcher is attached) writes no marker.
+        """
+        return self._applied_counts(self._get_connection())
+
+    @staticmethod
+    def _applied_counts(conn: sqlite3.Connection) -> dict[str, int]:
+        rows = conn.execute(
+            "SELECT stage, COUNT(*) FROM extraction_applied GROUP BY stage ORDER BY stage"
+        ).fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def promote_epoch_cutover_seed_only(
+        self, *, cutover_id: int, activated_at: str, probe_report: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Make a filled cutover the active epoch with no graph swap, in ONE transaction.
+
+        The graph-swapped path (`promote_epoch_cutover`) needs a checked staging
+        graph and marks applied the turns it contains. This path is for a live
+        graph no extraction has ever run against, which therefore holds only
+        seed data (the operator's precondition, CUTOVER.md 6A; an empty event
+        log shows it only if the log has not been reset or replaced since the
+        graph was seeded). No turn is
+        marked: every logged turn stays apply-pending and the dispatcher applies
+        them all, in log order, from the candidate cache.
+
+        This method does not look at the graph. `probe_report` is the caller's
+        read-only probe result, recorded verbatim; the probe finds no stamped
+        and no unseeded element, which does not rule out every extraction write
+        (see the comment above `SEED_ONLY_PROBE_CYPHER` in
+        `backend/extraction_backlog/cutover.py`).
+
+        Inside a single `BEGIN IMMEDIATE`:
+
+        1. re-check the cutover is 'ready' or 'checked', that the active epoch
+           is still its source epoch, and that `extraction_applied` has NO row
+           under any epoch (a turn recorded as applied or curated means the
+           graph may hold extracted data the probe did not see);
+        2. append the candidate's stamp triple to `epoch_ledger` (prev = the
+           source epoch, provisional 0);
+        3. write the new epoch's `extraction_activation` row first-hand, with
+           `turns_at_activation` = the logged turns and `marked_applied` =
+           `legacy_unextracted` = 0, so `BacklogStore.ensure_activation` never
+           runs its automatic first-activation rule for it (which would mark
+           every candidate-cached turn applied);
+        4. set the cutover to 'promoted' with `promoted_epoch_id` and a
+           `check_report` recording the mode (`seed_only_graph`), the probe
+           counts, and any earlier check report under `prior_check_report`.
+
+        No `extraction_applied` row is written. A crash anywhere before COMMIT
+        leaves none of it written. The fill (a candidate cache row per logged
+        turn) is NOT re-checked here: the cache is a separate database. The
+        caller checks it before this transaction; a turn logged in between is
+        inferred fresh under the new epoch by the dispatcher.
+
+        Args:
+            cutover_id: The open cutover to promote.
+            activated_at: ISO-8601 timestamp for the ledger, activation and
+                cutover rows.
+            probe_report: The live-graph probe's counts, recorded verbatim.
+
+        Returns:
+            `epoch_id`, `turns_at_activation`, and `marked_applied` (always 0).
+
+        Raises:
+            EpochCutoverStateError: The cutover is not 'ready' or 'checked', the
+                active epoch is no longer its source epoch, or an apply marker
+                exists under any epoch.
+        """
+        conn = self._get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM epoch_cutover WHERE cutover_id = ?", (cutover_id,)
+            ).fetchone()
+            if row is None or row["state"] not in ("ready", "checked"):
+                state = None if row is None else row["state"]
+                raise EpochCutoverStateError(
+                    f"cutover {cutover_id} is {state!r}; only a 'ready' or 'checked' cutover "
+                    "can be promoted over a seed-only graph"
+                )
+            current = conn.execute(
+                "SELECT * FROM epoch_ledger ORDER BY epoch_id DESC LIMIT 1"
+            ).fetchone()
+            if current is None or int(current["epoch_id"]) != row["source_epoch_id"]:
+                raise EpochCutoverStateError(
+                    f"the active epoch is "
+                    f"{None if current is None else int(current['epoch_id'])}, but cutover "
+                    f"{cutover_id} began from epoch {row['source_epoch_id']}; abandon it and "
+                    "begin again"
+                )
+            markers = self._applied_counts(conn)
+            if markers:
+                raise EpochCutoverStateError(
+                    f"extraction_applied holds apply markers "
+                    f"({', '.join(f'{stage}={n}' for stage, n in markers.items())}): a "
+                    "turn has been applied to a graph under some epoch, so the live graph is "
+                    "not seed-only; use the graph-swapped path"
+                )
+            turns = int(conn.execute("SELECT COUNT(*) FROM conversation_turn_events").fetchone()[0])
+            prior = row["check_report"]
+            report = {
+                "promotion_mode": "seed_only_graph",
+                "promoted_at": activated_at,
+                "graph_probe": dict(probe_report),
+                "prior_check_report": None if prior is None else self._decode_report(prior),
+            }
+
+            cursor = conn.execute(
+                "INSERT INTO epoch_ledger (ontology_version, extraction_version, model_hash, "
+                "activated_at, prev_epoch_id, provisional) VALUES (?, ?, ?, ?, ?, 0)",
+                (
+                    row["ontology_version"],
+                    row["extraction_version"],
+                    row["model_hash"],
+                    activated_at,
+                    int(current["epoch_id"]),
+                ),
+            )
+            epoch_id = int(cursor.lastrowid)
+            self._promotion_fault_point("ledger_appended")
+            conn.execute(
+                "INSERT INTO extraction_activation (epoch_id, activated_at, turns_at_activation, "
+                "marked_applied, legacy_unextracted) VALUES (?, ?, ?, 0, 0)",
+                (epoch_id, activated_at, turns),
+            )
+            conn.execute(
+                "UPDATE epoch_cutover SET state = 'promoted', promoted_epoch_id = ?, "
+                "check_report = ?, updated_at = ? WHERE cutover_id = ?",
+                (epoch_id, json.dumps(report, sort_keys=True), activated_at, cutover_id),
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            # BaseException for the same reason as `promote_epoch_cutover`: an
+            # abort between the ledger append and the activation must not leave
+            # a half-written transaction on this shared connection.
+            conn.execute("ROLLBACK")
+            raise
+        return {"epoch_id": epoch_id, "turns_at_activation": turns, "marked_applied": 0}
+
+    @staticmethod
+    def _decode_report(text: str) -> Any:
+        """A stored check report as JSON, or the raw text if it does not parse."""
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text
+
     def _promotion_fault_point(self, step: str) -> None:
         """No-op seam between promotion's ledger append and its activation write.
 
-        Tests replace it to inject a crash at exactly that point and prove the
-        transaction leaves neither written. Production never overrides it.
+        Both promotion transactions (`promote_epoch_cutover` and
+        `promote_epoch_cutover_seed_only`) call it. Tests replace it to inject a
+        crash at exactly that point and prove the transaction leaves neither
+        written. Production never overrides it.
         """
 
     def close(self) -> None:

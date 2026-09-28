@@ -13,7 +13,7 @@ import pytest
 from backend import server
 from backend.extraction_backlog import telemetry
 from backend.extraction_backlog.status import extraction_status, health_block
-from tests.unit.extraction_backlog.conftest import wait_until
+from tests.unit.extraction_backlog.conftest import ONTOLOGY_VERSION, wait_until
 
 
 @pytest.fixture(autouse=True)
@@ -200,9 +200,13 @@ class TestWebSocketPush:
         )
         from tests.mocks.config import build_test_config
 
-        dispatcher = await server._start_extraction_dispatcher(
-            voice_processor, build_test_config(embedding_model="test-emb")
-        )
+        config = build_test_config(embedding_model="test-emb")
+        # The backend under test is configured to match the active epoch;
+        # the writer-stamp guard would otherwise stall it.
+        config.model_hash = world.service.model_hash
+        config.extraction_version = world.service.extraction_version
+        config.ontology_version = ONTOLOGY_VERSION
+        dispatcher = await server._start_extraction_dispatcher(voice_processor, config)
         world.dispatchers.append(dispatcher)
         await wait_until(lambda: not captured.empty())
 
