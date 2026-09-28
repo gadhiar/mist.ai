@@ -183,7 +183,9 @@ def test_happy_path_turn_yields_stream_complete_with_its_fields():
 
     assert recorder.consume({"type": "stream_start", "turn_id": "aaaa-1111"}) is None
     assert recorder.consume({"type": "stream_token", "turn_id": "aaaa-1111", "token": "No"}) is None
-    assert recorder.consume({"type": "stream_token", "turn_id": "aaaa-1111", "token": "ted"}) is None
+    assert (
+        recorder.consume({"type": "stream_token", "turn_id": "aaaa-1111", "token": "ted"}) is None
+    )
     outcome = recorder.consume(STREAM_COMPLETE, now=104.5)
 
     assert outcome is not None
@@ -1194,9 +1196,7 @@ def _curation_row(**overrides) -> dict:
 
 
 STARTED_LOG = "INFO - Curation scheduler started with 6 jobs\n"
-NOT_STARTED_LOG = (
-    "INFO - Curation scheduler NOT started: MIST_CURATION_SCHEDULER_ENABLED is off.\n"
-)
+NOT_STARTED_LOG = "INFO - Curation scheduler NOT started: MIST_CURATION_SCHEDULER_ENABLED is off.\n"
 
 
 def test_a4_passes_on_a_scheduled_completed_run_that_examined_five():

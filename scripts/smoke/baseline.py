@@ -118,12 +118,12 @@ class Delta:
 
 
 def open_readonly(path: Path) -> sqlite3.Connection:
-    """Open a SQLite database read-only, through a `file:` URI.
+    r"""Open a SQLite database read-only, through a `file:` URI.
 
     `Path.as_uri()` rather than string concatenation because this runs on
     Windows: it produces `file:///D:/...` with the drive letter and any spaces
     percent-encoded, which SQLite's URI parser accepts. A hand-built
-    `"file:" + str(path)` leaves a bare `D:\\...` that SQLite reads as a
+    `"file:" + str(path)` leaves a bare `D:\...` that SQLite reads as a
     relative path plus an unknown authority.
 
     Args:
@@ -338,9 +338,19 @@ def neo4j_counts(container: str, user: str, password: str, database: str) -> dic
     for name, query in queries.items():
         result = run_command(
             [
-                "docker", "exec", container, "cypher-shell",
-                "-u", user, "-p", password, "-d", database,
-                "--format", "plain", query,
+                "docker",
+                "exec",
+                container,
+                "cypher-shell",
+                "-u",
+                user,
+                "-p",
+                password,
+                "-d",
+                database,
+                "--format",
+                "plain",
+                query,
             ]
         )
         if not result.ok:
@@ -348,7 +358,7 @@ def neo4j_counts(container: str, user: str, password: str, database: str) -> dic
             continue
         rows = parse_cypher_plain(result.stdout)
         if not rows or "value" not in rows[0]:
-            errors.append(f"{name}: unparseable output {result.stdout!r}")
+            errors.append(f"{name}: unparsable output {result.stdout!r}")
             continue
         try:
             counts[name] = int(rows[0]["value"])
@@ -492,9 +502,7 @@ def _compare_counts(
         before = pre_counts.get(field)
         after = post_counts.get(field)
         if before == after:
-            deltas.append(
-                Delta(check, field, before, after, UNCHANGED, "identical in both phases")
-            )
+            deltas.append(Delta(check, field, before, after, UNCHANGED, "identical in both phases"))
             continue
         verdict, reasoning = rules.get(
             field, (CONTAMINATION, "no adjudication rule for this field; treated as contamination")
@@ -871,9 +879,7 @@ def render_comparison(deltas: list[Delta]) -> tuple[str, int]:
         lines.append(f"    why : {delta.reasoning}")
 
     lines.append("-" * 78)
-    lines.append(
-        "  ".join(f"{verdict}={count}" for verdict, count in sorted(by_verdict.items()))
-    )
+    lines.append("  ".join(f"{verdict}={count}" for verdict, count in sorted(by_verdict.items())))
 
     if by_verdict.get(CONTAMINATION):
         lines.append(
@@ -963,11 +969,7 @@ def main(argv: list[str] | None = None) -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(snapshot, indent=2, default=str), encoding="utf-8")
 
-    unavailable = [
-        name
-        for name, check in snapshot["checks"].items()
-        if _has_unavailable(check)
-    ]
+    unavailable = [name for name, check in snapshot["checks"].items() if _has_unavailable(check)]
     print(f"[baseline] {args.phase} snapshot written to {args.out}")
     for name, check in snapshot["checks"].items():
         print(f"[baseline]   {name}: {_summarise_check(check)}")

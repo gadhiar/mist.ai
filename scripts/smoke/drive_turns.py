@@ -282,7 +282,7 @@ def parse_frame(payload: str | bytes) -> dict[str, Any] | None:
     Returns:
         The decoded object when it is a JSON object, else None.
     """
-    if isinstance(payload, (bytes, bytearray)):
+    if isinstance(payload, bytes | bytearray):
         return None
     try:
         decoded = json.loads(payload)
@@ -679,7 +679,7 @@ async def _run_turn(
         payload = await asyncio.wait_for(ws.recv(), timeout=remaining)
         frame = parse_frame(payload)
         if frame is None:
-            kind = "binary_frame" if isinstance(payload, (bytes, bytearray)) else "undecodable"
+            kind = "binary_frame" if isinstance(payload, bytes | bytearray) else "undecodable"
             transcript.write("note", event=kind, turn_index=spec.index)
             continue
         transcript.write("frame", turn_index=spec.index, frame=frame)

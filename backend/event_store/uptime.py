@@ -496,7 +496,7 @@ def format_uptime_report(report: UptimeReport, *, now: datetime) -> str:
         f"  Tolerance:  {report.tolerance_seconds:.0f}s, used for every gap in this run.",
         "  Clock:      host wall clock, one started_at timestamp per row.",
         f"  Excluded:   {report.rows_excluded_manual} manual-trigger row(s), "
-        f"{report.rows_excluded_unparseable} row(s) with an unparseable started_at.",
+        f"{report.rows_excluded_unparseable} row(s) with an unparsable started_at.",
         "",
         "WINDOW",
     ]

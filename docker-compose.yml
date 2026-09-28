@@ -93,7 +93,7 @@ services:
     healthcheck:
       # Derives the verdict from the body, not the status code: /health is
       # always 200 so the hydrator's urllib fetch cannot mistake a degraded
-      # backend for an unreachable one. Unreachable or unparseable still raises
+      # backend for an unreachable one. Unreachable or unparsable still raises
       # out of urlopen/json.load and exits non-zero, as before.
       # restart_recommended is advisory: Docker restart policies react to
       # container exit, not to healthcheck state, and there is no autoheal

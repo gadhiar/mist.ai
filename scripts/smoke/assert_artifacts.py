@@ -117,8 +117,9 @@ EXPECTED_TURNS = 5
 #: Validated against this before being interpolated into Cypher: cypher-shell is
 #: invoked without a shell, but the id still becomes part of a query string, and
 #: a value restricted to hex digits and hyphens cannot close a quote.
-SESSION_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-                           r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+SESSION_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-" r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 #: `backend/vault/writer.py:538` renders `<root>/sessions/<date>-<slug>.md`,
 #: with the slug validated as lowercase kebab-case at `writer.py:536`.
@@ -128,7 +129,9 @@ SESSION_NOTE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*\.md$"
 #: `backend/knowledge/extraction/pipeline.py:642`, `rate-limited` is `:650`,
 #: `significance ... < ...` is `:676-681` (the only one that prints numbers),
 #: `duplicate` is `:687`.
-EXTRACTION_SKIP_RE = re.compile(r"Extraction skipped \((?P<reason>[^)]*)\) for '(?P<utterance>[^']*)'")
+EXTRACTION_SKIP_RE = re.compile(
+    r"Extraction skipped \((?P<reason>[^)]*)\) for '(?P<utterance>[^']*)'"
+)
 
 SKIP_GATE_CITATIONS = {
     "too short": "backend/knowledge/extraction/pipeline.py:640-643 (fewer than 3 words)",
@@ -399,7 +402,9 @@ def adjudicate_a1(
 
     if not transcript.present:
         return Verdict(
-            "A1", "turn rows", INCONCLUSIVE,
+            "A1",
+            "turn rows",
+            INCONCLUSIVE,
             "no usable driver transcript, so it cannot be established whether the "
             "turns ever completed",
             tuple(evidence + [f"transcript problem: {transcript.error}"]),
@@ -407,7 +412,9 @@ def adjudicate_a1(
 
     if completes < expected_turns:
         return Verdict(
-            "A1", "turn rows", INCONCLUSIVE,
+            "A1",
+            "turn rows",
+            INCONCLUSIVE,
             f"only {completes} of {expected_turns} turns reached stream_complete, so "
             "A1 was never fully exercised. This is not a FAIL: a turn that did not "
             "complete never reached _record_turn_event "
@@ -425,7 +432,9 @@ def adjudicate_a1(
 
     if not mine:
         return Verdict(
-            "A1", "turn rows", FAIL,
+            "A1",
+            "turn rows",
+            FAIL,
             f"the driver recorded {completes} stream_complete frames but "
             "conversation_turn_events holds no row for this session. The turns ran "
             "and were not written.",
@@ -474,19 +483,21 @@ def adjudicate_a1(
                 "(backend/chat/conversation_handler.py:2317-2319 hardcodes it)"
             )
         if row.get("turn_count") != expected_turns:
-            problems.append(
-                f"turn_count is {row.get('turn_count')!r}, expected {expected_turns}"
-            )
+            problems.append(f"turn_count is {row.get('turn_count')!r}, expected {expected_turns}")
 
     if problems:
         return Verdict(
-            "A1", "turn rows", FAIL,
+            "A1",
+            "turn rows",
+            FAIL,
             "turn rows exist but do not match the expected shape",
             tuple(evidence + [f"mismatch: {problem}" for problem in problems]),
         )
 
     return Verdict(
-        "A1", "turn rows", PASS,
+        "A1",
+        "turn rows",
+        PASS,
         f"{len(mine)} turn rows and 1 session row, origin='real', "
         f"input_modality='text', turn_count={expected_turns}",
         tuple(evidence),
@@ -539,14 +550,18 @@ def adjudicate_a2(
 
     if cypher_error is not None:
         return Verdict(
-            "A2", "entity with EXTRACTED_FROM", INCONCLUSIVE,
+            "A2",
+            "entity with EXTRACTED_FROM",
+            INCONCLUSIVE,
             "the Cypher count did not run, so there is no positive evidence either way",
             tuple(evidence + [f"cypher error: {cypher_error}"]),
         )
 
     if entity_count and entity_count > 0:
         return Verdict(
-            "A2", "entity with EXTRACTED_FROM", PASS,
+            "A2",
+            "entity with EXTRACTED_FROM",
+            PASS,
             f"{entity_count} entity/entities anchored to this session's "
             f"ConversationContext via {edge_count} EXTRACTED_FROM edge(s)",
             tuple(
@@ -561,7 +576,9 @@ def adjudicate_a2(
 
     if skips:
         return Verdict(
-            "A2", "entity with EXTRACTED_FROM", INCONCLUSIVE,
+            "A2",
+            "entity with EXTRACTED_FROM",
+            INCONCLUSIVE,
             f"no entities, and {len(skips)} utterance(s) were declined by an extraction "
             "gate. A per-turn skip is normal behaviour, not a defect -- but every turn "
             "being skipped means extraction ran and chose not to write.",
@@ -578,7 +595,9 @@ def adjudicate_a2(
 
     if not log_available:
         return Verdict(
-            "A2", "entity with EXTRACTED_FROM", INCONCLUSIVE,
+            "A2",
+            "entity with EXTRACTED_FROM",
+            INCONCLUSIVE,
             "no entities, and no backend log was readable, so it cannot be told apart "
             "from every turn being declined by a gate",
             tuple(
@@ -594,7 +613,9 @@ def adjudicate_a2(
 
     if a1_status == PASS:
         return Verdict(
-            "A2", "entity with EXTRACTED_FROM", FAIL,
+            "A2",
+            "entity with EXTRACTED_FROM",
+            FAIL,
             "turns were recorded (A1 PASS), no entities were written, and the backend "
             "log carries no `Extraction skipped (` line. Extraction never ran.",
             tuple(
@@ -613,7 +634,9 @@ def adjudicate_a2(
         )
 
     return Verdict(
-        "A2", "entity with EXTRACTED_FROM", INCONCLUSIVE,
+        "A2",
+        "entity with EXTRACTED_FROM",
+        INCONCLUSIVE,
         f"no entities and no skip lines, but A1 is {a1_status}: the turns were not "
         "established as recorded, so extraction had nothing to run on",
         tuple(evidence),
@@ -667,7 +690,9 @@ def adjudicate_a3(
         The verdict.
     """
     new_notes = sorted(name for name in after if name not in before and SESSION_NOTE_RE.match(name))
-    written_lines = [line for line in find_lines(log_text, NOTE_WRITTEN_MARKER) if session_id in line]
+    written_lines = [
+        line for line in find_lines(log_text, NOTE_WRITTEN_MARKER) if session_id in line
+    ]
     threshold_lines = [
         line for line in find_lines(log_text, BELOW_THRESHOLD_MARKER) if session_id in line
     ]
@@ -709,13 +734,17 @@ def adjudicate_a3(
         evidence.append(f"corpus facts present in the new note(s): {matched or 'none'}")
         if not matched:
             return Verdict(
-                "A3", "session note", INCONCLUSIVE,
+                "A3",
+                "session note",
+                INCONCLUSIVE,
                 f"a note appeared ({', '.join(new_notes)}) but it names none of the "
                 "corpus facts, so it cannot be shown to be this conversation's note",
                 tuple(evidence + [f"looked for: {corpus_facts}"]),
             )
         return Verdict(
-            "A3", "session note", PASS,
+            "A3",
+            "session note",
+            PASS,
             f"{len(new_notes)} new session note ({', '.join(new_notes)}) naming "
             f"{len(matched)} corpus fact(s)",
             tuple(evidence),
@@ -723,7 +752,9 @@ def adjudicate_a3(
 
     if threshold_lines:
         return Verdict(
-            "A3", "session note", INCONCLUSIVE,
+            "A3",
+            "session note",
+            INCONCLUSIVE,
             "no note, and the synthesizer returned None: end_session hit `continue` at "
             "backend/chat/conversation_handler.py:1961-1963. That is a legitimate 'not "
             "worth remembering' decision, not a pipeline failure.",
@@ -740,7 +771,9 @@ def adjudicate_a3(
 
     if no_turn_lines:
         return Verdict(
-            "A3", "session note", INCONCLUSIVE,
+            "A3",
+            "session note",
+            INCONCLUSIVE,
             "no note, and end_session found no event-store turns for this session "
             "(backend/chat/conversation_handler.py:1952-1958). A3 depends on A1; fix "
             "that first.",
@@ -749,7 +782,9 @@ def adjudicate_a3(
 
     if not transcript.present or not transcript.closed:
         return Verdict(
-            "A3", "session note", INCONCLUSIVE,
+            "A3",
+            "session note",
+            INCONCLUSIVE,
             "no note, and the driver did not record a clean close, so the disconnect "
             "hook cannot be shown to have run",
             tuple(
@@ -764,14 +799,18 @@ def adjudicate_a3(
 
     if not log_available:
         return Verdict(
-            "A3", "session note", INCONCLUSIVE,
+            "A3",
+            "session note",
+            INCONCLUSIVE,
             "no note and no readable backend log. The two discriminating lines are "
             "DEBUG-only, so their absence here carries no information.",
             tuple(evidence),
         )
 
     return Verdict(
-        "A3", "session note", FAIL,
+        "A3",
+        "session note",
+        FAIL,
         "the driver closed cleanly, the backend log carries no 'below synthesis "
         "threshold' line for this session, and no note appeared",
         tuple(
@@ -874,7 +913,9 @@ def adjudicate_a4(
     if not rows:
         if not_started:
             return Verdict(
-                "A4", "curation with examined > 0", INCONCLUSIVE,
+                "A4",
+                "curation with examined > 0",
+                INCONCLUSIVE,
                 "no self_reflection row, and the backend logged that the scheduler did "
                 "not start. The job never ran, so nothing about `examined` was tested.",
                 tuple(
@@ -892,7 +933,9 @@ def adjudicate_a4(
             )
         if started:
             return Verdict(
-                "A4", "curation with examined > 0", INCONCLUSIVE,
+                "A4",
+                "curation with examined > 0",
+                INCONCLUSIVE,
                 "the scheduler started but wrote no self_reflection row. Something "
                 "between the loop and the ledger did not complete.",
                 tuple(
@@ -913,9 +956,10 @@ def adjudicate_a4(
                 ),
             )
         return Verdict(
-            "A4", "curation with examined > 0", INCONCLUSIVE,
-            "no self_reflection row, and no backend log to say whether the scheduler "
-            "started",
+            "A4",
+            "curation with examined > 0",
+            INCONCLUSIVE,
+            "no self_reflection row, and no backend log to say whether the scheduler " "started",
             tuple(
                 evidence
                 + [
@@ -931,7 +975,9 @@ def adjudicate_a4(
     scheduled = [row for row in rows if row.get("trigger_source") == "scheduled"]
     if not scheduled:
         return Verdict(
-            "A4", "curation with examined > 0", INCONCLUSIVE,
+            "A4",
+            "curation with examined > 0",
+            INCONCLUSIVE,
             "self_reflection rows exist but none has trigger_source='scheduled'. The "
             "experiment tests the SCHEDULER; a manual row came from `run_all_once` "
             "(backend/knowledge/curation/scheduler.py:158) and does not answer it.",
@@ -944,7 +990,9 @@ def adjudicate_a4(
 
     if outcome != "completed":
         return Verdict(
-            "A4", "curation with examined > 0", FAIL,
+            "A4",
+            "curation with examined > 0",
+            FAIL,
             f"the newest scheduled self_reflection run has outcome={outcome!r}",
             tuple(
                 evidence
@@ -958,7 +1006,9 @@ def adjudicate_a4(
 
     if not examined:
         return Verdict(
-            "A4", "curation with examined > 0", FAIL,
+            "A4",
+            "curation with examined > 0",
+            FAIL,
             f"the run completed and examined={examined!r}. THIS IS THE BUG THE "
             "EXPERIMENT EXISTS TO FIND, and it is the live stack's exact symptom: a "
             "job that returns zeros WITHOUT LOOKING.",
@@ -1000,9 +1050,7 @@ def adjudicate_a4(
 # ---------------------------------------------------------------------------
 
 
-def read_backend_log(
-    container: str | None, files: list[Path]
-) -> tuple[str, list[str]]:
+def read_backend_log(container: str | None, files: list[Path]) -> tuple[str, list[str]]:
     """Assemble backend log text from captured files and, if possible, the container.
 
     Args:
@@ -1134,9 +1182,19 @@ def query_smoke_graph(
     def _run(query: str) -> tuple[list[dict[str, str]], str | None]:
         result = run_command(
             [
-                "docker", "exec", container, "cypher-shell",
-                "-u", user, "-p", password, "-d", database,
-                "--format", "plain", query,
+                "docker",
+                "exec",
+                container,
+                "cypher-shell",
+                "-u",
+                user,
+                "-p",
+                password,
+                "-d",
+                database,
+                "--format",
+                "plain",
+                query,
             ]
         )
         if not result.ok:
@@ -1152,7 +1210,7 @@ def query_smoke_graph(
         entities = int(counts[0].get("entities", ""))
         edges = int(counts[0].get("edges", ""))
     except ValueError:
-        return {"error": f"unparseable counts: {counts[0]!r}"}
+        return {"error": f"unparsable counts: {counts[0]!r}"}
 
     rows, sample_error = _run(sample_query)
     return {"entities": entities, "edges": edges, "rows": rows, "sample_error": sample_error}
@@ -1276,8 +1334,10 @@ def main(argv: list[str] | None = None) -> int:
         listing = list_session_notes(vault_root)
         args.snapshot_vault.parent.mkdir(parents=True, exist_ok=True)
         args.snapshot_vault.write_text(json.dumps(listing, indent=2), encoding="utf-8")
-        print(f"[assert] vault session-note listing ({len(listing)} file(s)) -> "
-              f"{args.snapshot_vault}")
+        print(
+            f"[assert] vault session-note listing ({len(listing)} file(s)) -> "
+            f"{args.snapshot_vault}"
+        )
         return EXIT_OK
 
     try:
@@ -1344,9 +1404,7 @@ def main(argv: list[str] | None = None) -> int:
     if store.get("status") != "ok":
         print(f"  event store    : UNAVAILABLE ({store.get('error')})")
 
-    a1 = adjudicate_a1(
-        store.get("turns", []), store.get("sessions", []), transcript, session_id
-    )
+    a1 = adjudicate_a1(store.get("turns", []), store.get("sessions", []), transcript, session_id)
     a2 = adjudicate_a2(
         graph.get("entities"),
         graph.get("edges"),

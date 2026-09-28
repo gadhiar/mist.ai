@@ -587,7 +587,7 @@ class TestHarnessShape:
     def test_neither_service_restarts(self, compose):
         for service in (BACKEND_SERVICE, NEO4J_SERVICE):
             assert compose["services"][service].get("restart") == "no", (
-                f"{service} is not `restart: \"no\"`. A run that dies "
+                f'{service} is not `restart: "no"`. A run that dies '
                 f"mid-conversation must stay dead: a silent restart leaves a "
                 f"half-recorded turn sequence behind assertions that then measure "
                 f"an artifact count nobody can interpret."
@@ -679,9 +679,7 @@ class TestHarnessShape:
             compose = {
                 "volumes": {"mist-hf-cache": None},
                 "services": {
-                    BACKEND_SERVICE: {
-                        "volumes": [f"{host}:/app/data", "mist-hf-cache:/cache"]
-                    }
+                    BACKEND_SERVICE: {"volumes": [f"{host}:/app/data", "mist-hf-cache:/cache"]}
                 },
             }
             binds = _bind_mounts(compose, BACKEND_SERVICE)
@@ -691,12 +689,10 @@ class TestHarnessShape:
                 f"bind mount; got {binds!r}. It would escape every "
                 f"forbidden-mount assertion in this module."
             )
-            assert host not in names, (
-                f"{host!r} was counted as a NAMED VOLUME; got {names!r}."
-            )
-            assert names == ["mist-hf-cache"], (
-                f"the genuinely named volume was misclassified; got {names!r}"
-            )
+            assert host not in names, f"{host!r} was counted as a NAMED VOLUME; got {names!r}."
+            assert names == [
+                "mist-hf-cache"
+            ], f"the genuinely named volume was misclassified; got {names!r}"
 
     def test_named_volumes_are_not_reported_as_binds(self, compose):
         """The complement holds on the shipped file: no false positives.
@@ -769,19 +765,13 @@ class TestHarnessShape:
         """The guard above fires on the exact evasion it exists to stop."""
         smuggled = {
             "volumes": {
-                "innocent-name": {
-                    "driver_opts": {"type": "none", "device": "./data", "o": "bind"}
-                }
+                "innocent-name": {"driver_opts": {"type": "none", "device": "./data", "o": "bind"}}
             },
-            "services": {
-                BACKEND_SERVICE: {"volumes": ["innocent-name:/app/data"]}
-            },
+            "services": {BACKEND_SERVICE: {"volumes": ["innocent-name:/app/data"]}},
         }
         # It passes the mount-entry helpers, which is the whole problem.
         assert _volume_names(smuggled, BACKEND_SERVICE) == ["innocent-name"]
         assert _bind_mounts(smuggled, BACKEND_SERVICE) == []
         # The declaration check is what catches it.
         with pytest.raises(AssertionError, match="driver_opts"):
-            TestHarnessShape().test_no_named_volume_is_bind_backed_via_driver_opts(
-                smuggled
-            )
+            TestHarnessShape().test_no_named_volume_is_bind_backed_via_driver_opts(smuggled)
