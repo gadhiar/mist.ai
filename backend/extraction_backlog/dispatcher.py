@@ -23,11 +23,13 @@ FAILURES
 - The backend's WRITER stamps disagree with the active epoch: state
   `stalled`, nothing applied or dispatched. Curation writes a stamp triple
   taken from `KnowledgeConfig` (`ontology_version`, `extraction_version`,
-  `compose_model_hash(config)`), not from the epoch ledger, onto the
-  relationship edges reconciliation writes (`curation/reconciliation.py`)
-  and onto each EXTRACTED_FROM edge (`curation/graph_writer.py`,
-  `_extracted_from_clause`). Other edges curation writes, such as
-  LEARNED_FROM and ABOUT, carry no stamps. `build_extraction_dispatcher`
+  `compose_model_hash(config)`), not from the epoch ledger, onto each
+  relationship edge reconciliation CREATES (the `ON CREATE SET` of
+  `_apply_append` and `_apply_structural` in `curation/reconciliation.py`)
+  and onto each EXTRACTED_FROM edge it creates or matches
+  (`curation/graph_writer.py`, `_extracted_from_clause`). Reconciliation's
+  `ON MATCH` updates, closes and reinforces set no stamps, and other edges
+  curation writes, such as LEARNED_FROM and ABOUT, carry none. `build_extraction_dispatcher`
   derives `writer_stamps` with the same function `build_curation_pipeline`
   uses (`factories.writer_stamps_from_config`). Outside an open cutover,
   each step compares all three fields with the active epoch before it scans
@@ -35,9 +37,12 @@ FAILURES
   `/v1/info`, sending a job, writing the cache, curating or writing an apply
   marker, and the reason (both stamp triples) is logged. The epoch's first
   activation (`_ensure_activation`) runs before the guard and is not
-  guarded: when the epoch has no activation row yet, it records the floor
-  and marks the turns already cached under the epoch applied
-  (`BacklogStore.ensure_activation`). It writes nothing to the graph. The fix is to set
+  guarded: when the epoch has no activation row yet, it records the floor,
+  marks the turns already cached under the epoch applied, and writes an
+  `extraction_legacy_turns` row for each logged turn with no cache row
+  under the epoch (`BacklogStore.ensure_activation`,
+  `EventStore.record_extraction_activation`). It writes nothing to the
+  graph. The fix is to set
   `MIST_MODEL_HASH` (or deploy the code whose versions match the epoch) and
   restart the backend. The cutover fill is not guarded: it writes candidate
   cache rows and applies nothing to the live graph.
@@ -224,8 +229,9 @@ class ExtractionDispatcher:
             settings: Mode, retry and backoff configuration.
             embedding_model_name: The backend's embedding model identity, folded
                 into the service's bare model hash for the epoch comparison.
-            writer_stamps: The stamp triple curation writes onto the edges
-                it stamps. `build_extraction_dispatcher` derives it from
+            writer_stamps: The stamp triple curation sets on the edges
+                reconciliation creates and on EXTRACTED_FROM edges (see
+                FAILURES in the module docstring). `build_extraction_dispatcher` derives it from
                 `KnowledgeConfig` with `writer_stamps_from_config`, the
                 function `build_curation_pipeline` uses. Outside a cutover
                 the dispatcher stalls rather than apply or dispatch while it
@@ -497,9 +503,10 @@ class ExtractionDispatcher:
             return await self._fill_step(cutover)
 
         # Writer-stamp guard: everything below can apply to the live graph.
-        # Curation stamps what it writes with its own config-derived triple,
-        # which `self._writer_stamps` stands for, so the steps below run only
-        # when that triple equals the active epoch's stamps.
+        # Curation sets its own config-derived triple on the edges listed
+        # under FAILURES in the module docstring, and `self._writer_stamps`
+        # stands for that triple, so the steps below run only when it equals
+        # the active epoch's stamps.
         mismatch = self._writer_stamp_mismatch(epoch)
         if mismatch is not None:
             if self._writer_mismatch_logged_epoch != epoch.epoch_id:
