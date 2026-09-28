@@ -242,6 +242,7 @@ class _Run:
                 stall_recheck_s=0.05,
             ),
             embedding_model_name=_EMBEDDING_MODEL,
+            writer_stamps=self.stamps,
         )
         self.dispatchers.append(dispatcher)
         return dispatcher

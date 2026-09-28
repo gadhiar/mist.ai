@@ -20,6 +20,17 @@ build_derivation_context`).
 
 FAILURES
 --------
+- The backend's WRITER stamps disagree with the active epoch: state
+  `stalled`, nothing applied or dispatched. The graph writer stamps every
+  edge from `KnowledgeConfig` (`ontology_version`, `extraction_version`,
+  `compose_model_hash(config)`), not from the epoch ledger, and the
+  dispatcher receives those same stamps as `writer_stamps`. Outside an open
+  cutover, each step compares all three fields with the active epoch before
+  it scans the backlog. On any difference the step returns without calling
+  `/v1/info`, sending a job, writing the cache, curating or writing a marker,
+  and the reason (both stamp triples) is logged. The fix is to set
+  `MIST_MODEL_HASH` (or deploy the code whose versions match the epoch) and
+  restart the backend. The cutover fill is not guarded: it applies nothing.
 - Service unreachable, or `model_loading`: not the job's fault. State
   `unreachable`, exponential reconnect backoff, no attempt counted.
 - `/v1/info` (or a reply's stamps) disagree with the active epoch, or an
@@ -116,6 +127,7 @@ from backend.extraction_contract.models import (
     ServiceStatus,
     is_compatible,
 )
+from backend.knowledge.curation.graph_writer import RebuildStamps
 from backend.knowledge.extraction.pipeline import (
     ApplyReport,
     ExtractionPipeline,
@@ -187,6 +199,7 @@ class ExtractionDispatcher:
         inference: ExtractionInference | None,
         settings: DispatcherSettings,
         embedding_model_name: str,
+        writer_stamps: RebuildStamps,
         clock: Callable[[], datetime] | None = None,
         on_stop: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
@@ -201,6 +214,10 @@ class ExtractionDispatcher:
             settings: Mode, retry and backoff configuration.
             embedding_model_name: The backend's embedding model identity, folded
                 into the service's bare model hash for the epoch comparison.
+            writer_stamps: The stamps the graph writer applies with (built
+                from `KnowledgeConfig` in `backend/factories.py`). Outside a
+                cutover the dispatcher stalls rather than apply or dispatch
+                while they differ from the active epoch's stamps.
             clock: Wall clock (tz-aware). Defaults to `datetime.now(UTC)`.
             on_stop: Awaited once at the end of `stop()`, e.g. to close an
                 HTTP client the factory built for this dispatcher.
@@ -215,6 +232,8 @@ class ExtractionDispatcher:
         self._inference = inference
         self._settings = settings
         self._embedding_model_name = embedding_model_name
+        self._writer_stamps = writer_stamps
+        self._writer_mismatch_logged_epoch: int | None = None
         self._clock: Callable[[], datetime] = clock or (lambda: datetime.now(UTC))
         self._on_stop = on_stop
 
@@ -465,6 +484,17 @@ class ExtractionDispatcher:
         if cutover is not None:
             return await self._fill_step(cutover)
 
+        # Writer-stamp guard: everything below can apply to the live graph,
+        # which is stamped from `self._writer_stamps`, so it runs only when
+        # those equal the active epoch's stamps.
+        mismatch = self._writer_stamp_mismatch(epoch)
+        if mismatch is not None:
+            if self._writer_mismatch_logged_epoch != epoch.epoch_id:
+                self._writer_mismatch_logged_epoch = epoch.epoch_id
+                logger.error("Extraction dispatcher refuses to apply: %s", mismatch)
+            self._set_state(STATE_STALLED, reason=mismatch)
+            return _Wait(self._settings.stall_recheck_s, True)
+
         scan = self._store.scan(epoch)
         head = scan.head
         if head is None:
@@ -526,6 +556,26 @@ class ExtractionDispatcher:
     # ------------------------------------------------------------------
     # Service / epoch checks
     # ------------------------------------------------------------------
+
+    def _writer_stamp_mismatch(self, epoch: Epoch) -> str | None:
+        """None when the writer stamps equal `epoch`'s on all three fields, else why not."""
+        writer = self._writer_stamps
+        if (
+            writer.ontology_version == epoch.ontology_version
+            and writer.extraction_version == epoch.extraction_version
+            and writer.model_hash == epoch.model_hash
+        ):
+            return None
+        return (
+            f"backend writer stamps (ontology_version={writer.ontology_version!r}, "
+            f"extraction_version={writer.extraction_version!r}, "
+            f"model_hash={writer.model_hash!r}) != {epoch.label} "
+            f"(ontology_version={epoch.ontology_version!r}, "
+            f"extraction_version={epoch.extraction_version!r}, "
+            f"model_hash={epoch.model_hash!r}); nothing is applied or dispatched until "
+            "they match. Set MIST_MODEL_HASH (or deploy the code whose ontology and "
+            "extraction versions match the epoch), then restart the backend"
+        )
 
     def _composed(self, bare_model_hash: str) -> str:
         return compose_epoch_model_hash(bare_model_hash, self._embedding_model_name)
