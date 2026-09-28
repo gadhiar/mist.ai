@@ -160,6 +160,23 @@ class TestLlamaServerPins:
         assert "-ncmoe" in command
         assert "EXTRACTION_LOCAL_NCMOE" in command[command.index("-ncmoe") + 1]
 
+    def test_ncmoe_default_is_24(self) -> None:
+        # gpt-oss-20b's block_count is verified as 24 via GGUF metadata (the
+        # host build's finding); 24 means "all experts on CPU", replacing the
+        # previous unverified 999 sentinel.
+        command = _command(_local_llm())
+        value = command[command.index("-ncmoe") + 1]
+        assert value == "${EXTRACTION_LOCAL_NCMOE:-24}", value
+
+    def test_ctx_size_default_is_16384(self) -> None:
+        # A real /v1/extract probe needed 9162 prompt tokens plus
+        # max_tokens=2048 from the extraction engine, exceeding the old 8192
+        # default.
+        env = _env_dict(_local_llm())
+        assert env["LLAMA_ARG_CTX_SIZE"] == "${EXTRACTION_LLM_CTX_SIZE:-16384}", env[
+            "LLAMA_ARG_CTX_SIZE"
+        ]
+
 
 class TestProfile:
     def test_every_service_has_exactly_the_local_profile(self) -> None:
