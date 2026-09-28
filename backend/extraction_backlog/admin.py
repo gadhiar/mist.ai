@@ -371,10 +371,10 @@ def _add_cutover_parser(sub) -> None:
         "--seed-only-graph",
         action="store_true",
         help=(
-            "the log never held an extracted turn, so the live graph holds seed data only "
-            "(operator precondition, CUTOVER.md 6A; a read-only probe checks for stamped "
-            "and unseeded elements first); promotes a 'ready' or 'checked' candidate "
-            "without a swap"
+            "no extraction has ever run against this live graph, so it holds seed data "
+            "only (operator precondition, CUTOVER.md 6A; an empty log does not show it if "
+            "the log was reset; a read-only probe checks for stamped and unseeded elements "
+            "first); promotes a 'ready' or 'checked' candidate without a swap"
         ),
     )
 
