@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -238,6 +239,16 @@ class FakeClock:
         return self.now
 
 
+class FakeSleep:
+    """Records requested sleeps instead of sleeping."""
+
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+
+
 def write_gold(path: Path, n: int) -> Path:
     """A synthetic n-probe gold corpus: 2 entities and 1 relationship each."""
     lines = []
@@ -283,6 +294,7 @@ async def run_execute(
     **kwargs: Any,
 ) -> int:
     _, client = state_and_client
+    kwargs.setdefault("sleep", FakeSleep())  # a test must never really sleep
     async with client:
         return await probe.execute(
             endpoint=ENDPOINT, out_dir=out_dir, gold_path=gold_path, client=client, **kwargs
@@ -340,7 +352,11 @@ def _service_error(code: ErrorCode, message: str, status: int | None) -> Inferen
         (_response(0, 1), None, (probe.OUTCOME_OK, None)),
         (_response(0, 0), None, (probe.OUTCOME_EMPTY, None)),
         (None, _service_error(ErrorCode.TIMEOUT, "t", 504), (probe.OUTCOME_TIMEOUT, "timeout")),
-        (None, _service_error(ErrorCode.TIMEOUT, "t", None), (probe.OUTCOME_TIMEOUT, "timeout")),
+        (
+            None,
+            _service_error(ErrorCode.TIMEOUT, "t", None),
+            (probe.OUTCOME_CLIENT_TIMEOUT, "timeout"),
+        ),
         (
             None,
             _service_error(
@@ -499,6 +515,7 @@ async def test_each_failure_class_is_recorded_and_scored_as_false_negatives(
         "ok": 3,
         "empty": 1,
         "timeout": 1,
+        "client_timeout": 0,
         "schema_repair_exhausted": 1,
         "upstream_llm": 1,
         "unreachable": 2,
@@ -537,21 +554,173 @@ async def test_each_failure_class_is_recorded_and_scored_as_false_negatives(
     # Latency over completed (200) cases only.
     assert summary["latency_ms"]["n"] == 4
     assert summary["latency_ms_all_cases"]["n"] == 11
+    assert set(summary["latency_notes"]) == {"latency_ms", "latency_ms_all_cases"}
+
+    # Failed cases are counted and the summary warns that precision/typing exclude them.
+    assert summary["failed_cases"] == 7
+    assert sorted(summary["failed_probe_ids"]) == sorted(summary["unmatched_probe_ids"])
+    assert summary["cases_not_run"] == 0
+    warning = summary["interpretation_warning"]
+    assert "7 case(s) failed" in warning
+    assert "EXCLUDE" in warning and "INCLUDE" in warning
+    assert "precision" in warning.lower() and "recall" in warning.lower()
 
 
 @pytest.mark.asyncio
-async def test_client_read_timeout_is_classified_as_timeout(tmp_path: Path) -> None:
+async def test_clean_run_has_no_interpretation_warning(tmp_path: Path) -> None:
     gold = write_gold(tmp_path / "gold.jsonl", 2)
-    world = make_world(gold)
-    world[0].read_timeout_for.add("I use tool1 daily")
     out = tmp_path / "out"
 
-    await run_execute(state_and_client=world, gold_path=gold, out_dir=out)
+    code = await run_execute(state_and_client=make_world(gold), gold_path=gold, out_dir=out)
+
+    assert code == 0
+    summary = read_summary(out)
+    assert summary["interpretation_warning"] is None
+    assert summary["failed_cases"] == 0 and summary["failed_probe_ids"] == []
+    assert all("scored" not in row for row in read_rows(out).values())
+
+
+@pytest.mark.asyncio
+async def test_client_read_timeout_is_its_own_class_and_drains_before_the_next_request(
+    tmp_path: Path,
+) -> None:
+    gold = write_gold(tmp_path / "gold.jsonl", 3)
+    world = make_world(gold)
+    state, _ = world
+    state.read_timeout_for.add("I use tool1 daily")
+    sleep = FakeSleep()
+    out = tmp_path / "out"
+
+    await run_execute(
+        state_and_client=world, gold_path=gold, out_dir=out, drain_s=42.0, sleep=sleep
+    )
 
     rows = read_rows(out)
-    assert rows["p-1"]["outcome_class"] == "timeout"
+    assert rows["p-1"]["outcome_class"] == "client_timeout"
     assert rows["p-1"]["http_status"] is None
     assert rows["p-2"]["outcome_class"] == "ok"
+    assert sleep.calls == [42.0]  # once, after the client timeout only
+    summary = read_summary(out)
+    assert summary["failure_classes"]["client_timeout"] == 1
+    assert summary["failure_classes"]["timeout"] == 0
+    assert summary["run"]["drain_s"] == 42.0
+
+
+@pytest.mark.asyncio
+async def test_service_504_is_a_timeout_and_does_not_drain(tmp_path: Path) -> None:
+    gold = write_gold(tmp_path / "gold.jsonl", 2)
+    world = make_world(gold)
+    world[0].behaviour["I use tool1 daily"] = "timeout"
+    sleep = FakeSleep()
+
+    await run_execute(state_and_client=world, gold_path=gold, out_dir=tmp_path / "out", sleep=sleep)
+
+    assert read_rows(tmp_path / "out")["p-1"]["outcome_class"] == "timeout"
+    assert sleep.calls == []
+
+
+@pytest.mark.asyncio
+async def test_no_drain_after_a_client_timeout_on_the_last_probe(tmp_path: Path) -> None:
+    gold = write_gold(tmp_path / "gold.jsonl", 2)
+    world = make_world(gold)
+    world[0].read_timeout_for.add("I use tool2 daily")
+    sleep = FakeSleep()
+
+    await run_execute(state_and_client=world, gold_path=gold, out_dir=tmp_path / "out", sleep=sleep)
+
+    assert sleep.calls == []
+
+
+@pytest.mark.asyncio
+async def test_two_consecutive_client_timeouts_stop_the_run(tmp_path: Path) -> None:
+    gold = write_gold(tmp_path / "gold.jsonl", 5)
+    world = make_world(gold)
+    state, _ = world
+    state.read_timeout_for.update({"I use tool2 daily", "I use tool3 daily"})
+    sleep = FakeSleep()
+    out = tmp_path / "out"
+
+    code = await run_execute(
+        state_and_client=world, gold_path=gold, out_dir=out, drain_s=5.0, sleep=sleep
+    )
+
+    assert code == 1
+    summary = read_summary(out)
+    assert summary["cases_run"] == 3
+    assert summary["not_run_probe_ids"] == ["p-4", "p-5"]
+    assert summary["run"]["stopped_reason"] == probe.STOP_CLIENT_TIMEOUT
+    # The scripted timeouts fail in the transport, so only p-1 reached the app; p-4 and p-5
+    # were never sent (not_run above).
+    assert len(state.received) == 1
+    assert sleep.calls == [5.0]  # drained after the first only; the second stopped the run
+
+
+@pytest.mark.asyncio
+async def test_non_consecutive_client_timeouts_do_not_stop_the_run(tmp_path: Path) -> None:
+    gold = write_gold(tmp_path / "gold.jsonl", 5)
+    world = make_world(gold)
+    world[0].read_timeout_for.update({"I use tool1 daily", "I use tool3 daily"})
+    sleep = FakeSleep()
+    out = tmp_path / "out"
+
+    await run_execute(state_and_client=world, gold_path=gold, out_dir=out, sleep=sleep)
+
+    summary = read_summary(out)
+    assert summary["cases_run"] == 5
+    assert summary["run"]["stopped_reason"] is None
+    assert len(sleep.calls) == 2
+
+
+def test_default_client_timeout_covers_one_jobs_worst_case() -> None:
+    assert probe.DEFAULT_CLIENT_TIMEOUT_S == 960.0
+    assert probe.DEFAULT_DRAIN_S == 120.0
+    args = probe.parse_args(["--endpoint", ENDPOINT, "--out", "x"])
+    assert args.client_timeout_s == 960.0 and args.drain_s == 120.0
+
+
+def test_unparsable_marker_matches_the_message_the_engine_builds() -> None:
+    """A rewording of the engine's message must fail this test, not silently misclassify."""
+    source = (_REPO_ROOT / "backend" / "extraction_service" / "engine.py").read_text(
+        encoding="utf-8"
+    )
+    assert "unparsable after" in source
+    match = re.search(r'f"(Extraction output unparsable after \{[^}]+\} attempts)"', source)
+    assert match is not None, "engine.py no longer builds the 'unparsable after N attempts' message"
+    message = re.sub(r"\{[^}]+\}", "2", match.group(1))
+    assert probe._UNPARSABLE_RE.search(message)
+    error = InferenceServiceError(
+        f"upstream_llm (HTTP 502): {message}",
+        code=ErrorCode.UPSTREAM_LLM,
+        retryable=True,
+        http_status=502,
+    )
+    assert probe.classify_outcome(response=None, error=error)[0] == probe.OUTCOME_REPAIR_EXHAUSTED
+
+
+@pytest.mark.asyncio
+async def test_rows_and_raw_are_written_incrementally_and_survive_a_crash(
+    tmp_path: Path,
+) -> None:
+    gold = write_gold(tmp_path / "gold.jsonl", 5)
+    world = make_world(gold)
+    state, _ = world
+
+    def crash_on_third(n_received: int) -> None:
+        if n_received == 3:
+            raise RuntimeError("simulated crash of the service app")
+
+    state.on_request = crash_on_third
+    out = tmp_path / "out"
+
+    with pytest.raises(RuntimeError):
+        await run_execute(state_and_client=world, gold_path=gold, out_dir=out)
+
+    row_lines = (out / probe.OUT_ROWS).read_text(encoding="utf-8").splitlines()
+    raw_lines = (out / probe.OUT_RAW).read_text(encoding="utf-8").splitlines()
+    assert [json.loads(x)["id"] for x in row_lines] == ["p-1", "p-2"]
+    assert all(json.loads(x)["scored"] is False for x in row_lines)
+    assert [json.loads(x)["id"] for x in raw_lines] == ["p-1", "p-2"]
+    assert not (out / probe.OUT_SUMMARY).exists()  # the crash came before scoring
 
 
 @pytest.mark.asyncio
@@ -858,11 +1027,69 @@ async def test_comparison_flags_regressed_probes_and_reports_scope_agreement(
     assert scope["baseline"]["mean_confidence"] == pytest.approx(0.95)
     assert scope["host"]["mean_confidence"] == pytest.approx((0.9 + 0.5 + 0.9) / 3)
 
+    # The host run failed p-2, so it is incomplete: the comparison says so up front.
+    host_run = comparison["host_run"]
+    assert host_run["complete"] is False
+    assert host_run["failed_cases"] == 1
+    assert host_run["failure_classes"]["timeout"] == 1
+    assert host_run["cases_not_run"] == 0
+    assert "EXCLUDE" in host_run["interpretation_warning"]
+    assert comparison["probe_sets"]["differ"] is False
+
     text = (out / probe.OUT_COMPARISON_MD).read_text(encoding="utf-8")
+    assert text.splitlines()[2].startswith("**[INCOMPLETE]")  # banner before any table
+    assert text.index("[INCOMPLETE]") < text.index("## Metrics")
+    assert "matched probes: 3/4" in text
+    assert "failure classes:" in text
+    assert "NO (INCOMPLETE run)" in text  # the plain inside-CI verdict is never bare
+    assert "PROBE SETS DIFFER" not in text
     assert "p-2" in text and "p-3" in text
     assert "entity recall" in text
     assert "2/3" in text
     assert text.isascii()
+
+
+@pytest.mark.asyncio
+async def test_complete_run_comparison_has_no_incomplete_banner(tmp_path: Path) -> None:
+    gold = write_gold(tmp_path / "gold.jsonl", 3)
+    baseline = write_baseline(tmp_path / "baseline", 3)
+    out = tmp_path / "out"
+
+    code = await run_execute(
+        state_and_client=make_world(gold), gold_path=gold, out_dir=out, baseline_dir=baseline
+    )
+
+    assert code == 0
+    comparison = json.loads((out / probe.OUT_COMPARISON_JSON).read_text(encoding="utf-8"))
+    assert comparison["host_run"]["complete"] is True
+    assert comparison["host_run"]["interpretation_warning"] is None
+    assert comparison["probe_sets"]["differ"] is False
+    text = (out / probe.OUT_COMPARISON_MD).read_text(encoding="utf-8")
+    assert "INCOMPLETE" not in text and "PROBE SETS DIFFER" not in text
+    assert "complete: yes" in text
+
+
+@pytest.mark.parametrize("via", ["limit", "baseline_larger"])
+@pytest.mark.asyncio
+async def test_comparison_warns_when_probe_sets_differ(tmp_path: Path, via: str) -> None:
+    gold = write_gold(tmp_path / "gold.jsonl", 4)
+    baseline = write_baseline(tmp_path / "baseline", 6 if via == "baseline_larger" else 4)
+    out = tmp_path / "out"
+    kwargs: dict[str, Any] = {"limit": 2} if via == "limit" else {}
+
+    await run_execute(
+        state_and_client=make_world(gold),
+        gold_path=gold,
+        out_dir=out,
+        baseline_dir=baseline,
+        **kwargs,
+    )
+
+    comparison = json.loads((out / probe.OUT_COMPARISON_JSON).read_text(encoding="utf-8"))
+    assert comparison["probe_sets"]["differ"] is True
+    text = (out / probe.OUT_COMPARISON_MD).read_text(encoding="utf-8")
+    assert "PROBE SETS DIFFER" in text
+    assert "not directly comparable" in text
 
 
 @pytest.mark.parametrize("variant", ["empty_dir", "missing_dir", "no_debug"])
