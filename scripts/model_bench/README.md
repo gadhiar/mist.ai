@@ -689,6 +689,40 @@ generated. The third validates `decision_rules.json` against `arms.json` only an
 sha256 it was rendered with, so re-rendering a recorded run after an edit to that file changes the
 header sha and the per-arm sha `[INFO]`/`[WARN]` lines even when every metric is identical.
 
+## Extraction gauntlet against the extraction service
+
+`probes/extraction_service.py` runs the same 60-probe gold corpus and the same scorer as the
+`extraction` suite, but through the extraction service's `POST /v1/extract` instead of the
+in-process path. It is strictly sequential (shared single GPU), sends a fresh `job_id` per call
+so the host idempotency cache cannot replay, and never retries: a failure is recorded, not retried.
+
+```
+python -m scripts.model_bench.probes.extraction_service --endpoint http://HOST:8090 \
+    --out <results-root>/service-run --baseline <results-root>/mb2/c9
+```
+
+Outputs in `--out` (existing files are never overwritten): `extraction_service.jsonl` (per-probe
+rows), `extraction_service_raw.jsonl` (raw 200 responses), `extraction_service_summary.json`
+(metrics with Wilson and cluster-bootstrap CIs, endpoint info, failure classes, latency), and,
+with `--baseline`, `comparison.json` / `comparison.md` (metric table against the baseline's
+bootstrap CI, regressed probe ids, scope agreement with the baseline run). Rows and raw
+responses are written one flushed line per case, so a crash keeps partial results; the rows file
+is replaced with the scored rows when the run ends. Exit code is non-zero when the run is
+incomplete (any probe unmatched or not run).
+
+Precision and typing accuracy count only returned output, so failed cases do not lower them;
+recall and F1 count those cases as all false negatives. The summary carries `failed_cases`,
+`cases_not_run` and an `interpretation_warning` when either is non-zero, and `comparison.md`
+opens with an INCOMPLETE banner. `latency_ms` covers completed (HTTP 200) cases only;
+`latency_ms_all_cases` includes failures.
+
+Stop conditions: 3 consecutive `unreachable` cases, 2 consecutive `client_timeout` cases, or
+`--max-minutes` (default 50). A `client_timeout` (the client gave up; the service may still be
+running the job) is distinct from `timeout` (the service answered 504). `--client-timeout-s`
+defaults to 960, above one job's worst case (scope call plus two extraction attempts), and after
+any client timeout the run waits `--drain-s` (default 120) before the next request so the
+abandoned job does not overlap the next one on the single GPU.
+
 ## Known gaps / next steps
 
 - `run_host.py`'s and `analyse.py`'s exact CLI flags (line ~1700 / ~1307 in
