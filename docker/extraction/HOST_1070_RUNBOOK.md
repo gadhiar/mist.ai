@@ -2,13 +2,12 @@ GTX 1070 extraction host -- setup runbook (T5, goal mist-two-loop / MIS-171)
 ===========================================================================
 
 Who runs this: Raj and the lead, on the host. Nothing here is run by a delegate.
-A real build has since run most of this runbook once (see the "Measured on the
-real host build" / "VERIFIED" notes throughout) -- but its context size (8192)
-and the resulting ncmoe=12 fit are superseded (see step 5.3 and
-`docker/extraction/README.md`'s "Context size" section), so the fit still
-needs a re-run before the host is deployed. Every step still marked
-[UNVERIFIED] is a reasoned instruction that has not been checked on the real
-machine; replace the marker with what was observed when you run it.
+A real build has run most of this runbook (see the "Measured on the real host
+build" / "VERIFIED" notes throughout), including a re-fit at the current
+context size (16384) -- see step 5.3 and `docker/extraction/README.md`'s
+"Host ncmoe sizing" table. Every step still marked [UNVERIFIED] is a reasoned
+instruction that has not been checked on the real machine; replace the marker
+with what was observed when you run it.
 
 What the host is for: it runs the standalone compose file
 `docker/extraction/compose.host.yml` -- ONLY the stateless extraction service
@@ -55,11 +54,20 @@ the kernels on first load (source: lead's b11151 check,
 
 WSL 2.7.14 tears down the distro when the last `wsl.exe` client exits, even
 with systemd enabled inside the distro -- `vmIdleTimeout` does not prevent
-this. The fix that worked on the real host build was a persistent keepalive
-WSL session: an at-logon scheduled task holding a `sleep infinity` process
-alive inside the distro, so the distro (and the Docker Engine/containers
-running in it) survives without an interactive `wsl.exe` session attached.
-This is only relevant to a Docker-Engine-in-WSL setup, not Docker Desktop.
+this. The fix is a persistent keepalive WSL session, so the distro (and the
+Docker Engine/containers running in it) survives without an interactive
+`wsl.exe` session attached. This is only relevant to a Docker-Engine-in-WSL
+setup, not Docker Desktop.
+
+The original implementation was a simple at-logon scheduled task holding a
+`sleep infinity` process alive inside the distro. That task has since been
+killed by Windows three times (error `0xC000013A`). It has been rebuilt to
+be self-healing: a Windows Scheduled Task with a `TimeTrigger` that
+re-checks and, if needed, restarts the keepalive session every 5 minutes,
+rather than a one-shot task that only runs at logon. Worst-case downtime if
+the keepalive process dies is therefore about 5 minutes (until the next
+trigger check) plus about 30 seconds for WSL and the containers inside it
+to come back up.
 
 **Other benign quirks observed on the real host build, noted here only where
 they generalize beyond that one machine:** `sudo` inside the WSL distro may
@@ -112,6 +120,26 @@ it) -- compose loads `.env` from the directory of the compose file you pass with
 
 Every other `EXTRACTION_*` variable has a default; `docker/extraction/README.md`
 section "Environment variables" lists them.
+
+**Out-of-repo timeout override, retirement.** Before this compose passthrough
+landed, `compose.host.yml` had no way to forward `EXTRACTION_LLM_TIMEOUT_SECONDS`
+at all, so the live host set it to `300` via an out-of-repo override file
+(`/home/user/overrides/timeout.yml` on the host, loaded by the host's own
+`start-mist-stack.cmd` script) as a workaround. Now that
+`EXTRACTION_LLM_TIMEOUT_SECONDS` is forwarded (see
+`docker/extraction/compose.host.yml`'s `mist-extraction-host` service), that
+override is no longer load-bearing. On the host:
+
+1. Set `EXTRACTION_LLM_TIMEOUT_SECONDS=300` (or whatever value is in use)
+   directly in the host's own `.env` beside `docker/extraction/compose.host.yml`
+   (the same file created in this step, next to `EXTRACTION_MODEL_HASH` and
+   `TS_AUTHKEY`).
+2. Delete `/home/user/overrides/timeout.yml`.
+3. Remove `start-mist-stack.cmd`'s reference to that override file.
+
+`start-mist-stack.cmd` is out-of-repo and host-local -- these three steps are
+for Raj or the operator to carry out on the host, not something a delegate
+can do from this checkout.
 
 5. First start, Pascal check and fit measurement
 ------------------------------------------------
@@ -178,17 +206,39 @@ Keep at least 512 MiB of VRAM headroom, the margin the `scripts/model_bench`
 fit clause uses. Pick the lowest value that fits, write it into `.env`, and
 record the sweep in the PR or the vault note.
 
-**The real host build's sweep is recorded here as the illustrating case, not a
-recommended default -- it was measured at ctx 8192 with a 406-token prompt and
-is superseded now that `EXTRACTION_LLM_CTX_SIZE` defaults to 16384 (see
-`docker/extraction/README.md`'s "Context size" section); it must be
-re-measured with an extraction-sized prompt before any value is adopted as the
-new default.** Fit found `ncmoe=12` (peak VRAM 7407/8192 MiB, 785 MiB
-headroom; decode 19.1 t/s, prompt 155 t/s; after reboot 19.0/139); `ncmoe=11`
-failed on headroom (380 MiB). RAM/swap pressure: at `ncmoe=999` (a sentinel
-value predating the 24-layer verification), WSL sat at 11.3 of 12 GiB with
-swap in use; at `ncmoe=12`, 5.3 GiB was free with no swap -- illustrating that
-pressure rises with higher `ncmoe`, not lower.
+**Re-fit at ctx 16384** (9,272-token prompt, `max_tokens=2048`), the current
+ctx-size default:
+
+| `ncmoe` | peak VRAM | headroom | prompt t/s | decode t/s | `/v1/extract` |
+|---|---|---|---|---|---|
+| 12 | 7632 MiB | 560 MiB | 499 | 17.7 | 51.3 s |
+| 13 | 7244 MiB | 948 MiB | 483 | 16.4 | 51.5 s |
+| 14 | 6840 MiB | 1352 MiB | 481 | 14.9 | 51.8 s |
+
+No swap at any of these values. Idle VRAM is about 7560 MiB at `ncmoe=12`.
+The prompt cache works. Entity count varies slightly across `ncmoe` (4 vs 3
+entities on a fixed test conversation); relationships are identical. Prompt
+throughput across the sweep is approximately 500 t/s (the earlier recorded
+~155 t/s figure was measured at the old ctx-8192/406-token setup and is
+superseded by this table).
+
+**Recommended `ncmoe` for this host: 13, not the bare-minimum 12.** Step
+5.3's general "pick the lowest value that fits" guidance above assumes VRAM
+is otherwise idle; this GPU also drives the host's own display, so `ncmoe=12`
+leaves only 560 MiB headroom -- tighter than is comfortable when the same
+card is also rendering a desktop. `ncmoe=13` leaves 948 MiB headroom for a
+small, predictable decode-speed cost (16.4 vs 17.7 t/s). Set
+`EXTRACTION_HOST_NCMOE=13` in the host's own `.env` (`docker/extraction/compose.host.yml`'s
+own committed default stays `24`, all-experts-on-CPU, until an operator
+opts into a tighter value this way).
+
+**Recommended operator setting: `ncmoe=13`, not the bare minimum `ncmoe=12`.**
+This GPU also drives the host's own display -- `12` fits with only 560 MiB
+spare, which is tighter than desirable when the same card is also rendering
+a desktop. `13` leaves substantially more headroom (948 MiB) for a small,
+predictable decode-speed cost (16.4 vs 17.7 t/s). Write
+`EXTRACTION_HOST_NCMOE=13` into `.env` to opt in; `compose.host.yml`'s own
+committed default stays `24` (all experts on CPU) until an operator does.
 
 6. Tailscale exposure
 ---------------------

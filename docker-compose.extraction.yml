@@ -171,6 +171,36 @@ services:
       - EXTRACTION_REASONING_EFFORT=${EXTRACTION_REASONING_EFFORT:-low}
       - EXTRACTION_LOCATION_LABEL=local-4070
       - LLAMA_CPP_BUILD=b11151
+      # EXTRACTION_LLM_TIMEOUT_SECONDS / EXTRACTION_MAX_ATTEMPTS /
+      # EXTRACTION_CONSTRAINED_MODE were previously silently unreachable
+      # inside this container: compose never forwarded them, even though
+      # docker/extraction/README.md documented them as operator-settable.
+      # ServiceSettings.from_env() (backend/extraction_service/settings.py)
+      # reads each straight from the process environment, but an
+      # `environment:` list that omits a key leaves that key unset inside
+      # the container regardless of what the host shell has -- so all three
+      # silently fell back to the dataclass defaults no matter what an
+      # operator set on the host.
+      #
+      # EXTRACTION_LLM_TIMEOUT_SECONDS: ServiceSettings.llm_timeout_seconds
+      # defaults to 30.0s, but the ctx-16384 re-fit measured a real cold
+      # /v1/extract call at 51.3-51.8s across the ncmoe sweep (see
+      # docker/extraction/README.md's "Host ncmoe sizing" table) -- 30s
+      # fails outright on this hardware. 120 gives real headroom above the
+      # measured figure.
+      - EXTRACTION_LLM_TIMEOUT_SECONDS=${EXTRACTION_LLM_TIMEOUT_SECONDS:-120}
+      # EXTRACTION_MAX_ATTEMPTS: matches ServiceSettings.max_attempts' own
+      # default (2 -- the first call plus one repair retry on unparsable
+      # output).
+      - EXTRACTION_MAX_ATTEMPTS=${EXTRACTION_MAX_ATTEMPTS:-2}
+      # EXTRACTION_CONSTRAINED_MODE: default is an EMPTY string, not a mode
+      # name. engine.py's _resolve_constrained_mode reads
+      # `self._settings.constrained_mode or self._adapter.default_constrained_mode`
+      # -- a Python `or`, so an empty string is falsy and falls through to
+      # the adapter's own default, exactly like the unset/None case before
+      # this var was reachable. This makes the setting overridable without
+      # changing today's effective default.
+      - EXTRACTION_CONSTRAINED_MODE=${EXTRACTION_CONSTRAINED_MODE:-}
     depends_on:
       mist-extraction-llm-local:
         condition: service_healthy

@@ -101,13 +101,41 @@ one, so a deploy never silently runs on a `from_env()` fallback value.
 | `EXTRACTION_LOCATION_LABEL` | `local-4070` | `host-1070` | Reported in `/v1/info`; hardcoded per deployment, not overridable via `.env`. |
 | `LLAMA_CPP_BUILD` | `b11151` | same | Reported in `ResultStamps`/`/v1/info`; shared with the compose image pin. |
 | `EXTRACTION_DEBUG_PORT` | `8090` | n/a (no ports published) | Local-only, `127.0.0.1` loopback; see Tailscale exposure below. |
+| `EXTRACTION_LLM_TIMEOUT_SECONDS` | `120` | same | Per-LLM-call timeout. `ServiceSettings.llm_timeout_seconds`'s own dataclass default is `30.0`s, but the ctx-16384 re-fit measured a real cold `/v1/extract` call at 51.3-51.8s (see "Host ncmoe sizing" below); 120 gives real headroom. |
+| `EXTRACTION_MAX_ATTEMPTS` | `2` | same | Maximum extraction attempts per job (first call plus repair retries on unparsable output), matching `ServiceSettings.max_attempts`'s own default. |
+| `EXTRACTION_CONSTRAINED_MODE` | empty | same | Overrides the adapter's `default_constrained_mode` when set. Empty is falsy in `engine.py`'s `constrained_mode or adapter.default_constrained_mode`, so it falls through to the adapter's default -- the same effective behavior as unset. |
+
+**`EXTRACTION_LLM_TIMEOUT_SECONDS` caveat for the host.** 120s covers the
+measured end-to-end `/v1/extract` figures above, but `llm_timeout_seconds`
+bounds each individual LLM call, and the extraction stage alone asks for
+`max_tokens=2048` (`backend/extraction_service/engine.py`). At the host's
+`ncmoe=13` re-fit (16.4 decode t/s, 483 prompt t/s), a call that used the
+full 2048-token budget would take roughly 145s (about 19s prompt processing
+plus about 125s decode) -- over the 120s generic default. The host's own
+`.env` should keep `EXTRACTION_LLM_TIMEOUT_SECONDS=300` (see
+`docker/extraction/HOST_1070_RUNBOOK.md`'s "Out-of-repo timeout override,
+retirement" note) rather than relying on this compose-file fallback;
+120 is sized for the common case and for the local (4070) deployment, whose
+much faster decode keeps it well clear of this worst case.
 
 Every other `ServiceSettings` field (`reasoning_budget_tokens`,
-`constrained_mode`, `llm_timeout_seconds`, `max_attempts`,
 `idempotency_cache_size`, `scope_enabled`, `temperature`, `port`) has a
 tested default in `settings.py` and is left unset here deliberately --
 `EXTRACTION_REASONING_BUDGET_TOKENS` in particular MUST stay unset (see
 "No reasoning-budget cap" below).
+
+**Idempotency-cache trap (operator note).** `ServiceSettings.idempotency_cache_size`
+(default 256) backs a `job_id` -> `ExtractResponse` LRU cache
+(`backend/extraction_service/app.py`'s `_ResultCache`, keyed on `job_id`
+alone -- `cache.knows(req.job_id)` / `cache.get_or_run(req.job_id, ...)`).
+Reusing the same `job_id` across repeated `/v1/extract` calls -- for
+example while manually timing something, or re-running a probe script
+without regenerating IDs -- returns the CACHED result instead of
+re-invoking the LLM, silently. `request_id` is not part of the cache key;
+it is used only for log correlation (the "job complete"/"job failed" log
+lines), so reusing it alone has no effect on caching. Always use a fresh
+`job_id` when timing or re-testing the service, and regenerate `request_id`
+alongside it for clean log correlation.
 
 ### llama-server (`mist-extraction-llm-local` / `mist-extraction-llm-host`)
 
@@ -132,12 +160,21 @@ real `--help` capture for this build.
   `backend/llm/llama_server_provider.py` reads via `getattr(message,
   "reasoning_content", None)`.
 
-  **Observed on the real host build (b11151):** neither `LLAMA_ARG_REASONING`
-  nor `LLAMA_ARG_THINK` seemed to have any effect -- `/props` showed
-  `reasoning_format none` and `chat_format Content-only` with these flags set.
-  No A/B comparison against the flags unset was recorded, so this is an
-  observation, not a controlled finding. A follow-up task (not this one)
-  addresses reasoning-format flags for this build; no fix is applied here.
+  **A/B'd on the real host build (b11151), ctx 16384.** Three configurations
+  were compared: shipped flags (`LLAMA_ARG_REASONING=on`,
+  `LLAMA_ARG_THINK=deepseek`); `LLAMA_ARG_THINK` simply unset; and
+  `LLAMA_ARG_CHAT_TEMPLATE=gpt-oss`. The first two behave identically (HTTP
+  200, extraction succeeds); the third makes the model emit garbage and
+  extraction returns HTTP 502, so it is rejected. The flags stay as shipped.
+
+  `/props` shows `reasoning_format none` and `chat_format Content-only`
+  under every one of these configurations, including the working ones --
+  `/props` is NOT a reliable indicator of whether the reasoning flags are
+  doing anything here. Inspecting the actual completion (not `/props`)
+  shows `reasoning_content` on the response message IS populated when the
+  flags are set, so the flags do have an effect; the earlier "neither flag
+  seemed to have any effect" note was an incorrect inference from an
+  unreliable indicator.
 - `-ncmoe` / `--n-cpu-moe N` (line 124) -- see "Local ncmoe sizing" and
   "Host ncmoe sizing" below.
 - `-b`/`-ub 2048`, `-lm none` -- CPU-MoE prompt-processing batch sizes and
@@ -175,9 +212,8 @@ the prompt -- 9162 + 2048 > 8192, so extraction could not succeed at the old
 default. The default is now `16384`, which gives headroom over that
 measurement.
 
-**The previously recorded host ncmoe fit (see "Host ncmoe sizing" below) was
-measured at ctx 8192 with a 406-token prompt. It is NOT valid at ctx 16384
-and must be re-measured.** No re-fit number exists yet -- do not invent one.
+The host ncmoe fit has been re-measured at ctx 16384 -- see "Host ncmoe
+sizing" below for the current table.
 
 Local ncmoe sizing (`EXTRACTION_LOCAL_NCMOE`, default `24`)
 --------------------------------------------------------------
@@ -217,19 +253,33 @@ Host ncmoe sizing (`EXTRACTION_HOST_NCMOE`, default `24`)
 
 Same "all experts on CPU" default and same reasoning as local -- `24` is
 verified via GGUF metadata (`block_count`), not the load log; see "Local
-ncmoe sizing" above. The real host build measured a fit of `ncmoe=12` (peak
-VRAM 7407/8192 MiB, decode 19.1 t/s, prompt 155 t/s), **but that measurement
-was taken at ctx 8192 with a 406-token prompt and is NOT valid now that ctx
-defaults to 16384** (see "Context size" above) -- it must be re-measured
-before any value tighter than `24` is recorded here as the default. Do not
-substitute the ctx-8192 measurement for a real re-fit.
+ncmoe sizing" above. `24` stays the shipped compose-file default (conservative,
+all-CPU); an operator opts into a tighter value via `EXTRACTION_HOST_NCMOE`
+in the host's own `.env`.
 
-RAM/swap pressure while sweeping `ncmoe`: the real host build's illustrating
-measurement found pressure WORST at HIGH `ncmoe` (more experts held on CPU
-consumes more system RAM), not at low `ncmoe` -- at `ncmoe=999` WSL sat at
-11.3 of 12 GiB with swap in use, while at `ncmoe=12` there was 5.3 GiB free
-and no swap. This is the build's illustrating case, not a recommended
-default, and it too is superseded pending the ctx-16384 re-fit.
+**Re-fit at ctx 16384** (9,272-token prompt, `max_tokens=2048`), gpt-oss-20b
+on the GTX 1070 (Pascal, 8 GB):
+
+| `ncmoe` | peak VRAM | headroom | prompt t/s | decode t/s | `/v1/extract` |
+|---|---|---|---|---|---|
+| 12 | 7632 MiB | 560 MiB | 499 | 17.7 | 51.3 s |
+| 13 | 7244 MiB | 948 MiB | 483 | 16.4 | 51.5 s |
+| 14 | 6840 MiB | 1352 MiB | 481 | 14.9 | 51.8 s |
+
+No swap at any of these values. Idle VRAM is about 7560 MiB at `ncmoe=12`.
+The prompt cache works. Entity count varies slightly across `ncmoe` (4 vs 3
+entities on a fixed test conversation); relationships are identical. Prompt
+throughput across the sweep is approximately 500 t/s (the previously
+recorded ~155 t/s figure was measured at the old ctx-8192/406-token setup
+and is superseded by this table).
+
+**Recommended operator setting: `ncmoe=13`, not the bare minimum
+`ncmoe=12`.** This GPU also drives the host's own display -- `12` fits with
+only 560 MiB spare, which is tighter than desirable when the same card is
+also rendering a desktop. `13` leaves substantially more headroom (948 MiB)
+for a small, predictable decode-speed cost (16.4 vs 17.7 t/s). Set
+`EXTRACTION_HOST_NCMOE=13` in the host's own `.env` to opt in; the
+compose-file default stays `24` until an operator does.
 
 Tailscale exposure model (host deployment only, `compose.host.yml`)
 -----------------------------------------------------------------------
