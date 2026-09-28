@@ -10,8 +10,9 @@ probe), `ExtractionDispatcher._fill_step` (filling),
 `EventStore.promote_epoch_cutover` and `EventStore.promote_epoch_cutover_seed_only`
 (the two promotion transactions), `backend/extraction_backlog/admin.py` (CLI).
 
-When the live graph holds seed data only (nothing any extraction epoch wrote),
-skip sections 4 and 5: see section 6A.
+When the conversation log has never held a turn that was extracted into the live
+graph (for example, the log is empty), skip sections 4 and 5: see section 6A and
+its precondition.
 
 Every command below is marked:
 
@@ -36,9 +37,10 @@ Every command below is marked:
                           transaction (section 6)
     promote --seed-only-graph
              ready | checked -> promoted
-                          live graph proven seed-only by a read-only probe; candidate
-                          appended to epoch_ledger + first-hand activation marking
-                          nothing, one SQLite transaction (section 6A)
+                          read-only probe finds no stamped and no unseeded element,
+                          no apply marker exists; candidate appended to epoch_ledger
+                          + first-hand activation marking nothing, one SQLite
+                          transaction (section 6A; operator precondition there)
     abandon  -> abandoned deletes nothing
 
 While a cutover is open (filling, ready or checked):
@@ -281,20 +283,52 @@ Keep the extraction service on the candidate model: it is now the active epoch's
 
 ## 6A. Promote over a seed-only live graph (no rebuild, no swap)
 
-When it applies: the live graph contains ONLY the seed. The seed applier stamps
-every node and edge it writes with `seed_version`
-(`backend/knowledge/seed/applier.py`); extraction-path writers stamp
-`ontology_version` on nodes and `ontology_version`, `extraction_version` and
-`model_hash` on relationships (`backend/knowledge/curation/graph_writer.py`,
-`reconciliation.py`, `skill_derivation.py`). [VERIFIED-IN-REPO] A graph with
-nothing but seed-stamped elements is the same under every extraction epoch, so
-the candidate can become active over it as it is: sections 4 (rebuild) and 5
-(swap) are skipped. This is the path for a log whose turns were never applied to
-the live graph, including an empty log, where `cutover rebuild` cannot run (its
-floors must be >= 1).
+**Operator precondition.** Use this path ONLY when the conversation log has never
+held a turn that was extracted into the live graph: in practice, when
+`conversation_turn_events` is empty, or when you have independent evidence that no
+extraction ever ran against this graph. Then the live graph holds only what the
+seed applier wrote, and the candidate epoch can start from it as it is: sections
+4 (rebuild) and 5 (swap) are skipped. An empty log is also where `cutover rebuild`
+cannot run (its floors must be >= 1). The code does not enforce this
+precondition; the checks below cannot see every extraction write.
+
+Check the log is empty (read-only):
+
+    docker compose exec mist-backend python -m backend.extraction_backlog.admin cutover status
+
+It must print `covered=0 total=0`. `total` counts every logged turn, unfiltered
+(`_print_cutover` in `admin.py` -> `BacklogStore.fill_scan` ->
+`EventStore.list_turn_keys_in_replay_order`). [VERIFIED-IN-REPO] [UNIT-TESTED:
+the `covered=... total=...` line] [UNVERIFIED: not run against the live stack].
+The top-level `status` command does not print the logged-turn count.
+
+What the probe proves: at least one node, no node or relationship WITHOUT
+`seed_version`, and no node or relationship WITH `ontology_version`,
+`extraction_version` or `model_hash`. The seed applier sets `seed_version` on the
+nodes (`backend/knowledge/seed/applier.py:210`) and edges (`:78`) it writes.
+[VERIFIED-IN-REPO] Any element an extraction writer CREATES lacks `seed_version`,
+so the probe sees it.
+
+What the probe and the apply-marker check CANNOT see [VERIFIED-IN-REPO]:
+
+- an extraction write that mutates an existing seeded element without stamping
+  it: `backend/knowledge/extraction/internal_derivation.py:407-410` (Stage 9
+  UPDATE) and `:418-421` (DEPRECATE) on a `:__SelfModel__` node;
+  `backend/knowledge/curation/reconciliation.py:754-758` (the ON MATCH append on
+  an existing edge); `backend/knowledge/curation/skill_derivation.py:174` and
+  `:238` (edges MERGEd with no stamp, invisible when they match an existing
+  seeded edge) and `:187-190`, `:215-218` (SET on an existing node, no stamp);
+- a turn applied without a marker: `backend/chat/conversation_handler.py:2035-2049`
+  runs extraction in process whenever no dispatcher is attached and writes no
+  `extraction_applied` row; a turn recorded as legacy at the backlog's first
+  activation gets no marker whether or not an earlier path applied it
+  (`BacklogStore.ensure_activation`).
+
+Hence the precondition above: these checks back it up, they do not replace it.
 
 Stop the backend first, as for section 6, so no live-path writer can touch the
-graph between the probe and the promotion: [UNVERIFIED: not run from this branch]
+graph between the probe and the promotion, and no turn is logged during it:
+[UNVERIFIED: not run from this branch]
 
     docker compose stop mist-backend
     docker compose run --rm mist-backend python -m backend.extraction_backlog.admin \
@@ -313,8 +347,8 @@ Refused (exit 2, `[cutover] REFUSED: <reason>`, nothing written) when: [UNIT-TES
 - no cutover is open, or it is not `ready` or `checked`;
 - the fill is incomplete (a logged turn has no candidate cache row);
 - `extraction_applied` holds ANY row, under ANY epoch, `applied` or `curated`
-  (a turn has been applied to a graph, so the live graph may hold extracted
-  data);
+  (a recorded apply; an empty table does not prove no turn was applied, see
+  above);
 - the active epoch is no longer the cutover's source epoch;
 - the live-graph probe fails: it must find at least one node, every node and
   relationship carrying `seed_version`, and none carrying `ontology_version`,
@@ -327,6 +361,11 @@ The probe is ONE read-only Cypher statement (`SEED_ONLY_PROBE_CYPHER` in
 state, fill, marker and epoch checks pass, and before the transaction. A unit test
 refuses any write clause in it. [UNIT-TESTED: textually, and over a fake
 connection]
+
+The fill is checked before the transaction, not inside it (the candidate cache is
+a separate database). A turn logged after that check is not in the candidate
+cache, so after promotion the dispatcher infers it fresh under the new epoch, in
+its place in the log. With the backend stopped, no turn should be logged then.
 
 Otherwise ONE SQLite transaction (`EventStore.promote_epoch_cutover_seed_only`)
 re-checks the state, the source epoch and the markers, then:
@@ -390,3 +429,6 @@ epoch stays in `epoch_mismatch`.
 - The probe requires EVERY node to carry `seed_version`, so a node any other
   writer created (including Stage 9 self-model nodes) refuses the seed-only path
   even if it carries no extraction stamp.
+- The probe cannot see unstamped mutations of seeded elements, and the marker
+  check cannot see in-process or legacy applies (section 6A lists the file:line
+  sites). The seed-only path rests on the operator precondition in 6A.

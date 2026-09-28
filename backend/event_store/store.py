@@ -1375,8 +1375,11 @@ class EventStore:
     def count_extraction_applied_by_stage(self) -> dict[str, int]:
         """Apply markers across EVERY epoch, counted by stage ('curated', 'applied').
 
-        An empty dict means no turn has ever been recorded as (partly) applied to
-        a graph under any epoch, the condition seed-only promotion requires.
+        An empty dict means no turn has a recorded apply marker under any epoch,
+        one of the conditions seed-only promotion requires. It does not mean no
+        turn was ever applied: the in-process extraction path
+        (`backend/chat/conversation_handler.py:2035-2049`, used when no
+        dispatcher is attached) writes no marker.
         """
         return self._applied_counts(self._get_connection())
 
@@ -1390,15 +1393,20 @@ class EventStore:
     def promote_epoch_cutover_seed_only(
         self, *, cutover_id: int, activated_at: str, probe_report: dict[str, Any]
     ) -> dict[str, Any]:
-        """Make a filled cutover the active epoch over a SEED-ONLY live graph, in ONE transaction.
+        """Make a filled cutover the active epoch with no graph swap, in ONE transaction.
 
         The graph-swapped path (`promote_epoch_cutover`) needs a checked staging
-        graph and marks applied the turns it contains. When the live graph holds
-        nothing any extraction epoch wrote (the caller's read-only probe says
-        so, `probe_report`), it is already what the candidate epoch's graph
-        looks like before its first turn is applied, so no swap is needed and
-        no turn is marked: every logged turn stays apply-pending and the
-        dispatcher applies them all, in log order, from the candidate cache.
+        graph and marks applied the turns it contains. This path is for a log
+        that never held an extracted turn, whose live graph therefore holds
+        only seed data (the operator's precondition, CUTOVER.md 6A). No turn is
+        marked: every logged turn stays apply-pending and the dispatcher applies
+        them all, in log order, from the candidate cache.
+
+        This method does not look at the graph. `probe_report` is the caller's
+        read-only probe result, recorded verbatim; the probe finds no stamped
+        and no unseeded element, which does not rule out every extraction write
+        (see the comment above `SEED_ONLY_PROBE_CYPHER` in
+        `backend/extraction_backlog/cutover.py`).
 
         Inside a single `BEGIN IMMEDIATE`:
 
@@ -1418,7 +1426,10 @@ class EventStore:
            counts, and any earlier check report under `prior_check_report`.
 
         No `extraction_applied` row is written. A crash anywhere before COMMIT
-        leaves none of it written.
+        leaves none of it written. The fill (a candidate cache row per logged
+        turn) is NOT re-checked here: the cache is a separate database. The
+        caller checks it before this transaction; a turn logged in between is
+        inferred fresh under the new epoch by the dispatcher.
 
         Args:
             cutover_id: The open cutover to promote.

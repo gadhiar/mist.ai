@@ -114,7 +114,10 @@ def _begin(world) -> None:
 
 def _log(world, ts, index: int) -> str:
     return world.log_turn(
-        session_id="s1", turn_index=index, timestamp=ts(index), utterance=f"I really use tool{index}"
+        session_id="s1",
+        turn_index=index,
+        timestamp=ts(index),
+        utterance=f"I really use tool{index}",
     )
 
 
