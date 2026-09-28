@@ -1,7 +1,8 @@
 """The dispatcher's writer-stamp guard.
 
-Curation stamps reconciled relationship edges and EXTRACTED_FROM edges with a
-triple from `KnowledgeConfig`, not from the epoch ledger, so a backend whose
+Curation stamps the relationship edges reconciliation creates, and
+EXTRACTED_FROM edges, with a triple from `KnowledgeConfig`, not from the
+epoch ledger, so a backend whose
 writer stamps differ from the active epoch's must neither dispatch nor apply:
 it stalls with a reason naming both triples.
 """
