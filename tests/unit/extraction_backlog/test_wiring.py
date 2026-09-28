@@ -216,6 +216,42 @@ class TestFactory:
         assert dispatcher._inference is None
         assert dispatcher.snapshot().state == "disabled"
 
+    def test_writer_stamps_are_the_ones_the_curation_graph_writer_stamps_with(self):
+        from backend.factories import build_curation_pipeline, build_extraction_dispatcher
+        from backend.knowledge.curation.graph_writer import RebuildStamps
+        from backend.knowledge.version_stamps import compose_model_hash
+        from tests.mocks.neo4j import FakeGraphExecutor
+        from tests.unit.extraction_backlog.conftest import _build_world
+
+        world = _build_world(with_deriver=False)
+        config = build_test_config(embedding_model="wiring-emb")
+        config.model_hash = "wiring-model"
+        config.extraction_version = "wiring-ev"
+        config.ontology_version = "7.7.7"
+
+        dispatcher = build_extraction_dispatcher(
+            config,
+            pipeline=world.build_pipeline(),
+            event_store=world.event_store,
+            settings=DispatcherSettings(mode="off"),
+            extraction_cache=world.cache,
+        )
+        curation = build_curation_pipeline(
+            config,
+            FakeGraphExecutor(connection=FakeNeo4jConnection()),
+            embedding_provider=FakeEmbeddingGenerator(),
+        )
+
+        writer = dispatcher._writer_stamps
+        assert writer == RebuildStamps(
+            ontology_version="7.7.7",
+            extraction_version="wiring-ev",
+            model_hash=compose_model_hash(config),
+        )
+        assert writer.model_hash == "wiring-model|emb:wiring-emb"
+        assert writer == curation._graph_writer._rebuild_stamps
+        assert writer == curation._engine._stamps
+
 
 class TestAdminCli:
     def test_status_prints_the_backlog_counts(self, ts):

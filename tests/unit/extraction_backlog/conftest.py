@@ -133,7 +133,6 @@ class BacklogWorld:
 
     def build_pipeline(self) -> ExtractionPipeline:
         config = build_test_config(embedding_model=EMBEDDING_MODEL)
-        epoch = self.event_store.get_current_epoch()
         return ExtractionPipeline(
             preprocessor=PreProcessor(),
             extractor=OntologyConstrainedExtractor(config, llm=self.main_llm),
@@ -153,15 +152,28 @@ class BacklogWorld:
                 dedup_cache_ttl_seconds=300,
             ),
             extraction_cache=self.cache,
-            rebuild_stamps=RebuildStamps(
-                ontology_version=epoch["ontology_version"],
-                extraction_version=epoch["extraction_version"],
-                model_hash=epoch["model_hash"],
-            ),
+            rebuild_stamps=self.active_epoch_stamps(),
         )
 
-    def build_dispatcher(self, **setting_overrides) -> ExtractionDispatcher:
-        """A fresh dispatcher (and pipeline) over the SAME stores: a restart."""
+    def active_epoch_stamps(self) -> RebuildStamps:
+        """The active epoch's stamp triple, read now, as the writer's `RebuildStamps`."""
+        epoch = self.event_store.get_current_epoch()
+        return RebuildStamps(
+            ontology_version=epoch["ontology_version"],
+            extraction_version=epoch["extraction_version"],
+            model_hash=epoch["model_hash"],
+        )
+
+    def build_dispatcher(
+        self, *, writer_stamps: RebuildStamps | None = None, **setting_overrides
+    ) -> ExtractionDispatcher:
+        """A fresh dispatcher (and pipeline) over the SAME stores: a restart.
+
+        `writer_stamps` None means the ACTIVE epoch's stamps, read at build
+        time -- the operator recreating the backend with a matching
+        `MIST_MODEL_HASH`. Pass other stamps to model a backend whose config
+        disagrees with the epoch ledger.
+        """
         client = httpx.AsyncClient(
             transport=SwitchableTransport(self.service, build_fake_service_app(self.service))
         )
@@ -172,6 +184,9 @@ class BacklogWorld:
             inference=RemoteExtractionInference(client, SERVICE_URL),
             settings=fast_settings(**setting_overrides),
             embedding_model_name=EMBEDDING_MODEL,
+            writer_stamps=(
+                writer_stamps if writer_stamps is not None else self.active_epoch_stamps()
+            ),
         )
         self.dispatchers.append(dispatcher)
         return dispatcher
