@@ -1396,9 +1396,11 @@ class EventStore:
         """Make a filled cutover the active epoch with no graph swap, in ONE transaction.
 
         The graph-swapped path (`promote_epoch_cutover`) needs a checked staging
-        graph and marks applied the turns it contains. This path is for a log
-        that never held an extracted turn, whose live graph therefore holds
-        only seed data (the operator's precondition, CUTOVER.md 6A). No turn is
+        graph and marks applied the turns it contains. This path is for a live
+        graph no extraction has ever run against, which therefore holds only
+        seed data (the operator's precondition, CUTOVER.md 6A; an empty event
+        log shows it only if the log has not been reset or replaced since the
+        graph was seeded). No turn is
         marked: every logged turn stays apply-pending and the dispatcher applies
         them all, in log order, from the candidate cache.
 

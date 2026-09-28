@@ -10,9 +10,9 @@ probe), `ExtractionDispatcher._fill_step` (filling),
 `EventStore.promote_epoch_cutover` and `EventStore.promote_epoch_cutover_seed_only`
 (the two promotion transactions), `backend/extraction_backlog/admin.py` (CLI).
 
-When the conversation log has never held a turn that was extracted into the live
-graph (for example, the log is empty), skip sections 4 and 5: see section 6A and
-its precondition.
+When no extraction has ever run against the live graph, skip sections 4 and 5:
+see section 6A and its precondition. An empty conversation log alone does not
+establish that if the log has been reset or replaced since the graph was seeded.
 
 Every command below is marked:
 
@@ -283,41 +283,53 @@ Keep the extraction service on the candidate model: it is now the active epoch's
 
 ## 6A. Promote over a seed-only live graph (no rebuild, no swap)
 
-**Operator precondition.** Use this path ONLY when the conversation log has never
-held a turn that was extracted into the live graph: in practice, when
-`conversation_turn_events` is empty, or when you have independent evidence that no
-extraction ever ran against this graph. Then the live graph holds only what the
-seed applier wrote, and the candidate epoch can start from it as it is: sections
-4 (rebuild) and 5 (swap) are skipped. An empty log is also where `cutover rebuild`
-cannot run (its floors must be >= 1). The code does not enforce this
-precondition; the checks below cannot see every extraction write.
+**Operator precondition.** Use this path ONLY when no extraction has ever run
+against THIS live graph. Then the live graph holds only what the seed applier
+wrote, and the candidate epoch can start from it as it is: sections 4 (rebuild)
+and 5 (swap) are skipped. The code does not enforce this precondition, and the
+checks below cannot see every extraction write.
 
-Check the log is empty (read-only):
+An empty conversation log proves the precondition only if the event log
+(`event_store.db`) has not been reset or replaced since the graph was seeded: a
+reset log is empty whatever ran against the graph before the reset. If the log
+has been reset or replaced, you need independent evidence that no extraction ran
+against this graph (for example, that the graph itself was re-seeded from empty
+after the reset [UNVERIFIED: a proposal, not established from the repository]).
+An empty log is also where `cutover rebuild` cannot run (its
+floors must be >= 1).
+
+Check the log is currently empty (read-only):
 
     docker compose exec mist-backend python -m backend.extraction_backlog.admin cutover status
 
-It must print `covered=0 total=0`. `total` counts every logged turn, unfiltered
+It must print `covered=0 total=0`. This shows only that the log is empty NOW,
+not that it always was. `total` counts every logged turn, unfiltered
 (`_print_cutover` in `admin.py` -> `BacklogStore.fill_scan` ->
-`EventStore.list_turn_keys_in_replay_order`). [VERIFIED-IN-REPO] [UNIT-TESTED:
-the `covered=... total=...` line] [UNVERIFIED: not run against the live stack].
-The top-level `status` command does not print the logged-turn count.
+`EventStore.list_turn_keys_in_replay_order`). The line prints only while a
+cutover is open (`_cutover_status`, `admin.py:206-221`); at this step one is,
+since promotion needs it. [VERIFIED-IN-REPO] [UNIT-TESTED: the
+`covered=... total=...` line] [UNVERIFIED: not run against the live stack]. The
+top-level `status` command does not print the logged-turn count.
 
 What the probe proves: at least one node, no node or relationship WITHOUT
 `seed_version`, and no node or relationship WITH `ontology_version`,
 `extraction_version` or `model_hash`. The seed applier sets `seed_version` on the
 nodes (`backend/knowledge/seed/applier.py:210`) and edges (`:78`) it writes.
-[VERIFIED-IN-REPO] Any element an extraction writer CREATES lacks `seed_version`,
-so the probe sees it.
+[VERIFIED-IN-REPO] No extraction writer sets `seed_version` (`grep -rln
+seed_version backend/knowledge/curation backend/knowledge/extraction
+backend/chat` finds nothing), so any node or edge an extraction writer CREATES,
+stamped or not (for example the unstamped edges `skill_derivation.py:174` and
+`:238` MERGE), lacks `seed_version` and the probe sees it. [VERIFIED-IN-REPO]
 
 What the probe and the apply-marker check CANNOT see [VERIFIED-IN-REPO]:
 
-- an extraction write that mutates an existing seeded element without stamping
-  it: `backend/knowledge/extraction/internal_derivation.py:407-410` (Stage 9
-  UPDATE) and `:418-421` (DEPRECATE) on a `:__SelfModel__` node;
-  `backend/knowledge/curation/reconciliation.py:754-758` (the ON MATCH append on
-  an existing edge); `backend/knowledge/curation/skill_derivation.py:174` and
-  `:238` (edges MERGEd with no stamp, invisible when they match an existing
-  seeded edge) and `:187-190`, `:215-218` (SET on an existing node, no stamp);
+- an unstamped SET on an existing SEEDED element. On nodes:
+  `backend/knowledge/extraction/internal_derivation.py:407-410` (Stage 9 UPDATE)
+  and `:418-421` (DEPRECATE) on a `:__SelfModel__` node, and
+  `backend/knowledge/curation/skill_derivation.py:187-190` and `:215-218`. On
+  edges: `backend/knowledge/curation/reconciliation.py:754-758`, the ON MATCH
+  branch, when its MERGE matches a seeded edge (seed edges join `:__Entity__`
+  and `:__SelfModel__` nodes, `backend/knowledge/seed/applier.py:37-39, 74-77`);
 - a turn applied without a marker: `backend/chat/conversation_handler.py:2035-2049`
   runs extraction in process whenever no dispatcher is attached and writes no
   `extraction_applied` row; a turn recorded as legacy at the backlog's first
@@ -429,6 +441,8 @@ epoch stays in `epoch_mismatch`.
 - The probe requires EVERY node to carry `seed_version`, so a node any other
   writer created (including Stage 9 self-model nodes) refuses the seed-only path
   even if it carries no extraction stamp.
-- The probe cannot see unstamped mutations of seeded elements, and the marker
-  check cannot see in-process or legacy applies (section 6A lists the file:line
-  sites). The seed-only path rests on the operator precondition in 6A.
+- The probe cannot see unstamped SETs on seeded elements, and the marker check
+  cannot see in-process or legacy applies (section 6A lists the file:line
+  sites). The seed-only path rests on the operator precondition in 6A, and
+  `covered=0 total=0` shows only that the log is empty now, not that it was
+  never reset.

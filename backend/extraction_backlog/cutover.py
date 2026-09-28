@@ -21,8 +21,8 @@ until the new one passes a check. The lifecycle, one `epoch_cutover` row:
                            exists: the candidate is appended with a first-hand
                            activation that marks nothing, in one SQLite
                            transaction; the dispatcher then applies every
-                           logged turn in log order. For a log that never held
-                           an extracted turn (CUTOVER.md 6A)
+                           logged turn in log order. Only when no extraction
+                           has ever run against this live graph (CUTOVER.md 6A)
     abandon   -> abandoned deletes nothing
 
 Filling is the dispatcher's job (`ExtractionDispatcher._fill_step`); this
@@ -36,9 +36,10 @@ candidate model and cannot extract for the active epoch.
 
 The code never writes the live Neo4j graph. `promote` takes exactly one of two
 statements about it. `--graph-swapped`: the operator did the host swap in
-`CUTOVER.md`. `--seed-only-graph`: the operator's statement that no turn in the
-log was ever extracted into the live graph (CUTOVER.md 6A states the
-precondition). `promote_seed_only_cutover` checks what it can before promoting:
+`CUTOVER.md`. `--seed-only-graph`: the operator's statement that no extraction
+has ever run against this live graph (CUTOVER.md 6A states the precondition; an
+empty event log shows it only if the log has not been reset or replaced since
+the graph was seeded). `promote_seed_only_cutover` checks what it can before promoting:
 one read-only Cypher statement (`SEED_ONLY_PROBE_CYPHER`) finds no element
 carrying an extraction stamp and no element lacking `seed_version`, and
 `extraction_applied` is empty. Those checks cannot see every extraction write;
@@ -259,24 +260,27 @@ def promote_cutover(store: BacklogStore, *, graph_swapped: bool, now_iso: str) -
 # `:751-752` (relationships, ON CREATE only). An element such a writer creates
 # lacks `seed_version`, so the probe sees it either way.
 #
-# What the probe CANNOT see: an extraction write that mutates an existing
-# seeded element without stamping it.
-#   - `extraction/internal_derivation.py:407-410` (Stage 9 UPDATE) and
-#     `:418-421` (DEPRECATE) SET properties on a `:__SelfModel__` node,
-#     including a seeded one, and add no stamp.
-#   - `curation/reconciliation.py:754-758`, the ON MATCH branch, appends
-#     evidence to an existing edge, including a seeded one, and adds no stamp.
-#   - `curation/skill_derivation.py:174` and `:238` MERGE edges with no stamp
-#     (a newly created one lacks `seed_version`, so the probe sees it; a MERGE
-#     that matches an existing seeded edge leaves no trace), and `:187-190`
-#     and `:215-218` SET properties on an existing node with no stamp.
+# Unstamped CREATES are seen: an edge or node an extraction writer creates
+# without a stamp (e.g. `curation/skill_derivation.py:174` and `:238` MERGE
+# unstamped edges) still lacks `seed_version`, because no extraction writer
+# sets it, and the probe counts it.
+#
+# What the probe CANNOT see: an unstamped SET on an existing SEEDED element.
+#   - nodes: `extraction/internal_derivation.py:407-410` (Stage 9 UPDATE) and
+#     `:418-421` (DEPRECATE) on a `:__SelfModel__` node;
+#     `curation/skill_derivation.py:187-190` and `:215-218`;
+#   - edges: `curation/reconciliation.py:754-758`, the ON MATCH branch, when
+#     the MERGE matches a seeded edge (seed edges join `:__Entity__` and
+#     `:__SelfModel__` nodes, `seed/applier.py:37-39, 74-77`).
 # The apply-marker check (`extraction_applied` empty) does not close the gap:
 # `chat/conversation_handler.py:2035-2049` runs extraction in process whenever
 # no dispatcher is attached, and that path writes no `extraction_applied`
 # marker; and a turn recorded as legacy at the backlog's first activation (no
 # cache row; `BacklogStore.ensure_activation`) gets no marker whether or not an
 # earlier path applied it. Hence the operator precondition in CUTOVER.md 6A:
-# use this path only when the log never held an extracted turn.
+# no extraction has ever run against this live graph. An empty event log shows
+# that only if the log has not been reset or replaced since the graph was
+# seeded.
 #
 # ONE statement, read-only: MATCH, WITH, OPTIONAL MATCH, RETURN and
 # aggregations only (a unit test refuses any write clause). The relationship
@@ -418,9 +422,11 @@ def promote_seed_only_cutover(
 ) -> Promotion:
     """Make the filled candidate the active epoch without a staging rebuild or graph swap.
 
-    For a log that never held an extracted turn (CUTOVER.md 6A): then the live
-    graph holds only what the seed applier wrote, and the candidate epoch can
-    start from it as it is. That precondition is the operator's; this function
+    Only for a live graph no extraction has ever run against (CUTOVER.md 6A):
+    then it holds only what the seed applier wrote, and the candidate epoch
+    can start from it as it is. An empty event log shows that only if the log
+    has not been reset or replaced since the graph was seeded. That
+    precondition is the operator's; this function
     checks what it can observe, and those checks cannot see every extraction
     write (the comment above `SEED_ONLY_PROBE_CYPHER` lists what they miss).
     Refused, with nothing written, unless ALL of:
