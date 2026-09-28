@@ -10,6 +10,13 @@ The collector is a free-function module rather than a class so the
 emit task can call collect_metrics() with no state passed across the
 async boundary. GPU handle lives in a module-level singleton because
 NVML's nvmlInit() / nvmlShutdown() are process-scoped.
+
+Also collects `uptime_seconds` (ADR-017 v1.2.0,
+knowledge-vault/Decisions/ADR-017-frontend-websocket-message-contract.md:125).
+That field measures the BACKEND PROCESS via `psutil.Process().create_time()`,
+not the container or host machine -- `psutil.boot_time()` would measure
+host uptime and must never be used here. `UPTIME_SOURCE` is the constant
+emitted alongside it so the wire payload names what was measured.
 """
 
 from __future__ import annotations
@@ -36,6 +43,20 @@ _GIB: int = 1024**3
 # (d) NVML initialization failed for any reason.
 _GPU_HANDLE: object | None = None
 _GPU_INIT_FAILED: bool = False
+
+# Backend process start time (unix seconds), cached after the first
+# successful read -- it cannot change for the life of the process. None
+# when (a) it has not been read yet, or (b) the read failed and
+# _PROCESS_START_TIME_READ_FAILED records that as a one-way door, mirroring
+# _GPU_INIT_FAILED above, so a failing read is not retried (and re-logged)
+# on every 5s tick.
+_PROCESS_START_TIME: float | None = None
+_PROCESS_START_TIME_READ_FAILED: bool = False
+
+# Emitted verbatim on the wire beside uptime_seconds (ADR-017 v1.2.0) so the
+# payload names what was measured. Not a SystemMetrics field: it never
+# varies within a process, unlike the sampled values.
+UPTIME_SOURCE: str = "process"
 
 
 @dataclass(frozen=True)
@@ -76,12 +97,18 @@ class SystemMetrics:
     """Single-tick snapshot composed for the system_status WS payload.
 
     timestamp is unix milliseconds, captured at the moment of sampling.
+
+    uptime_seconds has no default deliberately: every construction site
+    (collect_metrics() below, and _fake_snapshot() in
+    tests/unit/test_server_system_status.py) must supply it explicitly, so
+    a future caller cannot silently emit null by omission.
     """
 
     timestamp: float
     cpu: CPUMetrics
     ram: RAMMetrics
     gpu: GPUMetrics
+    uptime_seconds: float | None
 
 
 def init_gpu() -> bool:
@@ -132,19 +159,72 @@ def shutdown_gpu() -> None:
 
 
 def reset_for_tests() -> None:
-    """Reset the module-level GPU state for test isolation.
+    """Reset the module-level GPU and process-uptime state for test isolation.
 
     Tests that exercise init_gpu() failure paths must reset the
     "already failed" flag between cases. Not exported for production
-    use; the production path treats _GPU_INIT_FAILED as a one-way door.
+    use; the production path treats _GPU_INIT_FAILED (and, identically,
+    _PROCESS_START_TIME_READ_FAILED) as a one-way door.
     """
-    global _GPU_HANDLE, _GPU_INIT_FAILED
+    global _GPU_HANDLE, _GPU_INIT_FAILED, _PROCESS_START_TIME, _PROCESS_START_TIME_READ_FAILED
     _GPU_HANDLE = None
     _GPU_INIT_FAILED = False
+    _PROCESS_START_TIME = None
+    _PROCESS_START_TIME_READ_FAILED = False
+
+
+def process_uptime_seconds(now: float | None = None) -> float | None:
+    """Seconds since this backend process started.
+
+    Sourced from `psutil.Process().create_time()` -- the BACKEND PROCESS's
+    own start time, not the container's and not the host's. `psutil.boot_time()`
+    would measure host uptime and is deliberately never called anywhere in
+    this module (see the module docstring).
+
+    The start time is read once and cached in the module-level
+    `_PROCESS_START_TIME` global, mirroring the `_GPU_HANDLE` singleton
+    pattern above -- it cannot change for the life of the process, so
+    re-reading on every 5s tick would be wasted work. `reset_for_tests()`
+    clears the cache for test isolation.
+
+    Args:
+        now: Injectable current time (unix seconds). Defaults to
+            `time.time()`. This is the test seam: tests inject a fixed
+            `(create_time, now)` pair rather than sleeping in real time
+            (tests/CLAUDE.md forbids `time.sleep()` in tests as
+            non-deterministic and slow).
+
+    Returns:
+        `now - create_time`, or `None` if the process start time could not
+        be read (e.g. a permissions error, or the process object is gone).
+        Never falls back to `0.0` -- `0.0` is a measurement and `None` is
+        the absence of one (ADR-017 v1.2.0's null-never-zero rule). Logs
+        one WARNING the first time the read fails; it is not retried on
+        subsequent ticks (see `_PROCESS_START_TIME_READ_FAILED` above).
+    """
+    global _PROCESS_START_TIME, _PROCESS_START_TIME_READ_FAILED
+
+    if _PROCESS_START_TIME is None and not _PROCESS_START_TIME_READ_FAILED:
+        try:
+            _PROCESS_START_TIME = psutil.Process().create_time()
+        except Exception as exc:
+            logger.warning(
+                "Failed to read backend process start time; uptime_seconds will be null: %s",
+                exc,
+            )
+            _PROCESS_START_TIME_READ_FAILED = True
+
+    if _PROCESS_START_TIME is None:
+        return None
+
+    if now is None:
+        now = time.time()
+
+    return now - _PROCESS_START_TIME
 
 
 def collect_metrics() -> SystemMetrics:
-    """Snapshot CPU + RAM + GPU into a single SystemMetrics record.
+    """Snapshot CPU + RAM + GPU + process uptime into a SystemMetrics record.
 
     Non-blocking. psutil.cpu_percent(interval=None) returns the CPU
     utilization since the previous call; the first invocation after
@@ -169,6 +249,7 @@ def collect_metrics() -> SystemMetrics:
         cpu=CPUMetrics(percent=float(cpu_percent), cores=int(cpu_cores)),
         ram=ram,
         gpu=gpu,
+        uptime_seconds=process_uptime_seconds(),
     )
 
 

@@ -3,14 +3,24 @@
 Exports the current graph structure from Neo4j for analysis.
 
 Usage:
-    python export_graph.py
+    python scripts/export_graph.py
 """
+
+import sys
+from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
 
-from backend.knowledge.config import get_config
-from backend.knowledge.storage import Neo4jConnection
+# Running this script by path puts scripts/ on sys.path[0], NOT the repo
+# root -- so `import backend` would fail. Add the repo root first (mirrors
+# scripts/mist_admin.py:81-83).
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from backend.knowledge.config import get_config  # noqa: E402
+from backend.knowledge.storage import Neo4jConnection  # noqa: E402
 
 console = Console()
 

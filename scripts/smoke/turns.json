@@ -1,0 +1,49 @@
+{
+  "corpus_id": "SMOKE-7F3A",
+  "persona": "Dana Whitfield, a synthetic persona. Deliberately not the owner's real facts, so nothing written into the smoke stores could be confused with genuine memory if a store ever leaked out of smoke-state/.",
+  "design_notes": [
+    "Every turn is above the 3-word extraction floor at backend/knowledge/extraction/pipeline.py:640 (`if len(utterance.split()) < 3`).",
+    "Turns 1-4 are concrete enough to be plausible extraction targets against the 0.3 significance threshold at backend/knowledge/config.py:151 (`significance_threshold: float = 0.3`), checked at pipeline.py:674. Plausible is not guaranteed: the gate is a scored decision, which is exactly why assertion A2 requires at least ONE turn to produce entities rather than all five.",
+    "Turn 5 is a retrieval probe, not an extraction target. Its `full_text` is a free read on retrieval quality and is reported separately from the four artifacts."
+  ],
+  "corpus_facts": [
+    "Dana Whitfield",
+    "Corvid Analytics",
+    "Sheffield",
+    "Redpanda",
+    "Kafka",
+    "Emil Nakamura",
+    "telemetry"
+  ],
+  "retrieval_probe_terms": [
+    "Redpanda",
+    "Kafka"
+  ],
+  "turns": [
+    {
+      "index": 1,
+      "purpose": "extraction-target",
+      "text": "Logging this under tag SMOKE-7F3A. My name is Dana Whitfield and I work as a systems engineer at Corvid Analytics."
+    },
+    {
+      "index": 2,
+      "purpose": "extraction-target",
+      "text": "Corvid Analytics is based in Sheffield, and I have worked there since March 2024."
+    },
+    {
+      "index": 3,
+      "purpose": "extraction-target",
+      "text": "I am migrating our telemetry pipeline from Kafka to Redpanda this quarter, because the operator cost of Kafka got too high."
+    },
+    {
+      "index": 4,
+      "purpose": "extraction-target",
+      "text": "My colleague Emil Nakamura owns the Redpanda migration runbook and reviews every change to it."
+    },
+    {
+      "index": 5,
+      "purpose": "retrieval-probe",
+      "text": "What do you know about my telemetry migration?"
+    }
+  ]
+}

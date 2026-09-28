@@ -18,6 +18,7 @@ from backend.system_metrics import (
     SystemMetrics,
     collect_metrics,
     init_gpu,
+    process_uptime_seconds,
     reset_for_tests,
     shutdown_gpu,
 )
@@ -67,6 +68,11 @@ class TestCollectMetricsShape:
     def test_ram_percent_in_range(self):
         result = collect_metrics()
         assert 0.0 <= result.ram.percent <= 100.0
+
+    def test_uptime_seconds_is_populated_and_non_negative(self):
+        result = collect_metrics()
+        assert result.uptime_seconds is not None
+        assert result.uptime_seconds >= 0
 
 
 class TestGPUPlaceholderWhenUnavailable:
@@ -216,3 +222,89 @@ class TestGPUSamplePath:
         assert result.gpu.name == "error"
         assert result.gpu.utilization_percent == 0.0
         assert result.gpu.temperature_c is None
+
+
+class TestProcessUptimeSeconds:
+    """process_uptime_seconds() sources from psutil.Process().create_time(),
+    caches the result, and returns None (never 0.0) on a read failure.
+    """
+
+    def test_returns_now_minus_create_time_for_known_pair(self, monkeypatch):
+        class _FakeProcess:
+            def create_time(self):
+                return 1000.0
+
+        monkeypatch.setattr(system_metrics.psutil, "Process", lambda: _FakeProcess())
+
+        result = process_uptime_seconds(now=1500.0)
+
+        assert result == 500.0
+
+    def test_returns_none_not_zero_when_read_raises(self, monkeypatch):
+        class _FailingProcess:
+            def create_time(self):
+                raise PermissionError("cannot access process")
+
+        monkeypatch.setattr(system_metrics.psutil, "Process", lambda: _FailingProcess())
+
+        result = process_uptime_seconds(now=1500.0)
+
+        assert result is None
+        assert result != 0
+        assert result is not False
+
+    def test_start_time_is_read_once_and_cached(self, monkeypatch):
+        """A second call with a different injected `now` must not re-read
+        the process start time -- it cannot change for the life of the
+        process, so the read is cached (mirrors the _GPU_HANDLE singleton).
+        """
+        read_count = {"n": 0}
+
+        class _FakeProcess:
+            def create_time(self):
+                read_count["n"] += 1
+                return 1000.0
+
+        monkeypatch.setattr(system_metrics.psutil, "Process", lambda: _FakeProcess())
+
+        first = process_uptime_seconds(now=1500.0)
+        second = process_uptime_seconds(now=2500.0)
+
+        assert first == 500.0
+        assert second == 1500.0
+        assert read_count["n"] == 1
+
+    def test_reset_for_tests_clears_the_cached_start_time(self, monkeypatch):
+        read_count = {"n": 0}
+
+        class _FakeProcess:
+            def create_time(self):
+                read_count["n"] += 1
+                return 1000.0
+
+        monkeypatch.setattr(system_metrics.psutil, "Process", lambda: _FakeProcess())
+
+        process_uptime_seconds(now=1500.0)
+        reset_for_tests()
+        process_uptime_seconds(now=1500.0)
+
+        assert read_count["n"] == 2
+
+
+class TestNoBootTimeUsage:
+    """Guard: psutil.boot_time() measures HOST uptime, not process uptime.
+    ADR-017 v1.2.0 and this module's docstring both require uptime_seconds
+    to source from psutil.Process().create_time() only. Monkeypatching
+    psutil.boot_time() to raise proves neither collect_metrics() nor
+    process_uptime_seconds() ever calls it -- this does not prove no OTHER
+    module calls it, only that this collector's code path does not.
+    """
+
+    def test_boot_time_never_called_by_collector(self, monkeypatch):
+        def _boom():
+            raise AssertionError("psutil.boot_time() must never be called")
+
+        monkeypatch.setattr(system_metrics.psutil, "boot_time", _boom)
+
+        collect_metrics()
+        process_uptime_seconds()

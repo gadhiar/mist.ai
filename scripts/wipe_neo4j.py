@@ -4,14 +4,24 @@ Deletes all nodes and relationships from Neo4j database.
 Use this to start fresh for testing.
 
 Usage:
-    python wipe_neo4j.py
+    python scripts/wipe_neo4j.py
 """
+
+import sys
+from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
 
-from backend.knowledge.config import get_config
-from backend.knowledge.storage import Neo4jConnection
+# Running this script by path puts scripts/ on sys.path[0], NOT the repo
+# root -- so `import backend` would fail. Add the repo root first (mirrors
+# scripts/mist_admin.py:81-83).
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from backend.knowledge.config import get_config  # noqa: E402
+from backend.knowledge.storage import Neo4jConnection  # noqa: E402
 
 console = Console()
 

@@ -125,9 +125,26 @@ class TestHealthEndpointReportsIt:
 
     @pytest.mark.asyncio
     async def test_existing_health_fields_are_preserved(self, monkeypatch):
-        """The endpoint has other consumers; this is an addition, not a rewrite."""
+        """The endpoint has other consumers; this is an addition, not a rewrite.
+
+        Still true of the three fields this test names -- `models_loaded`,
+        `active_connections` and `hydration_isolation` all survive the health
+        registry landing on top of them.
+
+        `status` is the one field that changed meaning, so it is asserted
+        differently rather than dropped. It used to be the literal `"healthy"`;
+        it is now derived from probes that called their dependencies
+        (`backend/health.py::derive_status`). No lifespan has run in a unit
+        test, so no registry exists and nothing has been measured, which the
+        endpoint reports as `unhealthy` with an empty `checks` mapping --
+        nothing verified is not healthy. Asserting the old literal here would
+        have pinned the defect the registry exists to remove.
+        """
         monkeypatch.delenv(_ENV, raising=False)
         payload = await server.health()
-        assert payload["status"] == "healthy"
+        assert payload["status"] in {"healthy", "degraded", "unhealthy"}
+        assert payload["checks"] == {}
+        assert payload["status"] == "unhealthy"
         assert "models_loaded" in payload
         assert "active_connections" in payload
+        assert "hydration_isolation" in payload
