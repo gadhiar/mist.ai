@@ -133,10 +133,11 @@ real `--help` capture for this build.
   "reasoning_content", None)`.
 
   **Observed on the real host build (b11151):** neither `LLAMA_ARG_REASONING`
-  nor `LLAMA_ARG_THINK` had any visible effect -- `/props` showed
-  `reasoning_format none` and `chat_format Content-only` regardless of these
-  flags. A follow-up task (not this one) addresses reasoning-format flags for
-  this build; no fix is applied here.
+  nor `LLAMA_ARG_THINK` seemed to have any effect -- `/props` showed
+  `reasoning_format none` and `chat_format Content-only` with these flags set.
+  No A/B comparison against the flags unset was recorded, so this is an
+  observation, not a controlled finding. A follow-up task (not this one)
+  addresses reasoning-format flags for this build; no fix is applied here.
 - `-ncmoe` / `--n-cpu-moe N` (line 124) -- see "Local ncmoe sizing" and
   "Host ncmoe sizing" below.
 - `-b`/`-ub 2048`, `-lm none` -- CPU-MoE prompt-processing batch sizes and
@@ -198,8 +199,9 @@ instruction for this case, the default here is **all experts on CPU**.
 
 gpt-oss-20b's MoE layer count is now **VERIFIED as 24** via the GGUF file's
 own metadata (`block_count`, confirmed on the real host build). b11151's
-llama-server load log does NOT print this for this build -- do not look for
-it there; the GGUF metadata is the correct source. `24` replaces the
+llama-server load log is not confirmed to print this either -- the real host
+build found it prints no CUDA device or offload lines at all -- so treat the
+GGUF metadata as the source rather than relying on the log. `24` replaces the
 previous saturating sentinel (`999`) as the precise "all experts on CPU"
 value -- the behavior is unchanged (still all experts on CPU by default),
 this is a precision fix, not a new performance tuning decision.

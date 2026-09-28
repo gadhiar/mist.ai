@@ -125,8 +125,8 @@ services:
     command:
       - "--no-webui"
       # gpt-oss-20b's block_count is verified as 24 via the GGUF file's own
-      # metadata (b11151's llama-server load log does not print it for this
-      # build -- see docker/extraction/HOST_1070_RUNBOOK.md step 5.2/5.3).
+      # metadata (b11151's llama-server load log is not confirmed to print it
+      # either -- see docker/extraction/HOST_1070_RUNBOOK.md step 5.2/5.3).
       # 24 still means "all experts on CPU" -- same qualitative default as
       # before, now expressed as the model's real layer count instead of a
       # saturating sentinel. The real host fit was measured at ncmoe=12, but
@@ -165,11 +165,12 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      # Pascal's first-load PTX JIT compile is slow and untimed by this
-      # worker (no GPU, no docker) -- generous start_period so the health
+      # Pascal's first-load PTX JIT compile is slow -- the real host build
+      # measured 64s cold (docker/extraction/HOST_1070_RUNBOOK.md step 5.1).
+      # Generous start_period, well above that measurement, so the health
       # check does not fail the container out from under a still-compiling
-      # first boot. mist-llm's own start_period (docker-compose.yml, no JIT
-      # concern there) is 60s; this is 5x that.
+      # first boot on a slower machine. mist-llm's own start_period
+      # (docker-compose.yml, no JIT concern there) is 60s; this is 5x that.
       start_period: 300s
     restart: unless-stopped
 

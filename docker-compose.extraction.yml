@@ -86,12 +86,12 @@ services:
       # for "10.8"/"gpt-oss" VRAM figures -- none found beyond the ncmoe=6
       # point above). Per the brief's own fallback: default to ALL experts
       # on CPU. gpt-oss-20b's block_count is now VERIFIED as 24 via the GGUF
-      # file's own metadata (the host build's finding -- b11151's
-      # llama-server load log does not print this; see
+      # file's own metadata (the host build's finding; b11151's llama-server
+      # load log is not confirmed to print this either -- see
       # docker/extraction/HOST_1070_RUNBOOK.md step 5.2/5.3), so 24 replaces
       # the previous saturating sentinel (999) as the precise "all experts
       # on CPU" value -- same qualitative default, now exact instead of a
-      # sentinel llama.cpp would otherwise clamp down to 24 anyway.
+      # sentinel llama.cpp would otherwise saturate down to anyway.
       # The lead measures the real fitting value on the 4070 alongside the
       # E4B and records it here (clause F,
       # scripts/model_bench/analyse.py:1025 -- arm_peak + voice_vram + margin

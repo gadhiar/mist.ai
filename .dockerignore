@@ -51,12 +51,16 @@ knowledge-vault/
 
 # Docker files themselves
 docker/
-# Chained re-include (dockerignore rule ordering: a pattern cannot re-include
-# a file whose parent directory is still excluded, so the directory itself
-# must be un-excluded before re-excluding its contents and re-including the
-# one file needed) -- the extraction Dockerfile's
-# `COPY docker/extraction/requirements.txt` needs this file to survive the
-# `docker/` exclusion above. See docker/extraction/README.md.
+# Chained re-include: `docker/` above excludes this whole tree, so
+# `!docker/extraction/` un-excludes the directory itself (so Docker's
+# build-context walker descends into it and evaluates further patterns),
+# `docker/extraction/*` re-excludes everything directly inside it, and
+# `!docker/extraction/requirements.txt` re-includes just that one file --
+# the extraction Dockerfile's `COPY docker/extraction/requirements.txt`
+# needs it to survive the `docker/` exclusion above. Only this one file and
+# the `docker/extraction/` directory entry itself survive; everything else
+# under `docker/`, including the rest of `docker/extraction/` (Dockerfile,
+# README.md, the host `.env`), stays excluded.
 !docker/extraction/
 docker/extraction/*
 !docker/extraction/requirements.txt
