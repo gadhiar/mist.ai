@@ -102,7 +102,15 @@ services:
     environment:
       - LLAMA_ARG_MODEL=/models/${EXTRACTION_MODEL_FILE:-ggml-org/gpt-oss-20b-MXFP4.gguf}
       - LLAMA_ARG_N_GPU_LAYERS=999
-      - LLAMA_ARG_CTX_SIZE=${EXTRACTION_LLM_CTX_SIZE:-8192}
+      # 16384, not 8192: a real /v1/extract probe (one-sentence utterance,
+      # empty history) needed 9162 prompt tokens, and the extraction engine
+      # (backend/extraction_service/engine.py) asks for max_tokens=2048 on
+      # top -- 9162 + 2048 > 8192, so extraction could not succeed at the
+      # old default. See docker/extraction/README.md's ctx-size subsection;
+      # the host ncmoe fit below was measured at ctx 8192 and is not valid
+      # at this ctx -- it needs re-measuring (docker/extraction/HOST_1070_RUNBOOK.md
+      # step 5.3).
+      - LLAMA_ARG_CTX_SIZE=${EXTRACTION_LLM_CTX_SIZE:-16384}
       - LLAMA_ARG_HOST=0.0.0.0
       - LLAMA_ARG_PORT=8080
       - LLAMA_ARG_N_PARALLEL=1
@@ -116,13 +124,18 @@ services:
       - CUDA_CACHE_MAXSIZE=2147483648
     command:
       - "--no-webui"
-      # Host RAM/CPU are not known yet -- this default is PROVISIONAL, same
-      # reasoning as extraction-local's (all experts on CPU, 999 as a
-      # saturating sentinel; see docker-compose.extraction.yml's -ncmoe
-      # comment). The lead re-measures once the host's actual RAM/CPU and
-      # the model's real fit are known.
+      # gpt-oss-20b's block_count is verified as 24 via the GGUF file's own
+      # metadata (b11151's llama-server load log is not confirmed to print it
+      # either -- see docker/extraction/HOST_1070_RUNBOOK.md step 5.2/5.3).
+      # 24 still means "all experts on CPU" -- same qualitative default as
+      # before, now expressed as the model's real layer count instead of a
+      # saturating sentinel. The real host fit was measured at ncmoe=12, but
+      # that measurement used ctx 8192 with a 406-token prompt and is
+      # superseded now that ctx defaults to 16384 (see LLAMA_ARG_CTX_SIZE
+      # above) -- it needs re-measuring before 24 is replaced with a tighter
+      # value here.
       - "-ncmoe"
-      - "${EXTRACTION_HOST_NCMOE:-999}"
+      - "${EXTRACTION_HOST_NCMOE:-24}"
       - "-b"
       - "2048"
       - "-ub"
@@ -152,11 +165,12 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      # Pascal's first-load PTX JIT compile is slow and untimed by this
-      # worker (no GPU, no docker) -- generous start_period so the health
+      # Pascal's first-load PTX JIT compile is slow -- the real host build
+      # measured 64s cold (docker/extraction/HOST_1070_RUNBOOK.md step 5.1).
+      # Generous start_period, well above that measurement, so the health
       # check does not fail the container out from under a still-compiling
-      # first boot. mist-llm's own start_period (docker-compose.yml, no JIT
-      # concern there) is 60s; this is 5x that.
+      # first boot on a slower machine. mist-llm's own start_period
+      # (docker-compose.yml, no JIT concern there) is 60s; this is 5x that.
       start_period: 300s
     restart: unless-stopped
 

@@ -1,10 +1,14 @@
 GTX 1070 extraction host -- setup runbook (T5, goal mist-two-loop / MIS-171)
 ===========================================================================
 
-Who runs this: Raj and the lead, on the host. Nothing here is run by a delegate,
-and nothing here has been executed yet. Every step marked [UNVERIFIED] is a
-reasoned instruction that has not been checked on the real machine; replace the
-marker with what was observed when you run it.
+Who runs this: Raj and the lead, on the host. Nothing here is run by a delegate.
+A real build has since run most of this runbook once (see the "Measured on the
+real host build" / "VERIFIED" notes throughout) -- but its context size (8192)
+and the resulting ncmoe=12 fit are superseded (see step 5.3 and
+`docker/extraction/README.md`'s "Context size" section), so the fit still
+needs a re-run before the host is deployed. Every step still marked
+[UNVERIFIED] is a reasoned instruction that has not been checked on the real
+machine; replace the marker with what was observed when you run it.
 
 What the host is for: it runs the standalone compose file
 `docker/extraction/compose.host.yml` -- ONLY the stateless extraction service
@@ -17,9 +21,11 @@ tailnet and is the only client. The host holds no graph, no event store and no M
 address: it can be wiped and rebuilt at any time, and a backlog simply accumulates
 on the main machine while it is down.
 
-Open inputs, needed before step 4:
-- Host RAM, CPU and OS (Raj's specs). The expert-offload setting and prompt
-  throughput depend on them.
+Host RAM, CPU and OS, needed before step 4: Win10 Home 22H2, WSL2 Ubuntu
+26.04, Docker Engine 29.8.1 (not Docker Desktop), nvidia-container-toolkit
+1.20.1, per the real host build. The expert-offload setting and prompt
+throughput depend on these; if you are setting up a DIFFERENT machine, confirm
+its own RAM/CPU/OS before step 4 rather than assuming this one's.
 
 ---
 
@@ -38,8 +44,30 @@ the kernels on first load (source: lead's b11151 check,
   should report `GeForce GTX 1070`, a 580.x driver and compute capability `6.1`.
   [UNVERIFIED]
 - Linux host: install the NVIDIA Container Toolkit so compose's
-  `deploy.resources.reservations.devices` reaches the GPU. Windows host: Docker
-  Desktop with the WSL2 backend. [UNVERIFIED which OS the host runs]
+  `deploy.resources.reservations.devices` reaches the GPU. Windows host: either
+  Docker Desktop with the WSL2 backend, OR Docker Engine (not Docker Desktop)
+  installed directly inside WSL2 Ubuntu with nvidia-container-toolkit -- both
+  are valid; the real host build used the latter (Win10 Home 22H2, WSL2 Ubuntu
+  26.04, Docker Engine 29.8.1, nvidia-container-toolkit 1.20.1).
+
+1a. WSL keepalive (Linux-host-in-WSL setups only)
+--------------------------------------------------
+
+WSL 2.7.14 tears down the distro when the last `wsl.exe` client exits, even
+with systemd enabled inside the distro -- `vmIdleTimeout` does not prevent
+this. The fix that worked on the real host build was a persistent keepalive
+WSL session: an at-logon scheduled task holding a `sleep infinity` process
+alive inside the distro, so the distro (and the Docker Engine/containers
+running in it) survives without an interactive `wsl.exe` session attached.
+This is only relevant to a Docker-Engine-in-WSL setup, not Docker Desktop.
+
+**Other benign quirks observed on the real host build, noted here only where
+they generalize beyond that one machine:** `sudo` inside the WSL distro may
+prompt for a password -- use `wsl -u root` (run the command directly as root
+inside the distro, from the Windows host) as an alternative where `sudo`
+inside the distro is unavailable or blocks. This is a WSL-invocation
+workaround, not a substitute for `sudo` on a Linux host. The NVIDIA driver
+inside WSL can log benign `dxgk` ioctl `-75` noise; this can be ignored.
 
 2. Images, pulled by digest
 ---------------------------
@@ -60,7 +88,8 @@ checkout of the same commit:
 3. Model file
 -------------
 
-Copy `ggml-org/gpt-oss-20b-MXFP4.gguf` (12.1 GB, the file `scripts/model_bench`
+Copy `ggml-org/gpt-oss-20b-MXFP4.gguf` (11.28 GiB, 12.1 GB decimal, the file
+`scripts/model_bench`
 arm `c9` benchmarked) into the host's models directory at the same relative path
 the compose file mounts (see `docker/extraction/README.md`, section "Model").
 Record its sha256; the value you choose for `EXTRACTION_MODEL_HASH` names this
@@ -75,7 +104,11 @@ it) -- compose loads `.env` from the directory of the compose file you pass with
 
     EXTRACTION_MODEL_HASH=<the epoch name for this file, e.g. gpt-oss-20b-mxfp4-<sha8>>
     TS_AUTHKEY=<a tailnet auth key, see step 6>
-    EXTRACTION_HOST_NCMOE=999      # provisional: all experts on CPU; step 5 measures
+    EXTRACTION_HOST_NCMOE=24       # all experts on CPU (verified block_count=24
+                                    # via GGUF metadata); step 5 measures a tighter fit
+    MODELS_DIR=<absolute host path to the models directory>  # overrides the
+                                    # ../../models default, which will not exist on
+                                    # a fresh host
 
 Every other `EXTRACTION_*` variable has a default; `docker/extraction/README.md`
 section "Environment variables" lists them.
@@ -88,33 +121,74 @@ section "Environment variables" lists them.
     docker compose -f docker/extraction/compose.host.yml up -d mist-extraction-llm-host
     docker compose -f docker/extraction/compose.host.yml logs -f mist-extraction-llm-host
 
-The first start JIT-compiles every kernel and can take several minutes. The
-compiled cache lands on the named volume `mist-extraction-cuda-cache`
-(`CUDA_CACHE_PATH`), so a second start should be much faster. Record both times.
-If the second start is as slow as the first, the cache is not persisting: check
-the volume mount before going further. [UNVERIFIED: first-start duration]
+The first start JIT-compiles every kernel. The compiled cache lands on the
+named volume `mist-extraction-cuda-cache` (`CUDA_CACHE_PATH`), so a second
+start should be much faster. Record both times on your own hardware -- the
+real host build's numbers below are one data point, not a guaranteed bound.
+If the second start is as slow as the first, the cache is not persisting:
+check the volume mount before going further.
 
-5.2 Pascal check. The llama-server log must list the GTX 1070 as a CUDA device
-with compute capability 6.1 and offload layers to it. Then:
+**Measured on the real host build:** 64 s cold (first start, uncached), 36 s
+warm (second start) -- the CUDA cache volume persisting across restarts is what
+makes the second start faster.
+
+**Volume naming note:** running `compose.host.yml` without an explicit project
+name derives the project name from the compose file's own directory
+(`extraction`), and Compose prefixes every named volume with it -- the volume
+actually created on the host is `extraction_mist-extraction-cuda-cache`, not
+the bare `mist-extraction-cuda-cache` written in the compose file. Check
+`docker volume ls` on the host for the prefixed name.
+
+5.2 Service check. b11151's llama-server log prints no CUDA device line and no
+offload lines at all for this build -- do not look for them; there is nothing
+observable there to confirm. Verify instead via the endpoints the host actually
+serves:
 
     docker compose -f docker/extraction/compose.host.yml exec mist-extraction-llm-host curl -s localhost:8080/health
 
 must return status ok. (curl is in the server image: the compose healthcheck
-for this service and for `mist-llm` both call it.)
+for this service and for `mist-llm` both call it.) Then, once the extraction
+service is also up, confirm `/v1/info` (see step 6) reports the expected
+contract version, extraction version, model hash, adapter, build, and location
+label -- the real host build's `/v1/info` reported contract `1.0.0`, extraction
+`2026-06-14-r5`, model `gpt-oss-20b-mxfp4-27cd6c43`, `b11151`, adapter
+`gptoss`, label `host-1070`. `/health` and `/v1/info` returning ok do not by
+themselves confirm the GPU is in use (a CPU-only fallback would also answer
+them) -- confirm actual GPU use via `nvidia-smi` memory consumption during a
+request (step 5.3). The GGUF file's own metadata is the source for the
+model's total MoE layer count (`block_count`, used in step 5.3's sweep), not
+for what the GPU loaded at runtime -- b11151's load log states neither.
 
 5.3 Fit. The 1070 has 8 GB. gpt-oss-20b measured about 10.8 GiB on the 4070 with
-`ncmoe=6` (plan v1), so the host needs most or all expert layers on the CPU. Sweep
-`EXTRACTION_HOST_NCMOE` downward from 999 (fewer experts on CPU means more VRAM
-and faster decode), restarting the llama-server each time, and record for each
-value:
+`ncmoe=6` (plan v1), so the host needs most or all expert layers on the CPU.
+gpt-oss-20b's MoE layer count is VERIFIED as 24 via the GGUF file's own
+`block_count` metadata (b11151's llama-server load log is not confirmed to
+print this -- the real host build found it prints no CUDA device or offload
+lines at all; read the layer count from the GGUF file itself rather than
+relying on the log). Sweep `EXTRACTION_HOST_NCMOE`
+downward from 24 (fewer experts on CPU means more VRAM and faster decode),
+restarting the llama-server each time, and record for each value:
 - peak VRAM from `nvidia-smi --query-gpu=memory.used --format=csv -l 1` during a
   request;
 - decode tokens/s and prompt tokens/s from the llama-server timings;
-- host RAM in use (experts on CPU live in system RAM).
+- host RAM in use and swap activity (experts on CPU live in system RAM; RAM/swap
+  pressure is WORST at HIGH `ncmoe`, not low -- more experts held on CPU means
+  more system RAM used).
 Keep at least 512 MiB of VRAM headroom, the margin the `scripts/model_bench`
 fit clause uses. Pick the lowest value that fits, write it into `.env`, and
-record the sweep in the PR or the vault note. The number of expert layers in
-gpt-oss-20b is UNVERIFIED in this repo; the llama-server load log states it.
+record the sweep in the PR or the vault note.
+
+**The real host build's sweep is recorded here as the illustrating case, not a
+recommended default -- it was measured at ctx 8192 with a 406-token prompt and
+is superseded now that `EXTRACTION_LLM_CTX_SIZE` defaults to 16384 (see
+`docker/extraction/README.md`'s "Context size" section); it must be
+re-measured with an extraction-sized prompt before any value is adopted as the
+new default.** Fit found `ncmoe=12` (peak VRAM 7407/8192 MiB, 785 MiB
+headroom; decode 19.1 t/s, prompt 155 t/s; after reboot 19.0/139); `ncmoe=11`
+failed on headroom (380 MiB). RAM/swap pressure: at `ncmoe=999` (a sentinel
+value predating the 24-layer verification), WSL sat at 11.3 of 12 GiB with
+swap in use; at `ncmoe=12`, 5.3 GiB was free with no swap -- illustrating that
+pressure rises with higher `ncmoe`, not lower.
 
 6. Tailscale exposure
 ---------------------
@@ -125,7 +199,25 @@ port 8090. The llama-server is reachable only inside the compose network.
 
 - Create a tagged, non-ephemeral auth key in the tailnet admin console and put
   it in `TS_AUTHKEY`. Use an ACL that allows ONLY the main MIST machine to reach
-  this host on tcp/8090. [UNVERIFIED: ACL syntax against your tailnet policy]
+  this host on tcp/8090.
+
+  **Union-semantics caveat, confirmed on the real host build:** Tailscale ACL
+  grants are additive (a connection is allowed if ANY rule permits it), so a
+  pre-existing catch-all allow-all grant makes a narrower, host-specific rule
+  a no-op -- the narrow rule adds a permission but the catch-all grant already
+  allows everything, so nothing is actually restricted until the catch-all
+  grant itself is narrowed. The real build narrowed the catch-all grant to
+  `dst autogroup:member` before adding the host-specific rule. The applied,
+  Raj-approved policy on the real host build: the catch-all grant narrowed to
+  `dst autogroup:member`, plus a rule allowing only `<main MIST machine> ->
+  tag:mist-extraction tcp:8090`.
+
+  **If scripting this via the Tailscale API instead of the admin console:**
+  the real host build's session found the ACL/key update call needs POST, not
+  PUT; the key description field has a length limit; and conditional updates
+  need an `If-Match` header. This is a brief note for anyone who scripts it --
+  the admin console is the documented path above, no API-scripted flow ships
+  in this repo, and the exact endpoint/call was not recorded.
 - Start the rest of the profile:
 
       docker compose -f docker/extraction/compose.host.yml up -d
@@ -140,10 +232,11 @@ port 8090. The llama-server is reachable only inside the compose network.
   `EXTRACTION_MODEL_HASH`), `llama_cpp_build` `b11151` and `location_label`
   `host-1070`.
 - On the MIST machine, set `MIST_EXTRACTION_SERVICE_URL=http://<TS_HOSTNAME>:8090`
-  for the backend and restart it. The main backend container must itself be on
-  the tailnet (host networking through the host's Tailscale client, or a sidecar
-  of its own). [UNVERIFIED: how the main backend container reaches the tailnet
-  today; decide and record it]
+  for the backend and restart it. **Verified reachable:** the lead confirmed
+  `mist-extraction-gtx1070:8090/v1/health` and the tailnet IP's
+  `:8090/v1/health` both answer from inside the `mist-backend` container, so
+  the main backend container already reaches the tailnet with no additional
+  networking change needed.
 
 7. Wake-on-LAN (manual, Raj's decision 5)
 -----------------------------------------

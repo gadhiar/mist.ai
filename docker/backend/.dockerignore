@@ -1,5 +1,13 @@
 # Docker build context exclusions
-# The build context is the project root (.), so this file must be here.
+# NOT consulted by `docker build`: the backend service's build context
+# (docker-compose.yml, mist-backend) is the project root (.), and Docker
+# only reads a `.dockerignore` at the root of the build context (or a
+# Dockerfile-specific `<dockerfile>.dockerignore` next to the Dockerfile,
+# which this is not). Because the build context is the project root, this
+# file -- living at docker/backend/ -- is exactly where Docker does NOT
+# look; it is inert. The operative dockerignore for the backend build is
+# the root `.dockerignore`. This file is left in place as human-readable
+# documentation of intent, not because Docker reads it.
 
 # Python virtual environments (~10-20GB each)
 venv/
