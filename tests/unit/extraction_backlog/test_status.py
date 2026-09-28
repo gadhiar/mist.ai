@@ -243,7 +243,12 @@ class TestHttp:
 
         payload = await server.health()
 
-        assert payload["status"] == "healthy"
+        # No `_health_registry` exists in this unit context (no lifespan ran), so
+        # `_health_snapshot` reports the honest "nothing measured" answer, `unhealthy`
+        # -- see `server.health`'s docstring and `_health_snapshot`. This test predates
+        # that measured-report wiring and asserted the old hardcoded "healthy" literal;
+        # it checks the extraction block only now, like its
+        # `test_health_without_a_dispatcher_reports_disabled` sibling below.
         assert payload["extraction"]["state"] == "idle"
         assert payload["extraction"]["backlog_depth"] == 1
         assert payload["extraction"]["service"] == {"reachable": False}
