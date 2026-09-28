@@ -5,9 +5,13 @@ through the backlog under the new model, a staging graph is built from it and
 checked, and only then does the new epoch become active. The old graph stays
 live, frozen, until the swap.
 
-Code: `backend/extraction_backlog/cutover.py` (lifecycle, check),
-`ExtractionDispatcher._fill_step` (filling), `EventStore.promote_epoch_cutover`
-(the promotion transaction), `backend/extraction_backlog/admin.py` (CLI).
+Code: `backend/extraction_backlog/cutover.py` (lifecycle, check, seed-only
+probe), `ExtractionDispatcher._fill_step` (filling),
+`EventStore.promote_epoch_cutover` and `EventStore.promote_epoch_cutover_seed_only`
+(the two promotion transactions), `backend/extraction_backlog/admin.py` (CLI).
+
+When the live graph holds seed data only (nothing any extraction epoch wrote),
+skip sections 4 and 5: see section 6A.
 
 Every command below is marked:
 
@@ -25,8 +29,16 @@ Every command below is marked:
     begin    -> filling   candidate recorded in `epoch_cutover`; NOT in epoch_ledger
     (fill)   -> ready     every logged turn has a candidate cache row
     rebuild  -> checked   staging graph built twice under the candidate passed its gates
-    promote  -> promoted  candidate appended to epoch_ledger + first-hand activation,
-                          one SQLite transaction
+    promote --graph-swapped
+             checked -> promoted
+                          candidate appended to epoch_ledger + first-hand activation
+                          + applied markers through the rebuilt turn, one SQLite
+                          transaction (section 6)
+    promote --seed-only-graph
+             ready | checked -> promoted
+                          live graph proven seed-only by a read-only probe; candidate
+                          appended to epoch_ledger + first-hand activation marking
+                          nothing, one SQLite transaction (section 6A)
     abandon  -> abandoned deletes nothing
 
 While a cutover is open (filling, ready or checked):
@@ -267,6 +279,83 @@ Keep the extraction service on the candidate model: it is now the active epoch's
 
 ---
 
+## 6A. Promote over a seed-only live graph (no rebuild, no swap)
+
+When it applies: the live graph contains ONLY the seed. The seed applier stamps
+every node and edge it writes with `seed_version`
+(`backend/knowledge/seed/applier.py`); extraction-path writers stamp
+`ontology_version` on nodes and `ontology_version`, `extraction_version` and
+`model_hash` on relationships (`backend/knowledge/curation/graph_writer.py`,
+`reconciliation.py`, `skill_derivation.py`). [VERIFIED-IN-REPO] A graph with
+nothing but seed-stamped elements is the same under every extraction epoch, so
+the candidate can become active over it as it is: sections 4 (rebuild) and 5
+(swap) are skipped. This is the path for a log whose turns were never applied to
+the live graph, including an empty log, where `cutover rebuild` cannot run (its
+floors must be >= 1).
+
+Stop the backend first, as for section 6, so no live-path writer can touch the
+graph between the probe and the promotion: [UNVERIFIED: not run from this branch]
+
+    docker compose stop mist-backend
+    docker compose run --rm mist-backend python -m backend.extraction_backlog.admin \
+      cutover promote --seed-only-graph
+
+[VERIFIED-IN-REPO: `admin.py`, `_add_cutover_parser`] [UNIT-TESTED:
+`tests/unit/extraction_backlog/test_cutover_seed_only.py`, with a fake probe]
+[UNVERIFIED: the real probe (`probe_live_graph_from_env`) has not been run against
+Neo4j]
+
+`--seed-only-graph` and `--graph-swapped` are mutually exclusive; giving both is
+refused by argparse (exit 2) before anything is opened. [UNIT-TESTED]
+
+Refused (exit 2, `[cutover] REFUSED: <reason>`, nothing written) when: [UNIT-TESTED]
+
+- no cutover is open, or it is not `ready` or `checked`;
+- the fill is incomplete (a logged turn has no candidate cache row);
+- `extraction_applied` holds ANY row, under ANY epoch, `applied` or `curated`
+  (a turn has been applied to a graph, so the live graph may hold extracted
+  data);
+- the active epoch is no longer the cutover's source epoch;
+- the live-graph probe fails: it must find at least one node, every node and
+  relationship carrying `seed_version`, and none carrying `ontology_version`,
+  `extraction_version` or `model_hash`. A probe that cannot connect or errors is a
+  refusal too.
+
+The probe is ONE read-only Cypher statement (`SEED_ONLY_PROBE_CYPHER` in
+`cutover.py`) run on the LIVE graph named by the backend's environment
+(`config.neo4j`) through `Neo4jConnection.execute_query`. It runs only after the
+state, fill, marker and epoch checks pass, and before the transaction. A unit test
+refuses any write clause in it. [UNIT-TESTED: textually, and over a fake
+connection]
+
+Otherwise ONE SQLite transaction (`EventStore.promote_epoch_cutover_seed_only`)
+re-checks the state, the source epoch and the markers, then:
+
+1. appends the candidate to `epoch_ledger` (prev = the source epoch);
+2. writes the new epoch's backlog activation first-hand with
+   `turns_at_activation` = the logged turns and `marked_applied` =
+   `legacy_unextracted` = 0, so T2a's automatic first-activation rule does not
+   run for it;
+3. writes NO applied marker;
+4. sets the cutover to `promoted`, its `check_report` recording
+   `promotion_mode: seed_only_graph`, the probe counts, and any earlier check
+   report under `prior_check_report`.
+
+A crash anywhere inside leaves none of it written; run it again. [UNIT-TESTED:
+`TestPromoteSeedOnly::test_a_crash_between_ledger_append_and_activation_writes_nothing`]
+
+Next, as in section 6: set the printed `MIST_MODEL_HASH` in the backend's
+environment, then recreate the backend so its writers are stamped with the new
+epoch: [UNVERIFIED: not run from this branch]
+
+    docker compose up -d --force-recreate mist-backend
+
+The dispatcher then applies EVERY logged turn to the live graph, in log order,
+from the candidate cache rows (no new inference for turns already filled).
+[UNIT-TESTED: `test_every_turn_is_applied_in_log_order_from_the_candidate_cache`]
+
+---
+
 ## 7. Abandon
 
     docker compose exec mist-backend python -m backend.extraction_backlog.admin cutover abandon
@@ -293,3 +382,11 @@ epoch stays in `epoch_mismatch`.
 - The self-model gate compares the live and rebuilt `:__SelfModel__` node counts.
   Stage 9 runs on the live path and never on rebuild, so live self-model nodes
   written by Stage 9 make that gate fail.
+- The seed-only probe and the promotion transaction are not atomic with each
+  other: Neo4j and SQLite share no transaction. A live-graph write between the
+  probe and the COMMIT is not seen. Stopping the backend first (section 6A)
+  closes that window for the backend's own writers; the transaction re-checks
+  the SQLite side (state, source epoch, apply markers).
+- The probe requires EVERY node to carry `seed_version`, so a node any other
+  writer created (including Stage 9 self-model nodes) refuses the seed-only path
+  even if it carries no extraction stamp.
