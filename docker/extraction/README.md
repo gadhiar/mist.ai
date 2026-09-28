@@ -58,8 +58,9 @@ worktree's container).
 Model
 -----
 
-Both deployments ship **gpt-oss-20b** (`ggml-org/gpt-oss-20b-MXFP4.gguf`, 12.1
-GB, MoE with 3.6B active parameters, Harmony chat template), the same file
+Both deployments ship **gpt-oss-20b** (`ggml-org/gpt-oss-20b-MXFP4.gguf`,
+11.28 GiB (12.1 GB decimal), MoE with 3.6B active parameters, Harmony chat
+template), the same file
 `scripts/model_bench/arms.json`'s `c9` arm benchmarks. Reasoning is always
 on for this model; `EXTRACTION_REASONING_EFFORT` controls how much
 (`minimal`/`low`/`medium`/`high`/`xhigh`/`max`
@@ -130,6 +131,12 @@ real `--help` capture for this build.
   thoughts in `message.reasoning_content` (line 631), the exact attribute
   `backend/llm/llama_server_provider.py` reads via `getattr(message,
   "reasoning_content", None)`.
+
+  **Observed on the real host build (b11151):** neither `LLAMA_ARG_REASONING`
+  nor `LLAMA_ARG_THINK` had any visible effect -- `/props` showed
+  `reasoning_format none` and `chat_format Content-only` regardless of these
+  flags. A follow-up task (not this one) addresses reasoning-format flags for
+  this build; no fix is applied here.
 - `-ncmoe` / `--n-cpu-moe N` (line 124) -- see "Local ncmoe sizing" and
   "Host ncmoe sizing" below.
 - `-b`/`-ub 2048`, `-lm none` -- CPU-MoE prompt-processing batch sizes and
@@ -156,7 +163,22 @@ server's own unset-flag default resolve to the same unbudgeted behavior.
 `tests/unit/test_compose_extraction_host.py` (host) each assert
 `--reasoning-budget` is absent from their own llama-server command.
 
-Local ncmoe sizing (`EXTRACTION_LOCAL_NCMOE`, default `999`)
+Context size (`EXTRACTION_LLM_CTX_SIZE`, default `16384`)
+-----------------------------------------------------------
+
+`LLAMA_ARG_CTX_SIZE` used to default to `8192` on both deployments. A real
+`/v1/extract` probe (a one-sentence utterance, empty history) needed 9162
+prompt tokens, and the extraction engine
+(`backend/extraction_service/engine.py`) asks for `max_tokens=2048` on top of
+the prompt -- 9162 + 2048 > 8192, so extraction could not succeed at the old
+default. The default is now `16384`, which gives headroom over that
+measurement.
+
+**The previously recorded host ncmoe fit (see "Host ncmoe sizing" below) was
+measured at ctx 8192 with a 406-token prompt. It is NOT valid at ctx 16384
+and must be re-measured.** No re-fit number exists yet -- do not invent one.
+
+Local ncmoe sizing (`EXTRACTION_LOCAL_NCMOE`, default `24`)
 --------------------------------------------------------------
 
 gpt-oss-20b measured **~10.8 GiB VRAM at `ncmoe=6`** (per the T1b brief;
@@ -174,30 +196,38 @@ model on this card.** Searched `scripts/model_bench/README.md`,
 beyond the single `ncmoe=6` point above. Per the brief's own fallback
 instruction for this case, the default here is **all experts on CPU**.
 
-gpt-oss-20b's exact MoE layer count is **UNVERIFIED in this repo** -- no
-source states it (grepped for "24 layers", `num_hidden_layers`, `n_layer`,
-no match anywhere in the tree). Rather than hardcode an unverified layer
-count as the "all experts" value, the default is `999` -- llama.cpp clamps
-`-n-cpu-moe` to the model's real MoE layer count at load time, the same way
-`mist-llm`'s `LLAMA_ARG_N_GPU_LAYERS=999` in the root `docker-compose.yml`
-saturates at the model's real layer count without the compose file needing
-to name it.
+gpt-oss-20b's MoE layer count is now **VERIFIED as 24** via the GGUF file's
+own metadata (`block_count`, confirmed on the real host build). b11151's
+llama-server load log does NOT print this for this build -- do not look for
+it there; the GGUF metadata is the correct source. `24` replaces the
+previous saturating sentinel (`999`) as the precise "all experts on CPU"
+value -- the behavior is unchanged (still all experts on CPU by default),
+this is a precision fix, not a new performance tuning decision.
 
 **The lead measures the real fitting value on the 4070, beside the running
-E4B, and records it as the new default here** (replace `999` with the
-measured minimum `ncmoe` that satisfies clause F, or leave `999` if even
+E4B, and records it as the new default here** (replace `24` with the
+measured minimum `ncmoe` that satisfies clause F, or leave `24` if even
 "all experts on CPU" is the answer). Latency is acceptable for this
 setting either way -- extraction is asynchronous, per the T1b brief.
 
-Host ncmoe sizing (`EXTRACTION_HOST_NCMOE`, default `999`, PROVISIONAL)
+Host ncmoe sizing (`EXTRACTION_HOST_NCMOE`, default `24`)
 --------------------------------------------------------------------------
 
-Same "all experts on CPU" default and same reasoning as local, but marked
-**provisional**: the GTX 1070 host's RAM and CPU are not known to this
-worker at all (no access to that machine), so even the qualitative
-starting point (host RAM being enough for a 20B model's CPU-held experts)
-is unverified, not just the exact fitting number. The lead measures on the
-actual host once it is reachable and updates this default.
+Same "all experts on CPU" default and same reasoning as local -- `24` is
+verified via GGUF metadata (`block_count`), not the load log; see "Local
+ncmoe sizing" above. The real host build measured a fit of `ncmoe=12` (peak
+VRAM 7407/8192 MiB, decode 19.1 t/s, prompt 155 t/s), **but that measurement
+was taken at ctx 8192 with a 406-token prompt and is NOT valid now that ctx
+defaults to 16384** (see "Context size" above) -- it must be re-measured
+before any value tighter than `24` is recorded here as the default. Do not
+substitute the ctx-8192 measurement for a real re-fit.
+
+RAM/swap pressure while sweeping `ncmoe`: the real host build's illustrating
+measurement found pressure WORST at HIGH `ncmoe` (more experts held on CPU
+consumes more system RAM), not at low `ncmoe` -- at `ncmoe=999` WSL sat at
+11.3 of 12 GiB with swap in use, while at `ncmoe=12` there was 5.3 GiB free
+and no swap. This is the build's illustrating case, not a recommended
+default, and it too is superseded pending the ctx-16384 re-fit.
 
 Tailscale exposure model (host deployment only, `compose.host.yml`)
 -----------------------------------------------------------------------
@@ -218,7 +248,13 @@ resolved 2026-09-26):
   Tailscale admin console before `up`.
 - Sidecar state (machine identity, keys) lives on the named volume
   `mist-extraction-ts-state`, so re-authenticating is not needed on every
-  restart.
+  restart. **Volume naming note:** running `compose.host.yml` without an
+  explicit project name derives the project name from the compose file's own
+  directory (`extraction`, from `docker/extraction/`), and Compose prefixes
+  every named volume with it -- the volume actually created on the host is
+  `extraction_mist-extraction-ts-state`, not the bare name in this file's
+  `volumes:` block. Check `docker volume ls` on the host for the prefixed
+  name.
 - `mist-extraction-llm-host` is **not** in the sidecar's network namespace
   -- it stays on the ordinary compose network, unreachable from outside
   it. `mist-extraction-host` reaches it by compose DNS
@@ -233,7 +269,9 @@ CUDA JIT cache (host deployment only, `compose.host.yml`)
 The pinned image is a cuda12 build; Pascal (sm_61, the GTX 1070's
 architecture) ships PTX-only in it, so the driver JIT-compiles the SASS on
 first kernel load. `CUDA_CACHE_PATH=/root/.nv/ComputeCache` on the named
-volume `mist-extraction-cuda-cache`, plus a generous
+volume `mist-extraction-cuda-cache` (created on the host as
+`extraction_mist-extraction-cuda-cache` -- see the volume naming note under
+"Tailscale exposure model" above), plus a generous
 `CUDA_CACHE_MAXSIZE=2147483648` (2 GiB), makes that compile a one-time cost
 across container restarts rather than a repeat on every `up`.
 `mist-extraction-llm-host`'s healthcheck `start_period` is 300s (5x

@@ -52,7 +52,12 @@ services:
     environment:
       - LLAMA_ARG_MODEL=/models/${EXTRACTION_MODEL_FILE:-ggml-org/gpt-oss-20b-MXFP4.gguf}
       - LLAMA_ARG_N_GPU_LAYERS=999
-      - LLAMA_ARG_CTX_SIZE=${EXTRACTION_LLM_CTX_SIZE:-8192}
+      # 16384, not 8192: a real /v1/extract probe (one-sentence utterance,
+      # empty history) needed 9162 prompt tokens, and the extraction engine
+      # (backend/extraction_service/engine.py) asks for max_tokens=2048 on
+      # top -- 9162 + 2048 > 8192, so extraction could not succeed at the
+      # old default. See docker/extraction/README.md's ctx-size subsection.
+      - LLAMA_ARG_CTX_SIZE=${EXTRACTION_LLM_CTX_SIZE:-16384}
       - LLAMA_ARG_HOST=0.0.0.0
       - LLAMA_ARG_PORT=8080
       - LLAMA_ARG_N_PARALLEL=1
@@ -80,18 +85,19 @@ services:
       # card (searched scripts/model_bench/README.md, arms.json, analyse.py
       # for "10.8"/"gpt-oss" VRAM figures -- none found beyond the ncmoe=6
       # point above). Per the brief's own fallback: default to ALL experts
-      # on CPU. gpt-oss-20b's exact layer count is UNVERIFIED in this repo
-      # (no source states it -- grepped for "24 layers"/"num_hidden_layers"/
-      # "n_layer", no match), so 999 is used as a saturating sentinel the
-      # same way mist-llm's LLAMA_ARG_N_GPU_LAYERS=999 in docker-compose.yml
-      # saturates at the model's real layer count rather than naming it --
-      # llama.cpp clamps -ncmoe to the model's actual MoE layer count.
+      # on CPU. gpt-oss-20b's block_count is now VERIFIED as 24 via the GGUF
+      # file's own metadata (the host build's finding -- b11151's
+      # llama-server load log does not print this; see
+      # docker/extraction/HOST_1070_RUNBOOK.md step 5.2/5.3), so 24 replaces
+      # the previous saturating sentinel (999) as the precise "all experts
+      # on CPU" value -- same qualitative default, now exact instead of a
+      # sentinel llama.cpp would otherwise clamp down to 24 anyway.
       # The lead measures the real fitting value on the 4070 alongside the
       # E4B and records it here (clause F,
       # scripts/model_bench/analyse.py:1025 -- arm_peak + voice_vram + margin
       # <= total_mib).
       - "-ncmoe"
-      - "${EXTRACTION_LOCAL_NCMOE:-999}"
+      - "${EXTRACTION_LOCAL_NCMOE:-24}"
       # CPU-MoE prompt processing needs larger batch sizes (README.md:559,
       # modeled on c3/c9's arg_overrides).
       - "-b"

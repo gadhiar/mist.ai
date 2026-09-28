@@ -170,6 +170,25 @@ class TestLlamaServerPins:
         assert "-ncmoe" in command
         assert "EXTRACTION_HOST_NCMOE" in command[command.index("-ncmoe") + 1]
 
+    def test_ncmoe_default_is_24(self) -> None:
+        # gpt-oss-20b's block_count is verified as 24 via GGUF metadata (the
+        # host build's finding); 24 means "all experts on CPU", replacing the
+        # previous unverified 999 sentinel. The real host fit (ncmoe=12) was
+        # measured at ctx 8192 and is superseded by the ctx-16384 default
+        # below -- it needs re-measuring, so 24 (not 12) stays the default.
+        command = _command(_host_llm())
+        value = command[command.index("-ncmoe") + 1]
+        assert value == "${EXTRACTION_HOST_NCMOE:-24}", value
+
+    def test_ctx_size_default_is_16384(self) -> None:
+        # A real /v1/extract probe needed 9162 prompt tokens plus
+        # max_tokens=2048 from the extraction engine, exceeding the old 8192
+        # default.
+        env = _env_dict(_host_llm())
+        assert env["LLAMA_ARG_CTX_SIZE"] == "${EXTRACTION_LLM_CTX_SIZE:-16384}", env[
+            "LLAMA_ARG_CTX_SIZE"
+        ]
+
 
 class TestHostPublishesNoPorts:
     def test_no_service_publishes_ports(self) -> None:
