@@ -62,8 +62,10 @@ class TestGptOssAdapter:
 
         assert adapter.final_text(response) == '{"entities": []}'
 
-    def test_default_constrained_mode_is_none(self):
-        assert GptOssAdapter().default_constrained_mode == "none"
+    def test_default_constrained_mode_is_schema(self):
+        # "none" makes llama.cpp b11151's peg parser reject gpt-oss's
+        # `<|constrain|>JSON` Harmony wrapper (HTTP 500 on the scope call).
+        assert GptOssAdapter().default_constrained_mode == "schema"
 
 
 class TestQwenAdapter:

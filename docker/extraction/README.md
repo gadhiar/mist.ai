@@ -103,7 +103,20 @@ one, so a deploy never silently runs on a `from_env()` fallback value.
 | `EXTRACTION_DEBUG_PORT` | `8090` | n/a (no ports published) | Local-only, `127.0.0.1` loopback; see Tailscale exposure below. |
 | `EXTRACTION_LLM_TIMEOUT_SECONDS` | `120` | same | Per-LLM-call timeout. `ServiceSettings.llm_timeout_seconds`'s own dataclass default is `30.0`s, but the ctx-16384 re-fit measured a real cold `/v1/extract` call at 51.3-51.8s (see "Host ncmoe sizing" below); 120 gives real headroom. |
 | `EXTRACTION_MAX_ATTEMPTS` | `2` | same | Maximum extraction attempts per job (first call plus repair retries on unparsable output), matching `ServiceSettings.max_attempts`'s own default. |
-| `EXTRACTION_CONSTRAINED_MODE` | empty | same | Overrides the adapter's `default_constrained_mode` when set. Empty is falsy in `engine.py`'s `constrained_mode or adapter.default_constrained_mode`, so it falls through to the adapter's default -- the same effective behavior as unset. |
+| `EXTRACTION_CONSTRAINED_MODE` | empty | same | Overrides the adapter's `default_constrained_mode` when set. Empty is falsy in `engine.py`'s `constrained_mode or adapter.default_constrained_mode`, so it falls through to the adapter's default -- the same effective behavior as unset. The `gptoss` default is `schema` (it was `none`); see the note below the table. |
+
+**`EXTRACTION_CONSTRAINED_MODE` and the `gptoss` default.** `GptOssAdapter`'s
+`default_constrained_mode` is `schema`, not `none`. An A/B run on the
+extraction host (llama.cpp b11151, gpt-oss-20b) found that under `none` the
+model wraps its answer as `<|channel|>final <|constrain|>JSON<|message|>{...}`,
+llama-server's peg parser rejects that wrapper, and the scope-classification
+call returns HTTP 500 on every retry, so the job carries scope `unknown` with
+`scope_classification_failed`. `schema` and `json_object` both returned HTTP
+200 on the same call, and the extraction payload's entities and relationships
+were identical under all three modes. `schema` is the stricter of the two
+working modes. The host's `.env` may therefore leave
+`EXTRACTION_CONSTRAINED_MODE` empty: the adapter default it falls through to
+is now the working mode.
 
 **`EXTRACTION_LLM_TIMEOUT_SECONDS` caveat for the host.** 120s covers the
 measured end-to-end `/v1/extract` figures above, but `llm_timeout_seconds`
