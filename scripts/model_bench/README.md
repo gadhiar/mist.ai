@@ -689,6 +689,26 @@ generated. The third validates `decision_rules.json` against `arms.json` only an
 sha256 it was rendered with, so re-rendering a recorded run after an edit to that file changes the
 header sha and the per-arm sha `[INFO]`/`[WARN]` lines even when every metric is identical.
 
+## Extraction gauntlet against the extraction service
+
+`probes/extraction_service.py` runs the same 60-probe gold corpus and the same scorer as the
+`extraction` suite, but through the extraction service's `POST /v1/extract` instead of the
+in-process path. It is strictly sequential (shared single GPU), sends a fresh `job_id` per call
+so the host idempotency cache cannot replay, and never retries: a failure is recorded, not retried.
+
+```
+python -m scripts.model_bench.probes.extraction_service --endpoint http://HOST:8090 \
+    --out <results-root>/service-run --baseline <results-root>/mb2/c9
+```
+
+Outputs in `--out` (existing files are never overwritten): `extraction_service.jsonl` (per-probe
+rows), `extraction_service_raw.jsonl` (raw 200 responses), `extraction_service_summary.json`
+(metrics with Wilson and cluster-bootstrap CIs, endpoint info, failure classes, latency), and,
+with `--baseline`, `comparison.json` / `comparison.md` (metric table against the baseline's
+bootstrap CI, regressed probe ids, scope agreement with the baseline run). Exit code is non-zero
+when the run is incomplete (any probe unmatched or not run). The run stops early after 3
+consecutive `unreachable` cases or `--max-minutes` (default 50).
+
 ## Known gaps / next steps
 
 - `run_host.py`'s and `analyse.py`'s exact CLI flags (line ~1700 / ~1307 in
