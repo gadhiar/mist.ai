@@ -9,21 +9,35 @@ until the new one passes a check. The lifecycle, one `epoch_cutover` row:
                            logged turn (it keeps filling new turns after this)
     rebuild   -> checked   a staging graph built twice from the log under the
                            candidate passed the rebuild gates
-    promote   -> promoted  the candidate is appended to `epoch_ledger` with a
-                           first-hand activation, in one SQLite transaction
+    promote --graph-swapped
+              checked -> promoted
+                           the candidate is appended to `epoch_ledger` with a
+                           first-hand activation, the turns the swapped-in graph
+                           holds marked applied, in one SQLite transaction
+    promote --seed-only-graph
+              ready | checked -> promoted
+                           the live graph holds seed data only (read-only
+                           probe) and no turn was ever applied: the candidate is
+                           appended with a first-hand activation that marks
+                           nothing, in one SQLite transaction; the dispatcher
+                           then applies every logged turn in log order
     abandon   -> abandoned deletes nothing
 
 Filling is the dispatcher's job (`ExtractionDispatcher._fill_step`); this
-module holds the operator steps the admin CLI runs, and the rebuild check.
+module holds the operator steps the admin CLI runs, the rebuild check, and the
+seed-only graph probe.
 
 What is live while a cutover is open: the OLD graph, frozen. The dispatcher
 applies nothing while filling (it only caches under the candidate's stamps), so
 the active epoch's apply-pending turns stay pending; the service now serves the
 candidate model and cannot extract for the active epoch.
 
-The code never writes the live Neo4j graph. `promote` requires
-`--graph-swapped`, which the operator passes after doing the host swap in
-`CUTOVER.md`.
+The code never writes the live Neo4j graph. `promote` takes exactly one of two
+statements about it. `--graph-swapped`: the operator did the host swap in
+`CUTOVER.md`. `--seed-only-graph`: the live graph contains nothing any
+extraction epoch wrote, so it is identical under every epoch and needs no
+swap; this one is not taken on trust, `promote_seed_only_cutover` proves it with
+one read-only Cypher statement (`SEED_ONLY_PROBE_CYPHER`) before promoting.
 
 Every transition logs one structured INFO line (`log_transition`).
 """
@@ -153,14 +167,26 @@ def abandon_cutover(store: BacklogStore, *, now_iso: str) -> Cutover:
     return cutover
 
 
+PROMOTION_GRAPH_SWAPPED = "graph_swapped"
+PROMOTION_SEED_ONLY_GRAPH = "seed_only_graph"
+
+
 @dataclass(frozen=True, slots=True)
 class Promotion:
-    """What `promote_cutover` did."""
+    """What `promote_cutover` or `promote_seed_only_cutover` did.
+
+    Attributes:
+        mode: `PROMOTION_GRAPH_SWAPPED` or `PROMOTION_SEED_ONLY_GRAPH`.
+        graph_probe: The live-graph probe the seed-only path passed; None on
+            the graph-swapped path, which runs no probe.
+    """
 
     cutover: Cutover
     epoch_id: int
     marked_applied: int
     turns_at_activation: int
+    mode: str = PROMOTION_GRAPH_SWAPPED
+    graph_probe: GraphProbeReport | None = None
 
 
 def promote_cutover(store: BacklogStore, *, graph_swapped: bool, now_iso: str) -> Promotion:
@@ -182,12 +208,14 @@ def promote_cutover(store: BacklogStore, *, graph_swapped: bool, now_iso: str) -
     if cutover.state != "checked":
         raise CutoverRefusedError(
             f"cutover {cutover.cutover_id} is {cutover.state!r}; run `cutover rebuild` until "
-            "it records 'checked'"
+            "it records 'checked' (or, when the live graph holds seed data only, promote "
+            "with --seed-only-graph instead)"
         )
     if not graph_swapped:
         raise CutoverRefusedError(
             "--graph-swapped is required: pass it only after the live graph has been "
-            "replaced by the checked staging graph (backend/extraction_backlog/CUTOVER.md)"
+            "replaced by the checked staging graph; or pass --seed-only-graph instead when "
+            "the live graph holds seed data only (backend/extraction_backlog/CUTOVER.md)"
         )
     try:
         result = store.promote_cutover(cutover, activated_at=now_iso)
@@ -207,6 +235,242 @@ def promote_cutover(store: BacklogStore, *, graph_swapped: bool, now_iso: str) -
         epoch_id=int(result["epoch_id"]),
         marked_applied=int(result["marked_applied"]),
         turns_at_activation=int(result["turns_at_activation"]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# promote --seed-only-graph
+# ---------------------------------------------------------------------------
+
+# The seed applier stamps every node and edge it writes with `seed_version`
+# (`backend/knowledge/seed/applier.py`); every extraction-path writer stamps
+# `ontology_version` on nodes and `ontology_version`, `extraction_version` and
+# `model_hash` on relationships (`curation/graph_writer.py`,
+# `curation/reconciliation.py`, `curation/skill_derivation.py`). A graph whose
+# every element carries `seed_version` and none of the three extraction stamps
+# holds nothing an extraction epoch wrote.
+#
+# ONE statement, read-only: MATCH, WITH, OPTIONAL MATCH, RETURN and
+# aggregations only (a unit test refuses any write clause). The relationship
+# CASEs test `r IS NOT NULL` first because OPTIONAL MATCH yields one NULL `r`
+# on a graph with no relationships, and `NULL.seed_version IS NULL` is true.
+SEED_ONLY_PROBE_CYPHER = (
+    "MATCH (n) "
+    "WITH count(n) AS node_count, "
+    "count(CASE WHEN n.seed_version IS NULL THEN 1 END) AS nodes_without_seed_version, "
+    "count(CASE WHEN n.ontology_version IS NOT NULL OR n.extraction_version IS NOT NULL "
+    "OR n.model_hash IS NOT NULL THEN 1 END) AS nodes_with_extraction_stamp "
+    "OPTIONAL MATCH ()-[r]->() "
+    "RETURN node_count, nodes_without_seed_version, nodes_with_extraction_stamp, "
+    "count(r) AS relationship_count, "
+    "count(CASE WHEN r IS NOT NULL AND r.seed_version IS NULL THEN 1 END) "
+    "AS relationships_without_seed_version, "
+    "count(CASE WHEN r IS NOT NULL AND (r.ontology_version IS NOT NULL "
+    "OR r.extraction_version IS NOT NULL OR r.model_hash IS NOT NULL) THEN 1 END) "
+    "AS relationships_with_extraction_stamp"
+)
+
+
+class GraphProbeError(MistError):
+    """The live-graph probe could not connect, failed, or returned an unexpected shape."""
+
+
+@dataclass(frozen=True, slots=True)
+class GraphProbeReport:
+    """What `SEED_ONLY_PROBE_CYPHER` counted in the live graph."""
+
+    node_count: int
+    nodes_without_seed_version: int
+    nodes_with_extraction_stamp: int
+    relationship_count: int
+    relationships_without_seed_version: int
+    relationships_with_extraction_stamp: int
+
+    def as_dict(self) -> dict[str, int]:
+        """The counts by name, for the check report and the transition log line."""
+        return {
+            "node_count": self.node_count,
+            "nodes_without_seed_version": self.nodes_without_seed_version,
+            "nodes_with_extraction_stamp": self.nodes_with_extraction_stamp,
+            "relationship_count": self.relationship_count,
+            "relationships_without_seed_version": self.relationships_without_seed_version,
+            "relationships_with_extraction_stamp": self.relationships_with_extraction_stamp,
+        }
+
+    def violations(self) -> list[str]:
+        """Why this graph is not seed-only; empty when it is."""
+        found: list[str] = []
+        if self.node_count < 1:
+            found.append("the live graph has no nodes (the seed has not been applied)")
+        if self.nodes_without_seed_version:
+            found.append(f"{self.nodes_without_seed_version} node(s) without seed_version")
+        if self.nodes_with_extraction_stamp:
+            found.append(
+                f"{self.nodes_with_extraction_stamp} node(s) carrying ontology_version, "
+                "extraction_version or model_hash"
+            )
+        if self.relationships_without_seed_version:
+            found.append(
+                f"{self.relationships_without_seed_version} relationship(s) without seed_version"
+            )
+        if self.relationships_with_extraction_stamp:
+            found.append(
+                f"{self.relationships_with_extraction_stamp} relationship(s) carrying "
+                "ontology_version, extraction_version or model_hash"
+            )
+        return found
+
+
+# The probe seam: returns the live graph's counts, or raises a `MistError`
+# (`GraphProbeError` for a connection or query failure). Unit tests inject a
+# fake; `probe_live_graph_from_env` is the real one.
+GraphProbe = Callable[[], GraphProbeReport]
+
+
+def probe_graph(connection: Any) -> GraphProbeReport:
+    """Run `SEED_ONLY_PROBE_CYPHER` once over `connection` and parse its one row.
+
+    Uses `execute_query`, never `execute_write`. `Neo4jConnection` offers no
+    read-access-mode session (its only two paths are `execute_query`, an
+    auto-commit session in the driver's default access mode, and
+    `execute_write`), so read-only is guaranteed by the statement itself.
+
+    Raises:
+        GraphProbeError: The statement did not return exactly one row with
+            every count.
+    """
+    rows = connection.execute_query(SEED_ONLY_PROBE_CYPHER, {})
+    if len(rows) != 1:
+        raise GraphProbeError(f"the seed-only probe returned {len(rows)} rows, expected 1")
+    row = rows[0]
+    names = GraphProbeReport.__dataclass_fields__
+    missing = [name for name in names if row.get(name) is None]
+    if missing:
+        raise GraphProbeError(f"the seed-only probe returned no value for {missing}")
+    return GraphProbeReport(**{name: int(row[name]) for name in names})
+
+
+def probe_live_graph_from_env() -> GraphProbeReport:
+    """Open the LIVE graph named by the environment, probe it read-only, disconnect.
+
+    Needs Neo4j; not exercised by the unit tier (tests inject a fake probe).
+
+    Raises:
+        GraphProbeError: Connecting or querying failed, in any form: a
+            `MistError` from `Neo4jConnection`, an eval-isolation refusal, or a
+            neo4j driver error the connection does not wrap.
+    """
+    from neo4j.exceptions import DriverError, Neo4jError
+
+    from backend.knowledge.config import get_config
+    from backend.knowledge.eval_isolation import EvalIsolationError
+    from backend.knowledge.storage.neo4j_connection import Neo4jConnection
+
+    config = get_config()
+    connection = Neo4jConnection(config.neo4j)
+    try:
+        connection.connect()
+        return probe_graph(connection)
+    except GraphProbeError:
+        raise
+    except (MistError, EvalIsolationError, DriverError, Neo4jError) as exc:
+        raise GraphProbeError(
+            f"could not probe the live graph at {config.neo4j.uri}: {type(exc).__name__}: {exc}"
+        ) from exc
+    finally:
+        connection.disconnect()
+
+
+def promote_seed_only_cutover(
+    store: BacklogStore, *, graph_probe: GraphProbe, now_iso: str
+) -> Promotion:
+    """Make the filled candidate the active epoch over a live graph that holds seed data only.
+
+    A seed-only graph is identical under every extraction epoch, so no staging
+    rebuild or swap is needed. Refused, with nothing written, unless ALL of:
+
+    a. a cutover is open and is 'ready' or 'checked';
+    b. its fill is complete (`fill_scan(...).head is None`);
+    c. `extraction_applied` has no row under ANY epoch;
+    d. the active epoch is still the cutover's source epoch;
+    e. `graph_probe` succeeds and reports at least one node, every node and
+       relationship carrying `seed_version`, and none carrying
+       `ontology_version`, `extraction_version` or `model_hash`.
+
+    c and d are pre-checked here (so the probe is not run for nothing) and
+    re-checked, with a (f) state recheck, inside the promotion transaction
+    (`EventStore.promote_epoch_cutover_seed_only`), which writes the ledger row
+    and a first-hand activation that marks nothing. The probe runs only after
+    a to d pass, and before that transaction.
+
+    Raises:
+        CutoverRefusedError: Any refusal above, or the store refused.
+    """
+    cutover = store.open_cutover()
+    if cutover is None:
+        raise CutoverRefusedError("no cutover is open")
+    if cutover.state not in ("ready", "checked"):
+        raise CutoverRefusedError(
+            f"cutover {cutover.cutover_id} is {cutover.state!r}; wait until the dispatcher "
+            "has filled it ('ready')"
+        )
+    fill = store.fill_scan(cutover)
+    if fill.head is not None:
+        raise CutoverRefusedError(
+            f"the candidate covers {fill.covered} of {fill.total} logged turns; wait until "
+            "the dispatcher has filled the rest"
+        )
+    markers = store.event_store.count_extraction_applied_by_stage()
+    if markers:
+        counts = ", ".join(f"{stage}={n}" for stage, n in markers.items())
+        raise CutoverRefusedError(
+            f"extraction_applied holds apply markers ({counts}): a turn has been applied to "
+            "a graph under some epoch, so the live graph is not seed-only; use the "
+            "graph-swapped path"
+        )
+    epoch = store.active_epoch()
+    if epoch is None or epoch.epoch_id != cutover.source_epoch_id:
+        raise CutoverRefusedError(
+            f"the active epoch is {None if epoch is None else epoch.epoch_id}, but cutover "
+            f"{cutover.cutover_id} began from epoch {cutover.source_epoch_id}; abandon it and "
+            "begin again"
+        )
+
+    try:
+        probe = graph_probe()
+    except MistError as exc:
+        raise CutoverRefusedError(
+            f"the live graph probe failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    violations = probe.violations()
+    if violations:
+        raise CutoverRefusedError(
+            "the live graph is not seed-only: " + "; ".join(violations) + f" ({probe.as_dict()})"
+        )
+
+    try:
+        result = store.event_store.promote_epoch_cutover_seed_only(
+            cutover_id=cutover.cutover_id, activated_at=now_iso, probe_report=probe.as_dict()
+        )
+    except EpochCutoverStateError as exc:
+        raise CutoverRefusedError(str(exc)) from exc
+    log_transition(
+        cutover,
+        cutover.state,
+        "promoted",
+        mode=PROMOTION_SEED_ONLY_GRAPH,
+        epoch_id=result["epoch_id"],
+        marked_applied=result["marked_applied"],
+        turns_at_activation=result["turns_at_activation"],
+        **probe.as_dict(),
+    )
+    return Promotion(
+        cutover=cutover,
+        epoch_id=int(result["epoch_id"]),
+        marked_applied=int(result["marked_applied"]),
+        turns_at_activation=int(result["turns_at_activation"]),
+        mode=PROMOTION_SEED_ONLY_GRAPH,
+        graph_probe=probe,
     )
 
 
