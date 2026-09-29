@@ -1398,11 +1398,14 @@ class EventStore:
         The graph-swapped path (`promote_epoch_cutover`) needs a checked staging
         graph and marks applied the turns it contains. This path is for a live
         graph no extraction has ever run against, which therefore holds only
-        seed data (the operator's precondition, CUTOVER.md 6A; an empty event
-        log shows it only if the log has not been reset or replaced since the
-        graph was seeded). No turn is
-        marked: every logged turn stays apply-pending and the dispatcher applies
-        them all, in log order, from the candidate cache.
+        seed data (the operator's precondition, CUTOVER.md 6A), AND an empty
+        conversation log: `conversation_turn_events` must have no row, from any
+        session origin. A logged turn may have been extracted into the live
+        graph by a write the caller's probe cannot see; an empty log, after the
+        reseed CUTOVER.md 6A requires, is the evidence independent of the graph
+        that no turn was logged, and so none extracted, since that reseed. So
+        there is nothing to mark applied, and nothing is: the dispatcher
+        extracts and applies the turns logged after promotion, in log order.
 
         This method does not look at the graph. `probe_report` is the caller's
         read-only probe result, recorded verbatim; the probe finds no stamped
@@ -1413,25 +1416,25 @@ class EventStore:
         Inside a single `BEGIN IMMEDIATE`:
 
         1. re-check the cutover is 'ready' or 'checked', that the active epoch
-           is still its source epoch, and that `extraction_applied` has NO row
+           is still its source epoch, that `extraction_applied` has NO row
            under any epoch (a turn recorded as applied or curated means the
-           graph may hold extracted data the probe did not see);
+           graph may hold extracted data the probe did not see), and that
+           `conversation_turn_events` has NO row (a turn logged after the
+           caller's own check is refused here, under the write lock);
         2. append the candidate's stamp triple to `epoch_ledger` (prev = the
            source epoch, provisional 0);
         3. write the new epoch's `extraction_activation` row first-hand, with
-           `turns_at_activation` = the logged turns and `marked_applied` =
-           `legacy_unextracted` = 0, so `BacklogStore.ensure_activation` never
-           runs its automatic first-activation rule for it (which would mark
-           every candidate-cached turn applied);
+           `turns_at_activation` = `marked_applied` = `legacy_unextracted` = 0
+           (the log is empty), so `BacklogStore.ensure_activation` never runs
+           its automatic first-activation rule for it;
         4. set the cutover to 'promoted' with `promoted_epoch_id` and a
            `check_report` recording the mode (`seed_only_graph`), the probe
            counts, and any earlier check report under `prior_check_report`.
 
         No `extraction_applied` row is written. A crash anywhere before COMMIT
         leaves none of it written. The fill (a candidate cache row per logged
-        turn) is NOT re-checked here: the cache is a separate database. The
-        caller checks it before this transaction; a turn logged in between is
-        inferred fresh under the new epoch by the dispatcher.
+        turn) is NOT re-checked here: the cache is a separate database, and
+        with an empty log there is no turn for it to cover.
 
         Args:
             cutover_id: The open cutover to promote.
@@ -1440,12 +1443,13 @@ class EventStore:
             probe_report: The live-graph probe's counts, recorded verbatim.
 
         Returns:
-            `epoch_id`, `turns_at_activation`, and `marked_applied` (always 0).
+            `epoch_id`, `turns_at_activation` and `marked_applied` (both always
+            0).
 
         Raises:
             EpochCutoverStateError: The cutover is not 'ready' or 'checked', the
-                active epoch is no longer its source epoch, or an apply marker
-                exists under any epoch.
+                active epoch is no longer its source epoch, an apply marker
+                exists under any epoch, or the conversation log holds a turn.
         """
         conn = self._get_connection()
         try:
@@ -1478,6 +1482,13 @@ class EventStore:
                     "not seed-only; use the graph-swapped path"
                 )
             turns = int(conn.execute("SELECT COUNT(*) FROM conversation_turn_events").fetchone()[0])
+            if turns:
+                raise EpochCutoverStateError(
+                    f"the conversation log holds {turns} logged turn(s) "
+                    "(conversation_turn_events, any session origin): seed-only promotion "
+                    "requires an empty log, because a logged turn may have been extracted into "
+                    "the live graph by a write the probe cannot see; use the graph-swapped path"
+                )
             prior = row["check_report"]
             report = {
                 "promotion_mode": "seed_only_graph",

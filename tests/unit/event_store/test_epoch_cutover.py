@@ -267,13 +267,12 @@ def _seed_only(store: EventStore, cutover_id: int, activated_at: str = "t3") -> 
 class TestPromoteSeedOnly:
     def test_it_appends_the_epoch_and_an_activation_that_marks_nothing(self):
         store = _store()
-        _log(store, 3)
         cutover_id = _begin(store)
         _ready(store, cutover_id)
 
         result = _seed_only(store, cutover_id)
 
-        assert result == {"epoch_id": 2, "turns_at_activation": 3, "marked_applied": 0}
+        assert result == {"epoch_id": 2, "turns_at_activation": 0, "marked_applied": 0}
         epoch = store.get_current_epoch()
         assert (
             epoch["epoch_id"],
@@ -289,7 +288,7 @@ class TestPromoteSeedOnly:
             activation["turns_at_activation"],
             activation["marked_applied"],
             activation["legacy_unextracted"],
-        ) == (3, 0, 0)
+        ) == (0, 0, 0)
         assert _snapshot(store)["applied"] == []
         assert _snapshot(store)["legacy"] == []
         row = store.get_epoch_cutover(cutover_id)
@@ -303,10 +302,11 @@ class TestPromoteSeedOnly:
         assert store.get_open_epoch_cutover() is None
 
     def test_a_checked_cutovers_prior_report_is_kept_nested(self):
+        # Over an empty log: the seed-only method does not read
+        # `rebuilt_through_event_id`, so it need not name a logged turn.
         store = _store()
-        ids = _log(store, 2)
         cutover_id = _begin(store)
-        _checked(store, cutover_id, ids[1])
+        _checked(store, cutover_id, "evt-none")
         assert store.transition_epoch_cutover(
             cutover_id,
             from_states=("checked",),
@@ -381,7 +381,6 @@ class TestPromoteSeedOnly:
         # Arrange
         path = str(tmp_path / "event_store.db")
         store = _store(path)
-        _log(store, 3)
         cutover_id = _begin(store)
         _ready(store, cutover_id)
         before = _snapshot(store)
@@ -415,8 +414,52 @@ class TestPromoteSeedOnly:
 
         # And the promotion can simply be run again.
         result = _seed_only(reopened, cutover_id, activated_at="t4")
-        assert result == {"epoch_id": 2, "turns_at_activation": 3, "marked_applied": 0}
+        assert result == {"epoch_id": 2, "turns_at_activation": 0, "marked_applied": 0}
         reopened.close()
+
+    @pytest.mark.parametrize("origin", ["real", "test", "seed"])
+    def test_a_logged_turn_from_any_origin_is_refused_inside_the_transaction(self, origin):
+        store = _store()
+        store.start_session("s-origin", input_modality="text", origin=origin)
+        store.append_turn(
+            ConversationTurnEvent(
+                session_id="s-origin",
+                turn_index=0,
+                timestamp=T0,
+                user_utterance="turn 0",
+                system_response="ok",
+                ontology_version="1.4.0",
+            )
+        )
+        cutover_id = _begin(store)
+        _ready(store, cutover_id)
+        before = _snapshot(store)
+
+        with pytest.raises(EpochCutoverStateError, match=r"holds 1 logged turn\(s\)"):
+            _seed_only(store, cutover_id)
+
+        assert _snapshot(store) == before
+        assert store.get_epoch_cutover(cutover_id)["state"] == "ready"
+
+    def test_a_turn_another_connection_commits_before_the_transaction_is_refused(self, tmp_path):
+        # The backend's own EventStore (a second connection to the same file)
+        # logs a turn after the caller's checks; BEGIN IMMEDIATE sees it.
+        path = str(tmp_path / "event_store.db")
+        store = _store(path)
+        cutover_id = _begin(store)
+        _ready(store, cutover_id)
+        before = _snapshot(store)
+        backend = EventStore(db_path=path)
+        _log(backend, 2)
+        backend.close()
+
+        with pytest.raises(EpochCutoverStateError, match=r"holds 2 logged turn\(s\)"):
+            _seed_only(store, cutover_id)
+
+        after = _snapshot(store)
+        assert after == before
+        assert len(after["ledger"]) == 1
+        store.close()
 
     def test_the_graph_swapped_promotion_is_unchanged_by_a_seed_only_sibling(self):
         # The graph-swapped method still refuses a 'ready' cutover: seed-only
