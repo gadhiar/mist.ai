@@ -26,7 +26,8 @@ failed to write them. Embeddings have been silently lost on live data twice for
 exactly this reason.
 
 The three live behind one object so they cannot drift apart at the one call site
-that matters. `seed/gates.py:264-268` states the cost of drift outright:
+that matters. The `check_embeddings` docstring in seed/gates.py states the cost
+of drift outright:
 `canonical_serialize` excludes `embedding`, so a graph with no vectors is
 byte-identical to one with correct vectors, and nothing downstream of here can
 tell them apart.
@@ -69,7 +70,7 @@ class StagingSeeder:
     cannot be constructed.
 
     The live-target refusal is NOT implemented here. It lives at the write site,
-    in `_assert_seed_target_permitted` (`seed/applier.py:91`), default-CLOSED and
+    in `_assert_seed_target_permitted` (seed/applier.py), default-CLOSED and
     reached through `apply_seed_documents`'s `allow_live` parameter, which this
     class never sets. A guard at the call site is absent exactly when it matters;
     a guard at the write site cannot be bypassed by forgetting it here.

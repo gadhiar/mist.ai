@@ -47,8 +47,8 @@ _APPLIER_OWNED_NODE_PROPERTIES = frozenset(
 # The extraction stamps, refused as authored `SeedNode` properties. The
 # graph-reset guard (`admin.RESET_GUARD_CYPHER`) counts an `:__Entity__` node
 # carrying any of them as derived data, and the seed guard reuses that count
-# and adds `SEED_GUARD_STAMP_PROPERTIES` (applier.py:
-# `extraction_version`/`model_hash`) in every partition. So a seed node
+# and adds `SEED_GUARD_STAMP_PROPERTIES` in applier.py
+# (`extraction_version`/`model_hash`) in every partition. So a seed node
 # authored with one would make every later reseed refuse the graph the seed
 # itself wrote. `ontology_version` on a `:__SelfModel__` node alone trips
 # neither guard; it is refused anyway, because it marks the node as

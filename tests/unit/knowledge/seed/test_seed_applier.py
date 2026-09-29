@@ -598,9 +598,10 @@ class TestNodeDefinitionWrites:
         assert by_id["slalom"].index("ON MATCH SET") < by_id["slalom"].index("REMOVE n:")
 
     def test_user_node_keeps_the_user_label_and_sheds_the_rest(self, fake_connection):
-        """`:User` is the one `:__Entity__` type label invariant (every writer of
-        the user node sets it). It is SET, and excluded from the REMOVE; every
-        other ontology type label is removed.
+        """`:User` is the one `:__Entity__` type label the applier keeps
+        (`ENTITY_TYPE_LABELS_KEPT`, which names the writers that set it). It is
+        SET, and excluded from the REMOVE; every other ontology type label is
+        removed.
         """
         docs = [
             _doc(

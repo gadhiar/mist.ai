@@ -85,10 +85,15 @@ _MERGE_NODE = (
 )
 
 # The only ontology type label an `:__Entity__` node keeps as a graph label.
-# `:User` is an invariant of the user node, set by every writer that writes it
-# (`grep -n 'SET e:User' backend/knowledge/curation/graph_writer.py
-# backend/knowledge/storage/graph_store.py`); every other `:__Entity__` type
-# lives in `entity_type` only (MIS-177 D2, module docstring above).
+# `:User` is the user node's label: the graph writer, `GraphStore` and this
+# applier SET it when they write the user node (`grep -n 'SET e:User'
+# backend/knowledge/curation/graph_writer.py
+# backend/knowledge/storage/graph_store.py`). Not every writer of the user node
+# does: `SkillDerivationJob._create_skill` MERGEs it without the label
+# (`grep -n 'MERGE (u:__Entity__ {id: $user_entity_id})'
+# backend/knowledge/curation/skill_derivation.py`), so a user node only that
+# job has written carries no `:User`. Every other `:__Entity__` type lives in
+# `entity_type` only (MIS-177 D2, module docstring above).
 ENTITY_TYPE_LABELS_KEPT: frozenset[str] = frozenset({"User"})
 
 # A label is interpolated into Cypher, so each name is checked to be a plain

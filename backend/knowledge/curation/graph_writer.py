@@ -346,9 +346,10 @@ class CurationGraphWriter:
         writes it only for an entity dedup did NOT map onto an existing node
         (`grep -n 'is_update = entity_id in merge_lookup' backend/knowledge/curation/graph_writer.py`
         -> 195, plus this citation's own line). On a replay, dedup finds the entity the crashed run created,
-        by exact id first
-        (`grep -n 'existing = await self._find_existing' backend/knowledge/curation/deduplication.py`
-        -> 88), and emits a MergeAction for it, so the replay never writes the
+        by exact id first (`EntityDeduplicator.deduplicate` calls `_find_existing`,
+        whose tier 1 is the exact id: `grep -n 'existing = await self._find_existing'
+        backend/knowledge/curation/deduplication.py`), and emits a MergeAction for
+        it, so the replay never writes the
         LearningEvent. As a separate statement, a kill after the entity and
         before the LearningEvent therefore lost it for good. In this statement,
         the LearningEvent exists whenever the entity this event created does.

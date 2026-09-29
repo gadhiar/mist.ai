@@ -135,7 +135,7 @@ class _ContentRecordingCurationPipeline:
     relationships: list[list[dict]] = field(default_factory=list)
     # Shared with the seeder double when a test needs the ORDER of the two
     # relative to each other -- seed-apply must precede the replay loop, and the
-    # two writers do not commute (`seed/applier.py:62` clobbers,
+    # two writers do not commute (seed/applier.py `_MERGE_NODE` clobbers,
     # `curation/graph_writer.py` `_upsert_entity` is longest-wins). A per-double list
     # cannot express "before".
     order_sink: list[str] | None = None

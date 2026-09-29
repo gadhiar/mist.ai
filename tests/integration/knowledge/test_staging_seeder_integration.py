@@ -164,7 +164,8 @@ class TestTheCompositionAgainstARealGraph:
     def test_embeddings_are_present_at_the_declared_dimension(self, staging_conn, embedder):
         """The failure mode the canonical form is blind to BY DESIGN.
 
-        `canonical_serialize` excludes `embedding` (`seed/gates.py:264-268`), so a
+        `canonical_serialize` excludes `embedding` (the `check_embeddings`
+        docstring in seed/gates.py), so a
         seed-apply that skipped the backfill would certify byte-identical to one
         that did not. Only a direct read can tell them apart.
         """

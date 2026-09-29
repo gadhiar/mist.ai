@@ -1166,7 +1166,7 @@ def _build_log_regenerator(
         # never `live_conn`. Those two names differ by six characters at this call
         # site, which `_assert_seed_target_permitted`'s docstring calls out by name;
         # the refusal that protects against getting it wrong is at the WRITE site
-        # (`seed/applier.py:91`, default-CLOSED), not here, because a guard the
+        # (seed/applier.py, default-CLOSED), not here, because a guard the
         # caller must remember to add is absent exactly when it matters.
         staging_seeder=StagingSeeder(
             connection=staging_conn,
