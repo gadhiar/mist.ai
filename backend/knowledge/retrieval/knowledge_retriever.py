@@ -21,6 +21,7 @@ from backend.knowledge.models import (
 )
 from backend.knowledge.retrieval.query_classifier import QueryClassifier
 from backend.knowledge.storage import GraphStore
+from backend.knowledge.storage.partitions import USER_ENTITY_ID
 
 if TYPE_CHECKING:
     from backend.debug_jsonl_logger import DebugJSONLLogger
@@ -70,7 +71,7 @@ class KnowledgeRetriever:
         retriever = KnowledgeRetriever(config, graph_store)
         result = await retriever.retrieve(
             query="What programming languages do I know?",
-            user_id="User",
+            user_id=USER_ENTITY_ID,
             limit=20
         )
         print(result.formatted_context)
@@ -132,7 +133,7 @@ class KnowledgeRetriever:
     async def retrieve(
         self,
         query: str,
-        user_id: str = "User",
+        user_id: str = USER_ENTITY_ID,
         limit: int | None = None,
         similarity_threshold: float | None = None,
         max_hops: int | None = None,
@@ -151,7 +152,7 @@ class KnowledgeRetriever:
 
         Args:
             query: User's question or search query.
-            user_id: User entity ID (default "User").
+            user_id: User entity ID (default USER_ENTITY_ID, the stored id "user").
             limit: Max facts to return (default from config).
             similarity_threshold: Min similarity for vector search (default 0.6).
             max_hops: Graph traversal depth (default 2).
