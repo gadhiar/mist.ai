@@ -267,11 +267,12 @@ def promote_cutover(store: BacklogStore, *, graph_swapped: bool, now_iso: str) -
 # ON CREATE only), `SkillDerivationJob._create_skill` / `_ensure_capability`
 # (nodes, ON CREATE, `ontology_version`):
 #     grep -rn '[a-z]\.ontology_version = ' backend/knowledge/curation
-# An element such a writer creates lacks `seed_version` (no writer outside the
-# seed applier and the staging seeder sets it:
+# An element such a writer creates lacks `seed_version` when it is written (no
+# writer outside the seed applier and the staging seeder sets it:
 # `grep -rln seed_version backend/knowledge/curation backend/knowledge/extraction
 # backend/chat` lists only `curation/reconciliation.py`, which reads it and
-# never sets it), so the probe sees it either way.
+# never sets it), so the probe sees it, until a later reseed adopts it (see
+# "adopted elements" below).
 #
 # Unstamped CREATES are seen: an edge or node an extraction writer creates
 # without a stamp (e.g. the KNOWS and HAS_CAPABILITY edges
@@ -305,6 +306,24 @@ def promote_cutover(store: BacklogStore, *, graph_swapped: bool, now_iso: str) -
 #     Seed edges join `:__Entity__` and `:__SelfModel__` nodes
 #     (`_MERGE_EDGE`'s label union: `grep -n 'MATCH (s:'
 #     backend/knowledge/seed/applier.py`).
+#   - adopted elements: the seed applier's `_MERGE_NODE` MERGEs on the node id
+#     and `_MERGE_EDGE` on (subject, type, object), neither on `seed_version`,
+#     so a reseed gives `seed_version` to a non-seed element that survived its
+#     wipe and matches a seed node or fact:
+#         grep -nE '"MERGE \((n|s)' backend/knowledge/seed/applier.py
+#     An adopted element that carries an extraction stamp is still refused
+#     (e.g. a clamped seed copy from `ReconciliationEngine._apply_append`,
+#     which keeps its extraction stamps; the adoption also resets its
+#     `valid_to` to the seed fact's, reopening the retired belief, and the
+#     next reseed's wipe deletes it:
+#     `grep -n 'r.seed_origin_version = ' backend/knowledge/curation/reconciliation.py`).
+#     An adopted UNSTAMPED element passes, with any earlier write on it: the
+#     KNOWS and HAS_CAPABILITY edges and the `user` node `SkillDerivationJob`
+#     MERGEs carry no stamp (`grep -nE 'MERGE \((u|m)\)-|MERGE \(u:'
+#     backend/knowledge/curation/skill_derivation.py`). That needs a seed
+#     source defining the same node id or fact; whether the current one does
+#     is not established here (the source, `mist-memory/seed/`, is not in the
+#     repository). Refusing to seed over extraction writes is a follow-up (D11).
 #   - curation-scheduler jobs, which run inside the live backend and need no
 #     logged turn: `ConfidenceDecayJob` (confidence, status), `OrphanDetector`
 #     (status) and `EmbeddingMaintenance` (embedding; registered disabled):
@@ -318,7 +337,7 @@ def promote_cutover(store: BacklogStore, *, graph_swapped: bool, now_iso: str) -
 # (`BacklogStore.ensure_activation`) gets no marker whether or not an earlier
 # path applied it.
 #
-# The log-empty check does close it for the extraction writers, given the
+# The log-empty check narrows it for the extraction writers, given the
 # CUTOVER.md 6A procedure: both extraction paths act only on a turn that is in
 # the log (the dispatcher reads the log; the in-process branch needs the
 # `event_id` `append_turn` returned), and `SelfReflectionJob` reads its turns
@@ -326,7 +345,8 @@ def promote_cutover(store: BacklogStore, *, graph_swapped: bool, now_iso: str) -
 # with the backend stopped; the reseed deletes every current-version seed edge
 # and every seed node left without a relationship, then re-creates them, so a
 # pre-reseed SET survives only on a seed node that still has a non-seed
-# relationship, which this probe counts. An empty log at promotion, checked
+# relationship, which this probe counts, or on an unstamped element the
+# reseed adopted (above), which it does not. An empty log at promotion, checked
 # again under the write lock, then shows that no turn existed after the
 # reseed to be extracted. The curation-scheduler writers need no turn: that is
 # why the backend stays stopped from the reseed through promotion.
