@@ -3,8 +3,9 @@
 The backend image built on 2026-09-27 had no WebSocket library. uvicorn logged
 `No supported WebSocket library detected` and answered `GET /ws` with 404, which
 locked out the frontend, voice and the extraction E2E test. Root
-`requirements.txt` had pinned plain `uvicorn==0.46.0`; in uvicorn 0.46.0 the
-WebSocket libraries are only pulled in by the `standard` extra.
+`requirements.txt` had pinned plain `uvicorn==0.46.0`; in uvicorn 0.46.0
+`websockets` is pulled in only by the `standard` extra (`wsproto`, the other
+library uvicorn can use, is in no extra).
 
 Two independent checks, because neither covers the other:
 
@@ -16,8 +17,9 @@ Two independent checks, because neither covers the other:
   pinned `websockets==...`. This catches the regression regardless of what is
   installed in the environment running the tests.
 
-Hermetic: no network, no sockets, no Neo4j, no LLM. `uvicorn.Config.load()` only
-imports protocol classes and wraps the app; it does not bind a port.
+Hermetic: no network, no sockets, no Neo4j, no LLM. `uvicorn.Config.load()`
+resolves the HTTP, WebSocket and lifespan classes and wraps the app; it does not
+bind a port.
 """
 
 import re
@@ -37,7 +39,7 @@ PINNED_LINE = re.compile(
 
 
 async def _asgi_app(scope, receive, send) -> None:
-    """Minimal ASGI3 callable; never invoked, only handed to `uvicorn.Config`."""
+    """Minimal ASGI3 callable handed to `uvicorn.Config`; its body never runs."""
 
 
 def _pinned_requirements() -> dict[str, tuple[set[str], str]]:
