@@ -224,8 +224,9 @@ class TestSeedProvenance:
         for stamp in ("ontology_version", "extraction_version", "model_hash"):
             assert stamp not in query
             assert stamp not in params
-        # And the lineage property belongs to clamped copies only (KG-125 D1,
-        # see `BeliefRow` in curation/reconciliation.py).
+        # And the applier never writes the lineage property; only
+        # `_apply_append` does, on clamped copies (KG-125 D1, see `BeliefRow`
+        # in curation/reconciliation.py).
         assert "seed_origin_version" not in query
 
     def test_every_node_is_provenance_seed(self, fake_connection):

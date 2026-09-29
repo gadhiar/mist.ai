@@ -10,8 +10,10 @@ ontology table against a seed prior and pin what the copy carries:
 - provenance='seed', source_type='stated', confidence=1.0 (Option A);
 - seed_origin_version = the seed row's `seed_version` (D1), or the inherited
   `seed_origin_version` when the prior is itself a clamped copy;
-- NO `seed_version` parameter or SET (D1: that property means "written by the
-  applier" to the wipe, the gates and the cutover probe);
+- NO `seed_version` parameter or SET in `_apply_append` (D1: that property
+  means "written by the applier" to the wipe, the gates and the cutover
+  probe). A later reseed can still adopt the copy through the applier's
+  unkeyed `_MERGE_EDGE`; pre-existing, the D11 follow-up, not tested here;
 - the extraction stamps, so the seed-only cutover probe still refuses it.
 
 And the negatives: a fresh assertion and a copy of an extraction row stay
@@ -296,7 +298,8 @@ class TestCopyOfACopy:
     @pytest.mark.asyncio
     async def test_copy_of_a_clamped_seed_copy_inherits_the_original_seed_version(self):
         # The prior is itself a clamped copy of a seed row (an earlier turn
-        # closed it at 2026-01-01): provenance='seed', no seed_version (D1),
+        # closed it at 2026-01-01): provenance='seed', no seed_version (D1:
+        # `_apply_append` never writes it, and no reseed has adopted it),
         # lineage in seed_origin_version. A cease stating an earlier end
         # shortens it again -- a copy of a copy.
         first_copy = _seed_row(
@@ -324,8 +327,9 @@ class TestCopyOfACopy:
         _assert_seed_copy(params, origin="profile-v1")
 
     def test_seed_lineage_prefers_the_rows_own_seed_version(self):
-        # An applier-written row names its own version even if (impossibly)
-        # it also carried an inherited one.
+        # A row carrying both names its own version. Reachable: a reseed's
+        # unkeyed `_MERGE_EDGE` adopts a clamped copy and sets seed_version
+        # on it without removing seed_origin_version (the D11 follow-up).
         row = BeliefRow(
             edge_ref="r",
             predicate="USES",

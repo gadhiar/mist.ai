@@ -84,10 +84,21 @@ _MERGE_NODE = (
 # edge carried only `seed_version`, so the reconciliation engine read it
 # through its extraction defaults (0.8, 'extracted') and stamped any clamped
 # copy of it `provenance='extraction'`: the seed origin was lost the first time
-# a conversation retired a seed belief. The edge deliberately gets NO
+# a conversation retired a seed belief. This statement never WRITES
 # `ontology_version`/`extraction_version`/`model_hash`: those are extraction
 # stamps, and the seed-only cutover probe (`extraction_backlog/cutover.py`,
 # `SEED_ONLY_PROBE_CYPHER`) refuses any element carrying one.
+#
+# The MERGE is keyed only on (s, type, o), so it matches EVERY existing edge
+# of that type between the two nodes, not just the one it wrote last time --
+# including a clamped copy `curation/reconciliation.py` `_apply_append`
+# appended, and any extraction-written edge. On a reseed it adopts such an
+# edge: sets `seed_version` on it, resets `valid_from`/`valid_to` to the
+# fact's (reopening a retired belief), and overwrites provenance/source_type/
+# confidence; the adopted edge keeps any extraction stamps and any
+# `seed_origin_version` it already carried, and the next reseed's wipe deletes
+# it. Pre-existing for `seed_version`/`valid_to` before KG-125 (it widened the
+# overwritten set); tracked as the D11 follow-up, not fixed here.
 _MERGE_EDGE = (
     f"MATCH (s:{ENTITY_LABEL}|{SELF_MODEL_LABEL} {{id: $subject}}) "
     f"MATCH (o:{ENTITY_LABEL}|{SELF_MODEL_LABEL} {{id: $object}}) "
