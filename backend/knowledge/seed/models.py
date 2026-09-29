@@ -44,6 +44,28 @@ _APPLIER_OWNED_NODE_PROPERTIES = frozenset(
     {"entity_type", "seed_version", "provenance", "updated_at", "created_at"}
 )
 
+# The extraction stamps, refused as authored `SeedNode` properties. The
+# graph-reset guard (`admin.RESET_GUARD_CYPHER`) counts an `:__Entity__` node
+# carrying any of them as derived data, and the seed guard reuses that count
+# and adds `SEED_GUARD_STAMP_PROPERTIES` (applier.py:
+# `extraction_version`/`model_hash`) in every partition. So a seed node
+# authored with one would make every later reseed refuse the graph the seed
+# itself wrote. `ontology_version` on a `:__SelfModel__` node alone trips
+# neither guard; it is refused anyway, because it marks the node as
+# extraction-written (`SEED_ONLY_PROBE_CYPHER` in
+# backend/extraction_backlog/cutover.py counts all three on any node). The
+# same three names as
+# `admin._EXTRACTION_STAMP_PROPERTIES`, restated rather than imported because
+# admin.py imports this module at load time
+# (`grep -n 'from backend.knowledge.seed.models import' backend/knowledge/admin.py`),
+# so importing admin here is a cycle. `TestExtractionStampsNeverReachASeedNode`
+# in tests/unit/knowledge/seed/test_seed_applier.py pins the two to one set.
+# `apply_seed_documents` refuses a stamp independently of this validator (for a
+# `SeedNode` built with `model_construct`): `_validate_no_extraction_stamps`.
+_EXTRACTION_STAMP_NODE_PROPERTIES = frozenset(
+    {"ontology_version", "extraction_version", "model_hash"}
+)
+
 
 class SeedFact(BaseModel):
     """One typed fact destined for the graph.
@@ -147,7 +169,19 @@ class SeedNode(BaseModel):
 
     @model_validator(mode="after")
     def _no_applier_owned_extras(self) -> "SeedNode":
-        collisions = _APPLIER_OWNED_NODE_PROPERTIES & (self.model_extra or {}).keys()
+        extras = (self.model_extra or {}).keys()
+        stamps = _EXTRACTION_STAMP_NODE_PROPERTIES & extras
+        if stamps:
+            raise ValueError(
+                f"node {self.id!r} authors {sorted(stamps)}, which are extraction "
+                "stamps (ontology_version/extraction_version/model_hash), not "
+                "descriptive properties -- the graph-reset guard counts an "
+                ":__Entity__ node carrying any of them, and the seed guard also counts "
+                "a node in either partition carrying extraction_version or model_hash, "
+                "so the seed's own node would make later reseeds refuse the graph "
+                "(MIS-177)"
+            )
+        collisions = _APPLIER_OWNED_NODE_PROPERTIES & extras
         if collisions:
             raise ValueError(
                 f"node {self.id!r} authors {sorted(collisions)}, which the applier "
