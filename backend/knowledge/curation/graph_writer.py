@@ -51,14 +51,14 @@ class RebuildStamps:
     written. `mist_admin vault-rebuild` no longer reads them -- R1.3 (Task 8)
     made it a sidecar-only reindex with no graph-side comparison.
 
-    Nothing reads the stamps back off graph edges to compare them with current
-    config: the only query that reads the three properties is
-    `SEED_ONLY_PROBE_CYPHER` (`extraction_backlog/cutover.py`), and it tests
-    only whether they are non-null. The drift check that exists compares this
-    object, not the edges: `ExtractionDispatcher._writer_stamp_mismatch`
-    (`extraction_backlog/dispatcher.py`) compares the triple with the active
-    epoch's on all three fields. With no cutover open, a difference stalls the
-    dispatcher before it applies or dispatches; an open cutover's fill step runs
+    Nothing reads the stamps back off graph edges to compare them with current config. Two
+    queries name them and test only whether they are non-null: `SEED_ONLY_PROBE_CYPHER`
+    (`extraction_backlog/cutover.py`) and `RESET_GUARD_CYPHER` (`knowledge/admin.py`):
+    `grep -rnE 'model_hash IS NOT NULL|in _EXTRACTION_STAMP_PROPERTIES' backend`.
+    The drift check that exists compares this object, not the edges:
+    `ExtractionDispatcher._writer_stamp_mismatch` (`extraction_backlog/dispatcher.py`) compares
+    the triple with the active epoch's on all three fields. With no cutover open, a difference
+    stalls the dispatcher before it applies or dispatches; an open cutover's fill step runs
     before that check. `ExtractionPipeline` also writes the triple into each cache row.
 
     Stable for the lifetime of the writer -- the LLM binary and ontology

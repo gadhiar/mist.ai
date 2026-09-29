@@ -33,9 +33,13 @@ SEED_CONFIDENCE = 1.0
 # descriptive properties, they are the applier's own bookkeeping, and an
 # authored value under one of these names is a bug, not a preference: see
 # `_no_applier_owned_extras` below. `provenance` specifically: an authored
-# `provenance: extraction` would make the graph-reset guard
-# (`admin.RESET_GUARD_CYPHER`, which counts a node whose provenance is not
-# 'seed') count a seed node as extraction-derived.
+# value never reaches the graph. `_no_applier_owned_extras` refuses it when the
+# `SeedNode` is built, and a node that skipped that validator
+# (`model_construct`) still loses it, because `apply_seed_documents` writes
+# `"provenance": SEED_PROVENANCE` after the authored spread
+# (`grep -n '"provenance": SEED_PROVENANCE' backend/knowledge/seed/applier.py`).
+# Every seed node therefore carries `provenance='seed'`, one of the markers the
+# graph-reset guard (`admin.RESET_GUARD_CYPHER`) checks.
 _APPLIER_OWNED_NODE_PROPERTIES = frozenset(
     {"entity_type", "seed_version", "provenance", "updated_at", "created_at"}
 )

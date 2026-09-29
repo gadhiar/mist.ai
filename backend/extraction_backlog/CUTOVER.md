@@ -329,8 +329,8 @@ AFTER the last log reset and with the backend stopped, they are:
 
 1. **The reseed erases every earlier write to a seed element, or leaves
    something the probe counts, except on an unstamped element it adopts.**
-   `python scripts/mist_admin.py seed` (`cmd_seed` -> `reseed`) deletes every
-   edge carrying the current `seed_version`, then every node carrying it that
+   `python scripts/mist_admin.py seed --no-vault-bootstrap` (`cmd_seed` ->
+   `reseed`; 6A.3 step 3 says why the flag) deletes every edge carrying the current `seed_version`, then every node carrying it that
    has no relationship left, then MERGEs both back from the seed source
    (`wipe_seed_version`, `_WIPE_EDGES`, `_WIPE_NODES`, `apply_seed_documents`:
    `grep -nE '^_WIPE_(EDGES|NODES)|^def (reseed|wipe_seed_version|apply_seed_documents)' backend/knowledge/seed/applier.py`).
@@ -507,12 +507,20 @@ None of the `docker compose` forms below has been run from this branch
 3. **Reseed the live graph** (6A.1, point 1). This must come after the last log
    reset:
 
-       docker compose run --rm mist-backend python scripts/mist_admin.py seed
+       docker compose run --rm mist-backend python scripts/mist_admin.py seed --no-vault-bootstrap
 
    [VERIFIED-IN-REPO: `cmd_seed`, subcommand `seed`, in `scripts/mist_admin.py`;
    it calls `reseed(..., allow_live=True)`] It then backfills seed embeddings
    unless given `--no-embeddings`; that writes only `embedding`, which the probe
-   does not read.
+   does not read. `--no-vault-bootstrap` keeps the reseed to the graph: the
+   vault bootstrap runs after `cmd_seed` has already called
+   `connection.disconnect()`, and writes only `identity/mist.md` and
+   `users/<id>.md` (`users/user.md` for the seed's `user.md`) through
+   `VaultWriter` (`admin.bootstrap_vault_from_seed`), which neither reads nor
+   writes the graph or the event store (`grep -nE 'event_store|EventStore|neo4j|Neo4j'
+   backend/vault/writer.py` prints nothing), so it cannot change the probe or
+   the log-empty result and is not part of the cutover. [VERIFIED-IN-REPO:
+   `grep -nE 'connection.disconnect\(\)|no_vault_bootstrap' scripts/mist_admin.py`]
 
 4. **Probe, read-only:**
 

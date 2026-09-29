@@ -708,7 +708,19 @@ def _extraction_stamped(var: str) -> str:
 
 
 # The reset guard: every element `MATCH (n:__Entity__) DETACH DELETE n` would
-# remove that is not purely seed-applier-owned.
+# remove that lacks the seed applier's markers or carries an extraction
+# writer's. It reads markers only -- `provenance`, `seed_version` and the three
+# extraction stamps -- so it passes a seed element that a writer changed
+# WITHOUT stamping it: confidence decay and orphan archiving (`grep -n 'SET e\.'
+# backend/knowledge/curation/confidence_decay.py
+# backend/knowledge/curation/orphan_detector.py`), skill proficiency
+# (`grep -n 'SET e.proficiency' backend/knowledge/curation/skill_derivation.py`),
+# a reconciliation REINFORCE or CLOSE_TRANSACTION on a seed edge
+# (`grep -nE 'is ActionKind\.(CLOSE_TRANSACTION|REINFORCE):'
+# backend/knowledge/curation/reconciliation.py`), and an unstamped non-seed
+# element a reseed adopted (it gains `seed_version`). The comment above
+# `SEED_ONLY_PROBE_CYPHER` in backend/extraction_backlog/cutover.py lists the
+# same blind spots for the same three stamps.
 #
 # Nodes: every `:__Entity__` node whose provenance is not 'seed' (the rule
 # before KG-125, kept so no graph it refused becomes resettable), or that has
@@ -765,11 +777,12 @@ def count_non_seed_entities(connection: GraphConnection) -> int:
     """Return how many nodes and relationships block a reset without --include-derived.
 
     The sum of `count_reset_guard_elements`: `:__Entity__` nodes and the
-    relationships touching them that are not purely seed-applier-owned (see
-    `RESET_GUARD_CYPHER`). Used by the graph-reset safety guard
-    (`reset_graph`, `scripts/mist_admin.py` `cmd_graph_reset`) to refuse
-    wiping derived data unless --include-derived is explicitly passed. The
-    name predates relationships being counted.
+    relationships touching them that lack the seed applier's markers or carry
+    an extraction stamp (see `RESET_GUARD_CYPHER`, including what it cannot
+    see). `scripts/mist_admin.py` `cmd_graph_reset` calls it to refuse wiping
+    derived data unless --include-derived is explicitly passed; `reset_graph`
+    applies the same guard by calling `count_reset_guard_elements` directly.
+    The name predates relationships being counted.
     """
     nodes, relationships = count_reset_guard_elements(connection)
     return nodes + relationships
@@ -1804,9 +1817,12 @@ def reset_graph(connection: GraphConnection, include_derived: bool = False) -> d
 
     Safety: without include_derived this function refuses (raises, deletes
     nothing) when the graph holds any `:__Entity__` node, or any relationship
-    touching one, that is not purely seed-applier-owned: a node whose
-    provenance is not 'seed', or a node or relationship with no
-    `seed_version` or with an extraction stamp (`RESET_GUARD_CYPHER`).
+    touching one, that fails the marker checks: a node whose provenance is
+    not 'seed', or a node or relationship with no `seed_version` or with an
+    extraction stamp (`RESET_GUARD_CYPHER`). Markers only: an unstamped
+    write to a seed element (confidence decay, orphan archiving, skill
+    proficiency, a REINFORCE) passes, and is wiped; the comment above `RESET_GUARD_CYPHER`
+    lists these with their greps.
 
     Raises:
         Neo4jQueryError: Such nodes or relationships exist and include_derived

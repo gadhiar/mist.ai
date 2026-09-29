@@ -380,9 +380,11 @@ def build_curation_pipeline(
     # (C1 4.7, reconciliation.py) and every EXTRACTED_FROM->ConversationContext
     # edge (R1.3 moved this anchor off DERIVED_FROM->VaultNote) to record the
     # ontology, extraction prompt, and model binary active when each edge was
-    # written. Nothing reads them back off the edges to compare: the only
-    # query that reads them tests non-null (SEED_ONLY_PROBE_CYPHER in
-    # extraction_backlog/cutover.py). The extraction dispatcher's writer-stamp
+    # written. Nothing reads them back off the edges to compare: the two
+    # queries that name them test only non-null (SEED_ONLY_PROBE_CYPHER in
+    # extraction_backlog/cutover.py, RESET_GUARD_CYPHER in knowledge/admin.py:
+    # grep -rnE 'model_hash IS NOT NULL|in _EXTRACTION_STAMP_PROPERTIES'
+    # backend). The extraction dispatcher's writer-stamp
     # guard compares a triple derived by the same function (from its own
     # config) with the active epoch, not the stored edges, when no cutover is open.
     rebuild_stamps = writer_stamps_from_config(config)
