@@ -2679,10 +2679,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run hybrid (graph + vector) retrieval for a query.",
     )
     p_retrieve.add_argument("query", help="Natural-language query.")
+    # The user node's stored id: retrieval anchors on it by exact id
+    # (`GraphStore.get_user_relationships_to_entities`), so "User" matched
+    # nothing. partitions.py imports nothing but `__future__`, so this keeps
+    # `--help` free of backend dependencies.
+    from backend.knowledge.storage.partitions import USER_ENTITY_ID
+
     p_retrieve.add_argument(
         "--user-id",
-        default="User",
-        help="User identifier scoping the retrieval (default: User).",
+        default=USER_ENTITY_ID,
+        help=f"User node id scoping the retrieval (default: {USER_ENTITY_ID}).",
     )
     p_retrieve.add_argument(
         "--limit",
