@@ -410,6 +410,38 @@ class TestInfoServingConfig:
         assert [r.json()["ctx_size"] for r in responses] == [FAKE_N_CTX] * 3
         assert fake_llama_state.props_requests == 1
 
+    async def test_concurrent_calls_under_a_failing_props_retry_one_at_a_time(
+        self, service_settings, engine, health_probe
+    ):
+        # A failure is not cached, so every caller queued on the lock makes its
+        # own request -- sequentially, never overlapping, each with the timeout.
+        in_flight = 0
+        max_in_flight = 0
+        timeouts: list[dict] = []
+
+        async def failing(request: httpx.Request) -> httpx.Response:
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            timeouts.append(request.extensions["timeout"])
+            for _ in range(5):  # yield, so an unlocked caller could overlap
+                await asyncio.sleep(0)
+            in_flight -= 1
+            return httpx.Response(503, json={"error": "loading"})
+
+        source = LlamaPropsContextSize(
+            http_client=_props_client(failing), base_url=FAKE_BASE_URL, timeout=1.5
+        )
+        app = create_app(service_settings, engine, health_probe, source)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://service") as client:
+            responses = await asyncio.gather(*(client.get("/v1/info") for _ in range(8)))
+
+        assert [r.json()["ctx_size"] for r in responses] == [None] * 8
+        assert len(timeouts) == 8  # one request per caller: nothing was cached
+        assert max_in_flight == 1  # one at a time, under the lock
+        assert all(t["read"] == 1.5 and t["connect"] == 1.5 for t in timeouts)
+
     async def test_props_non_2xx_gives_a_null_ctx_size(self, client, fake_llama_state):
         fake_llama_state.props_status = 503
 

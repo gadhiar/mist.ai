@@ -115,12 +115,18 @@ class LlamaPropsContextSize:
     `LlamaServerProvider.server_context_size` and
     `backend.factories._probe_llama_server_n_ctx` parse.
 
-    The first successful read is cached for the life of the process, so
-    repeated `/v1/info` calls make one `/props` request between them. A
-    failed read is NOT cached: it returns None and the next call tries
-    again, so a service that starts before its llama-server has loaded
-    reports the real value once llama-server is up, rather than None
-    forever. A lock makes concurrent first calls share one request.
+    Every fetch runs under one lock. On success the value is cached for the
+    life of the process: concurrent first calls queued on the lock find it
+    cached and make no request of their own, and every later `/v1/info`
+    call is served from the cache.
+
+    A failed read (transport error, non-2xx, a body without an int `n_ctx`)
+    is NOT cached: that call returns None. So a service that starts before
+    its llama-server has loaded reports the real value once llama-server is
+    up, rather than None forever. The cost is that under a failing `/props`
+    each caller waiting on the lock retries in turn: N concurrent calls make
+    N sequential requests, each bounded by `timeout`, so the last of them
+    can wait up to N * `timeout`.
     """
 
     def __init__(self, http_client: httpx.AsyncClient, base_url: str, timeout: float = 2.0) -> None:
