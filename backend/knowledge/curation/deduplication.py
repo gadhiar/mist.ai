@@ -1,7 +1,7 @@
 """Entity deduplication against existing graph state.
 
-Stage 7a: 3-tier dedup (exact ID -> alias -> embedding similarity).
-Produces merge instructions for the graph writer.
+Stage 7a: 3-tier dedup (exact ID -> alias -> embedding similarity with a
+numeric/date name veto). Produces merge instructions for the graph writer.
 """
 
 import asyncio
@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 
 from backend.interfaces import EmbeddingProvider
 from backend.knowledge.curation.confidence import ConfidenceManager
+from backend.knowledge.curation.name_veto import names_conflict
 from backend.knowledge.ontologies.hierarchy import dedup_type_filter
 from backend.knowledge.storage.graph_executor import GraphExecutor
 
@@ -19,7 +20,20 @@ logger = logging.getLogger(__name__)
 # so 0.92 here is a raw cosine of 0.84, not 0.92. To choose the value from data,
 # run `python -m scripts.dedup_calibration` (scripts/dedup_calibration/README.md):
 # it reports where labelled duplicate and distinct pairs fall on this scale.
+#
+# The score alone is not the Tier-3 merge rule. A candidate at or above this
+# threshold is still rejected when its name and the incoming name carry
+# different numeric tokens or different month tokens
+# (`backend.knowledge.curation.name_veto.names_conflict`): distinct extracted
+# names such as 'P95' / 'P99 latency' or 'Q1' / 'Q2 2026' score 0.96-0.99, so no
+# threshold separates them. The calibration tool measures the score only and
+# does not model the veto.
 SIMILARITY_THRESHOLD = 0.92
+# Tier 3 fetches at most this many candidates at or above SIMILARITY_THRESHOLD,
+# in (score DESC, id ASC) order, and merges into the first one the name veto does
+# not reject. If every fetched candidate is vetoed there is no merge, even when a
+# lower-ranked candidate beyond this bound would have passed the veto.
+TIER3_CANDIDATE_LIMIT = 50
 MAX_ALIASES = 20
 
 
@@ -49,8 +63,18 @@ class DeduplicationResult:
 class EntityDeduplicator:
     """Deduplicates extracted entities against existing graph entities.
 
-    3-tier matching: exact ID -> alias -> embedding similarity (0.92 threshold).
-    Same entity_type required for all tiers.
+    3-tier matching, first match wins:
+
+    1. Exact id (case-insensitive), same entity_type.
+    2. Alias (case-insensitive), same entity_type.
+    3. Embedding similarity over the `dedup_type_filter` type set: candidates
+       whose Neo4j cosine score is >= SIMILARITY_THRESHOLD (0.92), ordered
+       score DESC then id ASC, at most TIER3_CANDIDATE_LIMIT of them. The first
+       candidate that the name veto (`name_veto.names_conflict`) does not reject
+       wins. The veto compares the incoming display name with the candidate's
+       display_name (its id when that is null) and rejects the pair when their
+       numeric tokens or month tokens differ, so 'P95' never merges into
+       'P99 latency'. If every candidate is vetoed, the entity is not merged.
     """
 
     def __init__(
@@ -117,11 +141,13 @@ class EntityDeduplicator:
     async def _find_existing(
         self, entity_id: str, entity_type: str, display_name: str
     ) -> dict | None:
-        """Deterministic 3-tier resolver: exact id -> alias -> exact cosine.
+        """Deterministic 3-tier resolver: exact id -> alias -> exact cosine + veto.
 
         Every tier has a total order (ORDER BY id; the cosine tier breaks ties on
         id) so live and a replay rebuild make identical merge decisions on the
-        same input -- no ANN, no insertion-order sensitivity.
+        same input -- no ANN, no insertion-order sensitivity. The Tier-3 name
+        veto is a pure function of two strings, so walking the ordered
+        candidates and taking the first unvetoed one keeps that property.
         """
         _RET = (
             "RETURN e.id AS id, e.entity_type AS entity_type, "
@@ -151,8 +177,9 @@ class EntityDeduplicator:
         # Tier 3: exact cosine over the widened-type candidate set. No ANN: a full
         # exact-cosine scan is a recall superset of HNSW top-k and is deterministic.
         # Probe embeds the display_name (the text the node's embedding is built
-        # from), compared against stored node embeddings. Winner = argmax over
-        # (score, id) as a total order.
+        # from), compared against stored node embeddings. Candidates come back in
+        # (score DESC, id ASC) order, a total order; the winner is the first one
+        # the numeric/date name veto does not reject.
         try:
             probe = await asyncio.get_running_loop().run_in_executor(
                 None, self._embedding_provider.generate_embedding, display_name
@@ -161,17 +188,29 @@ class EntityDeduplicator:
                 "MATCH (e:__Entity__) WHERE e.entity_type IN $types AND e.embedding IS NOT NULL "
                 "WITH e, vector.similarity.cosine(e.embedding, $embedding) AS score "
                 f"WHERE score >= $threshold {_RET}, score "
-                "ORDER BY score DESC, e.id ASC LIMIT 1",
+                "ORDER BY score DESC, e.id ASC LIMIT $candidate_limit",
                 {
                     "embedding": probe,
                     "threshold": SIMILARITY_THRESHOLD,
                     "types": dedup_type_filter(entity_type),
+                    "candidate_limit": TIER3_CANDIDATE_LIMIT,
                 },
             )
-            if results:
-                return results[0]
         except Exception:
             logger.debug("Cosine similarity search failed (expected if no embeddings present)")
+            return None
+
+        for candidate in results:
+            candidate_name = candidate.get("display_name") or candidate["id"]
+            if names_conflict(display_name, candidate_name):
+                logger.debug(
+                    "Tier-3 veto: %r not merged into %s (%r): numeric or month tokens differ",
+                    display_name,
+                    candidate["id"],
+                    candidate_name,
+                )
+                continue
+            return candidate
 
         return None
 
