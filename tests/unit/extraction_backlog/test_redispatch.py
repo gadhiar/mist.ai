@@ -24,6 +24,7 @@ from backend.event_store.store import EventStore
 from backend.extraction_backlog import admin
 from backend.extraction_backlog.redispatch import (
     EXCLUDED_PROPERTIES,
+    EXCLUDED_RELATIONSHIP_PROPERTIES,
     EXIT_CANNOT_RUN,
     EXIT_DIFFERS,
     EXIT_IDENTICAL,
@@ -43,6 +44,7 @@ from backend.extraction_backlog.redispatch import (
     relationship_key,
 )
 from backend.extraction_backlog.store import BacklogStore
+from backend.knowledge.curation.graph_writer import CurationGraphWriter, RebuildStamps
 from backend.knowledge.eval_isolation import LIVE_WS_ENDPOINTS
 from backend.knowledge.extraction.pipeline import ApplyReport
 from backend.knowledge.extraction_cache import SKIP_EXTRACTION_FAILED, ExtractionCache
@@ -193,6 +195,35 @@ class FakeGraph:
 
     def close(self) -> None:
         self.closes += 1
+
+
+_FIRST_APPLY = "2026-09-01T10:00:05+00:00"
+_RE_APPLY = "2026-09-28T12:00:00+00:00"
+
+
+def _extracted_from_on_match_set(*, now: str, event_id: str) -> dict[str, Any]:
+    """The properties `_extracted_from_clause`'s ON MATCH SET writes, read off the clause.
+
+    Built from the production fragment rather than restated, so a property
+    added to that SET shows up here. Only the writer's stamps are read from
+    `self`, so a stand-in carrying them is enough.
+    """
+    stamps = RebuildStamps(ontology_version="1.2.0", extraction_version="v-x", model_hash="m-x")
+    fragment, params = CurationGraphWriter._extracted_from_clause(
+        SimpleNamespace(_rebuild_stamps=stamps)  # type: ignore[arg-type]
+    )
+    match_set = fragment.split("ON MATCH SET ", 1)[1]
+    values = {"event_id": event_id, "now": now, **params}
+    written: dict[str, Any] = {}
+    for assignment in match_set.split(", "):
+        target, value = (part.strip() for part in assignment.split(" = ", 1))
+        assert target.startswith("r."), assignment
+        if value.startswith("$"):
+            written[target[2:]] = values[value[1:]]
+        else:
+            assert value.startswith("'") and value.endswith("'"), assignment
+            written[target[2:]] = value[1:-1]
+    return written
 
 
 class CountingProbe:
@@ -400,6 +431,70 @@ class TestVerdicts:
         assert _snapshot(world.event_store, world.cache) == before
         assert graph.closes == 1
 
+    def _extracted_from_world(self, mutate) -> FakeGraph:
+        """user, python and a ConversationContext; python -[EXTRACTED_FROM]-> ctx.
+
+        The edge carries what `_extracted_from_clause`'s ON MATCH SET wrote on
+        the turn's first apply; `mutate` runs as the re-apply.
+        """
+        nodes = [
+            _node("user"),
+            _node("python"),
+            _node("ctx-s1", labels=("__Provenance__", "ConversationContext")),
+        ]
+        rels = [
+            _rel("user", "USES", "python", derived_at=_FIRST_APPLY),
+            _rel(
+                "python",
+                "EXTRACTED_FROM",
+                "ctx-s1",
+                created_at=TS,
+                **_extracted_from_on_match_set(now=_FIRST_APPLY, event_id="evt-1"),
+            ),
+        ]
+        return FakeGraph(nodes=nodes, rels=rels, mutate=mutate)
+
+    def test_a_reapply_rewriting_only_extracted_from_derived_at_exits_0(self, world):
+        """The ON MATCH SET of `_extracted_from_clause`, re-run at a later wall clock."""
+        _applied_turn(world)
+        seen: list[set[str]] = []
+
+        def reapply(nodes, rels):
+            props = rels[1]["properties"]
+            before = dict(props)
+            props.update(_extracted_from_on_match_set(now=_RE_APPLY, event_id="evt-1"))
+            seen.append({k for k in props if props[k] != before.get(k)})
+
+        graph = self._extracted_from_world(reapply)
+        code, text = _cli(world, "evt-1", graph)
+        assert seen == [{"derived_at", "updated_at"}]  # the clause did change the edge
+        assert code == EXIT_IDENTICAL, text
+        assert "fingerprints IDENTICAL (exit 0)" in text
+
+    @pytest.mark.parametrize(
+        "where",
+        ["node", "other-relationship-type"],
+    )
+    def test_derived_at_elsewhere_still_exits_3(self, world, where):
+        _applied_turn(world)
+
+        def reapply(nodes, rels):
+            rels[1]["properties"].update(
+                _extracted_from_on_match_set(now=_RE_APPLY, event_id="evt-1")
+            )
+            if where == "node":
+                nodes[1]["properties"]["derived_at"] = _RE_APPLY
+            else:
+                rels[0]["properties"]["derived_at"] = _RE_APPLY
+
+        code, text = _cli(world, "evt-1", self._extracted_from_world(reapply))
+        assert code == EXIT_DIFFERS
+        assert "differing properties on changed elements: derived_at x1" in text
+        if where == "node":
+            assert '  changed node "python": derived_at' in text
+        else:
+            assert '  changed rel "user"-[USES]->"python": derived_at' in text
+
     def test_the_summary_lists_at_most_the_limit(self):
         before = fingerprint_graph([], [])
         after = fingerprint_graph([_node(f"n{i:02d}") for i in range(30)], [])
@@ -506,8 +601,28 @@ class TestVerdicts:
 
 
 class TestFingerprint:
-    def test_only_updated_at_is_excluded(self):
+    def test_only_updated_at_everywhere_and_extracted_from_derived_at_are_excluded(self):
         assert frozenset({"updated_at"}) == EXCLUDED_PROPERTIES
+        assert dict(EXCLUDED_RELATIONSHIP_PROPERTIES) == {
+            "EXTRACTED_FROM": frozenset({"derived_at"})
+        }
+
+    def test_derived_at_is_ignored_on_extracted_from_only(self):
+        def rel(rel_type: str, derived_at: str) -> str:
+            return fingerprint_graph([], [_rel("x", rel_type, "ctx", derived_at=derived_at)]).digest
+
+        assert rel("EXTRACTED_FROM", "2026-01-01") == rel("EXTRACTED_FROM", "2026-09-28")
+        assert rel("USES", "2026-01-01") != rel("USES", "2026-09-28")
+        assert (
+            fingerprint_graph([_node("x", derived_at="2026-01-01")], []).digest
+            != fingerprint_graph([_node("x", derived_at="2026-09-28")], []).digest
+        )
+
+    def test_other_extracted_from_properties_are_still_compared(self):
+        a = fingerprint_graph([], [_rel("x", "EXTRACTED_FROM", "ctx", source_utterance_id="e1")])
+        b = fingerprint_graph([], [_rel("x", "EXTRACTED_FROM", "ctx", source_utterance_id="e2")])
+        assert a.digest != b.digest
+        assert diff_fingerprints(a, b).property_counts == {"source_utterance_id": 1}
 
     def test_updated_at_is_ignored_on_nodes_and_relationships(self):
         a = fingerprint_graph(
