@@ -33,6 +33,7 @@ from backend.knowledge.curation.intervals import (
     parse_to_bound,
 )
 from backend.knowledge.ontologies import Cardinality, EdgeTypeDefinition, TemporalClass
+from backend.knowledge.seed.models import SEED_CONFIDENCE, SEED_PROVENANCE, SEED_SOURCE_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +147,15 @@ class EdgeAssertion:
 
 @dataclass(frozen=True, slots=True)
 class BeliefRow:
-    """An existing latest-belief edge version fetched from the graph."""
+    """An existing latest-belief edge version fetched from the graph.
+
+    `provenance`, `seed_version` and `seed_origin_version` are the edge's raw
+    property values (None when absent), NOT interpreted: whether a row counts
+    as seed-authored is decided in exactly one place, `is_seed`, which applies
+    the pre-KG-125 fallback. `seed_version` is set only by the seed applier;
+    `seed_origin_version` only by `ReconciliationEngine._apply_append` on a
+    clamped copy of a seed row (KG-125 D1).
+    """
 
     edge_ref: str  # Neo4j elementId(r)
     predicate: str
@@ -161,10 +170,40 @@ class BeliefRow:
     temporal_status: str
     evidence: list[str]
     source_utterance_id: str = ""
+    provenance: str | None = None
+    seed_version: str | None = None
+    seed_origin_version: str | None = None
 
     def interval(self) -> Interval:
         """Valid-time interval; legacy rows (no bounds) read as fully open."""
         return Interval(parse_from_bound(self.valid_from), parse_from_bound(self.valid_to))
+
+    @property
+    def is_seed(self) -> bool:
+        """True when this row is a seed fact or a clamped copy of one.
+
+        THE one place the pre-KG-125 fallback (D3) is applied: a seed edge
+        written before the applier set `provenance` has none, but carries the
+        `seed_version` only the applier writes, so a row with no provenance
+        and a non-null `seed_version` is a seed row. A row whose provenance is
+        set is taken at its word, whatever else it carries.
+        """
+        if self.provenance is None:
+            return self.seed_version is not None
+        return self.provenance == SEED_PROVENANCE
+
+    @property
+    def seed_lineage(self) -> str | None:
+        """The seed version this row descends from, for a clamped copy of it.
+
+        The applier-written row's own `seed_version`; for a row that is itself
+        a clamped copy (no `seed_version`, by D1), the `seed_origin_version`
+        it inherited -- so a copy of a copy still names the original seed.
+        None for a row that is not seed-authored.
+        """
+        if not self.is_seed:
+            return None
+        return self.seed_version if self.seed_version is not None else self.seed_origin_version
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,6 +479,9 @@ def _version_key(event_id: str, valid_from: str | None, valid_to: str | None) ->
     return f"{event_id}|{valid_from or 'open'}|{valid_to or 'open'}"
 
 
+# provenance / seed_version / seed_origin_version are returned RAW (no
+# coalesce): the pre-KG-125 seed fallback lives in `BeliefRow.is_seed`, not
+# here, so it is applied once whatever built the row.
 _BELIEF_RETURN = (
     "RETURN elementId(r) AS edge_ref, t.id AS target, r.valid_from AS valid_from, "
     "r.valid_to AS valid_to, coalesce(r.recorded_at, r.created_at, '') AS recorded_at, "
@@ -448,7 +490,9 @@ _BELIEF_RETURN = (
     "coalesce(r.context, '') AS context, "
     "coalesce(r.temporal_status, 'current') AS temporal_status, "
     "coalesce(r.evidence, []) AS evidence, "
-    "coalesce(r.source_utterance_id, '') AS source_utterance_id "
+    "coalesce(r.source_utterance_id, '') AS source_utterance_id, "
+    "r.provenance AS provenance, r.seed_version AS seed_version, "
+    "r.seed_origin_version AS seed_origin_version "
     "ORDER BY recorded_at, valid_from, source_utterance_id"
 )
 
@@ -546,6 +590,9 @@ class ReconciliationEngine:
                 temporal_status=str(row.get("temporal_status", "current")),
                 evidence=list(row.get("evidence") or []),
                 source_utterance_id=str(row.get("source_utterance_id", "")),
+                provenance=row.get("provenance"),
+                seed_version=row.get("seed_version"),
+                seed_origin_version=row.get("seed_origin_version"),
             )
             for row in rows
         ]
@@ -686,6 +733,27 @@ class ReconciliationEngine:
         stype = _sanitize(act.predicate)
         src = copy_of or assertion
         vf = act.valid_from if copy_of is None else copy_of.valid_from
+        # KG-125: a clamped copy of a seed row is still a seed fact, just with
+        # a shorter valid time. It keeps the canonical seed values -- not the
+        # row's own, which for a pre-KG-125 seed row are the coalesce defaults
+        # (0.8, 'extracted') `_BELIEF_RETURN` read it through -- and records
+        # its lineage in `seed_origin_version`. It never gets `seed_version`:
+        # the wipe, the seed gates and the cutover probe read that as "written
+        # by the applier" (D1). It DOES keep the extraction stamps below, so
+        # the seed-only cutover probe still refuses a graph holding one. A new
+        # assertion or a copy of an extraction row stays 'extraction' with no
+        # seed_origin_version (a NULL SET writes no property).
+        seed_copy = copy_of is not None and copy_of.is_seed
+        if seed_copy:
+            provenance, confidence, source_type = (
+                SEED_PROVENANCE,
+                SEED_CONFIDENCE,
+                SEED_SOURCE_TYPE,
+            )
+            seed_origin_version = copy_of.seed_lineage
+        else:
+            provenance, confidence, source_type = "extraction", src.confidence, src.source_type
+            seed_origin_version = None
         rows = await self._executor.execute_write(
             f"MATCH (s:__Entity__|__SelfModel__ {{id: $source}}) "
             f"MATCH (t:__Entity__ {{id: $target}}) "
@@ -697,7 +765,8 @@ class ReconciliationEngine:
             "r.confidence = $confidence, r.source_type = $source_type, "
             "r.context = $context, r.temporal_status = $temporal_status, "
             "r.evidence = $evidence, r.supersession_reason = $reason, "
-            "r.provenance = 'extraction', r.ontology_version = $ontology_version, "
+            "r.provenance = $provenance, r.seed_origin_version = $seed_origin_version, "
+            "r.ontology_version = $ontology_version, "
             "r.extraction_version = $extraction_version, r.model_hash = $model_hash, "
             "r.created_at = $now, r.updated_at = $now "
             "RETURN count(r) AS n",
@@ -710,8 +779,10 @@ class ReconciliationEngine:
                 "valid_to": act.valid_to,
                 "recorded_at": recorded_at,
                 "correction": act.correction,
-                "confidence": src.confidence,
-                "source_type": src.source_type,
+                "provenance": provenance,
+                "seed_origin_version": seed_origin_version,
+                "confidence": confidence,
+                "source_type": source_type,
                 "context": src.context,
                 # A version with a closed valid_to is by definition not a
                 # current state; copying the prior's 'current' verbatim onto

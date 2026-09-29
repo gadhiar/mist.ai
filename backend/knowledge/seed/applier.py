@@ -27,7 +27,13 @@ from backend.knowledge.ontologies import ALL_NODE_TYPE_NAMES
 from backend.knowledge.ontologies.v1_0_0 import ALL_EDGE_TYPE_NAMES
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
-from .models import SeedDocument, SeedNode
+from .models import (
+    SEED_CONFIDENCE,
+    SEED_PROVENANCE,
+    SEED_SOURCE_TYPE,
+    SeedDocument,
+    SeedNode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,12 +77,25 @@ _MERGE_NODE = (
 # precedent at backend/knowledge/admin.py's edge-merge helper, which solves
 # the identical two-partition matching problem for the older seed_data.yaml
 # path.
+#
+# KG-125 (MIS-175, Option A): every seed edge also carries what it IS --
+# `provenance='seed'`, `source_type='stated'`, `confidence=1.0` (the
+# `SEED_*` constants in models.py, passed as parameters). Before this, a seed
+# edge carried only `seed_version`, so the reconciliation engine read it
+# through its extraction defaults (0.8, 'extracted') and stamped any clamped
+# copy of it `provenance='extraction'`: the seed origin was lost the first time
+# a conversation retired a seed belief. The edge deliberately gets NO
+# `ontology_version`/`extraction_version`/`model_hash`: those are extraction
+# stamps, and the seed-only cutover probe (`extraction_backlog/cutover.py`,
+# `SEED_ONLY_PROBE_CYPHER`) refuses any element carrying one.
 _MERGE_EDGE = (
     f"MATCH (s:{ENTITY_LABEL}|{SELF_MODEL_LABEL} {{id: $subject}}) "
     f"MATCH (o:{ENTITY_LABEL}|{SELF_MODEL_LABEL} {{id: $object}}) "
     "MERGE (s)-[r:%s]->(o) "
     "SET r.seed_version = $seed_version, r.valid_from = $valid_from, "
-    "    r.valid_to = $valid_to, r.updated_at = $now "
+    "    r.valid_to = $valid_to, r.provenance = $provenance, "
+    "    r.source_type = $source_type, r.confidence = $confidence, "
+    "    r.updated_at = $now "
     "RETURN type(r) AS t"
 )
 
@@ -204,10 +223,16 @@ def apply_seed_documents(
         # graph via `n += $properties` on BOTH branches, corrupting the
         # create-only guarantee on every future ON MATCH re-seed, not merely
         # losing a values comparison on write.
+        #
+        # `provenance` (KG-125): a seed node is seed-authored, which is what
+        # `admin.count_non_seed_entities` (`coalesce(n.provenance,'') <>
+        # 'seed'`) keys on. Applier-owned like the other stamps, so it is in
+        # `_APPLIER_OWNED_NODE_PROPERTIES` and sits after the spread.
         properties = {
             **{k: v for k, v in node.model_dump().items() if k not in ("id", "type", "created_at")},
             "entity_type": node.type,
             "seed_version": seed_version,
+            "provenance": SEED_PROVENANCE,
             "updated_at": now_iso,
         }
         connection.execute_write(
@@ -227,6 +252,9 @@ def apply_seed_documents(
                     "seed_version": seed_version,
                     "valid_from": fact.valid_from,
                     "valid_to": fact.valid_to,
+                    "provenance": SEED_PROVENANCE,
+                    "source_type": SEED_SOURCE_TYPE,
+                    "confidence": SEED_CONFIDENCE,
                     "now": now_iso,
                 },
             )

@@ -67,7 +67,11 @@ class TestReconcileTurn:
         assert params["ontology_version"] == "1.2.0"
         # Bug A regression guard (rel side): extraction-time edges must carry
         # provenance='extraction' (moved here from the old writer tests).
-        assert "r.provenance = 'extraction'" in query
+        # KG-125 made the value a parameter so a clamped copy of a seed row
+        # can keep 'seed' (test_reconciliation_seed_provenance.py).
+        assert "r.provenance = $provenance" in query
+        assert params["provenance"] == "extraction"
+        assert params["seed_origin_version"] is None
 
     @pytest.mark.asyncio
     async def test_stated_start_date_lands_in_valid_from(self):

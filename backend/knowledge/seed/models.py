@@ -13,16 +13,30 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
+# What every seed-authored fact is, as a graph element (KG-125 / MIS-175,
+# Option A): authored rather than inferred, so `provenance='seed'`, stated by
+# the user rather than extracted, so `source_type='stated'`, and certain, so
+# `confidence=1.0`. `applier.py` writes these onto every seed edge (and
+# `SEED_PROVENANCE` onto every seed node); `curation/reconciliation.py` carries
+# them onto a clamped copy of a seed edge, so a seed belief keeps its origin
+# when reconciliation retires it. One definition, read by both writers, so the
+# two cannot drift.
+SEED_PROVENANCE = "seed"
+SEED_SOURCE_TYPE = "stated"
+SEED_CONFIDENCE = 1.0
+
 # Properties `applier.py`'s `_MERGE_NODE` stamps itself on every write
-# (`entity_type`/`seed_version`/`updated_at` via the `properties` map,
-# `created_at` via its own `ON CREATE SET` clause). `SeedNode.extra="allow"`
-# exists so a node's genuinely open-ended descriptive properties pass
-# through untouched (see the class docstring) -- but these four are not
+# (`entity_type`/`seed_version`/`provenance`/`updated_at` via the `properties`
+# map, `created_at` via its own `ON CREATE SET` clause). `SeedNode.extra=
+# "allow"` exists so a node's genuinely open-ended descriptive properties pass
+# through untouched (see the class docstring) -- but these five are not
 # descriptive properties, they are the applier's own bookkeeping, and an
 # authored value under one of these names is a bug, not a preference: see
-# `_no_applier_owned_extras` below.
+# `_no_applier_owned_extras` below. `provenance` specifically: an authored
+# `provenance: extraction` would make `admin.count_non_seed_entities` count a
+# seed node as extraction-derived.
 _APPLIER_OWNED_NODE_PROPERTIES = frozenset(
-    {"entity_type", "seed_version", "updated_at", "created_at"}
+    {"entity_type", "seed_version", "provenance", "updated_at", "created_at"}
 )
 
 
@@ -132,8 +146,8 @@ class SeedNode(BaseModel):
         if collisions:
             raise ValueError(
                 f"node {self.id!r} authors {sorted(collisions)}, which the applier "
-                "stamps itself on every write (entity_type/seed_version/updated_at/"
-                "created_at are applier-owned bookkeeping, not descriptive "
+                "stamps itself on every write (entity_type/seed_version/provenance/"
+                "updated_at/created_at are applier-owned bookkeeping, not descriptive "
                 "properties) -- an authored value here would silently win over the "
                 "applier's own stamp, and for seed_version specifically would make "
                 "this node un-wipeable by any future reseed (R1.4 whole-branch "
