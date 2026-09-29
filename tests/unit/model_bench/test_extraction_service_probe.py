@@ -108,6 +108,17 @@ class FakeState:
     in_flight: int = 0
     max_in_flight: int = 0
     on_request: Callable[[int], None] | None = None
+    # The /v1/info serving-config fields (contract 1.1.0). None makes /v1/info answer
+    # the way a 1.0.0 server does: the seven original fields only, no keys for these.
+    serving_config: dict[str, Any] | None = field(default_factory=lambda: dict(SERVING_CONFIG))
+
+
+SERVING_CONFIG = {
+    "constrained_mode": "schema",
+    "reasoning_effort": "low",
+    "temperature": 0.0,
+    "ctx_size": 16384,
+}
 
 
 def _ok_response(
@@ -151,16 +162,21 @@ def build_fake_app(state: FakeState) -> FastAPI:
     app = FastAPI()
 
     @app.get("/v1/info")
-    async def info() -> InfoResponse:
-        return InfoResponse(
-            contract_version=state.contract_version,
-            extraction_version=EXTRACTION_VERSION,
-            model_hash=MODEL_HASH,
-            model_file="fake.gguf",
-            llama_cpp_build="b0",
-            adapter="gptoss",
-            location_label="test-box",
-        )
+    async def info() -> JSONResponse:
+        body = {
+            "contract_version": state.contract_version,
+            "extraction_version": EXTRACTION_VERSION,
+            "model_hash": MODEL_HASH,
+            "model_file": "fake.gguf",
+            "llama_cpp_build": "b0",
+            "adapter": "gptoss",
+            "location_label": "test-box",
+        }
+        if state.serving_config is not None:
+            body.update(state.serving_config)
+        # Validate through the contract model, then send exactly `body`'s keys.
+        InfoResponse.model_validate(body)
+        return JSONResponse(body)
 
     @app.get("/v1/health")
     async def health() -> HealthResponse:
@@ -841,6 +857,83 @@ async def test_preflight_refuses_incompatible_or_unhealthy_service(
     assert code == 1
     assert world[0].received == []
     assert not (out / probe.OUT_SUMMARY).exists()
+
+
+def _warn_lines(stderr: str) -> list[str]:
+    return [line for line in stderr.splitlines() if line.startswith("[WARN]")]
+
+
+@pytest.mark.asyncio
+async def test_preflight_prints_and_the_summary_records_the_serving_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gold = write_gold(tmp_path / "gold.jsonl", 2)
+    out = tmp_path / "out"
+
+    code = await run_execute(state_and_client=make_world(gold), gold_path=gold, out_dir=out)
+
+    assert code == 0
+    stderr = capsys.readouterr().err
+    assert (
+        "[INFO] serving config: constrained_mode=schema reasoning_effort=low "
+        "temperature=0.0 ctx_size=16384"
+    ) in stderr
+    assert _warn_lines(stderr) == []
+    summary = read_summary(out)
+    assert summary["serving_config"] == SERVING_CONFIG
+    assert summary["serving_config_missing"] == []
+    assert {k: summary["endpoint"]["info"][k] for k in SERVING_CONFIG} == SERVING_CONFIG
+
+
+@pytest.mark.asyncio
+async def test_an_old_server_without_serving_config_warns_per_field_and_the_run_continues(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gold = write_gold(tmp_path / "gold.jsonl", 2)
+    world = make_world(gold)
+    state, _ = world
+    state.contract_version = "1.0.0"
+    state.serving_config = None  # /v1/info carries the seven 1.0.0 fields only
+    out = tmp_path / "out"
+
+    code = await run_execute(state_and_client=world, gold_path=gold, out_dir=out)
+
+    assert code == 0
+    assert len(state.received) == 2  # the run went ahead
+    stderr = capsys.readouterr().err
+    warns = _warn_lines(stderr)
+    assert len(warns) == 4
+    for name, line in zip(probe.SERVING_CONFIG_FIELDS, warns, strict=True):
+        assert f"did not report {name} " in line
+        assert "1.0.0" in line
+    assert "[FAIL]" not in stderr
+    assert (
+        "[INFO] serving config: constrained_mode=null reasoning_effort=null "
+        "temperature=null ctx_size=null"
+    ) in stderr
+    summary = read_summary(out)
+    assert summary["serving_config"] == dict.fromkeys(probe.SERVING_CONFIG_FIELDS)
+    assert summary["serving_config_missing"] == list(probe.SERVING_CONFIG_FIELDS)
+
+
+@pytest.mark.asyncio
+async def test_a_null_ctx_size_alone_gets_one_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gold = write_gold(tmp_path / "gold.jsonl", 1)
+    world = make_world(gold)
+    world[0].serving_config = {**SERVING_CONFIG, "ctx_size": None}
+    out = tmp_path / "out"
+
+    code = await run_execute(state_and_client=world, gold_path=gold, out_dir=out)
+
+    assert code == 0
+    warns = _warn_lines(capsys.readouterr().err)
+    assert len(warns) == 1 and "did not report ctx_size " in warns[0]
+    summary = read_summary(out)
+    assert summary["serving_config"]["ctx_size"] is None
+    assert summary["serving_config"]["constrained_mode"] == "schema"
+    assert summary["serving_config_missing"] == ["ctx_size"]
 
 
 @pytest.mark.asyncio

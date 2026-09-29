@@ -47,10 +47,19 @@ class RebuildStamps:
     to carry the ontology, extraction-prompt, and model identifiers that were
     active when the entity was extracted. R1.3 moved this anchor from
     DERIVED_FROM->VaultNote onto EXTRACTED_FROM->ConversationContext, and the
-    stamps' purpose is unchanged: they let a future consumer detect drift
-    against current config values. `mist_admin vault-rebuild` no longer reads
-    them -- R1.3 (Task 8) made it a sidecar-only reindex with no graph-side
-    comparison; drift consumption is not wired to any command today.
+    stamps' purpose is unchanged: they record what was active when the edge was
+    written. `mist_admin vault-rebuild` no longer reads them -- R1.3 (Task 8)
+    made it a sidecar-only reindex with no graph-side comparison.
+
+    Nothing reads the stamps back off graph edges to compare them with current config. Two
+    queries name them and test only whether they are non-null: `SEED_ONLY_PROBE_CYPHER`
+    (`extraction_backlog/cutover.py`) and `RESET_GUARD_CYPHER` (`knowledge/admin.py`):
+    `grep -rnE 'model_hash IS NOT NULL|in _EXTRACTION_STAMP_PROPERTIES' backend`.
+    The drift check that exists compares this object, not the edges:
+    `ExtractionDispatcher._writer_stamp_mismatch` (`extraction_backlog/dispatcher.py`) compares
+    the triple with the active epoch's on all three fields. With no cutover open, a difference
+    stalls the dispatcher before it applies or dispatches; an open cutover's fill step runs
+    before that check. `ExtractionPipeline` also writes the triple into each cache row.
 
     Stable for the lifetime of the writer -- the LLM binary and ontology
     version do not change mid-process. Constructed from `KnowledgeConfig`
@@ -58,9 +67,9 @@ class RebuildStamps:
     dependency; `ontology_version` and `extraction_version` trace back to
     `backend.knowledge.version_stamps`, the single authority for both.
 
-    `backend/factories.py` constructs this at two sites (one per consumer --
-    `build_curation_pipeline` and `build_extraction_pipeline`) from the same
-    `KnowledgeConfig`; a cross-factory test
+    `backend/factories.py` constructs this at two sites -- `writer_stamps_from_config`
+    (used by `build_curation_pipeline` and `build_extraction_dispatcher`) and
+    `build_extraction_pipeline` -- from the same `KnowledgeConfig`; a cross-factory test
     (`tests/unit/test_factories_rebuild_stamps.py::TestCrossFactoryStampAgreement`)
     asserts the two outputs are `==`. That coverage relies on every field here
     keeping the dataclass default `compare=True` -- a field declared with
@@ -336,10 +345,10 @@ class CurationGraphWriter:
         Why the `new_fact` LearningEvent is in this statement too. `write()`
         writes it only for an entity dedup did NOT map onto an existing node
         (`grep -n 'is_update = entity_id in merge_lookup' backend/knowledge/curation/graph_writer.py`
-        -> 186, plus this citation's own line). On a replay, dedup finds the entity the crashed run created,
+        -> 195, plus this citation's own line). On a replay, dedup finds the entity the crashed run created,
         by exact id first
         (`grep -n 'existing = await self._find_existing' backend/knowledge/curation/deduplication.py`
-        -> 84), and emits a MergeAction for it, so the replay never writes the
+        -> 88), and emits a MergeAction for it, so the replay never writes the
         LearningEvent. As a separate statement, a kill after the entity and
         before the LearningEvent therefore lost it for good. In this statement,
         the LearningEvent exists whenever the entity this event created does.

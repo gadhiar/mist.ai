@@ -1,10 +1,16 @@
-"""`cutover promote --seed-only-graph`: promotion over a live graph that holds seed data only.
+"""`cutover promote --seed-only-graph` and `cutover probe`: the seed-only path.
+
+Seed-only promotion needs an EMPTY conversation log (any session origin), so
+every promotion here is over an empty log, and a logged turn is a refusal: before
+the probe runs, and again inside the promotion transaction when the turn is
+logged after that first check.
 
 Every refusal is asserted write-free: the ledger, the activations, the apply
 markers, the legacy list and the whole `epoch_cutover` row are compared before
-and after. The live-graph probe is always a fake (`FakeProbe`); the unit tier
-never connects to Neo4j. The probe's Cypher is checked textually for write
-clauses, and `probe_graph` is run over a recording fake connection.
+and after. The live-graph probe is always a fake (`FakeProbe`), or the real
+probe over a fake `Neo4jConnection`; the unit tier never connects to Neo4j. The
+probe's Cypher is checked textually for write clauses, and `probe_graph` is run
+over a recording fake connection.
 """
 
 from __future__ import annotations
@@ -17,11 +23,13 @@ from datetime import datetime
 import pytest
 
 from backend.errors import Neo4jConnectionError, Neo4jQueryError
+from backend.event_store.store import EpochCutoverStateError
 from backend.extraction_backlog import admin
 from backend.extraction_backlog.cutover import (
     SEED_ONLY_PROBE_CYPHER,
     GraphProbeError,
     GraphProbeReport,
+    log_not_empty_reason,
     probe_graph,
 )
 from backend.knowledge.extraction_cache import OUTCOME_EXTRACTED
@@ -112,9 +120,9 @@ def _begin(world) -> None:
     assert code == 0, text
 
 
-def _log(world, ts, index: int) -> str:
+def _log(world, ts, index: int, *, session_id: str = "s1") -> str:
     return world.log_turn(
-        session_id="s1",
+        session_id=session_id,
         turn_index=index,
         timestamp=ts(index),
         utterance=f"I really use tool{index}",
@@ -133,8 +141,11 @@ def _cache_candidate(world, ts, event_id: str) -> None:
     )
 
 
-def _ready(world, ts, n: int = 3) -> list[str]:
-    """Log `n` turns (none applied), begin, cache every turn under the candidate, set 'ready'."""
+def _ready(world, ts, n: int = 0) -> list[str]:
+    """Log `n` turns (none applied), begin, cache every turn under the candidate, set 'ready'.
+
+    `n` = 0, the default, is the only log seed-only promotion accepts.
+    """
     ids = [_log(world, ts, i) for i in range(n)]
     _begin(world)
     for event_id in ids:
@@ -147,7 +158,7 @@ def _ready(world, ts, n: int = 3) -> list[str]:
 
 
 def _snapshot(world) -> dict[str, list[tuple]]:
-    """Every row a promotion could write, in a stable order, every column."""
+    """Every row a promotion could write, in a stable order, every column, plus the log."""
     conn = world.event_store._get_connection()
     queries = {
         "ledger": "SELECT * FROM epoch_ledger ORDER BY epoch_id",
@@ -155,6 +166,8 @@ def _snapshot(world) -> dict[str, list[tuple]]:
         "applied": "SELECT * FROM extraction_applied ORDER BY epoch_id, event_id",
         "legacy": "SELECT * FROM extraction_legacy_turns ORDER BY epoch_id, event_id",
         "cutover": "SELECT * FROM epoch_cutover ORDER BY cutover_id",
+        "turns": "SELECT * FROM conversation_turn_events ORDER BY event_id",
+        "sessions": "SELECT * FROM conversation_sessions ORDER BY session_id",
     }
     return {name: [tuple(row) for row in conn.execute(sql)] for name, sql in queries.items()}
 
@@ -257,12 +270,14 @@ class TestRefusals:
     def test_c_a_marker_written_during_the_probe_is_caught_inside_the_transaction(
         self, sync_world, ts
     ):
+        # The log is empty, so the marker names a turn that is not in it:
+        # `extraction_applied` has no foreign key, and any row refuses.
         world = sync_world
-        ids = _ready(world, ts, 3)
+        _ready(world, ts)
         probe = FakeProbe(
             world,
             during=lambda w: w.event_store.mark_extraction_stage(
-                event_id=ids[0], epoch_id=w.epoch_id, stage="curated", updated_at=ts(1)
+                event_id="evt-not-logged", epoch_id=w.epoch_id, stage="curated", updated_at=ts(1)
             ),
         )
 
@@ -291,7 +306,7 @@ class TestRefusals:
         self, sync_world, ts
     ):
         world = sync_world
-        _ready(world, ts, 2)
+        _ready(world, ts)
         probe = FakeProbe(
             world,
             during=lambda w: w.event_store.append_epoch(
@@ -305,6 +320,89 @@ class TestRefusals:
         assert probe.calls == 1
         assert _snapshot(world) == probe.snapshot_after
 
+    @pytest.mark.parametrize("origin", ["real", "test", "seed"])
+    def test_e_a_logged_turn_refuses_before_the_probe_runs(self, sync_world, ts, origin):
+        # Every turn is cached under the candidate, so a to d all pass; only
+        # the log refuses. Any session origin counts.
+        world = sync_world
+        world.event_store.start_session("s-origin", input_modality="text", origin=origin)
+        ids = [_log(world, ts, i, session_id="s-origin") for i in range(3)]
+        _begin(world)
+        for event_id in ids:
+            _cache_candidate(world, ts, event_id)
+        store = world.store
+        assert store.transition_cutover(
+            store.open_cutover(), from_states=("filling",), to_state="ready", updated_at=ts(10)
+        )
+        assert store.fill_scan(store.open_cutover()).head is None
+        probe = FakeProbe(world)
+        before = _snapshot(world)
+
+        code, text = _promote(world, probe)
+
+        _assert_refused(code, text, "the conversation log holds 3 logged turn(s)")
+        assert "use the graph-swapped path" in text
+        assert probe.calls == 0
+        assert _snapshot(world) == before
+
+    def test_e_a_turn_logged_during_the_probe_is_caught_inside_the_transaction(
+        self, sync_world, ts
+    ):
+        world = sync_world
+        _ready(world, ts)
+        probe = FakeProbe(world, during=lambda w: _log(w, ts, 0))
+
+        code, text = _promote(world, probe)
+
+        _assert_refused(code, text, "the conversation log holds 1 logged turn(s)")
+        assert probe.calls == 1
+        # The transaction wrote nothing on top of the logged turn.
+        assert _snapshot(world) == probe.snapshot_after
+        assert len(_snapshot(world)["ledger"]) == 1
+        assert world.store.open_cutover().state == "ready"
+
+    def test_e_a_turn_logged_after_the_probe_is_caught_inside_the_transaction(
+        self, sync_world, ts, monkeypatch
+    ):
+        # A store hook: the turn lands after the probe returns and immediately
+        # before the promotion transaction opens, the last window a concurrent
+        # writer has. Only the in-transaction re-check can see it.
+        world = sync_world
+        _ready(world, ts)
+        event_store = world.event_store
+        real_promote = event_store.promote_epoch_cutover_seed_only
+        seen: dict = {}
+
+        def log_then_promote(**kwargs):
+            _log(world, ts, 0)
+            seen["before_txn"] = _snapshot(world)
+            return real_promote(**kwargs)
+
+        monkeypatch.setattr(event_store, "promote_epoch_cutover_seed_only", log_then_promote)
+        probe = FakeProbe(world)
+
+        code, text = _promote(world, probe)
+
+        _assert_refused(code, text, "the conversation log holds 1 logged turn(s)")
+        assert probe.calls == 1
+        assert _snapshot(world) == seen["before_txn"]
+        assert len(seen["before_txn"]["ledger"]) == 1
+        assert world.store.open_cutover().state == "ready"
+
+    def test_e_the_pre_check_and_the_transaction_word_the_refusal_alike(self, sync_world, ts):
+        world = sync_world
+        _ready(world, ts, 1)
+
+        with pytest.raises(EpochCutoverStateError) as exc:
+            world.event_store.promote_epoch_cutover_seed_only(
+                cutover_id=world.store.open_cutover().cutover_id,
+                activated_at=NOW,
+                probe_report=SEED_ONLY.as_dict(),
+            )
+
+        assert str(exc.value) == log_not_empty_reason(1)
+        assert log_not_empty_reason(0) is None
+
     @pytest.mark.parametrize(
         ("field", "value", "reason"),
         [
@@ -315,9 +413,9 @@ class TestRefusals:
             ("relationships_with_extraction_stamp", 1, "1 relationship(s) carrying"),
         ],
     )
-    def test_e_a_graph_that_is_not_seed_only(self, sync_world, ts, field, value, reason):
+    def test_f_a_graph_that_is_not_seed_only(self, sync_world, ts, field, value, reason):
         world = sync_world
-        _ready(world, ts, 2)
+        _ready(world, ts)
         counts = SEED_ONLY.as_dict() | {field: value}
         probe = FakeProbe(world, GraphProbeReport(**counts))
         before = _snapshot(world)
@@ -336,9 +434,9 @@ class TestRefusals:
             GraphProbeError("the seed-only probe returned 0 rows, expected 1"),
         ],
     )
-    def test_e_a_probe_that_cannot_connect_or_errors(self, sync_world, ts, error):
+    def test_f_a_probe_that_cannot_connect_or_errors(self, sync_world, ts, error):
         world = sync_world
-        _ready(world, ts, 2)
+        _ready(world, ts)
         probe = FakeProbe(world, raises=error)
         before = _snapshot(world)
 
@@ -347,11 +445,9 @@ class TestRefusals:
         _assert_refused(code, text, f"the live graph probe failed: {type(error).__name__}")
         assert _snapshot(world) == before
 
-    def test_f_a_state_change_during_the_probe_is_caught_inside_the_transaction(
-        self, sync_world, ts
-    ):
+    def test_a_state_change_during_the_probe_is_caught_inside_the_transaction(self, sync_world, ts):
         world = sync_world
-        _ready(world, ts, 2)
+        _ready(world, ts)
 
         def abandon(w) -> None:
             store = w.store
@@ -404,7 +500,8 @@ class TestRefusals:
 # ---------------------------------------------------------------------------
 
 
-def _assert_seed_only_promoted(world, text: str, *, turns: int, prior=None) -> int:
+def _assert_seed_only_promoted(world, text: str, *, prior=None) -> int:
+    """The new epoch, its activation over an empty log, the record, and the CLI text."""
     epochs = world.event_store.list_epochs()
     assert len(epochs) == 2
     new_epoch = epochs[-1]
@@ -428,9 +525,10 @@ def _assert_seed_only_promoted(world, text: str, *, turns: int, prior=None) -> i
         activation["turns_at_activation"],
         activation["marked_applied"],
         activation["legacy_unextracted"],
-    ) == (turns, 0, 0)
+    ) == (0, 0, 0)
     assert _snapshot(world)["applied"] == []
     assert _snapshot(world)["legacy"] == []
+    assert _snapshot(world)["turns"] == []
     promoted = world.store.list_cutovers()[-1]
     assert (promoted.state, promoted.promoted_epoch_id) == ("promoted", new_epoch["epoch_id"])
     assert promoted.check_report == {
@@ -440,28 +538,31 @@ def _assert_seed_only_promoted(world, text: str, *, turns: int, prior=None) -> i
         "prior_check_report": prior,
     }
     assert f"MIST_MODEL_HASH={CANDIDATE}" in text
-    assert "0 of" in text and "seed-only live graph (32 node(s), 30 relationship(s)" in text
+    assert "seed-only live graph (32 node(s), 30 relationship(s)" in text
+    assert "and an empty conversation log: no turn was marked applied" in text
+    assert "logged turn(s) marked applied" not in text
     return int(new_epoch["epoch_id"])
 
 
 class TestSuccess:
-    def test_a_ready_cutover_is_promoted_with_an_activation_that_marks_nothing(
-        self, sync_world, ts
-    ):
+    def test_a_ready_cutover_over_an_empty_log_is_promoted_marking_nothing(self, sync_world, ts):
         world = sync_world
-        _ready(world, ts, 3)
+        _ready(world, ts)
         probe = FakeProbe(world)
 
         code, text = _promote(world, probe)
 
         assert code == 0, text
         assert probe.calls == 1
-        _assert_seed_only_promoted(world, text, turns=3)
+        _assert_seed_only_promoted(world, text)
         assert world.store.open_cutover() is None
 
     def test_a_checked_cutover_keeps_its_check_report_nested(self, sync_world, ts):
+        # A 'checked' cutover over an empty log cannot come from `cutover
+        # rebuild` (its floors are >= 1); the state is set directly here to
+        # show the seed-only path still accepts it and keeps the report.
         world = sync_world
-        ids = _ready(world, ts, 2)
+        _ready(world, ts)
         store = world.store
         assert store.transition_cutover(
             store.open_cutover(),
@@ -469,7 +570,7 @@ class TestSuccess:
             to_state="checked",
             updated_at=ts(11),
             rebuild_job_id="job",
-            rebuilt_through_event_id=ids[-1],
+            rebuilt_through_event_id="evt-none",
             check_report={"passed": True},
             write_check=True,
         )
@@ -477,7 +578,7 @@ class TestSuccess:
         code, text = _promote(world, FakeProbe(world))
 
         assert code == 0, text
-        _assert_seed_only_promoted(world, text, turns=2, prior={"passed": True})
+        _assert_seed_only_promoted(world, text, prior={"passed": True})
 
     def test_a_crash_at_the_fault_point_writes_nothing_and_a_rerun_succeeds(
         self, sync_world, ts, monkeypatch
@@ -486,7 +587,7 @@ class TestSuccess:
             pass
 
         world = sync_world
-        _ready(world, ts, 3)
+        _ready(world, ts)
         before = _snapshot(world)
 
         def crash(step: str) -> None:
@@ -503,11 +604,11 @@ class TestSuccess:
         code, text = _promote(world, FakeProbe(world))
 
         assert code == 0, text
-        _assert_seed_only_promoted(world, text, turns=3)
+        _assert_seed_only_promoted(world, text)
 
     def test_the_transition_is_logged_with_the_probe_counts(self, sync_world, ts, caplog):
         world = sync_world
-        _ready(world, ts, 1)
+        _ready(world, ts)
 
         with caplog.at_level("INFO", logger="backend.extraction_backlog.cutover"):
             assert _promote(world, FakeProbe(world))[0] == 0
@@ -521,12 +622,13 @@ class TestSuccess:
 
 class TestAfterPromotion:
     @pytest.mark.asyncio
-    async def test_every_turn_is_applied_in_log_order_from_the_candidate_cache(
-        self, backlog_world, ts
-    ):
-        # Arrange: 4 turns logged, NONE applied under the source epoch; filled.
+    async def test_a_filled_log_is_refused_even_with_every_turn_cached(self, backlog_world, ts):
+        # Was: 4 logged turns filled, promoted seed-only, then applied from
+        # the candidate cache. Under the empty-log rule the same world is a
+        # refusal: complete fill and no apply marker do not make it seed-only.
         world = backlog_world
-        ids = [_log(world, ts, i) for i in range(4)]
+        for i in range(4):
+            _log(world, ts, i)
         _begin(world)
         world.service.model_hash = CANDIDATE
         filler = world.build_dispatcher()
@@ -534,22 +636,44 @@ class TestAfterPromotion:
         await wait_until(lambda: world.store.open_cutover().state == "ready")
         await filler.stop(timeout=2.0)
         assert world.curation.event_ids == []
+        probe = FakeProbe(world)
+        before = _snapshot(world)
+
+        code, text = _promote(world, probe)
+
+        _assert_refused(code, text, "the conversation log holds 4 logged turn(s)")
+        assert probe.calls == 0
+        assert _snapshot(world) == before
+
+    @pytest.mark.asyncio
+    async def test_turns_logged_after_promotion_are_extracted_and_applied_in_log_order(
+        self, backlog_world, ts
+    ):
+        # Arrange: an empty log, filled to 'ready' by the dispatcher.
+        world = backlog_world
+        _begin(world)
+        world.service.model_hash = CANDIDATE
+        filler = world.build_dispatcher()
+        await filler.start()
+        await wait_until(lambda: world.store.open_cutover().state == "ready")
+        await filler.stop(timeout=2.0)
         received_before = len(world.service.received)
 
         # Act 1: seed-only promotion.
         code, text = _promote(world, FakeProbe(world))
         assert code == 0, text
-        epoch_id = _assert_seed_only_promoted(world, text, turns=4)
+        epoch_id = _assert_seed_only_promoted(world, text)
 
         # Act 2: a FRESH dispatcher, built after promotion (the backend
-        # recreated with the new MIST_MODEL_HASH), drains the log.
+        # recreated with the new MIST_MODEL_HASH); turns are logged and drained.
+        ids = [_log(world, ts, i) for i in range(3)]
         dispatcher = world.build_dispatcher()
         await dispatcher.start()
         assert await dispatcher.drain(timeout=5.0)
 
-        # Assert: every turn applied, in log order, from the cache.
+        # Assert: every turn inferred under the new epoch and applied in log order.
         assert world.curation.event_ids == ids
-        assert len(world.service.received) == received_before
+        assert len(world.service.received) == received_before + 3
         applied = (
             world.event_store._get_connection()
             .execute(
@@ -577,7 +701,155 @@ class TestAfterPromotion:
         code, text = _promote(world, FakeProbe(world))
 
         assert code == 0, text
-        _assert_seed_only_promoted(world, text, turns=0)
+        _assert_seed_only_promoted(world, text)
+
+
+# ---------------------------------------------------------------------------
+# `cutover probe`: the same checks, read-only
+# ---------------------------------------------------------------------------
+
+
+def _probe_cli(world, probe) -> tuple[int, str]:
+    return _cli(world, "cutover", "probe", probe=probe)
+
+
+class TestProbeCommand:
+    def test_an_empty_log_and_a_seed_only_graph_pass_with_exit_0(self, sync_world, ts):
+        world = sync_world
+        _ready(world, ts)
+        probe = FakeProbe(world)
+        before = _snapshot(world)
+
+        code, text = _probe_cli(world, probe)
+
+        assert code == 0, text
+        assert probe.calls == 1
+        assert "[probe] conversation log: PASS (0 logged turns)" in text
+        assert "[probe] live graph: PASS (node_count=32 " in text
+        assert "violation" not in text
+        assert _snapshot(world) == before
+        assert world.store.open_cutover().state == "ready"
+
+    def test_it_runs_without_an_open_cutover(self, sync_world):
+        world = sync_world
+        assert world.store.open_cutover() is None
+        before = _snapshot(world)
+
+        code, text = _probe_cli(world, FakeProbe(world))
+
+        assert code == 0, text
+        assert _snapshot(world) == before
+
+    def test_a_logged_turn_refuses_with_exit_2_and_the_graph_is_still_probed(self, sync_world, ts):
+        world = sync_world
+        world.event_store.start_session("s-test", input_modality="text", origin="test")
+        _log(world, ts, 0, session_id="s-test")
+        _log(world, ts, 1, session_id="s-test")
+        probe = FakeProbe(world)
+        before = _snapshot(world)
+
+        code, text = _probe_cli(world, probe)
+
+        assert code == 2, text
+        assert probe.calls == 1
+        assert "[probe] conversation log: REFUSED (2 logged turn(s))" in text
+        assert f"  violation: {log_not_empty_reason(2)}" in text
+        assert "[probe] live graph: PASS" in text
+        assert "would be REFUSED (exit 2)" in text
+        assert _snapshot(world) == before
+
+    def test_every_graph_violation_is_printed_with_exit_2(self, sync_world):
+        world = sync_world
+        bad = GraphProbeReport(
+            **(
+                SEED_ONLY.as_dict()
+                | {"nodes_without_seed_version": 4, "relationships_with_extraction_stamp": 5}
+            )
+        )
+        probe = FakeProbe(world, bad)
+        before = _snapshot(world)
+
+        code, text = _probe_cli(world, probe)
+
+        assert code == 2, text
+        assert "[probe] conversation log: PASS" in text
+        assert "[probe] live graph: REFUSED (" in text
+        assert "nodes_without_seed_version=4" in text
+        for violation in bad.violations():
+            assert f"  violation: {violation}" in text
+        assert len(bad.violations()) == 2
+        assert _snapshot(world) == before
+
+    def test_both_checks_failing_print_both_with_exit_2(self, sync_world, ts):
+        world = sync_world
+        _log(world, ts, 0)
+        probe = FakeProbe(world, GraphProbeReport(**(SEED_ONLY.as_dict() | {"node_count": 0})))
+
+        code, text = _probe_cli(world, probe)
+
+        assert code == 2, text
+        assert "conversation log: REFUSED (1 logged turn(s))" in text
+        assert "  violation: the live graph has no nodes" in text
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            Neo4jConnectionError("Failed to connect to Neo4j: refused"),
+            GraphProbeError("could not probe the live graph at bolt://x:7687: ServiceUnavailable"),
+        ],
+    )
+    @pytest.mark.parametrize("logged", [0, 1])
+    def test_a_probe_that_could_not_run_exits_1(self, sync_world, ts, error, logged):
+        # Exit 1 even when the log check already refuses: the graph result is
+        # unknown, and the operator must fix the probe to see it.
+        world = sync_world
+        for i in range(logged):
+            _log(world, ts, i)
+        probe = FakeProbe(world, raises=error)
+        before = _snapshot(world)
+
+        code, text = _probe_cli(world, probe)
+
+        assert code == 1, text
+        assert f"[probe] live graph: NOT RUN: {type(error).__name__}: " in text
+        assert "could not complete" in text
+        assert _snapshot(world) == before
+
+    def test_the_real_probe_over_a_fake_connection_writes_nothing(self, sync_world, monkeypatch):
+        # The CLI's default probe (`probe_live_graph_from_env`), with
+        # `Neo4jConnection` replaced: one read query, no write, disconnected.
+        from backend.knowledge.storage import neo4j_connection
+
+        events: list[str] = []
+
+        class ReadOnlyConnection:
+            def __init__(self, config) -> None:
+                events.append("init")
+
+            def connect(self) -> None:
+                events.append("connect")
+
+            def execute_query(self, query, params=None):
+                events.append("query")
+                assert query == SEED_ONLY_PROBE_CYPHER
+                return [SEED_ONLY.as_dict()]
+
+            def execute_write(self, query, params=None):
+                events.append("WRITE")
+                raise AssertionError("cutover probe must never write the graph")
+
+            def disconnect(self) -> None:
+                events.append("disconnect")
+
+        monkeypatch.setattr(neo4j_connection, "Neo4jConnection", ReadOnlyConnection)
+        world = sync_world
+        before = _snapshot(world)
+
+        code, text = _probe_cli(world, None)
+
+        assert code == 0, text
+        assert events == ["init", "connect", "query", "disconnect"]
+        assert _snapshot(world) == before
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
+from backend.errors import LLMConnectionError, LLMResponseError
 from backend.extraction_contract.models import (
     CONTRACT_MAJOR,
     CONTRACT_VERSION,
@@ -97,6 +98,83 @@ class LlamaHealthProbe:
         if response.status_code == 503:
             return HealthProbeResult(status="loading", llm_reachable=True)
         return HealthProbeResult(status="degraded", llm_reachable=False)
+
+
+class ContextSizeSource(Protocol):
+    """Contract for reading the configured llama-server's context window."""
+
+    async def ctx_size(self) -> int | None:
+        """Return llama-server's `n_ctx`, or None when it cannot be read."""
+        ...
+
+
+class LlamaPropsContextSize:
+    """Default ContextSizeSource: reads `n_ctx` from llama-server's `GET /props`.
+
+    The field path is `default_generation_settings.n_ctx`, the same one
+    `LlamaServerProvider.server_context_size` and
+    `backend.factories._probe_llama_server_n_ctx` parse.
+
+    Every fetch runs under one lock. On success the value is cached for the
+    life of the process: concurrent first calls queued on the lock find it
+    cached and make no request of their own, and every later `/v1/info`
+    call is served from the cache.
+
+    A failed read (transport error, non-2xx, a body without an int `n_ctx`)
+    is NOT cached: that call returns None. So a service that starts before
+    its llama-server has loaded reports the real value once llama-server is
+    up, rather than None forever. The cost is that under a failing `/props`
+    each caller waiting on the lock retries in turn: N concurrent calls make
+    N sequential requests, each bounded by `timeout`, so the last of them
+    can wait up to N * `timeout`.
+    """
+
+    def __init__(self, http_client: httpx.AsyncClient, base_url: str, timeout: float = 2.0) -> None:
+        self._client = http_client
+        self._base_url = base_url
+        self._timeout = timeout
+        self._cached: int | None = None
+        self._lock = asyncio.Lock()
+
+    async def ctx_size(self) -> int | None:
+        """Return the cached `n_ctx`, fetching it first if nothing is cached."""
+        if self._cached is not None:
+            return self._cached
+        async with self._lock:
+            if self._cached is not None:
+                return self._cached
+            try:
+                self._cached = await self._fetch()
+            except (LLMConnectionError, LLMResponseError) as exc:
+                logger.warning("llama-server context size unavailable; ctx_size=null: %s", exc)
+                return None
+            return self._cached
+
+    async def _fetch(self) -> int:
+        """GET `{base_url}/props` and return `default_generation_settings.n_ctx`.
+
+        Raises:
+            LLMConnectionError: The request failed at the transport level.
+            LLMResponseError: A non-2xx status, a non-JSON body, or a body
+                without an int at `default_generation_settings.n_ctx`.
+        """
+        url = f"{self._base_url}/props"
+        try:
+            response = await self._client.get(url, timeout=self._timeout)
+        except httpx.HTTPError as exc:
+            raise LLMConnectionError(f"GET {url} failed: {exc!r}") from exc
+        if not 200 <= response.status_code < 300:
+            raise LLMResponseError(f"GET {url} returned HTTP {response.status_code}")
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise LLMResponseError(f"GET {url} returned a non-JSON body") from exc
+        settings_block = data.get("default_generation_settings") if isinstance(data, dict) else None
+        n_ctx = settings_block.get("n_ctx") if isinstance(settings_block, dict) else None
+        # bool is an int subclass; a JSON true/false is not a context size.
+        if not isinstance(n_ctx, int) or isinstance(n_ctx, bool):
+            raise LLMResponseError(f"GET {url} carried no int at default_generation_settings.n_ctx")
+        return n_ctx
 
 
 class _IdempotencyCache:
@@ -183,10 +261,33 @@ def _error_response(code: ErrorCode, message: str) -> JSONResponse:
     )
 
 
+def _effective_constrained_mode(settings: ServiceSettings, adapter_name: str) -> str | None:
+    """The constrained-decoding mode the engine's LLM calls use.
+
+    Mirrors `ExtractionEngine._resolve_constrained_mode`, which reads
+    `settings.constrained_mode or adapter.default_constrained_mode`: a truthy
+    settings override wins, else the adapter's default. The test is truthiness,
+    not `is None`, because `compose.host.yml` forwards
+    `EXTRACTION_CONSTRAINED_MODE=${EXTRACTION_CONSTRAINED_MODE:-}`, so an unset
+    host variable arrives as an empty string and the engine falls through to
+    the adapter default. Adapter defaults are dataclass field defaults, so a
+    fresh `get_adapter(name)` carries the same value as the engine's instance.
+    None only when neither is known -- no override and an adapter name
+    `get_adapter` does not recognise.
+    """
+    if settings.constrained_mode:
+        return settings.constrained_mode
+    try:
+        return get_adapter(adapter_name).default_constrained_mode
+    except ValueError:
+        return None
+
+
 def create_app(
     settings: ServiceSettings,
     engine: ExtractionEngine,
     health_probe: HealthProbe,
+    ctx_size_source: ContextSizeSource,
 ) -> FastAPI:
     """Build the extraction service's FastAPI app from injected collaborators."""
     app = FastAPI(title="MIST extraction service")
@@ -313,7 +414,7 @@ def create_app(
 
     @app.get("/v1/info")
     async def info() -> InfoResponse:
-        """Report this service's configured identity and version stamps."""
+        """Report this service's identity, version stamps and serving config."""
         return InfoResponse(
             contract_version=CONTRACT_VERSION,
             extraction_version=EXTRACTION_VERSION,
@@ -322,6 +423,10 @@ def create_app(
             llama_cpp_build=settings.llama_cpp_build,
             adapter=engine.adapter_name,
             location_label=settings.location_label,
+            constrained_mode=_effective_constrained_mode(settings, engine.adapter_name),
+            reasoning_effort=settings.reasoning_effort,
+            temperature=settings.temperature,
+            ctx_size=await ctx_size_source.ctx_size(),
         )
 
     return app
@@ -337,5 +442,7 @@ def build_app_from_env() -> FastAPI:
         reasoning_budget_tokens=settings.reasoning_budget_tokens,
     )
     engine = ExtractionEngine(llm=llm, adapter=adapter, settings=settings)
-    health_probe = LlamaHealthProbe(http_client=httpx.AsyncClient(), base_url=settings.llm_base_url)
-    return create_app(settings, engine, health_probe)
+    http_client = httpx.AsyncClient()
+    health_probe = LlamaHealthProbe(http_client=http_client, base_url=settings.llm_base_url)
+    ctx_size_source = LlamaPropsContextSize(http_client=http_client, base_url=settings.llm_base_url)
+    return create_app(settings, engine, health_probe, ctx_size_source)

@@ -62,6 +62,41 @@ class TestGptOssAdapter:
 
         assert adapter.final_text(response) == '{"entities": []}'
 
+    @pytest.mark.parametrize(
+        "header",
+        [
+            # What gpt-oss-20b emitted on the extraction host (b11151, mode "none").
+            pytest.param("<|channel|>final <|constrain|>JSON<|message|>", id="constrain-JSON"),
+            # The Harmony guide's tool-call spelling of the same header.
+            pytest.param("<|channel|>final <|constrain|>json<|message|>", id="constrain-json"),
+            pytest.param("<|channel|>final<|constrain|>JSON<|message|>", id="constrain-no-space"),
+            pytest.param("<|channel|>final<|message|>", id="plain"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "end", [pytest.param("<|end|>", id="end"), pytest.param("<|return|>", id="return")]
+    )
+    def test_final_text_extracts_final_channel_under_each_header_form(self, header, end):
+        adapter = GptOssAdapter()
+        raw = (
+            "<|channel|>analysis<|message|>need the entity list<|end|>"
+            f'<|start|>assistant{header}{{"entities": []}}{end}'
+        )
+
+        assert adapter.final_text(LLMResponse(content=raw)) == '{"entities": []}'
+
+    def test_final_text_extracts_a_constrain_wrapped_final_with_no_end_marker(self):
+        adapter = GptOssAdapter()
+        raw = '<|channel|>final <|constrain|>JSON<|message|>{"scope": "unknown"}'
+
+        assert adapter.final_text(LLMResponse(content=raw)) == '{"scope": "unknown"}'
+
+    def test_final_text_leaves_an_analysis_only_transcript_unchanged(self):
+        adapter = GptOssAdapter()
+        raw = "<|channel|>analysis<|message|>still thinking<|end|>"
+
+        assert adapter.final_text(LLMResponse(content=raw)) == raw
+
     def test_default_constrained_mode_is_schema(self):
         # "none" makes llama.cpp b11151's peg parser reject gpt-oss's
         # `<|constrain|>JSON` Harmony wrapper (HTTP 500 on the scope call).

@@ -1,9 +1,12 @@
-"""T2b part A: the `extraction_status` push, `GET /extraction/status` and `/health`."""
+"""Extraction status: the `extraction_status` push, `GET /extraction/status`, `/health`,
+and the admin CLI's `status` command (`TestAdminStatusCli`).
+"""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import json
 import sqlite3
 from types import SimpleNamespace
@@ -11,9 +14,16 @@ from types import SimpleNamespace
 import pytest
 
 from backend import server
-from backend.extraction_backlog import telemetry
+from backend.extraction_backlog import admin, telemetry
 from backend.extraction_backlog.status import extraction_status, health_block
-from tests.unit.extraction_backlog.conftest import ONTOLOGY_VERSION, wait_until
+from backend.knowledge.version_stamps import EXTRACTION_VERSION as CODE_EXTRACTION_VERSION
+from backend.knowledge.version_stamps import ONTOLOGY_VERSION as CODE_ONTOLOGY_VERSION
+from tests.unit.extraction_backlog.conftest import (
+    EMBEDDING_MODEL,
+    ONTOLOGY_VERSION,
+    composed,
+    wait_until,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -213,6 +223,138 @@ class TestWebSocketPush:
         message = json.loads(captured.get_nowait())
         assert message["state"] == "unreachable"
         assert message["backlog_depth"] == 1
+
+
+def _matching_config(world):
+    """A backend config whose writer stamps equal the world's active epoch."""
+    from tests.mocks.config import build_test_config
+
+    config = build_test_config(embedding_model=EMBEDDING_MODEL)
+    config.model_hash = world.service.model_hash
+    config.extraction_version = world.service.extraction_version
+    config.ontology_version = ONTOLOGY_VERSION
+    return config
+
+
+def _admin_status(world, config) -> tuple[int, str]:
+    out = io.StringIO()
+    code = admin.main(["status"], store=world.store, out=out, knowledge_config=config)
+    return code, out.getvalue()
+
+
+class TestAdminStatusCli:
+    """`python -m backend.extraction_backlog.admin status`: the stamp lines."""
+
+    def test_it_prints_the_epoch_and_code_stamps_and_a_writer_stamp_match(self):
+        from tests.unit.extraction_backlog.conftest import _build_world
+
+        world = _build_world(with_deriver=False)
+        config = _matching_config(world)
+
+        code, text = _admin_status(world, config)
+
+        assert code == 0, text
+        assert (
+            f"epoch {world.epoch_id}: ontology_version={ONTOLOGY_VERSION} "
+            f"extraction_version={world.service.extraction_version} "
+            f"model_hash={composed(world.service.model_hash)}"
+        ) in text
+        assert (
+            f"code: ONTOLOGY_VERSION={CODE_ONTOLOGY_VERSION} "
+            f"EXTRACTION_VERSION={CODE_EXTRACTION_VERSION} "
+            f"configured model_hash={world.service.model_hash} (MIST_MODEL_HASH; composed "
+            f"{composed(world.service.model_hash)})"
+        ) in text
+        assert "writer stamps: match\n" in text
+        assert "MISMATCH" not in text
+
+    def test_a_different_model_hash_is_a_mismatch_naming_the_field(self):
+        from tests.unit.extraction_backlog.conftest import _build_world
+
+        world = _build_world(with_deriver=False)
+        config = _matching_config(world)
+        config.model_hash = "some-other-model"
+
+        code, text = _admin_status(world, config)
+
+        assert code == 0, text
+        assert "writer stamps: MISMATCH (model_hash)\n" in text
+        # The dispatcher guard's own reason follows, with both triples.
+        assert "nothing is applied or dispatched until they match" in text
+        assert "some-other-model" in text
+
+    def test_every_differing_field_is_named(self):
+        from tests.unit.extraction_backlog.conftest import _build_world
+
+        world = _build_world(with_deriver=False)
+        config = _matching_config(world)
+        config.ontology_version = "9.9.9"
+        config.extraction_version = "other-ev"
+        config.model_hash = "some-other-model"
+
+        _, text = _admin_status(world, config)
+
+        assert "writer stamps: MISMATCH (ontology_version, extraction_version, model_hash)" in text
+
+    def test_the_verdict_is_the_dispatcher_guards(self, monkeypatch):
+        # `status` does not compare the stamps itself: whatever the guard
+        # returns decides the line.
+        from backend.extraction_backlog.dispatcher import ExtractionDispatcher
+        from tests.unit.extraction_backlog.conftest import _build_world
+
+        world = _build_world(with_deriver=False)
+        monkeypatch.setattr(
+            ExtractionDispatcher, "_writer_stamp_mismatch", lambda self, epoch: "guard says no"
+        )
+
+        _, text = _admin_status(world, _matching_config(world))
+
+        assert "writer stamps: MISMATCH (see reason)\n  guard says no" in text
+
+    def test_an_open_cutover_prints_its_candidate_versions(self, ts):
+        from tests.unit.extraction_backlog.conftest import _build_world
+
+        world = _build_world(with_deriver=False)
+        store = world.store
+        store.begin_cutover(
+            ontology_version="1.5.0",
+            extraction_version="candidate-ev",
+            model_hash=composed("svc-model-2"),
+            bare_model_hash="svc-model-2",
+            source_epoch_id=world.epoch_id,
+            requested_at=ts(0),
+        )
+
+        code, text = _admin_status(world, _matching_config(world))
+
+        assert code == 0, text
+        assert (
+            "  candidate: ontology_version=1.5.0 extraction_version=candidate-ev "
+            f"model_hash={composed('svc-model-2')}"
+        ) in text
+        # Before promotion the writer stamps are still compared with the ACTIVE epoch.
+        assert "writer stamps: match" in text
+
+    def test_an_empty_ledger_exits_1(self):
+        from backend.event_store.store import EventStore
+        from backend.extraction_backlog.store import BacklogStore
+        from backend.knowledge.extraction_cache import ExtractionCache
+
+        event_store = EventStore(db_path=":memory:")
+        event_store.initialize()
+        cache = ExtractionCache(":memory:")
+        cache.initialize()
+        out = io.StringIO()
+
+        code = admin.main(
+            ["status"],
+            store=BacklogStore(event_store, cache),
+            out=out,
+            knowledge_config=SimpleNamespace(),
+        )
+
+        assert code == 1
+        assert "No epoch in the ledger" in out.getvalue()
 
 
 class TestHttp:

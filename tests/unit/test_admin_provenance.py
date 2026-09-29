@@ -23,14 +23,15 @@ def _make_connection(non_seed_count: int = 0) -> FakeNeo4jConnection:
     """Return a FakeNeo4jConnection pre-wired with query responses.
 
     The fake must return sensible values for:
-    - count_non_seed_entities (provenance != 'seed')
+    - the reset guard (`admin.RESET_GUARD_CYPHER`); what it counts is
+      evaluated in tests/unit/test_admin_reset_guard.py, not here
     - before-wipe counts for __Entity__ nodes and relationships
     - before-wipe count for __Provenance__ nodes (when include_derived=True)
     """
     return FakeNeo4jConnection(
         query_responses={
-            # count_non_seed_entities query
-            "coalesce(n.provenance": [{"count": non_seed_count}],
+            # reset guard query
+            admin.RESET_GUARD_CYPHER: [{"nodes": non_seed_count, "relationships": 0}],
             # before-wipe entity node count
             "MATCH (n:__Entity__) RETURN count(n)": [{"count": 3}],
             # before-wipe relationship count

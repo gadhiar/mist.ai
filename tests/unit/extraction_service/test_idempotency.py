@@ -230,10 +230,9 @@ class TestHealthProbeOrdering:
         assert len(fake_llama_state.chat_requests) == 2
 
     async def test_a_duplicate_of_an_in_flight_job_joins_it_while_the_model_loads(
-        self, client, fake_llama_state
+        self, client, fake_llama_state, blocked_chat
     ):
-        # Arrange: a job in flight.
-        fake_llama_state.delay_seconds = 0.1
+        # Arrange: a job in flight, held inside its first LLM call.
         fake_llama_state.chat_responses = [
             '{"scope": "unknown", "confidence": 0.0}',
             '{"entities": [], "relationships": []}',
@@ -241,11 +240,17 @@ class TestHealthProbeOrdering:
         body = make_extract_request(job_id="job-in-flight")
         first = asyncio.create_task(client.post("/v1/extract", json=body))
         while not fake_llama_state.chat_requests:
-            await asyncio.sleep(0.005)
+            await asyncio.sleep(0)
 
-        # Act: the health turns to loading; a duplicate arrives.
+        # Act: the health turns to loading; a duplicate arrives while the
+        # first run is still held. A duplicate that did not join would be
+        # refused with a 503 instead of waiting on the held run.
         fake_llama_state.health_status = 503
-        second = await client.post("/v1/extract", json=body)
+        second_task = asyncio.create_task(client.post("/v1/extract", json=body))
+        await _ticks(50)
+        assert not second_task.done()
+        blocked_chat.set()
+        second = await second_task
         first_response = await first
 
         # Assert
