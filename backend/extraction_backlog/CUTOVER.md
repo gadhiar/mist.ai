@@ -514,13 +514,20 @@ None of the `docker compose` forms below has been run from this branch
    unless given `--no-embeddings`; that writes only `embedding`, which the probe
    does not read. `--no-vault-bootstrap` keeps the reseed to the graph: the
    vault bootstrap runs after `cmd_seed` has already called
-   `connection.disconnect()`, and writes only `identity/mist.md` and
-   `users/<id>.md` (`users/user.md` for the seed's `user.md`) through
-   `VaultWriter` (`admin.bootstrap_vault_from_seed`), which neither reads nor
-   writes the graph or the event store (`grep -nE 'event_store|EventStore|neo4j|Neo4j'
-   backend/vault/writer.py` prints nothing), so it cannot change the probe or
-   the log-empty result and is not part of the cutover. [VERIFIED-IN-REPO:
-   `grep -nE 'connection.disconnect\(\)|no_vault_bootstrap' scripts/mist_admin.py`]
+   `connection.disconnect()`, and touches only the vault directory. It writes
+   the notes `identity/mist.md` and `users/<id>.md` (`users/user.md` for the
+   seed's `user.md`) through `VaultWriter` (`admin.bootstrap_vault_from_seed`);
+   before that, `VaultWriter.start` creates the vault subdirectories
+   (`sessions`, `identity`, `users`, `decisions`, `meta`) and, when the vault
+   has no `.git`, runs `git init` and an empty initial commit there, since
+   `git_auto_init` defaults to True (`MIST_VAULT_GIT_AUTO_INIT`):
+   `grep -nE '_ensure_directories_sync|_maybe_git_init|"commit"' backend/vault/writer.py`,
+   `grep -n git_auto_init backend/knowledge/config.py`. `VaultWriter` neither
+   reads nor writes the graph or the event store (`grep -nE
+   'event_store|EventStore|neo4j|Neo4j' backend/vault/writer.py` prints
+   nothing), so the bootstrap cannot change the graph, the event store, the
+   probe or the log-empty result, and is not part of the cutover.
+   [VERIFIED-IN-REPO: `grep -nE 'connection.disconnect\(\)|no_vault_bootstrap' scripts/mist_admin.py`]
 
 4. **Probe, read-only:**
 

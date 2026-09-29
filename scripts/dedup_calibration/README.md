@@ -55,16 +55,20 @@ re-embedding.
 ## What text is embedded
 
 - Probe side: the display name, as `EntityDeduplicator._find_existing` embeds it
-  (`deduplication.py:149-154`).
+  (`grep -n 'generate_embedding, display_name' backend/knowledge/curation/deduplication.py`).
 - Stored side, `extracted_vs_extracted`: the display name, as the extraction write path
-  stores it (`graph_writer.py:384-388`).
+  (`CurationGraphWriter._upsert_entity`) stores it
+  (`grep -n 'generate_embedding, display_name' backend/knowledge/curation/graph_writer.py`).
 - Stored side, `extracted_vs_seed`: `embedding_text_for(display_name, description, id)`
-  (`admin.py:319`, `:387`), which is the display name when the seed node has no
-  description. Datasets may add `b_description` to a seed-slice pair to model one that has.
+  (`_backfill_embeddings` and `_backfill_embeddings_for_seed`:
+  `grep -n 'embedding_text_for(' backend/knowledge/admin.py`), which is the display name
+  when the seed node has no description. Datasets may add `b_description` to a seed-slice
+  pair to model one that has.
 
 Two other builders write node embeddings and are not modelled here:
 `embedding_maintenance._build_embedding_text` (`"name entity_type description"`, job
-registered with `enabled=False` at `factories.py:995`) and `GraphStore._store_validated_node`
+registered with `enabled=False`: `grep -n 'name="embedding_maintenance"' backend/factories.py`)
+and `GraphStore._store_validated_node`
 (`"id entity_type description"`, reached from `graph_regenerator.py:439`). If either has run
 against the live graph, stored vectors there differ from what this tool measures.
 

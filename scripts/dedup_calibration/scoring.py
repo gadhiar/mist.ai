@@ -4,14 +4,17 @@ Which text is embedded, and where that was established:
 
 - Probe side (`a`): the entity's display name. `EntityDeduplicator._find_existing`
   embeds `display_name` for the tier-3 cosine probe
-  (`backend/knowledge/curation/deduplication.py:149-154`).
+  (`grep -n 'generate_embedding, display_name' backend/knowledge/curation/deduplication.py`).
 - Stored side, `extracted_vs_extracted`: the display name. The extraction
   write path stores `generate_embedding(display_name)` in
-  `CurationGraphWriter` (`backend/knowledge/curation/graph_writer.py:384-388`),
-  with `display_name = entity.get("name", entity_id)` at `graph_writer.py:375`.
+  `CurationGraphWriter._upsert_entity`, with
+  `display_name = entity.get("name", entity_id)`
+  (`grep -nE 'generate_embedding, display_name|display_name = entity.get'
+  backend/knowledge/curation/graph_writer.py`).
 - Stored side, `extracted_vs_seed`: `embedding_text_for(display_name,
-  description, node_id)`, the builder the seed embedding backfill uses
-  (`backend/knowledge/admin.py:319` and `:387`, defined in
+  description, node_id)`, the builder the seed embedding backfills
+  `_backfill_embeddings` and `_backfill_embeddings_for_seed` use
+  (`grep -n 'embedding_text_for(' backend/knowledge/admin.py`, defined in
   `backend/knowledge/embeddings/embedding_text.py:39-72`). With no
   description that is exactly the display name.
 

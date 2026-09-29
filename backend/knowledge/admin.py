@@ -711,16 +711,35 @@ def _extraction_stamped(var: str) -> str:
 # remove that lacks the seed applier's markers or carries an extraction
 # writer's. It reads markers only -- `provenance`, `seed_version` and the three
 # extraction stamps -- so it passes a seed element that a writer changed
-# WITHOUT stamping it: confidence decay and orphan archiving (`grep -n 'SET e\.'
-# backend/knowledge/curation/confidence_decay.py
-# backend/knowledge/curation/orphan_detector.py`), skill proficiency
-# (`grep -n 'SET e.proficiency' backend/knowledge/curation/skill_derivation.py`),
-# a reconciliation REINFORCE or CLOSE_TRANSACTION on a seed edge
-# (`grep -nE 'is ActionKind\.(CLOSE_TRANSACTION|REINFORCE):'
-# backend/knowledge/curation/reconciliation.py`), and an unstamped non-seed
-# element a reseed adopted (it gains `seed_version`). The comment above
-# `SEED_ONLY_PROBE_CYPHER` in backend/extraction_backlog/cutover.py lists the
-# same blind spots for the same three stamps.
+# WITHOUT stamping it:
+#   - confidence decay and orphan archiving, and `EmbeddingMaintenance`'s
+#     embedding writes (registered disabled: `grep -n embedding_maintenance
+#     backend/factories.py`): `grep -n 'SET e\.'
+#     backend/knowledge/curation/confidence_decay.py
+#     backend/knowledge/curation/orphan_detector.py
+#     backend/knowledge/curation/embedding_maintenance.py`;
+#   - skill proficiency: `grep -n 'SET e.proficiency'
+#     backend/knowledge/curation/skill_derivation.py`;
+#   - `CurationGraphWriter._upsert_entity`'s ON MATCH (confidence,
+#     display_name, description, updated_at; no stamp) when the statement
+#     carries no EXTRACTED_FROM clause; with one, the EXTRACTED_FROM edge
+#     lacks `seed_version` and is counted: `grep -n 'ON MATCH SET e.confidence'
+#     backend/knowledge/curation/graph_writer.py`;
+#   - reconciliation on a seed edge: the REINFORCE and CLOSE_TRANSACTION
+#     branches, and `_apply_structural`'s MERGE, which is keyed only on
+#     (source, type, target) and so can match a seed edge, whose ON MATCH sets
+#     confidence, evidence and updated_at with no stamp:
+#     `grep -nE 'is ActionKind\.(CLOSE_TRANSACTION|REINFORCE):|ON MATCH SET r.confidence'
+#     backend/knowledge/curation/reconciliation.py`;
+#   - an unstamped non-seed element a reseed adopted (it gains `seed_version`).
+# Against the list above `SEED_ONLY_PROBE_CYPHER` in
+# backend/extraction_backlog/cutover.py, entry by entry, the one difference is
+# `InternalKnowledgeDeriver._apply_operation`: that list has it, this one does
+# not, because it writes only `:__SelfModel__` nodes and MistIdentity edges
+# into that partition (`grep -n 'SELF_MODEL_LABEL}'
+# backend/knowledge/extraction/internal_derivation.py`; MistIdentity is a
+# SELF_MODEL_TYPES member in storage/partitions.py), which reset_graph never
+# deletes.
 #
 # Nodes: every `:__Entity__` node whose provenance is not 'seed' (the rule
 # before KG-125, kept so no graph it refused becomes resettable), or that has
@@ -1820,8 +1839,8 @@ def reset_graph(connection: GraphConnection, include_derived: bool = False) -> d
     touching one, that fails the marker checks: a node whose provenance is
     not 'seed', or a node or relationship with no `seed_version` or with an
     extraction stamp (`RESET_GUARD_CYPHER`). Markers only: an unstamped
-    write to a seed element (confidence decay, orphan archiving, skill
-    proficiency, a REINFORCE) passes, and is wiped; the comment above `RESET_GUARD_CYPHER`
+    write to a seed element (for example confidence decay, orphan archiving,
+    skill proficiency, a REINFORCE) passes, and is wiped; the comment above `RESET_GUARD_CYPHER`
     lists these with their greps.
 
     Raises:
