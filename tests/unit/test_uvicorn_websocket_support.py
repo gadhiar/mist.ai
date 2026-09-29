@@ -100,3 +100,68 @@ class TestRootRequirementsPinWebSocketSupport:
         )
         _extras, version = pins["websockets"]
         assert re.fullmatch(r"\d+(\.\d+)*", version), f"websockets pin {version!r} is not exact"
+
+
+# Members of uvicorn's `standard` extra that have open version ranges upstream.
+# Pinned to the versions read from the live backend image (MIS-177, i112) so a
+# rebuild cannot silently change the server stack. Static on purpose: these
+# checks parse the files and never compare against installed package versions.
+STANDARD_EXTRA_PINS = {
+    "httptools": "0.8.0",
+    "watchfiles": "1.3.0",
+    "uvloop": "0.22.1",
+}
+CHATTERBOX_PIN = "0.1.7"
+DOCKERFILE_PATH = REPO_ROOT / "docker" / "backend" / "Dockerfile"
+
+
+def _requirement_lines() -> list[str]:
+    """Non-comment, non-blank requirement lines with inline comments removed."""
+    lines = []
+    for line in REQUIREMENTS_PATH.read_text(encoding="utf-8").splitlines():
+        stripped = line.split(" #", 1)[0].strip()
+        if stripped and not stripped.startswith("#"):
+            lines.append(stripped)
+    return lines
+
+
+class TestStandardExtraMembersArePinned:
+    def test_standard_extra_members_are_pinned_to_live_versions(self) -> None:
+        pins = _pinned_requirements()
+
+        for name, expected in STANDARD_EXTRA_PINS.items():
+            assert name in pins, f"requirements.txt must pin `{name}=={expected}` exactly"
+            _extras, version = pins[name]
+            assert (
+                version == expected
+            ), f"{name} is pinned to {version!r}; the live backend image runs {expected}"
+
+    def test_uvloop_pin_carries_non_windows_marker(self) -> None:
+        uvloop_lines = [line for line in _requirement_lines() if line.lower().startswith("uvloop")]
+
+        assert len(uvloop_lines) == 1, "requirements.txt must contain exactly one uvloop line"
+        marker = re.sub(r"\s+", "", uvloop_lines[0].partition(";")[2])
+        assert marker == 'sys_platform!="win32"', (
+            "uvloop has no Windows wheels; its pin must end with "
+            f'`; sys_platform != "win32"`, got {uvloop_lines[0]!r}'
+        )
+
+
+class TestBackendDockerfilePinsChatterbox:
+    def test_chatterbox_tts_is_pinned_in_dockerfile(self) -> None:
+        text = DOCKERFILE_PATH.read_text(encoding="utf-8")
+
+        install_lines = [
+            line for line in text.splitlines() if re.search(r"pip install\b.*chatterbox-tts", line)
+        ]
+        assert install_lines, "docker/backend/Dockerfile must install chatterbox-tts"
+        for line in install_lines:
+            assert (
+                f"chatterbox-tts=={CHATTERBOX_PIN}" in line
+            ), f"chatterbox-tts must be pinned to =={CHATTERBOX_PIN} in the Dockerfile: {line!r}"
+
+    def test_stale_backend_requirements_file_is_gone(self) -> None:
+        assert not (REPO_ROOT / "backend" / "requirements.txt").exists(), (
+            "backend/requirements.txt was deleted (MIS-177, i111): the image installs the "
+            "root requirements.txt"
+        )
