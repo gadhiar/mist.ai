@@ -15,6 +15,10 @@ from backend.knowledge.storage.graph_executor import GraphExecutor
 
 logger = logging.getLogger(__name__)
 
+# Compared against Neo4j's vector.similarity.cosine, which returns (1 + cos) / 2,
+# so 0.92 here is a raw cosine of 0.84, not 0.92. To choose the value from data,
+# run `python -m scripts.dedup_calibration` (scripts/dedup_calibration/README.md):
+# it reports where labelled duplicate and distinct pairs fall on this scale.
 SIMILARITY_THRESHOLD = 0.92
 MAX_ALIASES = 20
 
