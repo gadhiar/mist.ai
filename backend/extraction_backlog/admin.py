@@ -11,6 +11,7 @@
     python -m backend.extraction_backlog.admin cutover promote --graph-swapped
     python -m backend.extraction_backlog.admin cutover promote --seed-only-graph
     python -m backend.extraction_backlog.admin cutover abandon
+    python -m backend.extraction_backlog.admin redispatch-check --event-id ID
 
 `status` reads the event store and extraction cache directly (it does not call
 the extraction service or need the backend running) and prints the active
@@ -54,6 +55,16 @@ or 4 (a non-vacuity or self-model gate failed), and records its report on the
 cutover either way. `cutover probe` exits 0 when the log is empty and the
 probe passes, 2 when either refuses, and 1 when the probe could not run (Neo4j
 unreachable, or any `GraphProbeError`), whatever the log check found.
+
+`redispatch-check --event-id ID` (FE-025) re-applies one applied turn from its
+cache row to the LIVE graph, with the backend stopped, and compares
+whole-graph fingerprints before and after; it writes no marker and no cache
+row (`redispatch.py` has the operator command and the details). Exit 0 the
+fingerprints are identical, 1 it could not run (Neo4j unreachable, the apply
+raised, or curation stage errors), 2 refused with nothing applied (no active
+epoch, no `applied` marker for the turn, no cache row under the active epoch,
+a skip row, writer stamps differ from the epoch, or the backend is not
+positively down), 3 the fingerprints differ.
 """
 
 from __future__ import annotations
@@ -493,6 +504,8 @@ def main(
     graph_probe: Callable | None = None,
     clock: Callable[[], datetime] | None = None,
     knowledge_config: KnowledgeConfig | None = None,
+    backend_probe: Callable | None = None,
+    redispatch_graph: Callable | None = None,
 ) -> int:
     """Run the CLI. `store`, `out` and the cutover dependencies are injectable for tests.
 
@@ -508,16 +521,23 @@ def main(
             it unconditionally. Defaults to the real read-only live-graph probe
             (`probe_live_graph_from_env`).
         clock: Wall clock (tz-aware) for the timestamps cutover rows record.
-        knowledge_config: For `status`, the configuration whose writer stamps
-            are compared with the active epoch; defaults to
-            `KnowledgeConfig.from_env()`, what a backend started from this
+        knowledge_config: For `status` and `redispatch-check`, the
+            configuration whose writer stamps are compared with the active
+            epoch (and, for `redispatch-check`, the graph it opens); defaults
+            to `KnowledgeConfig.from_env()`, what a backend started from this
             environment reads.
+        backend_probe: For `redispatch-check`, `() -> BackendProbe`; defaults
+            to `redispatch.probe_backend`, the live `GET /health` probe.
+        redispatch_graph: For `redispatch-check`, `() -> RedispatchGraph`,
+            called only after every refusal check passes; defaults to
+            `redispatch.open_live_graph_from_env(knowledge_config)`.
 
     Returns:
         Process exit code: 0 success, 1 no epoch, 2 refused or some requested
-        turn was not dead-lettered; `cutover rebuild` adds 1 and 4, and
-        `cutover probe` returns 1 when the probe could not run (see module
-        docstring).
+        turn was not dead-lettered; `cutover rebuild` adds 1 and 4,
+        `cutover probe` returns 1 when the probe could not run, and
+        `redispatch-check` returns 1 when it could not run and 3 when the
+        fingerprints differ (see module docstring).
     """
     parser = argparse.ArgumentParser(prog="python -m backend.extraction_backlog.admin")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -527,19 +547,31 @@ def main(
     )
     retry.add_argument("--event-id", default=None, help="retry only this turn")
     _add_cutover_parser(sub)
+    redispatch = sub.add_parser(
+        "redispatch-check",
+        help=(
+            "FE-025, backend stopped: re-apply one applied turn to the LIVE graph and compare "
+            "whole-graph fingerprints; exit 0 identical, 1 could not run, 2 refused, 3 differ"
+        ),
+    )
+    redispatch.add_argument("--event-id", required=True, help="the applied turn's event id")
     args = parser.parse_args(argv)
 
     stream = out if out is not None else sys.stdout
     backlog = store if store is not None else build_store_from_env()
     now_iso = (clock or (lambda: datetime.now(UTC)))().isoformat()
-    if args.command == "status":
-        if knowledge_config is None:
-            from backend.knowledge.config import KnowledgeConfig
+    if args.command in ("status", "redispatch-check") and knowledge_config is None:
+        from backend.knowledge.config import KnowledgeConfig
 
-            knowledge_config = KnowledgeConfig.from_env()
+        knowledge_config = KnowledgeConfig.from_env()
+    if args.command == "status":
         return _status(backlog, knowledge_config, stream)
     if args.command == "retry-dead-letters":
         return _retry(backlog, args.event_id, stream)
+    if args.command == "redispatch-check":
+        return _redispatch_check(
+            backlog, args.event_id, knowledge_config, backend_probe, redispatch_graph, stream
+        )
 
     command = args.cutover_command
     if command == "begin":
@@ -561,6 +593,36 @@ def main(
             return build_rebuild_deps_from_env(backlog, args.staging_uri, cutover)
 
     return _cutover_rebuild(backlog, args, rebuild_deps_factory, now_iso, stream)
+
+
+def _redispatch_check(
+    store: BacklogStore,
+    event_id: str,
+    config: KnowledgeConfig,
+    backend_probe: Callable | None,
+    redispatch_graph: Callable | None,
+    out: TextIO,
+) -> int:
+    """`redispatch-check`: see `redispatch.run_redispatch_check` for the exit codes."""
+    from backend.factories import writer_stamps_from_config
+
+    from .redispatch import open_live_graph_from_env, probe_backend, run_redispatch_check
+
+    def open_graph():
+        if redispatch_graph is not None:
+            return redispatch_graph()
+        return open_live_graph_from_env(config)
+
+    return asyncio.run(
+        run_redispatch_check(
+            event_id,
+            store=store,
+            writer_stamps=writer_stamps_from_config(config),
+            backend_probe=backend_probe if backend_probe is not None else probe_backend,
+            open_graph=open_graph,
+            out=out,
+        )
+    )
 
 
 if __name__ == "__main__":
