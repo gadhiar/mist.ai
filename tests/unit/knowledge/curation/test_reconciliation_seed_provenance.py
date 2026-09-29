@@ -12,8 +12,11 @@ ontology table against a seed prior and pin what the copy carries:
   `seed_origin_version` when the prior is itself a clamped copy;
 - NO `seed_version` parameter or SET in `_apply_append` (D1: that property
   means "written by the applier" to the wipe, the gates and the cutover
-  probe). A later reseed can still adopt the copy through the applier's
-  unkeyed `_MERGE_EDGE`; pre-existing, the D11 follow-up, not tested here;
+  probe). The applier's `_MERGE_EDGE` is not keyed on `seed_version` and
+  would adopt the copy, so since MIS-177 D1 the seed applier refuses a graph
+  holding one (the copy touches an `:__Entity__` node without
+  `seed_version`); that refusal is tested in
+  `tests/unit/knowledge/seed/test_seed_guard.py`, not here;
 - the extraction stamps, so the seed-only cutover probe still refuses it.
 
 And the negatives: a fresh assertion and a copy of an extraction row stay
@@ -327,9 +330,11 @@ class TestCopyOfACopy:
         _assert_seed_copy(params, origin="profile-v1")
 
     def test_seed_lineage_prefers_the_rows_own_seed_version(self):
-        # A row carrying both names its own version. Reachable: a reseed's
-        # unkeyed `_MERGE_EDGE` adopts a clamped copy and sets seed_version
-        # on it without removing seed_origin_version (the D11 follow-up).
+        # A row carrying both names its own version. Reachable on a graph
+        # reseeded before MIS-177 D1: the applier's `_MERGE_EDGE` adopted a
+        # clamped copy and set seed_version on it without removing
+        # seed_origin_version. The seed applier now refuses a graph holding
+        # a clamped copy before any write.
         row = BeliefRow(
             edge_ref="r",
             predicate="USES",

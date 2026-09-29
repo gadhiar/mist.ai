@@ -324,11 +324,13 @@ An empty log is also where `cutover rebuild` cannot run (its floors must be
 Neither the log nor the probe is evidence alone. The event log
 (`event_store.db`) has been reset before, and a reset log is empty whatever ran
 against the graph before the reset. The probe cannot see an unstamped SET on a
-seeded element, or an unstamped element a reseed adopted (6A.2). Taken together with a reseed of the live graph, done
+seeded element, or an unstamped `:__SelfModel__`-only element a reseed adopted
+(6A.2). Taken together with a reseed of the live graph, done
 AFTER the last log reset and with the backend stopped, they are:
 
 1. **The reseed erases every earlier write to a seed element, or leaves
-   something the probe counts, except on an unstamped element it adopts.**
+   something the probe counts, or refuses to run, except on an unstamped
+   `:__SelfModel__`-only element it adopts.**
    `python scripts/mist_admin.py seed --no-vault-bootstrap` (`cmd_seed` ->
    `reseed`; 6A.3 step 3 says why the flag) deletes every edge carrying the current `seed_version`, then every node carrying it that
    has no relationship left, then MERGEs both back from the seed source
@@ -341,27 +343,33 @@ AFTER the last log reset and with the backend stopped, they are:
 
    The re-created seed elements are not all new, though. The MERGEs match on
    the node id and on (subject, type, object), not on `seed_version`, so a
-   non-seed element that survived the wipe and matches a seed node or fact is
-   adopted: it gets `seed_version` and keeps its other properties (6A.2,
-   "adopted elements"). [VERIFIED-IN-REPO]
+   non-seed element that survived the wipe and matches a seed node or fact
+   would be adopted: it would get `seed_version` and keep its other
+   properties. Since MIS-177 D1 the reseed refuses, before its wipe, a graph
+   holding most such elements (6A.2, "adopted elements"); it can still adopt
+   an unstamped `:__SelfModel__`-only one. [VERIFIED-IN-REPO]
 
    No writer outside the seed applier and the staging seeder sets
    `seed_version` (`grep -rln seed_version backend/knowledge/curation
    backend/knowledge/extraction backend/chat` lists only
    `curation/reconciliation.py`, which reads it and never sets it; the
    reconciliation engine writes a clamped copy of a seed edge with
-   `seed_origin_version` plus extraction stamps, not `seed_version`, although
-   a later reseed can adopt that copy). [VERIFIED-IN-REPO] So an element
-   extraction created survives the wipe without `seed_version`, and so does
-   the relationship that kept a seed node alive, and the probe counts both
-   unless the re-apply adopted them. An adopted element with an extraction
-   stamp is still refused. An adopted UNSTAMPED element passes, carrying
-   whatever was written to it before the reseed.
+   `seed_origin_version` plus extraction stamps, not `seed_version`, and a
+   reseed refuses a graph holding that copy). [VERIFIED-IN-REPO] So an
+   element extraction created survives the wipe without `seed_version`, and
+   so does the relationship that kept a seed node alive, and the probe counts
+   both unless the re-apply adopted them. The reseed refuses to run over any
+   of them that touches an `:__Entity__` node or carries `extraction_version`,
+   `model_hash` or `provenance = 'extraction'`. An adopted element outside
+   those passes the probe if it is also unstamped, carrying whatever was
+   written to it before the reseed.
 
    So a reseeded graph that passes the probe carries no write from before the
-   reseed, except on an unstamped element the reseed adopted. That needs a
-   seed source defining the same node id or fact as an unstamped extraction
-   write. [UNVERIFIED: whether the current seed source does; it lives in
+   reseed, except on an unstamped `:__SelfModel__`-only element the reseed
+   adopted. That needs a seed source defining the same `:__SelfModel__` node
+   id, or a fact of the same type between the same two `:__SelfModel__`
+   nodes, as an unstamped extraction write.
+   [UNVERIFIED: whether the current seed source does; it lives in
    `mist-memory/seed/` (`load_seed_documents`), which is not in the
    repository]
 2. **The empty log shows nothing was extracted after the reseed.** Both
@@ -402,8 +410,8 @@ every node and edge it writes (`apply_seed_documents`, `_MERGE_EDGE`:
 Any node or edge an extraction writer CREATES, stamped or not (for example the
 unstamped KNOWS and HAS_CAPABILITY edges `SkillDerivationJob` MERGEs:
 `grep -nE 'MERGE \((u|m)\)-' backend/knowledge/curation/skill_derivation.py`),
-lacks `seed_version` when it is written, and the probe sees it until a reseed
-adopts it (below).
+lacks `seed_version` when it is written, and the probe sees it. A reseed
+refuses to run over most such elements and can adopt the rest (below).
 
 It cannot see an unstamped SET on an existing SEEDED element:
 
@@ -435,29 +443,45 @@ It cannot see an unstamped SET on an existing SEEDED element:
 - adopted elements. The seed applier's `_MERGE_NODE` MERGEs on the node id and
   `_MERGE_EDGE` on (subject, type, object); neither keys on `seed_version`
   (`grep -nE '"MERGE \((n|s)' backend/knowledge/seed/applier.py`). So a reseed
-  gives `seed_version`, and the seed's provenance, and for an edge its
+  would give `seed_version`, and the seed's provenance, and for an edge its
   `valid_from`, `valid_to`, `source_type` and `confidence`, to any non-seed
-  element that survived the wipe and matches a seed node or fact. It keeps
+  element that survived the wipe and matches a seed node or fact, keeping
   every property the seed does not set. [VERIFIED-IN-REPO]
-  - A stamped element stays visible. A clamped copy of a seed edge
-    (`ReconciliationEngine._apply_append`:
-    `grep -n 'r.seed_origin_version = ' backend/knowledge/curation/reconciliation.py`)
-    has the same type and endpoints as the seed edge it copies, so it matches
-    that seed fact while the fact is in the seed source. The reseed adopts it:
-    it resets `valid_to` to the seed fact's, so the retired belief reads as
-    current again, and sets provenance, `source_type` and `confidence` to the
-    seed values (which the copy already carries). The
-    copy keeps `ontology_version`, `extraction_version` and `model_hash`, so the
-    probe still refuses, and the next reseed's wipe deletes it. Known limit,
-    already in the base branch: the fix is the follow-up (D11) that makes
-    `seed` refuse a graph holding extraction writes.
-  - An UNSTAMPED element passes the probe once adopted, with anything written
-    to it before the reseed. Examples are the KNOWS and HAS_CAPABILITY edges
-    and the `user` node that `SkillDerivationJob` MERGEs without a stamp:
-    `grep -nE 'MERGE \((u|m)\)-|MERGE \(u:' backend/knowledge/curation/skill_derivation.py`.
-    This needs a seed source that defines the same node id, or an edge of the
-    same type between the same two nodes. [UNVERIFIED: whether the current
-    seed source (`mist-memory/seed/`, not in the repository) defines one]
+  - MIS-177 D1: `seed` (`reseed`, and `apply_seed_documents`) refuses, before
+    any write or wipe and with no override, a graph holding (a) anything the
+    graph-reset guard counts (`admin.RESET_GUARD_CYPHER`: an `:__Entity__`
+    node lacking `provenance = 'seed'` or `seed_version` or carrying an
+    extraction stamp, or a relationship touching an `:__Entity__` node
+    without `seed_version` or with a stamp), (b) any node or relationship, in
+    any partition, carrying `extraction_version` or `model_hash`, or (c) any
+    with `provenance = 'extraction'`:
+    `grep -nE '_assert_seed_target_holds_only_seed\(|^SEED_GUARD_STAMP_PROPERTIES' backend/knowledge/seed/applier.py`.
+    [UNIT-TESTED: `tests/unit/knowledge/seed/test_seed_guard.py`]
+    [UNVERIFIED: `tests/integration/knowledge/test_seed_guard_eval.py` has
+    not been run against Neo4j from this branch]
+  - A clamped copy of a seed edge (`ReconciliationEngine._apply_append`) has
+    the same type and endpoints as the seed edge it copies, so the reseed
+    would adopt it: reset `valid_to` to the seed fact's, so the retired
+    belief reads as current again, and let the next reseed's wipe delete it.
+    Its target is always an `:__Entity__` node and it has no `seed_version`
+    (`grep -nE 'MATCH \(t:__Entity__|r.seed_origin_version = ' backend/knowledge/curation/reconciliation.py`),
+    so (a) refuses the reseed. So do the KNOWS edge and the `user` node
+    `SkillDerivationJob` MERGEs without a stamp
+    (`grep -nE 'MERGE \(u:|MERGE \(u\)-' backend/knowledge/curation/skill_derivation.py`).
+  - An UNSTAMPED `:__SelfModel__`-only element is outside (a), (b) and (c),
+    so a reseed can still adopt it, and it then passes the probe with
+    anything written to it before the reseed. Examples are the HAS_CAPABILITY
+    edge `SkillDerivationJob` MERGEs and the edge Stage 9 MERGEs from
+    MistIdentity, neither with any property:
+    `grep -n 'MERGE (m)-\[:HAS_CAPABILITY\]' backend/knowledge/curation/skill_derivation.py`,
+    `grep -n 'MERGE (m)-\[:{rel_type}\]->(e)' backend/knowledge/extraction/internal_derivation.py`.
+    The nodes those two writers create carry `ontology_version` only, which
+    the probe refuses but the seed guard deliberately does not test (the
+    startup MistIdentity node carries it too; the comment above
+    `SEED_GUARD_STAMP_PROPERTIES` gives the greps). This needs a seed source
+    that defines the same node id, or an edge of the same type between the
+    same two nodes. [UNVERIFIED: whether the current seed source
+    (`mist-memory/seed/`, not in the repository) defines one]
 - curation-scheduler jobs, which need no logged turn:
   - `ConfidenceDecayJob` (`confidence`, and `status = 'archived'`, on active
     `:__Entity__` nodes of a decay-enabled `knowledge_domain`), `OrphanDetector`
@@ -510,7 +534,10 @@ None of the `docker compose` forms below has been run from this branch
        docker compose run --rm mist-backend python scripts/mist_admin.py seed --no-vault-bootstrap
 
    [VERIFIED-IN-REPO: `cmd_seed`, subcommand `seed`, in `scripts/mist_admin.py`;
-   it calls `reseed(..., allow_live=True)`] It then backfills seed embeddings
+   it calls `reseed(..., allow_live=True)`] If it refuses with
+   `SeedTargetNotSeedOnlyError` (6A.2, "adopted elements"), it has written
+   nothing and the precondition does not hold: do not continue on this path.
+   After a successful reseed it backfills seed embeddings
    unless given `--no-embeddings`; that writes only `embedding`, which the probe
    does not read. `--no-vault-bootstrap` keeps the reseed to the graph: the
    vault bootstrap runs after `cmd_seed` has already called
@@ -673,10 +700,11 @@ epoch stays in `epoch_mismatch`.
 - Seed-only promotion refuses any logged turn, of any session origin, including
   `test` and `seed` sessions that no extraction path would pick up. A log that
   holds turns goes through sections 4 to 6.
-- A reseed adopts a surviving non-seed element that matches a seed node or
-  fact (6A.2): a clamped seed copy is reopened (and still refused by the
-  probe), and an unstamped element then passes it. `seed` refusing a graph
-  that holds extraction writes is the follow-up (D11).
+- `seed` refuses a graph holding non-seed `:__Entity__` data, or any element
+  carrying `extraction_version`, `model_hash` or `provenance = 'extraction'`
+  (MIS-177 D1, 6A.2), but can still adopt an unstamped
+  `:__SelfModel__`-only element that matches a seed node or fact, which then
+  passes the probe.
 - The probe cannot see unstamped SETs on seeded elements, and the marker check
   cannot see in-process or legacy applies (section 6A.2 names the symbols and
   the greps). An empty log shows only that the log is empty now, not that it

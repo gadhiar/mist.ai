@@ -12,11 +12,21 @@ from pathlib import Path
 import pytest
 
 from backend.errors import SeedSourceError
-from backend.knowledge.seed.applier import apply_seed_documents
+from backend.knowledge.ontologies import ALL_NODE_TYPE_NAMES
+from backend.knowledge.seed.applier import apply_seed_documents, entity_type_labels_removed
 from backend.knowledge.seed.models import SeedDocument, SeedFact, SeedNode
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
 _NOW = "2026-07-31T00:00:00+00:00"
+
+
+def _removed_labels(query: str) -> list[str]:
+    """The labels a node write's `REMOVE n:A:B:...` clause names ([] if none)."""
+    _, sep, rest = query.partition("REMOVE n:")
+    if not sep:
+        return []
+    return rest.split(" ", 1)[0].split(":")
+
 
 # R1.4 Task 12 (addendum): apply_seed_documents now requires every fact's
 # subject/object to have a matching SeedNode -- the applier's own defense
@@ -554,7 +564,13 @@ class TestNodeDefinitionWrites:
             "description": "Default register is warm and engaged.",
         }
 
-    def test_sets_the_ontology_type_as_a_graph_label(self, fake_connection):
+    def test_entity_node_type_is_not_written_as_a_graph_label(self, fake_connection):
+        """MIS-177 D2 (replaces `test_sets_the_ontology_type_as_a_graph_label`,
+        which pinned the opposite): an `:__Entity__` node's type lives in the
+        `entity_type` property only. The write carries no `SET n:<Type>` and
+        REMOVEs every ontology type label, so a node the MERGE matched (one an
+        earlier seed labelled) ends with none either.
+        """
         docs = [
             _doc(
                 facts=[("slalom", "WORKS_ON", "mist-ai")],
@@ -569,8 +585,75 @@ class TestNodeDefinitionWrites:
 
         node_writes = [(q, p) for q, p in fake_connection.writes if not p.get("predicate")]
         by_id = {p["id"]: q for q, p in node_writes}
-        assert "SET n:Organization" in by_id["slalom"]
-        assert "SET n:Project" in by_id["mist-ai"]
+        for node_id in ("slalom", "mist-ai"):
+            query = by_id[node_id]
+            assert "SET n:" not in query, query
+            removed = _removed_labels(query)
+            assert set(removed) == set(ALL_NODE_TYPE_NAMES), removed
+        assert by_id["slalom"].index("ON MATCH SET") < by_id["slalom"].index("REMOVE n:")
+
+    def test_user_node_keeps_the_user_label_and_sheds_the_rest(self, fake_connection):
+        """`:User` is the one `:__Entity__` type label invariant (every writer of
+        the user node sets it). It is SET, and excluded from the REMOVE; every
+        other ontology type label is removed.
+        """
+        docs = [
+            _doc(
+                facts=[("user", "USES", "python")],
+                nodes=[
+                    SeedNode(id="user", type="User"),
+                    SeedNode(id="python", type="Technology"),
+                ],
+            )
+        ]
+
+        apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        node_writes = [(q, p) for q, p in fake_connection.writes if not p.get("predicate")]
+        query = {p["id"]: q for q, p in node_writes}["user"]
+        assert "SET n:User " in query
+        removed = _removed_labels(query)
+        assert "User" not in removed
+        assert set(removed) == set(ALL_NODE_TYPE_NAMES) - {"User"}
+        assert query.index("SET n:User ") < query.index("REMOVE n:")
+
+    def test_self_model_node_keeps_its_type_label_and_removes_nothing(self, fake_connection):
+        """`:__SelfModel__` nodes keep their type label (`:MistIdentity` is an
+        invariant: `ensure_mist_identity` MERGEs on it).
+        """
+        docs = [
+            _doc(
+                facts=[("mist-identity", "HAS_TRAIT", "trait-warm")],
+                partition=SELF_MODEL_LABEL,
+                nodes=[
+                    SeedNode(id="mist-identity", type="MistIdentity"),
+                    SeedNode(id="trait-warm", type="MistTrait"),
+                ],
+            )
+        ]
+
+        apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        node_writes = [(q, p) for q, p in fake_connection.writes if not p.get("predicate")]
+        by_id = {p["id"]: q for q, p in node_writes}
+        assert "SET n:MistIdentity " in by_id["mist-identity"]
+        assert "SET n:MistTrait " in by_id["trait-warm"]
+        for query in by_id.values():
+            assert f"MERGE (n:{SELF_MODEL_LABEL} {{id: $id}})" in query
+            assert "REMOVE" not in query, query
+
+    def test_remove_list_comes_from_the_ontology_not_the_source(self, monkeypatch):
+        """The REMOVE is built from `ALL_NODE_TYPE_NAMES`, whatever the node's
+        authored type; and an ontology name that is not a plain identifier is
+        refused rather than interpolated.
+        """
+        assert set(entity_type_labels_removed(None)) == set(ALL_NODE_TYPE_NAMES)
+        monkeypatch.setattr(
+            "backend.knowledge.seed.applier.ALL_NODE_TYPE_NAMES",
+            ["Concept", "Bad`) DETACH DELETE n //"],
+        )
+        with pytest.raises(ValueError, match="plain identifier"):
+            entity_type_labels_removed(None)
 
     def test_properties_are_merged_not_set_field_by_field(self, fake_connection):
         """`n += $properties` (admin.py's established shape) is what makes
@@ -603,11 +686,10 @@ class TestNodeDefinitionWrites:
             assert "n.created_at = $now" in on_create
             assert "n.created_at" not in rest
 
-    def test_entity_type_property_matches_the_interpolated_label(self, fake_connection):
-        """`entity_type` is stored as a PROPERTY in addition to the graph
-        LABEL (`SET n:{type}`) -- mirrors admin.py's `_seed_internal_nodes`
-        (`merge_params = {"entity_type": label, ...}`), since some readers
-        (e.g. `count_nodes_by_type`) query the property, not `labels(n)`.
+    def test_entity_type_property_matches_the_authored_type(self, fake_connection):
+        """`entity_type` is the node's type (MIS-177 D2): every type reader
+        (e.g. `count_nodes_by_type`) queries the property, not `labels(n)`,
+        and an `:__Entity__` non-User node carries no type label at all.
         """
         docs = [
             _doc(
