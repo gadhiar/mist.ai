@@ -123,9 +123,7 @@ def test_pass_rate_rows_from_fixture_arm_match_wilson_of_pass_count():
 
 def test_pass_rate_row_inherits_incomplete_coverage_from_score_row():
     ts = _test_scores()
-    score_row = _score_row(
-        ts, n_expected=10, complete=False, note="incomplete coverage: 4/10"
-    )
+    score_row = _score_row(ts, n_expected=10, complete=False, note="incomplete coverage: 4/10")
     row = analyse.compute_harness_pass_rates({"t": score_row}, {"t": ts}, STATS_CFG)["t"]
     assert row.complete is False
     assert row.note == "incomplete coverage: 4/10"
