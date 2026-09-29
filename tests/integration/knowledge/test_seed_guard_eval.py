@@ -136,8 +136,7 @@ def eval_connection():
 
 def _snapshot(conn) -> tuple[list, list]:
     nodes = conn.execute_query(
-        "MATCH (n) RETURN n.id AS id, labels(n) AS labels, properties(n) AS props "
-        "ORDER BY id",
+        "MATCH (n) RETURN n.id AS id, labels(n) AS labels, properties(n) AS props ORDER BY id",
         {},
     )
     relationships = conn.execute_query(
