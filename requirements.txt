@@ -6,8 +6,21 @@ httpx>=0.27  # Async HTTP client for health checks
 # Web server
 # backend/server.py imports fastapi and uvicorn directly. The image previously
 # got them only transitively through chatterbox-tts, with no explicit pin here.
+#
+# uvicorn's WebSocket support is optional. In uvicorn 0.46.0 the metadata lists
+# `websockets>=10.4` only under the `standard` extra, and
+# uvicorn/protocols/websockets/auto.py sets AutoWebSocketsProtocol to None when
+# neither `websockets` nor `wsproto` is importable. An image built that way
+# logged "No supported WebSocket library detected" and served 404 for GET /ws
+# (2026-09-27 backend build, MIS-176). The [standard] extra therefore stays on
+# the uvicorn pin. `websockets` is pinned explicitly on top of the extra, whose
+# range is open ended, to the version found installed next to uvicorn 0.46.0
+# in the mist.ai worker image (`pip list`). The reason it was absent from the
+# 2026-09-27 image is not established here.
+# tests/unit/test_uvicorn_websocket_support.py guards both lines.
 fastapi==0.136.1
-uvicorn==0.46.0
+uvicorn[standard]==0.46.0
+websockets==16.0
 
 # Knowledge Graph
 networkx==3.2.1
