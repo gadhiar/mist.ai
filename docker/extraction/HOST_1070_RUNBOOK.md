@@ -290,7 +290,10 @@ port 8090. The llama-server is reachable only inside the compose network.
 
   `/v1/info` must report `extraction_version`, `model_hash` (your
   `EXTRACTION_MODEL_HASH`), `llama_cpp_build` `b11151` and `location_label`
-  `host-1070`.
+  `host-1070`. A service built from contract 1.1.0 or later also reports its
+  serving config: `constrained_mode` (`schema` unless `.env` overrides it),
+  `reasoning_effort`, `temperature`, and `ctx_size` (llama-server's `n_ctx`,
+  read from its `/props`; null if that read failed).
 - On the MIST machine, set `MIST_EXTRACTION_SERVICE_URL=http://<TS_HOSTNAME>:8090`
   for the backend and restart it. **Verified reachable:** the lead confirmed
   `mist-extraction-gtx1070:8090/v1/health` and the tailnet IP's
@@ -339,3 +342,26 @@ on the backend.
 Record in the PR or the vault note: driver version, first and second start times,
 the ncmoe sweep and the chosen value, decode and prompt tokens/s, the tailnet
 hostname, and the WoL MAC and tool.
+
+10. Redeploying after a code change
+-----------------------------------
+
+The service image bakes the backend code in when it is built
+(`docker/extraction/Dockerfile`: `COPY backend/ /app/backend/`), and
+`compose.host.yml` mounts no source directory over it. A change anywhere under
+`backend/` -- `backend/extraction_service/` and `backend/extraction_contract/`
+included -- therefore needs a rebuilt image. **A plain `up -d` is a silent no-op
+for code changes:** it does not rebuild, so the container keeps running the old
+image and nothing reports an error. On the host, after checking out the new
+commit, rebuild and then recreate:
+
+    docker compose -f docker/extraction/compose.host.yml build
+    docker compose -f docker/extraction/compose.host.yml up -d --force-recreate
+
+Then confirm the new code is live from the MIST machine:
+
+    curl -s http://<TS_HOSTNAME>:8090/v1/info
+
+A service built from contract 1.1.0 or later reports `contract_version` `1.1.0`
+and the serving config fields listed in step 6. A response without them means
+the old image is still running.

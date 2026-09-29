@@ -723,6 +723,21 @@ defaults to 960, above one job's worst case (scope call plus two extraction atte
 any client timeout the run waits `--drain-s` (default 120) before the next request so the
 abandoned job does not overlap the next one on the single GPU.
 
+The preflight prints the serving config `/v1/info` reports (contract 1.1.0): `constrained_mode`,
+`reasoning_effort`, `temperature` and `ctx_size`, and the summary records them under
+`serving_config` (with `serving_config_missing` listing any the service did not report). A
+pre-1.1.0 server reports none of them; each missing field gets its own `[WARN]` line and the run
+continues. `ctx_size` is also null from a 1.1.0 server that could not read llama-server's
+`/props`.
+
+**A rerun at temperature 0 measures determinism, not variance.** The service's default
+`temperature` is 0.0, every probe is the same request on every run, and the recorded clock is
+pinned, so rerunning the gauntlet against the same serving config checks whether the stack is
+deterministic. Matching reruns are the expected outcome; they are not independent samples and they
+do not narrow the Wilson or bootstrap intervals, which are computed across the probes of one run.
+Tighter confidence intervals need more probes in the gold corpus, not more reruns. Compare runs
+only when their `serving_config` blocks match.
+
 ## Known gaps / next steps
 
 - `run_host.py`'s and `analyse.py`'s exact CLI flags (line ~1700 / ~1307 in
