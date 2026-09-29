@@ -33,8 +33,9 @@ SEED_CONFIDENCE = 1.0
 # descriptive properties, they are the applier's own bookkeeping, and an
 # authored value under one of these names is a bug, not a preference: see
 # `_no_applier_owned_extras` below. `provenance` specifically: an authored
-# `provenance: extraction` would make `admin.count_non_seed_entities` count a
-# seed node as extraction-derived.
+# `provenance: extraction` would make the graph-reset guard
+# (`admin.RESET_GUARD_CYPHER`, which counts a node whose provenance is not
+# 'seed') count a seed node as extraction-derived.
 _APPLIER_OWNED_NODE_PROPERTIES = frozenset(
     {"entity_type", "seed_version", "provenance", "updated_at", "created_at"}
 )

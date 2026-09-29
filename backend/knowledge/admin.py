@@ -337,15 +337,22 @@ def _backfill_embeddings_for_seed(
     because:
 
     1. `reseed()`'s wipe-then-apply cycle (Task 5) deletes every
-       `seed_version`-stamped node once its edges are wiped, then recreates
-       it via `MERGE ... ON CREATE SET n.created_at = $now` -- which sets
-       only `created_at`/`seed_version`/`updated_at`. `provenance` (and
-       `display_name`/`description`, if the node was previously touched by
-       the retired `apply_seed`) do NOT survive a delete+recreate; there is
-       no property memory across a Neo4j node deletion. `seed_version` DOES
-       survive, because it is re-stamped by the very `reseed()` call this
-       function runs after -- it is the one predicate proven to hold on
-       every re-seed, first run or tenth.
+       `seed_version`-stamped node left without a relationship
+       (`_WIPE_NODES` in `seed/applier.py`), then recreates it via
+       `_MERGE_NODE` (`ON CREATE SET n.created_at = $now, n += $properties`).
+       That `properties` map carries the node's authored `SeedNode`
+       properties plus `entity_type`, `seed_version`, `provenance='seed'`
+       (KG-125) and `updated_at` (`apply_seed_documents`, the `properties =`
+       dict in `seed/applier.py`), so both `seed_version` and `provenance`
+       hold on every recreated node, in both partitions. What does NOT come
+       back is `embedding`: the applier never writes it (`grep -n embedding
+       backend/knowledge/seed/applier.py` -> a comment only), and a Neo4j
+       node deletion keeps no properties. `seed_version = $seed_version` is
+       the narrower of the two predicates: it names exactly the nodes the
+       apply this function runs after has just stamped, where
+       `provenance = 'seed'` also holds on a seed node of any other seed
+       version and on a node the retired `apply_seed` wrote
+       (`SEED_METADATA_FIELDS` includes `provenance`).
     2. The self-model partition (`:__SelfModel__`) is never also
        `:__Entity__` (Task 4's partition-routing fix), so
        `_backfill_embeddings`'s `MATCH (n:__Entity__)` structurally cannot
@@ -359,8 +366,7 @@ def _backfill_embeddings_for_seed(
 
     Uses `display_name + description` as the embedded text, same as
     `_backfill_embeddings`; falls back to bare `id` when neither is present
-    (e.g. a node recreated fresh by `reseed` after losing those properties
-    in the delete+recreate above -- lower-quality embedding text, but a
+    (a `SeedNode` that authors neither -- lower-quality embedding text, but a
     real one, not a missing one).
 
     Args:
@@ -688,19 +694,85 @@ def count_provenance(connection: GraphConnection) -> dict[str, int]:
     return {row["provenance"]: row["count"] for row in rows}
 
 
-def count_non_seed_entities(connection: GraphConnection) -> int:
-    """Return count of __Entity__ nodes whose provenance is NOT 'seed'.
+# The extraction stamps: the three properties the seed-only cutover probe
+# (`SEED_ONLY_PROBE_CYPHER` in backend/extraction_backlog/cutover.py) tests
+# non-null to find an element an extraction writer touched. Named here rather
+# than imported, so backend.knowledge does not depend on
+# backend.extraction_backlog.
+_EXTRACTION_STAMP_PROPERTIES = ("ontology_version", "extraction_version", "model_hash")
 
-    Used by graph-reset safety guard to refuse wiping derived data unless
-    --include-derived is explicitly passed.
+
+def _extraction_stamped(var: str) -> str:
+    """Cypher: `var` carries at least one extraction stamp."""
+    return "(" + " OR ".join(f"{var}.{p} IS NOT NULL" for p in _EXTRACTION_STAMP_PROPERTIES) + ")"
+
+
+# The reset guard: every element `MATCH (n:__Entity__) DETACH DELETE n` would
+# remove that is not purely seed-applier-owned.
+#
+# Nodes: every `:__Entity__` node whose provenance is not 'seed' (the rule
+# before KG-125, kept so no graph it refused becomes resettable), or that has
+# no `seed_version`, or that carries an extraction stamp.
+#
+# Relationships: every relationship with at least one `:__Entity__` endpoint
+# (exactly those the DETACH DELETE removes; the directed pattern matches each
+# relationship once, an Entity-Entity one included) that has no
+# `seed_version` or carries an extraction stamp. KG-125 gave seed nodes
+# `provenance='seed'` (the `properties =` dict in seed/applier.py), so a node
+# test alone passes a graph of seed nodes joined by extraction edges, or one
+# holding a clamped copy of a seed edge (`provenance='seed'`,
+# `seed_origin_version`, no `seed_version`, extraction stamps:
+# `grep -n 'r.seed_origin_version = '
+# backend/knowledge/curation/reconciliation.py`).
+#
+# ONE read-only statement. `MATCH ... WITH count(n)` yields one row even on a
+# graph with no `:__Entity__` node, and the OPTIONAL MATCH keeps that row when
+# no relationship qualifies (`count(r)` then counts no NULL).
+RESET_GUARD_CYPHER = (
+    "MATCH (n:__Entity__) "
+    "WHERE coalesce(n.provenance, '') <> 'seed' "
+    "OR n.seed_version IS NULL "
+    f"OR {_extraction_stamped('n')} "
+    "WITH count(n) AS nodes "
+    "OPTIONAL MATCH (s)-[r]->(t) "
+    "WHERE (s:__Entity__ OR t:__Entity__) "
+    f"AND (r.seed_version IS NULL OR {_extraction_stamped('r')}) "
+    "RETURN nodes, count(r) AS relationships"
+)
+
+
+def count_reset_guard_elements(connection: GraphConnection) -> tuple[int, int]:
+    """Return (nodes, relationships) a no-flag `reset_graph` must not delete.
+
+    See `RESET_GUARD_CYPHER` for what counts. Fails closed: a missing row or
+    column raises rather than reading as zero.
+
+    Raises:
+        Neo4jQueryError: The query returned no row, or a row without the
+            `nodes` / `relationships` columns.
     """
-    query = """
-    MATCH (n:__Entity__)
-    WHERE coalesce(n.provenance, '') <> 'seed'
-    RETURN count(n) AS count
+    rows = connection.execute_query(RESET_GUARD_CYPHER)
+    if not rows:
+        raise Neo4jQueryError("reset guard query returned no row")
+    row = rows[0]
+    try:
+        return int(row["nodes"]), int(row["relationships"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise Neo4jQueryError(f"reset guard query returned an unexpected row: {row!r}") from exc
+
+
+def count_non_seed_entities(connection: GraphConnection) -> int:
+    """Return how many nodes and relationships block a reset without --include-derived.
+
+    The sum of `count_reset_guard_elements`: `:__Entity__` nodes and the
+    relationships touching them that are not purely seed-applier-owned (see
+    `RESET_GUARD_CYPHER`). Used by the graph-reset safety guard
+    (`reset_graph`, `scripts/mist_admin.py` `cmd_graph_reset`) to refuse
+    wiping derived data unless --include-derived is explicitly passed. The
+    name predates relationships being counted.
     """
-    result = connection.execute_query(query)
-    return result[0]["count"] if result else 0
+    nodes, relationships = count_reset_guard_elements(connection)
+    return nodes + relationships
 
 
 def provenance_counts_by_type(connection: GraphConnection) -> list[dict[str, Any]]:
@@ -1730,13 +1802,22 @@ def reset_graph(connection: GraphConnection, include_derived: bool = False) -> d
     survive the reset — this preserves the "keep seed, wipe conversation"
     pattern used during iterative gauntlet runs.
 
-    Safety: caller MUST verify non-seed entity count before calling with
-    include_derived=False; this function itself applies the guard and raises.
+    Safety: without include_derived this function refuses (raises, deletes
+    nothing) when the graph holds any `:__Entity__` node, or any relationship
+    touching one, that is not purely seed-applier-owned: a node whose
+    provenance is not 'seed', or a node or relationship with no
+    `seed_version` or with an extraction stamp (`RESET_GUARD_CYPHER`).
+
+    Raises:
+        Neo4jQueryError: Such nodes or relationships exist and include_derived
+            is False, or the guard query failed.
     """
-    non_seed = count_non_seed_entities(connection)
-    if non_seed > 0 and not include_derived:
+    guarded_nodes, guarded_relationships = count_reset_guard_elements(connection)
+    if guarded_nodes + guarded_relationships > 0 and not include_derived:
         raise Neo4jQueryError(
-            f"Refusing to reset: {non_seed} non-seed entities present. "
+            f"Refusing to reset: {guarded_nodes} non-seed nodes and "
+            f"{guarded_relationships} non-seed relationships present (no seed_version, an "
+            "extraction stamp, or node provenance other than 'seed'). "
             "Pass include_derived=True to proceed."
         )
     before_nodes = connection.execute_query("MATCH (n:__Entity__) RETURN count(n) AS count")[0][

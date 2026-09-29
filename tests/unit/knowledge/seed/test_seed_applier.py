@@ -187,9 +187,10 @@ class TestSeedProvenance:
     Every seed edge is provenance='seed', source_type='stated',
     confidence=1.0, still stamped seed_version, and carries NO extraction
     stamp (the seed-only cutover probe refuses any element with one). Every
-    seed node is provenance='seed', which `admin.count_non_seed_entities`
-    keys on. Pinned on BOTH the params and the query text: a fake records
-    params whether or not the query uses them.
+    seed node is provenance='seed', one of the conditions the graph-reset
+    guard (`admin.RESET_GUARD_CYPHER`) needs before it passes a node. Pinned
+    on BOTH the params and the query text: a fake records params whether or
+    not the query uses them.
     """
 
     def _edge_write(self, fake_connection) -> tuple[str, dict]:
