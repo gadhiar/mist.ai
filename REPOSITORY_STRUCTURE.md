@@ -161,7 +161,7 @@ Almost every ADR is in the vault, not in-repo. This section previously listed `a
 - Persona injection (MistIdentity, Cluster 3)
 
 ### 3. Voice Pipeline
-- VAD (Silero) -> STT (Whisper) -> LLM (Gemma 4 E4B via llama-server) -> TTS (Chatterbox Turbo)
+- VAD (Silero) -> STT (Whisper) -> LLM (Gemma 4 E4B via llama-server) -> TTS (Chatterbox)
 - Streaming parallelism (~4-5s TTFA)
 - Binary WebSocket audio protocol (MIST 16-byte frame header)
 - Interrupt fade-out, RMS normalization
