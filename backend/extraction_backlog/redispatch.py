@@ -66,8 +66,12 @@ THE FINGERPRINT
 ---------------
 `fetch_graph_fingerprint` reads every node (labels, all properties) and every
 relationship (type, endpoints, all properties) through `GraphExecutor`. Each
-element becomes canonical JSON (sorted keys, list order kept) with only
-`updated_at` removed (`EXCLUDED_PROPERTIES`), and is filed under a stable key:
+element becomes canonical JSON (sorted keys, list order kept) with two
+exclusions and no others: `updated_at` removed from every element
+(`EXCLUDED_PROPERTIES`), and `derived_at` removed from EXTRACTED_FROM
+relationships only (`EXCLUDED_RELATIONSHIP_PROPERTIES`, below). `derived_at`
+on a node or on a relationship of any other type is still compared. Each
+element is filed under a stable key:
 a node by its `id` property; a relationship by its endpoints' ids, its type,
 and its `version_key` / `valid_from` / `valid_to` where present. An element
 with no `id` is keyed by its labels. Elements that share a key are kept as a
@@ -75,19 +79,26 @@ sorted multiset, so a key collision is compared, not lost. The digest is the
 SHA-256 of the sorted key/body lines; the order the driver returns rows in
 cannot change it. Neo4j's `elementId` is never used.
 
-WHAT A RE-APPLY IS KNOWN TO CHANGE (found by reading, not excluded here)
-------------------------------------------------------------------------
-- `derived_at` on every EXTRACTED_FROM edge the turn's entities write:
-  `CurationGraphWriter._extracted_from_clause` sets `r.derived_at = $now` on
-  ON MATCH as well as ON CREATE, and `write()` takes `now` from
-  `datetime.now(UTC)`. A wall-clock audit field (`canonical_serialize.
-  AUDIT_FIELDS` excludes it), but this check does not, so any turn with at
-  least one entity exits 3 on it until that is decided.
-- `source_utterance_id` on those EXTRACTED_FROM edges is last-writer-wins
-  (set on ON MATCH). Re-applying a turn that is not the latest turn of its
-  session to extract an entity rewrites it back to this turn's event id, and
-  the `_upsert_entity` replay guard, which keys on it, then no longer
-  suppresses the confidence reinforce. Choose the most recently applied turn.
+WHAT A RE-APPLY IS KNOWN TO CHANGE (found by reading)
+----------------------------------------------------
+- Excluded: `derived_at` on every EXTRACTED_FROM edge the turn's entities
+  write. `CurationGraphWriter._extracted_from_clause` sets `r.derived_at =
+  $now` on ON MATCH as well as ON CREATE (ON MATCH also sets `r.updated_at`),
+  and `write()` takes `now` from `datetime.now(UTC)`
+  (`grep -n 'derived_at\|datetime.now' backend/knowledge/curation/graph_writer.py`),
+  so without the exclusion every turn with at least one entity exited 3 on
+  it. It is a wall-clock audit field (`canonical_serialize.AUDIT_FIELDS`
+  lists it). That clause is the only `derived_at` writer in
+  `backend/knowledge` (`grep -rn "derived_at = " backend/knowledge` ->
+  graph_writer.py only), so the exclusion is scoped to EXTRACTED_FROM rather
+  than made global: a `derived_at` change on any other element is not one
+  this reading explains, and is reported.
+- Not excluded: `source_utterance_id` on those EXTRACTED_FROM edges is
+  last-writer-wins (set on ON MATCH). Re-applying a turn that is not the
+  latest turn of its session to extract an entity rewrites it back to this
+  turn's event id, and the `_upsert_entity` replay guard, which keys on it,
+  then no longer suppresses the confidence reinforce. Choose the most
+  recently applied turn.
 """
 
 from __future__ import annotations
@@ -99,7 +110,7 @@ import socket
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import TYPE_CHECKING, Any, TextIO
 
 from neo4j.exceptions import DriverError, Neo4jError
@@ -122,9 +133,18 @@ EXIT_CANNOT_RUN = 1
 EXIT_REFUSED = 2
 EXIT_DIFFERS = 3
 
-# The only property the fingerprint ignores. Anything else a re-apply changes
-# is a finding (see the module docstring), not something to filter out here.
+# The only property the fingerprint ignores on every element. Anything else a
+# re-apply changes is a finding (see the module docstring), not something to
+# filter out here, except the per-type exclusions below.
 EXCLUDED_PROPERTIES: frozenset[str] = frozenset({"updated_at"})
+
+# Properties ignored on a relationship of one type only, keyed by type. The
+# EXTRACTED_FROM `derived_at` is rewritten from the wall clock on every
+# re-apply (module docstring, WHAT A RE-APPLY IS KNOWN TO CHANGE); on a node
+# or on any other relationship type it is still compared.
+EXCLUDED_RELATIONSHIP_PROPERTIES: Mapping[str, frozenset[str]] = MappingProxyType(
+    {"EXTRACTED_FROM": frozenset({"derived_at"})}
+)
 
 DEFAULT_DIFF_LIMIT = 20
 BACKEND_PROBE_TIMEOUT_S = 3.0
@@ -261,8 +281,14 @@ def canonical_json(value: Any) -> str:
     )
 
 
-def _without_excluded(properties: Mapping[str, Any] | None) -> dict[str, Any]:
-    return {k: v for k, v in (properties or {}).items() if k not in EXCLUDED_PROPERTIES}
+def _without_excluded(
+    properties: Mapping[str, Any] | None, also: frozenset[str] = frozenset()
+) -> dict[str, Any]:
+    return {
+        k: v
+        for k, v in (properties or {}).items()
+        if k not in EXCLUDED_PROPERTIES and k not in also
+    }
 
 
 def _endpoint_key(node_id: Any, labels: Iterable[str] | None) -> str:
@@ -301,12 +327,14 @@ def _node_body(row: Mapping[str, Any]) -> str:
 
 
 def _relationship_body(row: Mapping[str, Any]) -> str:
+    rel_type = row.get("type")
+    also = EXCLUDED_RELATIONSHIP_PROPERTIES.get(rel_type, frozenset())
     return canonical_json(
         {
-            "type": row.get("type"),
+            "type": rel_type,
             "start": _endpoint_key(row.get("start_id"), row.get("start_labels")),
             "end": _endpoint_key(row.get("end_id"), row.get("end_labels")),
-            "properties": _without_excluded(row.get("properties")),
+            "properties": _without_excluded(row.get("properties"), also),
         }
     )
 

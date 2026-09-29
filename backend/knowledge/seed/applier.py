@@ -235,9 +235,12 @@ def apply_seed_documents(
         # create-only guarantee on every future ON MATCH re-seed, not merely
         # losing a values comparison on write.
         #
-        # `provenance` (KG-125): a seed node is seed-authored, which is what
-        # `admin.count_non_seed_entities` (`coalesce(n.provenance,'') <>
-        # 'seed'`) keys on. Applier-owned like the other stamps, so it is in
+        # `provenance` (KG-125): a seed node is seed-authored. The graph-reset
+        # guard (`admin.RESET_GUARD_CYPHER`) counts an `:__Entity__` node
+        # whose provenance is not 'seed' as derived data, so a node without
+        # it blocks a reset; `provenance` alone does not pass one, since the
+        # guard also needs `seed_version` and no extraction stamp.
+        # Applier-owned like the other stamps, so it is in
         # `_APPLIER_OWNED_NODE_PROPERTIES` and sits after the spread.
         properties = {
             **{k: v for k, v in node.model_dump().items() if k not in ("id", "type", "created_at")},
