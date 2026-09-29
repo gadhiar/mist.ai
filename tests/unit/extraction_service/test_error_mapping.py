@@ -119,12 +119,14 @@ def _a_validation_error() -> ValidationError:
 @pytest.mark.asyncio
 class TestResponseBuildFailures:
     async def test_a_validation_error_while_building_the_response_is_a_502_envelope(
-        self, service_settings, health_probe
+        self, service_settings, health_probe, ctx_size_source
     ):
         import httpx
 
         engine = _EngineRaising(_a_validation_error())
-        app = create_app(service_settings, engine, health_probe)  # type: ignore[arg-type]
+        app = create_app(
+            service_settings, engine, health_probe, ctx_size_source  # type: ignore[arg-type]
+        )
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://service") as client:
             response = await client.post("/v1/extract", json=make_extract_request())

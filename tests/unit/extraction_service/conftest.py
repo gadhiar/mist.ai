@@ -8,13 +8,15 @@ own HTTP layer (FastAPI/Starlette) runs unmodified end to end.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 import pytest_asyncio
 from openai import AsyncOpenAI
 
 from backend.extraction_service.adapters import get_adapter
-from backend.extraction_service.app import LlamaHealthProbe, create_app
+from backend.extraction_service.app import LlamaHealthProbe, LlamaPropsContextSize, create_app
 from backend.extraction_service.engine import ExtractionEngine
 from backend.extraction_service.settings import ServiceSettings
 from backend.knowledge.version_stamps import EXTRACTION_VERSION
@@ -58,7 +60,33 @@ def health_probe(fake_llama_app) -> LlamaHealthProbe:
 
 
 @pytest.fixture
+def ctx_size_source(fake_llama_app) -> LlamaPropsContextSize:
+    http_client = httpx.AsyncClient(transport=httpx.ASGITransport(app=fake_llama_app))
+    return LlamaPropsContextSize(http_client=http_client, base_url=FAKE_BASE_URL)
+
+
+@pytest_asyncio.fixture
+async def blocked_chat(fake_llama_state: FakeLlamaState):
+    """Hold every fake chat call on an event until the test (or teardown) sets it.
+
+    A test that sets the event decides exactly when in-flight calls answer;
+    a test that never sets it gets calls that never answer. Teardown sets it
+    either way, inside the event loop, so no handler is left blocked.
+    """
+    gate = asyncio.Event()
+    fake_llama_state.chat_gate = gate
+    yield gate
+    gate.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+@pytest.fixture
 def service_settings() -> ServiceSettings:
+    # llm_timeout_seconds is a generous budget, not a test knob: every fake
+    # call here answers in well under a millisecond, so no test may lean on
+    # this margin. A test about the timeout itself builds its own settings
+    # and a fake call that never answers (see `blocked_chat`).
     return ServiceSettings(
         llm_base_url=FAKE_BASE_URL,
         model_hash="test-model-hash",
@@ -66,7 +94,7 @@ def service_settings() -> ServiceSettings:
         adapter_name="gptoss",
         reasoning_effort="low",
         max_attempts=2,
-        llm_timeout_seconds=0.3,
+        llm_timeout_seconds=10.0,
         idempotency_cache_size=8,
     )
 
@@ -86,8 +114,8 @@ def engine(wired_llm, adapter, service_settings: ServiceSettings) -> ExtractionE
 
 
 @pytest.fixture
-def service_app(service_settings, engine, health_probe):
-    return create_app(service_settings, engine, health_probe)
+def service_app(service_settings, engine, health_probe, ctx_size_source):
+    return create_app(service_settings, engine, health_probe, ctx_size_source)
 
 
 @pytest_asyncio.fixture
