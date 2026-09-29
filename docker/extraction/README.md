@@ -51,6 +51,24 @@ profile flag -- all three of its services start on a plain `up`.
     # Host, standalone on the GTX 1070 machine:
     docker compose -f docker/extraction/compose.host.yml up -d
 
+**Redeploying the host after a code change.** The service image bakes the
+backend code in at build time (`docker/extraction/Dockerfile`:
+`COPY backend/ /app/backend/`), and `compose.host.yml` mounts no source
+directory over it. So a change anywhere under `backend/` --
+`backend/extraction_service/` and `backend/extraction_contract/` included --
+reaches the host only through a rebuilt image. A plain `up -d` does not
+rebuild: it starts the image already built, and the host keeps running the
+old code with no error to say so. After pulling the new commit on the host,
+rebuild, then recreate:
+
+    docker compose -f docker/extraction/compose.host.yml build
+    docker compose -f docker/extraction/compose.host.yml up -d --force-recreate
+
+Then check `/v1/info` (HOST_1070_RUNBOOK.md step 6): a service built from
+contract 1.1.0 or later reports `contract_version` `1.1.0` and the serving
+config fields (`constrained_mode`, `reasoning_effort`, `temperature`,
+`ctx_size`); a response without them is still the old image.
+
 `docker compose config` and the smoke test against a running container are
 the lead's job, not this worker's (no docker, no GPU, no network in this
 worktree's container).

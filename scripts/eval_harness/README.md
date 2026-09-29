@@ -97,11 +97,23 @@ move on to the next candidate.
 ```
 --list-models       print every candidate ID
 --list-tests        print every registered test with its file path
---iterations N      run each case N times (for variance analysis)
+--iterations N      run each case N times (a repeatability check, not samples; see below)
 --seed 42           sampling seed passed through to llama-server
 --skip-report       run tests but skip markdown report generation
 --log-level DEBUG   more verbose logs
 ```
+
+**Iterations are not samples.** Every iteration of a case sends the same
+request with the same `--seed` (`run.py` passes one `seed` to every
+`run_case` call in its iteration loop), and extraction-mode tests default
+to temperature 0.0 (`run.py`, the `temperature` default in the candidate
+loader). With the prompt, seed and sampling settings all fixed, a second
+iteration measures whether llama-server is deterministic for that request,
+not how much the score varies. Identical iterations are the expected
+outcome, not evidence of low variance, and N identical iterations do not
+narrow any confidence interval. To tighten an interval, add more distinct
+cases (probes); to study sampling variance, vary the seed per run and use
+a non-zero temperature, and say so in the report.
 
 ### Environment overrides
 

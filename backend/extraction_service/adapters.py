@@ -47,13 +47,23 @@ class ModelFamilyAdapter(Protocol):
         ...
 
 
-# Harmony's final-channel message, e.g.:
+# Harmony's final-channel message, in either header form:
 #   <|channel|>analysis<|message|>...<|end|><|start|>assistant<|channel|>final<|message|>{...}
+#   <|channel|>final <|constrain|>JSON<|message|>{...}
+# The second form carries a content-type constraint between the channel and
+# the message. The uppercase `JSON` token is what gpt-oss-20b emitted on the
+# extraction host (llama.cpp b11151, constrained mode "none"; see
+# `GptOssAdapter`). OpenAI's Harmony format guide shows the same header with
+# a lowercase `json` on tool calls (recalled, not re-checked against the guide
+# when this was written), so the token is matched as any run of non-`<`
+# characters rather than one spelling.
 # llama-server is expected to return only the final-channel content in
 # `message.content` -- this is a defensive fallback for when it instead
 # returns the raw Harmony transcript (unverified on b11151 per the T0 brief).
 _HARMONY_FINAL_RE = re.compile(
-    r"<\|channel\|>final<\|message\|>(.*?)(?:<\|end\|>|<\|return\|>|$)", re.DOTALL
+    r"<\|channel\|>final(?:\s*<\|constrain\|>[^<]*)?\s*<\|message\|>"
+    r"(.*?)(?:<\|end\|>|<\|return\|>|$)",
+    re.DOTALL,
 )
 
 # A leading <think>...</think> block some Qwen-family chat templates emit
@@ -87,7 +97,9 @@ class GptOssAdapter:
     HTTP 200 on the same call, and the extraction payload's entities and
     relationships were identical under all three modes. "schema" is the
     stricter of the two working modes and matches `QwenAdapter` and
-    `GemmaAdapter`.
+    `GemmaAdapter`. Should raw Harmony markup reach `final_text` anyway,
+    `_HARMONY_FINAL_RE` recovers the message from that
+    `<|constrain|>`-wrapped header as well as from the plain one.
     """
 
     reasoning_effort: ReasoningEffort = "low"

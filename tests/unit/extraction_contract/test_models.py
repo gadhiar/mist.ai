@@ -11,6 +11,7 @@ import pytest
 from pydantic import ValidationError
 
 from backend.extraction_contract import (
+    CONTRACT_VERSION,
     ERROR_DEFAULT_RETRYABLE,
     ERROR_HTTP_STATUS,
     CutoverStatus,
@@ -133,14 +134,31 @@ def _health_response() -> HealthResponse:
 
 def _info_response() -> InfoResponse:
     return InfoResponse(
-        contract_version="1.0.0",
+        contract_version="1.1.0",
         extraction_version="2026-06-14-r5",
         model_hash="abc123",
         model_file="gpt-oss-20b.gguf",
         llama_cpp_build="b11151",
         adapter="gpt-oss-20b",
         location_label="local",
+        constrained_mode="schema",
+        reasoning_effort="low",
+        temperature=0.0,
+        ctx_size=8192,
     )
+
+
+# The /v1/info body a contract 1.0.0 server sends: the seven original fields
+# and nothing else.
+_INFO_1_0_0_PAYLOAD = {
+    "contract_version": "1.0.0",
+    "extraction_version": "2026-06-14-r5",
+    "model_hash": "abc123",
+    "model_file": "gpt-oss-20b.gguf",
+    "llama_cpp_build": "b11151",
+    "adapter": "gptoss",
+    "location_label": "gtx1070-host",
+}
 
 
 def _service_status() -> ServiceStatus:
@@ -301,6 +319,45 @@ class TestExtractionStatus:
 
         assert restored.last_job is None
         assert restored.cutover is None
+
+
+class TestInfoResponseServingConfig:
+    def test_a_1_0_0_payload_with_only_the_seven_original_fields_still_parses(self):
+        info = InfoResponse.model_validate(_INFO_1_0_0_PAYLOAD)
+
+        assert info.contract_version == "1.0.0"
+        assert info.location_label == "gtx1070-host"
+        assert info.constrained_mode is None
+        assert info.reasoning_effort is None
+        assert info.temperature is None
+        assert info.ctx_size is None
+
+    def test_a_1_0_0_payload_is_compatible_with_this_contract(self):
+        info = InfoResponse.model_validate(_INFO_1_0_0_PAYLOAD)
+
+        assert is_compatible(info.contract_version) is True
+
+    def test_the_serving_config_fields_round_trip(self):
+        dumped = _info_response().model_dump(mode="json")
+
+        assert dumped["constrained_mode"] == "schema"
+        assert dumped["reasoning_effort"] == "low"
+        assert dumped["temperature"] == 0.0
+        assert dumped["ctx_size"] == 8192
+
+    def test_ctx_size_may_be_null_on_a_1_1_0_payload(self):
+        payload = _info_response().model_dump(mode="json")
+        payload["ctx_size"] = None
+
+        assert InfoResponse.model_validate(payload).ctx_size is None
+
+
+class TestContractVersion:
+    def test_the_contract_is_1_1_0(self):
+        assert CONTRACT_VERSION == "1.1.0"
+
+    def test_this_contract_accepts_its_own_version(self):
+        assert is_compatible(CONTRACT_VERSION) is True
 
 
 class TestCutoverStatusChecked:

@@ -19,7 +19,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-CONTRACT_VERSION = "1.0.0"
+# 1.1.0: additive -- InfoResponse gained four optional serving-config fields.
+CONTRACT_VERSION = "1.1.0"
 CONTRACT_MAJOR = 1
 
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
@@ -257,7 +258,26 @@ class HealthResponse(BaseModel):
 
 
 class InfoResponse(BaseModel):
-    """Response body for the service's info endpoint."""
+    """Response body for the service's info endpoint.
+
+    The last four fields were added in contract 1.1.0 and describe the
+    serving configuration a result was produced under, so a gauntlet run can
+    record what it measured. Each defaults to None: a 1.0.0 server's payload
+    (the first seven fields only) still validates, and None always means
+    "not reported" -- an older server, or a value the service could not read
+    (`ctx_size` when llama-server's `/props` was unavailable).
+
+    Attributes:
+        constrained_mode: The constrained-decoding mode the service's LLM
+            calls use ("schema", "json_object", or "none") -- the effective
+            mode, after a settings override is applied to the adapter's
+            default.
+        reasoning_effort: The configured reasoning-effort hint ("low",
+            "medium", "high"). Only the gpt-oss adapter sends it to the model.
+        temperature: The sampling temperature every LLM-calling stage uses.
+        ctx_size: llama-server's context window (`n_ctx`), as its `/props`
+            endpoint reports it.
+    """
 
     contract_version: str
     extraction_version: str
@@ -266,6 +286,10 @@ class InfoResponse(BaseModel):
     llama_cpp_build: str
     adapter: str
     location_label: str
+    constrained_mode: str | None = None
+    reasoning_effort: str | None = None
+    temperature: float | None = None
+    ctx_size: int | None = None
 
 
 # ---------------------------------------------------------------------------

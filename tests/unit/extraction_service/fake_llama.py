@@ -1,10 +1,11 @@
 """A tiny fake llama-server as an ASGI app, for wiring into LlamaServerProvider.
 
-Implements just enough of the OpenAI-compatible surface the extraction
-service needs: `GET /health` and `POST /v1/chat/completions`. Tests mutate
-a shared `FakeLlamaState` to script responses (canned content per call,
-an HTTP error status, a health status, or an artificial delay for timeout
-tests) and to inspect what was actually sent (`chat_requests`).
+Implements just enough of llama-server's surface the extraction service
+needs: `GET /health`, `GET /props` and `POST /v1/chat/completions`. Tests
+mutate a shared `FakeLlamaState` to script responses (canned content per
+call, an HTTP error status, a health status, a `/props` status and body, or
+a gate that holds every chat call until a test releases it) and to inspect
+what was actually sent (`chat_requests`, `props_requests`).
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+
+FAKE_N_CTX = 8192
 
 
 @dataclass
@@ -31,9 +34,19 @@ class FakeLlamaState:
     # When set, /v1/chat/completions returns this HTTP status instead of a
     # completion (simulates an upstream 5xx).
     chat_status_code: int | None = None
-    # Artificial delay before responding, to trigger the engine's timeout.
-    delay_seconds: float = 0.0
+    # When set, every /v1/chat/completions call records its request and then
+    # blocks on this event before answering. A test that never sets it gets
+    # a call that never answers (the engine's timeout fires); a test that
+    # sets it controls exactly when in-flight calls complete. No wall clock.
+    # Use the `blocked_chat` fixture, which releases the gate at teardown.
+    chat_gate: asyncio.Event | None = None
     chat_requests: list[dict] = field(default_factory=list)
+    # GET /props: the status and JSON body to answer with.
+    props_status: int = 200
+    props_body: object = field(
+        default_factory=lambda: {"default_generation_settings": {"n_ctx": FAKE_N_CTX}}
+    )
+    props_requests: int = 0
 
     def next_response(self) -> str:
         index = min(len(self.chat_requests) - 1, len(self.chat_responses) - 1)
@@ -46,12 +59,16 @@ def build_fake_llama_app(state: FakeLlamaState) -> Starlette:
     async def health(request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok"}, status_code=state.health_status)
 
+    async def props(request: Request) -> JSONResponse:
+        state.props_requests += 1
+        return JSONResponse(state.props_body, status_code=state.props_status)
+
     async def chat_completions(request: Request) -> JSONResponse:
         body = await request.json()
         state.chat_requests.append(body)
 
-        if state.delay_seconds:
-            await asyncio.sleep(state.delay_seconds)
+        if state.chat_gate is not None:
+            await state.chat_gate.wait()
 
         if state.chat_status_code is not None:
             return JSONResponse(
@@ -79,6 +96,7 @@ def build_fake_llama_app(state: FakeLlamaState) -> Starlette:
     return Starlette(
         routes=[
             Route("/health", health, methods=["GET"]),
+            Route("/props", props, methods=["GET"]),
             Route("/v1/chat/completions", chat_completions, methods=["POST"]),
         ]
     )

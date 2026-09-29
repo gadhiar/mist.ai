@@ -3,8 +3,11 @@
 `scripts.model_bench.probes.extraction` runs the 60-probe gold corpus through the
 in-process production path against a local llama-server. This module is the
 smallest adapter that points the SAME corpus and the SAME scorer at a remote
-extraction service (`POST /v1/extract`, contract 1.0.0), so a cutover candidate
-can be compared with the ADR-027 baseline.
+extraction service (`POST /v1/extract`, contract 1.x), so a cutover candidate
+can be compared with the ADR-027 baseline. The preflight prints the serving config
+`/v1/info` reports (constrained mode, reasoning effort, temperature, ctx size; contract
+1.1.0) and the summary records it under `serving_config`; a field an older server does
+not report gets a `[WARN]` line and is recorded as null.
 
 Nothing is re-implemented:
 - Corpus and scoring: `scripts.eval_harness.score_extraction_run` (`iter_gold_probes`,
@@ -419,6 +422,41 @@ def host_scope_decisions(cases: list[CaseResult]) -> dict[str, tuple[str, float]
     }
 
 
+# The `/v1/info` fields (contract 1.1.0) that describe the serving config a run was
+# measured under. A pre-1.1.0 server omits all four; a 1.1.0 server reports `ctx_size`
+# as null when it could not read llama-server's `/props`.
+SERVING_CONFIG_FIELDS = ("constrained_mode", "reasoning_effort", "temperature", "ctx_size")
+
+
+def serving_config(info: InfoResponse) -> dict[str, Any]:
+    """The serving-config fields of `info`, None where the service reported none."""
+    return {name: getattr(info, name) for name in SERVING_CONFIG_FIELDS}
+
+
+def log_serving_config(info: InfoResponse) -> list[str]:
+    """Print the serving config, and one `[WARN]` per field the service did not report.
+
+    A missing field does not fail the preflight: the run goes ahead and records the
+    field as null, since an older server cannot report it.
+
+    Returns:
+        The names of the fields the service did not report.
+    """
+    config = serving_config(info)
+    _log(
+        "[INFO] serving config: "
+        + " ".join(f"{name}={'null' if value is None else value}" for name, value in config.items())
+    )
+    missing = [name for name, value in config.items() if value is None]
+    for name in missing:
+        _log(
+            f"[WARN] preflight: /v1/info did not report {name} (service contract "
+            f"{info.contract_version}; a pre-1.1.0 server, or a value it could not read); "
+            "continuing, recorded as null"
+        )
+    return missing
+
+
 def build_run_summary(
     *,
     probes: list[GoldProbe],
@@ -470,6 +508,9 @@ def build_run_summary(
         "info": info.model_dump(mode="json"),
         "health": health,
     }
+    config = serving_config(info)
+    summary["serving_config"] = config
+    summary["serving_config_missing"] = [name for name, value in config.items() if value is None]
     summary["run"] = {
         "session_id": session_id,
         "recorded_at": recorded_at,
@@ -1033,6 +1074,7 @@ async def execute(
     if not is_compatible(info.contract_version):
         _log(f"[FAIL] preflight: incompatible contract_version {info.contract_version!r}")
         return 1
+    log_serving_config(info)
     if health.status != "ok":
         _log(f"[FAIL] preflight: service health is {health.status!r}, not 'ok'")
         return 1

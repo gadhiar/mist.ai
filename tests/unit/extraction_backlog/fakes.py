@@ -102,6 +102,11 @@ def build_fake_service_app(state: FakeServiceState) -> FastAPI:
             llama_cpp_build="b0",
             adapter="fake",
             location_label=state.location_label,
+            # Contract 1.1.0 serving config, as a current service reports it.
+            constrained_mode="schema",
+            reasoning_effort="low",
+            temperature=0.0,
+            ctx_size=8192,
         )
 
     @app.get("/v1/health")
