@@ -7,15 +7,27 @@
     python -m backend.extraction_backlog.admin cutover status
     python -m backend.extraction_backlog.admin cutover rebuild --staging-uri URI \
         --min-seed-nodes N --expect-turns N --min-replay-edges N
+    python -m backend.extraction_backlog.admin cutover probe
     python -m backend.extraction_backlog.admin cutover promote --graph-swapped
     python -m backend.extraction_backlog.admin cutover promote --seed-only-graph
     python -m backend.extraction_backlog.admin cutover abandon
 
 `status` reads the event store and extraction cache directly (it does not call
-the extraction service or need the backend running) and prints the backlog for
-the active epoch, including `legacy_unextracted` (turns logged before the
-backlog first activated that had no cache row; never dispatched, and covered by
-the next cutover's re-extraction), and any open cutover.
+the extraction service or need the backend running) and prints the active
+epoch's stamps, the backlog for it, including `legacy_unextracted` (turns
+logged before the backlog first activated that had no cache row; never
+dispatched, and covered by the next cutover's re-extraction), and any open
+cutover with its candidate stamps. It also prints this code's
+`ONTOLOGY_VERSION` and `EXTRACTION_VERSION`, the configured `MIST_MODEL_HASH`,
+and `writer stamps: match` or `writer stamps: MISMATCH (<field>, ...)`: whether
+the stamps a backend started from this environment would write
+(`factories.writer_stamps_from_config`) equal the active epoch's, judged by
+the dispatcher's own guard (`ExtractionDispatcher._writer_stamp_mismatch`).
+
+`cutover probe` runs the seed-only checks read-only (`cutover.check_seed_only`):
+the conversation log must be empty and the live-graph probe must pass. It
+prints each result and every violation, and writes nothing to the event store,
+the cache or the graph. It works with or without an open cutover.
 
 `retry-dead-letters` puts dead-lettered turns (`extraction_failed` skips) back
 into the backlog: it restarts the turn's failure count and deletes the skip row
@@ -36,9 +48,12 @@ when it runs.
 `cutover ...` drives the epoch cutover (`cutover.py`; runbook in `CUTOVER.md`).
 `cutover promote` takes `--graph-swapped` or `--seed-only-graph`, never both
 (argparse refuses the pair with exit 2 before anything is opened).
-Exit codes: 0 done, 2 refused (nothing changed). `cutover rebuild` also exits
-1 (rebuild-twice disagreed) or 4 (a non-vacuity or self-model gate failed), and
-records its report on the cutover either way.
+Exit codes: 0 done, 2 refused (nothing changed). `status` exits 1 when the
+epoch ledger is empty. `cutover rebuild` also exits 1 (rebuild-twice disagreed)
+or 4 (a non-vacuity or self-model gate failed), and records its report on the
+cutover either way. `cutover probe` exits 0 when the log is empty and the
+probe passes, 2 when either refuses, and 1 when the probe could not run (Neo4j
+unreachable, or any `GraphProbeError`), whatever the log check found.
 """
 
 from __future__ import annotations
@@ -48,12 +63,17 @@ import asyncio
 import sys
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from typing import TextIO
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, TextIO
 
 from backend.event_store.store import EventStore
 from backend.knowledge.extraction_cache import ExtractionCache
 
-from .store import BacklogStore, Cutover
+from .store import BacklogStore, Cutover, Epoch
+
+if TYPE_CHECKING:
+    from backend.knowledge.config import KnowledgeConfig
+    from backend.knowledge.curation.graph_writer import RebuildStamps
 
 OUT_OF_ORDER_WARNING = (
     "[WARNING] A retried turn is applied OUT OF LOG ORDER: turns logged after it are "
@@ -89,7 +109,7 @@ def _print_cutover(store: BacklogStore, cutover: Cutover, out: TextIO) -> None:
         file=out,
     )
     print(
-        f"  target: ontology_version={cutover.ontology_version} "
+        f"  candidate: ontology_version={cutover.ontology_version} "
         f"extraction_version={cutover.extraction_version} model_hash={cutover.model_hash} "
         f"(service model_hash={cutover.bare_model_hash})",
         file=out,
@@ -112,18 +132,56 @@ def _print_cutover(store: BacklogStore, cutover: Cutover, out: TextIO) -> None:
             print(f"  failure: {str(report['failure']).splitlines()[0]}", file=out)
 
 
-def _status(store: BacklogStore, out: TextIO) -> int:
+_STAMP_FIELDS = ("ontology_version", "extraction_version", "model_hash")
+
+
+def _writer_stamps_verdict(writer: RebuildStamps, epoch: Epoch) -> tuple[str, str | None]:
+    """The `writer stamps: ...` line for `status`, and the guard's reason on a mismatch.
+
+    Match or mismatch is decided by the dispatcher's own guard,
+    `ExtractionDispatcher._writer_stamp_mismatch`, not a second comparison: it
+    reads nothing of the dispatcher but `_writer_stamps`, so it is called on a
+    stand-in holding just that. The field names listed on a mismatch are for
+    the operator's eye only; a mismatch the guard reports with no differing
+    field (not possible today) is still printed as MISMATCH.
+    """
+    from .dispatcher import ExtractionDispatcher
+
+    reason = ExtractionDispatcher._writer_stamp_mismatch(
+        SimpleNamespace(_writer_stamps=writer), epoch  # type: ignore[arg-type]
+    )
+    if reason is None:
+        return "writer stamps: match", None
+    differing = [name for name in _STAMP_FIELDS if getattr(writer, name) != getattr(epoch, name)]
+    return f"writer stamps: MISMATCH ({', '.join(differing) or 'see reason'})", reason
+
+
+def _status(store: BacklogStore, config: KnowledgeConfig, out: TextIO) -> int:
+    from backend.factories import writer_stamps_from_config
+    from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
+
     epoch = store.active_epoch()
     if epoch is None:
         print("No epoch in the ledger; nothing to report.", file=out)
         return 1
     scan = store.scan(epoch)
     activation = store.get_activation(epoch)
+    writer = writer_stamps_from_config(config)
     print(
-        f"epoch {epoch.epoch_id}: extraction_version={epoch.extraction_version} "
-        f"model_hash={epoch.model_hash}",
+        f"epoch {epoch.epoch_id}: ontology_version={epoch.ontology_version} "
+        f"extraction_version={epoch.extraction_version} model_hash={epoch.model_hash}",
         file=out,
     )
+    print(
+        f"code: ONTOLOGY_VERSION={ONTOLOGY_VERSION} EXTRACTION_VERSION={EXTRACTION_VERSION} "
+        f"configured model_hash={config.model_hash} (MIST_MODEL_HASH; composed "
+        f"{writer.model_hash})",
+        file=out,
+    )
+    verdict, reason = _writer_stamps_verdict(writer, epoch)
+    print(verdict, file=out)
+    if reason is not None:
+        print(f"  {reason}", file=out)
     if activation is None:
         print("activation: not yet activated (no dispatcher has run for this epoch)", file=out)
     else:
@@ -273,10 +331,9 @@ def _cutover_promote(
         print(
             f"[cutover] promoted cutover {cutover.cutover_id} to epoch {promotion.epoch_id} "
             f"over a seed-only live graph ({probe.node_count} node(s), "
-            f"{probe.relationship_count} relationship(s), all seed-stamped): "
-            f"{promotion.marked_applied} of {promotion.turns_at_activation} logged turn(s) "
-            "marked applied; every logged turn stays apply-pending and the dispatcher applies "
-            "them in log order from the candidate cache.",
+            f"{probe.relationship_count} relationship(s), all seed-stamped) and an empty "
+            "conversation log: no turn was marked applied. The dispatcher extracts and "
+            "applies turns logged from now on, in log order, under the new epoch.",
             file=out,
         )
     else:
@@ -300,6 +357,40 @@ def _cutover_promote(
             "be stamped with the code's value.",
             file=out,
         )
+    return 0
+
+
+def _cutover_probe(store: BacklogStore, graph_probe: Callable | None, out: TextIO) -> int:
+    """`cutover probe`: the seed-only checks, read-only. Exit 0 pass, 2 refused, 1 not run."""
+    from .cutover import check_seed_only, probe_live_graph_from_env
+
+    check = check_seed_only(
+        store, graph_probe=graph_probe if graph_probe is not None else probe_live_graph_from_env
+    )
+    if check.log_violation is None:
+        print("[probe] conversation log: PASS (0 logged turns)", file=out)
+    else:
+        print(f"[probe] conversation log: REFUSED ({check.logged_turns} logged turn(s))", file=out)
+        print(f"  violation: {check.log_violation}", file=out)
+    if check.graph_probe is None:
+        print(f"[probe] live graph: NOT RUN: {check.probe_error}", file=out)
+    else:
+        counts = " ".join(f"{name}={n}" for name, n in check.graph_probe.as_dict().items())
+        verdict = "PASS" if not check.graph_violations else "REFUSED"
+        print(f"[probe] live graph: {verdict} ({counts})", file=out)
+        for violation in check.graph_violations:
+            print(f"  violation: {violation}", file=out)
+    if check.graph_probe is None:
+        print("[probe] could not complete: the live graph probe did not run (exit 1)", file=out)
+        return 1
+    if check.log_violation is not None or check.graph_violations:
+        print("[probe] seed-only promotion would be REFUSED (exit 2)", file=out)
+        return 2
+    print(
+        "[probe] both checks pass (exit 0). The probe cannot see every write; the operator "
+        "precondition in CUTOVER.md 6A still applies.",
+        file=out,
+    )
     return 0
 
 
@@ -330,7 +421,9 @@ def _cutover_rebuild(
 
 
 def _add_cutover_parser(sub) -> None:
-    cutover = sub.add_parser("cutover", help="epoch cutover: begin, status, rebuild, promote")
+    cutover = sub.add_parser(
+        "cutover", help="epoch cutover: begin, status, probe, rebuild, promote, abandon"
+    )
     csub = cutover.add_subparsers(dest="cutover_command", required=True)
 
     begin = csub.add_parser("begin", help="open a candidate epoch; the dispatcher starts filling")
@@ -352,6 +445,14 @@ def _add_cutover_parser(sub) -> None:
 
     csub.add_parser("status", help="print the open cutover, or the last one")
 
+    csub.add_parser(
+        "probe",
+        help=(
+            "read-only: run the seed-only checks (empty conversation log, live-graph probe) "
+            "and print every violation; exit 0 pass, 2 refused, 1 the probe could not run"
+        ),
+    )
+
     rebuild = csub.add_parser(
         "rebuild", help="build the staging graph twice under the candidate and gate it"
     )
@@ -372,9 +473,10 @@ def _add_cutover_parser(sub) -> None:
         action="store_true",
         help=(
             "no extraction has ever run against this live graph, so it holds seed data "
-            "only (operator precondition, CUTOVER.md 6A; an empty log does not show it if "
-            "the log was reset; a read-only probe checks for stamped and unseeded elements "
-            "first); promotes a 'ready' or 'checked' candidate without a swap"
+            "only (operator precondition, CUTOVER.md 6A: reseed with the backend stopped, "
+            "then `cutover probe`); refused unless the conversation log is empty and a "
+            "read-only probe finds no stamped and no unseeded element; promotes a 'ready' "
+            "or 'checked' candidate without a swap"
         ),
     )
 
@@ -390,6 +492,7 @@ def main(
     rebuild_deps_factory: Callable | None = None,
     graph_probe: Callable | None = None,
     clock: Callable[[], datetime] | None = None,
+    knowledge_config: KnowledgeConfig | None = None,
 ) -> int:
     """Run the CLI. `store`, `out` and the cutover dependencies are injectable for tests.
 
@@ -398,15 +501,22 @@ def main(
             `KnowledgeConfig.embedding.model_name`.
         rebuild_deps_factory: For `cutover rebuild`, `Cutover -> RebuildDeps`;
             defaults to the real Neo4j wiring (`build_rebuild_deps_from_env`).
-        graph_probe: For `cutover promote --seed-only-graph`, a `GraphProbe`
-            (`() -> GraphProbeReport`), called at most once and only after the
-            cutover's state, fill and markers have passed; defaults to the real
-            read-only live-graph probe (`probe_live_graph_from_env`).
+        graph_probe: For `cutover promote --seed-only-graph` and `cutover
+            probe`, a `GraphProbe` (`() -> GraphProbeReport`), called at most
+            once. `promote` calls it only after the cutover's state, fill,
+            markers, source epoch and the empty log have passed; `probe` calls
+            it unconditionally. Defaults to the real read-only live-graph probe
+            (`probe_live_graph_from_env`).
         clock: Wall clock (tz-aware) for the timestamps cutover rows record.
+        knowledge_config: For `status`, the configuration whose writer stamps
+            are compared with the active epoch; defaults to
+            `KnowledgeConfig.from_env()`, what a backend started from this
+            environment reads.
 
     Returns:
         Process exit code: 0 success, 1 no epoch, 2 refused or some requested
-        turn was not dead-lettered; `cutover rebuild` adds 1 and 4 (see module
+        turn was not dead-lettered; `cutover rebuild` adds 1 and 4, and
+        `cutover probe` returns 1 when the probe could not run (see module
         docstring).
     """
     parser = argparse.ArgumentParser(prog="python -m backend.extraction_backlog.admin")
@@ -423,7 +533,11 @@ def main(
     backlog = store if store is not None else build_store_from_env()
     now_iso = (clock or (lambda: datetime.now(UTC)))().isoformat()
     if args.command == "status":
-        return _status(backlog, stream)
+        if knowledge_config is None:
+            from backend.knowledge.config import KnowledgeConfig
+
+            knowledge_config = KnowledgeConfig.from_env()
+        return _status(backlog, knowledge_config, stream)
     if args.command == "retry-dead-letters":
         return _retry(backlog, args.event_id, stream)
 
@@ -433,6 +547,8 @@ def main(
         return _cutover_begin(backlog, args, model, now_iso, stream)
     if command == "status":
         return _cutover_status(backlog, stream)
+    if command == "probe":
+        return _cutover_probe(backlog, graph_probe, stream)
     if command == "abandon":
         return _cutover_abandon(backlog, now_iso, stream)
     if command == "promote":

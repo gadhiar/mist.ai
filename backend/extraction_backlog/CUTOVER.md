@@ -11,8 +11,13 @@ probe), `ExtractionDispatcher._fill_step` (filling),
 (the two promotion transactions), `backend/extraction_backlog/admin.py` (CLI).
 
 When no extraction has ever run against the live graph, skip sections 4 and 5:
-see section 6A and its precondition. An empty conversation log alone does not
-establish that if the log has been reset or replaced since the graph was seeded.
+see section 6A and its precondition. That path needs an EMPTY conversation log,
+and because an empty log alone does not establish the precondition when the log
+has been reset or replaced, 6A reseeds the live graph with the backend stopped
+and probes it before promoting.
+
+Code anchors in this runbook are symbols. Where a line matters, the reference
+gives the grep that finds it, run from the repository root; line numbers drift.
 
 Every command below is marked:
 
@@ -37,10 +42,11 @@ Every command below is marked:
                           transaction (section 6)
     promote --seed-only-graph
              ready | checked -> promoted
-                          read-only probe finds no stamped and no unseeded element,
-                          no apply marker exists; candidate appended to epoch_ledger
-                          + first-hand activation marking nothing, one SQLite
-                          transaction (section 6A; operator precondition there)
+                          the conversation log is empty, no apply marker exists,
+                          read-only probe finds no stamped and no unseeded element;
+                          candidate appended to epoch_ledger + first-hand
+                          activation marking nothing, one SQLite transaction
+                          (section 6A; operator precondition there)
     abandon  -> abandoned deletes nothing
 
 While a cutover is open (filling, ready or checked):
@@ -80,6 +86,23 @@ so run it inside the backend container. [UNVERIFIED: `docker compose exec` form
 not run from this branch]
 
     docker compose exec mist-backend python -m backend.extraction_backlog.admin status
+
+`status` prints, besides the backlog counts and any open cutover (whose
+`candidate:` line carries its `ontology_version`, `extraction_version` and
+`model_hash`): [VERIFIED-IN-REPO: `_status` in `admin.py`] [UNIT-TESTED:
+`TestAdminStatusCli` in `tests/unit/extraction_backlog/test_status.py`]
+
+    epoch N: ontology_version=... extraction_version=... model_hash=...
+    code: ONTOLOGY_VERSION=... EXTRACTION_VERSION=... configured model_hash=<MIST_MODEL_HASH> (MIST_MODEL_HASH; composed <hash>)
+    writer stamps: match
+
+or `writer stamps: MISMATCH (<field>, ...)` followed by the dispatcher's own
+refusal text with both stamp triples. The writer stamps are what a backend
+started from this environment writes (`writer_stamps_from_config(
+KnowledgeConfig.from_env())`); the verdict is the dispatcher's guard
+(`ExtractionDispatcher._writer_stamp_mismatch`), compared with the ACTIVE epoch
+(not an open cutover's candidate). On a MISMATCH the dispatcher applies and
+dispatches nothing. Exit 0, or 1 when the epoch ledger is empty.
 
 ---
 
@@ -273,6 +296,10 @@ from the epoch ledger (`build_curation_pipeline` in `backend/factories.py`).
 
     docker compose up -d mist-backend
 
+`status` (section 1) must then print `writer stamps: match` against the new
+epoch; on `MISMATCH` the dispatcher stays stalled and applies nothing.
+[UNIT-TESTED: the `status` line only]
+
 The dispatcher then applies the turns after `rebuilt_through_event_id` to the new
 live graph, in order, from the candidate cache rows (no new inference for turns
 already filled). [UNIT-TESTED]
@@ -286,107 +313,248 @@ Keep the extraction service on the candidate model: it is now the active epoch's
 **Operator precondition.** Use this path ONLY when no extraction has ever run
 against THIS live graph. Then the live graph holds only what the seed applier
 wrote, and the candidate epoch can start from it as it is: sections 4 (rebuild)
-and 5 (swap) are skipped. The code does not enforce this precondition, and the
-checks below cannot see every extraction write.
+and 5 (swap) are skipped. The code cannot prove the precondition. It checks an
+empty conversation log, an empty `extraction_applied` and a read-only graph
+probe; the procedure in 6A.3 adds the reseed that makes those checks evidence.
+An empty log is also where `cutover rebuild` cannot run (its floors must be
+>= 1), so this is the only path for it.
 
-An empty conversation log proves the precondition only if the event log
-(`event_store.db`) has not been reset or replaced since the graph was seeded: a
-reset log is empty whatever ran against the graph before the reset. If the log
-has been reset or replaced, you need independent evidence that no extraction ran
-against this graph (for example, that the graph itself was re-seeded from empty
-after the reset [UNVERIFIED: a proposal, not established from the repository]).
-An empty log is also where `cutover rebuild` cannot run (its
-floors must be >= 1).
+### 6A.1 Why a reseed, an empty log and the probe are the evidence
 
-Check the log is currently empty (read-only):
+Neither the log nor the probe is evidence alone. The event log
+(`event_store.db`) has been reset before, and a reset log is empty whatever ran
+against the graph before the reset. The probe cannot see an unstamped SET on a
+seeded element (6A.2). Taken together with a reseed of the live graph, done
+AFTER the last log reset and with the backend stopped, they are:
 
-    docker compose exec mist-backend python -m backend.extraction_backlog.admin cutover status
+1. **The reseed erases every earlier write to a seed element, or leaves
+   something the probe counts.** `python scripts/mist_admin.py seed`
+   (`cmd_seed` -> `reseed`) deletes every edge carrying the current
+   `seed_version`, then every node carrying it that has no relationship left,
+   then re-creates both from the seed source (`wipe_seed_version`,
+   `_WIPE_EDGES`, `_WIPE_NODES`, `apply_seed_documents`:
+   `grep -nE '^_WIPE_(EDGES|NODES)|^def (reseed|wipe_seed_version|apply_seed_documents)' backend/knowledge/seed/applier.py`).
+   [VERIFIED-IN-REPO] So after it every seed edge is new, and every seed node is
+   new unless some relationship without the current `seed_version` still
+   touches it. No writer outside the seed applier and the staging seeder sets
+   `seed_version` (`grep -rln seed_version backend/knowledge/curation
+   backend/knowledge/extraction backend/chat` lists only
+   `curation/reconciliation.py`, which reads it and never sets it; a clamped
+   copy of a seed edge carries `seed_origin_version` plus extraction stamps
+   instead). [VERIFIED-IN-REPO] So every element extraction ever created
+   survives the wipe without `seed_version` and the probe counts it, and so is
+   the relationship that kept a seed node alive. A reseeded graph that passes
+   the probe carries no write from before the reseed.
+2. **The empty log shows nothing was extracted after the reseed.** Both
+   extraction paths act only on a turn in the log: the dispatcher reads the
+   log, and the in-process path runs only with the `event_id` `append_turn`
+   returned (`ConversationHandler`: `grep -n 'elif event_id:'
+   backend/chat/conversation_handler.py`). The curation scheduler's
+   `SelfReflectionJob`, which applies Stage 9 operations, reads its turns from
+   the log too (`get_turns_since`). [VERIFIED-IN-REPO] An empty log at
+   promotion, with no log reset after the reseed, means no turn existed after
+   it for any of them. Promotion checks the log before the probe and again
+   inside its transaction.
+3. **Stopping the backend excludes the writers that need no turn.** The
+   curation-scheduler jobs in 6A.2 run on timers inside the live backend and
+   write seed nodes without any logged turn. So the backend stays STOPPED from
+   the reseed through promotion.
 
-It must print `covered=0 total=0`. This shows only that the log is empty NOW,
-not that it always was. `total` counts every logged turn, unfiltered
-(`_print_cutover` in `admin.py` -> `BacklogStore.fill_scan` ->
-`EventStore.list_turn_keys_in_replay_order`). The line prints only while a
-cutover is open (`_cutover_status`, `admin.py:206-221`); at this step one is,
-since promotion needs it. [VERIFIED-IN-REPO] [UNIT-TESTED: the
-`covered=... total=...` line] [UNVERIFIED: not run against the live stack]. The
-top-level `status` command does not print the logged-turn count.
+The argument also rests on two things no command checks: [UNVERIFIED]
+
+- every `seed_version` in the live graph is the one the reseed wipes (the wipe
+  is scoped to one version, and the probe checks that `seed_version` is
+  present, not which). A read-only `MATCH (n) WHERE n.seed_version IS NOT NULL
+  RETURN DISTINCT n.seed_version` (and the same over relationships) would show
+  it; it has not been run;
+- nothing outside the backend (an operator script) wrote the live graph after
+  the reseed. Such writers have not been enumerated.
+
+### 6A.2 What the probe and the apply-marker check cannot see
+
+[VERIFIED-IN-REPO] The same list, with the same greps, is the comment above
+`SEED_ONLY_PROBE_CYPHER` in `cutover.py`.
 
 What the probe proves: at least one node, no node or relationship WITHOUT
 `seed_version`, and no node or relationship WITH `ontology_version`,
-`extraction_version` or `model_hash`. The seed applier sets `seed_version` on the
-nodes (`backend/knowledge/seed/applier.py:210`) and edges (`:78`) it writes.
-[VERIFIED-IN-REPO] No extraction writer sets `seed_version` (`grep -rln
-seed_version backend/knowledge/curation backend/knowledge/extraction
-backend/chat` finds nothing), so any node or edge an extraction writer CREATES,
-stamped or not (for example the unstamped edges `skill_derivation.py:174` and
-`:238` MERGE), lacks `seed_version` and the probe sees it. [VERIFIED-IN-REPO]
+`extraction_version` or `model_hash`. The seed applier sets `seed_version` on
+every node and edge it writes (`apply_seed_documents`, `_MERGE_EDGE`:
+`grep -nE '"seed_version": seed_version,|SET r\.seed_version' backend/knowledge/seed/applier.py`).
+Any node or edge an extraction writer CREATES, stamped or not (for example the
+unstamped KNOWS and HAS_CAPABILITY edges `SkillDerivationJob` MERGEs:
+`grep -nE 'MERGE \((u|m)\)-' backend/knowledge/curation/skill_derivation.py`),
+lacks `seed_version`, and the probe sees it.
 
-What the probe and the apply-marker check CANNOT see [VERIFIED-IN-REPO]:
+It cannot see an unstamped SET on an existing SEEDED element:
 
-- an unstamped SET on an existing SEEDED element. On nodes:
-  `backend/knowledge/extraction/internal_derivation.py:407-410` (Stage 9 UPDATE)
-  and `:418-421` (DEPRECATE) on a `:__SelfModel__` node, and
-  `backend/knowledge/curation/skill_derivation.py:187-190` and `:215-218`. On
-  edges: `backend/knowledge/curation/reconciliation.py:754-758`, the ON MATCH
-  branch, when its MERGE matches a seeded edge (seed edges join `:__Entity__`
-  and `:__SelfModel__` nodes, `backend/knowledge/seed/applier.py:37-39, 74-77`);
-- a turn applied without a marker: `backend/chat/conversation_handler.py:2035-2049`
-  runs extraction in process whenever no dispatcher is attached and writes no
-  `extraction_applied` row; a turn recorded as legacy at the backlog's first
-  activation gets no marker whether or not an earlier path applied it
-  (`BacklogStore.ensure_activation`).
+- nodes:
+  - `InternalKnowledgeDeriver._apply_operation` (Stage 9; also reached from
+    `SelfReflectionJob` through `derive`): the UPDATE and DEPRECATE branches,
+    and the CREATE-op MERGE's ON MATCH (`updated_at`, `confidence`, and a type
+    label) when it matches a seeded `:__SelfModel__` node:
+    `grep -nE 'op_type == "(UPDATE|DEPRECATE)"|ON MATCH SET' backend/knowledge/extraction/internal_derivation.py`;
+  - `SkillDerivationJob._update_skill` and the update branch of
+    `_ensure_capability`:
+    `grep -n 'SET e.proficiency' backend/knowledge/curation/skill_derivation.py`;
+  - `CurationGraphWriter._upsert_entity`'s ON MATCH when the statement carries
+    no EXTRACTED_FROM clause (`with_conversation_provenance` false; with it, the
+    EXTRACTED_FROM edge and its ConversationContext node lack `seed_version` and
+    are counted):
+    `grep -n 'ON MATCH SET e.confidence' backend/knowledge/curation/graph_writer.py`;
+- edges (seed edges join `:__Entity__` and `:__SelfModel__` nodes: the label
+  union in `_MERGE_EDGE`, `grep -n 'MATCH (s:' backend/knowledge/seed/applier.py`):
+  - `ReconciliationEngine._apply`'s CLOSE_TRANSACTION branch (`recorded_until`,
+    `is_latest_belief = false`, `updated_at`: a seed edge closed by
+    supersession) and REINFORCE branch (`confidence`, `evidence`,
+    `updated_at`), both by elementId, and `_apply_structural`'s ON MATCH
+    (`confidence`, `evidence`, `updated_at`) when its MERGE matches a seed edge:
+    `grep -nE 'is ActionKind\.(CLOSE_TRANSACTION|REINFORCE):|ON MATCH SET' backend/knowledge/curation/reconciliation.py`.
+    Whether the same turn also creates an element the probe does see (a new
+    version, a clamped copy) depends on the actions the planner chose; nothing
+    here relies on it;
+- curation-scheduler jobs, which need no logged turn:
+  - `ConfidenceDecayJob` (`confidence`, and `status = 'archived'`, on active
+    `:__Entity__` nodes of a decay-enabled `knowledge_domain`), `OrphanDetector`
+    (`status = 'archived'`) and `EmbeddingMaintenance` (`embedding`,
+    `embedding_updated_at`; registered with `enabled=False`):
+    `grep -n 'SET e\.' backend/knowledge/curation/confidence_decay.py backend/knowledge/curation/orphan_detector.py backend/knowledge/curation/embedding_maintenance.py`;
+  - they, `SkillDerivationJob` and `SelfReflectionJob` are built by
+    `build_curation_scheduler` (`backend/factories.py`:
+    `grep -nE 'name="(confidence_decay|orphan_detection|embedding_maintenance|skill_derivation|self_reflection)"' backend/factories.py`)
+    and started in the backend's lifespan (`backend/server.py`:
+    `grep -nE 'build_curation_scheduler\(|curation_scheduler\.start\(' backend/server.py`).
+    `CurationScheduler.start` skips them only under `MIST_HYDRATION_ISOLATION`
+    or with `MIST_CURATION_SCHEDULER_ENABLED` off (`curation_scheduler_enabled`,
+    default on).
 
-Hence the precondition above: these checks back it up, they do not replace it.
+The apply-marker check (`extraction_applied` empty) cannot see a turn applied
+without a marker: the in-process path above writes none, and a turn recorded as
+legacy at the backlog's first activation gets none whether or not an earlier
+path applied it (`BacklogStore.ensure_activation`). The log-empty check covers
+both: with no logged turn there is no such turn.
 
-Stop the backend first, as for section 6, so no live-path writer can touch the
-graph between the probe and the promotion, and no turn is logged during it:
-[UNVERIFIED: not run from this branch]
+Hence the precondition and 6A.1: these checks back it up, they do not replace
+it.
 
-    docker compose stop mist-backend
-    docker compose run --rm mist-backend python -m backend.extraction_backlog.admin \
-      cutover promote --seed-only-graph
+### 6A.3 Procedure
 
-[VERIFIED-IN-REPO: `admin.py`, `_add_cutover_parser`] [UNIT-TESTED:
-`tests/unit/extraction_backlog/test_cutover_seed_only.py`, with a fake probe]
-[UNVERIFIED: the real probe (`probe_live_graph_from_env`) has not been run against
-Neo4j]
+None of the `docker compose` forms below has been run from this branch
+[UNVERIFIED]; the commands themselves are [VERIFIED-IN-REPO] where marked.
+
+1. **Begin and reach `ready`.** Begin as in section 2 while the backend runs
+   (`MIST_EXTRACTION_INFERENCE=service`). With the log empty there is no turn to
+   fill, and the dispatcher's first fill step moves the cutover to `ready`
+   (`ExtractionDispatcher._fill_step`: no uncovered turn -> `ready`).
+   [UNIT-TESTED: `test_an_empty_log_fills_to_ready_and_promotes_with_zero_turns`,
+   with a fake service] Then:
+
+       docker compose exec mist-backend python -m backend.extraction_backlog.admin cutover status
+
+   It must print `state=ready` and `covered=0 total=0` (`total` counts every
+   logged turn: `_print_cutover` -> `BacklogStore.fill_scan`). [UNIT-TESTED: the
+   `covered=... total=...` line]
+
+2. **Stop the backend**, and keep it stopped through step 5 (6A.1, point 3):
+
+       docker compose stop mist-backend
+
+3. **Reseed the live graph** (6A.1, point 1). This must come after the last log
+   reset:
+
+       docker compose run --rm mist-backend python scripts/mist_admin.py seed
+
+   [VERIFIED-IN-REPO: `cmd_seed`, subcommand `seed`, in `scripts/mist_admin.py`;
+   it calls `reseed(..., allow_live=True)`] It then backfills seed embeddings
+   unless given `--no-embeddings`; that writes only `embedding`, which the probe
+   does not read.
+
+4. **Probe, read-only:**
+
+       docker compose run --rm mist-backend python -m backend.extraction_backlog.admin cutover probe
+
+   [VERIFIED-IN-REPO: `_cutover_probe` in `admin.py`, `check_seed_only` in
+   `cutover.py`] [UNIT-TESTED: `TestProbeCommand` in
+   `tests/unit/extraction_backlog/test_cutover_seed_only.py`, with a fake probe
+   and with the real probe over a fake connection that refuses writes]
+   [UNVERIFIED: the real probe has not been run against Neo4j]. It runs the
+   log-empty check and the graph probe (the probe even when the log check
+   fails) and prints one line per check and one `  violation: ...` line per
+   violation, for example:
+
+       [probe] conversation log: PASS (0 logged turns)
+       [probe] live graph: PASS (node_count=32 nodes_without_seed_version=0 nodes_with_extraction_stamp=0 relationship_count=30 relationships_without_seed_version=0 relationships_with_extraction_stamp=0)
+       [probe] both checks pass (exit 0). The probe cannot see every write; the operator precondition in CUTOVER.md 6A still applies.
+
+   Exit codes: 0 both checks pass; 2 either refuses (`conversation log:
+   REFUSED (N logged turn(s))` and/or `live graph: REFUSED (...)`); 1 the probe
+   could not run (Neo4j unreachable, or any `GraphProbeError`: `live graph: NOT
+   RUN: ...`), whatever the log check found. It writes nothing to the event
+   store, the cache or the graph, and works with or without an open cutover.
+   Do not promote on anything but exit 0.
+
+5. **Promote:**
+
+       docker compose run --rm mist-backend python -m backend.extraction_backlog.admin \
+         cutover promote --seed-only-graph
+
+   [VERIFIED-IN-REPO: `admin.py`, `_add_cutover_parser`] [UNIT-TESTED:
+   `tests/unit/extraction_backlog/test_cutover_seed_only.py`, with a fake probe]
+
+6. **Restart on the new epoch.** As in section 6: set the printed
+   `MIST_MODEL_HASH` in the backend's environment, then recreate the backend so
+   its writers are stamped with the new epoch:
+
+       docker compose up -d --force-recreate mist-backend
+
+   `status` (section 1) must print `writer stamps: match`. [UNIT-TESTED: the
+   `status` line]
 
 `--seed-only-graph` and `--graph-swapped` are mutually exclusive; giving both is
 refused by argparse (exit 2) before anything is opened. [UNIT-TESTED]
 
-Refused (exit 2, `[cutover] REFUSED: <reason>`, nothing written) when: [UNIT-TESTED]
+`cutover promote --seed-only-graph` exits 0 on promotion and 2 on any refusal,
+printing `[cutover] REFUSED: <reason>` and writing nothing, when: [UNIT-TESTED]
 
 - no cutover is open, or it is not `ready` or `checked`;
 - the fill is incomplete (a logged turn has no candidate cache row);
 - `extraction_applied` holds ANY row, under ANY epoch, `applied` or `curated`
   (a recorded apply; an empty table does not prove no turn was applied, see
-  above);
+  6A.2);
 - the active epoch is no longer the cutover's source epoch;
+- the conversation log is not empty: `conversation_turn_events` holds any row,
+  from any session origin (`real`, `test`, `seed`). The reason names the count:
+  `the conversation log holds N logged turn(s) (conversation_turn_events, any
+  session origin): seed-only promotion requires an empty log, ...; use the
+  graph-swapped path`. This check runs BEFORE the probe, so a non-empty log
+  never reaches Neo4j;
 - the live-graph probe fails: it must find at least one node, every node and
   relationship carrying `seed_version`, and none carrying `ontology_version`,
   `extraction_version` or `model_hash`. A probe that cannot connect or errors is a
-  refusal too.
+  refusal too (exit 2 here, where `cutover probe` exits 1).
 
 The probe is ONE read-only Cypher statement (`SEED_ONLY_PROBE_CYPHER` in
 `cutover.py`) run on the LIVE graph named by the backend's environment
-(`config.neo4j`) through `Neo4jConnection.execute_query`. It runs only after the
-state, fill, marker and epoch checks pass, and before the transaction. A unit test
-refuses any write clause in it. [UNIT-TESTED: textually, and over a fake
-connection]
+(`config.neo4j`) through `Neo4jConnection.execute_query`. `promote` runs it only
+after the state, fill, marker, epoch and log checks pass, and before the
+transaction. A unit test refuses any write clause in it. [UNIT-TESTED: textually,
+and over a fake connection]
 
 The fill is checked before the transaction, not inside it (the candidate cache is
-a separate database). A turn logged after that check is not in the candidate
-cache, so after promotion the dispatcher infers it fresh under the new epoch, in
-its place in the log. With the backend stopped, no turn should be logged then.
+a separate database); with an empty log there is no turn for it to cover.
 
-Otherwise ONE SQLite transaction (`EventStore.promote_epoch_cutover_seed_only`)
-re-checks the state, the source epoch and the markers, then:
+Otherwise ONE SQLite transaction under `BEGIN IMMEDIATE`
+(`EventStore.promote_epoch_cutover_seed_only`) re-checks the state, the source
+epoch, the markers and the empty log, so a turn logged after the first log check
+(during the probe, say) is refused there with the same reason and nothing is
+written [UNIT-TESTED: `test_e_a_turn_logged_during_the_probe_...`,
+`test_e_a_turn_logged_after_the_probe_...`, and
+`test_a_turn_another_connection_commits_before_the_transaction_is_refused`],
+then:
 
 1. appends the candidate to `epoch_ledger` (prev = the source epoch);
 2. writes the new epoch's backlog activation first-hand with
-   `turns_at_activation` = the logged turns and `marked_applied` =
-   `legacy_unextracted` = 0, so T2a's automatic first-activation rule does not
-   run for it;
+   `turns_at_activation` = `marked_applied` = `legacy_unextracted` = 0, so T2a's
+   automatic first-activation rule does not run for it;
 3. writes NO applied marker;
 4. sets the cutover to `promoted`, its `check_report` recording
    `promotion_mode: seed_only_graph`, the probe counts, and any earlier check
@@ -395,15 +563,14 @@ re-checks the state, the source epoch and the markers, then:
 A crash anywhere inside leaves none of it written; run it again. [UNIT-TESTED:
 `TestPromoteSeedOnly::test_a_crash_between_ledger_append_and_activation_writes_nothing`]
 
-Next, as in section 6: set the printed `MIST_MODEL_HASH` in the backend's
-environment, then recreate the backend so its writers are stamped with the new
-epoch: [UNVERIFIED: not run from this branch]
+On success it prints, for example:
 
-    docker compose up -d --force-recreate mist-backend
+    [cutover] promoted cutover 1 to epoch 2 over a seed-only live graph (32 node(s), 30 relationship(s), all seed-stamped) and an empty conversation log: no turn was marked applied. The dispatcher extracts and applies turns logged from now on, in log order, under the new epoch.
 
-The dispatcher then applies EVERY logged turn to the live graph, in log order,
-from the candidate cache rows (no new inference for turns already filled).
-[UNIT-TESTED: `test_every_turn_is_applied_in_log_order_from_the_candidate_cache`]
+followed by the `MIST_MODEL_HASH` line (section 6). After the restart the
+dispatcher extracts every turn logged from then on under the new epoch and
+applies it in log order. [UNIT-TESTED:
+`test_turns_logged_after_promotion_are_extracted_and_applied_in_log_order`]
 
 ---
 
@@ -435,14 +602,19 @@ epoch stays in `epoch_mismatch`.
   written by Stage 9 make that gate fail.
 - The seed-only probe and the promotion transaction are not atomic with each
   other: Neo4j and SQLite share no transaction. A live-graph write between the
-  probe and the COMMIT is not seen. Stopping the backend first (section 6A)
-  closes that window for the backend's own writers; the transaction re-checks
-  the SQLite side (state, source epoch, apply markers).
+  probe and the COMMIT is not seen. Keeping the backend stopped from the reseed
+  through promotion (section 6A.3) closes that window for the backend's own
+  writers, including the curation scheduler; the transaction re-checks the
+  SQLite side (state, source epoch, apply markers, empty log).
 - The probe requires EVERY node to carry `seed_version`, so a node any other
   writer created (including Stage 9 self-model nodes) refuses the seed-only path
   even if it carries no extraction stamp.
+- Seed-only promotion refuses any logged turn, of any session origin, including
+  `test` and `seed` sessions that no extraction path would pick up. A log that
+  holds turns goes through sections 4 to 6.
 - The probe cannot see unstamped SETs on seeded elements, and the marker check
-  cannot see in-process or legacy applies (section 6A lists the file:line
-  sites). The seed-only path rests on the operator precondition in 6A, and
-  `covered=0 total=0` shows only that the log is empty now, not that it was
-  never reset.
+  cannot see in-process or legacy applies (section 6A.2 names the symbols and
+  the greps). An empty log shows only that the log is empty now, not that it
+  was never reset. The seed-only path rests on the operator precondition and
+  the reseed-then-probe procedure in 6A; writers outside the backend are not
+  enumerated.
