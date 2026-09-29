@@ -6,18 +6,30 @@ rather than inferred from prose (R1.4 spec 2.0). Every node and edge carries
 version exact -- a node or edge written without the stamp is un-wipeable and
 becomes permanent graph litter that no gate can detect.
 
-R1.4 Task 12 (addendum): every node also gets its ontology type label and
-every descriptive property the source defines (`entity_type` plus whatever
-`SeedNode` carries beyond `id`/`type`). Before this task, `_MERGE_NODE` set
-only `seed_version`/`created_at`/`updated_at` -- Task 10's live run proved
-that a wipe-and-recreate cycle then leaves a node with no ontology label and
-no descriptive properties at all, since `MERGE` preserves untouched
-properties on a MATCH but a fresh CREATE gets nothing beyond what the query
-explicitly sets. See the Task 10 report for the live consequence.
+R1.4 Task 12 (addendum): every node also gets every descriptive property the
+source defines (`entity_type` plus whatever `SeedNode` carries beyond
+`id`/`type`). Before that task, the node MERGE set only
+`seed_version`/`created_at`/`updated_at` -- Task 10's live run proved that a
+wipe-and-recreate cycle then leaves a node with no type and no descriptive
+properties at all, since `MERGE` preserves untouched properties on a MATCH
+but a fresh CREATE gets nothing beyond what the query explicitly sets. See
+the Task 10 report for the live consequence.
+
+MIS-177 (i115): the node's type is the `entity_type` PROPERTY, not a graph
+label. Task 12 also wrote the type as a label on every node; on
+`:__Entity__` nodes that departed from the documented convention
+(`scripts/migrations/ontology_v1_4_0.py` module docstring: types are stored
+only as `entity_type`, with `:User` and `:MistIdentity` as the label
+invariants), and no reader used it -- every type reader filters on the
+property (`grep -rn 'entity_type' backend/knowledge/curation/deduplication.py
+backend/knowledge/storage/graph_store.py backend/vault/user_snapshot.py`;
+`count_nodes_by_type` in admin.py). `node_type_label` below states which
+nodes still get one.
 """
 
 import difflib
 import logging
+import re
 from pathlib import Path
 
 from backend.errors import SeedSourceError
@@ -37,8 +49,8 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
-# Partition label (`%s` #1) and ontology type label (`%s` #2) are both
-# interpolated, never fixed constants. Partition: the graph has two
+# Partition label and ontology type label are both interpolated (by
+# `_merge_node_query`), never fixed constants. Partition: the graph has two
 # id-scoped, constraint-isolated partitions (`entity_id_unique` on
 # :__Entity__, `selfmodel_id_unique` on :__SelfModel__) and a hardcoded
 # label here would create a duplicate :__Entity__ copy of every live
@@ -62,14 +74,85 @@ logger = logging.getLogger(__name__)
 # touching properties the applier does not own (e.g. `embedding`). Only
 # `created_at` is create-only, mirroring `backend/knowledge/admin.py`'s
 # `_seed_internal_nodes` (the established production precedent for this
-# exact shape: `MERGE (n:{partition} {id: $id}) ... SET n:{label}`).
+# MERGE shape). The label clauses and the RETURN are appended by
+# `_merge_node_query`.
 _MERGE_NODE = (
     "MERGE (n:%s {id: $id}) "
     "ON CREATE SET n.created_at = $now, n += $properties "
     "ON MATCH SET n += $properties "
-    "SET n:%s "
-    "RETURN n.id AS id"
 )
+
+# The only ontology type label an `:__Entity__` node keeps as a graph label.
+# `:User` is an invariant of the user node, set by every writer that writes it
+# (`grep -n 'SET e:User' backend/knowledge/curation/graph_writer.py
+# backend/knowledge/storage/graph_store.py`); every other `:__Entity__` type
+# lives in `entity_type` only (MIS-177 D2, module docstring above).
+ENTITY_TYPE_LABELS_KEPT: frozenset[str] = frozenset({"User"})
+
+# A label is interpolated into Cypher, so each name is checked to be a plain
+# identifier before it is used -- `ALL_NODE_TYPE_NAMES` is authored ontology
+# data, not user input, but a name that needed backtick-quoting would turn a
+# REMOVE into a syntax error or a different statement.
+_LABEL_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def node_type_label(partition: str, node_type: str) -> str | None:
+    """Return the ontology type label a seed node carries, or None for none.
+
+    `:__SelfModel__` nodes keep their type label (`:MistIdentity` is an
+    invariant, and `ensure_mist_identity` MERGEs on
+    `(:__SelfModel__:MistIdentity {id})`: `grep -n 'MERGE (m:__SelfModel__'
+    backend/knowledge/storage/graph_store.py`). An `:__Entity__` node keeps
+    only `User` (`ENTITY_TYPE_LABELS_KEPT`).
+
+    Args:
+        partition: `ENTITY_LABEL` or `SELF_MODEL_LABEL`.
+        node_type: The node's validated ontology type.
+
+    Returns:
+        The label to SET, or None when the node carries no type label.
+    """
+    if partition == SELF_MODEL_LABEL or node_type in ENTITY_TYPE_LABELS_KEPT:
+        return node_type
+    return None
+
+
+def entity_type_labels_removed(kept: str | None) -> list[str]:
+    """Return every ontology type label an `:__Entity__` seed node must not carry.
+
+    Built from `ALL_NODE_TYPE_NAMES` (the validated ontology), never from the
+    seed source, minus the one label the node keeps (if any).
+
+    Raises:
+        ValueError: An ontology type name is not a plain Cypher identifier.
+    """
+    removed = [name for name in ALL_NODE_TYPE_NAMES if name != kept]
+    for name in removed:
+        if not _LABEL_IDENTIFIER.match(name):
+            raise ValueError(
+                f"ontology node type {name!r} is not a plain identifier; refusing to "
+                "interpolate it into a REMOVE clause"
+            )
+    return removed
+
+
+def _merge_node_query(partition: str, node_type: str) -> str:
+    """Build the node MERGE for one seed node.
+
+    An `:__Entity__` node ends with no ontology type label except `User`,
+    whether the MERGE created it or matched an existing node: the REMOVE
+    strips any type label an earlier writer (a pre-MIS-177 seed, the retired
+    `admin.apply_seed`) left on it. A `:__SelfModel__` node gets its type
+    label SET and nothing removed.
+    """
+    label = node_type_label(partition, node_type)
+    query = _MERGE_NODE % partition
+    if label is not None:
+        query += f"SET n:{label} "
+    if partition == ENTITY_LABEL:
+        query += "REMOVE n:" + ":".join(entity_type_labels_removed(label)) + " "
+    return query + "RETURN n.id AS id"
+
 
 # The label union (`:A|B`) matches a node in EITHER partition -- this MATCH
 # must find self-model nodes as readily as entity nodes, since a fact's
@@ -163,8 +246,10 @@ def apply_seed_documents(
     Every node referenced by a fact (`_assign_node_partitions`'s output --
     unchanged from before Task 12; which ids get written is still driven by
     fact references, not by `doc.nodes` membership) is written with its full
-    `SeedNode` definition: ontology type label, `entity_type` property, and
-    every other descriptive property the source defines (R1.4 Task 12).
+    `SeedNode` definition: `entity_type` property and every other
+    descriptive property the source defines (R1.4 Task 12). Type labels
+    follow `node_type_label`: a `:__SelfModel__` node and a `User` node get
+    their type label; any other `:__Entity__` node ends with none (MIS-177).
 
     Args:
         connection: Sync graph connection. Callers in async contexts must
@@ -250,7 +335,7 @@ def apply_seed_documents(
             "updated_at": now_iso,
         }
         connection.execute_write(
-            _MERGE_NODE % (node_partitions[node_id], node.type),
+            _merge_node_query(node_partitions[node_id], node.type),
             {"id": node_id, "now": now_iso, "properties": properties},
         )
 
@@ -482,8 +567,9 @@ def _validate_node_types(documents: list[SeedDocument]) -> None:
     """Reject any node whose `type` is not a known ontology node type.
 
     Neo4j cannot parameterize a label, so `apply_seed_documents` interpolates
-    `node.type` directly into the Cypher string (`_MERGE_NODE % (partition,
-    node.type)`). That interpolation point is where this check belongs --
+    `node.type` directly into the Cypher string (`_merge_node_query`, for a
+    `:__SelfModel__` or `User` node). That interpolation point is where this
+    check belongs --
     Task 11's loader-level `_validate_node_types` (same name, different
     module) already rejects an unknown type at load time, but mirrors
     `_validate_predicates`'s reasoning below: a loader check does not
