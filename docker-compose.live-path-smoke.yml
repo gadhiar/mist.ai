@@ -115,7 +115,7 @@
 # test is the standing check.
 services:
   mist-neo4j-smoke:
-    image: neo4j:5
+    image: neo4j:5.26.23@sha256:40bf5ae9282213087e4d6036aab3ec443fe9c974d3dd4f14a11892c63157238f
     container_name: mist-neo4j-smoke
     profiles: ["smoke"]
     ports:
