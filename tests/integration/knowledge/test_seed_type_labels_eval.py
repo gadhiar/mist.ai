@@ -133,9 +133,7 @@ def test_seed_writes_type_labels_only_where_they_are_invariants(eval_connection)
     assert labels["lbl-mist"] == {SELF_MODEL_LABEL, "MistIdentity"}
     assert labels["lbl-trait"] == {SELF_MODEL_LABEL, "MistTrait"}
 
-    rows = conn.execute_query(
-        "MATCH (n) RETURN n.id AS id, n.entity_type AS entity_type", {}
-    )
+    rows = conn.execute_query("MATCH (n) RETURN n.id AS id, n.entity_type AS entity_type", {})
     assert {r["id"]: r["entity_type"] for r in rows} == {
         "lbl-user": "User",
         "lbl-rust": "Technology",
@@ -153,9 +151,7 @@ def test_node_definitions_gate_fails_on_a_stray_label_or_a_wrong_entity_type(eva
     apply_seed_documents(conn, _documents(), seed_version=_SEED_VERSION, now_iso=_NOW)
 
     conn.execute_write("MATCH (n:__Entity__ {id: 'lbl-rust'}) SET n:Technology", {})
-    conn.execute_write(
-        "MATCH (n:__Entity__ {id: 'lbl-acme'}) SET n.entity_type = 'Project'", {}
-    )
+    conn.execute_write("MATCH (n:__Entity__ {id: 'lbl-acme'}) SET n.entity_type = 'Project'", {})
 
     gate = check_node_definitions(conn, _documents(), seed_version=_SEED_VERSION)
     assert not gate.passed

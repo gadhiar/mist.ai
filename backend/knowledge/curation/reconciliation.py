@@ -162,10 +162,15 @@ class BeliefRow:
     it; D3 -- a row with no `provenance` but a non-null `seed_version` (a seed
     edge written before KG-125) is a seed row.
 
-    A later reseed can still ADOPT a clamped copy: the seed applier's unkeyed
-    `MERGE (s)-[r:TYPE]->(o)` (`seed/applier.py` `_MERGE_EDGE`) matches it and
-    sets `seed_version` on it, so a copy can carry both `seed_version` and
-    `seed_origin_version`. Pre-existing, tracked as the D11 follow-up.
+    The seed applier's `MERGE (s)-[r:TYPE]->(o)` (`seed/applier.py`
+    `_MERGE_EDGE`) is not keyed on `seed_version`, so a reseed would match a
+    clamped copy and set `seed_version` on it. Since MIS-177 D1 the applier
+    refuses, before any write or wipe, a graph holding one: the copy's target
+    is always an `:__Entity__` node (`_apply_append`'s `MATCH (t:__Entity__`)
+    and the copy has no `seed_version`, which `admin.RESET_GUARD_CYPHER`
+    counts (`grep -n '_assert_seed_target_holds_only_seed('
+    backend/knowledge/seed/applier.py`). A copy adopted before that guard
+    existed can still carry both `seed_version` and `seed_origin_version`.
     """
 
     edge_ref: str  # Neo4j elementId(r)
@@ -752,11 +757,15 @@ class ReconciliationEngine:
         # its lineage in `seed_origin_version`. This statement never writes
         # `seed_version` on a copy: the wipe (`seed/applier.py` `_WIPE_EDGES`),
         # the seed gates (`seed/gates.py`) and the cutover probe
-        # (`SEED_ONLY_PROBE_CYPHER`) read that as "written by the applier". A
-        # later reseed can still adopt the copy -- the applier's unkeyed MERGE
-        # (`seed/applier.py` `_MERGE_EDGE`) matches it and sets `seed_version`,
-        # resets its valid time and overwrites its provenance; pre-existing,
-        # tracked as the D11 follow-up. The copy DOES get the extraction stamps
+        # (`SEED_ONLY_PROBE_CYPHER`) read that as "written by the applier". The
+        # applier's MERGE (`seed/applier.py` `_MERGE_EDGE`) is not keyed on
+        # `seed_version` and would adopt the copy (set `seed_version`, reset its
+        # valid time, overwrite its provenance), so since MIS-177 D1 the
+        # applier refuses a graph holding one before any write or wipe: the
+        # copy touches an `:__Entity__` node (the target MATCH below) without
+        # `seed_version`, which `admin.RESET_GUARD_CYPHER` counts (`grep -n
+        # '_assert_seed_target_holds_only_seed(' backend/knowledge/seed/applier.py`).
+        # The copy DOES get the extraction stamps
         # below, so the seed-only cutover probe refuses a graph holding one. A
         # new assertion or a copy of an extraction row stays 'extraction' with
         # no seed_origin_version (a NULL SET writes no property).

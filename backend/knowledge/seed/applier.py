@@ -181,10 +181,12 @@ def _merge_node_query(partition: str, node_type: str) -> str:
 # overwrite provenance/source_type/confidence, and the next reseed's wipe would
 # delete it. MIS-177 D1 (the former D11 follow-up) closes that for the edges it
 # can see: `_assert_seed_target_holds_only_seed` refuses, before any write or
-# wipe, a graph holding a clamped copy `curation/reconciliation.py`
-# `_apply_append` appended (it carries extraction stamps), any edge touching an
-# `:__Entity__` node without `seed_version`, and any `provenance='extraction'`
-# edge. What it still cannot see -- unstamped edges between two
+# wipe, a graph holding any edge touching an `:__Entity__` node without
+# `seed_version` -- which includes every clamped copy
+# `curation/reconciliation.py` `_apply_append` appends (`grep -nE 'MATCH
+# \(t:__Entity__|r.seed_origin_version = '
+# backend/knowledge/curation/reconciliation.py`) -- any edge carrying
+# `extraction_version` or `model_hash`, and any `provenance='extraction'` edge. What it still cannot see -- unstamped edges between two
 # `:__SelfModel__` nodes -- is named above `SEED_GUARD_STAMP_PROPERTIES`.
 _MERGE_EDGE = (
     f"MATCH (s:{ENTITY_LABEL}|{SELF_MODEL_LABEL} {{id: $subject}}) "

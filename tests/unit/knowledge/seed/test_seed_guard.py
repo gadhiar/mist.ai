@@ -90,9 +90,7 @@ def _connection(
 
 
 def _apply(connection: FakeNeo4jConnection) -> dict[str, int]:
-    return apply_seed_documents(
-        connection, _documents(), seed_version=_SEED_VERSION, now_iso=_NOW
-    )
+    return apply_seed_documents(connection, _documents(), seed_version=_SEED_VERSION, now_iso=_NOW)
 
 
 def _reseed(connection: FakeNeo4jConnection) -> dict[str, int]:
@@ -166,9 +164,7 @@ class TestRefusesBeforeAnyWrite:
         [case[1:] for case in _BLOCKING],
         ids=[case[0] for case in _BLOCKING],
     )
-    def test_a_blocking_element_is_refused_with_its_count(
-        self, seed, reset_rows, seed_rows, named
-    ):
+    def test_a_blocking_element_is_refused_with_its_count(self, seed, reset_rows, seed_rows, named):
         conn = _connection(reset_guard_rows=reset_rows, seed_guard_rows=seed_rows)
 
         with pytest.raises(SeedTargetNotSeedOnlyError) as excinfo:

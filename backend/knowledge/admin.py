@@ -731,7 +731,13 @@ def _extraction_stamped(var: str) -> str:
 #     confidence, evidence and updated_at with no stamp:
 #     `grep -nE 'is ActionKind\.(CLOSE_TRANSACTION|REINFORCE):|ON MATCH SET r.confidence'
 #     backend/knowledge/curation/reconciliation.py`;
-#   - an unstamped non-seed element a reseed adopted (it gains `seed_version`).
+#   - an unstamped non-seed element a reseed adopted (it gains `seed_version`)
+#     before MIS-177 D1. The seed applier now refuses, before any write or
+#     wipe, a graph in which this statement counts anything (`grep -n
+#     count_reset_guard_elements backend/knowledge/seed/applier.py`), so a
+#     seed adopts no element this statement counts, unless a writer creates
+#     one between the guard's read and the seed's writes (they share no
+#     transaction).
 # Against the list above `SEED_ONLY_PROBE_CYPHER` in
 # backend/extraction_backlog/cutover.py, entry by entry, the one difference is
 # `InternalKnowledgeDeriver._apply_operation`: that list has it, this one does
@@ -798,10 +804,11 @@ def count_non_seed_entities(connection: GraphConnection) -> int:
     The sum of `count_reset_guard_elements`: `:__Entity__` nodes and the
     relationships touching them that lack the seed applier's markers or carry
     an extraction stamp (see `RESET_GUARD_CYPHER`, including what it cannot
-    see). `scripts/mist_admin.py` `cmd_graph_reset` calls it to refuse wiping
-    derived data unless --include-derived is explicitly passed; `reset_graph`
-    applies the same guard by calling `count_reset_guard_elements` directly.
-    The name predates relationships being counted.
+    see). No production code calls it: `scripts/mist_admin.py`
+    `cmd_graph_reset`, `reset_graph` and the seed applier all call
+    `count_reset_guard_elements` directly (`git grep -n -e
+    count_reset_guard_elements -e count_non_seed -- scripts backend`). The
+    name predates relationships being counted.
     """
     nodes, relationships = count_reset_guard_elements(connection)
     return nodes + relationships
