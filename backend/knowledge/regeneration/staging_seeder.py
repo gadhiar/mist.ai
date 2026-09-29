@@ -121,6 +121,9 @@ class StagingSeeder:
         Raises:
             EvalIsolationError: via `apply_seed_documents`, before any write,
                 when `connection` names the live graph.
+            SeedTargetNotSeedOnlyError: via `apply_seed_documents`, before any
+                write, when the target graph holds non-seed or extraction-written
+                elements (the seed guard, `backend/knowledge/seed/applier.py`).
         """
         counts = apply_seed_documents(
             self._connection,
