@@ -345,10 +345,10 @@ class CurationGraphWriter:
         Why the `new_fact` LearningEvent is in this statement too. `write()`
         writes it only for an entity dedup did NOT map onto an existing node
         (`grep -n 'is_update = entity_id in merge_lookup' backend/knowledge/curation/graph_writer.py`
-        -> 186, plus this citation's own line). On a replay, dedup finds the entity the crashed run created,
+        -> 195, plus this citation's own line). On a replay, dedup finds the entity the crashed run created,
         by exact id first
         (`grep -n 'existing = await self._find_existing' backend/knowledge/curation/deduplication.py`
-        -> 84), and emits a MergeAction for it, so the replay never writes the
+        -> 88), and emits a MergeAction for it, so the replay never writes the
         LearningEvent. As a separate statement, a kill after the entity and
         before the LearningEvent therefore lost it for good. In this statement,
         the LearningEvent exists whenever the entity this event created does.
