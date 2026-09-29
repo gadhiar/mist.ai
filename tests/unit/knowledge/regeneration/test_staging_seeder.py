@@ -15,8 +15,9 @@ steps and skipping any of them produces a graph that passes every gate:
    to write them.
 
 Bundled behind one object rather than left as three calls in `rebuild()` so the
-three cannot drift apart at the one call site that matters. `seed/gates.py:264`
-states the consequence of drifting: `canonical_serialize` excludes `embedding`,
+three cannot drift apart at the one call site that matters. The
+`check_embeddings` docstring in seed/gates.py states the consequence of
+drifting: `canonical_serialize` excludes `embedding`,
 so an unembedded rebuild is byte-identical to an embedded one.
 
 ## Why `now_iso` is injected rather than read from the clock
@@ -30,7 +31,7 @@ has nothing to do with determinism.
 
 ## Why the live-target refusal is tested here and not only at the write site
 
-`_assert_seed_target_permitted` (`seed/applier.py:91`) is default-CLOSED at the
+`_assert_seed_target_permitted` (seed/applier.py) is default-CLOSED at the
 write site, and its docstring names this exact insertion point as the reason:
 "at the R1.7 seed-apply insertion point, `source_conn` and `staging_conn` are
 both in scope and differ by six characters". After step A that specific confusion

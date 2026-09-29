@@ -1166,7 +1166,7 @@ def _build_log_regenerator(
         # never `live_conn`. Those two names differ by six characters at this call
         # site, which `_assert_seed_target_permitted`'s docstring calls out by name;
         # the refusal that protects against getting it wrong is at the WRITE site
-        # (`seed/applier.py:91`, default-CLOSED), not here, because a guard the
+        # (seed/applier.py, default-CLOSED), not here, because a guard the
         # caller must remember to add is absent exactly when it matters.
         staging_seeder=StagingSeeder(
             connection=staging_conn,
@@ -2679,10 +2679,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run hybrid (graph + vector) retrieval for a query.",
     )
     p_retrieve.add_argument("query", help="Natural-language query.")
+    # The user node's stored id: retrieval anchors on it by exact id
+    # (`GraphStore.get_user_relationships_to_entities`), so "User" matched
+    # nothing. partitions.py imports nothing but `__future__`, so this keeps
+    # `--help` free of backend dependencies.
+    from backend.knowledge.storage.partitions import USER_ENTITY_ID
+
     p_retrieve.add_argument(
         "--user-id",
-        default="User",
-        help="User identifier scoping the retrieval (default: User).",
+        default=USER_ENTITY_ID,
+        help=f"User node id scoping the retrieval (default: {USER_ENTITY_ID}).",
     )
     p_retrieve.add_argument(
         "--limit",

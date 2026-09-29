@@ -377,7 +377,7 @@ class LogRegenerator:
         #
         # ORDER IS LOAD-BEARING and the two writers do not commute:
         #
-        #   seed      `ON MATCH SET n += $properties`      (seed/applier.py:62)
+        #   seed      `ON MATCH SET n += $properties`      (seed/applier.py `_MERGE_NODE`)
         #               -- unconditional clobber of every authored property
         #   extraction `display_name = CASE WHEN size(existing) < size(new) ...`
         #               (curation/graph_writer.py `_upsert_entity`) -- longest-wins
@@ -482,7 +482,7 @@ class LogRegenerator:
         # NOTHING GOES HERE. The self-model copy-forward that used to occupy this
         # position is retired (MIS-130 step A), and its replacement does not belong
         # on this side of the loop: a seed-apply must run BEFORE the replay, because
-        # seed's `ON MATCH SET n += $properties` (seed/applier.py:62) and
+        # seed's `ON MATCH SET n += $properties` (seed/applier.py `_MERGE_NODE`) and
         # extraction's longest-wins `display_name` CASE (graph_writer.py `_upsert_entity`) do
         # not commute. The ordering rationale in full sits above the replay loop,
         # deliberately at the position the step must take rather than at the position

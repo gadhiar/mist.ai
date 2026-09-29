@@ -129,7 +129,7 @@ class ConversationTurnEvent:
         after `2026-01-01T06:00:00+00:00` (06:00Z) as a string while being earlier
         as an instant, so one mixed-offset writer silently misorders a rebuild --
         and replay order decides dedup outcomes
-        (`curation/deduplication.py:130-172`).
+        (`EntityDeduplicator._find_existing` in curation/deduplication.py).
 
         Every caller happens to pass UTC today (`datetime.now(UTC)` on the live
         path; `load_hydration_clock` normalises and refuses naive values). That is

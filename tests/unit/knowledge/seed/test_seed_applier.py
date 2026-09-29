@@ -10,10 +10,15 @@ graph litter that no gate detects.
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from backend.errors import SeedSourceError
 from backend.knowledge.ontologies import ALL_NODE_TYPE_NAMES
-from backend.knowledge.seed.applier import apply_seed_documents, entity_type_labels_removed
+from backend.knowledge.seed.applier import (
+    apply_seed_documents,
+    entity_type_labels_removed,
+    reseed,
+)
 from backend.knowledge.seed.models import SeedDocument, SeedFact, SeedNode
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
 
@@ -593,9 +598,10 @@ class TestNodeDefinitionWrites:
         assert by_id["slalom"].index("ON MATCH SET") < by_id["slalom"].index("REMOVE n:")
 
     def test_user_node_keeps_the_user_label_and_sheds_the_rest(self, fake_connection):
-        """`:User` is the one `:__Entity__` type label invariant (every writer of
-        the user node sets it). It is SET, and excluded from the REMOVE; every
-        other ontology type label is removed.
+        """`:User` is the one `:__Entity__` type label the applier keeps
+        (`ENTITY_TYPE_LABELS_KEPT`, which names the writers that set it). It is
+        SET, and excluded from the REMOVE; every other ontology type label is
+        removed.
         """
         docs = [
             _doc(
@@ -950,5 +956,154 @@ class TestApplierOwnDefenses:
 
         with pytest.raises(SeedSourceError, match="user"):
             apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        fake_connection.assert_no_writes()
+
+
+_STAMPS = ("ontology_version", "extraction_version", "model_hash")
+
+
+def _constructed_doc(node: SeedNode) -> SeedDocument:
+    """A document holding `node`, built without re-validating it.
+
+    `SeedDocument(nodes=[...])` re-validates each item (see
+    `TestAuthoredStampsNeverWinOverTheAppliersOwn`), which would re-run
+    `_no_applier_owned_extras` on a `model_construct`-built node.
+    """
+    return SeedDocument.model_construct(
+        seed_version="profile-v1",
+        nodes=[node, SeedNode(id="python", type="Technology")],
+        facts=[SeedFact(subject=node.id, predicate="USES", object="python")],
+        body="b",
+        source_path=Path("t.md"),
+        partition=ENTITY_LABEL,
+    )
+
+
+class TestExtractionStampsNeverReachASeedNode:
+    """MIS-177 review: an authored extraction stamp on a `SeedNode` reached
+    the graph through `n += $properties`, and the seed's own node then
+    tripped the graph-reset guard and the seed guard, refusing every later
+    reseed. Two layers: `SeedNode._no_applier_owned_extras` at construction,
+    and `_validate_no_extraction_stamps` in the applier for a node that
+    skipped the validator.
+    """
+
+    def test_models_stamp_names_match_the_admin_constant(self):
+        from backend.knowledge import admin
+        from backend.knowledge.seed import models
+
+        assert (
+            frozenset(admin._EXTRACTION_STAMP_PROPERTIES)
+            == models._EXTRACTION_STAMP_NODE_PROPERTIES
+        )
+
+    def test_the_reviewers_node_is_refused_at_construction(self):
+        with pytest.raises(ValidationError, match="extraction stamps"):
+            SeedNode(id="org", type="Organization", ontology_version="1.0.0", model_hash="h")
+
+    @pytest.mark.parametrize("stamp", _STAMPS)
+    def test_each_stamp_is_refused_at_construction(self, stamp):
+        with pytest.raises(ValidationError, match=stamp):
+            SeedNode(id="org", type="Organization", **{stamp: "x"})
+
+    @pytest.mark.parametrize("stamp", _STAMPS)
+    def test_apply_refuses_a_constructed_stamp_before_any_write(self, fake_connection, stamp):
+        node = SeedNode.model_construct(id="org", type="Organization", **{stamp: "x"})
+
+        with pytest.raises(SeedSourceError, match=stamp):
+            apply_seed_documents(
+                fake_connection, [_constructed_doc(node)], seed_version="profile-v1", now_iso=_NOW
+            )
+
+        fake_connection.assert_no_writes()
+
+    @pytest.mark.parametrize("stamp", _STAMPS)
+    def test_reseed_refuses_a_constructed_stamp_before_the_wipe(self, fake_connection, stamp):
+        node = SeedNode.model_construct(id="org", type="Organization", **{stamp: "x"})
+
+        with pytest.raises(SeedSourceError, match=stamp):
+            reseed(
+                fake_connection, [_constructed_doc(node)], seed_version="profile-v1", now_iso=_NOW
+            )
+
+        fake_connection.assert_no_writes()
+
+
+class TestLabelsAreCheckedBeforeTheFirstWrite:
+    """MIS-177 review: the label-identifier check ran inside the node write
+    loop, so an ontology name that is not a plain identifier raised after
+    earlier nodes were written -- and in `reseed`, after the wipe. Every
+    label the node MERGEs interpolate (SET and REMOVE) is now checked before
+    the first write.
+    """
+
+    @staticmethod
+    def _docs() -> list[SeedDocument]:
+        # Sorted node ids: mist-identity (self-model, no REMOVE), python
+        # (entity), trait-warm, user -- the self-model node sorts first, so
+        # an in-loop check fires after at least one write.
+        return [
+            _doc(
+                facts=[("mist-identity", "HAS_TRAIT", "trait-warm")],
+                partition=SELF_MODEL_LABEL,
+                nodes=[
+                    SeedNode(id="mist-identity", type="MistIdentity"),
+                    SeedNode(id="trait-warm", type="MistTrait"),
+                ],
+                source_path=Path("mist.md"),
+            ),
+            _doc(
+                facts=[("user", "USES", "python")],
+                nodes=[
+                    SeedNode(id="user", type="User"),
+                    SeedNode(id="python", type="Technology"),
+                ],
+                source_path=Path("user.md"),
+            ),
+        ]
+
+    @pytest.fixture
+    def bad_ontology_name(self, monkeypatch):
+        monkeypatch.setattr(
+            "backend.knowledge.seed.applier.ALL_NODE_TYPE_NAMES",
+            [*ALL_NODE_TYPE_NAMES, "Bad-Name"],
+        )
+
+    def test_apply_refuses_a_bad_remove_label_before_any_write(
+        self, fake_connection, bad_ontology_name
+    ):
+        with pytest.raises(SeedSourceError, match="Bad-Name"):
+            apply_seed_documents(
+                fake_connection, self._docs(), seed_version="profile-v1", now_iso=_NOW
+            )
+
+        fake_connection.assert_no_writes()
+
+    def test_reseed_refuses_a_bad_remove_label_before_the_wipe(
+        self, fake_connection, bad_ontology_name
+    ):
+        with pytest.raises(SeedSourceError, match="Bad-Name"):
+            reseed(fake_connection, self._docs(), seed_version="profile-v1", now_iso=_NOW)
+
+        fake_connection.assert_no_writes()
+
+    def test_a_bad_set_label_is_refused_too(self, fake_connection, bad_ontology_name):
+        """A `:__SelfModel__` node SETs its type label, so an ontology type
+        that is not a plain identifier must be refused there as well.
+        """
+        docs = [
+            _doc(
+                facts=[("mist-identity", "HAS_TRAIT", "odd")],
+                partition=SELF_MODEL_LABEL,
+                nodes=[
+                    SeedNode(id="mist-identity", type="MistIdentity"),
+                    SeedNode(id="odd", type="Bad-Name"),
+                ],
+            )
+        ]
+
+        with pytest.raises(SeedSourceError, match="SET"):
+            reseed(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
 
         fake_connection.assert_no_writes()

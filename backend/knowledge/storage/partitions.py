@@ -29,7 +29,8 @@ SELF_MODEL_LABEL = "__SelfModel__"
 # user node by id must use exactly this value ("User" matches nothing).
 # Writers of this id, established by:
 #   grep -n '"id": "user"' backend/knowledge/extraction/prompts.py   (line 49)
-#   grep -n "id: 'user'" backend/knowledge/curation/skill_derivation.py (line 173)
+#   grep -n '"user_entity_id": USER_ENTITY_ID' backend/knowledge/curation/skill_derivation.py
+#     (SkillDerivationJob._create_skill MERGEs {id: $user_entity_id} with this value)
 # Readers that take it by id: GraphStore.get_user_relationships_to_entities
 # (MATCH (user:__Entity__ {id: $user_id})) via KnowledgeRetriever.retrieve.
 USER_ENTITY_ID = "user"

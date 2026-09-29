@@ -35,7 +35,7 @@ from pathlib import Path
 
 from backend.errors import Neo4jQueryError, SeedSourceError, SeedTargetNotSeedOnlyError
 from backend.interfaces import GraphConnection
-from backend.knowledge.admin import count_reset_guard_elements
+from backend.knowledge.admin import _EXTRACTION_STAMP_PROPERTIES, count_reset_guard_elements
 from backend.knowledge.eval_isolation import assert_neo4j_uri_not_live
 from backend.knowledge.ontologies import ALL_NODE_TYPE_NAMES
 from backend.knowledge.ontologies.v1_0_0 import ALL_EDGE_TYPE_NAMES
@@ -85,10 +85,15 @@ _MERGE_NODE = (
 )
 
 # The only ontology type label an `:__Entity__` node keeps as a graph label.
-# `:User` is an invariant of the user node, set by every writer that writes it
-# (`grep -n 'SET e:User' backend/knowledge/curation/graph_writer.py
-# backend/knowledge/storage/graph_store.py`); every other `:__Entity__` type
-# lives in `entity_type` only (MIS-177 D2, module docstring above).
+# `:User` is the user node's label: the graph writer, `GraphStore` and this
+# applier SET it when they write the user node (`grep -n 'SET e:User'
+# backend/knowledge/curation/graph_writer.py
+# backend/knowledge/storage/graph_store.py`). Not every writer of the user node
+# does: `SkillDerivationJob._create_skill` MERGEs it without the label
+# (`grep -n 'MERGE (u:__Entity__ {id: $user_entity_id})'
+# backend/knowledge/curation/skill_derivation.py`), so a user node only that
+# job has written carries no `:User`. Every other `:__Entity__` type lives in
+# `entity_type` only (MIS-177 D2, module docstring above).
 ENTITY_TYPE_LABELS_KEPT: frozenset[str] = frozenset({"User"})
 
 # A label is interpolated into Cypher, so each name is checked to be a plain
@@ -119,6 +124,15 @@ def node_type_label(partition: str, node_type: str) -> str | None:
     return None
 
 
+def _require_label_identifier(name: str, clause: str) -> None:
+    """Raise ValueError unless `name` can be interpolated as a bare Cypher label."""
+    if not _LABEL_IDENTIFIER.match(name):
+        raise ValueError(
+            f"ontology node type {name!r} is not a plain identifier; refusing to "
+            f"interpolate it into a {clause} clause"
+        )
+
+
 def entity_type_labels_removed(kept: str | None) -> list[str]:
     """Return every ontology type label an `:__Entity__` seed node must not carry.
 
@@ -130,11 +144,7 @@ def entity_type_labels_removed(kept: str | None) -> list[str]:
     """
     removed = [name for name in ALL_NODE_TYPE_NAMES if name != kept]
     for name in removed:
-        if not _LABEL_IDENTIFIER.match(name):
-            raise ValueError(
-                f"ontology node type {name!r} is not a plain identifier; refusing to "
-                "interpolate it into a REMOVE clause"
-            )
+        _require_label_identifier(name, "REMOVE")
     return removed
 
 
@@ -146,10 +156,18 @@ def _merge_node_query(partition: str, node_type: str) -> str:
     strips any type label an earlier writer (a pre-MIS-177 seed, the retired
     `admin.apply_seed`) left on it. A `:__SelfModel__` node gets its type
     label SET and nothing removed.
+
+    Every label it interpolates, SET and REMOVE, is checked here, and
+    `_build_node_queries` calls this for every node before the first write,
+    so the check never fires mid-write.
+
+    Raises:
+        ValueError: A label it would interpolate is not a plain identifier.
     """
     label = node_type_label(partition, node_type)
     query = _MERGE_NODE % partition
     if label is not None:
+        _require_label_identifier(label, "SET")
         query += f"SET n:{label} "
     if partition == ENTITY_LABEL:
         query += "REMOVE n:" + ":".join(entity_type_labels_removed(label)) + " "
@@ -441,7 +459,10 @@ def apply_seed_documents(
             referential-integrity check re-asserted here as the applier's
             own defense -- a caller that constructs `SeedDocument`s
             directly, bypassing `load_seed_documents`, is not protected by
-            a loader-only check).
+            a loader-only check). Also raised, before any write, for a
+            node carrying an extraction stamp
+            (`_validate_no_extraction_stamps`) or a label that is not a plain
+            identifier (`_build_node_queries`).
         SeedTargetNotSeedOnlyError: The target graph holds an element the
             seed guard counts (`_assert_seed_target_holds_only_seed`).
             Raised before any write.
@@ -453,8 +474,10 @@ def apply_seed_documents(
     )
     _validate_predicates(documents)
     _validate_node_types(documents)
+    _validate_no_extraction_stamps(documents)
     node_partitions = _assign_node_partitions(documents)
     node_definitions = _collect_node_definitions(documents)
+    node_queries = _build_node_queries(node_partitions, node_definitions)
     # MIS-177 D1: after the source checks (which need no query), before the
     # first write.
     _assert_seed_target_holds_only_seed(connection, action="applying seed documents")
@@ -505,7 +528,7 @@ def apply_seed_documents(
             "updated_at": now_iso,
         }
         connection.execute_write(
-            _merge_node_query(node_partitions[node_id], node.type),
+            node_queries[node_id],
             {"id": node_id, "now": now_iso, "properties": properties},
         )
 
@@ -626,7 +649,9 @@ def reseed(
             node type, the same node id is assigned to two different
             partitions by different documents, the same node id is defined
             more than once, or a fact references an undefined node id.
-            Raised before the wipe runs.
+            Raised before the wipe runs. Also raised before the wipe for a
+            node carrying an extraction stamp or a label its MERGE would
+            interpolate that is not a plain identifier.
         SeedTargetNotSeedOnlyError: The target graph holds an element the
             seed guard counts. Raised before the wipe runs.
         Neo4jQueryError: A seed guard statement failed or returned no
@@ -638,8 +663,8 @@ def reseed(
     _assert_seed_target_permitted(connection, allow_live=allow_live, action="re-seeding")
     _validate_predicates(documents)
     _validate_node_types(documents)
-    _assign_node_partitions(documents)
-    _collect_node_definitions(documents)
+    _validate_no_extraction_stamps(documents)
+    _build_node_queries(_assign_node_partitions(documents), _collect_node_definitions(documents))
     # MIS-177 D1: BEFORE the wipe. The delegate's own check runs after the
     # wipe, on a graph the wipe has already changed; a refusal there would
     # leave the seed content deleted.
@@ -773,6 +798,68 @@ def _validate_node_types(documents: list[SeedDocument]) -> None:
                 f"{doc.source_path}: node {node.id!r} has unknown type {node.type!r}, "
                 f"not a recognized ontology node type.{hint}"
             )
+
+
+def _validate_no_extraction_stamps(documents: list[SeedDocument]) -> None:
+    """Reject any node whose properties carry an extraction stamp.
+
+    `SeedNode._no_applier_owned_extras` (models.py) refuses these names when a
+    node is built; this is the applier's independent second layer, for a
+    `SeedNode` that skipped that validator (`model_construct`). Ordering the
+    spread cannot neutralise a stamp the way it does an applier-owned key,
+    because the applier writes no stamp of its own for it to lose to: an
+    authored one would reach the graph through `n += $properties`. Which guard
+    then refuses the seed's own node is stated above
+    `_EXTRACTION_STAMP_NODE_PROPERTIES` in models.py.
+
+    Checks every name in `admin._EXTRACTION_STAMP_PROPERTIES` against the keys
+    `apply_seed_documents` spreads (`node.model_dump()`).
+
+    Raises:
+        SeedSourceError: A node carries `ontology_version`,
+            `extraction_version` or `model_hash`.
+    """
+    stamps = frozenset(_EXTRACTION_STAMP_PROPERTIES)
+    for doc in documents:
+        for node in doc.nodes:
+            found = stamps & node.model_dump().keys()
+            if found:
+                raise SeedSourceError(
+                    f"{doc.source_path}: node {node.id!r} carries extraction stamp(s) "
+                    f"{sorted(found)}; a seed node must not carry one, or the seed "
+                    "guard or graph-reset guard can refuse the graph this seed wrote "
+                    "(MIS-177)"
+                )
+
+
+def _build_node_queries(
+    node_partitions: dict[str, str], node_definitions: dict[str, SeedNode]
+) -> dict[str, str]:
+    """Build the MERGE for every node the applier will write, before any write.
+
+    `_merge_node_query` interpolates labels (SET and REMOVE) and refuses one
+    that is not a plain identifier; building every query here first means that
+    refusal happens before the first write, and in `reseed` before the wipe,
+    instead of after some nodes are already written. A node id with no
+    definition is skipped; the write loop reports it.
+
+    Returns:
+        Each defined, fact-referenced node id mapped to its MERGE statement.
+
+    Raises:
+        SeedSourceError: A label a node's MERGE would interpolate is not a
+            plain Cypher identifier.
+    """
+    queries: dict[str, str] = {}
+    for node_id in sorted(node_partitions):
+        node = node_definitions.get(node_id)
+        if node is None:
+            continue
+        try:
+            queries[node_id] = _merge_node_query(node_partitions[node_id], node.type)
+        except ValueError as exc:
+            raise SeedSourceError(f"node {node_id!r}: {exc}") from exc
+    return queries
 
 
 def _validate_predicates(documents: list[SeedDocument]) -> None:

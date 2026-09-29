@@ -15,8 +15,8 @@ events** -- and ADR-023 section 2 claims the entity subgraph is a function of th
 log.
 
 It is not cosmetic. `EntityDeduplicator._find_existing` resolves each incoming
-entity against whatever is already in the target graph
-(`curation/deduplication.py:130-172`), so processing order decides which entity wins
+entity against whatever is already in the target graph (curation/deduplication.py),
+so processing order decides which entity wins
 `display_name`, `description`, `entity_type`, and the alias union. A rebuild that
 replays in a different order than live accumulated produces different facts and the
 gate reports it as non-determinism.

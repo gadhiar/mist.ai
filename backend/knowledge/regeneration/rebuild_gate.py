@@ -427,8 +427,9 @@ def assert_seed_embeddings_present(gate_result) -> None:
 
     A second floor rather than a clause of `assert_seed_applied`, because a node
     count cannot see this failure and the canonical form is blind to it BY
-    DESIGN: `canonical_serialize` excludes `embedding` (`seed/gates.py:264-268`
-    -- "byte-identical whether embeddings are present, absent, or all-zero").
+    DESIGN: `canonical_serialize` excludes `embedding` (the `check_embeddings`
+    docstring in seed/gates.py -- "byte-identical whether embeddings are
+    present, absent, or all-zero").
     `apply_seed_documents` never writes `embedding` either; only the backfill
     does. So a seed-apply that skips or fails the backfill yields a graph
     nothing can retrieve from, and it certifies as identical to one that did
@@ -442,7 +443,8 @@ def assert_seed_embeddings_present(gate_result) -> None:
     failed to write them. `check_embeddings` re-reads the graph.
 
     A pass that examined nothing is refused too. `check_embeddings` is the only
-    seed gate that populates `examined` (`seed/gates.py:62-88`), so the check is
+    seed gate that populates `examined` (the `GateResult` docstring in
+    seed/gates.py), so the check is
     meaningful here and would be meaningless against the other four.
 
     Raises:

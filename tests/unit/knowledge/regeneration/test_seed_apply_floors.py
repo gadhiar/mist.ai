@@ -20,8 +20,8 @@ assertion, rather than by waiting for C.
 see the failure that has actually cost this project live data twice.
 `apply_seed_documents` never writes `embedding` -- only the backfill does
 (`mist_admin.py:180`) -- and `canonical_serialize` EXCLUDES `embedding`
-outright (`seed/gates.py:264-268`: "byte-identical whether embeddings are
-present, absent, or all-zero"). So a seed-apply that skips or fails the backfill
+outright (the `check_embeddings` docstring in seed/gates.py: "byte-identical
+whether embeddings are present, absent, or all-zero"). So a seed-apply that skips or fails the backfill
 produces a graph nothing can retrieve from, and it certifies as identical to one
 that did not. Node count green, determinism green, equality green, graph dead.
 
@@ -92,7 +92,8 @@ class TestSeedEmbeddingFloor:
         """The vacuous pass is the dangerous one, and it reports `passed=True`.
 
         `check_embeddings` is the only seed gate that populates `examined`
-        (`seed/gates.py:62-88`), so this check is meaningful here and would be
+        (the `GateResult` docstring in seed/gates.py), so this check is
+        meaningful here and would be
         meaningless against any of the other four.
         """
         result = GateResult(passed=True, failures=[], examined=0)

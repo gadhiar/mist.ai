@@ -18,7 +18,9 @@ logger = logging.getLogger(__name__)
 
 # Neo4j's vector.similarity.cosine returns (1 + cos) / 2, so 0.92 is a raw cosine of 0.84. Measure
 # it with `python -m scripts.dedup_calibration`. Tier 3 also vetoes candidates whose numeric or
-# month tokens differ from the incoming name's (name_veto): 'P95'/'P99 latency' scores 0.96-0.99.
+# month tokens differ from the incoming name's (name_veto): 'P95'/'P99 latency' scored 0.96-0.99
+# in the lead's live-container measurement of 2026-09-29 (MIS-177), which no committed artifact
+# records; the same tool is the in-repo way to measure it (see the name_veto module docstring).
 SIMILARITY_THRESHOLD = 0.92
 TIER3_CANDIDATE_LIMIT = 50  # Tier-3 candidates fetched before the veto; see _find_existing
 MAX_ALIASES = 20
@@ -137,9 +139,9 @@ class EntityDeduplicator:
            veto is a pure function of two strings, so the decision stays a
            deterministic function of graph state and input.
 
-        This method's line in `deduplicate` is cited by line number from
-        `CurationGraphWriter._upsert_entity` (graph_writer.py) and checked by
-        tests/unit/extraction_backlog/test_graph_writer_citations.py.
+        `CurationGraphWriter._upsert_entity` (graph_writer.py) cites this
+        method's call in `deduplicate` by name, not by line number, so this
+        module's line numbers are free to move.
         """
         _RET = (
             "RETURN e.id AS id, e.entity_type AS entity_type, "

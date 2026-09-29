@@ -1,11 +1,17 @@
 """Deterministic name veto for Tier-3 (embedding) entity deduplication.
 
 Embedding similarity cannot tell apart names that differ only in a number or a
-date. Measured on the live container, distinct extracted pairs such as
-'P95' / 'P99 latency', 'March 3' / 'March 13, 2026' and 'Q1' / 'Q2 2026' score
-0.96-0.99 on Neo4j's `vector.similarity.cosine` scale, above any usable
-threshold. Merging them destroys a distinct fact, so Tier 3 asks this module
-whether a candidate is vetoed before taking it.
+date. In the lead's live-container measurement of 2026-09-29 (MIS-177), distinct
+extracted pairs such as 'P95' / 'P99 latency', 'March 3' / 'March 13, 2026' and
+'Q1' / 'Q2 2026' scored 0.96-0.99 on Neo4j's `vector.similarity.cosine` scale,
+above any usable threshold. That figure is not reproducible from the repository:
+no committed artifact records it. The in-repo way to measure such pairs is
+`python -m scripts.dedup_calibration`, run where the embedding model is available
+(the backend container); it scores the labelled pairs in
+scripts/dedup_calibration/pairs.json, which include 'P95 latency' / 'P99 latency',
+and its `--output` JSON records every pair's score. Merging such a pair destroys
+a distinct fact, so Tier 3 asks this module whether a candidate is vetoed before
+taking it.
 
 The rule is purely lexical, so the same two names always give the same answer:
 
