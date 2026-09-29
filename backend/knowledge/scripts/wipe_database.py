@@ -95,7 +95,7 @@ def wipe_database():
     print("DATABASE WIPED SUCCESSFULLY")
     print("=" * 60)
     print("The Neo4j database is now completely empty.")
-    print("Run seed_from_docs.py to populate with MIST documentation.")
+    print("Ingest documents through IngestionPipeline to repopulate.")
     print("=" * 60 + "\n")
 
 
