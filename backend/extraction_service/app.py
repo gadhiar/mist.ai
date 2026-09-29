@@ -258,13 +258,18 @@ def _error_response(code: ErrorCode, message: str) -> JSONResponse:
 def _effective_constrained_mode(settings: ServiceSettings, adapter_name: str) -> str | None:
     """The constrained-decoding mode the engine's LLM calls use.
 
-    Mirrors `ExtractionEngine._resolve_constrained_mode`: a settings override
-    wins, else the adapter's `default_constrained_mode`. Adapter defaults are
-    dataclass field defaults, so a fresh `get_adapter(name)` carries the same
-    value as the engine's instance. None only when neither is known -- no
-    override and an adapter name `get_adapter` does not recognise.
+    Mirrors `ExtractionEngine._resolve_constrained_mode`, which reads
+    `settings.constrained_mode or adapter.default_constrained_mode`: a truthy
+    settings override wins, else the adapter's default. The test is truthiness,
+    not `is None`, because `compose.host.yml` forwards
+    `EXTRACTION_CONSTRAINED_MODE=${EXTRACTION_CONSTRAINED_MODE:-}`, so an unset
+    host variable arrives as an empty string and the engine falls through to
+    the adapter default. Adapter defaults are dataclass field defaults, so a
+    fresh `get_adapter(name)` carries the same value as the engine's instance.
+    None only when neither is known -- no override and an adapter name
+    `get_adapter` does not recognise.
     """
-    if settings.constrained_mode is not None:
+    if settings.constrained_mode:
         return settings.constrained_mode
     try:
         return get_adapter(adapter_name).default_constrained_mode

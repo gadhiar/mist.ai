@@ -367,6 +367,35 @@ class TestInfoServingConfig:
         assert data["reasoning_effort"] == "high"
         assert data["temperature"] == 0.7
 
+    async def test_an_empty_constrained_mode_reports_the_adapter_default(
+        self, service_settings, wired_llm, adapter, health_probe, ctx_size_source
+    ):
+        # compose.host.yml forwards EXTRACTION_CONSTRAINED_MODE=${...:-}, so an
+        # unset host variable arrives as "" -- and the engine uses the adapter
+        # default for it, which is what info must report.
+        settings = dataclasses.replace(service_settings, constrained_mode="")
+        engine = ExtractionEngine(llm=wired_llm, adapter=adapter, settings=settings)
+
+        response = await _get_info(create_app(settings, engine, health_probe, ctx_size_source))
+
+        assert response.json()["constrained_mode"] == "schema"
+        assert engine._resolve_constrained_mode() == "schema"
+
+    async def test_an_unknown_adapter_with_no_override_reports_a_null_constrained_mode(
+        self, service_settings, health_probe, ctx_size_source
+    ):
+        class _UnknownAdapterEngine:
+            adapter_name = "not-a-registered-adapter"
+
+        app = create_app(
+            service_settings, _UnknownAdapterEngine(), health_probe, ctx_size_source  # type: ignore[arg-type]
+        )
+
+        response = await _get_info(app)
+
+        assert response.status_code == 200
+        assert response.json()["constrained_mode"] is None
+
     async def test_props_is_fetched_once_across_repeated_info_calls(self, client, fake_llama_state):
         responses = [await client.get("/v1/info") for _ in range(3)]
 
