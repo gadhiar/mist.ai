@@ -162,6 +162,6 @@ class TestBackendDockerfilePinsChatterbox:
 
     def test_stale_backend_requirements_file_is_gone(self) -> None:
         assert not (REPO_ROOT / "backend" / "requirements.txt").exists(), (
-            "backend/requirements.txt was deleted (MIS-177, i111): the image installs the "
-            "root requirements.txt"
+            "the second requirements file under backend/ was deleted (MIS-177, i111): the "
+            "image installs the root requirements.txt"
         )
