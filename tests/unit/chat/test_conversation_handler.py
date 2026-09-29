@@ -2430,3 +2430,77 @@ class TestClearSession:
         handler.clear_session("never-touched")  # must not raise
 
         assert "never-touched" not in handler.sessions
+
+
+class TestQueryToolsUseStoredUserEntityId:
+    """The tool call sites must hand the retriever the stored user node id.
+
+    The stored user node is `(:__Entity__ {id: "user"})` (writers:
+    extraction/prompts.py and curation/skill_derivation.py). The handler used
+    to pass "User"; Neo4j matching is case-sensitive so the user-edge graph
+    leg (`GraphStore.get_user_relationships_to_entities`) matched nothing.
+    """
+
+    def _build_handler(self):
+        conn = FakeNeo4jConnection()
+        gs = GraphStore(conn, FakeEmbeddingGenerator())
+        self.user_rel_calls: list[dict] = []
+
+        gs.search_similar_entities = lambda **kwargs: [  # type: ignore[method-assign]
+            {"entity_id": "python", "entity_type": "Technology", "similarity": 0.9}
+        ]
+
+        def _user_rels(**kwargs):
+            self.user_rel_calls.append(kwargs)
+            return []
+
+        gs.get_user_relationships_to_entities = _user_rels  # type: ignore[method-assign]
+        gs.get_entity_neighborhood = lambda **kwargs: []  # type: ignore[method-assign]
+        config = build_test_config()
+        return ConversationHandler(
+            config=config,
+            graph_store=gs,
+            extraction_pipeline=FakeExtractionPipeline(),
+            retriever=_make_retriever(config, gs),
+            llm_provider=FakeLLM(),
+            conventions_loader=make_test_conventions_loader(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_query_knowledge_graph_queries_user_relationships_with_stored_id(self):
+        handler = self._build_handler()
+        handler._current_session_id = "s1"
+
+        await handler._handle_query_knowledge_graph(query="what do I use")
+
+        assert len(self.user_rel_calls) == 1
+        assert self.user_rel_calls[0]["user_id"] == "user"
+
+    @pytest.mark.asyncio
+    async def test_query_vault_passes_the_canonical_user_id_to_the_retriever(self):
+        from backend.knowledge.models import RetrievalResult
+        from backend.knowledge.storage.partitions import USER_ENTITY_ID
+
+        handler = self._build_handler()
+        captured: dict = {}
+
+        async def stub_retrieve(**kwargs):
+            captured.update(kwargs)
+            return RetrievalResult(
+                query=kwargs["query"],
+                user_id=kwargs["user_id"],
+                facts=[],
+                entities_found=0,
+                total_facts=0,
+                formatted_context="",
+                retrieval_time_ms=0.0,
+                vector_search_time_ms=0.0,
+                graph_traversal_time_ms=0.0,
+                config_used={},
+            )
+
+        handler.retriever.retrieve = stub_retrieve
+
+        await handler._handle_query_vault(query="backend architecture")
+
+        assert captured["user_id"] == USER_ENTITY_ID

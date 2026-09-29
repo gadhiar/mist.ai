@@ -37,6 +37,7 @@ from backend.knowledge.models import (
 )
 from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from backend.knowledge.storage.graph_store import GraphStore
+from backend.knowledge.storage.partitions import USER_ENTITY_ID
 from backend.llm import LLMRequest, StreamingLLMProvider
 from backend.llm.instrumented_provider import llm_call_context
 from backend.llm.models import LLMResponse, UsageMetadata
@@ -1011,7 +1012,7 @@ class ConversationHandler:
                 )
 
             result = await self.retriever.retrieve(
-                query=query, user_id="User", limit=limit, filters=filters
+                query=query, user_id=USER_ENTITY_ID, limit=limit, filters=filters
             )
 
             if result.total_facts == 0:
@@ -1066,7 +1067,7 @@ class ConversationHandler:
         try:
             result = await self.retriever.retrieve(
                 query=query,
-                user_id="User",
+                user_id=USER_ENTITY_ID,
                 limit=limit,
                 force_intent="historical",
             )

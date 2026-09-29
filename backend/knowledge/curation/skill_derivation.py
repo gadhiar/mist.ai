@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from backend.knowledge.config import SkillDerivationConfig
 from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
 from backend.knowledge.storage.graph_executor import GraphExecutor
-from backend.knowledge.storage.partitions import SELF_MODEL_LABEL
+from backend.knowledge.storage.partitions import SELF_MODEL_LABEL, USER_ENTITY_ID
 from backend.knowledge.version_stamps import ONTOLOGY_VERSION
 
 logger = logging.getLogger(__name__)
@@ -170,7 +170,7 @@ class SkillDerivationJob:
             "  e.updated_at = $now, "
             "  e.ontology_version = $ontology_version "
             "WITH e "
-            "MERGE (u:__Entity__ {id: 'user'}) "
+            "MERGE (u:__Entity__ {id: $user_entity_id}) "
             "MERGE (u)-[:KNOWS]->(e)",
             {
                 "skill_id": skill_id,
@@ -179,6 +179,7 @@ class SkillDerivationJob:
                 "tool_type": tool_type,
                 "now": now,
                 "ontology_version": ONTOLOGY_VERSION,
+                "user_entity_id": USER_ENTITY_ID,
             },
         )
 
