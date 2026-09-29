@@ -158,9 +158,14 @@ class BeliefRow:
 
     The two KG-125 decisions (Linear MIS-175) these fields implement:
     D1 -- a clamped copy of a seed row records its lineage in
-    `seed_origin_version` and NEVER gets `seed_version`; D3 -- a row with no
-    `provenance` but a non-null `seed_version` (a seed edge written before
-    KG-125) is a seed row.
+    `seed_origin_version`, and `_apply_append` never writes `seed_version` on
+    it; D3 -- a row with no `provenance` but a non-null `seed_version` (a seed
+    edge written before KG-125) is a seed row.
+
+    A later reseed can still ADOPT a clamped copy: the seed applier's unkeyed
+    `MERGE (s)-[r:TYPE]->(o)` (`seed/applier.py` `_MERGE_EDGE`) matches it and
+    sets `seed_version` on it, so a copy can carry both `seed_version` and
+    `seed_origin_version`. Pre-existing, tracked as the D11 follow-up.
     """
 
     edge_ref: str  # Neo4j elementId(r)
@@ -202,10 +207,11 @@ class BeliefRow:
     def seed_lineage(self) -> str | None:
         """The seed version this row descends from, for a clamped copy of it.
 
-        The applier-written row's own `seed_version`; for a row that is itself
-        a clamped copy (no `seed_version`, by D1), the `seed_origin_version`
-        it inherited -- so a copy of a copy still names the original seed.
-        None for a row that is not seed-authored.
+        The row's own `seed_version` when it has one (an applier-written row,
+        or a copy a reseed adopted -- see the class docstring); otherwise, for
+        a clamped copy `_apply_append` wrote without `seed_version` (D1), the
+        `seed_origin_version` it inherited -- so a copy of a copy still names
+        the original seed. None for a row that is not seed-authored.
         """
         if not self.is_seed:
             return None
@@ -743,13 +749,17 @@ class ReconciliationEngine:
         # a shorter valid time. It keeps the canonical seed values -- not the
         # row's own, which for a pre-KG-125 seed row are the coalesce defaults
         # (0.8, 'extracted') `_BELIEF_RETURN` read it through -- and records
-        # its lineage in `seed_origin_version`. It never gets `seed_version`:
-        # the wipe (`seed/applier.py` `_WIPE_EDGES`), the seed gates
-        # (`seed/gates.py`) and the cutover probe (`SEED_ONLY_PROBE_CYPHER`)
-        # read that as "written by the applier". It DOES keep the extraction stamps below, so
-        # the seed-only cutover probe still refuses a graph holding one. A new
-        # assertion or a copy of an extraction row stays 'extraction' with no
-        # seed_origin_version (a NULL SET writes no property).
+        # its lineage in `seed_origin_version`. This statement never writes
+        # `seed_version` on a copy: the wipe (`seed/applier.py` `_WIPE_EDGES`),
+        # the seed gates (`seed/gates.py`) and the cutover probe
+        # (`SEED_ONLY_PROBE_CYPHER`) read that as "written by the applier". A
+        # later reseed can still adopt the copy -- the applier's unkeyed MERGE
+        # (`seed/applier.py` `_MERGE_EDGE`) matches it and sets `seed_version`,
+        # resets its valid time and overwrites its provenance; pre-existing,
+        # tracked as the D11 follow-up. The copy DOES get the extraction stamps
+        # below, so the seed-only cutover probe refuses a graph holding one. A
+        # new assertion or a copy of an extraction row stays 'extraction' with
+        # no seed_origin_version (a NULL SET writes no property).
         seed_copy = copy_of is not None and copy_of.is_seed
         if seed_copy:
             provenance, confidence, source_type = (
