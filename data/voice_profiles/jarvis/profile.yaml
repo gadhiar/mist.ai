@@ -1,5 +1,5 @@
 name: jarvis
-description: "JARVIS voice via Chatterbox Turbo zero-shot cloning from 25s reference"
+description: "JARVIS voice via Chatterbox zero-shot cloning from 25s reference"
 speaker_id: 0
 tts_engine: chatterbox
 sample_rate: 24000

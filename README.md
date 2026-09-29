@@ -30,7 +30,7 @@ MIST.AI is a cognitive architecture built from first principles. It combines a l
 |  +------------------------------------------------------------+  |
 |  |  Voice Pipeline                                             |  |
 |  |  VAD (Silero) -> STT (Whisper) -> LLM (Gemma 4 E4B)         |  |
-|  |                                -> TTS (Chatterbox Turbo)    |  |
+|  |                                -> TTS (Chatterbox)    |  |
 |  +------------------------------------------------------------+  |
 |  +------------------------------------------------------------+  |
 |  |  Knowledge System (four-layer per ADR-010)                  |  |
@@ -50,7 +50,7 @@ MIST.AI is a cognitive architecture built from first principles. It combines a l
 |-------------|---------------------------------------------|
 | LLM         | Gemma 4 E4B Q5_K_M via llama-server         |
 | STT         | OpenAI Whisper                              |
-| TTS         | Chatterbox Turbo (zero-shot voice cloning)  |
+| TTS         | Chatterbox (zero-shot voice cloning)  |
 | VAD         | Silero VAD                                  |
 | Server      | FastAPI + Uvicorn + WebSockets              |
 | Database    | Neo4j 5.x (knowledge graph)                 |
@@ -151,7 +151,7 @@ mist.ai/
   backend/              # Python -- FastAPI server, voice pipeline, knowledge system
   mist-memory/          # ADR-010 vault layer (sessions, identity, users, decisions)
   data/                 # Runtime artifacts (event store, sidecar SQLite, snapshots)
-  dependencies/csm/     # Legacy Sesame CSM TTS fork (Apache 2.0); Chatterbox Turbo is current
+  dependencies/csm/     # Legacy Sesame CSM TTS fork (Apache 2.0); Chatterbox is current
   docs/                 # Guides, setup, architecture decisions
 ```
 

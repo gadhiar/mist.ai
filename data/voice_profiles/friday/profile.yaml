@@ -1,5 +1,5 @@
 name: friday
-description: "FRIDAY voice via Chatterbox Turbo zero-shot cloning from 46s reference"
+description: "FRIDAY voice via Chatterbox zero-shot cloning from 46s reference"
 speaker_id: 0
 tts_engine: chatterbox
 sample_rate: 24000

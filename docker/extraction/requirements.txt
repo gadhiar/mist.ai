@@ -1,21 +1,21 @@
 # Extraction service deploy image dependencies (T1b, goal mist-two-loop / MIS-171).
 #
 # This is the measured third-party import closure of
-# `python -m backend.extraction_service` (T1a's brief), not
-# `backend/requirements.txt` -- that file targets the full voice+graph
-# backend image and leaves most of this list unpinned (it relies on the
+# `python -m backend.extraction_service` (T1a's brief), not the root
+# `requirements.txt` -- that file targets the full voice+graph backend
+# image and leaves most of this list unpinned (it relies on the
 # torch/chatterbox install order in docker/backend/Dockerfile to pull them
 # in transitively). Every module below IS actually imported at process
 # start; verified 2026-09-26 by running the service's entry import
 # (`import backend.extraction_service.app`) inside the worker container and
 # reading `sys.modules`.
 #
-# Pin policy: where backend/requirements.txt or the repo root
-# requirements.txt already pins a distribution with `==`, that pin is used
-# here unchanged. Everything else is pinned to the version installed in
-# this worker's container (`pip show <name>` / `pip list --format=freeze`,
-# read 2026-09-26) -- backend/requirements.txt itself leaves these
-# unpinned (`>=`), so there is no in-repo exact pin to copy.
+# Pin policy: where the repo root requirements.txt already pins a
+# distribution with `==`, that pin is used here unchanged. Everything else
+# is pinned to the version installed in this worker's container
+# (`pip show <name>` / `pip list --format=freeze`, read 2026-09-26) -- the
+# root requirements.txt itself leaves these unpinned or does not list them,
+# so there is no in-repo exact pin to copy.
 #
 # Module (as imported) -> distribution (as installed) -> why it's here:
 #   annotated_doc     -> annotated-doc      fastapi dependency (Annotated[..., Doc(...)])

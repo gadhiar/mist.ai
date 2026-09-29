@@ -21,6 +21,13 @@ httpx>=0.27  # Async HTTP client for health checks
 fastapi==0.136.1
 uvicorn[standard]==0.46.0
 websockets==16.0
+# The `standard` extra's other members (httptools, watchfiles, uvloop) are also
+# open ranges upstream, so a rebuild could change the server stack silently.
+# Pinned to the versions read from the live backend image. uvloop is not
+# published for Windows, hence the marker.
+httptools==0.8.0
+watchfiles==1.3.0
+uvloop==0.22.1; sys_platform != "win32"
 
 # Knowledge Graph
 networkx==3.2.1
