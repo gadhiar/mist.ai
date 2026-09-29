@@ -28,7 +28,8 @@ decision_rules.json sha256: `e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3
 
 | metric | value | n | n_expected | complete | wilson | bootstrap |
 |---|---|---|---|---|---|---|
-| harness_score[schema_conformance] | 1.0000 | 12 | 12 | True | [0.7575, 1.0000] | [1.0000, 1.0000] |
+| harness_score[schema_conformance] | 1.0000 | 12 | 12 | True | n/a | [1.0000, 1.0000] |
+| harness_pass_rate[schema_conformance] | 1.0000 | 12 | 12 | True | [0.7575, 1.0000] | n/a |
 | truncation_rate[schema_conformance] | 0.0000 | 12 | 12 | True | [0.0000, 0.2425] | [0.0000, 0.0000] |
 | decode_tps | n/a | n/a | n/a | n/a | n/a | n/a |
 | arm_peak_mib | n/a | n/a | n/a | n/a | n/a | n/a |
@@ -37,7 +38,8 @@ decision_rules.json sha256: `e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3
 
 | metric | value | n | n_expected | complete | wilson | bootstrap |
 |---|---|---|---|---|---|---|
-| harness_score[schema_conformance] | 1.0000 | 12 | 12 | True | [0.7575, 1.0000] | [1.0000, 1.0000] |
+| harness_score[schema_conformance] | 1.0000 | 12 | 12 | True | n/a | [1.0000, 1.0000] |
+| harness_pass_rate[schema_conformance] | 1.0000 | 12 | 12 | True | [0.7575, 1.0000] | n/a |
 | truncation_rate[schema_conformance] | 0.0000 | 12 | 12 | True | [0.0000, 0.2425] | [0.0000, 0.0000] |
 | decode_tps | n/a | n/a | n/a | n/a | n/a | n/a |
 | arm_peak_mib | n/a | n/a | n/a | n/a | n/a | n/a |
@@ -46,8 +48,10 @@ decision_rules.json sha256: `e6562bff1ccf2ab4374305597eeb6587a9eff8cbbeeff4987c3
 
 | metric | value | n | n_expected | complete | wilson | bootstrap |
 |---|---|---|---|---|---|---|
-| harness_score[schema_conformance_json_object] | 1.0000 | 12 | 12 | True | [0.7575, 1.0000] | [1.0000, 1.0000] |
-| harness_score[tool_selection] | 1.0000 | 8 | 8 | True | [0.6756, 1.0000] | [1.0000, 1.0000] |
+| harness_score[schema_conformance_json_object] | 1.0000 | 12 | 12 | True | n/a | [1.0000, 1.0000] |
+| harness_score[tool_selection] | 1.0000 | 8 | 8 | True | n/a | [1.0000, 1.0000] |
+| harness_pass_rate[schema_conformance_json_object] | 1.0000 | 12 | 12 | True | [0.7575, 1.0000] | n/a |
+| harness_pass_rate[tool_selection] | 1.0000 | 8 | 8 | True | [0.6756, 1.0000] | n/a |
 | truncation_rate[schema_conformance_json_object] | 0.0000 | 12 | 12 | True | [0.0000, 0.2425] | [0.0000, 0.0000] |
 | truncation_rate[tool_selection] | 0.0000 | 8 | 8 | True | [0.0000, 0.3244] | [0.0000, 0.0000] |
 | decode_tps | n/a | n/a | n/a | n/a | n/a | n/a |
@@ -124,8 +128,10 @@ no meta.json / arm absent
 | layout_acc[screen] | 0.4167 | 72 | 72 | True | [0.3099, 0.5319] | [0.1667, 0.6667] |
 | layout_mean_completion_tokens[screen] | 219.5833 | 72 | n/a | n/a | n/a | n/a | (per_correct=527.0000) |
 | layout_p95_wall_ms[screen] | 7500.0000 | 72 | n/a | n/a | n/a | n/a |
-| harness_score[schema_conformance_json_object] | 1.0000 | 12 | 12 | True | [0.7575, 1.0000] | [1.0000, 1.0000] |
-| harness_score[tool_selection] | 1.0000 | 8 | 8 | True | [0.6756, 1.0000] | [1.0000, 1.0000] |
+| harness_score[schema_conformance_json_object] | 1.0000 | 12 | 12 | True | n/a | [1.0000, 1.0000] |
+| harness_score[tool_selection] | 1.0000 | 8 | 8 | True | n/a | [1.0000, 1.0000] |
+| harness_pass_rate[schema_conformance_json_object] | 1.0000 | 12 | 12 | True | [0.7575, 1.0000] | n/a |
+| harness_pass_rate[tool_selection] | 1.0000 | 8 | 8 | True | [0.6756, 1.0000] | n/a |
 | truncation_rate[schema_conformance_json_object] | 0.0000 | 12 | 12 | True | [0.0000, 0.2425] | [0.0000, 0.0000] |
 | truncation_rate[tool_selection] | 0.0000 | 8 | 8 | True | [0.0000, 0.3244] | [0.0000, 0.0000] |
 | decode_tps | 40.0000 | 3 | n/a | n/a | n/a | n/a |
@@ -153,9 +159,12 @@ no meta.json / arm absent
 | layout_mean_completion_tokens[screen] | 219.5833 | 72 | n/a | n/a | n/a | n/a | (per_correct=292.7778) |
 | layout_p95_wall_ms[finalist] | 7500.0000 | 216 | n/a | n/a | n/a | n/a |
 | layout_p95_wall_ms[screen] | 7500.0000 | 72 | n/a | n/a | n/a | n/a |
-| harness_score[schema_conformance] | 1.0000 | 12 | 12 | True | [0.7575, 1.0000] | [1.0000, 1.0000] |
-| harness_score[schema_conformance_json_object] | 1.0000 | 12 | 12 | True | [0.7575, 1.0000] | [1.0000, 1.0000] |
-| harness_score[tool_selection] | 1.0000 | 8 | 8 | True | [0.6756, 1.0000] | [1.0000, 1.0000] |
+| harness_score[schema_conformance] | 1.0000 | 12 | 12 | True | n/a | [1.0000, 1.0000] |
+| harness_score[schema_conformance_json_object] | 1.0000 | 12 | 12 | True | n/a | [1.0000, 1.0000] |
+| harness_score[tool_selection] | 1.0000 | 8 | 8 | True | n/a | [1.0000, 1.0000] |
+| harness_pass_rate[schema_conformance] | 1.0000 | 12 | 12 | True | [0.7575, 1.0000] | n/a |
+| harness_pass_rate[schema_conformance_json_object] | 1.0000 | 12 | 12 | True | [0.7575, 1.0000] | n/a |
+| harness_pass_rate[tool_selection] | 1.0000 | 8 | 8 | True | [0.6756, 1.0000] | n/a |
 | truncation_rate[schema_conformance] | 0.0833 | 12 | 12 | True | [0.0149, 0.3539] | [0.0000, 0.2500] |
 | truncation_rate[schema_conformance_json_object] | 0.1667 | 12 | 12 | True | [0.0470, 0.4480] | [0.0000, 0.4167] |
 | truncation_rate[tool_selection] | 0.0000 | 8 | 8 | True | [0.0000, 0.3244] | [0.0000, 0.0000] |
@@ -220,7 +229,8 @@ no meta.json / arm absent
 
 | metric | value | n | n_expected | complete | wilson | bootstrap |
 |---|---|---|---|---|---|---|
-| harness_score[schema_conformance] | 1.0000 | 12 | 12 | True | [0.7575, 1.0000] | [1.0000, 1.0000] |
+| harness_score[schema_conformance] | 1.0000 | 12 | 12 | True | n/a | [1.0000, 1.0000] |
+| harness_pass_rate[schema_conformance] | 1.0000 | 12 | 12 | True | [0.7575, 1.0000] | n/a |
 | truncation_rate[schema_conformance] | 0.0000 | 12 | 12 | True | [0.0000, 0.2425] | [0.0000, 0.0000] |
 | decode_tps | n/a | n/a | n/a | n/a | n/a | n/a |
 | arm_peak_mib | n/a | n/a | n/a | n/a | n/a | n/a |
@@ -229,7 +239,8 @@ no meta.json / arm absent
 
 | metric | value | n | n_expected | complete | wilson | bootstrap |
 |---|---|---|---|---|---|---|
-| harness_score[schema_conformance] | 1.0000 | 12 | 12 | True | [0.7575, 1.0000] | [1.0000, 1.0000] |
+| harness_score[schema_conformance] | 1.0000 | 12 | 12 | True | n/a | [1.0000, 1.0000] |
+| harness_pass_rate[schema_conformance] | 1.0000 | 12 | 12 | True | [0.7575, 1.0000] | n/a |
 | truncation_rate[schema_conformance] | 0.0000 | 12 | 12 | True | [0.0000, 0.2425] | [0.0000, 0.0000] |
 | decode_tps | n/a | n/a | n/a | n/a | n/a | n/a |
 | arm_peak_mib | n/a | n/a | n/a | n/a | n/a | n/a |
@@ -238,7 +249,8 @@ no meta.json / arm absent
 
 | metric | value | n | n_expected | complete | wilson | bootstrap |
 |---|---|---|---|---|---|---|
-| harness_score[schema_conformance] | 1.0000 | 12 | 12 | True | [0.7575, 1.0000] | [1.0000, 1.0000] |
+| harness_score[schema_conformance] | 1.0000 | 12 | 12 | True | n/a | [1.0000, 1.0000] |
+| harness_pass_rate[schema_conformance] | 1.0000 | 12 | 12 | True | [0.7575, 1.0000] | n/a |
 | truncation_rate[schema_conformance] | 0.0000 | 12 | 12 | True | [0.0000, 0.2425] | [0.0000, 0.0000] |
 | decode_tps | n/a | n/a | n/a | n/a | n/a | n/a |
 | arm_peak_mib | n/a | n/a | n/a | n/a | n/a | n/a |

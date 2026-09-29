@@ -26,6 +26,23 @@
         "wilson": null
       },
       "error_count": 0,
+      "harness_pass_rate": {
+        "schema_conformance": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": 12,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 1.0,
+          "wilson": [
+            0.757506,
+            1.0
+          ]
+        }
+      },
       "harness_score": {
         "schema_conformance": {
           "bootstrap": [
@@ -40,10 +57,7 @@
           "n_expected": 12,
           "note": null,
           "value": 1.0,
-          "wilson": [
-            0.757506,
-            1.0
-          ]
+          "wilson": null
         }
       },
       "layout_acc": {},
@@ -103,6 +117,23 @@
         "wilson": null
       },
       "error_count": 0,
+      "harness_pass_rate": {
+        "schema_conformance": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": 12,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 1.0,
+          "wilson": [
+            0.757506,
+            1.0
+          ]
+        }
+      },
       "harness_score": {
         "schema_conformance": {
           "bootstrap": [
@@ -117,10 +148,7 @@
           "n_expected": 12,
           "note": null,
           "value": 1.0,
-          "wilson": [
-            0.757506,
-            1.0
-          ]
+          "wilson": null
         }
       },
       "layout_acc": {},
@@ -180,6 +208,23 @@
         "wilson": null
       },
       "error_count": 0,
+      "harness_pass_rate": {
+        "schema_conformance": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": 12,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 1.0,
+          "wilson": [
+            0.757506,
+            1.0
+          ]
+        }
+      },
       "harness_score": {
         "schema_conformance": {
           "bootstrap": [
@@ -194,10 +239,7 @@
           "n_expected": 12,
           "note": null,
           "value": 1.0,
-          "wilson": [
-            0.757506,
-            1.0
-          ]
+          "wilson": null
         }
       },
       "layout_acc": {},
@@ -260,6 +302,23 @@
         "wilson": null
       },
       "error_count": 0,
+      "harness_pass_rate": {
+        "schema_conformance": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": 12,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 1.0,
+          "wilson": [
+            0.757506,
+            1.0
+          ]
+        }
+      },
       "harness_score": {
         "schema_conformance": {
           "bootstrap": [
@@ -274,10 +333,7 @@
           "n_expected": 12,
           "note": null,
           "value": 1.0,
-          "wilson": [
-            0.757506,
-            1.0
-          ]
+          "wilson": null
         }
       },
       "layout_acc": {},
@@ -343,6 +399,7 @@
         "wilson": null
       },
       "error_count": 0,
+      "harness_pass_rate": {},
       "harness_score": {},
       "layout_acc": {},
       "layout_completion_tokens_per_correct": {},
@@ -407,6 +464,23 @@
         "wilson": null
       },
       "error_count": 1,
+      "harness_pass_rate": {
+        "schema_conformance": {
+          "bootstrap": null,
+          "complete": true,
+          "extra": {},
+          "k": 12,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 1.0,
+          "wilson": [
+            0.757506,
+            1.0
+          ]
+        }
+      },
       "harness_score": {
         "schema_conformance": {
           "bootstrap": [
@@ -421,10 +495,7 @@
           "n_expected": 12,
           "note": null,
           "value": 1.0,
-          "wilson": [
-            0.757506,
-            1.0
-          ]
+          "wilson": null
         }
       },
       "layout_acc": {},
@@ -483,12 +554,9 @@
         "wilson": null
       },
       "error_count": 0,
-      "harness_score": {
+      "harness_pass_rate": {
         "schema_conformance_json_object": {
-          "bootstrap": [
-            1.0,
-            1.0
-          ],
+          "bootstrap": null,
           "complete": true,
           "extra": {},
           "k": 12,
@@ -503,10 +571,7 @@
           ]
         },
         "tool_selection": {
-          "bootstrap": [
-            1.0,
-            1.0
-          ],
+          "bootstrap": null,
           "complete": true,
           "extra": {},
           "k": 8,
@@ -519,6 +584,38 @@
             0.675592,
             1.0
           ]
+        }
+      },
+      "harness_score": {
+        "schema_conformance_json_object": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 12,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 1.0,
+          "wilson": null
+        },
+        "tool_selection": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 8,
+          "missing": false,
+          "n": 8,
+          "n_expected": 8,
+          "note": null,
+          "value": 1.0,
+          "wilson": null
         }
       },
       "layout_acc": {},
@@ -598,6 +695,7 @@
         "wilson": null
       },
       "error_count": 0,
+      "harness_pass_rate": {},
       "harness_score": {},
       "layout_acc": {
         "screen": {
@@ -700,6 +798,7 @@
         "wilson": null
       },
       "error_count": 0,
+      "harness_pass_rate": {},
       "harness_score": {},
       "layout_acc": {
         "screen": {
@@ -785,6 +884,7 @@
         "wilson": null
       },
       "error_count": 0,
+      "harness_pass_rate": {},
       "harness_score": {},
       "layout_acc": {
         "screen": {
@@ -873,12 +973,9 @@
         "wilson": null
       },
       "error_count": 0,
-      "harness_score": {
+      "harness_pass_rate": {
         "schema_conformance_json_object": {
-          "bootstrap": [
-            1.0,
-            1.0
-          ],
+          "bootstrap": null,
           "complete": true,
           "extra": {},
           "k": 12,
@@ -893,10 +990,7 @@
           ]
         },
         "tool_selection": {
-          "bootstrap": [
-            1.0,
-            1.0
-          ],
+          "bootstrap": null,
           "complete": true,
           "extra": {},
           "k": 8,
@@ -909,6 +1003,38 @@
             0.675592,
             1.0
           ]
+        }
+      },
+      "harness_score": {
+        "schema_conformance_json_object": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 12,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 1.0,
+          "wilson": null
+        },
+        "tool_selection": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 8,
+          "missing": false,
+          "n": 8,
+          "n_expected": 8,
+          "note": null,
+          "value": 1.0,
+          "wilson": null
         }
       },
       "layout_acc": {
@@ -1059,6 +1185,7 @@
         "wilson": null
       },
       "error_count": 0,
+      "harness_pass_rate": {},
       "harness_score": {},
       "layout_acc": {
         "screen": {
@@ -1144,12 +1271,9 @@
         "wilson": null
       },
       "error_count": 0,
-      "harness_score": {
+      "harness_pass_rate": {
         "schema_conformance": {
-          "bootstrap": [
-            1.0,
-            1.0
-          ],
+          "bootstrap": null,
           "complete": true,
           "extra": {},
           "k": 12,
@@ -1164,10 +1288,7 @@
           ]
         },
         "schema_conformance_json_object": {
-          "bootstrap": [
-            1.0,
-            1.0
-          ],
+          "bootstrap": null,
           "complete": true,
           "extra": {},
           "k": 12,
@@ -1182,10 +1303,7 @@
           ]
         },
         "tool_selection": {
-          "bootstrap": [
-            1.0,
-            1.0
-          ],
+          "bootstrap": null,
           "complete": true,
           "extra": {},
           "k": 8,
@@ -1198,6 +1316,53 @@
             0.675592,
             1.0
           ]
+        }
+      },
+      "harness_score": {
+        "schema_conformance": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 12,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 1.0,
+          "wilson": null
+        },
+        "schema_conformance_json_object": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 12,
+          "missing": false,
+          "n": 12,
+          "n_expected": 12,
+          "note": null,
+          "value": 1.0,
+          "wilson": null
+        },
+        "tool_selection": {
+          "bootstrap": [
+            1.0,
+            1.0
+          ],
+          "complete": true,
+          "extra": {},
+          "k": 8,
+          "missing": false,
+          "n": 8,
+          "n_expected": 8,
+          "note": null,
+          "value": 1.0,
+          "wilson": null
         }
       },
       "layout_acc": {
