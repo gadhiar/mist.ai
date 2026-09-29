@@ -48,13 +48,13 @@ _APPLIER_OWNED_NODE_PROPERTIES = frozenset(
 # graph-reset guard (`admin.RESET_GUARD_CYPHER`) counts an `:__Entity__` node
 # carrying any of them as derived data, and the seed guard reuses that count
 # and adds `SEED_GUARD_STAMP_PROPERTIES` in applier.py
-# (`extraction_version`/`model_hash`) in every partition. So a seed node
-# authored with one would make every later reseed refuse the graph the seed
-# itself wrote. `ontology_version` on a `:__SelfModel__` node alone trips
-# neither guard; it is refused anyway, because it marks the node as
-# extraction-written (`SEED_ONLY_PROBE_CYPHER` in
-# backend/extraction_backlog/cutover.py counts all three on any node). The
-# same three names as
+# (`extraction_version`/`model_hash`) in every partition. So an `:__Entity__`
+# seed node with any stamp, or any seed node with `extraction_version` or
+# `model_hash`, would make every later reseed refuse the graph the seed itself
+# wrote. `ontology_version` on a `:__SelfModel__` node alone trips neither
+# guard; it is refused anyway, because it marks the node as extraction-written
+# (`SEED_ONLY_PROBE_CYPHER` in backend/extraction_backlog/cutover.py counts all
+# three on any node). The same three names as
 # `admin._EXTRACTION_STAMP_PROPERTIES`, restated rather than imported because
 # admin.py imports this module at load time
 # (`grep -n 'from backend.knowledge.seed.models import' backend/knowledge/admin.py`),
