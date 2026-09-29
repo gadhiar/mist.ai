@@ -16,6 +16,8 @@ ontology table against a seed prior and pin what the copy carries:
 
 And the negatives: a fresh assertion and a copy of an extraction row stay
 'extraction' with no seed_origin_version.
+
+D1 / D3 are the KG-125 decisions defined on `BeliefRow` (reconciliation.py).
 """
 
 import pytest

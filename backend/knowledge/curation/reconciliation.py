@@ -154,7 +154,13 @@ class BeliefRow:
     as seed-authored is decided in exactly one place, `is_seed`, which applies
     the pre-KG-125 fallback. `seed_version` is set only by the seed applier;
     `seed_origin_version` only by `ReconciliationEngine._apply_append` on a
-    clamped copy of a seed row (KG-125 D1).
+    clamped copy of a seed row.
+
+    The two KG-125 decisions (Linear MIS-175) these fields implement:
+    D1 -- a clamped copy of a seed row records its lineage in
+    `seed_origin_version` and NEVER gets `seed_version`; D3 -- a row with no
+    `provenance` but a non-null `seed_version` (a seed edge written before
+    KG-125) is a seed row.
     """
 
     edge_ref: str  # Neo4j elementId(r)
@@ -738,8 +744,9 @@ class ReconciliationEngine:
         # row's own, which for a pre-KG-125 seed row are the coalesce defaults
         # (0.8, 'extracted') `_BELIEF_RETURN` read it through -- and records
         # its lineage in `seed_origin_version`. It never gets `seed_version`:
-        # the wipe, the seed gates and the cutover probe read that as "written
-        # by the applier" (D1). It DOES keep the extraction stamps below, so
+        # the wipe (`seed/applier.py` `_WIPE_EDGES`), the seed gates
+        # (`seed/gates.py`) and the cutover probe (`SEED_ONLY_PROBE_CYPHER`)
+        # read that as "written by the applier". It DOES keep the extraction stamps below, so
         # the seed-only cutover probe still refuses a graph holding one. A new
         # assertion or a copy of an extraction row stays 'extraction' with no
         # seed_origin_version (a NULL SET writes no property).
