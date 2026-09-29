@@ -714,7 +714,8 @@ class GraphStore:
         This finds direct connections: User -[r]-> Entity or User <-[r]- Entity
 
         Args:
-            user_id: User entity ID (typically "User")
+            user_id: User entity ID, `USER_ENTITY_ID` ("user") in
+                `backend/knowledge/storage/partitions.py`
             entity_ids: List of entity IDs to check connections to
             relationship_types: Optional filter for specific relationships
 
