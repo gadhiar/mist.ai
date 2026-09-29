@@ -181,6 +181,79 @@ class TestForwarding:
             assert params.get("now") == "2020-06-15T00:00:00+00:00"
 
 
+class TestSeedProvenance:
+    """KG-125 (MIS-175, Option A): a seed fact says what it is.
+
+    Every seed edge is provenance='seed', source_type='stated',
+    confidence=1.0, still stamped seed_version, and carries NO extraction
+    stamp (the seed-only cutover probe refuses any element with one). Every
+    seed node is provenance='seed', which `admin.count_non_seed_entities`
+    keys on. Pinned on BOTH the params and the query text: a fake records
+    params whether or not the query uses them.
+    """
+
+    def _edge_write(self, fake_connection) -> tuple[str, dict]:
+        edges = [(q, p) for q, p in fake_connection.writes if p.get("predicate")]
+        assert len(edges) == 1
+        return edges[0]
+
+    def test_edge_is_seed_stated_certain(self, fake_connection):
+        docs = [_doc(facts=[("user", "WORKS_AT", "slalom")])]
+
+        apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        query, params = self._edge_write(fake_connection)
+        assert params["provenance"] == "seed"
+        assert params["source_type"] == "stated"
+        assert params["confidence"] == 1.0
+        assert params["seed_version"] == "profile-v1"
+        for clause in (
+            "r.provenance = $provenance",
+            "r.source_type = $source_type",
+            "r.confidence = $confidence",
+            "r.seed_version = $seed_version",
+        ):
+            assert clause in query, f"{clause!r} missing from {query!r}"
+
+    def test_edge_never_carries_an_extraction_stamp(self, fake_connection):
+        docs = [_doc(facts=[("user", "WORKS_AT", "slalom")])]
+
+        apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        query, params = self._edge_write(fake_connection)
+        for stamp in ("ontology_version", "extraction_version", "model_hash"):
+            assert stamp not in query
+            assert stamp not in params
+        # And the lineage property belongs to clamped copies only (KG-125 D1,
+        # see `BeliefRow` in curation/reconciliation.py).
+        assert "seed_origin_version" not in query
+
+    def test_every_node_is_provenance_seed(self, fake_connection):
+        docs = [_doc(facts=[("user", "WORKS_AT", "slalom")])]
+
+        apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        node_writes = [(q, p) for q, p in fake_connection.writes if not p.get("predicate")]
+        assert len(node_writes) == 2
+        for query, params in node_writes:
+            assert params["properties"]["provenance"] == "seed"
+            assert "n += $properties" in query
+            for stamp in ("ontology_version", "extraction_version", "model_hash"):
+                assert stamp not in params["properties"]
+
+    def test_seed_values_are_the_shared_constants(self):
+        # One definition read by the applier AND the reconciliation engine's
+        # clamped-copy path, so the two cannot drift.
+        from backend.knowledge.seed import models
+
+        assert (models.SEED_PROVENANCE, models.SEED_SOURCE_TYPE, models.SEED_CONFIDENCE) == (
+            "seed",
+            "stated",
+            1.0,
+        )
+        assert "provenance" in models._APPLIER_OWNED_NODE_PROPERTIES
+
+
 class TestNodeWrites:
     def test_writes_one_node_per_unique_subject_and_object(self, fake_connection):
         """Two facts sharing the same subject must not double-write that node."""
@@ -463,6 +536,7 @@ class TestNodeDefinitionWrites:
         assert by_id["mist-identity"] == {
             "entity_type": "MistIdentity",
             "seed_version": "profile-v1",
+            "provenance": "seed",
             "updated_at": _NOW,
             "display_name": "MIST",
             "pronouns": "she/her",
@@ -471,6 +545,7 @@ class TestNodeDefinitionWrites:
         assert by_id["trait-warm"] == {
             "entity_type": "MistTrait",
             "seed_version": "profile-v1",
+            "provenance": "seed",
             "updated_at": _NOW,
             "display_name": "Warm",
             "axis": "Persona",
@@ -587,6 +662,7 @@ class TestAuthoredStampsNeverWinOverTheAppliersOwn:
             display_name="Raj Gadhia",
             entity_type="Bogus",
             seed_version="evil-version",
+            provenance="extraction",
             updated_at="1999-01-01T00:00:00+00:00",
             created_at="1999-01-01T00:00:00+00:00",
         )
@@ -609,6 +685,7 @@ class TestAuthoredStampsNeverWinOverTheAppliersOwn:
 
         assert user_props["entity_type"] == "User", user_props
         assert user_props["seed_version"] == "profile-v1", user_props
+        assert user_props["provenance"] == "seed", user_props
         assert user_props["updated_at"] == _NOW, user_props
         # A legitimate extra property (not one of the four reserved names)
         # must still flow through untouched -- this is not a lockdown of

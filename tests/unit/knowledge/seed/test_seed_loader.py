@@ -428,6 +428,7 @@ Raj uses Neo4j.
     [
         pytest.param("entity_type", id="entity_type"),
         pytest.param("seed_version", id="seed_version"),
+        pytest.param("provenance", id="provenance"),
         pytest.param("updated_at", id="updated_at"),
         pytest.param("created_at", id="created_at"),
     ],
