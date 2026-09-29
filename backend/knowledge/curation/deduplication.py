@@ -16,24 +16,11 @@ from backend.knowledge.storage.graph_executor import GraphExecutor
 
 logger = logging.getLogger(__name__)
 
-# Compared against Neo4j's vector.similarity.cosine, which returns (1 + cos) / 2,
-# so 0.92 here is a raw cosine of 0.84, not 0.92. To choose the value from data,
-# run `python -m scripts.dedup_calibration` (scripts/dedup_calibration/README.md):
-# it reports where labelled duplicate and distinct pairs fall on this scale.
-#
-# The score alone is not the Tier-3 merge rule. A candidate at or above this
-# threshold is still rejected when its name and the incoming name carry
-# different numeric tokens or different month tokens
-# (`backend.knowledge.curation.name_veto.names_conflict`): distinct extracted
-# names such as 'P95' / 'P99 latency' or 'Q1' / 'Q2 2026' score 0.96-0.99, so no
-# threshold separates them. The calibration tool measures the score only and
-# does not model the veto.
+# Neo4j's vector.similarity.cosine returns (1 + cos) / 2, so 0.92 is a raw cosine of 0.84. Measure
+# it with `python -m scripts.dedup_calibration`. Tier 3 also vetoes candidates whose numeric or
+# month tokens differ from the incoming name's (name_veto): 'P95'/'P99 latency' scores 0.96-0.99.
 SIMILARITY_THRESHOLD = 0.92
-# Tier 3 fetches at most this many candidates at or above SIMILARITY_THRESHOLD,
-# in (score DESC, id ASC) order, and merges into the first one the name veto does
-# not reject. If every fetched candidate is vetoed there is no merge, even when a
-# lower-ranked candidate beyond this bound would have passed the veto.
-TIER3_CANDIDATE_LIMIT = 50
+TIER3_CANDIDATE_LIMIT = 50  # Tier-3 candidates fetched before the veto; see _find_existing
 MAX_ALIASES = 20
 
 
@@ -61,20 +48,9 @@ class DeduplicationResult:
 
 
 class EntityDeduplicator:
-    """Deduplicates extracted entities against existing graph entities.
+    """Deduplicates extracted entities: exact id -> alias -> cosine with a numeric/date veto.
 
-    3-tier matching, first match wins:
-
-    1. Exact id (case-insensitive), same entity_type.
-    2. Alias (case-insensitive), same entity_type.
-    3. Embedding similarity over the `dedup_type_filter` type set: candidates
-       whose Neo4j cosine score is >= SIMILARITY_THRESHOLD (0.92), ordered
-       score DESC then id ASC, at most TIER3_CANDIDATE_LIMIT of them. The first
-       candidate that the name veto (`name_veto.names_conflict`) does not reject
-       wins. The veto compares the incoming display name with the candidate's
-       display_name (its id when that is null) and rejects the pair when their
-       numeric tokens or month tokens differ, so 'P95' never merges into
-       'P99 latency'. If every candidate is vetoed, the entity is not merged.
+    Tier-3 candidates whose numeric or month tokens differ from the incoming name are skipped.
     """
 
     def __init__(
@@ -145,9 +121,25 @@ class EntityDeduplicator:
 
         Every tier has a total order (ORDER BY id; the cosine tier breaks ties on
         id) so live and a replay rebuild make identical merge decisions on the
-        same input -- no ANN, no insertion-order sensitivity. The Tier-3 name
-        veto is a pure function of two strings, so walking the ordered
-        candidates and taking the first unvetoed one keeps that property.
+        same input -- no ANN, no insertion-order sensitivity.
+
+        1. Exact id (case-insensitive), same entity_type.
+        2. Alias (case-insensitive), same entity_type.
+        3. Exact cosine over the `dedup_type_filter` type set: at most
+           TIER3_CANDIDATE_LIMIT candidates whose Neo4j cosine score is
+           >= SIMILARITY_THRESHOLD, ordered score DESC then id ASC. The first
+           candidate the name veto (`name_veto.names_conflict`) does not reject
+           wins. The veto compares `display_name` with the candidate's
+           display_name (its id when that is null) and rejects the pair when
+           their numeric tokens or month tokens differ, so 'P95' never merges
+           into 'P99 latency'. If every fetched candidate is vetoed there is no
+           merge, even when a candidate beyond the bound would have passed. The
+           veto is a pure function of two strings, so the decision stays a
+           deterministic function of graph state and input.
+
+        This method's line in `deduplicate` is cited by line number from
+        `CurationGraphWriter._upsert_entity` (graph_writer.py) and checked by
+        tests/unit/extraction_backlog/test_graph_writer_citations.py.
         """
         _RET = (
             "RETURN e.id AS id, e.entity_type AS entity_type, "
