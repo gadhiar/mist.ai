@@ -324,27 +324,46 @@ An empty log is also where `cutover rebuild` cannot run (its floors must be
 Neither the log nor the probe is evidence alone. The event log
 (`event_store.db`) has been reset before, and a reset log is empty whatever ran
 against the graph before the reset. The probe cannot see an unstamped SET on a
-seeded element (6A.2). Taken together with a reseed of the live graph, done
+seeded element, or an unstamped element a reseed adopted (6A.2). Taken together with a reseed of the live graph, done
 AFTER the last log reset and with the backend stopped, they are:
 
 1. **The reseed erases every earlier write to a seed element, or leaves
-   something the probe counts.** `python scripts/mist_admin.py seed`
-   (`cmd_seed` -> `reseed`) deletes every edge carrying the current
-   `seed_version`, then every node carrying it that has no relationship left,
-   then re-creates both from the seed source (`wipe_seed_version`,
-   `_WIPE_EDGES`, `_WIPE_NODES`, `apply_seed_documents`:
+   something the probe counts, except on an unstamped element it adopts.**
+   `python scripts/mist_admin.py seed` (`cmd_seed` -> `reseed`) deletes every
+   edge carrying the current `seed_version`, then every node carrying it that
+   has no relationship left, then MERGEs both back from the seed source
+   (`wipe_seed_version`, `_WIPE_EDGES`, `_WIPE_NODES`, `apply_seed_documents`:
    `grep -nE '^_WIPE_(EDGES|NODES)|^def (reseed|wipe_seed_version|apply_seed_documents)' backend/knowledge/seed/applier.py`).
-   [VERIFIED-IN-REPO] So after it every seed edge is new, and every seed node is
-   new unless some relationship without the current `seed_version` still
-   touches it. No writer outside the seed applier and the staging seeder sets
+   [VERIFIED-IN-REPO] So every element that carried the current
+   `seed_version` before the reseed is deleted and re-created, except a seed
+   node that some relationship without the current `seed_version` still
+   touches. [VERIFIED-IN-REPO]
+
+   The re-created seed elements are not all new, though. The MERGEs match on
+   the node id and on (subject, type, object), not on `seed_version`, so a
+   non-seed element that survived the wipe and matches a seed node or fact is
+   adopted: it gets `seed_version` and keeps its other properties (6A.2,
+   "adopted elements"). [VERIFIED-IN-REPO]
+
+   No writer outside the seed applier and the staging seeder sets
    `seed_version` (`grep -rln seed_version backend/knowledge/curation
    backend/knowledge/extraction backend/chat` lists only
-   `curation/reconciliation.py`, which reads it and never sets it; a clamped
-   copy of a seed edge carries `seed_origin_version` plus extraction stamps
-   instead). [VERIFIED-IN-REPO] So every element extraction ever created
-   survives the wipe without `seed_version` and the probe counts it, and so is
-   the relationship that kept a seed node alive. A reseeded graph that passes
-   the probe carries no write from before the reseed.
+   `curation/reconciliation.py`, which reads it and never sets it; the
+   reconciliation engine writes a clamped copy of a seed edge with
+   `seed_origin_version` plus extraction stamps, not `seed_version`, although
+   a later reseed can adopt that copy). [VERIFIED-IN-REPO] So an element
+   extraction created survives the wipe without `seed_version`, and so does
+   the relationship that kept a seed node alive, and the probe counts both
+   unless the re-apply adopted them. An adopted element with an extraction
+   stamp is still refused. An adopted UNSTAMPED element passes, carrying
+   whatever was written to it before the reseed.
+
+   So a reseeded graph that passes the probe carries no write from before the
+   reseed, except on an unstamped element the reseed adopted. That needs a
+   seed source defining the same node id or fact as an unstamped extraction
+   write. [UNVERIFIED: whether the current seed source does; it lives in
+   `mist-memory/seed/` (`load_seed_documents`), which is not in the
+   repository]
 2. **The empty log shows nothing was extracted after the reseed.** Both
    extraction paths act only on a turn in the log: the dispatcher reads the
    log, and the in-process path runs only with the `event_id` `append_turn`
@@ -383,7 +402,8 @@ every node and edge it writes (`apply_seed_documents`, `_MERGE_EDGE`:
 Any node or edge an extraction writer CREATES, stamped or not (for example the
 unstamped KNOWS and HAS_CAPABILITY edges `SkillDerivationJob` MERGEs:
 `grep -nE 'MERGE \((u|m)\)-' backend/knowledge/curation/skill_derivation.py`),
-lacks `seed_version`, and the probe sees it.
+lacks `seed_version` when it is written, and the probe sees it until a reseed
+adopts it (below).
 
 It cannot see an unstamped SET on an existing SEEDED element:
 
@@ -412,6 +432,32 @@ It cannot see an unstamped SET on an existing SEEDED element:
     Whether the same turn also creates an element the probe does see (a new
     version, a clamped copy) depends on the actions the planner chose; nothing
     here relies on it;
+- adopted elements. The seed applier's `_MERGE_NODE` MERGEs on the node id and
+  `_MERGE_EDGE` on (subject, type, object); neither keys on `seed_version`
+  (`grep -nE '"MERGE \((n|s)' backend/knowledge/seed/applier.py`). So a reseed
+  gives `seed_version`, and the seed's provenance, and for an edge its
+  `valid_from`, `valid_to`, `source_type` and `confidence`, to any non-seed
+  element that survived the wipe and matches a seed node or fact. It keeps
+  every property the seed does not set. [VERIFIED-IN-REPO]
+  - A stamped element stays visible. A clamped copy of a seed edge
+    (`ReconciliationEngine._apply_append`:
+    `grep -n 'r.seed_origin_version = ' backend/knowledge/curation/reconciliation.py`)
+    has the same type and endpoints as the seed edge it copies, so it matches
+    that seed fact while the fact is in the seed source. The reseed adopts it:
+    it resets `valid_to` to the seed fact's, so the retired belief reads as
+    current again, and sets provenance, `source_type` and `confidence` to the
+    seed values (which the copy already carries). The
+    copy keeps `ontology_version`, `extraction_version` and `model_hash`, so the
+    probe still refuses, and the next reseed's wipe deletes it. Known limit,
+    already in the base branch: the fix is the follow-up (D11) that makes
+    `seed` refuse a graph holding extraction writes.
+  - An UNSTAMPED element passes the probe once adopted, with anything written
+    to it before the reseed. Examples are the KNOWS and HAS_CAPABILITY edges
+    and the `user` node that `SkillDerivationJob` MERGEs without a stamp:
+    `grep -nE 'MERGE \((u|m)\)-|MERGE \(u:' backend/knowledge/curation/skill_derivation.py`.
+    This needs a seed source that defines the same node id, or an edge of the
+    same type between the same two nodes. [UNVERIFIED: whether the current
+    seed source (`mist-memory/seed/`, not in the repository) defines one]
 - curation-scheduler jobs, which need no logged turn:
   - `ConfidenceDecayJob` (`confidence`, and `status = 'archived'`, on active
     `:__Entity__` nodes of a decay-enabled `knowledge_domain`), `OrphanDetector`
@@ -612,6 +658,10 @@ epoch stays in `epoch_mismatch`.
 - Seed-only promotion refuses any logged turn, of any session origin, including
   `test` and `seed` sessions that no extraction path would pick up. A log that
   holds turns goes through sections 4 to 6.
+- A reseed adopts a surviving non-seed element that matches a seed node or
+  fact (6A.2): a clamped seed copy is reopened (and still refused by the
+  probe), and an unstamped element then passes it. `seed` refusing a graph
+  that holds extraction writes is the follow-up (D11).
 - The probe cannot see unstamped SETs on seeded elements, and the marker check
   cannot see in-process or legacy applies (section 6A.2 names the symbols and
   the greps). An empty log shows only that the log is empty now, not that it
