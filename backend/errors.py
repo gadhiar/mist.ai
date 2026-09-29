@@ -137,3 +137,11 @@ class FilewatcherError(MistError):
 
 class SeedSourceError(MistError):
     """The seed source is missing, malformed, or internally inconsistent."""
+
+
+class SeedTargetNotSeedOnlyError(MistError):
+    """The graph a seed would write already holds non-seed or extraction-written data.
+
+    Raised by the seed applier before any write or wipe (MIS-177 D1): seeding
+    over such a graph adopts its elements and the next wipe deletes them.
+    """

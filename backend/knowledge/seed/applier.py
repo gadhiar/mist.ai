@@ -30,10 +30,12 @@ nodes still get one.
 import difflib
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
-from backend.errors import SeedSourceError
+from backend.errors import Neo4jQueryError, SeedSourceError, SeedTargetNotSeedOnlyError
 from backend.interfaces import GraphConnection
+from backend.knowledge.admin import count_reset_guard_elements
 from backend.knowledge.eval_isolation import assert_neo4j_uri_not_live
 from backend.knowledge.ontologies import ALL_NODE_TYPE_NAMES
 from backend.knowledge.ontologies.v1_0_0 import ALL_EDGE_TYPE_NAMES
@@ -173,15 +175,17 @@ def _merge_node_query(partition: str, node_type: str) -> str:
 # `SEED_ONLY_PROBE_CYPHER`) refuses any element carrying one.
 #
 # The MERGE is keyed only on (s, type, o), so it matches EVERY existing edge
-# of that type between the two nodes, not just the one it wrote last time --
-# including a clamped copy `curation/reconciliation.py` `_apply_append`
-# appended, and any extraction-written edge. On a reseed it adopts such an
-# edge: sets `seed_version` on it, resets `valid_from`/`valid_to` to the
-# fact's (reopening a retired belief), and overwrites provenance/source_type/
-# confidence; the adopted edge keeps any extraction stamps and any
-# `seed_origin_version` it already carried, and the next reseed's wipe deletes
-# it. Pre-existing for `seed_version`/`valid_to` before KG-125 (it widened the
-# overwritten set); tracked as the D11 follow-up, not fixed here.
+# of that type between the two nodes, not just the one it wrote last time.
+# Adopting a non-seed edge would set `seed_version` on it, reset
+# `valid_from`/`valid_to` to the fact's (reopening a retired belief) and
+# overwrite provenance/source_type/confidence, and the next reseed's wipe would
+# delete it. MIS-177 D1 (the former D11 follow-up) closes that for the edges it
+# can see: `_assert_seed_target_holds_only_seed` refuses, before any write or
+# wipe, a graph holding a clamped copy `curation/reconciliation.py`
+# `_apply_append` appended (it carries extraction stamps), any edge touching an
+# `:__Entity__` node without `seed_version`, and any `provenance='extraction'`
+# edge. What it still cannot see -- unstamped edges between two
+# `:__SelfModel__` nodes -- is named above `SEED_GUARD_STAMP_PROPERTIES`.
 _MERGE_EDGE = (
     f"MATCH (s:{ENTITY_LABEL}|{SELF_MODEL_LABEL} {{id: $subject}}) "
     f"MATCH (o:{ENTITY_LABEL}|{SELF_MODEL_LABEL} {{id: $object}}) "
@@ -199,6 +203,162 @@ _WIPE_NODES = (
     "AND NOT (n)--() "
     "DELETE n RETURN count(n) AS n"
 )
+
+# ---------------------------------------------------------------------------
+# The seed guard (MIS-177 D1)
+#
+# A seed or reseed refuses, before any write or wipe, a graph that holds:
+#   (a) anything `admin.RESET_GUARD_CYPHER` counts: an `:__Entity__` node whose
+#       provenance is not 'seed', or with no `seed_version`, or with any of
+#       `admin._EXTRACTION_STAMP_PROPERTIES` (its own `ontology_version` arm
+#       included); or a relationship touching an `:__Entity__` node with no
+#       `seed_version` or with such a stamp. Reused through
+#       `admin.count_reset_guard_elements`, not restated;
+#   (b) any node or relationship, in ANY partition, carrying one of
+#       `SEED_GUARD_STAMP_PROPERTIES`;
+#   (c) any node or relationship, in any partition, with
+#       `provenance = 'extraction'` (writers: `grep -n "provenance = 'extraction'"
+#       backend/knowledge/curation/graph_writer.py
+#       backend/knowledge/curation/reconciliation.py`).
+# No override. Adopting such an element is what this guard exists to stop:
+# the seed MERGEs (`_MERGE_NODE`, `_MERGE_EDGE`) match on id and on
+# (subject, type, object) alone.
+# ---------------------------------------------------------------------------
+
+# The stamps (b) tests in every partition. `ontology_version` is deliberately
+# NOT one of them, although `admin._EXTRACTION_STAMP_PROPERTIES` lists it:
+# `GraphStore.ensure_mist_identity` writes `ontology_version` on the
+# `:__SelfModel__:MistIdentity` node it creates
+# (`grep -n 'm.ontology_version = ' backend/knowledge/storage/graph_store.py`),
+# and the backend calls it at startup whenever internal derivation is enabled
+# (`grep -n 'gs.ensure_mist_identity()' backend/factories.py`). With
+# `ontology_version` here, a graph whose backend started before its first seed
+# could never be seeded, and no command clears the property.
+#
+# The gap this leaves, deliberately not closed here (a follow-up decision):
+# Stage 9 self-model nodes carry `ontology_version` as their only stamp and no
+# provenance (`grep -n 'e.ontology_version = \$ontology_version'
+# backend/knowledge/extraction/internal_derivation.py`), and the edge it
+# MERGEs from MistIdentity to them carries no property at all (`grep -n
+# 'MERGE (m)-\[:{rel_type}\]->(e)'
+# backend/knowledge/extraction/internal_derivation.py`).
+# `SkillDerivationJob._ensure_capability` writes the same shape
+# (`grep -nE 'e.ontology_version = |MERGE \(m\)-\[:HAS_CAPABILITY\]'
+# backend/knowledge/curation/skill_derivation.py`). Both are `:__SelfModel__`
+# only, so (a) never sees them either; a seed node or fact with the same id or
+# (subject, type, object) would adopt them.
+SEED_GUARD_STAMP_PROPERTIES = ("extraction_version", "model_hash")
+
+
+def _seed_guard_stamped(var: str) -> str:
+    """Cypher: `var` carries at least one of `SEED_GUARD_STAMP_PROPERTIES`."""
+    return "(" + " OR ".join(f"{var}.{p} IS NOT NULL" for p in SEED_GUARD_STAMP_PROPERTIES) + ")"
+
+
+# ONE read-only statement for (b) and (c). `MATCH (n) WITH count(...)` yields
+# one row even on an empty graph, and the OPTIONAL MATCH keeps that row when
+# the graph has no relationship; the relationship CASEs test `r IS NOT NULL`
+# first because OPTIONAL MATCH then binds one NULL `r`.
+SEED_GUARD_CYPHER = (
+    "MATCH (n) "
+    "WITH "
+    f"count(CASE WHEN {_seed_guard_stamped('n')} THEN 1 END) AS stamped_nodes, "
+    "count(CASE WHEN n.provenance = 'extraction' THEN 1 END) AS extraction_nodes "
+    "OPTIONAL MATCH ()-[r]->() "
+    "RETURN stamped_nodes, extraction_nodes, "
+    f"count(CASE WHEN r IS NOT NULL AND {_seed_guard_stamped('r')} THEN 1 END) "
+    "AS stamped_relationships, "
+    "count(CASE WHEN r IS NOT NULL AND r.provenance = 'extraction' THEN 1 END) "
+    "AS extraction_relationships"
+)
+
+SEED_GUARD_COLUMNS = (
+    "stamped_nodes",
+    "extraction_nodes",
+    "stamped_relationships",
+    "extraction_relationships",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SeedGuardCounts:
+    """What the seed guard counted in the target graph. Every field must be 0 to seed."""
+
+    reset_guard_nodes: int
+    reset_guard_relationships: int
+    stamped_nodes: int
+    stamped_relationships: int
+    extraction_nodes: int
+    extraction_relationships: int
+
+    def blocking(self) -> bool:
+        """True when any count is nonzero."""
+        return any(
+            (
+                self.reset_guard_nodes,
+                self.reset_guard_relationships,
+                self.stamped_nodes,
+                self.stamped_relationships,
+                self.extraction_nodes,
+                self.extraction_relationships,
+            )
+        )
+
+    def describe(self) -> str:
+        """Every count, by name, for the refusal message."""
+        return (
+            f"{self.reset_guard_nodes} non-seed :__Entity__ node(s) and "
+            f"{self.reset_guard_relationships} non-seed relationship(s) touching one "
+            "(admin.RESET_GUARD_CYPHER); "
+            f"{self.stamped_nodes} node(s) and {self.stamped_relationships} relationship(s) "
+            "in any partition carrying extraction_version or model_hash; "
+            f"{self.extraction_nodes} node(s) and {self.extraction_relationships} "
+            "relationship(s) with provenance='extraction'"
+        )
+
+
+def count_seed_guard_elements(connection: GraphConnection) -> SeedGuardCounts:
+    """Run the seed guard's two read-only statements and return their counts.
+
+    Fails closed, like `admin.count_reset_guard_elements` (which it calls for
+    (a)): a missing row, or a row without every column, raises rather than
+    reading as zero.
+
+    Raises:
+        Neo4jQueryError: Either statement returned no row or an unexpected row.
+    """
+    reset_nodes, reset_relationships = count_reset_guard_elements(connection)
+    rows = connection.execute_query(SEED_GUARD_CYPHER)
+    if not rows:
+        raise Neo4jQueryError("seed guard query returned no row")
+    row = rows[0]
+    try:
+        values = {name: int(row[name]) for name in SEED_GUARD_COLUMNS}
+    except (KeyError, TypeError, ValueError) as exc:
+        raise Neo4jQueryError(f"seed guard query returned an unexpected row: {row!r}") from exc
+    return SeedGuardCounts(
+        reset_guard_nodes=reset_nodes,
+        reset_guard_relationships=reset_relationships,
+        **values,
+    )
+
+
+def _assert_seed_target_holds_only_seed(connection: GraphConnection, *, action: str) -> None:
+    """Refuse to seed a graph holding non-seed or extraction-written elements.
+
+    Raises:
+        SeedTargetNotSeedOnlyError: Any seed guard count is nonzero; the
+            message names every count.
+        Neo4jQueryError: A guard statement failed or returned no usable row.
+    """
+    counts = count_seed_guard_elements(connection)
+    if counts.blocking():
+        raise SeedTargetNotSeedOnlyError(
+            f"Refusing {action}: the target graph holds {counts.describe()}. Seeding "
+            "would adopt such elements and a later reseed's wipe would delete them. "
+            "Seed an empty or seed-only graph (graph-reset --include-derived removes "
+            ":__Entity__ and :__Provenance__ data; :__SelfModel__ data is not reset)."
+        )
 
 
 def _assert_seed_target_permitted(
@@ -280,6 +440,11 @@ def apply_seed_documents(
             own defense -- a caller that constructs `SeedDocument`s
             directly, bypassing `load_seed_documents`, is not protected by
             a loader-only check).
+        SeedTargetNotSeedOnlyError: The target graph holds an element the
+            seed guard counts (`_assert_seed_target_holds_only_seed`).
+            Raised before any write.
+        Neo4jQueryError: A seed guard statement failed or returned no
+            usable row (fail closed). Raised before any write.
     """
     _assert_seed_target_permitted(
         connection, allow_live=allow_live, action="applying seed documents"
@@ -288,6 +453,9 @@ def apply_seed_documents(
     _validate_node_types(documents)
     node_partitions = _assign_node_partitions(documents)
     node_definitions = _collect_node_definitions(documents)
+    # MIS-177 D1: after the source checks (which need no query), before the
+    # first write.
+    _assert_seed_target_holds_only_seed(connection, action="applying seed documents")
 
     for node_id in sorted(node_partitions):
         node = node_definitions.get(node_id)
@@ -457,6 +625,10 @@ def reseed(
             partitions by different documents, the same node id is defined
             more than once, or a fact references an undefined node id.
             Raised before the wipe runs.
+        SeedTargetNotSeedOnlyError: The target graph holds an element the
+            seed guard counts. Raised before the wipe runs.
+        Neo4jQueryError: A seed guard statement failed or returned no
+            usable row (fail closed). Raised before the wipe runs.
     """
     # BEFORE the wipe, and independently of the delegate's own guard: by the
     # time `apply_seed_documents` refused, `wipe_seed_version` would already
@@ -466,6 +638,10 @@ def reseed(
     _validate_node_types(documents)
     _assign_node_partitions(documents)
     _collect_node_definitions(documents)
+    # MIS-177 D1: BEFORE the wipe. The delegate's own check runs after the
+    # wipe, on a graph the wipe has already changed; a refusal there would
+    # leave the seed content deleted.
+    _assert_seed_target_holds_only_seed(connection, action="re-seeding")
     wipe_seed_version(connection, seed_version)
     return apply_seed_documents(
         connection,
