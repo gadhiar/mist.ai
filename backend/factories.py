@@ -384,7 +384,7 @@ def build_curation_pipeline(
     # query that reads them tests non-null (SEED_ONLY_PROBE_CYPHER in
     # extraction_backlog/cutover.py). The extraction dispatcher's writer-stamp
     # guard compares a triple derived by the same function (from its own
-    # config) with the active epoch, not with the stored edges.
+    # config) with the active epoch, not the stored edges, when no cutover is open.
     rebuild_stamps = writer_stamps_from_config(config)
     return CurationPipeline(
         deduplicator=EntityDeduplicator(executor, embedding_provider, confidence_mgr),

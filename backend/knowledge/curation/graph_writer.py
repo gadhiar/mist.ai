@@ -57,9 +57,9 @@ class RebuildStamps:
     only whether they are non-null. The drift check that exists compares this
     object, not the edges: `ExtractionDispatcher._writer_stamp_mismatch`
     (`extraction_backlog/dispatcher.py`) compares the triple with the active
-    epoch's on all three fields, and on any difference stalls the dispatcher
-    so nothing is applied or dispatched. `ExtractionPipeline` also writes the
-    same triple into each extraction-cache row.
+    epoch's on all three fields. With no cutover open, a difference stalls the
+    dispatcher before it applies or dispatches; an open cutover's fill step runs
+    before that check. `ExtractionPipeline` also writes the triple into each cache row.
 
     Stable for the lifetime of the writer -- the LLM binary and ontology
     version do not change mid-process. Constructed from `KnowledgeConfig`
