@@ -15,8 +15,9 @@ steps and skipping any of them produces a graph that passes every gate:
    to write them.
 
 Bundled behind one object rather than left as three calls in `rebuild()` so the
-three cannot drift apart at the one call site that matters. `seed/gates.py:264`
-states the consequence of drifting: `canonical_serialize` excludes `embedding`,
+three cannot drift apart at the one call site that matters. The
+`check_embeddings` docstring in seed/gates.py states the consequence of
+drifting: `canonical_serialize` excludes `embedding`,
 so an unembedded rebuild is byte-identical to an embedded one.
 
 ## Why `now_iso` is injected rather than read from the clock
@@ -30,7 +31,7 @@ has nothing to do with determinism.
 
 ## Why the live-target refusal is tested here and not only at the write site
 
-`_assert_seed_target_permitted` (`seed/applier.py:91`) is default-CLOSED at the
+`_assert_seed_target_permitted` (seed/applier.py) is default-CLOSED at the
 write site, and its docstring names this exact insertion point as the reason:
 "at the R1.7 seed-apply insertion point, `source_conn` and `staging_conn` are
 both in scope and differ by six characters". After step A that specific confusion
@@ -44,8 +45,10 @@ from pathlib import Path
 
 import pytest
 
+from backend.errors import Neo4jQueryError
 from backend.knowledge.regeneration.staging_seeder import SeedApplyResult, StagingSeeder
 from backend.knowledge.seed.models import SeedDocument, SeedFact, SeedNode
+from tests.unit.knowledge.seed.seed_guard_rows import answer_seed_guard
 
 _SEED_VERSION = "test-seed-1"
 _NOW = "2026-07-01T09:00:00+00:00"
@@ -76,10 +79,15 @@ class _Config:
 
 
 class _RecordingConnection:
-    """Records writes; answers every read with `rows`.
+    """Records writes; answers the seed guard cleanly and every other read with `rows`.
 
     A real `EventStore`-style double is not available for Neo4j, and the
     mocking table's "external service" row prescribes a fake here.
+
+    The seed guard (MIS-177 D1) runs two reads before the apply's first write
+    and fails closed on an empty result, so an empty graph must answer them
+    with a zero row, as real Neo4j does. `rows` still answers every other read,
+    the embedding gate's included.
     """
 
     def __init__(self, uri="bolt://mist-neo4j-staging:7687", rows=None):
@@ -92,6 +100,9 @@ class _RecordingConnection:
         return []
 
     def execute_query(self, query, params=None):
+        guard_rows = answer_seed_guard(query)
+        if guard_rows is not None:
+            return guard_rows
         return list(self._rows)
 
 
@@ -167,6 +178,20 @@ class TestResultReporting:
             "returned no rows. Swallowing this is how both historical live "
             "embedding losses stayed invisible."
         )
+
+
+class TestSeedGuardFailsClosed:
+    def test_a_graph_that_answers_no_guard_read_is_refused_before_any_write(self):
+        """MIS-177 D1: the seed guard reads first and treats no row as a refusal."""
+
+        class _Silent(_RecordingConnection):
+            def execute_query(self, query, params=None):
+                return []
+
+        conn = _Silent()
+        with pytest.raises(Neo4jQueryError, match="guard query returned no row"):
+            _seeder(conn).apply(now_iso=_NOW)
+        assert conn.writes == []
 
 
 class TestConstructionRefusals:

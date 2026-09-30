@@ -119,6 +119,14 @@ def test_seed_yields_expected_entity_selfmodel_split(real_neo4j_connection):
     # reseed's wipe (scoped on seed_version) is what actually clears
     # :__SelfModel__ before recreating it, exercising the same wipe path
     # `mist_admin.py seed` uses live.
+    #
+    # MIS-177 D1: `reseed` now refuses, before its wipe, a graph holding any
+    # element the seed guard counts (`count_seed_guard_elements` in
+    # seed/applier.py). reset_graph clears the `:__Entity__` arm; a
+    # `:__SelfModel__` element carrying extraction_version, model_hash or
+    # provenance='extraction' survives it and makes this reseed raise
+    # SeedTargetNotSeedOnlyError. On the disposable eval instance, empty it
+    # first (`MATCH (n) DETACH DELETE n`).
     admin.reset_graph(conn, include_derived=True)
     admin.ensure_schema(conn)
 

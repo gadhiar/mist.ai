@@ -241,6 +241,13 @@ class LogRegenerator:
                 optional (a unique id is generated). For resume runs this is REQUIRED
                 (it must match the row created during the initial run).
             resume_from: Event ID to resume after (cursor-based); None for a full run.
+                A resume re-applies the seed, above the replay loop, to a staging
+                graph that already holds the first run's replayed writes, and the
+                seed guard (MIS-177 D1) refuses that graph before any seed write:
+                `grep -n '_assert_seed_target_holds_only_seed('
+                backend/knowledge/seed/applier.py`. The refusal is kept by
+                decision; there is no wipe-then-resume path. Pinned by
+                tests/unit/knowledge/regeneration/test_rebuild_resume_seed_guard.py.
             origins: Session provenance values to replay. Defaults to
                 `CANONICAL_ORIGINS` (`('real',)`) -- a rebuild of the canonical
                 graph must not absorb probe or eval traffic. Pass explicitly to
@@ -255,6 +262,9 @@ class LogRegenerator:
             RebuildError: If resume_from is set but job_id is None, or if resume_from
                 is set while `journal` is non-durable (no checkpoint rows were ever
                 persisted, so there is no cursor to resume against).
+            SeedTargetNotSeedOnlyError: Via the seeder's `apply_seed_documents`,
+                when staging already holds data the seed guard counts -- on a
+                resume, the first run's replayed writes.
         """
         assert_rebuild_target_not_live(staging_uri, live_uri)
 
@@ -367,7 +377,7 @@ class LogRegenerator:
         #
         # ORDER IS LOAD-BEARING and the two writers do not commute:
         #
-        #   seed      `ON MATCH SET n += $properties`      (seed/applier.py:62)
+        #   seed      `ON MATCH SET n += $properties`      (seed/applier.py `_MERGE_NODE`)
         #               -- unconditional clobber of every authored property
         #   extraction `display_name = CASE WHEN size(existing) < size(new) ...`
         #               (curation/graph_writer.py `_upsert_entity`) -- longest-wins
@@ -472,7 +482,7 @@ class LogRegenerator:
         # NOTHING GOES HERE. The self-model copy-forward that used to occupy this
         # position is retired (MIS-130 step A), and its replacement does not belong
         # on this side of the loop: a seed-apply must run BEFORE the replay, because
-        # seed's `ON MATCH SET n += $properties` (seed/applier.py:62) and
+        # seed's `ON MATCH SET n += $properties` (seed/applier.py `_MERGE_NODE`) and
         # extraction's longest-wins `display_name` CASE (graph_writer.py `_upsert_entity`) do
         # not commute. The ordering rationale in full sits above the replay loop,
         # deliberately at the position the step must take rather than at the position

@@ -548,7 +548,6 @@ def compute_harness_scores_for_arm(
         complete = n == expected_n
         value = test_scores.mean_score
         k = test_scores.pass_count
-        wilson = wilson_interval(k, n, stats_cfg["wilson_z"]) if n > 0 else None
         values_by_cluster: dict[str, list[float]] = {}
         for cs in test_scores.case_scores:
             values_by_cluster.setdefault(cs.case_id, []).append(cs.score)
@@ -563,17 +562,58 @@ def compute_harness_scores_for_arm(
             else None
         )
         note = None if complete else f"incomplete coverage: {n}/{expected_n}"
+        # The value is a MEAN of graded case scores, so its interval is the cluster
+        # bootstrap over those same scores. No Wilson interval here: Wilson is an
+        # interval for a pass PROPORTION, a different statistic (finding i67, D6);
+        # the proportion and its Wilson interval live on the separate pass-rate row
+        # built by compute_harness_pass_rates.
         results[name] = MetricResult(
             value=value,
             n=n,
             n_expected=expected_n,
             k=k,
-            wilson=wilson,
+            wilson=None,
             bootstrap=bootstrap,
             complete=complete,
             note=note,
         )
     return results, raw
+
+
+def compute_harness_pass_rates(
+    harness_scores: dict[str, MetricResult],
+    raw_scores: dict[str, harness_scorers.TestScores],
+    stats_cfg: dict[str, Any],
+) -> dict[str, MetricResult]:
+    """Returns the pass-rate row per test_name, paired with its Wilson interval.
+
+    value = pass_count / n and wilson = wilson_interval(pass_count, n, z): a proportion
+    and the interval for a proportion. Coverage (n, n_expected, complete, note) is copied
+    from the test's mean-score row in `harness_scores`, so both rows always agree on
+    whether the arm's coverage was complete. A test with no records yields the same
+    missing_metric shape as its mean-score row. No bootstrap CI: the bootstrap belongs
+    to the mean-score row.
+    """
+    results: dict[str, MetricResult] = {}
+    for name, score_row in harness_scores.items():
+        test_scores = raw_scores.get(name)
+        if score_row.missing or test_scores is None:
+            results[name] = missing_metric(
+                score_row.note or f"no harness records for test {name!r}"
+            )
+            continue
+        n = score_row.n or 0
+        k = test_scores.pass_count
+        results[name] = MetricResult(
+            value=(k / n) if n > 0 else None,
+            n=n,
+            n_expected=score_row.n_expected,
+            k=k,
+            wilson=wilson_interval(k, n, stats_cfg["wilson_z"]) if n > 0 else None,
+            complete=score_row.complete,
+            note=score_row.note,
+        )
+    return results
 
 
 def compute_truncation_rate(
@@ -700,6 +740,8 @@ class ArmMetrics:
     layout_completion_tokens_per_correct: dict[str, float | None] = field(default_factory=dict)
     layout_p95_wall_ms: dict[str, MetricResult] = field(default_factory=dict)
     harness_score: dict[str, MetricResult] = field(default_factory=dict)  # test_name -> result
+    # test_name -> pass proportion + Wilson interval; display-only, never read by a gate.
+    harness_pass_rate: dict[str, MetricResult] = field(default_factory=dict)
     truncation_rate: dict[str, MetricResult] = field(default_factory=dict)
     decode_tps: MetricResult = field(
         default_factory=lambda: missing_metric("no ttft.jsonl for this arm")
@@ -790,6 +832,7 @@ def compute_all_metrics(results_dir: Path, arm_ids: list[str], rules: dict[str, 
 
         harness_scores, raw_scores = compute_harness_scores_for_arm(inputs, stats_cfg)
         am.harness_score = harness_scores
+        am.harness_pass_rate = compute_harness_pass_rates(harness_scores, raw_scores, stats_cfg)
         raw_test_scores[arm_id] = raw_scores
         for test_name in harness_scores:
             am.truncation_rate[test_name] = compute_truncation_rate(inputs, test_name, stats_cfg)
@@ -2592,6 +2635,11 @@ def render_report(
                 f"| harness_score[{test_name}] | {_fmt(r.value)} | {_fmt(r.n)} | {_fmt(r.n_expected)} | "
                 f"{r.complete} | {_fmt_ci(r.wilson)} | {_fmt_ci(r.bootstrap)} |"
             )
+        for test_name, r in sorted(am.harness_pass_rate.items()):
+            lines.append(
+                f"| harness_pass_rate[{test_name}] | {_fmt(r.value)} | {_fmt(r.n)} | {_fmt(r.n_expected)} | "
+                f"{r.complete} | {_fmt_ci(r.wilson)} | {_fmt_ci(r.bootstrap)} |"
+            )
         for test_name, r in sorted(am.truncation_rate.items()):
             lines.append(
                 f"| truncation_rate[{test_name}] | {_fmt(r.value)} | {_fmt(r.n)} | {_fmt(r.n_expected)} | "
@@ -2807,6 +2855,7 @@ def build_summary(
             "layout_completion_tokens_per_correct": dict(am.layout_completion_tokens_per_correct),
             "layout_p95_wall_ms": {p: r.to_dict() for p, r in am.layout_p95_wall_ms.items()},
             "harness_score": {t: r.to_dict() for t, r in am.harness_score.items()},
+            "harness_pass_rate": {t: r.to_dict() for t, r in am.harness_pass_rate.items()},
             "truncation_rate": {t: r.to_dict() for t, r in am.truncation_rate.items()},
             "decode_tps": am.decode_tps.to_dict(),
             "ttft_ms": {str(ctx): r.to_dict() for ctx, r in am.ttft_ms.items()},

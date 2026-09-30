@@ -3,7 +3,8 @@
 ## The three things this pins
 
 **1. ORDER.** The seed-apply runs BEFORE the replay loop, and the two writers do
-not commute. Seed does `ON MATCH SET n += $properties` (`seed/applier.py:62`) --
+not commute. Seed does `ON MATCH SET n += $properties` (seed/applier.py
+`_MERGE_NODE`) --
 an unconditional clobber of every authored property. Extraction does
 `display_name = CASE WHEN size(e.display_name) < size($display_name) ...`
 (`curation/graph_writer.py` `_upsert_entity`) -- longest-wins. Live applies seed first

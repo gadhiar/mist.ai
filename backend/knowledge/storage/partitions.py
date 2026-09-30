@@ -24,6 +24,17 @@ ENTITY_LABEL = "__Entity__"
 PROVENANCE_LABEL = "__Provenance__"
 SELF_MODEL_LABEL = "__SelfModel__"
 
+# The stored id of the singleton user node (:__Entity__ {id: "user"}). Neo4j
+# property matching is case-sensitive, so every graph read that anchors on the
+# user node by id must use exactly this value ("User" matches nothing).
+# Writers of this id, established by:
+#   grep -n '"id": "user"' backend/knowledge/extraction/prompts.py   (line 49)
+#   grep -n '"user_entity_id": USER_ENTITY_ID' backend/knowledge/curation/skill_derivation.py
+#     (SkillDerivationJob._create_skill MERGEs {id: $user_entity_id} with this value)
+# Readers that take it by id: GraphStore.get_user_relationships_to_entities
+# (MATCH (user:__Entity__ {id: $user_id})) via KnowledgeRetriever.retrieve.
+USER_ENTITY_ID = "user"
+
 # The five entity types that live in the :__SelfModel__ partition. MistIdentity
 # is the singleton root; the other four hang off it via HAS_* edges.
 SELF_MODEL_TYPES: frozenset[str] = frozenset(

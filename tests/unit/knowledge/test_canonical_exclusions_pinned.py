@@ -46,7 +46,8 @@ class TestPinnedByExactEquality:
     def test_derived_artifact_fields(self):
         """`embedding` is excluded because it is huge and float-noisy.
 
-        The cost is documented in `seed/gates.py:264-268`: a canonical form is
+        The cost is documented in the `check_embeddings` docstring in
+        seed/gates.py: a canonical form is
         byte-identical whether embeddings are present, absent, or all-zero, so
         a seed-apply that skips the backfill produces a graph nothing can
         retrieve from AND certifies clean. That is why MIS-130 carries a

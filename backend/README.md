@@ -176,7 +176,7 @@ class VoiceConfig(BaseModel):
   0.7 conversation temperature split
 - **Fallback:** OllamaProvider remains wired for `LLM_BACKEND=ollama`
 
-### TTS: Chatterbox Turbo
+### TTS: Chatterbox
 - **Model:** Zero-shot voice cloning from reference WAV (MIT license)
 - **Sample Rate:** 24kHz
 - **Latency:** ~0.74x RTF in-container

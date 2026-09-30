@@ -1,4 +1,4 @@
-"""Chatterbox Turbo voice cloning trials with varying parameters.
+"""Chatterbox voice cloning trials with varying parameters.
 
 Tests different reference configurations and generation settings
 to find the optimal JARVIS voice clone.
@@ -75,7 +75,7 @@ def run_trial(
 
 def main():
     print("=" * 60)
-    print("CHATTERBOX TURBO - JARVIS VOICE CLONING TRIALS")
+    print("CHATTERBOX - JARVIS VOICE CLONING TRIALS")
     print("=" * 60)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -83,7 +83,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load model once
-    print("\nLoading Chatterbox Turbo...")
+    print("\nLoading Chatterbox...")
     from chatterbox.tts import ChatterboxTTS
 
     model = ChatterboxTTS.from_pretrained(device=device)

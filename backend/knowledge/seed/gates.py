@@ -12,7 +12,8 @@ the Task 11-14 addendum, `check_embeddings` by I7):
   this sub-project lost 32 nodes / 30 relationships with zero provenance
   in the first place.
 - `check_node_definitions` -- every seeded NODE (not just every fact)
-  carries its ontology type label and a display name in the live graph.
+  carries its type (`entity_type`, plus the type label where the applier
+  writes one) and a display name in the live graph.
   This is the gate Task 10's live defect needed and did not have: Gate 2
   checks that authored facts are present, and the wipe-and-recreate cycle
   that stripped every node's ontology label and descriptive property left
@@ -54,6 +55,8 @@ from backend.interfaces import EmbeddingProvider, GraphConnection
 from backend.knowledge.embeddings.embedding_text import embedding_text_for
 from backend.knowledge.seed.models import SeedDocument, SeedNode
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
+
+from .applier import entity_type_labels_removed, node_type_label
 
 logger = logging.getLogger(__name__)
 
@@ -150,19 +153,38 @@ def check_facts_present(
     return GateResult(passed=not failures, failures=failures)
 
 
-# One MATCH clause carrying BOTH the document's partition label and the
-# node's ontology type label (`:{partition}:{type}`) -- a node missing
-# EITHER label fails to bind and is reported, rather than needing two
-# separate checks. This is deliberately the same interpolate-and-pin
-# discipline as `_CHECK_FACT_QUERY`'s predicate: Neo4j cannot parameterize
-# a label, and a query that only checked `display_name IS NOT NULL`
-# without also re-asserting the labels in the MATCH pattern would still
-# pass on a node holding the right property under the wrong label.
+# The node's type is its `entity_type` PROPERTY (MIS-177 D2), checked in the
+# WHERE against the authored type. The MATCH pattern carries the document's
+# partition label, plus the ontology type label wherever the applier still
+# writes one (`node_type_label` in applier.py: `:__SelfModel__` nodes and
+# `User`), interpolated as `%s` because Neo4j cannot parameterize a label --
+# the same interpolate-and-pin discipline as `_CHECK_FACT_QUERY`'s predicate.
+# A node missing a required label fails to bind and is reported.
+#
+# `$forbidden_labels` is the other half of the applier's contract: an
+# `:__Entity__` seed node carries no ontology type label except `User`
+# (`entity_type_labels_removed` in applier.py). Empty for `:__SelfModel__`,
+# where the applier removes nothing.
 _CHECK_NODE_QUERY = (
-    "MATCH (n:%s:%s {id: $id}) "
+    "MATCH (n:%s {id: $id}) "
     "WHERE n.seed_version = $seed_version AND n.display_name IS NOT NULL "
+    "AND n.entity_type = $entity_type "
+    "AND none(label IN labels(n) WHERE label IN $forbidden_labels) "
     "RETURN count(n) AS n"
 )
+
+
+def _node_match_labels(partition: str, node_type: str) -> str:
+    """Return the `partition[:Type]` label expression `_CHECK_NODE_QUERY` matches on."""
+    label = node_type_label(partition, node_type)
+    return partition if label is None else f"{partition}:{label}"
+
+
+def _forbidden_node_labels(partition: str, node_type: str) -> list[str]:
+    """Return the ontology type labels the applier removes from this node."""
+    if partition != ENTITY_LABEL:
+        return []
+    return entity_type_labels_removed(node_type_label(partition, node_type))
 
 
 def check_node_definitions(
@@ -171,20 +193,20 @@ def check_node_definitions(
     *,
     seed_version: str,
 ) -> GateResult:
-    """Verify every seeded node carries its ontology type label and a display name.
+    """Verify every seeded node carries its type and a display name.
 
     This is the gate R1.4 Task 10's live defect needed and did not have.
-    `reseed()`'s wipe-then-apply cycle stripped every node's ontology type
-    label (`MistIdentity`, `MistTrait`, `User`, `Organization`, ...) and
-    every descriptive property (including `display_name`) down to a bare
+    `reseed()`'s wipe-then-apply cycle stripped every node's type and every
+    descriptive property (including `display_name`) down to a bare
     partition label plus `id`/timestamps/`seed_version` -- and
     `check_facts_present` (Gate 2) passed throughout, because the edges
     those facts describe were recreated correctly from the source; only
     the NODES lost their identity. This gate checks the nodes directly:
     for every `SeedNode` the source defines, the live graph node must
-    match on both its document's partition label and its ontology type
-    label in one MATCH clause (a node missing either fails to bind) and
-    carry a non-null `display_name`.
+    match on its document's partition label (plus its type label, where
+    the applier writes one), carry `entity_type` equal to the authored
+    type and a non-null `display_name`, and carry none of the type labels
+    the applier removes from an `:__Entity__` node (MIS-177 D2).
 
     Read-only: issues `execute_query` only, never `execute_write`.
 
@@ -195,23 +217,27 @@ def check_node_definitions(
 
     Returns:
         `GateResult` with one failure line per node whose live graph
-        counterpart is missing its partition label, its ontology type
-        label, or a non-null `display_name`.
+        counterpart does not satisfy all of the above.
     """
     failures: list[str] = []
     for doc in documents:
         for node in doc.nodes:
-            query = _CHECK_NODE_QUERY % (doc.partition, node.type)
+            query = _CHECK_NODE_QUERY % _node_match_labels(doc.partition, node.type)
             results = connection.execute_query(
                 query,
-                {"id": node.id, "seed_version": seed_version},
+                {
+                    "id": node.id,
+                    "seed_version": seed_version,
+                    "entity_type": node.type,
+                    "forbidden_labels": _forbidden_node_labels(doc.partition, node.type),
+                },
             )
             if _count(results) < 1:
                 failures.append(
-                    f"{doc.source_path}: node {node.id!r} is missing its "
-                    f"{doc.partition!r} partition label, its {node.type!r} ontology "
-                    f"type label, or a non-null display_name at "
-                    f"seed_version={seed_version!r}"
+                    f"{doc.source_path}: node {node.id!r} does not match "
+                    f"`{_node_match_labels(doc.partition, node.type)}` with "
+                    f"entity_type={node.type!r}, a non-null display_name and no "
+                    f"stray ontology type label at seed_version={seed_version!r}"
                 )
     return GateResult(passed=not failures, failures=failures)
 

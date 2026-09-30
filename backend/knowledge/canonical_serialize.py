@@ -47,11 +47,11 @@ EPOCH_STAMP_FIELDS = frozenset({"ontology_version", "extraction_version", "model
 
 # Derived artifacts: reproducible in principle, not compared in practice.
 # `embedding` is large and float-noisy, and excluding it has a documented cost
-# -- `seed/gates.py:264-268` records that a canonical form is byte-identical
-# whether embeddings are present, absent, or all-zero, so a seed-apply that
-# skips the backfill yields a graph nothing can retrieve from AND certifies
-# clean. MIS-130 carries a separate presence-and-dimension assertion because
-# THIS set cannot cover it.
+# -- the `check_embeddings` docstring in seed/gates.py records that a canonical
+# form is byte-identical whether embeddings are present, absent, or all-zero,
+# so a seed-apply that skips the backfill yields a graph nothing can retrieve
+# from AND certifies clean. MIS-130 carries a separate presence-and-dimension
+# assertion because THIS set cannot cover it.
 DERIVED_ARTIFACT_FIELDS = frozenset({"embedding"})
 
 # Excluded on NODES only; the same property on an edge is compared.

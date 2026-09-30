@@ -10,8 +10,15 @@ what threshold each policy implies. It does not change the threshold.
 `SIMILARITY_THRESHOLD = 0.92` is compared against Neo4j's
 `vector.similarity.cosine`, which returns `(1 + cos) / 2`. So 0.92 is a raw
 cosine of 0.84. The report shows both scales; every threshold it prints is a
-Neo4j score, with the raw-cosine equivalent beside it. A pair merges when
-`score >= threshold`.
+Neo4j score, with the raw-cosine equivalent beside it. The tool treats a pair
+as merging when `score >= threshold`.
+
+That is the score half of the Tier-3 rule only. `EntityDeduplicator._find_existing`
+also rejects a candidate at or above the threshold when the two names carry
+different numeric tokens (digit runs, compared by value) or different month tokens
+(`backend/knowledge/curation/name_veto.py`). This tool does not apply that veto, so a
+distinct pair the veto would reject, such as `P95 latency` / `P99 latency`, still
+counts as a false merge here when it scores at or above the threshold.
 
 ## Run it (live, inside the backend container)
 

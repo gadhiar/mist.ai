@@ -1,4 +1,4 @@
-"""Text-to-Speech engines: Sesame CSM and Chatterbox Turbo."""
+"""Text-to-Speech engines: Sesame CSM and Chatterbox."""
 
 import logging
 import sys
@@ -240,7 +240,7 @@ logger = logging.getLogger(__name__)
 
 
 class ChatterboxTTS:
-    """Wrapper for Chatterbox Turbo TTS with zero-shot voice cloning.
+    """Wrapper for Chatterbox TTS with zero-shot voice cloning.
 
     Unlike CSM, Chatterbox does not use context segments or fine-tuned weights.
     It clones voice from a single reference WAV file at inference time.
@@ -262,13 +262,13 @@ class ChatterboxTTS:
         self.device = device
         self.reference_audio_path = str(profile.reference_audio_path)
 
-        logger.info("Loading Chatterbox Turbo (%s) on %s...", profile.name, device)
+        logger.info("Loading Chatterbox (%s) on %s...", profile.name, device)
 
         from chatterbox.tts import ChatterboxTTS as _ChatterboxTTS
 
         self.model = _ChatterboxTTS.from_pretrained(device=device)
 
-        logger.info("Chatterbox Turbo (%s) loaded", profile.name)
+        logger.info("Chatterbox (%s) loaded", profile.name)
 
     def generate(self, text: str) -> torch.Tensor:
         """Generate speech from text using zero-shot voice cloning.

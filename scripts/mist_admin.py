@@ -173,13 +173,18 @@ def cmd_seed(args: argparse.Namespace) -> int:
             print(f"  {layer}: {count}")
         print(f"[seed] Total writes: {sum(counts.values())}")
 
-        # Embedding backfill: the new applier stamps seed_version/created_at/
-        # updated_at only -- it never sets `embedding`, and a second `seed`
-        # run's wipe-then-recreate cycle does not preserve properties the
-        # applier itself does not set. _backfill_embeddings_for_seed matches
-        # on seed_version across BOTH graph partitions (unlike the pre-R1.4
-        # _backfill_embeddings, which is :__Entity__-only and provenance-
-        # scoped -- neither survives this applier's write shape). Disabled
+        # Embedding backfill: the applier writes each node's authored
+        # properties plus `entity_type`, `seed_version`, `provenance` and
+        # `updated_at` (the `properties =` dict in `apply_seed_documents`), and
+        # `created_at` on create (`_MERGE_NODE`), but never `embedding`
+        # (`grep -n embedding backend/knowledge/seed/applier.py` -> comments
+        # only); and a second `seed` run's wipe-then-recreate cycle does not
+        # preserve properties the applier itself does not set.
+        # _backfill_embeddings_for_seed matches on seed_version across BOTH
+        # graph partitions; the pre-R1.4 _backfill_embeddings is
+        # `MATCH (n:__Entity__)` only, so it can never reach a :__SelfModel__
+        # node (`_backfill_embeddings_for_seed`'s docstring in admin.py gives
+        # the full comparison). Disabled
         # with --no-embeddings.
         if not args.no_embeddings:
             from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
@@ -1161,7 +1166,7 @@ def _build_log_regenerator(
         # never `live_conn`. Those two names differ by six characters at this call
         # site, which `_assert_seed_target_permitted`'s docstring calls out by name;
         # the refusal that protects against getting it wrong is at the WRITE site
-        # (`seed/applier.py:91`, default-CLOSED), not here, because a guard the
+        # (seed/applier.py, default-CLOSED), not here, because a guard the
         # caller must remember to add is absent exactly when it matters.
         staging_seeder=StagingSeeder(
             connection=staging_conn,
@@ -1434,7 +1439,12 @@ def cmd_graph_reset(args: argparse.Namespace) -> int:
     be = _load_backend()
     connection = _connect(be)
     try:
-        non_seed = be.admin.count_non_seed_entities(connection)
+        # The reset guard counts nodes AND relationships (`RESET_GUARD_CYPHER`
+        # in admin.py), so the two are reported separately, never summed
+        # under one "entities" label (MIS-177 i107).
+        guard_nodes, guard_rels = be.admin.count_reset_guard_elements(connection)
+        non_seed = guard_nodes + guard_rels
+        blocking = f"{guard_nodes} non-seed node(s) and {guard_rels} non-seed relationship(s)"
         node_count = connection.execute_query("MATCH (n:__Entity__) RETURN count(n) AS count")[0][
             "count"
         ]
@@ -1443,13 +1453,13 @@ def cmd_graph_reset(args: argparse.Namespace) -> int:
         )[0]["count"]
 
         print(f"[graph-reset] Current graph: {node_count} nodes, {rel_count} relationships")
-        print(f"[graph-reset] Non-seed entities: {non_seed}")
+        print(f"[graph-reset] Blocking a reset without --include-derived: {blocking}")
 
         if args.dry_run:
             print("[graph-reset] --dry-run: no changes written.")
             if non_seed > 0 and not args.include_derived:
                 print(
-                    f"[graph-reset] WOULD REFUSE: {non_seed} non-seed entities present. "
+                    f"[graph-reset] WOULD REFUSE: {blocking} present. "
                     "Re-run with --include-derived to override."
                 )
             elif node_count == 0:
@@ -1467,7 +1477,7 @@ def cmd_graph_reset(args: argparse.Namespace) -> int:
 
         if non_seed > 0 and not args.include_derived:
             print(
-                f"[graph-reset] REFUSING: {non_seed} non-seed entities present. "
+                f"[graph-reset] REFUSING: {blocking} present. "
                 "Pass --include-derived to wipe anyway."
             )
             return 2
@@ -2624,7 +2634,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_reset.add_argument(
         "--include-derived",
         action="store_true",
-        help="Allow wiping entities whose provenance is not 'seed'.",
+        help=(
+            "Allow the reset when :__Entity__ nodes, or relationships touching them, lack "
+            "the seed applier's markers or carry an extraction stamp; also wipes "
+            ":__Provenance__ nodes."
+        ),
     )
     p_reset.set_defaults(func=cmd_graph_reset)
 
@@ -2665,10 +2679,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run hybrid (graph + vector) retrieval for a query.",
     )
     p_retrieve.add_argument("query", help="Natural-language query.")
+    # The user node's stored id: retrieval anchors on it by exact id
+    # (`GraphStore.get_user_relationships_to_entities`), so "User" matched
+    # nothing. partitions.py imports nothing but `__future__`, so this keeps
+    # `--help` free of backend dependencies.
+    from backend.knowledge.storage.partitions import USER_ENTITY_ID
+
     p_retrieve.add_argument(
         "--user-id",
-        default="User",
-        help="User identifier scoping the retrieval (default: User).",
+        default=USER_ENTITY_ID,
+        help=f"User node id scoping the retrieval (default: {USER_ENTITY_ID}).",
     )
     p_retrieve.add_argument(
         "--limit",

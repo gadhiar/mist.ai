@@ -41,7 +41,7 @@ RUN pip install torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 \
     --index-url https://download.pytorch.org/whl/cu124
 
 # 2. Chatterbox TTS (installs its own deps but torch is already pinned above)
-RUN pip install chatterbox-tts soundfile
+RUN pip install chatterbox-tts==0.1.7 soundfile
 
 # 3. Backend requirements (requirements.txt changes rarely)
 COPY requirements.txt /app/requirements.txt

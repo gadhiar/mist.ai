@@ -17,6 +17,14 @@ so unrelated texts sit near raw cosine 0.75 and some pairs clear 0.84. Its
 docstring says it "should not be used for similarity threshold testing". The
 first eval run (2026-09-27) used it: "t2acrash-zig" and "t2acrash-rust" scored
 0.9203, turn 1's `zig` merged into `rust`, and the run wrote no `zig` node at all.
+
+Tier 3 also applies a name veto (`backend/knowledge/curation/name_veto.py`): a
+candidate above the threshold is still rejected when the two names carry
+different numeric tokens or different month tokens. It does not keep this
+harness's entities apart: every name starts with `t2acrash-`, so each carries
+the same numeric token {2} and no month token, and the veto passes every pair.
+The score check in `tests/unit/extraction_backlog/test_crash_replay_harness.py`
+remains the guard.
 """
 
 from __future__ import annotations

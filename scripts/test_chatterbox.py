@@ -1,4 +1,4 @@
-"""Quick Chatterbox Turbo evaluation with JARVIS reference clip.
+"""Quick Chatterbox evaluation with JARVIS reference clip.
 
 Usage:
     python scripts/test_chatterbox.py
@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 def main():
     print("=" * 60)
-    print("CHATTERBOX TURBO - JARVIS VOICE EVAL")
+    print("CHATTERBOX - JARVIS VOICE EVAL")
     print("=" * 60)
 
     # Check GPU
@@ -34,7 +34,7 @@ def main():
     print(f"  Duration: {len(ref_audio)/ref_sr:.1f}s, Sample rate: {ref_sr}Hz")
 
     # Load Chatterbox
-    print("\nLoading Chatterbox Turbo...")
+    print("\nLoading Chatterbox...")
     t0 = time.perf_counter()
     from chatterbox.tts import ChatterboxTTS
 

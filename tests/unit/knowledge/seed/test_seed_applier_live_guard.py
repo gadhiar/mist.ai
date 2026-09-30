@@ -29,6 +29,7 @@ import pytest
 from backend.knowledge.eval_isolation import EvalIsolationError
 from backend.knowledge.seed.applier import apply_seed_documents, reseed
 from tests.mocks.neo4j import FakeNeo4jConnection
+from tests.unit.knowledge.seed.seed_guard_rows import clean_seed_guard_router
 
 _NOW = "2026-08-26T00:00:00+00:00"
 
@@ -39,9 +40,15 @@ class _Config:
 
 
 class _ConnectionWithUri(FakeNeo4jConnection):
-    """A fake that DOES expose `.config.uri`, standing in for a real connection."""
+    """A fake that DOES expose `.config.uri`, standing in for a real connection.
+
+    It answers the seed guard's two reads (MIS-177 D1) with a clean row, as an
+    empty graph does, so a permitted target reaches the apply; the live refusal
+    these tests pin runs before either read.
+    """
 
     def __init__(self, uri: str, **kwargs):
+        kwargs.setdefault("query_router", clean_seed_guard_router)
         super().__init__(**kwargs)
         self.config = _Config(uri=uri)
 
@@ -94,7 +101,12 @@ class TestApplySeedDocumentsLiveGuard:
         A double cannot reach live, so "cannot determine the URI" is not the
         dangerous case here -- it is proof the object is not a real connection.
         """
-        apply_seed_documents(FakeNeo4jConnection(), docs, seed_version="v1", now_iso=_NOW)
+        apply_seed_documents(
+            FakeNeo4jConnection(query_router=clean_seed_guard_router),
+            docs,
+            seed_version="v1",
+            now_iso=_NOW,
+        )
 
 
 class TestReseedLiveGuard:
