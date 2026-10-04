@@ -114,7 +114,7 @@ The reviews on that branch worked -- every finding was caught. **Scoped per-task
 - Python 3.11+
 - FastAPI + Uvicorn (WebSocket server, port 8001)
 - Docker Compose (backend + Neo4j 5 + llama-server)
-- llama-server (LLM inference - Gemma 4 E4B Q5_K_M via llama.cpp)
+- llama-server (LLM inference - interactive: Gemma 4 E4B Q5_K_M via llama.cpp; extraction: a separate llama-server host, gpt-oss-20b since 2026-09-29; live model ids from each host's /v1/info)
 - Whisper (STT)
 - Chatterbox Turbo (TTS - MIT license, zero-shot voice cloning)
 - Neo4j 5.x (knowledge graph)
@@ -330,7 +330,7 @@ Co-Authored-By: Claude <noreply@anthropic.com>
 - Must be air-gapped capable (local-first design)
 
 **Model Choices:**
-- LLM: Gemma 4 E4B Q5_K_M (via llama-server)
+- LLM: Gemma 4 E4B Q5_K_M for the interactive path (via llama-server); extraction runs on a separate llama-server host (gpt-oss-20b since 2026-09-29)
 - Embeddings: all-MiniLM-L6-v2 (384-dim, fast)
 - STT: Whisper base (1.4GB model)
 - TTS: Chatterbox Turbo (0.74x RTF, 3.9GB VRAM, zero-shot cloning)
