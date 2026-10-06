@@ -16,7 +16,7 @@ purpose. A legitimate change to the exclusion set SHOULD fail them; the
 required response is to update the expectation here in the same commit, with a
 sentence saying what the gate can no longer see and why that is acceptable.
 
-The union test is derived rather than enumerated, per `tests/CLAUDE.md`
+The union test is derived rather than enumerated, per `TESTING.md`
 ("Derived beats enumerated whenever the enumeration can go stale"): it
 introspects the module for exclusion frozensets, so a NEW one added later fails
 until it is pinned here. An enumerated test would silently ignore it -- which is

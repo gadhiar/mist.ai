@@ -5,7 +5,7 @@ resolves to the production root, a rebuild reads the answer key and scores
 itself perfect -- with no symptom anywhere.
 
 `KnowledgeConfig.from_env()` is used here rather than `build_test_config()`
-(tests/CLAUDE.md's usual rule) deliberately: the property under test IS the
+(TESTING.md's usual rule) deliberately: the property under test IS the
 real, environment-derived production path, and `assert_not_production_root`
 itself calls `KnowledgeConfig.from_env()` internally (never an injected
 config). Substituting a test config would verify a fiction instead of the

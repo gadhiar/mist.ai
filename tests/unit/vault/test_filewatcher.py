@@ -181,7 +181,7 @@ async def _wait_for(predicate, *, settle: float = 0.0, timeout: float = _DEBOUNC
     exactly the flake this replaced: the 250ms budget was never marginal
     (measured fire latency ~102ms, ~147ms of headroom), so failures were
     always large stalls rather than near-misses, which a fixed sleep can never
-    absorb but a poll can. See `tests/CLAUDE.md`: "no time-dependent
+    absorb but a poll can. See `TESTING.md`: "no time-dependent
     assertions".
 
     Deliberately returns None rather than asserting. The caller's existing

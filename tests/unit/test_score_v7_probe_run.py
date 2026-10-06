@@ -48,7 +48,7 @@ from eval_harness.score_v7_probe_run import (  # noqa: E402  -- after sys.path i
 )
 
 # ---------------------------------------------------------------------------
-# Factory helpers (per tests/CLAUDE.md "Factory Functions")
+# Factory helpers (per TESTING.md "Factory Functions")
 # ---------------------------------------------------------------------------
 
 

@@ -16,7 +16,7 @@ covered behaviorally in-container). They confirm:
   enablement guard is respected, mirroring the server)
 - the sidecar handle is released (closed) after the command, even on success
 
-Patching is used as a last resort per tests/CLAUDE.md: cmd_chat/cmd_replay are
+Patching is used as a last resort per TESTING.md: cmd_chat/cmd_replay are
 module-level CLI glue calling other module-level functions. Spies are explicit
 (record args / return scripted values), never bare MagicMock at I/O boundaries.
 """

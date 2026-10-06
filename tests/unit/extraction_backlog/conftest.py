@@ -1,7 +1,8 @@
 """Fixtures for the extraction-backlog suite.
 
 `backlog_world` builds one hermetic world: a real in-memory `EventStore` and
-`ExtractionCache` (tests/CLAUDE.md: real SQLite at that boundary), an epoch
+`ExtractionCache` (real SQLite at that boundary; TESTING.md, Event Store
+Testing), an epoch
 whose stamps match the fake service, a real `ExtractionPipeline` whose LLM
 stages are wired to a counting `FakeLLM` (the "main chat model" -- it must see
 zero calls), a stateful `FakeGraphCuration`, and a dispatcher factory that can

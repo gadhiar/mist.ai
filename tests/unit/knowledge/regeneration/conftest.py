@@ -1,7 +1,7 @@
 """Shared fixtures for LogRegenerator replay tests (Task 6, fix round 1).
 
 `regenerator_factory` builds a `LogRegenerator` wired to test doubles at the
-documented I/O boundaries (`tests/CLAUDE.md`'s mocking table): a real
+documented I/O boundaries (`TESTING.md`'s mocking table): a real
 in-memory `EventStore` and a real in-memory `ExtractionCache` (both SQLite --
 that table's "Filesystem / SQLite" row prescribes the real store over a
 hand-rolled fake, precisely so a signature drift on `.get()`/`.put()` fails

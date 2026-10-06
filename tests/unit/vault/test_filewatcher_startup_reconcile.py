@@ -45,7 +45,7 @@ class FakeSidecarIndex:
 
     Mirrors the fake in test_filewatcher.py and adds distinct_paths() so the
     startup-reconcile path can be exercised without a bare MagicMock at the
-    sidecar I/O boundary (per tests/CLAUDE.md). distinct_paths_return is the
+    sidecar I/O boundary (per TESTING.md). distinct_paths_return is the
     set of paths the sidecar reports as currently indexed.
     """
 

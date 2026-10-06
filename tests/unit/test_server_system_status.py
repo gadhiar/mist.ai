@@ -121,7 +121,7 @@ class TestSystemStatusLoopEmits:
         the documented sub-keys. Top-level keys are derived from
         dataclasses.fields(SystemMetrics) rather than hardcoded, so this
         assertion auto-extends to a future field instead of going stale
-        (tests/CLAUDE.md "derived beats enumerated").
+        (TESTING.md "derived beats enumerated").
         """
         from backend import server
 

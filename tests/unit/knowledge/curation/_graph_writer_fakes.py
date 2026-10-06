@@ -1,7 +1,7 @@
 """Shared fakes for curation graph-writer unit tests.
 
 Built on the canonical test doubles in `tests/mocks/` rather than a private
-copy -- `tests/CLAUDE.md`'s Mocking Rules require mocking only at I/O
+copy -- `TESTING.md`'s Mocking Rules require mocking only at I/O
 boundaries and reusing the doubles in `tests/mocks/`. `FakeNeo4jConnection`
 already records every write as `(query, params)`, so `make_writer` returns
 the connection (not the `FakeGraphExecutor` wrapper) for assertions.

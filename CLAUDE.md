@@ -24,7 +24,7 @@ Conventions.
   Read it first (`/mist-status` does).
 - `REPOSITORY_STRUCTURE.md` -- layout; update it when you add a directory or a major file.
 - `CONTRIBUTING.md` -- code style, commit format, pre-commit hooks, the AI-slop checker.
-- `TESTING.md` and `tests/CLAUDE.md` -- test conventions.
+- `TESTING.md` -- test conventions.
 - `KNOWN_ISSUES.md` -- the backlog of known-dead and known-broken code.
 - ADRs: repo-scoped in `docs/decisions/`; cross-project and integration ADRs (memory
   architecture, vault layer, FE/BE protocol) in the knowledge vault at
@@ -178,7 +178,7 @@ commit ends with the `Co-Authored-By` line only: no `Claude-Session:` trailer.
 
 ## Testing
 
-Conventions: `TESTING.md` and `tests/CLAUDE.md`. Run tests inside the backend container. On Git
+Conventions: `TESTING.md`. Run tests inside the backend container. On Git
 Bash for Windows, `MSYS_NO_PATHCONV=1` stops the shell rewriting container paths such as `/app`,
 and `-T` skips TTY allocation for a non-interactive run:
 
