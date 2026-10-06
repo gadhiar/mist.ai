@@ -4,8 +4,8 @@ See that module's docstring for the full spec this pins: gap classification
 into continuous/outage/restart, the longest-continuous-run lower bound, and
 the null-not-zero rule for an empty or single-row ledger.
 
-Per tests/CLAUDE.md's rule that expectations must not be circular, no expected
-value here is produced by calling the function under test. They come from two
+Expectations must not be circular, so no expected value here is produced by
+calling the function under test. They come from two
 different routes, and the distinction matters when reading a failure:
 
 - `test_longest_continuous_run_matches_independent_boundary_arithmetic`

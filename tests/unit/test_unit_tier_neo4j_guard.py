@@ -17,7 +17,7 @@ What these tests do NOT prove:
   executes before this function-scoped fixture regardless of what this file
   asserts.
 - Real Neo4j connectivity or query behavior; `GraphDatabase` is patched, per
-  tests/CLAUDE.md's "Patching (Last Resort)" convention, because
+  TESTING.md's "Patching (Last Resort)" convention, because
   `Neo4jConnection` has no DI seam for the driver.
 - Anything about `pytest --noconftest`, or a test that clears the isolation
   env vars itself after the autouse fixture runs -- both are named as blind
@@ -61,7 +61,7 @@ class TestEnvOverrideIsCleared:
     Asserting only that MIST_EVAL_NEO4J_HOSTS is absent (with nothing ever
     setting it) is a guard that can be silently SATISFIED: the assertion
     passes whether or not the fixture's delenv ever ran, because there was
-    never a value to clear (tests/CLAUDE.md, "Say what a guard does AND does
+    never a value to clear (TESTING.md, "Say what a guard does AND does
     not catch"). This class instead ARRANGES the hole the delenv exists to
     close -- a class-scoped override widening MIST_EVAL_NEO4J_HOSTS to admit
     the live endpoint -- then proves the per-test fixture still wins.

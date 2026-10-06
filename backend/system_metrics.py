@@ -191,7 +191,7 @@ def process_uptime_seconds(now: float | None = None) -> float | None:
         now: Injectable current time (unix seconds). Defaults to
             `time.time()`. This is the test seam: tests inject a fixed
             `(create_time, now)` pair rather than sleeping in real time
-            (tests/CLAUDE.md forbids `time.sleep()` in tests as
+            (TESTING.md forbids `time.sleep()` in tests as
             non-deterministic and slow).
 
     Returns:

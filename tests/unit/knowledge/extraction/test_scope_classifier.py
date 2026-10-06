@@ -1,6 +1,6 @@
 """Tests for Stage 1.5 SubjectScopeClassifier.
 
-Follows tests/CLAUDE.md: explicit fakes (FakeLLM) via DI, no MagicMock,
+Follows TESTING.md: explicit fakes (FakeLLM) via DI, no MagicMock,
 arrange/act/assert structure, class grouping by concern, descriptive
 snake_case names.
 """

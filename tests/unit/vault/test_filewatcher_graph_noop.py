@@ -108,7 +108,7 @@ from backend.vault.filewatcher import VaultFilewatcher
 # round-2 strength, which fix round 2 itself proved permeable to two mutation
 # forms. This does not bite in
 # MIST.AI's actual verification environment (tests run in-container only,
-# per tests/CLAUDE.md and every task brief in this plan; sentence_transformers
+# per TESTING.md and every task brief in this plan; sentence_transformers
 # is always present there). The alternative -- restructuring to avoid the
 # backend.factories dependency -- would mean not exercising the real
 # build_graph_store/GraphStore integration points this guard exists to watch,
@@ -472,7 +472,7 @@ def test_conversation_handler_subscribes_exactly_the_cache_eviction_listener(
 
     Builds the real `ConversationHandler.__init__` -- the sole `.subscribe(`
     call site in backend/ -- against a real `InvalidationBus`, with fakes at
-    every I/O boundary (Neo4j, embeddings, LLM) per tests/CLAUDE.md, so no
+    every I/O boundary (Neo4j, embeddings, LLM) per TESTING.md, so no
     sentence_transformers or live Neo4j is required. Pins the resulting
     subscriber set to exactly one listener: the handler's own
     `_on_vault_rebuild` cache-eviction method. A second subscriber added
@@ -541,7 +541,7 @@ def test_conversation_handler_subscribes_exactly_the_cache_eviction_listener(
 # does not: every one of them calls `GraphConnection.execute_write` at
 # least once. Trap at that connection boundary instead of inferring a write
 # occurred from its net effect on graph shape (the side-effect-boundary
-# pattern tests/CLAUDE.md prescribes).
+# pattern TESTING.md prescribes).
 
 
 def test_on_vault_rebuild_performs_no_graph_writes(tmp_path: Path) -> None:

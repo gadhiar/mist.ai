@@ -1,7 +1,7 @@
 """Shared fixtures for the extraction service test suite.
 
 Wires the real `LlamaServerProvider` (and a real `LlamaHealthProbe`) to a
-fake llama-server that is itself a small ASGI app, per `tests/CLAUDE.md`'s
+fake llama-server that is itself a small ASGI app, per `TESTING.md`'s
 mock-only-at-I/O-boundaries rule -- no network, no GPU, and the service's
 own HTTP layer (FastAPI/Starlette) runs unmodified end to end.
 """

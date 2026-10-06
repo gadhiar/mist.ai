@@ -369,7 +369,7 @@ sub-gate that distinguishes "applied nothing" from "applied correctly".
 
 Suite measured on the branch tip, not inherited: **3295 passed / 6 skipped / 3 xfailed / 0
 failed**. Baseline at branch point was 3102. Every guard added was mutation-tested -- 23 mutants
-across the six commits, all killed; the mutation-revert discipline in `tests/CLAUDE.md` was
+across the six commits, all killed; the mutation-revert discipline (now in `TESTING.md`, Verification Hazards) was
 followed (file copies, never `git checkout --`, tree confirmed marker-free before each suite run).
 
 Two ticket framings were found incomplete while implementing and are corrected in the tickets
@@ -1495,7 +1495,6 @@ cause of Bug J -- and it is the first thing a maintainer opens to tune extractio
 - **CONTRIBUTING.md** — Code quality standards
 - **KNOWN_ISSUES.md** — P3 backlog from backend audit (45 open)
 - **TESTING.md** — Test conventions
-- **tests/CLAUDE.md** — Backend test AI guidance
 - Frontend test guidance lives in the mist-frontend repo
 
 ### Configuration

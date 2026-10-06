@@ -92,7 +92,7 @@ Three separately testable concerns, deliberately not one function:
   must never write to the store it is reading.
 - `format_uptime_report`: pure string formatting, given a report and an
   injected `now` (so tests never depend on the wall clock, per
-  `tests/CLAUDE.md`'s determinism rule).
+  `TESTING.md`'s determinism rule).
 
 `build_uptime_report` composes the filtering/parsing step and `derive_uptime`
 into one `UptimeReport`; it is pure over the raw `(started_at, trigger_source)`
@@ -450,8 +450,8 @@ def format_uptime_report(report: UptimeReport, *, now: datetime) -> str:
     """Render a `UptimeReport` as the `[uptime]` CLI report text.
 
     `now` is injected rather than read from the clock so this function stays
-    deterministic and testable (`tests/CLAUDE.md`'s "no time-dependent
-    assertions" rule) -- the caller (`cmd_uptime`) passes `datetime.now(UTC)`.
+    deterministic and testable (`TESTING.md`'s determinism rule: no
+    time-dependence) -- the caller (`cmd_uptime`) passes `datetime.now(UTC)`.
 
     Args:
         report: Output of `build_uptime_report`.

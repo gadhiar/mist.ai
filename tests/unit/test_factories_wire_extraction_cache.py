@@ -93,7 +93,7 @@ def test_live_pipeline_is_built_with_a_real_extraction_cache(tmp_path):
     from backend.factories import build_extraction_pipeline
     from tests.mocks.config import build_test_config
 
-    # tests/CLAUDE.md: "Config factory: build_test_config() -- never
+    # TESTING.md: "Config factory: build_test_config() -- never
     # KnowledgeConfig.from_env()". event_store_db_path is a first-class
     # keyword on build_test_config, so the cache path (derived from it, the
     # same convention `_build_log_regenerator` in scripts/mist_admin.py uses:
