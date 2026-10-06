@@ -1,53 +1,14 @@
-# Claude AI Integration Guide for MIST.AI
+# MIST.AI - Claude Code Guide
 
-## CRITICAL RULES - READ FIRST
+MIST.AI (or M.I.S.T; not "Mist.AI", "mist" or "MIST") is a cognitive architecture research
+platform: a transparent, locally-run AI system with persistent memory. It is not a ChatGPT
+replacement and not a simple productivity assistant.
 
-### 1. NO EMOJIS OR EMOTICONS - EVER
-
-**ABSOLUTE RULE:** Never use emojis, emoticons, or unicode decorative symbols in ANY output.
-
-This includes:
-- Code comments
-- Documentation files (README, guides, markdown files)
-- Commit messages
-- File content
-- Communication with the user
-- Todo items
-- Log messages
-
-**Instead use plain text indicators:**
-- `[COMPLETE]` or `[DONE]` instead of checkmarks
-- `[WARNING]` or `[ALERT]` instead of warning symbols
-- `[SUCCESS]` or `[OK]` instead of check marks
-- `[ERROR]` or `[FAIL]` instead of X marks
-- `[IN PROGRESS]` or `[WORKING]` instead of hourglass
-- `->` instead of arrow symbols
-- `<->` instead of bidirectional arrows
-- `---` or `===` for dividers instead of decorative lines
-
-### 2. Project Identity
-
-**Official Name:** MIST.AI or M.I.S.T (not "Mist.AI", "mist", or "MIST")
-
-**Project Type:** Cognitive architecture research platform
-- NOT a ChatGPT replacement
-- NOT a simple productivity assistant
-- IS a transparent, locally-run AI system with persistent memory
-
-### 3. Communication Style
-
-**Professional & Technical:**
-- Objective technical accuracy over emotional validation
-- No superlatives (amazing, awesome, fantastic, incredible)
-- No filler phrases ("let's dive in", "exciting", "powerful")
-- Facts and problem-solving focus
-- Disagree when necessary - technical correctness matters
-
-**Direct Communication:**
-- Start with the answer, then explain if needed
-- No lengthy preambles
-- Use clear, concise language
-- Monospace-friendly formatting (this is a CLI tool)
+This repository is PUBLIC: treat everything committed or pushed here as world-readable. Raj's
+communication rules and delegation model live in the global `~/.claude/CLAUDE.md`; this file holds
+what is specific to this repository, plus two rules that delegates working here need because they
+never load the global file: the engineering philosophy below and the no-slop line under Code
+Conventions.
 
 ---
 
@@ -57,675 +18,185 @@ This includes:
 
 ---
 
+## Where Things Are
+
+- `CODEBASE.md` -- live state: branch, HEAD, phase, subsystem status, test count, next actions.
+  Read it first (`/mist-status` does).
+- `REPOSITORY_STRUCTURE.md` -- layout; update it when you add a directory or a major file.
+- `CONTRIBUTING.md` -- code style, commit format, pre-commit hooks, the AI-slop checker.
+- `TESTING.md` and `tests/CLAUDE.md` -- test conventions.
+- `KNOWN_ISSUES.md` -- the backlog of known-dead and known-broken code.
+- ADRs: repo-scoped in `docs/decisions/`; cross-project and integration ADRs (memory
+  architecture, vault layer, FE/BE protocol) in the knowledge vault at
+  `D:\Users\rajga\knowledge-vault\Decisions\`. Phase specs: `docs/superpowers/specs/`. `docs/`
+  is gitignored apart from a few tracked files, so most of it exists only in Raj's checkout, not
+  in a worktree.
+- `mist-frontend/` -- the Tauri 2 + React 19 + react-three-fiber frontend: a separate git
+  repository (remote `gadhiar/mist-frontend`) that this repository gitignores, with its own
+  CLAUDE.md. The two meet at the WebSocket protocol (ADR-016, ADR-017), not at code style. The
+  Flutter frontend (`mist_desktop/`) was decommissioned 2026-05-11; commit `e18c092` preserves it.
+- `dependencies/csm/` -- legacy Sesame CSM TTS (Apache 2.0), kept for rollback only. Preserve its
+  Apache 2.0 license headers in any file you modify there.
+- Empty directories are runtime or placeholder paths. Do not remove them.
+- `.env` is never committed. Secrets come from environment variables, documented in `.env.example`.
+
+---
+
+## Stack and Constraints
+
+- Backend: Python 3.11+, FastAPI + Uvicorn WebSocket server on port 8001, in Docker Compose
+  (services `mist-backend`, `mist-neo4j` with Neo4j 5, `mist-llm` with llama-server) on
+  `nvidia/cuda:12.4.0-devel-ubuntu22.04` with PyTorch 2.6 + cu124. All backend work runs in the
+  container.
+- LLM inference: interactive: Gemma 4 E4B Q5_K_M via llama.cpp's llama-server; extraction: a
+  separate llama-server host (`docker-compose.extraction.yml`), gpt-oss-20b since 2026-09-29.
+  Read live model ids from each host's `/v1/info`.
+- Voice: VAD -> Whisper STT -> LLM -> Chatterbox Turbo TTS (MIT license, zero-shot voice cloning;
+  adapter `ChatterboxTTS` in `src/multimodal/tts.py`).
+- Knowledge: Neo4j knowledge graph; vault layer (ADR-010, partly superseded by ADR-023):
+  `mist-memory/` markdown corpus + sqlite-vec sidecar index + watchdog filewatcher. Embeddings:
+  all-MiniLM-L6-v2 (384-dim).
+- Hardware (queried 2026-03-23): NVIDIA GeForce RTX 4070 SUPER 12 GB VRAM, AMD Ryzen 7 7800X3D
+  (16 threads), ~32 GB RAM, Windows 11 host.
+- Subsystem status lives in `CODEBASE.md`, not here.
+
+### Design Principles
+
+- **Transparency.** Every decision the AI makes is visible: tool calls shown, entity extractions
+  logged, knowledge-graph retrievals visualizable. No hidden behaviour.
+- **Local-first.** Core functionality works without internet (llama-server, local Neo4j, offline
+  knowledge system) and stays air-gapped capable; every integration must degrade offline
+  (ADR-025). Cloud delegation only for strategic decisions.
+- **Privacy.** The user controls all data: no telemetry without explicit consent, local storage
+  only, export and delete supported.
+
+---
+
 ## CODEBASE.md Maintenance Protocol
 
-`CODEBASE.md` is the authoritative in-repo snapshot of current project state -- branch, HEAD, active phase, per-subsystem status, test count, next actions. It is the first thing a fresh session reads (via `/mist-status`), so a stale CODEBASE.md silently misleads every future session. This is not hypothetical: on 2026-07-29 it still named a long-merged feature branch and a HEAD five phases behind reality.
+`CODEBASE.md` is the authoritative in-repo snapshot of current state and the first thing a fresh
+session reads, so a stale one silently misleads every later session (on 2026-07-29 it still named
+a long-merged feature branch and a HEAD five phases behind). Keep it current as a side effect of
+routine work, not as a task deferred for later. Delegates never write it; they report the drift.
 
-Keep it current as a side effect of routine work -- do NOT treat updating it as a separate task to be deferred:
-
-- **On any status / scan / context-loading pass** (`/mist-status`, session start, "where are we"): if the header (Last Updated / Branch / Status), Current Focus, test count, or any subsystem bullet diverges from `git` or the vault workstream note, reconcile it in the same turn before reporting status.
-- **On landing a milestone / merging to `main` / changing the active branch or HEAD:** update the header block and Current Focus before the work is considered done.
-- **On adding, removing, or materially changing a subsystem:** update its bullet under Current Status.
-
-Rules:
-- **Ground every claim in real state.** Read `git -C "D:\Users\rajga\mist.ai" status` / `log` and the vault workstream note; never copy a hash, count, or version forward without verifying it against the source. If a number cannot be verified (e.g. an ontology rel-type count), flag it rather than guessing.
-- **Preserve history.** Demote the prior header entry to a nested `PRIOR ENTRY --` rather than deleting it (the running-history style this file already uses).
-- **Docs are TRACKED and PUSHED.** CODEBASE.md and CLAUDE.md live in git and go to origin like any other file. What stays local is the `docs/` tree -- specs, plans, and findings registers -- which is gitignored (`.gitignore:69`), along with `tests/CLAUDE.md` (`.gitignore:73` matches `CLAUDE.md` at any depth, but the two root files predate the rule and remain tracked). **This line previously read "Docs are local-only ... never pushed to origin" while both files were already tracked AND already present on `origin/main`** -- a documented convention contradicted by observable state, which is precisely the defect class the 2026-08-03 reachability work existed to remove. Corrected 2026-08-04 rather than left standing.
-- **Schema / convention / structure changes** belong in this CLAUDE.md, not only in CODEBASE.md.
+- **On any status, scan or context-loading pass** (`/mist-status`, session start, "where are we"):
+  if the header (Last Updated, Branch, Status), Current Focus, test count or a subsystem bullet
+  diverges from git or the vault workstream note, reconcile it in the same turn before reporting
+  status.
+- **On landing a milestone, merging to `main`, or changing the active branch or HEAD:** update the
+  header block and Current Focus before the work counts as done.
+- **On adding, removing or materially changing a subsystem:** update its bullet under Current
+  Status.
+- **Ground every claim in real state:** `git status` and `git log` in this repository, and the
+  vault workstream note. Never copy a hash, count or version forward without verifying it; if a
+  number cannot be verified, flag it rather than guessing.
+- **Preserve history:** demote the prior header entry to a nested `PRIOR ENTRY --` rather than
+  deleting it.
+- Schema, convention and structure changes belong in this CLAUDE.md, not only in CODEBASE.md.
+- Which documentation files are tracked and pushed: the global CLAUDE.md, Git Workflow.
 
 ---
 
 ## Plan Verification Protocol
 
-Implementation plans and design specs assert things about the codebase -- "X has no caller," "this would create a cycle," "that branch varies per turn." **Those assertions get executed by people and agents who will not re-derive them.** A false one propagates into code, tests that certify it, and a docstring that documents it.
+Plans and specs assert things about the codebase ("X has no caller", "this would create a
+cycle"), and people and agents execute those assertions without re-deriving them. On 2026-08-04,
+R1.4.6 T0 shipped five falsified rationales on one branch, ten across two branches. In every case
+the conclusion was right and the stated reason was invented; each fell to a few seconds of
+`grep`, and two were already recorded in `KNOWN_ISSUES.md`. Every falsified claim was about code
+its author had not opened; the claims about code that had been read survived two reviews.
 
-This is not hypothetical. On 2026-08-04, R1.4.6 T0 shipped with **five falsified rationales** on one branch: four in the plan, and a fifth inside the fix for the other four. In every case the CONCLUSION was correct and the STATED REASON was invented rather than checked. Each fell to a few seconds of `grep`. Two of them (`audio_queue` having no writer, `process_audio_chunk` having no caller) were **already documented in `KNOWN_ISSUES.md:114-118`** -- the information was in the repo and nobody looked.
-
-The diagnosis is specific and worth stating, because it makes the rule actionable: **every falsified claim was about code the author had not opened.** The claims about code that HAD been read -- the three deliberate non-resets in `reset_connection_state` -- were correct and survived two independent reviews. Same author, same session, same confidence in the prose. The only variable was whether the file had been read. Uniform confidence over non-uniform verification is what makes the bad claims indistinguishable from the good ones.
-
-### Rules
-
-- **Every causal claim about the codebase carries the command that establishes it.** Not "no cycle exists" but ``no cycle: `grep '^from\|^import' backend/chat/stream_events.py` -> dataclasses, typing only``. If you cannot produce the command, you have not checked -- and you find that out while writing, not two hours later in review.
-- **Before mandating work on any attribute or method, grep `KNOWN_ISSUES.md` for it.** It is a backlog of known-dead and known-broken things. It is cheap to search and it is routinely not searched.
-- **Run a claim-check pass before dispatching a plan.** One agent, one job: extract every factual assertion about the codebase from the plan and verify each against source. This is mechanical and cheap. It is the same work a whole-branch reviewer does -- but before any implementer builds on a false premise, rather than after commits, task reviews, a fix wave, and follow-up corrections.
-- **State unverified claims as unverified.** If a conclusion is right but you have not established why, say so ("do not reset this -- reason not verified") rather than supplying a plausible mechanism. A missing reason is a prompt to check; a wrong reason is a trap.
-- **Every sentence is separately falsifiable. A sentence does not inherit its neighbour's evidence.** This is the single highest-yield rule here: **ten** falsified claims on 2026-08-04 across two branches, and every one was a correct conclusion with an invented reason sitting beside a verified one, in the same voice, with nothing distinguishing them to a reader.
-
-  The instances, because the shape is easier to recognise than to describe. A docstring merged *`audio_queue` has no writer at all* with *`process_audio_chunk` feeds `vad_processor` and has no caller* -- two true facts, one false sentence. A plan wrote "the V7/V9 negative-control holes" because one auditor covered both files, when V9 fails closed and has no such hole. A registry entry claimed `schema_conformance_lenient` examines the "same count as strict", false precisely in the repairable-input case the lenient variant exists to handle. A comment said `aggregate_quality_score` "sums" when it returns `statistics.mean`, contradicting its own sibling comment two hundred lines away. And a coordinator asserted in a message that `dump_run_scores_json` was "the durable artifact" -- a function with **zero callers** -- which an implementer then encoded verbatim into a committed docstring, beside a `None`-vs-`0` explanation that had been mutation-tested. Verified and invented, same paragraph, same edit.
-
-  **The error enters at compression.** Summarising several branches, files, or facts into one clause silently gives the clause only one member's properties. The earlier framing of this rule -- "never collapse two adjacent facts into one label" -- was too narrow: it reads as a naming problem when it is an evidence-inheritance problem, and it would not have caught the "sums"/"averages" or "durable artifact" cases.
-
-  **What to do:** check each clause of a multi-part sentence against the code separately; when a sentence describes more than one code path, verify it against every path; and treat a docstring or comment block as a list of independent claims, not a unit. This is also what rule 1 is really for -- a claim with its command beside it and a claim without are *visually distinct objects*. Two confident sentences are not.
-
-### Why the fix belongs upstream, not in more review
-
-The reviews on that branch worked -- every finding was caught. **Scoped per-task review structurally CANNOT catch this class**, because the deadness lives outside the diff: you cannot see that `audio_queue` has no producer by reading a diff that adds a consumer to it. Only the whole-branch gate could, and it did. So:
-
-- **Never waive the whole-branch review gate.** 2026-08-03 recorded "no independent review verdict exists for this branch" as not-done rather than waived; 2026-08-04 is the concrete case for why that bar is right.
-- **Do not answer this failure mode with more downstream review layers.** That makes the late catch more expensive without moving it earlier.
-
----
-
-## Project Context
-
-### Current Architecture (Updated: 2026-05-11)
-
-**Backend (Python):**
-- Python 3.11+
-- FastAPI + Uvicorn (WebSocket server, port 8001)
-- Docker Compose (backend + Neo4j 5 + llama-server)
-- llama-server (LLM inference - interactive: Gemma 4 E4B Q5_K_M via llama.cpp; extraction: a separate llama-server host, gpt-oss-20b since 2026-09-29; live model ids from each host's /v1/info)
-- Whisper (STT)
-- Chatterbox Turbo (TTS - MIT license, zero-shot voice cloning)
-- Neo4j 5.x (knowledge graph)
-- PyTorch 2.6.0 + CUDA 12.4 (Linux container)
-- Voice pipeline: VAD -> STT (Whisper) -> LLM (Gemma 4 E4B) -> TTS (Chatterbox Turbo) with streaming parallelism (~4-5s TTFA)
-- Log streaming: WebSocketLogHandler with request ID propagation, persistent file logging
-- Vault layer (ADR-010): mist-memory/ markdown corpus + sqlite-vec sidecar index + watchdog filewatcher
-- Status: PRODUCTION READY (continuous-usage hardening + FE/BE integration in progress)
-- Deployment: Docker Compose (nvidia/cuda:12.4.0-devel-ubuntu22.04)
-
-**Frontend (separate git repository nested at `./mist-frontend/` (own .git, no remote)):**
-- Tauri 2.x cross-platform desktop shell
-- React 19 + TypeScript strict
-- three.js + @react-three/fiber + drei (spatial 3D composition)
-- Vite build
-- Native WebSocket via Tauri shell, connecting to backend at `ws://localhost:8001/ws`
-- Integration contracts: ADR-016 (LLM-mediated FE tool calls; BE-decided routing) + ADR-017 (WebSocket message contract). Both live in `knowledge-vault/Decisions/`.
-- Status: production-ready as of 2026-05-08; FE/BE Wave 1 shipped 2026-05-10 on branch `integration/v1`.
-- The Flutter Desktop frontend at `mist_desktop/` was decommissioned 2026-05-11. Git history at commit `e18c092` preserves the Flutter source if reference is needed.
-
-**Key Technologies:**
-- Python 3.11+, FastAPI, llama-server, openai (Python client), Neo4j, PyTorch
-- Docker Compose (backend + Neo4j + llama-server), PyTorch 2.6+cu124
-- Tauri 2.x + React 19 + react-three-fiber + TypeScript (frontend, separate repo)
-- Chatterbox Turbo TTS (MIT license, zero-shot voice cloning)
-
-### Current Branch Status
-
-See `CODEBASE.md` for live branch status, active workstreams, recent commits, and outstanding issues.
+- **Every causal claim about the codebase carries the command that establishes it.** Not "no
+  cycle exists" but ``no cycle: `grep '^from\|^import' backend/chat/stream_events.py` ->
+  dataclasses, typing only``. If you cannot produce the command, you have not checked.
+- **Before mandating work on any attribute or method, grep `KNOWN_ISSUES.md` for it.** It is
+  cheap to search and routinely not searched.
+- **Run a claim-check pass before dispatching a plan:** one agent extracts every factual
+  assertion about the codebase from the plan and verifies each against source, before any
+  implementer builds on a false premise.
+- **State unverified claims as unverified** ("do not reset this -- reason not verified") rather
+  than supplying a plausible mechanism. A missing reason prompts a check; a wrong reason is a
+  trap.
+- **Every sentence is separately falsifiable; a sentence does not inherit its neighbour's
+  evidence.** The error enters at compression: summarising several branches, files or facts into
+  one clause gives the clause only one member's properties. Check each clause of a multi-part
+  sentence separately, verify a sentence that describes several code paths against every path,
+  and treat a docstring or comment block as a list of independent claims. Instances from
+  2026-08-04: a docstring merged "`audio_queue` has no writer" with "`process_audio_chunk` ... has
+  no caller" (two true facts, one false sentence); a comment said `aggregate_quality_score` "sums"
+  when it returns `statistics.mean`; a message called `dump_run_scores_json` "the durable
+  artifact" when it had zero callers, and an implementer copied that into a committed docstring.
+- **Never waive the whole-branch review gate.** Scoped per-task review cannot catch this class,
+  because the deadness lives outside the diff; only the whole-branch gate can.
+- **Do not answer this failure mode with more downstream review layers.** That makes the late
+  catch more expensive without moving it earlier.
 
 ---
 
-## Context Management Strategy
+## Code Conventions
 
-### Essential Context Files (Always Read First)
+Formatting (black and ruff, line length 100), PEP 585/604 type hints, Google-style docstrings and
+the AI-slop checker are in `CONTRIBUTING.md`. In addition:
 
-When starting any work session, read these files in order:
-
-1. **CODEBASE.md** - Current status, active work, recent changes
-2. **REPOSITORY_STRUCTURE.md** - Project organization and file structure
-3. **.env** - Configuration (never commit or expose secrets)
-4. **Git status** - Check uncommitted changes and current branch
-5. **Recent commits** - Last 3-5 commits to understand recent work
-
-### When Deep Context Needed
-
-For architectural decisions or understanding design rationale:
-- `docs/decisions/adr_*.md` - Repo-scoped ADRs
-- `knowledge-vault/Decisions/ADR-*.md` - Cross-project + integration ADRs (memory architecture, vault layer, FE/BE protocol)
-- `docs/superpowers/specs/` - Phase implementation specs
-
-For specific areas:
-- `CODEBASE.md` - Recent work, cluster status, current blockers
-- `TESTING.md` - Test conventions
-- `KNOWN_ISSUES.md` - P3 backlog
-
-### Documentation Update Requirements
-
-Update these files when making significant changes:
-
-**Always:**
-- Update CODEBASE.md after completing features or major changes
-- Update git commit messages with clear descriptions
-
-**When Applicable:**
-- Update REPOSITORY_STRUCTURE.md when adding new directories/major files
-- Create ADR (repo-scoped under `docs/decisions/`, cross-project under `knowledge-vault/Decisions/`)
-- Update relevant guide files when changing workflows
+- Imports: relative within a package, absolute across packages. From `typing`, import only
+  `TypeVar`, `Protocol`, `Literal` and `TypedDict`.
+- Docstrings use single backticks for inline code, and explain why, not what.
+- No superlatives, filler phrases or marketing tone in code, comments, docstrings, docs or commit
+  messages (the list: `CONTRIBUTING.md`, Reviewing AI-Generated Code). The pre-commit hook runs
+  `check_ai_slop.py --critical-only`, which checks emojis only; run
+  `python scripts/check_ai_slop.py` without the flag to see the rest.
+- **Dependency injection.** A class that depends on an external system (Neo4j, LLM backend,
+  embeddings, event store) takes it as a required constructor parameter; no hidden construction
+  in `__init__`. Real wiring lives in `backend/factories.py`; tests pass fakes to constructors.
+- **Errors.** I/O error handling uses the specific `MistError` subclasses in `backend/errors.py`.
+  Never catch bare `Exception` in new code.
+- **Async boundaries.** Never call sync Neo4j from async code: use `GraphExecutor`
+  (`backend/knowledge/storage/graph_executor.py`). `GraphStore` methods stay sync.
+- **Resource lifetime.** Acquire, read or write, release; do CPU, I/O or inference work holding
+  nothing; then acquire, write results, release. This applies to Neo4j transactions, LLM client
+  calls and GPU tensor allocations. Never hold a Neo4j transaction open during LLM inference.
+- **HTTP.** Every HTTP request (LLM backend, external services) calls
+  `response.raise_for_status()` or checks the status code explicitly. Never consume an error
+  response silently.
+- **Data types.** `@dataclass(frozen=True)` for ontology and domain objects;
+  `@dataclass(frozen=True, slots=True)` for new internal data structures; Pydantic `BaseModel`
+  only for WebSocket message schemas or API validation. No raw dicts where a dataclass gives type
+  safety.
+- **External code.** Check license compatibility (MIT-compatible preferred), record it in
+  LICENSE or NOTICE, preserve original copyright notices, and document your modifications.
+- For multi-step implementation work in an interactive session, present the plan and get Raj's
+  confirmation before executing.
 
 ---
 
-## Code Style Guidelines
+## Commits
 
-### Python Code Style
-
-**Formatting:**
-- PEP 8 compliant
-- Line length: 100 characters (configured in pyproject.toml)
-- Use Black formatter (no manual formatting decisions)
-- Import order: stdlib, third-party, local (handled by isort/ruff)
-- Within a package, use relative imports for intra-package references.
-- Use absolute imports for cross-package references.
-
-**Type Hints:**
-```python
-def function_name(param: str, optional: int = 0) -> ReturnType:
-    """Docstring here."""
-    pass
-```
-
-Use PEP 585/604 syntax (Python 3.11+):
-- `list[str]` not `List[str]`, `dict[str, int]` not `Dict[str, int]`
-- `str | None` not `Optional[str]`, `int | str` not `Union[int, str]`
-- Only import from `typing`: TypeVar, Protocol, Literal, TypedDict
-
-**Docstrings:**
-```python
-"""
-Brief one-line summary.
-
-Longer description if needed. Explain the "why" not the "what".
-
-Args:
-    param: Description of parameter
-    optional: Description with default behavior
-
-Returns:
-    Description of return value
-
-Raises:
-    ValueError: When validation fails
-"""
-```
-
-Use single backticks for inline code references in docstrings (not double backticks).
-
-**File Headers:**
-```python
-"""
-Module-level docstring explaining purpose.
-
-Key classes/functions overview if module is complex.
-"""
-import statements...
-```
-
-### Frontend Code Style
-
-Frontend code lives in a separate git repository nested at `./mist-frontend/` (own .git, no remote). See that repository's own contributing guide and CLAUDE.md (when refreshed post-spatial-app-reframe) for TypeScript / React / Tauri conventions. The two repos coordinate at the protocol layer (ADR-016 + ADR-017), not at the code-style layer.
+Conventional commits; format and types in `CONTRIBUTING.md`. The repository is public, so a
+commit ends with the `Co-Authored-By` line only: no `Claude-Session:` trailer.
 
 ---
-
-## Git Commit Guidelines
-
-### Commit Message Format
-
-```
-type(scope): Brief description (max 72 chars)
-
-Longer description if needed, explaining:
-- What changed and why
-- Any breaking changes
-- Related issues or PRs
-
-[FOOTER with attribution]
-Generated with [Claude Code](https://claude.com/claude-code)
-
-Co-Authored-By: Claude <noreply@anthropic.com>
-```
-
-### Commit Types
-
-- `feat`: New feature
-- `fix`: Bug fix
-- `docs`: Documentation changes
-- `style`: Code style changes (formatting, no functional changes)
-- `refactor`: Code refactoring (no feat/fix)
-- `test`: Adding/updating tests
-- `chore`: Maintenance tasks, dependency updates
-
-### Rules
-
-- NO EMOJIS in commit messages
-- Use present tense ("add feature" not "added feature")
-- Capitalize first letter of description
-- No period at end of subject line
-- Blank line between subject and body
-
----
-
-## Licensing & Attribution
-
-### Main Project
-- License: MIT License
-- Copyright: Project maintainer
-- Attribution: Not required but appreciated
-
-### Third-Party Code
-
-**Sesame CSM TTS (legacy, replaced by Chatterbox Turbo):**
-- License: Apache 2.0
-- Location: `dependencies/csm/`
-- Status: No longer active. Chatterbox Turbo is the current TTS engine.
-- Code retained for rollback only
-- Must preserve Apache 2.0 license headers in modified files
-
-**Chatterbox Turbo TTS:**
-- License: MIT
-- Installed via pip (chatterbox-tts package)
-- Zero-shot voice cloning from reference WAV
-- Adapter: `src/multimodal/tts.py` (ChatterboxTTS class)
-
-**When Using External Code:**
-1. Check license compatibility (MIT-compatible licenses preferred)
-2. Document in appropriate LICENSE/NOTICE files
-3. Preserve original copyright notices
-4. Document modifications if you change the code
-
----
-
-## Key Constraints & Decisions
-
-### Technical Constraints
-
-**Hardware (actual, queried 2026-03-23):**
-- GPU: NVIDIA GeForce RTX 4070 SUPER, 12 GB VRAM
-- CPU: AMD Ryzen 7 7800X3D 8-Core (16 threads) @ 4.2 GHz
-- RAM: ~32 GB
-- CUDA 13.1, Driver 591.74
-- Backend runs in Docker container (nvidia/cuda:12.4.0-devel-ubuntu22.04)
-- Can run 14B quantized models (Q4_K_M) with voice off; 7-12B with voice on
-- Windows 11 primary development platform
-- Must be air-gapped capable (local-first design)
-
-**Model Choices:**
-- LLM: Gemma 4 E4B Q5_K_M for the interactive path (via llama-server); extraction runs on a separate llama-server host (gpt-oss-20b since 2026-09-29)
-- Embeddings: all-MiniLM-L6-v2 (384-dim, fast)
-- STT: Whisper base (1.4GB model)
-- TTS: Chatterbox Turbo (0.74x RTF, 3.9GB VRAM, zero-shot cloning)
-
-### Design Philosophy
-
-**Transparency:** Every decision the AI makes should be visible
-- Show tool calls explicitly
-- Log entity extractions
-- Visualize knowledge graph retrievals
-- No hidden "magic"
-
-**Local-First:** Core functionality works without internet
-- llama-server for LLM
-- Local Neo4j database
-- Offline-capable knowledge system
-- Cloud delegation only for strategic decisions
-
-**Privacy:** User controls all data
-- No telemetry without explicit consent
-- Local storage only
-- Air-gapped operation possible
-- Export/delete capabilities
-
----
-
-## Working with AI Code Assistants
-
-### For Claude Code (You!)
-
-**Session Management:**
-- Always read CODEBASE.md at start of session
-- Use TodoWrite tool to track multi-step tasks
-- Mark todos complete immediately after finishing
-- Update CODEBASE.md before ending session
-
-**Plan Mode:**
-- Use ExitPlanMode for multi-step implementation tasks
-- Present clear plan before executing
-- Ask clarifying questions if requirements unclear
-- One task in_progress at a time in TodoWrite
-
-**Code Changes:**
-- Read files before editing them
-- Use Edit tool for existing files (not Write)
-- Never use emojis (yes, this is repeated intentionally)
-- Test changes if possible
-- Document breaking changes
-
-### For Other AI Tools
-
-**Cursor/Copilot:**
-- Follow same style guidelines
-- Read CLAUDE.md before generating code
-- No emojis in generated code or comments
-- Use check_ai_slop.py to validate output
-
-**ChatGPT/Claude Web:**
-- Good for architectural discussions
-- Document decisions in ADRs (docs/decisions/ or knowledge-vault/Decisions/)
-- Don't copy-paste code without review
-- Remove AI filler phrases before committing
-
-## Dependency Injection
-
-### Enforceable rule: No hidden construction in __init__
-
-All classes that depend on external systems (Neo4j, LLM backend, embeddings,
-event store) MUST accept dependencies as required constructor parameters.
-Factory functions in `backend/factories.py` handle real wiring.
-
-```python
-# CORRECT: required params
-class GraphStore:
-    def __init__(self, connection: GraphConnection, embedding_generator: EmbeddingProvider):
-        self.connection = connection
-        self.embedding_generator = embedding_generator
-
-# WRONG: hidden construction
-class GraphStore:
-    def __init__(self, config):
-        self.connection = Neo4jConnection(config.neo4j)
-```
-
-For tests, bypass factories and pass fakes directly to constructors.
-
-## Error Handling
-
-### Enforceable rule: Use MistError hierarchy
-
-All I/O error handling MUST use specific exception types from
-`backend/errors.py`. Never catch bare `Exception` in new code.
-
-```python
-# CORRECT
-from backend.errors import Neo4jQueryError
-try:
-    results = connection.execute_query(query)
-except Neo4jQueryError as e:
-    logger.error("Query failed: %s", e)
-
-# WRONG
-try:
-    results = connection.execute_query(query)
-except Exception as e:
-    logger.error(str(e))
-```
-
-Available exceptions: Neo4jConnectionError, Neo4jQueryError,
-LLMConnectionError, LLMResponseError, ExtractionError,
-ExtractionValidationError, NormalizationError, EmbeddingError.
-
-## Async Boundaries
-
-### Enforceable rule: Never call sync Neo4j from async contexts
-
-Use `GraphExecutor` for all async graph operations. GraphStore methods
-remain sync. GraphExecutor wraps them for async callers.
-
-```python
-# CORRECT: async code uses GraphExecutor
-results = await executor.execute_query("MATCH (n) RETURN n")
-
-# WRONG: async code calls sync GraphStore directly
-results = graph_store.connection.execute_query("MATCH (n) RETURN n")
-```
-
-## Resource Lifetime
-
-Structure operations in phases:
-1. Acquire resource -> read/write -> release (short-lived)
-2. Do CPU/IO/inference work with no held resources
-3. Acquire resource -> write results -> release
-
-Applies to: Neo4j transactions, LLM client calls, GPU tensor
-allocations. Never hold a Neo4j transaction open during LLM inference.
-
-## HTTP Response Handling
-
-### Enforceable rule: Check HTTP responses
-
-All HTTP requests (to LLM backend, external services) must either call
-`response.raise_for_status()` or explicitly check the status code.
-Never silently consume error responses.
-
-## Dataclass vs Pydantic
-
-- `@dataclass(frozen=True)` for ontology and domain objects (immutable)
-- `@dataclass(frozen=True, slots=True)` for new internal data structures
-- Pydantic `BaseModel` only for WebSocket message schemas or API validation
-- Never use raw dicts where a dataclass provides type safety
-
-## Subdirectory Guides
-
-- `tests/CLAUDE.md` -- Backend test conventions and AI guidance
-
-Frontend test conventions live in the nested mist-frontend repo at `./mist-frontend/`.
 
 ## Testing
 
-See `TESTING.md` for conventions and `tests/CLAUDE.md` for AI-specific
-test guidance. Run tests inside the backend container. On Git Bash for
-Windows, `MSYS_NO_PATHCONV=1` stops the shell rewriting container paths such
-as `/app`, and `-T` skips TTY allocation for a non-interactive run:
+Conventions: `TESTING.md` and `tests/CLAUDE.md`. Run tests inside the backend container. On Git
+Bash for Windows, `MSYS_NO_PATHCONV=1` stops the shell rewriting container paths such as `/app`,
+and `-T` skips TTY allocation for a non-interactive run:
 
 ```bash
 MSYS_NO_PATHCONV=1 docker compose exec -T mist-backend python -m pytest tests/unit/
 ```
 
-The unit tier never writes to the live graph. An autouse fixture in
-`tests/unit/conftest.py` sets `MIST_EVAL_ISOLATION=1` and unsets
-`MIST_EVAL_NEO4J_HOSTS` for every unit test, so `Neo4jConnection.connect()`
-refuses any endpoint outside the default eval allowlist. That includes the
-live `bolt://mist-neo4j:7687`, which `docker-compose.yml` sets as `NEO4J_URI`
-inside the backend container.
+The unit tier never writes to the live graph. An autouse fixture in `tests/unit/conftest.py` sets
+`MIST_EVAL_ISOLATION=1` and unsets `MIST_EVAL_NEO4J_HOSTS` for every unit test, so
+`Neo4jConnection.connect()` refuses any endpoint outside the default eval allowlist, including the
+live `bolt://mist-neo4j:7687` that `docker-compose.yml` sets as `NEO4J_URI` in the container.
 
-That fixture is a live-write guard, not hermeticity. It still admits the eval
-endpoints, and it does nothing about other I/O. A unit test that needs a graph
-or vector store injects a fake -- for example
-`build_conversation_handler(graph_store=..., vector_store=..., llm_provider=...)`
--- instead of letting a factory build a real one.
+That fixture is a live-write guard, not hermeticity: it still admits the eval endpoints, and it
+does nothing about other I/O. A unit test that needs a graph or vector store injects a fake -- for
+example `build_conversation_handler(graph_store=..., vector_store=..., llm_provider=...)` --
+instead of letting a factory build a real one.
 
 ---
 
-## Anti-Patterns to Avoid
-
-### "AI Slop" Patterns
-
-These indicate low-quality AI output and must be removed:
-
-**Emojis & Symbols:**
-- Any emoji or unicode decorative character
-- Checkmarks, X marks, arrows, etc.
-
-**Superlative Language:**
-- "Amazing", "incredible", "powerful", "fantastic"
-- "Robust", "seamless", "cutting-edge"
-- "Revolutionary", "game-changing", "world-class"
-
-**Filler Phrases:**
-- "Let's dive in/into"
-- "First and foremost"
-- "It's worth noting that"
-- "At the end of the day"
-- "Moving forward"
-
-**Over-Enthusiasm:**
-- Excessive exclamation marks
-- Overly positive tone inappropriate for technical docs
-- Marketing-style language in code comments
-
-**Use check_ai_slop.py to detect these patterns:**
-```bash
-python scripts/check_ai_slop.py --critical-only  # Fast check
-python scripts/check_ai_slop.py --fix            # Auto-fix
-```
-
-Full documentation: [docs/AI_SLOP_CHECKER.md](docs/AI_SLOP_CHECKER.md)
-
----
-
-## Common Tasks & How To Approach Them
-
-### Adding a New Feature
-
-1. Check CODEBASE.md for current status
-2. Read relevant ADRs if touching architecture
-3. Create TodoWrite plan for multi-step features
-4. Implement with proper type hints/documentation
-5. Test manually or write tests
-6. Update CODEBASE.md with changes
-7. Commit with clear message (no emojis!)
-
-### Debugging Issues
-
-1. Check recent git commits for related changes
-2. Read relevant code sections completely
-3. Check logs/error messages carefully
-4. Reproduce issue if possible
-5. Fix with minimal changes
-6. Document why the bug occurred if not obvious
-
-### Refactoring Code
-
-1. Understand current behavior first
-2. Write tests if not present
-3. Make incremental changes
-4. Test after each change
-5. Update documentation if behavior changes
-6. Commit frequently with clear messages
-
-### Writing Documentation
-
-1. No emojis or decorative symbols
-2. Use clear headings and structure
-3. Code examples where helpful
-4. Explain "why" not just "what"
-5. Keep it up-to-date with code
-6. Link to related docs
-
----
-
-## Error Handling & Edge Cases
-
-### When Things Go Wrong
-
-**Don't:**
-- Panic and make hasty changes
-- Mark tasks complete if they failed
-- Hide errors in logs
-- Add workarounds without documentation
-
-**Do:**
-- Report errors clearly to user
-- Document unexpected behavior
-- Add error handling for edge cases
-- Update todos to reflect blockers
-- Ask user for guidance if stuck
-
-### Uncertainty Handling
-
-**If you're not sure:**
-- Use AskUserQuestion tool
-- Check existing code for patterns
-- Read relevant ADRs or docs
-- Propose approach and ask for confirmation
-- Don't guess and hope it works
-
----
-
-## Tool Usage Guidelines
-
-### TodoWrite Best Practices
-
-- Create todos for any multi-step task (3+ steps)
-- Use clear, actionable todo descriptions
-- Provide both `content` and `activeForm`
-- Mark complete IMMEDIATELY after finishing
-- Only one todo `in_progress` at a time
-- Remove/update todos if plans change
-
-### File Operations
-
-- Always Read before Edit
-- Use Edit for existing files (never Write)
-- Use Write only for new files
-- Glob/Grep for finding files
-- Bash only for git, build tools, not file operations
-
-### Delegated Work
-
-Delegated work on this machine follows the main-lead protocol, not agent teams. Agent teams are
-turned off (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0`).
-
-- A persistent `main-lead` session owns goals and delegates to sub-leads, workers and reviewers as
-  nested background subagents.
-- Every goal's plan is approved by Raj before implementation starts, and every merge is confirmed by
-  him.
-- One worktree per worker, on `agent/<goal>/<task>`. Worker commands run in no-network containers.
-- Delegates never write `CLAUDE.md`, `CODEBASE.md`, `KNOWN_ISSUES.md`, or the knowledge vault.
-
-The operating rules for delegates live in the `delegate-rules` skill, which is preloaded into every
-delegate, including the expert role-framing requirement for any agent prompt. See the global
-`~/.claude/CLAUDE.md` "Main Lead Operating Model" section.
-
-### Task Agent (Explore/Research)
-
-- Use for complex searches requiring multiple rounds
-- Use Explore agent for codebase questions
-- Specify thoroughness level (quick, medium, very thorough)
-- Don't use for simple file path reads
-
----
-
-## Project-Specific Notes
-
-### Modified Third-Party Code
-
-**Sesame CSM TTS (legacy, replaced by Chatterbox Turbo):**
-- License: Apache 2.0
-- Location: `dependencies/csm/`
-- Status: No longer active. Chatterbox Turbo is the current TTS engine.
-- Code retained for rollback only
-- Must preserve Apache 2.0 license headers in modified files
-
-**Chatterbox Turbo TTS:**
-- License: MIT
-- Installed via pip (chatterbox-tts package)
-- Zero-shot voice cloning from reference WAV
-- Adapter: `src/multimodal/tts.py` (ChatterboxTTS class)
-
-### Empty Directories
-
-Some directories may be empty - DO NOT REMOVE THEM.
-They're placeholders for planned features:
-- Future test directories
-- Planned component directories
-- Architecture scaffolding
-
-### .env Security
-
-- Never commit .env file
-- Never expose secrets in code/logs
-- Use environment variables for all secrets
-- Document required env vars in .env.example
-
----
-
-## Summary - Quick Reference
-
-**Three Golden Rules:**
-1. NO EMOJIS EVER (yes, third time stating this)
-2. Read CODEBASE.md at session start
-3. Update CODEBASE.md at session end
-
-**Code Quality:**
-- Format: black (Python)
-- Lint: ruff (Python)
-- Type hints required (Python)
-- Docstrings for public APIs
-
-**Communication:**
-- Professional, technical, objective
-- No AI slop patterns
-- Clear and concise
-- Run check_ai_slop.py before committing
-
-**Git:**
-- Conventional commits
-- No emojis in messages
-- Clear descriptions
-- Test before committing
-
----
-
-For questions or clarifications, ask the user directly. When in doubt, check existing code for patterns and conventions.
-
-Last Updated: 2026-05-11 (Flutter Desktop decommissioned; mist-frontend/ Tauri repo canonical for FE)
+Last Updated: 2026-10-06 (claude-md-review: duplicates of CONTRIBUTING.md,
+TESTING.md, the global CLAUDE.md and the harness removed; stale stack facts fixed)
