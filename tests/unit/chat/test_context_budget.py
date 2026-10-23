@@ -596,6 +596,32 @@ class TestPlanWithMemoryBlock:
         assert plan.history_budget == 0
         assert plan.pruned_history == []
 
+    def test_empty_block_plans_like_no_block(self):
+        # T10 passes "" when no memory item clears the threshold; the plan must
+        # then be the plan with no retrieval at all, field for field.
+        planner = ContextBudgetPlanner(config=_default_config())
+        history = [{"role": "user", "content": "h" * 100} for _ in range(40)]
+
+        no_block = planner.plan(**self._KWARGS, retrieval_result=None, history=history)
+        empty_block = planner.plan(
+            **self._KWARGS, retrieval_result=None, history=history, memory_block_text=""
+        )
+
+        assert empty_block == no_block
+
+    def test_empty_block_with_retrieval_result_raises_value_error(self):
+        # An empty block is still a block: it occupies the retrieval segment, so
+        # a retrieval result beside it is a caller error, not a silent fallback.
+        planner = ContextBudgetPlanner(config=_default_config())
+
+        with pytest.raises(ValueError, match="memory_block_text"):
+            planner.plan(
+                **self._KWARGS,
+                retrieval_result=_make_retrieval_result([_make_fact()]),
+                history=[],
+                memory_block_text="",
+            )
+
     def test_explicit_none_block_matches_the_legacy_plan(self):
         planner = ContextBudgetPlanner(config=_default_config())
         result = _make_retrieval_result([_make_fact()])
