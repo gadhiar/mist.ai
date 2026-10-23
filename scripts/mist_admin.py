@@ -191,7 +191,9 @@ def cmd_seed(args: argparse.Namespace) -> int:
             from backend.knowledge.seed.gates import check_embeddings
 
             print(f"[seed] Loading embedding model: {config.embedding.model_name}")
-            embedding_generator = EmbeddingGenerator(model_name=config.embedding.model_name)
+            embedding_generator = EmbeddingGenerator(
+                model_name=config.embedding.model_name, device=config.embedding.resolved_device()
+            )
             embedded = be.admin._backfill_embeddings_for_seed(
                 connection, embedding_generator, seed_version
             )
@@ -328,7 +330,9 @@ def cmd_seed_verify(args: argparse.Namespace) -> int:
     # exports `EmbeddingGenerator` lazily (I7 T1) precisely so the other four
     # gates do not pay a ~2.8s `sentence_transformers` import they never use.
     print(f"[seed-verify] Loading embedding model: {config.embedding.model_name}")
-    embedding_generator = EmbeddingGenerator(model_name=config.embedding.model_name)
+    embedding_generator = EmbeddingGenerator(
+        model_name=config.embedding.model_name, device=config.embedding.resolved_device()
+    )
 
     connection = _connect(be)
     try:
@@ -1122,7 +1126,9 @@ def _build_log_regenerator(
     # this is an admin CLI (sync batch), NOT the async server event loop, so there
     # is no event-loop lazy-loading hazard. A single instance is shared across
     # GraphStore and the curation pipeline to avoid loading two copies.
-    embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+    embedding_provider = EmbeddingGenerator(
+        config.embedding.model_name, device=config.embedding.resolved_device()
+    )
 
     # Initialize staging schema (idempotent) via a transient GraphStore.
     staging_store = GraphStore(connection=staging_conn, embedding_generator=embedding_provider)
@@ -2239,7 +2245,9 @@ def _build_cli_sidecar(config: Any) -> Any:
     from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
     from backend.vault.sidecar_index import VaultSidecarIndex
 
-    embedder = EmbeddingGenerator(config.embedding.model_name)
+    embedder = EmbeddingGenerator(
+        config.embedding.model_name, device=config.embedding.resolved_device()
+    )
     sidecar = VaultSidecarIndex(config.sidecar_index, embedder)
     sidecar.initialize()
     return sidecar
@@ -3013,7 +3021,9 @@ def cmd_vault_status(args: argparse.Namespace) -> int:
     from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
     from backend.vault.sidecar_index import VaultSidecarIndex
 
-    embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+    embedding_provider = EmbeddingGenerator(
+        config.embedding.model_name, device=config.embedding.resolved_device()
+    )
     sidecar = VaultSidecarIndex(config.sidecar_index, embedding_provider)
     try:
         sidecar.initialize()
@@ -3062,7 +3072,9 @@ def cmd_vault_reindex(args: argparse.Namespace) -> int:
     from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
     from backend.vault.sidecar_index import VaultSidecarIndex
 
-    embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+    embedding_provider = EmbeddingGenerator(
+        config.embedding.model_name, device=config.embedding.resolved_device()
+    )
     sidecar = VaultSidecarIndex(config.sidecar_index, embedding_provider)
     sidecar.initialize()
 
@@ -3133,7 +3145,9 @@ def _cmd_vault_rebuild_sidecar(args: argparse.Namespace) -> int:
     from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
     from backend.vault.sidecar_index import VaultSidecarIndex
 
-    embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+    embedding_provider = EmbeddingGenerator(
+        config.embedding.model_name, device=config.embedding.resolved_device()
+    )
     sidecar = VaultSidecarIndex(config.sidecar_index, embedding_provider)
     sidecar.initialize()  # Recreates schema on the freshly-deleted db
 

@@ -67,8 +67,9 @@ class _FakeConnection:
 class _FakeEmbeddingGenerator:
     """Minimal `EmbeddingProvider` fake -- satisfies the protocol, does no I/O."""
 
-    def __init__(self, model_name: str = "fake-model") -> None:
+    def __init__(self, model_name: str = "fake-model", device: str | None = None) -> None:
         self.model_name = model_name
+        self.device = device
 
     def generate_embedding(self, text: str) -> list[float]:
         return [0.0] * 384

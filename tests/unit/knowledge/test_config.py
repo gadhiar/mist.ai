@@ -484,3 +484,26 @@ class TestRebuildDeterminismStamps:
 
         assert config.extraction_version == EXTRACTION_VERSION
         assert config.model_hash == "gemma-4-e4b-q5-k-m-carteakey-full-v1"
+
+
+class TestEmbeddingConfigDeviceDefault:
+    """The embedding model stays off the GPU unless `EMBEDDING_DEVICE` asks for it.
+
+    A game holding the GPU must not have to share it with MiniLM, so the
+    default is `cpu` both on the dataclass and when the variable is unset.
+    """
+
+    def test_dataclass_default_is_cpu(self):
+        from backend.knowledge.config import EmbeddingConfig
+
+        assert EmbeddingConfig().device == "cpu"
+        assert EmbeddingConfig().resolved_device() == "cpu"
+
+    def test_from_env_default_is_cpu(self):
+        from backend.knowledge.config import EmbeddingConfig
+
+        with _env(EMBEDDING_DEVICE=None):
+            config = EmbeddingConfig.from_env()
+
+        assert config.device == "cpu"
+        assert config.resolved_device() == "cpu"

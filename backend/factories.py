@@ -185,7 +185,9 @@ def build_graph_store(
     if embedding_generator is None:
         from backend.knowledge.embeddings import EmbeddingGenerator
 
-        embedding_generator = EmbeddingGenerator(config.embedding.model_name)
+        embedding_generator = EmbeddingGenerator(
+            config.embedding.model_name, device=config.embedding.resolved_device()
+        )
     return GraphStore(conn, embedding_generator)
 
 
@@ -374,7 +376,9 @@ def build_curation_pipeline(
     from backend.knowledge.embeddings import EmbeddingGenerator
 
     if embedding_provider is None:
-        embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+        embedding_provider = EmbeddingGenerator(
+            config.embedding.model_name, device=config.embedding.resolved_device()
+        )
     confidence_mgr = ConfidenceManager()
     # ADR-010 Phase 8 rebuild-determinism stamps. Written to every fact edge
     # (C1 4.7, reconciliation.py) and every EXTRACTED_FROM->ConversationContext
@@ -952,7 +956,9 @@ def build_curation_scheduler(
 
     gs = build_graph_store(config)
     executor = build_graph_executor(config, gs.connection)
-    embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+    embedding_provider = EmbeddingGenerator(
+        config.embedding.model_name, device=config.embedding.resolved_device()
+    )
 
     provider = llm_provider or build_llm_provider(config)
     internal_deriver = InternalKnowledgeDeriver(llm=provider, executor=executor)
@@ -1093,7 +1099,9 @@ def build_ingestion_pipeline(
     if embedding_provider is None:
         from backend.knowledge.embeddings import EmbeddingGenerator
 
-        embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+        embedding_provider = EmbeddingGenerator(
+            config.embedding.model_name, device=config.embedding.resolved_device()
+        )
     ep = embedding_provider
     return IngestionPipeline(
         vector_store=vs,
@@ -1162,7 +1170,9 @@ def build_sidecar_index(
     if embedding_provider is None:
         from backend.knowledge.embeddings import EmbeddingGenerator
 
-        embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+        embedding_provider = EmbeddingGenerator(
+            config.embedding.model_name, device=config.embedding.resolved_device()
+        )
     index = VaultSidecarIndex(config.sidecar_index, embedding_provider)
     index.initialize()
     return index
