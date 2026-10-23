@@ -8,6 +8,7 @@ import contextlib
 import functools
 import json
 import logging
+import logging.handlers
 import os
 import sqlite3
 import sys
@@ -117,15 +118,48 @@ def _resolve_log_dir() -> Path:
     return Path(__file__).resolve().parents[1] / "logs"
 
 
+DEFAULT_LOG_MAX_BYTES = 50 * 1024 * 1024
+DEFAULT_LOG_BACKUP_COUNT = 5
+
+
+def _log_rotation_setting(name: str, default: int) -> int:
+    """Read one positive integer rotation setting, keeping the default for a bad value.
+
+    Zero is refused as well as negatives and non-numbers: `RotatingFileHandler`
+    never rolls over when either `maxBytes` or `backupCount` is 0, which would
+    silently restore the unbounded log this exists to prevent. Logged rather
+    than raised, because this runs first in `lifespan` and a typo in a log
+    setting should not stop the backend from starting.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value >= 1:
+        return value
+    logging.getLogger(__name__).error(
+        "%s=%r is not a positive integer; using %d", name, raw, default
+    )
+    return default
+
+
 def configure_file_logging(log_dir: Path) -> logging.Handler:
-    """Attach a persistent file handler for the backend log to the root logger.
+    """Attach a persistent, rotating file handler for the backend log to the root logger.
 
     Creates `log_dir` if it does not already exist and installs a
-    `FileHandler` for `log_dir / "mist-backend.log"` at DEBUG level, using
-    the same formatter as the console handler `logging.basicConfig` installs
-    at import time. Idempotent: if a `FileHandler` for that same file is
-    already on the root logger, that handler is returned instead of adding
-    a duplicate.
+    `RotatingFileHandler` for `log_dir / "mist-backend.log"` at DEBUG level,
+    using the same formatter as the console handler `logging.basicConfig`
+    installs at import time. Idempotent: if a `FileHandler` (rotating or not)
+    for that same file is already on the root logger, that handler is
+    returned instead of adding a duplicate.
+
+    The file rotates at `MIST_LOG_MAX_BYTES` (default 50 MiB) and keeps
+    `MIST_LOG_BACKUP_COUNT` old files (default 5, as `mist-backend.log.1` to
+    `.5`), both read at call time. A daily instance runs for weeks and logs
+    at DEBUG to a bind mount, so an unrotated file grows without bound.
 
     Only records emitted after this function runs reach the file. Records
     logged during module import, before `lifespan()` calls this, reach the
@@ -143,7 +177,11 @@ def configure_file_logging(log_dir: Path) -> logging.Handler:
     for handler in root_logger.handlers:
         if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == log_file:
             return handler
-    file_handler = logging.FileHandler(log_file)
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file,
+        maxBytes=_log_rotation_setting("MIST_LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES),
+        backupCount=_log_rotation_setting("MIST_LOG_BACKUP_COUNT", DEFAULT_LOG_BACKUP_COUNT),
+    )
     file_handler.setFormatter(logging.Formatter(_log_format))
     file_handler.setLevel(logging.DEBUG)  # Capture everything to disk
     root_logger.addHandler(file_handler)
