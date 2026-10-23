@@ -80,6 +80,11 @@ backend/
 │   ├── canonical_serialize.py   # F3 wall-clock-free graph form
 │   └── extraction_cache.py      # F3 content-addressed extraction cache
 │
+├── memory/                      # Memory read path: per-turn recall into a budgeted block
+│   ├── config.py                # MemoryConfig (MIST_MEMORY_*), nested as KnowledgeConfig.memory
+│   ├── models.py                # Request/result/item types, fact_key, MemoryTrace (turn-log keys)
+│   └── fact_render.py           # One sentence per fact, with valid-time qualifiers
+│
 └── vault/                       # ADR-010 vault layer (Cluster 8)
     ├── conventions.py           # MIST.md auto-load primitive (ADR-014)
     ├── sidecar_index.py         # sqlite-vec + FTS5 over markdown chunks
@@ -302,6 +307,7 @@ Frontend lives in a separate repo at `./mist-frontend/`. See that repo's contrib
 - **Integration tests:** `tests/integration/` (cluster-scoped reproducers; require live Neo4j + llama-server)
 - **Drift guards:** `tests/unit/test_eval_harness_scorers.py` locks scorer frozensets to ontology; `tests/unit/knowledge/extraction/test_validator.py::TestValidatorOntologyConsistency` locks validator to ontology
 - **Eval harness:** `scripts/eval_harness/` runs V1-V8 gauntlets; reports in `data/ingest/`
+- **Memory read path:** `tests/unit/memory/` (fakes in `tests/fakes/memory_fakes.py`); `tests/fixtures/memory_recall/` holds the synthetic recall fixture (facts, conversations, episodes, vault notes, corrections, probes) that `scripts/eval_harness/memory_recall.py` scores
 
 ---
 
