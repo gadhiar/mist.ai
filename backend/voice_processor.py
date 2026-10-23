@@ -139,8 +139,14 @@ class VoiceProcessor:
         # Event loop reference (for VAD callbacks in executor threads)
         self.loop = None
 
-    async def initialize(self):
-        """Initialize models and VAD."""
+    async def initialize(self, *, yielded: bool = False):
+        """Initialize models and VAD.
+
+        Args:
+            yielded: True when gaming mode holds the GPU at boot; forwarded to
+                `ModelManager.load_all_models`, which then skips Whisper and the
+                LLM warmup.
+        """
         log_timestamp("Initializing voice processor...")
 
         # Save event loop reference for VAD callbacks
@@ -175,7 +181,9 @@ class VoiceProcessor:
         )
 
         # Load models in thread pool to not block event loop
-        await self.loop.run_in_executor(None, self.models.load_all_models)
+        await self.loop.run_in_executor(
+            None, functools.partial(self.models.load_all_models, yielded=yielded)
+        )
 
         # Initialize VAD
         log_timestamp("Loading VAD (Voice Activity Detection)...")
