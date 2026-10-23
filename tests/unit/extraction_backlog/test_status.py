@@ -173,7 +173,12 @@ class TestCheckedProducer:
         assert status is not None
         assert status.state == "idle"
         assert status.backlog_depth == 1
-        assert status == extraction_status(dispatcher)
+        # Each snapshot computes the pending age from the dispatcher's real
+        # clock, so two calls can differ by a millisecond; compare the rest.
+        unstable = {"oldest_pending_age_ms"}
+        assert status.model_dump(exclude=unstable) == extraction_status(dispatcher).model_dump(
+            exclude=unstable
+        )
 
     def test_no_dispatcher_is_disabled_with_zero_counts(self):
         telemetry.record_unrecorded_turn("turn-1")
