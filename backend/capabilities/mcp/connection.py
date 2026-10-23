@@ -76,9 +76,11 @@ class McpConnection:
 
     A connection is started once and stopped once. Each connect attempt builds a new transport
     from `transport_factory`, opens it and lists its tools. On success the state is `available`
-    and calls go through; when a call hits a transport error the session is dropped and the
-    supervisor closes it and reconnects at once, listing the tools again. Consecutive failed
-    attempts back off by `backoff`. A call is never retried here: the caller decides.
+    and calls go through. When a call hits a transport error the session is dropped, and the
+    supervisor closes it and reconnects at once, listing the tools again. When a call's
+    credentials are rejected the session is dropped the same way, but the supervisor waits the
+    auth delay before it reconnects, as after a rejected connect. Consecutive failures back off
+    by `backoff`. A call is never retried here: the caller decides.
     """
 
     def __init__(
@@ -101,6 +103,9 @@ class McpConnection:
         self._tools: list[McpToolSpec] = []
         self._reason = "not started"
         self._reconnect = asyncio.Event()
+        # Set with `_reconnect` when a call's credentials were rejected, so the supervisor
+        # backs off before reconnecting instead of retrying a refused credential at once.
+        self._dropped_for_auth: CapabilityUnavailableError | None = None
 
     async def start(self) -> None:
         """Schedule the supervisor task and return without waiting for the first connect."""
@@ -154,28 +159,37 @@ class McpConnection:
         """Call one tool on the open session.
 
         Raises:
-            CapabilityUnavailableError: No session is open; the message is the last reason.
+            CapabilityUnavailableError: No session is open, and the message is the last reason;
+                or the transport reports the call's credentials rejected ("auth rejected"),
+                and the session is dropped for the supervisor to reconnect after the auth delay.
             McpTransportError: The call failed in the transport. The session is dropped for
-                the supervisor to reconnect, and the call is not retried.
+                the supervisor to reconnect at once.
+
+        A failed call is never retried.
         """
         session = self._session
         if session is None:
             raise CapabilityUnavailableError(self._reason)
         try:
             return await session.call_tool(name, arguments, timeout_s)
-        except McpTransportError as exc:
-            self._drop(session, _describe(exc))
+        except (CapabilityUnavailableError, McpTransportError) as exc:
+            self._drop(session, exc)
             raise
 
-    def _drop(self, session: McpTransport, reason: str) -> None:
+    def _drop(
+        self, session: McpTransport, failure: CapabilityUnavailableError | McpTransportError
+    ) -> None:
         # A call that started on an earlier session must not drop the current one.
         if self._session is not session:
             return
+        reason = _describe(failure)
         self._session = None
         self._tools = []
         self._reason = reason
+        if isinstance(failure, CapabilityUnavailableError):
+            self._dropped_for_auth = failure
         self._reconnect.set()
-        logger.warning("MCP session dropped after a transport error: %s; reconnecting", reason)
+        logger.warning("MCP session dropped after a failed call: %s; reconnecting", reason)
 
     async def _supervise(self) -> None:
         failures = 0
@@ -184,15 +198,15 @@ class McpConnection:
                 failure = await self._connect()
                 if failure is None:
                     failures = 0
-                    await self._reconnect.wait()
-                    await self._close_open()
-                    continue
+                    failure = await self._serve()
+                    if failure is None:
+                        continue
                 failures += 1
                 delay = self._backoff.delay(
                     failures, auth_rejected=isinstance(failure, CapabilityUnavailableError)
                 )
                 logger.warning(
-                    "MCP connect attempt %d failed: %s; retrying in %.1f s",
+                    "MCP connection failure %d in a row: %s; retrying in %.1f s",
                     failures,
                     self._reason,
                     delay,
@@ -207,9 +221,20 @@ class McpConnection:
             self._tools = []
             await self._close_open()
 
+    async def _serve(self) -> CapabilityUnavailableError | None:
+        """Wait until a call drops the session, then close it.
+
+        Returns the auth rejection that dropped it, which the caller backs off from like a
+        rejected connect, or None to reconnect at once.
+        """
+        await self._reconnect.wait()
+        await self._close_open()
+        return self._dropped_for_auth
+
     async def _connect(self) -> BaseException | None:
         """Make one connect attempt; return the contained failure, or None once connected."""
         self._reconnect.clear()
+        self._dropped_for_auth = None
         try:
             transport = self._transport_factory()
             await transport.open()

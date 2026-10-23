@@ -51,7 +51,12 @@ class McpTransport(Protocol):
 
     A transport raises `McpTransportError` for connect, session and call I/O failures, and
     `CapabilityUnavailableError` with the reason "auth rejected" when the server refuses its
-    credentials, which the supervisor backs off from for longer.
+    credentials, from `open`, `list_tools` or `call_tool`; the supervisor backs off from that
+    for longer.
+
+    An `open` that raises or is cancelled releases whatever it acquired, such as an SDK client
+    context it entered, before the exception propagates. The supervisor calls `close` only on a
+    transport whose `open` returned, so nothing else would release it.
     """
 
     async def open(self) -> None:
