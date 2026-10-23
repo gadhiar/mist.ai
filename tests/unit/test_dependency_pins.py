@@ -1,7 +1,7 @@
-"""Guard: root `requirements.txt` pins the capability layer's dependencies exactly.
+"""Guard: the capability layer's dependency pins in `requirements.txt` and `pyproject.toml`.
 
-- `mcp` is the Home Assistant MCP client that `backend/capabilities/mcp/sdk_transport.py`
-  builds on.
+- `mcp` is pinned for the Home Assistant MCP SDK transport that a later task of the
+  capabilities goal (T16) adds at `backend/capabilities/mcp/sdk_transport.py`.
 - `tzdata` supplies the IANA zone data that the stdlib `zoneinfo` reads for alarms. The
   backend image has no system zone database, so without it `zoneinfo.ZoneInfo` raises
   `ZoneInfoNotFoundError` for every zone name.
@@ -11,15 +11,21 @@ It also pins `pyarrow`, which `lancedb` imports. pyarrow 26 needs NumPy 2 at imp
 unbounded `pyarrow` range resolves to a release whose import fails. The pin stays at the
 last release that imports under numpy 1.26 until `chatterbox-tts` allows numpy 2.
 
-Static on purpose: the test parses `requirements.txt` and never imports `mcp`, `tzdata` or
-`pyarrow`, so it passes in an image that does not have them installed yet.
+`requirements.txt` carries the exact pins the image installs; `pyproject.toml` carries the
+matching ranges (`mcp>=2.3`, `tzdata>=2026.5`, `pyarrow>=17.0,<26`), and both are checked.
+
+Static on purpose: the test parses both files and never imports `mcp`, `tzdata` or
+`pyarrow`, so it passes in an image that does not have them installed yet. Specifiers are
+compared as strings rather than through `packaging`, which is not a declared dependency.
 """
 
 import re
+import tomllib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REQUIREMENTS_PATH = REPO_ROOT / "requirements.txt"
+PYPROJECT_PATH = REPO_ROOT / "pyproject.toml"
 
 # `name[extra1,extra2]==version`, optionally followed by a marker or an inline comment.
 PINNED_LINE = re.compile(
@@ -78,3 +84,45 @@ class TestPyarrowIsPinnedBelowNumpy2:
             f"pyarrow is pinned to {pins['pyarrow']!r}; {PYARROW_PIN} is the last release "
             "that imports under the numpy<2 that chatterbox-tts requires"
         )
+
+
+# `[project] dependencies` entry -> its comma-separated version clauses, whitespace removed.
+PYPROJECT_RANGES = {
+    "mcp": {">=2.3"},
+    "tzdata": {">=2026.5"},
+    "pyarrow": {">=17.0", "<26"},
+}
+
+# `name[extras] specifiers ; marker`; extras and marker are not needed for these entries.
+PYPROJECT_ENTRY = re.compile(
+    r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*(?P<specs>[^;]*)"
+)
+
+
+def _pyproject_dependencies() -> dict[str, set[str]]:
+    """Map lowercased distribution name -> set of version clauses in `[project] dependencies`."""
+    with PYPROJECT_PATH.open("rb") as handle:
+        entries = tomllib.load(handle)["project"]["dependencies"]
+    ranges: dict[str, set[str]] = {}
+    for entry in entries:
+        match = PYPROJECT_ENTRY.match(entry.strip())
+        assert match is not None, f"cannot parse pyproject dependency {entry!r}"
+        clauses = {
+            re.sub(r"\s+", "", clause)
+            for clause in match.group("specs").split(",")
+            if clause.strip()
+        }
+        ranges[match.group("name").lower()] = clauses
+    return ranges
+
+
+class TestPyprojectRangesMatchPins:
+    def test_pyproject_declares_capability_and_pyarrow_ranges(self) -> None:
+        ranges = _pyproject_dependencies()
+
+        for name, expected in PYPROJECT_RANGES.items():
+            assert name in ranges, f"pyproject.toml [project] dependencies must list {name}"
+            assert ranges[name] == expected, (
+                f"pyproject.toml declares {name} with {sorted(ranges[name])}; "
+                f"expected {sorted(expected)}"
+            )
