@@ -99,7 +99,10 @@ def fact_row_key(fact_key: str, version_key: str | None) -> str:
 
 
 def structural_row_key(fact_key: str) -> str:
-    """`row_key` of a structural edge, which has no `version_key`: `fact_row_key(fact_key, None)`."""
+    """`row_key` of a structural edge, which has no `version_key`.
+
+    Equal to `fact_row_key(fact_key, None)`.
+    """
     return fact_row_key(fact_key, None)
 
 
@@ -181,7 +184,11 @@ class FactGroup:
     Attributes:
         fact_key: The fact's identity across versions.
         versions: Every indexed version, ordered by `recorded_at` then `row_key`.
-        matched: Row keys of the versions the search matched, best first.
+        matched: Row keys of the matched versions among the rows the search fetched, best
+            first; never empty, and each key is in `versions`. The fetch is cut at a row count
+            (the bounded MATCH fetch, or the KNN's `k`), and the cut can fall inside one fact,
+            so a version that also matches but ranks past the cut is absent from `matched`
+            although it is in `versions`. `matched` is therefore not every matching version.
         score: Score of the best matched version, higher is better: `-bm25` for text and
             name search, cosine similarity for vector search.
     """
@@ -247,9 +254,14 @@ class FactIndex:
         embedder: Embeds rendered fact text (all-MiniLM-L6-v2 in production).
         tz: Zone timestamp bounds are rendered in, `MemoryConfig.tz`. It is required because
             the rendered text, and so the hash and the embedding, depends on it.
-        reader: Connection from `index_db.open_reader` on the same file. None reads on the
-            writer under its lock, so a search waits for a running write; that is the only
-            option for a `:memory:` index, which has no second connection.
+        reader: Connection from `index_db.open_reader` on the same file. It is required, so
+            the caller chooses the connection searches use. A `:memory:` index has no second
+            connection and passes its writer here; searches then run on the writer under its
+            lock and wait for a running write. A file-backed index given its writer raises.
+
+    Raises:
+        ValueError: `reader` is `writer` and the writer's database is a file, which would
+            make every search wait for the writes the reader exists to avoid.
     """
 
     def __init__(
@@ -258,15 +270,21 @@ class FactIndex:
         embedder: EmbeddingProvider,
         *,
         tz: tzinfo,
-        reader: sqlite3.Connection | None = None,
+        reader: sqlite3.Connection,
     ):
+        shared = reader is writer
+        if shared and _main_database_file(writer):
+            raise ValueError(
+                "a file-backed index needs its own reader from index_db.open_reader, "
+                "not the writer"
+            )
         self._writer = writer
         self._embedder = embedder
         self._tz = tz
         self._writer_lock = threading.Lock()
         self._write_lock = threading.Lock()
-        self._reader = writer if reader is None else reader
-        self._reader_lock = self._writer_lock if reader is None else threading.Lock()
+        self._reader = reader
+        self._reader_lock = self._writer_lock if shared else threading.Lock()
 
     # -- writes ---------------------------------------------------------------------------------
 
@@ -692,6 +710,14 @@ def _placeholders(count: int) -> str:
 def _chunks(keys: list[str]) -> Iterator[list[str]]:
     for start in range(0, len(keys), _IN_CHUNK):
         yield keys[start : start + _IN_CHUNK]
+
+
+def _main_database_file(conn: sqlite3.Connection) -> str:
+    """The file path of `conn`'s main database; empty for `:memory:`, which has no file."""
+    for _seq, name, path in conn.execute("PRAGMA database_list"):
+        if name == "main":
+            return str(path or "")
+    return ""
 
 
 def _check_limit(limit: int) -> None:

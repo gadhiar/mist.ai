@@ -159,13 +159,13 @@ def test_served_field_change_updates_the_row_without_re_embedding(
 
 
 def test_a_different_zone_changes_the_hash_and_re_embeds(
-    conn: sqlite3.Connection, fake_embedder: FakeEmbedder
+    conn: sqlite3.Connection, reader: sqlite3.Connection, fake_embedder: FakeEmbedder
 ) -> None:
     row = _fact("rk-acme", "Acme", valid_from="2026-03-01T23:30:00+00:00")
-    FactIndex(conn, fake_embedder, tz=UTC).upsert([row])
+    FactIndex(conn, fake_embedder, tz=UTC, reader=reader).upsert([row])
     east = timezone(timedelta(hours=5))
 
-    report = FactIndex(conn, fake_embedder, tz=east).upsert([row])
+    report = FactIndex(conn, fake_embedder, tz=east, reader=reader).upsert([row])
 
     assert render_fact(row, UTC) != render_fact(row, east)
     assert (report.updated, report.embedded) == (1, 1)
@@ -194,9 +194,9 @@ def test_upsert_rejects_a_repeated_row_key(index: FactIndex) -> None:
 
 
 def test_an_embedder_of_another_dimension_raises_memory_index_error(
-    conn: sqlite3.Connection,
+    conn: sqlite3.Connection, reader: sqlite3.Connection
 ) -> None:
-    index = FactIndex(conn, FakeEmbedder(dimension=8), tz=UTC)
+    index = FactIndex(conn, FakeEmbedder(dimension=8), tz=UTC, reader=reader)
 
     with pytest.raises(MemoryIndexError, match="384"):
         index.upsert([_fact("rk-acme", "Acme")])
@@ -259,12 +259,26 @@ def test_a_memory_index_serves_reads_on_its_single_connection(
     fake_embedder: FakeEmbedder,
 ) -> None:
     connection = open_index(":memory:", embedding_model_id=_MODEL)
-    index = FactIndex(connection, fake_embedder, tz=UTC)
+    index = FactIndex(connection, fake_embedder, tz=UTC, reader=connection)
 
     index.upsert([_fact("rk-acme", "Acme")])
 
     assert [group.versions[0].row_key for group in index.search_fts("acme")] == ["rk-acme"]
     connection.close()
+
+
+def test_the_reader_is_a_required_argument(
+    conn: sqlite3.Connection, fake_embedder: FakeEmbedder
+) -> None:
+    with pytest.raises(TypeError, match="reader"):
+        FactIndex(conn, fake_embedder, tz=UTC)  # type: ignore[call-arg]
+
+
+def test_a_file_backed_index_refuses_its_writer_as_its_reader(
+    conn: sqlite3.Connection, fake_embedder: FakeEmbedder
+) -> None:
+    with pytest.raises(ValueError, match="open_reader"):
+        FactIndex(conn, fake_embedder, tz=UTC, reader=conn)
 
 
 # -- row keys ----------------------------------------------------------------------------------
