@@ -641,8 +641,11 @@ class VaultSidecarIndex:
 
         Returns:
             List of result dicts, each containing:
-            ``{path, heading, content, frontmatter, note_type, score, distance, source}``.
-            ``score`` is ``1.0 / (1.0 + distance)``. Empty list on empty index.
+            ``{path, heading, content, frontmatter, note_type, score, distance, source,
+            mtime}``. ``score`` is ``1.0 / (1.0 + distance)``. ``mtime`` is the
+            file mtime (integer seconds) stored at indexing, which the memory
+            read path falls back to for a note's recency. Empty list on empty
+            index.
 
         Raises:
             SidecarIndexError: On database error.
@@ -662,7 +665,7 @@ class VaultSidecarIndex:
             rows = conn.execute(
                 """
                 SELECT vc.path, vc.heading, vc.content, vc.frontmatter_json,
-                       vc.note_type, distance
+                       vc.note_type, distance, vc.mtime
                 FROM vault_chunks_vec
                 JOIN vault_chunks vc ON vc.chunk_id = vault_chunks_vec.rowid
                 WHERE embedding MATCH ? AND k = ?
@@ -683,6 +686,7 @@ class VaultSidecarIndex:
                 "score": 1.0 / (1.0 + row[5]),
                 "distance": row[5],
                 "source": "vector",
+                "mtime": row[6],
             }
             for row in rows
         ]
@@ -736,7 +740,8 @@ class VaultSidecarIndex:
                 """
                 SELECT vc.path, vc.heading, vc.content, vc.frontmatter_json,
                        vc.note_type,
-                       -bm25(vault_chunks_fts, 1.0, ?) as score
+                       -bm25(vault_chunks_fts, 1.0, ?) as score,
+                       vc.mtime
                 FROM vault_chunks_fts
                 JOIN vault_chunks vc ON vc.chunk_id = vault_chunks_fts.rowid
                 WHERE vault_chunks_fts MATCH ?
@@ -763,6 +768,7 @@ class VaultSidecarIndex:
                 "score": row[5],
                 "distance": None,
                 "source": "fts",
+                "mtime": row[6],
             }
             for row in rows
         ]
@@ -799,7 +805,8 @@ class VaultSidecarIndex:
             1/(1+distance) in (0, 1], for hits seen by the vector leg, None for
             FTS-only hits) for UI display,
             ``vector_rank``, ``fts_rank`` (None if absent from that list),
-            and ``sources`` list. Empty if both retrievers return nothing.
+            ``sources`` list, and ``mtime`` as in `query_vector`. Empty if both
+            retrievers return nothing.
 
         Raises:
             SidecarIndexError: On database error.
@@ -917,6 +924,7 @@ class VaultSidecarIndex:
                     "content": result["content"],
                     "frontmatter": result["frontmatter"],
                     "note_type": result["note_type"],
+                    "mtime": result["mtime"],
                     "score": 0.0,
                     # display_similarity carries the distance-derived similarity
                     # (1/(1+distance), in (0, 1]) for UI display. Distinct from
@@ -942,6 +950,7 @@ class VaultSidecarIndex:
                     "content": result["content"],
                     "frontmatter": result["frontmatter"],
                     "note_type": result["note_type"],
+                    "mtime": result["mtime"],
                     "score": 0.0,
                     # FTS-only hit: no vector score available. A chunk also seen
                     # by the vector leg keeps its score via the else-branch
