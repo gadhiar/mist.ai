@@ -278,6 +278,22 @@ class TestRepeatRule:
         with pytest.raises(ValueError):
             RepeatRule.from_json(text)
 
+    @pytest.mark.parametrize("value", [b"{}", None, 7])
+    def test_from_json_rejects_a_value_that_is_not_text_with_value_error(self, value):
+        # A stored cell can hold any SQLite type. `json.loads` accepts bytes, so without the
+        # guard bytes holding a valid rule would decode; a stored rule must be text. For None
+        # and an int, `json.loads` raises `TypeError`, which a reader of stored rules does not
+        # treat as a damaged row. "JSON text" names the guard's message, so the bytes case
+        # fails when the guard is gone even though `{}` would be rejected later.
+        with pytest.raises(ValueError, match="JSON text"):
+            RepeatRule.from_json(value)  # type: ignore[arg-type]
+
+    def test_from_json_rejects_deeply_nested_json_with_value_error(self):
+        nested = "[" * 100000 + "]" * 100000
+
+        with pytest.raises(ValueError, match="nested too deeply"):
+            RepeatRule.from_json(nested)
+
     def test_constructor_rejects_an_unknown_kind(self):
         with pytest.raises(ValueError, match="hourly"):
             RepeatRule(kind="hourly", hour=7, minute=0)  # type: ignore[arg-type]
