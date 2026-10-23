@@ -14,8 +14,13 @@ from types import SimpleNamespace
 import pytest
 
 from backend import server
+from backend.errors import MistError
 from backend.extraction_backlog import admin, telemetry
-from backend.extraction_backlog.status import extraction_status, health_block
+from backend.extraction_backlog.status import (
+    checked_extraction_status,
+    extraction_status,
+    health_block,
+)
 from backend.knowledge.version_stamps import EXTRACTION_VERSION as CODE_EXTRACTION_VERSION
 from backend.knowledge.version_stamps import ONTOLOGY_VERSION as CODE_ONTOLOGY_VERSION
 from tests.unit.extraction_backlog.conftest import (
@@ -107,6 +112,22 @@ class TestProducer:
         assert status.state == "working"
         assert status.backlog_depth == 0
 
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            pytest.param(MistError("store closed"), id="mist-error"),
+            pytest.param(sqlite3.OperationalError("database is locked"), id="sqlite-error"),
+            pytest.param(OSError("disk I/O error"), id="os-error"),
+        ],
+    )
+    def test_each_caught_snapshot_failure_still_reports_zero_counts(self, exc):
+        """`extraction_status()`'s output is unchanged by the checked variant beneath it."""
+        broken = _BrokenDispatcher(exc)
+
+        status = extraction_status(broken)  # type: ignore[arg-type]
+
+        assert status == _zero_counts("working")
+
     def test_health_block_is_a_subset_of_the_status(self):
         status = extraction_status(None)
 
@@ -119,6 +140,79 @@ class TestProducer:
             "unrecorded_turns": 0,
             "service": {"reachable": False},
         }
+
+
+class _BrokenDispatcher:
+    """A service-mode dispatcher whose snapshot raises the given exception."""
+
+    mode = "service"
+    state = "working"
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def snapshot(self):
+        raise self._exc
+
+
+def _zero_counts(state: str):
+    """The fallback `extraction_status()` reports: the state, zero counts, no service."""
+    return extraction_status(None).model_copy(update={"state": state})
+
+
+class TestCheckedProducer:
+    """`checked_extraction_status`: None exactly where `extraction_status()` falls back."""
+
+    def test_a_running_dispatcher_returns_its_snapshot(self, backlog_world, ts):
+        world = backlog_world
+        world.log_turn(session_id="s1", turn_index=0, timestamp=ts(0), utterance="I use rust")
+        dispatcher = world.build_dispatcher()
+
+        status = checked_extraction_status(dispatcher)
+
+        assert status is not None
+        assert status.state == "idle"
+        assert status.backlog_depth == 1
+        assert status == extraction_status(dispatcher)
+
+    def test_no_dispatcher_is_disabled_with_zero_counts(self):
+        telemetry.record_unrecorded_turn("turn-1")
+
+        status = checked_extraction_status(None)
+
+        assert status == extraction_status(None)
+        assert status is not None
+        assert status.state == "disabled"
+        assert status.unrecorded_turns == 1
+
+    def test_an_off_mode_dispatcher_is_disabled_with_zero_counts(self, backlog_world, ts):
+        world = backlog_world
+        world.log_turn(session_id="s1", turn_index=0, timestamp=ts(0), utterance="I use rust")
+        dispatcher = world.build_dispatcher(mode="off")
+
+        status = checked_extraction_status(dispatcher)
+
+        assert status is not None
+        assert status.state == "disabled"
+        assert status.backlog_depth == 0
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            pytest.param(MistError("store closed"), id="mist-error"),
+            pytest.param(sqlite3.OperationalError("database is locked"), id="sqlite-error"),
+            pytest.param(OSError("disk I/O error"), id="os-error"),
+        ],
+    )
+    def test_a_caught_snapshot_failure_is_none(self, exc):
+        status = checked_extraction_status(_BrokenDispatcher(exc))  # type: ignore[arg-type]
+
+        assert status is None
+
+    def test_an_uncaught_snapshot_failure_propagates(self):
+        """Only the three storage failures are absorbed; a bug is not a status."""
+        with pytest.raises(KeyError):
+            checked_extraction_status(_BrokenDispatcher(KeyError("bug")))  # type: ignore[arg-type]
 
 
 class TestWebSocketPush:

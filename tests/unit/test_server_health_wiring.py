@@ -26,13 +26,16 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from backend import server
+from backend.extraction_contract.models import HealthResponse
 from backend.health import (
     BroadcasterProbe,
     BroadcasterState,
+    HealthProbeSettings,
     HealthRegistry,
     ProbeFailed,
     ProbeUnavailable,
@@ -44,6 +47,9 @@ _GLOBALS = (
     "_health_registry",
     "voice_processor",
     "vault_sidecar",
+    "extraction_dispatcher",
+    "_extraction_dispatcher_start_failed",
+    "_extraction_health_client",
 )
 
 
@@ -59,6 +65,8 @@ def restore_server_globals():
     server._models_ready = False
     server._broadcaster_state = None
     server._health_registry = None
+    server.extraction_dispatcher = None
+    server._extraction_dispatcher_start_failed = False
     yield
     for name, value in saved.items():
         setattr(server, name, value)
@@ -115,6 +123,39 @@ class FakeVoiceProcessorHoldingLLM:
 
     def __init__(self, provider) -> None:
         self._llm_provider = provider
+
+
+class FakeExtractionInference:
+    """The one method `ExtractionServiceProbe` calls, answering ok."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def health(self) -> HealthResponse:
+        self.calls += 1
+        return HealthResponse(status="ok", llm_reachable=True, uptime_s=5.0)
+
+
+class FakeIdleDispatcher:
+    """A service-mode dispatcher with nothing queued and a readable backlog."""
+
+    mode = "service"
+    state = "idle"
+
+    def snapshot(self):
+        from backend.extraction_backlog.status import extraction_status
+
+        return extraction_status(None).model_copy(update={"state": "idle"})
+
+
+def build_server_registry(executor, settings: HealthProbeSettings | None = None):
+    """`_build_health_registry` with fakes for the extraction service and settings."""
+    return server._build_health_registry(
+        executor,
+        BroadcasterState(),
+        FakeExtractionInference(),
+        settings if settings is not None else HealthProbeSettings(),
+    )
 
 
 async def settle() -> None:
@@ -379,7 +420,7 @@ async def test_accessors_are_lazy(executor):
     server.voice_processor = None
     server.vault_sidecar = None
 
-    registry = server._build_health_registry(executor, BroadcasterState())
+    registry = build_server_registry(executor)
 
     provider = FakeLLMProvider()
     sidecar = FakeSidecar()
@@ -427,3 +468,182 @@ async def test_existing_fields_preserved(monkeypatch):
     assert with_registry["active_connections"] == len(server.active_connections)
     assert with_registry["hydration_isolation"] is False
     assert with_registry["status"] == "healthy"
+
+
+# 8
+@pytest.mark.asyncio
+async def test_registry_carries_the_extraction_and_backup_checks(executor):
+    """Three degrading checks join the five, none of which a restart repairs."""
+    registry = build_server_registry(executor)
+
+    checks = registry.snapshot()["checks"]
+
+    assert set(checks) == {
+        "neo4j",
+        "llm",
+        "event_store",
+        "vault_sidecar",
+        "broadcaster",
+        "extraction_service",
+        "extraction_backlog",
+        "backup",
+    }
+    for name in ("extraction_service", "extraction_backlog", "backup"):
+        assert checks[name]["severity"] == "degrades", name
+        assert checks[name]["restart_repairs"] is False, name
+
+
+# 9
+@pytest.mark.asyncio
+async def test_extraction_accessors_read_the_dispatcher_and_start_flag_lazily(executor):
+    """The registry is built before `lifespan` starts the dispatcher.
+
+    So both the dispatcher and the start-failed flag must be read when the
+    probe runs: a captured None would report `disabled_by_config` for the life
+    of the process, and a captured False would hide a failed start.
+    """
+    registry = build_server_registry(executor)
+
+    server._extraction_dispatcher_start_failed = True
+    await registry.run_once()
+    failed = registry.snapshot()["checks"]
+    server._extraction_dispatcher_start_failed = False
+    server.extraction_dispatcher = FakeIdleDispatcher()
+    await registry.run_once()
+    running = registry.snapshot()["checks"]
+
+    for name in ("extraction_service", "extraction_backlog"):
+        assert (failed[name]["status"], failed[name]["reason"]) == (
+            "down",
+            "unavailable_at_boot",
+        ), name
+        assert (running[name]["status"], running[name]["reason"]) == ("up", "ok"), name
+
+
+# 10
+@pytest.mark.asyncio
+async def test_backup_reads_the_injected_settings(executor, tmp_path):
+    """Unset on the workstation stack, so `backup` is null there, not down."""
+    unset = build_server_registry(executor)
+    await unset.run_once()
+    absent = build_server_registry(
+        executor, HealthProbeSettings(backup_status_path=tmp_path / "absent.json")
+    )
+    await absent.run_once()
+
+    assert unset.snapshot()["checks"]["backup"]["reason"] == "disabled_by_config"
+    assert absent.snapshot()["checks"]["backup"]["reason"] == "backup_never_run"
+
+
+# 11
+@pytest.mark.asyncio
+async def test_health_top_level_keys_and_extraction_block_are_unchanged(executor):
+    """The new checks live under `checks`; no other `/health` field changes."""
+    registry = build_server_registry(executor)
+    await registry.run_once()
+    server._health_registry = registry
+
+    payload = await server.health()
+
+    assert set(payload) == {
+        "status",
+        "restart_recommended",
+        "probe_loop",
+        "probe_interval_seconds",
+        "checked_at",
+        "checks",
+        "models_loaded",
+        "active_connections",
+        "hydration_isolation",
+        "extraction",
+    }
+    extraction = payload["extraction"]
+    assert set(extraction) == {
+        "state",
+        "backlog_depth",
+        "dead_lettered",
+        "unrecorded_turns",
+        "service",
+    }
+    assert extraction["service"] == {"reachable": False}
+    assert extraction["state"] == "disabled"
+
+
+# 12
+@pytest.mark.asyncio
+async def test_a_dispatcher_start_that_raises_reads_unavailable_at_boot(executor):
+    """The path `lifespan` takes when `_start_extraction_dispatcher` raises.
+
+    Without the recorded flag a None dispatcher reads `disabled_by_config`,
+    which would report a failed start as a deliberate switch-off.
+    """
+
+    async def failing_start():
+        raise ValueError("MIST_EXTRACTION_MAX_ATTEMPTS must be >= 1, got 0")
+
+    registry = build_server_registry(executor)
+
+    dispatcher = await server._start_extraction_dispatcher_recording_failure(failing_start)
+    server.extraction_dispatcher = dispatcher
+    await registry.run_once()
+    checks = registry.snapshot()["checks"]
+
+    assert dispatcher is None
+    assert server._extraction_dispatcher_start_failed is True
+    for name in ("extraction_service", "extraction_backlog"):
+        assert (checks[name]["status"], checks[name]["reason"]) == (
+            "down",
+            "unavailable_at_boot",
+        ), name
+
+
+# 13
+@pytest.mark.asyncio
+async def test_a_dispatcher_start_that_succeeds_clears_the_flag():
+    started = FakeIdleDispatcher()
+
+    async def start():
+        return started
+
+    server._extraction_dispatcher_start_failed = True
+
+    dispatcher = await server._start_extraction_dispatcher_recording_failure(start)
+
+    assert dispatcher is started
+    assert server._extraction_dispatcher_start_failed is False
+
+
+# 14
+@pytest.mark.asyncio
+async def test_the_probe_client_has_a_two_second_timeout_and_is_closed_at_shutdown():
+    """Its own bound, independent of the dispatcher's 300 s extract client."""
+    client = server._new_extraction_health_client()
+    server._extraction_health_client = client
+
+    assert client.timeout == httpx.Timeout(2.0)
+
+    await server._close_extraction_health_client()
+
+    assert client.is_closed
+    assert server._extraction_health_client is None
+    # A second shutdown call, or one with no client built, is a no-op.
+    await server._close_extraction_health_client()
+
+
+def test_extraction_service_url_follows_the_dispatcher_setting(monkeypatch):
+    """The probe checks the same service the dispatcher sends jobs to."""
+    monkeypatch.setenv("MIST_EXTRACTION_SERVICE_URL", "http://extraction-host:8090")
+
+    assert server._extraction_service_url() == "http://extraction-host:8090"
+
+
+def test_extraction_service_url_survives_a_malformed_dispatcher_setting(monkeypatch):
+    """A bad `MIST_EXTRACTION_*` value fails the dispatcher's start, not the boot.
+
+    The probe then reports `unavailable_at_boot` before it calls anything, so
+    the URL it holds only has to be well formed.
+    """
+    monkeypatch.setenv("MIST_EXTRACTION_MAX_ATTEMPTS", "many")
+    monkeypatch.setenv("MIST_EXTRACTION_SERVICE_URL", "http://extraction-host:8090")
+
+    assert server._extraction_service_url() == "http://extraction-host:8090"
