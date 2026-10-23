@@ -21,9 +21,14 @@ Retrieval methods:
 - `query_vector`: embedding nearest-neighbour via vec0.
 - `query_fts`: BM25 lexical search via FTS5.
 - `query_hybrid`: Reciprocal Rank Fusion (RRF) merge of both.
+- `query_hybrid_readonly`: the same merge, async, on a second read-only
+  connection with its own `vault-sidecar-read` thread.
 
-This module is sync. Async callers (filewatcher, ConversationHandler)
-wrap calls via `asyncio.get_event_loop().run_in_executor`.
+The database runs in WAL, so the read-only connection reads the last
+committed snapshot while the writer holds a transaction: the memory read
+path's per-turn query never waits behind a filewatcher reindex. Every other
+method is sync; async callers (filewatcher, ConversationHandler) route them
+through `run_async`, the writer's single worker thread.
 """
 
 import asyncio
@@ -58,6 +63,10 @@ logger = logging.getLogger(__name__)
 # in double quotes it is a string literal, not an operator (so "not sure" matches
 # the literal words rather than invoking the NOT operator).
 _FTS5_TOKEN_SPLIT = re.compile(r'[\s"\'()*:.\-+^?]+')
+
+# SQLite's name for a private in-memory database, which has no file to open a
+# second connection on and no WAL.
+_MEMORY_PATH = ":memory:"
 
 # Heading regex: one or more '#' followed by a space and heading text.
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
@@ -127,6 +136,29 @@ def _check_match(match: str) -> None:
     """
     if match not in _MATCH_MODES:
         raise ValueError(f"match must be 'all' or 'any', got {match!r}")
+
+
+def _remove_orphan_wal_files(db_path: Path) -> None:
+    """Delete the `-wal` and `-shm` of a database file that no longer exists.
+
+    Call it only when `db_path` is missing. Such files belong to a deleted
+    database: `mist_admin vault-rebuild` unlinks only the `.db`, and a backend
+    still holding the old index open keeps its WAL and its shared-memory index
+    on disk. Opening a new database at the same path would read them as its
+    own, replaying the old file's frames into the new one, and the new
+    database fails with a disk I/O error or an integrity failure. A database
+    file that exists keeps its WAL, which may hold its latest commits.
+
+    A process still holding the deleted file keeps its open handles and goes
+    on serving the old index until it restarts.
+    """
+    for suffix in ("-wal", "-shm"):
+        sibling = db_path.with_name(db_path.name + suffix)
+        if sibling.exists():
+            logger.warning(
+                "sidecar: removing %s, left by a deleted database at %s", sibling, db_path
+            )
+            sibling.unlink(missing_ok=True)
 
 
 def _quote_fts5(text: str, *, match: MatchMode = "all") -> str:
@@ -261,10 +293,10 @@ class VaultSidecarIndex:
         idx.initialize()          # creates / opens DB, emits DDL
         idx.upsert_file(...)      # index a note
         results = idx.query_hybrid(embedding, text, k=5)
-        idx.close()               # release connection
+        idx.close()               # release both connections
 
-    All public methods are synchronous. Call from async code via
-    `loop.run_in_executor(None, idx.method, *args)`.
+    Public methods are synchronous except `run_async` and
+    `query_hybrid_readonly`. Call the others from async code via `run_async`.
 
     Implements `SidecarIndexProtocol` from `backend.interfaces`.
     """
@@ -289,11 +321,27 @@ class VaultSidecarIndex:
         # voice frames for tens to hundreds of ms per turn. max_workers=1
         # keeps sqlite access serialized.
         self._worker: ThreadPoolExecutor | None = None
+        # Read-only second connection and its own single thread, for
+        # `query_hybrid_readonly`. The writer's worker is shared with the
+        # filewatcher's `upsert_file`, which embeds every chunk inside its
+        # write transaction, so a turn's query queued there waits for the
+        # whole reindex. Under WAL this connection reads the last committed
+        # snapshot instead. Both are opened by `initialize` and released by
+        # `close`; the connection is used only on the read thread.
+        self._reader: sqlite3.Connection | None = None
+        self._read_worker: ThreadPoolExecutor | None = None
 
     def _ensure_worker(self) -> ThreadPoolExecutor:
         if self._worker is None:
             self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vault-sidecar")
         return self._worker
+
+    def _ensure_read_worker(self) -> ThreadPoolExecutor:
+        if self._read_worker is None:
+            self._read_worker = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="vault-sidecar-read"
+            )
+        return self._read_worker
 
     async def run_async(self, fn, /, *args):
         """Run a sidecar operation on the dedicated single worker thread.
@@ -325,15 +373,26 @@ class VaultSidecarIndex:
         extension. If `config.rebuild_on_startup` is True, all four
         schema objects are dropped before re-creation.
 
+        A file database is switched to WAL and gets a second, read-only
+        connection for `query_hybrid_readonly`, so a reader never waits on
+        the writer. When the database file is missing, any `-wal` and `-shm`
+        left beside it are removed first (see `_remove_orphan_wal_files`). `:memory:` has neither: a private in-memory database has
+        no second connection, and its read-only queries run on the writer.
+
         Idempotent: safe to call multiple times.
 
         Raises:
-            SidecarIndexError: If the database cannot be opened or the
-                schema cannot be created.
+            SidecarIndexError: If the database cannot be opened, cannot use
+                WAL, or the schema or the read connection cannot be created.
         """
+        conn: sqlite3.Connection | None = None
         try:
+            in_memory = self.config.db_path == _MEMORY_PATH
             db_path = Path(self.config.db_path)
-            db_path.parent.mkdir(parents=True, exist_ok=True)
+            if not in_memory:
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+                if not db_path.exists():
+                    _remove_orphan_wal_files(db_path)
 
             # check_same_thread=False: the connection is opened on the
             # caller's thread (loop thread at server startup, main thread in
@@ -347,18 +406,76 @@ class VaultSidecarIndex:
             sqlite_vec.load(conn)
             conn.enable_load_extension(False)
 
+            if not in_memory:
+                mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                if str(mode).lower() != "wal":
+                    raise SidecarIndexError(
+                        f"sidecar index at {db_path} cannot use WAL (journal mode {mode})"
+                    )
+                # Under WAL, NORMAL can lose the latest commits on power loss
+                # but does not corrupt the file; the index is derived from the
+                # vault and rebuildable.
+                conn.execute("PRAGMA synchronous=NORMAL")
+
             if self.config.rebuild_on_startup:
                 logger.info("rebuild_on_startup=True -- dropping sidecar schema before recreate")
                 self._drop_schema(conn)
 
             self._create_schema(conn)
-            self._conn = conn
-            logger.info("VaultSidecarIndex initialized at %s", db_path)
+            reader = None if in_memory else self._open_reader(db_path)
+        except SidecarIndexError:
+            if conn is not None:
+                conn.close()
+            raise
         except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError) as exc:
+            if conn is not None:
+                conn.close()
             raise SidecarIndexError(f"Failed to initialize sidecar index: {exc}") from exc
+        self._close_reader()
+        self._conn = conn
+        self._reader = reader
+        logger.info("VaultSidecarIndex initialized at %s", db_path)
+
+    def _open_reader(self, db_path: Path) -> sqlite3.Connection:
+        """Open the read-only connection `query_hybrid_readonly` runs on.
+
+        `mode=ro` makes a stray write fail instead of taking the write lock,
+        and refuses to create a missing file. sqlite-vec is loaded because the
+        vector leg queries the vec0 table.
+        """
+        uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        reader = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        try:
+            reader.row_factory = sqlite3.Row
+            reader.enable_load_extension(True)
+            sqlite_vec.load(reader)
+            reader.enable_load_extension(False)
+        except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError):
+            reader.close()
+            raise
+        return reader
+
+    def _close_reader(self) -> None:
+        """Stop the read thread, then close the read connection.
+
+        The thread is joined before the connection closes, so a query still
+        running on it never sees its connection closed underneath it. The
+        join waits at most for the one query in flight.
+        """
+        if self._read_worker is not None:
+            self._read_worker.shutdown(wait=True)
+            self._read_worker = None
+        if self._reader is not None:
+            try:
+                self._reader.close()
+            except sqlite3.OperationalError:
+                pass
+            finally:
+                self._reader = None
 
     def close(self) -> None:
-        """Close the database connection and worker thread. Idempotent."""
+        """Close both connections and both worker threads. Idempotent."""
+        self._close_reader()
         if self._worker is not None:
             self._worker.shutdown(wait=False)
             self._worker = None
@@ -531,6 +648,10 @@ class VaultSidecarIndex:
             SidecarIndexError: On database error.
         """
         self._require_connection()
+        return self._vector_rows(self._conn, embedding, k)  # type: ignore[arg-type]
+
+    def _vector_rows(self, conn: sqlite3.Connection, embedding: list[float], k: int) -> list[dict]:
+        """`query_vector` on `conn`, the writer or the read-only connection."""
         dim = self.config.embedding_dimension
         try:
             packed = struct.pack(f"<{dim}f", *embedding)
@@ -538,7 +659,7 @@ class VaultSidecarIndex:
             raise SidecarIndexError(f"Failed to pack embedding: {exc}") from exc
 
         try:
-            rows = self._conn.execute(  # type: ignore[union-attr]
+            rows = conn.execute(
                 """
                 SELECT vc.path, vc.heading, vc.content, vc.frontmatter_json,
                        vc.note_type, distance
@@ -596,6 +717,12 @@ class VaultSidecarIndex:
             ValueError: `match` is neither `"all"` nor `"any"`.
         """
         self._require_connection()
+        return self._fts_rows(self._conn, text, k, match)  # type: ignore[arg-type]
+
+    def _fts_rows(
+        self, conn: sqlite3.Connection, text: str, k: int, match: MatchMode
+    ) -> list[dict]:
+        """`query_fts` on `conn`, the writer or the read-only connection."""
         safe_text = _quote_fts5(text, match=match)
         # No indexable tokens (e.g. an all-punctuation query like "???"): an
         # empty MATCH expression would itself be an FTS5 syntax error. Skip the
@@ -605,7 +732,7 @@ class VaultSidecarIndex:
         weight = self.config.heading_context_weight
 
         try:
-            rows = self._conn.execute(  # type: ignore[union-attr]
+            rows = conn.execute(
                 """
                 SELECT vc.path, vc.heading, vc.content, vc.frontmatter_json,
                        vc.note_type,
@@ -679,9 +806,103 @@ class VaultSidecarIndex:
             ValueError: `match` is neither `"all"` nor `"any"`.
         """
         _check_match(match)
+        self._require_connection()
+        return self._hybrid(self._conn, embedding, text, k, rrf_k, match)  # type: ignore[arg-type]
+
+    async def query_hybrid_readonly(
+        self,
+        embedding: list[float],
+        text: str,
+        k: int = 10,
+        rrf_k: int = 60,
+        match: MatchMode = "all",
+    ) -> list[dict]:
+        """`query_hybrid` on the read-only connection and the `vault-sidecar-read` thread.
+
+        The writer's single worker also runs the filewatcher's `upsert_file`,
+        which embeds every chunk inside its write transaction, so a query
+        queued behind it waits for the whole reindex. Under WAL this
+        connection reads the last committed snapshot while a write is open,
+        so a turn's query returns without waiting; it does not see a write
+        that has not committed yet. A `:memory:` index has no second
+        connection, so its query runs on the writer's worker instead.
+
+        Arguments and result are those of `query_hybrid`.
+
+        Raises:
+            SidecarIndexError: The index is not initialized or the database
+                fails.
+            ValueError: `match` is neither `"all"` nor `"any"`.
+        """
+        _check_match(match)
+        self._require_connection()
+        if self._reader is None:
+            return await self.run_async(self.query_hybrid, embedding, text, k, rrf_k, match)
+        reader = self._reader
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._ensure_read_worker(),
+            self._hybrid_in_snapshot,
+            reader,
+            embedding,
+            text,
+            k,
+            rrf_k,
+            match,
+        )
+
+    def _hybrid_in_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        embedding: list[float],
+        text: str,
+        k: int,
+        rrf_k: int,
+        match: MatchMode,
+    ) -> list[dict]:
+        """`_hybrid` inside one read transaction on the read-only connection.
+
+        The two legs are separate statements; without the transaction a
+        reindex committing between them could give one leg the old chunks and
+        the other the new ones. A failure to begin or end the transaction is
+        a SidecarIndexError like any other read failure, so the fetcher's
+        MistError handling covers it.
+        """
+        try:
+            conn.execute("BEGIN")
+        except sqlite3.Error as exc:
+            raise SidecarIndexError(f"query_hybrid_readonly failed: {exc}") from exc
+        ended = False
+        try:
+            rows = self._hybrid(conn, embedding, text, k, rrf_k, match)
+            try:
+                conn.execute("COMMIT")
+            except sqlite3.Error as exc:
+                raise SidecarIndexError(f"query_hybrid_readonly failed: {exc}") from exc
+            ended = True
+            return rows
+        finally:
+            # A read transaction left open would pin the WAL snapshot this
+            # connection reads, so the next query would not see new commits.
+            if not ended and conn.in_transaction:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error as exc:
+                    logger.warning("query_hybrid_readonly: rollback failed: %s", exc)
+
+    def _hybrid(
+        self,
+        conn: sqlite3.Connection,
+        embedding: list[float],
+        text: str,
+        k: int,
+        rrf_k: int,
+        match: MatchMode,
+    ) -> list[dict]:
+        """The RRF merge of `query_hybrid`, on `conn` (the writer or the reader)."""
         overshoot = k * 2
-        vector_results = self.query_vector(embedding, k=overshoot)
-        fts_results = self.query_fts(text, k=overshoot, match=match)
+        vector_results = self._vector_rows(conn, embedding, overshoot)
+        fts_results = self._fts_rows(conn, text, overshoot, match)
 
         # Keyed by (path, heading) -- heading may be None for file-level chunks.
         merged: dict[tuple[str, str | None], dict] = {}

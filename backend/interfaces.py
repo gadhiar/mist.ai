@@ -141,6 +141,17 @@ class SidecarIndexProtocol(Protocol):
         rrf_k: int = 60,
         match: Literal["all", "any"] = "all",
     ) -> list[dict]: ...
+    async def query_hybrid_readonly(
+        self,
+        embedding: list[float],
+        text: str,
+        k: int = 10,
+        rrf_k: int = 60,
+        match: Literal["all", "any"] = "all",
+    ) -> list[dict]:
+        """`query_hybrid` on a read-only connection that never waits behind a reindex."""
+        ...
+
     def chunk_count(self) -> int: ...
     def distinct_paths(self) -> list[str]: ...
     def health_check(self) -> bool: ...
