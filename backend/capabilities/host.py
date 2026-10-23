@@ -18,14 +18,15 @@ log apply to all of them:
 Confirmation is cross-turn. A turn holds `generation_lock` until it ends, so a "yes" can never
 reach a turn that waits for it; a call that needs confirmation is stored as a proposal instead,
 and a later utterance (`pre_llm`) or the client's `action_decision` (`decide`) resolves it. Both
-can be in flight on the main loop at once, so each pops the proposal synchronously before its
-first await, and only one of them runs it.
+can be in flight on the main loop at once. Each takes the proposal with `ProposalStore.pop`,
+which is synchronous, so only the first to call it gets the proposal and runs it.
 
-The host never catches a bare `Exception`. The pipeline contains `CapabilityError` and the
-per-call timeout, and a decode contains `ActionDecodeError` and its timeout. Any other exception
-from `invoke`, `on_active_utterance` or `match_intent` reaches the host's caller: inside a turn,
-the turn's own error backstop. A capability's `start` runs in a task of its own, and a failure
-of any kind there makes that capability `unavailable`.
+The host never catches a bare `Exception`. The pipeline contains a `CapabilityError` from
+`invoke` and the per-call timeout, and a decode contains `ActionDecodeError` and its timeout.
+Any other exception from `invoke`, and any exception at all from `on_active_utterance` or
+`match_intent`, reaches the host's caller: inside a turn, the turn's own error backstop. A
+capability's `start` runs in a task of its own, and a failure of any kind there makes that
+capability `unavailable`.
 """
 
 from __future__ import annotations
@@ -226,7 +227,9 @@ class CapabilityHost(CapabilityTurnPort):
     session and delivered only through `drain_events`, so the `events` of the resolutions and
     results those methods return are empty. `decide` runs outside any turn: it returns its
     payload in `PreTurnResolution.events` and never touches a session's buffer. Expiry goes to
-    the event sink, because no turn is running when a proposal expires.
+    the event sink. The store reports it through `on_expire`, which has no turn to buffer for:
+    it runs from the store's timer task, outside any turn, or synchronously inside a `pop`,
+    which a turn's `pre_llm` can call.
     """
 
     def __init__(
@@ -254,7 +257,8 @@ class CapabilityHost(CapabilityTurnPort):
             decoder: Builds and parses the action decodes.
             secrets: Every secret value, for `redact`.
             action_log: Where each invocation is recorded.
-            event_sink: Receives payloads produced outside any turn (proposal expiry).
+            event_sink: Receives each proposal expiry, which the store reports from its timer
+                task or from inside `pop`.
             clock: Supplies call times, proposal deadlines and the expiry timer.
             settings: Timeouts, the proposal lifetime, the fast-path switch and wake words.
             timeout_runner: Bounds each invoke and decode; `asyncio.wait_for` by default.
@@ -393,7 +397,7 @@ class CapabilityHost(CapabilityTurnPort):
         if match is None:
             self._supersede_live(session_id)
         else:
-            # Popped before any await, so a concurrent `decide` finds nothing to run.
+            # `pop` is synchronous, so this turn and a concurrent `decide` cannot both get it.
             proposal = self._proposals.pop(session_id, None)
             if proposal is not None:
                 decision, remainder = match

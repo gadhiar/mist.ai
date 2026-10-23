@@ -168,7 +168,11 @@ class AlarmActionMessage(_Inbound):
 
 
 class EventSink(Protocol):
-    """Receives capability payloads produced outside any turn, such as a proposal's expiry."""
+    """Receives capability payloads that are broadcast rather than delivered with a turn.
+
+    A proposal's expiry is one: the store reports it from its timer task outside any turn, or
+    from inside a `pop` that a turn makes.
+    """
 
     def emit(self, payload: dict[str, object]) -> None:
         """Send one payload; safe to call from any thread."""
