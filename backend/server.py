@@ -83,6 +83,7 @@ from backend.knowledge.eval_isolation import (  # isort:skip
     is_hydration_isolation_active,
 )
 from backend.log_handler import WebSocketLogHandler  # isort:skip
+from backend.origins import allowed_origins, origin_allowed  # isort:skip
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -1298,14 +1299,24 @@ async def lifespan(app: FastAPI):
 # FastAPI app with lifespan
 app = FastAPI(title="Mist.AI Voice Server", lifespan=lifespan)
 
-# CORS for web frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Configure properly for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+def configure_cors(app: FastAPI) -> None:
+    """Add `CORSMiddleware` allowing only the browser origins in `allowed_origins()`.
+
+    A function rather than inline so the tests can configure a fresh app under a
+    changed `MIST_ALLOWED_ORIGINS` without reloading this module, because the
+    middleware reads its options once, here.
+    """
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(allowed_origins()),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+
+configure_cors(app)
 
 
 @app.get("/")
@@ -1578,7 +1589,16 @@ async def websocket_endpoint(websocket: WebSocket):
         discriminated error, status, log_config_ack, log,
         plus binary audio frames (MIST protocol: MSG_AUDIO_CHUNK /
         MSG_AUDIO_COMPLETE).
+
+    A browser origin outside `allowed_origins()` is closed with 1008 before
+    `accept`, because browsers apply no CORS to WebSockets (`backend/origins.py`).
     """
+    origin = websocket.headers.get("origin")
+    if not origin_allowed(origin, allowed_origins()):
+        logger.warning("WebSocket refused origin: %s", origin)
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept(headers=None)
     async with active_connections_lock:
         active_connections.add(websocket)
