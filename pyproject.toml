@@ -36,6 +36,8 @@ dependencies = [
     "pydantic>=2.10",
     "pydantic-settings>=2.5",
     "numpy>=1.26,<2",
+    "mcp>=2.3",
+    "tzdata>=2026.5",
 ]
 
 [project.optional-dependencies]
