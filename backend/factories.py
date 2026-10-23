@@ -906,6 +906,7 @@ def build_curation_scheduler(
     event_store: EventStoreProvider | None = None,
     tracker: "ToolUsageTracker | None" = None,  # noqa: F821
     llm_provider: StreamingLLMProvider | None = None,
+    defer_llm_jobs: Callable[[], bool] | None = None,
 ):
     """Create a fully wired CurationScheduler with all maintenance jobs.
 
@@ -938,6 +939,11 @@ def build_curation_scheduler(
             `phase: "llm_call"` JSONL records even when the gate is on, and
             the extra `LlamaServerProvider` opens a duplicate pair of OpenAI
             clients that nothing closes. Pass the live handler's provider.
+        defer_llm_jobs: True while gaming mode holds the GPU, which stops
+            mist-llm. The scheduler then skips `self_reflection`, the only job
+            built with the LLM (through `InternalKnowledgeDeriver`), without
+            advancing its `last_run`, so it runs once the deferral ends. None,
+            as with no gaming mode configured, never defers.
     """
     from backend.knowledge.curation.centrality import CentralityAnalyzer
     from backend.knowledge.curation.community import CommunityDetector
@@ -984,7 +990,7 @@ def build_curation_scheduler(
             (JobConfig(name="orphan_detection", interval_seconds=604800), OrphanDetector(executor)),
             (JobConfig(name="health_scoring", interval_seconds=86400), GraphHealthScorer(executor)),
             (
-                JobConfig(name="self_reflection", interval_seconds=86400),
+                JobConfig(name="self_reflection", interval_seconds=86400, requires_llm=True),
                 SelfReflectionJob(
                     executor=executor,
                     internal_deriver=internal_deriver,
@@ -1020,6 +1026,7 @@ def build_curation_scheduler(
         # the scheduler logs results and drops them, which is why
         # `CurationScheduler.__init__` warns rather than defaulting quietly.
         run_recorder=event_store,
+        defer_llm_jobs=defer_llm_jobs,
     )
 
 

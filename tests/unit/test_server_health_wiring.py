@@ -7,9 +7,12 @@ for a crash, an accessor that captured a value instead of reading one, and an
 endpoint that answers with a status code the hydrator cannot distinguish from a
 dead socket.
 
-No test here boots the ASGI lifespan. The pieces `lifespan` calls are module
-level for exactly that reason, so the sequence and the wiring are assertable
-without faking the model stack.
+Most tests here do not boot the ASGI lifespan. The pieces `lifespan` calls are
+module level for exactly that reason, so the sequence and the wiring are
+assertable without faking the model stack. The gaming-mode tests at the end
+are the exception: what they pin is which object `lifespan` hands to the voice
+processor, the probes and the curation scheduler, so they run `lifespan` with
+every builder that would reach the model stack, Neo4j or the vault replaced.
 
 `test_health_is_always_200` uses `fastapi.testclient.TestClient`, and that is
 the first use of it in `tests/` -- `grep -rln TestClient tests/` found nothing
@@ -25,6 +28,8 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -32,6 +37,7 @@ from fastapi.testclient import TestClient
 
 from backend import server
 from backend.extraction_contract.models import HealthResponse
+from backend.gpu_yield import GpuYield
 from backend.health import (
     BroadcasterProbe,
     BroadcasterState,
@@ -50,6 +56,7 @@ _GLOBALS = (
     "extraction_dispatcher",
     "_extraction_dispatcher_start_failed",
     "_extraction_health_client",
+    "_gpu_yield",
 )
 
 
@@ -148,13 +155,14 @@ class FakeIdleDispatcher:
         return extraction_status(None).model_copy(update={"state": "idle"})
 
 
-def build_server_registry(executor, settings: HealthProbeSettings | None = None):
+def build_server_registry(executor, settings: HealthProbeSettings | None = None, yield_state=None):
     """`_build_health_registry` with fakes for the extraction service and settings."""
     return server._build_health_registry(
         executor,
         BroadcasterState(),
         FakeExtractionInference(),
         settings if settings is not None else HealthProbeSettings(),
+        yield_state=yield_state,
     )
 
 
@@ -178,7 +186,7 @@ async def test_models_loaded_is_false_during_initialize():
     release = asyncio.Event()
 
     class FakeVoiceProcessor:
-        async def initialize(self) -> None:
+        async def initialize(self, *, yielded: bool = False) -> None:
             initializing.set()
             await release.wait()
 
@@ -647,3 +655,247 @@ def test_extraction_service_url_survives_a_malformed_dispatcher_setting(monkeypa
     monkeypatch.setenv("MIST_EXTRACTION_SERVICE_URL", "http://extraction-host:8090")
 
     assert server._extraction_service_url() == "http://extraction-host:8090"
+
+
+# -- Gaming mode ---------------------------------------------------------------
+
+
+def _noop() -> None:
+    return None
+
+
+def _failing_resume() -> None:
+    raise RuntimeError("no memory for Whisper")
+
+
+def _marked(tmp_path) -> Path:
+    marker = tmp_path / "gpu-yielded"
+    marker.write_text('{"v": 1, "since": "2026-10-23T00:00:00Z", "by": "manual"}')
+    return marker
+
+
+@pytest.mark.asyncio
+async def test_llm_check_reads_yielded_from_the_yield_state(executor, tmp_path):
+    gpu = GpuYield(_marked(tmp_path), _noop, _noop, poll_s=2.0)
+    registry = build_server_registry(executor, yield_state=gpu.state)
+    server._health_registry = registry
+
+    await registry.run_once()
+    payload = await server.health()
+
+    llm = payload["checks"]["llm"]
+    assert (llm["status"], llm["reason"]) == ("yielded", "gpu_yielded")
+    assert payload["status"] == "yielded"
+    assert payload["restart_recommended"] is False
+
+
+@pytest.mark.asyncio
+async def test_llm_check_reads_down_when_the_reload_failed(executor, tmp_path):
+    marker = _marked(tmp_path)
+    gpu = GpuYield(marker, _noop, _failing_resume, poll_s=2.0)
+    marker.unlink()
+    await gpu.poll_once()
+    registry = build_server_registry(executor, yield_state=gpu.state)
+
+    await registry.run_once()
+
+    llm = registry.snapshot()["checks"]["llm"]
+    assert (llm["status"], llm["reason"]) == ("down", "resume_failed")
+
+
+class FakeLifespanVoiceProcessor:
+    """What `lifespan` constructs in place of `VoiceProcessor`: no models."""
+
+    instances: list["FakeLifespanVoiceProcessor"] = []
+
+    def __init__(self, config, message_queue, **kwargs) -> None:
+        self.models = None
+        self.initialized_with: dict | None = None
+        self.gpu_yield_tasks_during_initialize: list[asyncio.Task] | None = None
+        FakeLifespanVoiceProcessor.instances.append(self)
+
+    async def initialize(self, *, yielded: bool = False) -> None:
+        self.initialized_with = {"yielded": yielded}
+        # The poll must start only after the model manager exists: a poll
+        # running during the load could release or reload a Whisper that is
+        # still being built.
+        self.gpu_yield_tasks_during_initialize = _gpu_yield_tasks()
+
+
+class FakeScheduler:
+    async def start(self) -> bool:
+        return False
+
+    async def stop(self) -> None:
+        return None
+
+
+@pytest.fixture
+def lifespan_harness(monkeypatch, tmp_path):
+    """Run the real `lifespan` with nothing behind it.
+
+    The builders that would open the vault, Neo4j or the model stack return
+    None or fakes, the file log and the system-status task are switched off,
+    and every global `lifespan` rebinds is restored afterwards. What is left
+    is the wiring under test: the yield state, the voice processor's
+    `initialize` call, the probe registry and the curation scheduler call.
+    """
+    for name in (
+        "voice_processor",
+        "curation_scheduler",
+        "log_handler",
+        "extraction_dispatcher",
+        "vault_writer",
+        "vault_sidecar",
+        "vault_filewatcher",
+        "vault_invalidation_bus",
+        "_broadcaster_state",
+        "_health_registry",
+        "_health_probe_executor",
+        "_extraction_health_client",
+        "_extraction_dispatcher_start_failed",
+        "_gpu_yield",
+        "_models_ready",
+    ):
+        monkeypatch.setattr(server, name, getattr(server, name))
+    monkeypatch.setattr(server, "message_queue", asyncio.Queue())
+    monkeypatch.setattr(server, "configure_file_logging", lambda log_dir: None)
+    monkeypatch.setattr(server, "build_vault_writer", lambda *a, **k: None)
+    monkeypatch.setattr(server, "build_sidecar_index", lambda *a, **k: None)
+    monkeypatch.setattr(server, "build_phase3_components", lambda *a, **k: None)
+    FakeLifespanVoiceProcessor.instances = []
+    monkeypatch.setattr(server, "VoiceProcessor", FakeLifespanVoiceProcessor)
+    scheduler_kwargs: dict = {}
+
+    def fake_build_curation_scheduler(config, **kwargs):
+        scheduler_kwargs.update(kwargs)
+        return FakeScheduler()
+
+    monkeypatch.setattr(server, "build_curation_scheduler", fake_build_curation_scheduler)
+    monkeypatch.delenv("MIST_OPS_DIR", raising=False)
+    monkeypatch.delenv("MIST_BACKUP_STATUS_PATH", raising=False)
+    monkeypatch.delenv("MIST_GPU_YIELD_POLL_S", raising=False)
+
+    def configure(*, tts_enabled: bool) -> None:
+        system_status = server.config.system_status.model_copy(update={"enabled": False})
+        monkeypatch.setattr(
+            server,
+            "config",
+            server.config.model_copy(
+                update={"tts_enabled": tts_enabled, "system_status": system_status}
+            ),
+        )
+
+    return SimpleNamespace(configure=configure, scheduler_kwargs=scheduler_kwargs)
+
+
+def _gpu_yield_tasks() -> list[asyncio.Task]:
+    return [t for t in asyncio.all_tasks() if t.get_name() == "gpu-yield"]
+
+
+@pytest.mark.asyncio
+async def test_lifespan_without_ops_dir_builds_no_gpu_yield(lifespan_harness):
+    lifespan_harness.configure(tts_enabled=False)
+
+    async with server.lifespan(server.app):
+        await server._health_registry.run_once()
+        llm = server._health_registry.snapshot()["checks"]["llm"]
+        voice_processor = FakeLifespanVoiceProcessor.instances[0]
+        tasks = _gpu_yield_tasks()
+
+    assert server._gpu_yield is None
+    assert tasks == []
+    assert voice_processor.initialized_with == {"yielded": False}
+    assert lifespan_harness.scheduler_kwargs["defer_llm_jobs"] is None
+    # No yield state reaches the probe, so the llm check asks the provider.
+    assert (llm["status"], llm["reason"]) == ("down", "unavailable_at_boot")
+
+
+@pytest.mark.asyncio
+async def test_lifespan_with_a_marker_boots_yielded_and_wires_every_reader(
+    lifespan_harness, monkeypatch, tmp_path
+):
+    lifespan_harness.configure(tts_enabled=False)
+    _marked(tmp_path)
+    monkeypatch.setenv("MIST_OPS_DIR", str(tmp_path))
+
+    async with server.lifespan(server.app):
+        gpu = server._gpu_yield
+        await server._health_registry.run_once()
+        payload = await server.health()
+        voice_processor = FakeLifespanVoiceProcessor.instances[0]
+        tasks = _gpu_yield_tasks()
+
+    assert isinstance(gpu, GpuYield)
+    assert gpu.state() == "yielded"
+    assert voice_processor.initialized_with == {"yielded": True}
+    assert lifespan_harness.scheduler_kwargs["defer_llm_jobs"] == gpu.is_yielded
+    assert (payload["checks"]["llm"]["status"], payload["checks"]["llm"]["reason"]) == (
+        "yielded",
+        "gpu_yielded",
+    )
+    assert payload["status"] == "yielded"
+    assert len(tasks) == 1
+    assert tasks[0].done()
+    assert voice_processor.gpu_yield_tasks_during_initialize == []
+
+
+class ResumeBug:
+    """A model manager whose reload raises an error `GpuYield` does not catch."""
+
+    knowledge = None
+
+    def reacquire_gpu_models(self) -> None:
+        raise ValueError("unexpected reload failure")
+
+    def shutdown(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_a_dead_gpu_yield_poll_logs_one_error_naming_the_exception_class(
+    lifespan_harness, monkeypatch, tmp_path, caplog
+):
+    lifespan_harness.configure(tts_enabled=False)
+    marker = _marked(tmp_path)
+    monkeypatch.setenv("MIST_OPS_DIR", str(tmp_path))
+    monkeypatch.setenv("MIST_GPU_YIELD_POLL_S", "0.01")
+
+    with caplog.at_level(logging.ERROR, logger="backend.server"):
+        async with server.lifespan(server.app):
+            server.voice_processor.models = ResumeBug()
+            (task,) = _gpu_yield_tasks()
+            marker.unlink()
+            await asyncio.wait([task], timeout=5.0)
+            state = server._gpu_yield.state()
+
+    assert task.done() and not task.cancelled()
+    assert isinstance(task.exception(), ValueError)
+    died = [r for r in caplog.records if r.levelno >= logging.ERROR and "poll" in r.getMessage()]
+    assert len(died) == 1
+    assert "ValueError" in died[0].getMessage()
+    assert state == "yielded"
+
+
+@pytest.mark.asyncio
+async def test_lifespan_with_tts_on_logs_the_conflict_and_builds_no_gpu_yield(
+    lifespan_harness, monkeypatch, tmp_path, caplog
+):
+    lifespan_harness.configure(tts_enabled=True)
+    _marked(tmp_path)
+    monkeypatch.setenv("MIST_OPS_DIR", str(tmp_path))
+
+    with caplog.at_level(logging.ERROR, logger="backend.server"):
+        async with server.lifespan(server.app):
+            voice_processor = FakeLifespanVoiceProcessor.instances[0]
+
+    conflict = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.ERROR and "MIST_OPS_DIR" in r.getMessage()
+    ]
+    assert len(conflict) == 1
+    assert "TTS" in conflict[0]
+    assert server._gpu_yield is None
+    assert voice_processor.initialized_with == {"yielded": False}
+    assert lifespan_harness.scheduler_kwargs["defer_llm_jobs"] is None
