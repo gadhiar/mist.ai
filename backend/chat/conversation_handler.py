@@ -9,6 +9,7 @@ Enables LLM to autonomously:
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import math
 import random
@@ -44,6 +45,8 @@ from backend.llm.models import LLMResponse, UsageMetadata
 from backend.llm.models import ToolCall as LLMToolCall
 from backend.sentence_detector import SentenceBoundaryDetector
 from backend.vault.conventions import ConventionsLoader
+
+from .turn_scope import TurnScope
 
 if TYPE_CHECKING:
     from backend.chat.hydration_clock import HydrationClock
@@ -960,23 +963,21 @@ class ConversationHandler:
         self._slop_detector = SlopDetector()
         self._slop_max_regen_attempts = 2
 
-        # ADR-017 Wave 2: per-turn FE-bound event buffer. Reset at the top of
-        # every handle_message; appended during tool dispatch
-        # (tool_call_started/completed, cards_summon/dismiss, graph_subgraph);
-        # drained by handle_message_streaming as WSEvent yields before Token
-        # chars so the bridge forwards them to the canonical message_queue.
-        self._turn_ws_events: list[dict[str, Any]] = []
-
-        # ADR-017 Wave 2: per-turn context used by tool handlers that need
-        # session/turn awareness (graph_subgraph distant-points RNG seed).
-        # Set at the top of handle_message; read inside dispatch handlers.
-        self._current_session_id: str | None = None
-        self._current_turn_index: int = 0
+        # Source of `TurnScope.turn_index`. Per-turn state (the ADR-017
+        # FE-bound event buffer, session id, turn index) lives on the
+        # `TurnScope` each turn creates, not on this shared handler, so
+        # concurrent turns in different sessions cannot see each other's
+        # events. The counter itself stays handler-wide and monotonic: a
+        # session's graph seeds keep the values they had when the index was a
+        # handler attribute.
+        self._turn_indices = itertools.count(1)
 
         logger.info("ConversationHandler initialized with model: %s", llm_provider.model)
 
     async def _handle_query_knowledge_graph(
         self,
+        scope: TurnScope,
+        /,
         query: str,
         entity_types: list[str] | None = None,
         relationship_types: list[str] | None = None,
@@ -986,9 +987,15 @@ class ConversationHandler:
         """Execute the query_knowledge_graph tool.
 
         ADR-017 Wave 2: on successful retrieval with at least one fact,
-        appends a graph_subgraph WS event to the per-turn buffer so the
-        FE graph form can render the focal + neighbors. Empty retrievals
-        skip the emit (the FE keeps prior graphData).
+        appends a graph_subgraph WS event to `scope`'s buffer, seeded with
+        `scope.graph_seed`, so the FE graph form can render the focal +
+        neighbors. Empty retrievals skip the emit (the FE keeps prior
+        graphData).
+
+        `scope` is positional-only, like every tool handler's, which keeps
+        it out of the keyword namespace the LLM's arguments arrive in: a
+        model-supplied `scope` argument fails with a `TypeError` naming the
+        positional-only parameter.
 
         LLM-context split (BE/FE differentiation):
         - 'compact' (default): the LLM-facing result is the focal entity
@@ -1024,12 +1031,9 @@ class ConversationHandler:
             # ADR-017 Wave 2: emit graph_subgraph alongside the textual
             # tool result so the FE renders the focal + depth-1 neighborhood
             # for this query. Seed RNG with session+turn for layout stability.
-            graph_payload = _build_graph_subgraph_payload(
-                result,
-                seed=f"{self._current_session_id}:{self._current_turn_index}",
-            )
+            graph_payload = _build_graph_subgraph_payload(result, seed=scope.graph_seed)
             if graph_payload is not None:
-                self._turn_ws_events.append(graph_payload)
+                scope.emit(graph_payload)
 
             if verbosity == "full":
                 return result.formatted_context
@@ -1041,6 +1045,8 @@ class ConversationHandler:
 
     async def _handle_query_vault(
         self,
+        scope: TurnScope,
+        /,
         query: str,
         limit: int = 5,
         display_hint: str = "auto",
@@ -1105,7 +1111,7 @@ class ConversationHandler:
 
             vault_facts = [f for f in result.facts if f.subject == "VaultNote"]
             if vault_facts:
-                self._turn_ws_events.append(
+                scope.emit(
                     _build_vault_results_payload(
                         query=query,
                         facts=vault_facts,
@@ -1118,7 +1124,7 @@ class ConversationHandler:
             logger.error("Error querying vault: %s", e)
             return f"Error searching vault: {e!s}"
 
-    async def _handle_switch_form(self, form: str, reason: str) -> str:
+    async def _handle_switch_form(self, scope: TurnScope, /, form: str, reason: str) -> str:
         """Execute the frontend.switch_form tool.
 
         Appends a form_switch WS event with the target form + reason per
@@ -1129,7 +1135,7 @@ class ConversationHandler:
             raise ValueError(f"invalid form: {form!r}; must be one of ['ring', 'cloud', 'graph']")
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("reason must be a non-empty string")
-        self._turn_ws_events.append(
+        scope.emit(
             {
                 "type": "form_switch",
                 "form": form,
@@ -1138,11 +1144,13 @@ class ConversationHandler:
         )
         return f"Switched to {form} form"
 
-    async def _handle_summon_cards(self, header: str, cards: list[dict[str, Any]]) -> str:
+    async def _handle_summon_cards(
+        self, scope: TurnScope, /, header: str, cards: list[dict[str, Any]]
+    ) -> str:
         """Execute the frontend.summon_cards tool.
 
         Normalizes each card's pattern (default 'lines'), validates against
-        the closed enum, then appends a cards_summon WS event to the per-turn
+        the closed enum, then appends a cards_summon WS event to `scope`'s
         buffer per ADR-017 Wave 2. Returns a short string to the LLM so the
         final-pass response can reference what was displayed.
         """
@@ -1165,22 +1173,20 @@ class ConversationHandler:
                     f" must be one of {sorted(_VALID_CARD_PATTERNS)}"
                 )
             normalized.append({"id": card_id, "label": label, "pattern": pattern})
-        self._turn_ws_events.append(
-            {"type": "cards_summon", "panel": {"header": header, "cards": normalized}}
-        )
+        scope.emit({"type": "cards_summon", "panel": {"header": header, "cards": normalized}})
         return f"Displayed {len(normalized)} cards"
 
-    async def _handle_dismiss_cards(self) -> str:
+    async def _handle_dismiss_cards(self, scope: TurnScope, /) -> str:
         """Execute the frontend.dismiss_cards tool.
 
-        Appends a cards_dismiss WS event (empty payload per ADR-017) to the
-        per-turn buffer. Returns a short string to the LLM.
+        Appends a cards_dismiss WS event (empty payload per ADR-017) to
+        `scope`'s buffer. Returns a short string to the LLM.
         """
-        self._turn_ws_events.append({"type": "cards_dismiss"})
+        scope.emit({"type": "cards_dismiss"})
         return "Dismissed cards panel"
 
-    async def _dispatch_tool(self, tool_call: LLMToolCall) -> str:
-        """Dispatch a tool call to its handler.
+    async def _dispatch_tool(self, scope: TurnScope, tool_call: LLMToolCall) -> str:
+        """Dispatch a tool call to its handler, within the turn's `scope`.
 
         Raises ToolNotFoundError when the LLM calls a tool name not in the
         handler registry. The observability wrap catches and emits as a
@@ -1197,14 +1203,16 @@ class ConversationHandler:
         handler = handlers.get(tool_call.name)
         if handler is None:
             raise _ToolNotFoundError(tool_call.name)
-        return await handler(**tool_call.arguments)
+        return await handler(scope, **tool_call.arguments)
 
-    async def _dispatch_tool_with_observability(self, tool_call: LLMToolCall) -> str:
+    async def _dispatch_tool_with_observability(
+        self, scope: TurnScope, tool_call: LLMToolCall
+    ) -> str:
         """Dispatch a tool call with FE-bound observability events.
 
         Appends tool_call_started before _dispatch_tool runs and
-        tool_call_completed after (success or failure) into the per-turn
-        WS event buffer. Returns the tool result string; on exception,
+        tool_call_completed after (success or failure) into `scope`'s WS
+        event buffer. Returns the tool result string; on exception,
         substitutes a "Tool error: ..." sentinel and records a sanitized
         error label on the completed event (type name + message; no
         repr() that could leak module paths or internal state).
@@ -1217,7 +1225,7 @@ class ConversationHandler:
         # and JSONL records all join on ONE tool_call_id (ADR-017 UUID
         # convention); mint only when the provider sent none.
         tool_call_id = tool_call.id or str(uuid.uuid4())
-        self._turn_ws_events.append(
+        scope.emit(
             {
                 "type": "tool_call_started",
                 "tool_call_id": tool_call_id,
@@ -1228,7 +1236,7 @@ class ConversationHandler:
         start = time.perf_counter()
         error: str | None = None
         try:
-            tool_result = await self._dispatch_tool(tool_call)
+            tool_result = await self._dispatch_tool(scope, tool_call)
         except _ToolNotFoundError as exc:
             tool_result = (
                 f"Tool not found: {exc.tool_name}." " Pick a tool from the registered catalog."
@@ -1241,7 +1249,7 @@ class ConversationHandler:
             # detail that the FE has no business displaying.
             error = f"{type(exc).__name__}: {exc}"
         duration_ms = int((time.perf_counter() - start) * 1000)
-        self._turn_ws_events.append(
+        scope.emit(
             {
                 "type": "tool_call_completed",
                 "tool_call_id": tool_call_id,
@@ -1454,19 +1462,13 @@ class ConversationHandler:
         )
         return self._slop_detector.strip_fixable(sentence)
 
-    def _pop_turn_ws_events(self) -> list[dict[str, Any]]:
-        """Atomically drain the per-turn ADR-017 WS event buffer.
+    def _new_turn_scope(self, session_id: str) -> TurnScope:
+        """Create the `TurnScope` for a turn that is starting.
 
-        Used both for the inline drain right after each tool dispatch (so
-        tool_call_started/completed reach the caller as they happen rather
-        than batched at end of turn, T3/v2) and for the top-level `finally`
-        safety net in `handle_message_streaming` that guarantees no
-        `tool_call_started` is ever left unpaired even if something raises
-        between the two.
+        `next()` on the counter has no await around it, so two turns starting
+        concurrently always get distinct indices.
         """
-        events = self._turn_ws_events
-        self._turn_ws_events = []
-        return events
+        return TurnScope(session_id=session_id, turn_index=next(self._turn_indices))
 
     async def _stream_llm_pass(
         self,
@@ -1742,13 +1744,12 @@ class ConversationHandler:
             2, plus one error Token on the error path), and a single
             terminal Complete event.
         """
-        # ADR-017 Wave 2: clear per-turn FE-bound event buffer. Events
-        # (tool_call_*, cards_*, graph_subgraph) accumulate here during this
-        # turn and are drained as WSEvent yields, inline after each tool
-        # dispatch and as a safety net in the top-level `finally` below.
-        self._turn_ws_events = []
-        self._current_session_id = session_id
-        self._current_turn_index += 1
+        # ADR-017 Wave 2: this turn's FE-bound events (tool_call_*, cards_*,
+        # graph_subgraph) accumulate on its own scope and are drained as
+        # WSEvent yields, inline after each tool dispatch and as a safety net
+        # in the top-level `finally` below. A concurrent turn in another
+        # session has its own scope, so neither drains the other's events.
+        scope = self._new_turn_scope(session_id)
 
         # Get or create session
         session = self.get_or_create_session(session_id, user_id)
@@ -1862,10 +1863,10 @@ class ConversationHandler:
                     # ADR-017 Wave 2: dispatch with observability wrap. Emits
                     # tool_call_started before _dispatch_tool runs and
                     # tool_call_completed after (success or failure) into the
-                    # per-turn buffer. T3/v2: drained immediately below so the
-                    # pair reaches the caller as it happens.
-                    tool_result = await self._dispatch_tool_with_observability(tc)
-                    for payload in self._pop_turn_ws_events():
+                    # turn scope's buffer. T3/v2: drained immediately below so
+                    # the pair reaches the caller as it happens.
+                    tool_result = await self._dispatch_tool_with_observability(scope, tc)
+                    for payload in scope.drain_ws_events():
                         if payload.get("type") == "tool_call_started":
                             tool_calls_used += 1
                         yield WSEvent(payload=payload)
@@ -2098,7 +2099,7 @@ class ConversationHandler:
             # the tool loop) is drained here so tool_call_started never
             # orphans a missing tool_call_completed, even across an
             # exception raised between the two.
-            for payload in self._pop_turn_ws_events():
+            for payload in scope.drain_ws_events():
                 if payload.get("type") == "tool_call_started":
                     tool_calls_used += 1
                 yield WSEvent(payload=payload)
