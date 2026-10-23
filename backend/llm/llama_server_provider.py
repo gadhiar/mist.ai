@@ -22,6 +22,21 @@ from backend.llm.provider import StreamingLLMProvider
 logger = logging.getLogger(__name__)
 
 
+async def _close_stream(stream: object) -> None:
+    """Close a streaming chat-completions response.
+
+    The openai client returns an `AsyncStream`, whose async `close()` closes
+    the underlying HTTP response. Any other async iterator handed back in its
+    place (an async generator has `aclose()`, not `close()`) is closed through
+    `aclose()` when it has one.
+    """
+    close = getattr(stream, "close", None)
+    if close is None:
+        close = getattr(stream, "aclose", None)
+    if close is not None:
+        await close()
+
+
 class LlamaServerProvider(StreamingLLMProvider):
     """StreamingLLMProvider backed by llama-server's OpenAI-compatible API."""
 
@@ -170,45 +185,54 @@ class LlamaServerProvider(StreamingLLMProvider):
     async def generate(
         self, request: LLMRequest, *, stream: bool = False
     ) -> AsyncGenerator[LLMResponse, None]:
-        """Generate via async OpenAI client. Yields partial or complete responses."""
+        """Generate via async OpenAI client. Yields partial or complete responses.
+
+        The streaming HTTP response is closed in `finally`, so a consumer
+        that stops early (a cancelled turn, a `break` followed by `aclose()`)
+        releases the llama-server connection at that moment instead of
+        leaving the server generating tokens nobody reads.
+        """
         kwargs = self._build_kwargs(request, stream)
 
         if stream:
             response = await self._async_client.chat.completions.create(**kwargs)
-            tool_call_acc: dict[int, dict[str, Any]] = {}
-            reasoning_parts: list[str] = []
-            finish_reason: str | None = None
-            usage: UsageMetadata | None = None
-            async for chunk in response:
-                chunk_usage = getattr(chunk, "usage", None)
-                if chunk_usage:
-                    usage = self._parse_usage(chunk_usage)
-                if not chunk.choices:
-                    # The final usage-only chunk (stream_options.include_usage)
-                    # has no choices at all.
-                    continue
-                choice = chunk.choices[0]
-                delta = choice.delta
-                content = getattr(delta, "content", None)
-                if content:
-                    yield LLMResponse(content=content, partial=True)
-                reasoning_piece = getattr(delta, "reasoning_content", None)
-                if reasoning_piece:
-                    reasoning_parts.append(reasoning_piece)
-                tool_call_deltas = getattr(delta, "tool_calls", None)
-                if tool_call_deltas:
-                    self._accumulate_tool_call_deltas(tool_call_acc, tool_call_deltas)
-                choice_finish_reason = getattr(choice, "finish_reason", None)
-                if choice_finish_reason:
-                    finish_reason = choice_finish_reason
-            yield LLMResponse(
-                content=None,
-                tool_calls=self._finalize_tool_calls(tool_call_acc),
-                reasoning_content="".join(reasoning_parts) or None,
-                finish_reason=finish_reason,
-                usage=usage,
-                partial=False,
-            )
+            try:
+                tool_call_acc: dict[int, dict[str, Any]] = {}
+                reasoning_parts: list[str] = []
+                finish_reason: str | None = None
+                usage: UsageMetadata | None = None
+                async for chunk in response:
+                    chunk_usage = getattr(chunk, "usage", None)
+                    if chunk_usage:
+                        usage = self._parse_usage(chunk_usage)
+                    if not chunk.choices:
+                        # The final usage-only chunk (stream_options.include_usage)
+                        # has no choices at all.
+                        continue
+                    choice = chunk.choices[0]
+                    delta = choice.delta
+                    content = getattr(delta, "content", None)
+                    if content:
+                        yield LLMResponse(content=content, partial=True)
+                    reasoning_piece = getattr(delta, "reasoning_content", None)
+                    if reasoning_piece:
+                        reasoning_parts.append(reasoning_piece)
+                    tool_call_deltas = getattr(delta, "tool_calls", None)
+                    if tool_call_deltas:
+                        self._accumulate_tool_call_deltas(tool_call_acc, tool_call_deltas)
+                    choice_finish_reason = getattr(choice, "finish_reason", None)
+                    if choice_finish_reason:
+                        finish_reason = choice_finish_reason
+                yield LLMResponse(
+                    content=None,
+                    tool_calls=self._finalize_tool_calls(tool_call_acc),
+                    reasoning_content="".join(reasoning_parts) or None,
+                    finish_reason=finish_reason,
+                    usage=usage,
+                    partial=False,
+                )
+            finally:
+                await _close_stream(response)
         else:
             response = await self._async_client.chat.completions.create(**kwargs)
             message = response.choices[0].message
