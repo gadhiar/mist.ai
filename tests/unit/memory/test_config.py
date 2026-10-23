@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import backend.memory.config as memory_config
 from backend.errors import MemoryConfigError, MistError
 from backend.memory.config import MEMORY_ENV_VARS, MemoryConfig
 
@@ -19,9 +20,14 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 @pytest.fixture(autouse=True)
 def _clear_memory_env(monkeypatch):
-    """Start every test with no MIST_MEMORY_* variable set, whatever the process holds."""
+    """Start every test with no MIST_MEMORY_* variable set and the unset-zone warning unsent.
+
+    The warning is once per process, so an earlier test that built a config would otherwise
+    have spent it; monkeypatch restores the flag afterwards, so nothing leaks between tests.
+    """
     for name in MEMORY_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(memory_config, "_tz_unset_warned", False)
 
 
 def _never_called(name: str) -> tzinfo:
@@ -173,6 +179,15 @@ class TestZone:
         assert config.tz is UTC
         assert config.tz_name is None
         assert any("MIST_MEMORY_TZ" in record.getMessage() for record in caplog.records)
+
+    def test_unset_zone_warns_once_per_process(self, caplog):
+        """Startup builds the config several times and health probes can rebuild it; warn once."""
+        with caplog.at_level("WARNING", logger="backend.memory.config"):
+            configs = [MemoryConfig.from_env(tz_resolver=_never_called) for _ in range(3)]
+
+        warnings = [r for r in caplog.records if "MIST_MEMORY_TZ" in r.getMessage()]
+        assert len(warnings) == 1
+        assert all(config.tz is UTC for config in configs)
 
     def test_blank_zone_counts_as_unset(self, monkeypatch):
         monkeypatch.setenv("MIST_MEMORY_TZ", "")
