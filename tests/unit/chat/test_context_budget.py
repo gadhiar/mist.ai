@@ -29,7 +29,43 @@ from backend.chat.context_budget import (
     score_fact_for_retrieval_pruning,
 )
 from backend.knowledge.config import ContextBudgetConfig
-from backend.knowledge.models import RetrievalResult, RetrievedFact
+from backend.knowledge.models import RetrievalResult, RetrievedFact, fact_ref
+
+# ---------------------------------------------------------------------------
+# Plan identity invariants, checked on every plan() in this module
+# ---------------------------------------------------------------------------
+
+
+def _assert_plan_identities(plan: BudgetPlan, retrieval_result: RetrievalResult | None) -> None:
+    assert plan.facts_kept == len(plan.kept_fact_refs)
+    assert plan.facts_dropped == len(plan.dropped_fact_refs)
+    # The planner re-renders exactly when the scored path ran, which is when it
+    # emits text other than the retriever's own block. Passing the block
+    # through is not a re-render; emitting "" because no fact fits is one.
+    passed_through = (
+        retrieval_result is not None
+        and plan.pruned_retrieval_text == retrieval_result.formatted_context
+    )
+    assert plan.retrieval_rerendered == (
+        plan.pruned_retrieval_text is not None and not passed_through
+    )
+
+
+@pytest.fixture(autouse=True)
+def _check_every_plan(monkeypatch):
+    """Spy on `plan()` so every planner test in this module, old and new, also
+    proves the kept/dropped refs agree with the counts. Removing the fixture
+    drops that coverage from the pre-existing tests silently.
+    """
+    original = ContextBudgetPlanner.plan
+
+    def checked(self, **kwargs):
+        plan = original(self, **kwargs)
+        _assert_plan_identities(plan, kwargs.get("retrieval_result"))
+        return plan
+
+    monkeypatch.setattr(ContextBudgetPlanner, "plan", checked)
+
 
 # ---------------------------------------------------------------------------
 # Factories
@@ -507,3 +543,132 @@ class TestBudgetPlanDataclass:
         )
         with pytest.raises((AttributeError, TypeError)):
             plan.fits = False  # type: ignore[misc]
+
+    def test_identity_fields_default_to_empty_and_false(self):
+        plan = BudgetPlan(
+            fits=True,
+            total_budget=100,
+            fixed_cost=10,
+            retrieval_budget=30,
+            history_budget=60,
+            pruned_retrieval_text=None,
+            pruned_history=[],
+            retrieval_used=0,
+            history_used=0,
+            facts_kept=0,
+            facts_dropped=0,
+        )
+
+        assert plan.kept_fact_refs == ()
+        assert plan.dropped_fact_refs == ()
+        assert plan.retrieval_rerendered is False
+
+
+# ---------------------------------------------------------------------------
+# Kept and dropped fact refs
+# ---------------------------------------------------------------------------
+
+
+def _pruning_config(retrieval_budget_ratio: float = 0.1) -> ContextBudgetConfig:
+    return _default_config(
+        context_window=500,
+        output_reserve_tokens=50,
+        safety_margin_tokens=10,
+        retrieval_budget_ratio=retrieval_budget_ratio,
+    )
+
+
+def _plan(planner: ContextBudgetPlanner, result: RetrievalResult | None, **overrides):
+    kwargs = {
+        "persona_text": "p",
+        "static_text": "s",
+        "retrieval_result": result,
+        "live_advisory_text": None,
+        "history": [],
+        "tools": None,
+        "max_output_tokens": 50,
+    }
+    kwargs.update(overrides)
+    return planner.plan(**kwargs)
+
+
+def _ranked_facts() -> list[RetrievedFact]:
+    return [
+        _make_fact(subject="L1", similarity=0.1),
+        _make_fact(subject="H", similarity=0.95),
+        _make_fact(subject="L2", similarity=0.2),
+        _make_fact(subject="L3", similarity=0.3),
+    ]
+
+
+class TestBudgetPlanFactRefs:
+    def test_pass_through_keeps_every_fact_in_retrieval_order(self):
+        planner = ContextBudgetPlanner(config=_default_config())
+        facts = _ranked_facts()
+        result = _make_retrieval_result(facts)
+
+        plan = _plan(planner, result, max_output_tokens=100)
+
+        assert plan.kept_fact_refs == tuple(fact_ref(f) for f in facts)
+        assert plan.dropped_fact_refs == ()
+        assert plan.retrieval_rerendered is False
+
+    def test_scored_path_reports_kept_in_score_order_and_the_rest_dropped(self):
+        planner = ContextBudgetPlanner(config=_pruning_config())
+        facts = _ranked_facts()
+        result = _make_retrieval_result(facts, formatted="BIG HEADER " * 200)
+
+        plan = _plan(planner, result)
+
+        by_score = [facts[1], facts[3], facts[2], facts[0]]
+        kept = plan.facts_kept
+        assert 0 < kept < len(facts)
+        assert plan.kept_fact_refs == tuple(fact_ref(f) for f in by_score[:kept])
+        assert plan.dropped_fact_refs == tuple(fact_ref(f) for f in by_score[kept:])
+        assert plan.retrieval_rerendered is True
+
+    def test_scored_path_that_keeps_nothing_still_counts_as_rerendered(self):
+        planner = ContextBudgetPlanner(config=_pruning_config(retrieval_budget_ratio=0.01))
+        facts = _ranked_facts()
+        result = _make_retrieval_result(facts, formatted="BIG HEADER " * 200)
+
+        plan = _plan(planner, result)
+
+        assert plan.pruned_retrieval_text == ""
+        assert plan.kept_fact_refs == ()
+        assert len(plan.dropped_fact_refs) == len(facts)
+        assert plan.retrieval_rerendered is True
+
+    def test_plan_that_does_not_fit_drops_every_fact(self):
+        planner = ContextBudgetPlanner(config=_default_config(context_window=200))
+        facts = _ranked_facts()
+        result = _make_retrieval_result(facts)
+
+        plan = _plan(planner, result, persona_text="p" * 5000)
+
+        assert plan.fits is False
+        assert plan.kept_fact_refs == ()
+        assert plan.dropped_fact_refs == tuple(fact_ref(f) for f in facts)
+        assert plan.retrieval_rerendered is False
+
+    def test_no_retrieval_reports_no_refs(self):
+        planner = ContextBudgetPlanner(config=_default_config())
+
+        plan = _plan(planner, None)
+
+        assert plan.kept_fact_refs == ()
+        assert plan.dropped_fact_refs == ()
+        assert plan.retrieval_rerendered is False
+
+    def test_rerender_leaves_the_prompt_text_unchanged(self):
+        planner = ContextBudgetPlanner(config=_pruning_config())
+        result = _make_retrieval_result(_ranked_facts(), formatted="BIG HEADER " * 200)
+
+        plan = _plan(planner, result)
+
+        assert plan.pruned_retrieval_text == (
+            "Relevant knowledge from your graph (query: 'test query'):\n"
+            + "".join(
+                f"- {s} -[USES]-> Python\n" for s in ("H", "L3", "L2", "L1")[: plan.facts_kept]
+            )
+        )
