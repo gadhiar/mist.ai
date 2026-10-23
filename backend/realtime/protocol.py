@@ -32,6 +32,8 @@ from pydantic import (
     RootModel,
     SerializerFunctionWrapHandler,
     ValidationError,
+    ValidationInfo,
+    field_validator,
     model_serializer,
 )
 
@@ -52,6 +54,7 @@ DOWNLINK_SAMPLE_RATE = 24000
 PCM16_SAMPLE_BYTES = 2
 MAX_TURN_TAG = 0xFFFF
 MAX_SEQ = 0xFFFFFFFF
+MAX_REQ = 0xFFFFFFFF
 
 
 class MsgType(IntEnum):
@@ -93,7 +96,12 @@ class Frame:
     Attributes:
         msg_type: The frame's message type.
         turn_tag: The turn's audio tag on downlink frames; 0 on uplink frames.
-        seq: Per-stream sequence number; the receiver counts gaps rather than reordering.
+        seq: Per-stream sequence number. The receiver only counts gaps with it: it never
+            reorders or cuts audio by `seq`. On the uplink the contract has the server rebase
+            the count whenever `seq` does not rise: the first frame, or a `seq` not above the
+            last one, sets a new base with no gap, and only a forward jump counts the missing
+            frames. So a client may restart `seq` at 0 when it applies the answer to its newest
+            `voice_start`, and the restart counts no gap.
         sample_rate: 16000 uplink, 24000 downlink.
         payload: PCM16 mono little-endian samples, or empty for the marker types.
     """
@@ -234,9 +242,21 @@ def _drop_none(data: dict[str, object], *names: str) -> dict[str, object]:
 
 
 class VoiceStartMessage(_WireModel):
-    """Open the session's voice path with the client's capture and playback parameters."""
+    """Open the session's voice path with the client's capture and playback parameters.
+
+    While voice is active it reconfigures the running voice session instead. Each
+    `voice_start` gets exactly one answer, a `voice_state` with `cause` `answer`.
+
+    Attributes:
+        req: Assigned by the client from 1 (its first `voice_start` on the connection),
+            strictly increasing per connection, at most 4294967295. The answer carries it in
+            `voice_state.req`, which is how the client tells its answer from a broadcast. The
+            schema checks only the range; the strictly-increasing check needs the connection's
+            history, so it belongs to the session.
+    """
 
     type: Literal["voice_start"] = "voice_start"
+    req: int = Field(ge=1, le=MAX_REQ)
     mode: VoiceMode
     sample_rate: Literal[16000]
     frame_ms: Literal[20]
@@ -484,11 +504,39 @@ class SessionCapabilities(_WireModel):
 class VoiceStateMessage(_WireModel):
     """The session's voice configuration, engines and GPU placement.
 
-    Sent on `voice_start` and to every session when the GPU mode changes, so `mode` is null for
-    a session that has not started voice.
+    `cause` says why it was sent, and has two values:
+
+    - `answer`: the reply to one `voice_start`, sent only to the session that sent it and
+      exactly once per `voice_start`, a refused one and one that failed validation included.
+      Answers go out in the order the `voice_start`s were received; an answer ready early waits
+      for every earlier one.
+    - `broadcast`: a resend to every session, whether or not it has started voice, whenever one
+      of the three things it carries about the GPU changes: the mode, an engine's location, or
+      the active trigger set.
+
+    A client takes the answer to its `voice_start` from `cause` and `req`, never from `active`
+    or `mode`: a broadcast can carry the same mode, and matching by arrival order alone would
+    shift every later answer if one went missing.
+
+    Attributes:
+        cause: `answer` or `broadcast`, as above.
+        req: The answered `voice_start`'s `req`. Null for a broadcast, and in an answer only when
+            that `voice_start`'s `req` could not be read. A broadcast with `req` set fails
+            validation, which `parse_server_message` raises as `ProtocolError`.
+        active: Whether voice is active in the session when the message is sent, in an answer
+            and a broadcast alike.
+        mode: The session's active voice mode, null while voice is off; so a broadcast to a
+            session that has not started voice carries null, and a broadcast sent while a
+            reconfigure is pending carries the current mode, not the requested one.
+        refused: Null when the request was applied. Otherwise why it was not: a reason the
+            requested mode is unavailable, `superseded` (a newer valid `voice_start` arrived
+            first), `voice_stop` (a `voice_stop` arrived first) or `invalid` (the
+            `voice_start` failed validation).
     """
 
     type: Literal["voice_state"] = "voice_state"
+    cause: Literal["answer", "broadcast"]
+    req: int | None = Field(ge=1, le=MAX_REQ)
     active: bool
     mode: VoiceMode | None
     uplink: StreamFormat
@@ -503,6 +551,14 @@ class VoiceStateMessage(_WireModel):
     speech_service: SpeechServiceState
     refused: str | None
 
+    @field_validator("req")
+    @classmethod
+    def _broadcast_answers_no_request(cls, req: int | None, info: ValidationInfo) -> int | None:
+        # `cause` is declared before `req`, so it is in `info.data` once it validated.
+        if req is not None and info.data.get("cause") == "broadcast":
+            raise ValueError("a broadcast answers no voice_start, so req must be null")
+        return req
+
 
 class TranscriptPartialMessage(_WireModel):
     """An interim transcript; the first `stable_chars` characters will not change."""
@@ -514,7 +570,12 @@ class TranscriptPartialMessage(_WireModel):
 
 
 class TranscriptionMessage(_WireModel):
-    """The final transcript of an utterance."""
+    """The final transcript of an utterance; it closes the utterance it names.
+
+    A closing message is the last message that names its utterance, and the client finalizes
+    the utterance's partial on it. `text` is what the turn takes from the utterance: the whole
+    text, or the text after its keyword.
+    """
 
     type: Literal["transcription"] = "transcription"
     text: str
@@ -550,17 +611,28 @@ class SupersedeDetail(_WireModel):
 
 
 class BargeInDetail(_WireModel):
-    """Detail of a `barge_in` decision."""
+    """Detail of a `barge_in` decision.
+
+    `utterance_id` is set or null by what produced the verdict, not by its reason: it names the
+    utterance when a transcript (partial or final), a press or a wake produced it, and is null
+    when an endpoint `barge_in` report, the UI stop or `voice_stop` did.
+    """
 
     keyword: str | None
     phase: str
+    utterance_id: str | None
 
 
 class BargeInIgnoredDetail(_WireModel):
-    """Detail of a `barge_in_ignored` decision."""
+    """Detail of a `barge_in_ignored` decision.
+
+    `utterance_id` follows the same rule as in `BargeInDetail`: for example `not_armed` for an
+    endpoint report that arrived before the arm delay carries null.
+    """
 
     keyword: str | None
     text: str
+    utterance_id: str | None
 
 
 class DroppedDetail(_WireModel):
@@ -574,10 +646,29 @@ class DroppedDetail(_WireModel):
 
 
 class DegradedDetail(_WireModel):
-    """Detail of a `degraded` decision."""
+    """Detail of a `degraded` decision.
+
+    The sender sets `voiced_text` and `text_from_token` for reason `tts_failed`, where the turn
+    switches from speech to text mid-turn, and sends both null for every other reason. The schema
+    checks only that `text_from_token` is not negative.
+
+    - `voiced_text` is the text of the audio synthesized before the failure and still sent
+      after it, the most the client will play: "" for a text reply. It is an exact prefix of the
+      concatenation of the turn's `stream_token` texts, so the client compares strings and does
+      no offset arithmetic. A later `stream_cancelled` replaces it with its `spoken_text`.
+    - `text_from_token` is the 0-based index, among the turn's `stream_token` messages, of the
+      first one delivered as text after the switch. It equals the number of `stream_token`
+      messages sent before the switch, so when none follows it is one past the last.
+
+    The client renders the turn's text after `voiced_text` as unspoken: the part of the tokens
+    sent before the switch that `voiced_text` does not cover, and every token from
+    `text_from_token` on.
+    """
 
     engine: str | None
     error: str | None
+    voiced_text: str | None
+    text_from_token: int | None = Field(ge=0)
 
 
 class OverloadDetail(_WireModel):
@@ -588,10 +679,11 @@ class OverloadDetail(_WireModel):
 
 
 class WakeLostDetail(_WireModel):
-    """Detail of a `wake_lost` decision."""
+    """Detail of a `wake_lost` decision; `utterance_id` names the utterance the lost wake opened."""
 
     winner_score: float
     score: float
+    utterance_id: str
 
 
 class PlacementDetail(_WireModel):
@@ -663,12 +755,21 @@ class VoiceDecisionBargeInIgnored(_WireModel):
 
 
 class VoiceDecisionDropped(_WireModel):
-    """An utterance was discarded without opening a turn."""
+    """An utterance was discarded without opening a turn; it closes the utterance it names.
+
+    `noise`, `no_speech` and `stt_error` are ingress drops. `text_input`: a `text` message
+    closed it. `keyword`: a keyword interrupt consumed it with nothing after the keyword.
+    `ignored`: it ended while MIST spoke without interrupting. `voice_stop`: `voice_stop`
+    closed it. `detail.no_speech_prob` and `detail.avg_logprob` are null when no final
+    transcript exists.
+    """
 
     type: Literal["voice_decision"] = "voice_decision"
     kind: Literal["dropped"] = "dropped"
     turn_id: str | None
-    reason: Literal["noise", "no_speech", "stt_error", "text_input"]
+    reason: Literal[
+        "noise", "no_speech", "stt_error", "text_input", "keyword", "voice_stop", "ignored"
+    ]
     detail: DroppedDetail
 
 
@@ -700,7 +801,10 @@ class VoiceDecisionOverload(_WireModel):
 
 
 class VoiceDecisionWakeLost(_WireModel):
-    """Another room unit won wake arbitration."""
+    """Another room unit won wake arbitration; it closes the utterance it names.
+
+    That is the utterance the lost wake opened, and the message is sent only while it is open.
+    """
 
     type: Literal["voice_decision"] = "voice_decision"
     kind: Literal["wake_lost"] = "wake_lost"
@@ -797,7 +901,12 @@ class StreamStartMessage(_WireModel):
 
 
 class StreamCancelledMessage(_WireModel):
-    """A turn stopped before completing; `spoken_text` is what the user heard of it."""
+    """A turn stopped before completing; `spoken_text` is what the user heard of it.
+
+    `spoken_text` is null exactly when the turn's `stream_start` had channel `text`. A
+    `tts`-channel turn carries its spoken prefix, or "" when nothing played, a turn that
+    `tts_failed` moved to text mid-turn included, since that turn keeps its `tts` channel.
+    """
 
     type: Literal["stream_cancelled"] = "stream_cancelled"
     turn_id: str
@@ -917,6 +1026,45 @@ def parse_client_message(raw: str | bytes) -> ClientMessage:
             field of the wrong type or value; `field` names it (dotted for nested fields).
     """
     return _validate(_ClientEnvelope, raw)
+
+
+@dataclass(frozen=True, slots=True)
+class VoiceStartPeek:
+    """The one field read from text that may be a `voice_start`, valid or not.
+
+    Attributes:
+        req: The message's `req` when it is a JSON integer from 1 to 4294967295, else None.
+    """
+
+    req: int | None
+
+
+def peek_voice_start(raw: str | bytes) -> VoiceStartPeek | None:
+    """Read the `req` of a `voice_start` without validating the rest of it.
+
+    The session answers every `voice_start`, one that fails validation included, with a
+    `voice_state` carrying its `req`. `parse_client_message` raises on such a message without
+    returning any field, so the session reads the one field the answer needs here. The codec
+    keeps no state: the strictly-increasing check on `req` is the session's.
+
+    Returns:
+        None unless `raw` is a JSON object whose `type` is `voice_start`. Otherwise a peek whose
+        `req` is the message's `req` when that is a JSON integer from 1 to 4294967295, and None
+        when it is missing, out of range or of another JSON type (`true` included).
+    """
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        # RecursionError: the stdlib decoder recurses once per nesting level, so deeply nested
+        # client text would otherwise escape as an exception the caller does not expect.
+        return None
+    if not isinstance(data, dict) or data.get("type") != "voice_start":
+        return None
+    req = data.get("req")
+    # JSON `true` decodes to a bool, which is an int subclass, so it is excluded by name.
+    if isinstance(req, int) and not isinstance(req, bool) and 1 <= req <= MAX_REQ:
+        return VoiceStartPeek(req=req)
+    return VoiceStartPeek(req=None)
 
 
 def parse_server_message(raw: str | bytes) -> ServerMessage:
