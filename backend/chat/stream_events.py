@@ -29,10 +29,15 @@ class Token(StreamEvent):
     `pass_num=1` for tokens streamed from the initial LLM call. `pass_num=2`
     for tokens streamed from the post-tool-call final pass (only emitted when
     the LLM invoked tools mid-turn).
+
+    `is_error` marks the one Token the pipeline's error path emits ("I
+    encountered an error: ..."). It is displayed and recorded like any other
+    Token, but a voice consumer must not speak it.
     """
 
     text: str
     pass_num: int = 1
+    is_error: bool = False
 
 
 @dataclass(frozen=True, slots=True)

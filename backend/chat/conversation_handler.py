@@ -1251,6 +1251,48 @@ class ConversationHandler:
         )
         return tool_result
 
+    async def _run_dispatched_tool(self, scope: TurnScope, tool_call: LLMToolCall) -> str:
+        """Run one dispatched tool to completion and put its result on `scope`.
+
+        Runs as its own task (see `stream_turn`), so it finishes, and its
+        result reaches `scope.tool_results` for the commit, even when the
+        stream that dispatched it was cancelled. Tool usage is recorded here
+        for the same reason.
+
+        ADR-017 Wave 2: `_dispatch_tool_with_observability` emits
+        tool_call_started before `_dispatch_tool` runs and
+        tool_call_completed after (success or failure) into the scope's
+        buffer; the stream drains them right after the tool returns.
+        """
+        tool_result = await self._dispatch_tool_with_observability(scope, tool_call)
+        scope.tool_results.append(
+            {
+                "name": tool_call.name,
+                "result": tool_result,
+                "tool_call_id": tool_call.id,
+            }
+        )
+
+        # Record tool usage for skill derivation
+        if self._tool_usage_tracker is not None:
+            from backend.knowledge.extraction.tool_usage_tracker import (
+                ToolCallRecord,
+                classify_tool_type,
+            )
+
+            self._tool_usage_tracker.record(
+                ToolCallRecord(
+                    tool_name=tool_call.name,
+                    tool_type=classify_tool_type(tool_call.name),
+                    context=str(tool_call.arguments)[:500],
+                    success=not tool_result.startswith("Tool not found:"),
+                    timestamp=datetime.now(UTC),
+                    session_id=scope.session_id,
+                    event_id="",
+                )
+            )
+        return tool_result
+
     def get_or_create_session(self, session_id: str, user_id: str = "User") -> ConversationSession:
         """Get existing session or create new one."""
         if session_id not in self.sessions:
@@ -1934,6 +1976,11 @@ class ConversationHandler:
             if pass1_response is not None and pass1_response.tool_calls:
                 logger.info("[TOOLS] LLM made %d tool calls", len(pass1_response.tool_calls))
 
+                # A held turn may still be cancelled without trace, so it
+                # streams but dispatches nothing until the controller sets
+                # the gate. A cancel here dispatches and records nothing.
+                await scope.dispatch_gate.wait()
+
                 # Execute tool calls
                 for tc in pass1_response.tool_calls:
                     logger.info("[TOOLS] Executing tool: %s", tc.name)
@@ -1944,19 +1991,14 @@ class ConversationHandler:
                     scope.tool_dispatched = True
                     scope.tool_calls.append({"name": tc.name, "args": tc.arguments})
 
-                    # ADR-017 Wave 2: dispatch with observability wrap. Emits
-                    # tool_call_started before _dispatch_tool runs and
-                    # tool_call_completed after (success or failure) into the
-                    # turn scope's buffer. T3/v2: drained immediately below so
-                    # the pair reaches the caller as it happens.
-                    tool_result = await self._dispatch_tool_with_observability(scope, tc)
-                    scope.tool_results.append(
-                        {
-                            "name": tc.name,
-                            "result": tool_result,
-                            "tool_call_id": tc.id,
-                        }
-                    )
+                    # Each tool runs as its own task held by the scope and is
+                    # awaited through `asyncio.shield`: cancelling this stream
+                    # (a barge-in) must not abandon a tool that may already
+                    # have had effects. The controller waits for it with
+                    # `scope.wait_tools` and commits its real result.
+                    tool_task = asyncio.create_task(self._run_dispatched_tool(scope, tc))
+                    scope.tool_tasks.append(tool_task)
+                    tool_result = await asyncio.shield(tool_task)
                     for payload in scope.drain_ws_events():
                         if payload.get("type") == "tool_call_started":
                             tool_calls_used += 1
@@ -1967,27 +2009,6 @@ class ConversationHandler:
                         tool_result[:200] + "..." if len(tool_result) > 200 else tool_result
                     )
                     logger.info("[TOOLS]   Result: %s", result_preview)
-
-                    # Record tool usage for skill derivation
-                    if self._tool_usage_tracker is not None:
-                        from datetime import UTC
-
-                        from backend.knowledge.extraction.tool_usage_tracker import (
-                            ToolCallRecord,
-                            classify_tool_type,
-                        )
-
-                        self._tool_usage_tracker.record(
-                            ToolCallRecord(
-                                tool_name=tc.name,
-                                tool_type=classify_tool_type(tc.name),
-                                context=str(tc.arguments)[:500],
-                                success=not tool_result.startswith("Tool not found:"),
-                                timestamp=datetime.now(UTC),
-                                session_id=session_id,
-                                event_id="",
-                            )
-                        )
 
                 # Build assistant message with tool_calls for correlation
                 assistant_msg = {
@@ -2070,7 +2091,7 @@ class ConversationHandler:
             error_text = ("\n\n" if state.emitted else "") + error_msg
             state.emitted += error_text
             scope.error = error_msg
-            error_token = Token(text=error_text, pass_num=current_pass)
+            error_token = Token(text=error_text, pass_num=current_pass, is_error=True)
 
         # ADR-017 Wave 2 safety net: any WS event not already drained inline
         # above (normally none -- see the per-dispatch drain in the tool loop)
@@ -2150,6 +2171,12 @@ class ConversationHandler:
         user_message = request.user_text
         session = self.get_or_create_session(session_id, request.user_id)
         tool_calls = [dict(entry) for entry in scope.tool_calls] or None
+        if tool_calls and delivery.tool_effect_unknown:
+            # A tool still running (or cancelled) at commit may or may not
+            # have had its effect; the row says so rather than guessing.
+            for entry, task in zip(tool_calls, scope.tool_tasks, strict=False):
+                if not task.done() or task.cancelled():
+                    entry["effect_unknown"] = True
         tool_results = list(scope.tool_results) or None
         generated_response = None if delivery.outcome == "completed" else scope.generated_text
         outcome_fields = {

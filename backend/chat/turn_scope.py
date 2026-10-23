@@ -49,7 +49,7 @@ class TurnRequest:
             carries it on the scope.
         held: True while the turn may still be cancelled without trace (the
             utterance might continue). A held turn's `dispatch_gate` starts
-            clear.
+            clear, so it streams but dispatches no tool until released.
     """
 
     session_id: str
@@ -148,7 +148,8 @@ class TurnScope:
             dispatch and drained by the streaming pipeline as `WSEvent`s.
         request: The request the turn was opened with, interruption note
             included. None only for a scope built outside `open_turn`.
-        dispatch_gate: Set by `open_turn` unless the request is held.
+        dispatch_gate: Set by `open_turn` unless the request is held; tool
+            dispatch waits for it.
         tool_dispatched: True once any tool call has been dispatched. A turn
             that dispatched a tool is committed even when superseded,
             because the tool may have had effects.
@@ -168,6 +169,9 @@ class TurnScope:
             event-log row.
         commit_result: The first `commit_turn` result; a second commit
             returns it and writes nothing.
+        tool_tasks: One task per dispatched tool call, parallel to
+            `tool_calls`. Held here, not by the stream, so a tool outlives
+            a cancelled stream; see `wait_tools`.
     """
 
     session_id: str
@@ -184,11 +188,26 @@ class TurnScope:
     context_window: list[dict[str, object]] | None = None
     retrieval_result: RetrievalResult | None = None
     commit_result: CommitResult | None = None
+    tool_tasks: list[asyncio.Task[str]] = field(default_factory=list)
 
     @property
     def generated_text(self) -> str:
         """Every Token piece the stream has yielded so far, across both passes."""
         return self.stream.emitted
+
+    async def wait_tools(self, timeout_s: float) -> bool:
+        """Wait up to `timeout_s` for every dispatched tool; return whether all finished.
+
+        Used after a cancel: a tool that finishes within the grace leaves
+        its real result in `tool_results` for the commit; one that does not
+        is committed with its effect marked unknown. The tools are not
+        cancelled here, whatever the outcome.
+        """
+        pending = [task for task in self.tool_tasks if not task.done()]
+        if not pending:
+            return True
+        _done, still_pending = await asyncio.wait(pending, timeout=timeout_s)
+        return not still_pending
 
     @property
     def graph_seed(self) -> str:

@@ -19,6 +19,7 @@ from backend.chat.conversation_handler import ConversationHandler
 from backend.chat.mist_context import MistContext
 from backend.chat.stream_events import Token
 from backend.chat.turn_scope import TurnDelivery, TurnRequest, TurnScope
+from backend.errors import LLMConnectionError
 from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from backend.knowledge.storage.graph_store import GraphStore
 from backend.llm.models import ToolCall as LLMToolCall
@@ -242,3 +243,164 @@ class TestCommitAfterCancel:
         assert (row["stt_model"], row["tts_model"]) == ("stt-fake", "tts-fake")
         history = [(m.role, m.content) for m in handler.sessions["s1"].messages]
         assert history == [("user", "hello"), ("assistant", "Heard this part.")]
+
+
+async def _until(condition) -> None:
+    """Yield to the loop until `condition()` holds, then a few ticks more.
+
+    The extra ticks let a task that just made the condition true run on to
+    its next suspension point (here: the dispatch-gate wait).
+    """
+    while not condition():
+        await asyncio.sleep(0)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+class TestDispatchGate:
+    @pytest.mark.asyncio
+    async def test_held_turn_dispatches_no_tool_until_the_gate_is_set(self):
+        handler, _ = _handler(
+            [ScriptedPass(chunks=[], tool_calls=[TOOL_CALL]), ScriptedPass(chunks=["Done."])]
+        )
+        tool = _BlockingTool()
+        tool.release.set()
+        handler._dispatch_tool = tool
+        scope = handler.open_turn(_request(held=True))
+        task = _consume(handler, scope, [])
+        await _until(lambda: 1 in scope.stream.pass_text)
+
+        dispatched_while_held = list(tool.calls)
+        scope.dispatch_gate.set()
+        await task
+
+        assert dispatched_while_held == []
+        assert tool.calls == [TOOL_CALL]
+
+    @pytest.mark.asyncio
+    async def test_cancel_while_held_dispatches_and_records_nothing(self):
+        handler, _ = _handler(
+            [ScriptedPass(chunks=[], tool_calls=[TOOL_CALL]), ScriptedPass(chunks=["Unused."])]
+        )
+        tool = _BlockingTool()
+        handler._dispatch_tool = tool
+        scope = handler.open_turn(_request(held=True))
+        task = _consume(handler, scope, [])
+        await _until(lambda: 1 in scope.stream.pass_text)
+
+        await _cancel(task)
+
+        assert tool.calls == []
+        assert scope.tool_dispatched is False
+        assert scope.tool_calls == []
+        _assert_nothing_recorded(handler)
+
+
+class TestToolOutlivesCancel:
+    @pytest.mark.asyncio
+    async def test_cancel_mid_tool_leaves_the_tool_running(self):
+        handler, _ = _handler(
+            [ScriptedPass(chunks=[], tool_calls=[TOOL_CALL]), ScriptedPass(chunks=["Unused."])]
+        )
+        tool = _BlockingTool()
+        handler._dispatch_tool = tool
+        scope = handler.open_turn(_request())
+        task = _consume(handler, scope, [])
+        await tool.entered.wait()
+        await _cancel(task)
+
+        finished_before_release = await scope.wait_tools(0.0)
+        tool.release.set()
+        finished_after_release = await scope.wait_tools(1.0)
+
+        assert finished_before_release is False
+        assert finished_after_release is True
+        assert tool.finished == 1
+        assert scope.tool_results == [
+            {"name": "query_knowledge_graph", "result": "tool result", "tool_call_id": "call_1"}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_commit_after_the_tool_finished_records_its_result(self):
+        handler, _ = _handler(
+            [ScriptedPass(chunks=[], tool_calls=[TOOL_CALL]), ScriptedPass(chunks=["Unused."])]
+        )
+        tool = _BlockingTool()
+        handler._dispatch_tool = tool
+        scope = handler.open_turn(_request())
+        task = _consume(handler, scope, [])
+        await tool.entered.wait()
+        await _cancel(task)
+        tool.release.set()
+        await scope.wait_tools(1.0)
+
+        handler.commit_turn(
+            scope,
+            TurnDelivery(outcome="interrupted", delivered_text="", stt_model=None, tts_model=None),
+        )
+
+        row = handler.event_store.get_turns("s1")[0]
+        assert row["tool_calls"] == [{"name": "query_knowledge_graph", "args": {"query": "rust"}}]
+        assistant = handler.sessions["s1"].messages[-1]
+        assert assistant.tool_results == scope.tool_results
+
+    @pytest.mark.asyncio
+    async def test_effect_unknown_marks_the_unfinished_tool_in_the_event_row(self):
+        handler, _ = _handler(
+            [ScriptedPass(chunks=[], tool_calls=[TOOL_CALL]), ScriptedPass(chunks=["Unused."])]
+        )
+        tool = _BlockingTool()
+        handler._dispatch_tool = tool
+        scope = handler.open_turn(_request())
+        task = _consume(handler, scope, [])
+        await tool.entered.wait()
+        await _cancel(task)
+        finished = await scope.wait_tools(0.0)
+
+        handler.commit_turn(
+            scope,
+            TurnDelivery(
+                outcome="interrupted",
+                delivered_text="",
+                stt_model=None,
+                tts_model=None,
+                tool_effect_unknown=True,
+            ),
+        )
+        tool.release.set()
+        await scope.wait_tools(1.0)
+
+        assert finished is False
+        row = handler.event_store.get_turns("s1")[0]
+        assert row["tool_calls"] == [
+            {"name": "query_knowledge_graph", "args": {"query": "rust"}, "effect_unknown": True}
+        ]
+
+
+class TestErrorTokenMarked:
+    @pytest.mark.asyncio
+    async def test_only_the_error_path_token_is_marked(self):
+        handler, _ = _handler(
+            [
+                ScriptedPass(
+                    chunks=["The first sentence made it out. And then"],
+                    error=LLMConnectionError("connection reset"),
+                )
+            ]
+        )
+
+        tokens = [
+            event
+            async for event in handler.handle_message_streaming(
+                user_message="hello", session_id="s1"
+            )
+            if isinstance(event, Token)
+        ]
+
+        assert [(t.text, t.is_error) for t in tokens] == [
+            ("The first sentence made it out.", False),
+            ("\n\nI encountered an error: connection reset", True),
+        ]
+
+    def test_token_is_not_an_error_by_default(self):
+        assert Token(text="hi").is_error is False
