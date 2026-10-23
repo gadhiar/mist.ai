@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 
 from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
+from backend.memory.config import MemoryConfig
 
 load_dotenv()
 
@@ -604,6 +605,9 @@ class KnowledgeConfig:
     sidecar_index: SidecarIndexConfig = None  # type: ignore[assignment]
     filewatcher: FilewatcherConfig = None  # type: ignore[assignment]
 
+    # mist-read-path: the memory read path (backend/memory)
+    memory: MemoryConfig = None  # type: ignore[assignment]
+
     # Feature flags
     enable_knowledge_integration: bool = True  # Master switch for knowledge system
 
@@ -662,6 +666,8 @@ class KnowledgeConfig:
             self.sidecar_index = SidecarIndexConfig()
         if self.filewatcher is None:
             self.filewatcher = FilewatcherConfig()
+        if self.memory is None:
+            self.memory = MemoryConfig()
 
     @classmethod
     def from_env(cls) -> "KnowledgeConfig":
@@ -681,6 +687,7 @@ class KnowledgeConfig:
             vault=VaultConfig.from_env(),
             sidecar_index=SidecarIndexConfig.from_env(),
             filewatcher=FilewatcherConfig.from_env(),
+            memory=MemoryConfig.from_env(),
             enable_knowledge_integration=os.getenv("ENABLE_KNOWLEDGE_INTEGRATION", "true").lower()
             == "true",
             enable_versioning=os.getenv("ENABLE_VERSIONING", "true").lower() == "true",
