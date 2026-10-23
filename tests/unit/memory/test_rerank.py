@@ -66,7 +66,11 @@ class FakeCrossEncoderModel:
         # The real class applies its checkpoint's default activation unless the caller passes
         # one, so the fake does too: a reranker that relied on the default would see it here.
         activation = activation_fct if activation_fct is not None else owner.default_activation
-        return [float(activation(x)) for x in logits]
+        scores = [float(activation(x)) for x in logits]
+        if owner.labels > 1:
+            # A multi-label head gives one row per pair, as the real class's 2-d array does.
+            return [[score] * owner.labels for score in scores]  # type: ignore[misc]
+        return scores
 
 
 @dataclass
@@ -86,6 +90,7 @@ class FakeCrossEncoderClass:
     load_error: Exception | None = None
     predict_error: Exception | None = None
     drop_one_score: bool = False
+    labels: int = 1
     built: list[FakeCrossEncoderModel] = field(default_factory=list)
 
     def __call__(
@@ -212,6 +217,36 @@ def test_model_path_that_is_a_file_raises(tmp_path: Path) -> None:
 
     with pytest.raises(MemoryRerankError, match="model.safetensors"):
         _build(weights_file, FakeCrossEncoderClass())
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(b'{"version": "1.0", "truncation": nu', id="truncated"),
+        pytest.param(b'{"normalizer": "\xff\xfe"}', id="not-utf8"),
+    ],
+)
+def test_unreadable_tokenizer_json_raises_naming_path_and_device(
+    model_dir: Path, content: bytes
+) -> None:
+    (model_dir / "tokenizer.json").write_bytes(content)
+    fake_class = FakeCrossEncoderClass()
+
+    with pytest.raises(MemoryRerankError, match="tokenizer.json") as excinfo:
+        _build(model_dir, fake_class, device="cuda")
+
+    assert str(model_dir) in str(excinfo.value)
+    assert "cuda" in str(excinfo.value)
+    assert fake_class.built == []
+
+
+def test_tokenizer_json_that_parses_loads(model_dir: Path) -> None:
+    (model_dir / "tokenizer.json").write_text('{"version": "1.0"}', encoding="utf-8")
+    fake_class = FakeCrossEncoderClass()
+
+    _build(model_dir, fake_class)
+
+    assert fake_class.model.model_name == str(model_dir)
 
 
 @pytest.mark.parametrize(
@@ -450,13 +485,57 @@ def test_score_count_mismatch_raises(model_dir: Path) -> None:
         reranker.score("query", ["a", "b", "c"])
 
 
-def test_nan_logit_raises(model_dir: Path) -> None:
+@pytest.mark.parametrize(
+    "logit",
+    [
+        pytest.param(math.nan, id="nan"),
+        pytest.param(math.inf, id="inf"),
+        pytest.param(-math.inf, id="minus-inf"),
+    ],
+)
+def test_non_finite_logit_raises_naming_path_and_device(model_dir: Path, logit: float) -> None:
+    fake_class = FakeCrossEncoderClass()
+    reranker = _build(model_dir, fake_class, device="cuda")
+    fake_class.logits["broken"] = logit
+
+    with pytest.raises(MemoryRerankError, match="non-finite") as excinfo:
+        reranker.score("query", ["fine", "broken"])
+
+    assert str(model_dir) in str(excinfo.value)
+    assert "cuda" in str(excinfo.value)
+
+
+def test_score_count_mismatch_names_path_and_device(model_dir: Path) -> None:
+    fake_class = FakeCrossEncoderClass()
+    reranker = _build(model_dir, fake_class, device="cuda")
+    fake_class.drop_one_score = True
+
+    with pytest.raises(MemoryRerankError) as excinfo:
+        reranker.score("query", ["a", "b"])
+
+    assert str(model_dir) in str(excinfo.value)
+    assert "cuda" in str(excinfo.value)
+
+
+def test_multi_label_checkpoint_fails_the_warm_up_naming_path_and_device(
+    model_dir: Path,
+) -> None:
+    fake_class = FakeCrossEncoderClass(labels=2)
+
+    with pytest.raises(MemoryRerankError, match="one score per pair") as excinfo:
+        _build(model_dir, fake_class, device="cuda")
+
+    assert str(model_dir) in str(excinfo.value)
+    assert "cuda" in str(excinfo.value)
+
+
+def test_multi_label_output_in_score_raises(model_dir: Path) -> None:
     fake_class = FakeCrossEncoderClass()
     reranker = _build(model_dir, fake_class)
-    fake_class.logits["broken"] = math.nan
+    fake_class.labels = 3
 
-    with pytest.raises(MemoryRerankError, match="NaN"):
-        reranker.score("query", ["fine", "broken"])
+    with pytest.raises(MemoryRerankError, match="one score per pair"):
+        reranker.score("query", ["a", "b"])
 
 
 # -- NullReranker -----------------------------------------------------------------------------
