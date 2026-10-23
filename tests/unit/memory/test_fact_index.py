@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from backend.errors import MemoryIndexError
+from backend.errors import EmbeddingError, MemoryIndexError
 from backend.memory.fact_index import FactIndex, content_hash, fact_row_key, structural_row_key
 from backend.memory.fact_render import render_fact
 from backend.memory.index_db import open_index, open_reader, write_transaction
@@ -202,6 +202,66 @@ def test_an_embedder_of_another_dimension_raises_memory_index_error(
         index.upsert([_fact("rk-acme", "Acme")])
 
     assert index.get("rk-acme") is None
+
+
+class _FailingEmbedder:
+    """An embedder whose `generate_embeddings` raises `error`, as a model that fails to load does."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def generate_embedding(self, text: str) -> list[float]:
+        raise self.error
+
+    def generate_embeddings(self, texts: list[str]) -> list[list[float]]:
+        raise self.error
+
+
+def _snapshot_of(conn: sqlite3.Connection) -> tuple[list[tuple[object, ...]], int, int]:
+    rows = conn.execute("SELECT row_key, content_hash, text FROM facts ORDER BY row_key").fetchall()
+    fts = conn.execute("SELECT count(*) FROM facts_fts").fetchone()[0]
+    vec = conn.execute("SELECT count(*) FROM facts_vec").fetchone()[0]
+    return rows, fts, vec
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, OSError, ValueError])
+@pytest.mark.parametrize("method", ["upsert", "diff_apply"])
+def test_an_embedder_failure_raises_memory_index_error_and_writes_nothing(
+    index: FactIndex,
+    conn: sqlite3.Connection,
+    reader: sqlite3.Connection,
+    error_type: type[Exception],
+    method: str,
+) -> None:
+    index.upsert([_fact("rk-a", "Acme"), _fact("rk-b", "Kestrel")])
+    before = _snapshot_of(conn)
+    original = error_type("cannot embed 'User works at Northwind.'")
+    failing = FactIndex(conn, _FailingEmbedder(original), tz=UTC, reader=reader)
+    # rk-a changes its text, rk-c is new and rk-b is absent, so diff_apply would also delete.
+    rows = [_fact("rk-a", "Acme", valid_to="2026-03-01"), _fact("rk-c", "Northwind")]
+
+    with pytest.raises(MemoryIndexError) as caught:
+        getattr(failing, method)(rows)
+
+    assert caught.value.__cause__ is original
+    message = str(caught.value)
+    assert error_type.__name__ in message
+    assert "2 texts" in message
+    assert "Northwind" not in message
+    assert _snapshot_of(conn) == before
+
+
+def test_an_embedding_error_propagates_unchanged(
+    conn: sqlite3.Connection, reader: sqlite3.Connection
+) -> None:
+    original = EmbeddingError("the embedding model is unavailable")
+    failing = FactIndex(conn, _FailingEmbedder(original), tz=UTC, reader=reader)
+
+    with pytest.raises(EmbeddingError) as caught:
+        failing.upsert([_fact("rk-a", "Acme")])
+
+    assert caught.value is original
+    assert _snapshot_of(conn) == ([], 0, 0)
 
 
 def test_a_database_failure_raises_memory_index_error(

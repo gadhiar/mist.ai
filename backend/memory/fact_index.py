@@ -249,6 +249,11 @@ class FactIndex:
     upsert and `BEGIN IMMEDIATE` keep its writes and these from corrupting the table, not from
     racing.
 
+    A write embeds before it opens its transaction, so an embedder failure leaves the table
+    untouched. RuntimeError, OSError and ValueError from the embedder become MemoryIndexError,
+    so a caller that handles MistError sees the failure; EmbeddingError, already a MistError,
+    propagates unchanged.
+
     Args:
         writer: Connection from `index_db.open_index`.
         embedder: Embeds rendered fact text (all-MiniLM-L6-v2 in production).
@@ -299,8 +304,10 @@ class FactIndex:
 
         Raises:
             ValueError: A `row_key` repeats.
-            MemoryIndexError: The database fails, or the embedder returns the wrong number
-                or size of vectors. An exception the embedder raises propagates unchanged.
+            MemoryIndexError: The database fails; the embedder raises RuntimeError, OSError
+                or ValueError; or it returns the wrong number or size of vectors. Nothing is
+                written.
+            EmbeddingError: The embedder raised it; it propagates unchanged.
         """
         prepared = self._prepare(rows)
         with self._write_lock:
@@ -321,8 +328,10 @@ class FactIndex:
 
         Raises:
             ValueError: A `row_key` repeats.
-            MemoryIndexError: The database fails, or the embedder returns the wrong number
-                or size of vectors. An exception the embedder raises propagates unchanged.
+            MemoryIndexError: The database fails; the embedder raises RuntimeError, OSError
+                or ValueError; or it returns the wrong number or size of vectors. Nothing is
+                written or deleted.
+            EmbeddingError: The embedder raised it; it propagates unchanged.
         """
         prepared = self._prepare(snapshot)
         wanted = {item.row.row_key for item in prepared}
@@ -566,7 +575,15 @@ class FactIndex:
     def _embed(self, texts: list[str]) -> list[bytes]:
         if not texts:
             return []
-        vectors = self._embedder.generate_embeddings(texts)
+        try:
+            vectors = self._embedder.generate_embeddings(texts)
+        except (RuntimeError, OSError, ValueError) as exc:
+            # The production embedder loads its model on first use, so a missing model or CUDA
+            # out of memory arrives here as a raw RuntimeError or OSError. The message names
+            # the type and the count only: the texts are the user's facts.
+            raise MemoryIndexError(
+                f"embedder failed with {type(exc).__name__} on {len(texts)} texts"
+            ) from exc
         if len(vectors) != len(texts):
             raise MemoryIndexError(
                 f"embedder returned {len(vectors)} vectors for {len(texts)} texts"
