@@ -115,7 +115,9 @@ class TestTypes:
             60.0,
         ]
         assert policy.delay(1, auth_rejected=True) == 300.0
-        assert BackoffPolicy(jitter=lambda d: d / 2).delay(3, auth_rejected=False) == 2.0
+        halved = BackoffPolicy(jitter=lambda d: d / 2)
+        assert halved.delay(3, auth_rejected=False) == 2.0
+        assert halved.delay(1, auth_rejected=True) == 150.0
 
 
 class TestLifecycle:
@@ -124,17 +126,22 @@ class TestLifecycle:
         server = FakeHomeAssistant()
         server.open_gate = asyncio.Event()
         clock = FakeClock()
-        async with _running(_connection(server, clock)) as conn:
-            status = conn.state()
-            assert status.state == "unavailable"
-            assert status.reason == "connecting"
-            assert conn.tools() == []
-            await _until(lambda: len(server.open_tasks) == 1)
-            assert conn.state().state == "unavailable"
-            server.open_gate.set()
-            await _connected(conn)
-            assert conn.state().reason is None
-            assert [t.name for t in conn.tools()] == CORE_TOOLS
+
+        async def scenario() -> None:
+            async with _running(_connection(server, clock)) as conn:
+                status = conn.state()
+                assert status.state == "unavailable"
+                assert status.reason == "connecting"
+                assert conn.tools() == []
+                await _until(lambda: len(server.open_tasks) == 1)
+                assert conn.state().state == "unavailable"
+                server.open_gate.set()
+                await _connected(conn)
+                assert conn.state().reason is None
+                assert [t.name for t in conn.tools()] == CORE_TOOLS
+
+        # Bounded so a `start()` that waits for the gated connect fails in seconds, not hangs.
+        await asyncio.wait_for(scenario(), 5.0)
 
     @pytest.mark.asyncio
     async def test_open_close_on_supervisor_and_call_from_another_task(self):
@@ -296,6 +303,7 @@ class TestCallTool:
             status = conn.state()
             assert status.state == "unavailable"
             assert status.reason == "connection reset"
+            assert conn.tools() == []
             with pytest.raises(CapabilityUnavailableError, match="connection reset"):
                 await conn.call_tool(TURN_ON, {}, 5.0)
             await _until(lambda: len(server.open_tasks) == 2)
@@ -314,6 +322,56 @@ class TestCallTool:
             with pytest.raises(McpTransportError, match="timed out"):
                 await conn.call_tool(LIVE_CONTEXT, {}, 0.01)
             assert conn.state().state == "unavailable"
+
+    @pytest.mark.asyncio
+    async def test_late_failure_from_an_earlier_session_keeps_the_current_one(self):
+        server = FakeHomeAssistant()
+        server.call_gate = asyncio.Event()
+        conn = _connection(server, FakeClock())
+        async with _running(conn):
+            await _connected(conn)
+            # Held on the first session until the gate opens.
+            late = asyncio.create_task(conn.call_tool(TURN_ON, {}, 30.0))
+            await _until(lambda: len(server.calls) == 1)
+            with pytest.raises(McpTransportError, match="timed out"):
+                await conn.call_tool(TURN_OFF, {}, 0.01)
+            await _until(lambda: len(server.list_tools_tasks) == 2)
+            await _connected(conn)
+            server.call_script.append(McpTransportError("late reset on the first session"))
+            server.call_gate.set()
+            with pytest.raises(McpTransportError, match="late reset"):
+                await late
+            assert conn.state().state == "available"
+            assert [t.name for t in conn.tools()] == CORE_TOOLS
+            assert len(server.open_tasks) == 2
+            result = await conn.call_tool(TURN_ON, {}, 5.0)
+            assert result.is_error is False
+
+    @pytest.mark.asyncio
+    async def test_auth_rejected_call_drops_the_session_and_waits_the_auth_delay(self):
+        server = FakeHomeAssistant()
+        clock = FakeClock(settle_timeout_s=0.3)
+        conn = _connection(server, clock, jitter=lambda d: d + 0.5)
+        async with _running(conn):
+            await _connected(conn)
+            server.call_script.append(auth_rejected())
+            with pytest.raises(CapabilityUnavailableError, match="auth rejected"):
+                await conn.call_tool(TURN_ON, {"name": "Bedroom Lamp"}, 5.0)
+            assert len(server.calls) == 1
+            status = conn.state()
+            assert status.state == "unavailable"
+            assert status.reason == "auth rejected"
+            assert status.task_dead is False
+            assert conn.tools() == []
+            await clock.wait_for_sleepers(1)
+            assert clock.sleeps == [300.5]
+            assert server.close_tasks == [server.open_tasks[0]]
+            await clock.advance(300.0)
+            assert len(server.open_tasks) == 1
+            await clock.advance(0.5)
+            await _connected(conn)
+            assert len(server.open_tasks) == 2
+            assert len(server.calls) == 1
 
     @pytest.mark.asyncio
     async def test_tool_error_result_is_returned_and_keeps_the_session(self):
@@ -383,6 +441,7 @@ class TestSupervision:
         assert server.close_tasks == []
         await conn.stop()
         assert conn.task_dead() is True
+        assert conn.state() == status
         assert server.close_tasks == []
         assert len(_records(caplog, logging.ERROR)) == 1
 
