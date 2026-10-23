@@ -1234,3 +1234,190 @@ def test_readme_reading_health_gives_each_reason_and_remedy():
 
 def test_readme_claims_nothing_unmeasured_about_two_llama_servers():
     assert "one llama-server is what the 12 GB card holds" not in README.read_text(encoding="utf-8")
+
+
+def test_readme_start_after_power_on_section():
+    section = readme_section("Start after power-on")
+    for phrase in (
+        "(a)",
+        "(c)",
+        "register-signin-task.ps1",
+        "-LockAtSignIn",
+        "unregister-signin-task.ps1",
+        "Start when you sign in",
+        "Autologon",
+        "LSA secret",
+        "DefaultPassword",
+        "plain text",
+        "seconds after the desktop",
+        "On resume, display logon screen",
+        "unrecorded",
+        "/usage/uptime",
+    ):
+        assert phrase in section, phrase
+
+
+# --- The sign-in task scripts ----------------------------------------------------------------
+#
+# The runner has no PowerShell, so the scripts are checked by parsing their text.
+
+WINDOWS_DIR = REPO_ROOT / "deploy" / "daily" / "windows"
+REGISTER = WINDOWS_DIR / "register-signin-task.ps1"
+UNREGISTER = WINDOWS_DIR / "unregister-signin-task.ps1"
+TASK_NAME = "MIST daily instance"
+
+
+def ps_header(path: Path) -> str:
+    match = re.search(r"<#(.*?)#>", path.read_text(encoding="utf-8"), re.S)
+    assert match is not None, f"{path.name} has no <# ... #> header comment"
+    return match.group(1)
+
+
+def ps_code(path: Path) -> str:
+    """The script without comments, with each backtick line continuation joined."""
+    text = re.sub(r"<#.*?#>", "", path.read_text(encoding="utf-8"), flags=re.S)
+    lines = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+    return re.sub(r"`\n\s*", " ", "\n".join(lines))
+
+
+def ps_statements(code: str, command: str) -> list[str]:
+    return [line for line in code.splitlines() if re.search(rf"(?<![\w-]){command}\b", line)]
+
+
+def balanced_group(text: str, start: int) -> str:
+    """The text from the bracket at `start` to its matching close, outside quoted strings."""
+    pairs = {"(": ")", "{": "}", "[": "]"}
+    stack: list[str] = []
+    quote: str | None = None
+    for index in range(start, len(text)):
+        char = text[index]
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in "'\"":
+            quote = char
+        elif char in pairs:
+            stack.append(pairs[char])
+        elif char in pairs.values():
+            assert stack and stack.pop() == char, f"unbalanced {char} at {index}"
+            if not stack:
+                return text[start : index + 1]
+    raise AssertionError(f"no close for the bracket at {start}")
+
+
+@pytest.mark.parametrize("path", [REGISTER, UNREGISTER], ids=lambda p: p.name)
+def test_sign_in_scripts_are_ascii_with_balanced_brackets(path):
+    data = path.read_bytes()
+    # Windows PowerShell 5.1 reads a file without a byte-order mark in the ANSI code page.
+    assert data.isascii()
+    code = ps_code(path)
+    depth = 0
+    quote = None
+    for char in code:
+        if quote is not None:
+            quote = None if char == quote else quote
+        elif char in "'\"":
+            quote = char
+        elif char in "({[":
+            depth += 1
+        elif char in ")}]":
+            depth -= 1
+            assert depth >= 0
+    assert depth == 0 and quote is None
+
+
+def test_register_script_takes_python_root_and_the_lock_switch():
+    code = ps_code(REGISTER)
+    param = balanced_group(code, code.index("param("))
+    assert re.search(r"\[string\]\s*\$Python\b", param)
+    assert re.search(r"\[string\]\s*\$Root\b", param)
+    assert re.search(r"\[switch\]\s*\$LockAtSignIn\b", param)
+
+
+def test_register_script_registers_one_task_with_the_specified_settings():
+    code = ps_code(REGISTER)
+    calls = [
+        call
+        for call in ps_statements(code, "Register-ScheduledTask")
+        if f"-TaskName '{TASK_NAME}'" in call
+    ]
+    assert len(calls) == 1, calls
+    call = calls[0]
+    assert "-Trigger $Trigger" in call and "-Action $Actions" in call
+    assert "-Principal $Principal" in call
+    settings_at = call.index("-Settings (New-ScheduledTaskSettingsSet")
+    settings = balanced_group(call, call.index("(", settings_at))
+    assert "-ExecutionTimeLimit ([TimeSpan]::Zero)" in settings
+    assert "-AllowStartIfOnBatteries" in settings
+    assert "-DontStopIfGoingOnBatteries" in settings
+
+
+def test_register_script_triggers_at_the_current_users_sign_in_without_a_credential():
+    code = ps_code(REGISTER)
+    assert re.search(r"New-ScheduledTaskTrigger -AtLogOn -User \$User\b", code)
+    assert "[System.Security.Principal.WindowsIdentity]::GetCurrent().Name" in code
+    assert re.search(r"New-ScheduledTaskPrincipal -UserId \$User -LogonType Interactive\b", code)
+    for forbidden in (
+        "-Password",
+        "Get-Credential",
+        "ConvertTo-SecureString",
+        "AutoAdminLogon",
+        "DefaultPassword",
+        "Winlogon",
+        "Set-ItemProperty",
+        "New-ItemProperty",
+        "reg add",
+        "Autologon",
+    ):
+        assert forbidden.lower() not in code.lower(), forbidden
+
+
+def test_register_script_runs_up_from_the_roots_bin():
+    code = ps_code(REGISTER)
+    assert '\'"{0}/bin/instance.py" up --root "{0}"\' -f $RootPath' in code
+    up_actions = [
+        line
+        for line in ps_statements(code, "New-ScheduledTaskAction")
+        if "-Argument $UpArgument" in line
+    ]
+    assert len(up_actions) == 1
+    assert "-Execute $PythonPath" in up_actions[0]
+
+
+def test_register_script_locks_first_only_inside_the_lock_switch_block():
+    code = ps_code(REGISTER)
+    lock = "New-ScheduledTaskAction -Execute 'rundll32.exe' -Argument 'user32.dll,LockWorkStation'"
+    assert code.count(lock) == 1
+    block_at = code.index("if ($LockAtSignIn) ")
+    block = balanced_group(code, code.index("{", block_at))
+    assert lock in block
+    # The lock action is added to the list before the `up` action.
+    assert code.index(lock) < code.index("-Argument $UpArgument")
+    assert "$Actions = @()" in code
+
+
+def test_register_script_prints_the_schtasks_query_line():
+    code = ps_code(REGISTER)
+    assert f"schtasks.exe /query /tn '{TASK_NAME}'" in code
+    assert code.index("Register-ScheduledTask") < code.index("schtasks.exe /query")
+
+
+def test_register_script_header_says_how_to_run_it_and_what_it_depends_on():
+    header = ps_header(REGISTER)
+    assert "powershell -ExecutionPolicy Bypass -File" in header
+    assert re.search(r"Docker\s+Desktop's own \"Start when you sign in\" setting", header)
+    assert re.search(
+        r"-LockAtSignIn is for a machine Raj has set to sign\s+in automatically", header
+    )
+    assert "stores no credential and does not turn automatic sign-in on" in header
+
+
+def test_unregister_script_removes_the_task():
+    code = ps_code(UNREGISTER)
+    removals = ps_statements(code, "Unregister-ScheduledTask")
+    assert removals == [
+        removal for removal in removals if f"-TaskName '{TASK_NAME}' -Confirm:$false" in removal
+    ]
+    assert len(removals) == 1
+    assert "powershell -ExecutionPolicy Bypass -File" in ps_header(UNREGISTER)

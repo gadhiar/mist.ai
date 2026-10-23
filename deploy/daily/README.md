@@ -244,6 +244,48 @@ Any check reads `ok` with status `up` when nothing above applies.
 
 ---
 
+## Start after power-on
+
+Docker Desktop starts at sign-in by its own "Start when you sign in" setting, and brings back
+the containers, which have `restart: unless-stopped`. A Windows sign-in task, "MIST daily
+instance", then runs `<root>/bin/instance.py up --root <root>`, which waits up to 10 minutes
+for Docker and checks that the release is the one recorded. The build ships two ways to start
+before anyone types a command:
+
+- (a) Automatic sign-in with an immediate lock. `register-signin-task.ps1 -LockAtSignIn` makes
+  the task's first action lock the workstation (`rundll32.exe user32.dll,LockWorkStation`),
+  ahead of `up`. What it needs from Raj: turning Windows automatic sign-in on himself, and
+  Docker Desktop's "Start when you sign in". The build stores no credential and changes no
+  sign-in setting. With automatic sign-in, Windows keeps the password itself: as an LSA secret
+  when it is set through Sysinternals Autologon, or in plain text in the Winlogon
+  `DefaultPassword` registry value when it is set by hand. Use Autologon. The lock comes when
+  Task Scheduler starts the task, seconds after the desktop shows, and never if the task fails
+  to start. As a backstop, set a screen saver with "On resume, display logon screen", which
+  locks the session after its wait even when the task did not.
+- (c) Sign-in only. `register-signin-task.ps1` without `-LockAtSignIn`. What it needs from
+  Raj: signing in after power-on, and Docker Desktop's "Start when you sign in". The instance
+  starts once he signs in.
+
+A third way, a dedicated Docker Engine in its own WSL2 distribution that needs no sign-in, is
+not built here. Deploy decision A4 chooses between (a) and (c).
+
+Register the task from the repository or from `release/<tag>/deploy/daily/windows/`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File register-signin-task.ps1 -Python <python.exe> -Root <root> [-LockAtSignIn]
+```
+
+The script needs `<root>/bin/instance.py`, which `switch` puts there, and prints the task's
+`schtasks /query` line. The task runs as the signed-in user, only while that user is signed in,
+with no time limit and no battery conditions. Task Scheduler keeps each run's exit code:
+`schtasks /query /tn "MIST daily instance" /v` shows it as Last Result.
+`unregister-signin-task.ps1` removes the task, for a rollback; it does not stop the instance.
+
+Either way, the time from power-on until the instance records its first status is a gap in the
+uptime ledger: `/usage/uptime` counts it as `unrecorded`, never as up.
+
+---
+
 ## No scripted traffic to the daily instance
 
 Nothing scripted talks to the daily instance: no eval, gauntlet, hydration, smoke run or replay,
