@@ -1306,22 +1306,32 @@ async def health() -> dict:
 
     Fields from the snapshot
     ------------------------
-    - `status`: `healthy` / `degraded` / `unhealthy`, derived from `checks` by
-      `health.derive_status`, which is pure and reproducible from this payload.
+    - `status`: `healthy` / `degraded` / `yielded` / `unhealthy`, derived from
+      `checks` by `health.derive_status`, which is pure and reproducible from
+      this payload. `yielded` means a check reports `status: "yielded"`: the
+      LLM was stopped on purpose to free the GPU, so MIST cannot hold a
+      conversation, by choice rather than by fault. It outranks `degraded`
+      and yields to `unhealthy` (another fatal check down), and a yielded
+      check that goes stale reads unknown, so a dead probe loop reads
+      `degraded`, never `yielded`.
     - `restart_recommended`: whether restarting the PROCESS would plausibly
       help, which is a different question from `status`. Advisory only -- Docker
       restart policies react to container exit, not to healthcheck state, and
-      there is no autoheal sidecar, so nothing acts on this today.
+      there is no autoheal sidecar, so nothing acts on this today. A yielded
+      check never sets it.
     - `probe_loop`: `alive`, `dead` (no cycle completed within
       `dead_after_seconds`, so the cache is unrefreshed), or
       `PROBE_LOOP_NOT_STARTED` when no registry exists -- reachable only
       outside a completed `lifespan`, and reported as `unhealthy` with an empty
       `checks` mapping, because nothing verified is not healthy.
     - `checks`: one entry per dependency. `status: null` means NOT MEASURED and
-      carries a `reason` from a closed vocabulary; it never means `up`. The
-      checks are `neo4j`, `llm`, `event_store`, `vault_sidecar`, `broadcaster`
-      and three that say whether MIST is still learning and backed up, each
-      `severity: degrades` and `restart_repairs: false`:
+      carries a `reason` from a closed vocabulary; it never means `up`.
+      `status: "yielded"` (reason `gpu_yielded`) is set by the `llm` check
+      when given a yield state that reads `yielded`, and records
+      `consecutive_failures` 0; a yield state of `resume_failed` reads `down`.
+      The checks are `neo4j`, `llm`, `event_store`, `vault_sidecar`,
+      `broadcaster` and three that say whether MIST is still learning and
+      backed up, each `severity: degrades` and `restart_repairs: false`:
       - `extraction_service`: its own `GET /v1/health` call to the extraction
         service every cycle, so a switched-off host reads `down` /
         `unreachable` even while the dispatcher is idle. Also `down` for

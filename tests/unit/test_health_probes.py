@@ -43,6 +43,7 @@ from backend.health import (
     Neo4jProbe,
     ProbeFailed,
     ProbeUnavailable,
+    ProbeYielded,
     VaultSidecarProbe,
     derive_status,
 )
@@ -500,10 +501,13 @@ def _recompute(checks: dict[str, dict], probe_loop: str, settled: int = 5):
         for n, c in checks.items()
         if n not in down and (c["status"] is None or c["stale"] is True)
     }
+    yielded = {n for n, c in checks.items() if n not in down | unknown and c["status"] == "yielded"}
     fatal_down = {n for n in down if checks[n]["severity"] == "fatal"}
 
     if fatal_down:
         status = "unhealthy"
+    elif yielded:
+        status = "yielded"
     elif down | unknown:
         status = "degraded"
     else:
@@ -538,6 +542,12 @@ MATRIX = [
         {"a": _check("down", restart_repairs=False, failures=9)},
         "alive",
     ),
+    ({"a": _check("up"), "b": _check("yielded", severity="fatal")}, "alive"),
+    ({"a": _check("down"), "b": _check("yielded", severity="fatal")}, "alive"),
+    ({"a": _check("down", severity="fatal"), "b": _check("yielded", severity="fatal")}, "alive"),
+    ({"a": _check("up"), "b": _check("yielded", severity="fatal", stale=True)}, "alive"),
+    ({"a": _check(None), "b": _check("yielded", severity="fatal")}, "alive"),
+    ({"a": _check("up"), "b": _check("yielded", severity="fatal")}, "dead"),
 ]
 
 
@@ -1312,8 +1322,24 @@ class TestHealthProbeSettings:
         BackupProbe(settings, clock.wall)
 
 
-def test_new_reasons_are_in_the_closed_vocabulary():
-    for reason in (
+_REASONS_BEFORE_THIS_GOAL = frozenset(
+    {
+        "ok",
+        "not_probed_yet",
+        "not_started",
+        "disabled_by_config",
+        "unavailable_at_boot",
+        "no_probe_implemented",
+        "unreachable",
+        "query_failed",
+        "closed",
+        "task_dead",
+    }
+)
+_ELEVEN_NEW_REASONS = frozenset(
+    {
+        "gpu_yielded",
+        "resume_failed",
         "epoch_mismatch",
         "service_degraded",
         "stalled",
@@ -1323,5 +1349,129 @@ def test_new_reasons_are_in_the_closed_vocabulary():
         "backup_failed",
         "backup_suspect",
         "backup_overdue",
-    ):
-        assert reason in PROBE_REASONS, reason
+    }
+)
+
+
+def test_the_vocabulary_gains_exactly_the_eleven_new_reasons():
+    """A word added here is a promise about `/health`, so the set is pinned whole."""
+    assert len(_ELEVEN_NEW_REASONS) == 11
+    assert PROBE_REASONS == _REASONS_BEFORE_THIS_GOAL | _ELEVEN_NEW_REASONS
+
+
+# ---------------------------------------------------------------------------
+# The yielded status
+# ---------------------------------------------------------------------------
+
+
+def llm_probe(provider: FakeLLMProvider, state: str | None) -> LLMProbe:
+    if state is None:
+        return LLMProbe(lambda: provider)
+    return LLMProbe(lambda: provider, yield_state=lambda: state)
+
+
+class TestLLMProbeYieldState:
+    def test_yield_state_is_keyword_only_and_defaults_to_none(self):
+        parameter = inspect.signature(LLMProbe).parameters["yield_state"]
+
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is None
+
+    @pytest.mark.asyncio
+    async def test_yielded_renders_yielded_without_calling_the_provider(self, clock):
+        """The LLM was stopped on purpose; probing it would only report it gone."""
+        provider = FakeLLMProvider(healthy=False)
+
+        check = await run_single(clock, llm_probe(provider, "yielded"))
+
+        assert (check["status"], check["reason"]) == ("yielded", "gpu_yielded")
+        assert check["consecutive_failures"] == 0
+        assert provider.calls == 0
+
+    @pytest.mark.asyncio
+    async def test_resume_failed_is_down_without_calling_the_provider(self, clock):
+        """A failed reload is a fault, not a choice."""
+        provider = FakeLLMProvider(healthy=True)
+
+        check = await run_single(clock, llm_probe(provider, "resume_failed"))
+
+        assert (check["status"], check["reason"]) == ("down", "resume_failed")
+        assert provider.calls == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", [pytest.param("normal", id="normal"), None])
+    @pytest.mark.parametrize("healthy", [True, False])
+    async def test_normal_or_no_yield_state_probes_as_before(self, clock, state, healthy):
+        provider = FakeLLMProvider(healthy=healthy)
+
+        check = await run_single(clock, llm_probe(provider, state))
+
+        assert check["status"] == ("up" if healthy else "down")
+        assert provider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_a_yielded_probe_resets_failures_and_never_recommends_a_restart(clock):
+    """Even after `settled_failures` was exceeded, a yield is not a crash."""
+    outcome = {"raise": ProbeFailed("task_dead")}
+
+    async def behaviour() -> None:
+        raise outcome["raise"]
+
+    probe = StubProbe("gpu_holder", behaviour, severity="fatal", restart_repairs=True)
+    registry = build_registry(clock, [probe])
+    for _ in range(SETTLED_FAILURES + 1):
+        await registry.run_once()
+    assert registry.snapshot()["restart_recommended"] is True
+
+    outcome["raise"] = ProbeYielded("gpu_yielded")
+    await registry.run_once()
+    snapshot = registry.snapshot()
+
+    check = snapshot["checks"]["gpu_holder"]
+    assert (check["status"], check["reason"]) == ("yielded", "gpu_yielded")
+    assert check["consecutive_failures"] == 0
+    assert check["latency_ms"] is not None
+    assert snapshot["status"] == "yielded"
+    assert snapshot["restart_recommended"] is False
+
+
+class TestDeriveStatusYielded:
+    def test_a_yielded_fatal_check_with_everything_else_up_is_yielded(self):
+        checks = {
+            "llm": _check("yielded", severity="fatal"),
+            "neo4j": _check("up"),
+            "broadcaster": _check("up", severity="fatal"),
+        }
+
+        assert derive_status(checks, "alive") == ("yielded", False)
+
+    def test_another_fatal_check_down_is_still_unhealthy(self):
+        checks = {
+            "llm": _check("yielded", severity="fatal"),
+            "broadcaster": _check("down", severity="fatal"),
+        }
+
+        assert derive_status(checks, "alive")[0] == "unhealthy"
+
+    def test_yielded_outranks_a_degrading_check_that_is_down(self):
+        checks = {
+            "llm": _check("yielded", severity="fatal"),
+            "extraction_service": _check("down"),
+        }
+
+        assert derive_status(checks, "alive")[0] == "yielded"
+
+    def test_a_stale_yielded_check_reads_unknown_so_the_status_is_degraded(self):
+        """A dead probe loop must never keep reporting `yielded`."""
+        checks = {
+            "llm": _check("yielded", severity="fatal", stale=True),
+            "neo4j": _check("up"),
+        }
+
+        assert derive_status(checks, "alive")[0] == "degraded"
+
+    def test_a_yielded_check_never_recommends_a_restart_at_any_failure_count(self):
+        checks = {"llm": _check("yielded", severity="fatal", restart_repairs=True, failures=99)}
+
+        assert derive_status(checks, "alive", settled_failures=5) == ("yielded", False)

@@ -1512,7 +1512,9 @@ def cmd_stack_status(args: argparse.Namespace) -> int:
     rather than its HTTP code -- `/health` answers 200 even when it reports a
     fault, so an exit code derived from the code would print green over a red
     body. `_print_status_line` shows the body's own status word and, when the
-    backend asks for one, a restart notice.
+    backend asks for one, a restart notice. A `yielded` backend prints
+    `[YIELD]` rather than `[FAIL]` and still exits 1: while yielded, MIST
+    cannot hold a conversation.
     """
     be = _load_backend()
     config = be.get_config()
@@ -2432,7 +2434,15 @@ def _print_extraction_only_summary(results: list[dict]) -> None:
 def _print_status_line(status: dict) -> None:
     service = status.get("service", "?")
     state = status.get("status", "?")
-    indicator = "OK" if state == "healthy" else "FAIL"
+    # `yielded` is the backend giving the GPU away on purpose (gaming mode), so
+    # `[FAIL]` would call a choice a fault. It is still not healthy, and
+    # `cmd_stack_status` still exits 1 for it.
+    if state == "healthy":
+        indicator = "OK"
+    elif state == "yielded":
+        indicator = "YIELD"
+    else:
+        indicator = "FAIL"
     details: list[str] = []
     if "url" in status:
         details.append(status["url"])

@@ -1955,7 +1955,9 @@ def probe_backend(base_url: str, timeout: float = 5.0) -> dict[str, Any]:
 
     Returns:
         A status dict. `status` is the backend's own verdict (`healthy`,
-        `degraded`, `unhealthy`), or one of `http_<code>`, `unreadable_body`,
+        `degraded`, `yielded`, `unhealthy`), passed through unchanged --
+        `yielded` means the backend stopped its LLM on purpose to free the GPU
+        -- or one of `http_<code>`, `unreadable_body`,
         `no_status_field`, `unreachable`, `timeout`. `restart_recommended` is
         present whenever the body supplied a usable `status`.
     """

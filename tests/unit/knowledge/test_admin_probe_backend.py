@@ -138,6 +138,16 @@ def test_healthy_body_is_reported_healthy(respond_with) -> None:
     assert result["restart_recommended"] is False
 
 
+def test_yielded_body_is_reported_yielded(respond_with) -> None:
+    """A backend that gave the GPU away says so, and is neither healthy nor down."""
+    respond_with(200, _new_shape_body("yielded", restart_recommended=False))
+
+    result = admin.probe_backend("http://localhost:8001")
+
+    assert result["status"] == "yielded"
+    assert result["restart_recommended"] is False
+
+
 def test_body_longer_than_200_bytes_still_parses(respond_with) -> None:
     """3. The regression this module exists for.
 
