@@ -44,6 +44,8 @@ from backend.audio_protocol import (
     generate_fade_out,
     rms_normalize,
 )
+from backend.errors import GpuYieldedError
+from backend.gpu_yield import YIELDED_MESSAGE, turn_refusal
 from backend.request_context import (
     current_request_id,
     current_session_id,
@@ -287,6 +289,15 @@ class VoiceProcessor:
             # Otherwise, process immediately (don't set latest_user_input)
             self._process_conversation_turn(user_text, request_id=request_id)
 
+        except GpuYieldedError:
+            # The turn passed the WebSocket gate just before gaming mode
+            # released Whisper. It gets the gate's own refusal rather than a
+            # model error, and no turn is recorded: nothing was transcribed.
+            log_timestamp("Speech turn refused: the GPU is yielded to gaming mode")
+            asyncio.run_coroutine_threadsafe(
+                self.message_queue.put(json.dumps(turn_refusal(YIELDED_MESSAGE))),
+                self.loop,
+            )
         except Exception as e:
             logger.error(f"Error processing user speech: {e}", exc_info=True)
             asyncio.run_coroutine_threadsafe(

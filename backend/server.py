@@ -62,6 +62,14 @@ from backend.factories import (  # isort:skip
     build_sidecar_index,
     build_vault_writer,
 )
+from backend.gpu_yield import (  # isort:skip
+    MARKER_NAME,
+    RESUME_FAILED_MESSAGE,
+    YIELDED_MESSAGE,
+    GpuYield,
+    gpu_yield_poll_s,
+    turn_refusal,
+)
 from backend.health import (  # isort:skip
     BackupProbe,
     BroadcasterProbe,
@@ -245,6 +253,9 @@ _extraction_dispatcher_start_failed: bool = False
 # phase (httpx applies it to connect, read, write and pool separately) regardless.
 _extraction_health_client: httpx.AsyncClient | None = None
 EXTRACTION_HEALTH_CLIENT_TIMEOUT_S = 2.0
+# Gaming mode (`backend/gpu_yield.py`). None when `MIST_OPS_DIR` is unset, or
+# set while TTS is on: the backend is then never yielded.
+_gpu_yield: GpuYield | None = None
 
 # `probe_loop` value for "the registry was never constructed", distinct from
 # `health.py`'s `alive` / `dead`, which both describe a loop that ran. It is
@@ -378,7 +389,9 @@ async def health_status_loop(interval_seconds: float = 30.0) -> None:
     (per prototype ``edges-v10`` ``Offline persistent indicator``):
 
     - ``llm``: True iff ``voice_processor.models`` is initialized (LLM
-      backend loaded)
+      backend loaded) and gaming mode does not hold the GPU. While yielded,
+      or while the reload after gaming mode is failing, no model is loaded
+      for a turn, so it is False.
     - ``agent``: True iff ``voice_processor.models.knowledge.enabled``
       (knowledge subsystem operational; False means degraded MIST)
     - ``local``: True always (if this loop is running, the BE is up)
@@ -389,7 +402,7 @@ async def health_status_loop(interval_seconds: float = 30.0) -> None:
     while True:
         await asyncio.sleep(interval_seconds)
         try:
-            llm = bool(voice_processor and voice_processor.models)
+            llm = bool(voice_processor and voice_processor.models) and not _gpu_is_yielded()
             agent = bool(
                 voice_processor
                 and voice_processor.models
@@ -408,6 +421,95 @@ async def health_status_loop(interval_seconds: float = 30.0) -> None:
             await message_queue.put(payload)
         except Exception as e:  # noqa: BLE001
             logger.error("Health status emit failed: %s", e)
+
+
+def _gpu_is_yielded() -> bool:
+    """Whether gaming mode holds the GPU (`yielded` or `resume_failed`)."""
+    return _gpu_yield is not None and _gpu_yield.is_yielded()
+
+
+def _yielded_turn_refusal() -> dict | None:
+    """The error envelope an `audio` or `text` message gets while yielded, else None.
+
+    The existing ADR-017 error shape, retriable, with a fixed message per
+    state, so the client fails the turn fast and plainly. The message schemas
+    are unchanged.
+    """
+    if _gpu_yield is None:
+        return None
+    state = _gpu_yield.state()
+    if state == "normal":
+        return None
+    return turn_refusal(YIELDED_MESSAGE if state == "yielded" else RESUME_FAILED_MESSAGE)
+
+
+def _release_gpu_models() -> None:
+    """`GpuYield.on_yield`: release the live model manager's GPU models.
+
+    Reads `voice_processor` when called, because the model manager exists
+    only once `initialize()` has built it, after the `GpuYield` is built.
+    """
+    models = getattr(voice_processor, "models", None)
+    if models is not None:
+        models.release_gpu_models()
+
+
+def _reacquire_gpu_models() -> None:
+    """`GpuYield.on_resume`: reload the live model manager's GPU models."""
+    models = getattr(voice_processor, "models", None)
+    if models is not None:
+        models.reacquire_gpu_models()
+
+
+def _build_gpu_yield(ops_dir: str | None, *, tts_enabled: bool, poll_s: float) -> GpuYield | None:
+    """Build the gaming-mode watcher on `<ops_dir>/gpu-yielded`, or None.
+
+    None when `ops_dir` (`MIST_OPS_DIR`) is unset or blank: no gaming mode,
+    never yielded. None, with one error, when TTS is on as well: gaming mode
+    releases Whisper only, and Chatterbox cannot yet be released safely, so a
+    backend with TTS on does not yield.
+
+    Args:
+        ops_dir: The `MIST_OPS_DIR` value.
+        tts_enabled: `config.tts_enabled`.
+        poll_s: Marker poll interval (`MIST_GPU_YIELD_POLL_S`).
+    """
+    if ops_dir is None or not ops_dir.strip():
+        return None
+    if tts_enabled:
+        logger.error(
+            "MIST_OPS_DIR is set but TTS_ENABLED is true: gaming mode needs TTS off, so no "
+            "GPU yield is built and a stopped LLM will read down"
+        )
+        return None
+    return GpuYield(
+        Path(ops_dir.strip()) / MARKER_NAME,
+        _release_gpu_models,
+        _reacquire_gpu_models,
+        poll_s=poll_s,
+    )
+
+
+def _on_gpu_yield_loop_done(task: "asyncio.Task") -> None:
+    """Done-callback for the gaming-mode poll task; logs a death, ignores a cancel.
+
+    The same cancellation guard as `_on_broadcaster_done`: `lifespan` cancels
+    this task at every shutdown. `GpuYield` catches only `RuntimeError` and
+    `OSError` from its callbacks, so any other error ends the poll and freezes
+    the yield state; this one ERROR line, naming the class, keeps that from
+    being silent.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "Gaming-mode poll loop died (%s); the yield state is now frozen",
+            type(exc).__name__,
+            exc_info=exc,
+        )
+    else:
+        logger.error("Gaming-mode poll loop returned; the yield state is now frozen")
 
 
 def _extraction_status_payload(dispatcher) -> str:
@@ -838,7 +940,7 @@ def _event_store_configured() -> bool:
     return KnowledgeConfig.from_env().event_store.enabled
 
 
-async def _initialize_voice_processor(processor: VoiceProcessor) -> None:
+async def _initialize_voice_processor(processor: VoiceProcessor, *, yielded: bool = False) -> None:
     """Load the model stack and only then publish readiness.
 
     The ordering is the whole point, so it is a function rather than two lines
@@ -849,10 +951,12 @@ async def _initialize_voice_processor(processor: VoiceProcessor) -> None:
 
     Args:
         processor: The already-constructed `VoiceProcessor` to initialize.
+        yielded: Gaming mode holds the GPU at boot; the GPU models and the LLM
+            warmup are skipped.
     """
     global _models_ready
 
-    await processor.initialize()
+    await processor.initialize(yielded=yielded)
     _models_ready = True
 
 
@@ -927,6 +1031,7 @@ def _build_health_registry(
     broadcaster_state: BroadcasterState,
     extraction_inference: ExtractionServiceHealthSource,
     probe_settings: HealthProbeSettings,
+    yield_state: "Callable[[], str] | None" = None,
 ) -> HealthRegistry:
     """Construct the eight dependency probes and the registry that runs them.
 
@@ -958,6 +1063,9 @@ def _build_health_registry(
             `extraction_service` check calls, over its own HTTP client. Owned
             by the caller, which closes that client at shutdown.
         probe_settings: Thresholds and the backup status path.
+        yield_state: `GpuYield.state`, so the llm check reads `yielded` while
+            gaming mode holds the GPU and `down` (`resume_failed`) while the
+            reload fails. None without gaming mode.
 
     Returns:
         A registry whose `run_forever` the caller schedules.
@@ -972,7 +1080,7 @@ def _build_health_registry(
 
     probes = [
         Neo4jProbe(_health_graph_connection, _knowledge_configured, executor),
-        LLMProbe(_health_llm_provider),
+        LLMProbe(_health_llm_provider, yield_state=yield_state),
         EventStoreProbe(_health_event_store, _event_store_configured),
         VaultSidecarProbe(lambda: vault_sidecar),
         BroadcasterProbe(broadcaster_state.state),
@@ -995,7 +1103,7 @@ async def lifespan(app: FastAPI):
     global voice_processor, curation_scheduler, log_handler, extraction_dispatcher
     global vault_writer, vault_sidecar, vault_filewatcher, vault_invalidation_bus
     global _broadcaster_state, _health_registry, _health_probe_executor
-    global _extraction_health_client
+    global _extraction_health_client, _gpu_yield
 
     # Startup
     logger.info("=" * 60)
@@ -1077,10 +1185,26 @@ async def lifespan(app: FastAPI):
         vault_sidecar=vault_sidecar,
         invalidation_bus=vault_invalidation_bus,
     )
+    # Gaming mode, built before the model load so a backend that boots while
+    # the marker exists skips Whisper and the LLM warmup. Its poll starts only
+    # after initialize() returns, so a marker that came or went during the
+    # load is acted on by the first poll.
+    _gpu_yield = _build_gpu_yield(
+        os.environ.get("MIST_OPS_DIR"),
+        tts_enabled=bool(config.tts_enabled),
+        poll_s=gpu_yield_poll_s(),
+    )
+    yield_state = _gpu_yield.state if _gpu_yield is not None else None
+    defer_llm_jobs = _gpu_yield.is_yielded if _gpu_yield is not None else None
     # Sets `_models_ready` only once initialize() has returned, so
     # `/health.models_loaded` reports a state the process has actually reached
     # rather than the mere existence of the object above.
-    await _initialize_voice_processor(voice_processor)
+    await _initialize_voice_processor(voice_processor, yielded=_gpu_is_yielded())
+    gpu_yield_task: asyncio.Task | None = None
+    if _gpu_yield is not None:
+        gpu_yield_task = asyncio.create_task(_gpu_yield.run_forever(), name="gpu-yield")
+        gpu_yield_task.add_done_callback(_on_gpu_yield_loop_done)
+        logger.info("Gaming mode enabled (initial state: %s)", _gpu_yield.state())
 
     # Start message broadcaster. The state record is created and marked alive
     # here, beside the task it describes: `BroadcasterProbe` renders
@@ -1109,6 +1233,7 @@ async def lifespan(app: FastAPI):
         _broadcaster_state,
         RemoteExtractionInference(_extraction_health_client, _extraction_service_url()),
         HealthProbeSettings.from_env(),
+        yield_state=yield_state,
     )
     health_probe_task = asyncio.create_task(_health_registry.run_forever(), name="health-probes")
     health_probe_task.add_done_callback(_on_health_probe_loop_done)
@@ -1160,8 +1285,8 @@ async def lifespan(app: FastAPI):
             event_store=curation_deps.event_store,
             tracker=curation_deps.tracker,
             llm_provider=curation_deps.llm_provider,
-            # No gaming mode is wired yet, so the LLM job is never deferred.
-            defer_llm_jobs=None,
+            # `self_reflection` waits while gaming mode has stopped mist-llm.
+            defer_llm_jobs=defer_llm_jobs,
         )
         if await curation_scheduler.start():
             logger.info("Curation scheduler started")
@@ -1287,6 +1412,11 @@ async def lifespan(app: FastAPI):
     heartbeat_task.cancel()
     health_probe_task.cancel()
     broadcaster_task.cancel()
+    if gpu_yield_task is not None:
+        gpu_yield_task.cancel()
+        # Waits for the cancel to land; `return_exceptions` keeps a loop that
+        # already died (logged by its done-callback) from raising here.
+        await asyncio.gather(gpu_yield_task, return_exceptions=True)
     # `wait=False` deliberately: a probe thread wedged on the timeout-less Neo4j
     # driver would otherwise hold shutdown for the driver's own 60s acquisition
     # timeout. The pool has one worker and the process is ending.
@@ -1661,6 +1791,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             # Handle different message types
+            if msg_type in ("audio", "text"):
+                # Gaming mode: refuse the turn before it is processed or
+                # recorded. Every other message type is handled as usual.
+                refusal = _yielded_turn_refusal()
+                if refusal is not None:
+                    await websocket.send_json(refusal)
+                    continue
+
             if msg_type == "audio":
                 # Complete audio from client (no VAD, just transcribe and process)
                 audio_payload = data.get("audio")
