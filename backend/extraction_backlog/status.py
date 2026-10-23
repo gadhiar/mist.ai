@@ -8,12 +8,17 @@ Three surfaces read the same object so they cannot disagree:
 - `GET /extraction/status`;
 - the `extraction` block of `/health` (`health_block`).
 
-It never raises. With no dispatcher, or a dispatcher in `off` mode, the status
-is state `disabled` with zero counts; `unrecorded_turns` is filled in either
-way, from `telemetry`. A storage failure while the dispatcher computes its
-snapshot is logged and reported as the dispatcher's current state with zero
-counts, because a status endpoint that errors hides the state an operator is
-looking for.
+`extraction_status` never raises. With no dispatcher, or a dispatcher in `off`
+mode, the status is state `disabled` with zero counts; `unrecorded_turns` is
+filled in either way, from `telemetry`. A storage failure while the dispatcher
+computes its snapshot is logged and reported as the dispatcher's current state
+with zero counts, because a status endpoint that errors hides the state an
+operator is looking for.
+
+`checked_extraction_status` is the same producer without that fallback: it
+returns None where `extraction_status` would substitute zero counts. The
+`extraction_backlog` health probe reads it, because zero counts from a backlog
+it could not read would otherwise look exactly like an empty, healthy one.
 """
 
 from __future__ import annotations
@@ -55,6 +60,30 @@ def _empty(state: str) -> ExtractionStatus:
     )
 
 
+def checked_extraction_status(
+    dispatcher: ExtractionDispatcher | None,
+) -> ExtractionStatus | None:
+    """The current `ExtractionStatus`, or None when the snapshot could not be read.
+
+    Args:
+        dispatcher: The server's dispatcher, or None when knowledge integration
+            is off or the dispatcher failed to start.
+
+    Returns:
+        The dispatcher's snapshot; state `disabled` with zero counts for no
+        dispatcher or `off` mode; or None when the snapshot raised a
+        `MistError`, `sqlite3.Error` or `OSError`, which is logged here.
+    """
+    if dispatcher is None or dispatcher.mode == "off":
+        return _empty(STATE_DISABLED)
+    try:
+        # `snapshot()` reads `telemetry.unrecorded_turns()` itself.
+        return dispatcher.snapshot()
+    except (MistError, sqlite3.Error, OSError) as exc:
+        logger.warning("Extraction status snapshot failed: %s", exc)
+        return None
+
+
 def extraction_status(dispatcher: ExtractionDispatcher | None) -> ExtractionStatus:
     """The current `ExtractionStatus`, for any dispatcher or none.
 
@@ -63,17 +92,15 @@ def extraction_status(dispatcher: ExtractionDispatcher | None) -> ExtractionStat
             is off or the dispatcher failed to start.
 
     Returns:
-        The status. `unrecorded_turns` is always the process-wide count.
+        The status. `unrecorded_turns` is always the process-wide count. A
+        snapshot that could not be read reports the dispatcher's state with
+        zero counts.
     """
-    if dispatcher is None or dispatcher.mode == "off":
-        return _empty(STATE_DISABLED)
-    try:
-        snapshot = dispatcher.snapshot()
-    except (MistError, sqlite3.Error, OSError) as exc:
-        logger.warning("Extraction status snapshot failed; reporting zero counts: %s", exc)
-        return _empty(dispatcher.state)
-    # `snapshot()` reads `telemetry.unrecorded_turns()` itself.
-    return snapshot
+    status = checked_extraction_status(dispatcher)
+    if status is not None:
+        return status
+    # None comes only from a dispatcher whose snapshot raised.
+    return _empty(dispatcher.state if dispatcher is not None else STATE_DISABLED)
 
 
 def health_block(status: ExtractionStatus) -> dict[str, Any]:

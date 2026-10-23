@@ -48,9 +48,16 @@ The numbers, and why each is what it is
   file). Cited by service name rather than by line: this module's own branch
   inserted eight lines above both blocks and invalidated the line numbers that
   used to stand here.
-- Probe timeouts 2.0s (neo4j, llm) and 0.5s (sqlite-backed). Chosen so that
-  every probe timing out at once still leaves the cycle finishing inside its own
-  10s interval. These bound the loop, never the request.
+- Probe timeouts 2.0s (neo4j, llm), 2.5s (extraction_service) and 0.5s
+  (sqlite- and file-backed). extraction_service's own HTTP client is built
+  with `httpx.AsyncClient(timeout=2.0)`, which httpx applies to each phase
+  (connect, read, write, pool acquisition) separately, not to the whole call.
+  A refused connection or a host that never accepts it fails inside 2.0s and
+  reads `unreachable`; a call whose phases each finish under 2.0s but
+  together pass 2.5s reaches the probe's own bound first and reads `timeout`.
+  Probes run concurrently, so every probe timing out at once still leaves the
+  cycle finishing inside its own 10s interval. These bound the loop, never the
+  request.
 - `stale_after_seconds = 30.0`, three intervals. Survives two missed ticks
   without flapping.
 - `dead_after_seconds = 90.0`, nine intervals. Every check going stale at once
@@ -94,14 +101,24 @@ to the log; the payload gets a vocabulary word.
 
 import asyncio
 import functools
+import json
 import logging
-from collections.abc import Callable
+import math
+import os
+from collections.abc import Callable, Mapping
 from concurrent.futures import Executor
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Literal, Protocol
 
 from backend.errors import MistError
+from backend.extraction_backlog.errors import (
+    InferenceResponseInvalidError,
+    InferenceServiceError,
+    InferenceUnreachableError,
+)
+from backend.extraction_contract.models import ExtractionStatus, HealthResponse
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +133,21 @@ logger = logging.getLogger(__name__)
 # probe can ever raise it -- `Neo4jConnection.health_check` collapses every
 # failure into `{"status": "unhealthy"}` (`neo4j_connection.py:149-155`), so
 # publishing it would advertise a distinction `/health` never makes.
+#
+# The extraction and backup terms, one per row of their checks:
+# - `epoch_mismatch`: the dispatcher refuses to dispatch because the service's
+#   epoch stamps differ from the backend's (dispatcher state `epoch_mismatch`).
+# - `service_degraded`: the extraction service answered `GET /v1/health`, but
+#   its `status` was not `ok` or it could not reach its own LLM.
+# - `stalled`: the dispatcher state is `stalled`; nothing is being extracted.
+# - `backlog_overdue`: the oldest pending turn is older than the backlog max age.
+# - `dead_lettered`: at least one turn is dead-lettered and awaits a retry.
+# - `backup_never_run`: backups are configured but no status file exists yet.
+# - `backup_failed`: the last attempt did not succeed and no recent success
+#   covers it.
+# - `backup_suspect`: as `backup_failed`, but the last dump was set aside as
+#   empty or shrunken, which wants a review rather than a retry.
+# - `backup_overdue`: the last success is older than the backup max age.
 PROBE_REASONS: frozenset[str] = frozenset(
     {
         "ok",
@@ -128,6 +160,15 @@ PROBE_REASONS: frozenset[str] = frozenset(
         "query_failed",
         "closed",
         "task_dead",
+        "epoch_mismatch",
+        "service_degraded",
+        "stalled",
+        "backlog_overdue",
+        "dead_lettered",
+        "backup_never_run",
+        "backup_failed",
+        "backup_suspect",
+        "backup_overdue",
     }
 )
 
@@ -135,6 +176,9 @@ DEFAULT_INTERVAL_SECONDS = 10.0
 DEFAULT_STALE_AFTER_SECONDS = 30.0
 DEFAULT_DEAD_AFTER_SECONDS = 90.0
 DEFAULT_SETTLED_FAILURES = 5
+
+DEFAULT_BACKLOG_MAX_AGE_S = 21600.0
+DEFAULT_BACKUP_MAX_AGE_HOURS = 26.0
 
 Severity = Literal["fatal", "degrades"]
 
@@ -233,6 +277,110 @@ class SidecarHealthSource(Protocol):
     def health_check(self) -> bool:
         """Return True when the index is open and its schema is intact."""
         ...
+
+
+class ExtractionServiceHealthSource(Protocol):
+    """The one method `ExtractionServiceProbe` needs from `RemoteExtractionInference`."""
+
+    async def health(self) -> HealthResponse:
+        """Call `GET /v1/health`, raising a typed inference error on failure."""
+        ...
+
+
+class ExtractionDispatcherHealthSource(Protocol):
+    """What the extraction probes read from the dispatcher itself."""
+
+    @property
+    def mode(self) -> str:
+        """`service` or `off`."""
+        ...
+
+    @property
+    def state(self) -> str:
+        """The dispatcher state, e.g. `idle`, `stalled` or `epoch_mismatch`."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class HealthProbeSettings:
+    """The thresholds and paths the extraction and backup probes read.
+
+    Attributes:
+        backlog_max_age_s: Age of the oldest pending turn past which
+            `extraction_backlog` reads `backlog_overdue`
+            (`MIST_HEALTH_BACKLOG_MAX_AGE_S`). Six hours: an extraction host
+            that is off for an evening is reported by `extraction_service` at
+            once, and the backlog only counts as overdue once it has outlasted
+            that.
+        backup_status_path: The backup scheduler's status file
+            (`MIST_BACKUP_STATUS_PATH`), or None when backups are not
+            configured here, which renders `backup` null.
+        backup_max_age_hours: Age of the last success past which `backup`
+            reads down (`MIST_BACKUP_MAX_AGE_HOURS`). 26 hours is the daily
+            interval plus two hours of slack for a slow or retried dump.
+    """
+
+    backlog_max_age_s: float = DEFAULT_BACKLOG_MAX_AGE_S
+    backup_status_path: Path | None = None
+    backup_max_age_hours: float = DEFAULT_BACKUP_MAX_AGE_HOURS
+
+    @classmethod
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> "HealthProbeSettings":
+        """Read the settings from the environment, keeping a default for a bad value.
+
+        A malformed or non-positive age is logged and replaced by its default
+        rather than raised: this runs in `lifespan`, and a typo in a health
+        threshold should not stop MIST serving, nor switch a check off.
+
+        Args:
+            environ: The variables to read; `os.environ` when None.
+
+        Returns:
+            The settings.
+        """
+        env = os.environ if environ is None else environ
+        raw_path = (env.get("MIST_BACKUP_STATUS_PATH") or "").strip()
+        return cls(
+            backlog_max_age_s=_positive_float(
+                env, "MIST_HEALTH_BACKLOG_MAX_AGE_S", DEFAULT_BACKLOG_MAX_AGE_S
+            ),
+            backup_status_path=Path(raw_path) if raw_path else None,
+            backup_max_age_hours=_positive_float(
+                env,
+                "MIST_BACKUP_MAX_AGE_HOURS",
+                DEFAULT_BACKUP_MAX_AGE_HOURS,
+                limit=_MAX_TIMEDELTA_HOURS,
+            ),
+        )
+
+
+# The largest hour count `timedelta(hours=...)` holds, in whole days so float
+# rounding cannot push it past `timedelta.max`. `BackupProbe` builds that
+# `timedelta` in `lifespan`, where an `OverflowError` would stop the boot.
+_MAX_TIMEDELTA_HOURS = float(timedelta.max.days * 24)
+
+
+def _positive_float(
+    env: Mapping[str, str], name: str, default: float, *, limit: float = math.inf
+) -> float:
+    """Parse one finite positive number up to `limit`, logging and defaulting a bad value.
+
+    `inf` and `nan` parse as floats, so they are refused explicitly: neither is
+    an age anyone means, and an infinite one overflows `timedelta`.
+    """
+    raw = (env.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+    if math.isfinite(value) and 0 < value <= limit:
+        return value
+    logger.error(
+        "%s=%r is not a finite positive number up to %s; using %s", name, raw, limit, default
+    )
+    return default
 
 
 def _coerce_reason(reason: str | None, probe_name: str) -> str | None:
@@ -514,6 +662,259 @@ class BroadcasterProbe:
             raise ProbeUnavailable("not_started")
         if state == "dead":
             raise ProbeFailed("task_dead")
+
+
+class ExtractionServiceProbe:
+    """Calls the extraction service's `GET /v1/health` on every probe cycle.
+
+    The dispatcher only learns the service is gone when it has a job to send,
+    so an idle dispatcher beside a switched-off extraction host reads `idle`.
+    This probe makes its own call through its own `RemoteExtractionInference`
+    (built by the server over a dedicated `httpx.AsyncClient` with a 2-second
+    timeout per phase), so
+    the host's absence shows within one interval whether or not work is queued.
+
+    The dispatcher is read for two things only: whether there is one at all
+    (none, or `off` mode, is null `disabled_by_config`) and whether its state
+    is `epoch_mismatch`, which a healthy reply from the service cannot show.
+    `start_failed` is the server's record that the dispatcher raised at boot,
+    which a None dispatcher alone cannot tell apart from one never configured.
+
+    `severity="degrades"`: conversation goes on, and turns are logged for later
+    extraction. `restart_repairs=False`: the host is a separate machine.
+    """
+
+    def __init__(
+        self,
+        inference: ExtractionServiceHealthSource,
+        get_dispatcher: Callable[[], ExtractionDispatcherHealthSource | None],
+        start_failed: Callable[[], bool],
+    ) -> None:
+        self.name = "extraction_service"
+        self.severity: Severity = "degrades"
+        self.restart_repairs = False
+        self.timeout_seconds = 2.5
+        self._inference = inference
+        self._get_dispatcher = get_dispatcher
+        self._start_failed = start_failed
+
+    async def check(self) -> None:
+        """Evaluate item 3's `extraction_service` rows, top-down."""
+        if self._start_failed():
+            raise ProbeFailed("unavailable_at_boot")
+        dispatcher = self._get_dispatcher()
+        if dispatcher is None or dispatcher.mode == "off":
+            raise ProbeUnavailable("disabled_by_config")
+
+        try:
+            reply = await self._inference.health()
+        except InferenceUnreachableError as exc:
+            logger.debug("extraction service unreachable: %s", exc)
+            raise ProbeFailed("unreachable") from exc
+        except (InferenceServiceError, InferenceResponseInvalidError) as exc:
+            logger.warning("extraction service health call failed: %s", exc)
+            raise ProbeFailed("query_failed") from exc
+
+        if reply.status != "ok" or not reply.llm_reachable:
+            raise ProbeFailed("service_degraded")
+        if dispatcher.state == "epoch_mismatch":
+            raise ProbeFailed("epoch_mismatch")
+
+
+class ExtractionBacklogProbe:
+    """Reports whether MIST is still learning from what it hears.
+
+    Reads the producer behind the `extraction` block, through
+    `checked_extraction_status` (injected as `read_status`), which returns
+    None where the block falls back to zero counts. Zero counts from a backlog
+    that could not be read look like an empty one, so None reads
+    `query_failed` here instead of `ok`.
+
+    `stalled` and `backlog_overdue` are evaluated before `dead_lettered`, so a
+    lasting dead letter never hides a stalled or overdue backlog. The count is
+    current, not cumulative: a retried dead letter leaves it.
+
+    Reads SQLite through `asyncio.to_thread`, as `EventStoreProbe` does, and
+    takes no executor: behind the Neo4j probe's single worker a wedged graph
+    call would read as an extraction timeout.
+
+    `severity="degrades"`, `restart_repairs=False`: turns keep being logged,
+    and a restart replays the same backlog.
+    """
+
+    def __init__(
+        self,
+        get_dispatcher: Callable[[], ExtractionDispatcherHealthSource | None],
+        read_status: Callable[..., ExtractionStatus | None],
+        start_failed: Callable[[], bool],
+        settings: HealthProbeSettings,
+    ) -> None:
+        self.name = "extraction_backlog"
+        self.severity: Severity = "degrades"
+        self.restart_repairs = False
+        self.timeout_seconds = 0.5
+        self._get_dispatcher = get_dispatcher
+        self._read_status = read_status
+        self._start_failed = start_failed
+        self._max_age_ms = settings.backlog_max_age_s * 1000.0
+
+    async def check(self) -> None:
+        """Evaluate item 3's `extraction_backlog` rows, top-down."""
+        if self._start_failed():
+            raise ProbeFailed("unavailable_at_boot")
+        dispatcher = self._get_dispatcher()
+        if dispatcher is None or dispatcher.mode == "off":
+            raise ProbeUnavailable("disabled_by_config")
+
+        status = await asyncio.to_thread(self._read_status, dispatcher)
+        if status is None:
+            raise ProbeFailed("query_failed")
+        if status.state == "stalled":
+            raise ProbeFailed("stalled")
+        oldest = status.oldest_pending_age_ms
+        if oldest is not None and oldest > self._max_age_ms:
+            raise ProbeFailed("backlog_overdue")
+        if status.dead_lettered > 0:
+            raise ProbeFailed("dead_lettered")
+
+
+# Every key of the backup scheduler's status file. A file missing any of them
+# was not written by the scheduler this build pairs with, so it is not trusted.
+_BACKUP_STATUS_KEYS: frozenset[str] = frozenset(
+    {
+        "v",
+        "last_attempt_at",
+        "last_result",
+        "last_exit_code",
+        "last_success_at",
+        "last_label",
+        "last_duration_s",
+        "retained",
+        "last_success_counts",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _BackupRecord:
+    """The two status-file fields the backup rows decide on."""
+
+    last_result: str | None
+    last_success_at: datetime | None
+
+
+class BackupProbe:
+    """Reports whether the last good backup is recent enough.
+
+    Reads the status file the backup scheduler writes after every attempt.
+    With no status path configured (the workstation stack), the check is
+    null: nothing here backs up, and saying `down` would claim a failure.
+
+    `backup_suspect` comes before `backup_failed` because a dump set aside as
+    empty or shrunken needs a person to look at it, while a failed one is
+    retried on its own. Both apply only once the last good success is older
+    than the max age: a failed attempt beside a recent success is still
+    backed up.
+
+    Reads the file through `asyncio.to_thread` and takes no executor, for the
+    same reason as `ExtractionBacklogProbe`. The wall clock is injected
+    because the file's timestamps are wall time.
+
+    `severity="degrades"`, `restart_repairs=False`: backups run in their own
+    container, and a backend restart does nothing for them.
+    """
+
+    def __init__(
+        self,
+        settings: HealthProbeSettings,
+        wall_clock: Callable[[], datetime],
+    ) -> None:
+        self.name = "backup"
+        self.severity: Severity = "degrades"
+        self.restart_repairs = False
+        self.timeout_seconds = 0.5
+        self._path = settings.backup_status_path
+        self._max_age = timedelta(hours=settings.backup_max_age_hours)
+        self._wall_clock = wall_clock
+
+    async def check(self) -> None:
+        """Evaluate item 3's `backup` rows, top-down."""
+        if self._path is None:
+            raise ProbeUnavailable("disabled_by_config")
+        try:
+            text = await asyncio.to_thread(self._read_text, self._path)
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning("backup status file unreadable: %s", exc)
+            raise ProbeFailed("query_failed") from exc
+        if text is None:
+            raise ProbeFailed("backup_never_run")
+
+        record = _parse_backup_status(text)
+        success_at = record.last_success_at
+        # A null success is stale even beside `last_result: "ok"`: no success
+        # within the max age means not backed up, so that reads `backup_overdue`.
+        stale = success_at is None or self._wall_clock() - success_at > self._max_age
+        if record.last_result == "suspect" and stale:
+            raise ProbeFailed("backup_suspect")
+        if record.last_result != "ok" and stale:
+            raise ProbeFailed("backup_failed")
+        if stale:
+            raise ProbeFailed("backup_overdue")
+
+    @staticmethod
+    def _read_text(path: Path) -> str | None:
+        """Return the file's text, or None when it does not exist."""
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+
+
+def _parse_backup_status(text: str) -> _BackupRecord:
+    """Validate a status file body, raising `ProbeFailed("query_failed")` if unusable.
+
+    Args:
+        text: The file's contents.
+
+    Returns:
+        The two fields the backup rows read.
+    """
+    try:
+        body = json.loads(text)
+    except json.JSONDecodeError as exc:
+        logger.warning("backup status file is not JSON: %s", exc)
+        raise ProbeFailed("query_failed") from exc
+    if not isinstance(body, dict):
+        logger.warning("backup status file is not a JSON object")
+        raise ProbeFailed("query_failed")
+    missing = _BACKUP_STATUS_KEYS - body.keys()
+    if missing:
+        logger.warning("backup status file lacks keys: %s", sorted(missing))
+        raise ProbeFailed("query_failed")
+
+    last_result = body["last_result"]
+    if last_result is not None and not isinstance(last_result, str):
+        logger.warning("backup status file has a non-string last_result: %r", last_result)
+        raise ProbeFailed("query_failed")
+    return _BackupRecord(
+        last_result=last_result,
+        last_success_at=_parse_utc(body["last_success_at"]),
+    )
+
+
+def _parse_utc(value: object) -> datetime | None:
+    """Parse an ISO-8601 timestamp, reading one without an offset as UTC."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        logger.warning("backup status timestamp is not a string: %r", value)
+        raise ProbeFailed("query_failed")
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError as exc:
+        logger.warning("backup status timestamp is not ISO-8601: %r", value)
+        raise ProbeFailed("query_failed") from exc
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
 
 def derive_status(

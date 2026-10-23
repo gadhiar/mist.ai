@@ -29,6 +29,7 @@ if sys.platform == "win32":
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8")
 
+import httpx
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -61,9 +62,14 @@ from backend.factories import (  # isort:skip
     build_vault_writer,
 )
 from backend.health import (  # isort:skip
+    BackupProbe,
     BroadcasterProbe,
     BroadcasterState,
     EventStoreProbe,
+    ExtractionBacklogProbe,
+    ExtractionServiceHealthSource,
+    ExtractionServiceProbe,
+    HealthProbeSettings,
     HealthRegistry,
     LLMProbe,
     Neo4jProbe,
@@ -78,6 +84,9 @@ from backend.knowledge.eval_isolation import (  # isort:skip
 from backend.log_handler import WebSocketLogHandler  # isort:skip
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from backend.extraction_backlog.dispatcher import ExtractionDispatcher
     from backend.interfaces import EventStoreProvider
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
     from backend.llm import StreamingLLMProvider
@@ -185,6 +194,18 @@ _models_ready: bool = False
 _broadcaster_state: BroadcasterState | None = None
 _health_registry: HealthRegistry | None = None
 _health_probe_executor: Executor | None = None
+# Set when `_start_extraction_dispatcher` raised at boot. Without it a None
+# `extraction_dispatcher` reads the same whether the dispatcher failed to start
+# or was never configured, and the extraction checks would report a failed
+# start as `disabled_by_config`.
+_extraction_dispatcher_start_failed: bool = False
+# The extraction-service health check's own HTTP client. The dispatcher's client
+# carries `/v1/extract`'s read timeout (300 s by default) and a 5 s connect
+# timeout (`backend.factories.build_extraction_dispatcher`), and exists only
+# while a service-mode dispatcher runs; the probe needs a 2 s timeout on every
+# phase (httpx applies it to connect, read, write and pool separately) regardless.
+_extraction_health_client: httpx.AsyncClient | None = None
+EXTRACTION_HEALTH_CLIENT_TIMEOUT_S = 2.0
 
 # `probe_loop` value for "the registry was never constructed", distinct from
 # `health.py`'s `alive` / `dead`, which both describe a loop that ran. It is
@@ -796,11 +817,79 @@ async def _initialize_voice_processor(processor: VoiceProcessor) -> None:
     _models_ready = True
 
 
+async def _start_extraction_dispatcher_recording_failure(
+    start: "Callable[[], Awaitable[ExtractionDispatcher | None]]",
+) -> "ExtractionDispatcher | None":
+    """Start the dispatcher, recording a failed start for the health checks.
+
+    A module function rather than lines in `lifespan` so the failure path is
+    testable without booting the model stack. The flag is what lets the two
+    extraction checks report `unavailable_at_boot` until a restart succeeds;
+    without it a None dispatcher reads `disabled_by_config`, as if extraction
+    had been switched off on purpose.
+
+    Args:
+        start: Awaitable factory that builds, starts and attaches the
+            dispatcher (`_start_extraction_dispatcher` bound to its arguments).
+
+    Returns:
+        The started dispatcher, or None when there is none to start or the
+        start raised one of the errors `_start_extraction_dispatcher` can.
+    """
+    global _extraction_dispatcher_start_failed
+
+    _extraction_dispatcher_start_failed = False
+    try:
+        return await start()
+    except (MistError, sqlite3.Error, OSError, ValueError) as e:
+        logger.error("Extraction dispatcher failed to start: %s", e, exc_info=True)
+        _extraction_dispatcher_start_failed = True
+        return None
+
+
+def _new_extraction_health_client() -> httpx.AsyncClient:
+    """The `extraction_service` check's own HTTP client, closed at shutdown.
+
+    httpx applies the 2.0 s timeout to each phase (connect, read, write, pool)
+    separately; the probe's own 2.5 s timeout bounds the whole call.
+    """
+    return httpx.AsyncClient(timeout=EXTRACTION_HEALTH_CLIENT_TIMEOUT_S)
+
+
+async def _close_extraction_health_client() -> None:
+    """Close and forget the probe client; a no-op when none was built."""
+    global _extraction_health_client
+
+    client = _extraction_health_client
+    _extraction_health_client = None
+    if client is not None:
+        await client.aclose()
+
+
+def _extraction_service_url() -> str:
+    """The extraction service root the dispatcher would send jobs to.
+
+    Read through `DispatcherSettings.from_env`, so the probe checks the same
+    host the dispatcher uses. A malformed `MIST_EXTRACTION_*` variable makes
+    that raise; it also makes the dispatcher's start fail, after which the
+    probe reports `unavailable_at_boot` without calling anything, so the URL is
+    then read on its own rather than failing the boot here.
+    """
+    from backend.extraction_backlog.settings import DEFAULT_SERVICE_URL, DispatcherSettings
+
+    try:
+        return DispatcherSettings.from_env().service_url
+    except ValueError:
+        return (os.getenv("MIST_EXTRACTION_SERVICE_URL") or DEFAULT_SERVICE_URL).strip()
+
+
 def _build_health_registry(
     executor: Executor,
     broadcaster_state: BroadcasterState,
+    extraction_inference: ExtractionServiceHealthSource,
+    probe_settings: HealthProbeSettings,
 ) -> HealthRegistry:
-    """Construct the five dependency probes and the registry that runs them.
+    """Construct the eight dependency probes and the registry that runs them.
 
     Every accessor is a callable that reads module state WHEN THE PROBE RUNS,
     never a value captured here. `voice_processor`, `vault_sidecar` and the
@@ -816,20 +905,41 @@ def _build_health_registry(
     the entire content of this wiring, and it cannot be asserted without booting
     the full model stack unless the construction is its own function.
 
+    The registry is built before `lifespan` starts the extraction dispatcher,
+    so `extraction_dispatcher` and `_extraction_dispatcher_start_failed` in
+    particular must be read when the probe runs.
+
     Args:
         executor: Single-worker pool for the blocking Neo4j driver call. Owned
             by the caller, which is also responsible for shutting it down.
+            Only `Neo4jProbe` uses it; the extraction-backlog and backup probes
+            read through `asyncio.to_thread`.
         broadcaster_state: The live record the broadcast task publishes into.
+        extraction_inference: The extraction service client the
+            `extraction_service` check calls, over its own HTTP client. Owned
+            by the caller, which closes that client at shutdown.
+        probe_settings: Thresholds and the backup status path.
 
     Returns:
         A registry whose `run_forever` the caller schedules.
     """
+    from backend.extraction_backlog.status import checked_extraction_status
+
+    def dispatcher():
+        return extraction_dispatcher
+
+    def start_failed() -> bool:
+        return _extraction_dispatcher_start_failed
+
     probes = [
         Neo4jProbe(_health_graph_connection, _knowledge_configured, executor),
         LLMProbe(_health_llm_provider),
         EventStoreProbe(_health_event_store, _event_store_configured),
         VaultSidecarProbe(lambda: vault_sidecar),
         BroadcasterProbe(broadcaster_state.state),
+        ExtractionServiceProbe(extraction_inference, dispatcher, start_failed),
+        ExtractionBacklogProbe(dispatcher, checked_extraction_status, start_failed, probe_settings),
+        BackupProbe(probe_settings, lambda: datetime.now(UTC)),
     ]
     return HealthRegistry(
         probes,
@@ -846,6 +956,7 @@ async def lifespan(app: FastAPI):
     global voice_processor, curation_scheduler, log_handler, extraction_dispatcher
     global vault_writer, vault_sidecar, vault_filewatcher, vault_invalidation_bus
     global _broadcaster_state, _health_registry, _health_probe_executor
+    global _extraction_health_client
 
     # Startup
     logger.info("=" * 60)
@@ -951,7 +1062,15 @@ async def lifespan(app: FastAPI):
     # stopping it, so an unbounded pool would leak one thread per tick into a
     # hung dependency. See `backend/health.py`'s module docstring.
     _health_probe_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="health-probe")
-    _health_registry = _build_health_registry(_health_probe_executor, _broadcaster_state)
+    from backend.extraction_backlog.inference import RemoteExtractionInference
+
+    _extraction_health_client = _new_extraction_health_client()
+    _health_registry = _build_health_registry(
+        _health_probe_executor,
+        _broadcaster_state,
+        RemoteExtractionInference(_extraction_health_client, _extraction_service_url()),
+        HealthProbeSettings.from_env(),
+    )
     health_probe_task = asyncio.create_task(_health_registry.run_forever(), name="health-probes")
     health_probe_task.add_done_callback(_on_health_probe_loop_done)
 
@@ -1018,13 +1137,9 @@ async def lifespan(app: FastAPI):
     # T2a: extraction backlog. After voice_processor.initialize() so the
     # handler it attaches to is the live one.
     extraction_dispatcher = None
-    try:
-        extraction_dispatcher = await _start_extraction_dispatcher(
-            voice_processor, knowledge_config
-        )
-    except (MistError, sqlite3.Error, OSError, ValueError) as e:
-        logger.error("Extraction dispatcher failed to start: %s", e, exc_info=True)
-        extraction_dispatcher = None
+    extraction_dispatcher = await _start_extraction_dispatcher_recording_failure(
+        lambda: _start_extraction_dispatcher(voice_processor, knowledge_config)
+    )
 
     # ADR-017 additive `extraction_status`: periodic push, with or without a
     # dispatcher (none -> `disabled` plus `unrecorded_turns`). Transitions are
@@ -1136,6 +1251,8 @@ async def lifespan(app: FastAPI):
     # timeout. The pool has one worker and the process is ending.
     if _health_probe_executor is not None:
         _health_probe_executor.shutdown(wait=False)
+    # After the probe loop is cancelled, so no new health call starts on it.
+    await _close_extraction_health_client()
     if voice_processor and voice_processor.models:
         voice_processor.models.shutdown()
 
@@ -1201,7 +1318,26 @@ async def health() -> dict:
       outside a completed `lifespan`, and reported as `unhealthy` with an empty
       `checks` mapping, because nothing verified is not healthy.
     - `checks`: one entry per dependency. `status: null` means NOT MEASURED and
-      carries a `reason` from a closed vocabulary; it never means `up`.
+      carries a `reason` from a closed vocabulary; it never means `up`. The
+      checks are `neo4j`, `llm`, `event_store`, `vault_sidecar`, `broadcaster`
+      and three that say whether MIST is still learning and backed up, each
+      `severity: degrades` and `restart_repairs: false`:
+      - `extraction_service`: its own `GET /v1/health` call to the extraction
+        service every cycle, so a switched-off host reads `down` /
+        `unreachable` even while the dispatcher is idle. Also `down` for
+        `query_failed`, `service_degraded`, `epoch_mismatch`, or
+        `unavailable_at_boot` when the dispatcher failed to start; null
+        `disabled_by_config` with no dispatcher or in `off` mode.
+      - `extraction_backlog`: the producer behind the `extraction` block,
+        `down` for `stalled`, `backlog_overdue` (oldest pending turn past
+        `MIST_HEALTH_BACKLOG_MAX_AGE_S`) and `dead_lettered`, in that order, or
+        `query_failed` when the backlog could not be read -- where the
+        `extraction` block shows zero counts.
+      - `backup`: the backup scheduler's status file at
+        `MIST_BACKUP_STATUS_PATH`; null `disabled_by_config` when that is
+        unset, otherwise `down` for `backup_never_run`, `query_failed`,
+        `backup_suspect`, `backup_failed` or `backup_overdue` (last success
+        older than `MIST_BACKUP_MAX_AGE_HOURS`).
     - `checked_at`: wall time of the last COMPLETED cycle, null before the
       first.
 
