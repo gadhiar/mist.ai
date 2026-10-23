@@ -189,3 +189,53 @@ class TestValidation:
         config = load_capabilities_config({"MIST_CAPABILITY_ROUTER_STICKY_TURNS": "0"})
 
         assert config.router.sticky_turns == 0
+
+
+class TestDurationBounds:
+    """Durations that feed date arithmetic have an upper bound; the others stay unbounded."""
+
+    def test_ring_timeout_at_its_bound_loads(self):
+        config = load_capabilities_config({"MIST_ALARM_RING_TIMEOUT_S": "3600"})
+
+        assert config.alarms.ring_timeout_s == 3600.0
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param("3601", id="bound-plus-one"),
+            pytest.param("1e12", id="date-overflow"),
+        ],
+    )
+    def test_ring_timeout_above_its_bound_is_refused(self, raw):
+        with pytest.raises(CapabilityConfigError) as excinfo:
+            load_capabilities_config({"MIST_ALARM_RING_TIMEOUT_S": raw})
+
+        assert str(excinfo.value) == (
+            f"MIST_ALARM_RING_TIMEOUT_S='{raw}' is out of range (<= 3600 s)"
+        )
+
+    def test_proposal_ttl_at_its_bound_loads(self):
+        config = load_capabilities_config({"MIST_CAPABILITY_PROPOSAL_TTL_S": "600"})
+
+        assert config.proposal_ttl_s == 600.0
+
+    def test_proposal_ttl_above_its_bound_is_refused(self):
+        with pytest.raises(CapabilityConfigError) as excinfo:
+            load_capabilities_config({"MIST_CAPABILITY_PROPOSAL_TTL_S": "601"})
+
+        assert str(excinfo.value) == (
+            "MIST_CAPABILITY_PROPOSAL_TTL_S='601' is out of range (<= 600 s)"
+        )
+
+    def test_settings_without_date_arithmetic_stay_unbounded(self):
+        config = load_capabilities_config(
+            {
+                "MIST_ALARM_MISSED_GRACE_S": "1e12",
+                "MIST_CAPABILITY_TOOL_TIMEOUT_S": "1e12",
+                "MIST_CAPABILITY_DECODE_TIMEOUT_S": "1e12",
+            }
+        )
+
+        assert config.alarms.missed_grace_s == 1e12
+        assert config.tool_timeout_s == 1e12
+        assert config.decode_timeout_s == 1e12

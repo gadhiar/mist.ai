@@ -19,6 +19,16 @@ KNOWN_CAPABILITIES = ("clock", "alarms", "timers", "lights", "music")
 _TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
 _FALSE_WORDS = frozenset({"0", "false", "no", "off"})
 
+# Upper bounds for the durations that feed date arithmetic. The scheduler adds the ring timeout
+# to an alarm's `fired_at`, and `ProposalStore` builds a `timedelta` from the TTL and adds it to
+# the current time; an unbounded value overflows `datetime` there. An alarm still ringing an
+# hour after it fired has gone unheard, and a proposal's expiry is what keeps a late "yes" from
+# approving an action the user no longer has in mind, so both bounds stay in minutes.
+# The missed-grace window and the tool and decode timeouts feed no date arithmetic and stay
+# unbounded.
+RING_TIMEOUT_MAX_S = 3600.0
+PROPOSAL_TTL_MAX_S = 600.0
+
 
 @dataclass(frozen=True, slots=True)
 class RouterSettings:
@@ -106,7 +116,9 @@ def load_capabilities_config(env: Mapping[str, str]) -> CapabilitiesConfig:
         db_path=_text(env, "MIST_CAPABILITIES_DB_PATH") or "data/capabilities.db",
         policy_file=_text(env, "MIST_CAPABILITY_POLICY_FILE"),
         tool_timeout_s=_seconds(env, "MIST_CAPABILITY_TOOL_TIMEOUT_S", default=8.0),
-        proposal_ttl_s=_seconds(env, "MIST_CAPABILITY_PROPOSAL_TTL_S", default=60.0),
+        proposal_ttl_s=_seconds(
+            env, "MIST_CAPABILITY_PROPOSAL_TTL_S", default=60.0, high=PROPOSAL_TTL_MAX_S
+        ),
         tool_token_budget=_int(env, "MIST_CAPABILITY_TOOL_TOKEN_BUDGET", default=1200, low=1),
         fast_path=_bool(env, "MIST_CAPABILITY_FAST_PATH", default=True),
         decode_timeout_s=_seconds(env, "MIST_CAPABILITY_DECODE_TIMEOUT_S", default=10.0),
@@ -118,7 +130,9 @@ def load_capabilities_config(env: Mapping[str, str]) -> CapabilitiesConfig:
             embedding_threshold=_threshold(env, "MIST_CAPABILITY_ROUTER_EMBEDDING_THRESHOLD"),
         ),
         alarms=AlarmSettings(
-            ring_timeout_s=_seconds(env, "MIST_ALARM_RING_TIMEOUT_S", default=600.0),
+            ring_timeout_s=_seconds(
+                env, "MIST_ALARM_RING_TIMEOUT_S", default=600.0, high=RING_TIMEOUT_MAX_S
+            ),
             snooze_minutes=_int(env, "MIST_ALARM_SNOOZE_MINUTES", default=9, low=1, high=60),
             missed_grace_s=_seconds(
                 env, "MIST_ALARM_MISSED_GRACE_S", default=900.0, allow_zero=True
@@ -196,7 +210,12 @@ def _int(
 
 
 def _seconds(
-    env: Mapping[str, str], name: str, *, default: float, allow_zero: bool = False
+    env: Mapping[str, str],
+    name: str,
+    *,
+    default: float,
+    allow_zero: bool = False,
+    high: float | None = None,
 ) -> float:
     raw = _text(env, name)
     if raw is None:
@@ -208,6 +227,8 @@ def _seconds(
     if not math.isfinite(value) or value < 0 or (value == 0 and not allow_zero):
         bound = ">= 0" if allow_zero else "> 0"
         raise CapabilityConfigError(f"{name}={raw!r} must be a finite number {bound}")
+    if high is not None and value > high:
+        raise CapabilityConfigError(f"{name}={raw!r} is out of range (<= {high:g} s)")
     return value
 
 
