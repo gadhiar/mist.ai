@@ -33,7 +33,7 @@ if sys.platform == "win32":
 import httpx
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 # `python backend/server.py` makes CPython prepend the SCRIPT's directory --
@@ -1465,6 +1465,54 @@ async def get_extraction_status():
     from backend.extraction_backlog.status import extraction_status
 
     return extraction_status(extraction_dispatcher).model_dump(mode="json")
+
+
+@app.get("/usage/turns-per-day")
+async def usage_turns_per_day(days: int = Query(7, ge=1, le=90)):
+    """Real-origin turns per local day, counts only, and the 5-of-7 gate (ADR-042).
+
+    This endpoint is how the lead reads the daily-use gate without opening the
+    event store: it answers with dates and integers and nothing else, so
+    reading the gate never means reading a conversation. The body is
+    `{"timezone", "origin": "real", "days": [{"date", "real_turns"}],
+    "gate": {"window_days": 7, "required_days": 5, "days_used", "met"}}`
+    and holds no session id, utterance, response or time finer than a date.
+
+    - `days` (1-90, default 7) is dense, oldest first, and ends today in
+      `timezone`; out of range is a 422 from the query validation.
+    - `gate` always covers the 7 local days ending today, whatever `days` is.
+    - `timezone` is `MIST_USAGE_TIMEZONE`, default UTC; an unknown name falls
+      back to UTC, is logged, and is reported here as `UTC`.
+    - A turn counts when its session's origin is `real` or its session row
+      is missing, the event store's own rule.
+    - A store that is missing, locked or unreadable is a 503 with
+      `{"error": "store_unavailable"}`. The store is opened read-only through
+      a `mode=ro` URI, never through `EventStore`, so a missing file is not
+      created.
+
+    The read runs in a worker thread: SQLite waits up to
+    `usage.BUSY_TIMEOUT_SECONDS` on a lock, which must not stall the event
+    loop that carries the WebSocket.
+    """
+    from fastapi.responses import JSONResponse
+
+    from backend.event_store.usage import (
+        UsageStoreUnavailableError,
+        build_turns_per_day,
+        resolve_store_path,
+    )
+    from backend.knowledge.config import EventStoreConfig
+
+    # `EventStoreConfig` alone, not `KnowledgeConfig.from_env()`: the counts
+    # need one path, and an unrelated malformed setting should not turn them
+    # into a 500.
+    db_path = resolve_store_path(EventStoreConfig.from_env().db_path)
+    try:
+        result = await asyncio.to_thread(build_turns_per_day, db_path, days=days)
+    except UsageStoreUnavailableError as exc:
+        logger.warning("GET /usage/turns-per-day: %s", exc)
+        return JSONResponse(status_code=503, content={"error": "store_unavailable"})
+    return result.to_payload()
 
 
 def _hydration_isolation_for_health() -> bool:
