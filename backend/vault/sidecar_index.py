@@ -35,6 +35,7 @@ import struct
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Literal
 
 import sqlite_vec
 
@@ -115,7 +116,20 @@ def _is_excluded_from_indexing(path: str | Path) -> bool:
     return False
 
 
-def _quote_fts5(text: str) -> str:
+MatchMode = Literal["all", "any"]
+_MATCH_MODES: frozenset[str] = frozenset({"all", "any"})
+
+
+def _check_match(match: str) -> None:
+    """Refuse a match mode other than `"all"` or `"any"`.
+
+    Any other string would silently fall back to one of the two joins, hiding a caller's typo.
+    """
+    if match not in _MATCH_MODES:
+        raise ValueError(f"match must be 'all' or 'any', got {match!r}")
+
+
+def _quote_fts5(text: str, *, match: MatchMode = "all") -> str:
     """Build a robust FTS5 MATCH expression from arbitrary user text.
 
     Natural-language input routinely contains FTS5 metacharacters (`? " ' ( )
@@ -138,17 +152,31 @@ def _quote_fts5(text: str) -> str:
     `query_fts` treats an empty MATCH expression as "no lexical hits" rather
     than issuing it.
 
+    `match="any"` joins the same quoted literals with `OR` instead. The memory
+    read path asks for it because a recall query is a sentence: under the AND,
+    one word that no note contains empties the lexical leg, while under the OR
+    a note sharing any word is a candidate and bm25 ranks the notes sharing the
+    most words first. The quoting is the same in both modes, so `OR` here is
+    the only operator that can reach FTS5.
+
     Args:
         text: Raw user-supplied query text.
+        match: `"all"` (implicit AND, the default) or `"any"` (OR).
 
     Returns:
-        A MATCH expression of space-joined quoted string literals, or the empty
-        string if `text` contains no FTS5-indexable tokens.
+        A MATCH expression of quoted string literals joined by spaces (`"all"`)
+        or by ` OR ` (`"any"`), or the empty string if `text` contains no
+        FTS5-indexable tokens.
+
+    Raises:
+        ValueError: `match` is neither `"all"` nor `"any"`.
     """
+    _check_match(match)
     tokens = [tok for tok in _FTS5_TOKEN_SPLIT.split(text) if tok]
     if not tokens:
         return ""
-    return " ".join(f'"{tok.replace(chr(34), chr(34) * 2)}"' for tok in tokens)
+    separator = " OR " if match == "any" else " "
+    return separator.join(f'"{tok.replace(chr(34), chr(34) * 2)}"' for tok in tokens)
 
 
 def _extract_heading_blocks(content: str) -> list[tuple[str, int, str]]:
@@ -538,7 +566,7 @@ class VaultSidecarIndex:
             for row in rows
         ]
 
-    def query_fts(self, text: str, k: int = 10) -> list[dict]:
+    def query_fts(self, text: str, k: int = 10, match: MatchMode = "all") -> list[dict]:
         """Return top-k chunks by BM25 lexical relevance.
 
         FTS5 returns smaller (more-negative) BM25 scores for better matches.
@@ -555,6 +583,9 @@ class VaultSidecarIndex:
         Args:
             text: User-supplied search query.
             k: Maximum results to return.
+            match: `"all"` requires every token (implicit AND); `"any"` ORs
+                them, so one token absent from every note does not empty the
+                result (see `_quote_fts5`).
 
         Returns:
             List of result dicts with the same shape as `query_vector`,
@@ -562,9 +593,10 @@ class VaultSidecarIndex:
 
         Raises:
             SidecarIndexError: On unexpected database errors.
+            ValueError: `match` is neither `"all"` nor `"any"`.
         """
         self._require_connection()
-        safe_text = _quote_fts5(text)
+        safe_text = _quote_fts5(text, match=match)
         # No indexable tokens (e.g. an all-punctuation query like "???"): an
         # empty MATCH expression would itself be an FTS5 syntax error. Skip the
         # query entirely -- there are no lexical hits to find.
@@ -614,6 +646,7 @@ class VaultSidecarIndex:
         text: str,
         k: int = 10,
         rrf_k: int = 60,
+        match: MatchMode = "all",
     ) -> list[dict]:
         """Return top-k chunks via Reciprocal Rank Fusion of vector + FTS.
 
@@ -628,6 +661,10 @@ class VaultSidecarIndex:
             text: Query text for the FTS retriever.
             k: Final top-k to return.
             rrf_k: RRF constant (larger = flatter ranking curve).
+            match: Token combination of the FTS leg, `"all"` (the default,
+                which every existing caller relies on) or `"any"`, which the
+                memory read path uses so a sentence-shaped query keeps the
+                lexical hits of the words that do occur.
 
         Returns:
             List of result dicts with ``score=rrf_combined`` (the RRF ordering
@@ -636,10 +673,15 @@ class VaultSidecarIndex:
             FTS-only hits) for UI display,
             ``vector_rank``, ``fts_rank`` (None if absent from that list),
             and ``sources`` list. Empty if both retrievers return nothing.
+
+        Raises:
+            SidecarIndexError: On database error.
+            ValueError: `match` is neither `"all"` nor `"any"`.
         """
+        _check_match(match)
         overshoot = k * 2
         vector_results = self.query_vector(embedding, k=overshoot)
-        fts_results = self.query_fts(text, k=overshoot)
+        fts_results = self.query_fts(text, k=overshoot, match=match)
 
         # Keyed by (path, heading) -- heading may be None for file-level chunks.
         merged: dict[tuple[str, str | None], dict] = {}
