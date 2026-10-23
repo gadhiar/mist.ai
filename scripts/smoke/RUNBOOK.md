@@ -162,22 +162,23 @@ downstream of here means anything.
 
     MSYS_NO_PATHCONV=1 docker exec mist-backend-smoke ls -la /app/mist-memory /app/dev-state
 
-Expect **"No such file or directory" for both.** Nothing in
-`docker/backend/Dockerfile` creates them and the compose file does not mount
-them.
+Expect **both to exist and be empty.** `docker/backend/Dockerfile:119-122`
+creates them as empty directories owned by appuser, so they are baked into the
+image. The compose file does not mount them: they are container-layer
+directories, not the host's `./mist-memory` or `./dev-state`.
 
     MSYS_NO_PATHCONV=1 docker exec mist-backend-smoke ls -la /app/data
 
-This one **does** exist, and that is correct rather than alarming:
-`docker/backend/Dockerfile:106` runs
-`mkdir -p /app/data/voice_profiles /app/data/vector_store /app/data/audio`, so
-the directory is baked into the image. It is a container-layer directory, not
-the host's `./data`.
+This one exists too, and that is correct rather than alarming: the same
+`docker/backend/Dockerfile:119-122` creates `/app/data` and its
+`voice_profiles`, `vector_store` and `audio` subdirectories. It is a
+container-layer directory, not the host's `./data`.
 
-**Abort if:** `/app/data` contains an `event_store.db`, a `vault_sidecar.db`, or
-anything under `vector_store/`. Empty directories are the expected state; live
-content there would mean the host directory got mounted after all, and 3.1
-should already have caught it.
+**Abort if:** `/app/mist-memory` or `/app/dev-state` holds anything, or
+`/app/data` contains an `event_store.db`, a `vault_sidecar.db`, or anything
+under `vector_store/`. Empty directories are the expected state; live content
+there would mean the host directory got mounted after all, and 3.1 should
+already have caught it.
 
     MSYS_NO_PATHCONV=1 docker exec mist-backend-smoke ls -la /app/smoke-state
 
@@ -228,7 +229,7 @@ reached a live smoke run: invoked by path, `sys.path[0]` is `scripts/` rather
 than the repo root, so `import backend` raised `ModuleNotFoundError` before
 `main()` ran. `-m` puts the working directory on `sys.path` instead, and
 `docker exec` inherits the image's `WORKDIR /app`
-(`docker/backend/Dockerfile:96`), so the repo root is found by construction.
+(`docker/backend/Dockerfile:102`), so the repo root is found by construction.
 The path form works again now -- `scripts/initialize_schema.py:17-19` adds the
 repo root itself, and `tests/unit/scripts/test_initialize_schema.py` pins that
 -- but `-m` does not depend on that bootstrap staying in place, and it is the

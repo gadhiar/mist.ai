@@ -8,11 +8,12 @@ compose edit could silently undo:
   results that justified it;
 - `--cache-ram` is still passed, the prompt-cache cap that keeps mist-llm from starving the
   Docker VM (PR #17);
-- the neo4j service in each of the five compose files that run one (`NEO4J_COMPOSE_FILES`) uses
-  the one `PINNED_NEO4J_IMAGE`, a version tag plus digest, so a pull cannot swap the database
-  under the live graph. The service is found by its image, not by name: the names differ across
-  files. The digest is the one the live container ran on 2026-09-28; it is not checked here
-  against a registry.
+- the neo4j service in each compose file that runs one (`NEO4J_COMPOSE_FILES`, discovered from
+  the root `docker-compose*.yml` files and every `*.yml` under `deploy/`) uses the one
+  `PINNED_NEO4J_IMAGE`, a version tag plus digest, so a pull cannot swap the database under the
+  live graph. The service is found by its image, not by name: the names differ across files. The
+  digest is the one the live container ran on 2026-09-28; it is not checked here against a
+  registry.
 """
 
 import re
@@ -28,7 +29,8 @@ PINNED_NEO4J_IMAGE = (
     "neo4j:5.26.23@sha256:40bf5ae9282213087e4d6036aab3ec443fe9c974d3dd4f14a11892c63157238f"
 )
 NEO4J_PIN_PATTERN = re.compile(r"^neo4j:\d+\.\d+\.\d+@sha256:[0-9a-f]{64}$")
-NEO4J_COMPOSE_FILES = (
+# The files this test listed by hand before it discovered them; discovery must keep finding them.
+LISTED_NEO4J_COMPOSE_FILES = (
     "docker-compose.yml",
     "docker-compose.eval-neo4j.yml",
     "docker-compose.staging-neo4j.yml",
@@ -74,11 +76,27 @@ def _neo4j_images(compose_file: str) -> dict[str, str]:
     """Service name -> image for every service whose image is a neo4j image."""
     with (REPO_ROOT / compose_file).open(encoding="utf-8") as fh:
         compose = yaml.safe_load(fh)
+    services = compose.get("services") if isinstance(compose, dict) else None
     return {
         name: service["image"]
-        for name, service in compose["services"].items()
+        for name, service in (services or {}).items()
         if str(service.get("image", "")).startswith("neo4j")
     }
+
+
+def _discover_neo4j_compose_files() -> tuple[str, ...]:
+    """Every root `docker-compose*.yml` and `deploy/**/*.yml` that runs a neo4j image.
+
+    Discovered rather than listed, so a new compose file that runs Neo4j is pinned the day it is
+    added instead of the day someone remembers this list.
+    """
+    candidates = sorted(REPO_ROOT.glob("docker-compose*.yml"))
+    candidates += sorted((REPO_ROOT / "deploy").rglob("*.yml"))
+    relative = (path.relative_to(REPO_ROOT).as_posix() for path in candidates)
+    return tuple(name for name in relative if _neo4j_images(name))
+
+
+NEO4J_COMPOSE_FILES = _discover_neo4j_compose_files()
 
 
 def test_pinned_neo4j_image_matches_the_pin_pattern() -> None:
@@ -92,6 +110,14 @@ def test_neo4j_service_image_is_the_pinned_image(compose_file: str) -> None:
     ((name, image),) = images.items()
     assert image == PINNED_NEO4J_IMAGE, f"{compose_file}: service {name!r} runs {image!r}"
     assert NEO4J_PIN_PATTERN.match(image), f"{compose_file}: {name!r} is not pinned: {image!r}"
+
+
+def test_discovery_keeps_the_five_files_listed_before_it() -> None:
+    assert set(LISTED_NEO4J_COMPOSE_FILES) <= set(NEO4J_COMPOSE_FILES)
+
+
+def test_discovery_searches_deploy() -> None:
+    assert "deploy/daily/compose.yml" in NEO4J_COMPOSE_FILES
 
 
 def test_neo4j_pin_pattern_rejects_a_moving_tag_and_a_short_digest() -> None:
