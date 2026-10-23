@@ -269,6 +269,11 @@ def test_an_unparsable_timestamp_has_no_local_date() -> None:
         ("2026-03-09T03:30:00+00:00", date(2026, 3, 8)),
         # Fall back, Sunday 1 November 2026: 23:30 EST (UTC-5) is 04:30Z on the 2nd.
         ("2026-11-02T04:30:00+00:00", date(2026, 11, 1)),
+        # The first night after spring forward: 00:15 EDT on the 9th is 04:15Z.
+        # A fixed EST offset (or pytz's LMT from `replace(tzinfo=...)`) puts it on
+        # the 8th, and a fixed EDT offset fails the fall-back case above, so only
+        # a zone-aware conversion passes all three.
+        ("2026-03-09T04:15:00+00:00", date(2026, 3, 9)),
     ],
 )
 def test_a_late_turn_on_a_dst_change_day_lands_on_its_local_date(

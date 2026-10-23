@@ -7,10 +7,12 @@ Every store is synthetic, built in `tmp_path` from the real `schema.sql`, and
 `tests/unit/test_server_health_wiring.py`: entering it would run the ASGI
 lifespan and load the model stack.
 
-The route reads the wall clock, so turns are stamped relative to
-`datetime.now(UTC)` at whole-day offsets and the assertions are on counts and
-the gate rather than on a particular date. If the test straddles UTC midnight,
-each offset shifts by one day, which keeps every turn inside the 7-day window.
+The route reads the wall clock, so turns are stamped at whole-day offsets from
+one `now` read per test (the `now` fixture), and the assertions are on counts
+and the gate rather than on a particular date. Reading the clock once keeps the
+offsets distinct from each other; if UTC midnight then passes before the
+request, every turn shifts by the same one day, which keeps each turn inside
+the 7-day window and the one at 12 days outside it.
 """
 
 from __future__ import annotations
@@ -53,8 +55,8 @@ def _add_session(path: Path, session_id: str, origin: str) -> None:
     conn.close()
 
 
-def _add_turn(path: Path, session_id: str, days_ago: int) -> None:
-    stamp = (datetime.now(UTC) - timedelta(days=days_ago)).isoformat()
+def _add_turn(path: Path, session_id: str, days_ago: int, now: datetime) -> None:
+    stamp = (now - timedelta(days=days_ago)).isoformat()
     conn = sqlite3.connect(path)
     conn.execute(
         "INSERT INTO conversation_turn_events "
@@ -77,6 +79,11 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(server.app)
+
+
+@pytest.fixture
+def now() -> datetime:
+    return datetime.now(UTC)
 
 
 def test_returns_the_contract_shape(store: Path, client: TestClient) -> None:
@@ -104,15 +111,15 @@ def test_days_are_dense_oldest_first_and_end_today(store: Path, client: TestClie
     assert dates[-1] in {before, after}
 
 
-def test_counts_only_real_origin_turns(store: Path, client: TestClient) -> None:
+def test_counts_only_real_origin_turns(store: Path, client: TestClient, now: datetime) -> None:
     _add_session(store, "s-real", "real")
     _add_session(store, "s-test", "test")
     _add_session(store, "s-seed", "seed")
     for days_ago in (1, 2):
-        _add_turn(store, "s-real", days_ago)
-        _add_turn(store, "s-test", days_ago)
-        _add_turn(store, "s-seed", days_ago)
-    _add_turn(store, "s-no-session-row", 3)
+        _add_turn(store, "s-real", days_ago, now)
+        _add_turn(store, "s-test", days_ago, now)
+        _add_turn(store, "s-seed", days_ago, now)
+    _add_turn(store, "s-no-session-row", 3, now)
 
     body = client.get("/usage/turns-per-day").json()
 
@@ -120,20 +127,20 @@ def test_counts_only_real_origin_turns(store: Path, client: TestClient) -> None:
     assert body["gate"]["days_used"] == 3
 
 
-def test_gate_is_met_at_five_used_days(store: Path, client: TestClient) -> None:
+def test_gate_is_met_at_five_used_days(store: Path, client: TestClient, now: datetime) -> None:
     for days_ago in (0, 1, 2, 3, 4):
-        _add_turn(store, "s-real", days_ago)
+        _add_turn(store, "s-real", days_ago, now)
 
     gate = client.get("/usage/turns-per-day").json()["gate"]
 
     assert (gate["days_used"], gate["met"]) == (5, True)
 
 
-def test_gate_is_not_met_at_four_used_days(store: Path, client: TestClient) -> None:
+def test_gate_is_not_met_at_four_used_days(store: Path, client: TestClient, now: datetime) -> None:
     for days_ago in (0, 1, 3, 4):
-        _add_turn(store, "s-real", days_ago)
+        _add_turn(store, "s-real", days_ago, now)
     # Outside the 7-day window whatever `days` is asked for.
-    _add_turn(store, "s-real", 12)
+    _add_turn(store, "s-real", 12, now)
 
     body = client.get("/usage/turns-per-day", params={"days": 30}).json()
 
@@ -141,9 +148,11 @@ def test_gate_is_not_met_at_four_used_days(store: Path, client: TestClient) -> N
     assert (body["gate"]["days_used"], body["gate"]["met"]) == (4, False)
 
 
-def test_gate_covers_seven_days_even_when_one_day_is_asked(store: Path, client: TestClient) -> None:
+def test_gate_covers_seven_days_even_when_one_day_is_asked(
+    store: Path, client: TestClient, now: datetime
+) -> None:
     for days_ago in (0, 1, 2, 3, 4):
-        _add_turn(store, "s-real", days_ago)
+        _add_turn(store, "s-real", days_ago, now)
 
     body = client.get("/usage/turns-per-day", params={"days": 1}).json()
 
@@ -219,11 +228,11 @@ def test_configured_zone_is_reported(
 
 
 def test_response_holds_no_session_id_utterance_or_time_of_day(
-    store: Path, client: TestClient
+    store: Path, client: TestClient, now: datetime
 ) -> None:
     _add_session(store, _SESSION_ID, "real")
-    _add_turn(store, _SESSION_ID, 0)
-    _add_turn(store, _SESSION_ID, 2)
+    _add_turn(store, _SESSION_ID, 0, now)
+    _add_turn(store, _SESSION_ID, 2, now)
 
     response = client.get("/usage/turns-per-day", params={"days": 90})
     text = response.text
