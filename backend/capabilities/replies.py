@@ -110,7 +110,8 @@ def _failure_reason(outcome: ToolOutcome) -> str:
 
 def _pending_summary(records: Sequence[ActionRecord]) -> str:
     # The same join as `ProposalStore.put`, so the question names the calls exactly as the
-    # proposal's summary does; only a final full stop is trimmed, as the templates add one.
+    # proposal's summary does. `_trim` drops surrounding whitespace and trailing full stops,
+    # because the templates add their own.
     parts = [r.args_summary for r in records if r.outcome.status == _PENDING]
     return _trim(", then ".join(parts))
 

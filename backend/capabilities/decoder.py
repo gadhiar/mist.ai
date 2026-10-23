@@ -4,8 +4,8 @@ A small model chooses better among fewer, shorter options, and a short prompt pr
 So a routed turn gets a separate prompt, sharing nothing with the main chat prompt (no persona,
 retrieval or profile text), whose only job is to choose among the offered catalog lines, and a
 JSON schema that llama-server turns into a grammar, so tool names and enum slots are limited to
-what the turn offers. The prompt and the schema are byte-identical for the same inputs, which keeps the
-request reproducible in tests and logs.
+what the turn offers. The prompt and the schema are byte-identical for the same inputs, which
+keeps the request reproducible in tests and logs.
 """
 
 from __future__ import annotations
