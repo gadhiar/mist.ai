@@ -10,8 +10,10 @@ protocol.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import numbers
 import statistics
 import sys
 import time
@@ -152,6 +154,25 @@ def _sigmoid(x: float) -> float:
     return z / (1.0 + z)
 
 
+def _check_tokenizer_json(model_dir: Path, device: str) -> None:
+    """Parse the model directory's `tokenizer.json`, when it has one, before loading.
+
+    tokenizers reports a truncated or undecodable `tokenizer.json` with a plain `Exception`,
+    which the load cannot catch without a bare `except Exception`. Reading the file here first
+    turns those faults into MemoryRerankError, so the factory can fall back to NullReranker.
+    """
+    path = model_dir / "tokenizer.json"
+    if not path.is_file():
+        return
+    try:
+        json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MemoryRerankError(
+            f"reranker tokenizer.json in {model_dir} for {device} is unreadable: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
 class CrossEncoderReranker:
     """A local cross-encoder on an explicit device, calibrated at load for the deadline.
 
@@ -184,9 +205,19 @@ class CrossEncoderReranker:
             batch_size: Pairs per forward pass.
 
         Raises:
-            MemoryRerankError: The device is not `cpu` or `cuda`, the path is not a
-                directory, or the model fails to load or to score the warm-up batch. The
-                message names the path and the device, for the startup log.
+            MemoryRerankError: The device is not `cpu` or `cuda`; the path is not a directory;
+                its `tokenizer.json` cannot be read or is not valid JSON; loading raises
+                OSError, ValueError, RuntimeError or SafetensorError; or the warm-up batch fails
+                with one of those or does not come back as one finite score per pair (a
+                checkpoint with more than one label, for example). The message names the path
+                and the device, for the startup log.
+
+        Known limit: tokenizers reports some faults with a plain `Exception`, which this
+        constructor does not catch, since a bare `except Exception` would also swallow
+        programming errors. The read of `tokenizer.json` above turns a truncated or undecodable
+        file into MemoryRerankError, but a file that is valid JSON and that tokenizers still
+        rejects fails startup loudly instead of falling back to NullReranker. The baked model is
+        pinned by revision (H3), so such a file means a broken bake rather than a runtime fault.
         """
         if device not in _DEVICES:
             raise MemoryRerankError(
@@ -196,6 +227,7 @@ class CrossEncoderReranker:
             raise MemoryRerankError(
                 f"reranker model path {model_path} does not exist or is not a directory"
             )
+        _check_tokenizer_json(Path(model_path), device)
         self._model_path = model_path
         self._device = device
         self._clock = clock
@@ -234,20 +266,12 @@ class CrossEncoderReranker:
         the cost beforehand with `pairs_within`.
 
         Raises:
-            MemoryRerankError: The forward pass failed, returned the wrong number of scores, or
-                returned a NaN logit, which no score in [0, 1] can stand for. An infinite logit
-                maps to 0 or 1. The message never includes the query or the texts.
+            MemoryRerankError: The forward pass failed or did not return one finite score per
+                pair. The message names the path and the device, never the query or the texts.
         """
         if not texts:
             return []
         logits = self._predict([(query, text) for text in texts])
-        if len(logits) != len(texts):
-            raise MemoryRerankError(
-                f"reranker at {self._model_path} returned {len(logits)} scores for "
-                f"{len(texts)} pairs"
-            )
-        if any(math.isnan(logit) for logit in logits):
-            raise MemoryRerankError(f"reranker at {self._model_path} returned a NaN logit")
         return [_sigmoid(logit) for logit in logits]
 
     def pairs_within(self, budget_ms: float) -> int:
@@ -264,29 +288,49 @@ class CrossEncoderReranker:
         return math.floor((budget_ms - self._call_overhead_ms) / self._cost_per_pair_ms)
 
     def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+        """Run one forward pass and check its output is one finite logit per pair.
+
+        The checks run here, so the warm-up and `score` reject the same outputs. A checkpoint
+        with more than one label returns a row per pair, which `float` cannot take, and a NaN
+        or infinite logit means a broken forward pass (an fp16 overflow, for example), not a
+        relevance judgement.
+        """
+        where = f"reranker at {self._model_path} on {self._device}"
         try:
-            raw = self._model.predict(
-                pairs,
-                batch_size=self._batch_size,
-                show_progress_bar=False,
-                activation_fct=_identity,
-                convert_to_numpy=True,
+            raw = list(
+                self._model.predict(
+                    pairs,
+                    batch_size=self._batch_size,
+                    show_progress_bar=False,
+                    activation_fct=_identity,
+                    convert_to_numpy=True,
+                )
             )
-            return [float(value) for value in raw]
         except _MODEL_ERRORS as exc:
             # The pairs are user text, so only the exception type reaches the message.
             raise MemoryRerankError(
-                f"reranker at {self._model_path} on {self._device} failed to score "
-                f"{len(pairs)} pairs: {type(exc).__name__}"
+                f"{where} failed to score {len(pairs)} pairs: {type(exc).__name__}"
             ) from exc
+        if len(raw) != len(pairs):
+            raise MemoryRerankError(f"{where} returned {len(raw)} scores for {len(pairs)} pairs")
+        # numpy registers its floating types as `numbers.Real`; a row of a 2-d array is not.
+        if not all(isinstance(value, numbers.Real) for value in raw):
+            raise MemoryRerankError(
+                f"{where} did not return one score per pair; a checkpoint with more than one "
+                "label cannot rerank"
+            )
+        logits = [float(value) for value in raw]
+        if not all(math.isfinite(logit) for logit in logits):
+            raise MemoryRerankError(f"{where} returned a non-finite logit")
+        return logits
 
     def _calibrate(self) -> tuple[float, float]:
         """Measure the per-call overhead and the per-pair cost on the fixed batch.
 
         The first call is not timed: it moves the weights to the device and pays the other
-        one-off setup costs of a first forward pass, which no turn pays again. Each later round times one pair and
-        the whole batch; the medians give a line through two points, whose slope is the cost
-        per pair and whose remainder at one pair is the overhead.
+        one-off setup costs of a first forward pass, which no turn pays again. Each later round
+        times one pair and the whole batch; the medians give a line through two points, whose
+        slope is the cost per pair and whose remainder at one pair is the overhead.
         """
         batch = [(_CALIBRATION_QUERY, text) for text in _CALIBRATION_TEXTS]
         single = batch[:1]
