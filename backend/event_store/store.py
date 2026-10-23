@@ -38,6 +38,11 @@ _DEFAULT_DB_DIR = Path.home() / ".mist"
 _DEFAULT_DB_PATH = _DEFAULT_DB_DIR / "event_store.db"
 _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
+# Added to `conversation_turn_events` after databases already existed, so `initialize()`
+# migrates them. Order matches schema.sql, so a migrated table lists them in the same order
+# as a fresh one.
+_TURN_OUTCOME_COLUMNS = ("turn_outcome", "generated_response", "turn_modality")
+
 
 class EventStore:
     """Append-only event store backed by SQLite.
@@ -111,6 +116,18 @@ class EventStore:
                 "ALTER TABLE epoch_ledger ADD COLUMN provisional INTEGER NOT NULL DEFAULT 0"
             )
             logger.info("Event store: added `provisional` column to epoch_ledger")
+
+        # MIS-127: the turn outcome columns, under the same guard and for the same
+        # reason as `origin` above. They are nullable with no default, so SQLite leaves
+        # every existing row NULL: a turn logged before the change has no recorded
+        # outcome, and inventing 'completed' for it would claim something never observed.
+        turn_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(conversation_turn_events)")
+        }
+        for column in _TURN_OUTCOME_COLUMNS:
+            if column not in turn_columns:
+                conn.execute(f"ALTER TABLE conversation_turn_events ADD COLUMN {column} TEXT")
+                logger.info("Event store: added `%s` column to conversation_turn_events", column)
 
         logger.info("Event store initialized at %s", self.db_path)
 
@@ -227,14 +244,16 @@ class EventStore:
                     context_window, retrieval_context, tool_calls,
                     audio_hash, audio_format, audio_duration_ms, audio_sample_rate,
                     stt_model, tts_model, llm_model, llm_parameters,
-                    ontology_version
+                    ontology_version,
+                    turn_outcome, generated_response, turn_modality
                 ) VALUES (
                     :event_id, :session_id, :turn_index, :timestamp,
                     :user_utterance, :system_response,
                     :context_window, :retrieval_context, :tool_calls,
                     :audio_hash, :audio_format, :audio_duration_ms, :audio_sample_rate,
                     :stt_model, :tts_model, :llm_model, :llm_parameters,
-                    :ontology_version
+                    :ontology_version,
+                    :turn_outcome, :generated_response, :turn_modality
                 )
                 """,
                 row,
