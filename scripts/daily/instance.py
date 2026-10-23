@@ -10,16 +10,20 @@ and modules beside it.
 Every Docker and git call goes through `Context.runner`, one injected callable, every sleep and
 poll through `Context.sleep` and `Context.monotonic`, and every HTTP read through
 `Context.fetch`, so the tests assert exact argument lists with no Docker, git, network or
-real waiting.
+real waiting. Before any command runs, `subprocess_runner` passes it to `volume_safety.py`,
+loaded from beside this file, which refuses every form that could delete a volume.
 
-Exit codes: 0 done; 2 refused, nothing changed; 1 failed part-way, with the state named.
-`backup-now` returns the one-shot backup's own exit code.
+Exit codes: 0 done; 2 refused, nothing changed; 1 failed part-way, with the state named, or a
+command the volume guard refused.
+`backup-now` returns the one-shot backup's own exit code, `accept-backup-baseline` the
+scheduler's, and `drill-restore` and `drill-verify` those of restore and verify.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib.util
 import io
 import json
 import math
@@ -38,6 +42,25 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol
+
+
+def _load_volume_safety():
+    """Exec the guard module beside this file and return it.
+
+    Loaded by path because this file runs two ways: as `scripts.daily.instance` under pytest
+    and as `python <path>/instance.py`, `<root>/bin/` included. Neither puts `scripts/daily`
+    on `sys.path`, so a bare import fails under pytest and a dotted one fails from `bin/`. A
+    missing guard is an import error naming `volume_safety.py`: there is no fallback, so no
+    command can run without it.
+    """
+    path = Path(__file__).with_name("volume_safety.py")
+    spec = importlib.util.spec_from_file_location("volume_safety", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+volume_safety = _load_volume_safety()
 
 # Both names are spelled here rather than imported, because this file runs where `backend` is
 # not importable. They equal `LIVE_INSTANCE_MARKER` and `LIVE_INSTANCES_FILE_ENV` in
@@ -91,8 +114,35 @@ BACKUP_PROFILE = "backup"
 DEFAULT_SHARE_NETWORK = "mist-llm-share"
 CONFIG_FILES_LABEL = "com.docker.compose.project.config_files"
 PROJECT_LABEL = "com.docker.compose.project"
+SERVICE_LABEL = "com.docker.compose.service"
+NEO4J_SERVICE = "mist-neo4j"
+# Where both compose files mount the graph volume inside the Neo4j container.
+NEO4J_DATA_MOUNT = "/data"
 REVISION_LABEL = "org.opencontainers.image.revision"
 BACKUP_ONCE = ("python", "-m", "scripts.backup.scheduler", "--once")
+
+ACCEPT_SUSPECT = ("python", "-m", "scripts.backup.scheduler", "--accept-suspect")
+
+# The restore drill (item 8). The graph URI is the drill compose file's `NEO4J_URI`, which is in
+# the dev allowlist of `backend/knowledge/eval_isolation.py`; a unit test pins the equality. The
+# marker name is `RESTORE_MARKER_FILENAME` in `scripts/backup/target.py`, spelled here because
+# this file runs where `scripts.backup` is not importable; a unit test pins that too.
+DRILL_COMPOSE_FILE = "deploy/daily/restore-drill.yml"
+DRILL_GRAPH_URI = "bolt://mist-neo4j-dev:7687"
+RESTORE_MARKER_FILENAME = "MIST_RESTORE_TARGET"
+DRILL_RECORD = "drill.json"
+DRILL_ROLE_LABEL = "org.mist.role"
+DRILL_ROLE = "drill"
+DRILL_INSTANCE_LABEL = "org.mist.instance"
+DRILL_RESTORE_SERVICE = "mist-restore"
+DRILL_NEO4J_SERVICE = "mist-neo4j-dev"
+DRILL_RUN_PROFILE = "run"
+DRILL_STANDBY = "standby"
+DRILL_PRE_RESTORE = "pre-restore"
+STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+# An artifact or backup label joined into a container path, and a volume name: a plain name.
+PLAIN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*", re.ASCII)
+VOLUME_LINE = re.compile(rb"^MIST_DAILY_NEO4J_VOLUME=[^\r\n]*", re.M)
 
 GPU_YIELDED_MARKER = "gpu-yielded"
 BACKUPS_ARMED_MARKER = "backups-armed"
@@ -116,28 +166,53 @@ class CommandResult:
 
 
 class Runner(Protocol):
-    """Runs one command, with optional bytes on its standard input."""
+    """Runs one command, with optional bytes on its standard input.
 
-    def __call__(self, argv: Sequence[str], *, stdin: bytes | None = None) -> CommandResult:
+    `env`, when given, is the command's whole environment; only the restore drill passes one,
+    to hand compose two variables that must never be written to `daily.env` (item 8).
+    """
+
+    def __call__(
+        self,
+        argv: Sequence[str],
+        *,
+        stdin: bytes | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> CommandResult:
         """Run `argv` and return its exit code and captured output."""
         ...
 
 
-def subprocess_runner(argv: Sequence[str], *, stdin: bytes | None = None) -> CommandResult:
+def subprocess_runner(
+    argv: Sequence[str],
+    *,
+    stdin: bytes | None = None,
+    env: Mapping[str, str] | None = None,
+) -> CommandResult:
     """Run `argv` without a shell, capturing its output.
 
     A missing program reads as exit 127, the shell's convention, so a host without Docker on
     its PATH gets the same refusal or failure message as one whose daemon is down.
+
+    Raises:
+        volume_safety.DestructiveCommandError: Before anything runs, for an argv that could
+            delete a volume. Every git and Docker command passes here.
     """
     command = list(argv)
+    volume_safety.assert_volume_safe(command)
+    environment = None if env is None else dict(env)
     try:
         if stdin is None:
             completed = subprocess.run(  # nosec B603 - fixed argument list, no shell
-                command, stdin=subprocess.DEVNULL, capture_output=True, check=False
+                command,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                check=False,
+                env=environment,
             )
         else:
             completed = subprocess.run(  # nosec B603 - fixed argument list, no shell
-                command, input=stdin, capture_output=True, check=False
+                command, input=stdin, capture_output=True, check=False, env=environment
             )
     except FileNotFoundError as exc:
         return CommandResult(127, b"", f"{command[0]}: {exc}".encode())
@@ -895,7 +970,15 @@ def _check_backup_path(inst: Instance, ctx: Context) -> None:
     label = f"MIST_BACKUP_HOST_PATH={raw}"
     if not (Path(raw).is_absolute() or raw.startswith("~")):
         raise RefusedError(f"{label} in {inst.env_path} is not an absolute path")
-    path = _absolute_path(raw, ctx.home)
+    _check_protected_path(_absolute_path(raw, ctx.home), label, inst, ctx)
+
+
+def _check_protected_path(path: Path, label: str, inst: Instance, ctx: Context) -> None:
+    """Refuse a resolved path inside the instance root, a live root, or a git work tree.
+
+    The backup host path and a drill root share these refusals (item 5): a loss of the instance
+    must not take either with it, and neither may sit where a repository tool can reach it.
+    """
     if path.is_relative_to(inst.root):
         raise RefusedError(f"{label} is inside the instance root {inst.root}")
     for line in _read_registry(_registry_path(ctx)):
@@ -1307,6 +1390,716 @@ def cmd_disarm_backups(args: argparse.Namespace, ctx: Context) -> None:
     print(f"backups disarmed: removed {marker} and stopped {BACKUP_SERVICE}")
 
 
+def _check_plain_name(value: str, what: str) -> None:
+    """Refuse a name that could leave the directory it is joined to, or read as a flag."""
+    if not PLAIN_NAME.fullmatch(value):
+        raise RefusedError(
+            f"{what} {value!r} is not a plain name (letters, digits, '.', '_' and '-', "
+            "starting with a letter or digit)"
+        )
+
+
+def cmd_accept_backup_baseline(args: argparse.Namespace, ctx: Context) -> int:
+    """Make a reviewed suspect backup the baseline later attempts are judged against (item 6)."""
+    _check_plain_name(args.label, "LABEL")
+    inst = _load_instance(args.root, ctx)
+    _require_backup_path(inst)
+    _check_static_configuration(inst, ctx)
+    _check_release_image(inst, ctx)
+    result = ctx.runner(
+        [
+            *inst.compose(),
+            "--profile",
+            BACKUP_PROFILE,
+            "run",
+            "--rm",
+            BACKUP_SERVICE,
+            *ACCEPT_SUSPECT,
+            args.label,
+        ]
+    )
+    _echo(result)
+    if result.returncode != EXIT_OK:
+        print(
+            f"instance.py accept-backup-baseline: the scheduler exited {result.returncode}",
+            file=sys.stderr,
+        )
+    return result.returncode
+
+
+# --- The restore drill and promotion ---------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Drill:
+    """One drill root and what `drill-start` recorded in its `drill.json`."""
+
+    root: Path
+    volume: str
+    artifact: str
+    started_at: datetime
+
+    def standby(self, name: str) -> Path:
+        """The restore's target for `state` or `mist-memory`, and what `promote` moves in."""
+        return self.root / DRILL_STANDBY / name
+
+
+def _drill_project(inst: Instance) -> str:
+    return f"{inst.project}-drill"
+
+
+def _drill_compose(inst: Instance) -> list[str]:
+    """The drill project's `docker compose` prefix: the release's drill file, the instance's env.
+
+    `--env-file daily.env` gives the drill graph the instance's password, so a promoted volume
+    keeps the authentication the instance's Neo4j expects (item 8).
+    """
+    return [
+        "docker",
+        "compose",
+        "-p",
+        _drill_project(inst),
+        "-f",
+        str(inst.release_dir().joinpath(*DRILL_COMPOSE_FILE.split("/"))),
+        "--env-file",
+        str(inst.env_path),
+    ]
+
+
+def _drill_env(ctx: Context, drill: Drill) -> dict[str, str]:
+    """The process environment plus the two drill variables, which never reach `daily.env`."""
+    return {
+        **ctx.environ,
+        "MIST_DRILL_NEO4J_VOLUME": drill.volume,
+        "MIST_DRILL_ROOT": drill.root.as_posix(),
+    }
+
+
+def _run_drill(inst: Instance, ctx: Context, drill: Drill, *tail: str) -> CommandResult:
+    return ctx.runner([*_drill_compose(inst), *tail], env=_drill_env(ctx, drill))
+
+
+def _restore_in_drill(*tail: str) -> list[str]:
+    """`run --rm mist-restore -m <module> ...`: the release image runs `python -m` there."""
+    return [
+        "--profile",
+        DRILL_RUN_PROFILE,
+        "run",
+        "--rm",
+        DRILL_RESTORE_SERVICE,
+        "-m",
+        *tail,
+    ]
+
+
+def _drill_root(raw: str, inst: Instance, ctx: Context) -> Path:
+    path = _absolute_path(raw, ctx.home)
+    _check_protected_path(path, f"drill root {path}", inst, ctx)
+    return path
+
+
+def _check_drill_file(inst: Instance) -> None:
+    drill_file = inst.release_dir().joinpath(*DRILL_COMPOSE_FILE.split("/"))
+    if not drill_file.is_file():
+        raise RefusedError(
+            f"{drill_file} does not exist; release {inst.tag} predates the restore drill, so "
+            "switch to a release that carries it"
+        )
+
+
+def _parse_utc(raw: object) -> datetime | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        moment = datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    return moment.replace(tzinfo=UTC)
+
+
+def _read_drill(root: Path) -> Drill:
+    """The drill `drill-start` prepared in `root`.
+
+    Raises:
+        RefusedError: When `root` holds no readable `drill.json` with a plain volume and
+            artifact name and a start time.
+    """
+    path = root / DRILL_RECORD
+    fix = "run drill-start for this drill root first"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RefusedError(f"{path} does not exist; {fix}") from exc
+    except (OSError, ValueError) as exc:
+        raise RefusedError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(record, dict):
+        raise RefusedError(f"{path} is not a drill record")
+    volume, artifact = record.get("volume"), record.get("artifact")
+    started_at = _parse_utc(record.get("started_at"))
+    if not isinstance(volume, str) or not isinstance(artifact, str) or started_at is None:
+        raise RefusedError(f"{path} lacks volume, artifact or started_at")
+    _check_plain_name(volume, f"{path}'s volume")
+    _check_plain_name(artifact, f"{path}'s artifact")
+    return Drill(root, volume, artifact, started_at)
+
+
+def _check_not_instance_volume(inst: Instance, volume: str) -> None:
+    if volume == inst.env.get("MIST_DAILY_NEO4J_VOLUME"):
+        raise RefusedError(
+            f"volume {volume} is the one {inst.env_path} names in MIST_DAILY_NEO4J_VOLUME; a "
+            "drill never touches the instance's graph"
+        )
+
+
+def _check_drill_volume(inst: Instance, ctx: Context, volume: str) -> None:
+    """Item 8's volume check, before any call that uses the volume.
+
+    The volume must carry both labels `drill-start` gave it, and no container outside the drill
+    project may mount it, so neither the instance's graph nor another instance's drill is ever
+    restored into or removed.
+    """
+    _check_not_instance_volume(inst, volume)
+    inspected = ctx.runner(["docker", "volume", "inspect", "--format", "{{json .Labels}}", volume])
+    if inspected.returncode != 0:
+        raise RefusedError(f"cannot inspect volume {volume}: {_stderr_tail(inspected)}")
+    try:
+        labels = json.loads(inspected.stdout.decode("utf-8", "replace") or "null")
+    except json.JSONDecodeError:
+        labels = None
+    wanted = {DRILL_ROLE_LABEL: DRILL_ROLE, DRILL_INSTANCE_LABEL: inst.name}
+    if not isinstance(labels, dict) or any(labels.get(k) != v for k, v in wanted.items()):
+        raise RefusedError(
+            f"volume {volume} is not labelled "
+            + " and ".join(f"{k}={v}" for k, v in wanted.items())
+            + f"; drill-start made no such volume (labels: {labels})"
+        )
+    listed = ctx.runner(
+        [
+            "docker",
+            "ps",
+            "-a",
+            "--filter",
+            f"volume={volume}",
+            "--format",
+            '{{.Label "' + PROJECT_LABEL + '"}}',
+        ]
+    )
+    if listed.returncode != 0:
+        raise RefusedError(
+            f"cannot list the containers that mount {volume}: {_stderr_tail(listed)}"
+        )
+    project = _drill_project(inst)
+    others = [
+        line.strip() or "(no compose project)"
+        for line in listed.stdout.decode("utf-8", "replace").splitlines()
+        if line.strip() != project
+    ]
+    if others:
+        raise RefusedError(
+            f"volume {volume} is mounted by containers outside {project}: {', '.join(others)}"
+        )
+
+
+class MountReadError(Exception):
+    """A service's containers, or one container's mounts, could not be read."""
+
+
+def _data_volumes(ctx: Context, project: str, service: str) -> dict[str, str | None]:
+    """The volume each container of `service` in `project` mounts at /data, by container id.
+
+    The lookup is by compose label, so it finds a container whatever volume it took when compose
+    created it; compose reuses that container on a later run even when the run names another
+    volume. A container with no volume at /data maps to None.
+
+    Raises:
+        MountReadError: When the containers cannot be listed, or a container's mounts cannot be
+            read or are not the list `docker inspect` prints.
+    """
+    listed = ctx.runner(
+        [
+            "docker",
+            "ps",
+            "-a",
+            "--filter",
+            f"label={PROJECT_LABEL}={project}",
+            "--filter",
+            f"label={SERVICE_LABEL}={service}",
+            "-q",
+        ]
+    )
+    if listed.returncode != 0:
+        raise MountReadError(
+            f"cannot list the {service} containers of {project}: {_stderr_tail(listed)}"
+        )
+    volumes: dict[str, str | None] = {}
+    for container in listed.stdout.decode("utf-8", "replace").split():
+        inspected = ctx.runner(["docker", "inspect", "--format", "{{json .Mounts}}", container])
+        where = f"the mounts of {service} container {container}"
+        if inspected.returncode != 0:
+            raise MountReadError(f"cannot read {where}: {_stderr_tail(inspected)}")
+        try:
+            mounts = json.loads(inspected.stdout.decode("utf-8", "replace") or "null")
+        except json.JSONDecodeError:
+            mounts = None
+        if not isinstance(mounts, list) or not all(isinstance(m, dict) for m in mounts):
+            raise MountReadError(f"cannot read {where}: docker inspect printed no mount list")
+        data = [m for m in mounts if m.get("Destination") == NEO4J_DATA_MOUNT]
+        name = data[0].get("Name") if data and data[0].get("Type") == "volume" else None
+        volumes[container] = name if isinstance(name, str) else None
+    return volumes
+
+
+def _mounts_other_than(volumes: dict[str, str | None], volume: str) -> list[str]:
+    """One phrase per container whose /data is not `volume`."""
+    return [
+        (
+            f"container {container} mounts {found} at {NEO4J_DATA_MOUNT}"
+            if found
+            else f"container {container} has no {NEO4J_DATA_MOUNT} volume"
+        )
+        for container, found in volumes.items()
+        if found != volume
+    ]
+
+
+def _drill_neo4j_problem(
+    inst: Instance, ctx: Context, drill: Drill, *, required: bool
+) -> str | None:
+    """Why the drill project's Neo4j is not on this drill's volume, or None when it is.
+
+    Every drill of an instance runs in the one project `mist-<instance>-drill`, so a Neo4j
+    container an earlier drill left behind would take this drill's restore, and its verify, on
+    the earlier drill's volume. With no container, compose creates one on this drill's volume,
+    which is no problem unless `required`.
+    """
+    project = _drill_project(inst)
+    try:
+        volumes = _data_volumes(ctx, project, DRILL_NEO4J_SERVICE)
+    except MountReadError as exc:
+        return str(exc)
+    if not volumes:
+        return f"no {DRILL_NEO4J_SERVICE} container of {project} remains" if required else None
+    others = _mounts_other_than(volumes, drill.volume)
+    if others:
+        return (
+            f"{project}'s {DRILL_NEO4J_SERVICE} is not on this drill's volume {drill.volume}: "
+            + "; ".join(others)
+        )
+    return None
+
+
+def _load_drill(args: argparse.Namespace, ctx: Context) -> tuple[Instance, Drill]:
+    """The instance and its prepared drill, with every check that needs no Docker."""
+    inst = _load_instance(args.root, ctx)
+    drill = _read_drill(_drill_root(args.drill_root, inst, ctx))
+    _check_not_instance_volume(inst, drill.volume)
+    _check_drill_file(inst)
+    _check_static_configuration(inst, ctx)
+    _require_backup_path(inst)
+    return inst, drill
+
+
+def _check_no_drill_containers(inst: Instance, ctx: Context) -> None:
+    """One drill per instance at a time: refuse while the drill project has any container.
+
+    The drill project's Neo4j keeps the volume it was created on, so a new drill started beside
+    an earlier drill's containers would restore into the earlier drill's graph.
+    """
+    project = _drill_project(inst)
+    listed = ctx.runner(
+        ["docker", "ps", "-a", "--filter", f"label={PROJECT_LABEL}={project}", "-q"]
+    )
+    if listed.returncode != 0:
+        raise RefusedError(
+            f"cannot list the containers of {project}, so an earlier drill's may remain: "
+            f"{_stderr_tail(listed)}; once Docker answers, run drill-end for any earlier drill"
+        )
+    leftover = listed.stdout.decode("utf-8", "replace").split()
+    if leftover:
+        raise RefusedError(
+            f"containers {', '.join(leftover)} of {project} remain from an earlier drill; one "
+            "drill per instance runs at a time, so run drill-end for that drill first"
+        )
+
+
+def cmd_drill_start(args: argparse.Namespace, ctx: Context) -> None:
+    """Create a fresh labelled volume and an empty standby for one restore drill.
+
+    The restore handshake, `standby/state/MIST_RESTORE_TARGET`, is left for the operator to
+    create by hand: nothing in MIST.AI creates it.
+    """
+    _check_plain_name(args.artifact, "--artifact")
+    inst = _load_instance(args.root, ctx)
+    root = _drill_root(args.drill_root, inst, ctx)
+    if root.exists() and (not root.is_dir() or any(root.iterdir())):
+        raise RefusedError(f"drill root {root} is not an empty directory")
+    _check_drill_file(inst)
+    _check_static_configuration(inst, ctx)
+    _require_backup_path(inst)
+    manifest = _absolute_path(_backup_host_path(inst), ctx.home) / args.artifact / "manifest.json"
+    if not manifest.is_file():
+        raise RefusedError(f"{manifest} does not exist; name an artifact in the backup root")
+    _check_release_image(inst, ctx)
+    _check_no_drill_containers(inst, ctx)
+
+    started = ctx.clock()
+    volume = f"{_drill_project(inst)}-{started.astimezone(UTC).strftime(STAMP_FORMAT)}"
+    _check_not_instance_volume(inst, volume)
+    existing = ctx.runner(["docker", "volume", "inspect", "--format", "{{json .Labels}}", volume])
+    if existing.returncode == 0:
+        raise RefusedError(f"volume {volume} already exists; run drill-start again")
+    created = ctx.runner(
+        [
+            "docker",
+            "volume",
+            "create",
+            "--label",
+            f"{DRILL_ROLE_LABEL}={DRILL_ROLE}",
+            "--label",
+            f"{DRILL_INSTANCE_LABEL}={inst.name}",
+            volume,
+        ]
+    )
+    if created.returncode != 0:
+        raise RefusedError(f"cannot create volume {volume}: {_stderr_tail(created)}")
+    record = {"volume": volume, "artifact": args.artifact, "started_at": _format_utc(started)}
+    try:
+        (root / DRILL_STANDBY / "state").mkdir(parents=True, exist_ok=True)
+        (root / DRILL_PRE_RESTORE).mkdir(exist_ok=True)
+        _write_atomic(root / DRILL_RECORD, (json.dumps(record) + "\n").encode("utf-8"))
+    except OSError as exc:
+        raise FailedError(
+            f"created volume {volume}, but preparing {root} failed: {exc}; empty {root} and run "
+            "drill-start again"
+        ) from exc
+    standby = root / DRILL_STANDBY / "state"
+    print(f"drill ready: volume {volume}, artifact {args.artifact}, standby {standby}")
+    print(f"next: create {standby / RESTORE_MARKER_FILENAME} by hand, then run drill-restore")
+
+
+def cmd_drill_restore(args: argparse.Namespace, ctx: Context) -> int:
+    """Restore the drill's artifact into the drill graph and the standby directories.
+
+    Without `--confirm-target`, restore's own refusal prints the token to type; every gate of
+    `scripts.backup.restore` applies unchanged.
+    """
+    inst, drill = _load_drill(args, ctx)
+    matches = [entry for entry in _drill_records(inst, drill) if entry[1].get("result") == "match"]
+    if matches:
+        verified_at = _format_utc(max(matches, key=lambda entry: entry[0])[0])
+        raise RefusedError(
+            f"drill {drill.root} verified a match at {verified_at}; restoring again would change "
+            "the graph that verified, so promote it, or run drill-end and start a new drill"
+        )
+    _check_release_image(inst, ctx)
+    _check_drill_volume(inst, ctx, drill.volume)
+    problem = _drill_neo4j_problem(inst, ctx, drill, required=False)
+    if problem is not None:
+        raise RefusedError(
+            f"{problem}; restoring now would write another drill's graph. Run drill-end, which "
+            f"removes every container of {_drill_project(inst)} and keeps every volume, then "
+            "drill-restore again"
+        )
+    tail = [
+        "scripts.backup.restore",
+        "--artifact",
+        f"/backup/{drill.artifact}",
+        "--target-root",
+        f"/drill/{DRILL_STANDBY}/state",
+        "--target-vault-root",
+        f"/drill/{DRILL_STANDBY}/mist-memory",
+        "--backup-root",
+        f"/drill/{DRILL_PRE_RESTORE}",
+        "--target-graph-uri",
+        DRILL_GRAPH_URI,
+    ]
+    if args.confirm_target is not None:
+        tail += ["--confirm-target", args.confirm_target]
+    result = _run_drill(inst, ctx, drill, *_restore_in_drill(*tail))
+    _echo(result)
+    return result.returncode
+
+
+def _verify_result(stdout: bytes) -> dict | None:
+    """The item 7 JSON object verify printed as its last line, or None."""
+    lines = [line for line in stdout.decode("utf-8", "replace").splitlines() if line.strip()]
+    if not lines:
+        return None
+    try:
+        payload = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or payload.get("result") not in ("match", "mismatch"):
+        return None
+    return payload
+
+
+def cmd_drill_verify(args: argparse.Namespace, ctx: Context) -> int:
+    """Compare the restored drill with its artifact and record the counts in `ops/`."""
+    inst, drill = _load_drill(args, ctx)
+    _check_release_image(inst, ctx)
+    _check_drill_volume(inst, ctx, drill.volume)
+    result = _run_drill(
+        inst,
+        ctx,
+        drill,
+        *_restore_in_drill(
+            "scripts.backup.verify",
+            "--artifact",
+            f"/backup/{drill.artifact}",
+            "--graph-uri",
+            DRILL_GRAPH_URI,
+            "--state-root",
+            f"/drill/{DRILL_STANDBY}/state",
+            "--vault-root",
+            f"/drill/{DRILL_STANDBY}/mist-memory",
+        ),
+    )
+    _echo(result)
+    problem = _drill_neo4j_problem(inst, ctx, drill, required=True)
+    if problem is not None:
+        raise FailedError(
+            f"verify ran, but {problem}, so it did not compare this drill's graph; no drill "
+            "record was written. Run drill-end, then drill-restore and drill-verify again"
+        )
+    verified = _verify_result(result.stdout)
+    if verified is None:
+        print(
+            f"instance.py drill-verify: verify exited {result.returncode} without a result; "
+            "no drill record was written",
+            file=sys.stderr,
+        )
+        return result.returncode if result.returncode != EXIT_OK else EXIT_FAILED
+    now = ctx.clock()
+    record = {
+        "v": 1,
+        "drill_root": str(drill.root),
+        "volume": drill.volume,
+        "artifact": drill.artifact,
+        "verified_at": _format_utc(now),
+        "exit_code": result.returncode,
+        **verified,
+    }
+    path = inst.ops / f"drill-{now.astimezone(UTC).strftime(STAMP_FORMAT)}.json"
+    try:
+        _write_atomic(path, (json.dumps(record, indent=2) + "\n").encode("utf-8"))
+    except OSError as exc:
+        raise FailedError(f"verify finished, but {path} could not be written: {exc}") from exc
+    print(f"drill {verified['result']}: wrote {path}")
+    return result.returncode
+
+
+def cmd_drill_end(args: argparse.Namespace, ctx: Context) -> None:
+    """Remove the drill's containers; the volume and the drill root stay for a person to delete."""
+    inst, drill = _load_drill(args, ctx)
+    _check_drill_volume(inst, ctx, drill.volume)
+    result = _run_drill(inst, ctx, drill, "rm", "-s", "-f")
+    if result.returncode != 0:
+        raise FailedError(
+            f"removing the drill containers failed, so some may remain: {_stderr_tail(result)}"
+        )
+    print(f"removed the drill containers of {_drill_project(inst)}; volume {drill.volume} stays")
+
+
+def _same_drive(first: Path, second: Path) -> bool:
+    """Whether a rename can move `first` beside `second`: one drive and one filesystem."""
+    first_drive = os.path.normcase(os.path.splitdrive(str(first))[0])
+    second_drive = os.path.normcase(os.path.splitdrive(str(second))[0])
+    try:
+        return first_drive == second_drive and first.stat().st_dev == second.stat().st_dev
+    except OSError:
+        return False
+
+
+def _drill_records(inst: Instance, drill: Drill) -> list[tuple[datetime, dict]]:
+    """This drill's `ops/` verify records newer than its `drill.json`, with their times.
+
+    A record counts only when its drill root, volume and artifact are this drill's, so a record
+    another drill wrote, or one from before `drill-start` reused the root, never counts.
+    """
+    records = []
+    for path in sorted(inst.ops.glob("drill-*.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        verified_at = _parse_utc(record.get("verified_at"))
+        same_drill = (
+            isinstance(record.get("drill_root"), str)
+            and _normalized(record["drill_root"]) == _normalized(str(drill.root))
+            and record.get("volume") == drill.volume
+            and record.get("artifact") == drill.artifact
+        )
+        if same_drill and verified_at is not None and verified_at > drill.started_at:
+            records.append((verified_at, record))
+    return records
+
+
+def _check_verified_match(inst: Instance, drill: Drill) -> None:
+    """Refuse unless this drill's newest verify record is a match newer than its `drill.json`."""
+    records = _drill_records(inst, drill)
+    if not records:
+        raise RefusedError(
+            f"ops/ holds no drill-verify record for {drill.root} newer than its drill.json; run "
+            "drill-verify first"
+        )
+    _newest, record = max(records, key=lambda entry: entry[0])
+    if record.get("result") != "match" or record.get("exit_code") != EXIT_OK:
+        raise RefusedError(
+            f"the newest drill-verify record for {drill.root} is not a match; promote only a "
+            "drill that verified"
+        )
+
+
+def cmd_promote(args: argparse.Namespace, ctx: Context) -> None:
+    """Make a verified drill the instance: its volume the graph, its standby the state and vault.
+
+    The order is item 8's. The drill's containers are removed and the volume proven unmounted
+    before the instance stops, so a refusal there leaves the instance as it was. The instance's
+    containers are then stopped and removed, without their volumes, before anything moves, so
+    `up` creates a Neo4j container on the promoted volume; after `up`, its /data mount is read
+    back to prove it. The old directories are renamed into `retired/<stamp>/`, never deleted, so
+    the move is reversible.
+    """
+    inst, drill = _load_drill(args, ctx)
+    _check_verified_match(inst, drill)
+    sources = [drill.standby(name) for name in MARKED_SUBDIRS]
+    currents = [inst.root / name for name in MARKED_SUBDIRS]
+    missing = [str(path) for path in (*sources, *currents) if not path.is_dir()]
+    if missing:
+        raise RefusedError(f"promote moves directories that do not exist: {', '.join(missing)}")
+    if not _same_drive(drill.root, inst.root):
+        raise RefusedError(
+            f"drill root {drill.root} is on another drive or filesystem than {inst.root}; "
+            "promote moves by rename, so start the drill on the instance's drive"
+        )
+    try:
+        env_bytes = inst.env_path.read_bytes()
+        marker_bytes = (inst.root / LIVE_INSTANCE_MARKER).read_bytes()
+    except OSError as exc:
+        raise RefusedError(f"cannot read the instance's daily.env or marker: {exc}") from exc
+    volume_lines = len(VOLUME_LINE.findall(env_bytes))
+    if volume_lines != 1:
+        raise RefusedError(
+            f"{inst.env_path} has {volume_lines} MIST_DAILY_NEO4J_VOLUME= lines; promote "
+            "rewrites one"
+        )
+    stamp = ctx.clock().astimezone(UTC).strftime(STAMP_FORMAT)
+    retired = inst.root / "retired" / stamp
+    if retired.exists():
+        raise RefusedError(f"{retired} already exists; run promote again")
+    _check_release_image(inst, ctx)
+    _check_drill_volume(inst, ctx, drill.volume)
+
+    removed = _run_drill(inst, ctx, drill, "rm", "-s", "-f")
+    if removed.returncode != 0:
+        raise FailedError(
+            "removing the drill containers failed, so some may remain; the instance was not "
+            f"stopped and nothing moved: {_stderr_tail(removed)}"
+        )
+    mounted = ctx.runner(["docker", "ps", "-a", "--filter", f"volume={drill.volume}", "-q"])
+    holders = mounted.stdout.decode("utf-8", "replace").split()
+    if mounted.returncode != 0 or holders:
+        reason = (
+            f"containers {', '.join(holders)} still mount it"
+            if holders
+            else f"the containers that mount it cannot be listed ({_stderr_tail(mounted)})"
+        )
+        raise RefusedError(
+            f"volume {drill.volume}: {reason}; the instance was not stopped and nothing moved"
+        )
+    stopped = ctx.runner([*inst.compose(), "--profile", BACKUP_PROFILE, "stop"])
+    if stopped.returncode != 0:
+        raise FailedError(
+            f"stopping project {inst.project} failed, so it may be partly stopped; nothing "
+            f"moved, and up --root {inst.root} restarts it: {_stderr_tail(stopped)}"
+        )
+    # A stopped container keeps its volume: `up` would restart the old graph unless it is gone.
+    cleared = ctx.runner([*inst.compose(), "--profile", BACKUP_PROFILE, "rm", "-f"])
+    if cleared.returncode != 0:
+        raise FailedError(
+            f"project {inst.project} is stopped, but removing its containers failed, so some "
+            f"may remain; nothing moved, and up --root {inst.root} restarts it: "
+            f"{_stderr_tail(cleared)}"
+        )
+
+    done: list[str] = []
+
+    def failed(step: str, exc: OSError) -> FailedError:
+        so_far = "; ".join(done) if done else "nothing moved"
+        return FailedError(
+            f"the instance is stopped and {step} failed ({exc}). Done so far: {so_far}. Put "
+            f"back any directory {retired} holds before running up --root {inst.root}"
+        )
+
+    try:
+        retired.mkdir(parents=True)
+    except OSError as exc:
+        raise failed(f"creating {retired}", exc) from exc
+    for current in currents:
+        try:
+            os.rename(current, retired / current.name)
+        except OSError as exc:
+            raise failed(f"moving {current} into {retired}", exc) from exc
+        done.append(f"{current.name} moved to {retired}")
+    for source, current in zip(sources, currents, strict=True):
+        try:
+            os.rename(source, current)
+        except OSError as exc:
+            raise failed(f"moving {source} to {current}", exc) from exc
+        done.append(f"the drill's {current.name} is now {current}")
+    # A promoted handshake would make the live state a valid restore target.
+    handshake = inst.root / "state" / RESTORE_MARKER_FILENAME
+    try:
+        os.unlink(handshake)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise failed(f"deleting {handshake}", exc) from exc
+    done.append(f"deleted {handshake}")
+    for current in currents:
+        try:
+            _write_atomic(current / LIVE_INSTANCE_MARKER, marker_bytes)
+        except OSError as exc:
+            raise failed(f"marking {current}", exc) from exc
+    done.append("state and mist-memory marked")
+    new_env = VOLUME_LINE.sub(f"MIST_DAILY_NEO4J_VOLUME={drill.volume}".encode(), env_bytes)
+    try:
+        _write_atomic(inst.env_path, new_env)
+    except OSError as exc:
+        raise failed(f"rewriting {inst.env_path}", exc) from exc
+    done.append(f"{inst.env_path} names volume {drill.volume}")
+    print(f"promoted: {'; '.join(done)}")
+
+    promoted = _load_instance(inst.root, ctx)
+    try:
+        instance_up(promoted, ctx, DEFAULT_UP_WAIT_MINUTES)
+    except InstanceError as exc:
+        raise FailedError(
+            f"the drill is promoted ({'; '.join(done)}), but up failed: {exc}. The old state "
+            f"and vault are in {retired}; daily.env names volume {drill.volume}"
+        ) from exc
+    try:
+        volumes = _data_volumes(ctx, promoted.project, NEO4J_SERVICE)
+    except MountReadError as exc:
+        problem: str | None = str(exc)
+    else:
+        others = _mounts_other_than(volumes, drill.volume)
+        if not volumes:
+            problem = f"no {NEO4J_SERVICE} container of {promoted.project} was found"
+        else:
+            problem = "; ".join(others) if others else None
+    if problem is not None:
+        raise FailedError(
+            f"the drill is promoted and up ran, but {problem}, where {NEO4J_SERVICE} must mount "
+            f"the promoted volume {drill.volume} at {NEO4J_DATA_MOUNT}. daily.env names "
+            f"{drill.volume}; the old state and vault are in {retired}"
+        )
+    print(f"{NEO4J_SERVICE} mounts {drill.volume} at {NEO4J_DATA_MOUNT}")
+
+
 # --- Gaming mode -----------------------------------------------------------------------------
 
 
@@ -1686,6 +2479,51 @@ def build_parser() -> argparse.ArgumentParser:
     backup_now = commands.add_parser("backup-now", help="run one backup attempt now")
     backup_now.add_argument("--root", required=True)
     backup_now.set_defaults(handler=cmd_backup_now)
+
+    accept = commands.add_parser(
+        "accept-backup-baseline", help="make a reviewed suspect backup the new baseline"
+    )
+    accept.add_argument("--root", required=True)
+    accept.add_argument("--label", required=True, help="the directory name under suspect/")
+    accept.set_defaults(handler=cmd_accept_backup_baseline)
+
+    drill_start = commands.add_parser(
+        "drill-start", help="create a fresh labelled volume and standby for a restore drill"
+    )
+    drill_start.add_argument("--root", required=True)
+    drill_start.add_argument(
+        "--drill-root", required=True, help="an empty directory outside the instance root"
+    )
+    drill_start.add_argument(
+        "--artifact", required=True, help="a backup's directory name in MIST_BACKUP_HOST_PATH"
+    )
+    drill_start.set_defaults(handler=cmd_drill_start)
+
+    drill_commands = (
+        (
+            "drill-restore",
+            cmd_drill_restore,
+            "restore the drill's artifact into the drill volume and standby",
+        ),
+        (
+            "drill-verify",
+            cmd_drill_verify,
+            "compare the restored drill with its artifact and record the result",
+        ),
+        ("drill-end", cmd_drill_end, "remove the drill's containers; the volume stays"),
+        ("promote", cmd_promote, "make a verified drill the instance's graph, state and vault"),
+    )
+    for name, handler, summary in drill_commands:
+        sub = commands.add_parser(name, help=summary)
+        sub.add_argument("--root", required=True)
+        sub.add_argument("--drill-root", required=True)
+        if name == "drill-restore":
+            sub.add_argument(
+                "--confirm-target",
+                metavar="TOKEN",
+                help="the token restore printed when run without it",
+            )
+        sub.set_defaults(handler=handler)
     return parser
 
 
@@ -1711,6 +2549,15 @@ def main(argv: Sequence[str] | None = None, ctx: Context | None = None) -> int:
     except InstanceError as exc:
         print(f"instance.py {args.command}: {exc.label}: {exc}", file=sys.stderr)
         return exc.exit_code
+    except volume_safety.DestructiveCommandError as exc:
+        # Exit 1, not 2: a refusal mid-way, after `promote` has moved directories, has changed
+        # something.
+        print(
+            f"instance.py {args.command}: refused a volume-deleting command: "
+            f"{' '.join(exc.argv)}",
+            file=sys.stderr,
+        )
+        return EXIT_FAILED
     return EXIT_OK if code is None else code
 
 

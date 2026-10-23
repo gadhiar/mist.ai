@@ -134,16 +134,17 @@ taken from the root's marker, and every compose call passes
 `-f <root>/release/<MIST_RELEASE_TAG>/deploy/daily/compose.yml --env-file <root>/daily.env`.
 
 Exit codes: 0 done; 2 refused, nothing changed; 1 failed part-way, and the message names the
-state left. `backup-now` returns the backup attempt's own exit code.
+state left. `backup-now` returns the backup attempt's own exit code, `accept-backup-baseline`
+the scheduler's, and `drill-restore` and `drill-verify` those of restore and verify.
 
-`switch`, `up`, `arm-backups` and `backup-now` first check the configuration, and refuse with
-exit 2 before anything starts:
+`switch`, `up`, `arm-backups`, `backup-now` and `drill-start` first check the configuration,
+and refuse with exit 2 before anything starts:
 
 - an instance named `daily` whose `daily.env` sets `MIST_DAILY_WS_PORT`,
   `MIST_DAILY_BOLT_PORT` or `MIST_DAILY_NEO4J_HTTP_PORT` to anything but 8001, 7687 and 7474;
 - any instance with one of those ports in 7688, 7689, 7690 or 8002;
-- a `MIST_BACKUP_HOST_PATH` inside the instance root, inside a registered live root or a
-  directory holding `.mist-live-instance`, or inside a git work tree;
+- a `MIST_BACKUP_HOST_PATH` or drill root inside the instance root, inside a registered live
+  root or a directory holding `.mist-live-instance`, or inside a git work tree;
 - a `mist-backend:<tag>` image whose ID differs from `ops/release-<tag>.json`. The fix is
   `release-build <tag>`, which rebuilds the image from the tag and records it again. This is
   the one check that asks Docker, with `docker image inspect`; it changes nothing.
@@ -152,7 +153,7 @@ exit 2 before anything starts:
 |---|---|
 | `switch TAG [--skip-backup]` | Refuses a tag with no `release/<tag>/`, a tag with no `mist-backend:<tag>` image, and a `rehearsal-` tag on the instance named `daily`. When `MIST_BACKUP_HOST_PATH` is set and `mist-backend` is running, it runs `backup-now` on the current release first, and stops with that exit code if the backup fails. It then rewrites only the `MIST_RELEASE_TAG=` line of `daily.env`, copies every `*.py` file of `release/<tag>/scripts/daily/` into `bin/`, and runs `up`. |
 | `up [--wait-minutes N]` | Waits up to N minutes (default 10) for `docker info`, creates the share network if it is missing, and starts `mist-neo4j`, `mist-llm` and `mist-backend` in one call, leaving `mist-llm` out while `ops/gpu-yielded` exists. Only when `ops/backups-armed` exists does it start `mist-backup`, in a second call, so a failure there (exit 1) leaves the first three running. Last, it names every container of the project whose compose config-file label is not the release's compose file, and exits 1. |
-| `down` | `docker compose ... --profile backup stop`. It stops every container and removes nothing: no command of this CLI runs `down -v`, `rm -v` or `volume rm`. |
+| `down` | `docker compose ... --profile backup stop`. It stops every container and removes nothing: no command of this CLI runs `down -v`, `rm -v` or `volume rm`. Every command passes `volume_safety.py`, which `instance.py` loads from beside itself, before it runs; the guard refuses `-v`, `--volumes`, `prune`, `down` and every `volume` subcommand but `inspect` and `create`, and the CLI exits 1 naming the command. |
 | `status` | Prints the running backend's image tag, its image ID with `match` or `MISMATCH` against the release record, and its `org.opencontainers.image.revision` label; each container from another compose file (then exit 1), and it exits 1 too when the project's containers cannot be listed, since then that check could not run; the `gaming-mode status` line; `/health`'s status and each check's status and reason; and `/usage/turns-per-day?days=7`'s counts and gate. |
 | `gaming-mode on [--by manual\|watcher]` | Yields the GPU to a game: see Gaming mode below. |
 | `gaming-mode off [--wait-minutes N]` | Ends the yield, waiting up to N minutes (default 5) for `mist-llm`. |
@@ -160,6 +161,21 @@ exit 2 before anything starts:
 | `arm-backups` | Writes `ops/backups-armed` and starts `mist-backup`; from then on every `up` starts it too. The deploy plan arms backups only after a restore drill passes. |
 | `disarm-backups` | Removes `ops/backups-armed`, then stops `mist-backup`. |
 | `backup-now` | One attempt, armed or not: `docker compose ... --profile backup run --rm mist-backup python -m scripts.backup.scheduler --once`. |
+| `accept-backup-baseline --label LABEL` | Makes a reviewed suspect backup the baseline: `docker compose ... --profile backup run --rm mist-backup python -m scripts.backup.scheduler --accept-suspect LABEL`, which moves `suspect/LABEL` back into the backup root and records it as the last success. See `backup_suspect` under Reading /health. |
+| `drill-start --drill-root D --artifact NAME` | Starts a restore drill of the backup `NAME` in `MIST_BACKUP_HOST_PATH`. Refuses a drill root that is not empty or fails the path checks above, a volume name that already exists, and any container of the drill project that remains from an earlier drill (one drill per instance at a time). Creates the volume `mist-<instance>-drill-<UTC stamp>` with labels `org.mist.role=drill` and `org.mist.instance=<instance>`, and writes `D/drill.json` (`volume`, `artifact`, `started_at`). |
+| `drill-restore --drill-root D [--confirm-target TOKEN]` | Runs `scripts.backup.restore` in the drill project into the drill volume and `D/standby/`, with `--confirm-target` only when given, so the first run prints the token restore wants. Refuses a drill that already verified a `match`, and a drill project whose `mist-neo4j-dev` mounts another volume at `/data` or whose mounts cannot be read. |
+| `drill-verify --drill-root D` | Runs `scripts.backup.verify` against the restored drill and writes its counts to `ops/drill-<UTC stamp>.json`. Exit 0 match, 1 mismatch. Then reads the `/data` mount of the drill project's `mist-neo4j-dev`; unless it is the drill volume, it writes no record and exits 1. |
+| `drill-end --drill-root D` | Removes the drill's containers (`rm -s -f`, no `-v`). The volume and the drill root stay until you delete them. |
+| `promote --drill-root D` | Makes a verified drill the instance: the volume becomes `MIST_DAILY_NEO4J_VOLUME`, `D/standby/state` and `D/standby/mist-memory` replace `state/` and `mist-memory/`, which move to `retired/<UTC stamp>/`, and the instance comes back up. Before anything moves it stops the instance and removes its containers (`--profile backup rm -f`, no `-v`), so `up` creates `mist-neo4j` on the promoted volume; after `up` it reads that container's `/data` mount and exits 1 unless it is the drill volume. |
+
+The drill commands run `deploy/daily/restore-drill.yml` from the release as project
+`mist-<instance>-drill`, with `MIST_DRILL_NEO4J_VOLUME` and `MIST_DRILL_ROOT` set in that
+command's environment only. Before any call that uses the volume, `drill-restore`,
+`drill-verify`, `drill-end` and `promote` refuse a volume without both drill labels, the volume
+`MIST_DAILY_NEO4J_VOLUME` names, and a volume any container outside the drill project mounts.
+`promote` also refuses without a `match` record newer than `drill.json`, and a drill root on
+another drive than the instance root. The runbook, with the order and every gate, is
+`deploy/daily/RESTORE.md`; never run `restore-drill.yml` by hand.
 
 `compose.yml` declares `${MIST_BACKUP_HOST_PATH:?...}`, so compose refuses the file unless
 `daily.env` sets it. In practice `MIST_BACKUP_HOST_PATH` is therefore always set, and `switch`
@@ -235,6 +251,7 @@ changes, with what each means and what to do.
 | `backup` | `disabled_by_config` | null | `MIST_BACKUP_STATUS_PATH` is unset; not the case in this compose file. | None. |
 | `backup` | `backup_never_run` | down | Backups are configured but no status file exists yet. | `arm-backups` once a drill has passed, or `backup-now` for one attempt. |
 | `backup` | `query_failed` | down | `ops/backup-status.json` cannot be read or lacks a key. | The next attempt overwrites it; run `backup-now`. |
+| `backup` | `backup_suspect` | down | The last dump failed the success rule (an empty graph or vault, a lost store, or fewer nodes than `MIST_BACKUP_MIN_NODE_RATIO` of the last success), so it was moved to `suspect/` and prune did not run; no success is recent. | Inspect `<backup root>/suspect/<label>/manifest.json`, where the backup root is `MIST_BACKUP_HOST_PATH`, against the last success's counts in `ops/backup-status.json`. If the shrink is expected, run `accept-backup-baseline --label <label>`; otherwise find what emptied the graph, vault or store before the next attempt. |
 | `backup` | `backup_failed` | down | The last attempt failed and no success is recent. | Read `docker compose -p mist-daily logs mist-backup`, fix the destination, run `backup-now`. |
 | `backup` | `backup_overdue` | down | The last success is older than `MIST_BACKUP_MAX_AGE_HOURS` (default 26). | Check that `mist-backup` runs (`status`); `arm-backups` if it was disarmed. |
 | `llm` | `gpu_yielded` | yielded | Gaming mode is on. | `gaming-mode off`. |

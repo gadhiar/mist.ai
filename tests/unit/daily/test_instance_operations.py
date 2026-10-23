@@ -847,15 +847,46 @@ def string_lists(source: str) -> list[list[str]]:
 
 def test_no_argv_construction_can_delete_a_volume():
     source = SCRIPT.read_text(encoding="utf-8")
+    module = ast.parse(source)
     constants = {
         node.value
-        for node in ast.walk(ast.parse(source))
+        for node in ast.walk(module)
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     }
-    # No flag that removes volumes, no `rm` or `volume` subcommand, anywhere in the module.
-    assert not constants & {"-v", "--volumes", "rm", "volume", "prune"}
+    # No flag that removes volumes and no `prune`, anywhere in the module.
+    assert not constants & {"-v", "--volumes", "prune"}
     for items in string_lists(source):
         assert "down" not in items, items
+
+    # `volume` only as `volume inspect` or `volume create` (the restore drill's), in every list
+    # or tuple display and every call's positional arguments. The sole argument of a
+    # `.get(...)` is a key, not an argv; a subscript key is never scanned.
+    def word(node: ast.AST | None) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        return None
+
+    for node in ast.walk(module):
+        if isinstance(node, ast.List | ast.Tuple):
+            elements = list(node.elts)
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "get"
+                and len(node.args) == 1
+                and not node.keywords
+            ):
+                continue
+            elements = list(node.args)
+        else:
+            continue
+        for position, element in enumerate(elements):
+            if word(element) != "volume":
+                continue
+            after = elements[position + 1] if position + 1 < len(elements) else None
+            shown = ast.unparse(after) if after is not None else "nothing"
+            assert word(after) in ("inspect", "create"), f"line {node.lineno}: volume, {shown}"
 
 
 def test_every_command_argv_recorded_here_is_volume_safe(make_ctx, daily):
