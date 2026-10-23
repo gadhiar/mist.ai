@@ -7,9 +7,10 @@ extraction pipeline models (re-exported from their source modules).
 """
 
 import enum
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 
 class RoutingDestination(str, enum.Enum):
@@ -225,6 +226,88 @@ class RetrievedFact:
         return self.to_triple_string()
 
 
+RetrievalSource = Literal["vault", "graph", "vector"]
+
+# The (subject, subject_type) pairs `KnowledgeRetriever` stamps on the facts it
+# maps from vault sidecar rows and vector store chunks. Every other fact is a
+# graph relationship. The subject is part of the mark because the graph also
+# holds `DocumentChunk` nodes, so the type alone does not identify a vector fact.
+_VAULT_FACT_MARK = ("VaultNote", "VaultSession")
+_VECTOR_FACT_MARK = ("Document", "DocumentChunk")
+
+# Hex digits of the SHA-256 kept in a ref, fixed by the turn-trace contract.
+_FACT_REF_HEX_DIGITS = 20
+
+
+def _fact_source(fact: RetrievedFact) -> RetrievalSource:
+    mark = (fact.subject, fact.subject_type)
+    if mark == _VAULT_FACT_MARK:
+        return "vault"
+    if mark == _VECTOR_FACT_MARK:
+        return "vector"
+    return "graph"
+
+
+def fact_ref(fact: RetrievedFact) -> str:
+    """Return an opaque, stable ref for a retrieved fact: `<source>:<20 hex digits>`.
+
+    The turn trace records which memories a turn saw without writing their
+    text, so the ref is a hash of the fact's natural key. mist-read-path maps a
+    ref back by hashing the vault and graph it is granted with the same keys:
+
+    - vault: the path, the heading and the SHA-256 hex of `properties["text"]`,
+      joined by newlines. The heading is `fact.object`; a file-level chunk,
+      whose sidecar heading is null, is keyed with the heading `(file)`, the
+      object the retriever gives it. The text digest is part of the key because
+      the sidecar writes one chunk per heading block, so two sections of one
+      note can share a path and a heading.
+    - graph: `<subject>|<predicate>|<object>`.
+    - vector: `properties["chunk_id"]`.
+
+    Args:
+        fact: A fact produced by `KnowledgeRetriever`, or one shaped like it.
+
+    Returns:
+        The ref, matching `^(vault|graph|vector):[0-9a-f]{20}$`.
+    """
+    source = _fact_source(fact)
+    properties = fact.properties or {}
+    if source == "vault":
+        text = str(properties.get("text") or "")
+        text_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        key = f"{properties.get('path') or ''}\n{fact.object}\n{text_digest}"
+    elif source == "vector":
+        key = str(properties.get("chunk_id") or "")
+    else:
+        key = f"{fact.subject}|{fact.predicate}|{fact.object}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return f"{source}:{digest[:_FACT_REF_HEX_DIGITS]}"
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalCandidate:
+    """One row a retrieval leg returned, before the merge and the limit.
+
+    The vault and vector legs report every row they returned, before any
+    filtering, so an empty vault chunk the retriever drops still appears. The
+    graph leg reports its facts after `RetrievalFilters` and triple dedup: a
+    row the caller's filters exclude has no disposition in the turn trace, and
+    a duplicate triple has the same ref as the fact it repeats.
+
+    `rank` is the 1-based position within its leg, `score` the leg's own score
+    for the row, `selected` whether the fact reached `RetrievalResult.facts`,
+    and `empty` whether the row was a vault chunk with no body, which the
+    retriever drops before formatting.
+    """
+
+    source: RetrievalSource
+    ref: str
+    rank: int
+    score: float | None
+    selected: bool
+    empty: bool
+
+
 @dataclass
 class RetrievalResult:
     """Complete result from knowledge retrieval.
@@ -256,6 +339,11 @@ class RetrievalResult:
     requires_mcp: bool = False  # True when live data needed
     suggested_tools: tuple[str, ...] = ()  # MCP tools for live intent
     document_chunks_used: int = 0  # Number of vector store chunks in results
+
+    # Each leg's rows in leg order (graph, vector, vault) and rank: every vault
+    # and vector row, and the graph facts after filters and dedup (see
+    # `RetrievalCandidate`).
+    candidates: tuple[RetrievalCandidate, ...] = ()
 
     def get_top_facts(self, n: int = 10) -> list[RetrievedFact]:
         """Get top N facts by score."""
