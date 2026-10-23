@@ -32,6 +32,7 @@ from backend.memory.ranking import (
     shortlist,
     window_term,
 )
+from backend.vault.models import AuthoredBy
 from tests.fakes.memory_fakes import FakeClock
 
 NOW = FakeClock().now()  # 2026-10-22 18:00 UTC
@@ -227,6 +228,13 @@ class TestConfidenceTerm:
             pytest.param(_note("n", "user-edit"), 0.9, id="note-user-edit"),
             pytest.param(_note("n", "mist"), 0.7, id="note-mist"),
             pytest.param(_note("n", None), 0.7, id="note-unknown-author"),
+            pytest.param(_note("n", "mist-pending-review"), 0.5, id="note-pending-review"),
+            pytest.param(_note("n", AuthoredBy.USER), 0.9, id="note-enum-user"),
+            pytest.param(_note("n", AuthoredBy.USER_EDIT), 0.9, id="note-enum-user-edit"),
+            pytest.param(_note("n", AuthoredBy.MIST), 0.7, id="note-enum-mist"),
+            pytest.param(
+                _note("n", AuthoredBy.MIST_PENDING_REVIEW), 0.5, id="note-enum-pending-review"
+            ),
             pytest.param(_fact("f", confidence=0.65), 0.65, id="fact-edge-confidence"),
             pytest.param(_fact("f", confidence=None), 0.5, id="fact-without-confidence"),
             pytest.param(_fact("f", confidence=1.4), 1.0, id="fact-clamped-high"),
@@ -279,6 +287,45 @@ class TestWindowTerm:
     ) -> None:
         assert window_term(candidate, YESTERDAY) == expected
 
+    @pytest.mark.parametrize(
+        "candidate",
+        [
+            pytest.param(_fact("f", when=datetime(2026, 10, 21, 9)), id="naive-when"),
+            pytest.param(
+                _episode(
+                    "e",
+                    when=datetime(2026, 10, 21, 9, tzinfo=UTC),
+                    span=(datetime(2026, 10, 21, 8), datetime(2026, 10, 21, 9, tzinfo=UTC)),
+                ),
+                id="naive-span-start",
+            ),
+            pytest.param(
+                _episode(
+                    "e",
+                    when=datetime(2026, 10, 21, 9, tzinfo=UTC),
+                    span=(datetime(2026, 10, 21, 8, tzinfo=UTC), datetime(2026, 10, 21, 9)),
+                ),
+                id="naive-span-end",
+            ),
+        ],
+    )
+    def test_naive_item_timestamp_is_rejected(self, candidate: Candidate) -> None:
+        with pytest.raises(ValueError, match="aware"):
+            window_term(candidate, YESTERDAY)
+
+    def test_naive_window_bound_is_rejected(self) -> None:
+        # TimeWindow refuses naive bounds when built; this one is forced past that check to
+        # show window_term does not rely on it.
+        window = TimeWindow(
+            start=datetime(2026, 10, 21, tzinfo=UTC),
+            end=datetime(2026, 10, 22, tzinfo=UTC),
+            phrase="yesterday",
+        )
+        object.__setattr__(window, "start", datetime(2026, 10, 21))
+
+        with pytest.raises(ValueError, match="aware"):
+            window_term(_fact("f"), window)
+
     def test_unbound_previous_conversation_window_is_rejected(self) -> None:
         last_time = TimeWindow(start=None, end=None, phrase="last time", previous_conversation=True)
 
@@ -287,24 +334,64 @@ class TestWindowTerm:
 
 
 class TestFinalScore:
-    def test_relevance_only_uses_rerank_scores_then_rrf_for_the_unscored_tail(self) -> None:
-        listed = [_fused(_fact("a"), 1.0), _fused(_fact("b"), 0.6), _fused(_fact("c"), 0.4)]
+    def test_partial_rerank_scales_unscored_items_under_the_prefix_minimum(self) -> None:
+        # The prefix minimum (0.4, item a) is not the last scored item (b, rrf_norm 0.8), so
+        # the tail is scaled by min(prefix) / rrf_norm of b: c = 0.4 * 0.6 / 0.8, d = 0.4 *
+        # 0.3 / 0.8. Unscaled, c's 0.6 would outrank the reranked a.
+        listed = [
+            _fused(_fact("a"), 1.0),
+            _fused(_fact("b"), 0.8),
+            _fused(_fact("c"), 0.6),
+            _fused(_fact("d"), 0.3),
+        ]
 
-        scored = score_shortlist(listed, [0.3, 0.9], now=NOW, window=None, config=RELEVANCE_ONLY)
+        scored = score_shortlist(listed, [0.4, 0.9], now=NOW, window=None, config=RELEVANCE_ONLY)
 
         assert [(s.candidate.item_id, s.score, s.reranked) for s in scored] == [
             ("b", pytest.approx(0.9), True),
-            ("c", pytest.approx(0.4), False),
-            ("a", pytest.approx(0.3), True),
+            ("a", pytest.approx(0.4), True),
+            ("c", pytest.approx(0.3), False),
+            ("d", pytest.approx(0.15), False),
         ]
 
-    def test_no_rerank_scores_falls_back_to_rrf_for_every_item(self) -> None:
+    def test_a_prefix_minimum_of_zero_sinks_the_unscored_tail_under_min_score(self) -> None:
+        config = MemoryConfig(
+            rerank_weight=1.0, recency_weight=0.0, confidence_weight=0.0, min_score=0.2
+        )
+        listed = [_fused(_fact("a"), 1.0), _fused(_fact("b"), 0.9), _fused(_fact("c"), 0.8)]
+
+        scored = score_shortlist(listed, [0.7, 0.0], now=NOW, window=None, config=config)
+
+        assert [s.candidate.item_id for s in scored] == ["a"]
+
+    def test_a_last_scored_item_with_zero_rrf_leaves_the_tail_at_zero(self) -> None:
+        listed = [_fused(_fact("a"), 0.0), _fused(_fact("b"), 0.0)]
+
+        scored = score_shortlist(listed, [0.5], now=NOW, window=None, config=RELEVANCE_ONLY)
+
+        assert [(s.candidate.item_id, s.score) for s in scored] == [("a", 0.5), ("b", 0.0)]
+
+    @pytest.mark.parametrize(
+        "rerank_scores",
+        [pytest.param(None, id="none"), pytest.param((), id="deadline-before-first-pair")],
+    )
+    def test_no_rerank_scores_falls_back_to_rrf_for_every_item(
+        self, rerank_scores: tuple[float, ...] | None
+    ) -> None:
         listed = [_fused(_fact("a"), 1.0), _fused(_fact("b"), 0.5)]
 
-        scored = score_shortlist(listed, None, now=NOW, window=None, config=RELEVANCE_ONLY)
+        scored = score_shortlist(listed, rerank_scores, now=NOW, window=None, config=RELEVANCE_ONLY)
 
         assert [(s.candidate.item_id, s.score) for s in scored] == [("a", 1.0), ("b", 0.5)]
         assert not any(s.reranked for s in scored)
+
+    def test_a_pending_review_note_ranks_below_an_equal_mist_note(self) -> None:
+        listed = [_fused(_note("a", "mist-pending-review")), _fused(_note("b", "mist"))]
+
+        scored = score_shortlist(listed, [0.6, 0.6], now=NOW, window=None, config=MemoryConfig())
+
+        assert [s.candidate.item_id for s in scored] == ["b", "a"]
+        assert scored[0].score - scored[1].score == pytest.approx(0.1 * (0.7 - 0.5))
 
     def test_recency_only(self) -> None:
         listed = [_fused(_fact("old", when=_days_ago(90))), _fused(_episode("new", when=NOW))]
