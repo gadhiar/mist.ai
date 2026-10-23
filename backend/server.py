@@ -1160,6 +1160,8 @@ async def lifespan(app: FastAPI):
             event_store=curation_deps.event_store,
             tracker=curation_deps.tracker,
             llm_provider=curation_deps.llm_provider,
+            # No gaming mode is wired yet, so the LLM job is never deferred.
+            defer_llm_jobs=None,
         )
         if await curation_scheduler.start():
             logger.info("Curation scheduler started")
