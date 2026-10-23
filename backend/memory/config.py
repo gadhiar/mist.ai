@@ -34,6 +34,10 @@ _WEIGHT_TOLERANCE = 1e-6
 _TRUE = frozenset({"true", "1", "yes", "on"})
 _FALSE = frozenset({"false", "0", "no", "off"})
 
+# Set once the unset-zone warning has been logged; see `_resolve_tz`. Tests reset it with
+# monkeypatch so each test sees a fresh process.
+_tz_unset_warned = False
+
 # Phase A variables, in `.env.example` order. Tests clear these to isolate a run, and the
 # `.env.example` check walks this tuple, so a new variable added here must be documented there.
 MEMORY_ENV_VARS: tuple[str, ...] = (
@@ -125,12 +129,23 @@ def _resolve_tz(resolver: TzResolver) -> tuple[tzinfo, str | None]:
     `zoneinfo.ZoneInfo("UTC")` itself needs a tz database, and the current image has none
     (Design point 5). A name the resolver rejects fails startup: answering "yesterday" in the
     wrong zone is worse than refusing to start.
+
+    The unset warning goes out once per process. Startup builds `KnowledgeConfig` several times,
+    and the Neo4j and event-store health probes rebuild it on every 10 s tick while the graph
+    connection or the event store was never built, whether it failed at boot or is switched off
+    (server.py `_knowledge_configured` and `_event_store_configured`, called from health.py's
+    probes when their source is None). Warning on every call would repeat the same line without
+    adding anything.
     """
+    global _tz_unset_warned
     name = _env("MIST_MEMORY_TZ")
     if name is None:
-        logger.warning(
-            "MIST_MEMORY_TZ is unset; memory read path resolves dates such as 'yesterday' in UTC"
-        )
+        if not _tz_unset_warned:
+            _tz_unset_warned = True
+            logger.warning(
+                "MIST_MEMORY_TZ is unset; memory read path resolves dates such as 'yesterday' "
+                "in UTC"
+            )
         return UTC, None
     try:
         return resolver(name), name
