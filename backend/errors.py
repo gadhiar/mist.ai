@@ -19,6 +19,26 @@ Hierarchy:
     +-- EmbeddingError
     +-- VectorStoreError
     +-- IngestionError
+    +-- VaultWriteError
+    +-- SidecarIndexError
+    +-- FilewatcherError
+    +-- SeedSourceError
+    +-- SeedTargetNotSeedOnlyError
+    +-- CapabilityError
+        +-- CapabilityConfigError
+        +-- CapabilityRegistrationError
+        +-- CapabilityUnavailableError
+        +-- CapabilityInvocationError
+        +-- CapabilityStoreError
+        +-- TimeParseError
+        +-- ActionDecodeError
+        +-- SecretMissingError
+        +-- McpError
+        |   +-- McpTransportError
+        |   +-- McpProtocolError
+        +-- SpotifyError
+            +-- SpotifyAuthError
+            +-- SpotifyApiError
 
 Usage:
     from backend.errors import Neo4jConnectionError
@@ -145,3 +165,80 @@ class SeedTargetNotSeedOnlyError(MistError):
     Raised by the seed applier before any write or wipe (MIS-177 D1): seeding
     over such a graph adopts its elements and the next wipe deletes them.
     """
+
+
+# -- Capabilities (lights, music, alarms; ADR-025) ------------------------------
+
+
+class CapabilityError(MistError):
+    """Base for capability-layer failures.
+
+    A capability raises a subclass for a failure that should become a `ToolOutcome`
+    status (`error`, `unavailable` or `invalid_args`) reported to the user, rather than
+    an unexpected exception.
+    """
+
+
+class CapabilityConfigError(CapabilityError):
+    """A capability environment variable or the policy file is invalid."""
+
+
+class CapabilityRegistrationError(CapabilityError):
+    """A capability or tool cannot be registered: too many tools, too large, or a bad schema."""
+
+
+class CapabilityUnavailableError(CapabilityError):
+    """The capability's provider cannot be reached right now; the outcome is `unavailable`."""
+
+
+class CapabilityInvocationError(CapabilityError):
+    """A tool call failed after it reached its provider; the outcome is `error`."""
+
+
+class CapabilityStoreError(CapabilityError):
+    """The capabilities database cannot be opened, migrated or written."""
+
+
+class TimeParseError(CapabilityError):
+    """A spoken time or duration could not be parsed; the message names the input."""
+
+
+class ActionDecodeError(CapabilityError):
+    """The constrained action decode produced output that does not parse or validate."""
+
+
+class SecretMissingError(CapabilityError):
+    """A secret is configured but cannot be read, for example an unreadable secret file."""
+
+
+class McpError(CapabilityError):
+    """Base for Model Context Protocol client failures."""
+
+
+class McpTransportError(McpError):
+    """The MCP transport failed: connect, session or call I/O."""
+
+
+class McpProtocolError(McpError):
+    """The MCP server answered with something the client cannot use."""
+
+
+class SpotifyError(CapabilityError):
+    """Base for Spotify Web API failures."""
+
+
+class SpotifyAuthError(SpotifyError):
+    """No usable Spotify token: missing, revoked, or refused on refresh."""
+
+
+class SpotifyApiError(SpotifyError):
+    """A Spotify Web API call answered with an error status.
+
+    `reason` is a short machine word (`premium_required`, `no_active_device`,
+    `rate_limited`) that the music capability turns into an outcome reason.
+    """
+
+    def __init__(self, status: int, reason: str) -> None:
+        super().__init__(f"Spotify API error {status}: {reason}")
+        self.status = status
+        self.reason = reason
