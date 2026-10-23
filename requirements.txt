@@ -56,6 +56,15 @@ watchdog>=3.0.0
 psutil==7.2.2
 pynvml>=11.5
 
+# Capabilities
+# mcp: the Home Assistant MCP client that backend/capabilities/mcp/sdk_transport.py
+# builds on.
+# tzdata: gives the stdlib `zoneinfo` the IANA zones that alarms need, because the
+# backend image has no system zone database.
+# tests/unit/test_dependency_pins.py guards both lines.
+mcp==2.3.0
+tzdata==2026.5
+
 # Visualization
 plotly==5.18.0
 
