@@ -6,8 +6,13 @@
   backend image has no system zone database, so without it `zoneinfo.ZoneInfo` raises
   `ZoneInfoNotFoundError` for every zone name.
 
-Static on purpose: the test parses `requirements.txt` and never imports `mcp` or `tzdata`,
-so it passes in an image that does not have them installed yet.
+It also pins `pyarrow`, which `lancedb` imports. pyarrow 26 needs NumPy 2 at import, but
+`chatterbox-tts` holds numpy below 2.0, so a fresh install ends at numpy 1.26.x and an
+unbounded `pyarrow` range resolves to a release whose import fails. The pin stays at the
+last release that imports under numpy 1.26 until `chatterbox-tts` allows numpy 2.
+
+Static on purpose: the test parses `requirements.txt` and never imports `mcp`, `tzdata` or
+`pyarrow`, so it passes in an image that does not have them installed yet.
 """
 
 import re
@@ -59,3 +64,17 @@ class TestCapabilityDependenciesArePinned:
         assert (
             pins["tzdata"] == CAPABILITY_PINS["tzdata"]
         ), f"tzdata is pinned to {pins['tzdata']!r}; the capability layer expects 2026.5"
+
+
+PYARROW_PIN = "25.0.1"
+
+
+class TestPyarrowIsPinnedBelowNumpy2:
+    def test_pyarrow_is_pinned_exactly(self) -> None:
+        pins = _pinned_requirements()
+
+        assert "pyarrow" in pins, f"requirements.txt must pin `pyarrow=={PYARROW_PIN}` exactly"
+        assert pins["pyarrow"] == PYARROW_PIN, (
+            f"pyarrow is pinned to {pins['pyarrow']!r}; {PYARROW_PIN} is the last release "
+            "that imports under the numpy<2 that chatterbox-tts requires"
+        )

@@ -38,7 +38,11 @@ neo4j==5.24.0
 # store and the vault sqlite-vec sidecar is current per ADR-010.)
 sentence-transformers==3.3.1
 lancedb>=0.20
-pyarrow>=17.0
+# pyarrow 26 needs NumPy 2 at import, but chatterbox-tts holds numpy below 2.0, so
+# a fresh install ends at numpy 1.26.x and the lancedb import of pyarrow fails.
+# Lift this pin once chatterbox-tts allows numpy 2.
+# tests/unit/test_dependency_pins.py guards this line.
+pyarrow==25.0.1
 
 # Vault Memory (Layer 2 - ADR-010 Cluster 8)
 sqlite-vec>=0.1.3
