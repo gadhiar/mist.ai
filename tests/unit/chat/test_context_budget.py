@@ -490,6 +490,125 @@ class TestContextBudgetPlanner:
         assert plan.fixed_cost > 50  # tool JSON alone exceeds ~50 tokens
 
 
+class TestPlanWithMemoryBlock:
+    """T32: the per-turn memory block is charged as the retrieval segment.
+
+    The block is prepended to the user message, so it carries no message overhead of its
+    own, and the history window must not move with the block's size, or the cached prompt
+    prefix would break from turn to turn.
+    """
+
+    _KWARGS = {
+        "persona_text": "p" * 36,
+        "static_text": "s" * 36,
+        "live_advisory_text": None,
+        "tools": None,
+        "max_output_tokens": 100,
+    }
+
+    def test_block_tokens_are_reported_as_retrieval_used_without_overhead(self):
+        planner = ContextBudgetPlanner(config=_default_config())
+        block = "m" * 360  # 100 tokens by the char/3.6 counter
+
+        plan = planner.plan(
+            **self._KWARGS, retrieval_result=None, history=[], memory_block_text=block
+        )
+
+        assert plan.fits is True
+        assert plan.retrieval_used == planner.counter.count(block) == 100
+
+    def test_block_leaves_pruned_retrieval_text_none(self):
+        planner = ContextBudgetPlanner(config=_default_config())
+
+        plan = planner.plan(
+            **self._KWARGS, retrieval_result=None, history=[], memory_block_text="m" * 36
+        )
+
+        assert plan.pruned_retrieval_text is None
+        assert plan.facts_kept == 0
+        assert plan.facts_dropped == 0
+
+    def test_history_budget_is_flex_minus_retrieval_budget_with_a_block(self):
+        planner = ContextBudgetPlanner(config=_default_config())
+
+        plan = planner.plan(
+            **self._KWARGS, retrieval_result=None, history=[], memory_block_text="m" * 36
+        )
+
+        flex = plan.total_budget - plan.fixed_cost
+        assert plan.history_budget == flex - plan.retrieval_budget
+
+    def test_history_window_does_not_move_with_block_size(self):
+        planner = ContextBudgetPlanner(config=_default_config())
+        history = [{"role": "user", "content": "h" * 100} for _ in range(40)]
+
+        small = planner.plan(
+            **self._KWARGS, retrieval_result=None, history=history, memory_block_text="m" * 36
+        )
+        large = planner.plan(
+            **self._KWARGS, retrieval_result=None, history=history, memory_block_text="m" * 900
+        )
+
+        assert small.retrieval_used < large.retrieval_used <= large.retrieval_budget
+        assert small.history_budget == large.history_budget
+        assert small.pruned_history == large.pruned_history
+
+    def test_block_with_retrieval_result_raises_value_error(self):
+        planner = ContextBudgetPlanner(config=_default_config())
+
+        with pytest.raises(ValueError, match="memory_block_text"):
+            planner.plan(
+                **self._KWARGS,
+                retrieval_result=_make_retrieval_result([_make_fact()]),
+                history=[],
+                memory_block_text="m",
+            )
+
+    def test_oversized_block_shrinks_history_so_the_total_fits(self, caplog):
+        planner = ContextBudgetPlanner(config=_default_config())
+        history = [{"role": "user", "content": "h" * 100} for _ in range(40)]
+        block = "m" * 1440  # 400 tokens, over the ~288-token retrieval budget
+
+        with caplog.at_level("WARNING", logger="backend.chat.context_budget"):
+            plan = planner.plan(
+                **self._KWARGS, retrieval_result=None, history=history, memory_block_text=block
+            )
+
+        flex = plan.total_budget - plan.fixed_cost
+        assert plan.fits is True
+        assert plan.retrieval_used == 400 > plan.retrieval_budget
+        assert plan.history_budget == flex - 400
+        assert plan.fixed_cost + plan.retrieval_used + plan.history_used <= plan.total_budget
+        assert any("memory block" in r.getMessage() for r in caplog.records)
+
+    def test_block_larger_than_flex_budget_does_not_fit(self):
+        planner = ContextBudgetPlanner(config=_default_config())
+        block = "m" * 36_000  # 10,000 tokens, more than the whole window
+
+        plan = planner.plan(
+            **self._KWARGS,
+            retrieval_result=None,
+            history=[{"role": "user", "content": "x"}],
+            memory_block_text=block,
+        )
+
+        assert plan.fits is False
+        assert plan.history_budget == 0
+        assert plan.pruned_history == []
+
+    def test_explicit_none_block_matches_the_legacy_plan(self):
+        planner = ContextBudgetPlanner(config=_default_config())
+        result = _make_retrieval_result([_make_fact()])
+        history = [{"role": "user", "content": "hi"}]
+
+        legacy = planner.plan(**self._KWARGS, retrieval_result=result, history=history)
+        explicit = planner.plan(
+            **self._KWARGS, retrieval_result=result, history=history, memory_block_text=None
+        )
+
+        assert explicit == legacy
+
+
 class TestBudgetPlanDataclass:
     def test_plan_is_frozen(self):
         plan = BudgetPlan(
