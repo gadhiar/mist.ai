@@ -15,6 +15,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
+from backend.vault.models import AuthoredBy
+
 from .config import MemoryConfig
 from .models import Candidate, EpisodeSource, FactSource, NoteSource, TimeWindow
 
@@ -33,13 +35,18 @@ _HALF_LIFE_DAYS: dict[str, float] = {
 }
 
 # Confidence by provenance. A note the user wrote or edited is their own statement; one MIST
-# wrote is its reading of the user. A summarized episode has been condensed by a model pass that
-# drops chatter; a raw episode or a single exchange is unfiltered conversation.
-USER_AUTHORS = frozenset({"user", "user-edit"})
+# wrote is its reading of the user, and one MIST flagged for review is a reading it was unsure
+# of, so it is trusted no more than raw conversation. A summarized episode has been condensed by
+# a model pass that drops chatter; a raw episode or a single exchange is unfiltered
+# conversation. The author sets hold the enum values, so a rename in AuthoredBy breaks this
+# import, and `_author_value` reduces either a member or a plain frontmatter string to one.
+USER_AUTHORS = frozenset({AuthoredBy.USER.value, AuthoredBy.USER_EDIT.value})
+PENDING_REVIEW_AUTHORS = frozenset({AuthoredBy.MIST_PENDING_REVIEW.value})
 USER_NOTE_CONFIDENCE = 0.9
 MIST_NOTE_CONFIDENCE = 0.7
 SUMMARIZED_EPISODE_CONFIDENCE = 0.7
 RAW_CONFIDENCE = 0.5
+PENDING_REVIEW_NOTE_CONFIDENCE = RAW_CONFIDENCE
 # A fact candidate always carries its edge confidence; one that does not is scored like raw
 # conversation rather than rejected, so a source bug costs ranking quality, not the turn.
 MISSING_FACT_CONFIDENCE = RAW_CONFIDENCE
@@ -54,9 +61,10 @@ class FusedCandidate:
     Attributes:
         candidate: The candidate, with the ranks of every pool that offered it merged.
         rrf: Its reciprocal rank fusion score, `sum(1 / (k + rank))` over those pools.
-        rrf_norm: `rrf` divided by the best `rrf` in the batch, in [0, 1]. It stands in for the
-            rerank score of an item the reranker did not reach, so it is scaled like one: the
-            batch's best item scores 1.
+        rrf_norm: `rrf` divided by the best `rrf` in the batch, in [0, 1]; the batch's best
+            item scores 1. It is the relevance of every item when the reranker scored none,
+            and when it scored only a prefix it sets the order of the unscored items, which
+            `score_shortlist` scales under the prefix's lowest rerank score.
     """
 
     candidate: Candidate
@@ -72,7 +80,9 @@ class ScoredCandidate:
         candidate: The candidate scored.
         score: `rerank_weight * relevance + recency_weight * time_term + confidence_weight *
             confidence`.
-        relevance: The rerank score, or `rrf_norm` when the reranker did not score the item.
+        relevance: The rerank score; for an item the reranker did not reach, `rrf_norm`
+            (nothing reranked) or `rrf_norm` scaled under the reranked prefix (see
+            `score_shortlist`).
         reranked: Whether `relevance` came from the reranker.
         time_term: The window-match term when `window_applied`, otherwise recency.
         window_applied: Whether a dated window replaced recency for this turn.
@@ -179,7 +189,12 @@ def confidence_term(candidate: Candidate) -> float:
             return MISSING_FACT_CONFIDENCE
         return min(1.0, max(0.0, candidate.confidence))
     if isinstance(source, NoteSource):
-        return USER_NOTE_CONFIDENCE if source.authored_by in USER_AUTHORS else MIST_NOTE_CONFIDENCE
+        author = _author_value(source.authored_by)
+        if author in USER_AUTHORS:
+            return USER_NOTE_CONFIDENCE
+        if author in PENDING_REVIEW_AUTHORS:
+            return PENDING_REVIEW_NOTE_CONFIDENCE
+        return MIST_NOTE_CONFIDENCE
     if isinstance(source, EpisodeSource):
         if source.summary_state == "summarized":
             return SUMMARIZED_EPISODE_CONFIDENCE
@@ -195,10 +210,20 @@ def window_term(candidate: Candidate, window: TimeWindow) -> float:
     [start, end).
 
     Raises:
-        ValueError: The window has no bounds ("last time" not yet dated by the fetcher).
+        ValueError: The window has no bounds ("last time" not yet dated by the fetcher), or a
+            window bound, the candidate's `when` or its span is naive, which would make the
+            comparison raise TypeError or, against another naive value, compare wall clocks.
     """
     if window.start is None or window.end is None:
         raise ValueError(f"window {window.phrase!r} has no bounds to match against")
+    _require_aware("window start", window.start)
+    _require_aware("window end", window.end)
+    if candidate.when is not None:
+        _require_aware("candidate when", candidate.when)
+    if candidate.span_start is not None:
+        _require_aware("candidate span_start", candidate.span_start)
+    if candidate.span_end is not None:
+        _require_aware("candidate span_end", candidate.span_end)
     if candidate.span_start is not None and candidate.span_end is not None:
         overlaps = candidate.span_start < window.end and candidate.span_end >= window.start
         return 1.0 if overlaps else 0.0
@@ -218,8 +243,22 @@ def score_shortlist(
     """Final scores for the shortlist, thresholded at `min_score` and ordered best first.
 
     `rerank_scores[i]` belongs to `shortlisted[i]`: the reranker scores the head of the
-    shortlist, best RRF first, until the deadline, and every item past the last score keeps its
-    `rrf_norm`. None (the NullReranker) leaves every item on `rrf_norm`.
+    shortlist, best RRF first, until the deadline (Design point 6, step 2). Relevance then is:
+
+    - no scores (an empty sequence, which is what the fetcher passes when the NullReranker's
+      `pairs_within` cuts the batch to nothing or the deadline falls before the first pair, or
+      None, still accepted): every item keeps its `rrf_norm`, the fallback the design gives for
+      a reranker that cannot run;
+    - scores for the first m items, 1 <= m < len: an unscored item i gets
+      `min(rerank_scores) * rrf_norm_i / rrf_norm_m`, where item m is the last one scored.
+
+    The design says unscored pairs keep their RRF-normalised score (Design point 6, step 2).
+    Taken literally, an RRF score of 0.6 would outrank a reranked item the cross-encoder
+    scored 0.4, so a deadline cut would promote exactly the items nobody read.
+    The scaling (a lead ruling, 2026-10-23) keeps the RRF order among the unscored items and
+    puts every one of them at or under the lowest reranked score; when `rrf_norm_m` is 0 every
+    later item's is too, and they get 0. A prefix minimum of 0 sinks the whole tail, normally
+    under `min_score`, which is intended: the reranker found nothing relevant that far down.
 
     The window-match term replaces recency only for a dated window. A "last time" window the
     fetcher could not date carries no span to match, so recency stands in: the previous
@@ -245,12 +284,13 @@ def score_shortlist(
         if not 0.0 <= value <= 1.0 or math.isnan(value):
             raise ValueError(f"rerank scores must be in [0, 1], got {value}")
     dated = window if window is not None and window.start is not None else None
+    tail_scale = _unscored_scale(shortlisted, scores)
 
     results: list[ScoredCandidate] = []
     for index, fused in enumerate(shortlisted):
         candidate = fused.candidate
         reranked = index < len(scores)
-        relevance = scores[index] if reranked else fused.rrf_norm
+        relevance = scores[index] if reranked else fused.rrf_norm * tail_scale
         time_term = recency_term(candidate, now) if dated is None else window_term(candidate, dated)
         confidence = confidence_term(candidate)
         score = (
@@ -273,6 +313,32 @@ def score_shortlist(
         )
     results.sort(key=lambda item: (-item.score, item.candidate.item_id, item.candidate.kind))
     return results
+
+
+def _unscored_scale(shortlisted: Sequence[FusedCandidate], scores: Sequence[float]) -> float:
+    """Factor applied to `rrf_norm` for items past the reranked prefix.
+
+    1 when nothing was reranked (pure RRF fallback); otherwise `min(scores) / rrf_norm_m` for
+    the last scored item m, or 0 when that `rrf_norm` is 0 (every later one is 0 as well, since
+    the shortlist is in RRF order).
+    """
+    if not scores:
+        return 1.0
+    last_scored_norm = shortlisted[len(scores) - 1].rrf_norm
+    if last_scored_norm <= 0:
+        return 0.0
+    return min(scores) / last_scored_norm
+
+
+def _author_value(authored_by: str | None) -> str | None:
+    """The plain string of an author, whether a NoteSource carries an AuthoredBy or a str.
+
+    The sets above hold plain values; reducing a member to its value keeps the lookup
+    independent of how Enum hashes its members.
+    """
+    if isinstance(authored_by, AuthoredBy):
+        return authored_by.value
+    return authored_by
 
 
 def _require_aware(name: str, value: datetime) -> None:
