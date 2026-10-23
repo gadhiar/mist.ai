@@ -1,0 +1,456 @@
+{
+  "contract": "MIST realtime protocol 2.0.0",
+  "protocol_version": "2.0.0",
+  "binary": [
+    {
+      "name": "audio_chunk",
+      "msg_type": 1,
+      "direction": "down",
+      "turn_tag": 7,
+      "seq": 42,
+      "sample_rate": 24000,
+      "payload_hex": "0000e80318fcff7f",
+      "frame_hex": "5453494d010007002a000000c05d00000000e80318fcff7f"
+    },
+    {
+      "name": "audio_chunk_max_tag_and_seq",
+      "msg_type": 1,
+      "direction": "down",
+      "turn_tag": 65535,
+      "seq": 4294967295,
+      "sample_rate": 24000,
+      "payload_hex": "0180",
+      "frame_hex": "5453494d0100ffffffffffffc05d00000180"
+    },
+    {
+      "name": "audio_complete",
+      "msg_type": 2,
+      "direction": "down",
+      "turn_tag": 7,
+      "seq": 43,
+      "sample_rate": 24000,
+      "payload_hex": "",
+      "frame_hex": "5453494d020007002b000000c05d0000"
+    },
+    {
+      "name": "interrupt_fade",
+      "msg_type": 3,
+      "direction": "down",
+      "turn_tag": 7,
+      "seq": 44,
+      "sample_rate": 24000,
+      "payload_hex": "",
+      "frame_hex": "5453494d030007002c000000c05d0000"
+    },
+    {
+      "name": "mic_audio",
+      "msg_type": 16,
+      "direction": "up",
+      "turn_tag": 0,
+      "seq": 0,
+      "sample_rate": 16000,
+      "payload_hex": "64009cff",
+      "frame_hex": "5453494d1000000000000000803e000064009cff"
+    }
+  ],
+  "control": {
+    "client_to_server": [
+      {
+        "name": "voice_start",
+        "message": {
+          "type": "voice_start",
+          "mode": "open",
+          "sample_rate": 16000,
+          "frame_ms": 20,
+          "aec": "browser",
+          "playback": true,
+          "endpoint": "desktop",
+          "local_kws": false
+        }
+      },
+      {
+        "name": "voice_stop",
+        "message": {"type": "voice_stop"}
+      },
+      {
+        "name": "ptt",
+        "message": {"type": "ptt", "pressed": true}
+      },
+      {
+        "name": "playback_progress",
+        "message": {"type": "playback_progress", "turn_id": "turn-1", "played_ms": 480}
+      },
+      {
+        "name": "playback_done",
+        "message": {"type": "playback_done", "turn_id": "turn-1", "played_ms": 2160}
+      },
+      {
+        "name": "barge_in",
+        "message": {"type": "barge_in", "turn_id": "turn-1", "keyword": "stop"}
+      },
+      {
+        "name": "wake",
+        "message": {"type": "wake", "keyword": "hey mist", "score": 0.87}
+      },
+      {
+        "name": "gpu_yield",
+        "message": {"type": "gpu_yield", "active": true, "source": "fullscreen"}
+      },
+      {
+        "name": "text",
+        "message": {"type": "text", "text": "What is on my calendar today?"}
+      },
+      {
+        "name": "interrupt",
+        "message": {"type": "interrupt"}
+      },
+      {
+        "name": "log_config",
+        "message": {
+          "type": "log_config",
+          "action": "set_level",
+          "level": "DEBUG",
+          "logger": "backend.realtime"
+        }
+      },
+      {
+        "name": "subscribe_logs",
+        "message": {"type": "subscribe_logs", "enabled": true, "levels": ["INFO", "WARNING"]}
+      }
+    ],
+    "server_to_client": [
+      {
+        "name": "voice_state",
+        "message": {
+          "type": "voice_state",
+          "active": true,
+          "mode": "open",
+          "uplink": {"sample_rate": 16000, "frame_ms": 20},
+          "downlink": {"sample_rate": 24000, "frame_ms": 40},
+          "playback": {"client_prebuffer_ms": 80, "fade_ms": 30, "progress_interval_ms": 240},
+          "barge_in": {"policy": "keyword", "keywords": ["stop", "wait"], "arm_delay_ms": 300},
+          "budget": {
+            "preset": "floor",
+            "end_of_turn_ms": 250,
+            "stt_final_ms": 250,
+            "context_build_ms": 0,
+            "llm_first_token_ms": 250,
+            "first_segment_ms": 120,
+            "tts_first_chunk_ms": 500,
+            "transport_playback_ms": 100,
+            "total_p50_ms": 1470,
+            "total_p90_ms": 2100,
+            "tool_call_ms": 450,
+            "barge_in_reaction_ms": 700
+          },
+          "engines": {
+            "vad": {"loaded": true, "location": "cpu", "model_id": "silero-vad", "vram_mib": null},
+            "eot": {"loaded": true, "location": "cpu", "model_id": "smart-turn", "vram_mib": null},
+            "stt": {
+              "loaded": true,
+              "location": "cuda:0",
+              "model_id": "whisper-small",
+              "vram_mib": 1024
+            },
+            "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null}
+          },
+          "tts_voice": {
+            "variant": "turbo",
+            "profile": null,
+            "source": "builtin",
+            "seconds": null,
+            "sha256_prefix": null
+          },
+          "vram_budget_mib": 4096,
+          "gpu": {"mode": "primary", "triggers": []},
+          "speech_service": {
+            "configured": false,
+            "connected": false,
+            "rtt_ms": null,
+            "location_label": null,
+            "model_mismatch": false
+          },
+          "refused": null
+        }
+      },
+      {
+        "name": "transcript_partial",
+        "message": {
+          "type": "transcript_partial",
+          "utterance_id": "utt-1",
+          "text": "what is on my",
+          "stable_chars": 8
+        }
+      },
+      {
+        "name": "transcription",
+        "message": {
+          "type": "transcription",
+          "text": "What is on my calendar today?",
+          "utterance_id": "utt-1"
+        }
+      },
+      {
+        "name": "vad_status",
+        "message": {"type": "vad_status", "status": "speech_started"}
+      },
+      {
+        "name": "voice_decision_endpoint",
+        "message": {
+          "type": "voice_decision",
+          "kind": "endpoint",
+          "turn_id": null,
+          "reason": "semantic",
+          "detail": {"utterance_id": "utt-1", "eot_probability": 0.91, "silence_ms": 240}
+        }
+      },
+      {
+        "name": "voice_decision_hold",
+        "message": {
+          "type": "voice_decision",
+          "kind": "hold",
+          "turn_id": "turn-2",
+          "reason": "eot_uncertain",
+          "detail": {"utterance_id": "utt-2"}
+        }
+      },
+      {
+        "name": "voice_decision_release",
+        "message": {
+          "type": "voice_decision",
+          "kind": "release",
+          "turn_id": "turn-2",
+          "reason": "silence_cap",
+          "detail": {"utterance_id": "utt-2"}
+        }
+      },
+      {
+        "name": "voice_decision_supersede",
+        "message": {
+          "type": "voice_decision",
+          "kind": "supersede",
+          "turn_id": "turn-2",
+          "reason": "continued_speech",
+          "detail": {"merged": true, "tool_dispatched": false}
+        }
+      },
+      {
+        "name": "voice_decision_barge_in",
+        "message": {
+          "type": "voice_decision",
+          "kind": "barge_in",
+          "turn_id": "turn-1",
+          "reason": "keyword",
+          "detail": {"keyword": "stop", "phase": "speaking"}
+        }
+      },
+      {
+        "name": "voice_decision_barge_in_ignored",
+        "message": {
+          "type": "voice_decision",
+          "kind": "barge_in_ignored",
+          "turn_id": "turn-1",
+          "reason": "no_keyword",
+          "detail": {"keyword": null, "text": "uh huh"}
+        }
+      },
+      {
+        "name": "voice_decision_dropped",
+        "message": {
+          "type": "voice_decision",
+          "kind": "dropped",
+          "turn_id": null,
+          "reason": "no_speech",
+          "detail": {
+            "utterance_id": "utt-3",
+            "duration_ms": 420,
+            "text": null,
+            "no_speech_prob": 0.82,
+            "avg_logprob": -1.4
+          }
+        }
+      },
+      {
+        "name": "voice_decision_degraded",
+        "message": {
+          "type": "voice_decision",
+          "kind": "degraded",
+          "turn_id": "turn-1",
+          "reason": "tts_failed",
+          "detail": {"engine": "tts", "error": "synthesis failed"}
+        }
+      },
+      {
+        "name": "voice_decision_overload",
+        "message": {
+          "type": "voice_decision",
+          "kind": "overload",
+          "turn_id": null,
+          "reason": "ingress_queue_full",
+          "detail": {"dropped_ms": 120, "lane": "stt"}
+        }
+      },
+      {
+        "name": "voice_decision_wake_lost",
+        "message": {
+          "type": "voice_decision",
+          "kind": "wake_lost",
+          "turn_id": null,
+          "reason": "arbitration",
+          "detail": {"winner_score": 0.93, "score": 0.71}
+        }
+      },
+      {
+        "name": "voice_decision_placement",
+        "message": {
+          "type": "voice_decision",
+          "kind": "placement",
+          "turn_id": null,
+          "reason": "fullscreen",
+          "detail": {
+            "mode": "yield",
+            "engines": {"stt": "cpu", "tts": "remote"},
+            "released_mib": 3072
+          }
+        }
+      },
+      {
+        "name": "playback_stop",
+        "message": {
+          "type": "playback_stop",
+          "turn_id": "turn-1",
+          "audio_tag": 7,
+          "fade_ms": 30,
+          "reason": "barge_in"
+        }
+      },
+      {
+        "name": "playback_duck",
+        "message": {"type": "playback_duck", "turn_id": "turn-1", "db": -12.0}
+      },
+      {
+        "name": "turn_metrics",
+        "message": {
+          "type": "turn_metrics",
+          "turn_id": "turn-1",
+          "origin": "voice",
+          "channel": "tts",
+          "kind": "plain",
+          "outcome": "completed",
+          "recorded": true,
+          "placement_mode": "primary",
+          "engines": {"stt": "cuda:0", "tts": "cuda:0"},
+          "timings": {
+            "eot_decided": 240,
+            "stt_final": 520,
+            "context_built": 530,
+            "request_sent": 535,
+            "first_token": 780,
+            "first_segment": 895,
+            "first_tts_chunk": 1430,
+            "first_frame_sent": 1440,
+            "first_played": 1530
+          },
+          "budget": {
+            "preset": "floor",
+            "end_of_turn_ms": 250,
+            "stt_final_ms": 250,
+            "context_build_ms": 0,
+            "llm_first_token_ms": 250,
+            "first_segment_ms": 120,
+            "tts_first_chunk_ms": 500,
+            "transport_playback_ms": 100,
+            "total_p50_ms": 1470,
+            "total_p90_ms": 2100,
+            "tool_call_ms": 450,
+            "barge_in_reaction_ms": 700
+          },
+          "over_budget": ["stt_final_ms", "context_build_ms", "tts_first_chunk_ms", "total_p50_ms"],
+          "ledger_source": "client",
+          "prompt": {
+            "prefix_tokens_est": 1800,
+            "history_tokens_est": 640,
+            "delta_tokens_est": 220,
+            "prompt_tokens": 2671,
+            "cached_tokens": null,
+            "prefix_changed": false,
+            "history_compacted": false
+          },
+          "lanes": {
+            "stt_wait_ms": 0,
+            "tts_wait_ms": 12,
+            "tts_busy_after_cancel_ms": 0,
+            "remote_rtt_ms": null
+          },
+          "stale_events": 0,
+          "bulk_dropped": 0
+        }
+      },
+      {
+        "name": "stream_start",
+        "message": {
+          "type": "stream_start",
+          "turn_id": "turn-1",
+          "channel": "tts",
+          "origin": "voice",
+          "audio_tag": 7
+        }
+      },
+      {
+        "name": "stream_start_text",
+        "message": {"type": "stream_start", "turn_id": "turn-3", "channel": "text", "origin": "text"}
+      },
+      {
+        "name": "stream_cancelled",
+        "message": {
+          "type": "stream_cancelled",
+          "turn_id": "turn-1",
+          "partial_text": "Your first meeting is at nine. After that",
+          "reason": "barge_in",
+          "spoken_text": "Your first meeting is at nine."
+        }
+      },
+      {
+        "name": "state_cycle",
+        "message": {"type": "state_cycle", "state": "speak", "turn_id": "turn-1"}
+      },
+      {
+        "name": "state_cycle_listen",
+        "message": {"type": "state_cycle", "state": "listen"}
+      },
+      {
+        "name": "error",
+        "message": {
+          "type": "error",
+          "kind": "protocol",
+          "message": "magic: expected 0x4D495354",
+          "retriable": false,
+          "context": null
+        }
+      },
+      {
+        "name": "session_started",
+        "message": {
+          "type": "session_started",
+          "session_id": "00000000-0000-4000-8000-000000000001",
+          "protocol_version": "2.0.0",
+          "mist_state": "idle",
+          "capabilities": {
+            "tts_enabled": true,
+            "vad_enabled": true,
+            "voice": {
+              "protocol": 2,
+              "modes": ["open", "ptt", "wake"],
+              "uplink_sample_rate": 16000,
+              "downlink_sample_rate": 24000,
+              "barge_in": "keyword",
+              "tts": true,
+              "stt": true,
+              "eot": true
+            }
+          }
+        }
+      }
+    ]
+  }
+}
