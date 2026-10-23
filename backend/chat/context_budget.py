@@ -242,8 +242,16 @@ class BudgetPlan:
 
     Returned by `ContextBudgetPlanner.plan()`. Callers use `pruned_retrieval_text`
     in place of the raw retrieval block and `pruned_history` in place of the
-    full history list. `fits` is False when even the minimum (persona + static)
-    exceeds context_window — a hard stop that should log + degrade gracefully.
+    full history list.
+
+    `fits` is False in two cases, each with no history and no retrieval text:
+
+    - The fixed cost (persona, static template, tools and the other fixed
+      segments) leaves no flexible budget: `fixed_cost >= total_budget`. This
+      is a hard stop that should log and degrade gracefully.
+    - A `memory_block_text` is larger than the whole flexible budget, though
+      the fixed cost fits: `fixed_cost < total_budget`. The caller drops the
+      block and plans again without it.
 
     `retrieval_budget` and `history_budget` are the allocated token budgets;
     `retrieval_used` and `history_used` are what the pruned output actually
