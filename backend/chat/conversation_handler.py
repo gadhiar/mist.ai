@@ -2127,7 +2127,8 @@ class ConversationHandler:
         `delivery.delivered_text` (what reached the user) becomes the
         assistant message in history and the row's `system_response`; when
         the outcome is not `completed`, the full generated text is kept
-        beside it in `generated_response`, which extraction never reads. So
+        beside it in `generated_response`, even when the two are equal (as
+        on a text turn's error), and extraction never reads it. So
         the conversation and the rebuilt graph follow what the user heard,
         and the rest stays inspectable. A cut-off reply reaches the model
         through the next request's `interruption_note`, not by rewriting
@@ -2868,8 +2869,11 @@ class ConversationHandler:
             tool_calls: Tool calls made during this turn, if any.
             turn_outcome: `completed`, `interrupted`, `superseded` or
                 `error`; None when the caller does not say.
-            generated_response: The full generated text when it differs
-                from what was delivered (`assistant_message`).
+            generated_response: The full generated text. `commit_turn`
+                passes it for every outcome other than `completed`, whether
+                or not it equals `assistant_message` (on a text turn that
+                ended in an error the two are the same text); None when the
+                outcome is `completed` or the caller does not pass it.
             turn_modality: `voice` or `text`. The session's first recorded
                 turn also sets `conversation_sessions.input_modality`
                 (`text` when None).

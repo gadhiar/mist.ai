@@ -201,9 +201,13 @@ class TestCancelRecordsNothing:
         events = handler.stream_turn(scope)
 
         first = await events.__anext__()
-        # An FE event waiting in the buffer, as a tool would leave one: a
-        # drain that yielded from a `finally` or `except` block would hand it
-        # out after `GeneratorExit`, and `aclose()` would raise RuntimeError.
+        # An FE event waiting in the buffer, as a tool would leave one. A
+        # drain that yielded from a block that runs on `GeneratorExit` (a
+        # `finally`, a bare `except:` or an `except BaseException`) would
+        # hand it out after `GeneratorExit`, and `aclose()` would raise
+        # RuntimeError. A drain in the `except Exception` block is out of
+        # this test's reach: `GeneratorExit` is a `BaseException`, so that
+        # block never runs on `aclose()` and cannot yield after it.
         scope.emit({"type": "tool_call_started", "tool_call_id": "call_1"})
         await events.aclose()
 
