@@ -7,10 +7,10 @@ what a candidate pool feeding a reranker needs.
 
 A token is a run of letters, digits and marks. Everything else separates tokens, including
 every FTS5 operator character and `_` and `'`, which are Unicode punctuation and so also
-separators to the index's `unicode61` tokenizer. So "Kestrel's" yields "kestrel" (the `s` is dropped as too short), as the
-index stored it, rather than a phrase "kestrel s" that no stored text contains. Queries and the
-index's FTS mirror both pass through `fold`, so a fullwidth or dotted-capital letter on either
-side still matches.
+separators to the index's `unicode61` tokenizer. So "Kestrel's" yields "kestrel" (the `s` is
+dropped as too short), as the index stored it, rather than a phrase "kestrel s" that no stored
+text contains. Queries and the index's FTS mirror both pass through `fold`, so a fullwidth or
+dotted-capital letter on either side still matches.
 """
 
 from __future__ import annotations
@@ -65,18 +65,21 @@ STOPWORDS: frozenset[str] = frozenset(_NLTK_STOPWORDS.split()) | frozenset(
 _MIN_TOKEN_CHARS = 2
 
 # The Combining Diacritical Marks block: the accents Latin, Greek and Cyrillic letters
-# decompose into, and the dot above that lowercasing "İ" leaves behind.
-_COMBINING_DIACRITICS = re.compile("[̀-ͯ]")
+# decompose into, and the combining dot above (U+0307) that lowercasing the capital dotted I
+# (U+0130) leaves behind. Escapes keep the source ASCII.
+_COMBINING_DIACRITICS = re.compile(r"[\u0300-\u036f]")
 
 
 def fold(text: str) -> str:
     """`text` in the one form the index stores and every query is read in.
 
     NFKC turns a fullwidth or compatibility letter into its plain form; lowercasing follows;
-    then the combining diacritics are removed, so "Café", "Cafe" plus a combining accent and
-    "café" fold alike, and "İstanbul", whose lowercase is "i" plus a combining dot, folds to
-    "istanbul". FactIndex writes its FTS mirror through this function and every query passes
-    through it, so stored text and queries can only differ in ways the tokenizer treats alike.
+    then the combining diacritics are removed, so "Cafe" with a precomposed e-acute (U+00E9),
+    "Cafe" with a combining acute (U+0301) after the "e", and plain "cafe" fold alike, and
+    "Istanbul" spelt with the capital dotted I (U+0130), whose lowercase is "i" plus a
+    combining dot, folds to "istanbul". FactIndex writes its FTS mirror through this function
+    and every query passes through it, so stored text and queries can only differ in ways the
+    tokenizer treats alike.
     """
     lowered = unicodedata.normalize("NFKC", text).lower()
     stripped = _COMBINING_DIACRITICS.sub("", unicodedata.normalize("NFD", lowered))
