@@ -171,7 +171,7 @@ class EventSink(Protocol):
     """Receives capability payloads that are broadcast rather than delivered with a turn.
 
     A proposal's expiry is one: the store reports it from its timer task outside any turn, or
-    from inside a `pop` that a turn makes.
+    from inside a `pop` made by a turn or by `decide`.
     """
 
     def emit(self, payload: dict[str, object]) -> None:

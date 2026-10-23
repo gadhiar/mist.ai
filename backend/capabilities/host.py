@@ -19,7 +19,7 @@ Confirmation is cross-turn. A turn holds `generation_lock` until it ends, so a "
 reach a turn that waits for it; a call that needs confirmation is stored as a proposal instead,
 and a later utterance (`pre_llm`) or the client's `action_decision` (`decide`) resolves it. Both
 can be in flight on the main loop at once. Each takes the proposal with `ProposalStore.pop`,
-which is synchronous, so only the first to call it gets the proposal and runs it.
+which is synchronous, so only the first to call it gets the proposal and resolves it.
 
 The host never catches a bare `Exception`. The pipeline contains a `CapabilityError` from
 `invoke` and the per-call timeout, and a decode contains `ActionDecodeError` and its timeout.
@@ -227,9 +227,9 @@ class CapabilityHost(CapabilityTurnPort):
     session and delivered only through `drain_events`, so the `events` of the resolutions and
     results those methods return are empty. `decide` runs outside any turn: it returns its
     payload in `PreTurnResolution.events` and never touches a session's buffer. Expiry goes to
-    the event sink. The store reports it through `on_expire`, which has no turn to buffer for:
-    it runs from the store's timer task, outside any turn, or synchronously inside a `pop`,
-    which a turn's `pre_llm` can call.
+    the event sink. The store reports it through `on_expire`, which is given no turn: it runs
+    from the store's timer task, outside any turn, or synchronously inside a `pop` made by a
+    turn or by `decide`.
     """
 
     def __init__(
