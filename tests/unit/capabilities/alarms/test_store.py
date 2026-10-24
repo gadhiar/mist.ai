@@ -556,3 +556,51 @@ class TestCorruptRows:
 
         assert alarm.alarm_id == alarm_id
         assert alarm.repeat == RepeatRule("daily", 6, 0)
+
+
+def _marked_text(raw: bytes) -> str:
+    """A text factory distinct from the default, so a test can tell it was put back."""
+    return raw.decode("utf-8")
+
+
+class TestTextFactoryRestore:
+    """Reads switch the shared connection to bytes; every other store on it expects its own."""
+
+    @staticmethod
+    async def _install_marked_factory(db: CapabilitiesDb) -> None:
+        def install(conn: sqlite3.Connection) -> None:
+            conn.text_factory = _marked_text
+
+        await db.run(install)
+
+    @staticmethod
+    async def _factory(db: CapabilitiesDb) -> object:
+        return await db.run(lambda conn: conn.text_factory)
+
+    @pytest.mark.asyncio
+    async def test_list_restores_the_previous_factory(self, store, db):
+        await store.create("alarm", T0)
+        await self._install_marked_factory(db)
+
+        await store.list()
+
+        assert await self._factory(db) is _marked_text
+
+    @pytest.mark.asyncio
+    async def test_due_restores_the_previous_factory(self, store, db):
+        await store.create("alarm", T0)
+        await self._install_marked_factory(db)
+
+        await store.due(T0)
+
+        assert await self._factory(db) is _marked_text
+
+    @pytest.mark.asyncio
+    async def test_a_failed_read_restores_the_previous_factory(self, store, db):
+        await self._install_marked_factory(db)
+        await db.run(lambda conn: conn.execute("DROP TABLE alarms"))
+
+        with pytest.raises(CapabilityStoreError, match="alarm store"):
+            await store.list()
+
+        assert await self._factory(db) is _marked_text
