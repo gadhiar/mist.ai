@@ -228,6 +228,88 @@ removes the marker. While the LLM loads, turns still get the yielded reply.
 The residual: the backend process keeps its CUDA context while yielded, which PyTorch frees
 only when the process exits. The scratch rehearsal (H3) records how large it is.
 
+### The gaming watcher
+
+`instance.py gaming-watch --root <root>` turns gaming mode on and off by itself, on Windows.
+Every `MIST_GAME_POLL_S` seconds (10 by default) it lists the running programs and asks whether
+one of them is a game's own process. A launcher, client, crash reporter, anti-cheat, overlay,
+redistributable or background app never counts, so MIST stays up while those sit in the
+background.
+
+What counts, by two rules in this order:
+
+1. **A Java game.** `java.exe` or `javaw.exe` counts when the folder it runs for lies under a
+   `MIST_GAME_RUNTIME_DIRS` entry, a game instance or server folder. That folder is its
+   `--gameDir` argument (a Minecraft client), or else its working directory (a server started
+   from its own folder). It does not count when its arguments run an installer
+   (`--installServer`, or a `-jar` file named like `*installer*.jar`), or when the folder lies
+   under a `MIST_GAME_EXCLUDE` directory. Where the Java itself is installed plays no part, so
+   a launcher's own Java, or any other Java program, does not count.
+2. **A game from a library.** Any program counts when it was started from under a
+   `MIST_GAME_DIRS` entry, a game library, unless an exclusion names it. A new game installed
+   into a library counts with no configuration change.
+
+What never counts, from a library either: the exclusion table that ships in `gamewatch.py`
+names generic classes once for every user, by folder (the store clients' own launcher and
+client folders, VR runtimes, shared redistributables, anti-cheat) and by file name (launchers,
+a client lobby, crash reporters, web helpers, overlays, installers, updaters,
+redistributables, uninstallers, anti-cheat). A non-game particular to one PC, such as a
+wallpaper app or a mod tool kept in a library, goes in `MIST_GAME_EXCLUDE`. A game whose own
+file name matches a shipped pattern, such as a title with "launcher" or "setup" in its
+executable's name, is missed; turn gaming mode on by hand for it.
+
+The three folder variables, each separated by `;` and set without quotes (spaces inside a
+directory are kept, backslashes are literal, and only the host CLI reads them):
+
+- `MIST_GAME_DIRS`: the game libraries.
+- `MIST_GAME_RUNTIME_DIRS`: the folders that hold game instances and servers run on Java.
+- `MIST_GAME_EXCLUDE`: host exclusions. An entry with `\`, `/` or `:` is a directory, and any
+  other is a file name pattern, matched ignoring case.
+
+For example:
+
+```
+MIST_GAME_DIRS=E:\SteamLibrary\steamapps\common;E:\Games
+MIST_GAME_RUNTIME_DIRS=E:\Minecraft\Instances;E:\Minecraft\Servers
+MIST_GAME_EXCLUDE=E:\SteamLibrary\steamapps\common\Some Wallpaper App;modtool*.exe
+```
+
+A path is under a directory when it is that directory or lies inside it, ignoring case:
+`E:\Games2\x.exe` is not under `E:\Games`. When entries nest, the lower index wins.
+`gaming-watch` refuses (exit 2) while `MIST_GAME_DIRS` and `MIST_GAME_RUNTIME_DIRS` are both
+unset or empty; either alone is enough.
+
+- When a game starts and there is no marker, it runs `gaming-mode on --by watcher`.
+- When no game has run for `MIST_GAME_RESUME_DELAY_S` seconds (120 by default), it runs
+  `gaming-mode off`, but only for its own marker (`by: watcher`). It never ends a manual gaming
+  mode: `gaming-mode on` by hand holds until `gaming-mode off` by hand.
+- If someone runs `gaming-mode off` while a game runs, it does not turn gaming mode on again
+  until it has seen a scan with no game.
+- Its `off` keeps scanning while `mist-llm` loads; a game started meanwhile stops `mist-llm`
+  again and the marker stays.
+- A failed `on` or `off` is logged and decided again at the next scan.
+
+A game running elevated (as administrator), or as another user, may go unseen: the watcher
+runs without elevation and skips any program it cannot open, and it never reads an elevated
+Java's working directory, so such a Java counts only through `--gameDir`. Turn gaming mode on
+by hand for such a game.
+
+The watcher needs a 64-bit Python, and refuses (exit 2) on any other: it reads a Java
+process's working directory through the x64 process layout. It reads no 32-bit Java's
+folder, so a 32-bit Java counts only through `--gameDir`.
+
+It logs each change to `logs/gaming-watch.log` under the root, rotated at 1 MiB with three old
+files kept. Its first line gives how many entries each folder variable holds and the position
+of each configured directory that does not exist. A log line names a game only by the variable
+and position of the entry it counted under, as `MIST_GAME_DIRS[0]` for the first library or
+`MIST_GAME_RUNTIME_DIRS[1]` for the second instance folder, never by the program's name, its
+path or its arguments; a Minecraft client's arguments carry its account's access token.
+
+`gamewatch.py` sits beside `instance.py` in `bin/`, where `switch` installs both. Without it,
+`gaming-watch` exits 1 naming the file, and every other command still runs. On Windows every
+Docker call the CLI makes starts without a console window, so the watcher can run under
+`pythonw.exe`.
+
 ---
 
 ## Reading /health

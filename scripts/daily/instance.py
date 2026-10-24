@@ -23,9 +23,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import importlib.util
 import io
 import json
+import logging
+import logging.handlers
 import math
 import os
 import re
@@ -155,6 +158,19 @@ LLM_POLL_S = 5.0
 HTTP_TIMEOUT_S = 5.0
 USAGE_DAYS = 7
 
+# The gaming watcher (item 17, Watcher).
+GAMEWATCH_FILE = "gamewatch.py"
+DEFAULT_GAME_POLL_S = 10.0
+DEFAULT_GAME_RESUME_DELAY_S = 120.0
+GAMING_WATCH_LOG = "gaming-watch.log"
+GAMING_WATCH_LOG_BYTES = 1024 * 1024
+GAMING_WATCH_LOG_BACKUPS = 3
+
+# Windows' `CREATE_NO_WINDOW` process creation flag. `subprocess` defines it only on Windows,
+# so the value is spelled here for the code path that reads it, and the tests that patch
+# `os.name`.
+CREATE_NO_WINDOW = 0x08000000
+
 
 @dataclass(frozen=True, slots=True)
 class CommandResult:
@@ -192,7 +208,9 @@ def subprocess_runner(
     """Run `argv` without a shell, capturing its output.
 
     A missing program reads as exit 127, the shell's convention, so a host without Docker on
-    its PATH gets the same refusal or failure message as one whose daemon is down.
+    its PATH gets the same refusal or failure message as one whose daemon is down. On Windows
+    every command starts with `CREATE_NO_WINDOW`, so `gaming-watch` under `pythonw` never
+    flashes a console window for each Docker call.
 
     Raises:
         volume_safety.DestructiveCommandError: Before anything runs, for an argv that could
@@ -201,6 +219,7 @@ def subprocess_runner(
     command = list(argv)
     volume_safety.assert_volume_safe(command)
     environment = None if env is None else dict(env)
+    flags = CREATE_NO_WINDOW if os.name == "nt" else 0
     try:
         if stdin is None:
             completed = subprocess.run(  # nosec B603 - fixed argument list, no shell
@@ -209,10 +228,16 @@ def subprocess_runner(
                 capture_output=True,
                 check=False,
                 env=environment,
+                creationflags=flags,
             )
         else:
             completed = subprocess.run(  # nosec B603 - fixed argument list, no shell
-                command, input=stdin, capture_output=True, check=False, env=environment
+                command,
+                input=stdin,
+                capture_output=True,
+                check=False,
+                env=environment,
+                creationflags=flags,
             )
     except FileNotFoundError as exc:
         return CommandResult(127, b"", f"{command[0]}: {exc}".encode())
@@ -263,6 +288,9 @@ class Context:
     `script_path` is where this file runs from: `init` finds the env example relative to it,
     and `release-build` finds its default repository from it. `sleep` and `monotonic` drive
     every wait and poll, and `fetch` every HTTP read, so a test never waits or connects.
+    `processes` lists the running processes for `gaming-watch` as `gamewatch.ProcessRecord`s;
+    None means `gamewatch.list_processes`, which exists only once that command has loaded the
+    file, so the annotation cannot name the record type.
     """
 
     runner: Runner = subprocess_runner
@@ -273,6 +301,7 @@ class Context:
     sleep: Callable[[float], None] = time.sleep
     monotonic: Callable[[], float] = time.monotonic
     fetch: Callable[[str, float], bytes] = urllib_fetch
+    processes: Callable[[], list] | None = None
 
 
 class InstanceError(Exception):
@@ -2103,17 +2132,27 @@ def cmd_promote(args: argparse.Namespace, ctx: Context) -> None:
 # --- Gaming mode -----------------------------------------------------------------------------
 
 
-def _gpu_yield_poll_s(inst: Instance) -> float:
-    raw = inst.env.get("MIST_GPU_YIELD_POLL_S", "")
+def _env_seconds(inst: Instance, name: str, default: float, *, allow_zero: bool = False) -> float:
+    """`daily.env`'s value for `name` in seconds, or `default` when it is unset or empty.
+
+    Raises:
+        RefusedError: When the value is not a finite number above zero (or zero, with
+            `allow_zero`).
+    """
+    raw = inst.env.get(name, "")
     if not raw:
-        return DEFAULT_GPU_YIELD_POLL_S
+        return default
     try:
         value = float(raw)
     except ValueError:
         value = math.nan
-    if not math.isfinite(value) or value <= 0:
-        raise RefusedError(f"{inst.env_path} sets MIST_GPU_YIELD_POLL_S={raw}, not seconds")
+    if not math.isfinite(value) or value < 0 or (value == 0 and not allow_zero):
+        raise RefusedError(f"{inst.env_path} sets {name}={raw}, not seconds")
     return value
+
+
+def _gpu_yield_poll_s(inst: Instance) -> float:
+    return _env_seconds(inst, "MIST_GPU_YIELD_POLL_S", DEFAULT_GPU_YIELD_POLL_S)
 
 
 def _read_gaming_marker(path: Path) -> tuple[bool, dict | None]:
@@ -2274,6 +2313,213 @@ def cmd_gaming_mode(args: argparse.Namespace, ctx: Context) -> None:
         root = _absolute_path(args.root, ctx.home)
         _instance_name(root)
         print(gaming_mode_line(root))
+
+
+# --- gaming-watch ----------------------------------------------------------------------------
+
+
+@functools.cache
+def _load_gamewatch():
+    """Exec `gamewatch.py` from beside this file and return it.
+
+    Loaded by path, as `volume_safety.py` is, and only by `gaming-watch`, so every other
+    command runs from a `bin/` that lacks it. A successful load is kept, so the lister's
+    `GameWatchError` is one class for the whole process.
+
+    Raises:
+        InstanceError: Exit 1, naming the file, when it is missing or cannot be imported.
+    """
+    path = Path(__file__).with_name(GAMEWATCH_FILE)
+    spec = importlib.util.spec_from_file_location("gamewatch", path)
+    if spec is None or spec.loader is None:
+        raise InstanceError(f"cannot load {GAMEWATCH_FILE} from {path.parent}")
+    module = importlib.util.module_from_spec(spec)
+    # `dataclass` looks its class's module up in `sys.modules` while the module executes.
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except (ImportError, OSError) as exc:
+        del sys.modules[spec.name]
+        raise InstanceError(
+            f"cannot load {GAMEWATCH_FILE} from {path.parent} ({exc}); switch installs it in "
+            "bin/ beside instance.py"
+        ) from exc
+    return module
+
+
+class _ListingFailedError(InstanceError):
+    """The watcher's process lister failed; the watch ends rather than acting blind."""
+
+
+@contextlib.contextmanager
+def _watch_log(path: Path):
+    """A logger writing to `path`, rotated at 1 MiB with three old files kept.
+
+    Lines carry the context clock's time, written by the caller, so the format is the message
+    alone.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        path,
+        maxBytes=GAMING_WATCH_LOG_BYTES,
+        backupCount=GAMING_WATCH_LOG_BACKUPS,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger(f"mist.gaming-watch.{path}")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(handler)
+    try:
+        yield logger
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+
+
+def _marker_by(path: Path) -> str | None:
+    """The marker's `by`, None without a marker, and `unknown` for one that does not parse."""
+    present, payload = _read_gaming_marker(path)
+    if not present:
+        return None
+    return "unknown" if payload is None else payload["by"]
+
+
+def _game_watch_setup(root: str | Path, ctx: Context, *, require_release: bool = True):
+    """Load `gamewatch.py`, the root and its game rules, with the watcher's refusals.
+
+    Returns the loaded module, the instance and its `GameRules`.
+
+    Raises:
+        InstanceError: Exit 1 when `gamewatch.py` cannot be loaded; `RefusedError` (exit 2) on
+            a Python that is not 64-bit, or when `MIST_GAME_DIRS` and `MIST_GAME_RUNTIME_DIRS`
+            are both unset or empty.
+    """
+    # First, before `daily.env` is read, so a `bin/` without the file says so whatever the
+    # configuration.
+    gamewatch = _load_gamewatch()
+    if not gamewatch.is_64_bit():
+        raise RefusedError(
+            "the gaming watcher needs a 64-bit Python: it reads a Java process's working "
+            "directory through the x64 process layout"
+        )
+    inst = _load_instance(root, ctx, require_release=require_release)
+    try:
+        env_text = inst.env_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RefusedError(f"cannot read {inst.env_path}: {exc}") from exc
+    rules = gamewatch.rules_from_env(env_text)
+    if not rules.libraries and not rules.runtime_dirs:
+        raise RefusedError(
+            f"{inst.env_path} sets neither MIST_GAME_DIRS nor MIST_GAME_RUNTIME_DIRS; set "
+            "MIST_GAME_DIRS to the game libraries or MIST_GAME_RUNTIME_DIRS to the game "
+            "instance and server folders, each separated by ;"
+        )
+    return gamewatch, inst, rules
+
+
+def _game_rule_entries(rules) -> list[tuple[str, str, bool]]:
+    """Each configured entry as (`VARIABLE[k]`, entry, whether it is a directory)."""
+    entries = [(f"MIST_GAME_DIRS[{k}]", entry, True) for k, entry in enumerate(rules.libraries)]
+    entries += [
+        (f"MIST_GAME_RUNTIME_DIRS[{k}]", entry, True) for k, entry in enumerate(rules.runtime_dirs)
+    ]
+    for k in range(max(len(rules.exclude_dirs), len(rules.exclude_names))):
+        directory = rules.exclude_dirs[k] if k < len(rules.exclude_dirs) else ""
+        name = rules.exclude_names[k] if k < len(rules.exclude_names) else ""
+        entries.append((f"MIST_GAME_EXCLUDE[{k}]", directory or name, bool(directory)))
+    return entries
+
+
+def gaming_watch(root: str | Path, ctx: Context, *, max_ticks: int | None = None) -> None:
+    """Yield the GPU while a game itself runs, and end the yield after it closes.
+
+    Each tick lists the processes, asks `gamewatch.find_game` whether one is a game's own
+    process, reads the marker, asks `gamewatch.decide` what to do, and runs the in-process
+    `gaming-mode on --by watcher` or `gaming-mode off`. A failed command is logged and decided
+    again on the next tick. The log names a game only by the variable and index of the entry it
+    counted under, never by a process name, a path or an argument: a Java client's arguments
+    carry its account's access token. `max_ticks` ends the loop for tests; the command itself
+    runs until it is stopped.
+
+    Raises:
+        InstanceError: Exit 1 when `gamewatch.py` cannot be loaded or the processes cannot be
+            listed; `RefusedError` (exit 2) on a Python that is not 64-bit, when neither
+            `MIST_GAME_DIRS` nor `MIST_GAME_RUNTIME_DIRS` is set, or when an interval is not
+            seconds.
+    """
+    gamewatch, inst, rules = _game_watch_setup(root, ctx)
+    poll_s = _env_seconds(inst, "MIST_GAME_POLL_S", DEFAULT_GAME_POLL_S)
+    resume_delay_s = _env_seconds(
+        inst, "MIST_GAME_RESUME_DELAY_S", DEFAULT_GAME_RESUME_DELAY_S, allow_zero=True
+    )
+    lister = ctx.processes if ctx.processes is not None else gamewatch.list_processes
+    marker = inst.ops / GPU_YIELDED_MARKER
+    entries = _game_rule_entries(rules)
+    exclude_count = sum(label.startswith("MIST_GAME_EXCLUDE[") for label, _e, _d in entries)
+    missing = [label for label, entry, is_dir in entries if is_dir and not os.path.isdir(entry)]
+
+    def find(log: logging.Logger):
+        try:
+            records = lister()
+        except gamewatch.GameWatchError as exc:
+            log.info(f"{_format_utc(ctx.clock())} listing processes failed: {exc}; stopping")
+            raise _ListingFailedError(f"cannot list processes: {exc}") from exc
+        return gamewatch.find_game(records, rules)
+
+    with _watch_log(inst.root / "logs" / GAMING_WATCH_LOG) as log:
+
+        def note(message: str) -> None:
+            log.info(f"{_format_utc(ctx.clock())} {message}")
+
+        note(
+            f"watching {len(rules.libraries)} MIST_GAME_DIRS, {len(rules.runtime_dirs)} "
+            f"MIST_GAME_RUNTIME_DIRS and {exclude_count} MIST_GAME_EXCLUDE entries every "
+            f"{poll_s:g} s, resume delay {resume_delay_s:g} s; missing: "
+            f"{', '.join(missing) or 'none'}"
+        )
+        state = gamewatch.INITIAL_STATE
+        seen: str | None = None
+        ticks = 0
+        while True:
+            verdict = find(log)
+            label = None if verdict is None else f"{verdict.variable}[{verdict.index}]"
+            if label != seen:
+                note("no game running" if label is None else f"game seen under {label}")
+                seen = label
+            previous = state
+            action, state = gamewatch.decide(
+                previous, verdict is not None, _marker_by(marker), ctx.monotonic(), resume_delay_s
+            )
+            if state.suppressed and not previous.suppressed:
+                note("gaming mode was ended by someone else; not yielding until no game runs")
+            if action == "on":
+                try:
+                    gaming_mode_on(inst.root, ctx, by="watcher")
+                    note("gaming-mode on --by watcher: done")
+                except InstanceError as exc:
+                    note(f"gaming-mode on --by watcher: {exc.label}: {exc}")
+            elif action == "off":
+
+                def game_running() -> bool:
+                    return find(log) is not None
+
+                try:
+                    outcome = gaming_mode_off(inst.root, ctx, should_abort=game_running)
+                    note(f"gaming-mode off: {outcome}")
+                except _ListingFailedError:
+                    raise
+                except InstanceError as exc:
+                    note(f"gaming-mode off: {exc.label}: {exc}")
+            ticks += 1
+            if max_ticks is not None and ticks >= max_ticks:
+                return
+            ctx.sleep(poll_s)
+
+
+def cmd_gaming_watch(args: argparse.Namespace, ctx: Context) -> None:
+    """`gaming-watch`: run the watcher until it is stopped."""
+    gaming_watch(args.root, ctx)
 
 
 # --- status ----------------------------------------------------------------------------------
@@ -2467,6 +2713,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long `off` waits for mist-llm to become healthy",
     )
     gaming.set_defaults(handler=cmd_gaming_mode)
+
+    watch = commands.add_parser(
+        "gaming-watch",
+        help="yield the GPU while a game itself runs; Windows, runs until stopped",
+    )
+    watch.add_argument("--root", required=True)
+    watch.set_defaults(handler=cmd_gaming_watch)
 
     arm = commands.add_parser("arm-backups", help="start scheduled backups, now and at every up")
     arm.add_argument("--root", required=True)
