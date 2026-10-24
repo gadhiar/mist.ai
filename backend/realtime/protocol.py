@@ -35,7 +35,9 @@ from pydantic import (
     ValidationInfo,
     field_validator,
     model_serializer,
+    model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 from .errors import ProtocolError
 
@@ -250,8 +252,10 @@ class VoiceStartMessage(_WireModel):
     Attributes:
         req: Assigned by the client from 1 (its first `voice_start` on the connection),
             strictly increasing per connection, at most 4294967295. The answer carries it in
-            `voice_state.req`, which is how the client tells its answer from a broadcast. The
-            schema checks only the range; the strictly-increasing check needs the connection's
+            `voice_state.req`. The client finds its answer by `cause` together with `req`, not
+            by `req` alone: a broadcast and the answer to a `voice_start` whose `req` could not
+            be read both carry `req` null, and only `cause` tells them apart. The schema checks
+            only the range; the strictly-increasing check needs the connection's
             history, so it belongs to the session.
     """
 
@@ -528,10 +532,13 @@ class VoiceStateMessage(_WireModel):
         mode: The session's active voice mode, null while voice is off; so a broadcast to a
             session that has not started voice carries null, and a broadcast sent while a
             reconfigure is pending carries the current mode, not the requested one.
-        refused: Null when the request was applied. Otherwise why it was not: a reason the
-            requested mode is unavailable, `superseded` (a newer valid `voice_start` arrived
-            first), `voice_stop` (a `voice_stop` arrived first) or `invalid` (the
-            `voice_start` failed validation).
+        refused: In an answer, null when the request was applied, and otherwise why it was
+            not: a reason the requested mode is unavailable, `superseded` (a newer valid
+            `voice_start` arrived first), `voice_stop` (a `voice_stop` arrived first) or
+            `invalid` (the `voice_start` failed validation). In a broadcast it names a mode the
+            session lost to a GPU change, for example when a `switch_failed` placement leaves
+            an engine `off`. `active` stays true then, because a lost mode does not turn voice
+            off.
     """
 
     type: Literal["voice_state"] = "voice_state"
@@ -648,9 +655,10 @@ class DroppedDetail(_WireModel):
 class DegradedDetail(_WireModel):
     """Detail of a `degraded` decision.
 
-    The sender sets `voiced_text` and `text_from_token` for reason `tts_failed`, where the turn
-    switches from speech to text mid-turn, and sends both null for every other reason. The schema
-    checks only that `text_from_token` is not negative.
+    `voiced_text` and `text_from_token` are both set for reason `tts_failed`, where the turn
+    switches from speech to text mid-turn, and both null for every other reason. The detail
+    cannot see the reason, so `VoiceDecisionDegraded` rejects a decision that breaks the rule,
+    naming the offending key; `text_from_token` is also never negative.
 
     - `voiced_text` is the text of the audio synthesized before the failure and still sent
       after it, the most the client will play: "" for a text reply. It is an exact prefix of the
@@ -774,7 +782,12 @@ class VoiceDecisionDropped(_WireModel):
 
 
 class VoiceDecisionDegraded(_WireModel):
-    """Part of the voice path failed and the turn continued without it."""
+    """Part of the voice path failed and the turn continued without it.
+
+    For reason `tts_failed` both `detail.voiced_text` and `detail.text_from_token` must be set,
+    and for every other reason both must be null; a decision that breaks this fails validation
+    naming the first offending key, which `parse_server_message` raises as `ProtocolError`.
+    """
 
     type: Literal["voice_decision"] = "voice_decision"
     kind: Literal["degraded"] = "degraded"
@@ -788,6 +801,19 @@ class VoiceDecisionDegraded(_WireModel):
         "vram_over_budget",
     ]
     detail: DegradedDetail
+
+    @model_validator(mode="after")
+    def _switch_keys_follow_the_reason(self) -> "VoiceDecisionDegraded":
+        switched = self.reason == "tts_failed"
+        for key in ("voiced_text", "text_from_token"):
+            if (getattr(self.detail, key) is None) == switched:
+                state = "set" if switched else "null"
+                raise PydanticCustomError(
+                    "degraded_switch_key",
+                    "{wire_field} must be {state} for reason {reason}",
+                    {"wire_field": f"detail.{key}", "state": state, "reason": self.reason},
+                )
+        return self
 
 
 class VoiceDecisionOverload(_WireModel):
@@ -996,13 +1022,20 @@ VOICE_DECISION_KINDS = _type_tags(VoiceDecisionMessage, "kind")
 
 
 def _protocol_error(exc: ValidationError) -> ProtocolError:
-    """Name the first failing field, dropping the union tags pydantic puts in the location."""
+    """Name the first failing field, dropping the union tags pydantic puts in the location.
+
+    A model validator that checks fields against each other fails at the model's own location,
+    so it names the field in its error's `wire_field` context, relative to that location.
+    """
     error = exc.errors(include_url=False)[0]
+    ctx = error.get("ctx", {})
     if error["type"] in ("union_tag_invalid", "union_tag_not_found"):
-        discriminator = str(error.get("ctx", {}).get("discriminator", "type")).strip("'")
+        discriminator = str(ctx.get("discriminator", "type")).strip("'")
         return ProtocolError(discriminator, error["msg"])
-    path = error["loc"][1:]
-    field = ".".join(str(part) for part in path) if path else "message"
+    parts = [str(part) for part in error["loc"][1:]]
+    if "wire_field" in ctx:
+        parts.append(str(ctx["wire_field"]))
+    field = ".".join(parts) if parts else "message"
     return ProtocolError(field, error["msg"])
 
 
@@ -1050,7 +1083,9 @@ def peek_voice_start(raw: str | bytes) -> VoiceStartPeek | None:
     Returns:
         None unless `raw` is a JSON object whose `type` is `voice_start`. Otherwise a peek whose
         `req` is the message's `req` when that is a JSON integer from 1 to 4294967295, and None
-        when it is missing, out of range or of another JSON type (`true` included).
+        when it is missing, out of range or of another JSON type (`true` included). Text nested
+        past the JSON decoder's recursion limit counts as unreadable and returns None, even when
+        its `type` is `voice_start`.
     """
     try:
         data = json.loads(raw)

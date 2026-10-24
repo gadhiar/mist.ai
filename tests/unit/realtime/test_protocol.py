@@ -510,6 +510,63 @@ def test_vector_budget_keys_come_from_the_design_doc(name):
     assert set(budget) <= DESIGN_BUDGET_KEYS
 
 
+# The Design doc's budget table (v1 plan, Latency budget): every preset the server can send, with
+# its eleven rows. A vector carrying another preset or other figures teaches the client a budget
+# the server never reports.
+DESIGN_BUDGET_PRESETS = {
+    "floor": {
+        "end_of_turn_ms": 250,
+        "stt_final_ms": 250,
+        "context_build_ms": 0,
+        "llm_first_token_ms": 250,
+        "first_segment_ms": 120,
+        "tts_first_chunk_ms": 500,
+        "transport_playback_ms": 100,
+        "total_p50_ms": 1470,
+        "total_p90_ms": 2100,
+        "tool_call_ms": 450,
+        "barge_in_reaction_ms": 700,
+    },
+    "floor_yield": {
+        "end_of_turn_ms": 250,
+        "stt_final_ms": 600,
+        "context_build_ms": 0,
+        "llm_first_token_ms": 500,
+        "first_segment_ms": 240,
+        "tts_first_chunk_ms": 1200,
+        "transport_playback_ms": 130,
+        "total_p50_ms": 2920,
+        "total_p90_ms": 4100,
+        "tool_call_ms": 900,
+        "barge_in_reaction_ms": 1200,
+    },
+    "memo": {
+        "end_of_turn_ms": 250,
+        "stt_final_ms": 50,
+        "context_build_ms": 0,
+        "llm_first_token_ms": 200,
+        "first_segment_ms": 100,
+        "tts_first_chunk_ms": 150,
+        "transport_playback_ms": 100,
+        "total_p50_ms": 850,
+        "total_p90_ms": 1200,
+        "tool_call_ms": 270,
+        "barge_in_reaction_ms": 700,
+    },
+}
+
+
+@pytest.mark.parametrize(
+    "vector", [v for v in SERVER_VECTORS if "budget" in v["message"]], ids=_vector_id
+)
+def test_vector_budget_is_a_design_preset_with_its_figures(vector):
+    budget = dict(vector["message"]["budget"])
+
+    preset = budget.pop("preset")
+
+    assert budget == DESIGN_BUDGET_PRESETS[preset]
+
+
 def test_vector_timing_and_over_budget_keys_come_from_the_design_doc():
     vector = next(v for v in SERVER_VECTORS if v["name"] == "turn_metrics")
     assert vector["message"]["timings"]
@@ -684,6 +741,36 @@ def test_degraded_text_from_token_accepts_zero():
     assert parsed.detail.text_from_token == 0
 
 
+@pytest.mark.parametrize("key", ["voiced_text", "text_from_token"])
+def test_degraded_tts_failed_with_a_null_switch_key_raises(key):
+    """Without both keys the client cannot tell the spoken part of the turn from the rest."""
+    message = _vector_message(SERVER_VECTORS, "voice_decision_degraded")
+    message["detail"][key] = None
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_server_message(json.dumps(message))
+
+    assert excinfo.value.field == f"detail.{key}"
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        pytest.param("voiced_text", "", id="voiced_text"),
+        pytest.param("text_from_token", 0, id="tf"),
+    ],
+)
+def test_degraded_other_reason_with_a_switch_key_set_raises(key, value):
+    """Only `tts_failed` switches a turn to text, so another reason setting a key misleads."""
+    message = _vector_message(SERVER_VECTORS, "voice_decision_degraded_tts_unavailable")
+    message["detail"][key] = value
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_server_message(json.dumps(message))
+
+    assert excinfo.value.field == f"detail.{key}"
+
+
 def test_voice_state_cause_outside_the_two_values_raises():
     message = dict(_vector_message(SERVER_VECTORS, "voice_state"), cause="reply")
 
@@ -848,7 +935,9 @@ def test_encode_rejects_empty_marker_at_rate_other_than_24000(msg_type, rate):
     ("documented", "terms"),
     [
         pytest.param(Frame, ("gap", "rebase", "restart"), id="Frame.seq"),
-        pytest.param(VoiceStartMessage, ("req", "from 1", "strictly increasing"), id="req"),
+        pytest.param(
+            VoiceStartMessage, ("req", "from 1", "strictly increasing", "`cause`"), id="req"
+        ),
         pytest.param(
             VoiceStateMessage,
             (
@@ -862,15 +951,19 @@ def test_encode_rejects_empty_marker_at_rate_other_than_24000(msg_type, rate):
                 "superseded",
                 "voice_stop",
                 "invalid",
+                "switch_failed",
             ),
             id="VoiceStateMessage",
         ),
+        pytest.param(peek_voice_start, ("recursion limit",), id="peek_voice_start"),
         pytest.param(StreamCancelledMessage, ("null", "`text`"), id="StreamCancelledMessage"),
         pytest.param(TranscriptionMessage, ("closes",), id="TranscriptionMessage"),
         pytest.param(VoiceDecisionDropped, ("closes",), id="VoiceDecisionDropped"),
         pytest.param(VoiceDecisionWakeLost, ("closes",), id="VoiceDecisionWakeLost"),
         pytest.param(
-            DegradedDetail, ("voiced_text", "text_from_token", "tts_failed"), id="DegradedDetail"
+            DegradedDetail,
+            ("voiced_text", "text_from_token", "tts_failed", "rejects"),
+            id="DegradedDetail",
         ),
     ],
 )
