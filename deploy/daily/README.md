@@ -310,6 +310,19 @@ path or its arguments; a Minecraft client's arguments carry its account's access
 Docker call the CLI makes starts without a console window, so the watcher can run under
 `pythonw.exe`.
 
+To start it at every sign-in, add `-GamingWatch` to `register-signin-task.ps1` (see "Start
+after power-on"):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\daily\windows\register-signin-task.ps1 -Python <python.exe> -Root <root> -GamingWatch
+```
+
+It registers a second task, "MIST gaming watch", which runs
+`<pythonw.exe> <root>/bin/instance.py gaming-watch --root <root>` with the same sign-in
+trigger and settings as the first, including no time limit. `pythonw.exe` comes from the
+directory of `-Python`, and the script refuses before registering anything when it is not
+there. `unregister-signin-task.ps1` removes both tasks.
+
 ---
 
 ## Reading /health

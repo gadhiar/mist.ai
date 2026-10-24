@@ -990,3 +990,168 @@ def test_readme_gaming_mode_section_describes_the_watcher():
         "MIST_GAME_DIRS[",
     ):
         assert phrase in section, phrase
+
+
+# --- The sign-in task scripts ----------------------------------------------------------------
+#
+# The runner has no PowerShell, so the scripts are checked by parsing their text, with the
+# helpers `tests/unit/daily/test_instance_operations.py` uses for the first task.
+
+WINDOWS_DIR = REPO_ROOT / "deploy" / "daily" / "windows"
+REGISTER = WINDOWS_DIR / "register-signin-task.ps1"
+UNREGISTER = WINDOWS_DIR / "unregister-signin-task.ps1"
+INSTANCE_TASK = "MIST daily instance"
+WATCH_TASK = "MIST gaming watch"
+SETTINGS = (
+    "-Settings (New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) "
+    "-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries)"
+)
+
+
+def ps_code(path: Path) -> str:
+    """The script without comments, with each backtick line continuation joined."""
+    text = re.sub(r"<#.*?#>", "", path.read_text(encoding="utf-8"), flags=re.S)
+    lines = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+    return re.sub(r"`\n\s*", " ", "\n".join(lines))
+
+
+def ps_header(path: Path) -> str:
+    match = re.search(r"<#(.*?)#>", path.read_text(encoding="utf-8"), re.S)
+    assert match is not None
+    return match.group(1)
+
+
+def ps_statements(code: str, command: str) -> list[str]:
+    return [line for line in code.splitlines() if re.search(rf"(?<![\w-]){command}\b", line)]
+
+
+def balanced_group(text: str, start: int) -> str:
+    """The text from the bracket at `start` to its matching close, outside quoted strings."""
+    pairs = {"(": ")", "{": "}", "[": "]"}
+    stack: list[str] = []
+    quote: str | None = None
+    for index in range(start, len(text)):
+        char = text[index]
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in "'\"":
+            quote = char
+        elif char in pairs:
+            stack.append(pairs[char])
+        elif char in pairs.values():
+            assert stack and stack.pop() == char
+            if not stack:
+                return text[start : index + 1]
+    raise AssertionError(f"no close for the bracket at {start}")
+
+
+def if_blocks(code: str, condition: str) -> list[tuple[int, str]]:
+    """Where each `if (<condition>) { ... }` in `code` starts, and its body."""
+    blocks = []
+    for match in re.finditer(rf"if \({re.escape(condition)}\) ", code):
+        blocks.append((match.start(), balanced_group(code, code.index("{", match.end() - 1))))
+    return blocks
+
+
+def watch_registration(code: str) -> str:
+    calls = [
+        call
+        for call in ps_statements(code, "Register-ScheduledTask")
+        if f"-TaskName '{WATCH_TASK}'" in call
+    ]
+    assert len(calls) == 1, calls
+    return calls[0]
+
+
+def test_register_script_takes_the_gaming_watch_switch():
+    code = ps_code(REGISTER)
+    param = balanced_group(code, code.index("param("))
+    assert re.search(r"\[switch\]\s*\$GamingWatch\b", param)
+
+
+def test_the_watch_task_is_registered_only_inside_the_switch_block():
+    code = ps_code(REGISTER)
+    call = watch_registration(code)
+    assert len([body for _at, body in if_blocks(code, "$GamingWatch") if call in body]) == 1
+
+
+def test_the_watch_task_runs_pythonw_gaming_watch_at_sign_in_with_the_same_settings():
+    code = ps_code(REGISTER)
+    call = watch_registration(code)
+    assert "-Trigger $Trigger" in call
+    assert "-Principal $Principal" in call
+    assert "-Action $WatchAction" in call
+    assert SETTINGS in call
+    first = next(
+        call
+        for call in ps_statements(code, "Register-ScheduledTask")
+        if f"-TaskName '{INSTANCE_TASK}'" in call
+    )
+    assert SETTINGS in first
+    actions = [
+        line
+        for line in ps_statements(code, "New-ScheduledTaskAction")
+        if line.lstrip().startswith("$WatchAction =")
+    ]
+    assert len(actions) == 1
+    assert "-Execute $PythonwPath" in actions[0]
+    assert "-Argument $WatchArgument" in actions[0]
+    assert '\'"{0}/bin/instance.py" gaming-watch --root "{0}"\' -f $RootPath' in code
+
+
+def test_pythonw_comes_from_the_python_directory_and_its_absence_refuses_before_any_task():
+    code = ps_code(REGISTER)
+    assert "$PythonDir = Split-Path -Path $PythonPath -Parent" in code
+    assert "$PythonwPath = Join-Path -Path $PythonDir -ChildPath 'pythonw.exe'" in code
+    checks = [
+        (at, body)
+        for at, body in if_blocks(code, "$GamingWatch")
+        if "Test-Path -LiteralPath $PythonwPath -PathType Leaf" in body
+    ]
+    assert len(checks) == 1
+    at, body = checks[0]
+    assert "throw" in body
+    # The refusal comes before the first task is registered, so a refusal changes nothing.
+    assert at < code.index("Register-ScheduledTask")
+
+
+def test_register_script_header_documents_the_switch():
+    header = ps_header(REGISTER)
+    assert "-GamingWatch" in header
+    assert WATCH_TASK in header
+    assert "pythonw.exe" in header
+
+
+def test_unregister_script_removes_both_tasks_each_only_if_present():
+    code = ps_code(UNREGISTER)
+    removals = ps_statements(code, "Unregister-ScheduledTask")
+    assert len(removals) == 2
+    for name in (INSTANCE_TASK, WATCH_TASK):
+        removal = f"Unregister-ScheduledTask -TaskName '{name}' -Confirm:$false"
+        assert sum(removal in line for line in removals) == 1, name
+        lookup = f"Get-ScheduledTask -TaskName '{name}' -ErrorAction SilentlyContinue"
+        variable = re.search(rf"(\$\w+) = {re.escape(lookup)}", code)
+        assert variable is not None, name
+        # The removal is the else branch of the check that the lookup found nothing.
+        check = f"if ($null -eq {variable.group(1)}) "
+        check_at = code.index(check, variable.end())
+        then_block = balanced_group(code, code.index("{", check_at))
+        rest = code[code.index(then_block, check_at) + len(then_block) :]
+        assert rest.lstrip().startswith("else"), name
+        else_block = balanced_group(rest, rest.index("{"))
+        assert removal in else_block, name
+        assert removal not in then_block, name
+
+
+def test_readme_says_how_to_register_the_watcher():
+    section = readme_section("Gaming mode")
+    for phrase in (
+        "-GamingWatch",
+        "register-signin-task.ps1",
+        WATCH_TASK,
+        "pythonw.exe",
+        "unregister-signin-task.ps1",
+    ):
+        assert phrase in section, phrase
