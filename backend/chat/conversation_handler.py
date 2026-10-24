@@ -2281,7 +2281,9 @@ class ConversationHandler:
             pass1_usage = state.pass_usage.get(1)
             if pass1_usage is not None:
                 scope.prompt_stats = replace(
-                    scope.prompt_stats, prompt_tokens=pass1_usage.prompt_tokens
+                    scope.prompt_stats,
+                    prompt_tokens=pass1_usage.prompt_tokens,
+                    cached_tokens=pass1_usage.cached_prompt_tokens,
                 )
 
             if pass1_response is not None and pass1_response.tool_calls:

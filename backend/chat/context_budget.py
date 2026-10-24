@@ -398,10 +398,10 @@ class PromptStats:
     """Prompt-size and cache statistics for one turn, kept on `TurnScope.prompt_stats`.
 
     The `*_est` counts are the planner's token estimates, taken when the
-    prompt is built. `prompt_tokens` comes from the provider's usage for
+    prompt is built. `prompt_tokens` and `cached_tokens` (prompt tokens the
+    server took from its KV cache) come from the provider's usage for
     pass 1, None until that pass finishes or when the provider reports
-    nothing. `cached_tokens` is always None: `UsageMetadata` does not carry
-    a cached count yet. `prefix_changed` is True when the stable prefix
+    nothing. `prefix_changed` is True when the stable prefix
     or the tool schemas differ from the session's previous turn.
     `history_compacted` is the history selection's `compacted`.
     """

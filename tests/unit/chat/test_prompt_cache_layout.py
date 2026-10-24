@@ -377,7 +377,23 @@ class TestPrefixChangeAndStats:
         assert stats.prompt_tokens == 1001
         assert stats.prefix_changed is False
         assert stats.history_compacted == "none"
-        assert hasattr(stats, "cached_tokens")
+        assert stats.cached_tokens is None
+
+    @pytest.mark.asyncio
+    async def test_cached_tokens_come_from_pass_one_usage(self):
+        handler, _ = _handler(0)
+        handler._provider = FakeStreamingLLMProvider(
+            [
+                ScriptedPass(
+                    chunks=["Reply."],
+                    usage=UsageMetadata(prompt_tokens=1200, cached_prompt_tokens=900),
+                )
+            ]
+        )
+        scope = await _run_turn(handler, _question(1))
+
+        assert scope.prompt_stats.prompt_tokens == 1200
+        assert scope.prompt_stats.cached_tokens == 900
 
     @pytest.mark.asyncio
     async def test_unchanged_prefix_is_not_flagged(self):
