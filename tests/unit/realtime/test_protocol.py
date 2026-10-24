@@ -24,19 +24,28 @@ from backend.realtime.protocol import (
     SERVER_MESSAGE_TYPES,
     UPLINK_SAMPLE_RATE,
     VOICE_DECISION_KINDS,
+    DegradedDetail,
     Direction,
     Frame,
     MsgType,
     PlaybackStopMessage,
     StateCycleMessage,
+    StreamCancelledMessage,
     StreamStartMessage,
+    TranscriptionMessage,
+    VoiceDecisionDropped,
     VoiceDecisionPlacement,
+    VoiceDecisionWakeLost,
+    VoiceStartMessage,
+    VoiceStartPeek,
+    VoiceStateMessage,
     decode_frame,
     encode_frame,
     encode_message,
     next_turn_tag,
     parse_client_message,
     parse_server_message,
+    peek_voice_start,
 )
 
 VECTORS_PATH = (
@@ -60,6 +69,12 @@ def _header(
 
 def _vector_id(vector: dict) -> str:
     return vector["name"]
+
+
+def _vector_message(vectors: list[dict], name: str) -> dict:
+    """A deep copy of the named vector's message, safe to mutate."""
+    vector = next(v for v in vectors if v["name"] == name)
+    return json.loads(json.dumps(vector["message"]))
 
 
 # -- errors ------------------------------------------------------------------
@@ -495,6 +510,63 @@ def test_vector_budget_keys_come_from_the_design_doc(name):
     assert set(budget) <= DESIGN_BUDGET_KEYS
 
 
+# The Design doc's budget table (v1 plan, Latency budget): every preset the server can send, with
+# its eleven rows. A vector carrying another preset or other figures teaches the client a budget
+# the server never reports.
+DESIGN_BUDGET_PRESETS = {
+    "floor": {
+        "end_of_turn_ms": 250,
+        "stt_final_ms": 250,
+        "context_build_ms": 0,
+        "llm_first_token_ms": 250,
+        "first_segment_ms": 120,
+        "tts_first_chunk_ms": 500,
+        "transport_playback_ms": 100,
+        "total_p50_ms": 1470,
+        "total_p90_ms": 2100,
+        "tool_call_ms": 450,
+        "barge_in_reaction_ms": 700,
+    },
+    "floor_yield": {
+        "end_of_turn_ms": 250,
+        "stt_final_ms": 600,
+        "context_build_ms": 0,
+        "llm_first_token_ms": 500,
+        "first_segment_ms": 240,
+        "tts_first_chunk_ms": 1200,
+        "transport_playback_ms": 130,
+        "total_p50_ms": 2920,
+        "total_p90_ms": 4100,
+        "tool_call_ms": 900,
+        "barge_in_reaction_ms": 1200,
+    },
+    "memo": {
+        "end_of_turn_ms": 250,
+        "stt_final_ms": 50,
+        "context_build_ms": 0,
+        "llm_first_token_ms": 200,
+        "first_segment_ms": 100,
+        "tts_first_chunk_ms": 150,
+        "transport_playback_ms": 100,
+        "total_p50_ms": 850,
+        "total_p90_ms": 1200,
+        "tool_call_ms": 270,
+        "barge_in_reaction_ms": 700,
+    },
+}
+
+
+@pytest.mark.parametrize(
+    "vector", [v for v in SERVER_VECTORS if "budget" in v["message"]], ids=_vector_id
+)
+def test_vector_budget_is_a_design_preset_with_its_figures(vector):
+    budget = dict(vector["message"]["budget"])
+
+    preset = budget.pop("preset")
+
+    assert budget == DESIGN_BUDGET_PRESETS[preset]
+
+
 def test_vector_timing_and_over_budget_keys_come_from_the_design_doc():
     vector = next(v for v in SERVER_VECTORS if v["name"] == "turn_metrics")
     assert vector["message"]["timings"]
@@ -558,9 +630,351 @@ def test_unknown_field_on_server_message_is_dropped():
 
 
 def test_voice_state_mode_null_round_trips():
-    """A GPU mode change reaches sessions that never sent `voice_start`, so `mode` is null."""
-    vector = next(v for v in SERVER_VECTORS if v["name"] == "voice_state")
-    message = dict(json.loads(json.dumps(vector["message"])), active=False, mode=None)
+    """A broadcast reaches sessions that never sent `voice_start`, so `mode` is null."""
+    message = _vector_message(SERVER_VECTORS, "voice_state_broadcast_before_voice_start")
+
     parsed = parse_server_message(json.dumps(message))
+
     assert parsed.mode is None
+    assert parsed.active is False
     assert json.loads(encode_message(parsed)) == message
+
+
+# -- second commit: utterance ids, answer correlation, the tts switch --------
+
+_MISSING = object()
+
+
+def _without(message: dict, path: tuple[str, ...]) -> dict:
+    target = message
+    for key in path[:-1]:
+        target = target[key]
+    del target[path[-1]]
+    return message
+
+
+@pytest.mark.parametrize(
+    ("direction", "name", "path"),
+    [
+        pytest.param(
+            "server", "voice_decision_barge_in", ("detail", "utterance_id"), id="barge_in-utterance"
+        ),
+        pytest.param(
+            "server",
+            "voice_decision_barge_in_ignored",
+            ("detail", "utterance_id"),
+            id="barge_in_ignored-utterance",
+        ),
+        pytest.param(
+            "server",
+            "voice_decision_wake_lost",
+            ("detail", "utterance_id"),
+            id="wake_lost-utterance",
+        ),
+        pytest.param(
+            "server", "voice_decision_degraded", ("detail", "voiced_text"), id="degraded-voiced"
+        ),
+        pytest.param(
+            "server",
+            "voice_decision_degraded",
+            ("detail", "text_from_token"),
+            id="degraded-text-from-token",
+        ),
+        pytest.param("server", "voice_state", ("cause",), id="voice_state-cause"),
+        pytest.param("server", "voice_state", ("req",), id="voice_state-req"),
+        pytest.param("client", "voice_start", ("req",), id="voice_start-req"),
+    ],
+)
+def test_each_new_key_is_required(direction, name, path):
+    """A nullable new key is still required: a sender that omits it breaks the contract."""
+    vectors, parse = (
+        (SERVER_VECTORS, parse_server_message)
+        if direction == "server"
+        else (CLIENT_VECTORS, parse_client_message)
+    )
+    message = _without(_vector_message(vectors, name), path)
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse(json.dumps(message))
+
+    assert excinfo.value.field == ".".join(path)
+
+
+@pytest.mark.parametrize("name", ["voice_decision_barge_in", "voice_decision_barge_in_ignored"])
+def test_barge_in_utterance_id_may_be_null(name):
+    message = _vector_message(SERVER_VECTORS, name)
+    message["detail"]["utterance_id"] = None
+
+    parsed = parse_server_message(json.dumps(message))
+
+    assert parsed.detail.utterance_id is None
+
+
+def test_wake_lost_utterance_id_is_never_null():
+    message = _vector_message(SERVER_VECTORS, "voice_decision_wake_lost")
+    message["detail"]["utterance_id"] = None
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_server_message(json.dumps(message))
+
+    assert excinfo.value.field == "detail.utterance_id"
+
+
+def test_degraded_text_from_token_rejects_a_negative_index():
+    message = _vector_message(SERVER_VECTORS, "voice_decision_degraded")
+    message["detail"]["text_from_token"] = -1
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_server_message(json.dumps(message))
+
+    assert excinfo.value.field == "detail.text_from_token"
+
+
+def test_degraded_text_from_token_accepts_zero():
+    """0 is a switch before any `stream_token` was sent: the whole text is unspoken."""
+    message = _vector_message(SERVER_VECTORS, "voice_decision_degraded")
+    message["detail"]["text_from_token"] = 0
+    message["detail"]["voiced_text"] = ""
+
+    parsed = parse_server_message(json.dumps(message))
+
+    assert parsed.detail.text_from_token == 0
+
+
+@pytest.mark.parametrize("key", ["voiced_text", "text_from_token"])
+def test_degraded_tts_failed_with_a_null_switch_key_raises(key):
+    """Without both keys the client cannot tell the spoken part of the turn from the rest."""
+    message = _vector_message(SERVER_VECTORS, "voice_decision_degraded")
+    message["detail"][key] = None
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_server_message(json.dumps(message))
+
+    assert excinfo.value.field == f"detail.{key}"
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        pytest.param("voiced_text", "", id="voiced_text"),
+        pytest.param("text_from_token", 0, id="tf"),
+    ],
+)
+def test_degraded_other_reason_with_a_switch_key_set_raises(key, value):
+    """Only `tts_failed` switches a turn to text, so another reason setting a key misleads."""
+    message = _vector_message(SERVER_VECTORS, "voice_decision_degraded_tts_unavailable")
+    message["detail"][key] = value
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_server_message(json.dumps(message))
+
+    assert excinfo.value.field == f"detail.{key}"
+
+
+def test_voice_state_cause_outside_the_two_values_raises():
+    message = dict(_vector_message(SERVER_VECTORS, "voice_state"), cause="reply")
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_server_message(json.dumps(message))
+
+    assert excinfo.value.field == "cause"
+
+
+_BAD_REQS = [
+    pytest.param(0, id="zero"),
+    pytest.param(4294967296, id="over-u32"),
+    pytest.param(1.0, id="float"),
+    pytest.param("1", id="string"),
+]
+
+
+@pytest.mark.parametrize("req", [*_BAD_REQS, pytest.param(_MISSING, id="missing")])
+def test_voice_start_req_must_be_a_u32_from_one(req):
+    message = _vector_message(CLIENT_VECTORS, "voice_start")
+    if req is _MISSING:
+        del message["req"]
+    else:
+        message["req"] = req
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_client_message(json.dumps(message))
+
+    assert excinfo.value.field == "req"
+
+
+@pytest.mark.parametrize("req", [1, 4294967295])
+def test_voice_start_req_bounds_parse(req):
+    message = dict(_vector_message(CLIENT_VECTORS, "voice_start"), req=req)
+
+    parsed = parse_client_message(json.dumps(message))
+
+    assert parsed.req == req
+
+
+def test_voice_state_broadcast_with_req_set_raises():
+    """A broadcast answers no request, so a `req` on it would be matched to the wrong one."""
+    message = _vector_message(SERVER_VECTORS, "voice_state_broadcast_before_voice_start")
+    message["req"] = 3
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_server_message(json.dumps(message))
+
+    assert excinfo.value.field == "req"
+
+
+@pytest.mark.parametrize("req", _BAD_REQS)
+def test_voice_state_answer_req_must_be_a_u32_from_one(req):
+    message = dict(_vector_message(SERVER_VECTORS, "voice_state"), req=req)
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_server_message(json.dumps(message))
+
+    assert excinfo.value.field == "req"
+
+
+@pytest.mark.parametrize("req", [1, 4294967295, None])
+def test_voice_state_answer_req_bounds_and_null_parse(req):
+    """An answer's `req` is null only when the `voice_start` it answers had no readable `req`."""
+    message = dict(_vector_message(SERVER_VECTORS, "voice_state"), req=req)
+
+    parsed = parse_server_message(json.dumps(message))
+
+    assert parsed.cause == "answer"
+    assert parsed.req == req
+
+
+def _voice_start_text(**changes: object) -> str:
+    return json.dumps(dict(_vector_message(CLIENT_VECTORS, "voice_start"), **changes))
+
+
+_DEEPLY_NESTED = '{"type": "voice_start", "req": 7, "x": ' + "[" * 100_000 + "]" * 100_000 + "}"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param(_voice_start_text(), VoiceStartPeek(req=1), id="valid"),
+        pytest.param(_voice_start_text(mode="loud", req=5), VoiceStartPeek(req=5), id="bad-mode"),
+        pytest.param(_voice_start_text(req="x"), VoiceStartPeek(req=None), id="req-string"),
+        pytest.param(json.dumps({"type": "ptt"}), None, id="other-type"),
+        pytest.param("{not json", None, id="not-json"),
+        pytest.param(json.dumps({"type": "voice_start"}), VoiceStartPeek(req=None), id="no-req"),
+        pytest.param(_voice_start_text(req=True), VoiceStartPeek(req=None), id="req-bool"),
+        pytest.param(_voice_start_text(req=5.0), VoiceStartPeek(req=None), id="req-float"),
+        pytest.param(_voice_start_text(req=0), VoiceStartPeek(req=None), id="req-zero"),
+        pytest.param(
+            _voice_start_text(req=4294967296), VoiceStartPeek(req=None), id="req-over-u32"
+        ),
+        pytest.param(
+            _voice_start_text(req=4294967295), VoiceStartPeek(req=4294967295), id="req-max"
+        ),
+        pytest.param(json.dumps(["voice_start"]), None, id="json-array"),
+        pytest.param(_DEEPLY_NESTED, None, id="nested-past-recursion-limit"),
+    ],
+)
+def test_peek_voice_start(raw, expected):
+    """The session answers a `voice_start` that failed validation with the `req` peeked here."""
+    assert peek_voice_start(raw) == expected
+
+
+def test_peek_reads_req_from_a_voice_start_that_fails_validation():
+    raw = _voice_start_text(mode="loud", req=5)
+
+    with pytest.raises(ProtocolError):
+        parse_client_message(raw)
+
+    assert peek_voice_start(raw) == VoiceStartPeek(req=5)
+
+
+@pytest.mark.parametrize("reason", ["keyword", "voice_stop", "ignored"])
+def test_dropped_closing_reasons_round_trip(reason):
+    message = dict(_vector_message(SERVER_VECTORS, "voice_decision_dropped"), reason=reason)
+
+    parsed = parse_server_message(json.dumps(message))
+
+    assert json.loads(encode_message(parsed)) == message
+
+
+def test_dropped_unknown_reason_still_raises():
+    message = dict(_vector_message(SERVER_VECTORS, "voice_decision_dropped"), reason="bored")
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_server_message(json.dumps(message))
+
+    assert excinfo.value.field == "reason"
+
+
+_EMPTY_MARKER_BAD_RATES = [
+    pytest.param(msg_type, rate, id=f"{msg_type.name.lower()}-{rate}")
+    for msg_type in (MsgType.AUDIO_COMPLETE, MsgType.INTERRUPT_FADE)
+    for rate in (0, UPLINK_SAMPLE_RATE)
+]
+
+
+@pytest.mark.parametrize(("msg_type", "rate"), _EMPTY_MARKER_BAD_RATES)
+def test_decode_rejects_empty_marker_at_rate_other_than_24000(msg_type, rate):
+    data = _header(msg_type=msg_type, turn_tag=1, sample_rate=rate)
+
+    with pytest.raises(ProtocolError) as excinfo:
+        decode_frame(data)
+
+    assert excinfo.value.field == "sample_rate"
+
+
+@pytest.mark.parametrize(("msg_type", "rate"), _EMPTY_MARKER_BAD_RATES)
+def test_encode_rejects_empty_marker_at_rate_other_than_24000(msg_type, rate):
+    frame = Frame(msg_type=msg_type, turn_tag=1, seq=0, sample_rate=rate)
+
+    with pytest.raises(ProtocolError) as excinfo:
+        encode_frame(frame)
+
+    assert excinfo.value.field == "sample_rate"
+
+
+@pytest.mark.parametrize(
+    ("documented", "terms"),
+    [
+        pytest.param(Frame, ("gap", "rebase", "restart"), id="Frame.seq"),
+        pytest.param(
+            VoiceStartMessage, ("req", "from 1", "strictly increasing", "`cause`"), id="req"
+        ),
+        pytest.param(
+            VoiceStateMessage,
+            (
+                "answer",
+                "broadcast",
+                "engine",
+                "trigger",
+                "order",
+                "req",
+                "active",
+                "superseded",
+                "voice_stop",
+                "invalid",
+                "switch_failed",
+            ),
+            id="VoiceStateMessage",
+        ),
+        pytest.param(peek_voice_start, ("recursion limit",), id="peek_voice_start"),
+        pytest.param(StreamCancelledMessage, ("null", "`text`"), id="StreamCancelledMessage"),
+        pytest.param(TranscriptionMessage, ("closes",), id="TranscriptionMessage"),
+        pytest.param(VoiceDecisionDropped, ("closes",), id="VoiceDecisionDropped"),
+        pytest.param(VoiceDecisionWakeLost, ("closes",), id="VoiceDecisionWakeLost"),
+        pytest.param(
+            DegradedDetail,
+            ("voiced_text", "text_from_token", "tts_failed", "rejects"),
+            id="DegradedDetail",
+        ),
+    ],
+)
+def test_docstrings_state_the_v2_rules(documented, terms):
+    """Fires when a v2 rule's key term is edited out of the docstring that states it.
+
+    It checks that the terms are present, not that the sentences around them are right; that is
+    the reviewer's job.
+    """
+    doc = documented.__doc__ or ""
+
+    missing = [term for term in terms if term not in doc]
+
+    assert missing == []
