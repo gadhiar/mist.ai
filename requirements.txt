@@ -38,7 +38,11 @@ neo4j==5.24.0
 # store and the vault sqlite-vec sidecar is current per ADR-010.)
 sentence-transformers==3.3.1
 lancedb>=0.20
-pyarrow>=17.0
+# pyarrow 26 needs NumPy 2 at import, but chatterbox-tts holds numpy below 2.0, so
+# a fresh install ends at numpy 1.26.x and the lancedb import of pyarrow fails.
+# Lift this pin once chatterbox-tts allows numpy 2.
+# tests/unit/test_dependency_pins.py guards this line.
+pyarrow==25.0.1
 
 # Vault Memory (Layer 2 - ADR-010 Cluster 8)
 sqlite-vec>=0.1.3
@@ -55,6 +59,15 @@ watchdog>=3.0.0
 # for host-side/dev installs until the image adds it deliberately.
 psutil==7.2.2
 pynvml>=11.5
+
+# Capabilities
+# mcp: pinned for the Home Assistant MCP SDK transport that a later task of the
+# capabilities goal (T16) adds at backend/capabilities/mcp/sdk_transport.py.
+# tzdata: gives the stdlib `zoneinfo` the IANA zones that alarms need, because the
+# backend image has no system zone database.
+# tests/unit/test_dependency_pins.py guards both lines.
+mcp==2.3.0
+tzdata==2026.5
 
 # Visualization
 plotly==5.18.0
