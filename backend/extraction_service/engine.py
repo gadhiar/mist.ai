@@ -87,6 +87,13 @@ _REPAIR_INSTRUCTION = (
     "markdown code fences, no explanation."
 )
 
+# Output token limits, one per LLM-calling stage. Named so the run identity
+# can record them: a limit that cuts an output short changes what the stage
+# returns as surely as a prompt edit does.
+SCOPE_MAX_TOKENS = 96
+EXTRACT_MAX_TOKENS = 2048
+DERIVE_MAX_TOKENS = 400
+
 
 class ExtractionServiceError(MistError):
     """Base class for extraction-service-specific failures.
@@ -379,7 +386,7 @@ class ExtractionEngine:
         start = time.perf_counter()
         request = self._build_request(
             messages=render_scope_messages(pre_processed),
-            max_tokens=96,
+            max_tokens=SCOPE_MAX_TOKENS,
             schema=SCOPE_OUTPUT_SCHEMA,
         )
         request = self._adapter.prepare(request, stage="scope")
@@ -419,7 +426,7 @@ class ExtractionEngine:
 
         for attempt in range(1, self._settings.max_attempts + 1):
             request = self._build_request(
-                messages=messages, max_tokens=2048, schema=EXTRACTION_OUTPUT_SCHEMA
+                messages=messages, max_tokens=EXTRACT_MAX_TOKENS, schema=EXTRACTION_OUTPUT_SCHEMA
             )
             request = self._adapter.prepare(request, stage="extract")
 
@@ -474,7 +481,7 @@ class ExtractionEngine:
                 matched_patterns=req.derivation.matched_patterns,
                 existing_internal_entities=req.derivation.existing_internal_entities,
             ),
-            max_tokens=400,
+            max_tokens=DERIVE_MAX_TOKENS,
             schema=DERIVATION_OUTPUT_SCHEMA,
         )
         request = self._adapter.prepare(request, stage="derive")
