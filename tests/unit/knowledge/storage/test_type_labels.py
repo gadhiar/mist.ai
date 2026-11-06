@@ -13,6 +13,7 @@ from backend.knowledge.ontologies.hierarchy import RETIRED_TYPE_MAP
 from backend.knowledge.ontologies.v1_0_0 import _EXTERNAL_NODE_TYPES, ALL_NODE_TYPE_NAMES
 from backend.knowledge.storage.partitions import SELF_MODEL_TYPES
 from backend.knowledge.storage.type_labels import ENTITY_TYPE_LABELS, entity_type_label
+from scripts.migrations.ontology_v1_4_0 import CYPHER as RETYPE_CYPHER
 from tests.unit.knowledge.curation.conftest import make_entity_dict
 from tests.unit.knowledge.curation.test_graph_writer_type_labels import (
     LabelGraphConnection,
@@ -76,6 +77,30 @@ class TestNoDynamicLabels:
         ]
 
         assert offenders == []
+
+
+class TestRetypeMigrationSwapsTheLabel:
+    """`scripts/migrations/ontology_v1_4_0.py` retypes a node and swaps its label
+    in the same statement, so the label keeps mirroring `entity_type`.
+    """
+
+    @pytest.mark.parametrize(
+        ("index", "old", "new"), [(0, "Topic", "Concept"), (1, "Milestone", "Event")]
+    )
+    def test_each_retype_sets_the_new_label_and_removes_the_old(self, index, old, new):
+        query = RETYPE_CYPHER[index]
+        match, sep, rest = query.partition(" SET ")
+        assert sep, query
+        assert match == f"MATCH (e:__Entity__) WHERE e.entity_type = '{old}'"
+        set_items, sep, remove = rest.partition(" REMOVE ")
+        assert sep, query
+        assert set_items.startswith(f"e.entity_type = '{new}', ")
+        assert set_items.endswith(f", e:{entity_type_label(new)}")
+        assert remove == f"e:{old}"
+        assert entity_type_label(old) is None
+
+    def test_the_migration_keeps_two_statements(self):
+        assert len(RETYPE_CYPHER) == 2
 
 
 class TestRebuildDeterminism:
