@@ -522,13 +522,13 @@ PYEOF
     fi
 
     # D3 - Schema accommodations
-    run_phase "D3" "${best_gemma_d2},hermes-4-14b-q5km-ngram" "schema_conformance,schema_conformance_lenient,schema_conformance_fewshot" 3
+    run_phase "D3" "${best_gemma_d2},hermes-4-14b-q5km-ngram" "schema_conformance,schema_conformance_lenient" 3
 
     # D4 - Reasoning tests
     run_phase "D4" "${best_gemma_d2},hermes-4-14b-q5km-ngram,hermes-4-14b-q5km-optimized" "cot_reasoning,long_turn_coherence,adversarial_persona" 3
 
     # D5 - Final verdict run with iterations=10
-    run_phase "D5" "$(phase_d5_finalists "${best_gemma_d2}")" "speed_minimal,schema_conformance,schema_conformance_lenient,schema_conformance_fewshot,tool_selection,personality,adversarial_persona,rag_integration,coherence,cot_reasoning,long_turn_coherence,speed" 10
+    run_phase "D5" "$(phase_d5_finalists "${best_gemma_d2}")" "speed_minimal,schema_conformance,schema_conformance_lenient,tool_selection,personality,adversarial_persona,rag_integration,coherence,cot_reasoning,long_turn_coherence,speed" 10
 
     # D6 - Generate verdict
     if ! phase_is_complete "D6"; then
