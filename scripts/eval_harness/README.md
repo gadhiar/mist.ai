@@ -13,9 +13,17 @@ Source of truth for candidate list and scoring rationale:
 
 ## Design
 
-The harness is intentionally **standalone**. It does not import from
-`backend/` and should run on any machine with `openai`, `httpx`, and
-`pyyaml` installed. It does not require Docker.
+The harness is intentionally **standalone**. It imports nothing from
+`backend/` at module load and should run on any machine with `openai`,
+`httpx`, and `pyyaml` installed. It does not require Docker. The one
+exception is deliberate: a test file that sets
+`prompt_source: production_extraction` (the three `schema_conformance*`
+files) has `run.py` import the production Stage 2 prompt
+(`backend/knowledge/extraction/prompts.py`) and output schema
+(`backend/extraction_service/schemas.py`) when it builds that file's
+requests, so the eval measures what the extraction service sends rather
+than a copy. Both modules import nothing, so the run still needs only the
+repository checkout.
 
 ```
 scripts/eval_harness/
@@ -25,12 +33,10 @@ scripts/eval_harness/
   scorers.py                # per-test scoring functions
   report.py                 # markdown report generator
   models.yaml               # 8 candidate configs (4 primary + 4 diagnostic)
-  grammars/
-    mist_ontology.gbnf      # GBNF grammar for 12 entity x 21 relationship ontology
   tests/
-    schema_conformance.yaml # 12 extraction cases
+    schema_conformance.yaml # 12 extraction cases, production prompt + schema
     tool_selection.yaml     # 8 tool-calling cases
-    personality.yaml        # 6 JARVIS / FRIDAY / Cortana style cases
+    personality.yaml        # 6 persona-adherence cases
     rag_integration.yaml    # 5 context-grounding cases
     coherence.yaml          # 5 multi-turn coherence cases
     speed.yaml              # 5 tokens-per-second cases
@@ -226,10 +232,14 @@ research (see Section 6 of the research note):
    containerized server. The harness itself does not run in a container.
 3. `--kv-unified 0` added to the default shared server args in
    `models.yaml`. Correctness fix under KV quantization.
-4. GBNF grammar is passed via `extra_body={"grammar": <text>}` in the
-   chat completion request, not `--grammar-file` on the server. This
-   lets the harness swap grammars per request without restarting the
-   server. See `HarnessClient.chat`.
+4. No `--grammar-file` on the server. The constrained arm (a test file
+   with `constrained: true`) sends the production extraction output
+   schema, `EXTRACTION_OUTPUT_SCHEMA`, per request as
+   `response_format={"type": "json_schema", "json_schema": {"name":
+   "response", "schema": <schema>, "strict": true}}`, the request the
+   extraction engine's `schema` mode sends. A candidate with
+   `gbnf_supported: false` is sent no constraint. See
+   `run.resolve_response_format`.
 5. Speculative decoding is dropped from the A/B baseline. Only one
    candidate has a shipped 0.5B draft model in this matrix and the
    1.3-1.7x real speedup on memory-bandwidth-bound consumer GPUs is

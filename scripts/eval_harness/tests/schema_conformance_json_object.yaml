@@ -1,39 +1,20 @@
 test_type: schema_conformance
 description: >-
-  Same ontology-constrained JSON extraction cases as schema_conformance,
-  scored by the same schema_conformance scorer, but run the way MIST's
-  live extraction path actually calls the model: response_format
-  {"type": "json_object"} with no GBNF grammar
-  (backend/knowledge/extraction/ontology_extractor.py:120 sets
-  json_mode=True; backend/llm/llama_server_provider.py:42-43 maps
-  json_mode only to response_format -- there is no grammar parameter in
-  that call path). Pairs with the bench-c0-prod candidate in models.yaml,
+  Same cases, production prompt source and reference date as
+  schema_conformance, scored by the same schema_conformance scorer, but
+  sent with response_format {"type": "json_object"} and no output schema:
+  the extraction engine's json_object constrained mode
+  (backend/extraction_service/engine.py, _build_request sets json_mode;
+  backend/llm/llama_server_provider.py maps json_mode to this
+  response_format). Pairs with the bench-c0-prod candidate in models.yaml,
   which also mirrors MIST's live temperature/top_p settings.
 
 temperature_mode: extraction
 max_tokens: 1024
-use_grammar: false
+prompt_source: production_extraction
+reference_date: "2026-06-14"
+constrained: false
 response_format: {"type": "json_object"}
-
-system_prompt: |
-  You are a knowledge extraction engine for a personal AI assistant. Your task is to extract structured knowledge from conversation text.
-
-  You MUST output ONLY valid JSON. No explanations. No markdown code fences. Just the JSON object.
-
-  Allowed Entity Types (use EXACTLY these strings):
-  User, Person, Organization, Technology, Skill, Project, Concept, Topic, Event, Goal, Preference, Location
-
-  Allowed Relationship Types (use EXACTLY these strings):
-  USES, KNOWS, WORKS_ON, WORKS_AT, INTERESTED_IN, HAS_GOAL, PREFERS, DISLIKES, EXPERT_IN, LEARNING, STRUGGLES_WITH, DECIDED, EXPERIENCED, IS_A, PART_OF, RELATED_TO, DEPENDS_ON, USED_FOR, WORKS_WITH, KNOWS_PERSON, MEMBER_OF
-
-  Output schema:
-  {"entities": [{"id": "kebab-case-id", "name": "Display Name", "type": "EntityType"}], "relationships": [{"source": "entity-id", "target": "entity-id", "type": "RELATIONSHIP_TYPE", "properties": {"confidence": 0.9, "temporal_status": "current|past|future", "start_date": null, "end_date": null, "temporal_expression": null, "context": null, "negated": false}}]}
-
-  Rules:
-  - The user is always the first entity with id "user", name "User", type "User" when first-person pronouns appear.
-  - Entity IDs are lowercase kebab-case derived from the display name.
-  - Extract ONLY what is explicitly stated.
-  - If nothing is extractable, return {"entities": [], "relationships": []}.
 
 cases:
   - id: simple_usage
