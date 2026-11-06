@@ -23,12 +23,14 @@ from backend.knowledge.curation.health import (
     GraphHealthScorer,
     HealthScore,
 )
+from backend.knowledge.ontologies.hierarchy import RETIRED_TYPE_MAP
 from backend.knowledge.storage.partitions import (
     ENTITY_LABEL,
     PROVENANCE_LABEL,
     SELF_MODEL_LABEL,
     SELF_MODEL_TYPES,
 )
+from backend.knowledge.storage.type_labels import ENTITY_TYPE_LABELS
 from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection, FakeNeo4jRecord
 
 # Ontology types that graph_writer.py writes into the :__Provenance__ partition
@@ -91,11 +93,12 @@ def _assert_every_predicate_accounted_for(query: str) -> None:
 
 
 def _node(
-    entity_type: str,
+    entity_type: str | None,
     *,
     confidence: float = 1.0,
     fresh: bool = True,
     status: str | None = "active",
+    labels: list[str] | None = None,
 ) -> dict:
     """Build one node for the fake population.
 
@@ -103,12 +106,18 @@ def _node(
     real shape of 20 of the 21 seeded self-model nodes, since the seed applier
     writes only the properties `mist-memory/seed/mist.md` authors and it
     authors `status` on `mist-identity` alone.
+
+    `labels` are the node's labels beside its partition label. The default is
+    what the writers give it: its type label when its type has one.
     """
     age = timedelta(days=1) if fresh else timedelta(days=90)
+    if labels is None:
+        labels = [entity_type] if entity_type in ENTITY_TYPE_LABELS else []
     node = {
         "entity_type": entity_type,
         "confidence": confidence,
         "updated_at": (datetime.now(UTC) - age).isoformat(),
+        "labels": labels,
     }
     if status is not None:
         node["status"] = status
@@ -142,6 +151,8 @@ class _PartitionedGraph:
         match = _MATCH_LABELS.search(query)
         if match is None:
             raise AssertionError(f"Fake cannot parse a MATCH partition from query: {query!r}")
+        if "AS type_label_mismatches" in query:
+            return self._type_label_mismatches(match.group(1), query, params or {})
         _assert_every_predicate_accounted_for(query)
         nodes = self._active(self._nodes_for(match.group(1)), query)
         return self._answer(query, params or {}, nodes)
@@ -165,6 +176,25 @@ class _PartitionedGraph:
             return [n for n in nodes if n.get("status") == "active"]
         return list(nodes)
 
+    def _type_label_mismatches(self, label_expression: str, query: str, params: dict) -> list:
+        """Evaluate the mismatch count the way `_TYPE_LABEL_MISMATCH_QUERY` states it.
+
+        Its only filter is the list comprehension that keeps the node's
+        ontology type labels, pinned textually in `TestTypeLabelMismatchQuery`;
+        it has no `status` predicate, so every node of the partition counts.
+        The two label sets come from the query's parameters, so the fake judges
+        a node by what production passes, not by a copy of it.
+        """
+        assert "status" not in query, query
+        universe = set(params["ontology_type_labels"])
+        allowed = set(params["entity_type_labels"])
+        count = 0
+        for node in self._nodes_for(label_expression):
+            have = [label for label in node["labels"] if label in universe]
+            expected = [node["entity_type"]] if node["entity_type"] in allowed else []
+            count += have != expected
+        return [FakeNeo4jRecord({"type_label_mismatches": count})]
+
     def _answer(self, query: str, params: dict, nodes: list[dict]) -> list:
         if "count(e) AS total" in query:
             return [FakeNeo4jRecord({"total": len(nodes)})]
@@ -182,7 +212,9 @@ class _PartitionedGraph:
         if "e.entity_type AS entity_type" in query:
             counts = Counter(n["entity_type"] for n in nodes)
             return [
-                FakeNeo4jRecord({"entity_type": t, "cnt": c}) for t, c in sorted(counts.items())
+                # `str` key: a node with no `entity_type` groups under None.
+                FakeNeo4jRecord({"entity_type": t, "cnt": c})
+                for t, c in sorted(counts.items(), key=lambda item: str(item[0]))
             ]
         raise AssertionError(f"Fake does not model this query: {query!r}")
 
@@ -488,6 +520,105 @@ class TestScoreCapping:
         assert result.coverage <= 100.0
         assert result.self_model <= 100.0
         assert result.overall <= 100.0
+
+
+class TestTypeLabelMismatches:
+    """The health report counts `:__Entity__` nodes whose type label and
+    `entity_type` disagree: a missing label, a wrong one, or a stray one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_graph_written_by_the_label_rule_has_no_mismatch(self):
+        scorer = _build_scorer(
+            entities=[_node("User"), _node("Person"), _node("Topic"), _node("Unknown")]
+        )
+
+        result = await scorer.run()
+
+        assert result.type_label_mismatches == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("entity_type", "labels"),
+        [
+            ("Person", []),
+            ("Person", ["Organization"]),
+            ("Person", ["Person", "Organization"]),
+            ("Topic", ["Concept"]),
+            ("MistIdentity", ["MistIdentity"]),
+            (None, ["Person"]),
+        ],
+        ids=["missing", "wrong", "extra", "retired-type", "self-model-label", "no-type"],
+    )
+    async def test_each_divergent_node_is_counted(self, entity_type, labels):
+        scorer = _build_scorer(
+            entities=[_node("Technology"), _node(entity_type, labels=labels)],
+        )
+
+        result = await scorer.run()
+
+        assert result.type_label_mismatches == 1
+
+    @pytest.mark.asyncio
+    async def test_inactive_nodes_are_counted_too(self):
+        """A label is structure, not belief state: an archived node still shows."""
+        scorer = _build_scorer(
+            entities=[_node("Technology"), _node("Person", labels=[], status="archived")],
+        )
+
+        result = await scorer.run()
+
+        assert result.type_label_mismatches == 1
+
+    @pytest.mark.asyncio
+    async def test_counted_on_an_empty_active_graph(self):
+        scorer = _build_scorer(entities=[_node("Person", labels=[], status="archived")])
+
+        result = await scorer.run()
+
+        assert result.entity_count == 0
+        assert result.type_label_mismatches == 1
+
+    @pytest.mark.asyncio
+    async def test_reads_only_the_entity_partition(self):
+        scorer = _build_scorer(
+            entities=[_node("Technology")],
+            self_model=[_node("MistTrait", labels=["MistTrait"])],
+            provenance=[_node("LearningEvent", labels=["LearningEvent"])],
+        )
+
+        result = await scorer.run()
+
+        assert result.type_label_mismatches == 0
+
+
+class TestTypeLabelMismatchQuery:
+    """Pins the clauses `_PartitionedGraph._type_label_mismatches` evaluates."""
+
+    @pytest.mark.asyncio
+    async def test_query_text_and_parameters(self):
+        connection = FakeNeo4jConnection(
+            query_router=_PartitionedGraph(population={ENTITY_LABEL: [_node("Person")]})
+        )
+        await GraphHealthScorer(FakeGraphExecutor(connection)).run()
+
+        [(query, params)] = [
+            (q, p) for q, p in connection.queries if "AS type_label_mismatches" in q
+        ]
+        assert query.startswith(f"MATCH (e:{ENTITY_LABEL})\n")
+        assert "[label IN labels(e) WHERE label IN $ontology_type_labels] AS type_labels" in query
+        assert (
+            "CASE WHEN e.entity_type IN $entity_type_labels THEN [e.entity_type] ELSE [] END"
+            " AS expected" in query
+        )
+        assert (
+            "sum(CASE WHEN type_labels = expected THEN 0 ELSE 1 END) AS type_label_mismatches"
+            in query
+        )
+        assert params["entity_type_labels"] == sorted(ENTITY_TYPE_LABELS)
+        assert set(params["ontology_type_labels"]) == (
+            set(_VALID_ENTITY_TYPES) | set(RETIRED_TYPE_MAP)
+        )
 
 
 class TestReturnType:
