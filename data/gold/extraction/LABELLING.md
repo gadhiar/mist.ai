@@ -166,10 +166,20 @@ entity: ext-09, ext-33 to ext-36, ext-58 and ext-59.
 `2026-05`, `2026-05-20`). The scorer matches them by prefix (`score_extraction_run.py:434-440`;
 design note line 26). A cessation with a stated stop date carries `valid_to` (ext-43).
 
-New rule: a relative date ("two weeks ago", "next month", "today is five years since") resolves
-against each run's reference date, so its gold is not deterministic (design note line 26).
-Label the fact without `valid_from` or `valid_to`, and create no Date entity from a relative
-date. Utterances that need a Date entity were written with absolute dates.
+New rule: a relative date ("yesterday", "two weeks ago", "last month", "next Friday") is
+resolved as prompt Rule 5 (`prompts.py:53`) tells the model to resolve it, against the reference
+date. The service gauntlet sends one pinned reference date with every probe, `2026-06-13`, a
+Saturday (`MIST_FIXED_CLOCK_PIN`, `scripts/model_bench/probes/extraction.py:57`, the default of
+its `--recorded-at`), so the gold is deterministic while a run keeps that default; a run with
+another `--recorded-at` cannot be scored on these probes. Label at the precision the expression
+states: "yesterday" is `2026-06-12`, "two weeks ago" is `2026-05-30`, "last month" is `2026-05`,
+"last year" is `2026`. "Last <weekday>" is the latest such day before 2026-06-13, and "next
+<weekday>" the first one after it. The resolved value goes where an absolute date would: on the
+edge as `valid_from` or `valid_to` for a stative fact, or as a `Date` entity with `OCCURRED_ON`
+for an event, but only when the expression resolves to a single day, because a Date id is a full
+`YYYY-MM-DD` (`v1_0_0.py:735-747`); an event dated only to a month or a year gets no Date
+entity. An expression too vague to resolve ("recently", "a while back") gets no date. New probes
+still prefer absolute dates (design note line 26).
 
 ### Assertion kinds
 
