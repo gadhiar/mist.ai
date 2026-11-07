@@ -171,9 +171,11 @@ def _fact_row(record: dict[str, object]) -> FactRow:
         fact_key=key,
         subject_id=subject_id,
         subject_name=str(record.get("subject_name") or subject_id),
+        subject_type=_entity_type(record.get("subject_type")),
         rel_type=rel_type,
         object_id=object_id,
         object_name=str(record.get("object_name") or object_id),
+        object_type=_entity_type(record.get("object_type")),
         valid_from=_text(record.get("valid_from")),
         valid_to=_text(record.get("valid_to")),
         recorded_at=_text(record.get("recorded_at")),
@@ -191,6 +193,13 @@ def _text(value: object) -> str | None:
     if value is None:
         return None
     return value if isinstance(value, str) else str(value)
+
+
+def _entity_type(value: object) -> str | None:
+    """A node's `entity_type`, or None when it has none; an empty string names no type."""
+    if value is None or value == "":
+        return None
+    return str(value)
 
 
 def _confidence(value: object) -> float:
@@ -216,6 +225,8 @@ def _content_order(row: FactRow) -> tuple[str | float, ...]:
         row.confidence,
         row.subject_name,
         row.object_name,
+        row.subject_type or "",
+        row.object_type or "",
     )
 
 

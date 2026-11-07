@@ -8,9 +8,10 @@ MemoryIndexError at open, and the factory rebuilds it.
 Tables:
 
 - `facts`: one row per latest-belief fact version, keyed by `row_key` and grouped by
-  `fact_key` when read. `id` is the rowid the two mirrors share.
-- `facts_fts`: FTS5 over the rendered text and the subject and object names, each stored in
-  `fts.fold` form.
+  `fact_key` when read, with the subject's and object's entity types. `id` is the rowid the
+  two mirrors share; `idx_facts_siblings` serves `FactIndex.siblings`.
+- `facts_fts`: FTS5 over the rendered text, the subject and object names, and the type terms
+  of both entity types (`type_terms.type_terms_text`), each stored in `fts.fold` form.
 - `facts_vec`: sqlite-vec `vec0` table of the rendered text's embedding, cosine distance.
 - `index_meta`: `schema_version`, `embedding_model_id` and the refresh watermarks.
 
@@ -37,7 +38,8 @@ from backend.errors import MemoryIndexError
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+# 2: `facts.subject_type`, `facts.object_type`, `facts_fts.type_terms`, `idx_facts_siblings`.
+SCHEMA_VERSION = 2
 EMBEDDING_DIMENSION = 384  # all-MiniLM-L6-v2, the embedder the vault sidecar also uses
 
 META_SCHEMA_VERSION = "schema_version"
@@ -64,9 +66,11 @@ FACTS_DDL: tuple[str, ...] = (
         fact_key            TEXT NOT NULL,
         subject_id          TEXT NOT NULL,
         subject_name        TEXT NOT NULL,
+        subject_type        TEXT,
         rel_type            TEXT NOT NULL,
         object_id           TEXT NOT NULL,
         object_name         TEXT NOT NULL,
+        object_type         TEXT,
         text                TEXT NOT NULL,
         valid_from          TEXT,
         valid_to            TEXT,
@@ -77,11 +81,14 @@ FACTS_DDL: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_facts_fact_key ON facts(fact_key)",
+    "CREATE INDEX IF NOT EXISTS idx_facts_siblings "
+    "ON facts(subject_id, rel_type, source_utterance_id)",
     """
     CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
         text,
         subject_name,
         object_name,
+        type_terms,
         tokenize='porter unicode61'
     )
     """,
@@ -285,12 +292,20 @@ def _check_meta(
 
 
 def _apply_schema(conn: sqlite3.Connection, embedding_model_id: str) -> None:
+    """Create the schema, checking the stored version and model before the fact tables.
+
+    The check comes first so this version's DDL never runs against a file of another version:
+    `IF NOT EXISTS` leaves an older `facts` table as it is, so an index on a column that table
+    lacks would fail with a message about the column instead of naming the version mismatch.
+    """
     with write_transaction(conn):
-        for statement in SCHEMA_DDL:
+        for statement in INDEX_META_DDL:
             conn.execute(statement)
         stored_version = get_meta(conn, META_SCHEMA_VERSION)
         stored_model = get_meta(conn, META_EMBEDDING_MODEL_ID)
         _check_meta(stored_version, stored_model, embedding_model_id)
+        for statement in FACTS_DDL:
+            conn.execute(statement)
         if stored_version is None:
             set_meta(conn, META_SCHEMA_VERSION, str(SCHEMA_VERSION))
         if stored_model is None:

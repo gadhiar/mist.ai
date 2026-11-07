@@ -180,6 +180,44 @@ class TestCurrentFactsLive:
         # Superseded, orphaned, non-allowlisted and provenance edges stay out.
         assert len(rows) == len(keys) + 1
         assert {row["rel_type"] for row in rows} == {"USES", "IS_A"}
+        # Both endpoint types come from `entity_type`.
+        assert {(row["subject_type"], row["object_type"]) for row in vim} == {
+            ("User", "Technology")
+        }
+        assert (structural[0]["subject_type"], structural[0]["object_type"]) == (
+            "Technology",
+            "Technology",
+        )
+
+    def test_a_node_without_an_entity_type_gives_none(self, connection):
+        connection.execute_write(
+            """
+            CREATE (u:__Entity__ {id: $uid, display_name: 'User', entity_type: 'User'})
+            CREATE (x:__Entity__ {id: $prefix + '-untyped', display_name: 'Untyped'})
+            CREATE (u)-[:USES {is_latest_belief: true, version_key: 'e1|open|open'}]->(x)
+            """,
+            {"uid": _UID, "prefix": _PREFIX},
+        )
+
+        (row,) = _ours(_page_all(connection, 1000))
+
+        assert (row["subject_type"], row["object_type"]) == ("User", None)
+
+    @pytest.mark.parametrize("rel_type", ["RECOMMENDS", "HAS_HABIT"])
+    def test_the_v1_3_0_user_centric_edges_are_served(self, connection, rel_type):
+        connection.execute_write(
+            f"""
+            CREATE (u:__Entity__ {{id: $uid, display_name: 'User', entity_type: 'User'}})
+            CREATE (x:__Entity__ {{id: $prefix + '-target', display_name: 'Target',
+                                  entity_type: 'Concept'}})
+            CREATE (u)-[:{rel_type} {{is_latest_belief: true, version_key: 'e1|open|open'}}]->(x)
+            """,
+            {"uid": _UID, "prefix": _PREFIX},
+        )
+
+        (row,) = _ours(_page_all(connection, 1000))
+
+        assert row["rel_type"] == rel_type
 
     def test_paging_neither_repeats_nor_drops_a_row(self, connection):
         _seed(connection)
@@ -205,3 +243,7 @@ class TestCurrentFactsLive:
             fact_row_key(vim_key, version_key) for version_key in keys.values()
         }
         assert len({row.row_key for row in rows}) == len(rows)
+        assert {(row.subject_type, row.object_type) for row in ours} == {
+            ("User", "Technology"),
+            ("Technology", "Technology"),
+        }

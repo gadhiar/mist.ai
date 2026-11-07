@@ -62,9 +62,11 @@ def _record(
         "page_key": page_key,
         "subject_id": subject_id,
         "subject_name": subject_id.title(),
+        "subject_type": "User" if subject_id == "user" else "Concept",
         "rel_type": rel_type,
         "object_id": object_id,
         "object_name": object_id.title(),
+        "object_type": "Technology",
         "version_key": version_key,
         "valid_from": "2026-01-01T00:00:00+00:00",
         "valid_to": None,
@@ -289,6 +291,7 @@ class TestGraphFactSourceRows:
                     "e7|2025-01-01|open",
                     subject_name="User",
                     object_name="Acme Labs",
+                    object_type="Organization",
                     valid_from="2025-01-01T00:00:00+00:00",
                     valid_to="2026-02-01T00:00:00+00:00",
                     recorded_at="2025-01-03T10:00:00+00:00",
@@ -306,9 +309,11 @@ class TestGraphFactSourceRows:
             fact_key=key,
             subject_id="user",
             subject_name="User",
+            subject_type="User",
             rel_type="WORKS_AT",
             object_id="acme",
             object_name="Acme Labs",
+            object_type="Organization",
             valid_from="2025-01-01T00:00:00+00:00",
             valid_to="2026-02-01T00:00:00+00:00",
             recorded_at="2025-01-03T10:00:00+00:00",
@@ -419,6 +424,26 @@ class TestGraphFactSourceRows:
         assert row.recorded_at is None
         assert row.valid_from is None
         assert row.source_utterance_id is None
+
+    @pytest.mark.parametrize("missing", [None, ""])
+    @pytest.mark.asyncio
+    async def test_a_node_without_an_entity_type_gives_no_type(self, missing):
+        graph = FakeGraph(
+            [_record("k1", "user", "USES", "python", subject_type=missing, object_type=missing)]
+        )
+
+        (row,) = await GraphFactSource(graph.executor, page_size=10).snapshot()
+
+        assert (row.subject_type, row.object_type) == (None, None)
+
+    @pytest.mark.asyncio
+    async def test_a_record_without_type_keys_gives_no_type(self):
+        record = _record("k1", "user", "USES", "python")
+        del record["subject_type"], record["object_type"]
+
+        (row,) = await GraphFactSource(FakeGraph([record]).executor, page_size=10).snapshot()
+
+        assert (row.subject_type, row.object_type) == (None, None)
 
 
 class TestGraphFactSourceErrors:

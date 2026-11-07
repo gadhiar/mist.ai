@@ -494,9 +494,11 @@ class TestFactRowAndCandidate:
             fact_key=key,
             subject_id="user",
             subject_name="User",
+            subject_type="User",
             rel_type="USES",
             object_id="python",
             object_name="Python",
+            object_type="Technology",
             valid_from="2024-03-05",
             valid_to=None,
             recorded_at="2026-10-19T18:00:00+00:00",
@@ -505,7 +507,27 @@ class TestFactRowAndCandidate:
         )
 
         assert row.fact_key == key
+        assert (row.subject_type, row.object_type) == ("User", "Technology")
         assert not hasattr(row, "__dict__")
+
+    def test_fact_row_requires_both_entity_types(self):
+        # No default: a producer that forgets the types fails here, not silently untyped.
+        with pytest.raises(TypeError, match="subject_type"):
+            FactRow(  # type: ignore[call-arg]
+                row_key="v-1",
+                fact_key=fact_key("user", "USES", "python"),
+                subject_id="user",
+                subject_name="User",
+                rel_type="USES",
+                object_id="python",
+                object_name="Python",
+                object_type="Technology",
+                valid_from=None,
+                valid_to=None,
+                recorded_at=None,
+                confidence=0.9,
+                source_utterance_id=None,
+            )
 
     def test_candidate_records_its_rank_in_each_pool(self):
         item = _fact_item()

@@ -370,15 +370,21 @@ class FactRow:
     and grouped by `fact_key` when read. The bounds and `recorded_at` stay the strings the graph
     stores (`valid_from` may be the `-inf` sentinel), because read-time currency compares them
     the way graph_store's predicate does. The index adds the rendered text and content hash.
+
+    `subject_type` and `object_type` are the nodes' `entity_type`, None when a node has none.
+    They have no default, so every producer states them: the index's type terms, and with them
+    every type-scoped question, depend on them.
     """
 
     row_key: str
     fact_key: str
     subject_id: str
     subject_name: str
+    subject_type: str | None
     rel_type: str
     object_id: str
     object_name: str
+    object_type: str | None
     valid_from: str | None
     valid_to: str | None
     recorded_at: str | None
