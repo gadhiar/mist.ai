@@ -449,11 +449,14 @@ Every service has a `mem_limit` from a variable, and Neo4j has an explicit heap 
 instead of sizing itself from the Docker VM, which is shared with other containers. The defaults
 are 8g backend, 3g Neo4j, 8g LLM and 4g backup.
 
-- Neo4j's and the LLM's come from the scratch rehearsal of 6 Nov 2026. Each holds the service's
-  measured peak plus the remaining growth of its own cache, with at least a quarter of the limit
-  free. Neo4j peaked at 1544 MiB on a near-empty graph (15 nodes), and its page cache fills to
-  512m as the store grows; llama-server peaked at 3496 MiB after a handful of prompts, and its
-  prompt cache may still grow to the 2048 MiB that `--cache-ram` allows.
+- Neo4j's and the LLM's come from the scratch rehearsal's rerun of 6 Nov 2026. Each holds the
+  service's measured peak plus the remaining growth of its own cache.
+  - Neo4j peaked at 1570 MiB on a near-empty graph, and its page cache fills to 512m as the store
+    grows: 2082 MiB, which leaves 32.2% of 3g free.
+  - llama-server peaked at 4602 MiB after a handful of prompts, and its prompt cache may still
+    grow to the 2048 MiB that `--cache-ram` allows: 6650 MiB, which leaves 18.8% of 8g free. At
+    the end of the rerun, `memory.stat` counted 5374 MiB of file pages, mostly the memory-mapped
+    model, which the kernel can reclaim, and 312 MiB of anonymous memory.
 - The backend's and backup's are estimates. The backend's has been measured on text turns only.
 
 The four limits add up to more than the Docker VM's memory, on purpose: each one bounds a single

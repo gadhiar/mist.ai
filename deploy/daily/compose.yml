@@ -98,8 +98,8 @@ services:
     volumes:
       - neo4j-data:/data
       - ${MIST_DAILY_ROOT}/logs/neo4j:/logs
-    # Holds the measured peak, 1544 MiB on a near-empty graph (15 nodes, scratch rehearsal,
-    # 6 Nov 2026), plus the page cache filling to its 512m, with at least a quarter of it free.
+    # Holds the measured peak, 1570 MiB on a near-empty graph (scratch rehearsal rerun,
+    # 6 Nov 2026), plus the page cache filling to its 512m: 2082 MiB, with 32.2% of it free.
     mem_limit: ${MIST_DAILY_NEO4J_MEM_LIMIT:-3g}
     logging: *logging
     restart: unless-stopped
@@ -157,9 +157,10 @@ services:
     networks:
       - default
       - llm-share
-    # Holds the measured peak, 3496 MiB after a handful of prompts (scratch rehearsal,
-    # 6 Nov 2026), plus the 2048 MiB the prompt cache may still grow to under --cache-ram, with
-    # at least a quarter of it free.
+    # Holds the measured peak, 4602 MiB after a handful of prompts (scratch rehearsal rerun,
+    # 6 Nov 2026), plus the 2048 MiB the prompt cache may still grow to under --cache-ram:
+    # 6650 MiB, with 18.8% of it free. At the end of the rerun, memory.stat counted 5374 MiB of
+    # file pages, mostly the memory-mapped model, which the kernel can reclaim, and 312 MiB anon.
     mem_limit: ${MIST_DAILY_LLM_MEM_LIMIT:-8g}
     logging: *logging
     deploy:
