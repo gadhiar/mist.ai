@@ -329,8 +329,8 @@ services:
       # another. There is deliberately no /app/logs bind mount (dev-hydration
       # has one at `docker-compose.dev-hydration.yml:190`): `backend/server.py:75-76`
       # does `Path("/app/logs").mkdir(parents=True, exist_ok=True)` and
-      # `docker/backend/Dockerfile:114` chowns /app to appuser, so the
-      # directory is created in the container's own layer and its logs die with
+      # `docker/backend/Dockerfile:119-122` creates it owned by appuser, so the
+      # directory lives in the container's own layer and its logs die with
       # the container -- which is the correct lifetime for a throwaway stack.
       - ./smoke-state:/app/smoke-state
       # Code, read-only, mirroring `docker-compose.dev-hydration.yml:226-231`

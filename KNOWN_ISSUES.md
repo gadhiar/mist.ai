@@ -2,7 +2,9 @@
 
 **Created:** 2026-03-22
 **Source:** Comprehensive 8-agent backend audit (6 sectional + integration + fix rounds)
-**Last Updated:** 2026-09-16 (MIS-146 hermetic unit tier: Test Isolation section added, 5 open items, tracked as MIS-147 and MIS-148 where filed. Prior -- 2026-06-14: MIS-124 / ontology v1.4.0 close-out: F2 typing gate CLEARED 0.909; rel-precision documented near-miss 0.833 -- residual bounded to model extraction quality (event-naming, metric structured-field emission, predicate choice) + small-model prompt sensitivity / flash-attn near-tie, deferred to a constrained-decoding / larger-model decision, NOT more canonicalization. Prior -- 2026-06-13 C3 close-out: 2 production-reproducibility findings added.)
+**Last Updated:** 2026-11-06 (daily instance: Daily Instance section added, 7 open items; the
+`mist-memory/` unit tests (MIS-147), the CORS wildcard and the Dockerfile pytest pin resolved.
+Prior -- 2026-09-16: MIS-146 hermetic unit tier: Test Isolation section added, 5 open items, tracked as MIS-147 and MIS-148 where filed. Prior -- 2026-06-14: MIS-124 / ontology v1.4.0 close-out: F2 typing gate CLEARED 0.909; rel-precision documented near-miss 0.833 -- residual bounded to model extraction quality (event-naming, metric structured-field emission, predicate choice) + small-model prompt sensitivity / flash-attn near-tie, deferred to a constrained-decoding / larger-model decision, NOT more canonicalization. Prior -- 2026-06-13 C3 close-out: 2 production-reproducibility findings added.)
 
 > This file tracks unresolved issues found during the pre-Phase-2 audit.
 > Items here are P3 (maintenance risk) -- not blocking, but should be
@@ -99,8 +101,8 @@ the adjacent findings it deliberately left out of scope.
   authorised. The unit tier is protected because its fixture unsets the
   variable; eval runs are not.
 
-- [ ] **Unit tests that read `mist-memory/` fail in a checkout without it
-  (MIS-147).** `mist-memory/` is gitignored and absent from git worktrees, so a
+- [x] **Unit tests that read `mist-memory/` fail in a checkout without it
+  (MIS-147).** -- RESOLVED 2026-11-06. `mist-memory/` is gitignored and absent from git worktrees, so a
   unit-tier run from a worktree in an isolated no-network container fails 25
   node IDs: 5 in
   `tests/unit/knowledge/test_seed_data.py::TestMistPreferenceNoAiSlop`, 9 in
@@ -110,8 +112,11 @@ the adjacent findings it deliberately left out of scope.
   2026-09-16. A unit test that reads the
   canonical memory corpus is not hermetic; the fix is to move these onto
   `tests/fixtures/test-vault` or an injected fixture.
+  Resolution: the 25 node IDs carry the `requires_vault` marker and are skipped when
+  `mist-memory/` is absent (`tests/unit/conftest.py:24-49`; 25 skips in the daily-instance
+  goal's base runs). The real-seed tests still need the private vault, by design.
 
-- [ ] **`docker/backend/Dockerfile:93` pins nothing.** The line is
+- [x] **`docker/backend/Dockerfile:93` pins nothing.** -- RESOLVED before 2026-11-06. The line is
   `RUN pip install pytest>=8.0 pytest-asyncio>=0.24`, unquoted, so the shell
   parses each `>=...` as an output redirection: it runs
   `pip install pytest pytest-asyncio`, creates files named `=8.0` and `=0.24`,
@@ -119,6 +124,8 @@ the adjacent findings it deliberately left out of scope.
   built image carries pytest 7.4.4 (`python -m pytest --version` in a container
   built from `mistai-mist-backend`, 2026-09-16), below the stated `>=8.0`.
   Quote the specifiers, then decide which pin is intended.
+  Resolution: step 6 installs `"pytest==7.4.4" "pytest-asyncio==0.23.8"`, quoted
+  (`docker/backend/Dockerfile:99`), pinning the versions the image already carried.
 
 - [ ] **`EvalIsolationError` escapes the Neo4j error handlers.**
   `EvalIsolationError` subclasses `RuntimeError`
@@ -139,6 +146,45 @@ the adjacent findings it deliberately left out of scope.
 
 ---
 
+## Daily Instance (2026-11-06, goal mist-daily-instance-build)
+
+- [ ] **Two overlays start the root project's mist-llm.** `docker-compose.dev-hydration.yml` and
+  `docker-compose.live-path-smoke.yml` overlay the root project, so they cannot run while the
+  daily instance holds the GPU. The fix is moving them onto `docker-compose.dev.yml`.
+
+- [ ] **Delegates cannot run a dev stack.** The worker runner starts containers with
+  `--network none` and no Docker socket (`hooks/run_in_container.py:1101` in the delegate
+  runner's configuration, outside this repository), so a delegate can neither start nor reach one.
+  Letting it do so is a configuration change there.
+
+- [ ] **A turn that dead-letters again holds `/health` at `degraded`.** After
+  `retry-dead-letters`, a turn that fails again keeps health degraded until the extraction defect
+  is fixed, because the extraction cache has no dismissed state
+  (`backend/knowledge/extraction_cache.py:73`).
+
+- [ ] **`docker compose up` in the checkout starts an empty MIST.** Once the deploy plan moves the
+  originals out of the checkout, it starts an empty MIST on port 8001 whenever the daily instance
+  is stopped. Use `docker-compose.dev.yml` for development.
+
+- [ ] **`InternalKnowledgeDeriver.derive` hides failures.** It returns an empty result on any
+  exception (`backend/knowledge/extraction/internal_derivation.py:235-238`), so a
+  `self_reflection` run against an unreachable LLM outside gaming mode records a success and its
+  turns never get batch reflection. The daily instance defers the job only while yielded.
+
+- [ ] **Gaming mode refuses to start with TTS on.** Releasing Chatterbox safely needs fresh worker
+  queues and an unbounded join: the queues are created once (`backend/voice_models/model_manager.py:113-114`),
+  and `shutdown` joins the TTS worker with a 2 s timeout (`:1096`). The goal that turns TTS on
+  in the daily instance owns that release.
+
+- [ ] **A game puts MIST at the off level.** She answers only with `YIELDED_MESSAGE`
+  (`backend/gpu_yield.py:51`) until `gaming-mode off`, or until the watcher ends it once the game
+  closes. Raj ruled on 6 Nov 2026 that a game should set a low level instead, at which short
+  answers keep working; it needs goal mist-model-host's tier router. With TTS on there is no
+  gaming mode at all (entry above), so the goal that turns speech on needs the low level, or a
+  safe release, first.
+
+---
+
 ## P3: Maintenance Risk / Technical Debt
 
 ### Server + Voice (Section A)
@@ -151,8 +197,11 @@ the adjacent findings it deliberately left out of scope.
   has no exception handler callback. If `broadcast_messages` raises, messages
   stop being delivered with no indication.
 
-- [ ] **server.py:106-111 -- CORS wildcard.** `allow_origins=["*"]` is acceptable
-  for local dev but must be tightened if server is ever network-exposed.
+- [x] **server.py:106-111 -- CORS wildcard.** -- RESOLVED 2026-11-06. `allow_origins=["*"]` was
+  acceptable for local dev but had to be tightened before the server is network-exposed.
+  `CORSMiddleware` now allows only the origins in `MIST_ALLOWED_ORIGINS` (`backend/origins.py`,
+  `backend/server.py:1608-1616`), and a WebSocket from any other browser origin is closed with
+  1008 (`backend/server.py:1953-1956`).
 
 - [ ] **server.py:170 -- No input size validation.** WebSocket `receive_json()`
   accepts arbitrarily large payloads. Could OOM on malicious input.

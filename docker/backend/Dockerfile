@@ -27,9 +27,12 @@ RUN groupadd -g 1000 appgroup \
     && git config --system user.email "mist-backend@local" \
     && git config --system user.name "MIST Backend"
 
-# Create venv inside container
-RUN python -m venv /opt/venv
+# Create the venv and hand it to appuser while it is empty. Every pip install below
+# runs as appuser, so the venv's files are appuser-owned as they are written, and no
+# later layer has to rewrite the ownership of the whole venv after a code change.
+RUN python -m venv /opt/venv && chown -R appuser:appgroup /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+USER appuser
 RUN pip install --upgrade pip
 
 # --- Dependency layers (ordered for cache stability) ---
@@ -44,7 +47,7 @@ RUN pip install torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 \
 RUN pip install chatterbox-tts==0.1.7 soundfile
 
 # 3. Backend requirements (requirements.txt changes rarely)
-COPY requirements.txt /app/requirements.txt
+COPY --chown=appuser:appgroup requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt
 
 # Ensure openai and httpx are installed (safety net if requirements.txt cache is stale)
@@ -100,21 +103,23 @@ WORKDIR /app
 
 # Copy application code (production mode -- dev mode overrides with volume mounts).
 # NOTE: ./data is always bind-mounted at runtime via docker-compose.yml.
-COPY backend/ /app/backend/
-COPY src/ /app/src/
-COPY dependencies/ /app/dependencies/
-COPY scripts/ /app/scripts/
+COPY --chown=appuser:appgroup backend/ /app/backend/
+COPY --chown=appuser:appgroup src/ /app/src/
+COPY --chown=appuser:appgroup dependencies/ /app/dependencies/
+COPY --chown=appuser:appgroup scripts/ /app/scripts/
 
-# Create data directories (populated by bind mount at runtime)
-RUN mkdir -p /app/data/voice_profiles /app/data/vector_store /app/data/audio
-
-# Cluster 8 Phase 2 P0 follow-up: hand off ownership to appuser AFTER all
-# root-owned dependency installation is done. /opt/venv ownership transfer
-# lets pip + python find their own site-packages without permission errors.
-# /app ownership transfer lets the runtime write to /app/data /app/logs
-# /app/mist-memory (bind mounts override these but the underlying mountpoint
-# directories must be writable for Docker to mount over them).
-RUN chown -R appuser:appgroup /opt/venv /app /home/appuser
+# Runtime directories, created and handed to appuser by name, without -R, so this
+# layer holds nine directory entries instead of a copy of everything under /app.
+# Each is a mount point or a path the backend writes without a mount: /app/data
+# and its three subdirectories, /app/logs (the live-path smoke backend mounts
+# none and writes it in the container layer), /app/mist-memory, /app/ops, and
+# /app/dev-state (a named volume, which Docker initialises from this directory's
+# ownership). Runs as root, because only root can give a directory to appuser.
+USER root
+RUN mkdir -p /app /app/data /app/data/voice_profiles /app/data/vector_store /app/data/audio \
+        /app/logs /app/mist-memory /app/ops /app/dev-state \
+    && chown appuser:appgroup /app /app/data /app/data/voice_profiles /app/data/vector_store \
+        /app/data/audio /app/logs /app/mist-memory /app/ops /app/dev-state
 
 USER appuser
 ENV HOME=/home/appuser
@@ -122,3 +127,12 @@ ENV HOME=/home/appuser
 EXPOSE 8001
 
 CMD ["python", "backend/server.py"]
+
+# Release identity, after CMD so a new tag or commit rebuilds only these metadata
+# layers. `instance.py release-build` passes both build args; `status` reads the
+# labels from the running container.
+ARG MIST_RELEASE_TAG=unreleased
+ARG MIST_RELEASE_COMMIT=unknown
+ENV MIST_RELEASE_TAG=${MIST_RELEASE_TAG}
+ENV MIST_RELEASE_COMMIT=${MIST_RELEASE_COMMIT}
+LABEL org.opencontainers.image.version=${MIST_RELEASE_TAG} org.opencontainers.image.revision=${MIST_RELEASE_COMMIT}

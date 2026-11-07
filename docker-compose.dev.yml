@@ -1,0 +1,236 @@
+# docker-compose.dev.yml -- the worktree dev stack, on a synthetic seed.
+#
+# Standalone: run it alone, never merged with docker-compose.yml or its overlays.
+#   docker compose -f docker-compose.dev.yml -p <name> up -d
+# Runbook: tests/fixtures/dev-instance/README.md. Contract: tests/unit/deploy/test_dev_compose.py.
+#
+# It runs from any worktree beside the daily instance and other dev stacks, so:
+# - no `name` and no `container_name`: the project name (`-p`, or the worktree's directory)
+#   scopes every container, network and volume, and two worktrees never share one;
+# - no `./data`, `./mist-memory`, `./logs` or `.env`: every store lives on the project's own
+#   `dev-state` volume, and the only binds are the code directories, read-only;
+# - every port binds 127.0.0.1, and each host port is a variable, so a second stack can move;
+# - the backend's one external network is the share network the daily llama-server joins.
+#   Neither the daily graph nor the daily backend is on it, so this stack cannot resolve them.
+#
+# The fixture is tests/fixtures/dev-instance: `mist-dev-seed` copies its vault into `dev-state`
+# and seeds the graph from its seed, so a fresh worktree gets a seeded graph from one `up`.
+
+x-dev-backend-env: &dev-backend-env
+  NEO4J_URI: bolt://mist-neo4j-dev:7687
+  NEO4J_USERNAME: neo4j
+  NEO4J_PASSWORD: ${MIST_DEV_NEO4J_PASSWORD:-mist-dev-only}
+  NEO4J_DATABASE: neo4j
+  # Literal paths on the dev-state volume, not interpolated: the workstation stack reads the same
+  # names from the host shell, and one export must not move two stacks' stores.
+  EVENT_STORE_DB_PATH: /app/dev-state/event_store.db
+  EVENT_STORE_AUDIO_DIR: /app/dev-state/audio
+  VECTOR_STORE_DATA_DIR: /app/dev-state/vector_store
+  MIST_VAULT_ROOT: /app/dev-state/vault
+  MIST_SIDECAR_DB_PATH: /app/dev-state/vault_sidecar.db
+  MIST_LOG_DIR: /app/dev-state/logs
+  # Model downloads (Hugging Face, torch, Whisper) land on the volume, so a recreate keeps them.
+  XDG_CACHE_HOME: /app/dev-state/cache
+  EMBEDDING_DEVICE: cpu
+
+services:
+  mist-neo4j-dev:
+    image: neo4j:5.26.23@sha256:40bf5ae9282213087e4d6036aab3ec443fe9c974d3dd4f14a11892c63157238f
+    ports:
+      - "127.0.0.1:${MIST_DEV_BOLT_PORT:-7690}:7687"
+      - "127.0.0.1:${MIST_DEV_NEO4J_HTTP_PORT:-7477}:7474"
+    environment:
+      NEO4J_AUTH: neo4j/${MIST_DEV_NEO4J_PASSWORD:-mist-dev-only}
+      NEO4J_PLUGINS: '["apoc"]'
+      # Explicit sizes, so a dev graph does not size itself from the whole Docker VM beside the
+      # daily instance.
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+    volumes:
+      - neo4j-dev-data:/data
+      - neo4j-dev-logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  mist-dev-seed:
+    # One shot, on every `up`. It copies the fixture vault only into an empty vault directory,
+    # so a dev-state in use keeps its notes. It then reseeds: wipe-then-apply of the fixture's
+    # seed_version, idempotent on a seed-only graph. Once the graph holds conversation-derived
+    # data, the seed guard (MIS-177) refuses before any write; on a reused dev-state that is the
+    # expected outcome, so the script reports it and exits 0, and only a fresh dev-state fails
+    # the service, which keeps the backend from starting on an unseeded graph.
+    image: ${MIST_BACKEND_IMAGE:?set MIST_BACKEND_IMAGE to a built backend image}
+    pull_policy: never
+    user: "1000:1000"
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        vault=/app/dev-state/vault
+        mkdir -p "$$vault"
+        fresh=no
+        if [ -z "$$(ls -A "$$vault")" ]; then
+          cp -R /app/tests/fixtures/dev-instance/vault/. "$$vault"/
+          fresh=yes
+          echo "mist-dev-seed: copied the fixture vault into $$vault"
+        fi
+        if python scripts/mist_admin.py seed --seed-dir /app/tests/fixtures/dev-instance/seed; then
+          exit 0
+        fi
+        if [ "$$fresh" = yes ]; then
+          echo "mist-dev-seed: the seed failed on a fresh dev-state; see the error above" >&2
+          exit 1
+        fi
+        echo "mist-dev-seed: the seed was refused on a dev-state already in use (the seed guard refuses a graph holding conversation-derived data); the graph is unchanged" >&2
+        exit 0
+    environment:
+      <<: *dev-backend-env
+    volumes:
+      - dev-state:/app/dev-state
+      - ./backend:/app/backend:ro
+      - ./src:/app/src:ro
+      - ./dependencies:/app/dependencies:ro
+      - ./scripts:/app/scripts:ro
+      - ./tests:/app/tests:ro
+      - ./voice_profiles:/app/voice_profiles:ro
+    depends_on:
+      mist-neo4j-dev:
+        condition: service_healthy
+    restart: "no"
+
+  mist-backend-dev:
+    image: ${MIST_BACKEND_IMAGE:?set MIST_BACKEND_IMAGE to a built backend image}
+    # Neither build nor pull: a pull of the chosen tag could fetch an unrelated public image.
+    pull_policy: never
+    user: "1000:1000"
+    ports:
+      - "127.0.0.1:${MIST_DEV_WS_PORT:-8002}:8001"
+    # No env_file: a worktree's `.env` may carry the workstation stack's live paths. With
+    # MIST_ALLOWED_ORIGINS unset, the code's default admits `tauri dev` on port 1420.
+    environment:
+      <<: *dev-backend-env
+      LLM_SERVER_URL: ${MIST_DEV_LLM_URL:-http://mist-llm:8080}
+      LLM_BACKEND: llamacpp
+      MODEL: gemma-4-e4b
+      # Dev turns are not real use: they stay out of the real-turn counts (ADR-042).
+      MIST_SESSION_ORIGIN: ${MIST_DEV_SESSION_ORIGIN:-test}
+      TTS_ENABLED: "false"
+      ENABLE_KNOWLEDGE_INTEGRATION: "true"
+    volumes:
+      - dev-state:/app/dev-state
+      - ./backend:/app/backend:ro
+      - ./src:/app/src:ro
+      - ./dependencies:/app/dependencies:ro
+      - ./scripts:/app/scripts:ro
+      - ./tests:/app/tests:ro
+      - ./voice_profiles:/app/voice_profiles:ro
+    networks:
+      - default
+      - llm-share
+    depends_on:
+      mist-neo4j-dev:
+        condition: service_healthy
+      mist-dev-seed:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      # Identical to docker-compose.yml's mist-backend healthcheck.
+      test: ["CMD", "python", "-c",
+             "import json,sys,urllib.request; p=json.load(urllib.request.urlopen('http://localhost:8001/health', timeout=5)); sys.exit(1 if p.get('restart_recommended') else 0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  mist-llm-dev:
+    # A llama-server of this stack's own, for when the shared one's single slot is in the way.
+    # Start with `--profile own-llm` and MIST_DEV_LLM_URL=http://mist-llm-dev:8080. Image,
+    # environment and command are docker-compose.yml's mist-llm with its defaults written out
+    # (parity-tested), as literals because the workstation stack reads those variable names from
+    # the host shell. No ports: only this stack's backend reaches it.
+    profiles: ["own-llm"]
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda-b11151@sha256:014f721265464f38ccb247c1338d07d852c4bae7509a4b4734d07a2bbadc765c
+    volumes:
+      # Long syntax with create_host_path off: compose parses every service's volumes, profiled
+      # or not, so the source must parse when MODELS_DIR is unset. Starting this profile without
+      # it then fails at container create on the placeholder path, which names the variable,
+      # instead of binding an empty directory created on the host.
+      - type: bind
+        source: ${MODELS_DIR:-./MODELS_DIR-is-unset}
+        target: /models
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      LLAMA_ARG_MODEL: /models/unsloth/gemma-4-E4B-it-Q5_K_M.gguf
+      LLAMA_ARG_N_GPU_LAYERS: "999"
+      LLAMA_ARG_CTX_SIZE: "32768"
+      LLAMA_ARG_FLASH_ATTN: "on"
+      LLAMA_ARG_HOST: 0.0.0.0
+      LLAMA_ARG_PORT: "8080"
+      LLAMA_ARG_THREADS: "10"
+      LLAMA_ARG_THREADS_BATCH: "12"
+      LLAMA_ARG_BATCH_SIZE: "1024"
+      LLAMA_ARG_UBATCH_SIZE: "512"
+      LLAMA_ARG_N_PARALLEL: "1"
+      LLAMA_ARG_METRICS: "1"
+      LLAMA_ARG_CACHE_TYPE_K: q8_0
+      LLAMA_ARG_CACHE_TYPE_V: q8_0
+      LLAMA_ARG_JINJA: "1"
+    command:
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--reasoning-format"
+      - "deepseek"
+      - "--temp"
+      - "1.0"
+      - "--top-p"
+      - "0.95"
+      - "--top-k"
+      - "64"
+      - "--min-p"
+      - "0.0"
+      - "--repeat-penalty"
+      - "1.0"
+      - "--seed"
+      - "3407"
+      - "--cache-ram"
+      - "2048"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+networks:
+  # Created once on the host (`docker network create mist-llm-share`); the daily compose's
+  # mist-llm joins it under the same name.
+  llm-share:
+    external: true
+    name: ${MIST_LLM_SHARE_NETWORK:-mist-llm-share}
+
+volumes:
+  # Project-scoped, so `down -v` on this project discards this worktree's state and nothing else.
+  dev-state:
+  neo4j-dev-data:
+  neo4j-dev-logs:
