@@ -1,10 +1,10 @@
-"""Tests for backend.memory.fact_render: one sentence per fact, with its temporal qualifiers."""
+"""Tests for backend.memory.fact_render: one sentence per fact or sibling list, with qualifiers."""
 
 from datetime import timedelta, timezone
 
 import pytest
 
-from backend.memory.fact_render import FACT_TEMPLATES, render_fact
+from backend.memory.fact_render import FACT_TEMPLATES, render_fact, render_fact_list
 from backend.memory.models import FactRow, fact_key
 
 # One expected sentence per template, subject "Sam" and object "Kestrel". Adding a template
@@ -152,3 +152,83 @@ def test_names_are_rendered_verbatim():
     row = _row("WORKS_AT", subject="User", obj="Acme Labs")
 
     assert render_fact(row) == "User works at Acme Labs."
+
+
+class TestFactList:
+    """Siblings of one utterance render as one sentence that lists every object."""
+
+    def test_two_siblings_are_joined_with_and(self):
+        rows = [_row(obj="Vim"), _row(obj="Rust")]
+
+        assert render_fact_list(rows) == "Sam uses Vim and Rust."
+
+    def test_more_siblings_are_listed_with_commas_before_the_last_and(self):
+        rows = [_row(obj="Vim"), _row(obj="Rust"), _row(obj="Zig")]
+
+        assert render_fact_list(rows) == "Sam uses Vim, Rust and Zig."
+
+    def test_objects_keep_the_given_order(self):
+        rows = [_row(obj="Zig"), _row(obj="Vim"), _row(obj="Rust")]
+
+        assert render_fact_list(rows) == "Sam uses Zig, Vim and Rust."
+
+    def test_the_relation_template_is_the_single_fact_template(self):
+        rows = [_row("HAS_GOAL", obj="run a marathon"), _row("HAS_GOAL", obj="learn Welsh")]
+
+        assert render_fact_list(rows) == "Sam has the goal: run a marathon and learn Welsh."
+
+    def test_learned_self_reads_herself(self):
+        rows = [_row("LEARNED_SELF", obj="patience"), _row("LEARNED_SELF", obj="brevity")]
+
+        assert render_fact_list(rows) == "Sam learned about herself: patience and brevity."
+
+    def test_an_unknown_relation_uses_the_generic_template(self):
+        rows = [_row("GREW_UP_IN", obj="Leeds"), _row("GREW_UP_IN", obj="York")]
+
+        assert render_fact_list(rows) == "Sam grew up in Leeds and York."
+
+    def test_a_shared_qualifier_is_stated_once_at_the_end(self):
+        rows = [_row(obj="Vim", valid_from="2024"), _row(obj="Rust", valid_from="2024")]
+
+        assert render_fact_list(rows) == "Sam uses Vim and Rust since 2024."
+
+    def test_differing_qualifiers_stay_with_their_objects(self):
+        rows = [
+            _row(obj="Vim", valid_from="2024"),
+            _row(obj="Rust"),
+            _row(obj="Zig", valid_to="2025-06"),
+        ]
+
+        assert render_fact_list(rows) == (
+            "Sam uses Vim (since 2024), Rust and Zig (until June 2025)."
+        )
+
+    def test_datetime_bounds_are_dated_in_the_given_zone(self):
+        rows = [
+            _row(obj="Vim", valid_from="2024-03-04T23:30:00+00:00"),
+            _row(obj="Rust", valid_from="2024-03-04T23:30:00+00:00"),
+        ]
+
+        assert render_fact_list(rows, tz=timezone(timedelta(hours=2))) == (
+            "Sam uses Vim and Rust since 5 March 2024."
+        )
+
+    def test_the_list_is_one_sentence(self):
+        rows = [_row(obj=name) for name in ("Vim", "Rust", "Zig", "Go")]
+        sentence = render_fact_list(rows)
+
+        assert sentence.count(".") == 1
+        assert sentence.endswith(".")
+        assert "\n" not in sentence
+
+    def test_fewer_than_two_facts_is_not_a_list(self):
+        with pytest.raises(ValueError, match="at least two"):
+            render_fact_list([_row(obj="Vim")])
+
+    def test_siblings_must_share_the_subject(self):
+        with pytest.raises(ValueError, match="subject"):
+            render_fact_list([_row(obj="Vim"), _row(obj="Rust", subject="Alex")])
+
+    def test_siblings_must_share_the_relation(self):
+        with pytest.raises(ValueError, match="relation"):
+            render_fact_list([_row(obj="Vim"), _row("PREFERS", obj="Rust")])

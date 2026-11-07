@@ -1,19 +1,19 @@
-"""Render a fact as one sentence for the memory index and the block.
+"""Render a fact, or a list of sibling facts, as one sentence for the memory index and the block.
 
 The sentence is what FTS matches, what the embedder encodes and what the model reads, so a
 relation type gets a phrase a person would say ("works at") rather than its edge label. The
 temporal qualifiers come from the version's valid-time bounds, which do not move with the
-clock, so the text can be computed once at refresh and stored.
+clock, so the text can be computed once at refresh and stored. A list's sentence is rendered
+by the block at read time, because which siblings it holds is decided per turn.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, tzinfo
 from types import MappingProxyType
-
-from .models import FactRow
+from typing import Protocol
 
 # The "always / since forever" bound, `ALWAYS` in backend/knowledge/curation/intervals.py.
 # Copied rather than imported: importing that module runs backend/knowledge/curation/__init__.py,
@@ -101,7 +101,40 @@ FACT_TEMPLATES: Mapping[str, str] = MappingProxyType(
 )
 
 
-def render_fact(row: FactRow, tz: tzinfo = UTC) -> str:
+class RenderableFact(Protocol):
+    """The fields a sentence is made from, shared by `FactRow` and the index's `IndexedFact`.
+
+    A protocol rather than either class, because fact_index imports this module and the block
+    renders the index's rows while the refresher renders the graph's.
+    """
+
+    @property
+    def subject_name(self) -> str:
+        """The subject's display name, the sentence's first words."""
+        ...
+
+    @property
+    def rel_type(self) -> str:
+        """The relation type, which picks the template."""
+        ...
+
+    @property
+    def object_name(self) -> str:
+        """The object's display name."""
+        ...
+
+    @property
+    def valid_from(self) -> str | None:
+        """The stored start bound, as the graph keeps it."""
+        ...
+
+    @property
+    def valid_to(self) -> str | None:
+        """The stored end bound, as the graph keeps it."""
+        ...
+
+
+def render_fact(row: RenderableFact, tz: tzinfo = UTC) -> str:
     """Render `row` as one sentence ending in its temporal qualifiers.
 
     Args:
@@ -113,14 +146,78 @@ def render_fact(row: FactRow, tz: tzinfo = UTC) -> str:
         For example "User works at Acme since 5 March 2024." A `-inf` or unparsable bound adds
         nothing.
     """
-    template = FACT_TEMPLATES.get(row.rel_type)
-    if template is None:
-        template = "{s} " + row.rel_type.lower().replace("_", " ") + " {o}"
-    sentence = template.format(s=row.subject_name, o=row.object_name)
-    qualifier = _qualifier(_bound_text(row.valid_from, tz), _bound_text(row.valid_to, tz))
+    sentence = _template(row.rel_type).format(s=row.subject_name, o=row.object_name)
+    qualifier = _row_qualifier(row, tz)
     if qualifier:
         sentence = f"{sentence} {qualifier}"
     return f"{sentence}."
+
+
+def render_fact_list(facts: Sequence[RenderableFact], tz: tzinfo = UTC) -> str:
+    """Render sibling facts, one subject and relation with several objects, as one sentence.
+
+    "I use Vim, Rust and Zig" is stored as three facts; read back as three sentences it costs
+    three times the subject and the verb, and the model loses that they were one list. The
+    sentence uses the relation's single-fact template with the objects joined in the given
+    order. A qualifier every member shares is stated once at the end; when the members'
+    qualifiers differ, each member keeps its own in parentheses, so no bound is attributed to
+    an object it does not belong to.
+
+    Args:
+        facts: The siblings, in the order the sentence lists them; at least two, with one
+            subject name and one relation type.
+        tz: Zone a full timestamp bound is dated in, as for `render_fact`.
+
+    Returns:
+        For example "User uses Vim, Rust and Zig since 2024." or "User uses Vim (since 2024)
+        and Rust."
+
+    Raises:
+        ValueError: Fewer than two facts, or the facts differ in subject name or relation type.
+    """
+    if len(facts) < 2:
+        raise ValueError(f"a fact list needs at least two facts, got {len(facts)}")
+    first = facts[0]
+    for fact in facts[1:]:
+        if fact.subject_name != first.subject_name:
+            raise ValueError(
+                f"a fact list has one subject, got {first.subject_name!r} and "
+                f"{fact.subject_name!r}"
+            )
+        if fact.rel_type != first.rel_type:
+            raise ValueError(
+                f"a fact list has one relation, got {first.rel_type!r} and {fact.rel_type!r}"
+            )
+    qualifiers = [_row_qualifier(fact, tz) for fact in facts]
+    shared = qualifiers[0] if len(set(qualifiers)) == 1 else None
+    if shared is not None:
+        objects = [fact.object_name for fact in facts]
+    else:
+        objects = [
+            f"{fact.object_name} ({qualifier})" if qualifier else fact.object_name
+            for fact, qualifier in zip(facts, qualifiers, strict=True)
+        ]
+    sentence = _template(first.rel_type).format(s=first.subject_name, o=_join(objects))
+    if shared:
+        sentence = f"{sentence} {shared}"
+    return f"{sentence}."
+
+
+def _template(rel_type: str) -> str:
+    """The relation's template, or "{s} <type in lower case> {o}" for a type without one."""
+    template = FACT_TEMPLATES.get(rel_type)
+    if template is None:
+        template = "{s} " + rel_type.lower().replace("_", " ") + " {o}"
+    return template
+
+
+def _join(names: Sequence[str]) -> str:
+    """At least two names as "A and B" or "A, B and C", without a serial comma."""
+    return f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def _row_qualifier(row: RenderableFact, tz: tzinfo) -> str:
+    return _qualifier(_bound_text(row.valid_from, tz), _bound_text(row.valid_to, tz))
 
 
 def _qualifier(start: str | None, end: str | None) -> str:
