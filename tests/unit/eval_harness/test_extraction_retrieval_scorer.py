@@ -255,6 +255,301 @@ def test_extra_fields_on_a_retrieved_fact_are_ignored(tmp_path: Path) -> None:
     assert _score(tmp_path, queries, run).per_query[0].hit is True
 
 
+# -- the build's merge map ------------------------------------------------------
+
+
+def _relevant(source: str, predicate: str, target: str, grade: int) -> ers.RelevantFact:
+    return ers.RelevantFact(source=source, predicate=predicate, target=target, grade=grade)
+
+
+def _retrieval_query(*relevant: ers.RelevantFact, kind: str = "direct") -> ers.RetrievalQuery:
+    return ers.RetrievalQuery(id="q", query="q", kind=kind, relevant=tuple(relevant))
+
+
+def _merge(incoming: str, graph: str, graph_type: str = "Technology") -> dict:
+    return {
+        "tag": "t",
+        "event_id": "golden-t",
+        "incoming_id": incoming,
+        "incoming_type": graph_type,
+        "graph_id": graph,
+        "graph_type": graph_type,
+    }
+
+
+PYTHON_MERGE = [_merge("python", "tech-python")]
+
+
+def test_merge_aliases_map_a_gold_id_to_its_graph_ids() -> None:
+    aliases = ers.merge_aliases([_merge("Python", "Tech_Python"), _merge("user", "user")])
+    # Keys take the relevant facts' form, values the retrieved facts'; a self-mapping drops.
+    assert aliases == {"python": frozenset({"tech-python"})}
+
+
+def test_a_metric_merge_value_is_rebuilt_value_first() -> None:
+    aliases = ers.merge_aliases(
+        [_merge("api-throughput", "requests-per-second-12000", graph_type="Metric")]
+    )
+    assert aliases == {"api-throughput": frozenset({"12000-requests-per-second"})}
+
+
+def test_accepted_keys_cross_both_endpoints_with_their_aliases() -> None:
+    aliases = {"user": frozenset({"raj"}), "python": frozenset({"tech-python"})}
+    keys = ers.accepted_keys(("user", "EXPERT_IN", "python"), aliases)
+    assert keys == {
+        ("user", "EXPERT_IN", "python"),
+        ("user", "EXPERT_IN", "tech-python"),
+        ("raj", "EXPERT_IN", "python"),
+        ("raj", "EXPERT_IN", "tech-python"),
+    }
+    assert ers.accepted_keys(_relevant("lua", "USED_FOR", "modding", 2), aliases) == {
+        ("lua", "USED_FOR", "modding")
+    }
+
+
+def test_a_merged_target_is_a_full_hit_through_the_merge_map() -> None:
+    query = _retrieval_query(_relevant("user", "EXPERT_IN", "python", 2))
+    retrieved = (("user", "EXPERT_IN", "tech-python"),)
+
+    without = ers.score_query(query, retrieved)
+    score = ers.score_query(query, retrieved, aliases=ers.merge_aliases(PYTHON_MERGE))
+
+    assert without.hit is False
+    assert (score.hit, score.recall, score.reciprocal_rank, score.ndcg) == (True, 1.0, 1.0, 1.0)
+
+
+def test_a_fact_with_both_endpoints_merged_is_a_full_hit() -> None:
+    aliases = ers.merge_aliases(
+        [_merge("ingest-service", "svc-ingest"), _merge("clickhouse", "db-clickhouse")]
+    )
+    query = _retrieval_query(_relevant("ingest-service", "DEPENDS_ON", "clickhouse", 2))
+    score = ers.score_query(query, (("svc-ingest", "DEPENDS_ON", "db-clickhouse"),), aliases)
+    assert (score.hit, score.recall, score.reciprocal_rank, score.ndcg) == (True, 1.0, 1.0, 1.0)
+
+
+def test_two_facts_resolving_to_one_key_collapse_into_one_item_at_the_higher_grade() -> None:
+    query = _retrieval_query(
+        _relevant("user", "USES", "python", 1),
+        _relevant("user", "USES", "tech-python", 2),
+        kind="type_scoped",
+    )
+    score = ers.score_query(
+        query, (("user", "USES", "tech-python"),), aliases=ers.merge_aliases(PYTHON_MERGE)
+    )
+    # One item, credited once at grade 2: the ideal is that one item, so nDCG reaches 1.
+    assert (score.hit, score.recall, score.reciprocal_rank) == (True, 1.0, 1.0)
+    assert score.ndcg == pytest.approx(1.0)
+
+
+def test_an_id_merged_into_two_graph_ids_is_credited_through_either() -> None:
+    aliases = ers.merge_aliases(PYTHON_MERGE + [_merge("python", "python-lang")])
+    query = _retrieval_query(_relevant("user", "EXPERT_IN", "python", 2))
+    for graph_id in ("tech-python", "python-lang"):
+        assert ers.score_query(query, (("user", "EXPERT_IN", graph_id),), aliases).hit is True
+
+
+def test_a_key_listed_twice_in_one_query_takes_its_higher_grade() -> None:
+    key = ("user", "KNOWS", "kotlin")
+    query = _retrieval_query(_relevant(*key, 2), _relevant(*key, 1))
+    score = ers.score_query(query, (key,))
+    assert (score.hit, score.recall, score.reciprocal_rank) == (True, 1.0, 1.0)
+    assert score.ndcg == pytest.approx(1.0)
+
+
+# -- the built graph's edge directions -----------------------------------------
+
+DEPENDS = ("ingest-service", "DEPENDS_ON", "clickhouse")
+REVERSED = ("clickhouse", "DEPENDS_ON", "ingest-service")
+
+
+def _record(merges: list[dict], edges: list[tuple[str, str, str]]) -> ers.BuildRecord:
+    return ers.build_record({"merges": merges, "edges": [list(e) for e in edges]})
+
+
+def _key(fact: dict) -> tuple[str, str, str]:
+    return (fact["source"], fact["predicate"], fact["target"])
+
+
+def test_orient_flips_a_key_whose_only_edge_is_its_reverse() -> None:
+    oriented, flipped = ers.orient((REVERSED,), frozenset({DEPENDS}))
+    assert (oriented, flipped) == ((DEPENDS,), 1)
+
+
+@pytest.mark.parametrize(
+    "edges",
+    [
+        pytest.param({DEPENDS}, id="an-edge-as-reported"),
+        pytest.param({DEPENDS, REVERSED}, id="both-directions"),
+        pytest.param(set(), id="neither-direction"),
+    ],
+)
+def test_orient_keeps_a_key_unless_only_its_reverse_is_an_edge(edges: set) -> None:
+    oriented, flipped = ers.orient((DEPENDS,), frozenset(edges))
+    assert (oriented, flipped) == ((DEPENDS,), 0)
+
+
+def test_a_record_with_no_merges_and_every_key_an_edge_scores_as_without_one(
+    tmp_path: Path,
+) -> None:
+    queries = [_graded(), _query("d", "direct", [_fact(A, 2)]), _query("n", "negative", [])]
+    run = [
+        {"id": "g", "retrieved": [C, *NOISE[:2], A]},
+        {"id": "d", "retrieved": NOISE[:3]},
+        {"id": "n", "retrieved": [NOISE[4]]},
+    ]
+    qs = ers.load_queries(_write_jsonl(tmp_path / "q.jsonl", queries))
+    loaded = ers.load_run(_write_jsonl(tmp_path / "r.jsonl", run))
+    edges = {key for facts in loaded.values() for key in facts}
+
+    plain = ers.score_run(qs, loaded)
+    built = ers.score_run(qs, loaded, build=_record([], sorted(edges)))
+
+    assert plain.build is None
+    assert built.per_query == plain.per_query
+    assert built.answerable == plain.answerable
+    assert built.by_kind == plain.by_kind
+    assert built.build is not None and built.build.reoriented == 0
+
+
+def test_a_fact_the_retriever_reported_reversed_is_flipped_and_credited(tmp_path: Path) -> None:
+    fact = dict(zip(("source", "predicate", "target"), DEPENDS, strict=True))
+    reported = dict(zip(("source", "predicate", "target"), REVERSED, strict=True))
+    qs = ers.load_queries(
+        _write_jsonl(tmp_path / "q.jsonl", [_query("t", "type_scoped", [_fact(fact, 2)])])
+    )
+    loaded = ers.load_run(
+        _write_jsonl(tmp_path / "r.jsonl", [{"id": "t", "retrieved": [NOISE[0], reported]}])
+    )
+
+    summary = ers.score_run(qs, loaded, build=_record([], [DEPENDS, _key(NOISE[0])]))
+
+    assert summary.per_query[0].hit is True
+    assert summary.per_query[0].reciprocal_rank == pytest.approx(0.5)
+    assert (summary.build.retrieved, summary.build.reoriented) == (2, 1)
+
+
+def test_an_extraction_direction_error_is_not_credited(tmp_path: Path) -> None:
+    # Extraction stored the edge reversed: the graph holds REVERSED only.
+    fact = dict(zip(("source", "predicate", "target"), DEPENDS, strict=True))
+    qs = ers.load_queries(
+        _write_jsonl(tmp_path / "q.jsonl", [_query("t", "type_scoped", [_fact(fact, 2)])])
+    )
+    record = _record([], [REVERSED])
+    for reported in (REVERSED, DEPENDS):
+        row = dict(zip(("source", "predicate", "target"), reported, strict=True))
+        loaded = ers.load_run(_write_jsonl(tmp_path / "r.jsonl", [{"id": "t", "retrieved": [row]}]))
+        assert ers.score_run(qs, loaded, build=record).per_query[0].hit is False
+
+
+def test_the_build_block_counts_merges_translations_and_flips(tmp_path: Path) -> None:
+    python = {"source": "user", "predicate": "EXPERT_IN", "target": "python"}
+    merged = {"source": "user", "predicate": "EXPERT_IN", "target": "tech-python"}
+    queries = [
+        _query("d", "direct", [_fact(python, 2), _fact(merged, 1)]),
+        _query("p", "paraphrase", [_fact(B, 2)]),
+    ]
+    run = [{"id": "d", "retrieved": [merged]}, {"id": "p", "retrieved": [A, B]}]
+    qs = ers.load_queries(_write_jsonl(tmp_path / "q.jsonl", queries))
+    loaded = ers.load_run(_write_jsonl(tmp_path / "r.jsonl", run))
+    record = _record(
+        PYTHON_MERGE + [_merge("python", "python-lang")],
+        [_key(merged), ("kotlin", "KNOWS", "user"), _key(B)],
+    )
+
+    summary = ers.score_run(qs, loaded, build=record)
+
+    block = summary.build
+    assert block == ers.BuildSummary(
+        merged_ids=1,
+        several_targets=("python",),
+        facts_translated=1,
+        facts_collapsed=1,
+        retrieved=3,
+        reoriented=1,
+    )
+    assert summary.per_query[0].ndcg == pytest.approx(1.0)
+    data = ers.summary_to_dict(summary)
+    assert data["build"] == {
+        "merged_ids": 1,
+        "several_targets": ["python"],
+        "facts_translated": 1,
+        "facts_collapsed": 1,
+        "retrieved": 3,
+        "reoriented": 1,
+    }
+    text = ers.render_markdown(summary)
+    assert "1 merged ids" in text and "1 of 3 retrieved facts reoriented" in text
+
+
+def test_a_summary_without_a_record_says_so(tmp_path: Path) -> None:
+    summary = _score(
+        tmp_path, [_query("d", "direct", [_fact(A, 2)])], [{"id": "d", "retrieved": [A]}]
+    )
+    assert ers.summary_to_dict(summary)["build"] is None
+    assert "scored without a build report" in ers.render_markdown(summary)
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        pytest.param({"edges": []}, id="no-merges"),
+        pytest.param({"merges": []}, id="no-edges"),
+        pytest.param({"merges": {}, "edges": []}, id="merges-not-a-list"),
+        pytest.param({"merges": [], "edges": [["a", "B"]]}, id="edge-not-a-triple"),
+        pytest.param({"merges": [{"graph_id": "x"}], "edges": []}, id="merge-without-id"),
+        pytest.param([], id="not-an-object"),
+    ],
+)
+def test_load_build_record_refuses_a_report_it_cannot_score_with(
+    tmp_path: Path, report: object
+) -> None:
+    path = tmp_path / "build_report.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(ValueError):
+        ers.load_build_record(path)
+
+
+def test_load_build_record_reads_merges_and_edges(tmp_path: Path) -> None:
+    path = tmp_path / "build_report.json"
+    path.write_text(
+        json.dumps({"merges": PYTHON_MERGE, "edges": [list(DEPENDS)], "other": 1}),
+        encoding="utf-8",
+    )
+    assert ers.load_build_record(path) == ers.BuildRecord(
+        aliases={"python": frozenset({"tech-python"})}, edges=frozenset({DEPENDS})
+    )
+
+
+def test_main_scores_through_a_build_report(tmp_path: Path) -> None:
+    python = {"source": "user", "predicate": "EXPERT_IN", "target": "python"}
+    merged = {"source": "user", "predicate": "EXPERT_IN", "target": "tech-python"}
+    qpath = _write_jsonl(tmp_path / "q.jsonl", [_query("d", "direct", [_fact(python, 2)])])
+    rpath = _write_jsonl(tmp_path / "run.jsonl", [{"id": "d", "retrieved": [merged]}])
+    report = tmp_path / "build_report.json"
+    report.write_text(
+        json.dumps({"merges": PYTHON_MERGE, "edges": [list(_key(merged))]}), encoding="utf-8"
+    )
+    out_json = tmp_path / "summary.json"
+    args = ["--queries", str(qpath), "--run", str(rpath), "--json-out", str(out_json)]
+
+    assert ers.main([*args, "--out", str(tmp_path / "a.md")]) == 0
+    assert json.loads(out_json.read_text(encoding="utf-8"))["answerable"]["hit_at_5"] == 0.0
+    assert ers.main([*args, "--out", str(tmp_path / "b.md"), "--build-report", str(report)]) == 0
+    written = json.loads(out_json.read_text(encoding="utf-8"))
+    assert written["answerable"]["hit_at_5"] == 1.0
+    assert written["build"]["merged_ids"] == 1
+
+
+def test_main_exits_2_on_a_build_report_without_merges_or_edges(tmp_path: Path) -> None:
+    qpath = _write_jsonl(tmp_path / "q.jsonl", [_query("d", "direct", [_fact(A, 2)])])
+    rpath = _write_jsonl(tmp_path / "run.jsonl", [{"id": "d", "retrieved": [A]}])
+    report = tmp_path / "build_report.json"
+    report.write_text(json.dumps({"missing": []}), encoding="utf-8")
+    args = ["--queries", str(qpath), "--run", str(rpath), "--build-report", str(report)]
+    assert ers.main(args) == 2
+    assert ers.main([*args[:4], "--build-report", str(tmp_path / "absent.json")]) == 2
+
+
 # -- loaders ------------------------------------------------------------------
 
 

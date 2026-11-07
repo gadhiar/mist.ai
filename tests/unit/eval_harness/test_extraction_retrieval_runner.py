@@ -10,6 +10,7 @@ reaches curation puts its facts in the "graph" and a turn that does not leaves t
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sys
@@ -112,6 +113,68 @@ class RecordingCurationPipeline:
         )
 
 
+@dataclass(slots=True)
+class MergingCurationPipeline:
+    """A curation pipeline whose dedup merges fixed ids into graph ids, as the seed's do.
+
+    It rewrites each merged entity's id in place and remaps the turn's relationships, as
+    `EntityDeduplicator` and `CurationPipeline` do, and reports the renames in
+    `dedup_result.id_renames`. `calls` holds the post-merge turn, so the fake graph holds
+    the graph ids.
+    """
+
+    renames: dict[str, str]
+    calls: list[CuratedTurn] = field(default_factory=list)
+    renamed_in: list[str] = field(default_factory=list)
+
+    async def curate_and_store(
+        self,
+        validation_result: ValidationResult,
+        event_id: str,
+        session_id: str,
+        source_metadata: Any = None,
+        recorded_at: str | None = None,
+    ) -> CurationResult:
+        id_renames: dict[str, str] = {}
+        for entity in validation_result.entities:
+            graph_id = self.renames.get(str(entity.get("id")))
+            if graph_id is not None:
+                id_renames[str(entity["id"])] = graph_id
+                entity["id"] = graph_id
+        relationships = [
+            {
+                **rel,
+                "source": id_renames.get(rel["source"], rel["source"]),
+                "target": id_renames.get(rel["target"], rel["target"]),
+            }
+            for rel in validation_result.relationships
+        ]
+        if id_renames:
+            self.renamed_in.append(event_id)
+        self.calls.append(
+            CuratedTurn(
+                event_id=event_id,
+                session_id=session_id,
+                recorded_at=recorded_at or "",
+                entities=list(validation_result.entities),
+                relationships=relationships,
+            )
+        )
+        return CurationResult(
+            write_result=WriteResult(),
+            dedup_result=DeduplicationResult(
+                entities=list(validation_result.entities),
+                merge_actions=[],
+                entities_merged=len(id_renames),
+                id_renames=id_renames,
+            ),
+            reconcile_result=ReconcileTurnResult(),
+            curation_time_ms=0.0,
+            validated_entities=validation_result.entities,
+            validated_relationships=relationships,
+        )
+
+
 def _graph_rows(pipeline: RecordingCurationPipeline, retired: set[tuple[str, str, str]]) -> list:
     """The facts query's answer: every curated relationship, current unless retired."""
     rows = []
@@ -164,9 +227,10 @@ class FakeWiring:
         *,
         retriever: FakeRetriever | None = None,
         retired: set[tuple[str, str, str]] | None = None,
+        pipeline: RecordingCurationPipeline | MergingCurationPipeline | None = None,
     ) -> None:
         self.config = build_test_config()
-        self.pipeline = RecordingCurationPipeline()
+        self.pipeline = pipeline or RecordingCurationPipeline()
         self.seeder = FakeStagingSeeder()
         self.retriever_obj = retriever or FakeRetriever()
         self.retired = retired or set()
@@ -177,6 +241,13 @@ class FakeWiring:
     def _route(self, query: str, params: dict | None) -> list | None:
         if query == runner.GRAPH_FACTS_QUERY:
             return _graph_rows(self.pipeline, self.retired)
+        if query == runner.NODE_TYPES_QUERY:
+            types = {
+                str(e.get("id")): str(e.get("type", ""))
+                for call in self.pipeline.calls
+                for e in call.entities
+            }
+            return [{"id": i, "type": types[i]} for i in (params or {})["ids"] if i in types]
         return None
 
     def connect(self, target: str) -> FakeNeo4jConnection:
@@ -186,7 +257,9 @@ class FakeWiring:
     def initialize_schema(self, connection: Any) -> None:
         self.schema_initialized += 1
 
-    def curation_pipeline(self, connection: Any) -> RecordingCurationPipeline:
+    def curation_pipeline(
+        self, connection: Any
+    ) -> RecordingCurationPipeline | MergingCurationPipeline:
         return self.pipeline
 
     def seed_step(self, connection: Any) -> tuple[FakeStagingSeeder, int]:
@@ -272,6 +345,12 @@ def _build(tmp_path: Path, wiring: FakeWiring, *payloads: str, out: str = "out")
     return runner.main(
         ["build", "--payloads", *payloads, "--target", EVAL_TARGET, "--out", str(tmp_path / out)],
         wiring=wiring,
+    )
+
+
+def _query(tmp_path: Path, wiring: FakeWiring, out: str = "out") -> int:
+    return runner.main(
+        ["query", "--target", EVAL_TARGET, "--out", str(tmp_path / out)], wiring=wiring
     )
 
 
@@ -481,6 +560,187 @@ class TestServiceBuild:
 
 
 # ---------------------------------------------------------------------------
+# v4 A7 and A8: the build records its merges and its graph's edges
+# ---------------------------------------------------------------------------
+
+EXPERT_IN_PYTHON = ("user", "EXPERT_IN", "python")
+EXPERT_IN_TECH_PYTHON = ("user", "EXPERT_IN", "tech-python")
+
+
+def _python_merging_wiring(**kwargs: Any) -> FakeWiring:
+    return FakeWiring(pipeline=MergingCurationPipeline({"python": "tech-python"}), **kwargs)
+
+
+def _expected_edges(wiring: FakeWiring) -> list[list[str]]:
+    keys = {scorer.normalise_fact(row) for row in _graph_rows(wiring.pipeline, wiring.retired)}
+    return [list(key) for key in sorted(keys)]
+
+
+class TestBuildRecord:
+    def test_records_each_merge_with_its_tag_event_and_both_types(self, tmp_path):
+        # Arrange
+        wiring = _python_merging_wiring()
+
+        # Act
+        _build(tmp_path, wiring, "gold")
+
+        # Assert
+        renamed_in = wiring.pipeline.renamed_in
+        assert renamed_in, "no dev turn names python"
+        assert _report(tmp_path)["merges"] == [
+            {
+                "tag": event_id.removeprefix("golden-"),
+                "event_id": event_id,
+                "incoming_id": "python",
+                "incoming_type": "Technology",
+                "graph_id": "tech-python",
+                "graph_type": "Technology",
+            }
+            for event_id in renamed_in
+        ]
+        merges = _report(tmp_path)["merges"]
+        assert all(runner.event_id_for(m["tag"]) == m["event_id"] for m in merges)
+
+    def test_a_relevant_fact_found_under_its_merged_id_is_merged_not_missing(self, tmp_path):
+        # Act
+        _build(tmp_path, _python_merging_wiring(), "gold")
+
+        # Assert
+        report = _report(tmp_path)
+        assert EXPERT_IN_PYTHON not in {
+            (m["source"], m["predicate"], m["target"]) for m in report["missing"]
+        }
+        merged = {(m["source"], m["predicate"], m["target"]): m for m in report["merged"]}
+        entry = merged[EXPERT_IN_PYTHON]
+        assert entry["found_as"] == list(EXPERT_IN_TECH_PYTHON)
+        assert {"rq-direct-05", "rq-type-scoped-01"} <= set(entry["query_ids"])
+
+    def test_a_build_without_merges_lists_nothing_merged(self, tmp_path):
+        # Act
+        _build(tmp_path, FakeWiring(), "gold")
+
+        # Assert
+        report = _report(tmp_path)
+        assert report["merges"] == []
+        assert report["merged"] == []
+
+    def test_edges_and_digest_match_the_built_graph_current_or_not(self, tmp_path):
+        # Arrange: a retired edge is in the graph, so it is an edge though not current.
+        fact, _ = _relevant_fact_in_one_probe()
+        wiring = FakeWiring(retired={fact})
+
+        # Act
+        _build(tmp_path, wiring, "gold")
+
+        # Assert
+        report = _report(tmp_path)
+        assert report["edges"] == _expected_edges(wiring)
+        assert list(fact) in report["edges"]
+        digest = hashlib.sha256(json.dumps(report["edges"]).encode("utf-8")).hexdigest()
+        assert report["graph_digest"] == f"sha256:{digest}"
+
+    def test_two_builds_of_the_same_input_give_the_same_digest(self, tmp_path):
+        # Act
+        _build(tmp_path, FakeWiring(), "gold", out="a")
+        _build(tmp_path, FakeWiring(), "gold", out="b")
+
+        # Assert
+        assert _report(tmp_path, "a")["graph_digest"] == _report(tmp_path, "b")["graph_digest"]
+
+    @pytest.mark.asyncio
+    async def test_the_recorder_passes_every_argument_through_and_returns_the_result(self):
+        # Arrange
+        wrapped = MergingCurationPipeline({"python": "tech-python"})
+        recorder = runner.MergeRecorder(wrapped)
+        result = ValidationResult(
+            valid=True,
+            entities=[{"id": "python", "type": "Technology"}, {"id": "user", "type": "User"}],
+            relationships=[{"source": "user", "type": "EXPERT_IN", "target": "python"}],
+        )
+
+        # Act
+        returned = await recorder.curate_and_store(
+            result,
+            event_id="golden-x",
+            session_id="session-x",
+            source_metadata=None,
+            recorded_at="2026-01-05T09:00:00+00:00",
+        )
+
+        # Assert
+        call = wrapped.calls[0]
+        assert (call.event_id, call.session_id, call.recorded_at) == (
+            "golden-x",
+            "session-x",
+            "2026-01-05T09:00:00+00:00",
+        )
+        assert returned.dedup_result.id_renames == {"python": "tech-python"}
+        assert returned.validated_relationships == call.relationships
+        assert recorder.merges == [
+            runner.RecordedMerge(
+                event_id="golden-x",
+                incoming_id="python",
+                incoming_type="Technology",
+                graph_id="tech-python",
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_recorder_returns_the_wrapped_result_object_itself(self):
+        # Arrange
+        sentinel = object()
+        outcome = CurationResult(
+            write_result=WriteResult(),
+            dedup_result=DeduplicationResult(entities=[], merge_actions=[], entities_merged=0),
+            reconcile_result=ReconcileTurnResult(),
+            curation_time_ms=0.0,
+        )
+        seen: list[tuple[tuple, dict]] = []
+
+        class Wrapped:
+            async def curate_and_store(self, *args: Any, **kwargs: Any) -> CurationResult:
+                seen.append((args, kwargs))
+                return outcome
+
+        result = ValidationResult(valid=True)
+
+        # Act
+        returned = await runner.MergeRecorder(Wrapped()).curate_and_store(
+            result, event_id="e", session_id="s", source_metadata=sentinel, recorded_at="t"
+        )
+
+        # Assert
+        assert returned is outcome
+        assert seen == [
+            (
+                (result,),
+                {
+                    "event_id": "e",
+                    "session_id": "s",
+                    "source_metadata": sentinel,
+                    "recorded_at": "t",
+                },
+            )
+        ]
+
+    def test_computes_merges_through_the_scorer_functions_not_a_copy(self):
+        # Assert
+        assert runner.merge_aliases is scorer.merge_aliases
+        assert runner.accepted_keys is scorer.accepted_keys
+
+    def test_the_build_line_names_the_merge_count(self, tmp_path, capsys):
+        # Arrange
+        wiring = _python_merging_wiring()
+
+        # Act
+        _build(tmp_path, wiring, "gold")
+
+        # Assert
+        merges = len(_report(tmp_path)["merges"])
+        assert re.search(rf"\b{merges} entity merges\b", capsys.readouterr().out)
+
+
+# ---------------------------------------------------------------------------
 # Decision 4: the target must be an eval endpoint
 # ---------------------------------------------------------------------------
 
@@ -585,11 +845,10 @@ class TestQuery:
         retriever = FakeRetriever()
         wiring = FakeWiring(retriever=retriever)
         queries = scorer.load_queries(QUERIES)
+        _build(tmp_path, wiring, "gold")
 
         # Act
-        code = runner.main(
-            ["query", "--target", EVAL_TARGET, "--out", str(tmp_path)], wiring=wiring
-        )
+        code = _query(tmp_path, wiring)
 
         # Assert
         assert code == 0
@@ -600,12 +859,13 @@ class TestQuery:
         answers = _answers_for_every_other_query()
         wiring = FakeWiring(retriever=FakeRetriever(answers))
         queries = scorer.load_queries(QUERIES)
+        _build(tmp_path, wiring, "gold")
 
         # Act
-        runner.main(["query", "--target", EVAL_TARGET, "--out", str(tmp_path)], wiring=wiring)
+        _query(tmp_path, wiring)
 
         # Assert
-        run = scorer.load_run(tmp_path / runner.RUN_FILE)
+        run = scorer.load_run(tmp_path / "out" / runner.RUN_FILE)
         assert list(run) == [q.id for q in queries]
         for query in queries:
             expected = tuple(f.key for f in query.relevant) if query.query in answers else ()
@@ -614,20 +874,25 @@ class TestQuery:
     def test_writes_the_summary_and_markdown_the_scorer_renders(self, tmp_path):
         # Arrange
         wiring = FakeWiring(retriever=FakeRetriever(_answers_for_every_other_query()))
+        _build(tmp_path, wiring, "gold")
+        out = tmp_path / "out"
 
         # Act
-        runner.main(["query", "--target", EVAL_TARGET, "--out", str(tmp_path)], wiring=wiring)
+        _query(tmp_path, wiring)
 
         # Assert
         summary = scorer.score_run(
-            scorer.load_queries(QUERIES), scorer.load_run(tmp_path / runner.RUN_FILE)
+            scorer.load_queries(QUERIES),
+            scorer.load_run(out / runner.RUN_FILE),
+            build=scorer.load_build_record(out / runner.BUILD_REPORT),
         )
-        written = json.loads((tmp_path / runner.SUMMARY_JSON).read_text(encoding="utf-8"))
+        written = json.loads((out / runner.SUMMARY_JSON).read_text(encoding="utf-8"))
         assert written == scorer.summary_to_dict(summary)
-        assert (tmp_path / runner.SUMMARY_MD).read_text(encoding="utf-8") == (
+        assert (out / runner.SUMMARY_MD).read_text(encoding="utf-8") == (
             scorer.render_markdown(summary)
         )
         assert 0.0 < written["answerable"]["hit_at_5"] < 1.0
+        assert written["build"] is not None
 
     def test_scores_through_the_scorer_functions_not_a_copy(self):
         # Assert
@@ -647,6 +912,149 @@ class TestQuery:
         # Assert
         assert isinstance(retriever, KnowledgeRetriever)
         assert rows == [{"id": scorer.load_queries(QUERIES)[0].id, "retrieved": []}]
+
+
+# ---------------------------------------------------------------------------
+# v4: query scores against the build that made its graph
+# ---------------------------------------------------------------------------
+
+
+def _write_report(tmp_path: Path, change: Any) -> None:
+    path = tmp_path / "out" / runner.BUILD_REPORT
+    report = json.loads(path.read_text(encoding="utf-8"))
+    change(report)
+    path.write_text(json.dumps(report), encoding="utf-8")
+
+
+def _drop_turn_relationships(wiring: FakeWiring) -> None:
+    _, tag = _relevant_fact_in_one_probe()
+    call = next(c for c in wiring.pipeline.calls if c.event_id == f"golden-{tag}")
+    call.relationships = []
+
+
+def _add_turn(wiring: FakeWiring) -> None:
+    wiring.pipeline.calls.append(
+        CuratedTurn(
+            event_id="golden-later",
+            session_id="later",
+            recorded_at="",
+            entities=[],
+            relationships=[{"source": "user", "type": "USES", "target": "a-later-tool"}],
+        )
+    )
+
+
+def _no_written_output(out: Path) -> bool:
+    return not any(
+        (out / name).exists() for name in (runner.RUN_FILE, runner.SUMMARY_JSON, runner.SUMMARY_MD)
+    )
+
+
+class TestQueryAgainstItsBuild:
+    @pytest.mark.parametrize(
+        "spoil",
+        [
+            pytest.param(
+                lambda tmp, wiring: (tmp / "out" / runner.BUILD_REPORT).unlink(), id="absent"
+            ),
+            pytest.param(
+                lambda tmp, wiring: (tmp / "out" / runner.BUILD_REPORT).write_text(
+                    "{not json", encoding="utf-8"
+                ),
+                id="malformed",
+            ),
+            pytest.param(
+                lambda tmp, wiring: _write_report(tmp, lambda r: r.pop("merges")),
+                id="no-merges",
+            ),
+            pytest.param(
+                lambda tmp, wiring: _write_report(tmp, lambda r: r.pop("edges")), id="no-edges"
+            ),
+            pytest.param(
+                lambda tmp, wiring: _write_report(tmp, lambda r: r.pop("graph_digest")),
+                id="no-digest",
+            ),
+            pytest.param(
+                lambda tmp, wiring: _write_report(
+                    tmp, lambda r: r.update(target="bolt://mist-neo4j-eval:7688")
+                ),
+                id="another-target",
+            ),
+            pytest.param(lambda tmp, wiring: _add_turn(wiring), id="graph-gained-an-edge"),
+            pytest.param(
+                lambda tmp, wiring: _drop_turn_relationships(wiring), id="graph-lost-an-edge"
+            ),
+        ],
+    )
+    def test_refuses_a_graph_its_build_report_does_not_describe(self, tmp_path, spoil):
+        # Arrange
+        retriever = FakeRetriever()
+        wiring = FakeWiring(retriever=retriever)
+        _build(tmp_path, wiring, "gold")
+        spoil(tmp_path, wiring)
+
+        # Act
+        code = _query(tmp_path, wiring)
+
+        # Assert: no query ran and no file was written.
+        assert code == 2
+        assert retriever.calls == []
+        assert _no_written_output(tmp_path / "out")
+
+    def test_refuses_before_connecting_when_the_report_is_absent(self, tmp_path):
+        # Arrange
+        wiring = FakeWiring()
+
+        # Act
+        code = _query(tmp_path, wiring)
+
+        # Assert
+        assert code == 2
+        assert wiring.connected == []
+        assert not (tmp_path / "out").exists()
+
+    def test_credits_a_reversed_neighbourhood_fact_and_a_merged_id(self, tmp_path):
+        # Arrange: rq-direct-05's fact is in the graph only as `user EXPERT_IN tech-python`,
+        # and a fact whose source is not the user comes back reversed, as the neighbourhood
+        # branch reports an edge reached from its target.
+        queries = {q.id: q for q in scorer.load_queries(QUERIES)}
+        wiring = _python_merging_wiring()
+        _build(tmp_path, wiring, "gold")
+        edges = {tuple(e) for e in _report(tmp_path)["edges"]}
+        reversed_query, fact = next(
+            (q, f)
+            for q in queries.values()
+            for f in q.relevant
+            if f.grade == scorer.ANSWER_GRADE
+            and f.source != "user"
+            and f.key in edges
+            and (f.target, f.predicate, f.source) not in edges
+            and scorer.normalise_fact(
+                {"source": f.target, "predicate": f.predicate, "target": f.source}
+            )
+            == (f.target, f.predicate, f.source)
+        )
+        wiring.retriever_obj = FakeRetriever(
+            {
+                queries["rq-direct-05"].query: [_fact(*EXPERT_IN_TECH_PYTHON)],
+                reversed_query.query: [_fact(fact.target, fact.predicate, fact.source)],
+            }
+        )
+
+        # Act
+        code = _query(tmp_path, wiring)
+
+        # Assert
+        assert code == 0
+        summary = json.loads((tmp_path / "out" / runner.SUMMARY_JSON).read_text(encoding="utf-8"))
+        hits = {s["id"]: s["hit"] for s in summary["per_query"]}
+        assert hits["rq-direct-05"] is True
+        assert hits[reversed_query.id] is True
+        assert summary["build"]["reoriented"] == 1
+        assert summary["build"]["merged_ids"] == 1
+        # The run file keeps what the retriever returned, unoriented.
+        run = scorer.load_run(tmp_path / "out" / runner.RUN_FILE)
+        assert run[reversed_query.id] == ((fact.target, fact.predicate, fact.source),)
 
 
 # ---------------------------------------------------------------------------

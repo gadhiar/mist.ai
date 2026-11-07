@@ -18,13 +18,31 @@ gauntlet's raw rows, recorded with the backlog store's `put_extracted` and the s
 dispatcher stores. A dev turn with no raw row (the gauntlet writes none for a failed case) is
 recorded as a failed extraction, as a dead-lettered turn is in production. The turns are then
 replayed into the target by `LogRegenerator.rebuild`, the existing rebuild path, after the
-target is wiped. `<out>/build_report.json` lists every relevant fact of the query file that is
-not a current edge of the built graph, so a miss the build caused is not read as a retrieval
-miss.
+target is wiped. The rebuild applies the configured seed before the first turn
+(`self._seeder.apply`), so the graph holds the seed's facts as well as extraction's.
 
-`query` runs each query through a `Retriever` (by default today's `KnowledgeRetriever`, at
-`limit=5`), writes `<out>/retrieval_run.jsonl` in the scorer's run-file schema, and writes
-`retrieval_summary.json` and `retrieval.md` with the scorer's own functions.
+`<out>/build_report.json` records, beside the rebuild's counts:
+
+- `merges`: each rename the dedup made, in replay order. `MergeRecorder` wraps the wiring's
+  curation pipeline and hands every call on unchanged; it reads each turn's incoming
+  `{id: type}` before the call, because `EntityDeduplicator.deduplicate` rewrites
+  `entity["id"]` in place, and the renames after it from `result.dedup_result.id_renames`.
+  The tag comes from the build's own schedule (`event_id_for`), and the graph type from one
+  read of the built graph (`NODE_TYPES_QUERY`).
+- `edges`: every edge of the built graph, current or not, as the scorer's keys
+  (`GRAPH_FACTS_QUERY`, `normalise_fact`), and `graph_digest`, a SHA-256 of that list.
+- `missing`: each relevant fact of the query file none of whose accepted keys (the scorer's
+  `accepted_keys` over `merge_aliases` of `merges`) is a current edge, so a miss the build
+  caused is not read as a retrieval miss; and `merged`, each relevant fact that is a current
+  edge only under a key a merge translated, with the key it was found as.
+
+`query` reads that report before it retrieves anything, and refuses (exit 2) a report that is
+absent, unusable, built into another target, or whose `graph_digest` no longer matches the
+target's edges, because another build has run since. It then runs each query through a
+`Retriever` (by default today's `KnowledgeRetriever`, at `limit=5`), writes
+`<out>/retrieval_run.jsonl` in the scorer's run-file schema as the retriever returned it, and
+writes `retrieval_summary.json` and `retrieval.md` with the scorer's own functions, scoring
+through the report's merges and orienting against its edges (`score_run(..., build=...)`).
 
 The target is refused unless it is a disposable eval endpoint: never live
 (`assert_neo4j_uri_not_live`), eval isolation on (`MIST_EVAL_ISOLATION=1`) and the endpoint on
@@ -41,6 +59,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import sys
 from collections.abc import Callable, Sequence
@@ -58,6 +77,8 @@ from backend.extraction_backlog.store import BacklogStore, Epoch  # noqa: E402
 from backend.extraction_contract.models import ExtractResponse  # noqa: E402
 from backend.interfaces import GraphConnection  # noqa: E402
 from backend.knowledge.config import KnowledgeConfig, Neo4jConfig  # noqa: E402
+from backend.knowledge.curation.graph_writer import SourceMetadata  # noqa: E402
+from backend.knowledge.curation.pipeline import CurationResult  # noqa: E402
 from backend.knowledge.eval_isolation import (  # noqa: E402
     EvalIsolationError,
     assert_neo4j_isolated,
@@ -68,7 +89,10 @@ from backend.knowledge.eval_isolation import (  # noqa: E402
 from backend.knowledge.extraction.confidence import ConfidenceScorer  # noqa: E402
 from backend.knowledge.extraction.normalizer import EntityNormalizer  # noqa: E402
 from backend.knowledge.extraction.temporal import TemporalResolver  # noqa: E402
-from backend.knowledge.extraction.validator import ExtractionValidator  # noqa: E402
+from backend.knowledge.extraction.validator import (  # noqa: E402
+    ExtractionValidator,
+    ValidationResult,
+)
 from backend.knowledge.extraction_cache import SKIP_EXTRACTION_FAILED  # noqa: E402
 from backend.knowledge.models import RetrievalResult, RetrievedFact  # noqa: E402
 from backend.knowledge.regeneration.log_regenerator import (  # noqa: E402
@@ -77,11 +101,16 @@ from backend.knowledge.regeneration.log_regenerator import (  # noqa: E402
 )
 from backend.knowledge.regeneration.rebuild_journal import EventStoreRebuildJournal  # noqa: E402
 from scripts.eval_harness.extraction_retrieval_score import (  # noqa: E402
+    BuildRecord,
     FactKey,
     K,
+    MergeAliases,
     RetrievalQuery,
+    accepted_keys,
+    build_record,
     load_queries,
     load_run,
+    merge_aliases,
     normalise_fact,
     render_markdown,
     score_run,
@@ -141,6 +170,13 @@ RETURN s.id AS source, s.entity_type AS source_type, type(r) AS predicate,
         AND coalesce(r.is_latest_belief, true)
         AND (r.valid_to IS NULL OR r.valid_to > $now)
         AND (r.valid_from IS NULL OR r.valid_from = '-inf' OR r.valid_from <= $now)) AS current
+"""
+
+# The entity type of each graph node a merge named, read once after the rebuild, so a merge
+# value is normalised with the type the node was written under (`merge_aliases`).
+NODE_TYPES_QUERY = """
+MATCH (n:__Entity__) WHERE n.id IN $ids
+RETURN n.id AS id, n.entity_type AS type
 """
 
 REASON_NOT_IN_GRAPH = "not_in_graph"
@@ -212,7 +248,9 @@ class Neo4jEvalWiring:
         if self._embedding_provider is None:
             from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
 
-            self._embedding_provider = EmbeddingGenerator(self.config.embedding.model_name)
+            self._embedding_provider = EmbeddingGenerator(
+                self.config.embedding.model_name, device=self.config.embedding.resolved_device()
+            )
         return self._embedding_provider
 
     def connect(self, target: str) -> GraphConnection:
@@ -506,24 +544,151 @@ def relevant_facts(queries: Sequence[RetrievalQuery]) -> dict[FactKey, list[str]
 
 
 def missing_relevant_facts(
-    queries: Sequence[RetrievalQuery], graph: dict[FactKey, bool]
+    queries: Sequence[RetrievalQuery],
+    graph: dict[FactKey, bool],
+    aliases: MergeAliases | None = None,
 ) -> list[dict[str, Any]]:
-    """The relevant facts the retriever could not return from `graph`, in query-file order."""
+    """The relevant facts the retriever could not return from `graph`, in query-file order.
+
+    A fact is present when any of its `accepted_keys` under `aliases` is a current edge; one
+    that is an edge only under keys none of which is current is listed as not current.
+    """
     missing = []
     for key, query_ids in relevant_facts(queries).items():
-        current = graph.get(key)
-        if current:
+        states = [graph.get(k) for k in accepted_keys(key, aliases or {})]
+        if any(states):
             continue
+        in_graph = any(state is not None for state in states)
         missing.append(
             {
                 "source": key[0],
                 "predicate": key[1],
                 "target": key[2],
-                "reason": REASON_NOT_IN_GRAPH if current is None else REASON_NOT_CURRENT,
+                "reason": REASON_NOT_CURRENT if in_graph else REASON_NOT_IN_GRAPH,
                 "query_ids": query_ids,
             }
         )
     return missing
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedMerge:
+    """One rename the dedup made in one turn, as the recorder saw it."""
+
+    event_id: str
+    incoming_id: str
+    incoming_type: str
+    graph_id: str
+
+
+class MergeRecorder:
+    """A pass-through around the curation pipeline that records the dedup's renames.
+
+    `curate_and_store` takes `CurationPipeline.curate_and_store`'s arguments and hands them on
+    unchanged. `EntityDeduplicator.deduplicate` rewrites `entity["id"]` in place, so the
+    incoming `{id: type}` is read before the call; the renames are read after it from
+    `result.dedup_result.id_renames`, which the dedup fills before that rewrite. The result
+    object is returned as the wrapped pipeline returned it.
+    """
+
+    __slots__ = ("_pipeline", "merges")
+
+    def __init__(self, pipeline: Any) -> None:
+        self._pipeline = pipeline
+        self.merges: list[RecordedMerge] = []
+
+    async def curate_and_store(
+        self,
+        validation_result: ValidationResult,
+        event_id: str,
+        session_id: str,
+        source_metadata: SourceMetadata | None = None,
+        recorded_at: str | None = None,
+    ) -> CurationResult:
+        """Curate through the wrapped pipeline and record the turn's renames."""
+        incoming_types = {
+            str(entity.get("id")): str(entity.get("type") or "")
+            for entity in validation_result.entities
+        }
+        result = await self._pipeline.curate_and_store(
+            validation_result,
+            event_id=event_id,
+            session_id=session_id,
+            source_metadata=source_metadata,
+            recorded_at=recorded_at,
+        )
+        for incoming_id, graph_id in result.dedup_result.id_renames.items():
+            self.merges.append(
+                RecordedMerge(
+                    event_id=event_id,
+                    incoming_id=incoming_id,
+                    incoming_type=incoming_types.get(incoming_id, ""),
+                    graph_id=graph_id,
+                )
+            )
+        return result
+
+
+def read_node_types(connection: GraphConnection, ids: Sequence[str]) -> dict[str, str]:
+    """The `entity_type` of each graph node in `ids`, in one query."""
+    if not ids:
+        return {}
+    rows = connection.execute_query(NODE_TYPES_QUERY, {"ids": sorted(set(ids))})
+    return {str(row["id"]): str(row["type"] or "") for row in rows}
+
+
+def merge_rows(
+    merges: Sequence[RecordedMerge], tags: Sequence[str], node_types: dict[str, str]
+) -> list[dict[str, Any]]:
+    """The report's `merges`: each rename in replay order, with its tag and graph type.
+
+    The tag is read back through the build's own schedule (`event_id_for`); a graph id the
+    built graph does not hold gets a null `graph_type`.
+    """
+    tag_by_event = {event_id_for(tag): tag for tag in tags}
+    return [
+        {
+            "tag": tag_by_event.get(merge.event_id),
+            "event_id": merge.event_id,
+            "incoming_id": merge.incoming_id,
+            "incoming_type": merge.incoming_type,
+            "graph_id": merge.graph_id,
+            "graph_type": node_types.get(merge.graph_id),
+        }
+        for merge in merges
+    ]
+
+
+def graph_edges(graph: dict[FactKey, bool]) -> list[list[str]]:
+    """Every edge of the graph, current or not, as sorted unique `[s, p, t]` keys."""
+    return [list(key) for key in sorted(graph)]
+
+
+def edges_digest(edges: list[list[str]]) -> str:
+    """`sha256:` and the hex digest of the edge list; currency is left out, being clock-bound."""
+    return "sha256:" + hashlib.sha256(json.dumps(edges).encode("utf-8")).hexdigest()
+
+
+def merged_relevant_facts(
+    queries: Sequence[RetrievalQuery], graph: dict[FactKey, bool], aliases: MergeAliases
+) -> list[dict[str, Any]]:
+    """The relevant facts that are current edges only under a key the merges translated."""
+    merged = []
+    for key, query_ids in relevant_facts(queries).items():
+        if graph.get(key):
+            continue
+        found = sorted(k for k in accepted_keys(key, aliases) if k != key and graph.get(k))
+        if found:
+            merged.append(
+                {
+                    "source": key[0],
+                    "predicate": key[1],
+                    "target": key[2],
+                    "found_as": list(found[0]),
+                    "query_ids": query_ids,
+                }
+            )
+    return merged
 
 
 def _stage_components(config: KnowledgeConfig) -> dict[str, Any]:
@@ -615,10 +780,11 @@ def build(
         connection.execute_write(WIPE_QUERY, {})
         wiring.initialize_schema(connection)
         seeder, min_seed_nodes = wiring.seed_step(connection)
+        recorder = MergeRecorder(wiring.curation_pipeline(connection))
         regenerator = LogRegenerator(
             event_store=materialized.event_store,
             extraction_cache=materialized.extraction_cache,
-            staging_curation_pipeline=wiring.curation_pipeline(connection),
+            staging_curation_pipeline=recorder,
             journal=EventStoreRebuildJournal(materialized.event_store),
             staging_seeder=seeder,
             **_stage_components(wiring.config),
@@ -634,8 +800,13 @@ def build(
         )
         checked_at = clock()
         graph = read_graph_facts(connection, now=checked_at)
+        node_types = read_node_types(connection, [m.graph_id for m in recorder.merges])
     finally:
         connection.disconnect()
+
+    merges = merge_rows(recorder.merges, tags, node_types)
+    aliases = merge_aliases(merges)
+    edges = graph_edges(graph)
 
     epoch = materialized.epoch
     build_report = {
@@ -658,7 +829,11 @@ def build(
         "rebuild": _rebuild_dict(report),
         "checked_at": checked_at.isoformat(),
         "relevant_facts": len(relevant_facts(queries)),
-        "missing": missing_relevant_facts(queries, graph),
+        "missing": missing_relevant_facts(queries, graph, aliases),
+        "merged": merged_relevant_facts(queries, graph, aliases),
+        "merges": merges,
+        "edges": edges,
+        "graph_digest": edges_digest(edges),
     }
     (out / BUILD_REPORT).write_text(json.dumps(build_report, indent=2) + "\n", encoding="utf-8")
     return build_report
@@ -693,6 +868,32 @@ async def run_queries(
     return rows
 
 
+def read_build_record(out: Path, target: str) -> tuple[BuildRecord, str]:
+    """The build record and graph digest of `<out>/build_report.json`, built into `target`.
+
+    Raises:
+        RetrievalRunnerError: When the report is absent, has no `graph_digest`, or names
+            another target.
+        ValueError: When the report is not JSON or `build_record` refuses it.
+    """
+    path = out / BUILD_REPORT
+    if not path.is_file():
+        raise RetrievalRunnerError(f"{path} not found; build into this --out before querying")
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path}: invalid JSON: {exc}") from exc
+    record = build_record(report)
+    digest = report.get("graph_digest")
+    if not digest:
+        raise RetrievalRunnerError(f"{path} has no graph_digest; build again")
+    if report.get("target") != target:
+        raise RetrievalRunnerError(
+            f"{path} was built into {report.get('target')!r}, not {target!r}"
+        )
+    return record, str(digest)
+
+
 def query(
     *,
     target: str,
@@ -700,18 +901,27 @@ def query(
     wiring: GraphWiring,
     queries_path: Path = QUERIES_PATH,
 ) -> dict[str, Any]:
-    """Query the built graph, write the run file, and score it with the T10 scorer.
+    """Query the built graph, write the run file, and score it against the build's record.
 
     Returns:
         The summary dict written to `retrieval_summary.json`.
 
     Raises:
         EvalIsolationError: When the target is refused.
+        RetrievalRunnerError, ValueError: When `<out>/build_report.json` is absent, unusable,
+            names another target, or no longer matches the target's edges.
     """
     assert_eval_target(target, rebuild=False)
+    record, digest = read_build_record(out, target)
     queries = load_queries(queries_path)
     connection = wiring.connect(target)
     try:
+        edges = graph_edges(read_graph_facts(connection, now=datetime.now(UTC)))
+        if edges_digest(edges) != digest:
+            raise RetrievalRunnerError(
+                f"the graph at {target!r} is not the one {out / BUILD_REPORT} describes "
+                "(another build has run since); build again"
+            )
         rows = asyncio.run(run_queries(wiring.retriever(connection), queries))
     finally:
         connection.disconnect()
@@ -719,7 +929,7 @@ def query(
     out.mkdir(parents=True, exist_ok=True)
     run_path = out / RUN_FILE
     run_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-    summary = score_run(queries, load_run(run_path))
+    summary = score_run(queries, load_run(run_path), build=record)
     summary_dict = summary_to_dict(summary)
     (out / SUMMARY_JSON).write_text(json.dumps(summary_dict, indent=2), encoding="utf-8")
     (out / SUMMARY_MD).write_text(render_markdown(summary), encoding="utf-8")
@@ -768,7 +978,8 @@ def main(argv: list[str] | None = None, *, wiring: GraphWiring | None = None) ->
             print(
                 f"[extraction-retrieval] built {report['turns']} turns "
                 f"({report['payloads']} payloads, {len(report['turns_without_payload'])} "
-                f"without one); {len(report['missing'])} of {report['relevant_facts']} "
+                f"without one); {len(report['merges'])} entity merges; "
+                f"{len(report['missing'])} of {report['relevant_facts']} "
                 f"relevant facts missing; report: {args.out / BUILD_REPORT}"
             )
         else:

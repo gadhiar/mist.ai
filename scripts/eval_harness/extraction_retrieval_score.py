@@ -2,9 +2,10 @@
 
 The query set (`data/gold/retrieval/queries-2026-11.jsonl`) names, per query, the gold facts
 that answer it (grade 2) or support it (grade 1). A run file records what a retriever returned
-for each query over a graph built from extraction's output for the dev turns. This module
-compares the two; it reads no graph and calls no retriever, so a run file written by a runner
-that builds the graph and queries it and one built by hand are scored the same way.
+for each query over a graph built from the seed and extraction's output for the dev turns.
+This module compares the two; it reads no graph and calls no retriever, so a run file written
+by a runner that builds the graph and queries it and one built by hand are scored the same
+way.
 
 Query file, one JSON object per line:
 
@@ -43,8 +44,33 @@ A fact retrieved twice earns its gain once, at its first rank. For negative quer
 number is the share that returned nothing. A kind with no query reports no value rather than
 a vacuous 0 or 1.
 
+With `--build-report`, the run is scored against the `build_report.json` of the build that
+made its graph (`extraction_retrieval.build`), read by `load_build_record`. The scorer uses
+two of its lists:
+
+- `merges`, each rename the dedup made while the build replayed the dev turns. The seed is
+  applied before the first turn (`LogRegenerator.rebuild`, `self._seeder.apply`), and a gold
+  entity the dedup matches to a seed node is rewritten to the node's id
+  (`EntityDeduplicator.deduplicate`, `entity["id"] = existing["id"]`), so its gold fact is
+  stored under the graph id. `merge_aliases` maps each gold id to the graph ids it merged
+  into, and `accepted_keys` lets a relevant fact be credited by any combination of its
+  endpoints' ids. Relevant facts whose accepted keys meet are joined into one item at the
+  higher grade, so one retrieved key credits one item once and nDCG stays at or below 1.
+- `edges`, every edge of the built graph in its stored direction. The retriever can report
+  an edge reversed: its user branch makes the user the subject of every fact
+  (`KnowledgeRetriever._gather_facts`, `subject=user_id`), and its neighbourhood branch
+  reports path order from an undirected match (`GraphStore.get_entity_neighborhood`,
+  `nodes[idx].id as source`). `orient` flips a retrieved key only when its reverse is an
+  edge and it is not, so a fact extraction stored reversed is still a miss.
+
+The summary's `build` block counts the merged ids, the facts translated and collapsed, and
+the retrieved facts reoriented. Without `--build-report`, every relevant fact is matched on
+its own key only and nothing is reoriented; a key the query lists twice takes its higher
+grade.
+
     python -m scripts.eval_harness.extraction_retrieval_score
         --queries data/gold/retrieval/queries-2026-11.jsonl --run <run.jsonl>
+        [--build-report build_report.json]
         [--json-out retrieval_summary.json] [--out retrieval.md]
 
 Exit 0, or 2 when an input is missing or malformed.
@@ -56,6 +82,7 @@ import argparse
 import json
 import math
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -78,6 +105,9 @@ GRADES = (1, 2)
 ANSWER_GRADE = 2
 
 FactKey = tuple[str, str, str]
+
+# A gold-side id mapped to the graph ids a build's dedup merged it into.
+MergeAliases = dict[str, frozenset[str]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +164,32 @@ class KindSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class BuildRecord:
+    """What a build report tells the scorer: the dedup's merges and the built graph's edges."""
+
+    aliases: MergeAliases
+    edges: frozenset[FactKey]
+
+
+@dataclass(frozen=True, slots=True)
+class BuildSummary:
+    """How a build record changed the scoring, counted so every translation is visible.
+
+    `merged_ids` counts gold ids with an alias; `several_targets` names each id merged into
+    more than one graph id. `facts_translated` counts relevant-fact rows with more than one
+    accepted key, and `facts_collapsed` the rows folded into another row's item.
+    `retrieved` and `reoriented` count over every retrieved fact of the run.
+    """
+
+    merged_ids: int
+    several_targets: tuple[str, ...]
+    facts_translated: int
+    facts_collapsed: int
+    retrieved: int
+    reoriented: int
+
+
+@dataclass(frozen=True, slots=True)
 class RetrievalSummary:
     """A scored run: every non-negative query together, each kind, and each query."""
 
@@ -144,6 +200,7 @@ class RetrievalSummary:
     answerable: KindSummary
     by_kind: dict[str, KindSummary]
     per_query: tuple[QueryScore, ...]
+    build: BuildSummary | None = None
 
     @property
     def negative_empty_share(self) -> float | None:
@@ -262,8 +319,116 @@ def _dcg(grades: list[int]) -> float:
     return sum(_gain(g) / math.log2(rank + 1) for rank, g in enumerate(grades, start=1))
 
 
-def score_query(query: RetrievalQuery, retrieved: tuple[FactKey, ...] | None) -> QueryScore:
-    """Score one query against its ranked facts, or None when it was not run."""
+def merge_aliases(merges: Iterable[dict[str, Any]]) -> MergeAliases:
+    """The build's merges as gold id -> graph ids, each side in the form it is matched in.
+
+    A key takes `canonical_id`, the form `load_queries` gives relevant facts; a value takes
+    `_produced_entity_match_id` with the graph node's type, the form `normalise_fact` gives
+    retrieved facts. A merge that maps an id onto itself is dropped.
+    """
+    aliases: dict[str, set[str]] = {}
+    for merge in merges:
+        gold = canonical_id(str(merge["incoming_id"]))
+        graph = _produced_entity_match_id(
+            str(merge["graph_id"]), str(merge.get("graph_type") or ""), {}
+        )
+        if graph != gold:
+            aliases.setdefault(gold, set()).add(graph)
+    return {gold: frozenset(graph) for gold, graph in aliases.items()}
+
+
+def accepted_keys(fact: RelevantFact | FactKey, aliases: MergeAliases) -> frozenset[FactKey]:
+    """Every key that counts as `fact`: each endpoint itself or a graph id it merged into."""
+    source, predicate, target = fact.key if isinstance(fact, RelevantFact) else fact
+    return frozenset(
+        (s, predicate, t)
+        for s in {source} | aliases.get(source, frozenset())
+        for t in {target} | aliases.get(target, frozenset())
+    )
+
+
+def build_record(report: Any) -> BuildRecord:
+    """The merges and edges of a parsed `build_report.json`.
+
+    Raises:
+        ValueError: When the report has no `merges` or `edges` list, as a report written
+            before the build recorded them has not, or an entry of either is malformed.
+    """
+    if not isinstance(report, dict):
+        raise ValueError("build report: expected a JSON object")
+    merges, edges = report.get("merges"), report.get("edges")
+    if not isinstance(merges, list) or not isinstance(edges, list):
+        raise ValueError(
+            "build report: no 'merges' or 'edges' list; it predates the build record, "
+            "so build again"
+        )
+    for merge in merges:
+        if not isinstance(merge, dict) or "incoming_id" not in merge or "graph_id" not in merge:
+            raise ValueError(f"build report: malformed merge {merge!r}")
+    keys: set[FactKey] = set()
+    for edge in edges:
+        if not isinstance(edge, list) or len(edge) != 3:
+            raise ValueError(f"build report: an edge is not [source, predicate, target]: {edge!r}")
+        keys.add((str(edge[0]), str(edge[1]), str(edge[2])))
+    return BuildRecord(aliases=merge_aliases(merges), edges=frozenset(keys))
+
+
+def load_build_record(path: Path) -> BuildRecord:
+    """`build_record` over the build report at `path`."""
+    return build_record(json.loads(path.read_text(encoding="utf-8")))
+
+
+def orient(
+    facts: tuple[FactKey, ...], edges: frozenset[FactKey]
+) -> tuple[tuple[FactKey, ...], int]:
+    """Each retrieved key in the direction the built graph holds it, and the count flipped.
+
+    A key is flipped only when its reverse is an edge and it is not: a key that is an edge as
+    reported, or whose two directions are both edges or neither, is kept as reported.
+    """
+    oriented = []
+    flipped = 0
+    for source, predicate, target in facts:
+        key, reverse = (source, predicate, target), (target, predicate, source)
+        if key not in edges and reverse in edges:
+            oriented.append(reverse)
+            flipped += 1
+        else:
+            oriented.append(key)
+    return tuple(oriented), flipped
+
+
+def _items(
+    relevant: tuple[RelevantFact, ...], aliases: MergeAliases
+) -> list[tuple[int, frozenset[FactKey]]]:
+    """The query's relevant facts joined into items with disjoint key sets.
+
+    Facts whose accepted keys intersect are joined, transitively, so one retrieved key can
+    credit at most one item. An item takes its highest member grade.
+    """
+    items: list[tuple[int, frozenset[FactKey]]] = []
+    for fact in relevant:
+        grade, keys = fact.grade, accepted_keys(fact, aliases)
+        kept = []
+        for item_grade, item_keys in items:
+            if item_keys & keys:
+                grade, keys = max(grade, item_grade), keys | item_keys
+            else:
+                kept.append((item_grade, item_keys))
+        items = [*kept, (grade, keys)]
+    return items
+
+
+def score_query(
+    query: RetrievalQuery,
+    retrieved: tuple[FactKey, ...] | None,
+    aliases: MergeAliases | None = None,
+) -> QueryScore:
+    """Score one query against its ranked facts, or None when it was not run.
+
+    With `aliases`, a relevant fact is credited by any of its `accepted_keys`; without, by
+    its own key only.
+    """
     ran = retrieved is not None
     facts = retrieved or ()
     if query.kind == "negative":
@@ -278,27 +443,28 @@ def score_query(query: RetrievalQuery, retrieved: tuple[FactKey, ...] | None) ->
             ndcg=None,
             empty=ran and not facts,
         )
-    grade_by_key = {fact.key: fact.grade for fact in query.relevant}
-    credited: set[FactKey] = set()
+    items = _items(query.relevant, aliases or {})
+    item_of = {key: index for index, (_, keys) in enumerate(items) for key in keys}
+    credited: set[int] = set()
     ranked_grades: list[int] = []
     first_answer = 0
     for rank, key in enumerate(facts[:K], start=1):
-        grade = grade_by_key.get(key, 0)
-        if key in credited:
-            grade = 0
-        elif grade:
-            credited.add(key)
+        index = item_of.get(key)
+        grade = 0
+        if index is not None and index not in credited:
+            credited.add(index)
+            grade = items[index][0]
         ranked_grades.append(grade)
         if grade == ANSWER_GRADE and not first_answer:
             first_answer = rank
-    ideal = sorted(grade_by_key.values(), reverse=True)[:K]
+    ideal = sorted((grade for grade, _ in items), reverse=True)[:K]
     return QueryScore(
         id=query.id,
         kind=query.kind,
         ran=ran,
         retrieved=len(facts),
         hit=bool(first_answer),
-        recall=len(credited) / len(grade_by_key),
+        recall=len(credited) / len(items),
         reciprocal_rank=1.0 / first_answer if first_answer else 0.0,
         ndcg=_dcg(ranked_grades) / _dcg(ideal),
         empty=None,
@@ -323,11 +489,40 @@ def _summarise(scores: list[QueryScore]) -> KindSummary:
     )
 
 
+def _build_summary(
+    queries: list[RetrievalQuery], run: dict[str, tuple[FactKey, ...]], build: BuildRecord
+) -> BuildSummary:
+    aliases = build.aliases
+    return BuildSummary(
+        merged_ids=len(aliases),
+        several_targets=tuple(sorted(gold for gold, graph in aliases.items() if len(graph) > 1)),
+        facts_translated=sum(
+            len(accepted_keys(fact, aliases)) > 1 for q in queries for fact in q.relevant
+        ),
+        facts_collapsed=sum(len(q.relevant) - len(_items(q.relevant, aliases)) for q in queries),
+        retrieved=sum(len(facts) for facts in run.values()),
+        reoriented=sum(orient(facts, build.edges)[1] for facts in run.values()),
+    )
+
+
 def score_run(
-    queries: list[RetrievalQuery], run: dict[str, tuple[FactKey, ...]]
+    queries: list[RetrievalQuery],
+    run: dict[str, tuple[FactKey, ...]],
+    *,
+    build: BuildRecord | None = None,
 ) -> RetrievalSummary:
-    """Score every query of the set against a loaded run."""
-    per_query = tuple(score_query(q, run.get(q.id)) for q in queries)
+    """Score every query of the set against a loaded run.
+
+    With `build`, each query's facts are first oriented against `build.edges`, then scored
+    through `build.aliases`; the summary's `build` block counts what that changed.
+    """
+    aliases: MergeAliases | None = None
+    build_summary: BuildSummary | None = None
+    if build is not None:
+        aliases = build.aliases
+        build_summary = _build_summary(queries, run, build)
+        run = {qid: orient(facts, build.edges)[0] for qid, facts in run.items()}
+    per_query = tuple(score_query(q, run.get(q.id), aliases) for q in queries)
     known = {q.id for q in queries}
     return RetrievalSummary(
         queries=len(queries),
@@ -337,6 +532,31 @@ def score_run(
         answerable=_summarise([s for s in per_query if s.kind in ANSWERABLE_KINDS]),
         by_kind={kind: _summarise([s for s in per_query if s.kind == kind]) for kind in KINDS},
         per_query=per_query,
+        build=build_summary,
+    )
+
+
+def _build_dict(summary: BuildSummary | None) -> dict[str, Any] | None:
+    if summary is None:
+        return None
+    return {
+        "merged_ids": summary.merged_ids,
+        "several_targets": list(summary.several_targets),
+        "facts_translated": summary.facts_translated,
+        "facts_collapsed": summary.facts_collapsed,
+        "retrieved": summary.retrieved,
+        "reoriented": summary.reoriented,
+    }
+
+
+def _build_line(summary: BuildSummary | None) -> str:
+    if summary is None:
+        return "- Build: scored without a build report"
+    return (
+        f"- Build: {summary.merged_ids} merged ids ({len(summary.several_targets)} into "
+        f"several graph ids), {summary.facts_translated} relevant facts translated, "
+        f"{summary.facts_collapsed} collapsed; {summary.reoriented} of {summary.retrieved} "
+        "retrieved facts reoriented"
     )
 
 
@@ -365,6 +585,7 @@ def summary_to_dict(summary: RetrievalSummary) -> dict[str, Any]:
         "answerable": _kind_dict(summary.answerable),
         "by_kind": {kind: _kind_dict(s) for kind, s in summary.by_kind.items()},
         "negative_empty_share": summary.negative_empty_share,
+        "build": _build_dict(summary.build),
         "per_query": [
             {
                 "id": s.id,
@@ -395,6 +616,7 @@ def render_markdown(summary: RetrievalSummary) -> str:
         f"- Target: hit at 5 >= {HIT_AT_5_TARGET:.2f} over non-negative queries: "
         f"{'PASS' if summary.meets_target else 'FAIL'}",
         f"- Negative queries that returned nothing: {_fmt(summary.negative_empty_share)}",
+        _build_line(summary.build),
         "",
         "| Kind | Queries | Ran | Hit at 5 | Recall at 5 | MRR | nDCG at 5 | Empty |",
         "|---|---|---|---|---|---|---|---|",
@@ -418,6 +640,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--run", required=True, type=Path, help="Run file JSONL.")
     p.add_argument("--json-out", default=None, type=Path, help="Write the JSON summary.")
     p.add_argument("--out", default=None, type=Path, help="Write markdown (default stdout).")
+    p.add_argument(
+        "--build-report",
+        default=None,
+        type=Path,
+        help="The build_report.json of the build that made the run's graph: score through "
+        "its merges and orient against its edges.",
+    )
     return p.parse_args(argv)
 
 
@@ -426,10 +655,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         queries = load_queries(args.queries)
         run = load_run(args.run)
+        build = load_build_record(args.build_report) if args.build_report else None
     except (OSError, ValueError, KeyError, TypeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    summary = score_run(queries, run)
+    summary = score_run(queries, run, build=build)
     text = render_markdown(summary)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)

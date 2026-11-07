@@ -20,10 +20,13 @@ The target is 0.90 hit at 5 over the non-negative queries.
 
 The read path's recall fixture (from the mist-read-path goal) scores retrieval over facts
 authored directly into a graph. It never passes an utterance through extraction, so it
-isolates the retriever. This set keeps extraction in the loop: its graph holds only what
-extraction stored for the dev turns, so a miss here can come from extraction (the fact was
-never stored, or stored under another id or predicate) as well as from the retriever. Read
-the two together: a fact the fixture finds and this set misses points at extraction.
+isolates the retriever. This set keeps extraction in the loop: its graph holds the seed the
+rebuild applies before the first turn (the committed synthetic seed under
+`tests/fixtures/dev-instance/seed/` for the published runs) and what extraction stored for
+the dev turns, written through the production curation path, dedup included. So a miss here
+can come from extraction (the fact was never stored, or stored under another id or
+predicate) as well as from the retriever. Read the two together: a fact the fixture finds and
+this set misses points at extraction.
 
 ## Query file: `queries-2026-11.jsonl`
 
@@ -82,8 +85,29 @@ admits only a Metric there, as `HAS_METRIC`'s target does). Predicates compare u
 ```bash
 python -m scripts.eval_harness.extraction_retrieval_score \
     --queries data/gold/retrieval/queries-2026-11.jsonl --run <run.jsonl> \
+    [--build-report <out>/build_report.json] \
     --json-out retrieval_summary.json --out retrieval.md
 ```
+
+`--build-report` scores the run against the build that made its graph
+(`scripts/eval_harness/extraction_retrieval.py`, `build`), which records each entity merge the
+dedup made and every edge of the built graph. The runner's `query` always scores this way, and
+refuses a graph its build report no longer describes. Two rules follow from it:
+
+- Merges: when the dedup merged a gold entity into a node with another id (a seed node,
+  for example), the gold fact is stored under that node's id. A relevant fact is then
+  credited by its own key or by any key with either endpoint replaced by a graph id that
+  endpoint merged into. Relevant facts of one query that resolve to a shared key count as
+  one fact at the higher grade, so nDCG stays at or below 1.
+- Orientation: the retriever can report an edge reversed (its user branch makes the user
+  the subject of every fact, and its neighbourhood branch reports path order). A retrieved
+  fact whose reverse is an edge of the built graph, and which is not one itself, is flipped
+  before matching. A fact that extraction stored reversed is an edge only in that direction,
+  so it stays a miss.
+
+The summary's `build` block counts the merged ids, the relevant facts translated or
+collapsed, and the retrieved facts reoriented. Without `--build-report`, every relevant fact
+matches on its own key only, nothing is reoriented, and the block is `null`.
 
 Per query, at k = 5:
 
@@ -93,7 +117,8 @@ Per query, at k = 5:
   is MRR;
 - nDCG at 5: gain 2^grade - 1, discounted by log2(rank + 1), over the ideal ordering.
 
-A fact retrieved twice is credited once, at its first rank. Each metric is averaged per kind
+A fact retrieved twice is credited once, at its first rank; a fact a query lists twice takes
+its higher grade. Each metric is averaged per kind
 and over every non-negative query. For the negative queries the one number is the share that
 returned nothing. Exit 0, or 2 when an input is missing or malformed.
 
