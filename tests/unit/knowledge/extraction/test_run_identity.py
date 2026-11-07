@@ -461,6 +461,7 @@ class TestRunIdentityCoverage:
             "backend.knowledge.extraction.preprocessor",
             "backend.knowledge.extraction.prompts",
             "backend.knowledge.extraction.scope_classifier",
+            "backend.knowledge.extraction.structure_splitter",
             "backend.llm.llama_server_provider",
         ]
 

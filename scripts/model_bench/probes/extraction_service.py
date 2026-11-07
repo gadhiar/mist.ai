@@ -624,6 +624,7 @@ def case_row_fields(case: CaseResult) -> dict[str, Any]:
                 "scope_label": resp.scope.label,
                 "scope_confidence": resp.scope.confidence,
                 "attempts": resp.attempts,
+                "stage2_calls": resp.stage2_calls,
                 "warnings": list(resp.warnings),
                 "run_identity": resp.stamps.run_identity,
                 "timings_ms": resp.timings_ms.model_dump(mode="json"),

@@ -6,16 +6,24 @@ ontology_extractor, internal_derivation) against a locally-configured
 `StreamingLLMProvider` and model-family adapter, with strict parsing and
 parse-and-repair so a failed job is reported as an error -- never cached
 as an empty extraction.
+
+Stage 2 runs the list pass: `structure_splitter` cuts a structured utterance
+into units that keep their parent context, and each batch of units is one
+Stage 2 call. An utterance without structure is one batch, sent exactly as
+before the list pass existed.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import importlib
 import json
 import logging
 import time
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import datetime
 from types import ModuleType
 from typing import Any
@@ -67,6 +75,14 @@ from backend.knowledge.extraction.scope_classifier import (
     parse_scope_output,
     render_scope_messages,
 )
+from backend.knowledge.extraction.structure_splitter import (
+    InputUnit,
+    batch_units,
+    merge_payloads,
+    render_batch,
+    render_unit,
+    split_structured,
+)
 from backend.knowledge.version_stamps import EXTRACTION_VERSION
 from backend.llm.models import LLMRequest
 from backend.llm.provider import StreamingLLMProvider
@@ -97,11 +113,12 @@ EXTRACT_MAX_TOKENS = 2048
 DERIVE_MAX_TOKENS = 400
 
 # The Stage 2 list pass's limits: the most units one call extracts, and the
-# most earlier units it sees as context. None while the service has no list
-# pass. They live here, beside the token limits, so the run identity reads
-# them from the module that applies them.
-LIST_BATCH_MAX_UNITS: int | None = None
-LIST_CONTEXT_MAX_UNITS: int | None = None
+# most earlier units of the same message a later batch sees as context. Small
+# batches keep a long list inside EXTRACT_MAX_TOKENS; the earlier units let an
+# item refer back to one in an earlier batch. They live here, beside the token
+# limits, so the run identity reads them from the module that applies them.
+LIST_BATCH_MAX_UNITS: int = 4
+LIST_CONTEXT_MAX_UNITS: int = 8
 
 # The code the run identity covers (`code_sha256` in
 # `backend.knowledge.extraction.run_identity`): this module, the adapters and
@@ -122,6 +139,7 @@ RUN_IDENTITY_CODE: tuple[ModuleType, ...] = tuple(
         "backend.knowledge.extraction.preprocessor",
         "backend.knowledge.extraction.prompts",
         "backend.knowledge.extraction.scope_classifier",
+        "backend.knowledge.extraction.structure_splitter",
         "backend.llm.llama_server_provider",
     )
 )
@@ -171,7 +189,7 @@ class ExtractionServiceError(MistError):
 
 
 class UpstreamLLMError(ExtractionServiceError):
-    """The configured llama-server call failed, or repair retries were exhausted.
+    """The llama-server call failed, repair retries ran out, or one unit's output was cut short.
 
     Maps to HTTP 502 / `ErrorCode.UPSTREAM_LLM`.
     """
@@ -181,6 +199,14 @@ class ExtractionTimeoutError(ExtractionServiceError):
     """An LLM call exceeded `ServiceSettings.llm_timeout_seconds`.
 
     Maps to HTTP 504 / `ErrorCode.TIMEOUT`.
+    """
+
+
+class _OutputTruncatedError(ExtractionServiceError):
+    """A Stage 2 output stopped at `EXTRACT_MAX_TOKENS` (`finish_reason == "length"`).
+
+    Internal to Stage 2: the batch is split and retried, and only a single
+    unit cut short leaves the engine, as `UpstreamLLMError`.
     """
 
 
@@ -273,6 +299,40 @@ def _strict_derivation(raw: str) -> DerivationOut:
         return DerivationOut(operations=operations)
     except ValidationError as exc:
         raise ExtractionValidationError(f"Derivation output rejected: {exc}") from exc
+
+
+@dataclass(slots=True)
+class _Stage2Run:
+    """What one turn's Stage 2 calls add up to, across its batches."""
+
+    calls: int = 0
+    attempts: int = 0
+    elapsed_ms: float = 0.0
+    payloads: list[ExtractionPayload] = field(default_factory=list)
+
+
+def _batch_input(
+    pre_processed: PreProcessedInput, units: Sequence[InputUnit], start: int, size: int
+) -> PreProcessedInput:
+    """The turn's pre-processed input, narrowed to the batch `units[start:start + size]`.
+
+    The batch's rendered units replace the utterance. The nearest earlier units
+    of the same message, at most `LIST_CONTEXT_MAX_UNITS`, follow the turn's
+    history as `[user]:` lines, the form the PreProcessor gives a user line,
+    so an item can refer back to one in an earlier batch. The first batch adds
+    none, so a turn without structure renders exactly as it did before.
+    """
+    text = render_batch(units[start : start + size])
+    earlier = units[max(0, start - LIST_CONTEXT_MAX_UNITS) : start]
+    return dataclasses.replace(
+        pre_processed,
+        original_text=text,
+        resolved_text=text,
+        conversation_context=[
+            *pre_processed.conversation_context,
+            *(f"[user]: {render_unit(unit)}" for unit in earlier),
+        ],
+    )
 
 
 def _compute_prompt_sha256(adapter: ModelFamilyAdapter) -> str:
@@ -393,7 +453,9 @@ class ExtractionEngine:
         )
 
         scope_out, scope_ms = await self._run_scope(pre_processed, warnings)
-        payload, extract_ms, attempts = await self._run_extraction(pre_processed)
+        stage2 = await self._run_extraction(pre_processed)
+        payload, merge_warnings = merge_payloads(stage2.payloads)
+        warnings.extend(merge_warnings)
         derivation_out, derive_ms = await self._run_derivation(req, warnings)
 
         total_ms = (time.perf_counter() - total_start) * 1000
@@ -415,11 +477,12 @@ class ExtractionEngine:
             ),
             timings_ms=TimingsMs(
                 scope=scope_ms,
-                extract=extract_ms,
+                extract=stage2.elapsed_ms,
                 derive=derive_ms,
                 total=total_ms,
             ),
-            attempts=attempts,
+            attempts=stage2.attempts,
+            stage2_calls=stage2.calls,
             warnings=warnings,
         )
 
@@ -491,10 +554,72 @@ class ExtractionEngine:
             warnings.append("scope_classification_failed")
         return ScopeOut(label=label, confidence=confidence), elapsed
 
-    async def _run_extraction(
-        self, pre_processed: PreProcessedInput
-    ) -> tuple[ExtractionPayload, float, int]:
-        """Stage 2. Strict parse with repair-retry up to `max_attempts`.
+    async def _run_extraction(self, pre_processed: PreProcessedInput) -> _Stage2Run:
+        """Stage 2: one call sequence per batch of at most `LIST_BATCH_MAX_UNITS` units.
+
+        Batches run in order, one at a time, and any batch failing fails the
+        turn: there are no partial results.
+
+        Raises:
+            ExtractionTimeoutError: An attempt exceeded the LLM timeout.
+            UpstreamLLMError: The LLM call failed, or every attempt's
+                output stayed unparsable.
+        """
+        units = split_structured(pre_processed.original_text)
+        run = _Stage2Run()
+        start = 0
+        for batch in batch_units(units, LIST_BATCH_MAX_UNITS):
+            await self._extract_units(pre_processed, units, start, len(batch), run)
+            start += len(batch)
+        return run
+
+    async def _extract_units(
+        self,
+        pre_processed: PreProcessedInput,
+        units: Sequence[InputUnit],
+        start: int,
+        size: int,
+        run: _Stage2Run,
+    ) -> None:
+        """Extract `units[start:start + size]`, halving the batch while its output is cut short.
+
+        An output that stops at `EXTRACT_MAX_TOKENS` is never repaired: the
+        repair retry would ask for the same output under the same limit. The
+        batch is split in two and each half extracted in turn, each seeing
+        the units before it as context, down to single units.
+
+        Raises:
+            UpstreamLLMError: A single unit's output was still cut short, or
+                a call failed or stayed unparsable.
+            ExtractionTimeoutError: An attempt exceeded the LLM timeout.
+        """
+        batch_input = _batch_input(pre_processed, units, start, size)
+        try:
+            payload = await self._extract_batch(batch_input, run)
+        except _OutputTruncatedError as exc:
+            if size == 1:
+                raise UpstreamLLMError(
+                    f"extraction output truncated at max_tokens ({EXTRACT_MAX_TOKENS}) "
+                    "on a single unit"
+                ) from exc
+            half = (size + 1) // 2
+            logger.warning(
+                "Extraction output cut short at max_tokens on %d units; retrying as %d and %d",
+                size,
+                half,
+                size - half,
+            )
+            await self._extract_units(pre_processed, units, start, half, run)
+            await self._extract_units(pre_processed, units, start + half, size - half, run)
+            return
+        run.payloads.append(payload)
+
+    async def _extract_batch(
+        self, batch_input: PreProcessedInput, run: _Stage2Run
+    ) -> ExtractionPayload:
+        """One batch's Stage 2 calls: strict parse with repair-retry up to `max_attempts`.
+
+        Adds its calls, attempts and time to `run`.
 
         Raises:
             ExtractionTimeoutError: An attempt exceeded the LLM timeout.
@@ -502,10 +627,20 @@ class ExtractionEngine:
                 output stayed unparsable.
         """
         start = time.perf_counter()
-        messages = render_extraction_messages(pre_processed)
+        try:
+            return await self._extract_attempts(batch_input, run)
+        finally:
+            run.elapsed_ms += (time.perf_counter() - start) * 1000
+
+    async def _extract_attempts(
+        self, batch_input: PreProcessedInput, run: _Stage2Run
+    ) -> ExtractionPayload:
+        messages = render_extraction_messages(batch_input)
         last_error: Exception | None = None
 
         for attempt in range(1, self._settings.max_attempts + 1):
+            run.calls += 1
+            run.attempts = max(run.attempts, attempt)
             request = self._build_request(
                 messages=messages, max_tokens=EXTRACT_MAX_TOKENS, schema=EXTRACTION_OUTPUT_SCHEMA
             )
@@ -521,6 +656,11 @@ class ExtractionEngine:
             except _LLM_TRANSPORT_ERRORS as exc:
                 raise UpstreamLLMError(f"Extraction LLM call failed: {exc}") from exc
 
+            if response.finish_reason == "length":
+                raise _OutputTruncatedError(
+                    f"Extraction output reached max_tokens={EXTRACT_MAX_TOKENS}"
+                    f" (attempt {attempt}/{self._settings.max_attempts})"
+                )
             raw = self._adapter.final_text(response)
             try:
                 payload = _strict_extraction_payload(raw)
@@ -539,8 +679,7 @@ class ExtractionEngine:
                 ]
                 continue
 
-            elapsed = (time.perf_counter() - start) * 1000
-            return payload, elapsed, attempt
+            return payload
 
         raise UpstreamLLMError(
             f"Extraction output unparsable after {self._settings.max_attempts} attempts"

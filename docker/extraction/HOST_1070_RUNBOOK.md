@@ -365,3 +365,10 @@ Then confirm the new code is live from the MIST machine:
 A service built from contract 1.1.0 or later reports `contract_version` `1.1.0`
 and the serving config fields listed in step 6. A response without them means
 the old image is still running.
+
+A service built with the Stage 2 list pass reports `contract_version` `1.2.0`,
+`extraction_version` `2026-11-06-r6`, and a `run_identity` field (`ri1-`
+followed by 64 hex characters) beside `run_identity_components`. A response
+that still shows `2026-06-14-r5` or has no `run_identity` field comes from the
+old image. The new extraction version is an epoch cutover for the backend:
+follow `backend/extraction_backlog/CUTOVER.md`.

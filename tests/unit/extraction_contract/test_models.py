@@ -440,6 +440,31 @@ class TestRunIdentityFields:
             InfoResponse.model_validate(payload)
 
 
+class TestStage2Calls:
+    """Contract 1.2.0 adds the Stage 2 call count, defaulting to the one call of 1.1.0."""
+
+    def test_a_1_1_0_response_without_stage2_calls_reports_one(self):
+        payload = _extract_response().model_dump(mode="json")
+        payload["contract_version"] = "1.1.0"
+        del payload["stage2_calls"]
+
+        assert ExtractResponse.model_validate(payload).stage2_calls == 1
+
+    def test_a_1_2_0_response_carries_its_count(self):
+        response = _extract_response_1_2_0().model_copy(update={"stage2_calls": 7})
+
+        restored = ExtractResponse.model_validate(response.model_dump(mode="json"))
+
+        assert restored.stage2_calls == 7
+
+    def test_zero_calls_is_rejected(self):
+        payload = _extract_response().model_dump(mode="json")
+        payload["stage2_calls"] = 0
+
+        with pytest.raises(ValidationError):
+            ExtractResponse.model_validate(payload)
+
+
 class TestCutoverStatusChecked:
     def test_checked_state_round_trips(self):
         status = _checked_cutover_status()

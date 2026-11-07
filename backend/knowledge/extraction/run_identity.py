@@ -77,10 +77,10 @@ class RunIdentityComponents:
         scope_max_tokens: Stage 1.5's output token limit.
         extract_max_tokens: Stage 2's output token limit.
         derive_max_tokens: Stage 9's output token limit.
-        list_batch_max_units: Most list units per Stage 2 call; None while
-            the service has no list pass.
-        list_context_max_units: Most earlier units sent as context; None
-            while the service has no list pass.
+        list_batch_max_units: Most list units per Stage 2 call. None is how a
+            service from before the list pass reported it.
+        list_context_max_units: Most earlier units sent as context; None as
+            for `list_batch_max_units`.
     """
 
     prompt_sha256: str
