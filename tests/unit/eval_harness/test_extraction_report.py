@@ -67,6 +67,7 @@ def _summary(tmp_path: Path, corpus: str, **overrides: Any) -> dict[str, Any]:
             "entity_recall": [0.5, 0.7],
             "rel_precision": [0.6, 0.875],
             "rel_recall": [0.4, 0.625],
+            "rel_f1": [0.45, 0.72],
         },
         "run_identity": RID_A,
         "run_identity_components": {"prompt": "p"},
@@ -193,8 +194,9 @@ def test_dev_and_heldout_side_by_side(
     assert _cells(md, "entity F1")[0] == "0.7200"
     assert _cells(md, "relation precision") == ["0.7500 [0.6000, 0.8750]", "0.5000 [no interval]"]
     assert _cells(md, "relation recall")[0] == "0.5000 [0.4000, 0.6250]"
-    # Relation F1 is the summary's own `rel_f1`, not recomputed.
-    assert _cells(md, "relation F1") == ["0.6000", "0.3333"]
+    # Relation F1 is the summary's own `rel_f1`, not recomputed, with the gauntlet's
+    # interval when the run recorded one.
+    assert _cells(md, "relation F1") == ["0.6000 [0.4500, 0.7200]", "0.3333 [no interval]"]
     assert _cells(md, "typing accuracy")[0] == "0.9500 [0.8100, 0.9900] Wilson"
     assert _cells(md, "RELATED_TO rate") == ["0.1250", "0.1250"]
     assert _cells(md, "outcomes") == ["ok 3", "ok 1, timeout 1"]
@@ -408,3 +410,106 @@ def test_list_only_row_agrees_with_the_scorer_on_an_all_list_run(tmp_path: Path)
     ]
     lo, hi = summary["bootstrap"]["rel_recall"]
     assert _cells(md, "relation recall") == [f"{r:.4f} [{lo:.4f}, {hi:.4f}]"]
+
+
+def _relation_f1_cell(tmp_path: Path, bootstrap: Any) -> str:
+    run = _write_run(
+        tmp_path / "run",
+        _summary(tmp_path, "dev-lists-2026-11.jsonl", bootstrap=bootstrap),
+        DEV_ROWS,
+    )
+    code, md = _run_report(tmp_path, run)
+    assert code == 0
+    return _cells(md, "relation F1")[0]
+
+
+def test_relation_f1_cell_prints_the_recorded_interval(tmp_path: Path) -> None:
+    bootstrap = {"B": 2000, "confidence": 0.95, "rel_f1": [0.5, 0.6875]}
+    assert _relation_f1_cell(tmp_path, bootstrap) == "0.6000 [0.5000, 0.6875]"
+
+
+@pytest.mark.parametrize(
+    "bootstrap",
+    [
+        {"B": 2000, "confidence": 0.95, "rel_precision": [0.6, 0.875]},
+        {"B": 2000, "confidence": 0.95, "rel_f1": None},
+        None,
+    ],
+    ids=["pre-t12-summary", "empty-corpus", "no-bootstrap-block"],
+)
+def test_relation_f1_cell_without_an_interval(tmp_path: Path, bootstrap: Any) -> None:
+    assert _relation_f1_cell(tmp_path, bootstrap) == "0.6000 [no interval]"
+
+
+@pytest.mark.parametrize(
+    "rel_f1",
+    [[0.5], [0.5, 0.6, 0.7], ["0.5", 0.7], [0.5, True], "0.5-0.7", {"lo": 0.5, "hi": 0.7}, 0.5],
+    ids=["one-bound", "three-bounds", "string-bound", "bool-bound", "string", "object", "number"],
+)
+def test_relation_f1_cell_with_a_malformed_interval(tmp_path: Path, rel_f1: Any) -> None:
+    bootstrap = {"B": 2000, "confidence": 0.95, "rel_f1": rel_f1}
+    assert _relation_f1_cell(tmp_path, bootstrap) == "0.6000 [no interval]"
+
+
+def test_relation_f1_cell_reads_the_gauntlets_own_interval(tmp_path: Path) -> None:
+    """A summary from the gauntlet's own builder prints its `bootstrap.rel_f1` interval."""
+    user = GoldEntity("user", "User")
+    tools = ["git", "vim", "make"]
+    probes = [
+        GoldProbe(
+            tag=f"ext-0{i}-tools-{i}",
+            utterance=f"utterance {i}",
+            entities=(user, *(GoldEntity(t, "Tool") for t in tools)),
+            relationships=tuple(GoldRel("user", "User", "USES", t, "Tool") for t in tools),
+        )
+        for i in range(1, 4)
+    ]
+    ents = (user, GoldEntity("git", "Tool"), GoldEntity("ed", "Tool"))
+    index = {
+        "utterance 1": Produced(
+            utterance="utterance 1",
+            parse_ok=True,
+            entities=ents,
+            entity_type_by_id={e.id: e.type for e in ents},
+            relationships=tuple(
+                {"source": "user", "predicate": "USES", "target": t, "properties": {}}
+                for t in ("git", "ed")
+            ),
+        )
+    }
+    report = score_run(probes, index)
+    gold = tmp_path / "gold.jsonl"
+    gold.write_text("{}\n", encoding="utf-8")
+    summary = build_summary(
+        report,
+        gold_path=gold,
+        ontology_version="test",
+        bootstrap_seed=1,
+        bootstrap_b=50,
+        bootstrap_confidence=0.95,
+        wilson_z=1.96,
+    )
+    gold.unlink()
+    summary.update(run_identity=RID_A, failure_classes=_failure_classes(ok=1))
+    run = _write_run(tmp_path / "run", summary, build_per_item_rows(report))
+    code, md = _run_report(tmp_path, run)
+    assert code == 0
+    lo, hi = summary["bootstrap"]["rel_f1"]
+    assert _cells(md, "relation F1") == [f"{summary['rel_f1']:.4f} [{lo:.4f}, {hi:.4f}]"]
+
+
+def test_notes_say_which_f1_cells_carry_an_interval(
+    tmp_path: Path, dev_and_heldout: tuple[Path, Path]
+) -> None:
+    code, md = _run_report(tmp_path, *dev_and_heldout)
+    assert code == 0
+    assert "computes no F1 interval" not in md
+    assert "Relation F1 carries the gauntlet's cluster bootstrap when the run recorded one" in md
+    assert "Entity F1 and the list-only row carry no interval" in md
+
+
+def test_module_docstring_says_which_f1_cells_carry_an_interval() -> None:
+    doc = " ".join((er.__doc__ or "").split())
+    assert "computes no interval for either F1" not in doc
+    assert "relation F1 carries the gauntlet's cluster bootstrap when the run recorded one" in doc
+    assert "entity F1 and the list-only row carry none" in doc
