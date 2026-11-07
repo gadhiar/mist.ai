@@ -181,6 +181,24 @@ def test_every_engine_image_installs_under_the_torch_constraints(path):
         assert re.search(r"-r\s+\S*requirements-[\w-]+\.txt", args), args
 
 
+NEMO_SCRIPTS = "/opt/venv/lib/python3.11/site-packages/scripts"
+
+
+def test_the_asr_image_removes_nemos_scripts_package_and_checks_none_is_importable():
+    steps = normalised(instructions(BENCH_DIR / "asr.Dockerfile"))
+    install = next(i for i, (kw, args) in enumerate(steps) if kw == "RUN" and "pip install" in args)
+    after = steps[install + 1 :]
+
+    assert len(after) == 1, after
+    keyword, args = after[0]
+    assert keyword == "RUN"
+    assert f"rm -rf {NEMO_SCRIPTS}" in args
+    check = args.index("python -I -c")
+    assert args.index(f"rm -rf {NEMO_SCRIPTS}") < check
+    assert "find_spec('scripts') is not None" in args[check:]
+    assert "sys.exit(" in args[check:]
+
+
 @pytest.mark.parametrize("path", PIN_FILES, ids=lambda p: p.name)
 def test_every_pin_is_exact(path):
     entries = pins(path)

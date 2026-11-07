@@ -13,3 +13,12 @@ COPY requirements-asr.txt constraints-torch.txt /tmp/speech-bench/
 RUN python -m pip install --no-cache-dir \
         -r /tmp/speech-bench/requirements-asr.txt \
         -c /tmp/speech-bench/constraints-torch.txt
+
+# nemo_toolkit 2.7.3 installs a top-level `scripts` package into site-packages. The repository's
+# `scripts` has no `__init__.py`, so it is a namespace package, and a regular package anywhere on
+# `sys.path` wins over it: `scripts.model_bench` would not import, and none of the three engines
+# would load. The step removes NeMo's copy and fails the build if any `scripts` is still
+# importable. `-I` drops the working directory (/app, which holds the backend's `scripts/`) and
+# `PYTHONPATH` from `sys.path`, so only the installed packages are judged.
+RUN rm -rf /opt/venv/lib/python3.11/site-packages/scripts \
+    && python -I -c "import importlib.util, sys; sys.exit(importlib.util.find_spec('scripts') is not None)"
