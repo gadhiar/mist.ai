@@ -1,0 +1,7 @@
+# Hold the backend image's torch stack (docker/backend/Dockerfile installs all three from the
+# cu124 index; the worker image reports 2.6.0+cu124, 2.6.0+cu124 and 0.21.0+cu124), so an engine
+# package cannot pull a different torch into its bench image. A local version label such as
+# +cu124 satisfies these pins.
+torch==2.6.0
+torchaudio==2.6.0
+torchvision==0.21.0

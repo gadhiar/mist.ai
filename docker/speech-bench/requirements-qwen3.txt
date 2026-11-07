@@ -1,0 +1,5 @@
+# Qwen3-TTS 0.6B CustomVoice through faster-qwen3-tts (mist-model-host plan v2, engine facts).
+# faster-qwen3-tts 0.5.4 needs transformers 5.15.1 or later and below 6, and pulls qwen-tts-hf.
+faster-qwen3-tts==0.5.4
+transformers==5.22.2
+qwen-tts-hf==0.1.1.post1
