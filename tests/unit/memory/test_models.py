@@ -2,50 +2,98 @@
 
 import dataclasses
 import hashlib
-import json
 import math
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
+import backend.memory.models as memory_models
 from backend.memory.models import (
+    DEFAULT_SERVING,
     Candidate,
     EpisodeSource,
     ExchangeSource,
     FactRow,
     FactSource,
     FetchTimings,
+    MemoryCandidate,
     MemoryItem,
     MemoryRequest,
     MemoryResult,
-    MemoryTrace,
+    MemoryStage,
     NoteSource,
+    ServingProfile,
     TimeWindow,
     fact_key,
 )
 
 _NOW = datetime(2026, 10, 22, 18, 0, tzinfo=UTC)
 
-# The keys of `retrieval_context.memory`, copied from the design doc's Interfaces and
-# contracts ("Turn log"). A change here is a turn-log contract change and needs the ADR.
-_TRACE_KEYS = {
+# The keys of the trace's `memory` object, from plan v2 V5 ("One trace"). MemoryStage carries
+# them from the fetcher to the trace builder, which renders `timings` as `timings_ms`.
+_STAGE_KEYS = {
+    "ran",
+    "skip_reason",
+    "level",
+    "tier",
     "block_version",
-    "role",
     "budget_tokens",
     "tokens",
-    "delta_tokens_est",
-    "degraded",
     "degraded_reason",
-    "tz",
-    "prefetch_hit",
+    "prefetch_reuse",
     "reranked",
-    "timings_ms",
-    "items",
     "suppressed",
     "narrative_suppressed",
+    "timings",
+    "candidates",
+    "truncated",
 }
-_TIMING_KEYS = {"stage1", "stage2", "rerank", "queue_wait", "total"}
-_TRACE_ITEM_KEYS = {"ref", "kind", "id", "score"}
+_CANDIDATE_KEYS = {"source", "ref", "alt_ref", "rank", "score", "item", "disposition"}
+
+
+def _candidate(**overrides) -> MemoryCandidate:
+    values = {
+        "source": "graph",
+        "ref": "graph:0123456789abcdef0123",
+        "alt_ref": "graph:fedcba9876543210fedc",
+        "rank": 1,
+        "score": 0.82,
+        "item": 1,
+        "disposition": "injected",
+    }
+    values.update(overrides)
+    return MemoryCandidate(**values)
+
+
+def _stage(**overrides) -> MemoryStage:
+    values = {
+        "ran": True,
+        "skip_reason": None,
+        "level": "full",
+        "tier": "top",
+        "block_version": 1,
+        "budget_tokens": 500,
+        "tokens": 120,
+        "degraded_reason": None,
+        "prefetch_reuse": "stage1",
+        "reranked": 14,
+        "suppressed": 1,
+        "narrative_suppressed": 0,
+        "timings": FetchTimings(stage1_ms=4.0, total_ms=30.0, prefetch_hit=True),
+        "candidates": (
+            _candidate(),
+            _candidate(
+                source="vault",
+                ref="vault:00000000000000000001",
+                alt_ref=None,
+                rank=2,
+                item=None,
+                disposition="dropped_min_score",
+            ),
+        ),
+    }
+    values.update(overrides)
+    return MemoryStage(**values)
 
 
 def _fact_item(ref: str = "m1", score: float = 0.9) -> MemoryItem:
@@ -97,6 +145,7 @@ def _result(**overrides) -> MemoryResult:
         "reranked": 14,
         "suppressed": 1,
         "narrative_suppressed": 0,
+        "stage": _stage(),
     }
     values.update(overrides)
     return MemoryResult(**values)
@@ -143,6 +192,15 @@ class TestMemoryRequest:
 
         assert request.conversation_start is False
         assert request.budget_tokens is None
+        assert request.serving == ServingProfile(level="full", tier="top")
+        assert request.serving is DEFAULT_SERVING
+
+    def test_carries_the_serving_profile(self):
+        low = ServingProfile(level="low", tier="interaction")
+
+        request = MemoryRequest("s1", None, "q", _NOW, (), 0, serving=low)
+
+        assert request.serving is low
 
     def test_is_frozen_and_slotted(self):
         request = MemoryRequest("s1", None, "q", _NOW, (), 0)
@@ -224,72 +282,181 @@ class TestMemoryResult:
         assert (timings.stage1_ms, timings.total_ms, timings.prefetch_hit) == (0.0, 0.0, False)
 
 
-class TestMemoryTrace:
-    def _trace(self, **overrides) -> MemoryTrace:
-        return MemoryTrace.from_result(
-            overrides.pop("result", _result()),
-            block_version=1,
-            role="user_prefix",
-            tz="UTC",
-            delta_tokens_est=overrides.pop("delta_tokens_est", 410),
-        )
+class TestMemoryResultStage:
+    def test_a_result_carries_its_stage(self):
+        stage = _stage()
 
-    def test_to_json_keys_match_the_design_doc(self):
-        payload = self._trace().to_json()
+        assert _result(stage=stage).stage is stage
 
-        assert set(payload) == _TRACE_KEYS
-        assert set(payload["timings_ms"]) == _TIMING_KEYS
-        assert payload["items"]
-        for item in payload["items"]:
-            assert set(item) == _TRACE_ITEM_KEYS
+    def test_the_stage_is_required(self):
+        values = {f.name: getattr(_result(), f.name) for f in dataclasses.fields(MemoryResult)}
+        del values["stage"]
 
-    def test_to_json_values_come_from_the_result(self):
-        payload = self._trace().to_json()
+        with pytest.raises(TypeError, match="stage"):
+            MemoryResult(**values)
 
-        assert payload["block_version"] == 1
-        assert payload["role"] == "user_prefix"
-        assert payload["budget_tokens"] == 500
-        assert payload["tokens"] == 120
-        assert payload["delta_tokens_est"] == 410
-        assert payload["degraded"] is False
-        assert payload["degraded_reason"] is None
-        assert payload["tz"] == "UTC"
-        assert payload["prefetch_hit"] is True
-        assert payload["reranked"] == 14
-        assert payload["timings_ms"] == {
-            "stage1": 4.0,
-            "stage2": 21.5,
-            "rerank": 12.25,
-            "queue_wait": 0.5,
-            "total": 30.0,
-        }
-        assert payload["items"] == [
-            {"ref": "m1", "kind": "fact", "id": fact_key("user", "USES", "python"), "score": 0.9},
-            {"ref": "m2", "kind": "note", "id": "notes/project.md#Plans", "score": 0.5},
-        ]
-        assert payload["suppressed"] == 1
-        assert payload["narrative_suppressed"] == 0
+    def test_the_turn_log_trace_is_retired(self):
+        assert not hasattr(memory_models, "MemoryTrace")
 
-    def test_to_json_is_json_serialisable(self):
-        payload = self._trace(delta_tokens_est=None).to_json()
 
-        assert json.loads(json.dumps(payload)) == payload
+class TestServingProfile:
+    @pytest.mark.parametrize("level", ["full", "low", "off"])
+    @pytest.mark.parametrize("tier", ["top", "interaction"])
+    def test_every_level_and_tier_builds(self, level, tier):
+        profile = ServingProfile(level=level, tier=tier)
 
-    def test_empty_degraded_result_traces(self):
-        result = _result(
-            items=(),
-            block_text=None,
+        assert (profile.level, profile.tier) == (level, tier)
+
+    def test_the_default_is_full_on_the_top_tier(self):
+        assert ServingProfile(level="full", tier="top") == DEFAULT_SERVING
+
+    @pytest.mark.parametrize(
+        ("level", "tier", "fragment"),
+        [("max", "top", "level"), ("full", "bottom", "tier")],
+    )
+    def test_an_unknown_level_or_tier_is_rejected(self, level, tier, fragment):
+        with pytest.raises(ValueError, match=fragment):
+            ServingProfile(level=level, tier=tier)
+
+    def test_is_frozen_and_slotted(self):
+        profile = ServingProfile(level="off", tier="top")
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            profile.level = "full"  # type: ignore[misc]
+        assert not hasattr(profile, "__dict__")
+
+
+class TestMemoryCandidate:
+    def test_fields_are_the_trace_candidate_keys(self):
+        assert {f.name for f in dataclasses.fields(MemoryCandidate)} == _CANDIDATE_KEYS
+
+    def test_a_graph_candidate_carries_its_reversed_ref(self):
+        candidate = _candidate()
+
+        assert candidate.alt_ref == "graph:fedcba9876543210fedc"
+
+    def test_a_graph_candidate_needs_an_alt_ref(self):
+        with pytest.raises(ValueError, match="alt_ref"):
+            _candidate(alt_ref=None)
+
+    @pytest.mark.parametrize("source", ["vault", "episode", "exchange"])
+    def test_only_a_graph_candidate_has_an_alt_ref(self, source):
+        with pytest.raises(ValueError, match="alt_ref"):
+            _candidate(source=source, ref=f"{source}:00000000000000000001")
+
+        assert _candidate(source=source, alt_ref=None).alt_ref is None
+
+    def test_an_injected_candidate_has_a_block_position(self):
+        with pytest.raises(ValueError, match="item"):
+            _candidate(item=None)
+
+    @pytest.mark.parametrize(
+        "disposition",
+        ["dropped_min_score", "dropped_budget", "dropped_no_fit", "dropped_suppressed"],
+    )
+    def test_a_dropped_candidate_has_no_block_position(self, disposition):
+        with pytest.raises(ValueError, match="item"):
+            _candidate(disposition=disposition, item=2)
+
+        assert _candidate(disposition=disposition, item=None).item is None
+
+    @pytest.mark.parametrize(
+        ("overrides", "fragment"),
+        [
+            ({"source": "vector", "alt_ref": None}, "source"),
+            ({"disposition": "kept"}, "disposition"),
+            ({"rank": 0}, "rank"),
+            ({"item": 0}, "item"),
+        ],
+    )
+    def test_rejects_invalid_values(self, overrides, fragment):
+        with pytest.raises(ValueError, match=fragment):
+            _candidate(**overrides)
+
+
+class TestMemoryStage:
+    def test_fields_are_the_trace_memory_keys(self):
+        assert {f.name for f in dataclasses.fields(MemoryStage)} == _STAGE_KEYS
+
+    def test_no_field_carries_text(self):
+        """The trace holds refs and numbers only; text stays in the block."""
+        names = {f.name for f in dataclasses.fields(MemoryStage)} | _CANDIDATE_KEYS
+
+        assert not names & {"text", "block_text", "query_text"}
+
+    def test_a_ran_stage_builds_with_its_defaults(self):
+        stage = _stage()
+
+        assert stage.ran is True
+        assert stage.skip_reason is None
+        assert stage.truncated == 0
+        assert [c.disposition for c in stage.candidates] == ["injected", "dropped_min_score"]
+
+    @pytest.mark.parametrize("reason", ["off", "zero_budget", "error"])
+    def test_a_skipped_stage_names_its_reason(self, reason):
+        stage = _stage(
+            ran=False,
+            skip_reason=reason,
             tokens=0,
-            degraded=True,
-            degraded_reason="index_error",
+            prefetch_reuse="none",
             timings=FetchTimings(),
+            candidates=(),
         )
 
-        payload = self._trace(result=result).to_json()
+        assert stage.skip_reason == reason
 
-        assert payload["items"] == []
-        assert payload["degraded_reason"] == "index_error"
-        assert payload["prefetch_hit"] is False
+    def test_a_skipped_stage_needs_a_reason(self):
+        with pytest.raises(ValueError, match="skip_reason"):
+            _stage(ran=False, skip_reason=None)
+
+    def test_a_ran_stage_has_no_skip_reason(self):
+        with pytest.raises(ValueError, match="skip_reason"):
+            _stage(skip_reason="off")
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "deadline",
+            "index_error",
+            "index_rebuilding",
+            "reranker_unavailable",
+            "context_budget",
+        ],
+    )
+    def test_every_degraded_reason_is_accepted(self, reason):
+        assert _stage(degraded_reason=reason).degraded_reason == reason
+
+    @pytest.mark.parametrize(("reuse", "hit"), [("block", True), ("stage1", True), ("none", False)])
+    def test_prefetch_reuse_agrees_with_the_timings(self, reuse, hit):
+        timings = FetchTimings(prefetch_hit=hit)
+
+        assert _stage(prefetch_reuse=reuse, timings=timings).prefetch_reuse == reuse
+        with pytest.raises(ValueError, match="prefetch"):
+            _stage(prefetch_reuse=reuse, timings=FetchTimings(prefetch_hit=not hit))
+
+    @pytest.mark.parametrize(
+        ("overrides", "fragment"),
+        [
+            ({"skip_reason": "disabled", "ran": False}, "skip_reason"),
+            ({"level": "max"}, "level"),
+            ({"tier": "bottom"}, "tier"),
+            ({"degraded_reason": "timeout"}, "degraded_reason"),
+            ({"prefetch_reuse": "partial"}, "prefetch_reuse"),
+            ({"truncated": -1}, "truncated"),
+            ({"budget_tokens": -1}, "budget_tokens"),
+            ({"tokens": -1}, "tokens"),
+        ],
+    )
+    def test_rejects_invalid_values(self, overrides, fragment):
+        with pytest.raises(ValueError, match=fragment):
+            _stage(**overrides)
+
+    def test_is_frozen_and_slotted(self):
+        stage = _stage()
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            stage.tokens = 0  # type: ignore[misc]
+        assert not hasattr(stage, "__dict__")
 
 
 class TestTimeWindow:

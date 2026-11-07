@@ -1,8 +1,10 @@
-"""Data types of the memory read path, the fact key, and the turn-log trace.
+"""Data types of the memory read path, the fact key, the serving profile and the memory stage.
 
-`MemoryTrace` is the contract home for the keys of `retrieval_context.memory` in the turn log;
 `fact_key` is the one place a fact's identity is computed, so the index, the corrections and
-the CLI cannot disagree about which fact an id names.
+the CLI cannot disagree about which fact an id names. `ServingProfile` is how the serving side
+runs the turn, which sets the block budget. `MemoryStage` carries what the fetch did from the
+fetcher to the trace builder: the fields of the trace's `memory` key, refs and numbers only,
+never text.
 """
 
 from __future__ import annotations
@@ -17,7 +19,47 @@ from backend.knowledge.ontologies import EDGE_TYPES_BY_NAME
 
 ItemKind = Literal["fact", "episode", "exchange", "note"]
 SummaryState = Literal["raw", "summarized"]
-DegradedReason = Literal["deadline", "index_error", "reranker_unavailable", "context_budget"]
+DegradedReason = Literal[
+    "deadline", "index_error", "index_rebuilding", "reranker_unavailable", "context_budget"
+]
+ServingLevel = Literal["full", "low", "off"]
+ServingTier = Literal["top", "interaction"]
+CandidateSource = Literal["graph", "vault", "episode", "exchange"]
+CandidateDisposition = Literal[
+    "injected", "dropped_min_score", "dropped_budget", "dropped_no_fit", "dropped_suppressed"
+]
+StageSkipReason = Literal["off", "zero_budget", "error"]
+PrefetchReuse = Literal["block", "stage1", "none"]
+
+_DEGRADED_REASONS: tuple[str, ...] = (
+    "deadline",
+    "index_error",
+    "index_rebuilding",
+    "reranker_unavailable",
+    "context_budget",
+)
+_SERVING_LEVELS: tuple[str, ...] = ("full", "low", "off")
+_SERVING_TIERS: tuple[str, ...] = ("top", "interaction")
+_CANDIDATE_SOURCES: tuple[str, ...] = ("graph", "vault", "episode", "exchange")
+_CANDIDATE_DISPOSITIONS: tuple[str, ...] = (
+    "injected",
+    "dropped_min_score",
+    "dropped_budget",
+    "dropped_no_fit",
+    "dropped_suppressed",
+)
+_STAGE_SKIP_REASONS: tuple[str, ...] = ("off", "zero_budget", "error")
+_PREFETCH_REUSES: tuple[str, ...] = ("block", "stage1", "none")
+
+
+def _require_choice(field_name: str, value: object, choices: tuple[str, ...]) -> None:
+    if value not in choices:
+        raise ValueError(f"{field_name} must be one of {choices}, got {value!r}")
+
+
+def _require_non_negative(field_name: str, value: int) -> None:
+    if value < 0:
+        raise ValueError(f"{field_name} must not be negative, got {value}")
 
 
 def fact_key(subject_id: str, rel_type: str, object_id: str) -> str:
@@ -103,11 +145,34 @@ def _check_source(kind: str, source: object) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class ServingProfile:
+    """How the serving side runs this turn: its power level and the model tier answering it.
+
+    The level sets the block budget (`MemoryConfig.block_tokens_for`): full, low, or off, where
+    the fetch is skipped. The tier is recorded in the trace so a fetch's cost can be read per
+    tier; it does not change the budget, because one tier can run at more than one level.
+    """
+
+    level: ServingLevel
+    tier: ServingTier
+
+    def __post_init__(self) -> None:
+        """Reject a level or tier the read path has no budget for."""
+        _require_choice("level", self.level, _SERVING_LEVELS)
+        _require_choice("tier", self.tier, _SERVING_TIERS)
+
+
+# What a turn gets when no serving resolver is wired: today's main model at full power.
+DEFAULT_SERVING = ServingProfile(level="full", tier="top")
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryRequest:
     """One turn's request to the fetcher.
 
     `now` is the handler's fact-time seam, so a replay fetches against the same instant it
     records. `budget_tokens`, when set, lowers the configured block budget for this turn.
+    `serving` is the profile the turn runs under, recorded in the stage.
     """
 
     session_id: str
@@ -118,6 +183,7 @@ class MemoryRequest:
     turn_index: int
     conversation_start: bool = False
     budget_tokens: int | None = None
+    serving: ServingProfile = DEFAULT_SERVING
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,8 +216,10 @@ class MemoryItem:
 class FetchTimings:
     """Where one fetch spent its time, in milliseconds, and whether stage 1 was prefetched.
 
-    `prefetch_hit` lives here because MemoryResult's fields are fixed by the interface and
-    whether stage 1 came from the prefetch cache is part of how the fetch spent its time.
+    `prefetch_hit` says whether any prefetched work was reused, which is part of how the fetch
+    spent its time; `MemoryStage.prefetch_reuse` says which, and the stage checks the two agree.
+    The trace renders `total_ms` as `critical_path`: the fetch's time from the call, the span
+    `MemoryConfig.deadline_ms` bounds.
     """
 
     stage1_ms: float = 0.0
@@ -163,10 +231,114 @@ class FetchTimings:
 
 
 @dataclass(frozen=True, slots=True)
+class MemoryCandidate:
+    """One candidate the fetch considered, as the trace records it: a ref, never text.
+
+    Attributes:
+        source: Where the candidate came from: `graph`, `vault`, `episode` or `exchange`.
+        ref: The ref the tools would give the same memory (`graph_ref`, `vault_ref`, or an
+            `episode:` or `exchange:` hash), so a tool's ref joins the candidate.
+        alt_ref: For a graph candidate, the ref of the reversed orientation,
+            `graph_ref(object_id, predicate, subject_id)`. The tools' Cypher returns edges in
+            path order and puts the user first whatever the stored direction, so a tool ref
+            matches either this or `ref`. None for every other source.
+        rank: 1-based rank after fusion and rerank.
+        score: Final score.
+        item: 1-based position in the block for an injected candidate, else None.
+        disposition: What became of it: `injected`, or the reason it was dropped.
+    """
+
+    source: CandidateSource
+    ref: str
+    alt_ref: str | None
+    rank: int
+    score: float
+    item: int | None
+    disposition: CandidateDisposition
+
+    def __post_init__(self) -> None:
+        """Keep `alt_ref` to graph candidates and a block position to injected ones."""
+        _require_choice("source", self.source, _CANDIDATE_SOURCES)
+        _require_choice("disposition", self.disposition, _CANDIDATE_DISPOSITIONS)
+        if (self.alt_ref is not None) != (self.source == "graph"):
+            raise ValueError(
+                f"alt_ref is set for graph candidates only, got source={self.source!r} "
+                f"alt_ref={self.alt_ref!r}"
+            )
+        if (self.item is not None) != (self.disposition == "injected"):
+            raise ValueError(
+                f"item is set for injected candidates only, got disposition="
+                f"{self.disposition!r} item={self.item!r}"
+            )
+        if self.rank < 1:
+            raise ValueError(f"rank must be at least 1, got {self.rank}")
+        if self.item is not None and self.item < 1:
+            raise ValueError(f"item must be at least 1, got {self.item}")
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryStage:
+    """What one turn's fetch did, carried from the fetcher to the trace builder.
+
+    The fields are the trace's `memory` key; `timings` renders as `timings_ms`. A stage that
+    did not run (`ran` false) names why in `skip_reason`; a turn with memory disabled has no
+    stage at all. No field holds text, so nothing the user said reaches the trace through it.
+    Candidates arrive in the order the fetcher keeps them; capping them for the trace is the
+    trace builder's, which counts the rest in `truncated`.
+    """
+
+    ran: bool
+    skip_reason: StageSkipReason | None
+    level: ServingLevel
+    tier: ServingTier
+    block_version: int
+    budget_tokens: int
+    tokens: int
+    degraded_reason: DegradedReason | None
+    prefetch_reuse: PrefetchReuse
+    reranked: int
+    suppressed: int
+    narrative_suppressed: int
+    timings: FetchTimings
+    candidates: tuple[MemoryCandidate, ...]
+    truncated: int = 0
+
+    def __post_init__(self) -> None:
+        """Reject a stage whose fields contradict each other or the trace's value sets."""
+        if self.ran == (self.skip_reason is not None):
+            raise ValueError(
+                "a stage that ran has no skip_reason and one that did not names it, got "
+                f"ran={self.ran} skip_reason={self.skip_reason!r}"
+            )
+        if self.skip_reason is not None:
+            _require_choice("skip_reason", self.skip_reason, _STAGE_SKIP_REASONS)
+        _require_choice("level", self.level, _SERVING_LEVELS)
+        _require_choice("tier", self.tier, _SERVING_TIERS)
+        if self.degraded_reason is not None:
+            _require_choice("degraded_reason", self.degraded_reason, _DEGRADED_REASONS)
+        _require_choice("prefetch_reuse", self.prefetch_reuse, _PREFETCH_REUSES)
+        if self.timings.prefetch_hit != (self.prefetch_reuse != "none"):
+            raise ValueError(
+                f"prefetch_reuse={self.prefetch_reuse!r} disagrees with "
+                f"timings.prefetch_hit={self.timings.prefetch_hit}"
+            )
+        for name in (
+            "budget_tokens",
+            "tokens",
+            "reranked",
+            "suppressed",
+            "narrative_suppressed",
+            "truncated",
+        ):
+            _require_non_negative(name, getattr(self, name))
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryResult:
     """What `fetch` returns; it never raises, so failures arrive as `degraded` results.
 
     `degraded` and `degraded_reason` are set together, so a consumer can trust either one.
+    `stage` is what the trace records of the fetch.
     """
 
     items: tuple[MemoryItem, ...]
@@ -179,6 +351,7 @@ class MemoryResult:
     reranked: int
     suppressed: int
     narrative_suppressed: int
+    stage: MemoryStage
 
     def __post_init__(self) -> None:
         """Keep `degraded` and `degraded_reason` consistent."""
@@ -187,93 +360,6 @@ class MemoryResult:
                 "degraded and degraded_reason must be set together, got "
                 f"degraded={self.degraded} degraded_reason={self.degraded_reason!r}"
             )
-
-
-@dataclass(frozen=True, slots=True)
-class MemoryTrace:
-    """The typed source of `retrieval_context.memory` in the turn log.
-
-    `to_json` emits exactly the keys the design doc lists; this class is their contract home,
-    so a key change here is a turn-log contract change.
-    """
-
-    block_version: int
-    role: str
-    budget_tokens: int
-    tokens: int
-    delta_tokens_est: int | None
-    degraded: bool
-    degraded_reason: str | None
-    tz: str
-    reranked: int
-    timings: FetchTimings
-    items: tuple[MemoryItem, ...]
-    suppressed: int
-    narrative_suppressed: int
-
-    @classmethod
-    def from_result(
-        cls,
-        result: MemoryResult,
-        *,
-        block_version: int,
-        role: str,
-        tz: str,
-        delta_tokens_est: int | None,
-    ) -> MemoryTrace:
-        """Build the trace of one turn from its fetch result and the turn's prompt facts.
-
-        Args:
-            result: The fetch result, after any handler change such as a dropped block.
-            block_version: Version of the block format the turn used.
-            role: Block placement used (`user_prefix` or `system_tail`).
-            tz: Name of the zone temporal phrases were read in.
-            delta_tokens_est: Tokens after the longest common prefix with the previous turn's
-                message list, or None when there is no previous turn to compare.
-        """
-        return cls(
-            block_version=block_version,
-            role=role,
-            budget_tokens=result.budget_tokens,
-            tokens=result.tokens,
-            delta_tokens_est=delta_tokens_est,
-            degraded=result.degraded,
-            degraded_reason=result.degraded_reason,
-            tz=tz,
-            reranked=result.reranked,
-            timings=result.timings,
-            items=result.items,
-            suppressed=result.suppressed,
-            narrative_suppressed=result.narrative_suppressed,
-        )
-
-    def to_json(self) -> dict[str, object]:
-        """The JSON object written as `retrieval_context.memory`."""
-        return {
-            "block_version": self.block_version,
-            "role": self.role,
-            "budget_tokens": self.budget_tokens,
-            "tokens": self.tokens,
-            "delta_tokens_est": self.delta_tokens_est,
-            "degraded": self.degraded,
-            "degraded_reason": self.degraded_reason,
-            "tz": self.tz,
-            "prefetch_hit": self.timings.prefetch_hit,
-            "reranked": self.reranked,
-            "timings_ms": {
-                "stage1": self.timings.stage1_ms,
-                "stage2": self.timings.stage2_ms,
-                "rerank": self.timings.rerank_ms,
-                "queue_wait": self.timings.queue_wait_ms,
-                "total": self.timings.total_ms,
-            },
-            "items": [
-                {"ref": item.ref, "kind": item.kind, "id": item.item_id, "score": item.score}
-                for item in self.items
-            ],
-            "suppressed": self.suppressed,
-            "narrative_suppressed": self.narrative_suppressed,
-        }
 
 
 @dataclass(frozen=True, slots=True)

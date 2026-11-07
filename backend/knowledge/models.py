@@ -248,12 +248,43 @@ def _fact_source(fact: RetrievedFact) -> RetrievalSource:
     return "graph"
 
 
+def _ref(source: RetrievalSource, key: str) -> str:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return f"{source}:{digest[:_FACT_REF_HEX_DIGITS]}"
+
+
+def graph_ref(subject_id: str, predicate: str, object_id: str) -> str:
+    """Return the ref of a graph relationship: `graph:` and the hash of `s|p|o`.
+
+    The order is the one given, so `graph_ref(o, p, s)` is a different ref. The memory trace
+    records both orientations of a candidate, because the tools return edges in path order.
+
+    Returns:
+        The ref, matching `^graph:[0-9a-f]{20}$`.
+    """
+    return _ref("graph", f"{subject_id}|{predicate}|{object_id}")
+
+
+def vault_ref(path: str, heading: str, text: str) -> str:
+    """Return the ref of a vault chunk: `vault:` and the hash of its path, heading and text.
+
+    The key is the path, the heading and the SHA-256 hex of the text, joined by newlines; see
+    `fact_ref` for why the text is part of it.
+
+    Returns:
+        The ref, matching `^vault:[0-9a-f]{20}$`.
+    """
+    text_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return _ref("vault", f"{path}\n{heading}\n{text_digest}")
+
+
 def fact_ref(fact: RetrievedFact) -> str:
     """Return an opaque, stable ref for a retrieved fact: `<source>:<20 hex digits>`.
 
     The turn trace records which memories a turn saw without writing their
     text, so the ref is a hash of the fact's natural key. mist-read-path maps a
-    ref back by hashing the vault and graph it is granted with the same keys:
+    ref back by hashing the vault and graph it is granted with the same keys,
+    through the same `vault_ref` and `graph_ref`:
 
     - vault: the path, the heading and the SHA-256 hex of `properties["text"]`,
       joined by newlines. The heading is `fact.object`; a file-level chunk,
@@ -273,15 +304,12 @@ def fact_ref(fact: RetrievedFact) -> str:
     source = _fact_source(fact)
     properties = fact.properties or {}
     if source == "vault":
-        text = str(properties.get("text") or "")
-        text_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        key = f"{properties.get('path') or ''}\n{fact.object}\n{text_digest}"
-    elif source == "vector":
-        key = str(properties.get("chunk_id") or "")
-    else:
-        key = f"{fact.subject}|{fact.predicate}|{fact.object}"
-    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    return f"{source}:{digest[:_FACT_REF_HEX_DIGITS]}"
+        return vault_ref(
+            f"{properties.get('path') or ''}", fact.object, str(properties.get("text") or "")
+        )
+    if source == "vector":
+        return _ref("vector", str(properties.get("chunk_id") or ""))
+    return graph_ref(fact.subject, fact.predicate, fact.object)
 
 
 @dataclass(frozen=True, slots=True)

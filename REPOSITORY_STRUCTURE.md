@@ -60,6 +60,7 @@ backend/
 ├── interfaces.py                # Protocols (Embedding, VectorStore, GraphConnection, etc.)
 ├── origins.py                   # Browser origin allowlist for HTTP and the WebSocket
 ├── gpu_yield.py                 # Gaming mode: yield the GPU while the host marker exists
+├── user_timezone.py             # The user's zone from MIST_TIMEZONE, one resolver for every reader
 │
 ├── chat/                        # Conversation handling
 │   ├── conversation_handler.py  # Pass-loop + persona + budget + post-filter
@@ -98,7 +99,7 @@ backend/
 │
 ├── memory/                      # Memory read path: per-turn recall into a budgeted block
 │   ├── config.py                # MemoryConfig (MIST_MEMORY_*), nested as KnowledgeConfig.memory
-│   ├── models.py                # Request/result/item types, fact_key, MemoryTrace (turn-log keys)
+│   ├── models.py                # Request/result/item types, fact_key, ServingProfile, MemoryStage (trace memory key)
 │   └── fact_render.py           # One sentence per fact, with valid-time qualifiers
 │
 └── vault/                       # ADR-010 vault layer (Cluster 8)
