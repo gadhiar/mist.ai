@@ -39,7 +39,7 @@ One row per fact version, in the shape of the graph's fact rows.
 | `relation` | an ontology relationship type that is extractable and directional |
 | `object_id`, `object_name` | canonical id and display name |
 | `object_type` | the object's ontology node type, one of `EXTRACTABLE_NODE_TYPES` |
-| `text` | the sentence the fact is indexed under |
+| `text` | the authored sentence; the index serves `render_fact`'s sentence instead (`backend/memory/fact_render.py`), and the lexical tag is judged against that one |
 | `valid_from`, `valid_to` | validity interval; null means open |
 | `recorded_at` | when MIST learned it |
 | `confidence` | in (0, 1] |
@@ -252,6 +252,12 @@ crossword forgets reach `ideas/someday.md`.
   for the real models. Content tokens are the lowercase `[a-z0-9]+` runs of a text, minus a
   stopword list. The crude stem over-conflates on purpose ("dislike" and "dislikes", "run" and
   "running"), so a paraphrase is never one inflection away from a keyword hit.
+  - A tag is judged against the text the index serves, not the authored text. For a fact that
+    is `render_fact`'s sentence for every version of its key, rendered at UTC, plus its subject
+    and object names: fact-01's key reads "Wren prefers cortado since 12 January 2026.", not
+    "Wren's usual coffee order: a cortado.". A far-off zone can move a timestamp bound to the
+    next day and change a date word, so tags are judged at UTC, the zone every fixture timestamp
+    is written in.
   - Probes other than noise judge the query against their reference items: the expected items,
     or the forbidden items when nothing is expected (a probe after a forget). `lexical: true`
     means the query shares at least one exact content token with every reference item.

@@ -16,7 +16,8 @@ does not describe its query would move each of those numbers silently. This file
 - the list utterances: at least three turns whose sibling facts overflow the reader's 300-token
   block, each turn stating its whole list;
 - the probe authoring rules: availability at the probe's `now`, correction suppression, the
-  lexical tag, and the `list_item` and `type_scoped` shapes.
+  lexical tag (judged against the text the index serves, a fact's `render_fact` sentence), and
+  the `list_item` and `type_scoped` shapes.
 
 The segmentation here is written independently of any backend segmenter on purpose: it is the
 reference T17's segmenter must reproduce, so it must not share that segmenter's code. It depends
@@ -32,7 +33,7 @@ import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,7 @@ from backend.knowledge.ontologies.v1_0_0 import (  # noqa: E402
     EXTRACTABLE_NODE_TYPES,
     EXTRACTABLE_RELATIONSHIP_TYPES,
 )
+from backend.memory.fact_render import render_fact  # noqa: E402
 from scripts.eval_harness.memory_recall import (  # noqa: E402
     FIXTURE_DIR,
     PROBE_KINDS,
@@ -623,12 +625,47 @@ class TestCorrections:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class _RenderedVersion:
+    """One fact version in the shape `render_fact` reads (`RenderableFact`).
+
+    The bounds are `isoformat()` strings, as the index's rows carry them, so a timestamp bound
+    renders as a date in the zone passed to `render_fact`.
+    """
+
+    subject_name: str
+    rel_type: str
+    object_name: str
+    valid_from: str | None
+    valid_to: str | None
+
+    @classmethod
+    def of(cls, fact: Fact) -> _RenderedVersion:
+        return cls(
+            subject_name=fact.subject_name,
+            rel_type=fact.relation,
+            object_name=fact.object_name,
+            valid_from=None if fact.valid_from is None else fact.valid_from.isoformat(),
+            valid_to=None if fact.valid_to is None else fact.valid_to.isoformat(),
+        )
+
+
 def _item_texts(fixture: Fixture) -> dict[ItemRef, str]:
-    """The text each item is indexed under, which is what the lexical tag is judged against."""
+    """The text each item is served under, which is what the lexical tag is judged against.
+
+    A fact's text is the `render_fact` sentence of every version of its key, rendered at UTC,
+    plus its subject and object names: the index stores and matches that sentence, not the
+    authored `text`, so a tag judged on the authored wording would describe a query the fetcher
+    never sees. Every version is included, so the text does not depend on a probe's `now`: a
+    word any version's sentence carries counts toward a word match and against a paraphrase.
+    UTC is the zone every fixture timestamp is written in; a far-off zone can move a timestamp
+    bound to another day, and with it a date word.
+    """
     texts: dict[ItemRef, str] = {}
     for fact in fixture.facts:
         ref = ItemRef("fact", fact.fact_key)
-        texts[ref] = f"{texts.get(ref, '')} {fact.text} {fact.subject_name} {fact.object_name}"
+        sentence = render_fact(_RenderedVersion.of(fact), UTC)
+        texts[ref] = f"{texts.get(ref, '')} {sentence} {fact.subject_name} {fact.object_name}"
     for episode in fixture.episodes:
         texts[ItemRef("episode", episode.episode_id)] = " ".join(
             (episode.title, episode.summary, *episode.open_threads)
@@ -720,6 +757,9 @@ def _stem(token: str) -> str:
 
 def _lexical_violation(probe: Probe, texts: dict[ItemRef, str]) -> str | None:
     """Check the lexical tag: true when a word matcher can get the probe right.
+
+    `texts` is `_item_texts`, the text the index serves for each item, so a fact is judged by its
+    rendered sentence and not by its authored `text`.
 
     A noise probe is right when its block is empty, so its reference is every retrievable item,
     conversation turns included. Lexical true means the query shares no content token, not even
@@ -872,6 +912,17 @@ class TestProbes:
             }
             served = (in_scope & _available_at(fixture, probe.now)) - suppressed
             assert set(probe.expected) == served, probe.probe_id
+
+    def test_a_fact_is_judged_by_its_rendered_sentence(self, fixture: Fixture) -> None:
+        """fact-01's tag changed when the judged text moved from the authored sentence to the
+        one the index stores, so its key must read as `render_fact` renders it.
+        """
+        probe = next(p for p in fixture.probes if p.probe_id == "fact-01")
+
+        text = _item_texts(fixture)[probe.expected[0]]
+
+        assert "Wren prefers cortado since 12 January 2026." in text
+        assert "usual coffee order" not in text
 
     def test_lexical_tags_describe_the_query(self, fixture: Fixture) -> None:
         texts = _item_texts(fixture)
