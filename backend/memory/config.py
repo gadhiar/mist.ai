@@ -1,32 +1,28 @@
 """Configuration for the memory read path, nested as `KnowledgeConfig.memory`.
 
-Every field maps to one `MIST_MEMORY_*` variable documented in `.env.example`. Validation runs
-in `__post_init__` and raises MemoryConfigError naming the field, so a bad value stops startup
-instead of degrading recall quietly.
+Every field maps to one variable documented in `.env.example`: a `MIST_MEMORY_*` one, or for
+the zone `MIST_TIMEZONE`, which usage counting shares through `backend.user_timezone`.
+Validation runs in `__post_init__` and raises MemoryConfigError naming the field, so a bad value
+stops startup instead of degrading recall quietly.
 """
 
 from __future__ import annotations
 
-import logging
 import math
 import os
-import zoneinfo
-from collections.abc import Callable
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, tzinfo
 from typing import Literal
 
 from backend.errors import MemoryConfigError
+from backend.user_timezone import USER_TIMEZONE_ENV, ZoneLoader, resolve_user_timezone
 
-logger = logging.getLogger(__name__)
-
-BlockRole = Literal["user_prefix", "system_tail"]
 RerankBackend = Literal["local", "remote", "off"]
 RerankDevice = Literal["cpu", "cuda"]
 RemoteScoreKind = Literal["logit", "probability"]
-TzResolver = Callable[[str], tzinfo]
+TzResolver = ZoneLoader
 
-_BLOCK_ROLES: tuple[str, ...] = ("user_prefix", "system_tail")
 _RERANK_BACKENDS: tuple[str, ...] = ("local", "remote", "off")
 _RERANK_DEVICES: tuple[str, ...] = ("cpu", "cuda")
 _REMOTE_SCORE_KINDS: tuple[str, ...] = ("logit", "probability")
@@ -34,16 +30,19 @@ _WEIGHT_TOLERANCE = 1e-6
 _TRUE = frozenset({"true", "1", "yes", "on"})
 _FALSE = frozenset({"false", "0", "no", "off"})
 
-# Set once the unset-zone warning has been logged; see `_resolve_tz`. Tests reset it with
-# monkeypatch so each test sees a fresh process.
-_tz_unset_warned = False
+# Retired variables and what replaced each. One that is still set fails startup rather than
+# being ignored, so a deployment that relied on it learns where its setting went.
+RETIRED_MEMORY_ENV_VARS: Mapping[str, str] = {
+    "MIST_MEMORY_BLOCK_ROLE": "MIST_CTX_BUDGET_DELTA_PLACEMENT",
+    "MIST_MEMORY_TZ": USER_TIMEZONE_ENV,
+}
 
 # Phase A variables, in `.env.example` order. Tests clear these to isolate a run, and the
 # `.env.example` check walks this tuple, so a new variable added here must be documented there.
+# `MIST_TIMEZONE` is shared with usage counting and is documented once, in its own section.
 MEMORY_ENV_VARS: tuple[str, ...] = (
     "MIST_MEMORY_ENABLED",
     "MIST_MEMORY_BLOCK_TOKENS",
-    "MIST_MEMORY_BLOCK_ROLE",
     "MIST_MEMORY_CONTINUITY_SHARE",
     "MIST_MEMORY_MIN_SCORE",
     "MIST_MEMORY_DEADLINE_MS",
@@ -58,7 +57,7 @@ MEMORY_ENV_VARS: tuple[str, ...] = (
     "MIST_MEMORY_WEIGHTS",
     "MIST_MEMORY_INDEX_PATH",
     "MIST_MEMORY_REFRESH_DEBOUNCE_S",
-    "MIST_MEMORY_TZ",
+    USER_TIMEZONE_ENV,
 )
 
 
@@ -122,38 +121,38 @@ def _env_weights(name: str, default: tuple[float, float, float]) -> tuple[float,
     return rerank, recency, confidence
 
 
-def _resolve_tz(resolver: TzResolver) -> tuple[tzinfo, str | None]:
-    """Resolve `MIST_MEMORY_TZ` once, at config time.
+def _reject_retired() -> None:
+    """Fail on a retired variable that is still set, naming the variable that replaced it.
 
-    An unset zone maps to `datetime.timezone.utc` without calling the resolver, because
-    `zoneinfo.ZoneInfo("UTC")` itself needs a tz database, and the current image has none
-    (Design point 5). A name the resolver rejects fails startup: answering "yesterday" in the
-    wrong zone is worse than refusing to start.
-
-    The unset warning goes out once per process. Startup builds `KnowledgeConfig` several times,
-    and the Neo4j and event-store health probes rebuild it on every 10 s tick while the graph
-    connection or the event store was never built, whether it failed at boot or is switched off
-    (server.py `_knowledge_configured` and `_event_store_configured`, called from health.py's
-    probes when their source is None). Warning on every call would repeat the same line without
-    adding anything.
+    Blank counts as unset, as everywhere here: Compose forwards `${VAR:-}` as an empty string.
     """
-    global _tz_unset_warned
-    name = _env("MIST_MEMORY_TZ")
-    if name is None:
-        if not _tz_unset_warned:
-            _tz_unset_warned = True
-            logger.warning(
-                "MIST_MEMORY_TZ is unset; memory read path resolves dates such as 'yesterday' "
-                "in UTC"
-            )
-        return UTC, None
+    for name, replacement in RETIRED_MEMORY_ENV_VARS.items():
+        if _env(name) is not None:
+            raise MemoryConfigError(f"{name} is retired; set {replacement} instead")
+
+
+def _resolve_tz(load_zone: TzResolver | None) -> tuple[tzinfo, str | None]:
+    """Resolve `MIST_TIMEZONE` once, at config time, through the shared user-zone resolver.
+
+    Unset gives UTC with the resolver's one warning per process: startup builds
+    `KnowledgeConfig` several times, and the Neo4j and event-store health probes rebuild it on
+    every 10 s tick while the graph connection or the event store was never built (server.py
+    `_knowledge_configured` and `_event_store_configured`, called from health.py's probes when
+    their source is None). A name the resolver rejects fails startup: answering "yesterday" in
+    the wrong zone is worse than refusing to start.
+
+    Returns:
+        The zone, and the name it came from, or None when the zone is UTC because the variable
+        is unset or no zone database is installed.
+    """
+    name = _env(USER_TIMEZONE_ENV)
     try:
-        return resolver(name), name
-    except (KeyError, ValueError) as exc:
-        # ZoneInfoNotFoundError subclasses KeyError; a malformed key raises ValueError.
+        zone = resolve_user_timezone(os.environ, load_zone=load_zone)
+    except ValueError as exc:
         raise MemoryConfigError(
-            f"MIST_MEMORY_TZ={name!r} does not resolve to a time zone: {exc}"
+            f"{USER_TIMEZONE_ENV}={name!r} does not resolve to a time zone: {exc}"
         ) from exc
+    return zone, (None if zone is UTC else name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,8 +162,6 @@ class MemoryConfig:
     Attributes:
         enabled: False restores the legacy vault-only auto-inject.
         block_tokens: Token budget of the memory block; a request can lower it per turn.
-        block_role: Where the block goes: prepended to the last user message
-            (`user_prefix`) or as a system message directly before it (`system_tail`).
         continuity_share: Share of the budget reserved for episodes and exchanges when the
             turn has a temporal window or starts a conversation.
         min_score: Items below this final score are dropped. 0.35 is a placeholder until the
@@ -187,14 +184,14 @@ class MemoryConfig:
         index_path: Path of `memory_index.db`; None means beside the event store, resolved by
             the factory, which also propagates `:memory:`.
         refresh_debounce_s: Minimum seconds between two index refreshes.
-        tz: Zone used to read temporal phrases. Resolved once in `from_env`.
-        tz_name: The IANA name `tz` came from, or None when `MIST_MEMORY_TZ` is unset and `tz`
-            is UTC; the trace records which.
+        tz: Zone used to read temporal phrases, from `MIST_TIMEZONE`. Resolved once in
+            `from_env`.
+        tz_name: The IANA name `tz` came from, or None when `tz` is UTC because
+            `MIST_TIMEZONE` is unset or no zone database is installed; the trace records which.
     """
 
     enabled: bool = True
     block_tokens: int = 500
-    block_role: BlockRole = "user_prefix"
     continuity_share: float = 0.35
     min_score: float = 0.35
     deadline_ms: int = 50
@@ -232,7 +229,6 @@ class MemoryConfig:
             raise MemoryConfigError(
                 f"refresh_debounce_s must not be negative, got {self.refresh_debounce_s}"
             )
-        _require_choice("block_role", self.block_role, _BLOCK_ROLES)
         _require_choice("rerank_backend", self.rerank_backend, _RERANK_BACKENDS)
         _require_choice("rerank_device", self.rerank_device, _RERANK_DEVICES)
         _require_choice("rerank_remote_scores", self.rerank_remote_scores, _REMOTE_SCORE_KINDS)
@@ -252,17 +248,18 @@ class MemoryConfig:
             raise MemoryConfigError(f"tz must be a tzinfo, got {type(self.tz).__name__}")
 
     @classmethod
-    def from_env(cls, *, tz_resolver: TzResolver = zoneinfo.ZoneInfo) -> MemoryConfig:
-        """Load the Phase A settings from `MIST_MEMORY_*` variables.
+    def from_env(cls, *, tz_resolver: TzResolver | None = None) -> MemoryConfig:
+        """Load the Phase A settings from `MIST_MEMORY_*` variables and `MIST_TIMEZONE`.
 
         Args:
-            tz_resolver: Turns an IANA name into a tzinfo. Production uses
-                `zoneinfo.ZoneInfo`; tests pass a fake so they need no tz database.
+            tz_resolver: Replaces the zone lookup inside `resolve_user_timezone`, which turns
+                an IANA name into a tzinfo; None keeps the real lookup. Tests pass a fake.
 
         Raises:
-            MemoryConfigError: A variable does not parse, a value fails validation, or
-                `MIST_MEMORY_TZ` names a zone the resolver rejects.
+            MemoryConfigError: A retired variable is set, a variable does not parse, a value
+                fails validation, or `MIST_TIMEZONE` names a zone the resolver rejects.
         """
+        _reject_retired()
         rerank_weight, recency_weight, confidence_weight = _env_weights(
             "MIST_MEMORY_WEIGHTS", (0.8, 0.1, 0.1)
         )
@@ -270,7 +267,6 @@ class MemoryConfig:
         return cls(
             enabled=_env_bool("MIST_MEMORY_ENABLED", True),
             block_tokens=_env_int("MIST_MEMORY_BLOCK_TOKENS", 500),
-            block_role=_env("MIST_MEMORY_BLOCK_ROLE") or "user_prefix",  # type: ignore[arg-type]
             continuity_share=_env_float("MIST_MEMORY_CONTINUITY_SHARE", 0.35),
             min_score=_env_float("MIST_MEMORY_MIN_SCORE", 0.35),
             deadline_ms=_env_int("MIST_MEMORY_DEADLINE_MS", 50),

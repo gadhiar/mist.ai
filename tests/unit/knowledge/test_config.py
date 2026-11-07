@@ -436,7 +436,7 @@ class TestKnowledgeConfigMemoryWiring:
         assert config.memory == MemoryConfig()
 
     def test_from_env_builds_memory_without_a_tz_database(self):
-        """An unset MIST_MEMORY_TZ maps to UTC without zoneinfo, so this passes with no tzdata."""
+        """An unset MIST_TIMEZONE gives `datetime.timezone.utc`, which needs no zone database."""
         with _env(**_clear(*MEMORY_ENV_VARS)):
             config = KnowledgeConfig.from_env()
 

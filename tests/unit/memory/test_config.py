@@ -1,7 +1,7 @@
 """Tests for backend.memory.config.MemoryConfig.
 
-The zone tests pass a fake resolver, so they need no tz database. The single test of the
-production resolver (`zoneinfo.ZoneInfo`) skips while the worker image lacks tzdata.
+Most zone tests pass a fake zone lookup, so they need no tz database; the production lookup
+test uses the image's tzdata. The resolver's own cases are in tests/unit/test_user_timezone.py.
 """
 
 import re
@@ -11,23 +11,32 @@ from pathlib import Path
 
 import pytest
 
-import backend.memory.config as memory_config
+import backend.user_timezone as user_timezone
 from backend.errors import MemoryConfigError, MistError
-from backend.memory.config import MEMORY_ENV_VARS, MemoryConfig
+from backend.memory.config import MEMORY_ENV_VARS, RETIRED_MEMORY_ENV_VARS, MemoryConfig
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
+def _documented(text: str) -> dict[str, str]:
+    """Each `# NAME=value` or `NAME=value` line of a memory variable, first value per name."""
+    documented: dict[str, str] = {}
+    pattern = r"^#?\s*(MIST_MEMORY_[A-Z_]+|MIST_TIMEZONE)=(\S*)"
+    for match in re.finditer(pattern, text, re.MULTILINE):
+        documented.setdefault(match.group(1), match.group(2))
+    return documented
+
+
 @pytest.fixture(autouse=True)
 def _clear_memory_env(monkeypatch):
-    """Start every test with no MIST_MEMORY_* variable set and the unset-zone warning unsent.
+    """Start every test with no memory variable set and the unset-zone warning unsent.
 
     The warning is once per process, so an earlier test that built a config would otherwise
     have spent it; monkeypatch restores the flag afterwards, so nothing leaks between tests.
     """
-    for name in MEMORY_ENV_VARS:
+    for name in (*MEMORY_ENV_VARS, *RETIRED_MEMORY_ENV_VARS):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(memory_config, "_tz_unset_warned", False)
+    monkeypatch.setattr(user_timezone, "_unset_warned", False)
 
 
 def _never_called(name: str) -> tzinfo:
@@ -54,7 +63,6 @@ class TestDefaults:
 
         assert config.enabled is True
         assert config.block_tokens == 500
-        assert config.block_role == "user_prefix"
         assert config.continuity_share == 0.35
         assert config.min_score == 0.35
         assert config.deadline_ms == 50
@@ -90,7 +98,6 @@ class TestFromEnv:
         values = {
             "MIST_MEMORY_ENABLED": "false",
             "MIST_MEMORY_BLOCK_TOKENS": "300",
-            "MIST_MEMORY_BLOCK_ROLE": "system_tail",
             "MIST_MEMORY_CONTINUITY_SHARE": "0.5",
             "MIST_MEMORY_MIN_SCORE": "0.4",
             "MIST_MEMORY_DEADLINE_MS": "80",
@@ -113,7 +120,6 @@ class TestFromEnv:
 
         assert config.enabled is False
         assert config.block_tokens == 300
-        assert config.block_role == "system_tail"
         assert config.continuity_share == 0.5
         assert config.min_score == 0.4
         assert config.deadline_ms == 80
@@ -171,33 +177,34 @@ class TestFromEnv:
 
 
 class TestZone:
-    def test_unset_zone_is_utc_and_never_calls_the_resolver(self, caplog):
-        """`zoneinfo.ZoneInfo("UTC")` raises in an image without tzdata (Design point 5)."""
-        with caplog.at_level("WARNING", logger="backend.memory.config"):
+    def test_unset_zone_is_utc_and_never_calls_the_lookup(self, caplog):
+        """Unset needs no zone database: the resolver returns `datetime.timezone.utc`."""
+        with caplog.at_level("WARNING", logger=user_timezone.__name__):
             config = MemoryConfig.from_env(tz_resolver=_never_called)
 
         assert config.tz is UTC
         assert config.tz_name is None
-        assert any("MIST_MEMORY_TZ" in record.getMessage() for record in caplog.records)
+        assert any("MIST_TIMEZONE" in record.getMessage() for record in caplog.records)
 
     def test_unset_zone_warns_once_per_process(self, caplog):
         """Startup builds the config several times and health probes can rebuild it; warn once."""
-        with caplog.at_level("WARNING", logger="backend.memory.config"):
+        with caplog.at_level("WARNING", logger=user_timezone.__name__):
             configs = [MemoryConfig.from_env(tz_resolver=_never_called) for _ in range(3)]
 
-        warnings = [r for r in caplog.records if "MIST_MEMORY_TZ" in r.getMessage()]
+        warnings = [r for r in caplog.records if "MIST_TIMEZONE" in r.getMessage()]
         assert len(warnings) == 1
         assert all(config.tz is UTC for config in configs)
 
     def test_blank_zone_counts_as_unset(self, monkeypatch):
-        monkeypatch.setenv("MIST_MEMORY_TZ", "")
+        monkeypatch.setenv("MIST_TIMEZONE", "")
 
         config = MemoryConfig.from_env(tz_resolver=_never_called)
 
         assert config.tz is UTC
+        assert config.tz_name is None
 
     def test_set_zone_resolves_once_at_config_time(self, monkeypatch):
-        monkeypatch.setenv("MIST_MEMORY_TZ", "America/Chicago")
+        monkeypatch.setenv("MIST_TIMEZONE", "America/Chicago")
         resolver = _RecordingResolver()
 
         config = MemoryConfig.from_env(tz_resolver=resolver)
@@ -207,13 +214,14 @@ class TestZone:
         assert config.tz_name == "America/Chicago"
 
     def test_a_rejected_name_raises_memory_config_error_naming_the_variable(self, monkeypatch):
-        monkeypatch.setenv("MIST_MEMORY_TZ", "Mars/Olympus_Mons")
+        monkeypatch.setenv("MIST_TIMEZONE", "Mars/Olympus_Mons")
 
-        with pytest.raises(MemoryConfigError, match="MIST_MEMORY_TZ") as excinfo:
+        with pytest.raises(MemoryConfigError, match="MIST_TIMEZONE") as excinfo:
             MemoryConfig.from_env(tz_resolver=_rejecting)
 
         assert "Mars/Olympus_Mons" in str(excinfo.value)
-        assert isinstance(excinfo.value.__cause__, zoneinfo.ZoneInfoNotFoundError)
+        assert isinstance(excinfo.value.__cause__, ValueError)
+        assert isinstance(excinfo.value.__cause__.__cause__, zoneinfo.ZoneInfoNotFoundError)
 
     def test_a_malformed_name_raises_memory_config_error(self, monkeypatch):
         """A key like an absolute path makes zoneinfo raise ValueError, not a not-found error."""
@@ -221,22 +229,69 @@ class TestZone:
         def malformed(name: str) -> tzinfo:
             raise ValueError(f"ZoneInfo keys must be normalized relative paths, got: {name}")
 
-        monkeypatch.setenv("MIST_MEMORY_TZ", "/etc/localtime")
+        monkeypatch.setenv("MIST_TIMEZONE", "/etc/localtime")
 
-        with pytest.raises(MemoryConfigError, match="MIST_MEMORY_TZ"):
+        with pytest.raises(MemoryConfigError, match="MIST_TIMEZONE"):
             MemoryConfig.from_env(tz_resolver=malformed)
 
-    def test_production_resolver_resolves_an_iana_name(self, monkeypatch):
-        try:
-            expected = zoneinfo.ZoneInfo("America/Chicago")
-        except zoneinfo.ZoneInfoNotFoundError:
-            pytest.skip("tzdata absent until mist-capabilities-build T1's deps PR is in the image")
-        monkeypatch.setenv("MIST_MEMORY_TZ", "America/Chicago")
+    def test_a_missing_zone_database_gives_utc_without_a_name(self, monkeypatch):
+        monkeypatch.setenv("MIST_TIMEZONE", "America/Chicago")
+        monkeypatch.setattr(user_timezone, "available_timezones", set)
+        monkeypatch.setattr(user_timezone, "_missing_database_warned", set())
+
+        config = MemoryConfig.from_env(tz_resolver=_rejecting)
+
+        assert config.tz is UTC
+        assert config.tz_name is None
+
+    def test_production_lookup_resolves_an_iana_name(self, monkeypatch):
+        monkeypatch.setenv("MIST_TIMEZONE", "America/Chicago")
 
         config = MemoryConfig.from_env()
 
-        assert config.tz == expected
+        assert config.tz == zoneinfo.ZoneInfo("America/Chicago")
         assert config.tz_name == "America/Chicago"
+
+    def test_production_lookup_rejects_an_unknown_name(self, monkeypatch):
+        monkeypatch.setenv("MIST_TIMEZONE", "Mars/Olympus_Mons")
+
+        with pytest.raises(MemoryConfigError, match="Mars/Olympus_Mons"):
+            MemoryConfig.from_env()
+
+
+class TestRetiredVariables:
+    @pytest.mark.parametrize(
+        ("name", "value", "replacement"),
+        [
+            ("MIST_MEMORY_BLOCK_ROLE", "system_tail", "MIST_CTX_BUDGET_DELTA_PLACEMENT"),
+            ("MIST_MEMORY_TZ", "Europe/London", "MIST_TIMEZONE"),
+        ],
+    )
+    def test_a_set_retired_variable_fails_naming_its_replacement(
+        self, monkeypatch, name, value, replacement
+    ):
+        monkeypatch.setenv(name, value)
+
+        with pytest.raises(MemoryConfigError, match=name) as excinfo:
+            MemoryConfig.from_env(tz_resolver=_never_called)
+
+        assert replacement in str(excinfo.value)
+
+    @pytest.mark.parametrize("name", ["MIST_MEMORY_BLOCK_ROLE", "MIST_MEMORY_TZ"])
+    def test_a_blank_retired_variable_counts_as_unset(self, monkeypatch, name):
+        """Compose forwards `${VAR:-}` as an empty string, which must not fail startup."""
+        monkeypatch.setenv(name, "  ")
+
+        assert MemoryConfig.from_env(tz_resolver=_never_called) == MemoryConfig()
+
+    def test_retired_variables_leave_the_memory_variables(self):
+        assert set(RETIRED_MEMORY_ENV_VARS).isdisjoint(MEMORY_ENV_VARS)
+
+    def test_the_shared_zone_variable_joins_the_memory_variables(self):
+        assert "MIST_TIMEZONE" in MEMORY_ENV_VARS
+
+    def test_the_config_has_no_block_role(self):
+        assert not hasattr(MemoryConfig(), "block_role")
 
 
 class TestValidation:
@@ -250,7 +305,6 @@ class TestValidation:
             ({"min_score": 1.5}, "min_score"),
             ({"deadline_ms": 0}, "deadline_ms"),
             ({"rerank_top_n": 0}, "rerank_top_n"),
-            ({"block_role": "assistant"}, "block_role"),
             ({"rerank_device": "mps"}, "rerank_device"),
             ({"rerank_backend": "gpu"}, "rerank_backend"),
             ({"rerank_remote_scores": "raw"}, "rerank_remote_scores"),
@@ -321,9 +375,7 @@ class TestEnvExampleDocumentsEveryVariable:
         file cannot drift from the dataclass silently.
         """
         text = (_REPO_ROOT / ".env.example").read_text(encoding="utf-8")
-        documented: dict[str, str] = {}
-        for match in re.finditer(r"^#?\s*(MIST_MEMORY_[A-Z_]+)=(\S*)", text, re.MULTILINE):
-            documented.setdefault(match.group(1), match.group(2))
+        documented = _documented(text)
 
         missing = sorted(set(MEMORY_ENV_VARS) - set(documented))
         assert not missing, f".env.example does not document {missing}"
@@ -331,7 +383,6 @@ class TestEnvExampleDocumentsEveryVariable:
         defaults = MemoryConfig()
         assert documented["MIST_MEMORY_ENABLED"] == "true"
         assert int(documented["MIST_MEMORY_BLOCK_TOKENS"]) == defaults.block_tokens
-        assert documented["MIST_MEMORY_BLOCK_ROLE"] == defaults.block_role
         assert float(documented["MIST_MEMORY_CONTINUITY_SHARE"]) == defaults.continuity_share
         assert float(documented["MIST_MEMORY_MIN_SCORE"]) == defaults.min_score
         assert int(documented["MIST_MEMORY_DEADLINE_MS"]) == defaults.deadline_ms
@@ -343,6 +394,17 @@ class TestEnvExampleDocumentsEveryVariable:
         assert documented["MIST_MEMORY_RERANK_REMOTE_SCORES"] == defaults.rerank_remote_scores
         assert documented["MIST_MEMORY_WEIGHTS"] == "0.8,0.1,0.1"
         assert int(documented["MIST_MEMORY_REFRESH_DEBOUNCE_S"]) == defaults.refresh_debounce_s
+
+    def test_retired_variables_are_not_documented(self):
+        text = (_REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+
+        assert set(RETIRED_MEMORY_ENV_VARS).isdisjoint(_documented(text))
+
+    def test_the_shared_zone_variable_is_documented_once(self):
+        """Usage counting and memory share `MIST_TIMEZONE`; one entry documents both."""
+        text = (_REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+
+        assert len(re.findall(r"^#?\s*MIST_TIMEZONE=", text, re.MULTILINE)) == 1
 
     def test_window_comment_recommends_8192_for_e4b_and_keeps_auto(self):
         text = (_REPO_ROOT / ".env.example").read_text(encoding="utf-8")
