@@ -15,16 +15,17 @@ properties at all, since `MERGE` preserves untouched properties on a MATCH
 but a fresh CREATE gets nothing beyond what the query explicitly sets. See
 the Task 10 report for the live consequence.
 
-MIS-177 (i115): the node's type is the `entity_type` PROPERTY, not a graph
-label. Task 12 also wrote the type as a label on every node; on
-`:__Entity__` nodes that departed from the documented convention
-(`scripts/migrations/ontology_v1_4_0.py` module docstring: types are stored
-only as `entity_type`, with `:User` and `:MistIdentity` as the label
-invariants), and no reader used it -- every type reader filters on the
-property (`grep -rn 'entity_type' backend/knowledge/curation/deduplication.py
+Typed labels (approved by Raj on 2026-11-06, reversing MIS-177 D2): the
+node's type is the `entity_type` PROPERTY, and an `:__Entity__` node also
+carries that type as a graph label, mirroring the property, so the graph can
+be browsed and queried by type. D2 had removed every type label but `:User`
+from `:__Entity__` nodes; the label set and the rule are now shared with the
+curation graph writer (`backend/knowledge/storage/type_labels.py`). Every type
+reader still filters on the property (`grep -rn 'entity_type'
+backend/knowledge/curation/deduplication.py
 backend/knowledge/storage/graph_store.py backend/vault/user_snapshot.py`;
 `count_nodes_by_type` in admin.py). `node_type_label` below states which
-nodes still get one.
+label each node gets; the node MERGE removes every other ontology type label.
 """
 
 import difflib
@@ -40,6 +41,7 @@ from backend.knowledge.eval_isolation import assert_neo4j_uri_not_live
 from backend.knowledge.ontologies import ALL_NODE_TYPE_NAMES
 from backend.knowledge.ontologies.v1_0_0 import ALL_EDGE_TYPE_NAMES
 from backend.knowledge.storage.partitions import ENTITY_LABEL, SELF_MODEL_LABEL
+from backend.knowledge.storage.type_labels import entity_type_label
 
 from .models import (
     SEED_CONFIDENCE,
@@ -84,18 +86,6 @@ _MERGE_NODE = (
     "ON MATCH SET n += $properties "
 )
 
-# The only ontology type label an `:__Entity__` node keeps as a graph label.
-# `:User` is the user node's label: the graph writer, `GraphStore` and this
-# applier SET it when they write the user node (`grep -n 'SET e:User'
-# backend/knowledge/curation/graph_writer.py
-# backend/knowledge/storage/graph_store.py`). Not every writer of the user node
-# does: `SkillDerivationJob._create_skill` MERGEs it without the label
-# (`grep -n 'MERGE (u:__Entity__ {id: $user_entity_id})'
-# backend/knowledge/curation/skill_derivation.py`), so a user node only that
-# job has written carries no `:User`. Every other `:__Entity__` type lives in
-# `entity_type` only (MIS-177 D2, module docstring above).
-ENTITY_TYPE_LABELS_KEPT: frozenset[str] = frozenset({"User"})
-
 # A label is interpolated into Cypher, so each name is checked to be a plain
 # identifier before it is used -- `ALL_NODE_TYPE_NAMES` is authored ontology
 # data, not user input, but a name that needed backtick-quoting would turn a
@@ -109,8 +99,10 @@ def node_type_label(partition: str, node_type: str) -> str | None:
     `:__SelfModel__` nodes keep their type label (`:MistIdentity` is an
     invariant, and `ensure_mist_identity` MERGEs on
     `(:__SelfModel__:MistIdentity {id})`: `grep -n 'MERGE (m:__SelfModel__'
-    backend/knowledge/storage/graph_store.py`). An `:__Entity__` node keeps
-    only `User` (`ENTITY_TYPE_LABELS_KEPT`).
+    backend/knowledge/storage/graph_store.py`). An `:__Entity__` node gets
+    `entity_type_label(node_type)`: its own type for a type in
+    `ENTITY_TYPE_LABELS` (`User` included), and none for any other type (for
+    example a `MistIdentity` node seeded into `:__Entity__`).
 
     Args:
         partition: `ENTITY_LABEL` or `SELF_MODEL_LABEL`.
@@ -119,9 +111,9 @@ def node_type_label(partition: str, node_type: str) -> str | None:
     Returns:
         The label to SET, or None when the node carries no type label.
     """
-    if partition == SELF_MODEL_LABEL or node_type in ENTITY_TYPE_LABELS_KEPT:
+    if partition == SELF_MODEL_LABEL:
         return node_type
-    return None
+    return entity_type_label(node_type)
 
 
 def _require_label_identifier(name: str, clause: str) -> None:
@@ -151,9 +143,11 @@ def entity_type_labels_removed(kept: str | None) -> list[str]:
 def _merge_node_query(partition: str, node_type: str) -> str:
     """Build the node MERGE for one seed node.
 
-    An `:__Entity__` node ends with no ontology type label except `User`,
-    whether the MERGE created it or matched an existing node: the REMOVE
-    strips any type label an earlier writer (a pre-MIS-177 seed, the retired
+    An `:__Entity__` node ends with exactly its own type label
+    (`node_type_label`; none for a type without one), whether the MERGE
+    created it or matched an existing node: the SET adds the label a node
+    seeded under MIS-177 D2 lacks, and the REMOVE strips any other type label
+    an earlier writer (an earlier seed of another type, the retired
     `admin.apply_seed`) left on it. A `:__SelfModel__` node gets its type
     label SET and nothing removed.
 
@@ -428,8 +422,9 @@ def apply_seed_documents(
     fact references, not by `doc.nodes` membership) is written with its full
     `SeedNode` definition: `entity_type` property and every other
     descriptive property the source defines (R1.4 Task 12). Type labels
-    follow `node_type_label`: a `:__SelfModel__` node and a `User` node get
-    their type label; any other `:__Entity__` node ends with none (MIS-177).
+    follow `node_type_label`: a `:__SelfModel__` node gets its type label, and
+    an `:__Entity__` node ends with exactly its own type label, or none for a
+    type outside `ENTITY_TYPE_LABELS` (typed labels, reversing MIS-177 D2).
 
     Args:
         connection: Sync graph connection. Callers in async contexts must
