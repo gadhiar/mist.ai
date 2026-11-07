@@ -92,6 +92,17 @@ def echo_payload(gold: GoldProbe) -> dict[str, list[dict[str, Any]]]:
     }
 
 
+RUN_IDENTITY = "ri1-" + "c" * 64
+OTHER_RUN_IDENTITY = "ri1-" + "d" * 64
+RUN_IDENTITY_COMPONENTS = {
+    "prompt_sha256": "p" * 64,
+    "adapter": "gptoss",
+    "temperature": 0.0,
+    "scope_enabled": True,
+    "list_batch_max_units": None,
+}
+
+
 @dataclass
 class FakeState:
     """What the fake service reports and does; mutate it mid-test."""
@@ -111,6 +122,11 @@ class FakeState:
     # The /v1/info serving-config fields (contract 1.1.0). None makes /v1/info answer
     # the way a 1.0.0 server does: the seven original fields only, no keys for these.
     serving_config: dict[str, Any] | None = field(default_factory=lambda: dict(SERVING_CONFIG))
+    # The run identity /v1/info reports (contract 1.2.0) and every result is stamped
+    # with. None answers the way a pre-1.2.0 server does: no run-identity keys at all.
+    run_identity: str | None = RUN_IDENTITY
+    # utterance -> the stamp that result carries instead of `run_identity`.
+    stamp_for: dict[str, str | None] = field(default_factory=dict)
 
 
 SERVING_CONFIG = {
@@ -143,6 +159,7 @@ def _ok_response(
             prompt_sha256="0" * 64,
             llama_cpp_build="b0",
             adapter="fake",
+            run_identity=state.stamp_for.get(req.utterance, state.run_identity),
         ),
         timings_ms=TimingsMs(scope=1.0, extract=2.0, derive=None, total=3.0),
         attempts=attempts,
@@ -174,6 +191,9 @@ def build_fake_app(state: FakeState) -> FastAPI:
         }
         if state.serving_config is not None:
             body.update(state.serving_config)
+        if state.run_identity is not None:
+            body["run_identity"] = state.run_identity
+            body["run_identity_components"] = dict(RUN_IDENTITY_COMPONENTS)
         # Validate through the contract model, then send exactly `body`'s keys.
         InfoResponse.model_validate(body)
         return JSONResponse(body)
@@ -894,6 +914,7 @@ async def test_an_old_server_without_serving_config_warns_per_field_and_the_run_
     state, _ = world
     state.contract_version = "1.0.0"
     state.serving_config = None  # /v1/info carries the seven 1.0.0 fields only
+    state.run_identity = None
     out = tmp_path / "out"
 
     code = await run_execute(state_and_client=world, gold_path=gold, out_dir=out)
@@ -934,6 +955,79 @@ async def test_a_null_ctx_size_alone_gets_one_warning(
     assert summary["serving_config"]["ctx_size"] is None
     assert summary["serving_config"]["constrained_mode"] == "schema"
     assert summary["serving_config_missing"] == ["ctx_size"]
+
+
+@pytest.mark.asyncio
+async def test_the_summary_records_the_run_identity_and_its_components(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gold = write_gold(tmp_path / "gold.jsonl", 2)
+    out = tmp_path / "out"
+
+    code = await run_execute(state_and_client=make_world(gold), gold_path=gold, out_dir=out)
+
+    assert code == 0
+    stderr = capsys.readouterr().err
+    assert f"[INFO] run identity: {RUN_IDENTITY}" in stderr
+    assert _warn_lines(stderr) == []
+    summary = read_summary(out)
+    assert summary["run_identity"] == RUN_IDENTITY
+    assert summary["run_identity_components"] == RUN_IDENTITY_COMPONENTS
+    assert summary["run_identity_mismatches"] == []
+    rows = read_rows(out)
+    assert {pid: row["run_identity"] for pid, row in rows.items()} == {
+        "p-1": RUN_IDENTITY,
+        "p-2": RUN_IDENTITY,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_result_stamped_with_another_identity_warns_and_is_recorded(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gold = write_gold(tmp_path / "gold.jsonl", 3)
+    world = make_world(gold)
+    state, _ = world
+    state.stamp_for["I use tool2 daily"] = OTHER_RUN_IDENTITY
+    state.stamp_for["I use tool3 daily"] = None
+    out = tmp_path / "out"
+
+    code = await run_execute(state_and_client=world, gold_path=gold, out_dir=out)
+
+    assert code == 0  # scoring is unaffected; the run is flagged, not failed
+    warns = _warn_lines(capsys.readouterr().err)
+    assert len(warns) == 1
+    assert "2 of 3 results" in warns[0]
+    assert RUN_IDENTITY in warns[0]
+    assert "p-2" in warns[0] and "p-3" in warns[0]
+    summary = read_summary(out)
+    assert summary["run_identity"] == RUN_IDENTITY
+    assert summary["run_identity_mismatches"] == [
+        {"id": "p-2", "run_identity": OTHER_RUN_IDENTITY},
+        {"id": "p-3", "run_identity": None},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_server_without_a_run_identity_is_recorded_as_unrecorded(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gold = write_gold(tmp_path / "gold.jsonl", 2)
+    world = make_world(gold)
+    world[0].contract_version = "1.1.0"
+    world[0].run_identity = None
+    out = tmp_path / "out"
+
+    code = await run_execute(state_and_client=world, gold_path=gold, out_dir=out)
+
+    assert code == 0
+    stderr = capsys.readouterr().err
+    assert "[INFO] run identity: unrecorded" in stderr
+    assert _warn_lines(stderr) == []
+    summary = read_summary(out)
+    assert summary["run_identity"] is None
+    assert summary["run_identity_components"] is None
+    assert summary["run_identity_mismatches"] == []
 
 
 @pytest.mark.asyncio
