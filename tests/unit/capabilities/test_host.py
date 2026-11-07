@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import TypeVar
 
 import pytest
+import pytest_asyncio
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.capabilities.action_log import ActionLog
@@ -157,6 +158,17 @@ class Rig:
     db: CapabilitiesDb
 
 
+_RIGS: list[Rig] = []
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _stop_hosts():
+    """Stop every host a test built, so no proposal timer outlives the test's loop."""
+    yield
+    while _RIGS:
+        await _RIGS.pop().host.stop()
+
+
 def _rig(
     *capabilities: FakeCapability,
     settings: HostSettings | None = None,
@@ -189,7 +201,9 @@ def _rig(
         settings=settings or HostSettings(),
         **extra,  # type: ignore[arg-type]
     )
-    return Rig(host, {c.name: c for c in capabilities}, sink, clock, secrets, db)
+    rig = Rig(host, {c.name: c for c in capabilities}, sink, clock, secrets, db)
+    _RIGS.append(rig)
+    return rig
 
 
 def _ctx(source: str = "model", call_id: str = "call-1", session: str = SESSION):
@@ -617,6 +631,89 @@ class TestLifecycle:
 
         assert rig.caps["lights"].stopped
         assert rig.caps["music"].stopped
+
+
+def _unfinished_timers() -> list[asyncio.Task[object]]:
+    return [
+        task
+        for task in asyncio.all_tasks()
+        if not task.done() and task.get_coro().__qualname__ == "ProposalStore._expire_after_ttl"
+    ]
+
+
+class _FailingStop(FakeCapability):
+    """A capability whose first `stop` raises `RuntimeError`, as a bug outside the contract."""
+
+    async def stop(self) -> None:
+        if not self.stopped:
+            self.stopped = True
+            raise RuntimeError("bug in stop")
+
+
+class TestStopClosesProposals:
+    @pytest.mark.asyncio
+    async def test_stop_leaves_no_timer_and_announces_no_expiry(self):
+        rig = _rig(_lights())
+        await _propose(rig, ("lights.power", {"target": "bedroom"}))
+        await rig.clock.wait_for_sleepers(1)
+        assert len(_unfinished_timers()) == 1
+
+        await rig.host.stop()
+
+        assert _unfinished_timers() == []
+        assert rig.host.stats()["proposals"]["expired"] == 0
+        await rig.clock.advance(120)
+        assert rig.host.stats()["proposals"]["expired"] == 0
+        assert rig.sink.of_type("action_resolved") == []
+
+    @pytest.mark.asyncio
+    async def test_stop_raising_outside_the_contract_still_closes_the_store(self):
+        failing = _FailingStop("failing", tools=(make_tool_spec("failing.do"),))
+        rig = _rig(_lights(), failing)
+        await _propose(rig, ("lights.power", {"target": "bedroom"}))
+
+        with pytest.raises(RuntimeError, match="bug in stop"):
+            await rig.host.stop()
+
+        assert rig.caps["lights"].stopped
+        assert _unfinished_timers() == []
+
+    @pytest.mark.asyncio
+    async def test_run_actions_after_stop_records_the_held_call_as_an_error(self):
+        rig = _rig(_lights())
+        await rig.host.stop()
+        plan = rig.host.plan_turn(SESSION, "lights", [])
+
+        result = await rig.host.run_actions(
+            SESSION,
+            "turn-1",
+            "lights",
+            plan,
+            ScriptedDecode(_decoded(("lights.power", {"target": "bedroom"}))),
+        )
+
+        (record,) = result.records
+        assert record.outcome.status == "error"
+        assert record.outcome.reason == "proposal store is closed"
+        assert record.outcome.proposal_id is None
+        assert rig.caps["lights"].invocations == []
+        assert [e["type"] for e in rig.host.drain_events(SESSION)] == []
+        assert await _log_rows(rig.db) == [
+            ("lights.power", "lights", "model", "error", "proposal store is closed")
+        ]
+        assert _unfinished_timers() == []
+
+    @pytest.mark.asyncio
+    async def test_decide_after_stop_finds_no_live_proposal(self):
+        rig = _rig(_lights())
+        proposal_id = await _propose(rig, ("lights.power", {"target": "bedroom"}))
+        await rig.host.stop()
+
+        resolution = await rig.host.decide(SESSION, proposal_id, "approve")
+
+        assert resolution.handled is False
+        assert resolution.reply == NO_LIVE_PROPOSAL_REPLY
+        assert rig.caps["lights"].invocations == []
 
 
 # -- pre_llm ---------------------------------------------------------------------------------

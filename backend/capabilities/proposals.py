@@ -192,7 +192,11 @@ class ProposalStore:
         self._on_expire = on_expire
         self._live: dict[str, Proposal] = {}
         self._timers: dict[str, asyncio.Task[None]] = {}
+        # Every timer task not yet ended, whether or not its proposal is still live: `_finish`
+        # pops a cancelled timer from `_timers` before it has unwound, and `close` waits for it.
+        self._tasks: set[asyncio.Task[None]] = set()
         self._finished: OrderedDict[str, tuple[str, _Fate]] = OrderedDict()
+        self._closed = False
 
     def put(self, session_id: str, calls: Sequence[ProposedCall]) -> Proposal:
         """Store a turn's calls as one proposal, superseding the session's live one.
@@ -205,9 +209,12 @@ class ProposalStore:
             The new proposal.
 
         Raises:
+            CapabilityInvocationError: The store is closed; nothing changed and no timer started.
             ValueError: `calls` is empty.
             RuntimeError: No event loop is running in this thread, so no timer can start.
         """
+        if self._closed:
+            raise CapabilityInvocationError("proposal store is closed")
         if not calls:
             raise ValueError("a proposal needs at least one call")
         loop = asyncio.get_running_loop()
@@ -224,7 +231,9 @@ class ProposalStore:
         self._live[session_id] = proposal
         timer = loop.create_task(self._expire_after_ttl(proposal))
         timer.add_done_callback(self._on_timer_done)
+        timer.add_done_callback(self._tasks.discard)
         self._timers[proposal.proposal_id] = timer
+        self._tasks.add(timer)
         return proposal
 
     def pop(self, session_id: str, proposal_id: str | None) -> Proposal | None:
@@ -237,11 +246,14 @@ class ProposalStore:
 
         Returns:
             The proposal, now removed; or None when nothing is live, when the id was already
-            resolved or superseded, or when it belongs to another session.
+            resolved or superseded, when it belongs to another session, or for any session and
+            id once the store is closed.
 
         Raises:
             CapabilityInvocationError: `proposal_id` has expired, or is unknown to the store.
         """
+        if self._closed:
+            return None
         live = self._live.get(session_id)
         if live is not None and self._clock.now() >= live.expires_at:
             self._expire(live)
@@ -264,6 +276,36 @@ class ProposalStore:
         if fate == "expired":
             raise CapabilityInvocationError(f"proposal {proposal_id} has expired")
         return None
+
+    async def close(self) -> None:
+        """Drop every live proposal and wait for every expiry timer to end.
+
+        Before its first await it marks the store closed, cancels each live proposal's timer and
+        drops the proposals without calling `on_expire`: shutting down is not an expiry, so
+        nothing is announced or counted. A timer cancelled at its sleep, or whose sleep had
+        finished but which had not yet run, raises `CancelledError` at that sleep when it
+        resumes, so none reaches its expiry check. It then waits, without a bound, for every
+        timer the store created that has not ended, including one a `pop` cancelled that has
+        not yet unwound; a timer's only await is the clock's sleep, so a cancelled one always
+        ends.
+
+        After close, `put` raises and `pop` returns None. A second call returns at once and
+        logs nothing.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        dropped = len(self._live)
+        self._live.clear()
+        for timer in self._timers.values():
+            timer.cancel()
+        self._timers.clear()
+        logger.info("Proposal store closed; dropped %d live proposal(s)", dropped)
+        pending = [task for task in self._tasks if not task.done()]
+        # `asyncio.wait` rather than `gather` or `await task`, which would re-raise a timer's
+        # `CancelledError` here; and it is skipped when empty, as `wait` refuses an empty set.
+        if pending:
+            await asyncio.wait(pending)
 
     async def _expire_after_ttl(self, proposal: Proposal) -> None:
         await self._clock.sleep(self._ttl_s)

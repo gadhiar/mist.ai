@@ -337,21 +337,28 @@ class CapabilityHost(CapabilityTurnPort):
             await asyncio.wait(list(self._start_tasks.values()))
 
     async def stop(self) -> None:
-        """Cancel starts still pending, then stop every capability in registration order.
+        """Cancel pending starts, stop each capability in order, then close the proposal store.
 
         A `CapabilityError` from one capability's `stop` is logged at WARNING and the others
-        still stop.
+        still stop. The store closes in a `finally`, so it closes after the capabilities stop
+        even when a `stop` raises outside `CapabilityError`, which still propagates. Closing
+        drops the live proposals without announcing an expiry and waits for every expiry timer
+        to end, so none outlives the host; a later `decide` finds no live proposal, and a call
+        that policy holds is recorded as an error.
         """
-        pending = [task for task in self._start_tasks.values() if not task.done()]
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.wait(pending)
-        for capability in self._capabilities:
-            try:
-                await capability.stop()
-            except CapabilityError as exc:
-                logger.warning("Capability %s failed to stop: %s", capability.name, exc)
+        try:
+            pending = [task for task in self._start_tasks.values() if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.wait(pending)
+            for capability in self._capabilities:
+                try:
+                    await capability.stop()
+                except CapabilityError as exc:
+                    logger.warning("Capability %s failed to stop: %s", capability.name, exc)
+        finally:
+            await self._proposals.close()
 
     def statuses(self) -> list[CapabilityStatus]:
         """Return each capability's status, in registration order.
@@ -776,21 +783,33 @@ class CapabilityHost(CapabilityTurnPort):
         waiting: Sequence[tuple[int, _Ready, InvocationContext]],
         slots: list[ActionRecord | None],
     ) -> None:
-        """Bundle a turn's held calls into one proposal and fill their pending records."""
+        """Bundle a turn's held calls into one proposal and fill their pending records.
+
+        Once `stop` has closed the store, `put` refuses: each held call is then recorded with
+        the outcome `_outcome_for_error` gives that refusal, and no `action_proposed` is
+        buffered.
+        """
         self._supersede_live(session_id)
-        proposal = self._proposals.put(
-            session_id,
-            [
-                ProposedCall(
-                    capability=ready.capability.name,
-                    tool=ready.spec.name,
-                    args=ready.args,
-                    summary=ready.summary,
-                    risk=ready.spec.risk,
-                )
-                for _, ready, _ in waiting
-            ],
-        )
+        try:
+            proposal = self._proposals.put(
+                session_id,
+                [
+                    ProposedCall(
+                        capability=ready.capability.name,
+                        tool=ready.spec.name,
+                        args=ready.args,
+                        summary=ready.summary,
+                        risk=ready.spec.risk,
+                    )
+                    for _, ready, _ in waiting
+                ],
+            )
+        except CapabilityInvocationError as exc:
+            logger.warning("Capability calls could not be proposed: %s", _describe(exc))
+            for index, ready, ctx in waiting:
+                outcome = _outcome_for_error(ready.spec.name, exc)
+                slots[index] = await self._finish(ready, ctx, outcome, 0)
+            return
         self._buffer(session_id, _proposed_payload(proposal))
         for index, ready, ctx in waiting:
             outcome = ToolOutcome(
