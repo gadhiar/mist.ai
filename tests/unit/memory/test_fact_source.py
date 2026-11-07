@@ -35,7 +35,16 @@ from backend.memory.fact_source import (
     FactSnapshotSource,
     GraphFactSource,
 )
-from backend.memory.index_db import open_index, open_reader
+from backend.memory.index_db import (
+    META_EMBEDDING_MODEL_ID,
+    META_SCHEMA_VERSION,
+    SCHEMA_VERSION,
+    IndexRebuild,
+    degraded_reason,
+    get_meta,
+    open_index,
+    open_reader,
+)
 from backend.memory.models import FactRow, fact_key
 from backend.memory.ranking import MISSING_FACT_CONFIDENCE
 from tests.fakes.memory_fakes import FakeClock, FakeEmbedder
@@ -43,6 +52,7 @@ from tests.mocks.neo4j import FakeGraphExecutor, FakeNeo4jConnection
 
 _MODEL = "all-MiniLM-L6-v2"
 _DEBOUNCE_S = 30.0
+_RESCAN_S = 300.0
 _WAIT_S = 5.0
 
 
@@ -151,6 +161,12 @@ class ManualSleeper:
         return sum(1 for _, future in self._pending if not future.done())
 
     def release(self) -> None:
+        """Release the oldest sleep still waiting; a cancelled one (a timer a mark cut short)
+        is skipped.
+        """
+        self._pending = [
+            (seconds, future) for seconds, future in self._pending if not future.done()
+        ]
         seconds, future = self._pending.pop(0)
         self._clock.advance(seconds=seconds)
         future.set_result(None)
@@ -212,6 +228,7 @@ def _refresher(
     periodic: bool = False,
     executor: Executor | None = None,
     source: FactSnapshotSource | None = None,
+    rebuild: IndexRebuild | None = None,
 ) -> FactIndexRefresher:
     return FactIndexRefresher(
         source if source is not None else GraphFactSource(graph.executor, page_size=2),
@@ -219,7 +236,9 @@ def _refresher(
         executor if executor is not None else InlineExecutor(),
         clock=clock,
         debounce_s=_DEBOUNCE_S,
+        rescan_interval_s=_RESCAN_S,
         periodic=periodic,
+        rebuild=rebuild,
         sleep=sleeper,
     )
 
@@ -578,7 +597,9 @@ class TestMarkDirty:
 
 class TestRefreshLoop:
     @pytest.mark.asyncio
-    async def test_refreshes_once_at_startup_then_waits_for_a_mark(self, index, fake_clock):
+    async def test_refreshes_once_at_startup_then_waits_for_a_mark_or_the_interval(
+        self, index, fake_clock
+    ):
         graph = FakeGraph(_facts(3))
         sleeper = ManualSleeper(fake_clock)
         refresher = _refresher(graph, index, fake_clock, sleeper)
@@ -588,7 +609,8 @@ class TestRefreshLoop:
 
         assert index.count() == 3
         assert graph.pages == 2
-        assert sleeper.requests == []
+        assert sleeper.requests == [pytest.approx(_RESCAN_S)]
+        assert sleeper.waiting == 1
         await refresher.stop()
 
     @pytest.mark.asyncio
@@ -607,8 +629,10 @@ class TestRefreshLoop:
         refresher.mark_dirty()
         await _settle()
 
-        # Ten seconds after the startup refresh, the next may start twenty seconds later.
-        assert sleeper.requests == [pytest.approx(_DEBOUNCE_S - 10)]
+        # Ten seconds after the startup refresh, the next may start twenty seconds later; the
+        # first mark cut the rescan timer short.
+        assert sleeper.requests == [pytest.approx(_RESCAN_S), pytest.approx(_DEBOUNCE_S - 10)]
+        assert sleeper.waiting == 1
         assert graph.pages == scans_after_startup
         graph.records.append(_record("k999999", "user", "USES", "late"))
 
@@ -617,7 +641,9 @@ class TestRefreshLoop:
 
         assert index.count() == 4
         assert graph.pages == scans_after_startup + 3  # four rows in pages of two, then empty
-        assert sleeper.waiting == 0
+        # Only the next rescan timer is waiting: the three marks brought one refresh.
+        assert sleeper.waiting == 1
+        assert sleeper.requests[-1] == pytest.approx(_RESCAN_S)
         await refresher.stop()
 
     @pytest.mark.asyncio
@@ -633,7 +659,8 @@ class TestRefreshLoop:
         refresher.mark_dirty()
         await _settle()
 
-        assert sleeper.requests == []
+        # No debounce wait: the only sleeps are the rescan timers before and after the mark.
+        assert sleeper.requests == [pytest.approx(_RESCAN_S)] * 2
         assert index.count() == 2
         await refresher.stop()
 
@@ -682,7 +709,9 @@ class TestRefreshLoop:
                 InlineExecutor(),
                 clock=fake_clock,
                 debounce_s=0,
+                rescan_interval_s=_RESCAN_S,
                 periodic=True,
+                rebuild=None,
             )
 
     @pytest.mark.asyncio
@@ -723,7 +752,9 @@ class TestRefreshLoop:
             InlineExecutor(),
             clock=fake_clock,
             debounce_s=0,
+            rescan_interval_s=_RESCAN_S,
             periodic=False,
+            rebuild=None,
             sleep=sleeper,
         )
 
@@ -763,6 +794,199 @@ class TestRefreshLoop:
         assert refresher.running
         await refresher.stop()
         writer.close()
+
+
+class TestTimedRescan:
+    """Dispatcher mode rescans every `rescan_interval_s` too, for changes no apply event marks."""
+
+    @pytest.mark.asyncio
+    async def test_a_change_with_no_apply_event_is_indexed_after_one_interval(
+        self, index, fake_clock
+    ):
+        graph = FakeGraph(_facts(1))
+        sleeper = ManualSleeper(fake_clock)
+        refresher = _refresher(graph, index, fake_clock, sleeper)
+        refresher.start()
+        await _settle()
+        # Another process writes the graph: no dispatcher here sees it, so nothing marks.
+        graph.records.append(_record("k999999", "user", "USES", "late"))
+        await _settle()
+        assert index.count() == 1
+
+        sleeper.release()
+        await _settle()
+
+        assert index.count() == 2
+        assert sleeper.requests == [pytest.approx(_RESCAN_S)] * 2  # and the timer re-arms
+        await refresher.stop()
+
+    @pytest.mark.asyncio
+    async def test_a_mark_refresh_restarts_the_interval(self, index, fake_clock):
+        graph = FakeGraph(_facts(1))  # one page per scan, so pages count scans
+        sleeper = ManualSleeper(fake_clock)
+        refresher = _refresher(graph, index, fake_clock, sleeper)
+        refresher.start()
+        await _settle()
+
+        fake_clock.advance(seconds=_RESCAN_S - 10)
+        refresher.mark_dirty()
+        await _settle()
+
+        # The mark's refresh counts as the rescan: the timer waits a whole interval from it,
+        # not the ten seconds the old one had left.
+        assert graph.pages == 2
+        assert sleeper.waiting == 1
+        assert sleeper.requests == [pytest.approx(_RESCAN_S)] * 2
+        sleeper.release()
+        await _settle()
+        assert graph.pages == 3
+        await refresher.stop()
+
+    @pytest.mark.asyncio
+    async def test_a_mark_and_the_timer_due_together_bring_one_refresh(self, index, fake_clock):
+        graph = FakeGraph(_facts(1))
+        sleeper = ManualSleeper(fake_clock)
+        refresher = _refresher(graph, index, fake_clock, sleeper)
+        refresher.start()
+        await _settle()
+
+        refresher.mark_dirty()
+        sleeper.release()
+        await _settle()
+
+        assert graph.pages == 2
+        assert sleeper.waiting == 1
+        assert sleeper.requests == [pytest.approx(_RESCAN_S)] * 2
+        await refresher.stop()
+
+    @pytest.mark.asyncio
+    async def test_a_one_shot_refresh_restarts_the_interval(self, index, fake_clock):
+        graph = FakeGraph(_facts(1))
+        sleeper = ManualSleeper(fake_clock)
+        refresher = _refresher(graph, index, fake_clock, sleeper)
+        await refresher.refresh()
+        fake_clock.advance(seconds=100)
+
+        refresher.start()
+        await _settle()
+
+        assert graph.pages == 2
+        assert sleeper.requests == [pytest.approx(_RESCAN_S)]
+        await refresher.stop()
+
+    @pytest.mark.parametrize("interval", [0, -1])
+    def test_the_interval_must_be_positive(self, index, fake_clock, interval):
+        with pytest.raises(MemoryConfigError, match="MIST_MEMORY_RESCAN_INTERVAL_S"):
+            FactIndexRefresher(
+                GraphFactSource(FakeGraphExecutor()),
+                index,
+                InlineExecutor(),
+                clock=fake_clock,
+                debounce_s=_DEBOUNCE_S,
+                rescan_interval_s=interval,
+                periodic=False,
+                rebuild=None,
+            )
+
+
+@pytest.fixture
+def stale_file(tmp_path, fake_embedder) -> Iterator[tuple[object, FactIndex, object]]:
+    """An index file built for another embedder, opened as production opens it.
+
+    Yields the path, the FactIndex on the rebuilding file, and its reader connection.
+    """
+    path = tmp_path / "memory_index.db"
+    open_index(path, embedding_model_id="old-model").close()
+    writer = open_index(path, embedding_model_id=_MODEL)
+    reader = open_reader(path, embedding_model_id=_MODEL)
+    yield path, FactIndex(writer, fake_embedder, tz=UTC, reader=reader), reader
+    reader.close()
+    writer.close()
+
+
+class TestRebuild:
+    """The first rescan after an in-place rebuild refills the index and completes the rebuild."""
+
+    @pytest.mark.asyncio
+    async def test_reads_report_index_rebuilding_until_the_rescan_commits(
+        self, stale_file, fake_clock
+    ):
+        path, index, reader = stale_file
+        graph = FakeGraph(_facts(3))
+        source = GatedSource(GraphFactSource(graph.executor, page_size=2))
+        rebuild = IndexRebuild(path, embedding_model_id=_MODEL)
+        refresher = _refresher(
+            graph, index, fake_clock, ManualSleeper(fake_clock), source=source, rebuild=rebuild
+        )
+        refresher.start()
+        await _settle()
+        assert source.started == 1
+        assert degraded_reason(reader) == "index_rebuilding"
+        assert get_meta(reader, META_EMBEDDING_MODEL_ID) == "old-model"
+
+        source.gate.set()
+        await _settle()
+
+        assert index.count() == 3
+        assert degraded_reason(reader) is None
+        assert get_meta(reader, META_EMBEDDING_MODEL_ID) == _MODEL
+        assert get_meta(reader, META_SCHEMA_VERSION) == str(SCHEMA_VERSION)
+        await refresher.stop()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_rescan_leaves_the_rebuild_pending_and_the_retry_completes_it(
+        self, stale_file, fake_clock
+    ):
+        path, index, reader = stale_file
+        graph = FakeGraph(_facts(3))
+        graph.fail_after = 1
+        sleeper = ManualSleeper(fake_clock)
+        rebuild = IndexRebuild(path, embedding_model_id=_MODEL)
+        refresher = _refresher(graph, index, fake_clock, sleeper, rebuild=rebuild)
+        refresher.start()
+        await _settle()
+        assert index.count() == 0
+        assert degraded_reason(reader) == "index_rebuilding"
+
+        graph.fail_after = None
+        sleeper.release()
+        await _settle()
+
+        assert index.count() == 3
+        assert degraded_reason(reader) is None
+        await refresher.stop()
+
+    @pytest.mark.asyncio
+    async def test_a_one_shot_refresh_completes_the_rebuild(self, stale_file, fake_clock):
+        path, index, reader = stale_file
+        graph = FakeGraph(_facts(2))
+        rebuild = IndexRebuild(path, embedding_model_id=_MODEL)
+        refresher = _refresher(graph, index, fake_clock, ManualSleeper(fake_clock), rebuild=rebuild)
+
+        report = await refresher.refresh()
+
+        assert report == DiffReport(inserted=2, embedded=2)
+        assert degraded_reason(reader) is None
+        # The completed rebuild is not checked again: a second refresh does not reopen it.
+        assert await refresher.refresh() == DiffReport(unchanged=2)
+
+    @pytest.mark.asyncio
+    async def test_a_rescan_stopped_mid_scan_leaves_the_rebuild_pending(
+        self, stale_file, fake_clock
+    ):
+        path, index, reader = stale_file
+        graph = FakeGraph(_facts(3))
+        source = GatedSource(GraphFactSource(graph.executor, page_size=2))
+        rebuild = IndexRebuild(path, embedding_model_id=_MODEL)
+        refresher = _refresher(
+            graph, index, fake_clock, ManualSleeper(fake_clock), source=source, rebuild=rebuild
+        )
+        refresher.start()
+        await _settle()
+
+        await refresher.stop()
+
+        assert degraded_reason(reader) == "index_rebuilding"
 
 
 class FlakyEmbedder(FakeEmbedder):
@@ -899,7 +1123,9 @@ class TestScale:
                 pool,
                 clock=fake_clock,
                 debounce_s=_DEBOUNCE_S,
+                rescan_interval_s=_RESCAN_S,
                 periodic=False,
+                rebuild=None,
             )
 
             started = time.perf_counter()
