@@ -74,11 +74,26 @@ class TestCurrentFactsQueryPredicates:
             "AS recorded_at",
             "AS confidence",
             "AS source_utterance_id",
+            "AS subject_type",
+            "AS object_type",
         ):
             assert alias in text, alias
         assert "r.version_key AS version_key" in text
         assert "r.source_utterance_id AS source_utterance_id" in text
         assert "coalesce(r.recorded_at, r.created_at) AS recorded_at" in text
+
+    def test_types_come_from_entity_type(self):
+        query, _ = current_facts_query(None, 100)
+        text = _normalised(query)
+
+        # No fallback: a node without `entity_type` gives None, which indexes no type terms.
+        assert "s.entity_type AS subject_type" in text
+        assert "o.entity_type AS object_type" in text
+
+    def test_serves_the_v1_3_0_user_centric_edges(self):
+        _, params = current_facts_query(None, 100)
+
+        assert {"RECOMMENDS", "HAS_HABIT"} <= set(params["allowed_rel_types"])
 
     def test_names_fall_back_to_ids(self):
         query, _ = current_facts_query(None, 100)

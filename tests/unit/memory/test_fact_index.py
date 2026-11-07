@@ -32,6 +32,8 @@ def _fact(
     recorded_at: str | None = "2026-01-01T00:00:00+00:00",
     confidence: float = 0.9,
     source_utterance_id: str | None = "utt-1",
+    subject_type: str | None = "User",
+    object_type: str | None = "Organization",
 ) -> FactRow:
     subject_id = subject_name.lower()
     object_id = object_name.lower()
@@ -40,9 +42,11 @@ def _fact(
         fact_key=fact_key(subject_id, rel_type, object_id),
         subject_id=subject_id,
         subject_name=subject_name,
+        subject_type=subject_type,
         rel_type=rel_type,
         object_id=object_id,
         object_name=object_name,
+        object_type=object_type,
         valid_from=valid_from,
         valid_to=valid_to,
         recorded_at=recorded_at,
@@ -827,3 +831,204 @@ def test_currency_rejects_a_naive_now(index: FactIndex) -> None:
     assert stored is not None
     with pytest.raises(ValueError, match="aware"):
         stored.is_current_at(datetime(2026, 10, 22, 18, 0))
+
+
+# -- entity types and type terms ---------------------------------------------------------------
+
+
+def test_upsert_stores_both_entity_types(index: FactIndex) -> None:
+    index.upsert([_fact("rk-kestrel", "Kestrel", rel_type="USES", object_type="Technology")])
+
+    stored = index.get("rk-kestrel")
+
+    assert stored is not None
+    assert (stored.subject_type, stored.object_type) == ("User", "Technology")
+    assert index.versions(stored.fact_key)[0].object_type == "Technology"
+
+
+def test_an_untyped_row_stores_no_type(index: FactIndex) -> None:
+    index.upsert([_fact("rk-acme", "Acme", subject_type=None, object_type=None)])
+
+    stored = index.get("rk-acme")
+
+    assert stored is not None
+    assert (stored.subject_type, stored.object_type) == (None, None)
+
+
+def test_the_content_hash_covers_both_entity_types() -> None:
+    row = _fact("rk-acme", "Acme")
+    text = render_fact(row)
+
+    assert content_hash(row, text) != content_hash(replace(row, object_type="Project"), text)
+    assert content_hash(row, text) != content_hash(replace(row, subject_type="Person"), text)
+
+
+def test_a_type_scoped_query_matches_a_fact_by_its_type_with_no_name_in_it(
+    index: FactIndex,
+) -> None:
+    index.upsert(
+        [
+            _fact("rk-kestrel", "Kestrel", rel_type="USES", object_type="Technology"),
+            _fact("rk-ana", "Ana", rel_type="KNOWS", object_type="Person"),
+        ]
+    )
+
+    # Neither "Kestrel" nor "uses" is in the query; only the object's type is.
+    groups = index.search_fts("which technologies?")
+
+    assert [group.versions[0].row_key for group in groups] == ["rk-kestrel"]
+    assert [group.versions[0].row_key for group in index.search_fts("what people")] == ["rk-ana"]
+
+
+def test_a_type_scoped_query_matches_the_subject_type_too(index: FactIndex) -> None:
+    index.upsert(
+        [
+            _fact(
+                "rk-ana-acme",
+                "Acme",
+                subject_name="Ana",
+                subject_type="Person",
+                object_type="Organization",
+            )
+        ]
+    )
+
+    assert [group.fact_key for group in index.search_fts("person")] == [
+        fact_key("ana", "WORKS_AT", "acme")
+    ]
+
+
+def test_an_untyped_fact_is_not_matched_by_a_type_term(index: FactIndex) -> None:
+    index.upsert([_fact("rk-kestrel", "Kestrel", rel_type="USES", object_type=None)])
+
+    assert index.search_fts("technologies") == []
+
+
+def test_a_type_change_rewrites_the_type_terms_without_re_embedding(
+    index: FactIndex, fake_embedder: FakeEmbedder
+) -> None:
+    row = _fact("rk-kestrel", "Kestrel", rel_type="USES", object_type="Concept")
+    index.upsert([row])
+
+    report = index.upsert([replace(row, object_type="Technology")])
+
+    # The rendered text and so the embedding do not depend on the type.
+    assert (report.updated, report.embedded) == (1, 0)
+    assert len(fake_embedder.calls) == 1
+    assert [group.fact_key for group in index.search_fts("technology")] == [row.fact_key]
+    assert index.search_fts("concept") == []
+
+
+def test_name_search_ignores_the_type_terms(index: FactIndex) -> None:
+    # "Technology" is the object's type, not a name, so it anchors nothing.
+    index.upsert([_fact("rk-kestrel", "Kestrel", rel_type="USES", object_type="Technology")])
+
+    assert index.search_names(["tell me about technology"]) == []
+
+
+# -- siblings ----------------------------------------------------------------------------------
+
+_NOW = _at("2026-06-01T00:00:00")
+
+
+def _uses(
+    object_name: str,
+    *,
+    utterance: str = "utt-list",
+    recorded_at: str = "2026-01-01T00:00:00+00:00",
+    **overrides: object,
+) -> FactRow:
+    return _fact(
+        f"rk-{object_name.lower()}-{utterance}-{recorded_at}",
+        object_name,
+        rel_type="USES",
+        object_type="Technology",
+        source_utterance_id=utterance,
+        recorded_at=recorded_at,
+        **overrides,  # type: ignore[arg-type]
+    )
+
+
+def test_siblings_are_the_current_facts_of_one_subject_relation_and_utterance(
+    index: FactIndex,
+) -> None:
+    index.upsert(
+        [
+            _uses("Vim"),
+            _uses("Rust"),
+            _uses("Zig"),
+            _uses("Go", utterance="utt-other"),
+            _fact("rk-acme", "Acme", source_utterance_id="utt-list"),
+            _uses("Kestrel", subject_name="Ana"),
+        ]
+    )
+
+    siblings = index.siblings("user", "USES", "utt-list", now=_NOW)
+
+    assert [fact.object_name for fact in siblings] == ["Rust", "Vim", "Zig"]
+
+
+def test_siblings_leave_out_versions_not_current_at_now(index: FactIndex) -> None:
+    index.upsert(
+        [
+            _uses("Vim"),
+            _uses("Rust", valid_to="2026-03-01T00:00:00+00:00"),
+            _uses("Zig", valid_from="2027-01-01"),
+            _uses(
+                "Go", valid_from="2026-02-01T00:00:00+00:00", valid_to="2026-02-01T00:00:00+00:00"
+            ),
+        ]
+    )
+
+    siblings = index.siblings("user", "USES", "utt-list", now=_NOW)
+
+    assert [fact.object_name for fact in siblings] == ["Vim"]
+
+
+def test_siblings_keep_one_version_per_fact(index: FactIndex) -> None:
+    # Two current versions of one fact from the utterance: the one `current_at` picks is kept.
+    early = _uses("Vim", recorded_at="2026-01-01T00:00:00+00:00")
+    late = _uses("Vim", recorded_at="2026-01-02T00:00:00+00:00")
+    index.upsert([early, late, _uses("Rust")])
+
+    siblings = index.siblings("user", "USES", "utt-list", now=_NOW)
+
+    assert [fact.row_key for fact in siblings] == [_uses("Rust").row_key, late.row_key]
+    group = index.search_fts("vim")[0]
+    current = group.current_at(_NOW)
+    assert current is not None and current.row_key == late.row_key
+
+
+def test_siblings_order_is_stable_whatever_the_write_order(
+    conn: sqlite3.Connection, reader: sqlite3.Connection, fake_embedder: FakeEmbedder
+) -> None:
+    rows = [
+        _uses("zig", recorded_at="2026-01-01T00:00:01+00:00"),
+        _uses("Vim"),
+        _uses("rust"),
+        _uses("Ada"),
+    ]
+    index = FactIndex(conn, fake_embedder, tz=UTC, reader=reader)
+    index.upsert(rows)
+    forward = index.siblings("user", "USES", "utt-list", now=_NOW)
+    index.diff_apply([])
+    index.upsert(list(reversed(rows)))
+
+    backward = index.siblings("user", "USES", "utt-list", now=_NOW)
+
+    # Recorded order first, then the name case-folded, then the row key.
+    assert [fact.object_name for fact in forward] == ["Ada", "rust", "Vim", "zig"]
+    assert [fact.row_key for fact in backward] == [fact.row_key for fact in forward]
+
+
+def test_siblings_of_an_unknown_utterance_are_empty(index: FactIndex) -> None:
+    index.upsert([_uses("Vim")])
+
+    assert index.siblings("user", "USES", "utt-missing", now=_NOW) == ()
+
+
+def test_siblings_reject_a_naive_now(index: FactIndex) -> None:
+    index.upsert([_uses("Vim")])
+
+    with pytest.raises(ValueError, match="aware"):
+        index.siblings("user", "USES", "utt-list", now=datetime(2026, 6, 1))

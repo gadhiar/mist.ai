@@ -1,5 +1,8 @@
 """Every latest-belief fact version in `memory_index.db`, searchable by FTS, vector and name.
 
+The FTS mirror also holds each fact's type terms (`type_terms.TYPE_TERMS`), so a question that
+names a type ("which technologies do I use?") finds facts with no name in common with it.
+
 One row per version, keyed by `row_key`, so a clamped history copy, a tombstone and a fact that
 held in two separate periods each keep their own interval. Every search groups its hits by
 `fact_key` and returns all indexed versions of each fact, matched or not, so the fetcher can
@@ -33,14 +36,16 @@ from .fact_render import render_fact
 from .fts import build_or_query, fold, words
 from .index_db import EMBEDDING_DIMENSION, read_transaction, write_transaction
 from .models import FactRow
+from .type_terms import type_terms_text
 
 # The "always / since forever" lower bound, `ALWAYS` in backend/knowledge/curation/intervals.py,
 # copied for the reason fact_render.py gives (importing it loads the curation pipeline).
 _ALWAYS = "-inf"
 
 # Bumped when the hashed fields change, so every row re-hashes (and re-embeds if its text
-# changed) after an upgrade instead of keeping a hash computed another way.
-_HASH_VERSION = 1
+# changed) after an upgrade instead of keeping a hash computed another way. 2 added the
+# entity types.
+_HASH_VERSION = 2
 
 # Keys per `IN (...)` list: below SQLite's historical 999-variable limit.
 _IN_CHUNK = 500
@@ -50,9 +55,11 @@ _VEC_MAX_K = 4096
 
 _PACK = struct.Struct(f"<{EMBEDDING_DIMENSION}f")
 
+# In `IndexedFact` field order, which builds from these rows positionally.
 _COLUMNS = (
-    "row_key, fact_key, subject_id, subject_name, rel_type, object_id, object_name, text, "
-    "valid_from, valid_to, recorded_at, confidence, source_utterance_id, content_hash"
+    "row_key, fact_key, subject_id, subject_name, subject_type, rel_type, object_id, "
+    "object_name, object_type, text, valid_from, valid_to, recorded_at, confidence, "
+    "source_utterance_id, content_hash"
 )
 
 # First row bound of a MATCH query, per fact wanted; most facts have one or two versions.
@@ -126,9 +133,11 @@ def content_hash(row: FactRow, text: str) -> str:
         row.fact_key,
         row.subject_id,
         row.subject_name,
+        row.subject_type,
         row.rel_type,
         row.object_id,
         row.object_name,
+        row.object_type,
         row.valid_from,
         row.valid_to,
         row.recorded_at,
@@ -147,9 +156,11 @@ class IndexedFact:
     fact_key: str
     subject_id: str
     subject_name: str
+    subject_type: str | None
     rel_type: str
     object_id: str
     object_name: str
+    object_type: str | None
     text: str
     valid_from: str | None
     valid_to: str | None
@@ -207,7 +218,12 @@ class FactGroup:
         current = [version for version in self.versions if version.is_current_at(now)]
         if not current:
             return None
-        return max(current, key=lambda version: (version.recorded_at or "", version.row_key))
+        return max(current, key=_recorded_order)
+
+
+def _recorded_order(version: IndexedFact) -> tuple[str, str]:
+    """The order `current_at` picks among current versions by: recorded last, then `row_key`."""
+    return (version.recorded_at or "", version.row_key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,13 +391,72 @@ class FactIndex:
         with self._reader_lock, _index_errors("versions"):
             return self._load_versions([fact_key]).get(fact_key, ())
 
+    def siblings(
+        self,
+        subject_id: str,
+        rel_type: str,
+        source_utterance_id: str,
+        *,
+        now: datetime,
+    ) -> tuple[IndexedFact, ...]:
+        """The current facts one utterance stated with one subject and relation, as a list.
+
+        "I use Vim, Rust and Zig" is three facts that share `subject_id`, `rel_type` and
+        `source_utterance_id`; the fetcher serves them together as one list item. Only the
+        versions current at `now` (`IndexedFact.is_current_at`) are siblings, so a list item
+        never mixes in a closed, tombstoned or future-dated version. A fact with two current
+        versions from the utterance keeps the one `FactGroup.current_at` would pick.
+
+        `now` is keyword-only and beyond the plan's three-key signature because currency is
+        decided at read time; the index holds versions that are not current.
+
+        Args:
+            subject_id: The shared subject.
+            rel_type: The shared relation type.
+            source_utterance_id: The utterance the facts were extracted from.
+            now: The turn's instant, timezone-aware.
+
+        Returns:
+            One version per fact, ordered by `recorded_at`, then the folded object name, then
+            `row_key`: a total order, so it does not depend on the order the rows were
+            written to the index in.
+
+        Raises:
+            ValueError: `now` is naive.
+            MemoryIndexError: The database fails.
+        """
+        if now.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+        with self._reader_lock, _index_errors("sibling lookup"):
+            rows = self._reader.execute(
+                # `_COLUMNS` is a module constant
+                f"SELECT {_COLUMNS} FROM facts "  # nosec B608
+                "WHERE subject_id = ? AND rel_type = ? AND source_utterance_id = ?",
+                (subject_id, rel_type, source_utterance_id),
+            ).fetchall()
+        chosen: dict[str, IndexedFact] = {}
+        for fact in (IndexedFact(*row) for row in rows):
+            if not fact.is_current_at(now):
+                continue
+            kept = chosen.get(fact.fact_key)
+            if kept is None or _recorded_order(fact) > _recorded_order(kept):
+                chosen[fact.fact_key] = fact
+        return tuple(
+            sorted(
+                chosen.values(),
+                key=lambda fact: (fact.recorded_at or "", fold(fact.object_name), fact.row_key),
+            )
+        )
+
     def count(self) -> int:
         """Number of stored fact versions."""
         with self._reader_lock, _index_errors("count"):
             return self._reader.execute("SELECT count(*) FROM facts").fetchone()[0]
 
     def search_fts(self, query_text: str, *, limit: int = 20) -> list[FactGroup]:
-        """Facts whose text or names share a content word with `query_text`, best bm25 first.
+        """Facts whose text, names or type terms share a content word with `query_text`.
+
+        Best bm25 first.
 
         The query is the OR-mode expression of `fts.build_or_query`, so a fact needs only one
         of the query's content words to be a candidate.
@@ -605,14 +680,15 @@ class FactIndex:
         """
         row = item.row
         self._writer.execute(
-            "INSERT INTO facts (row_key, fact_key, subject_id, subject_name, rel_type, "
-            "object_id, object_name, text, valid_from, valid_to, recorded_at, confidence, "
-            "source_utterance_id, content_hash) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO facts (row_key, fact_key, subject_id, subject_name, subject_type, "
+            "rel_type, object_id, object_name, object_type, text, valid_from, valid_to, "
+            "recorded_at, confidence, source_utterance_id, content_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(row_key) DO UPDATE SET "
             "fact_key = excluded.fact_key, subject_id = excluded.subject_id, "
-            "subject_name = excluded.subject_name, rel_type = excluded.rel_type, "
-            "object_id = excluded.object_id, object_name = excluded.object_name, "
+            "subject_name = excluded.subject_name, subject_type = excluded.subject_type, "
+            "rel_type = excluded.rel_type, object_id = excluded.object_id, "
+            "object_name = excluded.object_name, object_type = excluded.object_type, "
             "text = excluded.text, valid_from = excluded.valid_from, "
             "valid_to = excluded.valid_to, recorded_at = excluded.recorded_at, "
             "confidence = excluded.confidence, "
@@ -623,9 +699,11 @@ class FactIndex:
                 row.fact_key,
                 row.subject_id,
                 row.subject_name,
+                row.subject_type,
                 row.rel_type,
                 row.object_id,
                 row.object_name,
+                row.object_type,
                 item.text,
                 row.valid_from,
                 row.valid_to,
@@ -641,8 +719,15 @@ class FactIndex:
         self._writer.execute("DELETE FROM facts_fts WHERE rowid = ?", (row_id,))
         # The mirror holds the folded form, the same form every query is built in.
         self._writer.execute(
-            "INSERT INTO facts_fts (rowid, text, subject_name, object_name) VALUES (?, ?, ?, ?)",
-            (row_id, fold(item.text), fold(row.subject_name), fold(row.object_name)),
+            "INSERT INTO facts_fts (rowid, text, subject_name, object_name, type_terms) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                row_id,
+                fold(item.text),
+                fold(row.subject_name),
+                fold(row.object_name),
+                fold(type_terms_text(row.subject_type, row.object_type)),
+            ),
         )
         if embedding is not None:
             self._writer.execute("DELETE FROM facts_vec WHERE rowid = ?", (row_id,))

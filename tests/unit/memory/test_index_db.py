@@ -135,6 +135,65 @@ def test_raises_when_the_stored_schema_version_differs(db_path: Path) -> None:
         open_index(db_path, embedding_model_id=_MODEL)
 
 
+def test_schema_version_is_two() -> None:
+    # 2 added the entity types and the FTS type terms; a version 1 file has neither.
+    assert SCHEMA_VERSION == 2
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+
+
+def test_facts_carry_both_entity_types(writer: sqlite3.Connection) -> None:
+    columns = _columns(writer, "facts")
+
+    assert {"subject_type", "object_type"} <= set(columns)
+
+
+def test_fts_mirror_has_a_type_terms_column(writer: sqlite3.Connection) -> None:
+    assert _columns(writer, "facts_fts") == ["text", "subject_name", "object_name", "type_terms"]
+
+
+def test_sibling_lookup_is_indexed(writer: sqlite3.Connection) -> None:
+    plan = " ".join(
+        str(row[-1])
+        for row in writer.execute(
+            "EXPLAIN QUERY PLAN SELECT row_key FROM facts "
+            "WHERE subject_id = ? AND rel_type = ? AND source_utterance_id = ?",
+            ("user", "USES", "utt-1"),
+        )
+    )
+
+    assert "idx_facts_siblings" in plan
+
+
+# The version 1 tables, as the schema 1 code created them.
+_V1_DDL = (
+    "CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    "CREATE TABLE facts (id INTEGER PRIMARY KEY, row_key TEXT NOT NULL UNIQUE, "
+    "fact_key TEXT NOT NULL, subject_id TEXT NOT NULL, subject_name TEXT NOT NULL, "
+    "rel_type TEXT NOT NULL, object_id TEXT NOT NULL, object_name TEXT NOT NULL, "
+    "text TEXT NOT NULL, valid_from TEXT, valid_to TEXT, recorded_at TEXT, "
+    "confidence REAL NOT NULL, source_utterance_id TEXT, content_hash TEXT NOT NULL)",
+    "CREATE VIRTUAL TABLE facts_fts USING fts5(text, subject_name, object_name, "
+    "tokenize='porter unicode61')",
+)
+
+
+def test_a_version_1_file_is_refused_by_its_version(db_path: Path) -> None:
+    conn = sqlite3.connect(db_path)
+    for statement in _V1_DDL:
+        conn.execute(statement)
+    conn.execute("INSERT INTO index_meta VALUES ('schema_version', '1')")
+    conn.execute("INSERT INTO index_meta VALUES ('embedding_model_id', ?)", (_MODEL,))
+    conn.commit()
+    conn.close()
+
+    # The version is checked before this schema's DDL runs, so the refusal names the version.
+    with pytest.raises(MemoryIndexError, match="built with schema 1"):
+        open_index(db_path, embedding_model_id=_MODEL)
+
+
 def _failing_loader(conn: sqlite3.Connection) -> None:
     raise sqlite3.OperationalError("vec0.so: cannot open shared object file")
 

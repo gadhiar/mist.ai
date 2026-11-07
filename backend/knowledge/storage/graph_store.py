@@ -62,6 +62,11 @@ _USER_FACING_REL_TYPES: list[str] = [
     "STRUGGLES_WITH",
     "DECIDED",
     "EXPERIENCED",
+    # v1.3.0 user-centric additions. Extractable since v1.3.0, so they are served too:
+    # test_user_facing_rel_types.py pins this list as a superset of
+    # EXTRACTABLE_RELATIONSHIP_TYPES.
+    "RECOMMENDS",
+    "HAS_HABIT",
     # Structural / ontological edges between entities
     "IS_A",
     "PART_OF",
@@ -116,9 +121,11 @@ RETURN
     page_key,
     s.id AS subject_id,
     coalesce(s.display_name, s.id) AS subject_name,
+    s.entity_type AS subject_type,
     type(r) AS rel_type,
     o.id AS object_id,
     coalesce(o.display_name, o.id) AS object_name,
+    o.entity_type AS object_type,
     r.version_key AS version_key,
     r.valid_from AS valid_from,
     r.valid_to AS valid_to,
