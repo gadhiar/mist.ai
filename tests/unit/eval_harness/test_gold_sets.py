@@ -5,8 +5,12 @@ categories from the tag alone, so the shape of the utterance file is load-bearin
 count, a reused 60-probe utterance or an entity name lifted from the production prompt would
 each make a later score mean something other than what it claims. The label checks run on
 whatever `labelling/labels-*.jsonl` files exist, so the two blind label passes are held to
-the loader and the ontology before adjudication reads them. The conventions behind these
-checks are in `data/gold/extraction/LABELLING.md`.
+the loader and the ontology before adjudication reads them. The published dev-list and
+held-out sets pass the same label checks, plus the checks a score on them depends on: their
+sizes, enough list-shaped and no-fact probes, type and predicate coverage, no held-out
+utterance shared with a dev probe, and no held-out entity lifted from the production prompt.
+The conventions behind these checks are in `data/gold/extraction/LABELLING.md`, and the
+adjudication that produced the sets is in `labelling/adjudication-2026-11.md`.
 """
 
 from __future__ import annotations
@@ -31,7 +35,10 @@ from backend.knowledge.ontologies.v1_0_0 import (  # noqa: E402
     EXTRACTABLE_RELATIONSHIP_TYPES,
     ONTOLOGY_V1_0_0,
 )
-from scripts.eval_harness.score_extraction_run import iter_gold_probes  # noqa: E402
+from scripts.eval_harness.score_extraction_run import (  # noqa: E402
+    canonical_id,
+    iter_gold_probes,
+)
 
 _GOLD_DIR = _REPO_ROOT / "data" / "gold" / "extraction"
 _LABELLING_DIR = _GOLD_DIR / "labelling"
@@ -372,16 +379,13 @@ def test_heldout_intents_cover_every_extractable_predicate_twice(heldout):
     assert short == {}
 
 
-# --- Label passes over the utterances -------------------------------------------------------
+# --- Label passes and the adjudicated gold sets ---------------------------------------------
 
 _LABEL_FILES = sorted(_LABELLING_DIR.glob("labels-*.jsonl"))
-_LABEL_PARAMS = [pytest.param(p, id=p.name) for p in _LABEL_FILES] or [
-    pytest.param(
-        None,
-        id="no-labels-file",
-        marks=pytest.mark.skip(reason="no labelling/labels-*.jsonl yet: the label passes add them"),
-    )
-]
+_DEV_GOLD = _GOLD_DIR / "dev-lists-2026-11.jsonl"
+_HELDOUT_GOLD = _GOLD_DIR / "heldout-2026-11.jsonl"
+# The published sets are labels too, so every label check below runs on them as well.
+_LABEL_PARAMS = [pytest.param(p, id=p.name) for p in (*_LABEL_FILES, _DEV_GOLD, _HELDOUT_GOLD)]
 
 
 def test_labels_are_judged_against_the_ontology_version_they_were_written_for():
@@ -468,3 +472,212 @@ def test_label_edge_types_are_allowed_for_their_predicate(path):
                 bad.append((probe.tag, rel.source_type, rel.predicate, rel.target_type))
 
     assert bad == []
+
+
+# --- The published dev-list and held-out sets ------------------------------------------------
+
+_ADJUDICATION = _LABELLING_DIR / "adjudication-2026-11.md"
+_GOLD_BY_SET = {"dev-lists": _DEV_GOLD, "heldout": _HELDOUT_GOLD}
+# A held-out probe may be dropped as unlabellable, so the held-out size is a range.
+_GOLD_SIZE_RANGE = {"dev-lists": (40, 40), "heldout": (190, 210)}
+_GOLD_ROW_FIELDS = {"utterance", "tag", "expected_entities", "expected_relationships"}
+_GOLD_ENTITY_FIELDS = {"id", "type"}
+_GOLD_EDGE_REQUIRED = {"source", "source_type", "predicate", "target", "target_type"}
+_GOLD_EDGE_OPTIONAL = {"valid_from", "valid_to", "assertion_kind"}
+_HELDOUT_LIST_MIN = 40
+_HELDOUT_NOFACT_MIN = 20
+_PROMPT_ANCHOR_IDS = {"user", "mist-identity"}
+# Held-out ids that are ordinary words of the prompt's prose rather than entities it teaches.
+# Each is the utterance's own name for the thing; a test below fails an entry no probe needs.
+_PROMPT_WORD_EXEMPTIONS = {
+    "events": "ho-033 'Kafka for events'; the prompt says 'life events' in Rule 11",
+    "temporal": "ho-122 names the Temporal workflow engine; the prompt says 'temporal ordering'",
+}
+
+
+def _gold_rows(path: Path) -> list[dict]:
+    assert path.is_file(), f"{path} is missing"
+    with path.open(encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def _report_section(heading: str) -> str:
+    text = _ADJUDICATION.read_text(encoding="utf-8")
+    match = re.search(rf"^## {re.escape(heading)}\n(?P<body>.*?)(?=^## |\Z)", text, re.M | re.S)
+    assert match is not None, f"{_ADJUDICATION.name} has no '## {heading}' section"
+    return match.group("body")
+
+
+def _is_empty(row: dict) -> bool:
+    return not row["expected_entities"] and not row["expected_relationships"]
+
+
+@pytest.mark.parametrize("set_name", sorted(_GOLD_BY_SET))
+def test_gold_set_size(set_name):
+    low, high = _GOLD_SIZE_RANGE[set_name]
+
+    assert low <= len(_gold_rows(_GOLD_BY_SET[set_name])) <= high
+
+
+@pytest.mark.parametrize("set_name", sorted(_GOLD_BY_SET))
+def test_gold_set_holds_only_its_own_utterance_rows(set_name):
+    own = {r["tag"] for r in _load_utterances() if r["set"] == set_name}
+
+    assert [r["tag"] for r in _gold_rows(_GOLD_BY_SET[set_name]) if r["tag"] not in own] == []
+
+
+@pytest.mark.parametrize("set_name", sorted(_GOLD_BY_SET))
+def test_every_probe_left_out_of_a_gold_set_is_listed_as_dropped(set_name):
+    own = {r["tag"] for r in _load_utterances() if r["set"] == set_name}
+    published = {r["tag"] for r in _gold_rows(_GOLD_BY_SET[set_name])}
+    dropped = _report_section("Dropped probes")
+
+    assert [t for t in sorted(own - published) if t not in dropped] == []
+
+
+@pytest.mark.parametrize("set_name", sorted(_GOLD_BY_SET))
+def test_gold_rows_follow_the_sixty_probe_schema(set_name):
+    bad = []
+
+    for row in _gold_rows(_GOLD_BY_SET[set_name]):
+        if set(row) != _GOLD_ROW_FIELDS:
+            bad.append((row["tag"], sorted(row)))
+        bad += [
+            (row["tag"], sorted(e))
+            for e in row["expected_entities"]
+            if set(e) != _GOLD_ENTITY_FIELDS
+        ]
+        for rel in row["expected_relationships"]:
+            keys = set(rel)
+            if not _GOLD_EDGE_REQUIRED <= keys <= _GOLD_EDGE_REQUIRED | _GOLD_EDGE_OPTIONAL:
+                bad.append((row["tag"], sorted(keys)))
+            if rel.get("assertion_kind") == "assert":
+                bad.append((row["tag"], "assertion_kind assert is written as absent"))
+
+    assert bad == []
+
+
+@pytest.mark.parametrize("set_name", sorted(_GOLD_BY_SET))
+def test_gold_sets_load_through_the_gold_loader_unchanged(set_name):
+    """The loader canonicalises ids, so an id it would rewrite could never match a produced one."""
+    path = _GOLD_BY_SET[set_name]
+    changed = []
+
+    for row, probe in zip(_gold_rows(path), iter_gold_probes(path), strict=True):
+        raw_entities = tuple((e["id"], e["type"]) for e in row["expected_entities"])
+        raw_edges = tuple(
+            (
+                r["source"],
+                r["source_type"],
+                r["predicate"],
+                r["target"],
+                r["target_type"],
+                r.get("valid_from"),
+                r.get("valid_to"),
+                r.get("assertion_kind", "assert"),
+            )
+            for r in row["expected_relationships"]
+        )
+        loaded_entities = tuple((e.id, e.type) for e in probe.entities)
+        loaded_edges = tuple(
+            (
+                r.source,
+                r.source_type,
+                r.predicate,
+                r.target,
+                r.target_type,
+                r.valid_from,
+                r.valid_to,
+                r.assertion_kind,
+            )
+            for r in probe.relationships
+        )
+        if (probe.tag, probe.utterance, loaded_entities, loaded_edges) != (
+            row["tag"],
+            row["utterance"],
+            raw_entities,
+            raw_edges,
+        ):
+            changed.append(row["tag"])
+
+    assert changed == []
+
+
+@pytest.mark.parametrize("set_name", sorted(_GOLD_BY_SET))
+def test_gold_entity_ids_are_unique_within_a_probe(set_name):
+    repeated = [
+        r["tag"]
+        for r in _gold_rows(_GOLD_BY_SET[set_name])
+        if len({e["id"] for e in r["expected_entities"]}) != len(r["expected_entities"])
+    ]
+
+    assert repeated == []
+
+
+def test_heldout_has_forty_list_shaped_probes():
+    lists = [r for r in _gold_rows(_HELDOUT_GOLD) if r["tag"].split("-")[2] == "list"]
+
+    assert len(lists) >= _HELDOUT_LIST_MIN
+
+
+def test_heldout_has_twenty_no_fact_probes_and_each_is_empty():
+    nofact = [r for r in _gold_rows(_HELDOUT_GOLD) if r["tag"].split("-")[2] == "nofact"]
+
+    assert len(nofact) >= _HELDOUT_NOFACT_MIN
+    assert [r["tag"] for r in nofact if not _is_empty(r)] == []
+
+
+def test_heldout_gold_covers_every_extractable_type_three_times_or_lists_the_gap():
+    counts = Counter(e["type"] for r in _gold_rows(_HELDOUT_GOLD) for e in r["expected_entities"])
+    gaps = _report_section("Coverage gaps")
+
+    short = [t for t in EXTRACTABLE_NODE_TYPES if counts[t] < _HELDOUT_TYPE_MIN]
+
+    assert [t for t in short if f"`{t}`" not in gaps] == []
+
+
+def test_heldout_gold_covers_every_extractable_predicate_twice_or_lists_the_gap():
+    counts = Counter(
+        r["predicate"] for row in _gold_rows(_HELDOUT_GOLD) for r in row["expected_relationships"]
+    )
+    gaps = _report_section("Coverage gaps")
+
+    short = [p for p in EXTRACTABLE_RELATIONSHIP_TYPES if counts[p] < _HELDOUT_PREDICATE_MIN]
+
+    assert [p for p in short if f"`{p}`" not in gaps] == []
+
+
+def test_no_heldout_utterance_is_shared_with_a_dev_probe():
+    dev = {_fold(r["utterance"]) for r in _gold_rows(_DEV_GOLD)}
+    dev |= {_fold(r["utterance"]) for r in _sixty_rows()}
+
+    assert [r["tag"] for r in _gold_rows(_HELDOUT_GOLD) if _fold(r["utterance"]) in dev] == []
+
+
+def _heldout_ids_in_the_prompt() -> dict[str, list[str]]:
+    hits: dict[str, list[str]] = {}
+    for row in _gold_rows(_HELDOUT_GOLD):
+        for entity in row["expected_entities"]:
+            if entity["id"] in _PROMPT_ANCHOR_IDS:
+                continue
+            if _term_pattern(entity["id"]).search(EXTRACTION_SYSTEM_PROMPT):
+                hits.setdefault(entity["id"], []).append(row["tag"])
+    return hits
+
+
+def test_no_heldout_entity_id_occurs_in_the_production_prompt():
+    """A held-out id the prompt itself spells out would score the prompt, not extraction."""
+    hits = _heldout_ids_in_the_prompt()
+
+    assert {i: tags for i, tags in hits.items() if i not in _PROMPT_WORD_EXEMPTIONS} == {}
+
+
+def test_every_prompt_word_exemption_is_still_needed():
+    assert sorted(set(_PROMPT_WORD_EXEMPTIONS) - set(_heldout_ids_in_the_prompt())) == []
+
+
+def test_heldout_ids_avoid_the_prompts_example_entities_outright():
+    """The exemptions above are prose words, never an id or name from the prompt's examples."""
+    example_ids = {canonical_id(t) for t in _prompt_entity_terms()}
+
+    assert sorted(set(_PROMPT_WORD_EXEMPTIONS) & example_ids) == []
