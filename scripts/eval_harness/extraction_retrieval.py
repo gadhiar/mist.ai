@@ -212,7 +212,9 @@ class Neo4jEvalWiring:
         if self._embedding_provider is None:
             from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
 
-            self._embedding_provider = EmbeddingGenerator(self.config.embedding.model_name)
+            self._embedding_provider = EmbeddingGenerator(
+                self.config.embedding.model_name, device=self.config.embedding.resolved_device()
+            )
         return self._embedding_provider
 
     def connect(self, target: str) -> GraphConnection:
