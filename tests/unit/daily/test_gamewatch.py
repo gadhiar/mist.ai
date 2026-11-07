@@ -1155,3 +1155,171 @@ def test_readme_says_how_to_register_the_watcher():
         "unregister-signin-task.ps1",
     ):
         assert phrase in section, phrase
+
+
+# --- gaming-scan -----------------------------------------------------------------------------
+
+ENV_SENTINEL = "zq8envsentinel"
+LAUNCHER = gamewatch.ProcessRecord("X:\\Library\\Example Game\\Launcher.exe")
+EXCLUDED_JAVA = gamewatch.ProcessRecord(
+    "X:\\Library\\Example Tool\\jre\\bin\\java.exe", cwd="X:\\Library\\Example Tool", args=()
+)
+STRAY_JAVA = gamewatch.ProcessRecord(JAVA, cwd="X:\\Projects\\tool", args=("-jar", "tool.jar"))
+INSTALLER_JAVA = gamewatch.ProcessRecord(
+    JAVA,
+    cwd="Y:\\Servers\\Example Server",
+    args=("-jar", "example-installer.jar", "--installServer"),
+)
+
+
+def scan_root(tmp_path: Path, present: Path, **kwargs) -> Path:
+    env = (
+        f"MIST_GAME_DIRS={LIBRARIES_LINE}\n"
+        f"MIST_GAME_RUNTIME_DIRS={RUNTIME_LINE};{present}\n"
+        "MIST_GAME_EXCLUDE=X:\\Library\\Example Tool;Backdrop*.exe\n"
+        f"MIST_SCAN_TEST_SECRET={ENV_SENTINEL}\n"
+    )
+    return make_root(tmp_path / "daily", env, **kwargs)
+
+
+def scan(root: Path, records, capsys) -> tuple[int, list[str], str]:
+    h = Harness(root, {}, [records])
+    code = instance.main(["gaming-scan", "--root", str(root)], h.ctx)
+    captured = capsys.readouterr()
+    return code, captured.out.splitlines(), captured.out + captured.err
+
+
+def test_gaming_scan_prints_the_entries_the_verdict_and_why_in_order(tmp_path, capsys):
+    present = tmp_path / "instances"
+    present.mkdir()
+    root = scan_root(tmp_path, present)
+    # Interleaved, so the output's grouping is the scan's; within a group the listing's order
+    # stands.
+    records = [OTHER, STRAY_JAVA, LAUNCHER, GAME, INSTALLER_JAVA, EXCLUDED_JAVA, SERVER]
+    code, lines, _text = scan(root, records, capsys)
+    assert code == 0
+    assert lines == [
+        "MIST_GAME_DIRS[0] X:\\Library (missing)",
+        "MIST_GAME_DIRS[1] X:\\Other Library (missing)",
+        "MIST_GAME_RUNTIME_DIRS[0] Y:\\Servers (missing)",
+        f"MIST_GAME_RUNTIME_DIRS[1] {present}",
+        "MIST_GAME_EXCLUDE[0] X:\\Library\\Example Tool (missing)",
+        "MIST_GAME_EXCLUDE[1] backdrop*.exe",
+        "game: yes",
+        f"counts MIST_GAME_DIRS[1]: {GAME.image}",
+        f"counts MIST_GAME_RUNTIME_DIRS[0]: {JAVA} for Y:\\Servers\\Example Server",
+        f"excluded shipped name *launcher*.exe: {LAUNCHER.image}",
+        f"excluded MIST_GAME_EXCLUDE[0]: {EXCLUDED_JAVA.image}",
+        f"not counted no runtime folder: {JAVA}",
+        f"not counted installer: {JAVA}",
+    ]
+
+
+def test_gaming_scan_says_no_game_when_nothing_counts(tmp_path, capsys):
+    root = scan_root(tmp_path, tmp_path)
+    code, lines, _text = scan(root, [OTHER, LAUNCHER], capsys)
+    assert code == 0
+    assert "game: no" in lines
+    assert not any(line.startswith("counts ") for line in lines)
+
+
+def test_gaming_scan_prints_a_runtime_folder_taken_from_gamedir(tmp_path, capsys):
+    client = gamewatch.ProcessRecord(
+        JAVA, args=("--accessToken", SENTINEL, "--gameDir", "Y:\\Servers\\Example Pack")
+    )
+    code, lines, text = scan(scan_root(tmp_path, tmp_path), [client], capsys)
+    assert code == 0
+    assert f"counts MIST_GAME_RUNTIME_DIRS[0]: {JAVA} for Y:\\Servers\\Example Pack" in lines
+    assert SENTINEL not in text
+
+
+def test_gaming_scan_prints_no_argument_and_no_other_env_line(tmp_path, capsys):
+    root = scan_root(tmp_path, tmp_path)
+    records = [SERVER, INSTALLER_JAVA, STRAY_JAVA]
+    _code, _lines, text = scan(root, records, capsys)
+    for fragment in (SENTINEL, ENV_SENTINEL, "accessToken", "-Xmx4G", "server.jar", "tool.jar"):
+        assert fragment not in text, fragment
+    assert "--installServer" not in text and "example-installer.jar" not in text
+
+
+def test_gaming_scan_writes_no_log(tmp_path, capsys):
+    root = scan_root(tmp_path, tmp_path)
+    before = sorted((root / "logs").iterdir())
+    scan(root, [GAME, SERVER], capsys)
+    assert sorted((root / "logs").iterdir()) == before == []
+
+
+def test_gaming_scan_refuses_without_either_folder_variable(tmp_path, capsys):
+    root = make_root(tmp_path / "daily", "MIST_GAME_EXCLUDE=X:\\Games\\Tool\n")
+    code, _lines, text = scan(root, [GAME], capsys)
+    assert code == 2
+    assert "MIST_GAME_DIRS" in text and "MIST_GAME_RUNTIME_DIRS" in text
+
+
+def test_gaming_scan_refuses_on_a_python_that_is_not_64_bit(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(instance._load_gamewatch(), "is_64_bit", lambda: False)
+    code, _lines, text = scan(scan_root(tmp_path, tmp_path), [GAME], capsys)
+    assert code == 2
+    assert "64-bit Python" in text
+
+
+def test_gaming_scan_exits_1_when_gamewatch_cannot_be_loaded(tmp_path, monkeypatch, capsys):
+    def missing():
+        raise instance.InstanceError("cannot load gamewatch.py from bin")
+
+    monkeypatch.setattr(instance, "_load_gamewatch", missing)
+    code, _lines, text = scan(scan_root(tmp_path, tmp_path), [GAME], capsys)
+    assert code == 1
+    assert "gamewatch.py" in text
+
+
+def test_gaming_scan_exits_1_when_listing_fails(tmp_path, capsys):
+    root = scan_root(tmp_path, tmp_path)
+
+    def broken() -> list[gamewatch.ProcessRecord]:
+        raise instance._load_gamewatch().GameWatchError("listing needs Windows")
+
+    ctx = dataclasses.replace(Harness(root, {}, [[]]).ctx, processes=broken)
+    assert instance.main(["gaming-scan", "--root", str(root)], ctx) == 1
+    assert "listing needs Windows" in capsys.readouterr().err
+    assert list((root / "logs").iterdir()) == []
+
+
+def test_gaming_scan_runs_before_a_release_is_switched_in_and_the_watch_does_not(tmp_path, capsys):
+    root = scan_root(tmp_path, tmp_path, tag="<release-tag>", release=False)
+    code, lines, _text = scan(root, [GAME], capsys)
+    assert code == 0
+    assert "game: yes" in lines
+    h = Harness(root, {}, [[GAME]])
+    assert instance.main(["gaming-watch", "--root", str(root)], h.ctx) == 2
+    assert h.lister.calls == 0
+
+
+def test_gaming_scan_is_a_listed_command():
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(DAILY_SCRIPTS),
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "gaming-scan" in completed.stdout
+
+
+def test_readme_gaming_mode_section_describes_the_scan():
+    section = readme_section("Gaming mode")
+    for phrase in (
+        "gaming-scan --root",
+        "`MIST_GAME_DIRS`",
+        "`MIST_GAME_RUNTIME_DIRS`",
+        "`MIST_GAME_EXCLUDE`",
+        "(missing)",
+        "game: yes",
+        "counts MIST_GAME_RUNTIME_DIRS[",
+        "excluded",
+        "not counted",
+        "prints no argument",
+        "writes no log",
+    ):
+        assert phrase in section, phrase

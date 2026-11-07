@@ -305,6 +305,26 @@ and position of the entry it counted under, as `MIST_GAME_DIRS[0]` for the first
 `MIST_GAME_RUNTIME_DIRS[1]` for the second instance folder, never by the program's name, its
 path or its arguments; a Minecraft client's arguments carry its account's access token.
 
+To see what counts and why, run `instance.py gaming-scan --root <root>`. It lists the running
+programs once, prints to the terminal, and writes no log; it needs no release switched in, so
+it runs before the first `switch` too. It prints, in this order:
+
+- each configured entry as `MIST_GAME_DIRS[0] <entry>`, with ` (missing)` after a directory
+  that does not exist;
+- `game: yes` or `game: no`;
+- `counts MIST_GAME_DIRS[<i>]: <program>` for each program that counts from a library, and
+  `counts MIST_GAME_RUNTIME_DIRS[<j>]: <program> for <folder>` for each Java game, with the
+  folder it counted for;
+- `excluded <reason>: <program>` for each program under a library that an exclusion removed,
+  the reason naming the shipped folder or file name pattern, or the `MIST_GAME_EXCLUDE` entry;
+- `not counted <reason>: <program>` for each other Java process, the reason being
+  `no runtime folder`, `installer`, `folder unreadable` or a `MIST_GAME_EXCLUDE` entry.
+
+The scan prints no argument other than a folder taken from `--gameDir`, and no other line of
+`daily.env`. When MIST steps down for something that is not a game, the scan names it: add it
+to `MIST_GAME_EXCLUDE`. It exits 0, 2 on the refusals `gaming-watch` makes, and 1 when
+`gamewatch.py` cannot be loaded or listing fails.
+
 `gamewatch.py` sits beside `instance.py` in `bin/`, where `switch` installs both. Without it,
 `gaming-watch` exits 1 naming the file, and every other command still runs. On Windows every
 Docker call the CLI makes starts without a console window, so the watcher can run under

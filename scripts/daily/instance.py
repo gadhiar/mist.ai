@@ -2522,6 +2522,62 @@ def cmd_gaming_watch(args: argparse.Namespace, ctx: Context) -> None:
     gaming_watch(args.root, ctx)
 
 
+# --- gaming-scan -----------------------------------------------------------------------------
+
+
+def gaming_scan(root: str | Path, ctx: Context) -> list[str]:
+    """What counts as a game among the running programs now, and why: the scan's lines.
+
+    It loads `gamewatch.py` and the root as `gaming-watch` does, with its refusals, except
+    that the root's release is not required: the scan starts and stops nothing, and the deploy
+    runs it before `switch` writes the release tag. It lists once and writes no log.
+
+    The lines are each configured entry, with ` (missing)` for a directory that does not
+    exist; `game: yes` or `game: no`; each counting program; each program under a library that
+    an exclusion removed; and each other shared runtime that does not count, with rule 1's
+    reason. No argument is printed other than a folder taken from `--gameDir`, because a Java
+    client's arguments carry its account's access token, and no other `daily.env` line.
+
+    Raises:
+        InstanceError: Exit 1 when `gamewatch.py` cannot be loaded or the processes cannot be
+            listed; `RefusedError` (exit 2) on the refusals `gaming-watch` makes.
+    """
+    gamewatch, _inst, rules = _game_watch_setup(root, ctx, require_release=False)
+    lister = ctx.processes if ctx.processes is not None else gamewatch.list_processes
+    try:
+        records = lister()
+    except gamewatch.GameWatchError as exc:
+        raise InstanceError(f"cannot list processes: {exc}") from exc
+
+    lines = []
+    for label, entry, is_dir in _game_rule_entries(rules):
+        missing = " (missing)" if is_dir and not os.path.isdir(entry) else ""
+        lines.append(f"{label} {entry}{missing}")
+    lines.append("game: yes" if gamewatch.find_game(records, rules) is not None else "game: no")
+    counted: list[str] = []
+    excluded: list[str] = []
+    not_counted: list[str] = []
+    for record in records:
+        verdict = gamewatch.classify(record, rules)
+        if verdict.counts:
+            folder = "" if verdict.folder is None else f" for {verdict.folder}"
+            counted.append(f"counts {verdict.variable}[{verdict.index}]: {record.image}{folder}")
+        elif gamewatch.lowest_index(record.image, rules.libraries) is not None:
+            excluded.append(f"excluded {verdict.reason}: {record.image}")
+        elif gamewatch.is_shared_runtime(record.image):
+            not_counted.append(f"not counted {verdict.reason}: {record.image}")
+    for group in (counted, excluded, not_counted):
+        # Many processes of one program would repeat a line; one says the same.
+        lines.extend(dict.fromkeys(group))
+    return lines
+
+
+def cmd_gaming_scan(args: argparse.Namespace, ctx: Context) -> None:
+    """`gaming-scan`: print which running programs count as a game, and why."""
+    for line in gaming_scan(args.root, ctx):
+        print(line)
+
+
 # --- status ----------------------------------------------------------------------------------
 
 
@@ -2720,6 +2776,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watch.add_argument("--root", required=True)
     watch.set_defaults(handler=cmd_gaming_watch)
+
+    scan = commands.add_parser(
+        "gaming-scan",
+        help="print which running programs count as a game and why; Windows, writes no log",
+    )
+    scan.add_argument("--root", required=True)
+    scan.set_defaults(handler=cmd_gaming_scan)
 
     arm = commands.add_parser("arm-backups", help="start scheduled backups, now and at every up")
     arm.add_argument("--root", required=True)
