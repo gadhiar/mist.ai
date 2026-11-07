@@ -834,6 +834,143 @@ class TestPreLlm:
 
         assert await rig.host.pre_llm(SESSION, "turn-1", "tell me a story") is None
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("step", ["active", "approval", "fast path"])
+    async def test_handled_resolution_carries_no_events(self, step):
+        alarms = _alarms()
+        alarms.active_replies["stop"] = ToolOutcome(status="ok", summary="Alarm stopped.")
+        lights = _lights(intents={"stop": FastIntent("lights.adjust", {"brightness": 30})})
+        rig = _rig(lights, alarms)
+        if step == "active":
+            alarms.ringing = True
+        utterance = "stop"
+        if step == "approval":
+            await _propose(rig, ("lights.power", {"target": "bedroom"}))
+            utterance = "yes"
+
+        resolution = await rig.host.pre_llm(SESSION, "turn-1", utterance)
+
+        assert resolution is not None and resolution.handled
+        assert resolution.records
+        assert resolution.events == ()
+
+
+class _RaisingHook(FakeCapability):
+    """A ringing capability whose `on_active_utterance` raises `error`."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__("alarms", tools=(make_tool_spec("alarms.list"),))
+        self.ringing = True
+        self.error = error
+
+    async def on_active_utterance(self, utterance: str, session_id: str) -> ToolOutcome | None:
+        self.active_utterances.append((utterance, session_id))
+        raise self.error
+
+
+async def _log_rows(db: CapabilitiesDb) -> list[tuple[object, ...]]:
+    """The action log's rows; none when no write has created its table yet."""
+
+    def read(conn) -> list[tuple[object, ...]]:
+        table = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'action_log'"
+        if conn.execute(table).fetchone() is None:
+            return []
+        return conn.execute(
+            "SELECT tool, capability, source, status, reason FROM action_log ORDER BY id"
+        ).fetchall()
+
+    return await db.run(read)
+
+
+class TestActiveHookContainment:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("error", "status", "reply"),
+        [
+            (
+                CapabilityInvocationError(f"store locked {TOKEN}"),
+                "error",
+                "That didn't work: store locked ***.",
+            ),
+            (
+                CapabilityUnavailableError(f"database gone {TOKEN}"),
+                "unavailable",
+                "Alarms is unavailable: database gone ***.",
+            ),
+        ],
+    )
+    async def test_capability_error_is_normalised_redacted_recorded_and_answered(
+        self, error, status, reply
+    ):
+        alarms = _RaisingHook(error)
+        lights = _lights(intents={"stop": FastIntent("lights.adjust", {"brightness": 30})})
+        rig = _rig(lights, alarms)
+        rig.secrets.register(Secret(TOKEN))
+
+        resolution = await rig.host.pre_llm(SESSION, "turn-1", "Stop.")
+
+        assert resolution is not None and resolution.handled
+        (record,) = resolution.records
+        assert record.tool == "alarms.on_active_utterance"
+        assert record.outcome.status == status
+        assert TOKEN not in record.outcome.summary
+        assert record.outcome.reason == str(error).replace(TOKEN, "***")
+        assert resolution.reply == reply
+        assert resolution.events == ()
+        assert alarms.active_utterances == [("stop", SESSION)]
+        assert lights.intent_queries == []
+        assert rig.host.stats()["invocations"][status] == 1
+        assert rig.host.stats()["by_source"]["fastpath"] == 1
+        assert await _log_rows(rig.db) == [
+            ("alarms.on_active_utterance", "alarms", "fastpath", status, record.outcome.reason)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_hook_overrunning_the_call_timeout_gives_the_timeout_outcome(self):
+        alarms = _alarms()
+        alarms.ringing = True
+        alarms.active_replies["stop"] = ToolOutcome(status="ok", summary="Alarm stopped.")
+        rig = _rig(
+            alarms, settings=HostSettings(tool_timeout_s=2.5), timeout_runner=_always_times_out
+        )
+
+        resolution = await rig.host.pre_llm(SESSION, "turn-1", "stop")
+
+        assert resolution is not None and resolution.handled
+        (record,) = resolution.records
+        assert record.outcome.status == "error"
+        assert record.outcome.reason == "timed out after 2.5 s"
+        assert record.outcome.summary == "alarms.on_active_utterance took too long."
+        assert resolution.reply == "That didn't work: timed out after 2.5 s."
+        assert rig.host.stats()["invocations"]["error"] == 1
+
+    @pytest.mark.asyncio
+    async def test_hook_is_bounded_by_the_tool_timeout(self):
+        timeouts = RecordingTimeouts()
+        alarms = _alarms()
+        alarms.ringing = True
+        alarms.active_replies["stop"] = ToolOutcome(status="ok", summary="Alarm stopped.")
+        rig = _rig(alarms, settings=HostSettings(tool_timeout_s=2.5), timeout_runner=timeouts)
+
+        resolution = await rig.host.pre_llm(SESSION, "turn-1", "stop")
+
+        assert resolution is not None and resolution.reply == "Alarm stopped."
+        assert timeouts.bounds == [2.5]
+
+    @pytest.mark.asyncio
+    async def test_other_exception_propagates_and_records_nothing(self):
+        alarms = _RaisingHook(RuntimeError("bug in the hook"))
+        rig = _rig(_lights(), alarms)
+
+        with pytest.raises(RuntimeError, match="bug in the hook"):
+            await rig.host.pre_llm(SESSION, "turn-1", "stop")
+
+        stats = rig.host.stats()
+        assert set(stats["invocations"].values()) == {0}
+        assert set(stats["by_source"].values()) == {0}
+        assert await _log_rows(rig.db) == []
+        assert rig.host.drain_events(SESSION) == []
+
 
 # -- plan_turn -------------------------------------------------------------------------------
 
@@ -1051,9 +1188,38 @@ class TestRunActions:
         assert result.notices == (DECODE_FAILURE_NOTICE,)
 
     def test_decode_failure_notice_text(self):
+        # It says the meant action did not run, and not that nothing ran: a "yes, and ..."
+        # turn may already have run approved calls.
         assert DECODE_FAILURE_NOTICE == (
-            "(I could not work out which action you meant, so I did not do anything.)"
+            "(I could not work out which action you meant, so I did not run it.)"
         )
+
+    @pytest.mark.asyncio
+    async def test_yes_and_turn_with_a_failed_decode_ends_with_the_notice(self):
+        rig = _rig(_lights())
+        rig.caps["lights"].outcomes.append(ToolOutcome(status="ok", summary="Lights off."))
+        await _propose(rig, ("lights.power", {"target": "bedroom"}))
+
+        approved = await rig.host.pre_llm(SESSION, "turn-1", "yes, and dim the lights")
+        assert approved is not None and approved.remainder == "dim the lights"
+        second = await rig.host.pre_llm(SESSION, "turn-1", approved.remainder)
+        plan = rig.host.plan_turn(SESSION, approved.remainder, [])
+        failed = await rig.host.run_actions(
+            SESSION,
+            "turn-1",
+            approved.remainder,
+            plan,
+            ScriptedDecode(DecodeReply(content="not json", finish_reason="stop")),
+        )
+
+        assert second is None
+        assert plan.decode is not None
+        assert [(r.tool, r.outcome.status) for r in approved.records] == [("lights.power", "ok")]
+        assert failed.records == ()
+        # The turn's text, in the order the handler sends it: the approval's reply, then the
+        # remainder's notices.
+        turn = [approved.reply, *failed.notices]
+        assert turn == ["Lights off.", DECODE_FAILURE_NOTICE]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("also_reply", [True, False])

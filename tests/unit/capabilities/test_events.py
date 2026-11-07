@@ -213,3 +213,36 @@ async def test_queue_event_sink_emit_from_another_thread_lands_one_json_string()
     assert isinstance(message, str)
     assert json.loads(message) == payload
     assert queue.empty()
+
+
+class _RecordingLoop:
+    """Wraps a loop and records each `call_soon_threadsafe`, so a test sees how `emit` queues."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self.threadsafe_calls: list[tuple[object, tuple[object, ...]]] = []
+
+    def call_soon_threadsafe(self, callback, *args):
+        self.threadsafe_calls.append((callback, args))
+        return self._loop.call_soon_threadsafe(callback, *args)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._loop, name)
+
+
+@pytest.mark.asyncio
+async def test_queue_event_sink_hands_its_put_to_call_soon_threadsafe():
+    loop = _RecordingLoop(asyncio.get_running_loop())
+    queue: asyncio.Queue[str | bytes] = asyncio.Queue()
+    sink = QueueEventSink(loop, queue)  # type: ignore[arg-type]
+    payload = PAYLOADS[3][1]
+
+    sink.emit(payload)
+
+    # Nothing is put until the loop runs the handed-over callback.
+    assert queue.empty()
+    ((callback, args),) = loop.threadsafe_calls
+    assert callback == queue.put_nowait
+    assert [json.loads(arg) for arg in args] == [payload]
+    message = await asyncio.wait_for(queue.get(), 2.0)
+    assert json.loads(message) == payload

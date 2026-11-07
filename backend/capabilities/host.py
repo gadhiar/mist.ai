@@ -22,11 +22,13 @@ can be in flight on the main loop at once. Each takes the proposal with `Proposa
 which is synchronous, so only the first to call it gets the proposal and resolves it.
 
 The host never catches a bare `Exception`. The pipeline contains a `CapabilityError` from
-`invoke` and the per-call timeout, and a decode contains `ActionDecodeError` and its timeout.
-Any other exception from `invoke`, and any exception at all from `on_active_utterance` or
-`match_intent`, reaches the host's caller: inside a turn, the turn's own error backstop. A
-capability's `start` runs in a task of its own, and a failure of any kind there makes that
-capability `unavailable`.
+`invoke` and the per-call timeout, and `on_active_utterance` is contained the same way: its
+`CapabilityError` is normalised by step 7 and its overrun gives the timeout outcome, each
+redacted and recorded. A decode contains `ActionDecodeError` and its timeout. Any other
+exception from `invoke` or `on_active_utterance`, and any exception at all from `match_intent`
+(a synchronous grammar over in-memory data, so it stays uncontained), reaches the host's
+caller: inside a turn, the turn's own error backstop. A capability's `start` runs in a task of
+its own, and a failure of any kind there makes that capability `unavailable`.
 """
 
 from __future__ import annotations
@@ -109,8 +111,12 @@ It is the same on every turn, so it stays in the cached prompt prefix. It covers
 where no decode ran but the model might still claim an action.
 """
 
-DECODE_FAILURE_NOTICE = "(I could not work out which action you meant, so I did not do anything.)"
-"""The notice appended after the main-pass text when the action decode fails or times out."""
+DECODE_FAILURE_NOTICE = "(I could not work out which action you meant, so I did not run it.)"
+"""The notice appended after the main-pass text when the action decode fails or times out.
+
+It says only that the meant action did not run, not that nothing ran: a "yes, and ..." turn
+may already have run the calls it approved.
+"""
 
 NO_LIVE_PROPOSAL_REPLY = "There is no live proposal to decide."
 """What `decide` answers when the session has no live proposal with that id."""
@@ -376,8 +382,9 @@ class CapabilityHost(CapabilityTurnPort):
         """Resolve the turn without the model, in the Design doc's pre-LLM order.
 
         1. While a capability is `active()`, it gets the normalised utterance through
-           `on_active_utterance`; an outcome answers the turn, and a live proposal is left as
-           it is.
+           `on_active_utterance`, under the per-call timeout; an outcome answers the turn, and
+           a live proposal is left as it is. A `CapabilityError` from the hook, or its overrun,
+           answers with the outcome the pipeline gives it (module docstring).
         2. Otherwise a yes or a no to the session's live proposal pops and decides it. A
            leading yes followed by more ("yes, and dim them") returns that text as `remainder`.
         3. Otherwise a live proposal is superseded by the utterance, and the turn continues.
@@ -668,11 +675,7 @@ class CapabilityHost(CapabilityTurnPort):
             outcome = await self._timeout(ready.capability.invoke(tool, ready.args, ctx), timeout)
         except TimeoutError:
             logger.warning("Capability call %s timed out after %g s", tool, timeout)
-            outcome = ToolOutcome(
-                status="error",
-                summary=f"{tool} took too long.",
-                reason=f"timed out after {timeout:g} s",
-            )
+            outcome = _timeout_outcome(tool, timeout)
         except CapabilityError as exc:
             logger.warning("Capability call %s failed: %s", tool, _describe(exc))
             outcome = _outcome_for_error(tool, exc)
@@ -852,11 +855,24 @@ class CapabilityHost(CapabilityTurnPort):
     async def _handle_active(
         self, session_id: str, turn_id: str, utterance: str, text: str
     ) -> PreTurnResolution | None:
+        timeout = self._settings.tool_timeout_s
         for capability in self._capabilities:
             if not capability.active():
                 continue
+            tool = f"{capability.name}{_ACTIVE_HOOK_SUFFIX}"
             started = time.monotonic()
-            outcome = await capability.on_active_utterance(text, session_id)
+            # Contained as `_execute` contains `invoke`: a stop that fails or hangs still acts
+            # on the world as far as the user can tell, so it gets an outcome and a record.
+            try:
+                outcome = await self._timeout(
+                    capability.on_active_utterance(text, session_id), timeout
+                )
+            except TimeoutError:
+                logger.warning("Capability hook %s timed out after %g s", tool, timeout)
+                outcome = _timeout_outcome(tool, timeout)
+            except CapabilityError as exc:
+                logger.warning("Capability hook %s failed: %s", tool, _describe(exc))
+                outcome = _outcome_for_error(tool, exc)
             if outcome is None:
                 continue
             duration_ms = int((time.monotonic() - started) * 1000)
@@ -868,7 +884,6 @@ class CapabilityHost(CapabilityTurnPort):
                 source="fastpath",
                 now=self._clock.now(),
             )
-            tool = f"{capability.name}{_ACTIVE_HOOK_SUFFIX}"
             record = await self._record(
                 ctx,
                 ctx.tool_call_id,
@@ -1030,6 +1045,13 @@ def _outcome_for_error(tool: str, exc: CapabilityError) -> ToolOutcome:
             status="invalid_args", summary=f"Invalid details for {tool}: {reason}.", reason=reason
         )
     return ToolOutcome(status="error", summary=f"{tool} failed.", reason=reason)
+
+
+def _timeout_outcome(tool: str, timeout: float) -> ToolOutcome:
+    """Stage 6's outcome for a call or an active-item hook that overran the per-call timeout."""
+    return ToolOutcome(
+        status="error", summary=f"{tool} took too long.", reason=f"timed out after {timeout:g} s"
+    )
 
 
 def _raw_args(arguments: Mapping[str, object]) -> str:
