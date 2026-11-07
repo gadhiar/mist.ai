@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 # 1.1.0: additive -- InfoResponse gained four optional serving-config fields.
 # 1.2.0: additive -- ResultStamps.run_identity, and InfoResponse.run_identity
-# with its components, all optional.
+# with its components, all optional; ExtractResponse.stage2_calls, default 1.
 CONTRACT_VERSION = "1.2.0"
 CONTRACT_MAJOR = 1
 
@@ -175,7 +175,15 @@ class TimingsMs(BaseModel):
 
 
 class ExtractResponse(BaseModel):
-    """Response body for a successfully completed extraction job."""
+    """Response body for a successfully completed extraction job.
+
+    Attributes:
+        attempts: The most attempts any one Stage 2 call sequence took: 1, or
+            more when a repair retry ran.
+        stage2_calls: Every Stage 2 model call the turn took (contract 1.2.0):
+            one per batch of units, plus splits and repair retries. Defaults
+            to 1, the one call a pre-1.2.0 service makes.
+    """
 
     contract_version: str
     job_id: str
@@ -186,6 +194,7 @@ class ExtractResponse(BaseModel):
     stamps: ResultStamps
     timings_ms: TimingsMs
     attempts: int = Field(ge=1)
+    stage2_calls: int = Field(default=1, ge=1)
     warnings: list[str] = Field(default_factory=list)
 
 

@@ -143,6 +143,7 @@ def _ok_response(
     payload: dict[str, list[dict[str, Any]]],
     *,
     attempts: int = 1,
+    stage2_calls: int = 1,
     warnings: tuple[str, ...] = (),
 ) -> ExtractResponse:
     label, confidence = state.scope_for.get(req.utterance, ("user-scope", 0.9))
@@ -163,6 +164,7 @@ def _ok_response(
         ),
         timings_ms=TimingsMs(scope=1.0, extract=2.0, derive=None, total=3.0),
         attempts=attempts,
+        stage2_calls=stage2_calls,
         warnings=list(warnings),
     )
 
@@ -236,6 +238,8 @@ def build_fake_app(state: FakeState) -> FastAPI:
                 return _ok_response(req, state, payload, warnings=("scope_classification_failed",))
             if behaviour == "attempts2":
                 return _ok_response(req, state, payload, attempts=2)
+            if behaviour == "list3":
+                return _ok_response(req, state, payload, stage2_calls=3)
             if behaviour == "extra_entity":
                 payload["entities"].append(
                     build_native_entity(entity_id="bonus", entity_type="Technology")
@@ -1028,6 +1032,23 @@ async def test_a_server_without_a_run_identity_is_recorded_as_unrecorded(
     assert summary["run_identity"] is None
     assert summary["run_identity_components"] is None
     assert summary["run_identity_mismatches"] == []
+
+
+@pytest.mark.asyncio
+async def test_each_case_row_records_its_stage2_calls(tmp_path: Path) -> None:
+    gold = write_gold(tmp_path / "gold.jsonl", 3)
+    world = make_world(gold)
+    state, _ = world
+    state.behaviour["I use tool2 daily"] = "list3"
+    state.behaviour["I use tool3 daily"] = "timeout"
+    out = tmp_path / "out"
+
+    await run_execute(state_and_client=world, gold_path=gold, out_dir=out)
+
+    rows = read_rows(out)
+    assert rows["p-1"]["stage2_calls"] == 1
+    assert rows["p-2"]["stage2_calls"] == 3
+    assert "stage2_calls" not in rows["p-3"]
 
 
 @pytest.mark.asyncio
