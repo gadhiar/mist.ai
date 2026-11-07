@@ -2,9 +2,10 @@
 
 The query set (`data/gold/retrieval/queries-2026-11.jsonl`) names, per query, the gold facts
 that answer it (grade 2) or support it (grade 1). A run file records what a retriever returned
-for each query over a graph built from extraction's output for the dev turns. This module
-compares the two; it reads no graph and calls no retriever, so a run file written by a runner
-that builds the graph and queries it and one built by hand are scored the same way.
+for each query over a graph built from the seed and extraction's output for the dev turns.
+This module compares the two; it reads no graph and calls no retriever, so a run file written
+by a runner that builds the graph and queries it and one built by hand are scored the same
+way.
 
 Query file, one JSON object per line:
 
@@ -43,8 +44,33 @@ A fact retrieved twice earns its gain once, at its first rank. For negative quer
 number is the share that returned nothing. A kind with no query reports no value rather than
 a vacuous 0 or 1.
 
+With `--build-report`, the run is scored against the `build_report.json` of the build that
+made its graph (`extraction_retrieval.build`), read by `load_build_record`. The scorer uses
+two of its lists:
+
+- `merges`, each rename the dedup made while the build replayed the dev turns. The seed is
+  applied before the first turn (`LogRegenerator.rebuild`, `self._seeder.apply`), and a gold
+  entity the dedup matches to a seed node is rewritten to the node's id
+  (`EntityDeduplicator.deduplicate`, `entity["id"] = existing["id"]`), so its gold fact is
+  stored under the graph id. `merge_aliases` maps each gold id to the graph ids it merged
+  into, and `accepted_keys` lets a relevant fact be credited by any combination of its
+  endpoints' ids. Relevant facts whose accepted keys meet are joined into one item at the
+  higher grade, so one retrieved key credits one item once and nDCG stays at or below 1.
+- `edges`, every edge of the built graph in its stored direction. The retriever can report
+  an edge reversed: its user branch makes the user the subject of every fact
+  (`KnowledgeRetriever._gather_facts`, `subject=user_id`), and its neighbourhood branch
+  reports path order from an undirected match (`GraphStore.get_entity_neighborhood`,
+  `nodes[idx].id as source`). `orient` flips a retrieved key only when its reverse is an
+  edge and it is not, so a fact extraction stored reversed is still a miss.
+
+The summary's `build` block counts the merged ids, the facts translated and collapsed, and
+the retrieved facts reoriented. Without `--build-report`, every relevant fact is matched on
+its own key only and nothing is reoriented; a key the query lists twice takes its higher
+grade.
+
     python -m scripts.eval_harness.extraction_retrieval_score
         --queries data/gold/retrieval/queries-2026-11.jsonl --run <run.jsonl>
+        [--build-report build_report.json]
         [--json-out retrieval_summary.json] [--out retrieval.md]
 
 Exit 0, or 2 when an input is missing or malformed.

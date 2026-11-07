@@ -18,13 +18,31 @@ gauntlet's raw rows, recorded with the backlog store's `put_extracted` and the s
 dispatcher stores. A dev turn with no raw row (the gauntlet writes none for a failed case) is
 recorded as a failed extraction, as a dead-lettered turn is in production. The turns are then
 replayed into the target by `LogRegenerator.rebuild`, the existing rebuild path, after the
-target is wiped. `<out>/build_report.json` lists every relevant fact of the query file that is
-not a current edge of the built graph, so a miss the build caused is not read as a retrieval
-miss.
+target is wiped. The rebuild applies the configured seed before the first turn
+(`self._seeder.apply`), so the graph holds the seed's facts as well as extraction's.
 
-`query` runs each query through a `Retriever` (by default today's `KnowledgeRetriever`, at
-`limit=5`), writes `<out>/retrieval_run.jsonl` in the scorer's run-file schema, and writes
-`retrieval_summary.json` and `retrieval.md` with the scorer's own functions.
+`<out>/build_report.json` records, beside the rebuild's counts:
+
+- `merges`: each rename the dedup made, in replay order. `MergeRecorder` wraps the wiring's
+  curation pipeline and hands every call on unchanged; it reads each turn's incoming
+  `{id: type}` before the call, because `EntityDeduplicator.deduplicate` rewrites
+  `entity["id"]` in place, and the renames after it from `result.dedup_result.id_renames`.
+  The tag comes from the build's own schedule (`event_id_for`), and the graph type from one
+  read of the built graph (`NODE_TYPES_QUERY`).
+- `edges`: every edge of the built graph, current or not, as the scorer's keys
+  (`GRAPH_FACTS_QUERY`, `normalise_fact`), and `graph_digest`, a SHA-256 of that list.
+- `missing`: each relevant fact of the query file none of whose accepted keys (the scorer's
+  `accepted_keys` over `merge_aliases` of `merges`) is a current edge, so a miss the build
+  caused is not read as a retrieval miss; and `merged`, each relevant fact that is a current
+  edge only under a key a merge translated, with the key it was found as.
+
+`query` reads that report before it retrieves anything, and refuses (exit 2) a report that is
+absent, unusable, built into another target, or whose `graph_digest` no longer matches the
+target's edges, because another build has run since. It then runs each query through a
+`Retriever` (by default today's `KnowledgeRetriever`, at `limit=5`), writes
+`<out>/retrieval_run.jsonl` in the scorer's run-file schema as the retriever returned it, and
+writes `retrieval_summary.json` and `retrieval.md` with the scorer's own functions, scoring
+through the report's merges and orienting against its edges (`score_run(..., build=...)`).
 
 The target is refused unless it is a disposable eval endpoint: never live
 (`assert_neo4j_uri_not_live`), eval isolation on (`MIST_EVAL_ISOLATION=1`) and the endpoint on
