@@ -6,6 +6,10 @@ from pathlib import Path
 
 import yaml
 
+# The one profile that ships (`data/voice_profiles/mist`). `backend/config.py` imports this so
+# every default names the same profile.
+DEFAULT_VOICE_PROFILE: str = "mist"
+
 
 @dataclass(frozen=True)
 class ReferenceClip:
@@ -29,7 +33,7 @@ class VoiceProfile:
 
     Supports two TTS engines:
     - CSM: requires fine-tuned weights_path + reference_clips for context
-    - Chatterbox: requires reference_audio_path for zero-shot voice cloning
+    - Chatterbox: optional reference_audio_path to clone; None uses the built-in voice
     """
 
     name: str
@@ -180,15 +184,16 @@ class VoiceProfileRegistry:
     def get_active(self) -> VoiceProfile:
         """Get the currently active voice profile.
 
-        Reads VOICE_PROFILE env var, defaults to 'jarvis'.
+        Reads the `VOICE_PROFILE` env var, defaulting to `DEFAULT_VOICE_PROFILE`.
 
         Returns:
             The active VoiceProfile.
 
         Raises:
-            KeyError: If the active profile name is not found.
+            KeyError: If the active profile name is not found. There is no
+                fallback, so a stale `VOICE_PROFILE` fails at TTS start.
         """
-        name = os.environ.get("VOICE_PROFILE", "jarvis")
+        name = os.environ.get("VOICE_PROFILE", DEFAULT_VOICE_PROFILE)
         return self.get(name)
 
     def available(self) -> list[str]:
