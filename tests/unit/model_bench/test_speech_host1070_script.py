@@ -2,10 +2,10 @@
 
 The script is checked twice: as text (ports, aliases, no `--rm`, logs before `docker rm`, the
 `--memory` cap, the filtered inspect and the restore trap), and by running it under bash with fake
-`docker`, `nvidia-smi`, `free` and `sleep` first on PATH. The fake GPU is an 8,192 MiB card on
-which extraction's model takes 6,996 MiB, and a bench server takes 300 MiB plus 20 MiB per layer
-(30 layers), so the layer search keeping 512 MiB free lands on 9. Nothing here touches a GPU, the
-network or docker.
+`docker`, `nvidia-smi`, `free` and `sleep` defined as shell functions through BASH_ENV. The fake
+GPU is an 8,192 MiB card on which extraction's model takes 6,996 MiB, and a bench server takes 300
+MiB plus 20 MiB per layer (30 layers), so the layer search keeping 512 MiB free lands on 9.
+Nothing here touches a GPU, the network or docker.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -361,21 +362,32 @@ class Host:
             target = self.models / pins["models"][model_id]["file"]
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(fake_bytes(model_id))
-        self.bin = tmp_path / "bin"
-        self.bin.mkdir()
-        for name, body in (("docker", FAKE_DOCKER), ("nvidia-smi", FAKE_NVIDIA_SMI)):
-            (self.bin / name).write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
-        (self.bin / "free").write_text(FAKE_FREE, encoding="utf-8")
-        (self.bin / "sleep").write_text(FAKE_SLEEP, encoding="utf-8")
-        for tool in self.bin.iterdir():
-            tool.chmod(0o755)
+        # The fakes are shell functions that hand each call to an interpreter, so they run where
+        # the temp directory is mounted noexec (a read-only review runner's /tmp). BASH_ENV
+        # defines them before the script's first line, and every bash the script starts reads it.
+        self.fakes = tmp_path / "fakes"
+        self.fakes.mkdir()
+        python = shlex.quote(sys.executable)
+        lines = []
+        for name, body, interpreter, suffix in (
+            ("docker", FAKE_DOCKER, python, ".py"),
+            ("nvidia-smi", FAKE_NVIDIA_SMI, python, ".py"),
+            ("free", FAKE_FREE, "bash", ".sh"),
+            ("sleep", FAKE_SLEEP, "bash", ".sh"),
+        ):
+            fake = self.fakes / f"{name}{suffix}"
+            fake.write_text(body, encoding="utf-8")
+            lines.append(f'{name}() {{ {interpreter} {shlex.quote(str(fake))} "$@"; }}\n')
+        self.prelude = self.fakes / "prelude.sh"
+        self.prelude.write_text("".join(lines), encoding="utf-8")
 
     def put(self, name: str, doc: dict) -> None:
         (self.state / "containers" / f"{name}.json").write_text(json.dumps(doc), encoding="utf-8")
 
     def run(self, script: str = "h6.sh", *args: str, **env: str) -> subprocess.CompletedProcess:
         environment = {
-            "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
+            "PATH": os.environ["PATH"],
+            "BASH_ENV": str(self.prelude),
             "HOME": str(self.home),
             "FAKE_STATE": str(self.state),
             "MODELS_DIR": str(self.models),
