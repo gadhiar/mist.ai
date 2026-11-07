@@ -989,7 +989,6 @@ def usage_payload() -> dict:
             {"date": "2026-10-22", "real_turns": 12},
             {"date": "2026-10-23", "real_turns": 3},
         ],
-        "gate": {"window_days": 7, "required_days": 5, "days_used": 2, "met": False},
     }
 
 
@@ -1044,8 +1043,27 @@ def test_status_prints_only_the_specified_lines(make_ctx, daily, capsys):
         "  backup: down backup_never_run",
         "  extraction_service: null disabled_by_config",
         "turns-per-day: 2026-10-21 0, 2026-10-22 12, 2026-10-23 3",
-        "gate: not met, 2 of 7 days used, 5 required",
+        "days used: 2 of 3",
     ]
+
+
+def test_status_prints_no_gate_line(make_ctx, daily, capsys):
+    runner = FakeRunner(status_responses(daily))
+    run(make_ctx(runner, fetch=status_fetch()), "status", "--root", str(daily.path))
+    assert not [line for line in capsys.readouterr().out.splitlines() if line.startswith("gate")]
+
+
+def test_status_reports_days_that_are_not_a_list_as_unreadable(make_ctx, daily, capsys):
+    payload = {**usage_payload(), "days": {"2026-10-23": 3}}
+    fetch = FakeFetch(
+        {
+            HEALTH_URL: json.dumps(health_payload()).encode(),
+            USAGE_URL: json.dumps(payload).encode(),
+        }
+    )
+    runner = FakeRunner(status_responses(daily))
+    run(make_ctx(runner, fetch=fetch), "status", "--root", str(daily.path))
+    assert capsys.readouterr().out.splitlines()[-1] == "turns-per-day: unreadable"
 
 
 def test_status_reports_an_image_mismatch(make_ctx, daily, capsys):

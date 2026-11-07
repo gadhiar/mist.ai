@@ -70,7 +70,7 @@ backend/
 │   └── retrieval_trace.py       # Per-turn trace of every retrieval candidate and its fate
 │
 ├── event_store/                 # Append-only SQLite event store
-│   ├── usage.py                 # Real-origin turns per local day (ADR-042 gate)
+│   ├── usage.py                 # Real-origin turns per local day (ADR-042 use metric)
 │   └── status_intervals.py      # Uptime ledger: /health status intervals per local day
 │
 ├── llm/                         # LLM provider abstraction

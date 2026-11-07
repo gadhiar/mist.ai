@@ -1,4 +1,4 @@
-"""Tests for `GET /usage/turns-per-day`, the counts-only read of the 5-of-7 gate.
+"""Tests for `GET /usage/turns-per-day`, the counts-only read of real use (ADR-042).
 
 Every store is synthetic, built in `tmp_path` from the real `schema.sql`, and
 `EVENT_STORE_DB_PATH` always points at it, so no test reaches `~/.mist`.
@@ -9,10 +9,10 @@ lifespan and load the model stack.
 
 The route reads the wall clock, so turns are stamped at whole-day offsets from
 one `now` read per test (the `now` fixture), and the assertions are on counts
-and the gate rather than on a particular date. Reading the clock once keeps the
-offsets distinct from each other; if UTC midnight then passes before the
-request, every turn shifts by the same one day, which keeps each turn inside
-the 7-day window and the one at 12 days outside it.
+rather than on a particular date. Reading the clock once keeps the offsets
+distinct from each other; if UTC midnight then passes before the request,
+every turn shifts by the same one day, which keeps each turn inside the days
+asked for and the one at 12 days outside a 7-day read.
 """
 
 from __future__ import annotations
@@ -91,13 +91,11 @@ def test_returns_the_contract_shape(store: Path, client: TestClient) -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == {"timezone", "origin", "days", "gate"}
+    assert set(body) == {"timezone", "origin", "days"}
     assert body["timezone"] == "UTC"
     assert body["origin"] == "real"
     assert len(body["days"]) == 7
     assert all(set(day) == {"date", "real_turns"} for day in body["days"])
-    assert set(body["gate"]) == {"window_days", "required_days", "days_used", "met"}
-    assert (body["gate"]["window_days"], body["gate"]["required_days"]) == (7, 5)
 
 
 def test_days_are_dense_oldest_first_and_end_today(store: Path, client: TestClient) -> None:
@@ -124,41 +122,32 @@ def test_counts_only_real_origin_turns(store: Path, client: TestClient, now: dat
     body = client.get("/usage/turns-per-day").json()
 
     assert sum(day["real_turns"] for day in body["days"]) == 3
-    assert body["gate"]["days_used"] == 3
+    assert sum(1 for day in body["days"] if day["real_turns"]) == 3
 
 
-def test_gate_is_met_at_five_used_days(store: Path, client: TestClient, now: datetime) -> None:
-    for days_ago in (0, 1, 2, 3, 4):
-        _add_turn(store, "s-real", days_ago, now)
-
-    gate = client.get("/usage/turns-per-day").json()["gate"]
-
-    assert (gate["days_used"], gate["met"]) == (5, True)
-
-
-def test_gate_is_not_met_at_four_used_days(store: Path, client: TestClient, now: datetime) -> None:
-    for days_ago in (0, 1, 3, 4):
-        _add_turn(store, "s-real", days_ago, now)
-    # Outside the 7-day window whatever `days` is asked for.
-    _add_turn(store, "s-real", 12, now)
-
-    body = client.get("/usage/turns-per-day", params={"days": 30}).json()
-
-    assert sum(day["real_turns"] for day in body["days"]) == 5
-    assert (body["gate"]["days_used"], body["gate"]["met"]) == (4, False)
-
-
-def test_gate_covers_seven_days_even_when_one_day_is_asked(
+def test_counts_cover_only_the_days_asked_for(
     store: Path, client: TestClient, now: datetime
 ) -> None:
+    for days_ago in (0, 1, 3, 4):
+        _add_turn(store, "s-real", days_ago, now)
+    _add_turn(store, "s-real", 12, now)
+
+    wide = client.get("/usage/turns-per-day", params={"days": 30}).json()
+    week = client.get("/usage/turns-per-day").json()
+
+    assert sum(day["real_turns"] for day in wide["days"]) == 5
+    assert sum(day["real_turns"] for day in week["days"]) == 4
+
+
+def test_one_day_asked_is_one_day_counted(store: Path, client: TestClient, now: datetime) -> None:
     for days_ago in (0, 1, 2, 3, 4):
         _add_turn(store, "s-real", days_ago, now)
 
     body = client.get("/usage/turns-per-day", params={"days": 1}).json()
 
+    assert set(body) == {"timezone", "origin", "days"}
     assert len(body["days"]) == 1
-    assert body["gate"]["window_days"] == 7
-    assert body["gate"]["days_used"] == 5
+    assert body["days"][0]["real_turns"] == 1
 
 
 @pytest.mark.parametrize("days", [1, 90])
@@ -251,4 +240,5 @@ def test_route_docstring_states_the_counts_only_contract() -> None:
 
     assert "counts only" in doc.lower()
     assert "without opening the event store" in doc
-    assert "gate" in doc
+    assert '"days": [{"date", "real_turns"}]' in doc
+    assert "gate" not in doc.lower()

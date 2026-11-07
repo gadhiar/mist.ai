@@ -2,7 +2,7 @@
 
 Browsers apply no CORS to WebSockets, so before this check any web page open
 on the host could connect to `ws://localhost:8001/ws`, read what MIST answers
-from memory, and add turns that count toward the 5-of-7 real-use gate.
+from memory, and add turns that count as real use (ADR-042).
 
 `TestClient` is constructed without the `with` block, as in
 `tests/unit/test_server_health_wiring.py`: entering it would run the ASGI
