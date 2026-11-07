@@ -89,6 +89,10 @@ class TestPersonalityConfig:
         assert "opening phrase" in prompt
         assert "Address the user as" not in prompt
 
+    def test_mist_is_the_only_personality(self):
+        profiles = sorted(p.name for p in VOICE_PROFILES_DIR.iterdir() if p.is_dir())
+        assert profiles == ["mist"]
+
     def test_empty_personality_fallback(self):
         prompt = _build_voice_system_prompt({})
         assert "M.I.S.T" in prompt
