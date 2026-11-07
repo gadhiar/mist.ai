@@ -41,7 +41,9 @@ _DAY_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 
 # One template per user-facing relation type (graph_store's `_USER_FACING_REL_TYPES` plus the
 # remaining ontology edge types between extracted entities). `{s}` is the subject name, `{o}`
-# the object name. A type missing here falls back to "{s} <type in lower case> {o}".
+# the object name. A type missing here falls back to "{s} <type in lower case> {o}". A
+# reflexive template names its subject's pronoun: LEARNED_SELF's source is always MistIdentity
+# (v1_0_0.py, `allowed_source_types`), and MIST.AI is "she", so it reads "herself".
 FACT_TEMPLATES: Mapping[str, str] = MappingProxyType(
     {
         # User profile and activity
@@ -90,7 +92,7 @@ FACT_TEMPLATES: Mapping[str, str] = MappingProxyType(
         "HAS_PREFERENCE": "{s} has the preference: {o}",
         "IS_UNCERTAIN_ABOUT": "{s} is uncertain about {o}",
         "ADAPTED_FOR": "{s} is adapted for {o}",
-        "LEARNED_SELF": "{s} learned about itself: {o}",
+        "LEARNED_SELF": "{s} learned about herself: {o}",
         "IMPLEMENTED_WITH": "{s} is implemented with {o}",
         "MIST_HAS_TRAIT": "{s} has the trait: {o}",
         "MIST_HAS_CAPABILITY": "{s} has the capability: {o}",

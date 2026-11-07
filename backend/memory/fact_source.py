@@ -18,7 +18,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Executor
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from neo4j.exceptions import DriverError, Neo4jError
 
@@ -37,6 +37,8 @@ from .models import FactRow, fact_key
 from .ranking import MISSING_FACT_CONFIDENCE
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 # Rows per page. Paging by `elementId(r)` is linear only within one page: no index orders
 # relationships by element id, so every page query expands and filters every matching edge
@@ -73,6 +75,14 @@ class DiffTarget(Protocol):
 
     def diff_apply(self, snapshot: Sequence[FactRow]) -> DiffReport:
         """Make the index equal to `snapshot` in one write; blocking."""
+        ...
+
+
+class RebuildCompletion(Protocol):
+    """Completes an in-place index rebuild after its full rescan: `index_db.IndexRebuild`."""
+
+    def complete(self) -> bool:
+        """Store the new versions if a rebuild is pending; whether one was. Blocking."""
         ...
 
 
@@ -234,9 +244,19 @@ class FactIndexRefresher:
     """Keeps the fact index equal to the graph's latest-belief versions.
 
     It refreshes once when started, then whenever marked dirty, at most once per
-    `debounce_s` measured start to start; in `periodic` mode, for a process with no extraction
-    dispatcher to mark it, it refreshes every `debounce_s` instead. A refresh is a full rescan
-    through `source` followed by one `diff_apply` on `executor`.
+    `debounce_s` measured start to start, and also every `rescan_interval_s` without a mark,
+    so a change written by another process, which no apply event here reports, is served
+    within one interval. A mark and the timer coalesce: whichever brings a refresh restarts
+    the interval from its start, and both due together bring one refresh. In `periodic` mode,
+    for a process with no extraction dispatcher to mark it, it refreshes every `debounce_s`
+    instead. A refresh is a full rescan through `source` followed by one `diff_apply` on
+    `executor`.
+
+    After an in-place rebuild (`index_db`), the first refresh that succeeds also completes the
+    rebuild through `rebuild`, in a commit of its own after the diff's, so the index reports
+    `index_rebuilding` until it holds the whole rescan. A failed or stopped refresh leaves the
+    rebuild pending for the next one. Once a refresh has succeeded the rebuild is not checked
+    again: only `open_index` starts one.
 
     Callers:
         - MemoryRuntime (T9) calls `start()` from its `start()` and awaits `stop()` from
@@ -264,16 +284,21 @@ class FactIndexRefresher:
         index: The FactIndex to diff-apply into.
         executor: The `memory-index` executor, owned by the caller; `diff_apply` blocks on
             SQLite and the embedder, so it never runs on the event loop.
-        clock: Monotonic seconds for the debounce.
+        clock: Monotonic seconds for the debounce and the rescan timer.
         debounce_s: Least time between the starts of two refreshes, and the timer interval in
             `periodic` mode (`MemoryConfig.refresh_debounce_s`).
+        rescan_interval_s: Longest time between the starts of two refreshes without a mark
+            (`MemoryConfig.rescan_interval_s`).
         periodic: Refresh on the timer whether or not marked; for a process with no
             dispatcher attached.
+        rebuild: Completes a pending in-place rebuild of the index file, normally an
+            `index_db.IndexRebuild` on it; None for an in-memory index, which never rebuilds.
         sleep: Waits that many seconds; tests inject one driven by their fake clock.
 
     Raises:
         MemoryConfigError: `debounce_s` is negative, or zero in `periodic` mode, where it
-            would make the timer a busy loop; startup fails naming the variable.
+            would make the timer a busy loop, or `rescan_interval_s` is not positive; startup
+            fails naming the variable.
     """
 
     def __init__(
@@ -284,7 +309,9 @@ class FactIndexRefresher:
         *,
         clock: MonotonicClock,
         debounce_s: float,
+        rescan_interval_s: float,
         periodic: bool,
+        rebuild: RebuildCompletion | None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ):
         if debounce_s < 0 or (periodic and debounce_s == 0):
@@ -292,16 +319,24 @@ class FactIndexRefresher:
             raise MemoryConfigError(
                 f"MIST_MEMORY_REFRESH_DEBOUNCE_S must be {needed}, got {debounce_s}"
             )
+        if rescan_interval_s <= 0:
+            raise MemoryConfigError(
+                f"MIST_MEMORY_RESCAN_INTERVAL_S must be positive, got {rescan_interval_s}"
+            )
         self._source = source
         self._index = index
         self._executor = executor
         self._clock = clock
         self._debounce_s = debounce_s
+        self._rescan_interval_s = rescan_interval_s
         self._periodic = periodic
+        self._rebuild = rebuild
+        self._rebuild_checked = rebuild is None
         self._sleep = sleep
         self._dirty = asyncio.Event()
         self._refresh_lock = asyncio.Lock()
         self._next_allowed = float("-inf")
+        self._next_rescan = float("-inf")
         self._task: asyncio.Task[None] | None = None
 
     @property
@@ -323,31 +358,62 @@ class FactIndexRefresher:
 
         Refreshes are serialised, so this and the loop never interleave. The dirty mark is
         cleared when the scan starts; a mark that lands during the scan stays set and brings
-        another refresh.
+        another refresh. The rescan timer restarts from this refresh's start. A pending
+        rebuild is completed after the diff commits.
 
         Returns:
             What the diff changed.
 
         Raises:
-            MistError: The scan or the write failed; the index is as it was before the call.
+            MistError: The scan, the write or the rebuild's completion failed; the index is as
+                it was before the call, or holds the full rescan with the rebuild still
+                pending.
             Any other exception the source or the embedder raises propagates unchanged.
         """
         async with self._refresh_lock:
             self._dirty.clear()
-            self._next_allowed = self._clock.monotonic() + self._debounce_s
+            started = self._clock.monotonic()
+            self._next_allowed = started + self._debounce_s
+            self._next_rescan = started + self._rescan_interval_s
             snapshot = await self._source.snapshot()
-            return await self._apply(snapshot)
+            report = await self._in_executor(self._index.diff_apply, snapshot)
+            if not self._rebuild_checked and self._rebuild is not None:
+                await self._in_executor(self._rebuild.complete)
+                self._rebuild_checked = True
+            return report
 
     async def run(self) -> None:
         """Refresh at once, then on each mark or timer tick, until cancelled."""
         await self._refresh_logged()
         while True:
             if not self._periodic:
-                await self._dirty.wait()
+                await self._wait_for_mark_or_rescan()
             delay = self._next_allowed - self._clock.monotonic()
             if delay > 0:
                 await self._sleep(delay)
             await self._refresh_logged()
+
+    async def _wait_for_mark_or_rescan(self) -> None:
+        """Return once marked dirty or once the rescan interval since the last refresh is up.
+
+        The timer is one injected sleep for the time left, raced against the mark; the loser
+        is cancelled, so a mark cuts the timer short and the next refresh re-arms it.
+        """
+        if self._dirty.is_set():
+            return
+        remaining = self._next_rescan - self._clock.monotonic()
+        if remaining <= 0:
+            return
+        mark = asyncio.ensure_future(self._dirty.wait())
+        timer = asyncio.ensure_future(self._sleep(remaining))
+        try:
+            await asyncio.wait({mark, timer}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for waiter in (mark, timer):
+                waiter.cancel()
+            await asyncio.wait({mark, timer})
+        if not timer.cancelled() and timer.exception() is not None:
+            raise timer.exception()
 
     def start(self) -> None:
         """Start `run()` as a task on the running loop.
@@ -399,9 +465,10 @@ class FactIndexRefresher:
             report.embedded,
         )
 
-    async def _apply(self, snapshot: list[FactRow]) -> DiffReport:
+    async def _in_executor(self, write: Callable[..., T], *args: object) -> T:
+        """Run one blocking index write on the executor, letting a stop wait for it."""
         loop = asyncio.get_running_loop()
-        future = loop.run_in_executor(self._executor, self._index.diff_apply, snapshot)
+        future = loop.run_in_executor(self._executor, write, *args)
         try:
             return await asyncio.shield(future)
         except asyncio.CancelledError:

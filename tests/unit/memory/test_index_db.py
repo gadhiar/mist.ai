@@ -1,6 +1,11 @@
-"""Tests for backend.memory.index_db: opening `memory_index.db` and checking what built it."""
+"""Tests for backend.memory.index_db: opening `memory_index.db`, checking what built it, and
+rebuilding it in place when something else did.
+"""
 
+import logging
 import sqlite3
+import subprocess  # nosec B404 - runs this interpreter on a fixed script, to crash mid-open
+import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -9,9 +14,15 @@ import pytest
 from backend.errors import MemoryIndexError
 from backend.memory.index_db import (
     META_EMBEDDING_MODEL_ID,
+    META_INDEX_STATE,
+    META_REBUILD_EMBEDDING_MODEL_ID,
+    META_REBUILD_SCHEMA_VERSION,
     META_SCHEMA_VERSION,
     SCHEMA_DDL,
     SCHEMA_VERSION,
+    STATE_REBUILDING,
+    IndexRebuild,
+    degraded_reason,
     get_meta,
     open_index,
     open_reader,
@@ -118,23 +129,6 @@ def test_memory_path_opens_without_a_file(opened: Callable) -> None:
     assert _schema_names(conn) >= _SCHEMA_OBJECTS
 
 
-def test_raises_when_the_stored_model_id_differs(db_path: Path) -> None:
-    open_index(db_path, embedding_model_id=_MODEL).close()
-
-    with pytest.raises(MemoryIndexError, match="other-model"):
-        open_index(db_path, embedding_model_id="other-model")
-
-
-def test_raises_when_the_stored_schema_version_differs(db_path: Path) -> None:
-    conn = open_index(db_path, embedding_model_id=_MODEL)
-    with write_transaction(conn):
-        set_meta(conn, META_SCHEMA_VERSION, str(SCHEMA_VERSION + 1))
-    conn.close()
-
-    with pytest.raises(MemoryIndexError, match="schema"):
-        open_index(db_path, embedding_model_id=_MODEL)
-
-
 def test_schema_version_is_two() -> None:
     # 2 added the entity types and the FTS type terms; a version 1 file has neither.
     assert SCHEMA_VERSION == 2
@@ -180,18 +174,294 @@ _V1_DDL = (
 )
 
 
-def test_a_version_1_file_is_refused_by_its_version(db_path: Path) -> None:
-    conn = sqlite3.connect(db_path)
+def _write_v1_file(path: Path) -> None:
+    conn = sqlite3.connect(path)
     for statement in _V1_DDL:
         conn.execute(statement)
+    conn.execute(
+        "INSERT INTO facts (row_key, fact_key, subject_id, subject_name, rel_type, object_id, "
+        "object_name, text, confidence, content_hash) "
+        "VALUES ('rk-v1', 'fk', 'user', 'User', 'USES', 'vim', 'Vim', 'User uses Vim.', 0.9, 'h')"
+    )
     conn.execute("INSERT INTO index_meta VALUES ('schema_version', '1')")
     conn.execute("INSERT INTO index_meta VALUES ('embedding_model_id', ?)", (_MODEL,))
     conn.commit()
     conn.close()
 
-    # The version is checked before this schema's DDL runs, so the refusal names the version.
-    with pytest.raises(MemoryIndexError, match="built with schema 1"):
-        open_index(db_path, embedding_model_id=_MODEL)
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and record.name == "backend.memory.index_db"
+    ]
+
+
+def _meta(conn: sqlite3.Connection) -> dict[str, str]:
+    return dict(conn.execute("SELECT key, value FROM index_meta").fetchall())
+
+
+# -- the in-place rebuild ----------------------------------------------------------------------
+
+
+def test_a_version_1_file_is_rebuilt_in_place_to_this_schema(
+    db_path: Path, opened: Callable, caplog: pytest.LogCaptureFixture
+) -> None:
+    _write_v1_file(db_path)
+
+    with caplog.at_level(logging.WARNING, logger="backend.memory.index_db"):
+        conn = opened(open_index(db_path, embedding_model_id=_MODEL))
+
+    assert {"subject_type", "object_type"} <= set(_columns(conn, "facts"))
+    assert _columns(conn, "facts_fts")[-1] == "type_terms"
+    assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
+    assert _schema_names(conn) >= _SCHEMA_OBJECTS
+    (warning,) = _warnings(caplog)
+    assert "schema 1" in warning and f"schema {SCHEMA_VERSION}" in warning
+    assert _MODEL in warning
+
+
+def test_a_stale_model_rebuilds_and_stores_rebuilding_with_the_old_versions(
+    db_path: Path, opened: Callable, caplog: pytest.LogCaptureFixture
+) -> None:
+    first = open_index(db_path, embedding_model_id=_MODEL)
+    _insert_fact(first, "rk-1")
+    with write_transaction(first):
+        set_meta(first, "facts_refreshed_at", "2026-10-22T18:00:00+00:00")
+    first.close()
+
+    with caplog.at_level(logging.WARNING, logger="backend.memory.index_db"):
+        conn = opened(open_index(db_path, embedding_model_id="other-model"))
+
+    assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
+    # Only the rebuild's final commit stores the new versions; until then the old ones stand.
+    assert _meta(conn) == {
+        META_SCHEMA_VERSION: str(SCHEMA_VERSION),
+        META_EMBEDDING_MODEL_ID: _MODEL,
+        META_INDEX_STATE: STATE_REBUILDING,
+        META_REBUILD_SCHEMA_VERSION: str(SCHEMA_VERSION),
+        META_REBUILD_EMBEDDING_MODEL_ID: "other-model",
+    }
+    (warning,) = _warnings(caplog)
+    assert _MODEL in warning and "other-model" in warning
+
+
+def test_a_stale_schema_version_rebuilds_naming_both_versions(
+    db_path: Path, opened: Callable, caplog: pytest.LogCaptureFixture
+) -> None:
+    conn = open_index(db_path, embedding_model_id=_MODEL)
+    _insert_fact(conn, "rk-1")
+    with write_transaction(conn):
+        set_meta(conn, META_SCHEMA_VERSION, str(SCHEMA_VERSION + 1))
+    conn.close()
+
+    with caplog.at_level(logging.WARNING, logger="backend.memory.index_db"):
+        rebuilt = opened(open_index(db_path, embedding_model_id=_MODEL))
+
+    assert rebuilt.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
+    assert get_meta(rebuilt, META_INDEX_STATE) == STATE_REBUILDING
+    (warning,) = _warnings(caplog)
+    assert f"schema {SCHEMA_VERSION + 1}" in warning and f"schema {SCHEMA_VERSION}" in warning
+
+
+def test_the_rebuild_keeps_the_same_file(db_path: Path, opened: Callable) -> None:
+    open_index(db_path, embedding_model_id=_MODEL).close()
+    inode = db_path.stat().st_ino
+
+    opened(open_index(db_path, embedding_model_id="other-model"))
+
+    assert db_path.stat().st_ino == inode
+
+
+def test_a_matching_index_is_opened_untouched(
+    db_path: Path, opened: Callable, caplog: pytest.LogCaptureFixture
+) -> None:
+    first = open_index(db_path, embedding_model_id=_MODEL)
+    _insert_fact(first, "rk-1")
+    meta_before = _meta(first)
+    first.close()
+
+    with caplog.at_level(logging.WARNING, logger="backend.memory.index_db"):
+        second = opened(open_index(db_path, embedding_model_id=_MODEL))
+
+    assert second.total_changes == 0
+    assert _meta(second) == meta_before
+    assert second.execute("SELECT row_key FROM facts").fetchall() == [("rk-1",)]
+    assert _warnings(caplog) == []
+    assert degraded_reason(second) is None
+
+
+def test_reads_during_the_rebuild_report_index_rebuilding(db_path: Path, opened: Callable) -> None:
+    open_index(db_path, embedding_model_id=_MODEL).close()
+    opened(open_index(db_path, embedding_model_id="other-model"))
+
+    reader = opened(open_reader(db_path, embedding_model_id="other-model"))
+
+    assert degraded_reason(reader) == "index_rebuilding"
+
+
+def test_a_reader_during_the_rebuild_needs_the_rebuild_target(
+    db_path: Path, opened: Callable
+) -> None:
+    open_index(db_path, embedding_model_id=_MODEL).close()
+    opened(open_index(db_path, embedding_model_id="other-model"))
+
+    # The stored model is still the old one, but the tables are being refilled for the new.
+    with pytest.raises(MemoryIndexError, match="other-model"):
+        open_reader(db_path, embedding_model_id=_MODEL)
+
+
+def test_a_reader_open_across_the_rebuild_keeps_working(db_path: Path, opened: Callable) -> None:
+    first = open_index(db_path, embedding_model_id=_MODEL)
+    _insert_fact(first, "rk-1")
+    first.close()
+    reader = opened(open_reader(db_path, embedding_model_id=_MODEL))
+    reader.execute("BEGIN")
+    assert reader.execute("SELECT row_key FROM facts").fetchall() == [("rk-1",)]
+
+    opened(open_index(db_path, embedding_model_id="other-model"))
+
+    # The read transaction keeps its snapshot; the next one sees the rebuilt, empty tables.
+    assert reader.execute("SELECT row_key FROM facts").fetchall() == [("rk-1",)]
+    reader.execute("COMMIT")
+    assert reader.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
+    assert reader.execute("SELECT count(*) FROM facts_vec").fetchone()[0] == 0
+    assert reader.execute("SELECT count(*) FROM facts_fts").fetchone()[0] == 0
+    assert degraded_reason(reader) == "index_rebuilding"
+
+
+def test_completing_the_rebuild_stores_the_new_versions(db_path: Path, opened: Callable) -> None:
+    open_index(db_path, embedding_model_id=_MODEL).close()
+    writer = opened(open_index(db_path, embedding_model_id="other-model"))
+    reader = opened(open_reader(db_path, embedding_model_id="other-model"))
+
+    assert IndexRebuild(db_path, embedding_model_id="other-model").complete() is True
+
+    assert _meta(writer) == {
+        META_SCHEMA_VERSION: str(SCHEMA_VERSION),
+        META_EMBEDDING_MODEL_ID: "other-model",
+    }
+    assert degraded_reason(reader) is None
+
+
+def test_completing_when_no_rebuild_is_pending_changes_nothing(
+    writer: sqlite3.Connection, db_path: Path
+) -> None:
+    meta_before = _meta(writer)
+
+    assert IndexRebuild(db_path, embedding_model_id=_MODEL).complete() is False
+
+    assert _meta(writer) == meta_before
+
+
+def test_an_index_rebuilt_and_completed_reopens_untouched(
+    db_path: Path, opened: Callable, caplog: pytest.LogCaptureFixture
+) -> None:
+    open_index(db_path, embedding_model_id=_MODEL).close()
+    open_index(db_path, embedding_model_id="other-model").close()
+    IndexRebuild(db_path, embedding_model_id="other-model").complete()
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger="backend.memory.index_db"):
+        conn = opened(open_index(db_path, embedding_model_id="other-model"))
+
+    assert conn.total_changes == 0
+    assert _warnings(caplog) == []
+
+
+def test_completing_for_another_target_raises(db_path: Path, opened: Callable) -> None:
+    open_index(db_path, embedding_model_id=_MODEL).close()
+    opened(open_index(db_path, embedding_model_id="other-model"))
+
+    with pytest.raises(MemoryIndexError, match="other-model"):
+        IndexRebuild(db_path, embedding_model_id="third-model").complete()
+
+
+def test_completing_a_missing_file_raises(db_path: Path) -> None:
+    with pytest.raises(MemoryIndexError):
+        IndexRebuild(db_path, embedding_model_id=_MODEL).complete()
+
+    assert not db_path.exists()
+
+
+def test_an_in_memory_index_has_no_rebuild() -> None:
+    with pytest.raises(ValueError, match="memory"):
+        IndexRebuild(":memory:", embedding_model_id=_MODEL)
+
+
+# A process that dies inside the drop transaction: the derived tables are already dropped
+# when the stand-in for the table creation kills the process without a commit.
+_CRASH_IN_DROP = """
+import os
+import sys
+
+from backend.memory import index_db
+
+
+def _crash(conn):
+    dropped = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'facts'").fetchone() is None
+    os._exit(3 if dropped and conn.in_transaction else 4)
+
+
+index_db._create_fact_tables = _crash
+index_db.open_index(sys.argv[1], embedding_model_id=sys.argv[2])
+os._exit(5)
+"""
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def test_a_crash_inside_the_drop_transaction_leaves_the_old_version(
+    db_path: Path, opened: Callable, caplog: pytest.LogCaptureFixture
+) -> None:
+    first = open_index(db_path, embedding_model_id=_MODEL)
+    _insert_fact(first, "rk-1")
+    first.close()
+
+    crashed = subprocess.run(
+        [sys.executable, "-c", _CRASH_IN_DROP, str(db_path), "other-model"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert crashed.returncode == 3, crashed.stderr.decode()
+    plain = sqlite3.connect(db_path)
+    try:
+        assert _meta(plain) == {
+            META_SCHEMA_VERSION: str(SCHEMA_VERSION),
+            META_EMBEDDING_MODEL_ID: _MODEL,
+        }
+        assert plain.execute("SELECT row_key FROM facts").fetchall() == [("rk-1",)]
+    finally:
+        plain.close()
+    # The next open still finds the old model and rebuilds again.
+    with caplog.at_level(logging.WARNING, logger="backend.memory.index_db"):
+        conn = opened(open_index(db_path, embedding_model_id="other-model"))
+    assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
+    assert get_meta(conn, META_INDEX_STATE) == STATE_REBUILDING
+    assert len(_warnings(caplog)) == 1
+
+
+def test_a_crash_during_the_rescan_rebuilds_again_at_the_next_open(
+    db_path: Path, opened: Callable, caplog: pytest.LogCaptureFixture
+) -> None:
+    open_index(db_path, embedding_model_id=_MODEL).close()
+    partial = open_index(db_path, embedding_model_id="other-model")
+    _insert_fact(partial, "rk-partial")  # the rescan wrote part of the facts, then died
+    partial.close()
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger="backend.memory.index_db"):
+        conn = opened(open_index(db_path, embedding_model_id="other-model"))
+
+    # A partial index never opens as valid: the tables are emptied again for a full rescan.
+    assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
+    assert get_meta(conn, META_INDEX_STATE) == STATE_REBUILDING
+    assert get_meta(conn, META_EMBEDDING_MODEL_ID) == _MODEL
+    (warning,) = _warnings(caplog)
+    assert _MODEL in warning and "other-model" in warning
 
 
 def _failing_loader(conn: sqlite3.Connection) -> None:

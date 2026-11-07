@@ -51,7 +51,7 @@ _EXPECTED = {
     "HAS_PREFERENCE": "Sam has the preference: Kestrel.",
     "IS_UNCERTAIN_ABOUT": "Sam is uncertain about Kestrel.",
     "ADAPTED_FOR": "Sam is adapted for Kestrel.",
-    "LEARNED_SELF": "Sam learned about itself: Kestrel.",
+    "LEARNED_SELF": "Sam learned about herself: Kestrel.",
     "IMPLEMENTED_WITH": "Sam is implemented with Kestrel.",
     "MIST_HAS_TRAIT": "Sam has the trait: Kestrel.",
     "MIST_HAS_CAPABILITY": "Sam has the capability: Kestrel.",
