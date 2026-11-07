@@ -73,9 +73,18 @@ def _record(
     *,
     tokens: int = 100,
     budget_tokens: int = 500,
+    ranks: tuple[int, ...] | None = None,
+    refs: tuple[str, ...] | None = None,
 ) -> RunRecord:
+    """A run record whose items are fetched in block order unless `ranks` says otherwise."""
     block = tuple(
-        BlockItem(ref=f"m{index}", kind=item.kind, id=item.id, score=0.9 - index * 0.01)
+        BlockItem(
+            ref=refs[index - 1] if refs else f"m{index}",
+            kind=item.kind,
+            id=item.id,
+            score=0.9 - index * 0.01,
+            rank=ranks[index - 1] if ranks else index,
+        )
         for index, item in enumerate(items, start=1)
     )
     return RunRecord(probe_id=probe_id, items=block, tokens=tokens, budget_tokens=budget_tokens)
@@ -156,6 +165,57 @@ class TestRecallAndMrr:
         assert overall.recall_at_block == 0.0
         assert overall.mrr == 0.0
         assert overall.precision_at_block == 0.0
+
+
+class TestMrrByFetchRank:
+    """MRR reads each item's fetch rank, not its block position (ruling b, 7 Nov 2026).
+
+    The block lays items out by section, facts before notes, so block position would charge a
+    note the fetcher ranked first for every fact placed ahead of it.
+    """
+
+    def test_an_expected_note_ranked_first_behind_two_facts_scores_one(self) -> None:
+        """Block [fa, fb, note] with fetch ranks [2, 3, 1]: the note was fetched first."""
+        probes = [_probe("p1", kind="note", expected=(NOTE_A,))]
+        run = [_record("p1", (FACT_A, FACT_B, NOTE_A), ranks=(2, 3, 1))]
+
+        overall = score_run(probes, run).overall
+
+        assert overall.mrr == 1.0
+
+    def test_an_expected_item_ranked_third_in_first_place_scores_a_third(self) -> None:
+        """Block [fa, fx] with ranks [3, 4]: the fetcher ranked two dropped candidates higher."""
+        probes = [_probe("p1", expected=(FACT_A,))]
+        run = [_record("p1", (FACT_A, FACT_X), ranks=(3, 4))]
+
+        overall = score_run(probes, run).overall
+
+        assert overall.mrr == pytest.approx(1 / 3)
+
+    def test_the_lowest_rank_among_expected_items_is_scored(self) -> None:
+        """Expected {fa, fb} at ranks 5 and 2: the reciprocal of 2, whatever the block order."""
+        probes = [_probe("p1", expected=(FACT_A, FACT_B))]
+        run = [_record("p1", (FACT_A, FACT_B), ranks=(5, 2))]
+
+        overall = score_run(probes, run).overall
+
+        assert overall.mrr == 0.5
+
+    def test_items_sharing_a_ref_and_a_rank_score_that_rank(self) -> None:
+        """A list's members are one block entry `m1` at rank 2; the expected member scores 1/2."""
+        probes = [_probe("p1", expected=(FACT_B,))]
+        run = [
+            _record(
+                "p1",
+                (FACT_X, FACT_A, FACT_B),
+                ranks=(1, 2, 2),
+                refs=("m0", "m1", "m1"),
+            )
+        ]
+
+        overall = score_run(probes, run).overall
+
+        assert overall.mrr == 0.5
 
 
 class TestPrecision:
@@ -451,7 +511,7 @@ class TestRunValidation:
     def test_a_record_with_an_unknown_item_kind_is_rejected(self) -> None:
         row = {
             "probe_id": "p1",
-            "items": [{"ref": "m1", "kind": "memo", "id": "x", "score": 0.5}],
+            "items": [{"ref": "m1", "kind": "memo", "id": "x", "score": 0.5, "rank": 1}],
             "tokens": 10,
             "budget_tokens": 500,
         }
@@ -462,7 +522,7 @@ class TestRunValidation:
     def test_a_record_may_carry_extra_keys_such_as_timings(self) -> None:
         row = {
             "probe_id": "p1",
-            "items": [{"ref": "m1", "kind": "fact", "id": "fa", "score": 0.5}],
+            "items": [{"ref": "m1", "kind": "fact", "id": "fa", "score": 0.5, "rank": 1}],
             "tokens": 10,
             "budget_tokens": 500,
             "timings_ms": {"total": 12.5},
@@ -472,6 +532,37 @@ class TestRunValidation:
         record = parse_run_record(row)
 
         assert record.items[0].item == FACT_A
+
+    def test_an_item_carries_its_fetch_rank(self) -> None:
+        row = {
+            "probe_id": "p1",
+            "items": [{"ref": "m1", "kind": "fact", "id": "fa", "score": 0.5, "rank": 7}],
+            "tokens": 10,
+            "budget_tokens": 500,
+        }
+
+        record = parse_run_record(row)
+
+        assert record.items[0].rank == 7
+
+    @pytest.mark.parametrize(
+        "rank",
+        [
+            pytest.param(None, id="missing"),
+            pytest.param(0, id="zero"),
+            pytest.param(True, id="bool"),
+        ],
+    )
+    def test_an_item_without_a_valid_rank_is_rejected(self, rank: object) -> None:
+        """MRR reads the rank, so a run written without one must fail, not score position."""
+        good = {"ref": "m1", "kind": "fact", "id": "fa", "score": 0.5, "rank": 1}
+        bad = {"ref": "m2", "kind": "fact", "id": "fb", "score": 0.4}
+        if rank is not None:
+            bad["rank"] = rank
+        row = {"probe_id": "p1", "items": [good, bad], "tokens": 10, "budget_tokens": 500}
+
+        with pytest.raises(ValueError, match=r"run record p1 items\[1\].*rank"):
+            parse_run_record(row)
 
 
 class TestProbeParsing:
@@ -551,7 +642,7 @@ class TestCommandLine:
         run_rows = [
             {
                 "probe_id": "p1",
-                "items": [{"ref": "m1", "kind": "fact", "id": "fa", "score": 0.8}],
+                "items": [{"ref": "m1", "kind": "fact", "id": "fa", "score": 0.8, "rank": 1}],
                 "tokens": 40,
                 "budget_tokens": 500,
             },
