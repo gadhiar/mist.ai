@@ -9,8 +9,10 @@ the loader and the ontology before adjudication reads them. The published dev-li
 held-out sets pass the same label checks, plus the checks a score on them depends on: their
 sizes, enough list-shaped and no-fact probes, type and predicate coverage, no held-out
 utterance shared with a dev probe, and no held-out entity lifted from the production prompt.
-The conventions behind these checks are in `data/gold/extraction/LABELLING.md`, and the
-adjudication that produced the sets is in `labelling/adjudication-2026-11.md`.
+The labelling rules that came out of Raj's check of 20 held-out probes (N11 to N16) are checked
+where a pattern in the utterance identifies the probes they govern. The conventions behind these
+checks are in `data/gold/extraction/LABELLING.md`, and the adjudication that produced the sets is
+in `labelling/adjudication-2026-11.md`.
 """
 
 from __future__ import annotations
@@ -681,3 +683,122 @@ def test_heldout_ids_avoid_the_prompts_example_entities_outright():
     example_ids = {canonical_id(t) for t in _prompt_entity_terms()}
 
     assert sorted(set(_PROMPT_WORD_EXEMPTIONS) & example_ids) == []
+
+
+# --- Labelling rules from the H8 check (N11 to N16 in LABELLING.md) ---------------------------
+
+# N11: a goal's stated time frame is its deadline, written as `valid_to` at the frame's end.
+# The reference date is 2026-06-13, so "this year" is 2026 and "next year" 2027.
+_GOAL_FRAMES = (
+    (re.compile(r"\bthis year\b", re.IGNORECASE), lambda m: "2026"),
+    (re.compile(r"\bnext year\b", re.IGNORECASE), lambda m: "2027"),
+    (re.compile(r"\bby (\d{4})\b"), lambda m: m.group(1)),
+)
+# N12: an utterance that states the earlier preference as well as the new one.
+_FLIPPED_PREFERENCE = re.compile(
+    r"\bused to (?:love|like|enjoy|prefer)\b|\b(?:like|enjoy|love)\b[^.;]*\banymore\b",
+    re.IGNORECASE,
+)
+# N14: a list item "X as the Y" names what kind of thing X is.
+_AS_THE_KIND = re.compile(
+    r"^\s*(?:[-*+•]|\d+[.)])\s+(?P<thing>.+?) as (?:the|my) (?P<kind>[a-z]+)$"
+)
+# N16: a relative the utterance names only by the relation, never by a first name.
+_UNNAMED_RELATIVE = re.compile(
+    r"\b[Mm]y (?P<relation>wife|husband|brother|sister|mother|father|grandfather|grandmother"
+    r"|uncle|aunt|cousin|son|daughter)\b(?!,?\s+[A-Z])"
+)
+
+
+def _all_gold_rows() -> list[dict]:
+    return _gold_rows(_DEV_GOLD) + _gold_rows(_HELDOUT_GOLD)
+
+
+def test_goal_time_frames_are_the_goal_edge_valid_to():
+    checked, wrong = 0, []
+
+    for row in _all_gold_rows():
+        expected = [f(m) for p, f in _GOAL_FRAMES if (m := p.search(row["utterance"]))]
+        goals = [r for r in row["expected_relationships"] if r["predicate"] == "HAS_GOAL"]
+        if not expected or not goals:
+            continue
+        for rel in goals:
+            checked += 1
+            if rel.get("valid_to") != expected[0]:
+                wrong.append((row["tag"], rel["target"], rel.get("valid_to")))
+
+    assert checked > 0, "no goal with a stated time frame was found"
+    assert wrong == []
+
+
+def test_a_flipped_preference_keeps_the_old_one_as_ceased():
+    checked, missing = 0, []
+
+    for row in _all_gold_rows():
+        if not _FLIPPED_PREFERENCE.search(row["utterance"]):
+            continue
+        edges = row["expected_relationships"]
+        ceased = {
+            r["target"]
+            for r in edges
+            if r["predicate"] == "PREFERS" and r.get("assertion_kind") == "cease"
+        }
+        for rel in edges:
+            if rel["predicate"] == "DISLIKES":
+                checked += 1
+                if rel["target"] not in ceased:
+                    missing.append((row["tag"], rel["target"]))
+
+    assert checked > 0, "no flipped preference was found"
+    assert missing == []
+
+
+def test_a_list_item_naming_its_kind_carries_an_is_a_edge():
+    checked, missing = 0, []
+
+    for row in _all_gold_rows():
+        is_a = {
+            (r["source"], r["target"])
+            for r in row["expected_relationships"]
+            if r["predicate"] == "IS_A"
+        }
+        for line in row["utterance"].splitlines():
+            match = _AS_THE_KIND.match(line)
+            if match is None:
+                continue
+            checked += 1
+            pair = (canonical_id(match["thing"]), canonical_id(match["kind"]))
+            if pair not in is_a:
+                missing.append((row["tag"], *pair))
+
+    assert checked > 0, "no 'X as the Y' list item was found"
+    assert missing == []
+
+
+def test_a_relative_named_only_by_the_relation_is_a_person_the_user_knows():
+    checked, missing = 0, []
+
+    for row in _all_gold_rows():
+        people = {e["id"] for e in row["expected_entities"] if e["type"] == "Person"}
+        known = {
+            r["target"] for r in row["expected_relationships"] if r["predicate"] == "KNOWS_PERSON"
+        }
+        for match in _UNNAMED_RELATIVE.finditer(row["utterance"]):
+            checked += 1
+            relation = match["relation"]
+            if relation not in people or relation not in known:
+                missing.append((row["tag"], relation))
+
+    assert checked > 0, "no relative named only by the relation was found"
+    assert missing == []
+
+
+def test_the_h8_marks_section_covers_every_sampled_probe():
+    # The sample quotes utterances that contain markdown headings, so its probes are found by
+    # their own `### `tag`` headings across the file rather than by cutting out the section.
+    report = _ADJUDICATION.read_text(encoding="utf-8")
+    marks = _report_section("H8 marks")
+    sampled = re.findall(r"^### `(ho-\d{3}-[a-z0-9-]+)`$", report, re.M)
+
+    assert len(sampled) == 20
+    assert [t for t in sampled if t[:6] not in marks] == []
