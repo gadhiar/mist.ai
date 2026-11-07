@@ -255,6 +255,107 @@ def test_extra_fields_on_a_retrieved_fact_are_ignored(tmp_path: Path) -> None:
     assert _score(tmp_path, queries, run).per_query[0].hit is True
 
 
+# -- the build's merge map ------------------------------------------------------
+
+
+def _relevant(source: str, predicate: str, target: str, grade: int) -> ers.RelevantFact:
+    return ers.RelevantFact(source=source, predicate=predicate, target=target, grade=grade)
+
+
+def _retrieval_query(*relevant: ers.RelevantFact, kind: str = "direct") -> ers.RetrievalQuery:
+    return ers.RetrievalQuery(id="q", query="q", kind=kind, relevant=tuple(relevant))
+
+
+def _merge(incoming: str, graph: str, graph_type: str = "Technology") -> dict:
+    return {
+        "tag": "t",
+        "event_id": "golden-t",
+        "incoming_id": incoming,
+        "incoming_type": graph_type,
+        "graph_id": graph,
+        "graph_type": graph_type,
+    }
+
+
+PYTHON_MERGE = [_merge("python", "tech-python")]
+
+
+def test_merge_aliases_map_a_gold_id_to_its_graph_ids() -> None:
+    aliases = ers.merge_aliases([_merge("Python", "Tech_Python"), _merge("user", "user")])
+    # Keys take the relevant facts' form, values the retrieved facts'; a self-mapping drops.
+    assert aliases == {"python": frozenset({"tech-python"})}
+
+
+def test_a_metric_merge_value_is_rebuilt_value_first() -> None:
+    aliases = ers.merge_aliases(
+        [_merge("api-throughput", "requests-per-second-12000", graph_type="Metric")]
+    )
+    assert aliases == {"api-throughput": frozenset({"12000-requests-per-second"})}
+
+
+def test_accepted_keys_cross_both_endpoints_with_their_aliases() -> None:
+    aliases = {"user": frozenset({"raj"}), "python": frozenset({"tech-python"})}
+    keys = ers.accepted_keys(("user", "EXPERT_IN", "python"), aliases)
+    assert keys == {
+        ("user", "EXPERT_IN", "python"),
+        ("user", "EXPERT_IN", "tech-python"),
+        ("raj", "EXPERT_IN", "python"),
+        ("raj", "EXPERT_IN", "tech-python"),
+    }
+    assert ers.accepted_keys(_relevant("lua", "USED_FOR", "modding", 2), aliases) == {
+        ("lua", "USED_FOR", "modding")
+    }
+
+
+def test_a_merged_target_is_a_full_hit_through_the_merge_map() -> None:
+    query = _retrieval_query(_relevant("user", "EXPERT_IN", "python", 2))
+    retrieved = (("user", "EXPERT_IN", "tech-python"),)
+
+    without = ers.score_query(query, retrieved)
+    score = ers.score_query(query, retrieved, aliases=ers.merge_aliases(PYTHON_MERGE))
+
+    assert without.hit is False
+    assert (score.hit, score.recall, score.reciprocal_rank, score.ndcg) == (True, 1.0, 1.0, 1.0)
+
+
+def test_a_fact_with_both_endpoints_merged_is_a_full_hit() -> None:
+    aliases = ers.merge_aliases(
+        [_merge("ingest-service", "svc-ingest"), _merge("clickhouse", "db-clickhouse")]
+    )
+    query = _retrieval_query(_relevant("ingest-service", "DEPENDS_ON", "clickhouse", 2))
+    score = ers.score_query(query, (("svc-ingest", "DEPENDS_ON", "db-clickhouse"),), aliases)
+    assert (score.hit, score.recall, score.reciprocal_rank, score.ndcg) == (True, 1.0, 1.0, 1.0)
+
+
+def test_two_facts_resolving_to_one_key_collapse_into_one_item_at_the_higher_grade() -> None:
+    query = _retrieval_query(
+        _relevant("user", "USES", "python", 1),
+        _relevant("user", "USES", "tech-python", 2),
+        kind="type_scoped",
+    )
+    score = ers.score_query(
+        query, (("user", "USES", "tech-python"),), aliases=ers.merge_aliases(PYTHON_MERGE)
+    )
+    # One item, credited once at grade 2: the ideal is that one item, so nDCG reaches 1.
+    assert (score.hit, score.recall, score.reciprocal_rank) == (True, 1.0, 1.0)
+    assert score.ndcg == pytest.approx(1.0)
+
+
+def test_an_id_merged_into_two_graph_ids_is_credited_through_either() -> None:
+    aliases = ers.merge_aliases(PYTHON_MERGE + [_merge("python", "python-lang")])
+    query = _retrieval_query(_relevant("user", "EXPERT_IN", "python", 2))
+    for graph_id in ("tech-python", "python-lang"):
+        assert ers.score_query(query, (("user", "EXPERT_IN", graph_id),), aliases).hit is True
+
+
+def test_a_key_listed_twice_in_one_query_takes_its_higher_grade() -> None:
+    key = ("user", "KNOWS", "kotlin")
+    query = _retrieval_query(_relevant(*key, 2), _relevant(*key, 1))
+    score = ers.score_query(query, (key,))
+    assert (score.hit, score.recall, score.reciprocal_rank) == (True, 1.0, 1.0)
+    assert score.ndcg == pytest.approx(1.0)
+
+
 # -- loaders ------------------------------------------------------------------
 
 

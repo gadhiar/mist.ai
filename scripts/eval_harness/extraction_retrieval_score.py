@@ -56,6 +56,7 @@ import argparse
 import json
 import math
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -78,6 +79,9 @@ GRADES = (1, 2)
 ANSWER_GRADE = 2
 
 FactKey = tuple[str, str, str]
+
+# A gold-side id mapped to the graph ids a build's dedup merged it into.
+MergeAliases = dict[str, frozenset[str]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,8 +266,65 @@ def _dcg(grades: list[int]) -> float:
     return sum(_gain(g) / math.log2(rank + 1) for rank, g in enumerate(grades, start=1))
 
 
-def score_query(query: RetrievalQuery, retrieved: tuple[FactKey, ...] | None) -> QueryScore:
-    """Score one query against its ranked facts, or None when it was not run."""
+def merge_aliases(merges: Iterable[dict[str, Any]]) -> MergeAliases:
+    """The build's merges as gold id -> graph ids, each side in the form it is matched in.
+
+    A key takes `canonical_id`, the form `load_queries` gives relevant facts; a value takes
+    `_produced_entity_match_id` with the graph node's type, the form `normalise_fact` gives
+    retrieved facts. A merge that maps an id onto itself is dropped.
+    """
+    aliases: dict[str, set[str]] = {}
+    for merge in merges:
+        gold = canonical_id(str(merge["incoming_id"]))
+        graph = _produced_entity_match_id(
+            str(merge["graph_id"]), str(merge.get("graph_type") or ""), {}
+        )
+        if graph != gold:
+            aliases.setdefault(gold, set()).add(graph)
+    return {gold: frozenset(graph) for gold, graph in aliases.items()}
+
+
+def accepted_keys(fact: RelevantFact | FactKey, aliases: MergeAliases) -> frozenset[FactKey]:
+    """Every key that counts as `fact`: each endpoint itself or a graph id it merged into."""
+    source, predicate, target = fact.key if isinstance(fact, RelevantFact) else fact
+    return frozenset(
+        (s, predicate, t)
+        for s in {source} | aliases.get(source, frozenset())
+        for t in {target} | aliases.get(target, frozenset())
+    )
+
+
+def _items(
+    relevant: tuple[RelevantFact, ...], aliases: MergeAliases
+) -> list[tuple[int, frozenset[FactKey]]]:
+    """The query's relevant facts joined into items with disjoint key sets.
+
+    Facts whose accepted keys intersect are joined, transitively, so one retrieved key can
+    credit at most one item. An item takes its highest member grade.
+    """
+    items: list[tuple[int, frozenset[FactKey]]] = []
+    for fact in relevant:
+        grade, keys = fact.grade, accepted_keys(fact, aliases)
+        kept = []
+        for item_grade, item_keys in items:
+            if item_keys & keys:
+                grade, keys = max(grade, item_grade), keys | item_keys
+            else:
+                kept.append((item_grade, item_keys))
+        items = [*kept, (grade, keys)]
+    return items
+
+
+def score_query(
+    query: RetrievalQuery,
+    retrieved: tuple[FactKey, ...] | None,
+    aliases: MergeAliases | None = None,
+) -> QueryScore:
+    """Score one query against its ranked facts, or None when it was not run.
+
+    With `aliases`, a relevant fact is credited by any of its `accepted_keys`; without, by
+    its own key only.
+    """
     ran = retrieved is not None
     facts = retrieved or ()
     if query.kind == "negative":
@@ -278,27 +339,28 @@ def score_query(query: RetrievalQuery, retrieved: tuple[FactKey, ...] | None) ->
             ndcg=None,
             empty=ran and not facts,
         )
-    grade_by_key = {fact.key: fact.grade for fact in query.relevant}
-    credited: set[FactKey] = set()
+    items = _items(query.relevant, aliases or {})
+    item_of = {key: index for index, (_, keys) in enumerate(items) for key in keys}
+    credited: set[int] = set()
     ranked_grades: list[int] = []
     first_answer = 0
     for rank, key in enumerate(facts[:K], start=1):
-        grade = grade_by_key.get(key, 0)
-        if key in credited:
-            grade = 0
-        elif grade:
-            credited.add(key)
+        index = item_of.get(key)
+        grade = 0
+        if index is not None and index not in credited:
+            credited.add(index)
+            grade = items[index][0]
         ranked_grades.append(grade)
         if grade == ANSWER_GRADE and not first_answer:
             first_answer = rank
-    ideal = sorted(grade_by_key.values(), reverse=True)[:K]
+    ideal = sorted((grade for grade, _ in items), reverse=True)[:K]
     return QueryScore(
         id=query.id,
         kind=query.kind,
         ran=ran,
         retrieved=len(facts),
         hit=bool(first_answer),
-        recall=len(credited) / len(grade_by_key),
+        recall=len(credited) / len(items),
         reciprocal_rank=1.0 / first_answer if first_answer else 0.0,
         ndcg=_dcg(ranked_grades) / _dcg(ideal),
         empty=None,
