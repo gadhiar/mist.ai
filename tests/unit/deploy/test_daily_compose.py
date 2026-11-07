@@ -76,7 +76,7 @@ LOGGING = {"driver": "json-file", "options": {"max-size": "20m", "max-file": "5"
 EXAMPLE_EXTRA_VARIABLES = (
     "MIST_EXTRACTION_INFERENCE",
     "MIST_EXTRACTION_SERVICE_URL",
-    "MIST_USAGE_TIMEZONE",
+    "MIST_TIMEZONE",
     "MIST_INSTANCE_NAME",
     "MODEL",
 )

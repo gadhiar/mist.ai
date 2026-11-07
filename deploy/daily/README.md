@@ -80,7 +80,7 @@ that is unset makes compose refuse the whole file before anything starts.
 | `MIST_ALLOWED_ORIGINS` | compose: browser origins the backend admits | no | the three Tauri origins |
 | `MIST_EXTRACTION_INFERENCE` | the backend through `env_file` | no | `service` |
 | `MIST_EXTRACTION_SERVICE_URL` | the backend through `env_file` | no | code default |
-| `MIST_USAGE_TIMEZONE` | the backend through `env_file` | no | UTC |
+| `MIST_TIMEZONE` | the backend through `env_file` | no | UTC |
 | `MIST_BACKUP_HOST_PATH` | compose: host directory mounted at `/backup` | yes | |
 | `MIST_BACKUP_INTERVAL_HOURS` | compose: the backup scheduler | no | `24` |
 | `MIST_BACKUP_RETAIN` | compose: the backup scheduler | no | `7` |
@@ -154,7 +154,7 @@ and refuse with exit 2 before anything starts:
 | `switch TAG [--skip-backup]` | Refuses a tag with no `release/<tag>/`, a tag with no `mist-backend:<tag>` image, and a `rehearsal-` tag on the instance named `daily`. When `MIST_BACKUP_HOST_PATH` is set and `mist-backend` is running, it runs `backup-now` on the current release first, and stops with that exit code if the backup fails. It then rewrites only the `MIST_RELEASE_TAG=` line of `daily.env`, copies every `*.py` file of `release/<tag>/scripts/daily/` into `bin/`, and runs `up`. |
 | `up [--wait-minutes N]` | Waits up to N minutes (default 10) for `docker info`, creates the share network if it is missing, and starts `mist-neo4j`, `mist-llm` and `mist-backend` in one call, leaving `mist-llm` out while `ops/gpu-yielded` exists. Only when `ops/backups-armed` exists does it start `mist-backup`, in a second call, so a failure there (exit 1) leaves the first three running. Last, it names every container of the project whose compose config-file label is not the release's compose file, and exits 1. |
 | `down` | `docker compose ... --profile backup stop`. It stops every container and removes nothing: no command of this CLI runs `down -v`, `rm -v` or `volume rm`. Every command passes `volume_safety.py`, which `instance.py` loads from beside itself, before it runs; the guard refuses `-v`, `--volumes`, `prune`, `down` and every `volume` subcommand but `inspect` and `create`, and the CLI exits 1 naming the command. |
-| `status` | Prints the running backend's image tag, its image ID with `match` or `MISMATCH` against the release record, and its `org.opencontainers.image.revision` label; each container from another compose file (then exit 1), and it exits 1 too when the project's containers cannot be listed, since then that check could not run; the `gaming-mode status` line; `/health`'s status and each check's status and reason; and `/usage/turns-per-day?days=7`'s counts and gate. |
+| `status` | Prints the running backend's image tag, its image ID with `match` or `MISMATCH` against the release record, and its `org.opencontainers.image.revision` label; each container from another compose file (then exit 1), and it exits 1 too when the project's containers cannot be listed, since then that check could not run; the `gaming-mode status` line; `/health`'s status and each check's status and reason; and `/usage/turns-per-day?days=7`'s counts and how many of those days had a real turn. |
 | `gaming-mode on [--by manual\|watcher]` | Yields the GPU to a game: see Gaming mode below. |
 | `gaming-mode off [--wait-minutes N]` | Ends the yield, waiting up to N minutes (default 5) for `mist-llm`. |
 | `gaming-mode status` | Prints `yielded since <time> by <who>`, or `normal`, from the marker alone. |
