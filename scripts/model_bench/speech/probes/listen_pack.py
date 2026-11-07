@@ -41,7 +41,7 @@ if __package__ in (None, ""):
 else:
     from .. import core
 
-# -20 LUFS integrated is the realtime design's level (realtime-voice v1:663). The range target is
+# -20 LUFS integrated is the level the realtime design sets. The range target is
 # set wide so that linear mode, which ffmpeg drops when a clip's measured range exceeds it, holds
 # for speech; the true-peak ceiling leaves headroom for the 48 kHz resample.
 TARGET_I = -20.0
