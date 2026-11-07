@@ -159,9 +159,10 @@ services:
       - llm-share
     # Holds the measured peak, 4602 MiB after a handful of prompts (scratch rehearsal rerun,
     # 6 Nov 2026), plus the 2048 MiB the prompt cache may still grow to under --cache-ram:
-    # 6650 MiB, with 18.8% of it free. At the end of the rerun, memory.stat counted 5374 MiB of
-    # file pages, mostly the memory-mapped model, which the kernel can reclaim, and 312 MiB anon.
-    mem_limit: ${MIST_DAILY_LLM_MEM_LIMIT:-8g}
+    # 6650 MiB, which leaves 27.8% of 9g free. At the end of the rerun, memory.stat counted
+    # 5374 MiB of file pages, mostly the memory-mapped model, which the kernel can reclaim, and
+    # 312 MiB anon.
+    mem_limit: ${MIST_DAILY_LLM_MEM_LIMIT:-9g}
     logging: *logging
     deploy:
       resources:
