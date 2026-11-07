@@ -262,6 +262,10 @@ CARD_TOTAL=""
 STARTED_UTC=""
 BEFORE_GPU=""
 BEFORE_AVAIL=""
+BEFORE_WINDOWS=""
+BEFORE_HEADROOM=""
+FIT_NEED=""
+FIT_HEADROOM=""
 CHOSEN_NGL=""
 PROBE_FITS=false
 PROBE_TOTAL=""
@@ -292,6 +296,29 @@ join_lines() { if [[ -s $1 ]]; then paste -sd, "$1"; fi; }
 gpu_used() { nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | awk 'NR == 1 { print $1 + 0 }'; }
 gpu_total() { nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | awk 'NR == 1 { print $1 + 0 }'; }
 available_mib() { free -m | awk '/^Mem:/ { print $7 }'; }
+# WSL's `free -m` does not see what Windows has left: the guest can report gigabytes available
+# while Windows itself is short, and a model admitted on the guest's figure then makes Windows
+# page. FreePhysicalMemory is in KiB, and powershell.exe ends its line with a CR that `$(...)`
+# keeps, so every whitespace character goes before the figure is checked.
+windows_free_mib() {
+  local raw
+  raw=$(powershell.exe -NoProfile -NonInteractive -Command "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory") || return 1
+  raw=${raw//[[:space:]]/}
+  [[ $raw =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$((10#$raw / 1024))"
+}
+smaller() { if (($1 < $2)); then printf '%s\n' "$1"; else printf '%s\n' "$2"; fi; }
+# Bash turns -e off inside $(...), so each read returns its own status for the caller's || die.
+headroom_mib() {
+  local guest windows
+  guest=$(available_mib) || return 1
+  [[ $guest =~ ^[0-9]+$ ]] || return 1
+  windows=$(windows_free_mib) || return 1
+  smaller "$guest" "$windows"
+}
+windows_read_failed() {
+  die "$1: powershell.exe gave no whole number for Windows' free memory; check that WSL interop runs powershell.exe from this shell"
+}
 state_of() { docker inspect --format '{{.State.Status}}' "$1" 2> /dev/null || echo absent; }
 max_of() { awk '$1 ~ /^[0-9]+$/ { if (m == "" || $1 + 0 > m) m = $1 + 0 } END { print m }' "$1"; }
 min_of() { awk '$1 ~ /^[0-9]+$/ { if (m == "" || $1 + 0 < m) m = $1 + 0 } END { print m }' "$1"; }
@@ -325,6 +352,7 @@ preflight() {
       SKIP_REASON[$m]="model file sha256 differs from the pin file"
     fi
   done
+  BEFORE_WINDOWS=$(windows_free_mib) || windows_read_failed "preflight, before anything is stopped"
 }
 
 record_state() {
@@ -349,6 +377,7 @@ begin() {
   record_state "$RUN_DIR/before"
   BEFORE_GPU=$(gpu_used)
   BEFORE_AVAIL=$(available_mib)
+  BEFORE_HEADROOM=$(smaller "$BEFORE_AVAIL" "$BEFORE_WINDOWS")
   trap restore EXIT
   trap 'exit 130' INT TERM HUP
 }
@@ -372,9 +401,14 @@ remove_own() {
   docker rm "$name" > /dev/null 2>&1 || log "could not remove $name"
 }
 
+# A fourth and fifth argument, the fit check's need and headroom, are recorded with the skip.
 add_skip() {
+  local figures=""
+  if [[ $# -ge 5 ]]; then
+    figures=$(printf ',"need_mib":%s,"headroom_mib":%s' "$(jnum "$4")" "$(jnum "$5")")
+  fi
   log "skip $1 on $2: $3"
-  printf '{"model":%s,"placement":%s,"reason":%s}\n' "$(jstr "$1")" "$(jstr "$2")" "$(jstr "$3")" >> "$EV/skips.jsonl"
+  printf '{"model":%s,"placement":%s,"reason":%s%s}\n' "$(jstr "$1")" "$(jstr "$2")" "$(jstr "$3")" "$figures" >> "$EV/skips.jsonl"
 }
 
 run_server() {
@@ -532,10 +566,13 @@ run_window() {
   local model=$1 placement=$2 pass=$3 alias=$4 kind=$5 ngl=$6 seconds=$7
   local start end gpu_before avail_before after_load="" peak="" avail_peak="" after_unload=""
   local unload_s="" status=served t0 tag
+  local windows_before windows_end="" headroom_before
   log "window $alias for $seconds s"
   start=$(utc)
   gpu_before=$(gpu_used)
   avail_before=$(available_mib)
+  windows_before=$(windows_free_mib) || windows_read_failed "window $alias"
+  headroom_before=$(smaller "$avail_before" "$windows_before")
   if start_server "$BENCH" "$SERVE_PORT" "$kind" "$model" "$alias" "$ngl"; then
     after_load=$(gpu_used)
     SAMPLE_N=$((SAMPLE_N + 1))
@@ -547,6 +584,7 @@ run_window() {
     [[ -n $peak && $peak -ge $after_load ]] || peak=$after_load
     avail_peak=$(min_of "$tag.free.csv")
     [[ -n $avail_peak ]] || avail_peak=$(available_mib)
+    windows_end=$(windows_free_mib) || windows_read_failed "window $alias"
     t0=$(now)
     remove_own "$BENCH" "$alias"
     wait_memory_returned "$gpu_before"
@@ -568,14 +606,20 @@ run_window() {
       "$seconds" "$(jnum "$START_LOAD_S")" "$(jnum "$unload_s")" "$(jnum "$START_CAP")"
     printf '"gpu_before_mib":%s,"gpu_after_load_mib":%s,"gpu_peak_mib":%s,"gpu_after_unload_mib":%s,' \
       "$(jnum "$gpu_before")" "$(jnum "$after_load")" "$(jnum "$peak")" "$(jnum "$after_unload")"
-    printf '"free_available_before_mib":%s,"free_available_peak_mib":%s}\n' \
+    printf '"free_available_before_mib":%s,"free_available_peak_mib":%s,' \
       "$(jnum "$avail_before")" "$(jnum "$avail_peak")"
+    printf '"windows_free_before_mib":%s,"headroom_before_mib":%s,"windows_free_end_mib":%s}\n' \
+      "$(jnum "$windows_before")" "$(jnum "$headroom_before")" "$(jnum "$windows_end")"
   } >> "$EV/windows.jsonl"
 }
 
+# A shared placement runs only if its file plus HOST_MARGIN_MIB fits the headroom, the smaller of
+# the guest's and Windows' free memory. Sets FIT_NEED and FIT_HEADROOM for the skip or refusal.
+# The `--memory` cap stays on `free -m`: it is a cgroup limit inside the guest.
 fits_host_memory() {
-  local need=$(((${SIZE[$1]} + 1048575) / 1048576 + HOST_MARGIN_MIB))
-  [[ $need -le $(available_mib) ]]
+  FIT_NEED=$(((${SIZE[$1]} + 1048575) / 1048576 + HOST_MARGIN_MIB))
+  FIT_HEADROOM=$(headroom_mib) || windows_read_failed "fit check for $1"
+  [[ $FIT_NEED -le $FIT_HEADROOM ]]
 }
 
 shared_block() {
@@ -585,7 +629,8 @@ shared_block() {
     return 0
   fi
   if ! fits_host_memory "$model"; then
-    add_skip "$model" gtx1070-shared "does not fit beside extraction in host memory"
+    add_skip "$model" gtx1070-shared "does not fit beside extraction in host memory" \
+      "$FIT_NEED" "$FIT_HEADROOM"
     return 0
   fi
   start_load_loop
@@ -633,8 +678,8 @@ write_summary() {
     printf '  "started_utc": %s,\n  "finished_utc": %s,\n' "$(jstr "$STARTED_UTC")" "$(jstr "$(utc)")"
     printf '  "exit_code": %s,\n  "threads": %s,\n  "card_total_mib": %s,\n' \
       "$code" "$(jnum "$THREADS")" "$(jnum "$CARD_TOTAL")"
-    printf '  "before": {"gpu_used_mib": %s, "free_available_mib": %s},\n' \
-      "$(jnum "$BEFORE_GPU")" "$(jnum "$BEFORE_AVAIL")"
+    printf '  "before": {"gpu_used_mib": %s, "free_available_mib": %s, "windows_free_mib": %s, "headroom_mib": %s},\n' \
+      "$(jnum "$BEFORE_GPU")" "$(jnum "$BEFORE_AVAIL")" "$(jnum "$BEFORE_WINDOWS")" "$(jnum "$BEFORE_HEADROOM")"
     printf '  "searches": [%s],\n' "$(join_lines "$EV/searches.jsonl")"
     printf '  "windows": [%s],\n' "$(join_lines "$EV/windows.jsonl")"
     printf '  "skips": [%s],\n' "$(join_lines "$EV/skips.jsonl")"
@@ -729,7 +774,9 @@ main_game() {
   if [[ -n ${SKIP_REASON[$model]:-} ]]; then
     die "$model: ${SKIP_REASON[$model]}"
   fi
-  fits_host_memory "$model" || die "$model does not fit beside extraction in host memory"
+  if ! fits_host_memory "$model"; then
+    die "$model does not fit beside extraction in host memory: needs $FIT_NEED MiB, headroom $FIT_HEADROOM MiB"
+  fi
   begin
   stop_extraction "$SVC"
   if [[ -z $ngl ]]; then

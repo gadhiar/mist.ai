@@ -2,9 +2,10 @@
 
 The script is checked twice: as text (ports, aliases, no `--rm`, logs before `docker rm`, the
 `--memory` cap, the filtered inspect and the restore trap), and by running it under bash with fake
-`docker`, `nvidia-smi`, `free` and `sleep` defined as shell functions through BASH_ENV. The fake
-GPU is an 8,192 MiB card on which extraction's model takes 6,996 MiB, and a bench server takes 300
-MiB plus 20 MiB per layer (30 layers), so the layer search keeping 512 MiB free lands on 9.
+`docker`, `nvidia-smi`, `free`, `sleep` and `powershell.exe` defined as shell functions through
+BASH_ENV. The fake GPU is an 8,192 MiB card on which extraction's model takes 6,996 MiB, and a
+bench server takes 300 MiB plus 20 MiB per layer (30 layers), so the layer search keeping 512 MiB
+free lands on 9.
 Nothing here touches a GPU, the network or docker.
 """
 
@@ -341,6 +342,17 @@ echo "Mem:           15000        8000        2000          10        5000      
 echo "Swap:           4096           0        4096"
 """
 
+# Windows' FreePhysicalMemory in KiB, with the CRLF a real powershell.exe prints through WSL
+# interop. The default, 15,625 MiB, is above the fake `free -m` figure, so the headroom stays 6,000.
+FAKE_POWERSHELL = """#!/bin/bash
+made=0
+if [[ -f $FAKE_STATE/powershell.txt ]]; then made=$(wc -l < "$FAKE_STATE/powershell.txt"); fi
+echo "$*" >> "$FAKE_STATE/powershell.txt"
+if [[ -n ${FAKE_POWERSHELL_FAIL:-} ]]; then exit 1; fi
+if [[ -n ${FAKE_POWERSHELL_FAIL_AFTER:-} ]] && ((made >= FAKE_POWERSHELL_FAIL_AFTER)); then exit 1; fi
+printf '%s\\r\\n' "${FAKE_WINDOWS_FREE_KIB:-16000000}"
+"""
+
 
 class Host:
     """A fake host-1070: a home with `~/mist-bench-h6/`, a models directory and fake tools."""
@@ -374,6 +386,7 @@ class Host:
             ("nvidia-smi", FAKE_NVIDIA_SMI, python, ".py"),
             ("free", FAKE_FREE, "bash", ".sh"),
             ("sleep", FAKE_SLEEP, "bash", ".sh"),
+            ("powershell.exe", FAKE_POWERSHELL, "bash", ".sh"),
         ):
             fake = self.fakes / f"{name}{suffix}"
             fake.write_text(body, encoding="utf-8")
@@ -770,3 +783,177 @@ def test_the_game_variant_refuses_an_unknown_model_before_stopping_anything(host
 
     assert proc.returncode != 0
     assert not any(c[0] in ("stop", "run") for c in host.calls())
+
+
+# ---------------------------------------------------------------------------
+# Windows free memory (plan v3, T11): the shared fit check reads the smaller of `free -m` and
+# Windows' FreePhysicalMemory; the `--memory` cap and the sampler stay on `free -m`.
+# ---------------------------------------------------------------------------
+
+POWERSHELL_ARGS = (
+    "-NoProfile -NonInteractive -Command (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory"
+)
+WINDOW_KEYS = ("windows_free_before_mib", "headroom_before_mib", "windows_free_end_mib")
+
+
+def powershell_calls(host: Host) -> list[str]:
+    path = host.state / "powershell.txt"
+    return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+
+def install_large_e4b(host: Host, tmp_path: Path) -> None:
+    """Regenerate the scripts with a 1.6 MiB `e4b-ref` file: rounded up, its fit check needs 1,026."""
+    pins = json.loads(PINS.read_text(encoding="utf-8"))
+    big = b"GGUF large fake weights\n" * 70_000
+    (host.models / pins["models"]["e4b-ref"]["file"]).write_bytes(big)
+    pins["models"]["e4b-ref"].update(sha256=hashlib.sha256(big).hexdigest(), size=len(big))
+    pins_path = tmp_path / "big_pins.json"
+    pins_path.write_text(json.dumps(pins), encoding="utf-8")
+    out = tmp_path / "again" / "h6.sh"
+    out.parent.mkdir()
+    for path in host1070_script.write_script(out, pins_path=pins_path, repo_root=_REPO_ROOT):
+        shutil.copy(path, host.h6 / path.name)
+
+
+def function_body(text: str, name: str) -> str:
+    body = text[text.index(f"\n{name}() {{") :]
+    return body[: body.index("\n}\n")]
+
+
+def expected_powershell_calls(summary: dict) -> int:
+    """1 in preflight, 1 per shared fit check, 2 per served window and 1 per failed window."""
+    shared = {"gtx1070-shared", "host1070-cpu"}
+    checked = {w["model"] for w in summary["windows"] if w["placement"] in shared}
+    checked |= {s["model"] for s in summary["skips"] if "need_mib" in s}
+    statuses = [w["status"] for w in summary["windows"]]
+    return 1 + len(checked) + 2 * statuses.count("served") + statuses.count("failed")
+
+
+def test_the_script_reads_windows_free_memory_but_its_sampler_does_not(h6_text):
+    reader = function_body(h6_text, "windows_free_mib")
+    assert (
+        'powershell.exe -NoProfile -NonInteractive -Command "(Get-CimInstance '
+        'Win32_OperatingSystem).FreePhysicalMemory"' in reader
+    )
+    assert "\nheadroom_mib() {" in h6_text
+    sampler = function_body(h6_text, "start_samplers")
+    assert "available_mib" in sampler
+    for word in ("windows_free_mib", "headroom_mib", "powershell.exe"):
+        assert word not in sampler, word
+
+
+@needs_bash
+def test_h6_skips_a_shared_placement_that_exceeds_the_windows_headroom(host, tmp_path):
+    install_large_e4b(host, tmp_path)
+
+    proc = host.run(FAKE_WINDOWS_FREE_KIB="1049600")
+
+    assert proc.returncode == 0, proc.stderr
+    served = host.served()
+    assert "e4b-ref@gtx1070-shared-idle" not in served
+    assert "e4b-ref@gtx1070" in served
+    (skip,) = (
+        s
+        for s in host.summary()["skips"]
+        if (s["model"], s["placement"]) == ("e4b-ref", "gtx1070-shared")
+    )
+    assert skip["reason"] == "does not fit beside extraction in host memory"
+    assert (skip["need_mib"], skip["headroom_mib"]) == (1026, 1025)
+
+
+@needs_bash
+def test_h6_keeps_the_memory_cap_on_free_when_windows_has_less(host):
+    proc = host.run(FAKE_WINDOWS_FREE_KIB="3072000")
+
+    assert proc.returncode == 0, proc.stderr
+    assert host.served() == H6_SERVED
+    caps = [c[c.index("--memory") + 1] for c in host.runs() if c[c.index("--name") + 1] != LOAD]
+    assert caps and set(caps) == {f"{6000 - 1024}m"}
+    windows = host.summary()["windows"]
+    assert {w["memory_cap_mib"] for w in windows} == {6000 - 1024}
+    assert {w["windows_free_before_mib"] for w in windows} == {3000}
+    assert {w["headroom_before_mib"] for w in windows} == {3000}
+
+
+@needs_bash
+def test_h6_records_windows_free_memory_in_each_window_and_the_summary(ran_h6):
+    host, proc = ran_h6
+    assert proc.returncode == 0, proc.stderr
+
+    summary = host.summary()
+    for window in summary["windows"]:
+        for key in WINDOW_KEYS:
+            assert isinstance(window[key], int), (window["alias"], key)
+        assert window["windows_free_before_mib"] == window["windows_free_end_mib"] == 15625
+        assert window["headroom_before_mib"] == 6000
+    before = summary["before"]
+    assert (before["windows_free_mib"], before["headroom_mib"]) == (15625, 6000)
+    assert before["free_available_mib"] == 6000
+
+
+@needs_bash
+@pytest.mark.parametrize(
+    "fault",
+    [{"FAKE_POWERSHELL_FAIL": "1"}, {"FAKE_WINDOWS_FREE_KIB": "junk"}],
+    ids=["powershell-fails", "not-a-number"],
+)
+def test_h6_stops_before_changing_anything_when_the_windows_read_fails(host, fault):
+    proc = host.run(**fault)
+
+    assert proc.returncode != 0
+    assert "powershell.exe" in proc.stderr
+    assert not any(c[0] in ("stop", "run") for c in host.calls())
+    assert not (host.h6 / "before").exists()
+    assert (host.status(LLM), host.status(SVC)) == ("running", "running")
+
+    again = host.run()
+
+    assert again.returncode == 0, again.stderr
+    assert host.served() == H6_SERVED
+
+
+@needs_bash
+def test_h6_restores_extraction_when_a_windows_read_fails_after_preflight(host):
+    proc = host.run(FAKE_POWERSHELL_FAIL_AFTER="1")
+
+    assert proc.returncode != 0
+    assert "powershell.exe" in proc.stderr
+    assert len(powershell_calls(host)) == 2
+    assert not any(c[0] == "run" for c in host.calls())
+    assert ["stop", SVC] in host.calls()
+    assert (host.status(LLM), host.status(SVC)) == ("running", "running")
+    assert host.summary()["exit_code"] != 0
+
+
+@needs_bash
+def test_h6_reads_windows_once_in_preflight_per_fit_check_and_twice_per_window(ran_h6):
+    host, proc = ran_h6
+    assert proc.returncode == 0, proc.stderr
+
+    calls = powershell_calls(host)
+    assert set(calls) == {POWERSHELL_ARGS}
+    assert len(calls) == expected_powershell_calls(host.summary()) == 1 + 4 + 2 * 11
+
+
+@needs_bash
+def test_h6_reads_windows_once_for_a_window_that_failed_to_start(host):
+    proc = host.run(FAKE_EXIT_ALIAS="minicpm5-2b@gtx1070")
+
+    assert proc.returncode == 0, proc.stderr
+    summary = host.summary()
+    failed = {w["alias"]: w for w in summary["windows"]}["minicpm5-2b@gtx1070"]
+    assert failed["status"] == "failed"
+    assert failed["windows_free_before_mib"] == 15625
+    assert failed["windows_free_end_mib"] is None
+    assert len(powershell_calls(host)) == expected_powershell_calls(summary) == 1 + 4 + 2 * 10 + 1
+
+
+@needs_bash
+def test_the_game_variant_refuses_a_model_beyond_the_windows_headroom_before_stopping(host):
+    proc = host.run("h6_game.sh", "gemma4-e2b", "9", FAKE_WINDOWS_FREE_KIB="1048576")
+
+    assert proc.returncode != 0
+    assert "does not fit beside extraction in host memory" in proc.stderr
+    assert "1025" in proc.stderr and "1024" in proc.stderr
+    assert not any(c[0] in ("stop", "run") for c in host.calls())
+    assert not list(host.h6.glob("game-*"))
