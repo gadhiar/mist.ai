@@ -5,7 +5,7 @@ This document tracks all modifications made to the original CSM Streaming codeba
 **Original License:** Apache License 2.0
 **Modified By:** Raj Gadhia
 **Project:** M.I.S.T Voice AI Assistant
-**Last Updated:** 2025-01-28
+**Last Updated:** 2026-11-07
 
 ---
 
@@ -90,7 +90,7 @@ except Exception as e:
 
 #### Modification 1: Optimized training hyperparameters
 **Lines:** 36-51
-**Reason:** Tuned for voice fine-tuning with Cortana dataset (277 clips)
+**Reason:** Tuned for voice fine-tuning with the 277-clip fine-tuning dataset
 **Impact:** Higher quality voice cloning with rank-96 LoRA
 
 ```python
@@ -105,7 +105,7 @@ R=32          # LoRA rank
 APLHA=32      # LoRA alpha
 
 # MODIFIED:
-NUM_EPOCHS = 15              # Optimized for Cortana dataset
+NUM_EPOCHS = 15              # Tuned for the 277-clip fine-tuning dataset
 BATCH_SIZE = 2               # Full GPU utilization (12GB VRAM available)
 GRADIENT_ACCUMULATION_STEPS = 4  # Effective batch size = 8
 LEARNING_RATE = 5e-7         # Lower LR for stable training
@@ -113,11 +113,11 @@ MAX_GRAD_NORM = 0.5          # Increased for better gradient flow
 WARMUP_STEPS = 150           # More warmup for longer training
 R=96                         # LoRA rank for voice quality
 APLHA=96                     # Keep scaling ratio at 1.0
-MAX_AUDIO_FILES = 0          # Use all 277 clips from Cortana dataset
+MAX_AUDIO_FILES = 0          # Use every clip of the 277-clip fine-tuning dataset
 ```
 
 **Results:**
-- Voice fine-tuning with Cortana dataset
+- Voice fine-tuning with the 277-clip fine-tuning dataset
 - High-quality voice consistency
 - Natural prosody and intonation
 
@@ -137,6 +137,36 @@ active_mask = label_masks[..., 0].reshape(-1)
 active_logits = c0_logits.reshape(-1, c0_logits.size(-1))[active_mask]
 active_labels = c0_labels.reshape(-1)[active_mask]
 ```
+
+---
+
+## Added Files
+
+### 1. `test_voice.py`
+
+A M.I.S.T script, not part of the original repository (added 2026-03-23). It loads CSM-1B
+with fine-tuned weights, generates a few test lines, trims silence, and writes WAV files to
+`test_output/` for listening.
+
+- `--profile <name>` loads the weights and reference clips from that voice profile through
+  `VoiceProfileRegistry` (`data/voice_profiles/`).
+- Standalone mode uses `--weights` (default `finetuned_model/model.safetensors`) and passes no
+  reference clips, so generation runs without voice anchoring.
+
+**Change (2026-11-07):** standalone mode no longer reads reference clips from a hard-coded local
+folder or from a named voice profile directory; the clip folder, the clip list and that fallback
+were removed.
+
+---
+
+## Removed Files
+
+### 1. `static/test.mp3`
+
+An upstream asset, added to this repository with the fork (commit 144fb8c), played by the
+web UI's "test output" button to check the selected speaker. Removed on 2026-11-07 so that the
+repository tracks no audio files. `static/app.js` is unchanged, so the legacy "test output"
+button (`static/app.js:92`) now plays nothing.
 
 ---
 
