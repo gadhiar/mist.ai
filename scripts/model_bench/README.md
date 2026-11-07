@@ -738,6 +738,126 @@ do not narrow the Wilson or bootstrap intervals, which are computed across the p
 Tighter confidence intervals need more probes in the gold corpus, not more reruns. Compare runs
 only when their `serving_config` blocks match.
 
+## Speech suites
+
+`speech_bench.py` measures the speech path and the low level: speech synthesis, recognition, end
+of turn, the prompt cache, what fits on the card, a small model on each placement, chained turns,
+and what the low level costs a game. Invocation, from the repo root:
+
+```
+python -m scripts.model_bench.speech_bench <subcommand>
+```
+
+The host side is stdlib only, like `bench_host.py`. The engines run in the bench images built from
+`docker/speech-bench/` (a base image and one per engine family), each with the repository mounted
+read-only; the code those containers run lives in `scripts/model_bench/speech/probes/`. Every
+container mounts its model files read-only from the speech or small models directory with
+`HF_HUB_OFFLINE=1`, so no container downloads anything. Every engine speaks in a stock voice its
+package ships: nothing is cloned, and no subcommand takes a voice sample.
+
+Results go to `<results-root>/<run>/speech/`, one directory per suite (`tts/`, `cache/`, `stt/`,
+`turn/`, `fit/`, `lowtier/`, `host1070/`, `chain/`, `game/`, `listening/`), with `host/` holding
+the H1 and H2 records. A results root inside the repository is refused, as `bench_host` refuses
+one, and no suite overwrites an earlier run's files.
+
+### Subcommands
+
+| Subcommand | What it does |
+|---|---|
+| `plan` | Checks each suite's committed inputs and prints every container argv; `--host-1070-script <path>` also writes the H6 script, outside the repository. No docker. |
+| `selftest` | Runs each suite's self-checks against the committed fixtures; prints `selftest ok`. |
+| `prepare` | Converts Raj's recordings in `--material-dir` to 16 kHz mono WAV and writes `manifest.json`. |
+| `small-serve`, `small-unserve` | Starts or removes `mist-bench-small` for a model and placement, timing load and unload. |
+| `tts` | Run 1: speech first audio and compute per second of speech, each engine in its stock voice; `--extra-voice ENGINE:VOICE` adds an untimed stock voice for listening. |
+| `cache` | Run 2: the prompt cache against the arm `bench_host serve` started. |
+| `stt` | Run 3: final-text time and word error rate. |
+| `turn` | Run 4: Smart Turn's verdict and inference time at every decision point. |
+| `fit` | Run 5: what fits on the card together, one `bench_host vram-step` per combination. |
+| `lowtier` | Run 7: a small model on a placement; `--remote-url` reads the host-1070 rows, `--e4b-reload` times E4B's return. |
+| `remote-memory` | Writes the H6 script's memory figures, layer counts and skips per model and placement. |
+| `chain` | Run 7's chained turns, speech in to first audio out; `--busy-arm c0` runs them while E4B writes. |
+| `game-session` | Runs 8 and 9, guided, in an administrator terminal; `--with-1070` adds the shared 1070 conditions, `--server-process <name>` adds run 9's server counters. |
+| `listen-pack` | Builds the blind listening page from run 1's saved clips. |
+| `report` | Writes `numbers.json` and `REPORT.md` under `speech/`. |
+
+### Bench run ids
+
+Each window that stops MIST takes a bench run id of its own, passed to every `bench_host` call and
+every `--bench-run` in it: `mh1-h4` for the speech session, `mh1-h5` for the low-level session,
+`mh1-h6` for the host-1070 rows. `game-session` makes its own, `mh1-game-<UTC time>`. A bench run
+id is never reused: `bench_host snapshot` refuses to overwrite a window's
+`session/snapshot.json`, and `game-session` refuses a bench run id whose `session/` directory
+exists.
+
+### The host steps, in order
+
+1. **H1 Re-check the GPU paths.** `nvidia-smi` on Windows and inside the backend image, torch's
+   view of the card, Docker's CPUs and memory, free disk, and `/v1/health` and `/v1/info` of the
+   extraction host from the main PC; the host-1070 session records the same on host-1070. Results
+   in `speech/host/gpu_path.txt`.
+2. **H2 Build the bench images and fetch the weights.** The four images from
+   `docker/speech-bench/`, the CPU llama.cpp image checked against its pinned digest, each model at
+   the revision the Hugging Face API reports that day, checked by sha256, and `speech/host/pins.json`
+   written. `speech_bench selftest` runs inside each image.
+3. **H3 Record Raj's utterances.** Raj records the 30 lines of `utterances.json`; `prepare` writes
+   the material manifest.
+4. **H4 The speech session** (`mh1-h4`, MIST stopped): `bench_host snapshot` and `stop
+   --with-neo4j`, `vram-step desktop`, `serve c0`, `selftest` and the smoke pass, run 2, run 1,
+   runs 3 and 4, run 5's speech combinations, `unserve`, then `bench_host restore` with an empty
+   diff and both health checks.
+5. **H5 The low-level session on the main PC** (`mh1-h5`, MIST stopped): `small-serve` and
+   `lowtier` per model and placement with `chain` on each, run 5's small-model steps with `c0`
+   served, `chain --busy-arm c0`, E4B's reload three times, then restore.
+6. **H6 The host-1070 rows** (`mh1-h6`): the lead writes the script with `plan
+   --host-1070-script`, the host-1070 session runs it once, `lowtier --remote-url` and `chain` read
+   the rows as each alias appears, and `remote-memory` writes the memory figures. The script
+   restores extraction on any exit, with an empty inspect diff.
+7. **H7 Raj's blind listening.** Raj rates every clip on `listening/index.html` and saves
+   `listening/ratings.csv`. Nothing names an engine or voice until `report` unblinds.
+8. **H8 Raj's game session** (run 8, opportunistic), in an administrator terminal:
+   `python -m scripts.model_bench.speech_bench game-session --results-root <results-root> --run mh1 --model <id>`,
+   with `--presentmon <path>` or `--manual-fps`. The lead then runs `report --replace`.
+9. **H9 Report and relay.** The lead writes the larger models' file sizes into
+   `speech/host/larger_models.json` and runs `report`.
+10. **H10 Raj's Minecraft session** (run 9, deferred): the H8 command with `--server-process <the
+    server's process name>`, then `report --replace`.
+
+### The report (`report --run R`)
+
+`report` reads every suite's rows and writes `speech/numbers.json` and `speech/REPORT.md`. Every
+figure carries its sample count, its median and 90th percentile where it has a spread, and a mark
+against its target: speech first audio 250 ms (floor 500), final text 80 ms (floor 250), prefill
+to first token 120 ms (floor 250), end-of-turn inference under 15 ms, memory headroom against the
+512 MiB margin and the 2 GiB gate, and the chained turn against 2 to 3 s. Its sections:
+
+- the budget of the reassessment, section 8, with each measured stage put in from its run and
+  every other stage labelled derived;
+- the levels, one answer per question of the tier design, with each placement's chained turn,
+  tool-call and hand-off validity, memory, load and unload, and game cost side by side;
+- runs 1 to 5 and 7 to 9, the blind listening ratings, and what a 16 to 24 GB card would add.
+
+A run with no rows yet, such as run 8 or 9 before a game session, reads "not yet run". The
+listening clips are unblinded only once `listening/ratings.csv` exists; until then `report`
+refuses before writing anything. `report` refuses to overwrite an earlier report; `--replace`
+renders it again, as H8 and H10 do when a session arrives.
+
+The larger-card section labels every figure derived and names its inputs. The larger models'
+file sizes come from a file the lead fills in during H9, `speech/host/larger_models.json` by
+default or the path given to `--larger-models`; the code fetches nothing:
+
+```json
+{
+  "schema": 1,
+  "source": "Hugging Face API, read in H9",
+  "reference": {"id": "<E4B file id>", "size_bytes": 0},
+  "models": [{"id": "<model file id>", "repository": "<org>/<repo>", "size_bytes": 0}]
+}
+```
+
+Every model needs an `id` and a positive `size_bytes`; `reference` is E4B's own file, which sets
+E4B's cache and buffers apart from its weights. Without the file, the section says which input is
+missing.
+
 ## Known gaps / next steps
 
 - `run_host.py`'s and `analyse.py`'s exact CLI flags (line ~1700 / ~1307 in

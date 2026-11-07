@@ -445,3 +445,67 @@ def test_a_malformed_larger_model_sizes_file_is_refused_before_any_write(tmp_pat
 
     assert "size_bytes" in capsys.readouterr().out
     assert not (_speech(root) / report.REPORT_FILE).exists()
+
+
+# ---------------------------------------------------------------------------
+# The README's speech section and REPOSITORY_STRUCTURE.md
+# ---------------------------------------------------------------------------
+
+README = _REPO_ROOT / "scripts" / "model_bench" / "README.md"
+STRUCTURE = _REPO_ROOT / "REPOSITORY_STRUCTURE.md"
+
+
+def _section(text: str, heading: str) -> str:
+    start = text.index(heading)
+    level = heading.split(" ", 1)[0]
+    rest = text[start + len(heading) :]
+    end = rest.find(f"\n{level} ")
+    return heading + (rest if end < 0 else rest[:end])
+
+
+def _speech_section() -> str:
+    return _section(README.read_text(encoding="utf-8"), "## Speech suites")
+
+
+def test_the_readme_speech_section_gives_the_host_steps_h1_to_h10_in_order():
+    section = _speech_section()
+
+    positions = [section.index(f"**H{n} ") for n in range(1, 11)]
+    assert positions == sorted(positions)
+
+
+def test_the_readme_speech_section_gives_the_bench_run_id_rule():
+    section = _speech_section()
+
+    for bench_run in ("`mh1-h4`", "`mh1-h5`", "`mh1-h6`", "`mh1-game-<UTC time>`"):
+        assert bench_run in section
+    assert "never reused" in section
+
+
+def test_the_readme_speech_section_names_every_subcommand():
+    section = _speech_section()
+    names = {"plan", "selftest", "small-serve", "small-unserve"}
+    names.update(name for spec in speech_bench.SUITE_REGISTRY for name in spec.subcommands)
+
+    assert sorted(n for n in names if f"`{n}`" not in section) == []
+    assert "`--replace`" in section
+    assert "`--larger-models`" in section
+
+
+def test_the_readme_speech_section_names_no_voice_profile_path():
+    section = _speech_section().lower()
+
+    assert "voice_profile" not in section
+    assert "voiceprofile" not in section
+    assert "voice-profile" not in section
+
+
+def test_the_structure_file_names_the_speech_directories():
+    text = STRUCTURE.read_text(encoding="utf-8")
+    scripts = _section(text, "### Scripts (`scripts/`)")
+    docker = _section(text, "### Container builds (`docker/`)")
+
+    assert "`model_bench/`" in scripts
+    assert scripts.index("`model_bench/`") < scripts.index("`speech/`")
+    assert "`speech/probes/`" in scripts
+    assert "`speech-bench/`" in docker
