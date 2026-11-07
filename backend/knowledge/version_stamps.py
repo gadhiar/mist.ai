@@ -21,8 +21,10 @@ The split this module enforces:
   `ONTOLOGY_VERSION` reads the active ontology object itself, so the stamp
   cannot disagree with the ontology actually in use.
 - `EXTRACTION_VERSION` describes the extraction prompt, which has no derivable
-  source, so it is the one literal here -- mechanically paired to the prompt
-  content by `TestExtractionVersionDriftGuard`.
+  source, so it is a literal -- mechanically paired to the prompt content by
+  `TestExtractionVersionDriftGuard`. The only other version literals here are
+  the history in `CODE_REVISIONS`, which records past values and is never read
+  as the current one.
 - `model_hash` names a DEPLOYED MODEL FILE rather than code, so it stays on
   `KnowledgeConfig` and remains env-configurable via `MIST_MODEL_HASH`.
 
@@ -31,11 +33,14 @@ The split this module enforces:
 cannot import it from there: the `backend.knowledge.extraction` package
 `__init__` eagerly imports `ontology_extractor`, which imports
 `KnowledgeConfig`, so the import cycles whenever `config` is the entry module.
-This module is a leaf -- it imports the ontology and nothing else -- so every
-consumer can read it regardless of import order.
+This module is a leaf -- its one backend import is the ontology, beside the
+standard library's `dataclasses` -- so every consumer can read it regardless
+of import order.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 from backend.knowledge.ontologies.v1_0_0 import ONTOLOGY_V1_0_0
 
@@ -88,6 +93,49 @@ ONTOLOGY_VERSION: str = ONTOLOGY_V1_0_0.version
 # from entity list (22 -> 21), retype Example 9 Milestone -> Event, add
 # Examples 25-26 (third-party shape, Abstraction fallback).
 EXTRACTION_VERSION: str = "2026-06-14-r5"
+
+
+@dataclass(frozen=True, slots=True)
+class CodeRevision:
+    """One deliberate change to the code that shapes extraction output.
+
+    Attributes:
+        extraction_version: The `EXTRACTION_VERSION` the change shipped under.
+        code_identity: `backend.knowledge.extraction.run_identity.code_identity`
+            of the service as it ships, after the change.
+        date: The day the entry was added, `YYYY-MM-DD`.
+        reason: What changed and why.
+    """
+
+    extraction_version: str
+    code_identity: str
+    date: str
+    reason: str
+
+
+# Every code identity the extraction service has shipped, oldest first. The
+# drift guard in tests/unit/knowledge/extraction/test_run_identity.py fails
+# until the newest entry names the current EXTRACTION_VERSION and the current
+# code identity, so each edit to a prompt, a per-stage token limit, the
+# ontology version or a module in `RUN_IDENTITY_CODE` lands with a dated line
+# here. Add the line under the same `extraction_version` when the change is for
+# new turns only; bump EXTRACTION_VERSION first when it should re-extract
+# history at the next cutover.
+#
+# Kept here rather than beside the run identity code because each entry binds
+# an extraction-version literal, which `TestNoBackendModuleRestatesAStamp`
+# allows in this module alone.
+CODE_REVISIONS: tuple[CodeRevision, ...] = (
+    CodeRevision(
+        extraction_version="2026-06-14-r5",
+        code_identity="ci1-3922ef29a46c559d0f9c479f3a8af16aca9a74205f0b2ffa8a3717b854306b20",
+        date="2026-11-06",
+        reason=(
+            "First recorded code identity (MIS-188): the r5 prompt and the service code "
+            "as they stood when the run identity was added."
+        ),
+    ),
+)
 
 
 def compose_model_hash(config: object) -> str:

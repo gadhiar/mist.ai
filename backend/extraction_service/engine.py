@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import json
 import logging
 import time
 from datetime import datetime
+from types import ModuleType
 from typing import Any
 
 from openai import APIError
@@ -85,6 +87,71 @@ _REPAIR_INSTRUCTION = (
     "JSON objects. Return ONLY a JSON object "
     'matching {"entities": [...], "relationships": [...]}. No prose, no '
     "markdown code fences, no explanation."
+)
+
+# Output token limits, one per LLM-calling stage. Named so the run identity
+# can record them: a limit that cuts an output short changes what the stage
+# returns as surely as a prompt edit does.
+SCOPE_MAX_TOKENS = 96
+EXTRACT_MAX_TOKENS = 2048
+DERIVE_MAX_TOKENS = 400
+
+# The code the run identity covers (`code_sha256` in
+# `backend.knowledge.extraction.run_identity`): this module, the adapters and
+# schemas, every `backend.knowledge.extraction` module imported above, whose
+# renderers and strict parsers Stages 1.5, 2 and 9 call, and the provider
+# module the service builds. Whole modules rather than functions, so a helper
+# a covered function calls is covered too; an edit elsewhere in a covered
+# module costs one `CODE_REVISIONS` line, never a silent miss.
+RUN_IDENTITY_CODE: tuple[ModuleType, ...] = tuple(
+    importlib.import_module(name)
+    for name in (
+        __name__,
+        "backend.extraction_service.adapters",
+        "backend.extraction_service.schemas",
+        "backend.knowledge.extraction.internal_derivation",
+        "backend.knowledge.extraction.internal_prompts",
+        "backend.knowledge.extraction.ontology_extractor",
+        "backend.knowledge.extraction.preprocessor",
+        "backend.knowledge.extraction.prompts",
+        "backend.knowledge.extraction.scope_classifier",
+        "backend.llm.llama_server_provider",
+    )
+)
+
+# The backend modules this module and the adapters import from that the run
+# identity does not hash, each with the reason. The coverage test in
+# tests/unit/knowledge/extraction/test_run_identity.py fails on an import in
+# neither tuple.
+RUN_IDENTITY_EXCLUDED: tuple[tuple[str, str], ...] = (
+    (
+        "backend.errors",
+        "exception types only: a failure is raised, never returned as a result",
+    ),
+    (
+        "backend.extraction_contract.models",
+        "the wire models; every response carries their CONTRACT_VERSION",
+    ),
+    (
+        "backend.llm.models",
+        "request and response containers; the covered provider module turns them "
+        "into the llama-server call",
+    ),
+    (
+        "backend.llm.provider",
+        "the provider Protocol, with no implementation",
+    ),
+    (
+        "backend.extraction_service.settings",
+        "its values are components already: temperature, attempts, constrained mode, "
+        "reasoning, the scope switch, the model hash and the llama.cpp build",
+    ),
+    (
+        "backend.knowledge.version_stamps",
+        "its versions are components already, and it holds CODE_REVISIONS: covering it "
+        "would move the code identity each new entry has to name, so the drift guard "
+        "could never pass",
+    ),
 )
 
 
@@ -220,7 +287,8 @@ def _compute_prompt_sha256(adapter: ModelFamilyAdapter) -> str:
     Not covered: the PreProcessor's context formatting (code, not a
     template) and request parameters (temperature, max_tokens, reasoning
     effort and budget, constrained mode), which are configuration and change
-    no prompt text.
+    no prompt text. The run identity covers both, beside this hash
+    (`backend.extraction_service.app.run_identity_components`).
 
     Components are joined with a unit separator (0x1F) rather than
     concatenated, so moving text from one component to its neighbour cannot
@@ -261,6 +329,7 @@ class ExtractionEngine:
         llm: StreamingLLMProvider,
         adapter: ModelFamilyAdapter,
         settings: ServiceSettings,
+        run_identity: str | None = None,
     ) -> None:
         """Initialize the engine.
 
@@ -268,10 +337,16 @@ class ExtractionEngine:
             llm: LLM provider for the service's own llama-server.
             adapter: Model-family adapter matching `llm`'s model.
             settings: Service configuration.
+            run_identity: The run identity to stamp on every result, computed
+                once at service start by the caller (`build_app`). The engine
+                takes it rather than computing it, so it imports no backend
+                module beyond those `RUN_IDENTITY_CODE` and
+                `RUN_IDENTITY_EXCLUDED` name. None stamps nothing.
         """
         self._llm = llm
         self._adapter = adapter
         self._settings = settings
+        self._run_identity = run_identity
         self._preprocessor = PreProcessor()
         self._prompt_sha256 = _compute_prompt_sha256(adapter)
 
@@ -279,6 +354,11 @@ class ExtractionEngine:
     def adapter_name(self) -> str:
         """The active model-family adapter's name (e.g. "gptoss")."""
         return self._adapter.name
+
+    @property
+    def run_identity(self) -> str | None:
+        """The run identity this engine stamps on every result."""
+        return self._run_identity
 
     async def run(self, req: ExtractRequest) -> ExtractResponse:
         """Run the full stage sequence for one job and build its response.
@@ -324,6 +404,7 @@ class ExtractionEngine:
                 prompt_sha256=self._prompt_sha256,
                 llama_cpp_build=self._settings.llama_cpp_build,
                 adapter=self._adapter.name,
+                run_identity=self._run_identity,
             ),
             timings_ms=TimingsMs(
                 scope=scope_ms,
@@ -379,7 +460,7 @@ class ExtractionEngine:
         start = time.perf_counter()
         request = self._build_request(
             messages=render_scope_messages(pre_processed),
-            max_tokens=96,
+            max_tokens=SCOPE_MAX_TOKENS,
             schema=SCOPE_OUTPUT_SCHEMA,
         )
         request = self._adapter.prepare(request, stage="scope")
@@ -419,7 +500,7 @@ class ExtractionEngine:
 
         for attempt in range(1, self._settings.max_attempts + 1):
             request = self._build_request(
-                messages=messages, max_tokens=2048, schema=EXTRACTION_OUTPUT_SCHEMA
+                messages=messages, max_tokens=EXTRACT_MAX_TOKENS, schema=EXTRACTION_OUTPUT_SCHEMA
             )
             request = self._adapter.prepare(request, stage="extract")
 
@@ -474,7 +555,7 @@ class ExtractionEngine:
                 matched_patterns=req.derivation.matched_patterns,
                 existing_internal_entities=req.derivation.existing_internal_entities,
             ),
-            max_tokens=400,
+            max_tokens=DERIVE_MAX_TOKENS,
             schema=DERIVATION_OUTPUT_SCHEMA,
         )
         request = self._adapter.prepare(request, stage="derive")

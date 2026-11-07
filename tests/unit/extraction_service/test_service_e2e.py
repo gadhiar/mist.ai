@@ -334,14 +334,14 @@ def _props_client(handler) -> httpx.AsyncClient:
 
 @pytest.mark.asyncio
 class TestInfoServingConfig:
-    """`/v1/info` reports the serving config a result was produced under (contract 1.1.0)."""
+    """`/v1/info` reports the serving config a result was produced under (contract 1.1.0 on)."""
 
     async def test_info_reports_the_settings_and_the_props_ctx_size(self, client, service_settings):
         response = await client.get("/v1/info")
 
         assert response.status_code == 200
         data = response.json()
-        assert data["contract_version"] == "1.1.0"
+        assert data["contract_version"] == "1.2.0"
         # No settings override: the gpt-oss adapter's default mode is in effect.
         assert service_settings.constrained_mode is None
         assert data["constrained_mode"] == "schema"
