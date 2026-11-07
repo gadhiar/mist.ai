@@ -17,7 +17,9 @@ what the gauntlet wrote, because it writes no value for them:
   the gauntlet's bootstrap uses), with the scorer's vacuous default of 1.0 for an empty
   denominator.
 
-The gauntlet computes no interval for either F1 or for a subset, so those cells carry none.
+Of the F1 cells, relation F1 carries the gauntlet's cluster bootstrap when the run recorded
+one (a summary written before the gauntlet recorded it shows `[no interval]`); the gauntlet
+computes no interval for a derived cell, so entity F1 and the list-only row carry none.
 
 A run with no run identity (a service from before contract 1.2.0, or a gauntlet from
 before it recorded one) shows as "unrecorded". Runs whose recorded identities differ, a
@@ -237,7 +239,7 @@ def _column(run: Run) -> dict[str, str]:
         "entity F1": _fmt(_f1(_number(s.get("entity_precision")), _number(s.get("entity_recall")))),
         "relation precision": _with_interval(s.get("rel_precision"), boot.get("rel_precision")),
         "relation recall": _with_interval(s.get("rel_recall"), boot.get("rel_recall")),
-        "relation F1": _fmt(_number(s.get("rel_f1"))),
+        "relation F1": _with_interval(s.get("rel_f1"), boot.get("rel_f1")),
         "typing accuracy": _with_interval(
             s.get("typing_accuracy"), wilson.get("typing_accuracy"), " Wilson"
         ),
@@ -293,9 +295,10 @@ def render_report(runs: list[Run], warnings: list[str]) -> str:
     lines += [
         "",
         "Precision and recall intervals are the gauntlet's cluster bootstrap by probe id; "
-        "typing carries its Wilson interval. The gauntlet computes no F1 interval. Entity F1 "
-        "is 2PR/(P+R) of the precision and recall shown. The list-only row pools the "
-        "relation counts of probes whose tag slug starts with `list-`.",
+        "typing carries its Wilson interval. Relation F1 carries the gauntlet's cluster "
+        "bootstrap when the run recorded one. Entity F1 and the list-only row carry no "
+        "interval. Entity F1 is 2PR/(P+R) of the precision and recall shown. The list-only "
+        "row pools the relation counts of probes whose tag slug starts with `list-`.",
     ]
     if warnings:
         lines += ["", "## Warnings", ""]
