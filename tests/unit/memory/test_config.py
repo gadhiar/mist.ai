@@ -109,7 +109,7 @@ class TestFromEnv:
             "MIST_MEMORY_RERANK_MODEL": "/opt/models/ms-marco-MiniLM-L-12-v2",
             "MIST_MEMORY_RERANK_TOP_N": "12",
             "MIST_MEMORY_RERANK_DEVICE": "cuda",
-            "MIST_MEMORY_RERANK_URL": "http://rerank.example:8080",
+            "MIST_MEMORY_RERANK_URL": "http://rerank.lan:8080",
             "MIST_MEMORY_RERANK_REMOTE_MODEL": "bge-reranker",
             "MIST_MEMORY_RERANK_TIMEOUT_MS": "25",
             "MIST_MEMORY_RERANK_REMOTE_SCORES": "probability",
@@ -134,7 +134,7 @@ class TestFromEnv:
         assert config.rerank_model == "/opt/models/ms-marco-MiniLM-L-12-v2"
         assert config.rerank_top_n == 12
         assert config.rerank_device == "cuda"
-        assert config.rerank_url == "http://rerank.example:8080"
+        assert config.rerank_url == "http://rerank.lan:8080"
         assert config.rerank_remote_model == "bge-reranker"
         assert config.rerank_timeout_ms == 25
         assert config.rerank_remote_scores == "probability"
@@ -407,7 +407,7 @@ class TestValidation:
             MemoryConfig(rerank_weight=0.7, recency_weight=0.2, confidence_weight=0.10001)
 
     def test_remote_with_url_and_timeout_is_valid(self):
-        config = MemoryConfig(rerank_backend="remote", rerank_url="http://rerank.example:8080")
+        config = MemoryConfig(rerank_backend="remote", rerank_url="http://rerank.lan:8080")
         assert config.rerank_timeout_ms == 40
 
     def test_local_and_off_need_no_url(self):
@@ -437,6 +437,123 @@ class TestValidation:
 
         assert issubclass(error, MistError)
         assert error is not MistError
+
+
+class TestRerankUrlIsPrivate:
+    """`rerank_url` must name a host on the local network, so memory text stays on it."""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # loopback, IPv4 and IPv6
+            "http://127.0.0.1:8080",
+            "http://127.200.3.4",
+            "http://[::1]:8080",
+            # RFC 1918, at both ends of each range
+            "http://10.0.0.1",
+            "http://10.255.255.254",
+            "http://172.16.0.1",
+            "http://172.31.255.254",
+            "http://192.168.0.1",
+            "http://192.168.255.254",
+            # CGNAT 100.64.0.0/10, the Tailscale address range
+            "http://100.64.0.1",
+            "http://100.127.255.254",
+            # an IPv4-mapped IPv6 address and a legacy IPv4 spelling are read as IPv4
+            "http://[::ffff:10.0.0.7]:8080",
+            "http://0x7f000001:8080",
+            # names
+            "http://localhost:8080",
+            "http://LOCALHOST",
+            "http://rerank:8080",
+            "http://rerank-host.tail1234.ts.net:8080",
+            "http://rerank.lan",
+            "http://rerank.local",
+            "http://rerank.internal",
+            "http://rerank.lan.:8080",
+            "https://rerank.lan:8443/base/",
+        ],
+    )
+    def test_accepts_a_private_host(self, url):
+        config = MemoryConfig(rerank_backend="remote", rerank_url=url)
+
+        assert config.rerank_url == url
+
+    @pytest.mark.parametrize(
+        ("url", "host"),
+        [
+            ("http://rerank.example.com:8080", "rerank.example.com"),
+            ("https://api.openai.com", "api.openai.com"),
+            ("http://lan.example.com", "lan.example.com"),
+            ("http://rerank.local.example.com", "rerank.local.example.com"),
+            ("http://evilts.net", "evilts.net"),
+            ("http://localhost.example.com", "localhost.example.com"),
+            # a single label with a trailing dot is a top-level name, resolved publicly
+            ("http://rerank.:8080", "rerank."),
+        ],
+    )
+    def test_rejects_a_public_host_naming_it(self, url, host):
+        with pytest.raises(MemoryConfigError, match=re.escape(repr(host))):
+            MemoryConfig(rerank_backend="remote", rerank_url=url)
+
+    @pytest.mark.parametrize(
+        ("url", "host"),
+        [
+            ("http://8.8.8.8", "8.8.8.8"),
+            ("http://11.0.0.1", "11.0.0.1"),
+            ("http://172.15.255.255", "172.15.255.255"),
+            ("http://172.32.0.1", "172.32.0.1"),
+            ("http://192.169.0.1", "192.169.0.1"),
+            ("http://100.63.255.255", "100.63.255.255"),
+            ("http://100.128.0.1", "100.128.0.1"),
+            ("http://169.254.1.1", "169.254.1.1"),
+            ("http://0.0.0.0", "0.0.0.0"),  # nosec B104 - a refused input, not a bind
+            ("http://[2001:4860:4860::8888]", "2001:4860:4860::8888"),
+            ("http://[fd00::1]", "fd00::1"),
+            ("http://[::ffff:8.8.8.8]", "::ffff:8.8.8.8"),
+            # legacy IPv4 spellings of 8.8.8.8 that the resolver would accept
+            ("http://134744072", "134744072"),
+            ("http://0x08080808", "0x08080808"),
+        ],
+    )
+    def test_rejects_an_ip_outside_the_private_ranges_naming_it(self, url, host):
+        with pytest.raises(MemoryConfigError, match=re.escape(repr(host))):
+            MemoryConfig(rerank_backend="remote", rerank_url=url)
+
+    @pytest.mark.parametrize(
+        ("url", "host"),
+        [
+            ("ftp://rerank.lan", "rerank.lan"),
+            ("ws://localhost:8080", "localhost"),
+            ("file://localhost/etc/passwd", "localhost"),
+        ],
+    )
+    def test_rejects_a_scheme_other_than_http_or_https_naming_the_host(self, url, host):
+        with pytest.raises(MemoryConfigError, match=r"scheme.*" + re.escape(repr(host))):
+            MemoryConfig(rerank_backend="remote", rerank_url=url)
+
+    @pytest.mark.parametrize("url", ["http://", "rerank.lan", "http://[::1"])
+    def test_rejects_a_url_without_a_usable_host(self, url):
+        with pytest.raises(MemoryConfigError, match="rerank_url"):
+            MemoryConfig(rerank_backend="remote", rerank_url=url)
+
+    def test_credentials_in_the_url_stay_out_of_the_error(self):
+        with pytest.raises(MemoryConfigError, match=re.escape("'8.8.8.8'")) as exc:
+            MemoryConfig(rerank_backend="remote", rerank_url="http://user:hunter2@8.8.8.8")
+
+        assert "hunter2" not in str(exc.value)
+
+    def test_a_public_url_fails_even_when_the_backend_does_not_use_it(self):
+        """A set URL is checked whatever the backend, so switching to remote cannot leak."""
+        with pytest.raises(MemoryConfigError, match="rerank.example.com"):
+            MemoryConfig(rerank_backend="local", rerank_url="http://rerank.example.com")
+
+    def test_from_env_rejects_a_public_rerank_url(self, monkeypatch):
+        monkeypatch.setenv("MIST_MEMORY_RERANK_BACKEND", "remote")
+        monkeypatch.setenv("MIST_MEMORY_RERANK_URL", "https://rerank.example.com/v1")
+
+        with pytest.raises(MemoryConfigError, match="rerank.example.com"):
+            MemoryConfig.from_env(tz_resolver=_never_called)
 
 
 class TestEnvExampleDocumentsEveryVariable:
