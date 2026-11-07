@@ -81,6 +81,9 @@ class McpConnection:
     credentials are rejected the session is dropped the same way, but the supervisor waits the
     auth delay before it reconnects, as after a rejected connect. Consecutive failures back off
     by `backoff`. A call is never retried here: the caller decides.
+
+    A state listener, when set, hears of every change of the (state, reason) pair `state()`
+    reports, so the host can broadcast it without waiting for its poll.
     """
 
     def __init__(
@@ -106,12 +109,24 @@ class McpConnection:
         # Set with `_reconnect` when a call's credentials were rejected, so the supervisor
         # backs off before reconnecting instead of retrying a refused credential at once.
         self._dropped_for_auth: CapabilityUnavailableError | None = None
+        self._listener: Callable[[], None] | None = None
+        # The (state, reason) pair last notified, so only a real change schedules the listener.
+        self._notified: tuple[str, str | None] = ("unavailable", self._reason)
+
+    def set_state_listener(self, listener: Callable[[], None] | None) -> None:
+        """Register the one callable told of each state change, or clear it with None.
+
+        It is scheduled with `loop.call_soon`, never called in place, so a listener that raises
+        reaches the loop's exception handler and cannot end the supervisor.
+        """
+        self._listener = listener
 
     async def start(self) -> None:
         """Schedule the supervisor task and return without waiting for the first connect."""
         if self._task is not None:
             return
         self._reason = "connecting"
+        self._notify_if_changed()
         self._task = asyncio.create_task(self._supervise(), name="mcp-connection")
         self._task.add_done_callback(self._on_supervisor_done)
 
@@ -119,9 +134,14 @@ class McpConnection:
         """Stop the supervisor, which closes an open transport in its own task first.
 
         The stopping flag is set before the cancel, so the done-callback reads the end as
-        orderly. A dead supervisor stays recorded as dead.
+        orderly. A dead supervisor stays recorded as dead. The reason is set to "stopped"
+        before the cancel, so a stop notifies the listener once: here when no session is open,
+        or from the supervisor's `finally` when it clears the open one.
         """
         self._stopping = True
+        if not self._dead:
+            self._reason = "stopped"
+        self._notify_if_changed()
         task = self._task
         if task is not None and not task.done():
             task.cancel()
@@ -130,6 +150,7 @@ class McpConnection:
         self._tools = []
         if not self._dead:
             self._reason = "stopped"
+        self._notify_if_changed()
 
     def state(self) -> CapabilityStatus:
         """Return the connection's status; `task_dead` is set once the supervisor has died."""
@@ -190,6 +211,7 @@ class McpConnection:
             self._dropped_for_auth = failure
         self._reconnect.set()
         logger.warning("MCP session dropped after a failed call: %s; reconnecting", reason)
+        self._notify_if_changed()
 
     async def _supervise(self) -> None:
         failures = 0
@@ -219,6 +241,7 @@ class McpConnection:
             # the task that called `open`.
             self._session = None
             self._tools = []
+            self._notify_if_changed()
             await self._close_open()
 
     async def _serve(self) -> CapabilityUnavailableError | None:
@@ -246,8 +269,10 @@ class McpConnection:
             self._tools = list(tools)
             self._session = transport
             logger.info("MCP session open with %d tools", len(tools))
+            self._notify_if_changed()
             return None
         self._reason = _describe(failure)
+        self._notify_if_changed()
         await self._close_open()
         return failure
 
@@ -295,3 +320,19 @@ class McpConnection:
         self._session = None
         self._tools = []
         self._reason = reason
+        self._notify_if_changed()
+
+    def _notify_if_changed(self) -> None:
+        """Schedule the listener when the (state, reason) pair differs from the last notified.
+
+        Every write to the session, the reason or the dead flag is followed by this call. The
+        pair is recorded even with no listener set, so a listener set later hears only of
+        changes made after it.
+        """
+        status = self.state()
+        pair = (status.state, status.reason)
+        if pair == self._notified:
+            return
+        self._notified = pair
+        if self._listener is not None:
+            asyncio.get_running_loop().call_soon(self._listener)
