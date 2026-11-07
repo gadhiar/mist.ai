@@ -67,6 +67,43 @@ respective licenses:
    Runs as separate service, not included in this repository.
 
 -------------------------------------------------------------------------------
+6. MS MARCO MiniLM-L-6-v2 Cross-Encoder
+   Location: Baked into the backend image at /opt/models/ms-marco-MiniLM-L-6-v2
+   Source: https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2
+   Revision: 233902d25c440f23af6f7d6e94d2946bac0bee0a
+   License: Apache License 2.0
+   Copyright: Original authors (see the model card)
+
+   Used as the memory read path's reranker. Downloaded at the pinned revision
+   during the image build (docker/backend/models.lock); not included in this
+   repository.
+
+-------------------------------------------------------------------------------
+7. MS MARCO MiniLM-L-12-v2 Cross-Encoder
+   Location: Baked into the backend image at /opt/models/ms-marco-MiniLM-L-12-v2
+   Source: https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-12-v2
+   Revision: 7b0235231ca2674cb8ca8f022859a6eba2b1c968
+   License: Apache License 2.0
+   Copyright: Original authors (see the model card)
+
+   Reranker candidate for the memory read path. Downloaded at the pinned
+   revision during the image build (docker/backend/models.lock); not included
+   in this repository.
+
+-------------------------------------------------------------------------------
+8. all-MiniLM-L6-v2 Sentence Embedding Model
+   Location: Baked into the backend image at /opt/models/all-MiniLM-L6-v2
+   Source: https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+   Revision: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+   License: Apache License 2.0
+   Copyright: Original authors (see the model card)
+
+   Used by the offline memory recall eval. Downloaded at the pinned revision
+   during the image build (docker/backend/models.lock); not included in this
+   repository. The production embedder loads the same model by name at
+   runtime into the Hugging Face cache.
+
+-------------------------------------------------------------------------------
 
 APACHE LICENSE 2.0 COMPONENTS
 
@@ -74,6 +111,8 @@ The following components are licensed under Apache License 2.0:
 - dependencies/csm/ (CSM Streaming - Modified)
 - Sesame CSM-1B Model
 - Qwen 2.5 Model
+- MS MARCO MiniLM-L-6-v2 and MiniLM-L-12-v2 Cross-Encoders
+- all-MiniLM-L6-v2 Sentence Embedding Model
 
 Apache License 2.0 Summary:
 You may use, reproduce, and distribute this work, with or without
@@ -99,4 +138,4 @@ distribution, and private use with minimal restrictions.
 
 For questions about licensing, contact: Raj Gadhia
 
-Last updated: 2025-01-28
+Last updated: 2026-11-07

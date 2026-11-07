@@ -64,6 +64,13 @@ docker/
 !docker/extraction/
 docker/extraction/*
 !docker/extraction/requirements.txt
+# The same chain for the backend: its Dockerfile's model layer runs
+# `COPY docker/backend/models.lock`, so that one file is re-included and
+# everything else under `docker/backend/` (the Dockerfile itself, any host
+# file) stays excluded. tests/unit/test_dockerignore_models_lock.py checks it.
+!docker/backend/
+docker/backend/*
+!docker/backend/models.lock
 
 # Node artifacts
 node_modules/
