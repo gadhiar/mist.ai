@@ -83,11 +83,13 @@ from backend.knowledge.regeneration.log_regenerator import (  # noqa: E402
 )
 from backend.knowledge.regeneration.rebuild_journal import EventStoreRebuildJournal  # noqa: E402
 from scripts.eval_harness.extraction_retrieval_score import (  # noqa: E402
+    BuildRecord,
     FactKey,
     K,
     MergeAliases,
     RetrievalQuery,
     accepted_keys,
+    build_record,
     load_queries,
     load_run,
     merge_aliases,
@@ -848,6 +850,32 @@ async def run_queries(
     return rows
 
 
+def read_build_record(out: Path, target: str) -> tuple[BuildRecord, str]:
+    """The build record and graph digest of `<out>/build_report.json`, built into `target`.
+
+    Raises:
+        RetrievalRunnerError: When the report is absent, has no `graph_digest`, or names
+            another target.
+        ValueError: When the report is not JSON or `build_record` refuses it.
+    """
+    path = out / BUILD_REPORT
+    if not path.is_file():
+        raise RetrievalRunnerError(f"{path} not found; build into this --out before querying")
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path}: invalid JSON: {exc}") from exc
+    record = build_record(report)
+    digest = report.get("graph_digest")
+    if not digest:
+        raise RetrievalRunnerError(f"{path} has no graph_digest; build again")
+    if report.get("target") != target:
+        raise RetrievalRunnerError(
+            f"{path} was built into {report.get('target')!r}, not {target!r}"
+        )
+    return record, str(digest)
+
+
 def query(
     *,
     target: str,
@@ -855,18 +883,27 @@ def query(
     wiring: GraphWiring,
     queries_path: Path = QUERIES_PATH,
 ) -> dict[str, Any]:
-    """Query the built graph, write the run file, and score it with the T10 scorer.
+    """Query the built graph, write the run file, and score it against the build's record.
 
     Returns:
         The summary dict written to `retrieval_summary.json`.
 
     Raises:
         EvalIsolationError: When the target is refused.
+        RetrievalRunnerError, ValueError: When `<out>/build_report.json` is absent, unusable,
+            names another target, or no longer matches the target's edges.
     """
     assert_eval_target(target, rebuild=False)
+    record, digest = read_build_record(out, target)
     queries = load_queries(queries_path)
     connection = wiring.connect(target)
     try:
+        edges = graph_edges(read_graph_facts(connection, now=datetime.now(UTC)))
+        if edges_digest(edges) != digest:
+            raise RetrievalRunnerError(
+                f"the graph at {target!r} is not the one {out / BUILD_REPORT} describes "
+                "(another build has run since); build again"
+            )
         rows = asyncio.run(run_queries(wiring.retriever(connection), queries))
     finally:
         connection.disconnect()
@@ -874,7 +911,7 @@ def query(
     out.mkdir(parents=True, exist_ok=True)
     run_path = out / RUN_FILE
     run_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-    summary = score_run(queries, load_run(run_path))
+    summary = score_run(queries, load_run(run_path), build=record)
     summary_dict = summary_to_dict(summary)
     (out / SUMMARY_JSON).write_text(json.dumps(summary_dict, indent=2), encoding="utf-8")
     (out / SUMMARY_MD).write_text(render_markdown(summary), encoding="utf-8")

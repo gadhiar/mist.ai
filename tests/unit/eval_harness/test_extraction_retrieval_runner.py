@@ -348,6 +348,12 @@ def _build(tmp_path: Path, wiring: FakeWiring, *payloads: str, out: str = "out")
     )
 
 
+def _query(tmp_path: Path, wiring: FakeWiring, out: str = "out") -> int:
+    return runner.main(
+        ["query", "--target", EVAL_TARGET, "--out", str(tmp_path / out)], wiring=wiring
+    )
+
+
 def _report(tmp_path: Path, out: str = "out") -> dict[str, Any]:
     return json.loads((tmp_path / out / runner.BUILD_REPORT).read_text(encoding="utf-8"))
 
@@ -839,11 +845,10 @@ class TestQuery:
         retriever = FakeRetriever()
         wiring = FakeWiring(retriever=retriever)
         queries = scorer.load_queries(QUERIES)
+        _build(tmp_path, wiring, "gold")
 
         # Act
-        code = runner.main(
-            ["query", "--target", EVAL_TARGET, "--out", str(tmp_path)], wiring=wiring
-        )
+        code = _query(tmp_path, wiring)
 
         # Assert
         assert code == 0
@@ -854,12 +859,13 @@ class TestQuery:
         answers = _answers_for_every_other_query()
         wiring = FakeWiring(retriever=FakeRetriever(answers))
         queries = scorer.load_queries(QUERIES)
+        _build(tmp_path, wiring, "gold")
 
         # Act
-        runner.main(["query", "--target", EVAL_TARGET, "--out", str(tmp_path)], wiring=wiring)
+        _query(tmp_path, wiring)
 
         # Assert
-        run = scorer.load_run(tmp_path / runner.RUN_FILE)
+        run = scorer.load_run(tmp_path / "out" / runner.RUN_FILE)
         assert list(run) == [q.id for q in queries]
         for query in queries:
             expected = tuple(f.key for f in query.relevant) if query.query in answers else ()
@@ -868,20 +874,25 @@ class TestQuery:
     def test_writes_the_summary_and_markdown_the_scorer_renders(self, tmp_path):
         # Arrange
         wiring = FakeWiring(retriever=FakeRetriever(_answers_for_every_other_query()))
+        _build(tmp_path, wiring, "gold")
+        out = tmp_path / "out"
 
         # Act
-        runner.main(["query", "--target", EVAL_TARGET, "--out", str(tmp_path)], wiring=wiring)
+        _query(tmp_path, wiring)
 
         # Assert
         summary = scorer.score_run(
-            scorer.load_queries(QUERIES), scorer.load_run(tmp_path / runner.RUN_FILE)
+            scorer.load_queries(QUERIES),
+            scorer.load_run(out / runner.RUN_FILE),
+            build=scorer.load_build_record(out / runner.BUILD_REPORT),
         )
-        written = json.loads((tmp_path / runner.SUMMARY_JSON).read_text(encoding="utf-8"))
+        written = json.loads((out / runner.SUMMARY_JSON).read_text(encoding="utf-8"))
         assert written == scorer.summary_to_dict(summary)
-        assert (tmp_path / runner.SUMMARY_MD).read_text(encoding="utf-8") == (
+        assert (out / runner.SUMMARY_MD).read_text(encoding="utf-8") == (
             scorer.render_markdown(summary)
         )
         assert 0.0 < written["answerable"]["hit_at_5"] < 1.0
+        assert written["build"] is not None
 
     def test_scores_through_the_scorer_functions_not_a_copy(self):
         # Assert
@@ -901,6 +912,149 @@ class TestQuery:
         # Assert
         assert isinstance(retriever, KnowledgeRetriever)
         assert rows == [{"id": scorer.load_queries(QUERIES)[0].id, "retrieved": []}]
+
+
+# ---------------------------------------------------------------------------
+# v4: query scores against the build that made its graph
+# ---------------------------------------------------------------------------
+
+
+def _write_report(tmp_path: Path, change: Any) -> None:
+    path = tmp_path / "out" / runner.BUILD_REPORT
+    report = json.loads(path.read_text(encoding="utf-8"))
+    change(report)
+    path.write_text(json.dumps(report), encoding="utf-8")
+
+
+def _drop_turn_relationships(wiring: FakeWiring) -> None:
+    _, tag = _relevant_fact_in_one_probe()
+    call = next(c for c in wiring.pipeline.calls if c.event_id == f"golden-{tag}")
+    call.relationships = []
+
+
+def _add_turn(wiring: FakeWiring) -> None:
+    wiring.pipeline.calls.append(
+        CuratedTurn(
+            event_id="golden-later",
+            session_id="later",
+            recorded_at="",
+            entities=[],
+            relationships=[{"source": "user", "type": "USES", "target": "a-later-tool"}],
+        )
+    )
+
+
+def _no_written_output(out: Path) -> bool:
+    return not any(
+        (out / name).exists() for name in (runner.RUN_FILE, runner.SUMMARY_JSON, runner.SUMMARY_MD)
+    )
+
+
+class TestQueryAgainstItsBuild:
+    @pytest.mark.parametrize(
+        "spoil",
+        [
+            pytest.param(
+                lambda tmp, wiring: (tmp / "out" / runner.BUILD_REPORT).unlink(), id="absent"
+            ),
+            pytest.param(
+                lambda tmp, wiring: (tmp / "out" / runner.BUILD_REPORT).write_text(
+                    "{not json", encoding="utf-8"
+                ),
+                id="malformed",
+            ),
+            pytest.param(
+                lambda tmp, wiring: _write_report(tmp, lambda r: r.pop("merges")),
+                id="no-merges",
+            ),
+            pytest.param(
+                lambda tmp, wiring: _write_report(tmp, lambda r: r.pop("edges")), id="no-edges"
+            ),
+            pytest.param(
+                lambda tmp, wiring: _write_report(tmp, lambda r: r.pop("graph_digest")),
+                id="no-digest",
+            ),
+            pytest.param(
+                lambda tmp, wiring: _write_report(
+                    tmp, lambda r: r.update(target="bolt://mist-neo4j-eval:7688")
+                ),
+                id="another-target",
+            ),
+            pytest.param(lambda tmp, wiring: _add_turn(wiring), id="graph-gained-an-edge"),
+            pytest.param(
+                lambda tmp, wiring: _drop_turn_relationships(wiring), id="graph-lost-an-edge"
+            ),
+        ],
+    )
+    def test_refuses_a_graph_its_build_report_does_not_describe(self, tmp_path, spoil):
+        # Arrange
+        retriever = FakeRetriever()
+        wiring = FakeWiring(retriever=retriever)
+        _build(tmp_path, wiring, "gold")
+        spoil(tmp_path, wiring)
+
+        # Act
+        code = _query(tmp_path, wiring)
+
+        # Assert: no query ran and no file was written.
+        assert code == 2
+        assert retriever.calls == []
+        assert _no_written_output(tmp_path / "out")
+
+    def test_refuses_before_connecting_when_the_report_is_absent(self, tmp_path):
+        # Arrange
+        wiring = FakeWiring()
+
+        # Act
+        code = _query(tmp_path, wiring)
+
+        # Assert
+        assert code == 2
+        assert wiring.connected == []
+        assert not (tmp_path / "out").exists()
+
+    def test_credits_a_reversed_neighbourhood_fact_and_a_merged_id(self, tmp_path):
+        # Arrange: rq-direct-05's fact is in the graph only as `user EXPERT_IN tech-python`,
+        # and a fact whose source is not the user comes back reversed, as the neighbourhood
+        # branch reports an edge reached from its target.
+        queries = {q.id: q for q in scorer.load_queries(QUERIES)}
+        wiring = _python_merging_wiring()
+        _build(tmp_path, wiring, "gold")
+        edges = {tuple(e) for e in _report(tmp_path)["edges"]}
+        reversed_query, fact = next(
+            (q, f)
+            for q in queries.values()
+            for f in q.relevant
+            if f.grade == scorer.ANSWER_GRADE
+            and f.source != "user"
+            and f.key in edges
+            and (f.target, f.predicate, f.source) not in edges
+            and scorer.normalise_fact(
+                {"source": f.target, "predicate": f.predicate, "target": f.source}
+            )
+            == (f.target, f.predicate, f.source)
+        )
+        wiring.retriever_obj = FakeRetriever(
+            {
+                queries["rq-direct-05"].query: [_fact(*EXPERT_IN_TECH_PYTHON)],
+                reversed_query.query: [_fact(fact.target, fact.predicate, fact.source)],
+            }
+        )
+
+        # Act
+        code = _query(tmp_path, wiring)
+
+        # Assert
+        assert code == 0
+        summary = json.loads((tmp_path / "out" / runner.SUMMARY_JSON).read_text(encoding="utf-8"))
+        hits = {s["id"]: s["hit"] for s in summary["per_query"]}
+        assert hits["rq-direct-05"] is True
+        assert hits[reversed_query.id] is True
+        assert summary["build"]["reoriented"] == 1
+        assert summary["build"]["merged_ids"] == 1
+        # The run file keeps what the retriever returned, unoriented.
+        run = scorer.load_run(tmp_path / "out" / runner.RUN_FILE)
+        assert run[reversed_query.id] == ((fact.target, fact.predicate, fact.source),)
 
 
 # ---------------------------------------------------------------------------
