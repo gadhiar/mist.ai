@@ -11,6 +11,7 @@ reaches curation puts its facts in the "graph" and a turn that does not leaves t
 from __future__ import annotations
 
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -646,3 +647,51 @@ class TestQuery:
         # Assert
         assert isinstance(retriever, KnowledgeRetriever)
         assert rows == [{"id": scorer.load_queries(QUERIES)[0].id, "retrieved": []}]
+
+
+# ---------------------------------------------------------------------------
+# Decision 7: the repository map names the goal's new paths
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "repo_path"),
+    [
+        pytest.param("data/gold/extraction/", "data/gold/extraction", id="gold-extraction"),
+        pytest.param("data/gold/retrieval/", "data/gold/retrieval", id="gold-retrieval"),
+        pytest.param(
+            "run_identity.py", "backend/knowledge/extraction/run_identity.py", id="run-identity"
+        ),
+        pytest.param(
+            "structure_splitter.py",
+            "backend/knowledge/extraction/structure_splitter.py",
+            id="structure-splitter",
+        ),
+        pytest.param(
+            "type_labels.py", "backend/knowledge/storage/type_labels.py", id="type-labels"
+        ),
+        pytest.param(
+            "extraction_report.py",
+            "scripts/eval_harness/extraction_report.py",
+            id="extraction-report",
+        ),
+        pytest.param(
+            "extraction_retrieval_score.py",
+            "scripts/eval_harness/extraction_retrieval_score.py",
+            id="retrieval-scorer",
+        ),
+        pytest.param(
+            "extraction_retrieval.py",
+            "scripts/eval_harness/extraction_retrieval.py",
+            id="retrieval-runner",
+        ),
+    ],
+)
+def test_repository_structure_lists_the_new_path(name, repo_path):
+    # Arrange
+    text = (_REPO_ROOT / "REPOSITORY_STRUCTURE.md").read_text(encoding="utf-8")
+    whole_name = re.compile(r"(?<![\w./-])" + re.escape(name) + r"(?![\w.-])")
+
+    # Assert: the map names the path, and the path is real.
+    assert whole_name.search(text), f"REPOSITORY_STRUCTURE.md does not list {name}"
+    assert (_REPO_ROOT / repo_path).exists()

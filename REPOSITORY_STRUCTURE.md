@@ -32,6 +32,13 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
 - `mist_admin.py` - Admin CLI (seed, seed-verify, replay, graph-stats, graph-reset, vault-rebuild, etc.)
 - `check_ai_slop.py` - AI-slop pattern checker (used by pre-commit)
 - `eval_harness/` - Phase 3 evaluator + scorers for V1-V8 gauntlets
+  - `extraction_report.py` - Dev and held-out extraction gauntlet scores side by side
+  - `extraction_retrieval_score.py` - Scores a retrieval run file at k = 5
+  - `extraction_retrieval.py` - Builds the retrieval eval graph from the dev turns and runs the queries
+
+### Gold sets (`data/gold/`)
+- `data/gold/extraction/` - Extraction gold sets (dev lists, held out) and the labelling guide (`LABELLING.md`)
+- `data/gold/retrieval/` - Retrieval queries over the dev gold facts, with a README
 
 ---
 
@@ -69,6 +76,8 @@ backend/
 │   ├── models.py                # RetrievalResult, QueryIntent, etc.
 │   ├── embeddings.py            # Sentence Transformers all-MiniLM-L6-v2
 │   ├── extraction/              # 6-stage extraction + subject-scope classifier
+│   │   ├── run_identity.py      # Run identity of the setup behind each result
+│   │   └── structure_splitter.py # List, table and heading units for Stage 2
 │   ├── curation/                # Dedup, ReconciliationEngine (reconciliation.py,
 │   │                            #   bitemporal C2; replaced conflict_resolver.py),
 │   │                            #   intervals.py, graph writer, regenerator, health
@@ -76,6 +85,7 @@ backend/
 │   ├── retrieval/               # Hybrid retrieval (graph + vector + vault RRF)
 │   ├── regeneration/            # Legacy no-curation replay (quarantined; R1 redesigns)
 │   ├── storage/                 # Neo4j executor, graph store, connection
+│   │   └── type_labels.py       # Ontology type labels for entity nodes
 │   ├── eval_isolation.py        # F1 fail-closed eval Neo4j allowlist guard
 │   ├── canonical_serialize.py   # F3 wall-clock-free graph form
 │   └── extraction_cache.py      # F3 content-addressed extraction cache
