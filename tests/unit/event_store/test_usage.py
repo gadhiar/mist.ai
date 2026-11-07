@@ -25,7 +25,6 @@ from backend.event_store.usage import (
     UsageStoreUnavailableError,
     build_turns_per_day,
     count_turns_per_day,
-    evaluate_gate,
     local_date,
     read_real_turn_timestamps,
     resolve_store_path,
@@ -239,7 +238,7 @@ def test_build_reports_the_fallback_zone(store: Path) -> None:
 def test_build_reads_the_zone_from_the_environment(
     store: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("MIST_USAGE_TIMEZONE", "Asia/Tokyo")
+    monkeypatch.setenv("MIST_TIMEZONE", "Asia/Tokyo")
 
     result = build_turns_per_day(str(store), days=1, now=datetime(2026, 10, 23, 20, tzinfo=UTC))
 
@@ -345,27 +344,30 @@ def test_ninety_days_is_accepted(store: Path) -> None:
     assert result.days[-1].date == date(2026, 10, 23)
 
 
-# --- the 5-of-7 gate -------------------------------------------------------------
+# --- read span -------------------------------------------------------------------
 
 
-def _counts(used: list[int]) -> tuple[DayCount, ...]:
-    return tuple(DayCount(date(2026, 10, 17 + i), n) for i, n in enumerate(used))
+def test_one_day_reads_from_the_prefilter_margin_only(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[date | None] = []
+
+    def capture(db_path: str, *, since: date | None = None) -> list[str]:
+        seen.append(since)
+        return []
+
+    monkeypatch.setattr(usage, "read_real_turn_timestamps", capture)
+
+    build_turns_per_day(
+        str(store), days=1, timezone_name="UTC", now=datetime(2026, 10, 23, 18, tzinfo=UTC)
+    )
+
+    # One day asked for: today, less the two-day margin, is 21 October. A read
+    # widened to a week would start on 15 October.
+    assert seen == [date(2026, 10, 21)]
 
 
-def test_gate_is_met_at_five_used_days_of_seven() -> None:
-    gate = evaluate_gate(_counts([3, 0, 1, 1, 0, 2, 7]))
-
-    assert (gate.window_days, gate.required_days, gate.days_used, gate.met) == (7, 5, 5, True)
-
-
-def test_gate_is_not_met_at_four_used_days_of_seven() -> None:
-    gate = evaluate_gate(_counts([3, 0, 1, 0, 0, 2, 7]))
-
-    assert (gate.days_used, gate.met) == (4, False)
-
-
-def test_gate_covers_the_last_seven_days_whatever_n_is(store: Path) -> None:
-    # Five used days, but only four inside the seven days ending 23 October.
+def test_the_counts_cover_only_the_days_asked_for(store: Path) -> None:
     for day in (10, 18, 20, 22, 23):
         _add_turn(store, "s-orphan", f"2026-10-{day:02d}T12:00:00+00:00")
     now = datetime(2026, 10, 23, 18, tzinfo=UTC)
@@ -374,20 +376,7 @@ def test_gate_covers_the_last_seven_days_whatever_n_is(store: Path) -> None:
     narrow = build_turns_per_day(str(store), days=1, timezone_name="UTC", now=now)
 
     assert sum(1 for d in wide.days if d.real_turns) == 5
-    assert (wide.gate.days_used, wide.gate.met) == (4, False)
-    assert narrow.gate == wide.gate
-    assert len(narrow.days) == 1
-
-
-def test_gate_met_end_to_end_at_five_days(store: Path) -> None:
-    for day in (17, 19, 20, 22, 23):
-        _add_turn(store, "s-orphan", f"2026-10-{day:02d}T12:00:00+00:00")
-
-    result = build_turns_per_day(
-        str(store), days=7, timezone_name="UTC", now=datetime(2026, 10, 23, 18, tzinfo=UTC)
-    )
-
-    assert (result.gate.days_used, result.gate.met) == (5, True)
+    assert narrow.days == (DayCount(date(2026, 10, 23), 1),)
 
 
 # --- payload -------------------------------------------------------------------
@@ -401,6 +390,7 @@ def test_payload_has_exactly_the_contract_shape(store: Path) -> None:
         str(store), days=2, timezone_name="UTC", now=datetime(2026, 10, 23, 12, tzinfo=UTC)
     ).to_payload()
 
+    assert set(payload) == {"timezone", "origin", "days"}
     assert payload == {
         "timezone": "UTC",
         "origin": "real",
@@ -408,5 +398,4 @@ def test_payload_has_exactly_the_contract_shape(store: Path) -> None:
             {"date": "2026-10-22", "real_turns": 1},
             {"date": "2026-10-23", "real_turns": 0},
         ],
-        "gate": {"window_days": 7, "required_days": 5, "days_used": 1, "met": False},
     }

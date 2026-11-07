@@ -1784,19 +1784,19 @@ async def get_extraction_status():
 
 @app.get("/usage/turns-per-day")
 async def usage_turns_per_day(days: int = Query(7, ge=1, le=90)):
-    """Real-origin turns per local day, counts only, and the 5-of-7 gate (ADR-042).
+    """Real-origin turns per local day, counts only: ADR-042's measure of real use.
 
-    This endpoint is how the lead reads the daily-use gate without opening the
-    event store: it answers with dates and integers and nothing else, so
-    reading the gate never means reading a conversation. The body is
-    `{"timezone", "origin": "real", "days": [{"date", "real_turns"}],
-    "gate": {"window_days": 7, "required_days": 5, "days_used", "met"}}`
-    and holds no session id, utterance, response or time finer than a date.
+    This endpoint is how the lead reads real use without opening the event
+    store: it answers with dates and integers and nothing else, so reading
+    the counts never means reading a conversation. The body is exactly
+    `{"timezone", "origin": "real", "days": [{"date", "real_turns"}]}`,
+    with no derived field, and holds no session id, utterance, response or
+    time finer than a date.
 
-    - `days` (1-90, default 7) is dense, oldest first, and ends today in
-      `timezone`; out of range is a 422 from the query validation.
-    - `gate` always covers the 7 local days ending today, whatever `days` is.
-    - `timezone` is `MIST_USAGE_TIMEZONE`, default UTC; an unknown name falls
+    - `days` (1-90, default 7) is dense, oldest first, ends today in
+      `timezone`, and covers exactly the days asked for; out of range is a
+      422 from the query validation.
+    - `timezone` is `MIST_TIMEZONE`, default UTC; an unknown name falls
       back to UTC, is logged, and is reported here as `UTC`.
     - A turn counts when its session's origin is `real` or its session row
       is missing, the event store's own rule.
@@ -1855,7 +1855,7 @@ async def usage_uptime(days: int = Query(7, ge=1, le=90)):
       not a stored row.
     - `days` (1-90, default 7) is dense, oldest first, and ends today in
       `timezone`; out of range is a 422 from the query validation.
-    - `timezone` is `MIST_USAGE_TIMEZONE`, default UTC; an unknown name falls
+    - `timezone` is `MIST_TIMEZONE`, default UTC; an unknown name falls
       back to UTC, is logged, and is reported here as `UTC`.
     - A store that is missing, locked or unreadable is a 503 with
       `{"error": "store_unavailable"}`. The store is opened read-only through

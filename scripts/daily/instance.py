@@ -2651,18 +2651,20 @@ def _usage_lines(inst: Instance, ctx: Context, port: str) -> list[str]:
     if not isinstance(payload, dict):
         return ["turns-per-day: unreachable"]
     days = payload.get("days")
-    gate = payload.get("gate")
-    if not isinstance(days, list) or not isinstance(gate, dict):
+    if not isinstance(days, list):
         return ["turns-per-day: unreadable"]
-    counts = ", ".join(
-        f"{day.get('date')} {day.get('real_turns')}" for day in days if isinstance(day, dict)
+    entries = [day for day in days if isinstance(day, dict)]
+    counts = ", ".join(f"{day.get('date')} {day.get('real_turns')}" for day in entries)
+    # Derived here from the days returned, not read from the endpoint: the counts are reported,
+    # and nothing waits on how many days had use (ADR-042).
+    used = sum(
+        1
+        for day in entries
+        if isinstance(day.get("real_turns"), int)
+        and not isinstance(day.get("real_turns"), bool)
+        and day["real_turns"] > 0
     )
-    met = "met" if gate.get("met") is True else "not met"
-    return [
-        f"turns-per-day: {counts}",
-        f"gate: {met}, {gate.get('days_used')} of {gate.get('window_days')} days used, "
-        f"{gate.get('required_days')} required",
-    ]
+    return [f"turns-per-day: {counts}", f"days used: {used} of {len(entries)}"]
 
 
 def cmd_status(args: argparse.Namespace, ctx: Context) -> int:

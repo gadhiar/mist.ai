@@ -1,8 +1,8 @@
 """Real-origin conversation turns per local day, counts only.
 
-ADR-042 makes real daily use the standing gate: MIST must be used on 5 of the
-last 7 days, counted from real-origin turns. This module answers that question
-from the event store and returns nothing but a zone name, dates and integers.
+ADR-042 measures real use from real-origin turns and reports it; nothing waits
+on the number. This module counts those turns per local day from the event
+store and returns nothing but a zone name, dates and integers.
 The query selects one column, `conversation_turn_events.timestamp`; no session
 id, utterance or response is ever read into this process.
 
@@ -25,7 +25,7 @@ must not create, migrate or write the store it reports on.
 
 Local dates
 -----------
-Turns are bucketed by their date in the zone named by `MIST_USAGE_TIMEZONE`
+Turns are bucketed by their date in the zone named by `MIST_TIMEZONE`
 (default UTC), resolved through `pytz`. `pytz` rather than `zoneinfo`: the
 backend image ships no IANA database for `zoneinfo` (no `tzdata` package and
 no system zone files), while `pytz` carries its own and is already installed
@@ -41,7 +41,7 @@ import logging
 import os
 import sqlite3
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
@@ -55,16 +55,13 @@ from .store import _DEFAULT_DB_PATH
 
 logger = logging.getLogger(__name__)
 
-TIMEZONE_ENV = "MIST_USAGE_TIMEZONE"
+TIMEZONE_ENV = "MIST_TIMEZONE"
 DEFAULT_TIMEZONE = "UTC"
 ORIGIN = "real"
 
 DEFAULT_DAYS = 7
 MIN_DAYS = 1
 MAX_DAYS = 90
-
-GATE_WINDOW_DAYS = 7
-GATE_REQUIRED_DAYS = 5
 
 # How long a read waits on a writer's lock before reporting the store
 # unavailable. sqlite3's own default is 5 s; a counts read has no reason to
@@ -98,22 +95,15 @@ class DayCount:
 
 
 @dataclass(frozen=True, slots=True)
-class UsageGate:
-    """The 5-of-7 standing gate over the local days ending today."""
-
-    window_days: int
-    required_days: int
-    days_used: int
-    met: bool
-
-
-@dataclass(frozen=True, slots=True)
 class TurnsPerDay:
-    """Dense per-day counts, oldest first and ending today, plus the gate."""
+    """Real use as reported: dense per-day counts, oldest first and ending today.
+
+    Only the counts and the zone they are dated in; whoever reads them decides
+    what they mean.
+    """
 
     timezone: str
     days: tuple[DayCount, ...]
-    gate: UsageGate
 
     def to_payload(self) -> dict:
         """Render the `GET /usage/turns-per-day` body: dates and integers only."""
@@ -121,12 +111,6 @@ class TurnsPerDay:
             "timezone": self.timezone,
             "origin": ORIGIN,
             "days": [{"date": d.date.isoformat(), "real_turns": d.real_turns} for d in self.days],
-            "gate": {
-                "window_days": self.gate.window_days,
-                "required_days": self.gate.required_days,
-                "days_used": self.gate.days_used,
-                "met": self.gate.met,
-            },
         }
 
 
@@ -136,7 +120,7 @@ def resolve_store_path(configured: str | None) -> str:
     `EventStoreConfig.db_path` (from `EVENT_STORE_DB_PATH`) is None when
     unset, and `EventStore.__init__` then falls back to `_DEFAULT_DB_PATH`;
     counting a different file from the one the live handler writes would
-    report a gate on the wrong data.
+    report real use from the wrong data.
     """
     return configured if configured else str(_DEFAULT_DB_PATH)
 
@@ -146,7 +130,7 @@ def resolve_timezone(name: str | None) -> tuple[tzinfo, str]:
 
     Unset or blank means the default, UTC, without a warning. An unknown name
     also yields UTC, but with a warning naming the value, because a typo in
-    `MIST_USAGE_TIMEZONE` shifts every late-evening turn onto the wrong date.
+    `MIST_TIMEZONE` shifts every late-evening turn onto the wrong date.
 
     Returns:
         The zone, and its canonical name (`UTC` on fallback).
@@ -251,18 +235,6 @@ def count_turns_per_day(
     )
 
 
-def evaluate_gate(last_days: Sequence[DayCount]) -> UsageGate:
-    """Apply the 5-of-7 gate to the last `GATE_WINDOW_DAYS` entries of `last_days`."""
-    window = last_days[-GATE_WINDOW_DAYS:]
-    days_used = sum(1 for day in window if day.real_turns > 0)
-    return UsageGate(
-        window_days=GATE_WINDOW_DAYS,
-        required_days=GATE_REQUIRED_DAYS,
-        days_used=days_used,
-        met=days_used >= GATE_REQUIRED_DAYS,
-    )
-
-
 def build_turns_per_day(
     db_path: str,
     *,
@@ -272,13 +244,14 @@ def build_turns_per_day(
 ) -> TurnsPerDay:
     """Count real-origin turns per local day over `days` days ending today.
 
-    The gate always covers the 7 local days ending today, whatever `days` is,
-    so the counts are taken over the longer of the two windows and then cut.
+    Only the days asked for are read and bucketed: the SQL pre-filter starts
+    `_PREFILTER_MARGIN_DAYS` before the first of them, and nothing older is
+    counted.
 
     Args:
         db_path: Path to the event store's SQLite file.
         days: Number of local days to report, from 1 to 90.
-        timezone_name: IANA zone name; None reads `MIST_USAGE_TIMEZONE`.
+        timezone_name: IANA zone name; None reads `MIST_TIMEZONE`.
         now: The current instant (aware); None means the wall clock.
 
     Raises:
@@ -293,13 +266,8 @@ def build_turns_per_day(
     current = now if now is not None else datetime.now(UTC)
     today = current.astimezone(zone).date()
 
-    span = max(days, GATE_WINDOW_DAYS)
-    since = today - timedelta(days=span - 1 + _PREFILTER_MARGIN_DAYS)
+    since = today - timedelta(days=days - 1 + _PREFILTER_MARGIN_DAYS)
     timestamps = read_real_turn_timestamps(db_path, since=since)
-    counts = count_turns_per_day(timestamps, zone, today=today, days=span)
+    counts = count_turns_per_day(timestamps, zone, today=today, days=days)
 
-    return TurnsPerDay(
-        timezone=zone_name,
-        days=counts[-days:],
-        gate=evaluate_gate(counts),
-    )
+    return TurnsPerDay(timezone=zone_name, days=counts)

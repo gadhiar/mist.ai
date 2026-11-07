@@ -68,7 +68,7 @@ class _StubRegistry:
 def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = _make_store(tmp_path / "event_store.db")
     monkeypatch.setenv("EVENT_STORE_DB_PATH", str(path))
-    monkeypatch.setenv("MIST_USAGE_TIMEZONE", "UTC")
+    monkeypatch.setenv("MIST_TIMEZONE", "UTC")
     monkeypatch.setattr(server, "_health_registry", _StubRegistry("healthy"))
     return path
 
@@ -176,7 +176,7 @@ class TestUptimeRoute:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        monkeypatch.setenv("MIST_USAGE_TIMEZONE", "Atlantis/Capital")
+        monkeypatch.setenv("MIST_TIMEZONE", "Atlantis/Capital")
 
         with caplog.at_level(logging.WARNING):
             response = client.get("/usage/uptime")
@@ -184,6 +184,21 @@ class TestUptimeRoute:
         assert response.status_code == 200
         assert response.json()["timezone"] == "UTC"
         assert "Atlantis/Capital" in caplog.text
+
+    def test_configured_zone_is_reported(
+        self, store: Path, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MIST_TIMEZONE", "Asia/Tokyo")
+
+        assert client.get("/usage/uptime").json()["timezone"] == "Asia/Tokyo"
+
+    def test_the_old_zone_variable_is_ignored(
+        self, store: Path, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("MIST_TIMEZONE")
+        monkeypatch.setenv("MIST_USAGE_TIMEZONE", "Asia/Tokyo")
+
+        assert client.get("/usage/uptime").json()["timezone"] == "UTC"
 
     def test_response_holds_no_session_id_utterance_or_time_of_day(
         self, store: Path, client: TestClient

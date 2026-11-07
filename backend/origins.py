@@ -4,7 +4,7 @@ Browsers apply CORS to HTTP but not to WebSockets: a page on any site can open
 `ws://localhost:8001/ws`, and the browser sends its `Origin` header without
 enforcing anything. Only the server can refuse it. Without that check, any page
 open on the host could drive MIST, read what she answers from memory, and add
-turns that count toward the real-use gate (ADR-042).
+turns that count as real use (ADR-042).
 
 A client that sends no `Origin` at all is not a browser page (a browser always
 sends one on a WebSocket upgrade), so it is a local program such as
