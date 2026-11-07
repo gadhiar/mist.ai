@@ -21,6 +21,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
+import yaml  # noqa: E402
 
 from scripts.model_bench import speech_bench  # noqa: E402
 from scripts.model_bench.speech import core, tts_suite  # noqa: E402
@@ -669,13 +670,86 @@ def chatterbox_modules(rec: Recorder):
     }
 
 
-def pocket_modules(rec: Recorder, *, streaming: bool):
+POCKET_REPO = "kyutai/pocket-tts-without-voice-cloning"
+POCKET_GATED_URI = (
+    "hf://kyutai/pocket-tts/languages/english/model.safetensors"
+    "@db04f0e653473e5c7333c69686ac92b7460b0c1d"
+)
+POCKET_MODEL_URI = (
+    f"hf://{POCKET_REPO}/languages/english/model.safetensors"
+    "@a7056f505a4a8ca72d8b5fb1440071d6f1a35739"
+)
+POCKET_TOKENIZER_URI = (
+    f"hf://{POCKET_REPO}/languages/english/tokenizer.json"
+    "@00eac05ed3d16bdc3f6b5d598874019c34a89214"
+)
+
+# The layout of Pocket TTS 4.0.1's installed `config/english.yaml`, shortened: its three `hf://`
+# URIs (the gated `weights_path` included), a non-ASCII `replace_characters` key, and the two
+# `weights_path` keys it leaves commented out.
+INSTALLED_POCKET_YAML = f"""\
+weights_path: {POCKET_GATED_URI}
+weights_path_without_voice_cloning: {POCKET_MODEL_URI}
+default_temperature: 0.3
+replace_characters:
+  "’": "'"
+  "‘": "'"
+flow_lm:
+  insert_bos_before_voice: true
+  dtype: float32
+  flow:
+    depth: 6
+    dim: 512
+  lookup_table:
+    dim: 1024
+    n_bins: 4000
+    tokenizer: tokenizers
+    tokenizer_path: {POCKET_TOKENIZER_URI}
+  #weights_path: final.safetensors
+mimi:
+  dtype: float32
+  sample_rate: 24000
+  seanet:
+    ratios:
+    - 6
+    - 5
+    - 4
+  #weights_path: codec.safetensors
+"""
+
+
+def pocket_setup(
+    tmp_path: Path, *, installed: str = INSTALLED_POCKET_YAML, missing: tuple[str, ...] = ()
+) -> tuple[Path, Path]:
+    """A fake installed configs directory and a models directory with Pocket's local files."""
+    configs_dir = tmp_path / "pocket_tts_config"
+    configs_dir.mkdir()
+    (configs_dir / "english.yaml").write_text(installed, encoding="utf-8")
+    models_dir = tmp_path / "models"
+    english = models_dir.joinpath(*POCKET_REPO.split("/"), "languages", "english")
+    (english / "embeddings").mkdir(parents=True)
+    files = ["model.safetensors", "tokenizer.json"]
+    files += [f"embeddings/{voice}.safetensors" for voice in TTS["pocket"]["voices"]]
+    for name in files:
+        if name not in missing:
+            (english / name).write_bytes(b"fake")
+    return configs_dir, models_dir
+
+
+def pocket_voice_state(models_dir: Path, voice: str) -> Path:
+    return models_dir.joinpath(
+        *POCKET_REPO.split("/"), "languages", "english", "embeddings", f"{voice}.safetensors"
+    )
+
+
+def pocket_modules(rec: Recorder, *, streaming: bool, configs_dir: Path):
     class Model:
         sample_rate = 24000
+        has_voice_cloning = True
 
-        def get_state_for_audio_prompt(self, name):
-            rec.record("state", name)
-            return f"state:{name}"
+        def get_state_for_audio_prompt(self, source):
+            rec.record("state", source)
+            return f"state:{Path(source).stem}"
 
         def generate_audio(self, state, text):
             rec.record("generate_audio", state, text)
@@ -691,12 +765,42 @@ def pocket_modules(rec: Recorder, *, streaming: bool):
         Model.generate_audio_stream = generate_audio_stream
 
     class TTSModel:
+        # Each config `load_model` was given, as read from its file during the call.
+        configs: list = []
+
         @staticmethod
-        def load_model():
-            rec.record("load_model")
+        def load_model(**kwargs):
+            rec.record("load_model", **kwargs)
+            if kwargs.get("config") is None:
+                raise AssertionError("load_model was called without a local config")
+            path = Path(kwargs["config"])
+            TTSModel.configs.append(yaml.safe_load(path.read_text(encoding="utf-8")))
             return Model()
 
-    return {"pocket_tts": types.SimpleNamespace(TTSModel=TTSModel), "torch": fake_torch(rec)}
+    return {
+        "pocket_tts": types.SimpleNamespace(TTSModel=TTSModel),
+        "pocket_tts.utils.config": types.SimpleNamespace(CONFIGS_DIR=configs_dir),
+        "torch": fake_torch(rec),
+    }
+
+
+def pocket_adapter(tmp_path: Path, rec: Recorder, *, streaming: bool = False, **setup):
+    configs_dir, models_dir = pocket_setup(tmp_path, **setup)
+    modules = pocket_modules(rec, streaming=streaming, configs_dir=configs_dir)
+    adapter = tts_engines.make_engine(
+        "pocket", models_dir=models_dir, importer=fake_importer(modules, [])
+    )
+    return adapter, modules, models_dir
+
+
+def remote_strings(value) -> list[str]:
+    if isinstance(value, dict):
+        return [s for k, v in value.items() for s in remote_strings(k) + remote_strings(v)]
+    if isinstance(value, list):
+        return [s for item in value for s in remote_strings(item)]
+    if isinstance(value, str) and value.startswith(("hf://", "http://", "https://")):
+        return [value]
+    return []
 
 
 @pytest.mark.parametrize("engine", list(TTS))
@@ -816,27 +920,23 @@ def test_the_original_adapter_refuses_a_setting_it_does_not_have():
         adapter.select_setting("whisper")
 
 
-def test_the_pocket_adapter_streams_when_the_package_has_a_streaming_call():
+def test_the_pocket_adapter_streams_when_the_package_has_a_streaming_call(tmp_path):
     rec = Recorder()
-    adapter = tts_engines.make_engine(
-        "pocket", importer=fake_importer(pocket_modules(rec, streaming=True), [])
-    )
+    adapter, _, models_dir = pocket_adapter(tmp_path, rec, streaming=True)
 
     adapter.load("alba")
     chunks = list(adapter.stream("Hello."))
 
     assert ("set_num_threads", (4,), {}) in rec.calls
-    assert ("state", ("alba",), {}) in rec.calls
+    assert ("state", (pocket_voice_state(models_dir, "alba"),), {}) in rec.calls
     assert ("generate_audio_stream", ("state:alba", "Hello."), {}) in rec.calls
     assert [len(c) for c in chunks] == [1, 2]
     assert adapter.streaming is True and adapter.sample_rate == 24000
 
 
-def test_the_pocket_adapter_yields_once_without_a_streaming_call():
+def test_the_pocket_adapter_yields_once_without_a_streaming_call(tmp_path):
     rec = Recorder()
-    adapter = tts_engines.make_engine(
-        "pocket", importer=fake_importer(pocket_modules(rec, streaming=False), [])
-    )
+    adapter, _, _ = pocket_adapter(tmp_path, rec, streaming=False)
 
     adapter.load("fantine")
     chunks = list(adapter.stream("Hello."))
@@ -846,16 +946,148 @@ def test_the_pocket_adapter_yields_once_without_a_streaming_call():
     assert adapter.streaming is False
 
 
-def test_no_adapter_passes_an_audio_argument_to_its_engine():
+def test_the_pocket_adapter_loads_a_copy_of_the_installed_config_naming_only_local_files(
+    tmp_path,
+):
     rec = Recorder()
-    modules = chatterbox_modules(rec) | qwen3_modules(rec) | pocket_modules(rec, streaming=False)
+    adapter, modules, models_dir = pocket_adapter(tmp_path, rec)
+    installed = yaml.safe_load(INSTALLED_POCKET_YAML)
+    english = models_dir.joinpath(*POCKET_REPO.split("/"), "languages", "english")
+
+    adapter.load("alba")
+
+    loads = [call for call in rec.calls if call[0] == "load_model"]
+    assert len(loads) == 1 and list(loads[0][2]) == ["config"]
+    config_path = Path(loads[0][2]["config"])
+    assert config_path.name == "english.yaml"
+    assert not config_path.exists()
+    [written] = modules["pocket_tts"].TTSModel.configs
+    # The three file keys are replaced and every other key is the installed one.
+    expected = installed
+    expected["weights_path"] = str(english / "model.safetensors")
+    expected["weights_path_without_voice_cloning"] = None
+    expected["flow_lm"]["lookup_table"]["tokenizer_path"] = str(english / "tokenizer.json")
+    assert written == expected
+    assert written["replace_characters"] == {"’": "'", "‘": "'"}
+    assert "weights_path" not in written["flow_lm"] and "weights_path" not in written["mimi"]
+    assert remote_strings(written) == []
+    assert "kyutai/pocket-tts/" not in json.dumps(written, ensure_ascii=False)
+
+
+def test_the_pocket_model_is_marked_as_having_no_voice_cloning_after_load(tmp_path):
+    rec = Recorder()
+    adapter, _, _ = pocket_adapter(tmp_path, rec)
+
+    adapter.load("alba")
+
+    assert adapter._model.has_voice_cloning is False
+
+
+def _replace(old: str, new: str):
+    return lambda text: text.replace(old, new)
+
+
+@pytest.mark.parametrize(
+    ("edit", "missing"),
+    [
+        pytest.param(
+            _replace(
+                f"weights_path_without_voice_cloning: {POCKET_MODEL_URI}",
+                "weights_path_without_voice_cloning: "
+                + POCKET_MODEL_URI.replace(POCKET_REPO, "kyutai/pocket-tts"),
+            ),
+            (),
+            id="fallback-uri-in-another-repository",
+        ),
+        pytest.param(
+            _replace(POCKET_MODEL_URI, POCKET_MODEL_URI[:-8] + "00000000"),
+            (),
+            id="fallback-uri-at-another-revision",
+        ),
+        pytest.param(
+            _replace(POCKET_MODEL_URI, POCKET_MODEL_URI.replace("english", "french")),
+            (),
+            id="fallback-uri-at-another-path",
+        ),
+        pytest.param(
+            _replace(POCKET_TOKENIZER_URI, POCKET_TOKENIZER_URI[:-8] + "00000000"),
+            (),
+            id="tokenizer-uri-at-another-revision",
+        ),
+        pytest.param(
+            _replace("  #weights_path: codec.safetensors", "  weights_path: codec.safetensors"),
+            (),
+            id="mimi-weights-path-set",
+        ),
+        pytest.param(
+            _replace("  #weights_path: final.safetensors", "  weights_path: final.safetensors"),
+            (),
+            id="flow-lm-weights-path-set",
+        ),
+        pytest.param(
+            lambda text: text + "voice: https://example.org/voices/alba.safetensors\n",
+            (),
+            id="another-remote-file",
+        ),
+        pytest.param(lambda text: text, ("model.safetensors",), id="model-file-missing"),
+        pytest.param(lambda text: text, ("tokenizer.json",), id="tokenizer-file-missing"),
+    ],
+)
+def test_the_pocket_adapter_refuses_anything_but_the_local_4_0_1_files_before_loading(
+    tmp_path, edit, missing
+):
+    rec = Recorder()
+    adapter, _, _ = pocket_adapter(
+        tmp_path, rec, installed=edit(INSTALLED_POCKET_YAML), missing=missing
+    )
+
+    with pytest.raises(core.SpeechBenchError):
+        adapter.load("alba")
+
+    assert "load_model" not in [call[0] for call in rec.calls]
+
+
+@pytest.mark.parametrize("voice", TTS["pocket"]["voices"])
+def test_the_pocket_adapter_passes_each_stock_voice_as_the_path_of_its_state_file(tmp_path, voice):
+    rec = Recorder()
+    adapter, _, models_dir = pocket_adapter(tmp_path, rec)
+
+    adapter.load(voice)
+
+    [state] = [args for name, args, _ in rec.calls if name == "state"]
+    assert state == (pocket_voice_state(models_dir, voice),)
+    assert isinstance(state[0], Path)
+
+
+def test_the_pocket_adapter_refuses_a_voice_whose_state_file_is_missing(tmp_path):
+    rec = Recorder()
+    adapter, _, _ = pocket_adapter(tmp_path, rec, missing=("embeddings/marius.safetensors",))
+
+    with pytest.raises(tts_engines.VoiceError, match="marius"):
+        adapter.load("marius")
+
+    assert "state" not in [call[0] for call in rec.calls]
+    assert adapter.voice is None
+
+
+def test_no_adapter_passes_an_audio_argument_to_its_engine(tmp_path):
+    rec = Recorder()
+    configs_dir, models_dir = pocket_setup(tmp_path)
+    modules = (
+        chatterbox_modules(rec)
+        | qwen3_modules(rec)
+        | pocket_modules(rec, streaming=False, configs_dir=configs_dir)
+    )
     for engine in TTS:
-        adapter = tts_engines.make_engine(engine, importer=fake_importer(modules, []))
+        adapter = tts_engines.make_engine(
+            engine, models_dir=models_dir, importer=fake_importer(modules, [])
+        )
         adapter.load(TTS[engine]["timing_voice"])
         list(adapter.stream("Hello."))
 
     passed = [key for _, _, kwargs in rec.calls for key in kwargs]
     assert not [k for k in passed if "audio" in k or "prompt" in k or "wav" in k]
+    assert [list(kw) for name, _, kw in rec.calls if name == "load_model"] == [["config"]]
 
 
 # ---------------------------------------------------------------------------
