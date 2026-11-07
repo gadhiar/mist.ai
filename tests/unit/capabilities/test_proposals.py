@@ -7,6 +7,7 @@ import logging
 from datetime import timedelta
 
 import pytest
+import pytest_asyncio
 
 from backend.capabilities.intents import normalize_utterance
 from backend.capabilities.proposals import DecisionMatcher, Proposal, ProposalStore, ProposedCall
@@ -144,8 +145,29 @@ class _Expiries:
         self.proposals.append(proposal)
 
 
+_STORES: list[ProposalStore] = []
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _close_stores():
+    """Close every store a test built, so no expiry timer outlives the test's loop."""
+    yield
+    while _STORES:
+        await _STORES.pop().close()
+
+
 def _store(clock: FakeClock, expiries: _Expiries | None = None) -> ProposalStore:
-    return ProposalStore(clock, TTL_S, expiries if expiries is not None else _Expiries())
+    store = ProposalStore(clock, TTL_S, expiries if expiries is not None else _Expiries())
+    _STORES.append(store)
+    return store
+
+
+def _timer_tasks() -> list[asyncio.Task[object]]:
+    return [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_coro().__qualname__ == "ProposalStore._expire_after_ttl"
+    ]
 
 
 class TestPut:
@@ -353,3 +375,119 @@ class TestExpiry:
             await clock.advance(TTL_S)
 
         assert any("sink broke" in (r.exc_text or str(r.exc_info)) for r in caplog.records)
+
+
+_LOGGER = "backend.capabilities.proposals"
+
+
+class TestClose:
+    @pytest.mark.asyncio
+    async def test_close_drops_live_proposals_and_ends_every_timer(self):
+        clock = FakeClock()
+        expiries = _Expiries()
+        store = _store(clock, expiries)
+        store.put("s1", [LIGHTS_OFF])
+        store.put("s2", [PLAY_JAZZ])
+        await clock.wait_for_sleepers(2)
+        timers = _timer_tasks()
+        assert len(timers) == 2
+
+        await store.close()
+
+        assert all(timer.done() for timer in timers)
+        assert _timer_tasks() == []
+        assert clock.pending == 0
+        await clock.advance(TTL_S * 2)
+        assert expiries.proposals == []
+
+    @pytest.mark.asyncio
+    async def test_close_ends_a_timer_that_has_not_started(self):
+        clock = FakeClock()
+        store = _store(clock)
+        store.put("s1", [LIGHTS_OFF])
+        (timer,) = _timer_tasks()
+
+        await store.close()
+
+        assert timer.done()
+        assert clock.pending == 0
+
+    @pytest.mark.asyncio
+    async def test_close_logs_one_info_line_with_the_count(self, caplog):
+        clock = FakeClock()
+        store = _store(clock)
+        store.put("s1", [LIGHTS_OFF])
+        store.put("s2", [PLAY_JAZZ])
+
+        with caplog.at_level(logging.INFO, logger=_LOGGER):
+            await store.close()
+
+        (record,) = (r for r in caplog.records if r.name == _LOGGER)
+        assert record.levelno == logging.INFO
+        assert "2" in record.getMessage()
+
+    @pytest.mark.asyncio
+    async def test_put_after_close_raises_and_creates_no_task(self):
+        store = _store(FakeClock())
+        await store.close()
+        before = asyncio.all_tasks()
+
+        with pytest.raises(CapabilityInvocationError, match="^proposal store is closed$"):
+            store.put("s1", [LIGHTS_OFF])
+
+        assert asyncio.all_tasks() == before
+        assert store.pop("s1", None) is None
+
+    @pytest.mark.asyncio
+    async def test_pop_after_close_returns_none(self):
+        store = _store(FakeClock())
+        dropped = store.put("s1", [LIGHTS_OFF])
+        resolved = store.put("s2", [PLAY_JAZZ])
+        store.pop("s2", None)
+
+        await store.close()
+
+        assert store.pop("s1", None) is None
+        assert store.pop("s1", dropped.proposal_id) is None
+        assert store.pop("s2", resolved.proposal_id) is None
+        assert store.pop("s1", "no-such-id") is None
+
+    @pytest.mark.asyncio
+    async def test_second_close_logs_nothing_more(self, caplog):
+        store = _store(FakeClock())
+        store.put("s1", [LIGHTS_OFF])
+
+        def lines() -> int:
+            return sum(1 for r in caplog.records if r.name == _LOGGER)
+
+        with caplog.at_level(logging.DEBUG, logger=_LOGGER):
+            await store.close()
+            first = lines()
+            await store.close()
+
+        assert first == 1
+        assert lines() == 1
+
+    @pytest.mark.asyncio
+    async def test_timer_cancelled_by_a_pop_just_before_close_has_ended(self):
+        clock = FakeClock()
+        store = _store(clock)
+        store.put("s1", [LIGHTS_OFF])
+        await clock.wait_for_sleepers(1)
+        (timer,) = _timer_tasks()
+
+        store.pop("s1", None)
+        assert not timer.done()
+        await store.close()
+
+        assert timer.done()
+
+    @pytest.mark.asyncio
+    async def test_close_of_an_empty_store_returns(self, caplog):
+        store = _store(FakeClock())
+
+        with caplog.at_level(logging.INFO, logger=_LOGGER):
+            await asyncio.wait_for(store.close(), 1.0)
+
+        (record,) = (r for r in caplog.records if r.name == _LOGGER)
+        assert "0" in record.getMessage()
