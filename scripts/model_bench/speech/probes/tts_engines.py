@@ -9,20 +9,30 @@ module loads no engine and the unit tests pass fake modules instead.
 Weights are read from the read-only mount at `CONTAINER_MODELS_DIR` (layout `<org>/<repo>/`)
 with `HF_HUB_OFFLINE=1`, so nothing is downloaded.
 
-The calls for faster-qwen3-tts and pocket-tts are written from the projects' documentation (the
-mist-model-host plan v2, engine facts); neither package is installed anywhere these tests run.
-Host step H2 confirms, against the installed packages, the faster-qwen3-tts 0.5.4 signatures and
-speaker ids, and Pocket TTS 4.0.1's streaming call and its offline load path. The Chatterbox
-calls were read from chatterbox-tts 0.1.7 in the worker image.
+The faster-qwen3-tts calls and Pocket TTS's streaming call are written from the projects'
+documentation (the mist-model-host plan v2, engine facts); neither package is installed anywhere
+these tests run. Host step H2 confirms, against the installed packages, the faster-qwen3-tts
+0.5.4 signatures and speaker ids, and Pocket TTS 4.0.1's streaming call. The Chatterbox calls
+were read from chatterbox-tts 0.1.7 in the worker image.
+
+Pocket TTS's offline load path was read from the installed 4.0.1 package. Its English config
+names its files as `hf://` URIs, which resolve only through a Hugging Face cache, so the adapter
+loads a copy of that config in which the model and tokenizer are the mounted files of the
+ungated repository. Each stock Pocket voice is passed as the path of its precomputed voice state,
+a safetensors file from the same repository and revision as the weights, which holds no audio.
 """
 
 from __future__ import annotations
 
+import copy
 import importlib
+import tempfile
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING
+
+import yaml
 
 from .. import core
 
@@ -41,6 +51,31 @@ _SETTING_META = ("lines", "timed")
 # shows no call, so the adapter streams only if the loaded model has this method and otherwise
 # synthesizes whole segments. H2 confirms the name.
 POCKET_STREAM_METHOD = "generate_audio_stream"
+
+# The installed config the adapter copies, from `pocket_tts.utils.config.CONFIGS_DIR`.
+POCKET_CONFIG = "english.yaml"
+
+# The two `hf://` URIs of Pocket TTS 4.0.1's `english.yaml` that name the ungated repository, each
+# mapped to its file under the engine's weights directory. Each is matched whole (repository,
+# path and revision), so another release's config is refused rather than loaded.
+POCKET_MODEL_URI = (
+    "hf://kyutai/pocket-tts-without-voice-cloning/languages/english/model.safetensors"
+    "@a7056f505a4a8ca72d8b5fb1440071d6f1a35739"
+)
+POCKET_TOKENIZER_URI = (
+    "hf://kyutai/pocket-tts-without-voice-cloning/languages/english/tokenizer.json"
+    "@00eac05ed3d16bdc3f6b5d598874019c34a89214"
+)
+POCKET_LOCAL_FILES = {
+    POCKET_MODEL_URI: "languages/english/model.safetensors",
+    POCKET_TOKENIZER_URI: "languages/english/tokenizer.json",
+}
+
+# The stock voices' precomputed states, under the engine's weights directory.
+POCKET_VOICE_STATES = "languages/english/embeddings"
+
+# Values `pocket_tts.utils.utils.download_if_necessary` fetches rather than opens.
+_REMOTE_PREFIXES = ("hf://", "http://", "https://")
 
 
 class VoiceError(core.SpeechBenchError):
@@ -196,22 +231,105 @@ class TurboEngine(ChatterboxEngine):
     class_name = "ChatterboxTurboTTS"
 
 
+def _strings(value: object) -> Iterator[str]:
+    """Every string in a parsed YAML document, mapping keys included."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from _strings(key)
+            yield from _strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _strings(item)
+    elif isinstance(value, str):
+        yield value
+
+
 class PocketEngine(StockVoiceEngine):
-    """Pocket TTS on the CPU with a pre-made voice, passed by name only."""
+    """Pocket TTS on the CPU, from the mounted ungated English model, with a stock voice state.
+
+    4.0.1 loads its model weights only from `weights_path`, the gated repository's URI, and falls
+    back to `weights_path_without_voice_cloning` only when that download raises. A local path
+    never raises, so the copy sets `weights_path` to the mounted ungated file and the fallback to
+    null: a failed load then raises instead of loading a second file.
+    """
 
     def _load_model(self) -> object:
         torch = self._import("torch")
         torch.set_num_threads(int(self._cfg["threads"]))
         package = self._import("pocket_tts")
-        # H2 confirms that `load_model()` reads the mounted weights offline, and which
-        # repository 4.0.1 loads.
-        model = package.TTSModel.load_model()
+        configs_dir = Path(self._import("pocket_tts.utils.config").CONFIGS_DIR)
+        installed = yaml.safe_load((configs_dir / POCKET_CONFIG).read_text(encoding="utf-8"))
+        config = self._local_config(installed)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / POCKET_CONFIG
+            with path.open("w", encoding="utf-8") as f:
+                yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
+            # `load_config` reads the file during this call. The model keeps its path as
+            # `origin`, read only for a voice passed by name, which this adapter never does.
+            model = package.TTSModel.load_model(config=path)
+        # The state upstream leaves after loading this same file through its fallback.
+        model.has_voice_cloning = False
         self.sample_rate = int(model.sample_rate)
         self.streaming = callable(getattr(model, POCKET_STREAM_METHOD, None))
         return model
 
+    def _local_config(self, installed: object) -> dict:
+        """A copy of the installed config whose files are all under the mounted weights.
+
+        Raises:
+            SpeechBenchError: the installed config does not have 4.0.1's URIs and layout, a
+                mapped file is missing, or the copy still names a remote file.
+        """
+        name = f"{self.name}: the installed {POCKET_CONFIG}"
+        if not isinstance(installed, dict):
+            raise core.SpeechBenchError(f"{name} is not a mapping")
+        flow_lm, mimi = installed.get("flow_lm"), installed.get("mimi")
+        if not isinstance(flow_lm, dict) or not isinstance(mimi, dict):
+            raise core.SpeechBenchError(f"{name} has no `flow_lm` or `mimi` section")
+        lookup_table = flow_lm.get("lookup_table")
+        tokenizer = lookup_table.get("tokenizer_path") if isinstance(lookup_table, dict) else None
+        for key, found, expected in (
+            (
+                "weights_path_without_voice_cloning",
+                installed.get("weights_path_without_voice_cloning"),
+                POCKET_MODEL_URI,
+            ),
+            ("flow_lm.lookup_table.tokenizer_path", tokenizer, POCKET_TOKENIZER_URI),
+        ):
+            if found != expected:
+                raise core.SpeechBenchError(
+                    f"{name} has {key} {found!r}; this adapter loads only {expected!r}, "
+                    "the value of Pocket TTS 4.0.1"
+                )
+        for section, values in (("flow_lm", flow_lm), ("mimi", mimi)):
+            if values.get("weights_path") is not None:
+                raise core.SpeechBenchError(
+                    f"{name} sets {section}.weights_path; Pocket TTS 4.0.1 leaves it unset"
+                )
+        model_file, tokenizer_file = (
+            self.weights_dir() / POCKET_LOCAL_FILES[uri]
+            for uri in (POCKET_MODEL_URI, POCKET_TOKENIZER_URI)
+        )
+        for path in (model_file, tokenizer_file):
+            if not path.is_file():
+                raise core.SpeechBenchError(f"{self.name}: {path} is not in the mounted weights")
+        config = copy.deepcopy(installed)
+        # Replaced by key: the installed value, the gated repository's URI, is never read.
+        config["weights_path"] = str(model_file)
+        config["weights_path_without_voice_cloning"] = None
+        config["flow_lm"]["lookup_table"]["tokenizer_path"] = str(tokenizer_file)
+        remote = sorted({s for s in _strings(config) if s.startswith(_REMOTE_PREFIXES)})
+        if remote:
+            raise core.SpeechBenchError(f"{name} still names remote files: {remote}")
+        return config
+
     def _select_voice(self, voice: str) -> None:
-        self._voice_state = self._model.get_state_for_audio_prompt(voice)
+        # A `Path` ending in `.safetensors` is opened as a voice state; a name would resolve
+        # through an `hf://` URI instead.
+        state = self.weights_dir() / POCKET_VOICE_STATES / f"{voice}.safetensors"
+        if not state.is_file():
+            raise VoiceError(f"{self.name}: stock voice {voice!r} has no state file at {state}")
+        self._voice_state = self._model.get_state_for_audio_prompt(state)
 
     def _stream(self, text: str) -> Iterator[numpy.ndarray]:
         if self.streaming:
