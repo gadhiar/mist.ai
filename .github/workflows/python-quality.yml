@@ -34,7 +34,7 @@ on:
 jobs:
   quality:
     name: pre-commit (all files)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -65,7 +65,7 @@ jobs:
   # because mist-memory/ is a private, gitignored directory that does not exist here.
   unit:
     name: unit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -84,30 +84,29 @@ jobs:
       # come only from the Dockerfile's step 2, and the audio shared libraries
       # only from its apt step. The deliberate differences are CPU wheels instead
       # of CUDA 12.4 ones, and no flash-attn (CUDA-only and optional in the image
-      # too, Dockerfile:87-90).
+      # too, Dockerfile:90-93).
 
       # Dockerfile:8-11, minus the interpreter packages setup-python provides.
-      # `sounddevice` loads libportaudio at import, and src/multimodal/stt.py
-      # imports it at module level; unit tests reach that import through
-      # backend/voice_processor.py -> backend/voice_models/model_manager.py, so
-      # without the library collection fails with "OSError: PortAudio library not
-      # found".
+      # libportaudio2 is installed to mirror the Dockerfile's apt step, which
+      # installs it for `sounddevice`. No module under backend/, src/ or scripts/
+      # imports `sounddevice` at module level, so collection does not need it;
+      # tests/unit/test_audio_import_boundary.py pins that.
       - name: Install system libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libsndfile1 libportaudio2 ffmpeg
 
-      # Dockerfile step 1 (lines 39-41), from the CPU index.
+      # Dockerfile step 1 (lines 42-44), from the CPU index.
       - name: Install PyTorch (CPU)
         run: |
           pip install torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 \
             --index-url https://download.pytorch.org/whl/cpu
 
-      # Dockerfile step 2 (line 44).
+      # Dockerfile step 2 (line 47).
       - name: Install Chatterbox TTS
         run: pip install chatterbox-tts soundfile
 
-      # Dockerfile step 3 (line 48) plus its safety net (line 51). requirements.txt's
+      # Dockerfile step 3 (line 51) plus its safety net (line 54). requirements.txt's
       # torch/torchaudio/torchvision pins now equal the CPU wheels installed above
       # (2.6.0/2.6.0/0.21.0), so `pip install -r requirements.txt` sees the
       # requirement already satisfied and leaves those wheels in place instead of
@@ -117,7 +116,7 @@ jobs:
           pip install -r requirements.txt
           pip install "openai>=1.30" "httpx>=0.27"
 
-      # Dockerfile step 4 (lines 53-61): re-pin PyTorch only if an earlier step
+      # Dockerfile step 4 (lines 56-64): re-pin PyTorch only if an earlier step
       # replaced it, here against the CPU build.
       - name: Re-pin PyTorch (CPU) if overwritten
         run: |
@@ -130,7 +129,7 @@ jobs:
             echo "PyTorch 2.6.0+cpu intact -- skipping re-pin"
           fi
 
-      # Mirrors the image's step 6 (Dockerfile:96), which installs the same quoted
+      # Mirrors the image's step 6 (Dockerfile:99), which installs the same quoted
       # pins: `pip install "pytest==7.4.4" "pytest-asyncio==0.23.8"`. Both versions
       # also now match requirements.txt directly, so this step is a re-affirmation
       # of what "Install backend requirements" above already installed, kept
@@ -173,7 +172,7 @@ jobs:
   # visible without gating a merge -- dropping it would have silently narrowed coverage.
   types:
     name: mypy (advisory)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     continue-on-error: true
     steps:
       - name: Checkout code

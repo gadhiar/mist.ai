@@ -37,6 +37,28 @@ network handshake that pairs with it is `scripts/hydration/target.py`.
 **Filesystem (`assert_isolated_root`).** Refuses a dev/hydration state root
 that is, sits under, or CONTAINS a live state directory.
 
+**Live instances, inside the filesystem guard (`assert_not_live_instance`).**
+`assert_isolated_root` calls it, so it is part of that guard, not a sixth. A
+daily instance keeps its
+state in a host directory outside every git work tree, which none of the five
+built-in roots name. Two mechanisms make it visible, and each covers a case the
+other cannot:
+
+- The marker `.mist-live-instance` travels with the directory. `instance.py
+  init` writes it in the instance root, `state/` and `mist-memory/`, so a path
+  at or under any of them is refused by walking upward from the path itself --
+  inside a container that mounts only `state/` or `mist-memory/`, where neither
+  the root nor the host registry is visible, and after the root is moved or
+  renamed. A walk upward never looks DOWN, though: the marker cannot tell a
+  caller that its candidate CONTAINS an instance.
+- The registry (`MIST_LIVE_INSTANCES_FILE`, default `~/.mist/live-instances`)
+  is the only way to see a live root from a directory above it. Each listed
+  root joins `live_state_roots()`, so all three arms of `assert_isolated_root`
+  apply to it, containment included. It fails closed: a registry that exists
+  but cannot be read or decoded, or holds a line that is not an absolute path,
+  refuses every guarded path, because the line it hides or garbles may name the
+  root a restore is about to clear.
+
 Allowlist for endpoints, denylist for paths -- and the asymmetry is not an
 inconsistency. The live Neo4j instance has many spellings (mist-neo4j,
 localhost:7687 via the host-published bolt port, 127.0.0.1, container IP, DNS
@@ -511,6 +533,75 @@ class IsolatedRootError(MistError):
     """Raised when a dev/hydration state root resolves onto live state."""
 
 
+# The file `instance.py init` writes in a live instance's root, `state/` and
+# `mist-memory/`. Its contents are for people; only its presence is read here.
+LIVE_INSTANCE_MARKER = ".mist-live-instance"
+
+# Names the live-instance registry. Unset, the registry is
+# `~/.mist/live-instances`; the unit-tier conftest points it at `os.devnull`.
+LIVE_INSTANCES_FILE_ENV = "MIST_LIVE_INSTANCES_FILE"
+
+
+def _live_instances_registry_path() -> Path:
+    """Where the live-instance registry is read from.
+
+    An empty value counts as unset, so it falls back to the home registry
+    rather than to `Path("")`, the current directory.
+    """
+    configured = os.environ.get(LIVE_INSTANCES_FILE_ENV, "").strip()
+    if configured:
+        return Path(configured)
+    return Path.home() / ".mist" / "live-instances"
+
+
+def _registered_live_roots() -> list[Path]:
+    """Every root listed in the live-instance registry, resolved.
+
+    A missing registry lists nothing: a machine that has never run
+    `instance.py init` has no instance to protect. Any other failure to read
+    or decode it raises, because a fail-open read here would bless the very
+    root the unreadable line names.
+
+    Raises:
+        IsolatedRootError: When the registry exists but cannot be read, is not
+            valid UTF-8, or holds a line that is not an absolute path. The
+            message names the file, and the line when one is at fault.
+    """
+    registry = _live_instances_registry_path()
+    try:
+        text = registry.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeDecodeError) as exc:
+        raise IsolatedRootError(
+            f"refusing every guarded path: the live-instance registry {registry} "
+            f"exists but cannot be read ({exc.__class__.__name__}: {exc}). It lists "
+            "the live MIST instances this guard must protect, so an unreadable "
+            f"registry fails closed. Repair or restore that file (or point "
+            f"{LIVE_INSTANCES_FILE_ENV} at the right one) and re-run."
+        ) from exc
+    roots: list[Path] = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        entry = line.strip()
+        if not entry:
+            continue
+        candidate = Path(entry)
+        if not candidate.is_absolute():
+            # Its only writers record absolute paths, so a relative line means
+            # a corrupt file. Resolving it against the current directory would
+            # protect whichever directory the caller happened to start in.
+            raise IsolatedRootError(
+                f"refusing every guarded path: line {number} of the live-instance "
+                f"registry {registry} is {entry!r}, which is not an absolute path. "
+                "The registry holds one absolute instance root per line, written "
+                "only by `instance.py init` and `retire`, so this file is corrupt "
+                f"and fails closed. Repair it (or point {LIVE_INSTANCES_FILE_ENV} "
+                "at the right one) and re-run."
+            )
+        roots.append(candidate.resolve())
+    return roots
+
+
 def live_state_roots() -> list[Path]:
     """Directories holding LIVE state that a dev/hydration root must not touch.
 
@@ -526,6 +617,13 @@ def live_state_roots() -> list[Path]:
     clone with no `mist-memory/`) silently leaves the denylist, and the guard
     then blesses a path that a later container run resolves straight onto live
     state. Presence on disk is not what makes a directory live.
+
+    After the five built-in roots come the roots in the live-instance registry
+    (see the module docstring), in file order.
+
+    Raises:
+        IsolatedRootError: When the registry exists but cannot be read or
+            decoded.
     """
     return [
         (REPO_ROOT / "data").resolve(),
@@ -533,7 +631,60 @@ def live_state_roots() -> list[Path]:
         Path("/app/data").resolve(),
         Path("/app/mist-memory").resolve(),
         (Path.home() / ".mist").resolve(),
+        *_registered_live_roots(),
     ]
+
+
+def assert_not_live_instance(path: Path | str, *, purpose: str) -> None:
+    """Refuse a path at or under a marked directory or a registered live root.
+
+    Only the IS and UNDER relations: the marker is found by walking upward from
+    `path`, which can never reveal an instance below it. `assert_isolated_root`
+    adds containment through `live_state_roots()`, which carries the registered
+    roots; the golden-log twin calls this directly and keeps its narrower
+    semantics.
+
+    Args:
+        path: The candidate. Resolved before any check.
+        purpose: Named in the refusal so the operator knows which tool refused.
+
+    Raises:
+        IsolatedRootError: When `path` is or sits under a directory holding
+            `.mist-live-instance` or a root listed in the registry; when a
+            marker's presence cannot be established; or when the registry
+            cannot be read.
+    """
+    resolved = Path(path).resolve()
+
+    for directory in (resolved, *resolved.parents):
+        marker = directory / LIVE_INSTANCE_MARKER
+        try:
+            # `lstat`, not `exists()`: a dangling symlink still counts as a
+            # marker, and an error other than "absent" is not taken as absence.
+            os.lstat(marker)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as exc:
+            raise IsolatedRootError(
+                f"refusing {purpose} path {resolved}: could not establish whether "
+                f"{marker} exists ({exc.__class__.__name__}: {exc}). A live MIST "
+                "instance is identified by that file, so an unreadable directory "
+                "fails closed."
+            ) from exc
+        raise IsolatedRootError(
+            f"refusing {purpose} path {resolved}: {directory} holds "
+            f"{LIVE_INSTANCE_MARKER}, so it is a live MIST instance's state. A dev, "
+            "eval, hydration, backup or restore tool must never write there. Point "
+            "it at a dedicated directory outside the instance."
+        )
+
+    for live in _registered_live_roots():
+        if resolved == live or live in resolved.parents:
+            raise IsolatedRootError(
+                f"refusing {purpose} path {resolved}: it is or sits under {live}, a "
+                f"live MIST instance registered in {_live_instances_registry_path()}. "
+                "Point it at a dedicated directory outside the instance."
+            )
 
 
 def assert_isolated_root(root: Path | str, *, purpose: str = "hydration") -> None:
@@ -546,13 +697,21 @@ def assert_isolated_root(root: Path | str, *, purpose: str = "hydration") -> Non
     target before writing. A restore pointed at the repo root would delete
     `data/` and `mist-memory/` on the way in.
 
+    A daily instance's root is refused by both mechanisms in the module
+    docstring: registered roots through `live_state_roots()`, so every arm of
+    the loop applies to them, and marked directories through
+    `assert_not_live_instance`, which runs after the loop so a registered root
+    reads the loop's more specific message.
+
     Args:
         root: The candidate dev/hydration state root.
         purpose: Named in the refusal so the operator knows which tool refused.
 
     Raises:
         IsolatedRootError: When `root` resolves onto live state, onto a
-            filesystem/drive root, or onto the home directory itself.
+            filesystem/drive root, or onto the home directory itself; when it
+            is or sits under a marked live instance; or when the live-instance
+            registry cannot be read.
     """
     resolved = Path(root).resolve()
 
@@ -585,6 +744,8 @@ def assert_isolated_root(root: Path | str, *, purpose: str = "hydration") -> Non
                 f"directory {live}. Restore clears its target before writing, so "
                 "this root would delete live state on the way in."
             )
+
+    assert_not_live_instance(resolved, purpose=purpose)
 
 
 def assert_neo4j_dev_isolated(uri: str) -> None:

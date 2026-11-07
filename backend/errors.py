@@ -19,6 +19,7 @@ Hierarchy:
     +-- EmbeddingError
     +-- VectorStoreError
     +-- IngestionError
+    +-- GpuYieldedError
 
 Usage:
     from backend.errors import Neo4jConnectionError
@@ -98,6 +99,18 @@ class VectorStoreError(MistError):
 
 class IngestionError(MistError):
     """Document ingestion pipeline failure."""
+
+
+# -- Gaming mode --------------------------------------------------------------
+
+
+class GpuYieldedError(MistError):
+    """Raised when a GPU model is needed while gaming mode has released it.
+
+    `ModelManager.transcribe_audio` raises it when Whisper is not loaded, which
+    is the case from `release_gpu_models` until `reacquire_gpu_models` succeeds,
+    and after a boot that started while the GPU was yielded.
+    """
 
 
 # -- Vault (ADR-010, Cluster 8) -----------------------------------------------

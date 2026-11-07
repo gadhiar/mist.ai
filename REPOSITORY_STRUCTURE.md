@@ -13,6 +13,7 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
 - `requirements.txt` - Python dependencies
 - `pyproject.toml` - Tool config (black, ruff, bandit, codespell, pytest)
 - `docker-compose.yml` + `docker-compose.override.yml` - 3-service stack (backend + Neo4j + llama-server)
+- `docker-compose.dev.yml` - Standalone worktree dev stack on the synthetic seed in `tests/fixtures/dev-instance/` (runbook: that directory's `README.md`)
 - `.pre-commit-config.yaml` - Pre-commit hook chain
 - `.gitignore`, `.dockerignore`, `.gitattributes` - VCS / container ignores
 
@@ -32,6 +33,14 @@ Python backend repository. Frontend is in a separate repo at `./mist-frontend/` 
 - `mist_admin.py` - Admin CLI (seed, seed-verify, replay, graph-stats, graph-reset, vault-rebuild, etc.)
 - `check_ai_slop.py` - AI-slop pattern checker (used by pre-commit)
 - `eval_harness/` - Phase 3 evaluator + scorers for V1-V8 gauntlets
+- `daily/` - The daily instance's host tools
+  - `instance.py` - Host CLI for a daily instance root (init, release-build, up, status, gaming mode, backups, restore drill, promote)
+  - `volume_safety.py` - Refuses `down -v`, `rm -v` and `volume rm` before any `instance.py` command runs
+  - `gamewatch.py` - The gaming watcher's process lister, game rules and decision
+- `backup/` - Backups of the graph, stores and vault, and their restore
+  - `scheduler.py` - Runs backups on a schedule inside the compose project; a bad dump never prunes good ones
+  - `status.py` - The backup status file: last attempt, its outcome and the last success
+  - `verify.py` - Compares a restored graph, stores and vault with the artifact they came from
 - `model_bench/` - Model bench host drivers; `scripts/model_bench/README.md` documents both
   - `bench_host.py` - Stops MIST, serves a pinned llama-server as `mist-bench-llm`, restores the stack
   - `speech_bench.py` - Speech suites CLI: runs 1 to 9 and the report
@@ -60,13 +69,20 @@ backend/
 ├── factories.py                 # Composition root (DI wiring)
 ├── errors.py                    # MistError hierarchy
 ├── interfaces.py                # Protocols (Embedding, VectorStore, GraphConnection, etc.)
+├── origins.py                   # Browser origin allowlist for HTTP and the WebSocket
+├── gpu_yield.py                 # Gaming mode: yield the GPU while the host marker exists
 │
 ├── chat/                        # Conversation handling
 │   ├── conversation_handler.py  # Pass-loop + persona + budget + post-filter
 │   ├── knowledge_integration.py # Bridge to voice system
 │   ├── mist_context.py          # Identity / persona renderer
 │   ├── slop_detector.py         # AI-slop pattern filter
-│   └── context_budget.py        # Cluster 6 ContextBudgetPlanner
+│   ├── context_budget.py        # Cluster 6 ContextBudgetPlanner
+│   └── retrieval_trace.py       # Per-turn trace of every retrieval candidate and its fate
+│
+├── event_store/                 # Append-only SQLite event store
+│   ├── usage.py                 # Real-origin turns per local day (ADR-042 use metric)
+│   └── status_intervals.py      # Uptime ledger: /health status intervals per local day
 │
 ├── llm/                         # LLM provider abstraction
 │   ├── provider.py              # Abstract StreamingLLMProvider
@@ -136,6 +152,43 @@ mist-memory/
 ```
 
 Sidecar index at `data/vault_sidecar.db` (sqlite-vec `vec0` + FTS5 over heading-block + file-level chunks).
+
+---
+
+## Daily Instance (`deploy/daily/`)
+
+The pinned-release instance for daily use, run by `scripts/daily/instance.py` from an instance
+root outside every git work tree.
+
+```
+deploy/daily/
+├── compose.yml                  # The mist-daily compose project (backend, Neo4j, llama-server, backup)
+├── daily.env.example            # Template for <root>/daily.env
+├── README.md                    # Contract, operation and the /health reasons table
+├── RESTORE.md                   # Restore drill and promotion
+├── restore-drill.yml            # Drill project: restores a backup into a fresh volume
+└── windows/
+    ├── register-signin-task.ps1    # Sign-in task that starts the instance (-GamingWatch adds the watcher's)
+    └── unregister-signin-task.ps1  # Removes both sign-in tasks, for a rollback
+```
+
+## Dev Instance Fixture (`tests/fixtures/dev-instance/`)
+
+The synthetic seed `docker-compose.dev.yml` starts from, and that `instance.py init --seed` reads
+for a rehearsal root: an invented self-model and a "Dev User".
+
+```
+tests/fixtures/dev-instance/
+├── README.md                    # Worktree dev stack runbook
+├── seed/                        # mist-seed documents for `mist_admin.py seed`
+│   ├── mist.md                  # Self-model (__SelfModel__ partition)
+│   └── dev-user.md              # The Dev User's facts
+└── vault/                       # Copied into an empty dev vault
+    ├── MIST.md
+    ├── identity/mist.md
+    ├── users/dev-user.md
+    └── sessions/                # Two synthesis notes
+```
 
 ---
 
