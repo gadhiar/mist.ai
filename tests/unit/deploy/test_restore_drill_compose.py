@@ -148,6 +148,11 @@ class TestDrillNeo4j:
         daily_env = _environment(daily["services"]["mist-neo4j"])
         assert drill_env[name] == daily_env[name]
 
+    def test_memory_limit_matches_the_instance(self, drill, daily):
+        # One variable and one default size both Neo4js, so a raised instance limit covers the
+        # drill too.
+        assert drill["services"][NEO4J]["mem_limit"] == daily["services"]["mist-neo4j"]["mem_limit"]
+
     def test_mounts_only_the_drill_volume_at_data(self, drill):
         assert _mounts(drill["services"][NEO4J]) == [(DRILL_VOLUME, "/data", "rw")]
 

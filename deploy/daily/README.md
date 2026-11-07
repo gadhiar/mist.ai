@@ -88,8 +88,8 @@ that is unset makes compose refuse the whole file before anything starts.
 | `MIST_BACKUP_RETRY_MINUTES` | compose: the backup scheduler | no | `60` |
 | `MIST_BACKUP_MIN_NODE_RATIO` | compose: the backup scheduler | no | `0.5` |
 | `MIST_DAILY_BACKEND_MEM_LIMIT` | compose: `mem_limit` of `mist-backend` | no | `8g` |
-| `MIST_DAILY_NEO4J_MEM_LIMIT` | compose: `mem_limit` of `mist-neo4j` | no | `2g` |
-| `MIST_DAILY_LLM_MEM_LIMIT` | compose: `mem_limit` of `mist-llm` | no | `4g` |
+| `MIST_DAILY_NEO4J_MEM_LIMIT` | compose: `mem_limit` of `mist-neo4j` | no | `3g` |
+| `MIST_DAILY_LLM_MEM_LIMIT` | compose: `mem_limit` of `mist-llm` | no | `8g` |
 | `MIST_DAILY_BACKUP_MEM_LIMIT` | compose: `mem_limit` of `mist-backup` | no | `4g` |
 | `MIST_DAILY_WS_PORT` | compose: host port of the WebSocket; rehearsal only | no | `8001` |
 | `MIST_DAILY_BOLT_PORT` | compose: host port of Neo4j Bolt; rehearsal only | no | `7687` |
@@ -447,7 +447,18 @@ start it while the daily instance runs:
 
 Every service has a `mem_limit` from a variable, and Neo4j has an explicit heap and page cache
 instead of sizing itself from the Docker VM, which is shared with other containers. The defaults
-(8g backend, 2g Neo4j, 4g LLM, 4g backup) are unmeasured estimates: check them against
-`docker stats` on the running instance, and raise any limit with less than 25% headroom over its
-observed peak. Every service also logs through the `json-file` driver with `max-size` 20m and
-`max-file` 5.
+are 8g backend, 3g Neo4j, 8g LLM and 4g backup.
+
+- Neo4j's and the LLM's come from the scratch rehearsal of 6 Nov 2026. Each holds the service's
+  measured peak plus the remaining growth of its own cache, with at least a quarter of the limit
+  free. Neo4j peaked at 1544 MiB on a near-empty graph (15 nodes), and its page cache fills to
+  512m as the store grows; llama-server peaked at 3496 MiB after a handful of prompts, and its
+  prompt cache may still grow to the 2048 MiB that `--cache-ram` allows.
+- The backend's and backup's are estimates. The backend's has been measured on text turns only.
+
+The four limits add up to more than the Docker VM's memory, on purpose: each one bounds a single
+service, and what must fit the VM is the sum of what the services use.
+
+Check the limits against `docker stats` on the running instance. Headroom is (limit - peak) /
+limit: raise any limit with less than 25% headroom over its observed peak. Every service also
+logs through the `json-file` driver with `max-size` 20m and `max-file` 5.

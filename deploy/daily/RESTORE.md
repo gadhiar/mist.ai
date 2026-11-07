@@ -43,7 +43,7 @@ drill started beside it would restore into, and verify, the first drill's graph.
   directory must be empty or not exist yet.
 - Pick the artifact: a directory under `MIST_BACKUP_HOST_PATH` that holds a `manifest.json`.
   The scheduler names each backup by its UTC start time, so the latest name is the newest.
-- The drill adds a Neo4j (up to `MIST_DAILY_NEO4J_MEM_LIMIT`, 2g by default) and a restore
+- The drill adds a Neo4j (up to `MIST_DAILY_NEO4J_MEM_LIMIT`, 3g by default) and a restore
   container (up to `MIST_DAILY_BACKUP_MEM_LIMIT`, 4g) to what already runs. On a host short of
   memory, stop `mist-llm` first by turning gaming mode on, and turn it off when the drill ends:
 
