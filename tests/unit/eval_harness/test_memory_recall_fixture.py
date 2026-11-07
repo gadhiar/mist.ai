@@ -10,9 +10,13 @@ does not describe its query would move each of those numbers silently. This file
 - referential integrity: every id a probe, correction, fact or episode names exists, and episode
   boundaries refer to real turns of their conversation;
 - every conversation boundary and every episode boundary, recomputed from conversations.jsonl;
-- the minimum counts of plan task T1;
-- the probe authoring rules: availability at the probe's `now`, correction suppression, and the
-  lexical tag.
+- the minimum counts of plan task T1, and the shape minimums of plan task T36;
+- the fact types: every subject and object typed with an extractable ontology node type, one type
+  per entity;
+- the list utterances: at least three turns whose sibling facts overflow the reader's 300-token
+  block, each turn stating its whole list;
+- the probe authoring rules: availability at the probe's `now`, correction suppression, the
+  lexical tag, and the `list_item` and `type_scoped` shapes.
 
 The segmentation here is written independently of any backend segmenter on purpose: it is the
 reference T17's segmenter must reproduce, so it must not share that segmenter's code. It depends
@@ -40,11 +44,13 @@ if str(_REPO_ROOT) not in sys.path:
 from backend.chat.context_budget import ApproximateTokenCounter  # noqa: E402
 from backend.knowledge.ontologies.v1_0_0 import (  # noqa: E402
     EDGE_TYPES_BY_NAME,
+    EXTRACTABLE_NODE_TYPES,
     EXTRACTABLE_RELATIONSHIP_TYPES,
 )
 from scripts.eval_harness.memory_recall import (  # noqa: E402
     FIXTURE_DIR,
     PROBE_KINDS,
+    PROBE_SHAPES,
     Correction,
     Episode,
     Fact,
@@ -72,6 +78,9 @@ CONVERSATION_GAP = timedelta(minutes=30)
 EPISODE_MAX_TURNS = 20
 EPISODE_MAX_TOKENS = 6000
 SUMMARY_MAX_WORDS = 80
+# The reader's memory block cap (plan T36): a list utterance must not fit in it.
+BLOCK_CAP_TOKENS = 300
+NEW_SHAPE_MINIMUM = 12
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +219,13 @@ class TestMinimumCounts:
 
         assert len(lexical_noise) >= 10
 
+    def test_each_new_probe_shape_has_at_least_twelve_probes(self, fixture: Fixture) -> None:
+        shapes = Counter(probe.shape for probe in fixture.probes)
+
+        assert set(shapes) == set(PROBE_SHAPES)
+        assert shapes["list_item"] >= NEW_SHAPE_MINIMUM
+        assert shapes["type_scoped"] >= NEW_SHAPE_MINIMUM
+
 
 # ---------------------------------------------------------------------------
 # Facts
@@ -228,6 +244,25 @@ class TestFacts:
         for fact in fixture.facts:
             assert fact.relation in EXTRACTABLE_RELATIONSHIP_TYPES, fact.row_key
             assert EDGE_TYPES_BY_NAME[fact.relation].directional, fact.row_key
+
+    def test_subject_and_object_types_are_extractable_node_types(self, fixture: Fixture) -> None:
+        """A type-scoped probe filters on these types, so each must be one the extractor emits."""
+        for fact in fixture.facts:
+            assert fact.subject_type in EXTRACTABLE_NODE_TYPES, fact.row_key
+            assert fact.object_type in EXTRACTABLE_NODE_TYPES, fact.row_key
+
+    def test_an_entity_has_one_type_in_every_fact(self, fixture: Fixture) -> None:
+        """An entity typed two ways would fall inside and outside the same type scope."""
+        types: dict[str, str] = {}
+        for fact in fixture.facts:
+            for entity_id, node_type in (
+                (fact.subject_id, fact.subject_type),
+                (fact.object_id, fact.object_type),
+            ):
+                assert types.setdefault(entity_id, node_type) == node_type, (
+                    fact.row_key,
+                    entity_id,
+                )
 
     def test_every_row_of_a_fact_key_names_the_same_triple(self, fixture: Fixture) -> None:
         names: dict[str, tuple[str, str, str]] = {}
@@ -440,6 +475,77 @@ class TestEpisodes:
     def test_summaries_stay_within_eighty_words(self, fixture: Fixture) -> None:
         for episode in fixture.episodes:
             assert len(episode.summary.split()) <= SUMMARY_MAX_WORDS, episode.episode_id
+
+
+# ---------------------------------------------------------------------------
+# List utterances
+# ---------------------------------------------------------------------------
+
+
+def _sibling_groups(fixture: Fixture) -> dict[tuple[str, str, str], tuple[Fact, ...]]:
+    """Facts extracted together from one list: same subject, relation and source turn.
+
+    A group needs two distinct fact keys; one fact with several versions is not a list.
+    """
+    grouped: dict[tuple[str, str, str], list[Fact]] = defaultdict(list)
+    for fact in fixture.facts:
+        if fact.source_utterance_id is not None:
+            key = (fact.subject_id, fact.relation, fact.source_utterance_id)
+            grouped[key].append(fact)
+    return {
+        key: tuple(facts)
+        for key, facts in grouped.items()
+        if len({fact.fact_key for fact in facts}) > 1
+    }
+
+
+def _group_tokens(facts: tuple[Fact, ...]) -> int:
+    counter = ApproximateTokenCounter()
+    return sum(counter.count(fact.text) for fact in facts)
+
+
+def _list_utterances(fixture: Fixture) -> dict[tuple[str, str, str], tuple[Fact, ...]]:
+    """The sibling groups whose texts alone overflow the reader's 300-token block."""
+    return {
+        key: facts
+        for key, facts in _sibling_groups(fixture).items()
+        if _group_tokens(facts) > BLOCK_CAP_TOKENS
+    }
+
+
+class TestListUtterances:
+    def test_at_least_three_list_utterances_overflow_the_block(self, fixture: Fixture) -> None:
+        """The reader's cap is only exercised when a list's siblings cannot all be served."""
+        sums = {key: _group_tokens(facts) for key, facts in _list_utterances(fixture).items()}
+
+        assert len(sums) >= 3, sums
+        assert all(total > BLOCK_CAP_TOKENS for total in sums.values())
+
+    def test_list_utterances_include_recommends_and_has_habit(self, fixture: Fixture) -> None:
+        relations = {relation for _, relation, _ in _list_utterances(fixture)}
+
+        assert {"RECOMMENDS", "HAS_HABIT"} <= relations
+
+    def test_each_list_turn_states_every_sibling(self, fixture: Fixture) -> None:
+        """A list fact must be read off its turn, not attached to a turn that never says it."""
+        turns = {turn.event_id: turn for turn in fixture.turns}
+        for (_, _, event_id), facts in _list_utterances(fixture).items():
+            utterance = turns[event_id].user_utterance
+            for fact in facts:
+                assert _whole_word(fact.object_name, utterance), (event_id, fact.object_name)
+
+    def test_each_list_turn_has_a_conversation_and_session_of_its_own(
+        self, fixture: Fixture
+    ) -> None:
+        """The list turns were added as new conversations, so no existing boundary moved."""
+        turns = {turn.event_id: turn for turn in fixture.turns}
+        for _, _, event_id in _list_utterances(fixture):
+            turn = turns[event_id]
+            conversation = {
+                t.event_id for t in fixture.turns if t.conversation_id == turn.conversation_id
+            }
+            session = {t.event_id for t in fixture.turns if t.session_id == turn.session_id}
+            assert conversation == session, event_id
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +833,45 @@ class TestProbes:
             for recorded_at, suppressed in suppressions:
                 if recorded_at < probe.now:
                     assert not suppressed & {*probe.expected, *probe.acceptable}, probe.probe_id
+
+    def test_list_item_probes_expect_every_sibling_of_one_utterance(self, fixture: Fixture) -> None:
+        """Recall on a list probe measures how much of one list survives the block cap."""
+        lists = {
+            frozenset(ItemRef("fact", fact.fact_key) for fact in facts)
+            for facts in _sibling_groups(fixture).values()
+        }
+        for probe in fixture.probes:
+            if probe.shape == "list_item":
+                assert probe.kind == "fact", probe.probe_id
+                assert frozenset(probe.expected) in lists, probe.probe_id
+
+    def test_type_scoped_probes_name_a_type_not_an_entity(self, fixture: Fixture) -> None:
+        """A type-scoped probe expects every served fact of one object type for its subject and
+        relation, and its query names none of those objects, so only the type can find them.
+        """
+        rows = {fact.fact_key: fact for fact in fixture.facts}
+        for probe in fixture.probes:
+            if probe.shape != "type_scoped":
+                continue
+            assert probe.kind == "fact" and probe.expected, probe.probe_id
+            assert {ref.kind for ref in probe.expected} == {"fact"}, probe.probe_id
+            facts = [rows[ref.id] for ref in probe.expected]
+            types = {fact.object_type for fact in facts}
+            assert len(types) == 1, (probe.probe_id, types)
+            for fact in facts:
+                assert not _whole_word(fact.object_name, probe.query), (probe.probe_id, fact)
+            suppressed: set[ItemRef] = set()
+            for correction in fixture.corrections:
+                if correction.recorded_at < probe.now:
+                    suppressed |= _suppressed_by(fixture, correction)
+            scopes = {(fact.subject_id, fact.relation) for fact in facts}
+            in_scope = {
+                ItemRef("fact", fact.fact_key)
+                for fact in fixture.facts
+                if (fact.subject_id, fact.relation) in scopes and fact.object_type in types
+            }
+            served = (in_scope & _available_at(fixture, probe.now)) - suppressed
+            assert set(probe.expected) == served, probe.probe_id
 
     def test_lexical_tags_describe_the_query(self, fixture: Fixture) -> None:
         texts = _item_texts(fixture)

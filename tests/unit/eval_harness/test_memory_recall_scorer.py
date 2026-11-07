@@ -48,6 +48,7 @@ def _probe(
     acceptable: tuple[ItemRef, ...] = (),
     forbidden: tuple[ItemRef, ...] = (),
     correction_id: str | None = None,
+    shape: str = "plain",
 ) -> Probe:
     return Probe(
         probe_id=probe_id,
@@ -62,6 +63,7 @@ def _probe(
         distractors=(),
         correction_id=correction_id,
         rationale="hand-built",
+        shape=shape,
     )
 
 
@@ -338,6 +340,97 @@ class TestBreakdowns:
         assert overall.precision_at_block == pytest.approx((1.0 + 0.0 + 0.0) / 3)
 
 
+class TestShapeBreakdown:
+    """The read path's list cap and type filter are judged on their own probes (plan T36)."""
+
+    def _report(self):
+        """Two list probes (one complete, one missing a sibling), a type probe and a plain one."""
+        probes = [
+            _probe("l1", shape="list_item", expected=(FACT_A, FACT_B)),
+            _probe("l2", shape="list_item", expected=(FACT_A, FACT_B)),
+            _probe("t1", shape="type_scoped", expected=(FACT_X,)),
+            _probe("p1", kind="noise"),
+        ]
+        run = [
+            _record("l1", (FACT_A, FACT_B)),
+            _record("l2", (FACT_A,), tokens=301, budget_tokens=300),
+            _record("t1", (FACT_B, FACT_X)),
+            _record("p1", ()),
+        ]
+        return score_run(probes, run)
+
+    def test_a_probe_built_without_a_shape_is_plain(self) -> None:
+        probe = Probe(
+            probe_id="p1",
+            kind="fact",
+            lexical=True,
+            query="q",
+            now=NOW,
+            conversation_start=False,
+            expected=(FACT_A,),
+            acceptable=(),
+            forbidden=(),
+            distractors=(),
+            correction_id=None,
+            rationale="r",
+        )
+
+        assert probe.shape == "plain"
+
+    def test_per_shape_metrics_are_computed_on_that_shape_alone(self) -> None:
+        """list_item: recall (1 + 1/2) / 2 and budget 1/2; type_scoped: recall 1, MRR 1/2."""
+        report = self._report()
+
+        list_item = report.by_shape["list_item"]
+        type_scoped = report.by_shape["type_scoped"]
+        plain = report.by_shape["plain"]
+        assert (list_item.probes, list_item.recall_at_block) == (2, 0.75)
+        assert list_item.budget_ok == 0.5
+        assert list_item.empty_on_noise is None
+        assert (type_scoped.recall_at_block, type_scoped.mrr) == (1.0, 0.5)
+        assert type_scoped.precision_at_block == 0.5
+        assert (plain.probes, plain.empty_on_noise, plain.recall_at_block) == (1, 1.0, None)
+
+    def test_every_shape_is_reported_even_without_probes(self) -> None:
+        report = score_run([_probe("p1", expected=(FACT_A,))], [_record("p1", (FACT_A,))])
+
+        assert set(report.by_shape) == {"plain", "list_item", "type_scoped"}
+        assert report.by_shape["list_item"].probes == 0
+        assert report.by_shape["list_item"].recall_at_block is None
+
+    def test_shape_does_not_move_the_overall_kind_or_tag_metrics(self) -> None:
+        """Relabelling every probe plain leaves every other breakdown as it was."""
+        report = self._report()
+        probes = [
+            _probe("l1", expected=(FACT_A, FACT_B)),
+            _probe("l2", expected=(FACT_A, FACT_B)),
+            _probe("t1", expected=(FACT_X,)),
+            _probe("p1", kind="noise"),
+        ]
+        run = [
+            _record("l1", (FACT_A, FACT_B)),
+            _record("l2", (FACT_A,), tokens=301, budget_tokens=300),
+            _record("t1", (FACT_B, FACT_X)),
+            _record("p1", ()),
+        ]
+        plain = score_run(probes, run)
+
+        assert report.overall == plain.overall
+        assert report.by_kind == plain.by_kind
+        assert report.by_lexical == plain.by_lexical
+        assert plain.by_shape["plain"] == plain.overall
+
+    def test_markdown_and_json_carry_a_row_per_shape(self) -> None:
+        report = self._report()
+
+        text = render_markdown(report)
+        data = report.to_json()
+
+        for shape in ("plain", "list_item", "type_scoped"):
+            assert f"| shape: {shape} |" in text
+        assert data["by_shape"]["list_item"]["recall_at_block"] == 0.75
+
+
 class TestRunValidation:
     def test_a_probe_without_a_run_record_is_an_error(self) -> None:
         with pytest.raises(ValueError, match="p2"):
@@ -396,6 +489,7 @@ class TestProbeParsing:
             "distractors": [{"kind": "fact", "id": "fb"}],
             "correction_id": None,
             "rationale": "why",
+            "shape": "plain",
         }
         row.update(overrides)
         return row
@@ -406,6 +500,19 @@ class TestProbeParsing:
         assert probe.expected == (FACT_A,)
         assert probe.distractors == (FACT_B,)
         assert probe.now == NOW
+        assert probe.shape == "plain"
+
+    @pytest.mark.parametrize("shape", ["plain", "list_item", "type_scoped"])
+    def test_each_shape_parses(self, shape: str) -> None:
+        assert parse_probe(self._row(shape=shape)).shape == shape
+
+    def test_a_row_without_a_shape_is_rejected(self) -> None:
+        """The fixture is strict: a dropped `shape` is an error, never a silent plain."""
+        row = self._row()
+        del row["shape"]
+
+        with pytest.raises(ValueError, match="shape"):
+            parse_probe(row)
 
     @pytest.mark.parametrize(
         ("overrides", "message"),
@@ -415,6 +522,7 @@ class TestProbeParsing:
             pytest.param({"now": "2026-03-16T09:00:00"}, "now", id="naive-timestamp"),
             pytest.param({"expected": [{"kind": "memo", "id": "x"}]}, "memo", id="bad-ref-kind"),
             pytest.param({"surprise": 1}, "surprise", id="unknown-key"),
+            pytest.param({"shape": "listy"}, "listy", id="unknown-shape"),
         ],
     )
     def test_an_invalid_row_is_rejected(self, overrides: dict[str, object], message: str) -> None:
@@ -469,6 +577,8 @@ class TestCommandLine:
         assert report["overall"]["empty_on_noise"] == 1.0
         assert report["by_kind"]["noise"]["probes"] == 1
         assert report["by_lexical"]["paraphrase"]["empty_on_noise"] == 1.0
+        assert report["by_shape"]["plain"]["probes"] == 2
+        assert report["by_shape"]["list_item"]["probes"] == 0
 
     def test_load_run_reads_one_record_per_line(self, tmp_path: Path) -> None:
         run_path = tmp_path / "run.jsonl"
