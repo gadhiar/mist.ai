@@ -28,8 +28,11 @@ Metrics, each a mean over the probes it is defined on:
   narrative that names it). Defined on probes with forbidden items. Its floor is 0.
 - budget_ok: 1 when the block's tokens are within its budget. Defined on every probe.
 
-Each is reported overall, per probe kind and per lexical tag, with `None` where no probe defines
-it, so a missing number is never confused with a zero.
+Each is reported overall, per probe kind, per lexical tag and per probe shape, with `None` where
+no probe defines it, so a missing number is never confused with a zero. The shape separates the
+probes that exercise the reader's list cap (`list_item`) and its type filter (`type_scoped`) from
+the rest (`plain`); a probe built in code without a shape is `plain`, so the overall, kind and tag
+numbers do not depend on it.
 
 Usage:
     python scripts/eval_harness/memory_recall.py --run run.jsonl [--probes probes.jsonl]
@@ -50,6 +53,7 @@ from typing import TypeVar
 FIXTURE_DIR = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "memory_recall"
 
 PROBE_KINDS = ("fact", "episode", "note", "continuity", "temporal", "correction", "noise")
+PROBE_SHAPES = ("plain", "list_item", "type_scoped")
 ITEM_KINDS = ("fact", "episode", "exchange", "note")
 LEXICAL_TAGS = {True: "lexical", False: "paraphrase"}
 FACT_STATES = ("current", "superseded", "future", "retracted")
@@ -203,6 +207,12 @@ class Probe:
     shares a content word with every expected item, or with every forbidden item when nothing is
     expected (a correction probe after a forget); false marks a paraphrase that shares no word
     stem with them, which only a semantic match finds.
+
+    `shape` says what the probe asks for: `list_item` expects every sibling fact of one list
+    utterance, more than a 300-token block holds, so it measures the reader's cap; `type_scoped`
+    names an entity type rather than an entity ("which apps do I use"), so it measures the type
+    filter; `plain` is everything else. It defaults to `plain` for probes built in code, while
+    a fixture row must carry it.
     """
 
     probe_id: str
@@ -217,6 +227,7 @@ class Probe:
     distractors: tuple[ItemRef, ...]
     correction_id: str | None
     rationale: str
+    shape: str = "plain"
 
 
 _PROBE_KEYS = (
@@ -232,6 +243,7 @@ _PROBE_KEYS = (
     "distractors",
     "correction_id",
     "rationale",
+    "shape",
 )
 
 
@@ -252,6 +264,7 @@ def parse_probe(row: Mapping[str, object]) -> Probe:
         distractors=_refs(row, "distractors", where),
         correction_id=_opt_str(row, "correction_id", where),
         rationale=_str(row, "rationale", where),
+        shape=_choice(row, "shape", PROBE_SHAPES, where),
     )
 
 
@@ -320,15 +333,20 @@ class Fact:
 
     Several rows can share a `fact_key`: a fact that held in two separate periods keeps one row
     per interval, which is how read-time currency picks the version that holds at `now`.
+
+    `subject_type` and `object_type` are ontology node types (`EXTRACTABLE_NODE_TYPES`), the
+    labels the graph gives each end, so a type-scoped probe can be answered by type alone.
     """
 
     row_key: str
     fact_key: str
     subject_id: str
     subject_name: str
+    subject_type: str
     relation: str
     object_id: str
     object_name: str
+    object_type: str
     text: str
     valid_from: datetime | None
     valid_to: datetime | None
@@ -348,9 +366,11 @@ def parse_fact(row: Mapping[str, object]) -> Fact:
         fact_key=_str(row, "fact_key", where),
         subject_id=_str(row, "subject_id", where),
         subject_name=_str(row, "subject_name", where),
+        subject_type=_str(row, "subject_type", where),
         relation=_str(row, "relation", where),
         object_id=_str(row, "object_id", where),
         object_name=_str(row, "object_name", where),
+        object_type=_str(row, "object_type", where),
         text=_str(row, "text", where),
         valid_from=_opt_datetime(row, "valid_from", where),
         valid_to=_opt_datetime(row, "valid_to", where),
@@ -592,11 +612,12 @@ class MetricSet:
 
 @dataclass(frozen=True, slots=True)
 class RecallReport:
-    """The metrics overall, per probe kind and per lexical tag."""
+    """The metrics overall, per probe kind, per lexical tag and per probe shape."""
 
     overall: MetricSet
     by_kind: Mapping[str, MetricSet]
     by_lexical: Mapping[str, MetricSet]
+    by_shape: Mapping[str, MetricSet]
 
     def to_json(self) -> dict[str, object]:
         """The report as plain JSON, the shape `--json-output` writes."""
@@ -604,6 +625,7 @@ class RecallReport:
             "overall": self.overall.to_json(),
             "by_kind": {kind: metrics.to_json() for kind, metrics in self.by_kind.items()},
             "by_lexical": {tag: metrics.to_json() for tag, metrics in self.by_lexical.items()},
+            "by_shape": {shape: metrics.to_json() for shape, metrics in self.by_shape.items()},
         }
 
 
@@ -715,7 +737,7 @@ def _index_run(probes: Sequence[Probe], run: Sequence[RunRecord]) -> dict[str, R
 
 
 def score_run(probes: Sequence[Probe], run: Sequence[RunRecord]) -> RecallReport:
-    """Score a run against the probes it answers, overall, per kind and per lexical tag."""
+    """Score a run against the probes it answers, overall, per kind, per tag and per shape."""
     records = _index_run(probes, run)
     scored = [(probe, _score_probe(probe, records[probe.probe_id])) for probe in probes]
     return RecallReport(
@@ -727,6 +749,10 @@ def score_run(probes: Sequence[Probe], run: Sequence[RunRecord]) -> RecallReport
         by_lexical={
             tag: _aggregate([score for probe, score in scored if probe.lexical is flag])
             for flag, tag in LEXICAL_TAGS.items()
+        },
+        by_shape={
+            shape: _aggregate([score for probe, score in scored if probe.shape == shape])
+            for shape in PROBE_SHAPES
         },
     )
 
@@ -761,6 +787,7 @@ def render_markdown(report: RecallReport) -> str:
     rows = [("overall", report.overall)]
     rows += [(f"kind: {kind}", metrics) for kind, metrics in report.by_kind.items()]
     rows += [(f"tag: {tag}", metrics) for tag, metrics in report.by_lexical.items()]
+    rows += [(f"shape: {shape}", metrics) for shape, metrics in report.by_shape.items()]
     lines = ["# Memory recall", "", header, rule]
     for name, metrics in rows:
         cells = " | ".join(_cell(getattr(metrics, field)) for _, field in _COLUMNS)
