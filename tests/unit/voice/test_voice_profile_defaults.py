@@ -48,3 +48,29 @@ def test_default_constant_is_mist():
     from src.multimodal.voice_profile import DEFAULT_VOICE_PROFILE
 
     assert DEFAULT_VOICE_PROFILE == "mist"
+
+
+def test_voice_config_defaults_to_mist():
+    from backend.config import VoiceConfig
+
+    assert VoiceConfig().voice_profile == "mist"
+
+
+def test_load_config_defaults_to_mist(monkeypatch):
+    from backend.config import load_config
+
+    monkeypatch.delenv("VOICE_PROFILE", raising=False)
+
+    assert load_config().voice_profile == "mist"
+
+
+def test_env_example_selects_mist():
+    lines = (REPO_ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+
+    assert "VOICE_PROFILE=mist" in lines
+
+
+def test_docker_compose_defaults_to_mist():
+    lines = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8").splitlines()
+
+    assert "- VOICE_PROFILE=${VOICE_PROFILE:-mist}" in [line.strip() for line in lines]
