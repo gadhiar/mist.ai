@@ -1,6 +1,19 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-09-22 (**the gate has RUN and PASSED, and MIST has had zero users for 104
+**Last Updated:** 2026-11-06 (**MIST is now a daily general assistant, and the daily instance is
+built.** ADR-042, amended 6 Nov 2026, sets the bar, the order and the power levels; see Current
+Focus.)
+
+The daily instance is a pinned compose deployment under `deploy/daily/`, run by
+`scripts/daily/instance.py`: install, switch to a release, health with a reason per check,
+scheduled backups, restore drills with promotion, use metrics from real-origin turns
+(`/usage/turns-per-day` and `/usage/uptime`, counted in `MIST_TIMEZONE`), and gaming mode, which
+yields the GPU while a game runs. It was rehearsed end to end on synthetic data, never on the live
+graph, and its memory limits hold the rehearsal's measured peaks with at least 25% headroom. It
+has not yet run on live data; the deploy plan does that. Run `git log --oneline -1`; do not trust
+a hash written here.
+
+**PRIOR ENTRY -- 2026-09-22:** (**the gate has RUN and PASSED, and MIST has had zero users for 104
 days. Both of those are new and the second one matters more.**)
 
 `main` is at `f62ef6d` and this file had been four commits behind it -- `2b2e733` (#8),
@@ -997,6 +1010,25 @@ Plan artifact for overnight post-MVP run: `~/.claude/plans/peaceful-greeting-bee
 ## Active Work
 
 ### Current Focus
+**The order, ADR-042 as amended on 6 Nov 2026:**
+- Step 0: host runs on this PC that measure the speech, memory and low-level options, with no
+  build.
+- Step 1: the daily instance (goal mist-daily-instance-build), with goal
+  mist-extraction-quality's fixes before the first real turn.
+- Step 2: capabilities by text, alarms and timers first and lights through Home Assistant, with
+  the read path's first phase alongside.
+- Step 3: realtime voice and the voice frontend, on the desktop.
+- Step 4: the room endpoint.
+- Polish comes after capability and feel. ADR-035 scoring stays parked until real logs exist.
+
+**Use metric.** Real-origin turns per local day, read from `/usage/turns-per-day`; no milestone
+waits on days of use (ADR-042, 6 Nov 2026 amendment, item 4).
+
+**Power levels (Raj, 6 Nov 2026).** Full, low and off cap the model tiers MIST uses, and a game or
+a command changes the level. Gaming mode is the off level, and a game sets off until goal
+mist-model-host's tier router delivers the low level.
+
+**Prior focus, 2026-09-15, kept as history; the order above supersedes it.**
 make-mist-usable Phase 2 / Sub-project A (MIS-120, In Progress in Linear), now in R1.7. **Latest
 landed on `main`:** MIS-130, merged at `02e5177` on 2026-09-15, followed by `StagingSeeder`
 integration coverage at `6a5b2c0` -- establish current `main` HEAD with `git rev-parse main` rather

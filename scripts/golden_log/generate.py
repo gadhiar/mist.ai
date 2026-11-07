@@ -34,6 +34,7 @@ from backend.errors import MistError
 from backend.event_store.models import ConversationTurnEvent
 from backend.event_store.store import EventStore
 from backend.knowledge.config import KnowledgeConfig
+from backend.knowledge.eval_isolation import IsolatedRootError, assert_not_live_instance
 from backend.knowledge.extraction_cache import OUTCOME_EXTRACTED, ExtractionCache
 from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
 
@@ -261,9 +262,20 @@ def assert_isolated_root(root: Path) -> None:
     and log stay separate channels, and a live seed run stripped the production graph on
     2026-07-31 -- so "never written to live" is enforced here rather than documented.
 
+    The shared live-instance check runs first. A daily instance keeps its state outside
+    the repository, where the candidate list below cannot see it; the marker and the
+    registry can. Its refusal is re-raised as `GoldenLogError`, the one type this CLI
+    handles. Everything after it keeps this twin's narrower IS and UNDER semantics.
+
     Raises:
-        GoldenLogError: When `root` resolves into a live data directory.
+        GoldenLogError: When `root` resolves into a live data directory, or is or sits
+            under a live MIST instance (marked or registered).
     """
+    try:
+        assert_not_live_instance(root, purpose="golden log store")
+    except IsolatedRootError as exc:
+        raise GoldenLogError(str(exc)) from exc
+
     resolved = root.resolve()
     for live in _live_data_roots():
         if resolved == live or live in resolved.parents:

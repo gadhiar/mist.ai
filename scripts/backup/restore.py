@@ -15,8 +15,8 @@ no flag disables any of them:
     3. A POSITIVE HANDSHAKE: the target carries the marker file
        `MIST_RESTORE_TARGET`, placed by the operator
        (`assert_restore_target_root`), on top of -- not instead of --
-       `assert_isolated_root` for the root and `assert_neo4j_dev_isolated` for
-       the graph URI.
+       `assert_isolated_root` for the root and the resolved vault root, and
+       `assert_neo4j_dev_isolated` for the graph URI.
     4. A PRE-RESTORE BACKUP of the target, taken FIRST, through T1's `run_dump`.
        If it fails, nothing is overwritten. The state about to be destroyed is
        captured before it is destroyed, which is the only reason a restore into
@@ -133,7 +133,12 @@ from backend.knowledge.admin import (
     read_schema_ddl,
     restore_graph_from_artifact,
 )
-from backend.knowledge.eval_isolation import EvalIsolationError, assert_neo4j_dev_isolated
+from backend.knowledge.eval_isolation import (
+    EvalIsolationError,
+    IsolatedRootError,
+    assert_isolated_root,
+    assert_neo4j_dev_isolated,
+)
 from backend.knowledge.graph_artifact import GraphArtifactError, load_artifact
 
 from .destination import resolve_backup_root
@@ -986,6 +991,45 @@ def assert_target_is_restorable(
     assert_no_restore_in_progress(target_root)
 
 
+def assert_target_vault_root_not_live(vault_root: Path | str) -> Path:
+    """Expand and resolve the vault tree a restore will replace, refusing live state.
+
+    `--target-root` has always passed `assert_isolated_root` (inside
+    `assert_restore_target_root`), but a custom `--target-vault-root` was
+    checked by nothing, and phase 5 renames whatever it names aside and moves
+    the artifact's tree onto it. That includes a daily instance's
+    `mist-memory/`, which sits under a marked root outside the repository.
+
+    The path is expanded and resolved ONCE, here, and the caller stages and
+    commits onto the returned path. Checking one spelling and writing another
+    is the hole this closes: `~/vault` checked as `$HOME/vault` but staged
+    relative to the current directory as `<cwd>/~/vault`, and a symlinked last
+    component checked at its target but renamed at the link.
+
+    Args:
+        vault_root: The operator's `--target-vault-root`, or the default
+            `<target-root>/vault`. Nothing is created.
+
+    Returns:
+        The expanded, resolved vault root, the one path every later phase uses.
+
+    Raises:
+        RestoreTargetError: When the vault root is, sits under, or contains
+            live state, including a marked or registered live instance. A
+            subclass `main` already reports at exit 2.
+    """
+    resolved = Path(vault_root).expanduser().resolve()
+    try:
+        assert_isolated_root(resolved, purpose="restore target vault")
+    except IsolatedRootError as exc:
+        raise RestoreTargetError(
+            f"{exc} (That wording is the shared live-state guard's, which this "
+            "restore reuses unchanged.) The restore would replace that vault tree, "
+            "so there is no --force for this."
+        ) from exc
+    return resolved
+
+
 def take_pre_restore_backup(
     *,
     target_root: Path,
@@ -1078,7 +1122,8 @@ def run_restore(
     and so that EVERY check that can refuse -- of the artifact OR of the target --
     happens before the first byte of the target changes:
 
-        target root resolved and not live -> handshake marker -> graph URI ->
+        target root resolved and not live -> handshake marker -> target vault
+        root not live -> graph URI ->
         typed token -> backup destination -> artifact manifest and digests ->
         graph leg decoded and relinkable -> TARGET preflight -> pre-restore
         backup -> [3] stage -> [4] graph -> [5] commit -> [6] cleanup
@@ -1119,7 +1164,8 @@ def run_restore(
         A `RestoreReport` naming the pre-restore artifact, which is the way back.
 
     Raises:
-        RestoreTargetError: The target is live, absent, or unmarked.
+        RestoreTargetError: The target is live, absent, or unmarked, or the
+            resolved vault root is live state.
         EvalIsolationError: The graph URI is not a dev endpoint. Deliberately
             NOT wrapped: it is the shared guard's refusal and reads better in
             its own words.
@@ -1145,6 +1191,11 @@ def run_restore(
             the vault are untouched: the commit had not started.
     """
     resolved_target = assert_restore_target_root(target_root)
+    vault_root = assert_target_vault_root_not_live(
+        resolved_target / DEFAULT_TARGET_VAULT_DIRNAME
+        if target_vault_root is None
+        else target_vault_root
+    )
     assert_neo4j_dev_isolated(target_graph_uri)
     assert_target_confirmed(resolved_target, confirm_token)
 
@@ -1152,11 +1203,6 @@ def run_restore(
         resolve_backup_root(purpose="pre-restore backup")
         if backup_root is None
         else resolve_backup_root(backup_root, purpose="pre-restore backup")
-    )
-    vault_root = (
-        resolved_target / DEFAULT_TARGET_VAULT_DIRNAME
-        if target_vault_root is None
-        else Path(target_vault_root)
     )
 
     source = Path(artifact_dir)

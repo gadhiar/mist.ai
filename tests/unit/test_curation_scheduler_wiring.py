@@ -246,6 +246,35 @@ class TestSchedulerObjectGraph:
         assert _job(scheduler, "self_reflection")._deriver._llm is handler._provider
 
 
+class TestLlmJobDeferral:
+    """Gaming mode defers the one job that calls the LLM, and only that one."""
+
+    def test_only_self_reflection_requires_the_llm(self):
+        handler = _make_handler()
+        scheduler, _ = _build_scheduler(handler.config)
+
+        requiring = sorted(c.name for c, _ in scheduler._jobs if c.requires_llm)
+
+        assert requiring == ["self_reflection"]
+
+    def test_defer_llm_jobs_reaches_the_scheduler(self):
+        handler = _make_handler()
+
+        def is_yielded() -> bool:
+            return True
+
+        scheduler, _ = _build_scheduler(handler.config, defer_llm_jobs=is_yielded)
+
+        assert scheduler._defer_llm_jobs is is_yielded
+
+    def test_defer_llm_jobs_defaults_to_none(self):
+        handler = _make_handler()
+
+        scheduler, _ = _build_scheduler(handler.config)
+
+        assert scheduler._defer_llm_jobs is None
+
+
 class TestSkillDerivationIsReachable:
     @pytest.mark.asyncio
     async def test_tool_calls_recorded_on_the_handler_reach_the_schedulers_job(self):

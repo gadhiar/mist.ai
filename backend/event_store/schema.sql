@@ -248,3 +248,28 @@ CREATE TABLE IF NOT EXISTS epoch_cutover (
     promoted_epoch_id INTEGER,                -- the ledger row promotion appended
     updated_at TEXT NOT NULL                  -- ISO-8601
 );
+
+-- ---------------------------------------------------------------------------
+-- Uptime ledger (T15). One row per run of ticks with the same /health status:
+-- the server's tick loop extends the newest row's last_seen_at while the
+-- status holds, and starts a new row on a change, after a gap longer than
+-- 2.5 tick periods, on the first tick after a start, or when the clock steps
+-- back. Written only by `record_status_tick` in
+-- `backend/event_store/status_intervals.py`, over its own connection.
+--
+-- degraded_beneath: for a yielded row, whether a check other than the
+-- yielded one was not up, so a yield over a sound system can be told from
+-- one that hid a fault. Always 0 for the other statuses.
+--
+-- started_at and last_seen_at are ISO-8601 UTC. Time after a row's
+-- last_seen_at is unrecorded, never up. A new table, so
+-- `CREATE TABLE IF NOT EXISTS` is the whole migration.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS instance_status_intervals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    status TEXT NOT NULL
+        CHECK (status IN ('healthy', 'degraded', 'yielded', 'unhealthy')),
+    degraded_beneath INTEGER NOT NULL DEFAULT 0 CHECK (degraded_beneath IN (0, 1)),
+    started_at TEXT NOT NULL,                 -- ISO-8601 UTC
+    last_seen_at TEXT NOT NULL                -- ISO-8601 UTC
+);

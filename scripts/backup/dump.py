@@ -78,7 +78,7 @@ from typing import Any
 from backend.errors import MistError
 from backend.interfaces import GraphConnection
 from backend.knowledge.admin import dump_full_graph_artifact, graph_version_stamps
-from backend.knowledge.eval_isolation import REPO_ROOT
+from backend.knowledge.eval_isolation import LIVE_INSTANCE_MARKER, REPO_ROOT
 from backend.knowledge.graph_artifact import GraphArtifactError, dumps_artifact
 
 from .destination import assert_backup_destination, resolve_backup_root
@@ -228,12 +228,21 @@ def copy_vault(vault_root: Path, artifact_dir: Path) -> tuple[int, int]:
     every fresh clone -- `mist-memory/` is gitignored with zero tracked files --
     and a dump that refused to run there would be a dump nobody could test.
 
-    THE WHOLE TREE IS COPIED, `.git` INCLUDED, AND THAT IS DELIBERATE. There is
-    no `ignore=` here on purpose: the live `mist-memory/` is a git repository
-    with no remote and no upstream, so its commits exist nowhere else, and
-    excluding `.git` would introduce a new data-loss mode inside a tool whose
-    whole job is to remove them. The two counts exist so that keeping the
-    plumbing does not also mean reporting it as notes.
+    THE WHOLE TREE IS COPIED, `.git` INCLUDED, AND THAT IS DELIBERATE. The
+    live `mist-memory/` is a git repository with no remote and no upstream, so
+    its commits exist nowhere else, and excluding `.git` would introduce a new
+    data-loss mode inside a tool whose whole job is to remove them. The two
+    counts exist so that keeping the plumbing does not also mean reporting it
+    as notes.
+
+    ONE FILE IS LEFT OUT: `.mist-live-instance` at the vault's top level, and
+    no file of that name anywhere else. A daily instance's `mist-memory/`
+    carries a copy of the marker, and the isolation guard refuses any path at
+    or under a marked directory, so a restored standby holding it would be
+    refused by its own verify. The marker states which directory is live; a
+    copy is not, until a promotion marks it. A file of that name deeper in the
+    tree is vault content, which a backup does not drop. Both counts are taken
+    from the copy, so neither includes the marker.
 
     KEEPING `.git` HAS A RECURRING COST, WHICH IS WORTH STATING RATHER THAN
     DISCOVERING. `digest_artifact_files` rglobs every file in the artifact
@@ -248,8 +257,16 @@ def copy_vault(vault_root: Path, artifact_dir: Path) -> tuple[int, int]:
     destination = artifact_dir / VAULT_DIRNAME
     if not vault_root.is_dir():
         return (0, 0)
+
+    def ignore_top_level_marker(directory: str, names: list[str]) -> list[str]:
+        # `copytree` passes `vault_root` itself only for the top level; every
+        # deeper call gets a joined path, so this matches the top level alone.
+        if Path(directory) == vault_root and LIVE_INSTANCE_MARKER in names:
+            return [LIVE_INSTANCE_MARKER]
+        return []
+
     try:
-        shutil.copytree(vault_root, destination)
+        shutil.copytree(vault_root, destination, ignore=ignore_top_level_marker)
     except OSError as exc:
         raise BackupError(
             f"could not copy the vault corpus from {vault_root}: {exc}. This tree is "

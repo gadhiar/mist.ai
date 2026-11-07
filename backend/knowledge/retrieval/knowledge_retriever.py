@@ -14,10 +14,13 @@ from backend.errors import VectorStoreError
 from backend.interfaces import EmbeddingProvider, SidecarIndexProtocol, VectorStoreProvider
 from backend.knowledge.config import KnowledgeConfig, QueryIntentConfig
 from backend.knowledge.models import (
+    RetrievalCandidate,
     RetrievalFilters,
     RetrievalResult,
+    RetrievalSource,
     RetrievedFact,
     VectorSearchResult,
+    fact_ref,
 )
 from backend.knowledge.retrieval.query_classifier import QueryClassifier
 from backend.knowledge.storage import GraphStore
@@ -164,6 +167,12 @@ class KnowledgeRetriever:
 
         Returns:
             RetrievalResult with facts, formatted context, and intent metadata.
+            `candidates` lets the turn trace show what was seen and not kept:
+            every row the vector and vault legs returned, before filtering,
+            and the graph leg's facts after `RetrievalFilters` and triple
+            dedup, since the trace has no disposition for a filtered row and a
+            duplicate triple shares its fact's ref. The identity and live
+            paths run no leg and leave it empty.
         """
         # Validate force_intent at the API surface so caller-side typos
         # (e.g. "Historical" with capital H, "vault") are caught here
@@ -261,6 +270,9 @@ class KnowledgeRetriever:
         graph_facts: list[RetrievedFact] = []
         vector_facts: list[RetrievedFact] = []
         vault_facts: list[RetrievedFact] = []
+        # Every vault row as (fact, empty), including the empty chunks the leg
+        # drops, so the candidates can show what the sidecar returned.
+        vault_rows: list[tuple[RetrievedFact, bool]] = []
         graph_candidates_raw: list[dict] = []
         vector_candidates_raw: list[VectorSearchResult] = []
         vault_candidates_raw: list[dict] = []
@@ -318,6 +330,7 @@ class KnowledgeRetriever:
                 query=query,
                 embedding=query_embedding,
                 limit=vault_limit,
+                row_sink=vault_rows,
             )
             vault_time = (time.time() - vault_start) * 1000
 
@@ -367,6 +380,15 @@ class KnowledgeRetriever:
         # the legacy "from your graph" framing)
         formatted_context = self.format_context(ranked_facts, query, intent=intent)
 
+        candidates = self._build_candidates(
+            legs=(
+                ("graph", [(fact, False) for fact in graph_facts]),
+                ("vector", [(fact, False) for fact in vector_facts]),
+                ("vault", vault_rows),
+            ),
+            selected=ranked_facts,
+        )
+
         total_time = (time.time() - start_time) * 1000
 
         result = RetrievalResult(
@@ -388,6 +410,7 @@ class KnowledgeRetriever:
             },
             intent=intent,
             document_chunks_used=document_chunks_used,
+            candidates=candidates,
         )
 
         logger.info(f"Retrieval complete: {result.summary()}")
@@ -512,6 +535,33 @@ class KnowledgeRetriever:
             event_id=event_id,
         )
 
+    @staticmethod
+    def _build_candidates(
+        *,
+        legs: tuple[tuple[RetrievalSource, list[tuple[RetrievedFact, bool]]], ...],
+        selected: list[RetrievedFact],
+    ) -> tuple[RetrievalCandidate, ...]:
+        """Turn each leg's `(fact, empty)` rows into candidates, in leg order.
+
+        Selection is by object identity, not by ref or merge key: the RRF
+        merges dedupe on `(subject, predicate, object)`, so two vault chunks
+        sharing a heading collapse into one fact, and only the one kept may
+        read as selected.
+        """
+        selected_ids = {id(fact) for fact in selected}
+        return tuple(
+            RetrievalCandidate(
+                source=source,
+                ref=fact_ref(fact),
+                rank=rank,
+                score=fact.similarity_score,
+                selected=id(fact) in selected_ids,
+                empty=empty,
+            )
+            for source, rows in legs
+            for rank, (fact, empty) in enumerate(rows, start=1)
+        )
+
     # -- Retrieval backends ---------------------------------------------------
 
     async def _relational_retrieve(
@@ -615,6 +665,7 @@ class KnowledgeRetriever:
         query: str,
         embedding: list[float],
         limit: int,
+        row_sink: list[tuple[RetrievedFact, bool]] | None = None,
     ) -> tuple[list[dict], list[RetrievedFact]]:
         """Retrieve session-note prose chunks from the vault sidecar.
 
@@ -637,6 +688,10 @@ class KnowledgeRetriever:
             query: User's natural language query (used for FTS lexical match).
             embedding: Pre-computed query embedding (vec0 input).
             limit: Maximum facts to return from this leg.
+            row_sink: When given, receives every sidecar row in rank order as
+                `(fact, empty)`, including the empty chunks this leg drops, so
+                `retrieve()` can report them as candidates. The return value
+                stays the filtered view.
 
         Returns:
             (raw_rows, facts) -- raw rows preserved for Cluster 5 debug
@@ -679,6 +734,40 @@ class KnowledgeRetriever:
             heading = row.get("heading") or "(file)"
             content = row.get("content", "")
             score = float(row.get("score", 0.0))
+            fact = RetrievedFact(
+                subject="VaultNote",
+                subject_type="VaultSession",
+                predicate="MENTIONS",
+                object=heading,
+                object_type="VaultChunk",
+                properties={
+                    "path": path,
+                    # `text` is the canonical key consumed by
+                    # `format_context` (the formatter is shared with
+                    # the document-chunk path, which has historically
+                    # used "text" too). `content` is retained as a
+                    # deprecated alias for one release cycle to avoid
+                    # silently breaking any out-of-tree consumer that
+                    # may have read the previous key. Schedule alias
+                    # removal in a follow-up.
+                    "text": content,
+                    "content": content,
+                    "vector_rank": row.get("vector_rank"),
+                    "fts_rank": row.get("fts_rank"),
+                    "sources": row.get("sources"),
+                    # Distance-derived similarity in (0, 1] for vector hits,
+                    # None for FTS-only hits (Task 1). Carried so the
+                    # vault_results FE payload can display a per-result
+                    # similarity instead of the RRF fusion score; None
+                    # renders as "lexical".
+                    "display_similarity": row.get("display_similarity"),
+                },
+                similarity_score=score,
+                graph_distance=_VECTOR_DISTANCE_SENTINEL,
+            )
+            empty = not (content or "").strip()
+            if row_sink is not None:
+                row_sink.append((fact, empty))
             # Skip chunks with empty/whitespace-only content. The sidecar
             # sometimes returns ranked rows that have a heading but no body
             # (file-level chunks where the section is empty, or stale rows
@@ -689,42 +778,10 @@ class KnowledgeRetriever:
             # alone -- which it did inconsistently, biasing tool-call
             # decisions on small-talk and technical-explainer queries.
             # Drop the noise at the source so it never reaches the prompt.
-            if not (content or "").strip():
+            if empty:
                 continue
             kept_rows.append(row)
-            facts.append(
-                RetrievedFact(
-                    subject="VaultNote",
-                    subject_type="VaultSession",
-                    predicate="MENTIONS",
-                    object=heading,
-                    object_type="VaultChunk",
-                    properties={
-                        "path": path,
-                        # `text` is the canonical key consumed by
-                        # `format_context` (the formatter is shared with
-                        # the document-chunk path, which has historically
-                        # used "text" too). `content` is retained as a
-                        # deprecated alias for one release cycle to avoid
-                        # silently breaking any out-of-tree consumer that
-                        # may have read the previous key. Schedule alias
-                        # removal in a follow-up.
-                        "text": content,
-                        "content": content,
-                        "vector_rank": row.get("vector_rank"),
-                        "fts_rank": row.get("fts_rank"),
-                        "sources": row.get("sources"),
-                        # Distance-derived similarity in (0, 1] for vector hits,
-                        # None for FTS-only hits (Task 1). Carried so the
-                        # vault_results FE payload can display a per-result
-                        # similarity instead of the RRF fusion score; None
-                        # renders as "lexical".
-                        "display_similarity": row.get("display_similarity"),
-                    },
-                    similarity_score=score,
-                    graph_distance=_VECTOR_DISTANCE_SENTINEL,
-                )
-            )
+            facts.append(fact)
 
         return kept_rows, facts
 

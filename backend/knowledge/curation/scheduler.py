@@ -17,6 +17,7 @@ import os
 import sqlite3
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -42,11 +43,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class JobConfig:
-    """Configuration for a scheduled curation job."""
+    """Configuration for a scheduled curation job.
+
+    `requires_llm` marks a job that calls the LLM. The scheduler skips such a
+    job while its `defer_llm_jobs` predicate is true (gaming mode has stopped
+    mist-llm), rather than running it into a failure that is still recorded
+    as a run.
+    """
 
     name: str
     interval_seconds: int
     enabled: bool = True
+    requires_llm: bool = False
 
 
 @dataclass(slots=True)
@@ -110,6 +118,9 @@ class CurationScheduler:
         self,
         jobs: list[tuple[JobConfig, Any]],
         run_recorder: CurationRunRecorder | None = None,
+        *,
+        defer_llm_jobs: Callable[[], bool] | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         """Initialize the scheduler.
 
@@ -122,11 +133,19 @@ class CurationScheduler:
                 parameter exists to close -- so construction logs a warning
                 rather than defaulting silently. A production None is
                 legitimate only when `config.event_store.enabled` is False.
+            defer_llm_jobs: True while a due `requires_llm` job must wait,
+                which is while gaming mode holds the GPU. Read just before each
+                such job would run. None means never defer.
+            clock: Wall clock in epoch seconds, deciding which jobs are due.
         """
         self._jobs = jobs
         self._run_recorder = run_recorder
+        self._defer_llm_jobs = defer_llm_jobs
+        self._clock = clock
         self._task: asyncio.Task | None = None
         self._running = False
+        self._last_run: dict[str, float] = {}
+        self._deferring = False
 
         if run_recorder is None:
             logger.warning(
@@ -292,36 +311,60 @@ class CurationScheduler:
 
     async def _loop(self) -> None:
         """Main scheduler loop. Runs jobs at their configured intervals."""
-        # Track last run time per job
-        last_run: dict[str, float] = {}
-
         while self._running:
-            now = time.time()
-
-            for config, job in self._jobs:
-                if not config.enabled:
-                    continue
-
-                # `last_run.get(name, 0.0)` makes every enabled job due on the
-                # first pass, so all of them run at scheduler start rather
-                # than after their interval. Long-standing behaviour, left
-                # alone deliberately -- but it means the ledger's first rows
-                # are written at boot.
-                last = last_run.get(config.name, 0.0)
-                if now - last >= config.interval_seconds:
-                    # The pre-existing broad handler, kept. It no longer wraps
-                    # the job itself -- `_execute_and_record` catches that and
-                    # turns it into a `failed` row -- so what is left for it to
-                    # guard is the recording step raising something other than
-                    # `sqlite3.Error`. A curation pass must not die because
-                    # observability storage misbehaved.
-                    try:
-                        result = await self._execute_and_record(config, job, TRIGGER_SCHEDULED)
-                        if not result.success:
-                            logger.error("Job %s failed: %s", config.name, result.error)
-                    except Exception as e:
-                        logger.error("Job %s could not be recorded: %s", config.name, e)
-                    last_run[config.name] = now
+            await self.run_due_jobs()
 
             # Sleep before next check (1 minute granularity)
             await asyncio.sleep(60)
+
+    async def run_due_jobs(self) -> None:
+        """Run one scheduled pass: every enabled job whose interval has elapsed.
+
+        A due `requires_llm` job is skipped while `defer_llm_jobs()` is true,
+        and its `last_run` is left where it was, so it is still due on the next
+        pass and runs on the first one after the deferral ends. The start and
+        the end of a deferral are logged once each, not on every pass.
+        """
+        now = self._clock()
+
+        for config, job in self._jobs:
+            if not config.enabled:
+                continue
+
+            # `_last_run.get(name, 0.0)` makes every enabled job due on the
+            # first pass, so all of them run at scheduler start rather than
+            # after their interval. Long-standing behaviour, left alone
+            # deliberately -- but it means the ledger's first rows are written
+            # at boot.
+            last = self._last_run.get(config.name, 0.0)
+            if now - last < config.interval_seconds:
+                continue
+
+            if config.requires_llm and self._llm_jobs_deferred():
+                continue
+
+            # The pre-existing broad handler, kept. It no longer wraps the job
+            # itself -- `_execute_and_record` catches that and turns it into a
+            # `failed` row -- so what is left for it to guard is the recording
+            # step raising something other than `sqlite3.Error`. A curation
+            # pass must not die because observability storage misbehaved.
+            try:
+                result = await self._execute_and_record(config, job, TRIGGER_SCHEDULED)
+                if not result.success:
+                    logger.error("Job %s failed: %s", config.name, result.error)
+            except Exception as e:
+                logger.error("Job %s could not be recorded: %s", config.name, e)
+            self._last_run[config.name] = now
+
+    def _llm_jobs_deferred(self) -> bool:
+        """Read the deferral predicate, logging only when its answer changes."""
+        deferred = self._defer_llm_jobs is not None and self._defer_llm_jobs()
+        if deferred and not self._deferring:
+            logger.info(
+                "Deferring LLM curation jobs: the GPU is yielded to gaming mode; "
+                "they run on the first pass after it ends"
+            )
+        elif not deferred and self._deferring:
+            logger.info("LLM curation job deferral ended: running the deferred jobs")
+        self._deferring = deferred
+        return deferred

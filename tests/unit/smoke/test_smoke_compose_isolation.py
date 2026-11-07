@@ -626,7 +626,7 @@ class TestHarnessShape:
     def test_backend_runs_as_uid_1000(self, compose):
         user = compose["services"][BACKEND_SERVICE].get("user")
         assert user == "1000:1000", (
-            f"{BACKEND_SERVICE} runs as {user!r}. docker/backend/Dockerfile:114 "
+            f"{BACKEND_SERVICE} runs as {user!r}. docker/backend/Dockerfile:121-122 "
             f"chowns /app to appuser (uid 1000); any other uid cannot write "
             f"./smoke-state through the bind mount."
         )

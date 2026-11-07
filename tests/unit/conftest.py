@@ -4,6 +4,7 @@ Shared fixtures for all unit tests. Import specific fixtures from
 tests/mocks/fixtures/ using Pattern B (explicit import + noqa).
 """
 
+import os
 import tempfile
 from pathlib import Path
 
@@ -84,9 +85,17 @@ def _guard_unit_tier_against_live_neo4j(monkeypatch):
     This is a live-write guard, not a hermeticity guarantee: it stops
     `Neo4jConnection.connect()` from reaching the live graph, but does not by
     itself make a test deterministic, network-free, or free of other I/O.
+
+    It also points MIST_LIVE_INSTANCES_FILE at `os.devnull`, an empty live-
+    instance registry. Without it every call to `assert_isolated_root` would
+    read the host's `~/.mist/live-instances`, so a unit test's verdict would
+    depend on which instances the machine running it has registered, and an
+    unreadable host registry would fail tests that never mention one. A test
+    that needs a registry writes one under `tmp_path` and overrides this.
     """
     monkeypatch.setenv("MIST_EVAL_ISOLATION", "1")
     monkeypatch.delenv("MIST_EVAL_NEO4J_HOSTS", raising=False)
+    monkeypatch.setenv("MIST_LIVE_INSTANCES_FILE", os.devnull)
 
 
 @pytest.fixture
