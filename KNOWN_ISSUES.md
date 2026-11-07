@@ -153,8 +153,8 @@ the adjacent findings it deliberately left out of scope.
   daily instance holds the GPU. The fix is moving them onto `docker-compose.dev.yml`.
 
 - [ ] **Delegates cannot run a dev stack.** The worker runner starts containers with
-  `--network none` and no Docker socket (`hooks/run_in_container.py:1101` in the Claude Code
-  configuration, outside this repository), so a delegate can neither start nor reach one.
+  `--network none` and no Docker socket (`hooks/run_in_container.py:1101` in the delegate
+  runner's configuration, outside this repository), so a delegate can neither start nor reach one.
   Letting it do so is a configuration change there.
 
 - [ ] **A turn that dead-letters again holds `/health` at `degraded`.** After
@@ -201,7 +201,7 @@ the adjacent findings it deliberately left out of scope.
   acceptable for local dev but had to be tightened before the server is network-exposed.
   `CORSMiddleware` now allows only the origins in `MIST_ALLOWED_ORIGINS` (`backend/origins.py`,
   `backend/server.py:1608-1616`), and a WebSocket from any other browser origin is closed with
-  1008 (`backend/server.py:1950-1954`).
+  1008 (`backend/server.py:1953-1956`).
 
 - [ ] **server.py:170 -- No input size validation.** WebSocket `receive_json()`
   accepts arbitrarily large payloads. Could OOM on malicious input.

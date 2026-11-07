@@ -200,5 +200,5 @@ instead of letting a factory build a real one.
 
 ---
 
-Last Updated: 2026-10-06 (claude-md-review: duplicates of CONTRIBUTING.md,
-TESTING.md, the global CLAUDE.md and the harness removed; stale stack facts fixed)
+Last Updated: 2026-11-06 (reframed to the 6 Nov bar and order; earlier, 2026-10-06:
+duplicates of CONTRIBUTING.md, TESTING.md, the global CLAUDE.md and the harness removed)
