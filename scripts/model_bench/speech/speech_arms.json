@@ -7,7 +7,7 @@
       "image": "mist-speech-bench-qwen3",
       "device": "cuda",
       "streaming": true,
-      "packages": {"faster-qwen3-tts": "0.5.4", "transformers": "5.22.2", "qwen-tts-hf": "0.1.1.post1", "torch": "2.6.0+cu124"},
+      "packages": {"faster-qwen3-tts": "0.5.4", "transformers": "5.16.1", "qwen-tts-hf": "0.1.1.post1", "torch": "2.6.0+cu124"},
       "model": {"repository": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "revision": "85e237c1", "bytes": 2493919668},
       "licence": "Apache-2.0",
       "settings": {

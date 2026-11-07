@@ -218,7 +218,7 @@ def test_the_constraints_hold_torch_and_its_companions_at_the_backend_versions()
 def test_the_qwen3_requirements_pin_faster_qwen3_tts_and_its_stack():
     assert pins(BENCH_DIR / "requirements-qwen3.txt") == [
         "faster-qwen3-tts==0.5.4",
-        "transformers==5.22.2",
+        "transformers==5.16.1",
         "qwen-tts-hf==0.1.1.post1",
     ]
 

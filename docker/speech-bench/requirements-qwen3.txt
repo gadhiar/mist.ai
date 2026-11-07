@@ -1,5 +1,9 @@
 # Qwen3-TTS 0.6B CustomVoice through faster-qwen3-tts (mist-model-host plan v2, engine facts).
 # faster-qwen3-tts 0.5.4 needs transformers 5.15.1 or later and below 6, and pulls qwen-tts-hf.
+# transformers is pinned at 5.16.1 from host step H2's trial (plan v3, T9): of the releases
+# faster-qwen3-tts 0.5.4 allows, each swapped into a copy of this image, only 5.16.0 and 5.16.1
+# construct the model. 5.15.1 needs an older tokenizers; every later release fails to import or
+# to construct it, the newest ones on qwen-tts-hf's tokenizer `upsample` property.
 faster-qwen3-tts==0.5.4
-transformers==5.22.2
+transformers==5.16.1
 qwen-tts-hf==0.1.1.post1
