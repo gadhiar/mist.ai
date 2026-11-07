@@ -102,7 +102,8 @@ ONTOLOGY_VERSION: str = ONTOLOGY_V1_0_0.version
 # 2026-11-06-r6: Stage 2 list pass (MIS-194), a code change with no prompt
 # change -- a structured turn is split into units that keep their parent
 # context and extracted four units a call, each later call seeing up to eight
-# earlier units. Bumped so history is re-extracted under it at the next cutover.
+# earlier units; a batch cut short at the output limit is split and retried.
+# Bumped so history is re-extracted under it at the next cutover.
 EXTRACTION_VERSION: str = "2026-11-06-r6"
 
 
@@ -148,12 +149,13 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-06-r6",
-        code_identity="ci1-dfbaabad8a62dc502cc5dabf1de50cbb2b963210b0ea39d96a5636191dc3c5aa",
+        code_identity="ci1-4894d508798bcaa72ff1d24421c85db43e14b640ea8f7d3de2433ce15a281505",
         date="2026-11-06",
         reason=(
             "Stage 2 list pass (MIS-194): structure_splitter joins the covered code, and "
             "a structured turn is extracted in batches of LIST_BATCH_MAX_UNITS = 4 units "
-            "with LIST_CONTEXT_MAX_UNITS = 8 earlier units as context. Re-extracts history."
+            "with LIST_CONTEXT_MAX_UNITS = 8 earlier units as context; a batch cut short "
+            "at EXTRACT_MAX_TOKENS is split in two and retried. Re-extracts history."
         ),
     ),
 )

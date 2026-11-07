@@ -229,9 +229,7 @@ async def test_a_thirty_item_list_is_extracted_four_units_a_call():
     assert response.stage2_calls == 8
     assert response.attempts == 1
     item_ids = [e["id"] for e in response.payload.entities if e["id"] != "user"]
-    assert item_ids == [
-        _slug(f"Things I want to try this year: thing {n}") for n in range(1, 31)
-    ]
+    assert item_ids == [_slug(f"Things I want to try this year: thing {n}") for n in range(1, 31)]
     assert [e["id"] for e in response.payload.entities].count("user") == 1
     assert len(response.payload.relationships) == 30
 
@@ -404,3 +402,114 @@ async def test_the_service_reports_stage2_calls(client, fake_llama_state):
     assert response.status_code == 200
     assert response.json()["stage2_calls"] == 2
     assert len(fake_llama_state.chat_requests) == 3
+
+
+# ---------------------------------------------------------------------------
+# A batch the output limit cuts short
+# ---------------------------------------------------------------------------
+
+_CUT_SHORT = LLMResponse(content='{"entities": [{"id": "user", "na', finish_reason="length")
+
+
+def cut_short_when(predicate: Callable[[str], bool]) -> StageAnswer:
+    """Cut the output short for every batch whose rendered text `predicate` accepts."""
+
+    def answer(request: LLMRequest, call: int) -> LLMResponse:
+        if predicate(batch_text(request)):
+            return _CUT_SHORT
+        return echo(request, call)
+
+    return answer
+
+
+def _is_repair(request: LLMRequest) -> bool:
+    return len(request.messages) > 2
+
+
+@pytest.mark.asyncio
+async def test_a_batch_cut_short_is_split_down_to_single_units():
+    text = numbered_list(5)
+    units = split_structured(text)
+    llm = ScriptedLLM(cut_short_when(lambda batch: "\n" in batch))
+
+    response = await make_engine(llm).run(make_request(text))
+
+    # The first batch of four splits into two, then into four single units;
+    # the second batch is one unit already.
+    assert [batch_text(r).count("\n") + 1 for r in llm.stage2_requests] == [4, 2, 1, 1, 2, 1, 1, 1]
+    assert response.stage2_calls == 8
+    assert response.attempts == 1
+    item_ids = [e["id"] for e in response.payload.entities if e["id"] != "user"]
+    assert item_ids == [_slug(render_unit(u)) for u in units]
+    assert not any(_is_repair(r) for r in llm.stage2_requests)
+
+
+@pytest.mark.asyncio
+async def test_each_half_sees_the_units_before_it():
+    text = numbered_list(5)
+    units = split_structured(text)
+    llm = ScriptedLLM(cut_short_when(lambda batch: "\n" in batch))
+
+    await make_engine(llm).run(make_request(text))
+
+    singles = [r for r in llm.stage2_requests if "\n" not in batch_text(r)]
+    assert [batch_text(r) for r in singles] == [render_unit(u) for u in units]
+    for index, request in enumerate(singles):
+        assert context_lines(request) == [f"[user]: {render_unit(u)}" for u in units[:index]]
+
+
+@pytest.mark.asyncio
+async def test_a_single_unit_cut_short_fails_the_turn_without_a_repair_retry():
+    llm = ScriptedLLM(cut_short_when(lambda batch: True))
+
+    with pytest.raises(UpstreamLLMError, match="extraction output truncated at max_tokens"):
+        await make_engine(llm).run(make_request("I use Rust for my backend work"))
+
+    assert len(llm.stage2_requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_one_list_item_cut_short_on_its_own_fails_the_turn():
+    text = numbered_list(5)
+    llm = ScriptedLLM(cut_short_when(lambda batch: "thing 3" in batch))
+
+    with pytest.raises(UpstreamLLMError, match="extraction output truncated at max_tokens"):
+        await make_engine(llm).run(make_request(text))
+
+    assert not any(_is_repair(r) for r in llm.stage2_requests)
+    assert batch_text(llm.stage2_requests[-1]) == "Things I want to try this year: thing 3"
+
+
+@pytest.mark.asyncio
+async def test_a_cut_short_repair_splits_the_batch_too():
+    def answer(request: LLMRequest, call: int) -> LLMResponse:
+        if call == 1:
+            return LLMResponse(content="not json", finish_reason="stop")
+        if call == 2:
+            return _CUT_SHORT
+        return echo(request, call)
+
+    llm = ScriptedLLM(answer)
+
+    response = await make_engine(llm).run(make_request(numbered_list(2)))
+
+    assert _is_repair(llm.stage2_requests[1])
+    assert [batch_text(r).count("\n") + 1 for r in llm.stage2_requests] == [2, 2, 1, 1]
+    assert response.stage2_calls == 4
+    assert response.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_an_unparsable_output_that_was_not_cut_short_keeps_the_repair_retry():
+    def answer(request: LLMRequest, call: int) -> LLMResponse:
+        if call == 1:
+            return LLMResponse(content="not json", finish_reason="stop")
+        return echo(request, call)
+
+    llm = ScriptedLLM(answer)
+
+    response = await make_engine(llm).run(make_request("I use Rust for my backend work"))
+
+    assert [_is_repair(r) for r in llm.stage2_requests] == [False, True]
+    assert response.attempts == 2
+    assert response.stage2_calls == 2

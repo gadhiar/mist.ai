@@ -189,7 +189,7 @@ class ExtractionServiceError(MistError):
 
 
 class UpstreamLLMError(ExtractionServiceError):
-    """The configured llama-server call failed, or repair retries were exhausted.
+    """The llama-server call failed, repair retries ran out, or one unit's output was cut short.
 
     Maps to HTTP 502 / `ErrorCode.UPSTREAM_LLM`.
     """
@@ -199,6 +199,14 @@ class ExtractionTimeoutError(ExtractionServiceError):
     """An LLM call exceeded `ServiceSettings.llm_timeout_seconds`.
 
     Maps to HTTP 504 / `ErrorCode.TIMEOUT`.
+    """
+
+
+class _OutputTruncatedError(ExtractionServiceError):
+    """A Stage 2 output stopped at `EXTRACT_MAX_TOKENS` (`finish_reason == "length"`).
+
+    Internal to Stage 2: the batch is split and retried, and only a single
+    unit cut short leaves the engine, as `UpstreamLLMError`.
     """
 
 
@@ -561,10 +569,50 @@ class ExtractionEngine:
         run = _Stage2Run()
         start = 0
         for batch in batch_units(units, LIST_BATCH_MAX_UNITS):
-            batch_input = _batch_input(pre_processed, units, start, len(batch))
-            run.payloads.append(await self._extract_batch(batch_input, run))
+            await self._extract_units(pre_processed, units, start, len(batch), run)
             start += len(batch)
         return run
+
+    async def _extract_units(
+        self,
+        pre_processed: PreProcessedInput,
+        units: Sequence[InputUnit],
+        start: int,
+        size: int,
+        run: _Stage2Run,
+    ) -> None:
+        """Extract `units[start:start + size]`, halving the batch while its output is cut short.
+
+        An output that stops at `EXTRACT_MAX_TOKENS` is never repaired: the
+        repair retry would ask for the same output under the same limit. The
+        batch is split in two and each half extracted in turn, each seeing
+        the units before it as context, down to single units.
+
+        Raises:
+            UpstreamLLMError: A single unit's output was still cut short, or
+                a call failed or stayed unparsable.
+            ExtractionTimeoutError: An attempt exceeded the LLM timeout.
+        """
+        batch_input = _batch_input(pre_processed, units, start, size)
+        try:
+            payload = await self._extract_batch(batch_input, run)
+        except _OutputTruncatedError as exc:
+            if size == 1:
+                raise UpstreamLLMError(
+                    f"extraction output truncated at max_tokens ({EXTRACT_MAX_TOKENS}) "
+                    "on a single unit"
+                ) from exc
+            half = (size + 1) // 2
+            logger.warning(
+                "Extraction output cut short at max_tokens on %d units; retrying as %d and %d",
+                size,
+                half,
+                size - half,
+            )
+            await self._extract_units(pre_processed, units, start, half, run)
+            await self._extract_units(pre_processed, units, start + half, size - half, run)
+            return
+        run.payloads.append(payload)
 
     async def _extract_batch(
         self, batch_input: PreProcessedInput, run: _Stage2Run
@@ -608,6 +656,11 @@ class ExtractionEngine:
             except _LLM_TRANSPORT_ERRORS as exc:
                 raise UpstreamLLMError(f"Extraction LLM call failed: {exc}") from exc
 
+            if response.finish_reason == "length":
+                raise _OutputTruncatedError(
+                    f"Extraction output reached max_tokens={EXTRACT_MAX_TOKENS}"
+                    f" (attempt {attempt}/{self._settings.max_attempts})"
+                )
             raw = self._adapter.final_text(response)
             try:
                 payload = _strict_extraction_payload(raw)
