@@ -173,7 +173,7 @@ Saturday (`MIST_FIXED_CLOCK_PIN`, `scripts/model_bench/probes/extraction.py:57`,
 its `--recorded-at`), so the gold is deterministic while a run keeps that default; a run with
 another `--recorded-at` cannot be scored on these probes. Label at the precision the expression
 states: "yesterday" is `2026-06-12`, "two weeks ago" is `2026-05-30`, "last month" is `2026-05`,
-"last year" is `2026`. "Last <weekday>" is the latest such day before 2026-06-13, and "next
+"last year" is `2025`. "Last <weekday>" is the latest such day before 2026-06-13, and "next
 <weekday>" the first one after it. The resolved value goes where an absolute date would: on the
 edge as `valid_from` or `valid_to` for a stative fact, or as a `Date` entity with `OCCURRED_ON`
 for an event, but only when the expression resolves to a single day, because a Date id is a full
