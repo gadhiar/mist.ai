@@ -159,6 +159,17 @@ were removed.
 
 ---
 
+## Removed Files
+
+### 1. `static/test.mp3`
+
+An upstream asset, added to this repository with the fork (commit 144fb8c), played by the
+web UI's "test output" button to check the selected speaker. Removed on 2026-11-07 so that the
+repository tracks no audio files. `static/app.js` is unchanged, so the legacy "test output"
+button (`static/app.js:92`) now plays nothing.
+
+---
+
 ## Unmodified Files
 
 The following files remain unchanged from the original repository:
