@@ -54,6 +54,10 @@ sys.path.insert(0, str(project_root))
 # qualified name removes both hazards outright.
 from backend.config import DEFAULT_CONFIG  # isort:skip
 from backend.errors import MistError  # isort:skip
+from backend.event_store.status_intervals import (  # isort:skip
+    degraded_beneath,
+    record_status_tick,
+)
 from backend.voice_processor import VoiceProcessor  # isort:skip
 from backend.factories import (  # isort:skip
     build_curation_scheduler,
@@ -264,6 +268,18 @@ _gpu_yield: GpuYield | None = None
 # reaches `derive_status`'s `probe_loop == "dead"` branch, because the checks
 # mapping is empty in that case and the empty-mapping guard returns first.
 PROBE_LOOP_NOT_STARTED = "not_started"
+
+# The uptime ledger's tick loop (`uptime_record_loop`). A row continues across
+# a silence of up to 2.5 periods, so one late or skipped tick does not split
+# it, while a backend that stopped for longer leaves its gap unrecorded.
+UPTIME_RECORD_ENV = "MIST_UPTIME_RECORD_S"
+DEFAULT_UPTIME_RECORD_S = 60.0
+UPTIME_GAP_PERIODS = 2.5
+# The first tick waits for every health check to report once, so a boot is
+# not recorded as the `degraded` that unmeasured checks derive to; a probe
+# that never reports does not hold the ledger back for longer than this.
+UPTIME_FIRST_TICK_WAIT_S = 60.0
+UPTIME_FIRST_TICK_POLL_S = 1.0
 
 
 async def broadcast_messages():
@@ -1095,6 +1111,150 @@ def _build_health_registry(
     )
 
 
+def uptime_record_s() -> float:
+    """The uptime ledger's tick period in seconds, from `MIST_UPTIME_RECORD_S`.
+
+    A value that is not a positive number is logged and replaced by the
+    default rather than raised, as `gpu_yield_poll_s` does: it is read while
+    the backend starts, and a typo here should not stop it.
+    """
+    raw = (os.environ.get(UPTIME_RECORD_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_UPTIME_RECORD_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+    if value > 0:
+        return value
+    logger.error(
+        "%s=%r is not a positive number; using %s",
+        UPTIME_RECORD_ENV,
+        raw,
+        DEFAULT_UPTIME_RECORD_S,
+    )
+    return DEFAULT_UPTIME_RECORD_S
+
+
+def _every_check_measured(snapshot: dict) -> bool:
+    """Whether every check in a registry snapshot has reported at least once."""
+    checks = snapshot.get("checks") or {}
+    return bool(checks) and all(check.get("age_seconds") is not None for check in checks.values())
+
+
+async def uptime_record_loop(
+    db_path: str,
+    snapshot: "Callable[[], dict]",
+    *,
+    period_s: float,
+    tick: "Callable[..., None]" = record_status_tick,
+    sleep: "Callable[[float], Awaitable[object]]" = asyncio.sleep,
+    clock: "Callable[[], datetime]" = lambda: datetime.now(UTC),
+) -> None:
+    """Record the derived `/health` status in the uptime ledger until cancelled.
+
+    The first tick waits until every check in the snapshot has been measured,
+    checking each `UPTIME_FIRST_TICK_POLL_S`, for at most
+    `UPTIME_FIRST_TICK_WAIT_S`, and then ticks anyway with `first_tick=True`
+    so a restart starts a new row. A first tick that fails leaves the next
+    one first as well: otherwise a quick restart would extend the previous
+    process's row across the time this one was down.
+
+    Each tick runs `tick` in a worker thread through `asyncio.to_thread`: it
+    may wait up to 5 s on another writer's lock, which must not stall the
+    event loop that carries the WebSocket. A `sqlite3.Error` or `MistError`
+    is logged and that tick skipped; the loop goes on.
+
+    Args:
+        db_path: The event store's database file.
+        snapshot: Renders the health registry's current snapshot.
+        period_s: Seconds between ticks; a row continues across a silence of
+            up to `UPTIME_GAP_PERIODS` periods.
+        tick: `record_status_tick`; injected in tests.
+        sleep: `asyncio.sleep`; injected in tests.
+        clock: The wall clock, aware; injected in tests.
+    """
+    waited = 0.0
+    while not _every_check_measured(snapshot()) and waited < UPTIME_FIRST_TICK_WAIT_S:
+        await sleep(UPTIME_FIRST_TICK_POLL_S)
+        waited += UPTIME_FIRST_TICK_POLL_S
+
+    first_tick = True
+    max_gap_s = UPTIME_GAP_PERIODS * period_s
+    while True:
+        current = snapshot()
+        try:
+            await asyncio.to_thread(
+                tick,
+                db_path,
+                current["status"],
+                degraded_beneath(current),
+                clock(),
+                max_gap_s=max_gap_s,
+                first_tick=first_tick,
+            )
+        except (sqlite3.Error, MistError) as exc:
+            logger.warning("Uptime ledger tick skipped: %s", exc)
+        else:
+            first_tick = False
+        await sleep(period_s)
+
+
+def _build_uptime_recorder(
+    event_store: "EventStoreProvider | None",
+    snapshot: "Callable[[], dict]",
+    period_s: float,
+) -> "Callable[[], Awaitable[None]] | None":
+    """Bind the uptime tick loop to the event store's database file, or None.
+
+    None when there is no event store (switched off, or the handler that owns
+    it was not built): the ledger lives in that store, so nothing is recorded.
+    Also None for an in-memory store, which a second connection cannot reach.
+
+    Args:
+        event_store: The live handler's event store.
+        snapshot: Renders the health registry's current snapshot.
+        period_s: `uptime_record_s()`.
+
+    Returns:
+        A no-argument coroutine function the caller schedules as a task.
+    """
+    if event_store is None:
+        logger.info("Uptime ledger: no event store, so no uptime is recorded")
+        return None
+    db_path = getattr(event_store, "db_path", None)
+    if db_path is None or str(db_path) == ":memory:":
+        logger.info("Uptime ledger: the event store has no database file; not recording")
+        return None
+    return functools.partial(uptime_record_loop, str(db_path), snapshot, period_s=period_s)
+
+
+def _on_uptime_loop_done(task: "asyncio.Task") -> None:
+    """Done-callback for the uptime tick loop; logs a death, ignores a cancel.
+
+    The same cancellation guard as `_on_broadcaster_done`. The loop survives
+    `sqlite3.Error` and `MistError`, so anything that ends it is a fault, and
+    every day after it reads as unrecorded; this line says why.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Uptime ledger loop died: %s", exc, exc_info=exc)
+    else:
+        logger.error("Uptime ledger loop returned; no further uptime is recorded")
+
+
+async def _stop_uptime_recorder(task: "asyncio.Task | None") -> None:
+    """Cancel the uptime tick loop and wait for the cancel to land."""
+    if task is None:
+        return
+    task.cancel()
+    # `return_exceptions` keeps a loop that already died (logged by its
+    # done-callback) from raising here.
+    await asyncio.gather(task, return_exceptions=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
@@ -1237,6 +1397,17 @@ async def lifespan(app: FastAPI):
     )
     health_probe_task = asyncio.create_task(_health_registry.run_forever(), name="health-probes")
     health_probe_task.add_done_callback(_on_health_probe_loop_done)
+
+    # The uptime ledger samples the registry above into the event store, so it
+    # starts after both exist; `voice_processor.initialize()` has returned, so
+    # the handler that owns the event store is the live one.
+    uptime_task: asyncio.Task | None = None
+    uptime_recorder = _build_uptime_recorder(
+        _health_event_store(), _health_snapshot, uptime_record_s()
+    )
+    if uptime_recorder is not None:
+        uptime_task = asyncio.create_task(uptime_recorder(), name="uptime-ledger")
+        uptime_task.add_done_callback(_on_uptime_loop_done)
 
     # Start system-status task (5s interval per ADR-017 system_status).
     # GPU init is best-effort; failure produces placeholder GPU blocks
@@ -1411,6 +1582,7 @@ async def lifespan(app: FastAPI):
     health_status_task.cancel()
     heartbeat_task.cancel()
     health_probe_task.cancel()
+    await _stop_uptime_recorder(uptime_task)
     broadcaster_task.cancel()
     if gpu_yield_task is not None:
         gpu_yield_task.cancel()
@@ -1654,6 +1826,59 @@ async def usage_turns_per_day(days: int = Query(7, ge=1, le=90)):
         result = await asyncio.to_thread(build_turns_per_day, db_path, days=days)
     except UsageStoreUnavailableError as exc:
         logger.warning("GET /usage/turns-per-day: %s", exc)
+        return JSONResponse(status_code=503, content={"error": "store_unavailable"})
+    return result.to_payload()
+
+
+@app.get("/usage/uptime")
+async def usage_uptime(days: int = Query(7, ge=1, le=90)):
+    """Seconds per local day that MIST was healthy, degraded, yielded or unhealthy.
+
+    Counts only: this is how the lead reads MIST's uptime without opening the
+    event store or a conversation. The body is `{"timezone", "current",
+    "days": [{"date", "healthy_s", "degraded_s", "yielded_s", "unhealthy_s",
+    "unrecorded_s", "yielded_degraded_s"}]}`, a zone name, a status word,
+    dates and integers, with no session id, utterance or time finer than a
+    date.
+
+    - The seconds come from the uptime ledger the server's own tick loop
+      writes every `MIST_UPTIME_RECORD_S` seconds. Time with no tick behind
+      it, because MIST was not running or had not yet ticked, is
+      unrecorded, never up: an interval ends at its last tick.
+    - Each day's first five values sum to that local day's real length
+      (86400 s, or 82800 s or 90000 s on a DST change), and today's to the
+      seconds elapsed so far. `yielded_s` is time with the LLM stopped on
+      purpose to free the GPU (gaming mode); `yielded_degraded_s` is the part
+      of it during which another check was also not up, and is not one of
+      the five.
+    - `current` is the live `/health` status at the time of the request,
+      not a stored row.
+    - `days` (1-90, default 7) is dense, oldest first, and ends today in
+      `timezone`; out of range is a 422 from the query validation.
+    - `timezone` is `MIST_USAGE_TIMEZONE`, default UTC; an unknown name falls
+      back to UTC, is logged, and is reported here as `UTC`.
+    - A store that is missing, locked or unreadable is a 503 with
+      `{"error": "store_unavailable"}`. The store is opened read-only through
+      a `mode=ro` URI, never through `EventStore`, so a missing file is not
+      created.
+
+    The read runs in a worker thread, as `/usage/turns-per-day`'s does.
+    """
+    from fastapi.responses import JSONResponse
+
+    from backend.event_store.status_intervals import (
+        UptimeStoreUnavailableError,
+        build_uptime_per_day,
+    )
+    from backend.event_store.usage import resolve_store_path
+    from backend.knowledge.config import EventStoreConfig
+
+    db_path = resolve_store_path(EventStoreConfig.from_env().db_path)
+    current = _health_snapshot()["status"]
+    try:
+        result = await asyncio.to_thread(build_uptime_per_day, db_path, current=current, days=days)
+    except UptimeStoreUnavailableError as exc:
+        logger.warning("GET /usage/uptime: %s", exc)
         return JSONResponse(status_code=503, content={"error": "store_unavailable"})
     return result.to_payload()
 
