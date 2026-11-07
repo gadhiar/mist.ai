@@ -1,5 +1,6 @@
 """Model Manager - Handles loading and lifecycle of all ML models."""
 
+import gc
 import logging
 import os
 import queue
@@ -14,6 +15,7 @@ sys.path.insert(0, "dependencies/csm")
 
 import torch
 
+from backend.errors import GpuYieldedError
 from backend.llm import LLMRequest, StreamingLLMProvider
 from src.multimodal.stt import WhisperSTT
 from src.multimodal.text_preprocessing import preprocess_text_for_tts
@@ -73,6 +75,11 @@ class ModelManager:
         self._vault_sidecar = vault_sidecar
         self._invalidation_bus = invalidation_bus
         self.stt = None
+        # The STT lock. `transcribe_audio` holds it from its read of `self.stt`
+        # to the end of the transcription, and `release_gpu_models` takes it
+        # before dropping the model, so gaming mode never frees Whisper under
+        # a transcription that is still using it.
+        self._stt_lock = threading.Lock()
         self.tts = None
         self.llm_model = config.llm_model
         self.event_loop = event_loop
@@ -110,14 +117,26 @@ class ModelManager:
         self.tts_generation_id = 0  # Track which generation is active
         self.tts_lock = threading.Lock()
 
-    def load_all_models(self):
-        """Load all models (STT, TTS, LLM)."""
+    def load_all_models(self, *, yielded: bool = False):
+        """Load all models (STT, TTS, LLM).
+
+        Args:
+            yielded: True when the backend boots while gaming mode holds the
+                GPU. Whisper and the LLM warmup are then skipped: mist-llm is
+                stopped, so the warmup request would fail the boot, and Whisper
+                would take GPU memory from the game. The embedding model is
+                still warmed on its configured device. Whisper is loaded by
+                `reacquire_gpu_models` when gaming mode ends.
+        """
         logger.info("Loading all models...")
         start = time.time()
 
         # Load STT
-        logger.info("1/3 Loading Whisper STT...")
-        self.stt = WhisperSTT(model_size=self.config.whisper_model)
+        if yielded:
+            logger.info("1/3 GPU yielded to gaming mode - skipping Whisper STT")
+        else:
+            logger.info("1/3 Loading Whisper STT...")
+            self.stt = WhisperSTT(model_size=self.config.whisper_model)
 
         # Start TTS worker thread (CSM pattern) - only if TTS is enabled
         if self.config.tts_enabled:
@@ -131,8 +150,11 @@ class ModelManager:
             logger.info("2/3 TTS disabled - skipping TTS model loading")
 
         # Warmup LLM
-        logger.info("3/3 Warming up LLM...")
-        if self._llm_provider is not None:
+        if yielded:
+            logger.info("3/3 GPU yielded to gaming mode - skipping the LLM warmup")
+        else:
+            logger.info("3/3 Warming up LLM...")
+        if not yielded and self._llm_provider is not None:
             warmup_request = LLMRequest(
                 messages=[{"role": "user", "content": "hi"}],
                 max_tokens=1,
@@ -379,8 +401,67 @@ class ModelManager:
             raise RuntimeError("TTS warmup failed")
 
     def transcribe_audio(self, audio_data, sample_rate=16000):
-        """Transcribe audio using Whisper."""
-        return self.stt.transcribe_audio(audio_data, sample_rate)
+        """Transcribe audio using Whisper.
+
+        Holds the STT lock for the whole transcription, so `release_gpu_models`
+        waits for it. Concurrent transcriptions therefore run one at a time.
+
+        Raises:
+            GpuYieldedError: Whisper is not loaded because gaming mode holds the
+                GPU, or its reload after gaming mode has not yet succeeded.
+        """
+        with self._stt_lock:
+            stt = self.stt
+            if stt is None:
+                raise GpuYieldedError(
+                    "Whisper is not loaded: the GPU is yielded to gaming mode or still reloading"
+                )
+            return stt.transcribe_audio(audio_data, sample_rate)
+
+    def release_gpu_models(self) -> None:
+        """Drop Whisper and return its GPU memory to the driver, for gaming mode.
+
+        Takes the STT lock, so a transcription in flight finishes first, drops
+        `self.stt`, and releases the lock before the collection, which needs no
+        lock. Idempotent: with Whisper already dropped it does nothing. Touches
+        no TTS state; a backend with TTS on builds no gaming mode.
+
+        The process keeps its CUDA context, which PyTorch frees only at exit.
+        """
+        with self._stt_lock:
+            released = self.stt is not None
+            self.stt = None
+        if not released:
+            return
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("Released Whisper for gaming mode")
+
+    def reacquire_gpu_models(self) -> None:
+        """Reload Whisper after gaming mode ends.
+
+        The model loads holding no lock, and is assigned under the STT lock.
+        A failed load leaves `self.stt` None and returns what it allocated to
+        the driver before the error propagates, so the caller's retry starts
+        from a clean cache. `try`/`finally` rather than `except`, so every
+        error type propagates unchanged.
+        """
+        with self._stt_lock:
+            if self.stt is not None:
+                return
+        loaded = False
+        try:
+            stt = WhisperSTT(model_size=self.config.whisper_model)
+            loaded = True
+        finally:
+            if not loaded:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        with self._stt_lock:
+            self.stt = stt
+        logger.info("Reloaded Whisper after gaming mode")
 
     def trim_to_last_sentence(self, text: str) -> str:
         """Trim text to last complete sentence boundary (CSM pattern).

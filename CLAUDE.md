@@ -1,8 +1,10 @@
 # MIST.AI - Claude Code Guide
 
-MIST.AI (or M.I.S.T; not "Mist.AI", "mist" or "MIST") is a cognitive architecture research
-platform: a transparent, locally-run AI system with persistent memory. It is not a ChatGPT
-replacement and not a simple productivity assistant.
+MIST.AI (or M.I.S.T; not "Mist.AI", "mist" or "MIST") is a daily general assistant that runs
+locally with persistent memory and operates as a transparent cognitive architecture: she learns
+daily, grows, and every decision she makes is visible. The bar (ADR-042) is a reference assistant
+Raj chose: match its capabilities first, then its feel, and polish last. Real use is measured from
+real-origin turns, and every milestone names the metric that shows it.
 
 This repository is PUBLIC: treat everything committed or pushed here as world-readable. Raj's
 communication rules and delegation model live in the global `~/.claude/CLAUDE.md`; this file holds
@@ -198,5 +200,5 @@ instead of letting a factory build a real one.
 
 ---
 
-Last Updated: 2026-10-06 (claude-md-review: duplicates of CONTRIBUTING.md,
-TESTING.md, the global CLAUDE.md and the harness removed; stale stack facts fixed)
+Last Updated: 2026-11-06 (reframed to the 6 Nov bar and order; earlier, 2026-10-06:
+duplicates of CONTRIBUTING.md, TESTING.md, the global CLAUDE.md and the harness removed)

@@ -8,6 +8,7 @@ import contextlib
 import functools
 import json
 import logging
+import logging.handlers
 import os
 import sqlite3
 import sys
@@ -29,9 +30,10 @@ if sys.platform == "win32":
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8")
 
+import httpx
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 # `python backend/server.py` makes CPython prepend the SCRIPT's directory --
@@ -52,6 +54,10 @@ sys.path.insert(0, str(project_root))
 # qualified name removes both hazards outright.
 from backend.config import DEFAULT_CONFIG  # isort:skip
 from backend.errors import MistError  # isort:skip
+from backend.event_store.status_intervals import (  # isort:skip
+    degraded_beneath,
+    record_status_tick,
+)
 from backend.voice_processor import VoiceProcessor  # isort:skip
 from backend.factories import (  # isort:skip
     build_curation_scheduler,
@@ -60,10 +66,23 @@ from backend.factories import (  # isort:skip
     build_sidecar_index,
     build_vault_writer,
 )
+from backend.gpu_yield import (  # isort:skip
+    MARKER_NAME,
+    RESUME_FAILED_MESSAGE,
+    YIELDED_MESSAGE,
+    GpuYield,
+    gpu_yield_poll_s,
+    turn_refusal,
+)
 from backend.health import (  # isort:skip
+    BackupProbe,
     BroadcasterProbe,
     BroadcasterState,
     EventStoreProbe,
+    ExtractionBacklogProbe,
+    ExtractionServiceHealthSource,
+    ExtractionServiceProbe,
+    HealthProbeSettings,
     HealthRegistry,
     LLMProbe,
     Neo4jProbe,
@@ -76,8 +95,12 @@ from backend.knowledge.eval_isolation import (  # isort:skip
     is_hydration_isolation_active,
 )
 from backend.log_handler import WebSocketLogHandler  # isort:skip
+from backend.origins import allowed_origins, origin_allowed  # isort:skip
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from backend.extraction_backlog.dispatcher import ExtractionDispatcher
     from backend.interfaces import EventStoreProvider
     from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
     from backend.llm import StreamingLLMProvider
@@ -108,15 +131,48 @@ def _resolve_log_dir() -> Path:
     return Path(__file__).resolve().parents[1] / "logs"
 
 
+DEFAULT_LOG_MAX_BYTES = 50 * 1024 * 1024
+DEFAULT_LOG_BACKUP_COUNT = 5
+
+
+def _log_rotation_setting(name: str, default: int) -> int:
+    """Read one positive integer rotation setting, keeping the default for a bad value.
+
+    Zero is refused as well as negatives and non-numbers: `RotatingFileHandler`
+    never rolls over when either `maxBytes` or `backupCount` is 0, which would
+    silently restore the unbounded log this exists to prevent. Logged rather
+    than raised, because this runs first in `lifespan` and a typo in a log
+    setting should not stop the backend from starting.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value >= 1:
+        return value
+    logging.getLogger(__name__).error(
+        "%s=%r is not a positive integer; using %d", name, raw, default
+    )
+    return default
+
+
 def configure_file_logging(log_dir: Path) -> logging.Handler:
-    """Attach a persistent file handler for the backend log to the root logger.
+    """Attach a persistent, rotating file handler for the backend log to the root logger.
 
     Creates `log_dir` if it does not already exist and installs a
-    `FileHandler` for `log_dir / "mist-backend.log"` at DEBUG level, using
-    the same formatter as the console handler `logging.basicConfig` installs
-    at import time. Idempotent: if a `FileHandler` for that same file is
-    already on the root logger, that handler is returned instead of adding
-    a duplicate.
+    `RotatingFileHandler` for `log_dir / "mist-backend.log"` at DEBUG level,
+    using the same formatter as the console handler `logging.basicConfig`
+    installs at import time. Idempotent: if a `FileHandler` (rotating or not)
+    for that same file is already on the root logger, that handler is
+    returned instead of adding a duplicate.
+
+    The file rotates at `MIST_LOG_MAX_BYTES` (default 50 MiB) and keeps
+    `MIST_LOG_BACKUP_COUNT` old files (default 5, as `mist-backend.log.1` to
+    `.5`), both read at call time. A daily instance runs for weeks and logs
+    at DEBUG to a bind mount, so an unrotated file grows without bound.
 
     Only records emitted after this function runs reach the file. Records
     logged during module import, before `lifespan()` calls this, reach the
@@ -134,7 +190,11 @@ def configure_file_logging(log_dir: Path) -> logging.Handler:
     for handler in root_logger.handlers:
         if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == log_file:
             return handler
-    file_handler = logging.FileHandler(log_file)
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file,
+        maxBytes=_log_rotation_setting("MIST_LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES),
+        backupCount=_log_rotation_setting("MIST_LOG_BACKUP_COUNT", DEFAULT_LOG_BACKUP_COUNT),
+    )
     file_handler.setFormatter(logging.Formatter(_log_format))
     file_handler.setLevel(logging.DEBUG)  # Capture everything to disk
     root_logger.addHandler(file_handler)
@@ -185,6 +245,21 @@ _models_ready: bool = False
 _broadcaster_state: BroadcasterState | None = None
 _health_registry: HealthRegistry | None = None
 _health_probe_executor: Executor | None = None
+# Set when `_start_extraction_dispatcher` raised at boot. Without it a None
+# `extraction_dispatcher` reads the same whether the dispatcher failed to start
+# or was never configured, and the extraction checks would report a failed
+# start as `disabled_by_config`.
+_extraction_dispatcher_start_failed: bool = False
+# The extraction-service health check's own HTTP client. The dispatcher's client
+# carries `/v1/extract`'s read timeout (300 s by default) and a 5 s connect
+# timeout (`backend.factories.build_extraction_dispatcher`), and exists only
+# while a service-mode dispatcher runs; the probe needs a 2 s timeout on every
+# phase (httpx applies it to connect, read, write and pool separately) regardless.
+_extraction_health_client: httpx.AsyncClient | None = None
+EXTRACTION_HEALTH_CLIENT_TIMEOUT_S = 2.0
+# Gaming mode (`backend/gpu_yield.py`). None when `MIST_OPS_DIR` is unset, or
+# set while TTS is on: the backend is then never yielded.
+_gpu_yield: GpuYield | None = None
 
 # `probe_loop` value for "the registry was never constructed", distinct from
 # `health.py`'s `alive` / `dead`, which both describe a loop that ran. It is
@@ -193,6 +268,18 @@ _health_probe_executor: Executor | None = None
 # reaches `derive_status`'s `probe_loop == "dead"` branch, because the checks
 # mapping is empty in that case and the empty-mapping guard returns first.
 PROBE_LOOP_NOT_STARTED = "not_started"
+
+# The uptime ledger's tick loop (`uptime_record_loop`). A row continues across
+# a silence of up to 2.5 periods, so one late or skipped tick does not split
+# it, while a backend that stopped for longer leaves its gap unrecorded.
+UPTIME_RECORD_ENV = "MIST_UPTIME_RECORD_S"
+DEFAULT_UPTIME_RECORD_S = 60.0
+UPTIME_GAP_PERIODS = 2.5
+# The first tick waits for every health check to report once, so a boot is
+# not recorded as the `degraded` that unmeasured checks derive to; a probe
+# that never reports does not hold the ledger back for longer than this.
+UPTIME_FIRST_TICK_WAIT_S = 60.0
+UPTIME_FIRST_TICK_POLL_S = 1.0
 
 
 async def broadcast_messages():
@@ -318,7 +405,9 @@ async def health_status_loop(interval_seconds: float = 30.0) -> None:
     (per prototype ``edges-v10`` ``Offline persistent indicator``):
 
     - ``llm``: True iff ``voice_processor.models`` is initialized (LLM
-      backend loaded)
+      backend loaded) and gaming mode does not hold the GPU. While yielded,
+      or while the reload after gaming mode is failing, no model is loaded
+      for a turn, so it is False.
     - ``agent``: True iff ``voice_processor.models.knowledge.enabled``
       (knowledge subsystem operational; False means degraded MIST)
     - ``local``: True always (if this loop is running, the BE is up)
@@ -329,7 +418,7 @@ async def health_status_loop(interval_seconds: float = 30.0) -> None:
     while True:
         await asyncio.sleep(interval_seconds)
         try:
-            llm = bool(voice_processor and voice_processor.models)
+            llm = bool(voice_processor and voice_processor.models) and not _gpu_is_yielded()
             agent = bool(
                 voice_processor
                 and voice_processor.models
@@ -348,6 +437,95 @@ async def health_status_loop(interval_seconds: float = 30.0) -> None:
             await message_queue.put(payload)
         except Exception as e:  # noqa: BLE001
             logger.error("Health status emit failed: %s", e)
+
+
+def _gpu_is_yielded() -> bool:
+    """Whether gaming mode holds the GPU (`yielded` or `resume_failed`)."""
+    return _gpu_yield is not None and _gpu_yield.is_yielded()
+
+
+def _yielded_turn_refusal() -> dict | None:
+    """The error envelope an `audio` or `text` message gets while yielded, else None.
+
+    The existing ADR-017 error shape, retriable, with a fixed message per
+    state, so the client fails the turn fast and plainly. The message schemas
+    are unchanged.
+    """
+    if _gpu_yield is None:
+        return None
+    state = _gpu_yield.state()
+    if state == "normal":
+        return None
+    return turn_refusal(YIELDED_MESSAGE if state == "yielded" else RESUME_FAILED_MESSAGE)
+
+
+def _release_gpu_models() -> None:
+    """`GpuYield.on_yield`: release the live model manager's GPU models.
+
+    Reads `voice_processor` when called, because the model manager exists
+    only once `initialize()` has built it, after the `GpuYield` is built.
+    """
+    models = getattr(voice_processor, "models", None)
+    if models is not None:
+        models.release_gpu_models()
+
+
+def _reacquire_gpu_models() -> None:
+    """`GpuYield.on_resume`: reload the live model manager's GPU models."""
+    models = getattr(voice_processor, "models", None)
+    if models is not None:
+        models.reacquire_gpu_models()
+
+
+def _build_gpu_yield(ops_dir: str | None, *, tts_enabled: bool, poll_s: float) -> GpuYield | None:
+    """Build the gaming-mode watcher on `<ops_dir>/gpu-yielded`, or None.
+
+    None when `ops_dir` (`MIST_OPS_DIR`) is unset or blank: no gaming mode,
+    never yielded. None, with one error, when TTS is on as well: gaming mode
+    releases Whisper only, and Chatterbox cannot yet be released safely, so a
+    backend with TTS on does not yield.
+
+    Args:
+        ops_dir: The `MIST_OPS_DIR` value.
+        tts_enabled: `config.tts_enabled`.
+        poll_s: Marker poll interval (`MIST_GPU_YIELD_POLL_S`).
+    """
+    if ops_dir is None or not ops_dir.strip():
+        return None
+    if tts_enabled:
+        logger.error(
+            "MIST_OPS_DIR is set but TTS_ENABLED is true: gaming mode needs TTS off, so no "
+            "GPU yield is built and a stopped LLM will read down"
+        )
+        return None
+    return GpuYield(
+        Path(ops_dir.strip()) / MARKER_NAME,
+        _release_gpu_models,
+        _reacquire_gpu_models,
+        poll_s=poll_s,
+    )
+
+
+def _on_gpu_yield_loop_done(task: "asyncio.Task") -> None:
+    """Done-callback for the gaming-mode poll task; logs a death, ignores a cancel.
+
+    The same cancellation guard as `_on_broadcaster_done`: `lifespan` cancels
+    this task at every shutdown. `GpuYield` catches only `RuntimeError` and
+    `OSError` from its callbacks, so any other error ends the poll and freezes
+    the yield state; this one ERROR line, naming the class, keeps that from
+    being silent.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "Gaming-mode poll loop died (%s); the yield state is now frozen",
+            type(exc).__name__,
+            exc_info=exc,
+        )
+    else:
+        logger.error("Gaming-mode poll loop returned; the yield state is now frozen")
 
 
 def _extraction_status_payload(dispatcher) -> str:
@@ -778,7 +956,7 @@ def _event_store_configured() -> bool:
     return KnowledgeConfig.from_env().event_store.enabled
 
 
-async def _initialize_voice_processor(processor: VoiceProcessor) -> None:
+async def _initialize_voice_processor(processor: VoiceProcessor, *, yielded: bool = False) -> None:
     """Load the model stack and only then publish readiness.
 
     The ordering is the whole point, so it is a function rather than two lines
@@ -789,18 +967,89 @@ async def _initialize_voice_processor(processor: VoiceProcessor) -> None:
 
     Args:
         processor: The already-constructed `VoiceProcessor` to initialize.
+        yielded: Gaming mode holds the GPU at boot; the GPU models and the LLM
+            warmup are skipped.
     """
     global _models_ready
 
-    await processor.initialize()
+    await processor.initialize(yielded=yielded)
     _models_ready = True
+
+
+async def _start_extraction_dispatcher_recording_failure(
+    start: "Callable[[], Awaitable[ExtractionDispatcher | None]]",
+) -> "ExtractionDispatcher | None":
+    """Start the dispatcher, recording a failed start for the health checks.
+
+    A module function rather than lines in `lifespan` so the failure path is
+    testable without booting the model stack. The flag is what lets the two
+    extraction checks report `unavailable_at_boot` until a restart succeeds;
+    without it a None dispatcher reads `disabled_by_config`, as if extraction
+    had been switched off on purpose.
+
+    Args:
+        start: Awaitable factory that builds, starts and attaches the
+            dispatcher (`_start_extraction_dispatcher` bound to its arguments).
+
+    Returns:
+        The started dispatcher, or None when there is none to start or the
+        start raised one of the errors `_start_extraction_dispatcher` can.
+    """
+    global _extraction_dispatcher_start_failed
+
+    _extraction_dispatcher_start_failed = False
+    try:
+        return await start()
+    except (MistError, sqlite3.Error, OSError, ValueError) as e:
+        logger.error("Extraction dispatcher failed to start: %s", e, exc_info=True)
+        _extraction_dispatcher_start_failed = True
+        return None
+
+
+def _new_extraction_health_client() -> httpx.AsyncClient:
+    """The `extraction_service` check's own HTTP client, closed at shutdown.
+
+    httpx applies the 2.0 s timeout to each phase (connect, read, write, pool)
+    separately; the probe's own 2.5 s timeout bounds the whole call.
+    """
+    return httpx.AsyncClient(timeout=EXTRACTION_HEALTH_CLIENT_TIMEOUT_S)
+
+
+async def _close_extraction_health_client() -> None:
+    """Close and forget the probe client; a no-op when none was built."""
+    global _extraction_health_client
+
+    client = _extraction_health_client
+    _extraction_health_client = None
+    if client is not None:
+        await client.aclose()
+
+
+def _extraction_service_url() -> str:
+    """The extraction service root the dispatcher would send jobs to.
+
+    Read through `DispatcherSettings.from_env`, so the probe checks the same
+    host the dispatcher uses. A malformed `MIST_EXTRACTION_*` variable makes
+    that raise; it also makes the dispatcher's start fail, after which the
+    probe reports `unavailable_at_boot` without calling anything, so the URL is
+    then read on its own rather than failing the boot here.
+    """
+    from backend.extraction_backlog.settings import DEFAULT_SERVICE_URL, DispatcherSettings
+
+    try:
+        return DispatcherSettings.from_env().service_url
+    except ValueError:
+        return (os.getenv("MIST_EXTRACTION_SERVICE_URL") or DEFAULT_SERVICE_URL).strip()
 
 
 def _build_health_registry(
     executor: Executor,
     broadcaster_state: BroadcasterState,
+    extraction_inference: ExtractionServiceHealthSource,
+    probe_settings: HealthProbeSettings,
+    yield_state: "Callable[[], str] | None" = None,
 ) -> HealthRegistry:
-    """Construct the five dependency probes and the registry that runs them.
+    """Construct the eight dependency probes and the registry that runs them.
 
     Every accessor is a callable that reads module state WHEN THE PROBE RUNS,
     never a value captured here. `voice_processor`, `vault_sidecar` and the
@@ -816,26 +1065,194 @@ def _build_health_registry(
     the entire content of this wiring, and it cannot be asserted without booting
     the full model stack unless the construction is its own function.
 
+    The registry is built before `lifespan` starts the extraction dispatcher,
+    so `extraction_dispatcher` and `_extraction_dispatcher_start_failed` in
+    particular must be read when the probe runs.
+
     Args:
         executor: Single-worker pool for the blocking Neo4j driver call. Owned
             by the caller, which is also responsible for shutting it down.
+            Only `Neo4jProbe` uses it; the extraction-backlog and backup probes
+            read through `asyncio.to_thread`.
         broadcaster_state: The live record the broadcast task publishes into.
+        extraction_inference: The extraction service client the
+            `extraction_service` check calls, over its own HTTP client. Owned
+            by the caller, which closes that client at shutdown.
+        probe_settings: Thresholds and the backup status path.
+        yield_state: `GpuYield.state`, so the llm check reads `yielded` while
+            gaming mode holds the GPU and `down` (`resume_failed`) while the
+            reload fails. None without gaming mode.
 
     Returns:
         A registry whose `run_forever` the caller schedules.
     """
+    from backend.extraction_backlog.status import checked_extraction_status
+
+    def dispatcher():
+        return extraction_dispatcher
+
+    def start_failed() -> bool:
+        return _extraction_dispatcher_start_failed
+
     probes = [
         Neo4jProbe(_health_graph_connection, _knowledge_configured, executor),
-        LLMProbe(_health_llm_provider),
+        LLMProbe(_health_llm_provider, yield_state=yield_state),
         EventStoreProbe(_health_event_store, _event_store_configured),
         VaultSidecarProbe(lambda: vault_sidecar),
         BroadcasterProbe(broadcaster_state.state),
+        ExtractionServiceProbe(extraction_inference, dispatcher, start_failed),
+        ExtractionBacklogProbe(dispatcher, checked_extraction_status, start_failed, probe_settings),
+        BackupProbe(probe_settings, lambda: datetime.now(UTC)),
     ]
     return HealthRegistry(
         probes,
         monotonic=time.monotonic,
         wall_clock=lambda: datetime.now(UTC),
     )
+
+
+def uptime_record_s() -> float:
+    """The uptime ledger's tick period in seconds, from `MIST_UPTIME_RECORD_S`.
+
+    A value that is not a positive number is logged and replaced by the
+    default rather than raised, as `gpu_yield_poll_s` does: it is read while
+    the backend starts, and a typo here should not stop it.
+    """
+    raw = (os.environ.get(UPTIME_RECORD_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_UPTIME_RECORD_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+    if value > 0:
+        return value
+    logger.error(
+        "%s=%r is not a positive number; using %s",
+        UPTIME_RECORD_ENV,
+        raw,
+        DEFAULT_UPTIME_RECORD_S,
+    )
+    return DEFAULT_UPTIME_RECORD_S
+
+
+def _every_check_measured(snapshot: dict) -> bool:
+    """Whether every check in a registry snapshot has reported at least once."""
+    checks = snapshot.get("checks") or {}
+    return bool(checks) and all(check.get("age_seconds") is not None for check in checks.values())
+
+
+async def uptime_record_loop(
+    db_path: str,
+    snapshot: "Callable[[], dict]",
+    *,
+    period_s: float,
+    tick: "Callable[..., None]" = record_status_tick,
+    sleep: "Callable[[float], Awaitable[object]]" = asyncio.sleep,
+    clock: "Callable[[], datetime]" = lambda: datetime.now(UTC),
+) -> None:
+    """Record the derived `/health` status in the uptime ledger until cancelled.
+
+    The first tick waits until every check in the snapshot has been measured,
+    checking each `UPTIME_FIRST_TICK_POLL_S`, for at most
+    `UPTIME_FIRST_TICK_WAIT_S`, and then ticks anyway with `first_tick=True`
+    so a restart starts a new row. A first tick that fails leaves the next
+    one first as well: otherwise a quick restart would extend the previous
+    process's row across the time this one was down.
+
+    Each tick runs `tick` in a worker thread through `asyncio.to_thread`: it
+    may wait up to 5 s on another writer's lock, which must not stall the
+    event loop that carries the WebSocket. A `sqlite3.Error` or `MistError`
+    is logged and that tick skipped; the loop goes on.
+
+    Args:
+        db_path: The event store's database file.
+        snapshot: Renders the health registry's current snapshot.
+        period_s: Seconds between ticks; a row continues across a silence of
+            up to `UPTIME_GAP_PERIODS` periods.
+        tick: `record_status_tick`; injected in tests.
+        sleep: `asyncio.sleep`; injected in tests.
+        clock: The wall clock, aware; injected in tests.
+    """
+    waited = 0.0
+    while not _every_check_measured(snapshot()) and waited < UPTIME_FIRST_TICK_WAIT_S:
+        await sleep(UPTIME_FIRST_TICK_POLL_S)
+        waited += UPTIME_FIRST_TICK_POLL_S
+
+    first_tick = True
+    max_gap_s = UPTIME_GAP_PERIODS * period_s
+    while True:
+        current = snapshot()
+        try:
+            await asyncio.to_thread(
+                tick,
+                db_path,
+                current["status"],
+                degraded_beneath(current),
+                clock(),
+                max_gap_s=max_gap_s,
+                first_tick=first_tick,
+            )
+        except (sqlite3.Error, MistError) as exc:
+            logger.warning("Uptime ledger tick skipped: %s", exc)
+        else:
+            first_tick = False
+        await sleep(period_s)
+
+
+def _build_uptime_recorder(
+    event_store: "EventStoreProvider | None",
+    snapshot: "Callable[[], dict]",
+    period_s: float,
+) -> "Callable[[], Awaitable[None]] | None":
+    """Bind the uptime tick loop to the event store's database file, or None.
+
+    None when there is no event store (switched off, or the handler that owns
+    it was not built): the ledger lives in that store, so nothing is recorded.
+    Also None for an in-memory store, which a second connection cannot reach.
+
+    Args:
+        event_store: The live handler's event store.
+        snapshot: Renders the health registry's current snapshot.
+        period_s: `uptime_record_s()`.
+
+    Returns:
+        A no-argument coroutine function the caller schedules as a task.
+    """
+    if event_store is None:
+        logger.info("Uptime ledger: no event store, so no uptime is recorded")
+        return None
+    db_path = getattr(event_store, "db_path", None)
+    if db_path is None or str(db_path) == ":memory:":
+        logger.info("Uptime ledger: the event store has no database file; not recording")
+        return None
+    return functools.partial(uptime_record_loop, str(db_path), snapshot, period_s=period_s)
+
+
+def _on_uptime_loop_done(task: "asyncio.Task") -> None:
+    """Done-callback for the uptime tick loop; logs a death, ignores a cancel.
+
+    The same cancellation guard as `_on_broadcaster_done`. The loop survives
+    `sqlite3.Error` and `MistError`, so anything that ends it is a fault, and
+    every day after it reads as unrecorded; this line says why.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Uptime ledger loop died: %s", exc, exc_info=exc)
+    else:
+        logger.error("Uptime ledger loop returned; no further uptime is recorded")
+
+
+async def _stop_uptime_recorder(task: "asyncio.Task | None") -> None:
+    """Cancel the uptime tick loop and wait for the cancel to land."""
+    if task is None:
+        return
+    task.cancel()
+    # `return_exceptions` keeps a loop that already died (logged by its
+    # done-callback) from raising here.
+    await asyncio.gather(task, return_exceptions=True)
 
 
 @asynccontextmanager
@@ -846,6 +1263,7 @@ async def lifespan(app: FastAPI):
     global voice_processor, curation_scheduler, log_handler, extraction_dispatcher
     global vault_writer, vault_sidecar, vault_filewatcher, vault_invalidation_bus
     global _broadcaster_state, _health_registry, _health_probe_executor
+    global _extraction_health_client, _gpu_yield
 
     # Startup
     logger.info("=" * 60)
@@ -927,10 +1345,26 @@ async def lifespan(app: FastAPI):
         vault_sidecar=vault_sidecar,
         invalidation_bus=vault_invalidation_bus,
     )
+    # Gaming mode, built before the model load so a backend that boots while
+    # the marker exists skips Whisper and the LLM warmup. Its poll starts only
+    # after initialize() returns, so a marker that came or went during the
+    # load is acted on by the first poll.
+    _gpu_yield = _build_gpu_yield(
+        os.environ.get("MIST_OPS_DIR"),
+        tts_enabled=bool(config.tts_enabled),
+        poll_s=gpu_yield_poll_s(),
+    )
+    yield_state = _gpu_yield.state if _gpu_yield is not None else None
+    defer_llm_jobs = _gpu_yield.is_yielded if _gpu_yield is not None else None
     # Sets `_models_ready` only once initialize() has returned, so
     # `/health.models_loaded` reports a state the process has actually reached
     # rather than the mere existence of the object above.
-    await _initialize_voice_processor(voice_processor)
+    await _initialize_voice_processor(voice_processor, yielded=_gpu_is_yielded())
+    gpu_yield_task: asyncio.Task | None = None
+    if _gpu_yield is not None:
+        gpu_yield_task = asyncio.create_task(_gpu_yield.run_forever(), name="gpu-yield")
+        gpu_yield_task.add_done_callback(_on_gpu_yield_loop_done)
+        logger.info("Gaming mode enabled (initial state: %s)", _gpu_yield.state())
 
     # Start message broadcaster. The state record is created and marked alive
     # here, beside the task it describes: `BroadcasterProbe` renders
@@ -951,9 +1385,29 @@ async def lifespan(app: FastAPI):
     # stopping it, so an unbounded pool would leak one thread per tick into a
     # hung dependency. See `backend/health.py`'s module docstring.
     _health_probe_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="health-probe")
-    _health_registry = _build_health_registry(_health_probe_executor, _broadcaster_state)
+    from backend.extraction_backlog.inference import RemoteExtractionInference
+
+    _extraction_health_client = _new_extraction_health_client()
+    _health_registry = _build_health_registry(
+        _health_probe_executor,
+        _broadcaster_state,
+        RemoteExtractionInference(_extraction_health_client, _extraction_service_url()),
+        HealthProbeSettings.from_env(),
+        yield_state=yield_state,
+    )
     health_probe_task = asyncio.create_task(_health_registry.run_forever(), name="health-probes")
     health_probe_task.add_done_callback(_on_health_probe_loop_done)
+
+    # The uptime ledger samples the registry above into the event store, so it
+    # starts after both exist; `voice_processor.initialize()` has returned, so
+    # the handler that owns the event store is the live one.
+    uptime_task: asyncio.Task | None = None
+    uptime_recorder = _build_uptime_recorder(
+        _health_event_store(), _health_snapshot, uptime_record_s()
+    )
+    if uptime_recorder is not None:
+        uptime_task = asyncio.create_task(uptime_recorder(), name="uptime-ledger")
+        uptime_task.add_done_callback(_on_uptime_loop_done)
 
     # Start system-status task (5s interval per ADR-017 system_status).
     # GPU init is best-effort; failure produces placeholder GPU blocks
@@ -1002,6 +1456,8 @@ async def lifespan(app: FastAPI):
             event_store=curation_deps.event_store,
             tracker=curation_deps.tracker,
             llm_provider=curation_deps.llm_provider,
+            # `self_reflection` waits while gaming mode has stopped mist-llm.
+            defer_llm_jobs=defer_llm_jobs,
         )
         if await curation_scheduler.start():
             logger.info("Curation scheduler started")
@@ -1018,13 +1474,9 @@ async def lifespan(app: FastAPI):
     # T2a: extraction backlog. After voice_processor.initialize() so the
     # handler it attaches to is the live one.
     extraction_dispatcher = None
-    try:
-        extraction_dispatcher = await _start_extraction_dispatcher(
-            voice_processor, knowledge_config
-        )
-    except (MistError, sqlite3.Error, OSError, ValueError) as e:
-        logger.error("Extraction dispatcher failed to start: %s", e, exc_info=True)
-        extraction_dispatcher = None
+    extraction_dispatcher = await _start_extraction_dispatcher_recording_failure(
+        lambda: _start_extraction_dispatcher(voice_processor, knowledge_config)
+    )
 
     # ADR-017 additive `extraction_status`: periodic push, with or without a
     # dispatcher (none -> `disabled` plus `unrecorded_turns`). Transitions are
@@ -1130,12 +1582,20 @@ async def lifespan(app: FastAPI):
     health_status_task.cancel()
     heartbeat_task.cancel()
     health_probe_task.cancel()
+    await _stop_uptime_recorder(uptime_task)
     broadcaster_task.cancel()
+    if gpu_yield_task is not None:
+        gpu_yield_task.cancel()
+        # Waits for the cancel to land; `return_exceptions` keeps a loop that
+        # already died (logged by its done-callback) from raising here.
+        await asyncio.gather(gpu_yield_task, return_exceptions=True)
     # `wait=False` deliberately: a probe thread wedged on the timeout-less Neo4j
     # driver would otherwise hold shutdown for the driver's own 60s acquisition
     # timeout. The pool has one worker and the process is ending.
     if _health_probe_executor is not None:
         _health_probe_executor.shutdown(wait=False)
+    # After the probe loop is cancelled, so no new health call starts on it.
+    await _close_extraction_health_client()
     if voice_processor and voice_processor.models:
         voice_processor.models.shutdown()
 
@@ -1143,14 +1603,24 @@ async def lifespan(app: FastAPI):
 # FastAPI app with lifespan
 app = FastAPI(title="Mist.AI Voice Server", lifespan=lifespan)
 
-# CORS for web frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Configure properly for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+def configure_cors(app: FastAPI) -> None:
+    """Add `CORSMiddleware` allowing only the browser origins in `allowed_origins()`.
+
+    A function rather than inline so the tests can configure a fresh app under a
+    changed `MIST_ALLOWED_ORIGINS` without reloading this module, because the
+    middleware reads its options once, here.
+    """
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(allowed_origins()),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+
+configure_cors(app)
 
 
 @app.get("/")
@@ -1189,12 +1659,19 @@ async def health() -> dict:
 
     Fields from the snapshot
     ------------------------
-    - `status`: `healthy` / `degraded` / `unhealthy`, derived from `checks` by
-      `health.derive_status`, which is pure and reproducible from this payload.
+    - `status`: `healthy` / `degraded` / `yielded` / `unhealthy`, derived from
+      `checks` by `health.derive_status`, which is pure and reproducible from
+      this payload. `yielded` means a check reports `status: "yielded"`: the
+      LLM was stopped on purpose to free the GPU, so MIST cannot hold a
+      conversation, by choice rather than by fault. It outranks `degraded`
+      and yields to `unhealthy` (another fatal check down), and a yielded
+      check that goes stale reads unknown, so a dead probe loop reads
+      `degraded`, never `yielded`.
     - `restart_recommended`: whether restarting the PROCESS would plausibly
       help, which is a different question from `status`. Advisory only -- Docker
       restart policies react to container exit, not to healthcheck state, and
-      there is no autoheal sidecar, so nothing acts on this today.
+      there is no autoheal sidecar, so nothing acts on this today. A yielded
+      check never sets it.
     - `probe_loop`: `alive`, `dead` (no cycle completed within
       `dead_after_seconds`, so the cache is unrefreshed), or
       `PROBE_LOOP_NOT_STARTED` when no registry exists -- reachable only
@@ -1202,6 +1679,28 @@ async def health() -> dict:
       `checks` mapping, because nothing verified is not healthy.
     - `checks`: one entry per dependency. `status: null` means NOT MEASURED and
       carries a `reason` from a closed vocabulary; it never means `up`.
+      `status: "yielded"` (reason `gpu_yielded`) is set by the `llm` check
+      when given a yield state that reads `yielded`, and records
+      `consecutive_failures` 0; a yield state of `resume_failed` reads `down`.
+      The checks are `neo4j`, `llm`, `event_store`, `vault_sidecar`,
+      `broadcaster` and three that say whether MIST is still learning and
+      backed up, each `severity: degrades` and `restart_repairs: false`:
+      - `extraction_service`: its own `GET /v1/health` call to the extraction
+        service every cycle, so a switched-off host reads `down` /
+        `unreachable` even while the dispatcher is idle. Also `down` for
+        `query_failed`, `service_degraded`, `epoch_mismatch`, or
+        `unavailable_at_boot` when the dispatcher failed to start; null
+        `disabled_by_config` with no dispatcher or in `off` mode.
+      - `extraction_backlog`: the producer behind the `extraction` block,
+        `down` for `stalled`, `backlog_overdue` (oldest pending turn past
+        `MIST_HEALTH_BACKLOG_MAX_AGE_S`) and `dead_lettered`, in that order, or
+        `query_failed` when the backlog could not be read -- where the
+        `extraction` block shows zero counts.
+      - `backup`: the backup scheduler's status file at
+        `MIST_BACKUP_STATUS_PATH`; null `disabled_by_config` when that is
+        unset, otherwise `down` for `backup_never_run`, `query_failed`,
+        `backup_suspect`, `backup_failed` or `backup_overdue` (last success
+        older than `MIST_BACKUP_MAX_AGE_HOURS`).
     - `checked_at`: wall time of the last COMPLETED cycle, null before the
       first.
 
@@ -1283,6 +1782,107 @@ async def get_extraction_status():
     return extraction_status(extraction_dispatcher).model_dump(mode="json")
 
 
+@app.get("/usage/turns-per-day")
+async def usage_turns_per_day(days: int = Query(7, ge=1, le=90)):
+    """Real-origin turns per local day, counts only: ADR-042's measure of real use.
+
+    This endpoint is how the lead reads real use without opening the event
+    store: it answers with dates and integers and nothing else, so reading
+    the counts never means reading a conversation. The body is exactly
+    `{"timezone", "origin": "real", "days": [{"date", "real_turns"}]}`,
+    with no derived field, and holds no session id, utterance, response or
+    time finer than a date.
+
+    - `days` (1-90, default 7) is dense, oldest first, ends today in
+      `timezone`, and covers exactly the days asked for; out of range is a
+      422 from the query validation.
+    - `timezone` is `MIST_TIMEZONE`, default UTC; an unknown name falls
+      back to UTC, is logged, and is reported here as `UTC`.
+    - A turn counts when its session's origin is `real` or its session row
+      is missing, the event store's own rule.
+    - A store that is missing, locked or unreadable is a 503 with
+      `{"error": "store_unavailable"}`. The store is opened read-only through
+      a `mode=ro` URI, never through `EventStore`, so a missing file is not
+      created.
+
+    The read runs in a worker thread: SQLite waits up to
+    `usage.BUSY_TIMEOUT_SECONDS` on a lock, which must not stall the event
+    loop that carries the WebSocket.
+    """
+    from fastapi.responses import JSONResponse
+
+    from backend.event_store.usage import (
+        UsageStoreUnavailableError,
+        build_turns_per_day,
+        resolve_store_path,
+    )
+    from backend.knowledge.config import EventStoreConfig
+
+    # `EventStoreConfig` alone, not `KnowledgeConfig.from_env()`: the counts
+    # need one path, and an unrelated malformed setting should not turn them
+    # into a 500.
+    db_path = resolve_store_path(EventStoreConfig.from_env().db_path)
+    try:
+        result = await asyncio.to_thread(build_turns_per_day, db_path, days=days)
+    except UsageStoreUnavailableError as exc:
+        logger.warning("GET /usage/turns-per-day: %s", exc)
+        return JSONResponse(status_code=503, content={"error": "store_unavailable"})
+    return result.to_payload()
+
+
+@app.get("/usage/uptime")
+async def usage_uptime(days: int = Query(7, ge=1, le=90)):
+    """Seconds per local day that MIST was healthy, degraded, yielded or unhealthy.
+
+    Counts only: this is how the lead reads MIST's uptime without opening the
+    event store or a conversation. The body is `{"timezone", "current",
+    "days": [{"date", "healthy_s", "degraded_s", "yielded_s", "unhealthy_s",
+    "unrecorded_s", "yielded_degraded_s"}]}`, a zone name, a status word,
+    dates and integers, with no session id, utterance or time finer than a
+    date.
+
+    - The seconds come from the uptime ledger the server's own tick loop
+      writes every `MIST_UPTIME_RECORD_S` seconds. Time with no tick behind
+      it, because MIST was not running or had not yet ticked, is
+      unrecorded, never up: an interval ends at its last tick.
+    - Each day's first five values sum to that local day's real length
+      (86400 s, or 82800 s or 90000 s on a DST change), and today's to the
+      seconds elapsed so far. `yielded_s` is time with the LLM stopped on
+      purpose to free the GPU (gaming mode); `yielded_degraded_s` is the part
+      of it during which another check was also not up, and is not one of
+      the five.
+    - `current` is the live `/health` status at the time of the request,
+      not a stored row.
+    - `days` (1-90, default 7) is dense, oldest first, and ends today in
+      `timezone`; out of range is a 422 from the query validation.
+    - `timezone` is `MIST_TIMEZONE`, default UTC; an unknown name falls
+      back to UTC, is logged, and is reported here as `UTC`.
+    - A store that is missing, locked or unreadable is a 503 with
+      `{"error": "store_unavailable"}`. The store is opened read-only through
+      a `mode=ro` URI, never through `EventStore`, so a missing file is not
+      created.
+
+    The read runs in a worker thread, as `/usage/turns-per-day`'s does.
+    """
+    from fastapi.responses import JSONResponse
+
+    from backend.event_store.status_intervals import (
+        UptimeStoreUnavailableError,
+        build_uptime_per_day,
+    )
+    from backend.event_store.usage import resolve_store_path
+    from backend.knowledge.config import EventStoreConfig
+
+    db_path = resolve_store_path(EventStoreConfig.from_env().db_path)
+    current = _health_snapshot()["status"]
+    try:
+        result = await asyncio.to_thread(build_uptime_per_day, db_path, current=current, days=days)
+    except UptimeStoreUnavailableError as exc:
+        logger.warning("GET /usage/uptime: %s", exc)
+        return JSONResponse(status_code=503, content={"error": "store_unavailable"})
+    return result.to_payload()
+
+
 def _hydration_isolation_for_health() -> bool:
     """Report the F4 flag, degrading a config typo to False rather than a 500.
 
@@ -1346,7 +1946,16 @@ async def websocket_endpoint(websocket: WebSocket):
         discriminated error, status, log_config_ack, log,
         plus binary audio frames (MIST protocol: MSG_AUDIO_CHUNK /
         MSG_AUDIO_COMPLETE).
+
+    A browser origin outside `allowed_origins()` is closed with 1008 before
+    `accept`, because browsers apply no CORS to WebSockets (`backend/origins.py`).
     """
+    origin = websocket.headers.get("origin")
+    if not origin_allowed(origin, allowed_origins()):
+        logger.warning("WebSocket refused origin: %s", origin)
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept(headers=None)
     async with active_connections_lock:
         active_connections.add(websocket)
@@ -1407,6 +2016,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             # Handle different message types
+            if msg_type in ("audio", "text"):
+                # Gaming mode: refuse the turn before it is processed or
+                # recorded. Every other message type is handled as usual.
+                refusal = _yielded_turn_refusal()
+                if refusal is not None:
+                    await websocket.send_json(refusal)
+                    continue
+
             if msg_type == "audio":
                 # Complete audio from client (no VAD, just transcribe and process)
                 audio_payload = data.get("audio")

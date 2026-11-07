@@ -1,7 +1,6 @@
 """Speech-to-Text using Whisper."""
 
 import numpy as np
-import sounddevice as sd
 import whisper
 
 
@@ -36,6 +35,10 @@ class WhisperSTT:
         Returns:
             Transcribed text
         """
+        # sounddevice opens PortAudio at import, and importing the backend must not need
+        # an audio host: the server transcribes audio it receives, never a local microphone.
+        import sounddevice as sd
+
         print(f"Recording for {duration} seconds...")
         print("Speak now!")
 

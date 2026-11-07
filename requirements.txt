@@ -78,7 +78,7 @@ python-dotenv==1.0.1
 rich==13.7.0
 
 # Multimodal (Speech)
-# NOTE: docker/backend/Dockerfile:40-41 and the CI unit job install torch/torchaudio/
+# NOTE: docker/backend/Dockerfile:43-44 and the CI unit job install torch/torchaudio/
 # torchvision separately, from a PyTorch index, before `pip install -r requirements.txt`
 # runs (cu124 in the image, cpu in CI). These pins match that install exactly, so pip
 # sees the requirement already satisfied and leaves the preinstalled wheels in place

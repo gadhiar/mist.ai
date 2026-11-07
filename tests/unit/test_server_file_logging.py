@@ -20,6 +20,7 @@ what happens on disk and in `sys.modules`, not about what gets printed.
 
 import json
 import logging
+import logging.handlers
 import os
 import subprocess
 import sys
@@ -139,6 +140,71 @@ def test_configure_file_logging_creates_file_logs_and_is_idempotent(tmp_path, cl
         if isinstance(h, logging.FileHandler) and Path(h.baseFilename) == log_file.resolve()
     ]
     assert len(matching_handlers) == 1
+
+
+def test_writing_past_max_bytes_rotates_to_a_numbered_file(
+    tmp_path, clean_root_logger, monkeypatch
+):
+    """The backend log no longer grows without bound on a long-running instance."""
+    from backend.server import configure_file_logging
+
+    monkeypatch.setenv("MIST_LOG_MAX_BYTES", "512")
+    monkeypatch.setenv("MIST_LOG_BACKUP_COUNT", "2")
+    log_dir = tmp_path / "logs"
+
+    handler = configure_file_logging(log_dir)
+    probe_logger = logging.getLogger("test_server_file_logging.rotation")
+    probe_logger.setLevel(logging.DEBUG)
+    for index in range(40):
+        probe_logger.debug("rotation record %03d %s", index, "x" * 40)
+    handler.flush()
+
+    assert (log_dir / "mist-backend.log").exists()
+    assert (log_dir / "mist-backend.log.1").exists()
+    assert (log_dir / "mist-backend.log.2").exists()
+    assert not (log_dir / "mist-backend.log.3").exists()
+    assert (log_dir / "mist-backend.log").stat().st_size <= 512
+
+
+def test_rotation_defaults_to_50_mib_and_five_backups(tmp_path, clean_root_logger, monkeypatch):
+    from backend.server import configure_file_logging
+
+    monkeypatch.delenv("MIST_LOG_MAX_BYTES", raising=False)
+    monkeypatch.delenv("MIST_LOG_BACKUP_COUNT", raising=False)
+
+    handler = configure_file_logging(tmp_path / "logs")
+
+    assert isinstance(handler, logging.handlers.RotatingFileHandler)
+    assert handler.maxBytes == 50 * 1024 * 1024
+    assert handler.backupCount == 5
+    # Level and formatter are unchanged by rotation.
+    assert handler.level == logging.DEBUG
+    assert handler.formatter is not None
+    assert handler.formatter._fmt == "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+
+@pytest.mark.parametrize(
+    ("name", "raw"),
+    [
+        pytest.param("MIST_LOG_MAX_BYTES", "lots", id="max-bytes-not-a-number"),
+        pytest.param("MIST_LOG_MAX_BYTES", "0", id="max-bytes-zero-would-never-rotate"),
+        pytest.param("MIST_LOG_BACKUP_COUNT", "-1", id="backup-count-negative"),
+    ],
+)
+def test_a_malformed_rotation_setting_keeps_its_default(
+    tmp_path, clean_root_logger, monkeypatch, name, raw
+):
+    """A typo in a log setting must not stop the backend from starting."""
+    from backend.server import configure_file_logging
+
+    monkeypatch.delenv("MIST_LOG_MAX_BYTES", raising=False)
+    monkeypatch.delenv("MIST_LOG_BACKUP_COUNT", raising=False)
+    monkeypatch.setenv(name, raw)
+
+    handler = configure_file_logging(tmp_path / "logs")
+
+    assert handler.maxBytes == 50 * 1024 * 1024
+    assert handler.backupCount == 5
 
 
 def test_resolve_log_dir_prefers_env_var(monkeypatch, tmp_path):
