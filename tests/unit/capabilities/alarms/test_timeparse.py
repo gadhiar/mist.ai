@@ -8,7 +8,12 @@ from datetime import UTC, datetime, timedelta, timezone, tzinfo
 
 import pytest
 
-from backend.capabilities.alarms.timeparse import RepeatRule, next_occurrence, parse_alarm_time
+from backend.capabilities.alarms.timeparse import (
+    RepeatRule,
+    next_occurrence,
+    parse_alarm_time,
+    parse_repeat,
+)
 from backend.errors import TimeParseError
 
 # A fixed-offset zone five hours behind UTC; the image has no IANA zone data until H1.
@@ -401,3 +406,303 @@ class TestDaylightSaving:
         result = parse_alarm_time("1:30am", None, before_fold, zone)
 
         assert result == datetime(2026, 11, 1, 5, 30, tzinfo=UTC)
+
+
+MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY, SATURDAY, SUNDAY = range(7)
+
+
+class TestCustomRepeatRule:
+    """`custom` rings on any non-empty set of weekdays, Monday 0 to Sunday 6."""
+
+    def test_custom_accepts_a_weekday_set(self):
+        rule = RepeatRule("custom", 7, 0, frozenset({MONDAY, THURSDAY}))
+
+        assert rule.days == frozenset({MONDAY, THURSDAY})
+
+    def test_custom_takes_days_as_a_keyword(self):
+        rule = RepeatRule(kind="custom", hour=7, minute=0, days=frozenset({SUNDAY}))
+
+        assert rule.days_set() == frozenset({SUNDAY})
+
+    def test_custom_stores_any_collection_of_days_as_a_frozenset(self):
+        rule = RepeatRule("custom", 7, 0, [THURSDAY, MONDAY, THURSDAY])  # type: ignore[arg-type]
+
+        assert rule.days == frozenset({MONDAY, THURSDAY})
+        assert isinstance(rule.days, frozenset)
+
+    def test_custom_rule_is_hashable_and_compares_by_its_set(self):
+        first = RepeatRule("custom", 7, 0, frozenset({MONDAY, THURSDAY}))
+        second = RepeatRule("custom", 7, 0, frozenset({THURSDAY, MONDAY}))
+
+        assert first == second
+        assert hash(first) == hash(second)
+
+    def test_custom_accepts_every_day_from_0_to_6(self):
+        assert RepeatRule("custom", 7, 0, frozenset(range(7))).days_set() == frozenset(range(7))
+
+    @pytest.mark.parametrize("days", [None, frozenset()])
+    def test_custom_without_days_is_refused(self, days):
+        with pytest.raises(ValueError, match="custom"):
+            RepeatRule("custom", 7, 0, days)
+
+    @pytest.mark.parametrize("kind", ["daily", "weekdays", "weekends"])
+    def test_days_on_a_preset_are_refused(self, kind):
+        with pytest.raises(ValueError, match=kind):
+            RepeatRule(kind, 7, 0, frozenset({MONDAY}))
+
+    @pytest.mark.parametrize("day", [-1, 7, 10])
+    def test_an_out_of_range_day_is_refused(self, day):
+        with pytest.raises(ValueError, match="0 to 6"):
+            RepeatRule("custom", 7, 0, frozenset({MONDAY, day}))
+
+    @pytest.mark.parametrize("day", [True, "0", 1.0, None])
+    def test_a_day_that_is_not_an_integer_is_refused(self, day):
+        with pytest.raises(ValueError, match="0 to 6"):
+            RepeatRule("custom", 7, 0, [day])  # type: ignore[list-item]
+
+    @pytest.mark.parametrize("days", ["03", 3, {"monday": 0}, [[0]]])
+    def test_days_that_are_not_a_collection_of_integers_are_refused(self, days):
+        with pytest.raises(ValueError):
+            RepeatRule("custom", 7, 0, days)  # type: ignore[arg-type]
+
+    def test_hour_and_minute_are_still_checked(self):
+        with pytest.raises(ValueError, match="hour"):
+            RepeatRule("custom", 24, 0, frozenset({MONDAY}))
+
+
+class TestDaysSet:
+    @pytest.mark.parametrize(
+        ("kind", "days"),
+        [
+            ("daily", frozenset(range(7))),
+            ("weekdays", frozenset(range(5))),
+            ("weekends", frozenset({SATURDAY, SUNDAY})),
+        ],
+    )
+    def test_presets(self, kind, days):
+        assert RepeatRule(kind, 7, 0).days_set() == days
+
+    def test_custom(self):
+        rule = RepeatRule("custom", 7, 0, frozenset({TUESDAY, FRIDAY}))
+
+        assert rule.days_set() == frozenset({TUESDAY, FRIDAY})
+
+    def test_presets_hold_no_days(self):
+        assert RepeatRule("daily", 7, 0).days is None
+
+
+class TestCustomRepeatRuleJson:
+    @pytest.mark.parametrize(
+        ("kind", "text"),
+        [
+            ("daily", '{"kind": "daily", "hour": 7, "minute": 5}'),
+            ("weekdays", '{"kind": "weekdays", "hour": 7, "minute": 5}'),
+            ("weekends", '{"kind": "weekends", "hour": 7, "minute": 5}'),
+        ],
+    )
+    def test_preset_json_carries_no_days(self, kind, text):
+        assert RepeatRule(kind, 7, 5).to_json() == text
+
+    def test_custom_json_holds_sorted_days(self):
+        rule = RepeatRule("custom", 6, 45, frozenset({THURSDAY, MONDAY, SUNDAY}))
+
+        assert rule.to_json() == '{"kind": "custom", "hour": 6, "minute": 45, "days": [0, 3, 6]}'
+
+    def test_custom_round_trip(self):
+        rule = RepeatRule("custom", 6, 45, frozenset({SUNDAY, WEDNESDAY}))
+
+        assert RepeatRule.from_json(rule.to_json()) == rule
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{"kind": "custom", "hour": 7, "minute": 0}',
+            '{"kind": "custom", "hour": 7, "minute": 0, "days": []}',
+            '{"kind": "custom", "hour": 7, "minute": 0, "days": null}',
+            '{"kind": "custom", "hour": 7, "minute": 0, "days": [7]}',
+            '{"kind": "custom", "hour": 7, "minute": 0, "days": [-1]}',
+            '{"kind": "custom", "hour": 7, "minute": 0, "days": [true]}',
+            '{"kind": "custom", "hour": 7, "minute": 0, "days": ["0"]}',
+            '{"kind": "custom", "hour": 7, "minute": 0, "days": [[0]]}',
+            '{"kind": "custom", "hour": 7, "minute": 0, "days": "03"}',
+            '{"kind": "custom", "hour": 7, "minute": 0, "days": {"0": 1}}',
+            '{"kind": "custom", "hour": 7, "minute": 0, "days": 3}',
+            '{"kind": "daily", "hour": 7, "minute": 0, "days": [0]}',
+            '{"kind": "daily", "hour": 7, "minute": 0, "days": null}',
+            '{"kind": "custom", "hour": 7, "minute": 0, "days": [0], "extra": 1}',
+        ],
+    )
+    def test_from_json_rejects_malformed_custom_text(self, text):
+        with pytest.raises(ValueError):
+            RepeatRule.from_json(text)
+
+
+class TestNextOccurrenceCustom:
+    MONDAY_THURSDAY = RepeatRule("custom", 7, 0, frozenset({MONDAY, THURSDAY}))
+
+    def test_later_today_on_a_listed_day(self):
+        assert next_occurrence(self.MONDAY_THURSDAY, MON_0600, TZ) == local(5, 7)
+
+    def test_skips_unlisted_days(self):
+        assert next_occurrence(self.MONDAY_THURSDAY, MON_0800, TZ) == local(8, 7)
+
+    def test_crosses_the_week_boundary(self):
+        friday_0800 = local(9, 8)
+
+        assert next_occurrence(self.MONDAY_THURSDAY, friday_0800, TZ) == local(12, 7)
+
+    def test_after_the_last_listed_day_of_the_week(self):
+        thursday_0800 = local(8, 8)
+
+        assert next_occurrence(self.MONDAY_THURSDAY, thursday_0800, TZ) == local(12, 7)
+
+    def test_single_day_after_its_time_is_a_week_later(self):
+        mondays = RepeatRule("custom", 7, 0, frozenset({MONDAY}))
+
+        assert next_occurrence(mondays, MON_0800, TZ) == local(12, 7)
+
+    def test_sunday_to_monday_crosses_the_week(self):
+        sunday_monday = RepeatRule("custom", 7, 0, frozenset({SUNDAY, MONDAY}))
+        sunday_0800 = local(11, 8)
+
+        assert next_occurrence(sunday_monday, sunday_0800, TZ) == local(12, 7)
+
+    def test_strictly_after(self):
+        assert next_occurrence(self.MONDAY_THURSDAY, local(5, 7), TZ) == local(8, 7)
+
+    def test_every_day_custom_matches_daily(self):
+        every_day = RepeatRule("custom", 7, 0, frozenset(range(7)))
+
+        assert next_occurrence(every_day, MON_0800, TZ) == next_occurrence(
+            RepeatRule("daily", 7, 0), MON_0800, TZ
+        )
+
+
+class TestCustomDaylightSaving:
+    """America/New_York: 2026-03-08 and 2026-11-01 are Sundays."""
+
+    def test_custom_keeps_its_wall_time_across_spring_forward(self):
+        zone = new_york()
+        thursday_0800 = local(5, 8, month=3, zone=zone)
+        mondays = RepeatRule("custom", 7, 0, frozenset({MONDAY}))
+
+        result = next_occurrence(mondays, thursday_0800, zone)
+
+        assert result == datetime(2026, 3, 9, 11, 0, tzinfo=UTC)  # 07:00 EDT
+
+    def test_custom_time_in_the_spring_forward_gap_shifts_forward(self):
+        zone = new_york()
+        friday = datetime(2026, 3, 6, 12, 0, tzinfo=UTC)
+        sundays = RepeatRule("custom", 2, 30, frozenset({SUNDAY}))
+
+        result = next_occurrence(sundays, friday, zone)
+
+        assert result == datetime(2026, 3, 8, 7, 30, tzinfo=UTC)  # 03:30 EDT
+
+    def test_custom_ambiguous_fall_back_time_takes_the_first_occurrence(self):
+        zone = new_york()
+        friday = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
+        sundays = RepeatRule("custom", 1, 30, frozenset({SUNDAY}))
+
+        result = next_occurrence(sundays, friday, zone)
+
+        assert result == datetime(2026, 11, 1, 5, 30, tzinfo=UTC)  # 01:30 EDT
+
+    def test_custom_fall_back_does_not_repeat_the_same_wall_time(self):
+        zone = new_york()
+        first_0130 = datetime(2026, 11, 1, 5, 30, tzinfo=UTC)
+        sundays = RepeatRule("custom", 1, 30, frozenset({SUNDAY}))
+
+        result = next_occurrence(sundays, first_0130, zone)
+
+        assert result == datetime(2026, 11, 8, 6, 30, tzinfo=UTC)  # 01:30 EST a week on
+
+
+# `parse_repeat` reads `normalize_utterance` output: lower case, punctuation gone, so
+# "every Monday, Thursday and Friday" arrives as "every monday thursday and friday".
+REPEAT_PHRASES = [
+    ("every day", "daily", None),
+    ("every weekday", "weekdays", None),
+    ("weekdays", "weekdays", None),
+    ("on weekends", "weekends", None),
+    ("every monday", "custom", {MONDAY}),
+    ("every sunday", "custom", {SUNDAY}),
+    ("every monday and thursday", "custom", {MONDAY, THURSDAY}),
+    ("every saturday and sunday", "custom", {SATURDAY, SUNDAY}),
+    ("every monday wednesday", "custom", {MONDAY, WEDNESDAY}),
+    ("every monday wednesday and friday", "custom", {MONDAY, WEDNESDAY, FRIDAY}),
+    ("every tuesday thursday saturday", "custom", {TUESDAY, THURSDAY, SATURDAY}),
+    (
+        "every monday tuesday wednesday thursday friday saturday and sunday",
+        "custom",
+        set(range(7)),
+    ),
+    ("every friday and monday", "custom", {MONDAY, FRIDAY}),
+    ("  every   monday and thursday ", "custom", {MONDAY, THURSDAY}),
+]
+
+NOT_REPEAT_PHRASES = [
+    "every now and then",
+    "every 5 minutes",
+    "every 2 days",
+    "every other day",
+    "every week",
+    "every month",
+    "every",
+    "",
+    "monday",
+    "on monday",
+    "every mon",
+    "every funday",
+    "every monday and",
+    "every and monday",
+    "every monday and tuesday and friday",
+    "every day at 7am",
+    "set an alarm every day",
+    "every weekday and monday",
+    "weekday",
+    "every weekend",
+]
+
+
+class TestParseRepeat:
+    def test_fixture_size(self):
+        assert len(REPEAT_PHRASES) >= 12
+        assert len(NOT_REPEAT_PHRASES) >= 12
+
+    @pytest.mark.parametrize(("text", "kind", "days"), REPEAT_PHRASES)
+    def test_reads_a_repeat_phrase(self, text, kind, days):
+        rule = parse_repeat(text, hour=7, minute=0)
+
+        assert rule is not None
+        assert rule.kind == kind
+        assert rule.days == (None if days is None else frozenset(days))
+
+    @pytest.mark.parametrize("text", NOT_REPEAT_PHRASES)
+    def test_anything_else_is_none(self, text):
+        assert parse_repeat(text, hour=7, minute=0) is None
+
+    def test_reads_case_and_commas_too(self):
+        rule = parse_repeat("Every Monday, Thursday", hour=7, minute=0)
+
+        assert rule is not None
+        assert rule.days_set() == frozenset({MONDAY, THURSDAY})
+
+    def test_the_rule_rings_at_the_given_time(self):
+        rule = parse_repeat("every monday and thursday", hour=6, minute=30)
+
+        assert rule == RepeatRule("custom", 6, 30, frozenset({MONDAY, THURSDAY}))
+
+    @pytest.mark.parametrize("kwargs", [{}, {"hour": 7}, {"minute": 0}])
+    def test_the_time_is_required(self, kwargs):
+        # A caller that forgets the time must fail at the call, not arm a midnight alarm.
+        with pytest.raises(TypeError):
+            parse_repeat("every day", **kwargs)
+
+    def test_the_time_is_keyword_only(self):
+        with pytest.raises(TypeError):
+            parse_repeat("every day", 7, 0)  # type: ignore[misc]
+
+    def test_an_out_of_range_time_is_refused(self):
+        with pytest.raises(ValueError, match="hour"):
+            parse_repeat("every day", hour=24, minute=0)
