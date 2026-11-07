@@ -8,19 +8,25 @@ against the probes.
 A run file is JSONL with one record per probe, written by the run harness (T9's
 `memory_recall_run.py`) or built by hand in tests:
 
-    {"probe_id": "fact-01", "items": [{"ref": "m1", "kind": "fact", "id": "...", "score": 0.82}],
+    {"probe_id": "fact-01",
+     "items": [{"ref": "m1", "kind": "fact", "id": "...", "score": 0.82, "rank": 1}],
      "tokens": 212, "budget_tokens": 500}
 
-`items` is the block in block order, with the same `{ref, kind, id, score}` shape as the turn
-log's `retrieval_context.memory.items`. Extra keys (timings, `reranked`, `delta_tokens_est`) are
-allowed and ignored, so the harness can record more than the scorer reads.
+`items` is the block in block order, each item `{ref, kind, id, score, rank}`. `rank` is
+required, an integer of at least 1: the fetcher's own 1-based `MemoryCandidate.rank` of the
+injected candidates the item stands for, the lowest when there are several (a list's members, a
+note's chunks), so several items may share a rank. Extra keys (timings, `reranked`,
+`delta_tokens_est`) are allowed and ignored, so the harness can record more than the scorer
+reads.
 
 Metrics, each a mean over the probes it is defined on:
 
 - recall@block: the share of a probe's expected items present in its block. Defined on probes
   with at least one expected item.
-- MRR: the reciprocal of the 1-based block position of the first expected item, 0 when none is
-  present. Defined on the same probes as recall.
+- MRR: 1 / the lowest `rank` among the probe's expected items present in the block, 0 when none
+  is present. Defined on the same probes as recall. It reads the fetch rank, not the block
+  position, because the block lays items out by section (facts, then conversations, then
+  notes), and position would charge a note the fetcher ranked first for every fact before it.
 - precision@block: the share of a block's items that are expected or acceptable. Defined on
   probes whose block is not empty, so a noise probe served anything scores 0 here as well.
 - empty_on_noise: 1 when a noise probe's block is empty. Defined on noise probes.
@@ -270,12 +276,19 @@ def parse_probe(row: Mapping[str, object]) -> Probe:
 
 @dataclass(frozen=True, slots=True)
 class BlockItem:
-    """One item of a run's block, in the turn log's `{ref, kind, id, score}` shape."""
+    """One item of a run's block: its block ref, identity, score and fetch rank.
+
+    `rank` is the fetcher's 1-based `MemoryCandidate.rank` of the injected candidate the item
+    stands for, the lowest when it stands for several (a list's members, a note's chunks). It
+    counts candidates ranked higher and then dropped, so a ranking error is not hidden by the
+    budget removing the item above. Several items may share a rank.
+    """
 
     ref: str
     kind: str
     id: str
     score: float
+    rank: int
 
     @property
     def item(self) -> ItemRef:
@@ -293,6 +306,14 @@ class RunRecord:
     budget_tokens: int
 
 
+def _rank(entry: Mapping[str, object], where: str) -> int:
+    """A 1-based fetch rank; a bool is refused although Python counts it as an int."""
+    value = entry["rank"]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{where}: rank must be an integer of at least 1, got {value!r}")
+    return value
+
+
 def parse_run_record(row: Mapping[str, object]) -> RunRecord:
     """Parse one run-file row; extra keys are ignored, missing or mistyped ones refused."""
     where = f"run record {row.get('probe_id', '?')}"
@@ -305,13 +326,14 @@ def parse_run_record(row: Mapping[str, object]) -> RunRecord:
         entry_where = f"{where} items[{index}]"
         if not isinstance(entry, dict):
             raise ValueError(f"{entry_where}: must be an object")
-        _check_keys(entry, ("ref", "kind", "id", "score"), entry_where, strict=False)
+        _check_keys(entry, ("ref", "kind", "id", "score", "rank"), entry_where, strict=False)
         items.append(
             BlockItem(
                 ref=_str(entry, "ref", entry_where),
                 kind=_choice(entry, "kind", ITEM_KINDS, entry_where),
                 id=_str(entry, "id", entry_where),
                 score=_float(entry, "score", entry_where),
+                rank=_rank(entry, entry_where),
             )
         )
     return RunRecord(
@@ -651,11 +673,8 @@ def _score_probe(probe: Probe, record: RunRecord) -> _ProbeScore:
     reciprocal_rank: float | None = None
     if expected:
         recall = len(expected & served) / len(expected)
-        reciprocal_rank = 0.0
-        for position, item in enumerate(block, start=1):
-            if item in expected:
-                reciprocal_rank = 1.0 / position
-                break
+        ranks = [item.rank for item in record.items if item.item in expected]
+        reciprocal_rank = 1.0 / min(ranks) if ranks else 0.0
 
     precision = None
     if block:

@@ -293,10 +293,17 @@ crossword forgets reach `ideas/someday.md`.
 A run file is JSONL with one record per probe:
 
 ```json
-{"probe_id": "fact-01", "items": [{"ref": "m1", "kind": "fact", "id": "...", "score": 0.82}], "tokens": 212, "budget_tokens": 500}
+{"probe_id": "fact-01", "items": [{"ref": "m1", "kind": "fact", "id": "...", "score": 0.82, "rank": 1}], "tokens": 212, "budget_tokens": 500}
 ```
 
-`items` is the block in block order. Score it with:
+`items` is the block in block order. Each item's `rank` is required, an integer of at least 1:
+the fetcher's own 1-based `MemoryCandidate.rank` of the injected candidates the item stands for,
+the lowest when there are several (a list's members, a note's chunks), so items may share a rank.
+A run item without a valid `rank` is refused, and the error names the item. MRR is 1 / the lowest
+`rank` among a probe's expected items present in the block, or 0 when none is present. It reads
+the fetch rank rather than the block position because the block lays items out by section, facts
+first, so a note the fetcher ranked first would otherwise score 1/2 or less behind any fact.
+Score it with:
 
 ```bash
 python scripts/eval_harness/memory_recall.py --run run.jsonl --json-output report.json
