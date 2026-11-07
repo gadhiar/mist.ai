@@ -153,6 +153,25 @@ def _nearest_rank_percentile(values: list[float], p: float) -> float:
     return sorted_vals[rank - 1]
 
 
+def _pooled_precision(tp: int, fp: int, fn: int) -> float:
+    return tp / (tp + fp) if (tp + fp) else 1.0
+
+
+def _pooled_recall(tp: int, fp: int, fn: int) -> float:
+    return tp / (tp + fn) if (tp + fn) else 1.0
+
+
+def _pooled_f1(tp: int, fp: int, fn: int) -> float:
+    return 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 1.0
+
+
+_RATIO_KINDS = {
+    "precision": _pooled_precision,
+    "recall": _pooled_recall,
+    "f1": _pooled_f1,
+}
+
+
 def cluster_bootstrap_ratio_ci(
     per_probe_counts: dict[str, tuple[int, int, int]],
     *,
@@ -161,7 +180,7 @@ def cluster_bootstrap_ratio_ci(
     confidence: float,
     kind: str,
 ) -> tuple[float, float] | None:
-    """Cluster bootstrap CI for a precision/recall ratio metric, resampled by probe tag.
+    """Cluster bootstrap CI for a ratio metric of pooled counts, resampled by probe tag.
 
     `per_probe_counts` maps probe tag -> (tp, fp, fn) for the metric family
     (entity or relationship). Each replicate resamples probe tags with
@@ -172,8 +191,26 @@ def cluster_bootstrap_ratio_ci(
     `scripts.model_bench.analyse.cluster_bootstrap_ci` computes, and why this
     module does not reuse it for these metrics).
 
-    `kind` is "precision" (tp/(tp+fp)) or "recall" (tp/(tp+fn)).
+    `kind` selects the ratio each replicate computes:
+
+    - "precision": tp/(tp+fp), or 1.0 when tp+fp is 0;
+    - "recall": tp/(tp+fn), or 1.0 when tp+fn is 0;
+    - "f1": 2tp/(2tp+fp+fn), or 1.0 when 2tp+fp+fn is 0. Under the scorer's
+      zero-denominator rule this equals 2PR/(P+R) of the pooled precision and
+      recall, with 0.0 when P+R is 0. F1 needs its own replicates because it
+      cannot be built from separate precision and recall intervals: both read
+      the same true positives.
+
+    Every call seeds its own `random.Random(seed)` and draws tags in the same
+    order, so calls that share `per_probe_counts`, `seed` and `n_replicates`
+    see the same resamples whatever their `kind`.
+
+    Raises:
+        ValueError: `kind` is not one of the three above.
     """
+    ratio = _RATIO_KINDS.get(kind)
+    if ratio is None:
+        raise ValueError(f"unknown kind {kind!r}; expected one of {sorted(_RATIO_KINDS)}")
     tags = sorted(per_probe_counts)
     if not tags:
         return None
@@ -188,10 +225,7 @@ def cluster_bootstrap_ratio_ci(
             tp += t
             fp += f_p
             fn += f_n
-        if kind == "precision":
-            replicate_values.append(tp / (tp + fp) if (tp + fp) else 1.0)
-        else:
-            replicate_values.append(tp / (tp + fn) if (tp + fn) else 1.0)
+        replicate_values.append(ratio(tp, fp, fn))
     alpha = 1.0 - confidence
     lo = _nearest_rank_percentile(replicate_values, 100.0 * (alpha / 2.0))
     hi = _nearest_rank_percentile(replicate_values, 100.0 * (1.0 - alpha / 2.0))
@@ -241,6 +275,12 @@ def build_summary(
     """The aggregate `extraction_summary.json` document: the scorer's own metrics
     plus Wilson intervals and a probe-id cluster bootstrap CI, unchanged from
     what `score_extraction_run.Report` computes.
+
+    The `bootstrap` block holds intervals for entity precision and recall and
+    for relation precision, recall and F1 (`rel_f1`), each None for an empty
+    corpus. All five use the same seed, B and confidence, so the relation F1
+    interval comes from the same resamples as the relation precision and
+    recall intervals. Entity F1 has no interval.
 
     Also computes `complete` / `unmatched_probe_ids` (T6 reviewer finding 1b):
     the SAME invariant `score_extraction_run._gates_pass` checks at
@@ -334,6 +374,13 @@ def build_summary(
                 seed=bootstrap_seed,
                 confidence=bootstrap_confidence,
                 kind="recall",
+            ),
+            "rel_f1": cluster_bootstrap_ratio_ci(
+                rel_counts,
+                n_replicates=bootstrap_b,
+                seed=bootstrap_seed,
+                confidence=bootstrap_confidence,
+                kind="f1",
             ),
         },
     }
