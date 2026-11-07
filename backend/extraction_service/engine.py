@@ -96,6 +96,13 @@ SCOPE_MAX_TOKENS = 96
 EXTRACT_MAX_TOKENS = 2048
 DERIVE_MAX_TOKENS = 400
 
+# The Stage 2 list pass's limits: the most units one call extracts, and the
+# most earlier units it sees as context. None while the service has no list
+# pass. They live here, beside the token limits, so the run identity reads
+# them from the module that applies them.
+LIST_BATCH_MAX_UNITS: int | None = None
+LIST_CONTEXT_MAX_UNITS: int | None = None
+
 # The code the run identity covers (`code_sha256` in
 # `backend.knowledge.extraction.run_identity`): this module, the adapters and
 # schemas, every `backend.knowledge.extraction` module imported above, whose

@@ -128,7 +128,7 @@ class CodeRevision:
 CODE_REVISIONS: tuple[CodeRevision, ...] = (
     CodeRevision(
         extraction_version="2026-06-14-r5",
-        code_identity="ci1-3922ef29a46c559d0f9c479f3a8af16aca9a74205f0b2ffa8a3717b854306b20",
+        code_identity="ci1-b030743cefc8b571347edb718211297adce19e0beae2490d2a639ea7df9522e5",
         date="2026-11-06",
         reason=(
             "First recorded code identity (MIS-188): the r5 prompt and the service code "

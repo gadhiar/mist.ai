@@ -43,6 +43,8 @@ from backend.extraction_service.adapters import ModelFamilyAdapter, get_adapter
 from backend.extraction_service.engine import (
     DERIVE_MAX_TOKENS,
     EXTRACT_MAX_TOKENS,
+    LIST_BATCH_MAX_UNITS,
+    LIST_CONTEXT_MAX_UNITS,
     RUN_IDENTITY_CODE,
     SCOPE_MAX_TOKENS,
     ExtractionEngine,
@@ -303,8 +305,8 @@ def run_identity_components(
     """The run identity's components for a service running `settings` with `adapter`.
 
     Every value is read from where the engine reads it: the prompt hash from
-    the same function the engine stamps with, the token limits from the
-    engine's constants, and the constrained mode as the engine resolves it
+    the same function the engine stamps with, the token and list-pass limits
+    from the engine's constants, and the constrained mode as the engine resolves it
     (`settings.constrained_mode or adapter.default_constrained_mode`).
     """
     return RunIdentityComponents(
@@ -324,8 +326,8 @@ def run_identity_components(
         scope_max_tokens=SCOPE_MAX_TOKENS,
         extract_max_tokens=EXTRACT_MAX_TOKENS,
         derive_max_tokens=DERIVE_MAX_TOKENS,
-        list_batch_max_units=None,
-        list_context_max_units=None,
+        list_batch_max_units=LIST_BATCH_MAX_UNITS,
+        list_context_max_units=LIST_CONTEXT_MAX_UNITS,
     )
 
 

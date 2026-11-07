@@ -137,8 +137,8 @@ class TestServiceReportsOneIdentity:
             "scope_max_tokens": 96,
             "extract_max_tokens": 2048,
             "derive_max_tokens": 400,
-            "list_batch_max_units": None,
-            "list_context_max_units": None,
+            "list_batch_max_units": engine_module.LIST_BATCH_MAX_UNITS,
+            "list_context_max_units": engine_module.LIST_CONTEXT_MAX_UNITS,
         }
 
     async def test_every_result_carries_the_identity_info_reports(
