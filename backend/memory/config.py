@@ -8,12 +8,16 @@ stops startup instead of degrading recall quietly.
 
 from __future__ import annotations
 
+import ipaddress
 import math
 import os
+import socket
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, tzinfo
 from typing import Literal
+
+import httpx
 
 from backend.errors import MemoryConfigError
 from backend.user_timezone import USER_TIMEZONE_ENV, ZoneLoader, resolve_user_timezone
@@ -32,6 +36,23 @@ _WEIGHT_TOLERANCE = 1e-6
 _BLOCK_TOKENS_LOW_RANGE = (0, 300)
 _LIST_MAX_ITEMS_RANGE = (2, 25)
 _MIN_RESCAN_INTERVAL_S = 30
+
+# Where `rerank_url` may point. The remote reranker is sent the query and the memory texts, so
+# its host must be on the local network or the tailnet: loopback, RFC 1918, and CGNAT
+# 100.64.0.0/10, which Tailscale assigns its nodes from.
+_PRIVATE_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = tuple(
+    ipaddress.ip_network(network)
+    for network in (
+        "127.0.0.0/8",
+        "::1/128",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "100.64.0.0/10",
+    )
+)
+_PRIVATE_SUFFIXES: tuple[str, ...] = (".ts.net", ".lan", ".local", ".internal")
+_RERANK_URL_SCHEMES: tuple[str, ...] = ("http", "https")
 _TRUE = frozenset({"true", "1", "yes", "on"})
 _FALSE = frozenset({"false", "0", "no", "off"})
 
@@ -181,7 +202,9 @@ class MemoryConfig:
         rerank_top_n: Ceiling on reranked pairs; the pairs scored are those that fit the
             deadline.
         rerank_device: Device for the local cross-encoder.
-        rerank_url: Base URL of the rerank server; required for `remote`.
+        rerank_url: Base URL of the rerank server; required for `remote`. Its scheme must be
+            http or https and its host private (`_require_private_rerank_url`), since the
+            server is sent the query and the memory texts.
         rerank_remote_model: Model name sent to the remote server, if it needs one.
         rerank_timeout_ms: Remote call timeout, capped at the deadline left when it starts.
         rerank_remote_scores: Whether the remote server returns logits (a sigmoid is applied)
@@ -267,6 +290,10 @@ class MemoryConfig:
                 raise MemoryConfigError(
                     f"rerank_timeout_ms must be positive for remote, got {self.rerank_timeout_ms}"
                 )
+        # Checked whatever the backend, so a public URL fails when it is set rather than on
+        # the day the backend switches to remote.
+        if self.rerank_url:
+            _require_private_rerank_url(self.rerank_url)
         if not isinstance(self.tz, tzinfo):
             raise MemoryConfigError(f"tz must be a tzinfo, got {type(self.tz).__name__}")
 
@@ -336,3 +363,73 @@ def _require_range(field_name: str, value: int, bounds: tuple[int, int]) -> None
 def _require_choice(field_name: str, value: str, choices: tuple[str, ...]) -> None:
     if value not in choices:
         raise MemoryConfigError(f"{field_name} must be one of {choices}, got {value!r}")
+
+
+def _require_private_rerank_url(url: str) -> None:
+    """Refuse a rerank URL whose scheme is not http or https or whose host is not private.
+
+    The URL is parsed by httpx, the client that will send the request, so the host checked is
+    the host connected to; a second parser could read an ambiguous URL differently. Messages
+    name the host and never the whole URL, which can carry credentials.
+
+    Raises:
+        MemoryConfigError: The URL does not parse, its scheme is not http or https, it names no
+            host, or its host is not one `_is_private_host` accepts.
+    """
+    try:
+        parsed = httpx.URL(url)
+    except httpx.InvalidURL as exc:
+        raise MemoryConfigError(f"rerank_url is not a valid URL: {exc}") from exc
+    host = parsed.host
+    if parsed.scheme not in _RERANK_URL_SCHEMES:
+        raise MemoryConfigError(
+            f"rerank_url scheme {parsed.scheme!r} for host {host!r} must be http or https"
+        )
+    if not host:
+        raise MemoryConfigError("rerank_url names no host")
+    if not _is_private_host(host):
+        raise MemoryConfigError(
+            f"rerank_url host {host!r} is not private: use a loopback, RFC 1918 or CGNAT "
+            "(100.64.0.0/10) address, localhost, a single-label name, or a name ending .ts.net, "
+            ".lan, .local or .internal"
+        )
+
+
+def _is_private_host(host: str) -> bool:
+    """Whether `host`, lowercased as httpx gives it, is on the local network or the tailnet.
+
+    An address must fall in `_PRIVATE_NETWORKS`. A name passes when it is `localhost`, a single
+    label (resolved through the local search domains), or ends in one of `_PRIVATE_SUFFIXES`.
+    A trailing dot marks an absolute name: it is dropped before the suffix check, but a single
+    label written with one is a top-level domain, resolved publicly, and fails.
+    """
+    address = _host_address(host)
+    if address is not None:
+        return any(address in network for network in _PRIVATE_NETWORKS)
+    name = host[:-1] if host.endswith(".") else host
+    if name == "localhost":
+        return True
+    if "." not in name:
+        return not host.endswith(".")
+    return name.endswith(_PRIVATE_SUFFIXES)
+
+
+def _host_address(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The IP address `host` spells, or None when it is a name.
+
+    Beyond the standard forms this reads what the system resolver also takes as IPv4: a single
+    number or hex (`134744072`, `0x08080808`), which would otherwise pass as a single-label
+    name. An IPv4-mapped IPv6 address is read as the IPv4 address it carries.
+    """
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        if not host.isascii():
+            return None
+        try:
+            return ipaddress.IPv4Address(socket.inet_aton(host))
+        except OSError:
+            return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    return address
