@@ -25,7 +25,12 @@ import pytest
 
 import scripts.backup.restore as restore_module
 from backend.errors import Neo4jQueryError
-from backend.knowledge.eval_isolation import REPO_ROOT, EvalIsolationError
+from backend.knowledge.eval_isolation import (
+    LIVE_INSTANCE_MARKER,
+    LIVE_INSTANCES_FILE_ENV,
+    REPO_ROOT,
+    EvalIsolationError,
+)
 from backend.knowledge.graph_artifact import GraphArtifactError
 from scripts.backup.destination import BACKUP_ROOT_ENV
 from scripts.backup.dump import run_dump
@@ -427,6 +432,139 @@ class TestTheFourGates:
             )
         assert target_graph.writes == []
         assert not list(backup_root.glob("pre-restore-*"))
+
+
+class TestTheTargetVaultRootIsGuarded:
+    """`--target-vault-root` gets the same live-state check as `--target-root`.
+
+    It used to be checked by nothing, so a restore aimed at a dev target could
+    still swap its vault onto a daily instance's `mist-memory/`.
+    """
+
+    @pytest.fixture
+    def marked_instance(self, tmp_path, monkeypatch):
+        """A daily instance root carrying the marker, with a vault of its own."""
+        monkeypatch.setenv(LIVE_INSTANCES_FILE_ENV, str(tmp_path / "no-registry"))
+        root = tmp_path / "daily"
+        (root / "mist-memory").mkdir(parents=True)
+        (root / LIVE_INSTANCE_MARKER).write_text('{"v": 1}', encoding="utf-8")
+        (root / "mist-memory" / "learned.md").write_text("# learned\n", encoding="utf-8")
+        return root
+
+    def test_a_vault_root_under_a_marked_directory_is_refused_before_any_write(
+        self, artifact, restore_target, target_graph, backup_root, marked_instance
+    ):
+        target_before = fingerprint(restore_target)
+        instance_before = fingerprint(marked_instance)
+
+        with pytest.raises(RestoreTargetError, match=LIVE_INSTANCE_MARKER):
+            restore(
+                artifact,
+                restore_target,
+                target_graph,
+                backup_root,
+                target_vault_root=marked_instance / "mist-memory",
+            )
+
+        assert fingerprint(restore_target) == target_before
+        assert fingerprint(marked_instance) == instance_before
+        assert target_graph.writes == []
+        assert not list(backup_root.glob("pre-restore-*"))
+
+    def test_the_cli_exits_2_with_the_target_untouched(
+        self, artifact, restore_target, target_graph, backup_root, marked_instance, monkeypatch
+    ):
+        # `main` builds its own connection, so the fake goes in at the class it
+        # imports. Without this, the unit tier's eval isolation would refuse the
+        # dev URI at `connect()` -- also exit 2, and for the wrong reason.
+        monkeypatch.setattr(
+            "backend.knowledge.storage.neo4j_connection.Neo4jConnection",
+            lambda _config: target_graph,
+        )
+        target_before = fingerprint(restore_target)
+
+        code = main(
+            [
+                "--artifact",
+                str(artifact),
+                "--target-root",
+                str(restore_target),
+                "--target-graph-uri",
+                TARGET_URI,
+                "--confirm-target",
+                str(restore_target.resolve()),
+                "--target-vault-root",
+                str(marked_instance / "mist-memory"),
+                "--backup-root",
+                str(backup_root),
+            ]
+        )
+
+        assert code == EXIT_REFUSED
+        assert fingerprint(restore_target) == target_before
+        assert target_graph.writes == []
+        assert not list(backup_root.glob("pre-restore-*"))
+
+    def test_a_literal_tilde_is_staged_where_it_was_checked(
+        self,
+        artifact,
+        restore_target,
+        target_graph,
+        backup_root,
+        tmp_path,
+        marked_instance,
+        monkeypatch,
+    ):
+        # The guard expanded `~` and staging did not, so `~/vault` was checked
+        # as `$HOME/vault` and written to `<cwd>/~/vault`. With the current
+        # directory inside a marked instance, that wrote into live state.
+        home = tmp_path / "home"
+        (home / "vault").mkdir(parents=True)
+        (home / "vault" / "old.md").write_text("# old\n", encoding="utf-8")
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.chdir(marked_instance)
+        instance_before = fingerprint(marked_instance)
+
+        report = restore(
+            artifact, restore_target, target_graph, backup_root, target_vault_root="~/vault"
+        )
+
+        assert fingerprint(marked_instance) == instance_before
+        assert report.vault_corpus_files == 2
+        assert (home / "vault" / "identity" / "mist.md").is_file()
+        assert not (home / "vault" / "old.md").exists()
+
+    @pytest.mark.skipif(
+        os.name == "nt", reason="creating a symlink needs a privilege Windows withholds"
+    )
+    def test_a_symlink_into_a_marked_directory_is_refused_and_nothing_is_written(
+        self, artifact, restore_target, target_graph, backup_root, tmp_path, marked_instance
+    ):
+        link = tmp_path / "vault-link"
+        link.symlink_to(marked_instance / "mist-memory", target_is_directory=True)
+        instance_before = fingerprint(marked_instance)
+
+        with pytest.raises(RestoreTargetError, match=LIVE_INSTANCE_MARKER):
+            restore(artifact, restore_target, target_graph, backup_root, target_vault_root=link)
+
+        assert fingerprint(marked_instance) == instance_before
+        assert link.is_symlink()
+        assert not list(tmp_path.glob(f"vault-link{STAGING_SUFFIX}"))
+        assert not list(backup_root.glob("pre-restore-*"))
+
+    def test_a_vault_root_outside_any_instance_still_restores(
+        self, artifact, restore_target, target_graph, backup_root, tmp_path, marked_instance
+    ):
+        sibling_vault = tmp_path / "dev-vault"
+        sibling_vault.mkdir()
+
+        report = restore(
+            artifact, restore_target, target_graph, backup_root, target_vault_root=sibling_vault
+        )
+
+        assert report.vault_corpus_files == 2
+        assert (marked_instance / "mist-memory" / "learned.md").is_file()
 
 
 class TestArtifactIntegrity:

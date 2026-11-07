@@ -27,7 +27,7 @@ class EmbeddingGenerator:
         # Returns list of 384 floats
     """
 
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2", device: str | None = None):
         """Initialize embedding generator.
 
         Args:
@@ -35,10 +35,16 @@ class EmbeddingGenerator:
                 Options:
                 - all-MiniLM-L6-v2 (default): Fast, 384d, good quality
                 - all-mpnet-base-v2: Slower, 768d, better quality
+            device: Torch device the model loads onto, such as `cpu`, `cuda`
+                or `cuda:1`. None lets sentence-transformers choose, which
+                means CUDA whenever it is available, so runtime callers pass
+                `config.embedding.resolved_device()` to keep the model where
+                `EMBEDDING_DEVICE` says.
         """
         self.model_name = model_name
+        self.device = device
         self._model = None
-        logger.info(f"EmbeddingGenerator initialized with model: {model_name}")
+        logger.info(f"EmbeddingGenerator initialized with model: {model_name}, device: {device}")
 
     def _get_model(self) -> SentenceTransformer:
         """Lazy load the embedding model.
@@ -47,7 +53,7 @@ class EmbeddingGenerator:
         """
         if self._model is None:
             logger.info(f"Loading embedding model: {self.model_name}")
-            self._model = SentenceTransformer(self.model_name)
+            self._model = SentenceTransformer(self.model_name, device=self.device)
             logger.info("Embedding model loaded successfully")
         return self._model
 
