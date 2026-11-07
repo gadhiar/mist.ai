@@ -80,7 +80,7 @@ that is unset makes compose refuse the whole file before anything starts.
 | `MIST_ALLOWED_ORIGINS` | compose: browser origins the backend admits | no | the three Tauri origins |
 | `MIST_EXTRACTION_INFERENCE` | the backend through `env_file` | no | `service` |
 | `MIST_EXTRACTION_SERVICE_URL` | the backend through `env_file` | no | code default |
-| `MIST_USAGE_TIMEZONE` | the backend through `env_file` | no | UTC |
+| `MIST_TIMEZONE` | the backend through `env_file` | no | UTC |
 | `MIST_BACKUP_HOST_PATH` | compose: host directory mounted at `/backup` | yes | |
 | `MIST_BACKUP_INTERVAL_HOURS` | compose: the backup scheduler | no | `24` |
 | `MIST_BACKUP_RETAIN` | compose: the backup scheduler | no | `7` |
@@ -88,8 +88,8 @@ that is unset makes compose refuse the whole file before anything starts.
 | `MIST_BACKUP_RETRY_MINUTES` | compose: the backup scheduler | no | `60` |
 | `MIST_BACKUP_MIN_NODE_RATIO` | compose: the backup scheduler | no | `0.5` |
 | `MIST_DAILY_BACKEND_MEM_LIMIT` | compose: `mem_limit` of `mist-backend` | no | `8g` |
-| `MIST_DAILY_NEO4J_MEM_LIMIT` | compose: `mem_limit` of `mist-neo4j` | no | `2g` |
-| `MIST_DAILY_LLM_MEM_LIMIT` | compose: `mem_limit` of `mist-llm` | no | `4g` |
+| `MIST_DAILY_NEO4J_MEM_LIMIT` | compose: `mem_limit` of `mist-neo4j` | no | `3g` |
+| `MIST_DAILY_LLM_MEM_LIMIT` | compose: `mem_limit` of `mist-llm` | no | `8g` |
 | `MIST_DAILY_BACKUP_MEM_LIMIT` | compose: `mem_limit` of `mist-backup` | no | `4g` |
 | `MIST_DAILY_WS_PORT` | compose: host port of the WebSocket; rehearsal only | no | `8001` |
 | `MIST_DAILY_BOLT_PORT` | compose: host port of Neo4j Bolt; rehearsal only | no | `7687` |
@@ -154,7 +154,7 @@ and refuse with exit 2 before anything starts:
 | `switch TAG [--skip-backup]` | Refuses a tag with no `release/<tag>/`, a tag with no `mist-backend:<tag>` image, and a `rehearsal-` tag on the instance named `daily`. When `MIST_BACKUP_HOST_PATH` is set and `mist-backend` is running, it runs `backup-now` on the current release first, and stops with that exit code if the backup fails. It then rewrites only the `MIST_RELEASE_TAG=` line of `daily.env`, copies every `*.py` file of `release/<tag>/scripts/daily/` into `bin/`, and runs `up`. |
 | `up [--wait-minutes N]` | Waits up to N minutes (default 10) for `docker info`, creates the share network if it is missing, and starts `mist-neo4j`, `mist-llm` and `mist-backend` in one call, leaving `mist-llm` out while `ops/gpu-yielded` exists. Only when `ops/backups-armed` exists does it start `mist-backup`, in a second call, so a failure there (exit 1) leaves the first three running. Last, it names every container of the project whose compose config-file label is not the release's compose file, and exits 1. |
 | `down` | `docker compose ... --profile backup stop`. It stops every container and removes nothing: no command of this CLI runs `down -v`, `rm -v` or `volume rm`. Every command passes `volume_safety.py`, which `instance.py` loads from beside itself, before it runs; the guard refuses `-v`, `--volumes`, `prune`, `down` and every `volume` subcommand but `inspect` and `create`, and the CLI exits 1 naming the command. |
-| `status` | Prints the running backend's image tag, its image ID with `match` or `MISMATCH` against the release record, and its `org.opencontainers.image.revision` label; each container from another compose file (then exit 1), and it exits 1 too when the project's containers cannot be listed, since then that check could not run; the `gaming-mode status` line; `/health`'s status and each check's status and reason; and `/usage/turns-per-day?days=7`'s counts and gate. |
+| `status` | Prints the running backend's image tag, its image ID with `match` or `MISMATCH` against the release record, and its `org.opencontainers.image.revision` label; each container from another compose file (then exit 1), and it exits 1 too when the project's containers cannot be listed, since then that check could not run; the `gaming-mode status` line; `/health`'s status and each check's status and reason; and `/usage/turns-per-day?days=7`'s counts and how many of those days had a real turn. |
 | `gaming-mode on [--by manual\|watcher]` | Yields the GPU to a game: see Gaming mode below. |
 | `gaming-mode off [--wait-minutes N]` | Ends the yield, waiting up to N minutes (default 5) for `mist-llm`. |
 | `gaming-mode status` | Prints `yielded since <time> by <who>`, or `normal`, from the marker alone. |
@@ -447,7 +447,18 @@ start it while the daily instance runs:
 
 Every service has a `mem_limit` from a variable, and Neo4j has an explicit heap and page cache
 instead of sizing itself from the Docker VM, which is shared with other containers. The defaults
-(8g backend, 2g Neo4j, 4g LLM, 4g backup) are unmeasured estimates: check them against
-`docker stats` on the running instance, and raise any limit with less than 25% headroom over its
-observed peak. Every service also logs through the `json-file` driver with `max-size` 20m and
-`max-file` 5.
+are 8g backend, 3g Neo4j, 8g LLM and 4g backup.
+
+- Neo4j's and the LLM's come from the scratch rehearsal of 6 Nov 2026. Each holds the service's
+  measured peak plus the remaining growth of its own cache, with at least a quarter of the limit
+  free. Neo4j peaked at 1544 MiB on a near-empty graph (15 nodes), and its page cache fills to
+  512m as the store grows; llama-server peaked at 3496 MiB after a handful of prompts, and its
+  prompt cache may still grow to the 2048 MiB that `--cache-ram` allows.
+- The backend's and backup's are estimates. The backend's has been measured on text turns only.
+
+The four limits add up to more than the Docker VM's memory, on purpose: each one bounds a single
+service, and what must fit the VM is the sum of what the services use.
+
+Check the limits against `docker stats` on the running instance. Headroom is (limit - peak) /
+limit: raise any limit with less than 25% headroom over its observed peak. Every service also
+logs through the `json-file` driver with `max-size` 20m and `max-file` 5.

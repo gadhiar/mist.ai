@@ -66,8 +66,8 @@ BACKUP_ENVIRONMENT = {
 }
 MEM_LIMITS = {
     BACKEND: "${MIST_DAILY_BACKEND_MEM_LIMIT:-8g}",
-    NEO4J: "${MIST_DAILY_NEO4J_MEM_LIMIT:-2g}",
-    LLM: "${MIST_DAILY_LLM_MEM_LIMIT:-4g}",
+    NEO4J: "${MIST_DAILY_NEO4J_MEM_LIMIT:-3g}",
+    LLM: "${MIST_DAILY_LLM_MEM_LIMIT:-8g}",
     BACKUP: "${MIST_DAILY_BACKUP_MEM_LIMIT:-4g}",
 }
 LOGGING = {"driver": "json-file", "options": {"max-size": "20m", "max-file": "5"}}
@@ -76,7 +76,7 @@ LOGGING = {"driver": "json-file", "options": {"max-size": "20m", "max-file": "5"
 EXAMPLE_EXTRA_VARIABLES = (
     "MIST_EXTRACTION_INFERENCE",
     "MIST_EXTRACTION_SERVICE_URL",
-    "MIST_USAGE_TIMEZONE",
+    "MIST_TIMEZONE",
     "MIST_INSTANCE_NAME",
     "MODEL",
 )
@@ -94,6 +94,9 @@ REQUIRED_INTERPOLATION = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):\?")
 EXAMPLE_ASSIGNMENT = re.compile(r"^(#\s*)?([A-Z][A-Z0-9_]*)=(.*)$")
 PLACEHOLDER = re.compile(r"^<[a-z0-9][a-z0-9-]*>$")
 NAMED_VOLUME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+SIZE = re.compile(r"^(\d+)([kmg]?)$")
+SIZE_UNITS = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3}
+MIB = 1024**2
 
 
 def _load(path: Path) -> dict:
@@ -154,6 +157,20 @@ def _mount_at(service: dict, target: str) -> tuple[str, str, str]:
     matches = [mount for mount in _mounts(service) if mount[1] == target]
     assert len(matches) == 1, f"expected one mount at {target}, found {matches!r}"
     return matches[0]
+
+
+def _default_of(value: str) -> str:
+    """The default of a single `${NAME:-default}` value."""
+    match = DEFAULT_INTERPOLATION.fullmatch(value)
+    assert match, f"not a `${{NAME:-default}}` value: {value!r}"
+    return match.group(2)
+
+
+def _size_in_bytes(size: str) -> int:
+    """Bytes in a compose or Neo4j size such as `3g` or `512m`, whose units are binary."""
+    match = SIZE.match(size.lower())
+    assert match, f"not a size: {size!r}"
+    return int(match.group(1)) * SIZE_UNITS[match.group(2)]
 
 
 def _compose_text() -> str:
@@ -373,6 +390,25 @@ class TestResources:
     @pytest.mark.parametrize("name", SERVICES)
     def test_memory_limit_comes_from_its_variable(self, compose, name):
         assert compose["services"][name]["mem_limit"] == MEM_LIMITS[name]
+
+    def test_neo4j_default_limit_is_above_its_heap_plus_page_cache(self, compose):
+        service = compose["services"][NEO4J]
+        environment = _environment(service)
+        heap = _default_of(environment["NEO4J_server_memory_heap_max__size"])
+        page_cache = _default_of(environment["NEO4J_server_memory_pagecache_size"])
+
+        limit = _size_in_bytes(_default_of(service["mem_limit"]))
+
+        assert limit > _size_in_bytes(heap) + _size_in_bytes(page_cache)
+
+    def test_llm_default_limit_is_above_the_prompt_cache_cap(self, compose):
+        service = compose["services"][LLM]
+        command = service["command"]
+        cache_ram_mib = int(_default_of(command[command.index("--cache-ram") + 1]))
+
+        limit = _size_in_bytes(_default_of(service["mem_limit"]))
+
+        assert limit > cache_ram_mib * MIB
 
     @pytest.mark.parametrize("name", SERVICES)
     def test_logs_rotate(self, compose, name):
