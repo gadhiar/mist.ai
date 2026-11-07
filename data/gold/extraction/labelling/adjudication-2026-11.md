@@ -243,15 +243,19 @@ them missing by design:
   definition; `MECHANISM_OF` refuses a DataStructure or Mechanism target).
 - ho-022, ho-035: giving up energy drinks and coffee (`HAS_HABIT` needs a cadence).
 - ho-086: the launch's old date (unresolvable without a month).
-- ho-018, ho-039, ho-121: a third party's study, new hobby or pastime (`LEARNING`,
-  `INTERESTED_IN` and `HAS_HABIT` take only a User source).
+- ho-018, ho-039, ho-121, ho-133: a third party's study, new hobby, pastime or lessons
+  (`LEARNING`, `INTERESTED_IN` and `HAS_HABIT` take only a User source).
+- ho-116: the board's decision (`DECIDED` takes only a User source); the board is an
+  entity-only label (N3, N6).
+- The class B facts listed under "H8 marks": none of them has a valid gold shape yet.
 
 ## Coverage gaps
 
 None. Every extractable entity type appears in at least 3 held-out gold entities (the fewest:
-Abstraction 3, Strategy 4, Pattern 6) and every extractable predicate in at least 2 held-out
+Abstraction 3, Strategy 5, Pattern 6) and every extractable predicate in at least 2 held-out
 gold edges (the fewest: `MECHANISM_OF` 2, `MIST_HAS_PREFERENCE` 2, then `APPLICABLE_TO`,
-`PART_OF`, `IS_A`, `MIST_HAS_CAPABILITY` and `MIST_HAS_TRAIT` 3 each).
+`PART_OF`, `MIST_HAS_CAPABILITY` and `MIST_HAS_TRAIT` 3 each). Recounted after the H8 marks,
+which raised `IS_A` from 3 to 7.
 
 ## Dropped probes
 
@@ -264,6 +268,9 @@ multi 3, neg 3, temporal 3, fill 3, nofact 2, coref 1, scope 1. Each category's 
 4, 3, 2.5, 2.5, 2.5, 2.5, 1.5 and 1.5; the three places left after rounding down go to the
 25-probe categories that state facts (neg, temporal, fill). Within a category the probes are
 drawn with `random.Random(20261106)` over the sorted tags.
+
+The labels below are the ones checked, at integration commit c1e938e. "H8 marks" lists what
+the check changed since.
 
 For each probe, check:
 
@@ -585,3 +592,112 @@ Entities: `user` (User), `beekeeping` (Concept)
 Edges:
 
 - `user` KNOWS `beekeeping`
+
+## H8 marks
+
+Raj checked the 20 sampled probes on 2026-11-06 and marked where the gold misses a fact he
+expects. Each mark is read as a pattern, not a one-probe fix, and put in one class:
+
+- **A**: the current ontology and validator can express it. It becomes a labelling rule (N11
+  to N16, now in `../LABELLING.md`) applied to every probe of the 240 where the pattern recurs.
+- **B**: it needs an ontology change: a missing predicate, an edge property, or a validator rule
+  that refuses the source or target. Nothing is labelled; the gap is listed for the ontology's
+  owner, with the smallest shape that would express it.
+- **C**: not extraction gold.
+
+Counts of affected probes come from reading every probe of the 240 and of the 60-probe set
+(`data/ingest/extraction-gold-2026-06-14.jsonl`), which stays unchanged.
+
+### Mark by mark
+
+| Probe | Mark | Class | Rule or gap |
+|---|---|---|---|
+| ho-004 | the goal's "this year" is not captured | A | N11 goal windows. Goal ids marked good, so N2 stands |
+| ho-006 | the release order of the three steps | B | B1 step order |
+| ho-009 | Kotlin at work, Elixir on weekends; shells are zsh | B, and A | B2 edge context; "shells are zsh" is N14 |
+| ho-016 | much better | none | no change |
+| ho-041 | "most services" is lost | B | B2 edge context (extent) |
+| ho-060 | nothing missing | none | no change |
+| ho-068 | headquarters against office | B | B3 location roles |
+| ho-079 | good | none | no change |
+| ho-081 | used to love it until now, a dislike from now | A | N12 flipped preferences |
+| ho-083 | solid | none | no change |
+| ho-096 | job against task | B | B8 job or role |
+| ho-116 | topic links; the decision and who owns it | A, and B | N13 topic links and N3's owner entity; B6 decision ownership |
+| ho-117 | the classes were in the evening | B | B2 edge context (time of day) |
+| ho-121 | user knows the uncle; his ongoing pastime; Pinecil is a soldering iron | A, and B | N14 for the soldering iron; `user KNOWS_PERSON imre` was already gold; B4 kinship, B5 ongoing activity |
+| ho-139 | good | none | no change |
+| ho-142 | an explicit "remember this" request should be stored | C | a capability of the memory system, not an extraction label |
+| ho-165 | the capability searches notes | A | N15 an activity keeps its object |
+| ho-180 | a platform relation, though `DEPENDS_ON` is acceptable | B | B9 runs-on; `DEPENDS_ON` stays |
+| ho-181 | good | none | no change |
+| ho-185 | the knowledge came from the grandfather | A, and B | N16 for the grandfather as a person; B7 provenance, B4 kinship |
+
+### Class A rules and the probes they changed
+
+22 probes changed: 16 held-out, 6 dev. No probe was changed by two rules.
+
+| Rule | Probes changed | Count | 60-probe rows that do not follow it | Beyond the prompt |
+|---|---|---|---|---|
+| N11 goal windows | ho-004, ho-187, dvl-09, dvl-29 | 4 | 0 (no Goal) | no: prompt Rules 5 and 16 |
+| N12 flipped preferences | ho-077, ho-081 | 2 | 0 | yes: Rule 6 gives `DISLIKES` only (`prompts.py:54`) |
+| N13 topic links | ho-007, ho-033, ho-104, ho-116, dvl-30 | 5 | 0 | yes: no rule links an event to its topic |
+| N14 kind nouns | ho-001, ho-009, ho-113, ho-121, dvl-01, dvl-17 | 6 | 1 (`ext-13`) | yes: no rule for a kind noun in apposition, after "as the" or in a heading |
+| N15 an activity keeps its object | ho-165 | 1 | 1 (`ext-58`) | no: it changes an id, not a fact |
+| N16 a relative named by the relation | ho-027, ho-029, ho-185, dvl-34 | 4 | 0 | yes: Example 7 gives no Person (`prompts.py:111-115`) |
+
+What changed:
+
+- N11: `valid_to` on every `HAS_GOAL` edge: `2026` (ho-004, three goals), `2035` (ho-187),
+  `2027` (dvl-09, three goals), `2027-03` (dvl-29). Not changed: ho-048 ("by spring", a season)
+  and ho-025 ("Q1" with no clear year).
+- N12: `user PREFERS <x>` with `assertion_kind` `cease` beside the existing `DISLIKES`. This
+  reverses the ho-081 row under "Corrections to rows both passes agreed on".
+- N13: ho-116 drops `steering-meeting RELATED_TO bergen` and gains `new-data-centre`
+  (Location), `steering-meeting RELATED_TO new-data-centre`, `new-data-centre RELATED_TO bergen`
+  and `board` (Organization, entity only, N3). ho-033 links `architecture-review` to
+  `session-store-replacement` and `kafka`; dvl-30 links `planning` to `docs-site-move` and
+  `feature-freeze`. ho-104 gains `legacy-billing-endpoints` (Technology) as the decision's
+  object, and ho-007 gains `offline-maps-feature` (Project) as the subject the decision is for.
+- N14: `IS_A` to a Concept: `wezterm` to `terminal`, `zsh` to `shell`, `late-trains` to
+  `covers-band`, `pinecil` to `soldering-iron`, `helix` to `editor` and `fish` to `shell`
+  (dvl-01), `kakoune` to `editor` (dvl-17). Not changed, because `IS_A` refuses the type:
+  dvl-25 (a Document), dvl-26 (a Project), dvl-38's glossary (DataStructure and Mechanism), and
+  dvl-22, whose entities are what the courses teach.
+- N15: ho-165's `search-by-meaning` becomes `search-notes-by-meaning`, replacing the id the
+  "Corrections" table gave it.
+- N16: `wife` (ho-027, with `wife WORKS_AT juniperwell-clinic` and the `user` entity),
+  `brother` (ho-029, with `brother USES elm`), `grandfather` (ho-185), `sister` (dvl-34), each
+  with `user KNOWS_PERSON`. Not changed: dvl-08's "my parents" (a group), ho-074's "her
+  sister", ho-078's "the baby".
+
+None of the new held-out ids occurs in the production prompt, and the T8 checks (counts,
+coverage, overlap, contamination, loading) still pass. `test_gold_sets.py` checks N11, N12, N16
+and the "as the" case of N14 on both sets.
+
+### Class B gaps
+
+Line numbers are in `backend/knowledge/ontologies/v1_0_0.py` unless another file is named. The
+validator derives its constraints from those definitions (`validator.py:40-65`). Gold records
+no entity property and, on an edge, only `valid_from`, `valid_to` and `assertion_kind`
+(`../LABELLING.md`, Row schema; `scripts/eval_harness/score_extraction_run.py:174-183`).
+
+| Gap | Marks | What blocks it | Smallest shape that would express it | Probes of the 240 | Probes of the 60 |
+|---|---|---|---|---|---|
+| B1 step order | ho-006 | `PRECEDED_BY` (1559) takes only an Event source and an Event or Date target; process steps are not Events (621-623) | a directional `FOLLOWS` predicate between steps (Mechanism, Strategy, Concept, Technology) | 3: ho-006, ho-038, dvl-02 (a ranked list) | 0 |
+| B2 edge context | ho-009, ho-041, ho-117 | the free-text `context` (220-224) and `frequency` (229-234) edge properties exist, but gold and the scorer carry neither | `setting` and `extent` edge properties and a scored `frequency`, each with a gold field | 19: ho-001, ho-009, ho-041, ho-058, ho-062, ho-066, ho-076, ho-106, ho-117, ho-161, ho-166, ho-174, dvl-10, dvl-13, dvl-21, dvl-24, dvl-25, dvl-31, dvl-40; and the cadence of 7 `HAS_HABIT` probes | 3: ext-13, ext-18, ext-24; and the cadence of ext-55 to ext-57 |
+| B3 location roles | ho-068 | no extractable predicate links an Organization, Person or User to a Location except `RELATED_TO` (1400-1407) and `IS_A` (1370-1390); `location_type` (712-724) is a node property | `LOCATED_IN` (Organization, Person, User, Location to Location) with a `role` edge property (headquarters, office, site, home, birthplace) | 6: ho-027, ho-068, ho-101, ho-116, ho-130, ho-184; N5's event places add 5 (ho-013, ho-103, ho-123, dvl-18, dvl-37) | 0 |
+| B4 kinship and relation to the user | ho-121, ho-185 | `KNOWS_PERSON` (1440-1445) has no relation field; `relationship_to_user` (483-488) is a node property, and the prompt puts the relation in the edge's `context` (`prompts.py`, Examples 23 and 25) | a `relationship_to_user` property on `KNOWS_PERSON`, with a closed vocabulary and a gold field | 18: ho-008, ho-011, ho-027, ho-029, ho-039, ho-042, ho-047, ho-051, ho-064, ho-103, ho-121, ho-135, ho-185, dvl-04, dvl-06, dvl-08, dvl-24, dvl-34 | 5: ext-08, ext-29, ext-30, ext-31, ext-32 |
+| B5 a third party's ongoing activity | ho-121 | `HAS_HABIT` (1359-1364), `INTERESTED_IN` (1266-1272) and `LEARNING` (1306-1311) take only a User source | widen those three sources to include Person | 4: ho-018, ho-039, ho-121, ho-133 | 0 |
+| B6 decision ownership | ho-116 | `DECIDED` (1321-1327) takes only a User source, so a team's decision is put on `user` (N3) and a board's has no edge | widen `DECIDED` sources to Person and Organization, the owner as source | 6: ho-116 (a board), and the team decisions of ho-007, ho-033, ho-061, ho-104, dvl-30 | 0 |
+| B7 knowledge provenance | ho-185 | `LEARNED_FROM` (1454-1459) is internal, LearningEvent to ConversationContext, and excluded from extraction (1883) | a `learned_from` edge property on `KNOWS`, `INTERESTED_IN` and `EXPERT_IN` holding the source entity's id (a Person, Document, Project or Organization), with a gold field | 5: ho-069, ho-124, ho-126, ho-185, dvl-25 | 0 |
+| B8 job or role | ho-096 | no type or predicate for a job; User `role` (439-444) and Person `role` (471-476) are node properties, so a job is forced into a Project with `WORKS_ON` (1251-1256) | a `Role` node type and `HAS_ROLE` (User, Person to Role) | 10: ho-005, ho-023, ho-041, ho-051, ho-096, ho-102, ho-123, ho-135, dvl-06, dvl-33 | 1: ext-31 |
+| B9 runs on a platform | ho-180 | no predicate; `DEPENDS_ON` (1409-1418) is the closest and stays, as Raj accepts it | `RUNS_ON` (Technology, Project, Organization to Technology) | 5: ho-049, ho-161, ho-180, dvl-13, dvl-24 | 0 |
+| B10 animals | the lead, 2026-11-06 (the read path's recall fixture types a pet dog as Person) | no animal type: the extractable types are `_EXTERNAL_NODE_TYPES` (1133-1162) plus MistIdentity (1877-1879), listed in the prompt at `prompts.py:14-17`; a Person is "a person other than the primary user" (468) | an `Animal` node type and `HAS_PET` (User, Person to Animal) | 1: ho-013 (a cat, with no entity; the adoption is the Event `cat-adoption`); none in dev | 0 |
+
+No probe was retyped for B10.
+
+### Class C
+
+ho-142: a request to store something ("remember this") is an instruction to the memory system.
+The extraction gold for a directive stays empty (prompt Rule 10), and nothing is labelled.
