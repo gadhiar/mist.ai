@@ -14,6 +14,7 @@ import pytest
 import backend.user_timezone as user_timezone
 from backend.errors import MemoryConfigError, MistError
 from backend.memory.config import MEMORY_ENV_VARS, RETIRED_MEMORY_ENV_VARS, MemoryConfig
+from backend.memory.models import ServingProfile
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -81,6 +82,9 @@ class TestDefaults:
         )
         assert config.index_path is None
         assert config.refresh_debounce_s == 30
+        assert config.block_tokens_low == 0
+        assert config.list_max_items == 10
+        assert config.rescan_interval_s == 300
         assert config.tz is UTC
         assert config.tz_name is None
 
@@ -112,6 +116,9 @@ class TestFromEnv:
             "MIST_MEMORY_WEIGHTS": "0.6, 0.3, 0.1",
             "MIST_MEMORY_INDEX_PATH": ":memory:",
             "MIST_MEMORY_REFRESH_DEBOUNCE_S": "5",
+            "MIST_MEMORY_BLOCK_TOKENS_LOW": "120",
+            "MIST_MEMORY_LIST_MAX_ITEMS": "6",
+            "MIST_MEMORY_RESCAN_INTERVAL_S": "45",
         }
         for name, value in values.items():
             monkeypatch.setenv(name, value)
@@ -138,6 +145,9 @@ class TestFromEnv:
         )
         assert config.index_path == ":memory:"
         assert config.refresh_debounce_s == 5
+        assert config.block_tokens_low == 120
+        assert config.list_max_items == 6
+        assert config.rescan_interval_s == 45
 
     def test_a_blank_variable_counts_as_unset(self, monkeypatch):
         """Compose passes `${VAR:-}` through as an empty string, which must mean the default."""
@@ -259,6 +269,35 @@ class TestZone:
             MemoryConfig.from_env()
 
 
+class TestBlockTokensFor:
+    def test_full_gets_the_full_budget(self):
+        config = MemoryConfig(block_tokens=500, block_tokens_low=120)
+
+        assert config.block_tokens_for(ServingProfile(level="full", tier="top")) == 500
+
+    def test_low_gets_the_low_budget(self):
+        config = MemoryConfig(block_tokens=500, block_tokens_low=120)
+
+        assert config.block_tokens_for(ServingProfile(level="low", tier="interaction")) == 120
+
+    @pytest.mark.parametrize("tier", ["top", "interaction"])
+    def test_off_gets_nothing(self, tier):
+        config = MemoryConfig(block_tokens=500, block_tokens_low=120)
+
+        assert config.block_tokens_for(ServingProfile(level="off", tier=tier)) == 0
+
+    def test_the_default_low_budget_is_zero(self):
+        assert MemoryConfig().block_tokens_for(ServingProfile(level="low", tier="top")) == 0
+
+    def test_the_tier_does_not_change_the_budget(self):
+        config = MemoryConfig(block_tokens=400)
+
+        top = config.block_tokens_for(ServingProfile(level="full", tier="top"))
+        interaction = config.block_tokens_for(ServingProfile(level="full", tier="interaction"))
+
+        assert top == interaction == 400
+
+
 class TestRetiredVariables:
     @pytest.mark.parametrize(
         ("name", "value", "replacement"),
@@ -316,11 +355,44 @@ class TestValidation:
                 "rerank_timeout_ms",
             ),
             ({"refresh_debounce_s": -1}, "refresh_debounce_s"),
+            ({"block_tokens_low": -1}, "block_tokens_low"),
+            ({"block_tokens_low": 301}, "block_tokens_low"),
+            ({"list_max_items": 1}, "list_max_items"),
+            ({"list_max_items": 26}, "list_max_items"),
+            ({"rescan_interval_s": 29}, "rescan_interval_s"),
         ],
     )
     def test_rejects_invalid_values(self, overrides, fragment):
         with pytest.raises(MemoryConfigError, match=fragment):
             MemoryConfig(**overrides)
+
+    @pytest.mark.parametrize(
+        ("overrides", "field"),
+        [
+            ({"block_tokens_low": 0}, "block_tokens_low"),
+            ({"block_tokens_low": 300}, "block_tokens_low"),
+            ({"list_max_items": 2}, "list_max_items"),
+            ({"list_max_items": 25}, "list_max_items"),
+            ({"rescan_interval_s": 30}, "rescan_interval_s"),
+        ],
+    )
+    def test_range_bounds_are_inclusive(self, overrides, field):
+        assert getattr(MemoryConfig(**overrides), field) == overrides[field]
+
+    @pytest.mark.parametrize(
+        ("name", "raw"),
+        [
+            ("MIST_MEMORY_BLOCK_TOKENS_LOW", "301"),
+            ("MIST_MEMORY_LIST_MAX_ITEMS", "30"),
+            ("MIST_MEMORY_RESCAN_INTERVAL_S", "10"),
+            ("MIST_MEMORY_LIST_MAX_ITEMS", "ten"),
+        ],
+    )
+    def test_from_env_rejects_out_of_range_variables(self, monkeypatch, name, raw):
+        monkeypatch.setenv(name, raw)
+
+        with pytest.raises(MemoryConfigError):
+            MemoryConfig.from_env(tz_resolver=_never_called)
 
     def test_share_bounds_are_inclusive(self):
         assert MemoryConfig(continuity_share=0.0).continuity_share == 0.0
@@ -394,6 +466,9 @@ class TestEnvExampleDocumentsEveryVariable:
         assert documented["MIST_MEMORY_RERANK_REMOTE_SCORES"] == defaults.rerank_remote_scores
         assert documented["MIST_MEMORY_WEIGHTS"] == "0.8,0.1,0.1"
         assert int(documented["MIST_MEMORY_REFRESH_DEBOUNCE_S"]) == defaults.refresh_debounce_s
+        assert int(documented["MIST_MEMORY_BLOCK_TOKENS_LOW"]) == defaults.block_tokens_low
+        assert int(documented["MIST_MEMORY_LIST_MAX_ITEMS"]) == defaults.list_max_items
+        assert int(documented["MIST_MEMORY_RESCAN_INTERVAL_S"]) == defaults.rescan_interval_s
 
     def test_retired_variables_are_not_documented(self):
         text = (_REPO_ROOT / ".env.example").read_text(encoding="utf-8")

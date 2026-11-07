@@ -18,6 +18,8 @@ from typing import Literal
 from backend.errors import MemoryConfigError
 from backend.user_timezone import USER_TIMEZONE_ENV, ZoneLoader, resolve_user_timezone
 
+from .models import ServingProfile
+
 RerankBackend = Literal["local", "remote", "off"]
 RerankDevice = Literal["cpu", "cuda"]
 RemoteScoreKind = Literal["logit", "probability"]
@@ -27,6 +29,9 @@ _RERANK_BACKENDS: tuple[str, ...] = ("local", "remote", "off")
 _RERANK_DEVICES: tuple[str, ...] = ("cpu", "cuda")
 _REMOTE_SCORE_KINDS: tuple[str, ...] = ("logit", "probability")
 _WEIGHT_TOLERANCE = 1e-6
+_BLOCK_TOKENS_LOW_RANGE = (0, 300)
+_LIST_MAX_ITEMS_RANGE = (2, 25)
+_MIN_RESCAN_INTERVAL_S = 30
 _TRUE = frozenset({"true", "1", "yes", "on"})
 _FALSE = frozenset({"false", "0", "no", "off"})
 
@@ -57,6 +62,9 @@ MEMORY_ENV_VARS: tuple[str, ...] = (
     "MIST_MEMORY_WEIGHTS",
     "MIST_MEMORY_INDEX_PATH",
     "MIST_MEMORY_REFRESH_DEBOUNCE_S",
+    "MIST_MEMORY_BLOCK_TOKENS_LOW",
+    "MIST_MEMORY_LIST_MAX_ITEMS",
+    "MIST_MEMORY_RESCAN_INTERVAL_S",
     USER_TIMEZONE_ENV,
 )
 
@@ -184,6 +192,11 @@ class MemoryConfig:
         index_path: Path of `memory_index.db`; None means beside the event store, resolved by
             the factory, which also propagates `:memory:`.
         refresh_debounce_s: Minimum seconds between two index refreshes.
+        block_tokens_low: Block budget at the low serving level, 0 to 300; 0 sends no block.
+            `block_tokens` is the budget at full, and off gets none.
+        list_max_items: Most siblings one list item can bring into the block, 2 to 25.
+        rescan_interval_s: Seconds between two rescans of the graph for changed facts, at
+            least 30.
         tz: Zone used to read temporal phrases, from `MIST_TIMEZONE`. Resolved once in
             `from_env`.
         tz_name: The IANA name `tz` came from, or None when `tz` is UTC because
@@ -208,6 +221,9 @@ class MemoryConfig:
     confidence_weight: float = 0.1
     index_path: str | None = None
     refresh_debounce_s: int = 30
+    block_tokens_low: int = 0
+    list_max_items: int = 10
+    rescan_interval_s: int = 300
     tz: tzinfo = UTC
     tz_name: str | None = None
 
@@ -228,6 +244,13 @@ class MemoryConfig:
         if self.refresh_debounce_s < 0:
             raise MemoryConfigError(
                 f"refresh_debounce_s must not be negative, got {self.refresh_debounce_s}"
+            )
+        _require_range("block_tokens_low", self.block_tokens_low, _BLOCK_TOKENS_LOW_RANGE)
+        _require_range("list_max_items", self.list_max_items, _LIST_MAX_ITEMS_RANGE)
+        if self.rescan_interval_s < _MIN_RESCAN_INTERVAL_S:
+            raise MemoryConfigError(
+                f"rescan_interval_s must be at least {_MIN_RESCAN_INTERVAL_S}, "
+                f"got {self.rescan_interval_s}"
             )
         _require_choice("rerank_backend", self.rerank_backend, _RERANK_BACKENDS)
         _require_choice("rerank_device", self.rerank_device, _RERANK_DEVICES)
@@ -284,9 +307,30 @@ class MemoryConfig:
             confidence_weight=confidence_weight,
             index_path=_env("MIST_MEMORY_INDEX_PATH"),
             refresh_debounce_s=_env_int("MIST_MEMORY_REFRESH_DEBOUNCE_S", 30),
+            block_tokens_low=_env_int("MIST_MEMORY_BLOCK_TOKENS_LOW", 0),
+            list_max_items=_env_int("MIST_MEMORY_LIST_MAX_ITEMS", 10),
+            rescan_interval_s=_env_int("MIST_MEMORY_RESCAN_INTERVAL_S", 300),
             tz=tz,
             tz_name=tz_name,
         )
+
+    def block_tokens_for(self, profile: ServingProfile) -> int:
+        """The block budget at `profile`'s level: full, low, or 0 at off.
+
+        The tier does not enter, because one tier can run at more than one level and so at
+        more than one prefill rate.
+        """
+        if profile.level == "full":
+            return self.block_tokens
+        if profile.level == "low":
+            return self.block_tokens_low
+        return 0
+
+
+def _require_range(field_name: str, value: int, bounds: tuple[int, int]) -> None:
+    low, high = bounds
+    if not low <= value <= high:
+        raise MemoryConfigError(f"{field_name} must be in [{low}, {high}], got {value}")
 
 
 def _require_choice(field_name: str, value: str, choices: tuple[str, ...]) -> None:
