@@ -72,7 +72,7 @@ def _add_turn(path: Path, session_id: str, days_ago: int, now: datetime) -> None
 def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = _make_store(tmp_path / "event_store.db")
     monkeypatch.setenv("EVENT_STORE_DB_PATH", str(path))
-    monkeypatch.setenv("MIST_USAGE_TIMEZONE", "UTC")
+    monkeypatch.setenv("MIST_TIMEZONE", "UTC")
     return path
 
 
@@ -198,7 +198,7 @@ def test_unknown_zone_falls_back_to_utc_and_is_logged(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    monkeypatch.setenv("MIST_USAGE_TIMEZONE", "Atlantis/Capital")
+    monkeypatch.setenv("MIST_TIMEZONE", "Atlantis/Capital")
 
     with caplog.at_level(logging.WARNING, logger=usage.__name__):
         response = client.get("/usage/turns-per-day")
@@ -211,9 +211,18 @@ def test_unknown_zone_falls_back_to_utc_and_is_logged(
 def test_configured_zone_is_reported(
     store: Path, client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("MIST_USAGE_TIMEZONE", "Europe/Berlin")
+    monkeypatch.setenv("MIST_TIMEZONE", "Asia/Tokyo")
 
-    assert client.get("/usage/turns-per-day").json()["timezone"] == "Europe/Berlin"
+    assert client.get("/usage/turns-per-day").json()["timezone"] == "Asia/Tokyo"
+
+
+def test_the_old_zone_variable_is_ignored(
+    store: Path, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MIST_TIMEZONE")
+    monkeypatch.setenv("MIST_USAGE_TIMEZONE", "Asia/Tokyo")
+
+    assert client.get("/usage/turns-per-day").json()["timezone"] == "UTC"
 
 
 def test_response_holds_no_session_id_utterance_or_time_of_day(

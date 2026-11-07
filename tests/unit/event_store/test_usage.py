@@ -238,7 +238,7 @@ def test_build_reports_the_fallback_zone(store: Path) -> None:
 def test_build_reads_the_zone_from_the_environment(
     store: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("MIST_USAGE_TIMEZONE", "Asia/Tokyo")
+    monkeypatch.setenv("MIST_TIMEZONE", "Asia/Tokyo")
 
     result = build_turns_per_day(str(store), days=1, now=datetime(2026, 10, 23, 20, tzinfo=UTC))
 

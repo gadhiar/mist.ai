@@ -25,7 +25,7 @@ must not create, migrate or write the store it reports on.
 
 Local dates
 -----------
-Turns are bucketed by their date in the zone named by `MIST_USAGE_TIMEZONE`
+Turns are bucketed by their date in the zone named by `MIST_TIMEZONE`
 (default UTC), resolved through `pytz`. `pytz` rather than `zoneinfo`: the
 backend image ships no IANA database for `zoneinfo` (no `tzdata` package and
 no system zone files), while `pytz` carries its own and is already installed
@@ -55,7 +55,7 @@ from .store import _DEFAULT_DB_PATH
 
 logger = logging.getLogger(__name__)
 
-TIMEZONE_ENV = "MIST_USAGE_TIMEZONE"
+TIMEZONE_ENV = "MIST_TIMEZONE"
 DEFAULT_TIMEZONE = "UTC"
 ORIGIN = "real"
 
@@ -130,7 +130,7 @@ def resolve_timezone(name: str | None) -> tuple[tzinfo, str]:
 
     Unset or blank means the default, UTC, without a warning. An unknown name
     also yields UTC, but with a warning naming the value, because a typo in
-    `MIST_USAGE_TIMEZONE` shifts every late-evening turn onto the wrong date.
+    `MIST_TIMEZONE` shifts every late-evening turn onto the wrong date.
 
     Returns:
         The zone, and its canonical name (`UTC` on fallback).
@@ -251,7 +251,7 @@ def build_turns_per_day(
     Args:
         db_path: Path to the event store's SQLite file.
         days: Number of local days to report, from 1 to 90.
-        timezone_name: IANA zone name; None reads `MIST_USAGE_TIMEZONE`.
+        timezone_name: IANA zone name; None reads `MIST_TIMEZONE`.
         now: The current instant (aware); None means the wall clock.
 
     Raises:

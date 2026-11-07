@@ -1796,7 +1796,7 @@ async def usage_turns_per_day(days: int = Query(7, ge=1, le=90)):
     - `days` (1-90, default 7) is dense, oldest first, ends today in
       `timezone`, and covers exactly the days asked for; out of range is a
       422 from the query validation.
-    - `timezone` is `MIST_USAGE_TIMEZONE`, default UTC; an unknown name falls
+    - `timezone` is `MIST_TIMEZONE`, default UTC; an unknown name falls
       back to UTC, is logged, and is reported here as `UTC`.
     - A turn counts when its session's origin is `real` or its session row
       is missing, the event store's own rule.
@@ -1855,7 +1855,7 @@ async def usage_uptime(days: int = Query(7, ge=1, le=90)):
       not a stored row.
     - `days` (1-90, default 7) is dense, oldest first, and ends today in
       `timezone`; out of range is a 422 from the query validation.
-    - `timezone` is `MIST_USAGE_TIMEZONE`, default UTC; an unknown name falls
+    - `timezone` is `MIST_TIMEZONE`, default UTC; an unknown name falls
       back to UTC, is logged, and is reported here as `UTC`.
     - A store that is missing, locked or unreadable is a 503 with
       `{"error": "store_unavailable"}`. The store is opened read-only through

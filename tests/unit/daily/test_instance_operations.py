@@ -581,7 +581,7 @@ def test_switch_rewrites_only_the_release_tag_line(make_ctx, daily):
     original = (
         daily.env.read_bytes()
         + b"# MIST_RELEASE_TAG=commented-out\r\n"
-        + b"MIST_USAGE_TIMEZONE=Europe/London   \r\n"
+        + b"MIST_TIMEZONE=Europe/London   \r\n"
         + b"MIST_BACKUP_RETAIN=7"
     )
     daily.env.write_bytes(original)
