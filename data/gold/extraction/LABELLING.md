@@ -31,8 +31,9 @@ extraction work for this goal.
 - Organisations are fictional (`Driftmere Analytics`, `Kelderwick Rail`). The 60-probe set
   uses some real company names; these sets use none, and the test fails any utterance that names
   an Organization entity of the 60-probe set.
-- People get first names only (`Marta`, `Teodor`). A person the utterance does not name gets no
-  entity (see Third parties below).
+- People get first names only (`Marta`, `Teodor`). A relative the utterance names only by the
+  relation ("my grandfather") is labelled by that relation (N16, under Durable third-party
+  facts below).
 - Nothing in any utterance, label or note is about Raj or any other real private person.
 - Real technologies, real public documents (books, papers, RFCs) and real places are allowed,
   as in the 60-probe set.
@@ -61,6 +62,11 @@ Each label row follows the 60-probe schema exactly, so `iter_gold_probes`
 - `id`, `source` and `target` are canonical: lowercase, hyphenated, letters, digits and hyphens
   only (`score_extraction_run.py:65-77`; prompt Rule 2, `prompts.py:50`). Versions collapse to
   the base name (Rule 3, `prompts.py:51`).
+- An id is written as `canonical_id` leaves it, so the file row and the loaded probe are the same
+  (N9). A decimal point is dropped: `31-gb-peak-memory`, not `3.1-gb-peak-memory`. The loader
+  and the normaliser's slug strip it anyway (`canonical_id.py:10-15`), so the loaded gold is
+  the same either way; written in loader form, the test can compare the file with what the
+  loader returns. Settled in the 2026-11 adjudication (dvl-39, ho-015).
 - Types and predicates are the extractable v1.4.0 sets only: `EXTRACTABLE_NODE_TYPES`
   (`v1_0_0.py:1877-1879`, 21 types) and `EXTRACTABLE_RELATIONSHIP_TYPES`
   (`v1_0_0.py:1914-1916`, 39 predicates). The test derives both sets from the module. `Topic`
@@ -75,6 +81,36 @@ Each label row follows the 60-probe schema exactly, so `iter_gold_probes`
   (prompt Rule 9, `prompts.py:57`; design note line 28).
 
 ## Conventions from the 60-probe set
+
+The rules marked N1 to N10 below came out of the 2026-11 adjudication
+(`labelling/adjudication-2026-11.md`, "Rules to add"), each with the precedent that settled it.
+N11 to N16 came out of the H8 check of 20 held-out probes against their gold (same file, "H8
+marks"), each from the mark that asked for it. A rule marked "beyond the prompt" asks for a fact
+the production prompt does not tell the model to extract; the gold labels it anyway, so the
+score shows what extraction misses.
+
+### Ids
+
+- **N1 Id surface.** An id is the utterance's own phrase for the thing, lowercased and
+  hyphenated, with leading articles and possessive pronouns dropped and a plural kept as
+  written: `regular-expressions` (`ext-28`), `in-memory-data-store` (`ext-41`), `backend-work`
+  (`ext-01`). A habit id names the activity, as `journaling` and `long-run` (`ext-55`,
+  `ext-57`). Where two ids both fit this and neither is the utterance's own phrase, the base
+  pass's stands (adjudication, Method).
+- **N15 An activity keeps its object.** An id for an activity, a capability or a habit keeps the
+  object the utterance gives it, possessives dropped: "MIST can search my notes by meaning" is
+  `search-notes-by-meaning`, not `search-by-meaning`, because the notes are part of the
+  capability. From the H8 mark on ho-165. It asks for no new fact, only the id's surface. The
+  60-probe `ext-58` writes "mentoring junior engineers" as `mentoring`, so it does not follow
+  this rule; that file stays unchanged.
+- **N2 Goal ids.** A Goal id is the goal's verb phrase as the utterance words it, articles and
+  possessive pronouns dropped: `get-pilots-license`, `cut-screen-time`, `pay-off-mortgage`. The
+  60-probe set has no Goal; this follows the goal ids both passes agreed on (`ship-saltmere` in
+  dvl-09, `learn-to-sail` in ho-091). The H8 check marked ho-004's goal ids good.
+- **N4 Name modifiers.** A name that only modifies another name (the Lisbon summit, the Corvane
+  outage drills, the Wrenfield Bakery ordering site) gets no entity of its own, unless a list's
+  lead-in carries it (List-shaped probes; dvl-35, ho-038). From `ext-18`, where "on the payments
+  team" adds no entity, and the agreed rows ho-057, ho-069, ho-095 and ho-188.
 
 ### The user anchor
 
@@ -95,6 +131,11 @@ When one utterance states a MIST fact and a user fact, each fact keeps its own s
 move a MIST fact onto `user` or a user fact onto `mist-identity`. Naming MIST does not make it
 the subject (`ho-174`).
 
+**N8 The team's tools.** A statement of which tools the user's team runs ("How our release
+goes", "our data stack", "we retired our self-hosted GitLab") puts `USES` on the user. A
+possessive that only names a thing ("Our API handles ...", `ext-24`) does not. From the agreed
+rows ho-073 and ho-094 and the `USES` edges both passes gave ho-006.
+
 ### Durable third-party facts
 
 When the user states a durable fact about another person, label both the anchor
@@ -108,11 +149,24 @@ An incidental encounter is not a durable fact. "I had coffee with my old manager
 the anchor only, with no Event for the coffee (changelog lines 19 and 38).
 
 Third-party facts are never moved onto the user (prompt line 35). A person the user does not
-claim to know (a name mentioned in passing) gets no `KNOWS_PERSON` edge. New rule: a person the
-utterance does not name ("my wife", "my brother") gets no entity, and that person's facts
-are dropped. The 60-probe set has no such case. The rule follows prompt Example 7
-(`prompts.py:111-115`), where "my coworker" produces no Person entity, and it keeps the ids
-stable across the two label passes.
+claim to know (a name mentioned in passing) gets no `KNOWS_PERSON` edge.
+
+**N16 A relative named by the relation.** A single person the user names only by their relation
+("my grandfather", "my wife", "my sister") is a `Person` whose id is the relation noun
+(`grandfather`, `wife`), with the anchor `user -[KNOWS_PERSON]-> <relation>` and that person's
+durable facts, as for a named person ("my wife's employer" is `wife -[WORKS_AT]-> <org>`). A
+group ("my parents") gets no entity, since a `Person` is one person, and neither does someone
+the utterance relates to another person ("her sister") or names without a possessive ("the
+baby"). From the H8 mark on ho-185, which asked for the grandfather the user's knowledge came
+from; how the knowledge came from him has no predicate (adjudication, "H8 marks", class B).
+This replaces the first batch's rule that an unnamed person gets no entity. Beyond the prompt:
+Example 7 (`prompts.py:111-115`) gives "my coworker" no Person entity, and Rule 19's example
+names the person. The 60-probe set has no unnamed relative.
+
+**N7 Third-party events.** A named person's own event that is not milestone-class (Ilse's
+thesis defense, Marta's birthday dinner, Imre's retirement) is `<person> EXPERIENCED <event>`,
+beside the anchor. From prompt Rule 19 (the third party's own fact, with the person as source)
+and Rule 11 (life events pair with `EXPERIENCED`); settled on dvl-15, dvl-37 and ho-121.
 
 ### Event and metric ids
 
@@ -133,11 +187,38 @@ ext-23, and Example 12 (`prompts.py:141-145`). A decision the user made is `user
 no `DECIDED` edge. The Event type's `event_type` values are at `v1_0_0.py:621-640`. Gold does
 not record entity properties.
 
+- **N10 Personal milestones.** Signing a lease is milestone-class, like closing on a house
+  (`ext-22`): an Event with no user `EXPERIENCED` edge. Settled on dvl-18 and ho-111.
+- **N3 Decisions.** A decision the user's team makes is `user DECIDED <decision event>`, and the
+  decision event is linked to the thing chosen by `RELATED_TO` when no canonical predicate links
+  an Event to it. The decision does not make its outcome a current fact (no `USES` for a tool
+  not yet adopted, no cease for one not yet retired). A decision by someone else gets the event
+  and the link but no `DECIDED`, and its owner is an entity even when the utterance names it
+  only by role ("the board" is an `Organization`); the owner has no edge to the decision, since
+  `DECIDED` takes only a `User` source (`v1_0_0.py:1321-1327`). From prompt Rule 11
+  ("decisions (paired with `DECIDED`)") and Rule 15, which reserves `RELATED_TO` for when no
+  canonical shape fits; settled on ho-007, ho-033 and dvl-30. The owner as an entity is from the
+  H8 mark on ho-116.
+- **N5 Stated places and organisations.** A place or organisation the utterance relates to an
+  event with a preposition ("in Bruges", "at Marrowby Press", "to Porto") is an entity, linked to
+  the event by `RELATED_TO`. From the agreed rows dvl-18, ho-013 and ho-027; the 60-probe set
+  has no stated place.
+- **N13 Topic links.** An Event the probe labels links by `RELATED_TO` to what the utterance
+  says it concerned: the subject a meeting discussed or decided on, the decisions it made, and
+  the object of a decision. Something chosen for a subject links to that subject, not to the
+  event. "At the steering meeting the board chose Bergen for the new data centre" is
+  `steering-meeting RELATED_TO new-data-centre` and `new-data-centre RELATED_TO bergen`, with no
+  edge from the meeting to Bergen. An event the utterance only implies (a review where options
+  "came up") is not added for this rule, and an option nobody chose still gets no edge
+  (List-shaped probes).
+  From the H8 mark on ho-116. Beyond the prompt: no rule tells the model to link an event to
+  its topic. The 60-probe set has no event with a stated topic.
+
 A Metric id puts the value first: `<value>-<unit>[-<quantity>]`, for example
 `12000-requests-per-second` and `87-percent-coverage` (changelog lines 22-23;
 `backend/knowledge/extraction/canonical_id.py:18-22`). Write the value as the utterance states
-it, decimal point included (`3.1-gb-peak-memory`). The loader strips the point when it
-canonicalises the id, the same way the normaliser's slug does (`canonical_id.py:10-15`). The
+it, in loader form (N9): `31-gb-peak-memory` for "3.1 GB peak memory", with the decimal point
+dropped as `canonical_id` drops it (`canonical_id.py:10-15`). The
 metric attaches through `HAS_METRIC` (`v1_0_0.py:1519`). That predicate's allowed sources
 include User, Project, Technology, Skill, Concept and Goal but not Organization or Event, so a
 metric about an organisation or an event gets no edge.
@@ -153,6 +234,33 @@ the seven children in v1.4.0, the same taxonomy revision that retired Topic and 
 (changelog lines 13-16). The 60-probe set has no `Abstraction` entity; the rule above is the
 prompt's and the ontology's. The held-out fill probes `ho-176` to `ho-178` were written to need
 the fallback.
+
+**N6 Type by its test.** A type is chosen by its type test, never to keep an edge. An edge the
+validator then refuses is dropped (Row schema). An entity left with no edge stays as an
+entity-only label when the utterance states something about it, as prompt Example 7 keeps
+`rust` with no relationship; a Metric left with no edge is dropped with it, as both passes did
+in dvl-24 and ho-131. Settled on ho-052, ho-129 and ho-134.
+
+**N14 Kind nouns.** When the utterance says what kind of thing a named entity is, beyond its
+entity type, the kind is a `Concept` and the entity gets `IS_A` to it: "a Pinecil soldering
+iron" is `pinecil IS_A soldering-iron`, "WezTerm as the terminal" is `wezterm IS_A terminal`, a
+heading "Shells" over "zsh" is `zsh IS_A shell`, "a covers band called The Late Trains" is
+`late-trains IS_A covers-band`. This is the shape of `ext-12` and `ext-41` ("X is a Y") and of
+`functional-language` in ho-180 and `city` in ho-184. No edge when:
+
+- the kind only restates the entity type, as the words of its description do (`v1_0_0.py`
+  type descriptions: a Technology is "a programming language, framework, library, tool,
+  platform, service, database, or protocol", so "Languages" or "the same library" adds nothing);
+- the validator refuses the pair (`IS_A` joins only Abstraction, Concept, Location,
+  Organization, Skill and Technology, so a Document, Project or Person gets none);
+- the kind is part of the name (`zephyr-rtos`, `kestrelmoor-hiking-society`, N4), or the
+  entity stands for something other than the thing the kind describes (a course's subject).
+
+From the H8 marks on ho-121 (the Pinecil is a soldering iron) and ho-009 ("shells are zsh").
+Beyond the prompt: the prompt teaches `IS_A` only by direction ("React" IS_A "Framework",
+`prompts.py:39`), with no rule for a kind noun in apposition, after "as the", or in a heading.
+The 60-probe `ext-13` ("Neovim as my daily editor") has no `neovim IS_A editor`, so it does not
+follow this rule; that file stays unchanged.
 
 ### Date entities
 
@@ -178,8 +286,19 @@ states: "yesterday" is `2026-06-12`, "two weeks ago" is `2026-05-30`, "last mont
 edge as `valid_from` or `valid_to` for a stative fact, or as a `Date` entity with `OCCURRED_ON`
 for an event, but only when the expression resolves to a single day, because a Date id is a full
 `YYYY-MM-DD` (`v1_0_0.py:735-747`); an event dated only to a month or a year gets no Date
-entity. An expression too vague to resolve ("recently", "a while back") gets no date. New probes
-still prefer absolute dates (design note line 26).
+entity. An expression too vague to resolve ("recently", "a while back") gets no date, and nor
+does a season ("since the spring", ho-106; "by spring", ho-048), whose bounds are a convention.
+New probes still prefer absolute dates (design note line 26).
+
+**N11 Goal windows.** A goal's stated time frame is its deadline: the `HAS_GOAL` edge carries
+`valid_to` at the frame's end, at the precision the frame states, and no `valid_from`, because
+the utterance does not say when the goal was set. "This year I want to" is `valid_to` `2026`,
+"Goals for next year" `2027`, "paid off by 2035" `2035`, "training for a 10k in March"
+`2027-03` (a goal looks forward, so a bare month is the first one after 2026-06-13). A lead-in
+sets the frame for every goal under it. A frame whose year is unclear ("Q1 goals" beside a
+done item, ho-025) gets no date. From the H8 mark on ho-004 ("This year" for the goal), and
+within prompt Rules 5 and 16 (`prompts.py:53`, `:64`): the frame is a date that scopes a
+stative fact. The 60-probe set has no Goal.
 
 ### Assertion kinds
 
@@ -188,9 +307,18 @@ still prefer absolute dates (design note line 26).
 that", "I was wrong about"). A self-correction is a retraction, not a directive (prompt Rule 6,
 `prompts.py:54`; ext-43 to ext-52). A replacement in one turn carries both edges: `cease` on
 the old target and an assertion on the new one (ext-53, ext-54). A negated preference is an
-assertion: "I don't like X" and "I don't like X anymore" are both `DISLIKES` (Rule 6; ext-15).
-A plain negation of something never stated ("I've never written PHP") is neither cease nor
-retract and gets no edge.
+assertion: "I don't like X" is `DISLIKES` (Rule 6; ext-15). A plain negation of something never
+stated ("I've never written PHP") is neither cease nor retract and gets no edge.
+
+**N12 Flipped preferences.** When the utterance states the earlier preference as well as the
+new one ("I used to love X, now it slows me down", "I don't enjoy X anymore"), it carries both:
+`user PREFERS X` with `assertion_kind` `cease`, and the new `user DISLIKES X` as an assertion,
+the same pair as a replacement (ext-53, ext-54). Neither edge gets a date: "now" contrasts the
+present with the past and states no day the preference changed. From the H8 mark on ho-081 (the
+user used to love it until now; going forward it is a dislike). This reverses the first
+batch's correction that kept only the new preference. Beyond the prompt: Rule 6
+(`prompts.py:54`) gives "don't like X anymore" as `DISLIKES` assert only. The 60-probe set has
+no flipped preference (ext-15 states no earlier one).
 
 ### No-fact probes
 
