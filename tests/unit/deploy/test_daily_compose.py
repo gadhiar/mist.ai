@@ -67,7 +67,7 @@ BACKUP_ENVIRONMENT = {
 MEM_LIMITS = {
     BACKEND: "${MIST_DAILY_BACKEND_MEM_LIMIT:-8g}",
     NEO4J: "${MIST_DAILY_NEO4J_MEM_LIMIT:-3g}",
-    LLM: "${MIST_DAILY_LLM_MEM_LIMIT:-8g}",
+    LLM: "${MIST_DAILY_LLM_MEM_LIMIT:-9g}",
     BACKUP: "${MIST_DAILY_BACKUP_MEM_LIMIT:-4g}",
 }
 LOGGING = {"driver": "json-file", "options": {"max-size": "20m", "max-file": "5"}}
