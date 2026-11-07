@@ -1,5 +1,5 @@
 # mist-speech-bench-asr: run 3's NeMo and onnx-asr engines (mist-model-host plan v2, engine facts).
 # nemo_toolkit 2.7.3 runs on the base image's torch 2.6 and transformers 4.57; NeMo 3.0 needs
-# Python 3.12 and torch 2.7. onnx-asr uses the base image's onnxruntime 1.25.1.
+# Python 3.12 and torch 2.7. onnx-asr uses the base image's onnxruntime 1.31.1 (requirements-base.txt).
 nemo_toolkit[asr]==2.7.3
 onnx-asr==0.12.0

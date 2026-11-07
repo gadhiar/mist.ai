@@ -7,7 +7,7 @@
       "image": "mist-speech-bench-qwen3",
       "device": "cuda",
       "streaming": true,
-      "packages": {"faster-qwen3-tts": "0.5.4", "transformers": "5.22.2", "qwen-tts-hf": "0.1.1.post1", "torch": "2.6.0+cu124"},
+      "packages": {"faster-qwen3-tts": "0.5.4", "transformers": "5.16.1", "qwen-tts-hf": "0.1.1.post1", "torch": "2.6.0+cu124"},
       "model": {"repository": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "revision": "85e237c1", "bytes": 2493919668},
       "licence": "Apache-2.0",
       "settings": {
@@ -88,7 +88,7 @@
       "device": "cpu",
       "threads": 4,
       "streaming": false,
-      "packages": {"onnx-asr": "0.12.0", "onnxruntime": "1.25.1"},
+      "packages": {"onnx-asr": "0.12.0", "onnxruntime": "1.31.1"},
       "model": {"onnx_asr_id": "nemo-parakeet-tdt-0.6b-v2", "verified": false},
       "licence": "code MIT, weights CC-BY-4.0"
     },
@@ -107,7 +107,7 @@
       "image": "mist-speech-bench-base",
       "device": "cpu",
       "threads": 4,
-      "packages": {"onnxruntime": "1.25.1"},
+      "packages": {"onnxruntime": "1.31.1"},
       "model": {"repository": "pipecat-ai/smart-turn-v3", "file": "smart-turn-v3.2-cpu.onnx", "bytes": 8679182, "quant": "int8"},
       "licence": "BSD-2-Clause"
     }

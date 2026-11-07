@@ -1,14 +1,17 @@
-"""docker/speech-bench/: the speech bench images (mist-model-host plan v2, bench images).
+"""docker/speech-bench/: the speech bench images (mist-model-host plan v2, bench images; v3, T9).
 
 Every Dockerfile in the directory is found by glob, so an image another task adds is held to the
 same rules: the lead builds each with `docker/speech-bench/` as the context, so a COPY may name
 only a plain requirements or constraints file beside the Dockerfile, never repository code; the
-base image is the running backend image with nothing added; every other image starts from the
-base and installs its pins under the torch constraints; every pin is `==`.
+base image is the running backend image plus one install of `requirements-base.txt` (onnxruntime,
+which the backend image lacks, with numpy held at the backend's version); every other image
+starts from the base and installs its pins under the torch constraints; every pin is `==`; and an
+arm in `speech_arms.json` that names a package pinned here names the pinned version.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -72,11 +75,79 @@ def test_every_copy_source_is_a_plain_pin_file_beside_the_dockerfile(path):
             assert (BENCH_DIR / source).is_file(), f"{path.name}: {source} is not beside it"
 
 
-def test_the_base_dockerfile_is_the_backend_image_with_nothing_added():
-    assert instructions(BENCH_DIR / "base.Dockerfile") == [
+def normalised(steps: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """The steps with each argument string's runs of whitespace collapsed to one space."""
+    return [(keyword, " ".join(args.split())) for keyword, args in steps]
+
+
+def header(path: Path) -> str:
+    """The comment block at the top of a Dockerfile, before its first instruction."""
+    lines = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        if not raw.startswith("#"):
+            break
+        lines.append(raw.lstrip("#").strip())
+    return " ".join(" ".join(lines).split())
+
+
+def test_the_base_dockerfile_is_the_backend_image_plus_the_base_pins():
+    assert normalised(instructions(BENCH_DIR / "base.Dockerfile")) == [
         ("ARG", "BACKEND_IMAGE"),
         ("FROM", "${BACKEND_IMAGE}"),
+        ("COPY", "requirements-base.txt constraints-torch.txt /tmp/speech-bench/"),
+        (
+            "RUN",
+            "python -m pip install --no-cache-dir -r /tmp/speech-bench/requirements-base.txt"
+            " -c /tmp/speech-bench/constraints-torch.txt",
+        ),
     ]
+
+
+def test_the_base_requirements_add_onnxruntime_and_hold_numpy_at_the_backend_version():
+    assert pins(BENCH_DIR / "requirements-base.txt") == [
+        "onnxruntime==1.31.1",
+        "numpy==1.26.4",
+    ]
+
+
+def test_the_base_header_names_what_it_adds_and_the_tagged_backend_build():
+    text = header(BENCH_DIR / "base.Dockerfile")
+
+    assert "nothing added" not in text
+    assert "onnxruntime 1.31.1" in text
+    assert "numpy" in text and "1.26.4" in text
+    assert "docker tag" in text
+    assert "BACKEND_IMAGE=mist-backend-pinned:" in text
+
+
+ARMS_FILE = _REPO_ROOT / "scripts" / "model_bench" / "speech" / "speech_arms.json"
+REQUIREMENT_FILES = sorted(BENCH_DIR.glob("requirements-*.txt"))
+
+
+def canonical(name: str) -> str:
+    """A distribution name without extras, compared as pip compares names (PEP 503)."""
+    return re.sub(r"[-_.]+", "-", name.split("[", 1)[0]).lower()
+
+
+def test_every_arm_package_pinned_beside_the_dockerfiles_carries_that_pin():
+    pinned: dict[str, list[tuple[str, str]]] = {}
+    for path in REQUIREMENT_FILES:
+        for entry in pins(path):
+            name, _, version = entry.partition("==")
+            pinned.setdefault(canonical(name), []).append((path.name, version))
+    arms = json.loads(ARMS_FILE.read_text(encoding="utf-8"))
+    checked = set()
+    mismatches = []
+    for kind in ("tts", "stt", "turn"):
+        for arm, cfg in arms[kind].items():
+            for package, version in (cfg.get("packages") or {}).items():
+                for source, pin in pinned.get(canonical(package), []):
+                    checked.add(canonical(package))
+                    if pin != version:
+                        mismatches.append(f"{kind}.{arm}: {package} {version}, {source} {pin}")
+
+    assert mismatches == []
+    assert {"onnxruntime", "transformers", "nemo-toolkit", "onnx-asr"} <= checked
 
 
 ENGINE_DOCKERFILES = [p for p in DOCKERFILES if p.name != "base.Dockerfile"]
@@ -110,6 +181,24 @@ def test_every_engine_image_installs_under_the_torch_constraints(path):
         assert re.search(r"-r\s+\S*requirements-[\w-]+\.txt", args), args
 
 
+NEMO_SCRIPTS = "/opt/venv/lib/python3.11/site-packages/scripts"
+
+
+def test_the_asr_image_removes_nemos_scripts_package_and_checks_none_is_importable():
+    steps = normalised(instructions(BENCH_DIR / "asr.Dockerfile"))
+    install = next(i for i, (kw, args) in enumerate(steps) if kw == "RUN" and "pip install" in args)
+    after = steps[install + 1 :]
+
+    assert len(after) == 1, after
+    keyword, args = after[0]
+    assert keyword == "RUN"
+    assert f"rm -rf {NEMO_SCRIPTS}" in args
+    check = args.index("python -I -c")
+    assert args.index(f"rm -rf {NEMO_SCRIPTS}") < check
+    assert "find_spec('scripts') is not None" in args[check:]
+    assert "sys.exit(" in args[check:]
+
+
 @pytest.mark.parametrize("path", PIN_FILES, ids=lambda p: p.name)
 def test_every_pin_is_exact(path):
     entries = pins(path)
@@ -129,7 +218,7 @@ def test_the_constraints_hold_torch_and_its_companions_at_the_backend_versions()
 def test_the_qwen3_requirements_pin_faster_qwen3_tts_and_its_stack():
     assert pins(BENCH_DIR / "requirements-qwen3.txt") == [
         "faster-qwen3-tts==0.5.4",
-        "transformers==5.22.2",
+        "transformers==5.16.1",
         "qwen-tts-hf==0.1.1.post1",
     ]
 
