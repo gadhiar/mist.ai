@@ -242,16 +242,8 @@ class BudgetPlan:
 
     Returned by `ContextBudgetPlanner.plan()`. Callers use `pruned_retrieval_text`
     in place of the raw retrieval block and `pruned_history` in place of the
-    full history list.
-
-    `fits` is False in two cases, each with no history and no retrieval text:
-
-    - The fixed cost (persona, static template, tools and the other fixed
-      segments) leaves no flexible budget: `fixed_cost >= total_budget`. This
-      is a hard stop that should log and degrade gracefully.
-    - A `memory_block_text` is larger than the whole flexible budget, though
-      the fixed cost fits: `fixed_cost < total_budget`. The caller drops the
-      block and plans again without it.
+    full history list. `fits` is False when even the minimum (persona + static)
+    exceeds context_window — a hard stop that should log + degrade gracefully.
 
     `retrieval_budget` and `history_budget` are the allocated token budgets;
     `retrieval_used` and `history_used` are what the pruned output actually
@@ -269,23 +261,6 @@ class BudgetPlan:
     history_used: int
     facts_kept: int
     facts_dropped: int
-
-
-@dataclass(frozen=True, slots=True)
-class _FlexAllocation:
-    """The budget arithmetic shared by `plan()` and `retrieval_allowance()`.
-
-    Kept in one place so the memory block's allowance, computed before the fetch, cannot
-    drift from the retrieval budget the turn's plan later charges it against.
-
-    `retrieval_budget` is 0 when `flex_budget` is 0, that is when the fixed cost does not
-    fit the window.
-    """
-
-    total_budget: int
-    fixed_cost: int
-    flex_budget: int
-    retrieval_budget: int
 
 
 class ContextBudgetPlanner:
@@ -361,82 +336,6 @@ class ContextBudgetPlanner:
         serialized = json.dumps(tools)
         return self._counter.count(serialized)
 
-    def _allocate(
-        self,
-        *,
-        persona_text: str | None,
-        static_text: str,
-        live_advisory_text: str | None,
-        tools: list[dict] | None,
-        max_output_tokens: int,
-        extra_fixed_texts: list[str] | None,
-    ) -> _FlexAllocation:
-        """Compute the total, the fixed cost, the flexible budget and its retrieval share.
-
-        Both `plan()` and `retrieval_allowance()` call this, so the allowance the memory
-        block is sized to is the retrieval budget the plan charges it against.
-        """
-        total_budget = max(
-            0,
-            self._config.context_window
-            - max_output_tokens
-            - self._config.output_reserve_tokens
-            - self._config.safety_margin_tokens,
-        )
-
-        # Fixed segments that never get pruned.
-        fixed_texts = [t for t in (persona_text, static_text, live_advisory_text) if t]
-        fixed_texts += [t for t in (extra_fixed_texts or []) if t]
-        fixed_cost = self._fixed_segment_tokens(fixed_texts)
-        fixed_cost += self._tools_schema_tokens(tools)
-
-        flex_budget = max(0, total_budget - fixed_cost)
-        retrieval_budget = int(flex_budget * self._config.retrieval_budget_ratio)
-        return _FlexAllocation(
-            total_budget=total_budget,
-            fixed_cost=fixed_cost,
-            flex_budget=flex_budget,
-            retrieval_budget=retrieval_budget,
-        )
-
-    def retrieval_allowance(
-        self,
-        *,
-        persona_text: str | None,
-        static_text: str,
-        live_advisory_text: str | None,
-        tools: list[dict] | None,
-        max_output_tokens: int,
-        extra_fixed_texts: list[str] | None = None,
-    ) -> int:
-        """Return the retrieval share `plan()` would give a turn with these fixed costs.
-
-        The memory block is fetched before the plan runs, so the handler needs its size
-        limit up front. Asking the planner, rather than assuming a fixed budget, lets the
-        block shrink when persona, conventions and profile grow inside a small window
-        instead of being dropped when the plan does not fit.
-
-        Args:
-            persona_text: Serialized persona block, as passed to `plan()`.
-            static_text: Static system-template body, as passed to `plan()`.
-            live_advisory_text: Optional live-data advisory body, as passed to `plan()`.
-            tools: Tool schema array, as passed to `plan()`.
-            max_output_tokens: `LLMRequest.max_tokens` for the coming call.
-            extra_fixed_texts: Always-injected blocks, as passed to `plan()`.
-
-        Returns:
-            `int(flex_budget * retrieval_budget_ratio)`, or 0 when the fixed cost does not
-            fit the window.
-        """
-        return self._allocate(
-            persona_text=persona_text,
-            static_text=static_text,
-            live_advisory_text=live_advisory_text,
-            tools=tools,
-            max_output_tokens=max_output_tokens,
-            extra_fixed_texts=extra_fixed_texts,
-        ).retrieval_budget
-
     def plan(
         self,
         *,
@@ -448,7 +347,6 @@ class ContextBudgetPlanner:
         tools: list[dict] | None,
         max_output_tokens: int,
         extra_fixed_texts: list[str] | None = None,
-        memory_block_text: str | None = None,
     ) -> BudgetPlan:
         """Plan the budget allocation for a single turn.
 
@@ -466,40 +364,26 @@ class ContextBudgetPlanner:
                 blocks eat the quality envelope past the 256-token safety
                 margin while the planner believes pruned retrieval/history
                 still fits.
-            memory_block_text: The per-turn memory block, which takes the
-                retrieval segment's place. It is charged with `counter.count`
-                and no message overhead, because it is prepended to the user
-                message rather than sent as a message of its own. History keeps
-                `flex - retrieval_budget` whatever the block's size, so the
-                history window does not move from turn to turn and break the
-                cached prompt prefix.
 
         Returns:
             BudgetPlan describing what survives the budget, what got pruned,
             and whether anything fits at all.
-
-        Raises:
-            ValueError: `memory_block_text` and `retrieval_result` are both
-                given; the two are alternative retrieval segments, and charging
-                both would let the prompt overflow the window.
         """
-        if memory_block_text is not None and retrieval_result is not None:
-            raise ValueError(
-                "plan() takes memory_block_text or retrieval_result, not both: each "
-                "fills the retrieval segment."
-            )
-
-        allocation = self._allocate(
-            persona_text=persona_text,
-            static_text=static_text,
-            live_advisory_text=live_advisory_text,
-            tools=tools,
-            max_output_tokens=max_output_tokens,
-            extra_fixed_texts=extra_fixed_texts,
+        total_budget = max(
+            0,
+            self._config.context_window
+            - max_output_tokens
+            - self._config.output_reserve_tokens
+            - self._config.safety_margin_tokens,
         )
-        total_budget = allocation.total_budget
-        fixed_cost = allocation.fixed_cost
-        flex_budget = allocation.flex_budget
+
+        # Fixed segments that never get pruned.
+        fixed_texts = [t for t in (persona_text, static_text, live_advisory_text) if t]
+        fixed_texts += [t for t in (extra_fixed_texts or []) if t]
+        fixed_cost = self._fixed_segment_tokens(fixed_texts)
+        fixed_cost += self._tools_schema_tokens(tools)
+
+        flex_budget = max(0, total_budget - fixed_cost)
         if flex_budget <= 0:
             logger.warning(
                 "ContextBudgetPlanner: fixed_cost %d exceeds total_budget %d "
@@ -527,16 +411,8 @@ class ContextBudgetPlanner:
             )
 
         # Allocate flex budget by ratio.
-        retrieval_budget = allocation.retrieval_budget
+        retrieval_budget = int(flex_budget * self._config.retrieval_budget_ratio)
         history_budget = flex_budget - retrieval_budget
-
-        if memory_block_text is not None:
-            return self._plan_with_memory_block(
-                allocation=allocation,
-                history_budget=history_budget,
-                memory_block_text=memory_block_text,
-                history=history,
-            )
 
         # Prune retrieval by priority score.
         pruned_retrieval_text: str | None = None
@@ -564,76 +440,6 @@ class ContextBudgetPlanner:
             history_used=history_used,
             facts_kept=facts_kept,
             facts_dropped=facts_dropped,
-        )
-
-    def _plan_with_memory_block(
-        self,
-        *,
-        allocation: _FlexAllocation,
-        history_budget: int,
-        memory_block_text: str,
-        history: list[dict[str, Any]],
-    ) -> BudgetPlan:
-        """Charge the memory block as the retrieval segment and prune history.
-
-        The block was sized to `retrieval_allowance()` before the fetch, so it normally fits
-        `retrieval_budget` and history keeps its own share. If the fixed costs grew between
-        the allowance and this plan, the block can exceed that share; history then gives up
-        the difference so the total still fits. A block larger than the whole flexible
-        budget cannot fit at all, and the plan says so, so the caller can drop the block and
-        plan again.
-        """
-        block_tokens = self._counter.count(memory_block_text)
-        flex_budget = allocation.flex_budget
-        retrieval_budget = allocation.retrieval_budget
-
-        if block_tokens > flex_budget:
-            logger.warning(
-                "ContextBudgetPlanner: memory block of %d tokens exceeds the flex budget %d; "
-                "the plan does not fit.",
-                block_tokens,
-                flex_budget,
-            )
-            return BudgetPlan(
-                fits=False,
-                total_budget=allocation.total_budget,
-                fixed_cost=allocation.fixed_cost,
-                retrieval_budget=retrieval_budget,
-                history_budget=0,
-                pruned_retrieval_text=None,
-                pruned_history=[],
-                retrieval_used=0,
-                history_used=0,
-                facts_kept=0,
-                facts_dropped=0,
-            )
-
-        if block_tokens > retrieval_budget:
-            logger.warning(
-                "ContextBudgetPlanner: memory block of %d tokens exceeds the retrieval "
-                "budget %d (fixed cost %d grew after the allowance); history shrinks to %d.",
-                block_tokens,
-                retrieval_budget,
-                allocation.fixed_cost,
-                flex_budget - block_tokens,
-            )
-            history_budget = flex_budget - block_tokens
-
-        pruned_history = self._history_strategy.select(history, history_budget, self._counter)
-        history_used = self._counter.count_messages(pruned_history)
-
-        return BudgetPlan(
-            fits=True,
-            total_budget=allocation.total_budget,
-            fixed_cost=allocation.fixed_cost,
-            retrieval_budget=retrieval_budget,
-            history_budget=history_budget,
-            pruned_retrieval_text=None,
-            pruned_history=pruned_history,
-            retrieval_used=block_tokens,
-            history_used=history_used,
-            facts_kept=0,
-            facts_dropped=0,
         )
 
     def _prune_retrieval(
