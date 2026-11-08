@@ -9,12 +9,21 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 
 import httpx
 import pytest
 
 from backend.extraction_service.app import LlamaPropsContextSize, create_app
-from backend.extraction_service.engine import ExtractionEngine
+from backend.extraction_service.engine import (
+    LIST_FRAME_MAX_TOKENS,
+    LIST_ITEM_MAX_TOKENS,
+    ExtractionEngine,
+)
+from backend.extraction_service.list_schemas import (
+    LIST_FRAME_OUTPUT_SCHEMA,
+    LIST_ITEM_OUTPUT_SCHEMA,
+)
 from backend.extraction_service.schemas import (
     DERIVATION_OUTPUT_SCHEMA,
     EXTRACTION_OUTPUT_SCHEMA,
@@ -131,6 +140,66 @@ class TestGptOssDefaultConstrainedMode:
                 "type": "json_schema",
                 "json_schema": {"name": "response", "schema": schema, "strict": True},
             }
+
+    async def test_a_structured_turn_sends_the_frame_and_item_schemas(
+        self, client, fake_llama_state
+    ):
+        frame = {
+            "frame_entities": [],
+            "groups": [
+                {
+                    "group": "G1",
+                    "templates": [{"subject": "user", "predicate": "USES", "object": "item"}],
+                    "item_type": "Technology",
+                    "unchecked": "plan",
+                }
+            ],
+            "facts": {"entities": [], "relationships": []},
+        }
+        items = {
+            "items": [
+                {
+                    "item": f"G1.{n}",
+                    "entity": {"span": name, "name": name, "type": "Technology"},
+                    "template": {
+                        "applies": True,
+                        "assertion_kind": "assert",
+                        "temporal_status": "current",
+                    },
+                    "entities": [],
+                    "relationships": [],
+                }
+                for n, name in enumerate(["Quillon", "Brask"], start=1)
+            ]
+        }
+        fake_llama_state.chat_responses = [
+            '{"scope": "user-scope", "confidence": 0.9}',
+            json.dumps(frame),
+            json.dumps(items),
+        ]
+        body = make_extract_request(utterance="Tools I use at work:\n- Quillon\n- Brask")
+
+        response = await client.post("/v1/extract", json=body)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["stage2_calls"] == 2
+        assert data["warnings"] == []
+        assert {
+            (r["source"], r["type"], r["target"]) for r in data["payload"]["relationships"]
+        } == {
+            ("user", "USES", "quillon"),
+            ("user", "USES", "brask"),
+        }
+        requests = fake_llama_state.chat_requests
+        assert [r["response_format"]["json_schema"]["schema"] for r in requests[1:]] == [
+            LIST_FRAME_OUTPUT_SCHEMA,
+            LIST_ITEM_OUTPUT_SCHEMA,
+        ]
+        assert [r["max_tokens"] for r in requests[1:]] == [
+            LIST_FRAME_MAX_TOKENS,
+            LIST_ITEM_MAX_TOKENS,
+        ]
 
 
 @pytest.mark.asyncio

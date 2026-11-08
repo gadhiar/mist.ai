@@ -139,6 +139,10 @@ class TestServiceReportsOneIdentity:
             "derive_max_tokens": 400,
             "list_batch_max_units": engine_module.LIST_BATCH_MAX_UNITS,
             "list_context_max_units": engine_module.LIST_CONTEXT_MAX_UNITS,
+            "list_frame_max_tokens": 2048,
+            "list_item_max_tokens": 2048,
+            "list_item_batch_max_units": 4,
+            "list_user_max_chars": 7200,
         }
 
     async def test_every_result_carries_the_identity_info_reports(
@@ -269,6 +273,11 @@ def test_the_effective_constrained_mode_is_recorded(service_settings):
         "SCOPE_CLASSIFIER_SYSTEM_PROMPT",
         "INTERNAL_DERIVATION_SYSTEM_PROMPT",
         "_REPAIR_INSTRUCTION",
+        "LIST_SYSTEM_PROMPT",
+        "LIST_FRAME_USER_TEMPLATE",
+        "LIST_ITEM_USER_TEMPLATE",
+        "LIST_FRAME_REPAIR_INSTRUCTION",
+        "LIST_ITEM_REPAIR_INSTRUCTION",
     ],
 )
 def test_a_prompt_edit_moves_the_identity(service_settings, monkeypatch, name):
@@ -284,6 +293,12 @@ def test_a_prompt_edit_moves_the_identity(service_settings, monkeypatch, name):
         "SCOPE_MAX_TOKENS",
         "EXTRACT_MAX_TOKENS",
         "DERIVE_MAX_TOKENS",
+        "LIST_BATCH_MAX_UNITS",
+        "LIST_CONTEXT_MAX_UNITS",
+        "LIST_FRAME_MAX_TOKENS",
+        "LIST_ITEM_MAX_TOKENS",
+        "LIST_ITEM_BATCH_MAX_UNITS",
+        "LIST_USER_MAX_CHARS",
         "ONTOLOGY_VERSION",
         "EXTRACTION_VERSION",
     ],
