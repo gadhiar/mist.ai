@@ -91,10 +91,28 @@ class McpConnection:
         transport_factory: Callable[[], McpTransport],
         clock: Clock,
         backoff: BackoffPolicy,
+        *,
+        stop_timeout_s: float = 5.0,
     ) -> None:
+        """Build a stopped connection; nothing connects until `start`.
+
+        Args:
+            transport_factory: Builds a fresh transport for each connect attempt.
+            clock: Supplies the backoff sleeps and status check times.
+            backoff: The delays between consecutive failed attempts.
+            stop_timeout_s: How long `stop` waits, in real loop time, for the supervisor to
+                end before it returns and leaves the task to end on its own.
+
+        Raises:
+            ValueError: `stop_timeout_s` is not finite or not above 0.
+        """
+        # False for 0, a negative value, `nan` and `inf` alike.
+        if not 0 < stop_timeout_s < float("inf"):
+            raise ValueError(f"stop_timeout_s must be finite and above 0, not {stop_timeout_s}")
         self._transport_factory = transport_factory
         self._clock = clock
         self._backoff = backoff
+        self._stop_timeout_s = stop_timeout_s
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
         self._dead = False
@@ -133,6 +151,12 @@ class McpConnection:
     async def stop(self) -> None:
         """Stop the supervisor, which closes an open transport in its own task first.
 
+        The wait for the supervisor is bounded by `stop_timeout_s` of real loop time, not the
+        injected clock, so a transport whose `close` hangs cannot hang the caller. At the
+        bound one WARNING is logged and this returns, leaving the task to end on its own; once
+        the stopping flag is set it publishes no session, makes no further connect attempt
+        and writes no reason, so the connection still reads "stopped".
+
         The stopping flag is set before the cancel, so the done-callback reads the end as
         orderly. A dead supervisor stays recorded as dead. The reason is set to "stopped"
         before the cancel, so a stop notifies the listener once: here when no session is open,
@@ -145,7 +169,13 @@ class McpConnection:
         task = self._task
         if task is not None and not task.done():
             task.cancel()
-            await asyncio.wait({task})
+            done, _ = await asyncio.wait({task}, timeout=self._stop_timeout_s)
+            if not done:
+                # Not cancelled again and awaited: that wait would be unbounded too.
+                logger.warning(
+                    "MCP supervisor still running %g s after stop; leaving it to end on its own",
+                    self._stop_timeout_s,
+                )
         self._session = None
         self._tools = []
         if not self._dead:
@@ -216,11 +246,18 @@ class McpConnection:
     async def _supervise(self) -> None:
         failures = 0
         try:
-            while True:
+            # The flag is checked after each connect attempt, each serve and each backoff
+            # sleep, so a supervisor whose callee swallowed the stop's cancel ends at the next
+            # check instead of running on after `stop()`.
+            while not self._stopping:
                 failure = await self._connect()
+                if self._stopping:
+                    break
                 if failure is None:
                     failures = 0
                     failure = await self._serve()
+                    if self._stopping:
+                        break
                     if failure is None:
                         continue
                 failures += 1
@@ -255,7 +292,12 @@ class McpConnection:
         return self._dropped_for_auth
 
     async def _connect(self) -> BaseException | None:
-        """Make one connect attempt; return the contained failure, or None once connected."""
+        """Make one connect attempt; return the contained failure, or None once connected.
+
+        Once `stop()` has set its flag, an attempt that still completes publishes no session
+        and writes no reason, so the connection keeps reading "stopped"; a transport it opened
+        stays in `_open` for the supervisor's `finally` to close.
+        """
         self._reconnect.clear()
         self._dropped_for_auth = None
         try:
@@ -266,13 +308,16 @@ class McpConnection:
         except _CONTAINED_ERRORS as exc:
             failure = exc
         else:
+            if self._stopping:
+                return None
             self._tools = list(tools)
             self._session = transport
             logger.info("MCP session open with %d tools", len(tools))
             self._notify_if_changed()
             return None
-        self._reason = _describe(failure)
-        self._notify_if_changed()
+        if not self._stopping:
+            self._reason = _describe(failure)
+            self._notify_if_changed()
         await self._close_open()
         return failure
 
