@@ -481,3 +481,95 @@ async def test_one_bad_session_does_not_abort_the_rest_of_the_backlog(catchup_ha
     await SessionNoteCatchup(**h.kwargs).run()
 
     assert h.synthesizer.calls == ["s-good"], "the good session must still be processed"
+
+
+# ---------------------------------------------------------------------------
+# Capability-only turns (T31)
+# ---------------------------------------------------------------------------
+
+
+def _turn(utterance: str, timestamp: str, answered_by: str | None) -> dict:
+    return {
+        "session_id": "s-mixed",
+        "user_utterance": utterance,
+        "system_response": "ok",
+        "timestamp": timestamp,
+        "answered_by": answered_by,
+    }
+
+
+class _ScriptedTurnsStore(_FakeEventStore):
+    def __init__(self, turns: list[dict]) -> None:
+        super().__init__()
+        self._turns = turns
+
+    def get_turns(self, session_id: str) -> list[dict]:
+        return [dict(turn) for turn in self._turns]
+
+
+class _TurnRecordingSynthesizer(_FakeSynthesizer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.turns: list[list[dict]] = []
+
+    async def synthesize(self, turns: list[dict]) -> SessionSynthesis | None:
+        self.turns.append(turns)
+        return await super().synthesize(turns)
+
+
+def _capability_harness(h: SimpleNamespace, turns: list[dict]) -> list[tuple[str, str, str]]:
+    """Wire `turns` and a recording synthesizer and path derivation into `h`."""
+    h.event_store = _ScriptedTurnsStore(turns)
+    h.event_store.sessions = ["s-mixed"]
+    h.sessions_with_graph_state = {"s-mixed"}
+    h.synthesizer = _TurnRecordingSynthesizer()
+    path_calls: list[tuple[str, str, str]] = []
+    real_path_for = h.kwargs["session_path_for"]
+
+    def _recording_path_for(session_id: str, first_utterance: str, date: str) -> str:
+        path_calls.append((session_id, first_utterance, date))
+        return real_path_for(session_id, first_utterance, date)
+
+    h.kwargs.update(
+        event_store=h.event_store,
+        synthesizer=h.synthesizer,
+        session_path_for=_recording_path_for,
+    )
+    return path_calls
+
+
+@pytest.mark.asyncio
+async def test_a_mixed_session_synthesizes_eligible_turns_at_the_first_turns_path(
+    catchup_harness,
+):
+    h = catchup_harness
+    turns = [
+        _turn("set a timer for ten minutes", "2026-07-28T23:59:00+00:00", "capability"),
+        _turn("tell me about the vault architecture", "2026-07-29T00:01:00+00:00", "model"),
+        _turn("and the sidecar index", "2026-07-29T00:02:00+00:00", None),
+    ]
+    path_calls = _capability_harness(h, turns)
+
+    await SessionNoteCatchup(**h.kwargs).run()
+
+    assert [[t["user_utterance"] for t in call] for call in h.synthesizer.turns] == [
+        ["tell me about the vault architecture", "and the sidecar index"]
+    ]
+    assert path_calls == [("s-mixed", "set a timer for ten minutes", "2026-07-28")]
+    assert [path for path, _ in h.writer.writes] == [str(h.sessions_dir / "2026-07-28-s-mixed.md")]
+
+
+@pytest.mark.asyncio
+async def test_an_all_capability_session_writes_no_note_and_no_skip_marker(catchup_harness):
+    h = catchup_harness
+    turns = [
+        _turn("set a timer for ten minutes", "2026-07-29T10:00:00+00:00", "capability"),
+        _turn("stop the alarm", "2026-07-29T10:05:00+00:00", "capability"),
+    ]
+    path_calls = _capability_harness(h, turns)
+
+    await SessionNoteCatchup(**h.kwargs).run()
+
+    assert h.synthesizer.turns == []
+    assert h.writer.writes == []
+    assert path_calls == []

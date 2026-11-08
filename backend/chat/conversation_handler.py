@@ -32,6 +32,7 @@ from backend.chat.stream_events import Complete, StreamEvent, Token, WSEvent
 from backend.errors import CapabilityUnavailableError
 from backend.event_store.models import AnsweredBy, ConversationTurnEvent
 from backend.event_store.store import EventStore
+from backend.extraction_backlog.eligibility import policy_skip_reason
 from backend.knowledge.config import KnowledgeConfig
 from backend.knowledge.models import (
     ConversationSession,
@@ -2882,7 +2883,13 @@ class ConversationHandler:
                         sid,
                     )
 
-            synthesis = await self.session_synthesizer.synthesize(turns)
+            # Capability-only turns are commands and templates, not part of
+            # what the session was about. A session of only those gives
+            # `synthesize([])`, which returns None with no model call. The
+            # note keeps the path allocated at the first turn, whichever it was.
+            synthesis = await self.session_synthesizer.synthesize(
+                [t for t in turns if policy_skip_reason(t.get("answered_by")) is None]
+            )
             if synthesis is None:
                 logger.debug("Session %s below synthesis threshold; writing no vault note", sid)
                 continue
