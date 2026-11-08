@@ -4,15 +4,40 @@ FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
-# System dependencies (curl for health checks, libportaudio2 for sounddevice)
+# System dependencies (curl for health checks and the interpreter download, libportaudio2 for sounddevice)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 python3.11-venv python3.11-dev python3-pip \
-    libsndfile1 libportaudio2 ffmpeg git wget curl \
+    ca-certificates libsndfile1 libportaudio2 ffmpeg git wget curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Set python3.11 as default
-RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
-    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
+# Interpreter: CPython from a python-build-standalone release archive, not Ubuntu 22.04's apt
+# python3.11. The apt package is 3.11.0rc1, a release candidate, and NeMo's TorchScript compile
+# segfaults on it. The archive is pinned by release tag and sha256, so a rebuild installs the same
+# bytes; a new 3.11 patch release is a bump of the three ARGs. The build then checks the version
+# and release level, the CA store the bundled OpenSSL finds, and the SQLite extension loading and
+# FTS5 the vault index needs, so a bad archive fails here rather than in the backend.
+# /opt/python/bin goes first on PATH so that `python -m venv` below runs this interpreter: a venv
+# records the directory of the `python` that created it as its `home` and finds its standard
+# library from there.
+ARG PYTHON_VERSION=3.11.18
+ARG PYTHON_BUILD_STANDALONE_RELEASE=20261026
+ARG PYTHON_ARCHIVE_SHA256=a87ee63646c8f8438b7af3954b2135ed2af91d033c631f12a8f20af903046d06
+RUN curl --fail --silent --show-error --location --proto '=https' -o /tmp/python.tar.gz \
+        "https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_BUILD_STANDALONE_RELEASE}/cpython-${PYTHON_VERSION}%2B${PYTHON_BUILD_STANDALONE_RELEASE}-x86_64-unknown-linux-gnu-install_only.tar.gz" \
+    && echo "${PYTHON_ARCHIVE_SHA256}  /tmp/python.tar.gz" | sha256sum --check --strict \
+    && mkdir /opt/python \
+    && tar -xzf /tmp/python.tar.gz -C /opt/python --strip-components=1 --no-same-owner \
+    && rm /tmp/python.tar.gz \
+    && ln -sf python3.11 /opt/python/bin/python \
+    && /opt/python/bin/python3.11 -c "import glob, os, platform, sqlite3, ssl, sys; \
+        v = platform.python_version(); \
+        assert v == '${PYTHON_VERSION}' and sys.version_info.releaselevel == 'final', (v, sys.version_info); \
+        p = ssl.get_default_verify_paths(); \
+        assert (p.cafile and os.path.isfile(p.cafile)) or (p.capath and glob.glob(os.path.join(p.capath, '*.0'))), p; \
+        c = sqlite3.connect(':memory:'); \
+        c.enable_load_extension(True); \
+        c.execute('CREATE VIRTUAL TABLE t USING fts5(x)'); \
+        print('CPython', v, sys.version_info.releaselevel, ssl.OPENSSL_VERSION, 'SQLite', sqlite3.sqlite_version)"
+ENV PATH="/opt/python/bin:$PATH"
 
 # Cluster 8 Phase 2 P0 follow-up (2026-04-22): non-root execution.
 # Create appuser UID 1000 (matches the conventional first user on Linux hosts
@@ -27,9 +52,12 @@ RUN groupadd -g 1000 appgroup \
     && git config --system user.email "mist-backend@local" \
     && git config --system user.name "MIST Backend"
 
-# Create venv inside container
-RUN python -m venv /opt/venv
+# Create the venv and hand it to appuser while it is empty. Every pip install below
+# runs as appuser, so the venv's files are appuser-owned as they are written, and no
+# later layer has to rewrite the ownership of the whole venv after a code change.
+RUN python -m venv /opt/venv && chown -R appuser:appgroup /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+USER appuser
 RUN pip install --upgrade pip
 
 # --- Dependency layers (ordered for cache stability) ---
@@ -44,7 +72,7 @@ RUN pip install torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 \
 RUN pip install chatterbox-tts==0.1.7 soundfile
 
 # 3. Backend requirements (requirements.txt changes rarely)
-COPY requirements.txt /app/requirements.txt
+COPY --chown=appuser:appgroup requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt
 
 # Ensure openai and httpx are installed (safety net if requirements.txt cache is stale)
@@ -100,21 +128,23 @@ WORKDIR /app
 
 # Copy application code (production mode -- dev mode overrides with volume mounts).
 # NOTE: ./data is always bind-mounted at runtime via docker-compose.yml.
-COPY backend/ /app/backend/
-COPY src/ /app/src/
-COPY dependencies/ /app/dependencies/
-COPY scripts/ /app/scripts/
+COPY --chown=appuser:appgroup backend/ /app/backend/
+COPY --chown=appuser:appgroup src/ /app/src/
+COPY --chown=appuser:appgroup dependencies/ /app/dependencies/
+COPY --chown=appuser:appgroup scripts/ /app/scripts/
 
-# Create data directories (populated by bind mount at runtime)
-RUN mkdir -p /app/data/voice_profiles /app/data/vector_store /app/data/audio
-
-# Cluster 8 Phase 2 P0 follow-up: hand off ownership to appuser AFTER all
-# root-owned dependency installation is done. /opt/venv ownership transfer
-# lets pip + python find their own site-packages without permission errors.
-# /app ownership transfer lets the runtime write to /app/data /app/logs
-# /app/mist-memory (bind mounts override these but the underlying mountpoint
-# directories must be writable for Docker to mount over them).
-RUN chown -R appuser:appgroup /opt/venv /app /home/appuser
+# Runtime directories, created and handed to appuser by name, without -R, so this
+# layer holds nine directory entries instead of a copy of everything under /app.
+# Each is a mount point or a path the backend writes without a mount: /app/data
+# and its three subdirectories, /app/logs (the live-path smoke backend mounts
+# none and writes it in the container layer), /app/mist-memory, /app/ops, and
+# /app/dev-state (a named volume, which Docker initialises from this directory's
+# ownership). Runs as root, because only root can give a directory to appuser.
+USER root
+RUN mkdir -p /app /app/data /app/data/voice_profiles /app/data/vector_store /app/data/audio \
+        /app/logs /app/mist-memory /app/ops /app/dev-state \
+    && chown appuser:appgroup /app /app/data /app/data/voice_profiles /app/data/vector_store \
+        /app/data/audio /app/logs /app/mist-memory /app/ops /app/dev-state
 
 USER appuser
 ENV HOME=/home/appuser
@@ -122,3 +152,12 @@ ENV HOME=/home/appuser
 EXPOSE 8001
 
 CMD ["python", "backend/server.py"]
+
+# Release identity, after CMD so a new tag or commit rebuilds only these metadata
+# layers. `instance.py release-build` passes both build args; `status` reads the
+# labels from the running container.
+ARG MIST_RELEASE_TAG=unreleased
+ARG MIST_RELEASE_COMMIT=unknown
+ENV MIST_RELEASE_TAG=${MIST_RELEASE_TAG}
+ENV MIST_RELEASE_COMMIT=${MIST_RELEASE_COMMIT}
+LABEL org.opencontainers.image.version=${MIST_RELEASE_TAG} org.opencontainers.image.revision=${MIST_RELEASE_COMMIT}

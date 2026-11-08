@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from backend.knowledge.models import RetrievalResult
     from backend.llm.models import ToolCall, UsageMetadata
 
+    from .retrieval_trace import TurnTraceBuilder
+
 
 @dataclass(frozen=True, slots=True)
 class TurnRequest:
@@ -172,6 +174,16 @@ class TurnScope:
         tool_tasks: One task per dispatched tool call, parallel to
             `tool_calls`. Held here, not by the stream, so a tool outlives
             a cancelled stream; see `wait_tools`.
+        trace: The turn's retrieval-trace builder, written to the event-log
+            row as `retrieval_context["trace"]`. `open_turn` sets a fresh
+            one; `commit_turn` renders it and sets it back to None, so a
+            feed after the commit (a shielded tool finishing late) reaches
+            no builder. None on a scope built outside `open_turn`, where
+            every feed is a no-op.
+        trace_failed: True once a feed or the render failed; the row then
+            gets `trace_failed()` and later feeds are skipped.
+        tool_call_index: 1-based position of the tool call being
+            dispatched, which the trace records as `call`.
     """
 
     session_id: str
@@ -189,6 +201,9 @@ class TurnScope:
     retrieval_result: RetrievalResult | None = None
     commit_result: CommitResult | None = None
     tool_tasks: list[asyncio.Task[str]] = field(default_factory=list)
+    trace: TurnTraceBuilder | None = None
+    trace_failed: bool = False
+    tool_call_index: int = 0
 
     @property
     def generated_text(self) -> str:

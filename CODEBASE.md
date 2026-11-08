@@ -1,6 +1,19 @@
 # MIST.AI Codebase Context
 
-**Last Updated:** 2026-09-22 (**the gate has RUN and PASSED, and MIST has had zero users for 104
+**Last Updated:** 2026-11-06 (**MIST is now a daily general assistant, and the daily instance is
+built.** ADR-042, amended 6 Nov 2026, sets the bar, the order and the power levels; see Current
+Focus.)
+
+The daily instance is a pinned compose deployment under `deploy/daily/`, run by
+`scripts/daily/instance.py`: install, switch to a release, health with a reason per check,
+scheduled backups, restore drills with promotion, use metrics from real-origin turns
+(`/usage/turns-per-day` and `/usage/uptime`, counted in `MIST_TIMEZONE`), and gaming mode, which
+yields the GPU while a game runs. It was rehearsed end to end on synthetic data, never on the live
+graph, and its memory limits hold the rehearsal's measured peaks with at least 25% headroom. It
+has not yet run on live data; the deploy plan does that. Run `git log --oneline -1`; do not trust
+a hash written here.
+
+**PRIOR ENTRY -- 2026-09-22:** (**the gate has RUN and PASSED, and MIST has had zero users for 104
 days. Both of those are new and the second one matters more.**)
 
 `main` is at `f62ef6d` and this file had been four commits behind it -- `2b2e733` (#8),
@@ -929,7 +942,7 @@ PRIOR ENTRY -- 2026-07-31 (R1.4 -- seed-utterance migration + Phase-1 data gate 
 - **StreamingLLMProvider abstraction:** `LlamaServerProvider` (primary), `OllamaProvider` (fallback), optionally wrapped by `InstrumentedStreamingLLMProvider` (Cluster 5) for JSONL observability.
 - **ConversationHandler:** Cluster 3 persona injection + Cluster 6 `ContextBudgetPlanner` + `_build_request` Pydantic-dump helper (Cluster 5). `conversation_max_tokens=1024` (up from 400; Cluster 6 fix for Bug E).
 - **ExtractionPipeline:** 6 stages + Stage 1.5 `SubjectScopeClassifier` (Cluster 1) — classifies each utterance as `user-scope | system-scope | third-party | unknown` between pre-processing and ontology extraction. Metadata threaded into `EXTRACTION_USER_TEMPLATE` as a `subject_scope` hint.
-- **Voice Pipeline:** VAD -> Whisper -> Gemma 4 E4B -> Chatterbox Turbo TTS with streaming parallelism. ~4-5s TTFA.
+- **Voice Pipeline:** VAD -> Whisper -> Gemma 4 E4B -> Chatterbox TTS (the original model) with streaming parallelism. ~4-5s TTFA.
 - **Audio Transport:** Binary WebSocket frames (MIST protocol: 16-byte header + PCM16), RMS normalization (-20 dBFS), interrupt fade-out.
 - **Log Streaming:** WebSocketLogHandler with per-logger gating, token bucket rate limiter, request ID propagation.
 - **Persistent Logging:** `./logs/mist-backend.log` at DEBUG level (survives container removal).
@@ -997,6 +1010,25 @@ Plan artifact for overnight post-MVP run: `~/.claude/plans/peaceful-greeting-bee
 ## Active Work
 
 ### Current Focus
+**The order, ADR-042 as amended on 6 Nov 2026:**
+- Step 0: host runs on this PC that measure the speech, memory and low-level options, with no
+  build.
+- Step 1: the daily instance (goal mist-daily-instance-build), with goal
+  mist-extraction-quality's fixes before the first real turn.
+- Step 2: capabilities by text, alarms and timers first and lights through Home Assistant, with
+  the read path's first phase alongside.
+- Step 3: realtime voice and the voice frontend, on the desktop.
+- Step 4: the room endpoint.
+- Polish comes after capability and feel. ADR-035 scoring stays parked until real logs exist.
+
+**Use metric.** Real-origin turns per local day, read from `/usage/turns-per-day`; no milestone
+waits on days of use (ADR-042, 6 Nov 2026 amendment, item 4).
+
+**Power levels (Raj, 6 Nov 2026).** Full, low and off cap the model tiers MIST uses, and a game or
+a command changes the level. Gaming mode is the off level, and a game sets off until goal
+mist-model-host's tier router delivers the low level.
+
+**Prior focus, 2026-09-15, kept as history; the order above supersedes it.**
 make-mist-usable Phase 2 / Sub-project A (MIS-120, In Progress in Linear), now in R1.7. **Latest
 landed on `main`:** MIS-130, merged at `02e5177` on 2026-09-15, followed by `StagingSeeder`
 integration coverage at `6a5b2c0` -- establish current `main` HEAD with `git rev-parse main` rather
@@ -1245,7 +1277,7 @@ VECTOR_STORE_DATA_DIR=/app/data/vector_store
 - `StreamingLLMProvider` abstraction: `LlamaServerProvider` primary, `OllamaProvider` fallback, `InstrumentedStreamingLLMProvider` decorator
 - openai + httpx (LLM client)
 - Whisper (STT — base model)
-- Chatterbox Turbo (TTS — zero-shot voice cloning, MIT)
+- Chatterbox, the original model (TTS — zero-shot voice cloning, MIT)
 - Neo4j 5.x (knowledge graph; `:__Entity__` user-facing, `:__Provenance__` audit-trail per ADR-009; bitemporal versioned fact edges per C1/C2)
 - LanceDB (vector store Layer 2 -- legacy; sidecar sqlite-vec covers vault retrieval, see KNOWN_ISSUES)
 - sqlite-vec + FTS5 (vault sidecar index, RRF hybrid query)
@@ -1528,7 +1560,7 @@ cause of Bug J -- and it is the first thing a maintainer opens to tune extractio
 | Extraction harness (F2/F3) | LANDED | extraction-only byte-reproducible harness (`replay --extraction-only`); full-chat non-determinism is flash-attn, not MIST code |
 | Extraction accuracy (C3 + MIS-124) | COMPLETE | `extraction_version=2026-06-14-r5` (r4 was C3; MIS-124 bumped it); typing 0.909 PASS, F2 rel precision 0.833 = documented near-miss vs 0.90 -- residual is model extraction QUALITY, not canonicalization; that lever is spent -> MIS-125 (constrained decoding or a larger model). V7 PASS R=0.950 P=1.000 FP 0/5 |
 | Reachability | **UNSOLVED, in progress** | ~20 features built/tested/wired to nothing, 6 shapes. `TestProductionCallerExists` covers shape 1 only. Mechanisms A-E designed; see "Known live bugs" and the findings register |
-| TTS | Chatterbox Turbo | 0.74x RTF, 3.9GB VRAM |
+| TTS | Chatterbox (original model) | 0.74x RTF, 3.9GB VRAM |
 | Frontend | Wave 1 integrated | Nested `./mist-frontend/` repo; ADR-017 v1.1.1 |
 | Code Quality | FULL SUITE | black, ruff, bandit, codespell, AI-slop, pre-commit |
 | Docker | COMPLETE | 3-service stack + eval profile (mist-backend, mist-neo4j, mist-llm, mist-neo4j-eval) |

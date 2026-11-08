@@ -1,0 +1,2 @@
+# Kyutai Pocket TTS (mist-model-host plan v2, engine facts).
+pocket-tts==4.0.1

@@ -16,7 +16,7 @@ import json
 
 import pytest
 
-from backend.knowledge.eval_isolation import REPO_ROOT
+from backend.knowledge.eval_isolation import LIVE_INSTANCE_MARKER, REPO_ROOT
 from backend.knowledge.graph_artifact import load_artifact
 from scripts.backup.destination import BACKUP_ROOT_ENV
 from scripts.backup.dump import (
@@ -382,6 +382,70 @@ class TestVaultCounts:
         _print_report(report)
         printed = capsys.readouterr().out
         assert "not one corpus note" in printed
+
+
+class TestTheLiveInstanceMarker:
+    """The vault's top-level `.mist-live-instance` stays out of every artifact.
+
+    A daily instance's `mist-memory/` carries a copy of the marker. Restored
+    with the rest of the tree, it would make the standby refuse its own verify,
+    because the isolation guard refuses any path under a marked directory.
+    """
+
+    @pytest.fixture
+    def marked_vault(self, tmp_path):
+        """A daily instance's vault: the marker, one note and one `.git` file."""
+        root = tmp_path / "instance" / "mist-memory"
+        root.mkdir(parents=True)
+        (root / LIVE_INSTANCE_MARKER).write_text('{"v": 1}', encoding="utf-8")
+        (root / "note.md").write_text("# note\n", encoding="utf-8")
+        (root / ".git").mkdir()
+        (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        return root
+
+    def test_the_artifact_holds_the_note_and_git_but_not_the_marker(
+        self, backup_root, graph_connection, state_root, marked_vault
+    ):
+        report = dump(backup_root, graph_connection, state_root, marked_vault)
+        captured = report.artifact_dir / VAULT_DIRNAME
+
+        assert (captured / "note.md").read_text(encoding="utf-8") == "# note\n"
+        assert (captured / ".git" / "HEAD").is_file()
+        assert not (captured / LIVE_INSTANCE_MARKER).exists()
+
+    def test_both_counts_exclude_the_marker(
+        self, backup_root, graph_connection, state_root, marked_vault
+    ):
+        report = dump(backup_root, graph_connection, state_root, marked_vault)
+        manifest = read_manifest(report.artifact_dir)
+
+        assert (report.vault_corpus_files, report.vault_files) == (1, 2)
+        assert manifest.vault["corpus_file_count"] == 1
+        assert manifest.vault["file_count"] == 2
+        # The note's key is asserted too, so the absence below is a real
+        # absence and not a key spelled differently from the manifest's.
+        assert f"{VAULT_DIRNAME}/note.md" in manifest.files
+        assert f"{VAULT_DIRNAME}/{LIVE_INSTANCE_MARKER}" not in manifest.files
+
+    def test_a_file_of_that_name_below_the_top_level_is_still_copied(
+        self, backup_root, graph_connection, state_root, marked_vault
+    ):
+        # Only the top-level marker is the instance's. Anything else of that
+        # name is vault content, and a backup does not drop content.
+        (marked_vault / "notes").mkdir()
+        (marked_vault / "notes" / LIVE_INSTANCE_MARKER).write_text("kept", encoding="utf-8")
+
+        report = dump(backup_root, graph_connection, state_root, marked_vault)
+
+        nested = report.artifact_dir / VAULT_DIRNAME / "notes" / LIVE_INSTANCE_MARKER
+        assert nested.read_text(encoding="utf-8") == "kept"
+
+    def test_the_source_vault_keeps_its_marker(
+        self, backup_root, graph_connection, state_root, marked_vault
+    ):
+        dump(backup_root, graph_connection, state_root, marked_vault)
+
+        assert (marked_vault / LIVE_INSTANCE_MARKER).is_file()
 
 
 class TestGitHead:

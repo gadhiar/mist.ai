@@ -35,6 +35,7 @@ from backend.knowledge.models import (
     RetrievalFilters,
     RetrievalResult,
     RetrievedFact,
+    fact_ref,
 )
 from backend.knowledge.retrieval.knowledge_retriever import KnowledgeRetriever
 from backend.knowledge.storage.graph_store import GraphStore
@@ -46,6 +47,7 @@ from backend.llm.models import ToolCall as LLMToolCall
 from backend.sentence_detector import SentenceBoundaryDetector
 from backend.vault.conventions import ConventionsLoader
 
+from .retrieval_trace import TurnTraceBuilder, refs_removed, trace_failed
 from .turn_scope import CommitResult, StreamTurnState, TurnDelivery, TurnRequest, TurnScope
 
 if TYPE_CHECKING:
@@ -201,6 +203,39 @@ def _chunk_id_for(path: str, section: str | None) -> str:
     return hashlib.sha1(key.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
 
 
+def _kg_compact_listing(facts: list[RetrievedFact]) -> tuple[RetrievedFact, list[str]]:
+    """Pick the compact output's focal fact and the neighbor labels it lists.
+
+    Shared by the compact formatter and the retrieval trace, so the trace's
+    `dropped_compact` is decided by the same rule that wrote the output.
+    `facts` must not be empty.
+    """
+    top_fact = max(facts, key=lambda f: f.similarity_score)
+    focal = top_fact.subject
+
+    seen_neighbors: list[str] = []
+    for f in facts:
+        if f.subject == focal and f.object not in seen_neighbors:
+            seen_neighbors.append(f.object)
+            if len(seen_neighbors) >= 6:
+                break
+    return top_fact, seen_neighbors
+
+
+def _kg_compact_unlisted_refs(facts: list[RetrievedFact]) -> tuple[str, ...]:
+    """Refs of the facts the compact output does not list.
+
+    The output lists a fact when its subject is the focal entity and its
+    object is one of the neighbor labels; every other fact is unlisted.
+    """
+    if not facts:
+        return ()
+    top_fact, neighbors = _kg_compact_listing(facts)
+    return tuple(
+        fact_ref(f) for f in facts if f.subject != top_fact.subject or f.object not in neighbors
+    )
+
+
 def _format_kg_compact_for_llm(facts: list[RetrievedFact]) -> str:
     """Compact LLM-facing summary of knowledge-graph retrieval results.
 
@@ -219,16 +254,9 @@ def _format_kg_compact_for_llm(facts: list[RetrievedFact]) -> str:
     """
     if not facts:
         return "No graph results."
-    top_fact = max(facts, key=lambda f: f.similarity_score)
+    top_fact, seen_neighbors = _kg_compact_listing(facts)
     focal = top_fact.subject
     focal_type = top_fact.subject_type
-
-    seen_neighbors: list[str] = []
-    for f in facts:
-        if f.subject == focal and f.object not in seen_neighbors:
-            seen_neighbors.append(f.object)
-            if len(seen_neighbors) >= 6:
-                break
 
     lines = [f"Focal: {focal} ({focal_type})"]
     if seen_neighbors:
@@ -954,10 +982,10 @@ class ConversationHandler:
         self._slop_max_regen_attempts = 2
 
         # Source of `TurnScope.turn_index`. Per-turn state (the ADR-017
-        # FE-bound event buffer, session id, turn index) lives on the
-        # `TurnScope` each turn creates, not on this shared handler, so
-        # concurrent turns in different sessions cannot see each other's
-        # events. The counter itself stays handler-wide and monotonic: a
+        # FE-bound event buffer, session id, turn index, retrieval trace)
+        # lives on the `TurnScope` each turn creates, not on this shared
+        # handler, so overlapping turns cannot see each other's events or
+        # trace. The counter itself stays handler-wide and monotonic: a
         # session's graph seeds keep the values they had when the index was a
         # handler attribute.
         self._turn_indices = itertools.count(1)
@@ -1001,37 +1029,66 @@ class ConversationHandler:
         if verbosity not in ("compact", "full"):
             raise ValueError(f"invalid verbosity: {verbosity!r}; must be 'compact' or 'full'")
         try:
-            filters = None
-            if entity_types or relationship_types:
-                filters = RetrievalFilters(
-                    entity_types=entity_types,
-                    relationship_types=relationship_types,
-                )
-
-            result = await self.retriever.retrieve(
-                query=query, user_id=USER_ENTITY_ID, limit=limit, filters=filters
+            tool_result, result = await self._query_knowledge_graph(
+                scope, query, entity_types, relationship_types, limit, verbosity
             )
-
-            if result.total_facts == 0:
-                return (
-                    f"No information found for query: '{query}'. "
-                    "You may want to ask the user about this topic."
-                )
-
-            # ADR-017 Wave 2: emit graph_subgraph alongside the textual
-            # tool result so the FE renders the focal + depth-1 neighborhood
-            # for this query. Seed RNG with session+turn for layout stability.
-            graph_payload = _build_graph_subgraph_payload(result, seed=scope.graph_seed)
-            if graph_payload is not None:
-                scope.emit(graph_payload)
-
-            if verbosity == "full":
-                return result.formatted_context
-            return _format_kg_compact_for_llm(result.facts)
-
         except Exception as e:
             logger.error("Error querying knowledge graph: %s", e)
             return f"Error searching knowledge graph: {e!s}"
+
+        # Fed after the `try`, so no trace error can be caught there and
+        # change the tool result the model gets.
+        self._feed_trace(
+            scope,
+            lambda trace: trace.tool_retrieved(
+                "query_knowledge_graph",
+                call=scope.tool_call_index,
+                limit=limit,
+                candidates=result.candidates,
+                unlisted_refs=(
+                    _kg_compact_unlisted_refs(result.facts) if verbosity == "compact" else ()
+                ),
+            ),
+        )
+        return tool_result
+
+    async def _query_knowledge_graph(
+        self,
+        scope: TurnScope,
+        query: str,
+        entity_types: list[str] | None,
+        relationship_types: list[str] | None,
+        limit: int,
+        verbosity: str,
+    ) -> tuple[str, RetrievalResult]:
+        """Run the `query_knowledge_graph` retrieval; return the tool result and the retrieval."""
+        filters = None
+        if entity_types or relationship_types:
+            filters = RetrievalFilters(
+                entity_types=entity_types,
+                relationship_types=relationship_types,
+            )
+
+        result = await self.retriever.retrieve(
+            query=query, user_id=USER_ENTITY_ID, limit=limit, filters=filters
+        )
+
+        if result.total_facts == 0:
+            return (
+                f"No information found for query: '{query}'. "
+                "You may want to ask the user about this topic."
+            ), result
+
+        # ADR-017 Wave 2: emit graph_subgraph alongside the textual
+        # tool result so the FE renders the focal + depth-1 neighborhood
+        # for this query. Seed RNG with session+turn for layout stability.
+        graph_payload = _build_graph_subgraph_payload(result, seed=scope.graph_seed)
+        if graph_payload is not None:
+            scope.emit(graph_payload)
+
+        if verbosity == "full":
+            return result.formatted_context, result
+        return _format_kg_compact_for_llm(result.facts), result
 
     async def _handle_query_vault(
         self,
@@ -1061,58 +1118,164 @@ class ConversationHandler:
             raise ValueError(f"limit must be between 1 and 10; got {limit}")
 
         try:
-            result = await self.retriever.retrieve(
-                query=query,
-                user_id=USER_ENTITY_ID,
-                limit=limit,
-                force_intent="historical",
+            tool_result, result, facts_before = await self._query_vault(
+                scope, query, limit, display_hint
             )
-
-            # Zero-result short-circuit: skip the vault_results emit so the FE
-            # keeps prior state, and signal absence to the LLM. Has to run
-            # before the emit branch to avoid the "FE sees results panel +
-            # LLM tells user no results" inconsistency.
-            if result.total_facts == 0:
-                return (
-                    f"No vault content found for query: '{query}'."
-                    " You may want to ask the user about this topic."
-                )
-
-            # The curated profile is ALWAYS-injected as its own block; the
-            # tool path must mirror the auto-inject dedup or the body appears
-            # twice in one prompt (deep review phase1-conversation-2). The
-            # sidecar keeps the profile indexed on purpose -- only the
-            # injection layer dedups.
-            profile_path = self._resolve_user_profile_path()
-            if profile_path is not None:
-                is_profile = self._profile_fact_matcher(profile_path)
-                kept = [f for f in result.facts if not is_profile(f)]
-                if len(kept) != len(result.facts):
-                    result.facts = kept
-                    result.total_facts = len(kept)
-                    if not kept:
-                        return (
-                            f"No vault content found for query: '{query}'."
-                            " You may want to ask the user about this topic."
-                        )
-                    result.formatted_context = self.retriever.format_context(
-                        kept, query, intent=result.intent
-                    )
-
-            vault_facts = [f for f in result.facts if f.subject == "VaultNote"]
-            if vault_facts:
-                scope.emit(
-                    _build_vault_results_payload(
-                        query=query,
-                        facts=vault_facts,
-                        display_hint=display_hint,
-                        total_results=result.total_facts,
-                    )
-                )
-            return result.formatted_context
         except Exception as e:
             logger.error("Error querying vault: %s", e)
             return f"Error searching vault: {e!s}"
+
+        # Fed after the `try`, so no trace error can be caught there and
+        # change the tool result the model gets.
+        self._trace_vault_tool(scope, result, facts_before, limit)
+        return tool_result
+
+    async def _query_vault(
+        self, scope: TurnScope, query: str, limit: int, display_hint: str
+    ) -> tuple[str, RetrievalResult, list[RetrievedFact]]:
+        """Run the `query_vault` retrieval.
+
+        Returns the tool result, the retrieval, and the facts the retriever
+        selected before the profile dedup, which the trace compares with the
+        retrieval's facts after it.
+        """
+        result = await self.retriever.retrieve(
+            query=query,
+            user_id=USER_ENTITY_ID,
+            limit=limit,
+            force_intent="historical",
+        )
+        # The dedup below replaces `result.facts` with a new list, so this
+        # one still names every fact the retriever selected.
+        facts_before = result.facts
+
+        # Zero-result short-circuit: skip the vault_results emit so the FE
+        # keeps prior state, and signal absence to the LLM. Has to run
+        # before the emit branch to avoid the "FE sees results panel +
+        # LLM tells user no results" inconsistency.
+        if result.total_facts == 0:
+            return (
+                (
+                    f"No vault content found for query: '{query}'."
+                    " You may want to ask the user about this topic."
+                ),
+                result,
+                facts_before,
+            )
+
+        # The curated profile is ALWAYS-injected as its own block; the
+        # tool path must mirror the auto-inject dedup or the body appears
+        # twice in one prompt (deep review phase1-conversation-2). The
+        # sidecar keeps the profile indexed on purpose -- only the
+        # injection layer dedups.
+        profile_path = self._resolve_user_profile_path()
+        if profile_path is not None:
+            is_profile = self._profile_fact_matcher(profile_path)
+            kept = [f for f in result.facts if not is_profile(f)]
+            if len(kept) != len(result.facts):
+                result.facts = kept
+                result.total_facts = len(kept)
+                if not kept:
+                    return (
+                        (
+                            f"No vault content found for query: '{query}'."
+                            " You may want to ask the user about this topic."
+                        ),
+                        result,
+                        facts_before,
+                    )
+                result.formatted_context = self.retriever.format_context(
+                    kept, query, intent=result.intent
+                )
+
+        vault_facts = [f for f in result.facts if f.subject == "VaultNote"]
+        if vault_facts:
+            scope.emit(
+                _build_vault_results_payload(
+                    query=query,
+                    facts=vault_facts,
+                    display_hint=display_hint,
+                    total_results=result.total_facts,
+                )
+            )
+        return result.formatted_context, result, facts_before
+
+    def _trace_auto_inject(
+        self,
+        trace: TurnTraceBuilder,
+        attempted: bool,
+        retrieval_result: RetrievalResult | None,
+    ) -> None:
+        """Feed the auto-inject outcome: skipped and why, or the candidates it saw.
+
+        A None result after an attempt means the retrieval raised: the
+        handler maps every auto-inject failure to None.
+        """
+        limit = self.config.auto_inject_limit
+        if not attempted:
+            reason = "disabled" if not self.config.auto_inject_docs else "short_message"
+            trace.auto_inject_skipped(reason, limit=None)
+        elif retrieval_result is None:
+            trace.auto_inject_skipped("error", limit=limit)
+        else:
+            trace.auto_inject_ran(retrieval_result.candidates, limit=limit)
+
+    def _trace_vault_tool(
+        self,
+        scope: TurnScope,
+        result: RetrievalResult,
+        facts_before: list[RetrievedFact],
+        limit: int,
+    ) -> None:
+        """Feed one `query_vault` retrieval to the turn's trace, with its profile dedup."""
+        self._feed_trace(
+            scope,
+            lambda trace: trace.tool_retrieved(
+                "query_vault",
+                call=scope.tool_call_index,
+                limit=limit,
+                candidates=result.candidates,
+                deduped_refs=refs_removed(facts_before, result.facts),
+            ),
+        )
+
+    def _feed_trace(
+        self, scope: TurnScope | None, feed: Callable[[TurnTraceBuilder], None]
+    ) -> None:
+        """Run one feed against `scope`'s trace builder, if it has one.
+
+        A no-op without a scope (a direct `_build_messages` call), on a scope
+        with no builder (built outside `open_turn`, or already committed),
+        or once the turn's trace has failed. The trace records a turn; it
+        must never change or break one. A builder error marks the turn's
+        trace failed, logged by class only so no fact text reaches the log,
+        and later feeds this turn are skipped.
+        """
+        if scope is None or scope.trace is None or scope.trace_failed:
+            return
+        try:
+            feed(scope.trace)
+        except (TypeError, ValueError, KeyError) as exc:
+            scope.trace_failed = True
+            logger.error("[TRACE] Retrieval trace builder failed: %s", type(exc).__name__)
+
+    def _turn_trace_payload(self, scope: TurnScope) -> dict[str, Any] | None:
+        """Render `scope`'s trace for `retrieval_context["trace"]`.
+
+        None when the scope has no builder. `trace_failed()` when a feed or
+        the render failed, so the row still says a trace was attempted.
+        """
+        trace = scope.trace
+        if trace is None:
+            return None
+        if scope.trace_failed:
+            return trace_failed()
+        try:
+            return trace.build()
+        except (TypeError, ValueError, KeyError) as exc:
+            scope.trace_failed = True
+            logger.error("[TRACE] Retrieval trace render failed: %s", type(exc).__name__)
+            return trace_failed()
 
     async def _handle_switch_form(self, scope: TurnScope, /, form: str, reason: str) -> str:
         """Execute the frontend.switch_form tool.
@@ -1215,6 +1378,7 @@ class ConversationHandler:
         # and JSONL records all join on ONE tool_call_id (ADR-017 UUID
         # convention); mint only when the provider sent none.
         tool_call_id = tool_call.id or str(uuid.uuid4())
+        scope.tool_call_index += 1
         scope.emit(
             {
                 "type": "tool_call_started",
@@ -1518,6 +1682,7 @@ class ConversationHandler:
         )
         if not request.held:
             scope.dispatch_gate.set()
+        scope.trace = TurnTraceBuilder()
         return scope
 
     def prefetch(self, session_id: str, partial_text: str | None) -> None:
@@ -1925,6 +2090,12 @@ class ConversationHandler:
             except Exception as e:
                 logger.error("[AUTO-RAG] Error during vault-only retrieval: %s", e)
                 retrieval_result = None
+        # Fed after the retrieval's own `try`, so a trace error can never be
+        # caught there and turn into a failed retrieval.
+        self._feed_trace(
+            scope,
+            lambda trace: self._trace_auto_inject(trace, auto_inject_enabled, retrieval_result),
+        )
 
         mist_context = await self._get_or_fetch_mist_context(session_id)
         messages = self._build_messages(
@@ -1934,6 +2105,7 @@ class ConversationHandler:
             mist_context=mist_context,
             max_output_tokens=self.config.llm.conversation_max_tokens,
             pending_user_message=user_message,
+            scope=scope,
         )
         scope.context_window = messages
         scope.retrieval_result = retrieval_result
@@ -2188,6 +2360,12 @@ class ConversationHandler:
             "tts_model": delivery.tts_model,
         }
 
+        # Rendered once for both write paths below, then dropped, so a feed
+        # after the commit (a shielded tool finishing late, a direct
+        # `_build_messages` call) reaches no builder.
+        trace = self._turn_trace_payload(scope)
+        scope.trace = None
+
         session.add_message("user", user_message)
         if delivery.outcome == "error":
             session.add_message("assistant", delivery.delivered_text)
@@ -2195,6 +2373,7 @@ class ConversationHandler:
                 session_id=session_id,
                 user_message=user_message,
                 assistant_message=delivery.delivered_text,
+                trace=trace,
                 **outcome_fields,
             )
             scope.commit_result = self._commit_result(event_id)
@@ -2232,6 +2411,7 @@ class ConversationHandler:
             context_window=scope.context_window,
             retrieval_result=scope.retrieval_result,
             tool_calls=tool_calls,
+            trace=trace,
             **outcome_fields,
         )
 
@@ -2845,6 +3025,7 @@ class ConversationHandler:
         retrieval_result: RetrievalResult | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
         *,
+        trace: dict[str, Any] | None = None,
         turn_outcome: str | None = None,
         generated_response: str | None = None,
         turn_modality: str | None = None,
@@ -2867,6 +3048,11 @@ class ConversationHandler:
             context_window: The full message list sent to the LLM.
             retrieval_result: Hybrid retrieval result from auto-RAG, if any.
             tool_calls: Tool calls made during this turn, if any.
+            trace: The turn's retrieval trace, written to
+                `retrieval_context["trace"]` beside the auto-RAG keys, which
+                keep their own condition. None (callers outside a turn, such
+                as the extraction-only admin path) leaves `retrieval_context`
+                as it was.
             turn_outcome: `completed`, `interrupted`, `superseded` or
                 `error`; None when the caller does not say.
             generated_response: The full generated text. `commit_turn`
@@ -2916,6 +3102,8 @@ class ConversationHandler:
                     "fact_count": retrieval_result.total_facts,
                     "document_chunks_used": retrieval_result.document_chunks_used,
                 }
+            if trace is not None:
+                retrieval_context = {**(retrieval_context or {}), "trace": trace}
 
             # UTC-aware fact-time: this exact instant becomes recorded_at on
             # every bitemporal edge the turn produces (never wall-clock at
@@ -3265,6 +3453,7 @@ class ConversationHandler:
         max_output_tokens: int = 400,
         *,
         pending_user_message: str | None = None,
+        scope: TurnScope | None = None,
     ) -> list[dict[str, str]]:
         """Build message list for LLM.
 
@@ -3295,6 +3484,9 @@ class ConversationHandler:
                 commit adds it). History is built as if it had been
                 appended, so the prompt is the same as when the message was
                 written to history before the turn ran.
+            scope: The turn whose trace receives the profile-dedup and
+                budget feeds. None (a direct call outside a turn) feeds
+                nothing.
 
         Returns:
             List of messages for LLM, budget-compliant when planner is active.
@@ -3323,7 +3515,15 @@ class ConversationHandler:
         # sidecar INDEX is untouched -- the profile stays retrievable for
         # content queries (e.g. "Slalom"); only the injection layer dedups.
         if profile_path is not None and retrieval_result is not None:
+            # The dedup assigns a new list, so `facts_before` keeps the old one.
+            facts_before = retrieval_result.facts
             self._dedup_profile_from_retrieval(retrieval_result, profile_path)
+            self._feed_trace(
+                scope,
+                lambda trace: trace.auto_inject_profile_dedup(
+                    refs_removed(facts_before, retrieval_result.facts)
+                ),
+            )
 
         # Live-data advisory is a fixed-cost segment when present.
         live_advisory_text: str | None = None
@@ -3374,6 +3574,11 @@ class ConversationHandler:
             )
             retrieval_text = plan.pruned_retrieval_text
             history = plan.pruned_history
+            # Covers the minimal fallback too: a plan that does not fit is
+            # recorded with `fits` false, and its facts as `dropped_no_fit`.
+            self._feed_trace(
+                scope, lambda trace: trace.budget_planned(plan, history_raw=len(raw_history))
+            )
             if not plan.fits:
                 logger.warning(
                     "[BUDGET] Context budget exceeded: fixed_cost=%d total_budget=%d. "

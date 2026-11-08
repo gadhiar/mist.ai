@@ -191,7 +191,9 @@ def cmd_seed(args: argparse.Namespace) -> int:
             from backend.knowledge.seed.gates import check_embeddings
 
             print(f"[seed] Loading embedding model: {config.embedding.model_name}")
-            embedding_generator = EmbeddingGenerator(model_name=config.embedding.model_name)
+            embedding_generator = EmbeddingGenerator(
+                model_name=config.embedding.model_name, device=config.embedding.resolved_device()
+            )
             embedded = be.admin._backfill_embeddings_for_seed(
                 connection, embedding_generator, seed_version
             )
@@ -328,7 +330,9 @@ def cmd_seed_verify(args: argparse.Namespace) -> int:
     # exports `EmbeddingGenerator` lazily (I7 T1) precisely so the other four
     # gates do not pay a ~2.8s `sentence_transformers` import they never use.
     print(f"[seed-verify] Loading embedding model: {config.embedding.model_name}")
-    embedding_generator = EmbeddingGenerator(model_name=config.embedding.model_name)
+    embedding_generator = EmbeddingGenerator(
+        model_name=config.embedding.model_name, device=config.embedding.resolved_device()
+    )
 
     connection = _connect(be)
     try:
@@ -1122,7 +1126,9 @@ def _build_log_regenerator(
     # this is an admin CLI (sync batch), NOT the async server event loop, so there
     # is no event-loop lazy-loading hazard. A single instance is shared across
     # GraphStore and the curation pipeline to avoid loading two copies.
-    embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+    embedding_provider = EmbeddingGenerator(
+        config.embedding.model_name, device=config.embedding.resolved_device()
+    )
 
     # Initialize staging schema (idempotent) via a transient GraphStore.
     staging_store = GraphStore(connection=staging_conn, embedding_generator=embedding_provider)
@@ -1512,7 +1518,9 @@ def cmd_stack_status(args: argparse.Namespace) -> int:
     rather than its HTTP code -- `/health` answers 200 even when it reports a
     fault, so an exit code derived from the code would print green over a red
     body. `_print_status_line` shows the body's own status word and, when the
-    backend asks for one, a restart notice.
+    backend asks for one, a restart notice. A `yielded` backend prints
+    `[YIELD]` rather than `[FAIL]` and still exits 1: while yielded, MIST
+    cannot hold a conversation.
     """
     be = _load_backend()
     config = be.get_config()
@@ -2237,7 +2245,9 @@ def _build_cli_sidecar(config: Any) -> Any:
     from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
     from backend.vault.sidecar_index import VaultSidecarIndex
 
-    embedder = EmbeddingGenerator(config.embedding.model_name)
+    embedder = EmbeddingGenerator(
+        config.embedding.model_name, device=config.embedding.resolved_device()
+    )
     sidecar = VaultSidecarIndex(config.sidecar_index, embedder)
     sidecar.initialize()
     return sidecar
@@ -2432,7 +2442,15 @@ def _print_extraction_only_summary(results: list[dict]) -> None:
 def _print_status_line(status: dict) -> None:
     service = status.get("service", "?")
     state = status.get("status", "?")
-    indicator = "OK" if state == "healthy" else "FAIL"
+    # `yielded` is the backend giving the GPU away on purpose (gaming mode), so
+    # `[FAIL]` would call a choice a fault. It is still not healthy, and
+    # `cmd_stack_status` still exits 1 for it.
+    if state == "healthy":
+        indicator = "OK"
+    elif state == "yielded":
+        indicator = "YIELD"
+    else:
+        indicator = "FAIL"
     details: list[str] = []
     if "url" in status:
         details.append(status["url"])
@@ -3003,7 +3021,9 @@ def cmd_vault_status(args: argparse.Namespace) -> int:
     from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
     from backend.vault.sidecar_index import VaultSidecarIndex
 
-    embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+    embedding_provider = EmbeddingGenerator(
+        config.embedding.model_name, device=config.embedding.resolved_device()
+    )
     sidecar = VaultSidecarIndex(config.sidecar_index, embedding_provider)
     try:
         sidecar.initialize()
@@ -3052,7 +3072,9 @@ def cmd_vault_reindex(args: argparse.Namespace) -> int:
     from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
     from backend.vault.sidecar_index import VaultSidecarIndex
 
-    embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+    embedding_provider = EmbeddingGenerator(
+        config.embedding.model_name, device=config.embedding.resolved_device()
+    )
     sidecar = VaultSidecarIndex(config.sidecar_index, embedding_provider)
     sidecar.initialize()
 
@@ -3123,7 +3145,9 @@ def _cmd_vault_rebuild_sidecar(args: argparse.Namespace) -> int:
     from backend.knowledge.embeddings.embedding_generator import EmbeddingGenerator
     from backend.vault.sidecar_index import VaultSidecarIndex
 
-    embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+    embedding_provider = EmbeddingGenerator(
+        config.embedding.model_name, device=config.embedding.resolved_device()
+    )
     sidecar = VaultSidecarIndex(config.sidecar_index, embedding_provider)
     sidecar.initialize()  # Recreates schema on the freshly-deleted db
 

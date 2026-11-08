@@ -224,7 +224,6 @@ class TestHandleMessageStreamingRecordsAsBefore:
             "user_utterance": "what do I know",
             "system_response": "You know Rust.",
             "context_window": provider.calls[1].messages,
-            "retrieval_context": None,
             "tool_calls": [{"name": "query_knowledge_graph", "args": {"query": "rust"}}],
             "audio_hash": None,
             "audio_format": None,
@@ -240,6 +239,9 @@ class TestHandleMessageStreamingRecordsAsBefore:
             "turn_modality": "text",
         }
         assert {key: row[key] for key in expected} == expected
+        # No auto-inject ran, so the retrieval trace is the only key; its
+        # content is pinned by test_conversation_handler_trace.py.
+        assert set(row["retrieval_context"]) == {"trace"}
         session = handler.event_store.get_session("s-fields")
         assert session.input_modality == "text"
         assert session.turn_count == 1

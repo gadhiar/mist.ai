@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "_comment": "Run 1 test lines (mist-model-host plan v2). Invented text, no personal data. Each line names the feeling it should carry; `emotive` marks the lines whose feeling is not neutral, list, figures or long, which `original` also renders in its `expressive` setting. `turbo_text` is what the Turbo engine receives instead of `text`: its paralinguistic tags are its only emotion control. The acknowledgements are timed and rendered for listening but kept out of the 5-to-25-word statistics.",
+  "lines": [
+    {"id": "L01", "feeling": "neutral", "emotive": false, "text": "Your timer is set for ten minutes, and I'll let you know when it's done."},
+    {"id": "L02", "feeling": "neutral", "emotive": false, "text": "It's eleven degrees outside right now, with light rain expected after six."},
+    {"id": "L03", "feeling": "tired, late at night", "emotive": true, "text": "It's nearly two in the morning, boss. Save it and finish this tomorrow.", "turbo_text": "[sigh] It's nearly two in the morning, boss. Save it and finish this tomorrow."},
+    {"id": "L04", "feeling": "tired, gentle", "emotive": true, "text": "Long day, wasn't it? I've set your alarm for eight. Get some sleep.", "turbo_text": "[sigh] Long day, wasn't it? I've set your alarm for eight. Get some sleep."},
+    {"id": "L05", "feeling": "warm greeting", "emotive": true, "text": "Evening. Good to have you back. What are we working on tonight?"},
+    {"id": "L06", "feeling": "dry humour", "emotive": true, "text": "Done. All four lights are off, which is a personal best for this room."},
+    {"id": "L07", "feeling": "amused", "emotive": true, "text": "You asked me that yesterday too. Same answer: the blue one.", "turbo_text": "You asked me that yesterday too. [chuckle] Same answer: the blue one."},
+    {"id": "L08", "feeling": "concerned, warning", "emotive": true, "text": "Careful there. Nobody actually has that number; what we have is an estimate."},
+    {"id": "L09", "feeling": "urgent", "emotive": true, "text": "Your train leaves in twelve minutes. If you go now, you'll make it."},
+    {"id": "L10", "feeling": "apologetic", "emotive": true, "text": "Sorry, I lost the connection to the lights. Give me a second to try again."},
+    {"id": "L11", "feeling": "curious question", "emotive": true, "text": "That's the new speaker, is it? What do you want it doing?"},
+    {"id": "L12", "feeling": "encouraging", "emotive": true, "text": "That's the third test passing in a row. Nice work, honestly."},
+    {"id": "L13", "feeling": "calm reassurance", "emotive": true, "text": "Nothing's broken. The backup finished at four, and every file checked out."},
+    {"id": "L14", "feeling": "list", "emotive": false, "text": "Headphones, charger, passport and the blue notebook. That's everything on your list."},
+    {"id": "L15", "feeling": "figures", "emotive": false, "text": "The survey says sixty-three point eight percent, from about two thousand people in September."},
+    {"id": "L16", "feeling": "long", "emotive": false, "text": "I've moved your dentist appointment to Thursday at half past three, and I'll remind you an hour before, so don't worry about it."},
+    {"id": "L17", "feeling": "sympathetic", "emotive": true, "text": "That's a shame. I know you were looking forward to it."},
+    {"id": "L18", "feeling": "playful refusal", "emotive": true, "text": "No, I'm not ordering pizza again. You told me to stop you, remember?"},
+    {"id": "L19", "feeling": "focused", "emotive": true, "text": "Give me a moment. I'm pulling the numbers from last week now."},
+    {"id": "L20", "feeling": "signing off", "emotive": true, "text": "Alright, I'll go quiet. Shout if you need me."}
+  ],
+  "acknowledgements": [
+    {"id": "A01", "text": "Checking."},
+    {"id": "A02", "text": "On it."},
+    {"id": "A03", "text": "Done."},
+    {"id": "A04", "text": "Let me find it."},
+    {"id": "A05", "text": "Got it, boss."},
+    {"id": "A06", "text": "One moment."}
+  ]
+}

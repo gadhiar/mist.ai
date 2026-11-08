@@ -92,6 +92,7 @@ class FakeWebSocket:
     def __init__(self, inbound: list[dict]) -> None:
         self._inbound = list(inbound)
         self.sent: list[dict] = []
+        self.headers: dict[str, str] = {}
 
     async def accept(self, headers=None) -> None:
         return None

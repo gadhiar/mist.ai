@@ -1,0 +1,233 @@
+# MIST.AI daily instance: the compose project that runs a pinned release.
+#
+# Self-contained: it reads no other compose file and binds nothing from a git work tree. Every
+# host path comes from the instance root (`MIST_DAILY_ROOT`), the model directory or the backup
+# destination, all set in `<root>/daily.env`. The instance CLI runs it as
+#   docker compose -p mist-<instance> -f <root>/release/<tag>/deploy/daily/compose.yml \
+#     --env-file <root>/daily.env ...
+# so `${VAR}` below resolves from daily.env, and the same file serves the backend as its env_file.
+# A `${VAR:?...}` that is unset refuses the whole file before anything starts.
+#
+# Contract and rationale: deploy/daily/README.md. The parity with docker-compose.yml (the mist-llm
+# image, command and environment, and the healthchecks) is pinned by
+# tests/unit/deploy/test_daily_compose.py, so change both files together.
+name: mist-daily
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  mist-backend:
+    # A release image built by `instance.py release-build`. `pull_policy: never` means compose
+    # neither builds nor pulls: a pull of `mist-backend:<tag>` could fetch an unrelated public
+    # image of that name.
+    image: mist-backend:${MIST_RELEASE_TAG:?set MIST_RELEASE_TAG in daily.env}
+    pull_policy: never
+    user: "1000:1000"
+    # Loopback only: the WebSocket has no authentication.
+    ports:
+      - "127.0.0.1:${MIST_DAILY_WS_PORT:-8001}:8001"
+    env_file:
+      - path: ${MIST_DAILY_ROOT:?set MIST_DAILY_ROOT in daily.env}/daily.env
+        required: true
+    # Literals win over env_file, so no line carried into daily.env can move a store, turn TTS on
+    # or put the embedding model on the GPU.
+    environment:
+      - NEO4J_URI=bolt://mist-neo4j:7687
+      - LLM_SERVER_URL=http://mist-llm:8080
+      - LLM_BACKEND=llamacpp
+      - MIST_SESSION_ORIGIN=real
+      - TTS_ENABLED=false
+      - EMBEDDING_DEVICE=cpu
+      - EVENT_STORE_DB_PATH=/app/data/event_store.db
+      - EVENT_STORE_AUDIO_DIR=/app/data/audio
+      - VECTOR_STORE_DATA_DIR=/app/data/vector_store
+      - MIST_VAULT_ROOT=/app/mist-memory
+      - MIST_SIDECAR_DB_PATH=/app/data/vault_sidecar.db
+      - MIST_LOG_DIR=/app/logs
+      - MIST_OPS_DIR=/app/ops
+      - MIST_BACKUP_STATUS_PATH=/app/ops/backup-status.json
+      # The Tauri app's origins only; the code's default also admits the Vite dev origin.
+      - MIST_ALLOWED_ORIGINS=${MIST_ALLOWED_ORIGINS:-http://tauri.localhost,https://tauri.localhost,tauri://localhost}
+    volumes:
+      - ${MIST_DAILY_ROOT}/state:/app/data
+      - ${MIST_DAILY_ROOT}/logs:/app/logs
+      - ${MIST_DAILY_ROOT}/mist-memory:/app/mist-memory
+      # Read-only here: only mist-backup and the host CLI write the ops directory.
+      - ${MIST_DAILY_ROOT}/ops:/app/ops:ro
+      - mist-hf-cache:/home/appuser/.cache/huggingface
+      - mist-torch-cache:/home/appuser/.cache/torch
+    mem_limit: ${MIST_DAILY_BACKEND_MEM_LIMIT:-8g}
+    logging: *logging
+    # Not mist-llm: gaming mode stops it while the backend keeps serving.
+    depends_on:
+      mist-neo4j:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      # Identical to docker-compose.yml's mist-backend healthcheck (parity-tested).
+      test: ["CMD", "python", "-c",
+             "import json,sys,urllib.request; p=json.load(urllib.request.urlopen('http://localhost:8001/health', timeout=5)); sys.exit(1 if p.get('restart_recommended') else 0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  mist-neo4j:
+    image: neo4j:5.26.23@sha256:40bf5ae9282213087e4d6036aab3ec443fe9c974d3dd4f14a11892c63157238f
+    ports:
+      - "127.0.0.1:${MIST_DAILY_BOLT_PORT:-7687}:7687"
+      - "127.0.0.1:${MIST_DAILY_NEO4J_HTTP_PORT:-7474}:7474"
+    # Explicit heap and page cache, so Neo4j does not size itself from the whole Docker VM.
+    environment:
+      - NEO4J_AUTH=${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in daily.env}
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_server_memory_heap_initial__size=${MIST_DAILY_NEO4J_HEAP:-1g}
+      - NEO4J_server_memory_heap_max__size=${MIST_DAILY_NEO4J_HEAP:-1g}
+      - NEO4J_server_memory_pagecache_size=${MIST_DAILY_NEO4J_PAGECACHE:-512m}
+    volumes:
+      - neo4j-data:/data
+      - ${MIST_DAILY_ROOT}/logs/neo4j:/logs
+    # Holds the measured peak, 1570 MiB on a near-empty graph (scratch rehearsal rerun,
+    # 6 Nov 2026), plus the page cache filling to its 512m: 2082 MiB, with 32.2% of it free.
+    mem_limit: ${MIST_DAILY_NEO4J_MEM_LIMIT:-3g}
+    logging: *logging
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  mist-llm:
+    # image, environment and command are docker-compose.yml's mist-llm, byte for byte once
+    # parsed (parity-tested); its comments there record why each value was chosen. There is no
+    # /config/system_prompt.txt mount, because nothing reads it.
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda-b11151@sha256:014f721265464f38ccb247c1338d07d852c4bae7509a4b4734d07a2bbadc765c
+    volumes:
+      - ${MODELS_DIR:?set MODELS_DIR in daily.env}:/models:ro
+    environment:
+      - LLAMA_ARG_MODEL=/models/${LLM_MODEL_FILE:-unsloth/gemma-4-E4B-it-Q5_K_M.gguf}
+      - LLAMA_ARG_N_GPU_LAYERS=999
+      - LLAMA_ARG_CTX_SIZE=${LLM_CTX_SIZE:-32768}
+      - LLAMA_ARG_FLASH_ATTN=on
+      - LLAMA_ARG_HOST=0.0.0.0
+      - LLAMA_ARG_PORT=8080
+      - LLAMA_ARG_THREADS=10
+      - LLAMA_ARG_THREADS_BATCH=12
+      - LLAMA_ARG_BATCH_SIZE=1024
+      - LLAMA_ARG_UBATCH_SIZE=512
+      - LLAMA_ARG_N_PARALLEL=1
+      - LLAMA_ARG_METRICS=1
+      - LLAMA_ARG_CACHE_TYPE_K=q8_0
+      - LLAMA_ARG_CACHE_TYPE_V=q8_0
+      - LLAMA_ARG_JINJA=1
+    command:
+      - "--no-kv-unified"
+      - "--no-webui"
+      - "--reasoning-format"
+      - "deepseek"
+      - "--temp"
+      - "1.0"
+      - "--top-p"
+      - "0.95"
+      - "--top-k"
+      - "64"
+      - "--min-p"
+      - "0.0"
+      - "--repeat-penalty"
+      - "1.0"
+      - "--seed"
+      - "3407"
+      - "--cache-ram"
+      - "${LLM_CACHE_RAM_MIB:-2048}"
+    # No ports: the backend reaches it inside the project, and a dev stack over llm-share.
+    # llama-server's HTTP API has no authentication without --api-key.
+    networks:
+      - default
+      - llm-share
+    # Holds the measured peak, 4602 MiB after a handful of prompts (scratch rehearsal rerun,
+    # 6 Nov 2026), plus the 2048 MiB the prompt cache may still grow to under --cache-ram:
+    # 6650 MiB, which leaves 27.8% of 9g free. At the end of the rerun, memory.stat counted
+    # 5374 MiB of file pages, mostly the memory-mapped model, which the kernel can reclaim, and
+    # 312 MiB anon.
+    mem_limit: ${MIST_DAILY_LLM_MEM_LIMIT:-9g}
+    logging: *logging
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  mist-backup:
+    # Off until armed: `instance.py arm-backups` starts it after a restore drill passes.
+    profiles: ["backup"]
+    image: mist-backend:${MIST_RELEASE_TAG:?set MIST_RELEASE_TAG in daily.env}
+    pull_policy: never
+    user: "1000:1000"
+    command: ["python", "-m", "scripts.backup.scheduler"]
+    environment:
+      - NEO4J_URI=bolt://mist-neo4j:7687
+      - NEO4J_USERNAME=${NEO4J_USERNAME:-neo4j}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:?set NEO4J_PASSWORD in daily.env}
+      - MIST_BACKUP_ROOT=/backup
+      - MIST_BACKUP_STATUS_PATH=/app/ops/backup-status.json
+      - MIST_BACKUP_INTERVAL_HOURS=${MIST_BACKUP_INTERVAL_HOURS:-24}
+      - MIST_BACKUP_RETAIN=${MIST_BACKUP_RETAIN:-7}
+      - MIST_BACKUP_CHECK_MINUTES=${MIST_BACKUP_CHECK_MINUTES:-10}
+      - MIST_BACKUP_RETRY_MINUTES=${MIST_BACKUP_RETRY_MINUTES:-60}
+      - MIST_BACKUP_MIN_NODE_RATIO=${MIST_BACKUP_MIN_NODE_RATIO:-0.5}
+      - EVENT_STORE_DB_PATH=/app/data/event_store.db
+      - EVENT_STORE_AUDIO_DIR=/app/data/audio
+      - VECTOR_STORE_DATA_DIR=/app/data/vector_store
+      - MIST_VAULT_ROOT=/app/mist-memory
+      - MIST_SIDECAR_DB_PATH=/app/data/vault_sidecar.db
+    volumes:
+      # Read-write: opening a WAL store with mode=ro still creates its -shm file
+      # (scripts/backup/stores.py:198-206).
+      - ${MIST_DAILY_ROOT}/state:/app/data
+      - ${MIST_DAILY_ROOT}/mist-memory:/app/mist-memory:ro
+      - ${MIST_DAILY_ROOT}/ops:/app/ops
+      - ${MIST_BACKUP_HOST_PATH:?set MIST_BACKUP_HOST_PATH in daily.env}:/backup
+    mem_limit: ${MIST_DAILY_BACKUP_MEM_LIMIT:-4g}
+    logging: *logging
+    depends_on:
+      mist-neo4j:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  # The share network a dev stack joins to reach mist-llm by name. mist-backend and mist-neo4j
+  # stay off it, so a dev stack cannot resolve the live graph or backend.
+  llm-share:
+    external: true
+    name: ${MIST_LLM_SHARE_NETWORK:-mist-llm-share}
+
+volumes:
+  # External, so `down -v` cannot delete the graph, and promoting a restored volume is a
+  # one-variable change in daily.env.
+  neo4j-data:
+    external: true
+    name: ${MIST_DAILY_NEO4J_VOLUME:?set MIST_DAILY_NEO4J_VOLUME in daily.env}
+  mist-hf-cache:
+  mist-torch-cache:
