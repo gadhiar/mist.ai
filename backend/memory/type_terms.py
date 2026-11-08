@@ -13,7 +13,13 @@ it. The index's `porter unicode61` tokenizer stems both sides, so a regular plur
 ("technologies") needs no entry, while an irregular one ("people") does.
 
 Each term is one token in `fts.fold` form, at least two characters long and not a stopword, so
-a query can keep it. Nothing here touches the rendered text or the embedding.
+a query can keep it. Nothing here touches the served text.
+
+The table has a second reader: the retrieval view's type gloss
+(backend/memory/retrieval_view.py, `render_fact_view` under a view with `type_gloss`) follows a
+fact's object with the first term of its type, "Brightgrid (organization)", in the text the
+models score. So the first term of each entry is also the word the embedder and the reranker
+read for that type, and reordering an entry changes the view text.
 """
 
 from __future__ import annotations
