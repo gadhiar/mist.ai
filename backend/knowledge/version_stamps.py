@@ -166,7 +166,7 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
     ),
     CodeRevision(
         extraction_version="2026-11-08-r7",
-        code_identity="ci1-994c81a3b88b345a7f89806dd819ffb6c6cc0d2134f0363656220ffab4eddbe8",
+        code_identity="ci1-265b3970c92f9b49a51618b5caceca8fca9c8900b4921383a44cff74317010d9",
         date="2026-11-08",
         reason=(
             "List frame path: list_frames, list_prompts, list_schemas, list_assembly and "

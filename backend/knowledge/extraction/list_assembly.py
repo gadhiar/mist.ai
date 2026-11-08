@@ -19,7 +19,7 @@ from collections.abc import Mapping, Sequence
 
 from backend.extraction_contract.models import ExtractionPayload
 
-from .canonical_id import canonical_metric_id
+from .canonical_id import canonical_metric_id, canonical_metric_id_from_id
 from .list_frames import (
     FrameOutput,
     GroupFrame,
@@ -211,14 +211,18 @@ def _derive(
     """The entity's id, its name, and the warnings deriving them raised.
 
     The name is the phrase the id is built from, so the normalizer, which re-derives
-    each id from the name, gives the rail's id back. A Metric's id is built from its
-    properties, by this rail and by the normalizer alike, so its name is the model's.
-    A Metric or Date with a value never reads its span, so its span is not snapped.
+    each id from the name, gives the rail's id back. A Metric with a value and a unit
+    or a quantity has its id built from those properties, by this rail and by the
+    normalizer's Pass 4 alike, so its name is the model's. Such a Metric, or a Date
+    with a value, never reads its span, so its span is not snapped. A Metric with only
+    a value is one Pass 4 does not rebuild: it keeps the id it derives from the name
+    and moves the number to the front (`canonical_metric_id_from_id`), as the scorer
+    does. So that Metric takes the span rail, and the same last step.
     """
     fixed = _FIXED_IDS.get(etype)
     if fixed is not None:
         return fixed["id"], fixed["name"], []
-    if etype == "Metric" and value is not None:
+    if etype == "Metric" and value is not None and (unit or quantity):
         return canonical_metric_id(value, unit, quantity), name or span, []
     if etype == "Date" and value is not None:
         return _canonical(value), value, []
@@ -232,6 +236,8 @@ def _derive(
         phrase = _drop_words(snapped, leading_articles_only=False)
     else:
         phrase = _drop_words(snapped, leading_articles_only=True)
+    if etype == "Metric":
+        return canonical_metric_id_from_id(_canonical(phrase)), phrase, warnings
     return _canonical(phrase), phrase, warnings
 
 
@@ -255,7 +261,10 @@ def list_entity_id(
         - The span snaps to the utterance (`_snap`); a span found nowhere is used as
           written, with `list_span_unmatched`. A trailing `'s` is then dropped, since
           a possessive names its owner; a plural is kept.
-        - Metric: `canonical_metric_id(value, unit, quantity)`. Date: the ISO value.
+        - Metric with a value and a unit or a quantity:
+          `canonical_metric_id(value, unit, quantity)`. A Metric with only a value, or
+          none, takes the rule for any other type, then `canonical_metric_id_from_id`,
+          as the normalizer and the scorer do. Date: the ISO value.
         - Event, or any entity marked `activity`: the model's name, with date
           tokens, the prepositions leading into them, articles, possessive
           pronouns and `<Name>'s` possessors dropped.

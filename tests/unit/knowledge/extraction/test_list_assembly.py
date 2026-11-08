@@ -40,7 +40,10 @@ _SCRIPTS = Path(__file__).resolve().parents[4] / "scripts"
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from eval_harness.score_extraction_run import canonical_id  # noqa: E402
+from eval_harness.score_extraction_run import (  # noqa: E402
+    _produced_entity_match_id,
+    canonical_id,
+)
 
 _USER = {"id": "user", "name": "User", "type": "User"}
 _MIST = {"id": "mist-identity", "name": "MIST", "type": "MistIdentity"}
@@ -811,3 +814,44 @@ class TestLeverRows:
         payload, _ = _run(*turn)
 
         assert await _normalized_ids(payload) == (ids, triples)
+
+
+class TestValueOnlyMetric:
+    """A Metric with a value but no unit or quantity, which Pass 4 does not rebuild."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("span", "expected"),
+        [("180 queued jobs", "180-queued-jobs"), ("queue of 180 jobs", "180-queue-of-jobs")],
+    )
+    async def test_its_id_survives_the_normalizer_and_matches_the_scorer(self, span, expected):
+        utterance = f"Ostrel:\n- {span}"
+        metric = ListEntity("e1", span, "queue depth", "Metric", value="180")
+        frame = _frame(
+            _group("G1"), frame_entities=[ListEntity("f1", "Ostrel", "Ostrel", "Project")]
+        )
+        items = [
+            _item(
+                "G1.1",
+                None,
+                applies=False,
+                entities=[metric],
+                relationships=[_rel("f1", "HAS_METRIC", "e1")],
+            )
+        ]
+
+        payload, warnings = _run(utterance, frame, items)
+
+        record = payload.entities[1]
+        assert record == {
+            "id": expected,
+            "name": span,
+            "type": "Metric",
+            "properties": {"value": "180", "unit": None, "quantity": None},
+        }
+        assert warnings == []
+        assert await _normalized_ids(payload) == (
+            ["ostrel", expected],
+            [("ostrel", "HAS_METRIC", expected)],
+        )
+        assert _produced_entity_match_id(expected, "Metric", record["properties"]) == expected
