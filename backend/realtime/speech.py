@@ -1,16 +1,16 @@
 """Speech engine contracts: the protocols model adapters implement and the values they exchange.
 
 The realtime layer never imports a model library. Ingress, the turn controller and the session
-talk to these protocols, and the adapters under `backend/realtime/engines/` (local Silero VAD,
-Smart Turn, Whisper and Chatterbox, and the remote speech service) implement them, so an engine
-can move between the GPU, the CPU and another host by configuration alone. Every engine call is
-blocking and runs on an `InferenceLane` worker thread (`lanes.py`); a `CancelToken` is how a
-barge-in reaches a call already running there.
+talk to these protocols, and the adapters under `backend/realtime/engines/` (Silero VAD, Smart
+Turn, and the STT and TTS engines step 0 picks) implement them, so an engine can move between
+the GPU and the CPU by configuration alone. Every engine call is blocking and runs on an
+`InferenceLane` worker thread (`lanes.py`); a `CancelToken` is how a barge-in reaches a call
+already running there.
 """
 
 import threading
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal, Protocol
 
 import numpy as np
@@ -42,34 +42,17 @@ class CancelToken:
 
 
 @dataclass(frozen=True, slots=True)
-class VoiceReference:
-    """The active voice profile's reference audio, held in memory for TTS conditioning.
-
-    `wav` is 24 kHz mono PCM16 WAV bytes. It is never written to disk and never logged, so it is
-    left out of `repr`, which is what log lines and assertion messages print.
-    """
-
-    profile: str
-    wav: bytes = field(repr=False)
-    sha256: str
-    seconds: float
-    exaggeration: float
-    cfg_weight: float
-
-
-@dataclass(frozen=True, slots=True)
 class VoiceInfo:
-    """The conditioning a synthesizer speaks with, as reported to clients and logs.
+    """The voice a synthesizer speaks with, as reported to clients and logs.
 
-    `source` is `profile` when it was built from a `VoiceReference` and `builtin` when the
-    engine kept its own default voice; the profile fields are then `None`. Only a hash prefix
-    is carried, so the report identifies the reference without exposing it.
+    MIST speaks one of the engine's stock voices, not a cloned one, so the report names the
+    engine (its id as `speech_arms.json` names it), the stock voice and the voice profile
+    (`VoiceSettings.profile`) the voice was chosen for.
     """
 
-    profile: str | None
-    source: Literal["profile", "builtin"]
-    seconds: float | None
-    sha256_prefix: str | None
+    engine: str
+    voice: str
+    profile: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,14 +161,15 @@ class StreamingTranscriber(Protocol):
 
 
 class SpeechSynthesizer(Protocol):
-    """A TTS engine with fixed voice conditioning.
+    """A TTS engine speaking one stock voice, chosen when the adapter is built.
 
-    `variant` is `turbo` or `original`; `voice` describes the conditioning it was built with,
-    from a `VoiceReference` or the engine's built-in voice.
+    `engine_id` is the engine's id (`PlacementConfig.tts_engine`) and `voice` the stock voice it
+    speaks. `sample_rate` is the rate of the audio the adapter yields: 24000 whatever the
+    engine's own rate, which the adapter converts from.
     """
 
     model_id: str
-    variant: str
+    engine_id: str
     sample_rate: int
     voice: VoiceInfo
 

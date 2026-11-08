@@ -25,7 +25,6 @@ from backend.realtime.speech import (
     TextSegment,
     TranscriptUpdate,
     VoiceInfo,
-    VoiceReference,
 )
 from tests.fakes.scripted_audio import (
     SAMPLE_RATE,
@@ -36,7 +35,7 @@ from tests.fakes.scripted_audio import (
     windows,
 )
 from tests.fakes.speech import (
-    BUILTIN_VOICE,
+    FAKE_VOICE,
     EnergyVad,
     FakeSynthesizer,
     ScriptedTranscriber,
@@ -93,39 +92,15 @@ class TestValueTypes:
             ("segment", TextSegment),
         ]
 
-    def test_voice_reference_fields_match_the_design_doc(self):
-        assert _fields(VoiceReference) == [
-            ("profile", str),
-            ("wav", bytes),
-            ("sha256", str),
-            ("seconds", float),
-            ("exaggeration", float),
-            ("cfg_weight", float),
-        ]
+    def test_voice_info_names_an_engine_a_stock_voice_and_the_profile(self):
+        assert _fields(VoiceInfo) == [("engine", str), ("voice", str), ("profile", str)]
 
-    def test_voice_reference_repr_leaves_out_the_reference_audio(self):
-        reference = VoiceReference(
-            profile="p",
-            wav=b"RIFF-secret",
-            sha256="ab",
-            seconds=6.0,
-            exaggeration=0.5,
-            cfg_weight=0.5,
-        )
-
-        assert "RIFF-secret" not in repr(reference)
-
-    def test_voice_info_fields_match_the_design_doc(self):
-        assert _fields(VoiceInfo) == [
-            ("profile", str | None),
-            ("source", Literal["profile", "builtin"]),
-            ("seconds", float | None),
-            ("sha256_prefix", str | None),
-        ]
+    def test_the_cloned_voice_reference_is_gone(self):
+        assert not hasattr(speech, "VoiceReference")
 
     @pytest.mark.parametrize(
         "cls",
-        [TranscriptUpdate, TextSegment, SynthChunk, VoiceReference, VoiceInfo],
+        [TranscriptUpdate, TextSegment, SynthChunk, VoiceInfo],
         ids=lambda cls: cls.__name__,
     )
     def test_value_types_are_frozen_and_slotted(self, cls):
@@ -158,7 +133,7 @@ class TestProtocols:
     def test_synthesizer_protocol_matches_the_design_doc(self):
         assert speech.SpeechSynthesizer.__annotations__ == {
             "model_id": str,
-            "variant": str,
+            "engine_id": str,
             "sample_rate": int,
             "voice": VoiceInfo,
         }
@@ -444,17 +419,24 @@ class TestFakeSynthesizer:
 
         assert slept == [0.05] * len(chunks)
 
-    def test_defaults_are_turbo_and_the_builtin_voice_and_both_are_settable(self):
+    def test_defaults_are_the_fake_engine_and_its_stock_voice_and_both_are_settable(self):
         synthesizer = FakeSynthesizer()
-        defaults = (synthesizer.variant, synthesizer.voice, synthesizer.sample_rate)
-        profile_voice = VoiceInfo("jarvis", "profile", 12.5, "0123abcd")
+        defaults = (synthesizer.engine_id, synthesizer.voice, synthesizer.sample_rate)
+        other_voice = VoiceInfo("kokoro", "af_heart", "studio")
 
-        synthesizer.variant = "original"
-        synthesizer.voice = profile_voice
+        synthesizer.engine_id = "kokoro"
+        synthesizer.voice = other_voice
 
-        assert defaults == ("turbo", BUILTIN_VOICE, 24000)
-        assert VoiceInfo(None, "builtin", None, None) == BUILTIN_VOICE
-        assert (synthesizer.variant, synthesizer.voice) == ("original", profile_voice)
+        assert defaults == ("fake", VoiceInfo("fake", "stock", "mist"), 24000)
+        assert VoiceInfo("fake", "stock", "mist") == FAKE_VOICE
+        assert (synthesizer.engine_id, synthesizer.voice) == ("kokoro", other_voice)
+
+    def test_engine_id_and_voice_are_constructor_arguments(self):
+        voice = VoiceInfo("kokoro", "af_heart", "mist")
+
+        synthesizer = FakeSynthesizer(engine_id="kokoro", voice=voice)
+
+        assert (synthesizer.engine_id, synthesizer.voice) == ("kokoro", voice)
 
     def test_records_every_requested_segment(self):
         synthesizer = FakeSynthesizer()

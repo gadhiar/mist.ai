@@ -27,7 +27,7 @@ from backend.realtime.speech import (
 STT_SAMPLE_RATE = 16000
 TTS_SAMPLE_RATE = 24000
 
-BUILTIN_VOICE = VoiceInfo(profile=None, source="builtin", seconds=None, sha256_prefix=None)
+FAKE_VOICE = VoiceInfo(engine="fake", voice="stock", profile="mist")
 
 
 class EnergyVadStream:
@@ -217,8 +217,8 @@ class FakeSynthesizer:
         self,
         *,
         model_id: str = "fake-tts",
-        variant: str = "turbo",
-        voice: VoiceInfo = BUILTIN_VOICE,
+        engine_id: str = "fake",
+        voice: VoiceInfo = FAKE_VOICE,
         sample_rate: int = TTS_SAMPLE_RATE,
         ms_per_char: int = 50,
         chunk_ms: int = 200,
@@ -226,7 +226,7 @@ class FakeSynthesizer:
         sleep: Callable[[float], object] = time.sleep,
     ) -> None:
         self.model_id = model_id
-        self.variant = variant
+        self.engine_id = engine_id
         self.voice = voice
         self.sample_rate = sample_rate
         self.ms_per_char = ms_per_char

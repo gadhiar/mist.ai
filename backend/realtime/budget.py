@@ -10,12 +10,12 @@ as an engine failure.
 
 import dataclasses
 import math
+import posixpath
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Literal, TypeVar
-from urllib.parse import urlsplit
+from typing import TypeVar
 
 _T = TypeVar("_T")
 
@@ -25,9 +25,11 @@ class VoiceLatencyBudget:
     """Per-stage latency targets in milliseconds, with the name of the preset they came from.
 
     `total_p50_ms` is the sum of the seven stages from `end_of_turn_ms` to
-    `transport_playback_ms` (`STAGE_FIELDS`); `total_p90_ms`, `tool_call_ms` and
-    `barge_in_reaction_ms` are separate targets outside that sum. `preset` travels with the
-    figures so `turn_metrics.budget.preset` can say which preset a turn was judged against.
+    `transport_playback_ms` (`STAGE_FIELDS`). Every row after it is a separate target outside
+    that sum: `total_p90_ms`, `tool_call_ms` and `barge_in_reaction_ms`, then the five screen
+    and caption targets from `wake_screen_ms` to `event_to_pixel_ms`, which time what the user
+    sees rather than a step of the reply. `preset` travels with the figures so
+    `turn_metrics.budget.preset` can say which preset a turn was judged against.
     """
 
     preset: str
@@ -42,38 +44,42 @@ class VoiceLatencyBudget:
     total_p90_ms: int
     tool_call_ms: int
     barge_in_reaction_ms: int
+    wake_screen_ms: int
+    caption_lag_ms: int
+    speech_screen_skew_ms: int
+    screen_command_ms: int
+    event_to_pixel_ms: int
 
 
 BUDGET_FIELDS: tuple[str, ...] = tuple(
     f.name for f in dataclasses.fields(VoiceLatencyBudget) if f.name != "preset"
 )
-"""The budget table's eleven rows, in table order."""
+"""The budget table's sixteen rows, in table order."""
 
 STAGE_FIELDS: tuple[str, ...] = BUDGET_FIELDS[:7]
 """The seven serial stages whose sum is `total_p50_ms`."""
 
+# The screen and caption targets, the same in every preset: wake to screen, caption lag behind
+# speech, speech-to-screen skew, a spoken screen command, and a client event to its pixels.
+_SCREEN_TARGETS = (300, 500, 150, 600, 50)
+
 
 def _preset(name: str, *rows: int) -> VoiceLatencyBudget:
-    return VoiceLatencyBudget(name, *rows)
+    return VoiceLatencyBudget(name, *rows, *_SCREEN_TARGETS)
 
 
-# The Design doc's Latency budget table. `floor` is what the 4070 SUPER host can do with no game
-# running, from measured rates where they exist and estimates where they do not; `floor_yield`
-# is STT and TTS on the CPU or a remote host while a game shares the card (estimates); `memo` is
-# the model-host memo's P50 budget sized for a larger GPU. Measured P50s replace the estimates
-# through `MIST_VOICE_BUDGET` overrides, not code changes.
+# The Design doc's Latency budget table. `floor` is what the 4070 SUPER host can do, from
+# measured rates where they exist and estimates where they do not; `memo` is the model-host
+# memo's P50 budget sized for a larger GPU. Measured P50s replace the estimates through
+# `MIST_VOICE_BUDGET` overrides, not code changes.
 BUDGET_PRESETS: Mapping[str, VoiceLatencyBudget] = MappingProxyType(
     {
         "floor": _preset("floor", 250, 250, 0, 250, 120, 500, 100, 1470, 2100, 450, 700),
-        "floor_yield": _preset(
-            "floor_yield", 250, 600, 0, 500, 240, 1200, 130, 2920, 4100, 900, 1200
-        ),
         "memo": _preset("memo", 250, 50, 0, 200, 100, 150, 100, 850, 1200, 270, 700),
     }
 )
 
 DEFAULT_BUDGET = "floor"
-DEFAULT_YIELD_BUDGET = "floor_yield"
 
 
 def parse_budget(spec: str) -> VoiceLatencyBudget:
@@ -120,11 +126,11 @@ class EndpointingConfig:
     Speech starts after `speech_start_windows` consecutive 512-sample VAD windows at or above
     `vad_threshold`, keeping `pre_roll_ms` of audio before them. Partials are requested every
     `stt_partial_interval_ms`, or `stt_partial_interval_speaking_ms` while MIST speaks, for
-    keyword detection. After `endpoint_silence_ms` of silence the final decode and the end-of-turn
-    score of the last `eot_window_ms` start together; a probability above `eot_threshold` ends
-    the turn, otherwise it is re-checked every `eot_recheck_ms` until `eot_max_silence_ms`. An
-    utterance under `min_utterance_ms` with an empty final is noise. A final with
-    `no_speech_prob` above `no_speech_threshold` and `avg_logprob` at or below
+    keyword detection and captions. After `endpoint_silence_ms` of silence the final decode and
+    the end-of-turn score of the last `eot_window_ms` start together; a probability above
+    `eot_threshold` ends the turn, otherwise it is re-checked every `eot_recheck_ms` until
+    `eot_max_silence_ms`. An utterance under `min_utterance_ms` with an empty final is noise. A
+    final with `no_speech_prob` above `no_speech_threshold` and `avg_logprob` at or below
     `logprob_threshold` is dropped as non-speech, the thresholds openai-whisper uses. Audio
     queued past `max_backlog_ms` is dropped oldest first.
     """
@@ -132,7 +138,7 @@ class EndpointingConfig:
     vad_threshold: float = 0.5
     speech_start_windows: int = 3
     pre_roll_ms: int = 300
-    stt_partial_interval_ms: int = 400
+    stt_partial_interval_ms: int = 250
     stt_partial_interval_speaking_ms: int = 250
     endpoint_silence_ms: int = 200
     eot_threshold: float = 0.5
@@ -154,7 +160,9 @@ class BargeInConfig:
     `keywords` (normalized: lower case, single spaces) as whole words in the first
     `keyword_window_words` words, and ignores a hit heard in TTS text played within
     `echo_guard_ms`. `wake_arbitration_ms` is the window in which wake reports from several
-    endpoints are compared and only the strongest answered.
+    endpoints are compared and only the strongest answered. `alarm_stop_keywords` are the
+    keywords that also stop a ringing alarm; each is one of `keywords`, so a word that stops an
+    alarm always stops MIST's speech too.
     """
 
     keywords: tuple[str, ...] = ("stop", "wait", "hold on", "cancel", "never mind")
@@ -162,6 +170,7 @@ class BargeInConfig:
     keyword_window_words: int = 3
     echo_guard_ms: int = 1500
     wake_arbitration_ms: int = 250
+    alarm_stop_keywords: tuple[str, ...] = ("stop",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,32 +197,24 @@ class SegmenterConfig:
     max_segment_chars: int = 200
 
 
-# The TTS model each variant loads when `PlacementConfig.tts_model` is `None`.
-TTS_MODEL_PINS: Mapping[str, str] = MappingProxyType(
-    {
-        "turbo": "ResembleAI/chatterbox-turbo@749d1c1a46eb10492095d68fbcf55691ccf137cd",
-        "original": "ResembleAI/chatterbox@5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18",
-    }
-)
-
-
 @dataclass(frozen=True, slots=True)
 class PlacementConfig:
-    """Where each engine runs and which weights it loads.
+    """Where each engine runs, which engine and weights it loads, and how the GPU is released.
 
-    A location is `cpu`, `cuda`, `cuda:<n>`, `remote` or `off`; a placement is an ordered tuple
-    of locations of which the first that loads wins, with `off` (no engine) only last. STT and
-    TTS have a placement for each GPU mode, primary and yield; VAD and end of turn run on one
-    device in both. Model settings are `<repo>@<revision>` for TTS and
-    `<repo>@<revision>:<file>` for the ONNX engines, so every download is pinned.
+    A location is `cpu`, `cuda`, `cuda:<n>` or `off`; a placement is an ordered tuple of
+    locations of which the first that loads wins, with `off` (no engine) only last. VAD and end
+    of turn run on one device. An engine id is `[a-z0-9][a-z0-9-]*`, a step 0 engine; `None`
+    loads nothing, so that capability is off until the adapters set a default. Model settings
+    are `<repo>@<revision>` for STT and TTS and `<repo>@<revision>:<file>` for the ONNX engines,
+    so every weight is pinned, and every weight is read under `models_dir`. `release_timeout_s`
+    bounds how long a GPU release waits for running jobs to stop.
     """
 
     vad_device: str = "cpu"
     eot_device: str = "cpu"
-    stt_primary: tuple[str, ...] = ("cuda", "cpu")
-    stt_yield: tuple[str, ...] = ("remote", "cpu")
-    tts_primary: tuple[str, ...] = ("cuda", "remote", "off")
-    tts_yield: tuple[str, ...] = ("remote", "off")
+    eot_threads: int = 4
+    stt_device: tuple[str, ...] = ("cuda", "cpu")
+    tts_device: tuple[str, ...] = ("cuda", "off")
     vad_model: str = (
         "onnx-community/silero-vad@e71cae966052b992a7eca6b17738916ce0eca4ec:onnx/model.onnx"
     )
@@ -221,35 +222,14 @@ class PlacementConfig:
         "pipecat-ai/smart-turn-v3@f766f81d3cfdf7737ac64aad813d91bbfd56bf93"
         ":smart-turn-v3.2-cpu.onnx"
     )
-    stt_model: str = "base"
-    tts_variant: Literal["turbo", "original"] = "turbo"
+    stt_engine: str | None = None
+    stt_model: str | None = None
+    tts_engine: str | None = None
     tts_model: str | None = None
-    speech_service_url: str | None = None
+    tts_voice: str | None = None
     vram_budget_mib: int = 4500
-
-
-@dataclass(frozen=True, slots=True)
-class VoiceReferenceConfig:
-    """Where the active voice profile's reference audio is read from."""
-
-    profiles_dir: str = "data/voice_profiles"
-    profile: str = "jarvis"
-
-
-@dataclass(frozen=True, slots=True)
-class GpuYieldConfig:
-    """When the voice engines give the GPU up to a game and take it back.
-
-    `triggers` may hold `manual`, `fullscreen` and `pressure`; pressure yields after free VRAM
-    stays under `free_mib` for `yield_after_s`, polled every `poll_s`.
-    """
-
-    triggers: frozenset[str] = frozenset({"manual", "fullscreen"})
-    free_mib: int = 512
-    yield_after_s: float = 3.0
-    resume_after_s: float = 30.0
-    switch_timeout_s: float = 10.0
-    poll_s: float = 1.0
+    release_timeout_s: float = 10.0
+    models_dir: str = "/models"
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,25 +244,20 @@ class VoiceSettings:
     """Every voice setting, as `load_voice_settings` read it at startup."""
 
     budget: VoiceLatencyBudget = field(default_factory=lambda: BUDGET_PRESETS[DEFAULT_BUDGET])
-    yield_budget: VoiceLatencyBudget = field(
-        default_factory=lambda: BUDGET_PRESETS[DEFAULT_YIELD_BUDGET]
-    )
     endpointing: EndpointingConfig = field(default_factory=EndpointingConfig)
     barge_in: BargeInConfig = field(default_factory=BargeInConfig)
     playback: PlaybackConfig = field(default_factory=PlaybackConfig)
     segmenter: SegmenterConfig = field(default_factory=SegmenterConfig)
     placement: PlacementConfig = field(default_factory=PlacementConfig)
-    voice_reference: VoiceReferenceConfig = field(default_factory=VoiceReferenceConfig)
-    gpu_yield: GpuYieldConfig = field(default_factory=GpuYieldConfig)
     turn: TurnConfig = field(default_factory=TurnConfig)
+    profile: str = "mist"
 
 
-_LOCATION = re.compile(r"cpu|cuda(?::\d+)?|remote|off")
+_LOCATION = re.compile(r"cpu|cuda(?::\d+)?|off")
 _DEVICE = re.compile(r"cpu|cuda(?::\d+)?")
-_TTS_MODEL = re.compile(r"[^@:\s]+@[^@:\s]+")
+_ENGINE_ID = re.compile(r"[a-z0-9][a-z0-9-]*")
+_REPO_MODEL = re.compile(r"[^@:\s]+@[^@:\s]+")
 _ONNX_MODEL = re.compile(r"[^@:\s]+@[^@:\s]+:[^@:\s]+")
-_TRIGGERS = frozenset({"manual", "fullscreen", "pressure"})
-_VARIANTS = ("turbo", "original")
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off"})
 
@@ -300,11 +275,17 @@ class _Env:
     def integer(self, name: str, default: int) -> int:
         return self._read(name, default, _parse_non_negative_int)
 
+    def positive_integer(self, name: str, default: int) -> int:
+        return self._read(name, default, _parse_positive_int)
+
     def number(self, name: str, default: float, *, allow_negative: bool = False) -> float:
         def parse(var: str, raw: str) -> float:
             return _parse_float(var, raw, allow_negative=allow_negative)
 
         return self._read(name, default, parse)
+
+    def positive_number(self, name: str, default: float) -> float:
+        return self._read(name, default, _parse_positive_float)
 
     def probability(self, name: str, default: float) -> float:
         return self._read(name, default, _parse_probability)
@@ -312,7 +293,7 @@ class _Env:
     def boolean(self, name: str, default: bool) -> bool:
         return self._read(name, default, _parse_bool)
 
-    def text(self, name: str, default: str) -> str:
+    def text(self, name: str, default: _T) -> str | _T:
         return self._read(name, default, _parse_non_empty)
 
     def placement(self, name: str, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -330,14 +311,11 @@ class _Env:
 
         return self._read(name, default, parse)
 
-    def choice(self, name: str, default: str, choices: tuple[str, ...]) -> str:
-        def parse(var: str, raw: str) -> str:
-            value = raw.strip()
-            if value not in choices:
-                raise ValueError(f"{var}: expected one of {', '.join(choices)}, got {raw!r}")
-            return value
+    def engine_id(self, name: str, default: str | None) -> str | None:
+        return self.pattern(name, default, _ENGINE_ID, "an engine id matching [a-z0-9][a-z0-9-]*")
 
-        return self._read(name, default, parse)
+    def absolute_path(self, name: str, default: str) -> str:
+        return self._read(name, default, _parse_absolute_path)
 
     def budget(self, name: str, default: str) -> VoiceLatencyBudget:
         def parse(var: str, raw: str) -> VoiceLatencyBudget:
@@ -351,12 +329,6 @@ class _Env:
     def keywords(self, name: str, default: tuple[str, ...]) -> tuple[str, ...]:
         return self._read(name, default, _parse_keywords)
 
-    def triggers(self, name: str, default: frozenset[str]) -> frozenset[str]:
-        return self._read(name, default, _parse_triggers)
-
-    def url(self, name: str, default: str | None) -> str | None:
-        return self._read(name, default, _parse_base_url)
-
 
 def _parse_non_negative_int(name: str, raw: str) -> int:
     try:
@@ -365,6 +337,16 @@ def _parse_non_negative_int(name: str, raw: str) -> int:
         raise ValueError(f"{name}: expected a non-negative integer, got {raw!r}") from exc
     if value < 0:
         raise ValueError(f"{name}: expected a non-negative integer, got {raw!r}")
+    return value
+
+
+def _parse_positive_int(name: str, raw: str) -> int:
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name}: expected a positive integer, got {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"{name}: expected a positive integer, got {raw!r}")
     return value
 
 
@@ -377,6 +359,13 @@ def _parse_float(name: str, raw: str, *, allow_negative: bool) -> float:
         raise ValueError(f"{name}: expected a finite number, got {raw!r}")
     if value < 0 and not allow_negative:
         raise ValueError(f"{name}: expected a non-negative number, got {raw!r}")
+    return value
+
+
+def _parse_positive_float(name: str, raw: str) -> float:
+    value = _parse_float(name, raw, allow_negative=False)
+    if value <= 0:
+        raise ValueError(f"{name}: expected a positive number, got {raw!r}")
     return value
 
 
@@ -403,6 +392,14 @@ def _parse_non_empty(name: str, raw: str) -> str:
     return value
 
 
+def _parse_absolute_path(name: str, raw: str) -> str:
+    # The backend runs in a Linux container, so the weights root is a POSIX path.
+    value = raw.strip()
+    if not posixpath.isabs(value):
+        raise ValueError(f"{name}: expected an absolute path, got {raw!r}")
+    return value
+
+
 def _split_list(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
@@ -414,8 +411,7 @@ def _parse_placement(name: str, raw: str) -> tuple[str, ...]:
     for location in locations:
         if not _LOCATION.fullmatch(location):
             raise ValueError(
-                f"{name}: unknown location {location!r}; "
-                "expected cpu, cuda, cuda:<n>, remote or off"
+                f"{name}: unknown location {location!r}; expected cpu, cuda, cuda:<n> or off"
             )
     if len(set(locations)) != len(locations):
         raise ValueError(f"{name}: a location is repeated in {raw!r}")
@@ -438,32 +434,24 @@ def _parse_keywords(name: str, raw: str) -> tuple[str, ...]:
     return keywords
 
 
-def _parse_triggers(name: str, raw: str) -> frozenset[str]:
-    triggers = frozenset(_split_list(raw))
-    unknown = sorted(triggers - _TRIGGERS)
-    if unknown:
-        raise ValueError(
-            f"{name}: unknown trigger {unknown[0]!r}; expected manual, fullscreen or pressure"
-        )
-    return triggers
-
-
-def _parse_base_url(name: str, raw: str) -> str:
-    value = raw.strip()
-    parts = urlsplit(value)
-    if parts.scheme not in ("http", "https") or not parts.hostname:
-        raise ValueError(f"{name}: expected an http:// or https:// base URL, got {raw!r}")
-    if parts.query or parts.fragment:
-        raise ValueError(f"{name}: a base URL takes no query or fragment, got {raw!r}")
-    return value
+def _alarm_stop_keywords(env: _Env, name: str, barge_in: BargeInConfig) -> tuple[str, ...]:
+    keywords = env.keywords(name, barge_in.alarm_stop_keywords)
+    for keyword in keywords:
+        if keyword not in barge_in.keywords:
+            raise ValueError(
+                f"{name}: {keyword!r} is not a barge-in keyword; expected one of "
+                f"{', '.join(barge_in.keywords)}"
+            )
+    return keywords
 
 
 def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
     """Read every voice setting from an environment mapping, defaulting what is unset.
 
-    Not read here: `MIST_VOICE_THINKING_BUDGET_TOKENS` and `MIST_VOICE_FIRST_SEGMENT_MIN_CHARS`
-    (the handler's `LLMConfig` owns them, and the handler never imports this package) and
-    `MIST_VOICE_PROFILES_HOST_DIR` (only Docker Compose substitutes it, into a mount).
+    Not read here: `MIST_VOICE_THINKING_BUDGET_TOKENS` and `MIST_VOICE_FIRST_SEGMENT_MIN_CHARS`,
+    which the handler's `LLMConfig` owns (the handler never imports this package). The variables
+    the GPU yield, the remote speech service and the cloned voice used are not read either, so a
+    stale `.env` entry for one of them changes nothing.
 
     Raises:
         ValueError: A set variable is malformed; the message starts with the variable's name.
@@ -497,6 +485,10 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
             "MIST_VOICE_WAKE_ARBITRATION_MS", barge_defaults.wake_arbitration_ms
         ),
     )
+    barge_in = dataclasses.replace(
+        barge_in,
+        alarm_stop_keywords=_alarm_stop_keywords(env, "MIST_VOICE_ALARM_STOP_KEYWORDS", barge_in),
+    )
     playback = PlaybackConfig(
         client_prebuffer_ms=env.integer(
             "MIST_VOICE_CLIENT_PREBUFFER_MS", PlaybackConfig().client_prebuffer_ms
@@ -508,39 +500,32 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
         ),
     )
     place = PlacementConfig()
-    tts_variant = env.choice("MIST_VOICE_TTS_VARIANT", place.tts_variant, _VARIANTS)
     placement = PlacementConfig(
         vad_device=env.device("MIST_VOICE_VAD_DEVICE", place.vad_device),
         eot_device=env.device("MIST_VOICE_EOT_DEVICE", place.eot_device),
-        stt_primary=env.placement("MIST_VOICE_STT_DEVICE", place.stt_primary),
-        stt_yield=env.placement("MIST_VOICE_STT_YIELD_DEVICE", place.stt_yield),
-        tts_primary=env.placement("MIST_VOICE_TTS_DEVICE", place.tts_primary),
-        tts_yield=env.placement("MIST_VOICE_TTS_YIELD_DEVICE", place.tts_yield),
+        eot_threads=env.positive_integer("MIST_VOICE_EOT_THREADS", place.eot_threads),
+        stt_device=env.placement("MIST_VOICE_STT_DEVICE", place.stt_device),
+        tts_device=env.placement("MIST_VOICE_TTS_DEVICE", place.tts_device),
         vad_model=env.pattern(
             "MIST_VOICE_VAD_MODEL", place.vad_model, _ONNX_MODEL, "<repo>@<revision>:<file>"
         ),
         eot_model=env.pattern(
             "MIST_VOICE_EOT_MODEL", place.eot_model, _ONNX_MODEL, "<repo>@<revision>:<file>"
         ),
-        stt_model=env.text("MIST_VOICE_STT_MODEL", place.stt_model),
-        tts_variant="original" if tts_variant == "original" else "turbo",
-        tts_model=env.pattern(
-            "MIST_VOICE_TTS_MODEL", place.tts_model, _TTS_MODEL, "<repo>@<revision>"
+        stt_engine=env.engine_id("MIST_VOICE_STT_ENGINE", place.stt_engine),
+        stt_model=env.pattern(
+            "MIST_VOICE_STT_MODEL", place.stt_model, _REPO_MODEL, "<repo>@<revision>"
         ),
-        speech_service_url=env.url("MIST_SPEECH_SERVICE_URL", place.speech_service_url),
+        tts_engine=env.engine_id("MIST_VOICE_TTS_ENGINE", place.tts_engine),
+        tts_model=env.pattern(
+            "MIST_VOICE_TTS_MODEL", place.tts_model, _REPO_MODEL, "<repo>@<revision>"
+        ),
+        tts_voice=env.text("MIST_VOICE_TTS_VOICE", place.tts_voice),
         vram_budget_mib=env.integer("MIST_VOICE_VRAM_BUDGET_MIB", place.vram_budget_mib),
-    )
-    reference = VoiceReferenceConfig()
-    voice_reference = VoiceReferenceConfig(
-        profiles_dir=env.text("MIST_VOICE_PROFILES_DIR", reference.profiles_dir),
-        profile=env.text("VOICE_PROFILE", reference.profile),
-    )
-    gpu = GpuYieldConfig()
-    gpu_yield = GpuYieldConfig(
-        triggers=env.triggers("MIST_VOICE_GPU_YIELD_TRIGGERS", gpu.triggers),
-        free_mib=env.integer("MIST_VOICE_GPU_YIELD_FREE_MIB", gpu.free_mib),
-        yield_after_s=env.number("MIST_VOICE_GPU_YIELD_AFTER_S", gpu.yield_after_s),
-        resume_after_s=env.number("MIST_VOICE_GPU_RESUME_AFTER_S", gpu.resume_after_s),
+        release_timeout_s=env.positive_number(
+            "MIST_VOICE_RELEASE_TIMEOUT_S", place.release_timeout_s
+        ),
+        models_dir=env.absolute_path("MIST_VOICE_MODELS_DIR", place.models_dir),
     )
     turn = TurnConfig(
         tool_cancel_grace_ms=env.integer(
@@ -549,13 +534,11 @@ def load_voice_settings(environ: Mapping[str, str]) -> VoiceSettings:
     )
     return VoiceSettings(
         budget=env.budget("MIST_VOICE_BUDGET", DEFAULT_BUDGET),
-        yield_budget=env.budget("MIST_VOICE_YIELD_BUDGET", DEFAULT_YIELD_BUDGET),
         endpointing=endpointing,
         barge_in=barge_in,
         playback=playback,
         segmenter=segmenter,
         placement=placement,
-        voice_reference=voice_reference,
-        gpu_yield=gpu_yield,
         turn=turn,
+        profile=env.text("VOICE_PROFILE", VoiceSettings().profile),
     )

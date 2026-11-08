@@ -5,33 +5,32 @@ makes `turn_metrics.over_budget` judge turns against a target nobody agreed to, 
 pinned figure by figure and by its sum rule. `load_voice_settings` is the only reader of the
 `MIST_VOICE_*` variables, so each variable is checked to reach its field and each malformed value
 to fail at startup with the variable's name, instead of surfacing later as a confusing engine
-error.
+error. The variables the GPU yield and the cloned voice used are pinned as ignored, so a stale
+`.env` entry neither fails startup nor changes a setting.
 """
 
 import dataclasses
 
 import pytest
 
+from backend.realtime import budget as budget_module
 from backend.realtime.budget import (
     BUDGET_FIELDS,
     BUDGET_PRESETS,
     STAGE_FIELDS,
-    TTS_MODEL_PINS,
     BargeInConfig,
     EndpointingConfig,
-    GpuYieldConfig,
     PlacementConfig,
     PlaybackConfig,
     SegmenterConfig,
     TurnConfig,
     VoiceLatencyBudget,
-    VoiceReferenceConfig,
     VoiceSettings,
     load_voice_settings,
     parse_budget,
 )
 
-TABLE_ROWS = (
+STAGE_ROWS = (
     "end_of_turn_ms",
     "stt_final_ms",
     "context_build_ms",
@@ -39,20 +38,31 @@ TABLE_ROWS = (
     "first_segment_ms",
     "tts_first_chunk_ms",
     "transport_playback_ms",
+)
+
+TABLE_ROWS = (
+    *STAGE_ROWS,
     "total_p50_ms",
     "total_p90_ms",
     "tool_call_ms",
     "barge_in_reaction_ms",
+    "wake_screen_ms",
+    "caption_lag_ms",
+    "speech_screen_skew_ms",
+    "screen_command_ms",
+    "event_to_pixel_ms",
 )
+
+# The five screen and caption targets, the same in every preset.
+SCREEN_TARGETS = (300, 500, 150, 600, 50)
 
 # The Design doc's Latency budget table, column by column, in TABLE_ROWS order.
 TABLE = {
-    "floor": (250, 250, 0, 250, 120, 500, 100, 1470, 2100, 450, 700),
-    "floor_yield": (250, 600, 0, 500, 240, 1200, 130, 2920, 4100, 900, 1200),
-    "memo": (250, 50, 0, 200, 100, 150, 100, 850, 1200, 270, 700),
+    "floor": (250, 250, 0, 250, 120, 500, 100, 1470, 2100, 450, 700, *SCREEN_TARGETS),
+    "memo": (250, 50, 0, 200, 100, 150, 100, 850, 1200, 270, 700, *SCREEN_TARGETS),
 }
 
-OUTSIDE_SUM = ("total_p90_ms", "tool_call_ms", "barge_in_reaction_ms")
+OUTSIDE_SUM = TABLE_ROWS[8:]
 
 
 def _rows(budget: VoiceLatencyBudget) -> tuple[int, ...]:
@@ -67,17 +77,18 @@ def _assert_sum_rule(budget: VoiceLatencyBudget) -> None:
 
 
 class TestBudgetShape:
-    def test_budget_has_the_tables_eleven_rows_and_a_preset_name(self):
+    def test_budget_has_sixteen_rows_and_a_preset_name(self):
         names = [field.name for field in dataclasses.fields(VoiceLatencyBudget)]
 
         assert names == ["preset", *TABLE_ROWS]
         assert BUDGET_FIELDS == TABLE_ROWS
+        assert len(BUDGET_FIELDS) == 16
 
     def test_stage_fields_are_the_seven_rows_from_end_of_turn_to_transport(self):
-        assert TABLE_ROWS[:7] == STAGE_FIELDS
+        assert STAGE_FIELDS == STAGE_ROWS
 
-    def test_presets_are_floor_floor_yield_and_memo(self):
-        assert set(BUDGET_PRESETS) == {"floor", "floor_yield", "memo"}
+    def test_presets_are_floor_and_memo(self):
+        assert set(BUDGET_PRESETS) == {"floor", "memo"}
 
     def test_budget_is_frozen_and_slotted(self):
         budget = BUDGET_PRESETS["floor"]
@@ -88,34 +99,27 @@ class TestBudgetShape:
 
 
 class TestPresets:
-    def test_floor_matches_the_table_and_its_total_is_the_stage_sum(self):
+    def test_floor_matches_the_table_and_its_total_is_the_seven_stage_sum(self):
         budget = BUDGET_PRESETS["floor"]
 
         assert _rows(budget) == TABLE["floor"]
         assert budget.preset == "floor"
+        assert budget.total_p50_ms == 1470
         _assert_sum_rule(budget)
 
-    def test_floor_yield_matches_the_table_and_its_total_is_the_stage_sum(self):
-        budget = BUDGET_PRESETS["floor_yield"]
-
-        assert _rows(budget) == TABLE["floor_yield"]
-        assert budget.preset == "floor_yield"
-        _assert_sum_rule(budget)
-
-    def test_memo_matches_the_table_and_its_total_is_the_stage_sum(self):
+    def test_memo_matches_the_table_and_its_total_is_the_seven_stage_sum(self):
         budget = BUDGET_PRESETS["memo"]
 
         assert _rows(budget) == TABLE["memo"]
         assert budget.preset == "memo"
+        assert budget.total_p50_ms == 850
         _assert_sum_rule(budget)
 
-    def test_default_budget_is_floor_not_memo_and_yield_is_floor_yield(self):
+    def test_default_budget_is_floor_not_memo(self):
         settings = load_voice_settings({})
 
         assert settings.budget == BUDGET_PRESETS["floor"]
         assert settings.budget.total_p50_ms == 1470
-        assert settings.yield_budget == BUDGET_PRESETS["floor_yield"]
-        assert settings.yield_budget.total_p50_ms == 2920
 
     def test_preset_name_travels_in_the_budget_turn_metrics_reports(self):
         budget = parse_budget("memo,tts_first_chunk_ms=420")
@@ -139,10 +143,16 @@ class TestParseBudget:
         assert budget.total_p90_ms == BUDGET_PRESETS["floor"].total_p90_ms
 
     def test_a_row_outside_the_sum_can_be_overridden_without_changing_the_total(self):
-        budget = parse_budget("floor_yield,tool_call_ms=1000")
+        budget = parse_budget("memo,tool_call_ms=1000")
 
         assert budget.tool_call_ms == 1000
-        assert budget.total_p50_ms == 2920
+        assert budget.total_p50_ms == 850
+
+    def test_a_screen_target_can_be_overridden_without_changing_the_total(self):
+        budget = parse_budget("floor,caption_lag_ms=700")
+
+        assert budget.caption_lag_ms == 700
+        assert budget.total_p50_ms == 1470
 
     def test_whitespace_around_items_is_ignored(self):
         assert parse_budget(" floor , stt_final_ms = 300 ") == parse_budget(
@@ -156,6 +166,10 @@ class TestParseBudget:
     def test_an_unknown_preset_raises_naming_it(self):
         with pytest.raises(ValueError, match="fastest"):
             parse_budget("fastest")
+
+    def test_the_removed_yield_preset_is_unknown(self):
+        with pytest.raises(ValueError, match="floor_yield"):
+            parse_budget("floor_yield")
 
     def test_an_unknown_row_raises_naming_it(self):
         with pytest.raises(ValueError, match="stt_partial_ms"):
@@ -181,7 +195,7 @@ CONFIG_DEFAULTS = [
             "vad_threshold": 0.5,
             "speech_start_windows": 3,
             "pre_roll_ms": 300,
-            "stt_partial_interval_ms": 400,
+            "stt_partial_interval_ms": 250,
             "stt_partial_interval_speaking_ms": 250,
             "endpoint_silence_ms": 200,
             "eot_threshold": 0.5,
@@ -204,6 +218,7 @@ CONFIG_DEFAULTS = [
             "keyword_window_words": 3,
             "echo_guard_ms": 1500,
             "wake_arbitration_ms": 250,
+            "alarm_stop_keywords": ("stop",),
         },
         id="barge-in",
     ),
@@ -228,10 +243,9 @@ CONFIG_DEFAULTS = [
         {
             "vad_device": "cpu",
             "eot_device": "cpu",
-            "stt_primary": ("cuda", "cpu"),
-            "stt_yield": ("remote", "cpu"),
-            "tts_primary": ("cuda", "remote", "off"),
-            "tts_yield": ("remote", "off"),
+            "eot_threads": 4,
+            "stt_device": ("cuda", "cpu"),
+            "tts_device": ("cuda", "off"),
             "vad_model": (
                 "onnx-community/silero-vad@e71cae966052b992a7eca6b17738916ce0eca4ec"
                 ":onnx/model.onnx"
@@ -240,30 +254,16 @@ CONFIG_DEFAULTS = [
                 "pipecat-ai/smart-turn-v3@f766f81d3cfdf7737ac64aad813d91bbfd56bf93"
                 ":smart-turn-v3.2-cpu.onnx"
             ),
-            "stt_model": "base",
-            "tts_variant": "turbo",
+            "stt_engine": None,
+            "stt_model": None,
+            "tts_engine": None,
             "tts_model": None,
-            "speech_service_url": None,
+            "tts_voice": None,
             "vram_budget_mib": 4500,
+            "release_timeout_s": 10.0,
+            "models_dir": "/models",
         },
         id="placement",
-    ),
-    pytest.param(
-        VoiceReferenceConfig,
-        {"profiles_dir": "data/voice_profiles", "profile": "jarvis"},
-        id="voice-reference",
-    ),
-    pytest.param(
-        GpuYieldConfig,
-        {
-            "triggers": frozenset({"manual", "fullscreen"}),
-            "free_mib": 512,
-            "yield_after_s": 3.0,
-            "resume_after_s": 30.0,
-            "switch_timeout_s": 10.0,
-            "poll_s": 1.0,
-        },
-        id="gpu-yield",
     ),
     pytest.param(TurnConfig, {"tool_cancel_grace_ms": 2000}, id="turn"),
 ]
@@ -292,11 +292,32 @@ class TestConfigDataclasses:
         with pytest.raises(dataclasses.FrozenInstanceError):
             settings.turn = TurnConfig()  # type: ignore[misc]
 
-    def test_tts_model_pins_cover_both_variants(self):
-        assert {
-            "turbo": "ResembleAI/chatterbox-turbo@749d1c1a46eb10492095d68fbcf55691ccf137cd",
-            "original": "ResembleAI/chatterbox@5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18",
-        } == TTS_MODEL_PINS
+    def test_voice_settings_fields_and_the_mist_profile_default(self):
+        names = [field.name for field in dataclasses.fields(VoiceSettings)]
+
+        assert names == [
+            "budget",
+            "endpointing",
+            "barge_in",
+            "playback",
+            "segmenter",
+            "placement",
+            "turn",
+            "profile",
+        ]
+        assert VoiceSettings().profile == "mist"
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "VoiceReferenceConfig",
+            "GpuYieldConfig",
+            "TTS_MODEL_PINS",
+            "DEFAULT_YIELD_BUDGET",
+        ],
+    )
+    def test_the_gpu_yield_and_cloned_voice_names_are_gone(self, name):
+        assert not hasattr(budget_module, name)
 
 
 class TestLoadVoiceSettingsDefaults:
@@ -305,30 +326,45 @@ class TestLoadVoiceSettingsDefaults:
 
         assert settings == VoiceSettings(
             budget=BUDGET_PRESETS["floor"],
-            yield_budget=BUDGET_PRESETS["floor_yield"],
             endpointing=EndpointingConfig(),
             barge_in=BargeInConfig(),
             playback=PlaybackConfig(),
             segmenter=SegmenterConfig(),
             placement=PlacementConfig(),
-            voice_reference=VoiceReferenceConfig(),
-            gpu_yield=GpuYieldConfig(),
             turn=TurnConfig(),
+            profile="mist",
         )
-        assert settings.placement.stt_primary == ("cuda", "cpu")
-        assert settings.placement.stt_yield == ("remote", "cpu")
-        assert settings.placement.tts_primary == ("cuda", "remote", "off")
-        assert settings.placement.tts_yield == ("remote", "off")
-        assert settings.placement.tts_variant == "turbo"
-        assert settings.placement.tts_model is None
-        assert settings.gpu_yield.triggers == frozenset({"manual", "fullscreen"})
-        assert settings.voice_reference.profiles_dir == "data/voice_profiles"
-        assert settings.voice_reference.profile == "jarvis"
+        assert settings.placement.stt_device == ("cuda", "cpu")
+        assert settings.placement.tts_device == ("cuda", "off")
+        assert settings.placement.stt_engine is None
+        assert settings.placement.tts_engine is None
+        assert settings.placement.tts_voice is None
+        assert settings.endpointing.stt_partial_interval_ms == 250
+        assert settings.placement.release_timeout_s == 10.0
+        assert settings.placement.models_dir == "/models"
+        assert settings.barge_in.alarm_stop_keywords == ("stop",)
+
+    def test_every_removed_variable_is_ignored(self):
+        removed = {
+            "MIST_VOICE_YIELD_BUDGET": "floor_yield,total_p50_ms=1",
+            "MIST_VOICE_STT_YIELD_DEVICE": "remote,cpu",
+            "MIST_VOICE_TTS_YIELD_DEVICE": "tpu",
+            "MIST_VOICE_TTS_VARIANT": "multilingual",
+            "MIST_VOICE_GPU_YIELD_TRIGGERS": "manual,game_detected",
+            "MIST_VOICE_GPU_YIELD_FREE_MIB": "-1",
+            "MIST_VOICE_GPU_YIELD_AFTER_S": "soon",
+            "MIST_VOICE_GPU_RESUME_AFTER_S": "nan",
+            "MIST_VOICE_PROFILES_DIR": "",
+            "MIST_SPEECH_SERVICE_URL": "ws://speech.example:8091",
+            # No mount uses it any more; it was only ever Docker Compose's.
+            "MIST_VOICE_PROFILES_HOST_DIR": "/srv/profiles",
+        }
+
+        assert load_voice_settings(removed) == load_voice_settings({})
 
     @pytest.mark.parametrize(
         "name",
         [
-            pytest.param("MIST_VOICE_PROFILES_HOST_DIR", id="compose-only-host-dir"),
             pytest.param("MIST_VOICE_THINKING_BUDGET_TOKENS", id="llm-config-thinking"),
             pytest.param("MIST_VOICE_FIRST_SEGMENT_MIN_CHARS", id="llm-config-first-segment"),
         ],
@@ -342,7 +378,6 @@ class TestLoadVoiceSettingsDefaults:
 # (variable, value, path to the field, expected value)
 VARIABLES = [
     ("MIST_VOICE_BUDGET", "memo", "budget", BUDGET_PRESETS["memo"]),
-    ("MIST_VOICE_YIELD_BUDGET", "floor", "yield_budget", BUDGET_PRESETS["floor"]),
     ("MIST_VOICE_CLIENT_PREBUFFER_MS", "120", "playback.client_prebuffer_ms", 120),
     ("MIST_VOICE_VAD_THRESHOLD", "0.65", "endpointing.vad_threshold", 0.65),
     ("MIST_VOICE_ENDPOINT_SILENCE_MS", "350", "endpointing.endpoint_silence_ms", 350),
@@ -356,24 +391,24 @@ VARIABLES = [
     ),
     ("MIST_VOICE_BARGE_IN_ARM_DELAY_MS", "800", "barge_in.arm_delay_ms", 800),
     ("MIST_VOICE_ECHO_GUARD_MS", "900", "barge_in.echo_guard_ms", 900),
+    (
+        "MIST_VOICE_ALARM_STOP_KEYWORDS",
+        " Stop ,cancel",
+        "barge_in.alarm_stop_keywords",
+        ("stop", "cancel"),
+    ),
     ("MIST_VOICE_SPECULATIVE_START", "false", "endpointing.speculative_start", False),
     ("MIST_VOICE_MAX_SEGMENT_CHARS", "150", "segmenter.max_segment_chars", 150),
     ("MIST_VOICE_VAD_DEVICE", "cuda", "placement.vad_device", "cuda"),
     ("MIST_VOICE_EOT_DEVICE", "cuda:1", "placement.eot_device", "cuda:1"),
+    ("MIST_VOICE_EOT_THREADS", "8", "placement.eot_threads", 8),
     (
         "MIST_VOICE_STT_DEVICE",
-        "cuda:0, remote, cpu",
-        "placement.stt_primary",
-        ("cuda:0", "remote", "cpu"),
+        "cuda:0, cpu, off",
+        "placement.stt_device",
+        ("cuda:0", "cpu", "off"),
     ),
-    ("MIST_VOICE_STT_YIELD_DEVICE", "cpu", "placement.stt_yield", ("cpu",)),
-    (
-        "MIST_VOICE_TTS_DEVICE",
-        "remote,cuda,off",
-        "placement.tts_primary",
-        ("remote", "cuda", "off"),
-    ),
-    ("MIST_VOICE_TTS_YIELD_DEVICE", "off", "placement.tts_yield", ("off",)),
+    ("MIST_VOICE_TTS_DEVICE", "off", "placement.tts_device", ("off",)),
     (
         "MIST_VOICE_VAD_MODEL",
         "org/vad@abc123:model.onnx",
@@ -386,27 +421,15 @@ VARIABLES = [
         "placement.eot_model",
         "org/eot@def456:onnx/x.onnx",
     ),
-    ("MIST_VOICE_STT_MODEL", "small.en", "placement.stt_model", "small.en"),
-    ("MIST_VOICE_TTS_VARIANT", "original", "placement.tts_variant", "original"),
+    ("MIST_VOICE_STT_ENGINE", "whisper-turbo", "placement.stt_engine", "whisper-turbo"),
+    ("MIST_VOICE_STT_MODEL", "org/stt@0123abc", "placement.stt_model", "org/stt@0123abc"),
+    ("MIST_VOICE_TTS_ENGINE", "kokoro2", "placement.tts_engine", "kokoro2"),
     ("MIST_VOICE_TTS_MODEL", "org/tts@0123abc", "placement.tts_model", "org/tts@0123abc"),
+    ("MIST_VOICE_TTS_VOICE", "af_heart", "placement.tts_voice", "af_heart"),
     ("MIST_VOICE_VRAM_BUDGET_MIB", "6000", "placement.vram_budget_mib", 6000),
-    (
-        "MIST_SPEECH_SERVICE_URL",
-        "http://speech.example:8091",
-        "placement.speech_service_url",
-        "http://speech.example:8091",
-    ),
-    ("MIST_VOICE_PROFILES_DIR", "/srv/profiles", "voice_reference.profiles_dir", "/srv/profiles"),
-    ("VOICE_PROFILE", "cortana", "voice_reference.profile", "cortana"),
-    (
-        "MIST_VOICE_GPU_YIELD_TRIGGERS",
-        "manual,pressure",
-        "gpu_yield.triggers",
-        frozenset({"manual", "pressure"}),
-    ),
-    ("MIST_VOICE_GPU_YIELD_FREE_MIB", "1024", "gpu_yield.free_mib", 1024),
-    ("MIST_VOICE_GPU_YIELD_AFTER_S", "5.5", "gpu_yield.yield_after_s", 5.5),
-    ("MIST_VOICE_GPU_RESUME_AFTER_S", "60", "gpu_yield.resume_after_s", 60.0),
+    ("MIST_VOICE_RELEASE_TIMEOUT_S", "2.5", "placement.release_timeout_s", 2.5),
+    ("MIST_VOICE_MODELS_DIR", "/srv/weights", "placement.models_dir", "/srv/weights"),
+    ("VOICE_PROFILE", "studio", "profile", "studio"),
     ("MIST_VOICE_NO_SPEECH_THRESHOLD", "0.8", "endpointing.no_speech_threshold", 0.8),
     ("MIST_VOICE_LOGPROB_THRESHOLD", "-0.5", "endpointing.logprob_threshold", -0.5),
     ("MIST_VOICE_TOOL_CANCEL_GRACE_MS", "3000", "turn.tool_cancel_grace_ms", 3000),
@@ -440,11 +463,11 @@ class TestLoadVoiceSettingsVariables:
         assert _get_path(settings, path) == expected
         assert settings == _with_path(load_voice_settings({}), path, expected)
 
-    def test_budget_variables_accept_stage_overrides(self):
-        settings = load_voice_settings({"MIST_VOICE_YIELD_BUDGET": "floor_yield,stt_final_ms=400"})
+    def test_the_budget_variable_accepts_stage_overrides(self):
+        settings = load_voice_settings({"MIST_VOICE_BUDGET": "memo,stt_final_ms=150"})
 
-        assert settings.yield_budget.stt_final_ms == 400
-        assert settings.yield_budget.total_p50_ms == 2720
+        assert settings.budget.stt_final_ms == 150
+        assert settings.budget.total_p50_ms == 950
 
     @pytest.mark.parametrize(
         "raw",
@@ -460,17 +483,21 @@ class TestLoadVoiceSettingsVariables:
 
         assert settings.endpointing.speculative_start is True
 
-    def test_https_speech_service_url_is_accepted(self):
-        settings = load_voice_settings({"MIST_SPEECH_SERVICE_URL": "https://speech.example/base"})
+    def test_alarm_stop_keywords_are_checked_against_the_configured_barge_in_keywords(self):
+        settings = load_voice_settings(
+            {
+                "MIST_VOICE_BARGE_IN_KEYWORDS": "halt,stop",
+                "MIST_VOICE_ALARM_STOP_KEYWORDS": "halt",
+            }
+        )
 
-        assert settings.placement.speech_service_url == "https://speech.example/base"
+        assert settings.barge_in.alarm_stop_keywords == ("halt",)
 
     def test_every_variable_in_the_configuration_list_is_covered(self):
         read = {case[0] for case in VARIABLES}
 
         assert read == {
             "MIST_VOICE_BUDGET",
-            "MIST_VOICE_YIELD_BUDGET",
             "MIST_VOICE_CLIENT_PREBUFFER_MS",
             "MIST_VOICE_VAD_THRESHOLD",
             "MIST_VOICE_ENDPOINT_SILENCE_MS",
@@ -479,28 +506,26 @@ class TestLoadVoiceSettingsVariables:
             "MIST_VOICE_BARGE_IN_KEYWORDS",
             "MIST_VOICE_BARGE_IN_ARM_DELAY_MS",
             "MIST_VOICE_ECHO_GUARD_MS",
+            "MIST_VOICE_ALARM_STOP_KEYWORDS",
             "MIST_VOICE_SPECULATIVE_START",
             "MIST_VOICE_MAX_SEGMENT_CHARS",
             "MIST_VOICE_VAD_DEVICE",
             "MIST_VOICE_EOT_DEVICE",
+            "MIST_VOICE_EOT_THREADS",
             "MIST_VOICE_STT_DEVICE",
-            "MIST_VOICE_STT_YIELD_DEVICE",
             "MIST_VOICE_TTS_DEVICE",
-            "MIST_VOICE_TTS_YIELD_DEVICE",
             "MIST_VOICE_VAD_MODEL",
             "MIST_VOICE_EOT_MODEL",
+            "MIST_VOICE_STT_ENGINE",
             "MIST_VOICE_STT_MODEL",
-            "MIST_VOICE_TTS_VARIANT",
+            "MIST_VOICE_TTS_ENGINE",
             "MIST_VOICE_TTS_MODEL",
-            "MIST_VOICE_PROFILES_DIR",
-            "MIST_SPEECH_SERVICE_URL",
-            "MIST_VOICE_GPU_YIELD_TRIGGERS",
-            "MIST_VOICE_GPU_YIELD_FREE_MIB",
-            "MIST_VOICE_GPU_YIELD_AFTER_S",
-            "MIST_VOICE_GPU_RESUME_AFTER_S",
+            "MIST_VOICE_TTS_VOICE",
+            "MIST_VOICE_VRAM_BUDGET_MIB",
+            "MIST_VOICE_RELEASE_TIMEOUT_S",
+            "MIST_VOICE_MODELS_DIR",
             "MIST_VOICE_NO_SPEECH_THRESHOLD",
             "MIST_VOICE_LOGPROB_THRESHOLD",
-            "MIST_VOICE_VRAM_BUDGET_MIB",
             "MIST_VOICE_TOOL_CANCEL_GRACE_MS",
             "MIST_VOICE_WAKE_ARBITRATION_MS",
             "VOICE_PROFILE",
@@ -511,10 +536,6 @@ class TestLoadVoiceSettingsErrors:
     def test_a_negative_number_raises_naming_the_variable(self):
         with pytest.raises(ValueError, match="MIST_VOICE_ENDPOINT_SILENCE_MS"):
             load_voice_settings({"MIST_VOICE_ENDPOINT_SILENCE_MS": "-200"})
-
-    def test_a_negative_float_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_VOICE_GPU_YIELD_AFTER_S"):
-            load_voice_settings({"MIST_VOICE_GPU_YIELD_AFTER_S": "-1.5"})
 
     def test_a_non_numeric_number_raises_naming_the_variable(self):
         with pytest.raises(ValueError, match="MIST_VOICE_CLIENT_PREBUFFER_MS"):
@@ -536,25 +557,30 @@ class TestLoadVoiceSettingsErrors:
         with pytest.raises(ValueError, match="MIST_VOICE_STT_DEVICE"):
             load_voice_settings({"MIST_VOICE_STT_DEVICE": "cuda,tpu"})
 
+    @pytest.mark.parametrize("name", ["MIST_VOICE_STT_DEVICE", "MIST_VOICE_TTS_DEVICE"])
+    def test_remote_is_no_longer_a_location(self, name):
+        with pytest.raises(ValueError, match=name):
+            load_voice_settings({name: "remote,off"})
+
     def test_a_malformed_cuda_index_raises_naming_the_variable(self):
         with pytest.raises(ValueError, match="MIST_VOICE_TTS_DEVICE"):
             load_voice_settings({"MIST_VOICE_TTS_DEVICE": "cuda:x,off"})
 
     def test_an_empty_placement_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_VOICE_TTS_YIELD_DEVICE"):
-            load_voice_settings({"MIST_VOICE_TTS_YIELD_DEVICE": ""})
+        with pytest.raises(ValueError, match="MIST_VOICE_TTS_DEVICE"):
+            load_voice_settings({"MIST_VOICE_TTS_DEVICE": ""})
 
     def test_a_placement_of_only_separators_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_VOICE_STT_YIELD_DEVICE"):
-            load_voice_settings({"MIST_VOICE_STT_YIELD_DEVICE": " , "})
+        with pytest.raises(ValueError, match="MIST_VOICE_STT_DEVICE"):
+            load_voice_settings({"MIST_VOICE_STT_DEVICE": " , "})
 
     def test_a_repeated_placement_location_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_VOICE_STT_YIELD_DEVICE"):
-            load_voice_settings({"MIST_VOICE_STT_YIELD_DEVICE": "cpu,remote,cpu"})
+        with pytest.raises(ValueError, match="MIST_VOICE_STT_DEVICE"):
+            load_voice_settings({"MIST_VOICE_STT_DEVICE": "cpu,cuda,cpu"})
 
     def test_off_before_the_last_place_raises_naming_the_variable(self):
         with pytest.raises(ValueError, match="MIST_VOICE_TTS_DEVICE"):
-            load_voice_settings({"MIST_VOICE_TTS_DEVICE": "cuda,off,remote"})
+            load_voice_settings({"MIST_VOICE_TTS_DEVICE": "cuda,off,cpu"})
 
     def test_a_vad_device_list_raises_naming_the_variable(self):
         with pytest.raises(ValueError, match="MIST_VOICE_VAD_DEVICE"):
@@ -568,13 +594,30 @@ class TestLoadVoiceSettingsErrors:
         with pytest.raises(ValueError, match="MIST_VOICE_EOT_DEVICE"):
             load_voice_settings({"MIST_VOICE_EOT_DEVICE": "off"})
 
-    def test_an_unknown_gpu_yield_trigger_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_VOICE_GPU_YIELD_TRIGGERS"):
-            load_voice_settings({"MIST_VOICE_GPU_YIELD_TRIGGERS": "manual,game_detected"})
+    @pytest.mark.parametrize("raw", ["0", "-2", "four"])
+    def test_end_of_turn_threads_must_be_a_positive_integer(self, raw):
+        with pytest.raises(ValueError, match="MIST_VOICE_EOT_THREADS"):
+            load_voice_settings({"MIST_VOICE_EOT_THREADS": raw})
 
-    def test_an_unknown_tts_variant_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_VOICE_TTS_VARIANT"):
-            load_voice_settings({"MIST_VOICE_TTS_VARIANT": "multilingual"})
+    @pytest.mark.parametrize("name", ["MIST_VOICE_STT_ENGINE", "MIST_VOICE_TTS_ENGINE"])
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param("", id="empty"),
+            pytest.param("Whisper", id="upper-case"),
+            pytest.param("-kokoro", id="leading-hyphen"),
+            pytest.param("faster_whisper", id="underscore"),
+            pytest.param("qwen3 tts", id="space"),
+            pytest.param("kokoro/v1", id="slash"),
+        ],
+    )
+    def test_an_engine_id_outside_the_id_form_raises_naming_the_variable(self, name, raw):
+        with pytest.raises(ValueError, match=name):
+            load_voice_settings({name: raw})
+
+    def test_an_stt_model_without_a_revision_raises_naming_the_variable(self):
+        with pytest.raises(ValueError, match="MIST_VOICE_STT_MODEL"):
+            load_voice_settings({"MIST_VOICE_STT_MODEL": "base"})
 
     def test_a_tts_model_without_a_revision_raises_naming_the_variable(self):
         with pytest.raises(ValueError, match="MIST_VOICE_TTS_MODEL"):
@@ -592,17 +635,42 @@ class TestLoadVoiceSettingsErrors:
         with pytest.raises(ValueError, match="MIST_VOICE_EOT_MODEL"):
             load_voice_settings({"MIST_VOICE_EOT_MODEL": "pipecat-ai/smart-turn-v3:model.onnx"})
 
-    def test_a_ws_speech_service_url_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_SPEECH_SERVICE_URL"):
-            load_voice_settings({"MIST_SPEECH_SERVICE_URL": "ws://speech.example:8091"})
+    def test_an_empty_tts_voice_raises_naming_the_variable(self):
+        with pytest.raises(ValueError, match="MIST_VOICE_TTS_VOICE"):
+            load_voice_settings({"MIST_VOICE_TTS_VOICE": " "})
 
-    def test_a_speech_service_url_without_a_host_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_SPEECH_SERVICE_URL"):
-            load_voice_settings({"MIST_SPEECH_SERVICE_URL": "http://"})
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param("0", id="zero"),
+            pytest.param("-1", id="negative"),
+            pytest.param("ten", id="non-numeric"),
+            pytest.param("inf", id="infinite"),
+        ],
+    )
+    def test_a_release_timeout_that_is_not_a_positive_number_raises_naming_it(self, raw):
+        with pytest.raises(ValueError, match="MIST_VOICE_RELEASE_TIMEOUT_S"):
+            load_voice_settings({"MIST_VOICE_RELEASE_TIMEOUT_S": raw})
 
-    def test_a_speech_service_url_with_a_query_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_SPEECH_SERVICE_URL"):
-            load_voice_settings({"MIST_SPEECH_SERVICE_URL": "http://speech.example?x=1"})
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param("", id="empty"),
+            pytest.param("models", id="relative"),
+            pytest.param("./models", id="dot-relative"),
+        ],
+    )
+    def test_a_models_dir_that_is_not_an_absolute_path_raises_naming_it(self, raw):
+        with pytest.raises(ValueError, match="MIST_VOICE_MODELS_DIR"):
+            load_voice_settings({"MIST_VOICE_MODELS_DIR": raw})
+
+    def test_an_alarm_stop_word_that_is_not_a_barge_in_keyword_raises_naming_it(self):
+        with pytest.raises(ValueError, match="MIST_VOICE_ALARM_STOP_KEYWORDS.*halt"):
+            load_voice_settings({"MIST_VOICE_ALARM_STOP_KEYWORDS": "stop,halt"})
+
+    def test_an_empty_alarm_stop_keyword_list_raises_naming_the_variable(self):
+        with pytest.raises(ValueError, match="MIST_VOICE_ALARM_STOP_KEYWORDS"):
+            load_voice_settings({"MIST_VOICE_ALARM_STOP_KEYWORDS": " , "})
 
     def test_an_unreadable_boolean_raises_naming_the_variable(self):
         with pytest.raises(ValueError, match="MIST_VOICE_SPECULATIVE_START"):
@@ -616,13 +684,9 @@ class TestLoadVoiceSettingsErrors:
         with pytest.raises(ValueError, match="MIST_VOICE_BUDGET.*fastest"):
             load_voice_settings({"MIST_VOICE_BUDGET": "fastest"})
 
-    def test_a_yield_budget_total_override_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_VOICE_YIELD_BUDGET.*total_p50_ms"):
-            load_voice_settings({"MIST_VOICE_YIELD_BUDGET": "floor_yield,total_p50_ms=1"})
-
-    def test_an_empty_stt_model_raises_naming_the_variable(self):
-        with pytest.raises(ValueError, match="MIST_VOICE_STT_MODEL"):
-            load_voice_settings({"MIST_VOICE_STT_MODEL": " "})
+    def test_a_budget_total_override_raises_naming_the_variable(self):
+        with pytest.raises(ValueError, match="MIST_VOICE_BUDGET.*total_p50_ms"):
+            load_voice_settings({"MIST_VOICE_BUDGET": "floor,total_p50_ms=1"})
 
     def test_an_empty_voice_profile_raises_naming_the_variable(self):
         with pytest.raises(ValueError, match="VOICE_PROFILE"):
