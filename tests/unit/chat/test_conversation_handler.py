@@ -610,8 +610,12 @@ class TestPersonaInjection:
         """Persona block must be the FIRST message and role system."""
         session = conversation_handler.get_or_create_session("persona-s1")
         messages = conversation_handler._build_messages(
-            session, max_history=10, retrieval_result=None, mist_context=sample_mist_context
-        )
+            session,
+            max_history=10,
+            retrieval_result=None,
+            mist_context=sample_mist_context,
+            pending_user_message="hello",
+        ).messages
         assert messages[0]["role"] == "system"
         assert "You are MIST" in messages[0]["content"]
         assert "she/her" in messages[0]["content"]
@@ -620,8 +624,12 @@ class TestPersonaInjection:
         """Absolute preferences render as HARD RULES in the persona block."""
         session = conversation_handler.get_or_create_session("persona-s2")
         messages = conversation_handler._build_messages(
-            session, max_history=10, retrieval_result=None, mist_context=sample_mist_context
-        )
+            session,
+            max_history=10,
+            retrieval_result=None,
+            mist_context=sample_mist_context,
+            pending_user_message="hello",
+        ).messages
         combined_system = "\n".join(m["content"] for m in messages if m["role"] == "system")
         assert "HARD RULE" in combined_system
         assert "No emoji or unicode decoration" in combined_system
@@ -629,8 +637,12 @@ class TestPersonaInjection:
     def test_persona_block_contains_traits(self, conversation_handler, sample_mist_context):
         session = conversation_handler.get_or_create_session("persona-s3")
         messages = conversation_handler._build_messages(
-            session, max_history=10, retrieval_result=None, mist_context=sample_mist_context
-        )
+            session,
+            max_history=10,
+            retrieval_result=None,
+            mist_context=sample_mist_context,
+            pending_user_message="hello",
+        ).messages
         combined_system = "\n".join(m["content"] for m in messages if m["role"] == "system")
         assert "Warm" in combined_system
 
@@ -638,8 +650,12 @@ class TestPersonaInjection:
         """When mist_context=None, the old hardcoded 'You are MIST' template is preserved."""
         session = conversation_handler.get_or_create_session("persona-s4")
         messages = conversation_handler._build_messages(
-            session, max_history=10, retrieval_result=None, mist_context=None
-        )
+            session,
+            max_history=10,
+            retrieval_result=None,
+            mist_context=None,
+            pending_user_message="hello",
+        ).messages
         # The fallback system prompt still has the static header line.
         assert messages[0]["role"] == "system"
         assert "MIST" in messages[0]["content"]
@@ -647,10 +663,17 @@ class TestPersonaInjection:
     def test_persona_block_appears_before_retrieval_context(
         self, conversation_handler, sample_mist_context
     ):
-        """Ordering: persona -> static template -> retrieval context -> history."""
+        """Ordering: persona -> static template -> history -> retrieval in the final user message.
+
+        Retrieval varies every turn, so it sits after the history, in the
+        final user message ahead of the user's words, where it cannot break
+        the cached prefix of the next turn's prompt.
+        """
         from backend.knowledge.models import RetrievalResult
 
         session = conversation_handler.get_or_create_session("persona-s5")
+        session.add_message("user", "an earlier question")
+        session.add_message("assistant", "an earlier answer")
         # Construct a minimal RetrievalResult with one fact so it injects.
         # Use sentinels on formatted_context to locate it.
         retrieval = RetrievalResult(
@@ -667,12 +690,20 @@ class TestPersonaInjection:
             intent="relational",
         )
         messages = conversation_handler._build_messages(
-            session, max_history=10, retrieval_result=retrieval, mist_context=sample_mist_context
-        )
+            session,
+            max_history=10,
+            retrieval_result=retrieval,
+            mist_context=sample_mist_context,
+            pending_user_message="what did we decide",
+        ).messages
         combined = "\n".join(m["content"] for m in messages)
         persona_idx = combined.index("You are MIST")
+        history_idx = combined.index("an earlier answer")
         retrieval_idx = combined.index("RETRIEVED_CONTEXT_SENTINEL")
-        assert persona_idx < retrieval_idx
+        assert persona_idx < history_idx < retrieval_idx
+        assert messages[-1]["role"] == "user"
+        assert "RETRIEVED_CONTEXT_SENTINEL" in messages[-1]["content"]
+        assert messages[-1]["content"].endswith("what did we decide")
 
 
 class TestMistContextCaching:
@@ -1078,13 +1109,15 @@ class TestBudgetAwareBuildMessages:
         # Wave 2 tool catalog additions: tool_call observability, cards,
         # query_vault, switch_form), leaves ~930 for retrieval+history.
         # 50 history messages * ~36 tokens each (user + assistant pair * msg
-        # body) -> well above 930 -> forces pruning.
+        # body) -> well above 930 -> forces pruning. The turn-delta reserve is
+        # kept small so most of the ~930 goes to history.
         config.context_budget = ContextBudgetConfig(
             context_window=3000,
             output_reserve_tokens=50,
             safety_margin_tokens=10,
             retrieval_budget_ratio=0.3,
             enabled=True,
+            turn_delta_max_tokens=100,
         )
         return ConversationHandler(
             config=config,
@@ -1111,15 +1144,17 @@ class TestBudgetAwareBuildMessages:
             retrieval_result=None,
             mist_context=None,
             max_output_tokens=50,
-        )
+            pending_user_message="the newest question",
+        ).messages
 
         # System prompt(s) still present.
         assert any(m["role"] == "system" for m in messages)
         # History (non-system messages) must be < 100 after pruning.
         history_msgs = [m for m in messages if m["role"] != "system"]
         assert len(history_msgs) < 100
-        # Last history message must be the most recent.
-        assert history_msgs[-1]["content"].startswith("reply 49")
+        # The prompt ends with the user's message, after the most recent reply.
+        assert history_msgs[-1]["content"] == "the newest question"
+        assert history_msgs[-2]["content"].startswith("reply 49")
 
     def test_disabled_budget_preserves_legacy_behavior(self):
         """When context_budget.enabled=False the handler skips pruning entirely."""
@@ -1155,7 +1190,8 @@ class TestBudgetAwareBuildMessages:
             max_history=10,
             retrieval_result=None,
             mist_context=None,
-        )
+            pending_user_message="the newest question",
+        ).messages
         # All 5 history messages present (no pruning). Count by content so the
         # assertion is robust to always-present prefix blocks injected as
         # non-system messages (vault conventions / the curated user-profile

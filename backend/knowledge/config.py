@@ -341,8 +341,8 @@ class ContextBudgetConfig:
     The model's usable attention window is usually smaller than its configured
     context window. Gemma 4 E4B at 32K ctx_size still degrades quality past
     its trained context (~8K). This config caps the total prompt budget and
-    splits the remainder (after persona + tools + static) between retrieval
-    and history via weight-based allocation.
+    splits the remainder (after the stable prefix and tools) between the
+    per-turn delta and history.
 
     - `context_window` is the hard ceiling; output `max_tokens` is subtracted.
       MIS-171 T4: this may be the literal string `"auto"` after `from_env()`
@@ -357,10 +357,25 @@ class ContextBudgetConfig:
       reach the arithmetic in `plan()`.
     - `output_reserve_tokens` additionally reserves headroom for the completion.
     - `safety_margin_tokens` is extra headroom for tokenizer inaccuracy.
-    - `retrieval_budget_ratio` allocates share of the remaining budget to
-      retrieval-context; history gets the rest.
+    - `retrieval_budget_ratio` caps retrieval at this share of the budget
+      left after the prefix; retrieval is also held to the delta reserve.
     - `history_strategy` names a strategy registered in
-      `backend.chat.context_budget` (defaults to sliding-window).
+      `backend.chat.context_budget`: `stable_window` (the default) or
+      `sliding_window`.
+    - `turn_delta_max_tokens` is the token cap for the per-turn delta (the
+      context that varies every turn: retrieval or memory, advisory,
+      interruption note, clock). The planner reserves it whole on every
+      turn, so the history budget does not move when the delta does.
+    - `delta_placement` is where that delta goes: `user_prefix`, ahead of
+      the user's words in the final user message, or `system_tail`, a system
+      message directly before the final user message.
+    - `history_high_water_factor` is how far, as a multiple of the history
+      message cap, `stable_window` lets the window grow before its start
+      steps forward. Below 1.0 the window could never hold the cap.
+
+    Raises:
+        ValueError: `delta_placement` is not one of the two placements, or
+            `history_high_water_factor` is below 1.0.
     """
 
     context_window: int | str = (
@@ -369,8 +384,24 @@ class ContextBudgetConfig:
     output_reserve_tokens: int = 512  # Headroom for completion output
     safety_margin_tokens: int = 256  # Absorbs tokenizer estimation error
     retrieval_budget_ratio: float = 0.4  # 40% of flex budget to retrieval
-    history_strategy: str = "sliding_window"  # sliding_window | (future) summarized
+    history_strategy: str = "stable_window"  # stable_window | sliding_window
     enabled: bool = True  # Master switch; False keeps legacy behavior
+    turn_delta_max_tokens: int = 1000
+    delta_placement: str = "user_prefix"  # user_prefix | system_tail, checked below
+    history_high_water_factor: float = 2.0
+
+    def __post_init__(self) -> None:
+        """Reject a placement or high-water factor the prompt layout cannot use."""
+        if self.delta_placement not in ("user_prefix", "system_tail"):
+            raise ValueError(
+                f"delta_placement must be 'user_prefix' or 'system_tail' "
+                f"(MIST_CTX_BUDGET_DELTA_PLACEMENT), got {self.delta_placement!r}"
+            )
+        if self.history_high_water_factor < 1.0:
+            raise ValueError(
+                f"history_high_water_factor must be at least 1.0 "
+                f"(MIST_CTX_BUDGET_HISTORY_HIGH_WATER), got {self.history_high_water_factor!r}"
+            )
 
     @classmethod
     def from_env(cls) -> "ContextBudgetConfig":
@@ -388,8 +419,11 @@ class ContextBudgetConfig:
             output_reserve_tokens=int(os.getenv("MIST_CTX_BUDGET_OUTPUT_RESERVE", "512")),
             safety_margin_tokens=int(os.getenv("MIST_CTX_BUDGET_SAFETY", "256")),
             retrieval_budget_ratio=float(os.getenv("MIST_CTX_BUDGET_RETRIEVAL_RATIO", "0.4")),
-            history_strategy=os.getenv("MIST_CTX_BUDGET_HISTORY_STRATEGY", "sliding_window"),
+            history_strategy=os.getenv("MIST_CTX_BUDGET_HISTORY_STRATEGY", "stable_window"),
             enabled=os.getenv("MIST_CTX_BUDGET_ENABLED", "true").lower() == "true",
+            turn_delta_max_tokens=int(os.getenv("MIST_CTX_BUDGET_TURN_DELTA_MAX_TOKENS", "1000")),
+            delta_placement=os.getenv("MIST_CTX_BUDGET_DELTA_PLACEMENT", "user_prefix"),
+            history_high_water_factor=float(os.getenv("MIST_CTX_BUDGET_HISTORY_HIGH_WATER", "2.0")),
         )
 
 

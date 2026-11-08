@@ -9,19 +9,29 @@ Enables LLM to autonomously:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
+import json
 import logging
 import math
 import random
+import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import aclosing
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
-from backend.chat.context_budget import ContextBudgetPlanner
+from backend.chat.context_budget import (
+    ApproximateTokenCounter,
+    ContextBudgetPlanner,
+    PromptStats,
+    TurnDeltaPart,
+    get_history_strategy,
+)
 from backend.chat.hydration_clock import HydrationClockError
 from backend.chat.mist_context import MistContext
 from backend.chat.session_synthesizer import SessionSynthesizer
@@ -29,7 +39,7 @@ from backend.chat.slop_detector import SlopDetector
 from backend.chat.stream_events import Complete, StreamEvent, Token, WSEvent
 from backend.event_store.models import ConversationTurnEvent
 from backend.event_store.store import EventStore
-from backend.knowledge.config import KnowledgeConfig
+from backend.knowledge.config import ContextBudgetConfig, KnowledgeConfig
 from backend.knowledge.models import (
     ConversationSession,
     RetrievalFilters,
@@ -731,6 +741,96 @@ def _format_user_profile_block(body: str) -> str:
     return f"=== WHAT YOU KNOW ABOUT THE USER (user profile) ===\n\n{body.strip()}\n"
 
 
+# ---------------------------------------------------------------------------
+# Per-turn delta (cache-stable prompt layout)
+#
+# Everything that varies per turn is rendered after the history, in the final
+# user message (or one system message directly before it), so the stable
+# prefix and the history of one prompt are a prefix of the next prompt and
+# llama-server can reuse its KV cache for them.
+# ---------------------------------------------------------------------------
+
+# The fixed lines `TurnRequest.interruption_note` renders as. They never quote
+# the cut-off reply: history already holds what the user heard as the
+# assistant message.
+_INTERRUPTION_NOTES: dict[str, str] = {
+    "mid_reply": (
+        "The user interrupted your previous reply; the assistant message above is the part "
+        "they heard."
+    ),
+    "before_reply": "The user interrupted your previous turn before you said anything.",
+}
+
+_DELTA_ORDER: tuple[str, ...] = ("clock", "interruption", "retrieval", "memory", "live_advisory")
+
+_DELTA_LABELS: dict[str, str] = {
+    "clock": "=== CURRENT TIME ===",
+    "interruption": "=== INTERRUPTION ===",
+    "retrieval": "=== RETRIEVED CONTEXT ===",
+    "memory": "=== MEMORY ===",
+    "live_advisory": "=== LIVE DATA ADVISORY ===",
+}
+
+_USER_MESSAGE_LABEL = "=== USER MESSAGE ==="
+
+
+def _render_turn_delta(
+    parts: list[TurnDeltaPart], user_text: str, placement: str
+) -> tuple[list[dict[str, str]], str]:
+    """Render the delta parts and the user's words as the prompt's last message(s).
+
+    With no parts the final message is the user's text unchanged. Otherwise
+    each part becomes a labelled block, in `_DELTA_ORDER`. `user_prefix`
+    puts the blocks ahead of the labelled user text in one user message;
+    `system_tail` puts them in one system message directly before the plain
+    user message.
+
+    Returns:
+        The message list to append after the history, and the rendered delta
+        text alone (without the user's words) for token accounting.
+    """
+    if not parts:
+        return [{"role": "user", "content": user_text}], ""
+    ordered = sorted(parts, key=lambda part: _DELTA_ORDER.index(part.kind))
+    delta_text = "\n\n".join(f"{_DELTA_LABELS[part.kind]}\n{part.text}" for part in ordered)
+    if placement == "system_tail":
+        return [
+            {"role": "system", "content": delta_text},
+            {"role": "user", "content": user_text},
+        ], delta_text
+    return [
+        {"role": "user", "content": f"{delta_text}\n\n{_USER_MESSAGE_LABEL}\n{user_text}"}
+    ], delta_text
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class PromptLayout:
+    """The prompt `_build_messages` composed, with what the turn reports about it.
+
+    Attributes:
+        messages: The message list for the LLM: stable prefix, history, then
+            the delta and the user's words.
+        prefix_fingerprint: `(component, sha256)` for each stable-prefix
+            component and the tool schemas, in a fixed order, so the handler
+            can tell which one changed between turns.
+        prefix_tokens_est: Estimated tokens of the prefix messages and tools.
+        history_tokens_est: Estimated tokens of the history messages shown.
+        delta_tokens_est: Estimated tokens of the rendered delta text.
+        history_compacted: The history selection's `compacted`.
+    """
+
+    messages: list[dict[str, Any]]
+    prefix_fingerprint: tuple[tuple[str, str], ...]
+    prefix_tokens_est: int
+    history_tokens_est: int
+    delta_tokens_est: int
+    history_compacted: Literal["none", "step", "budget"]
+
+
 def _pass_response(state: StreamTurnState, pass_num: int) -> LLMResponse | None:
     """Rebuild one finished pass as the single `LLMResponse` the pre-v2 code carried.
 
@@ -796,8 +896,9 @@ class ConversationHandler:
                 `MIST_DEBUG_JSONL` is unset the logger yields no-op records.
             budget_planner: Optional ContextBudgetPlanner (Cluster 6). When
                 None and `config.context_budget.enabled` is True, one is
-                constructed from `config.context_budget`. When disabled, the
-                handler falls back to legacy pre-Cluster-6 message assembly.
+                constructed from `config.context_budget`. When disabled,
+                retrieval is not pruned and the history strategy selects the
+                window with no token limit.
             vault_writer: Optional VaultWriterProtocol (Cluster 8 Phase 5).
                 When set, `end_session` renders one synthesis-only session
                 note (R1.3.1). None disables the vault layer entirely.
@@ -888,6 +989,26 @@ class ConversationHandler:
             self._budget_planner = ContextBudgetPlanner(config.context_budget)
         else:
             self._budget_planner = None
+
+        # Prompt layout settings and the history strategy. With the planner
+        # disabled the strategy still chooses the history window (with no
+        # token limit), so the stepped window keeps the prompt cache-stable
+        # either way.
+        if self._budget_planner is not None:
+            self._context_budget_config = self._budget_planner.config
+            self._history_strategy = self._budget_planner.history_strategy
+            self._prompt_counter = self._budget_planner.counter
+        else:
+            self._context_budget_config = (
+                getattr(config, "context_budget", None) or ContextBudgetConfig()
+            )
+            self._history_strategy = get_history_strategy(
+                self._context_budget_config.history_strategy
+            )
+            self._prompt_counter = ApproximateTokenCounter()
+        # Session id -> the previous turn's `PromptLayout.prefix_fingerprint`,
+        # to detect and name a stable-prefix change (see `_note_prefix_change`).
+        self._prefix_fingerprints: dict[str, tuple[tuple[str, str], ...]] = {}
 
         # LLM provider (replaces ChatOllama)
         self._provider = llm_provider
@@ -2098,17 +2219,28 @@ class ConversationHandler:
         )
 
         mist_context = await self._get_or_fetch_mist_context(session_id)
-        messages = self._build_messages(
+        layout = self._build_messages(
             session,
             max_history,
             retrieval_result=retrieval_result,
             mist_context=mist_context,
             max_output_tokens=self.config.llm.conversation_max_tokens,
             pending_user_message=user_message,
+            interruption_note=scope.request.interruption_note,
             scope=scope,
         )
+        messages = list(layout.messages)
         scope.context_window = messages
         scope.retrieval_result = retrieval_result
+        scope.prompt_stats = PromptStats(
+            prefix_tokens_est=layout.prefix_tokens_est,
+            history_tokens_est=layout.history_tokens_est,
+            delta_tokens_est=layout.delta_tokens_est,
+            prompt_tokens=None,
+            cached_tokens=None,
+            prefix_changed=self._note_prefix_change(session_id, layout.prefix_fingerprint),
+            history_compacted=layout.history_compacted,
+        )
 
         start = time.monotonic()
         state = scope.stream
@@ -2144,6 +2276,15 @@ class ConversationHandler:
                     yield stream_event
 
             pass1_response = _pass_response(state, 1)
+            # Pass 1 is the request this layout was built for; pass 2 adds
+            # tool messages, so its counts describe a longer prompt.
+            pass1_usage = state.pass_usage.get(1)
+            if pass1_usage is not None:
+                scope.prompt_stats = replace(
+                    scope.prompt_stats,
+                    prompt_tokens=pass1_usage.prompt_tokens,
+                    cached_tokens=pass1_usage.cached_prompt_tokens,
+                )
 
             if pass1_response is not None and pass1_response.tool_calls:
                 logger.info("[TOOLS] LLM made %d tool calls", len(pass1_response.tool_calls))
@@ -3452,44 +3593,58 @@ class ConversationHandler:
         mist_context: MistContext | None = None,
         max_output_tokens: int = 400,
         *,
-        pending_user_message: str | None = None,
+        pending_user_message: str,
+        interruption_note: Literal["mid_reply", "before_reply"] | None = None,
         scope: TurnScope | None = None,
-    ) -> list[dict[str, str]]:
-        """Build message list for LLM.
+    ) -> PromptLayout:
+        """Compose the turn's prompt in cache-stable order.
 
-        Ordering:
-          1. Persona block from MistContext (when provided) -- identity + HARD RULES
-          2. Static system template -- tool availability, strategy, guidelines
-          3. Retrieval context (when auto-RAG produced facts) — budget-pruned
-          4. Live-data advisory (when retrieval requires MCP)
-          5. Conversation history — budget-pruned via history strategy
+        llama-server reuses its KV cache up to the first token that differs
+        from the previous prompt, so the layout keeps everything that varies
+        per turn at the end:
 
-        Cluster 6: when `self._budget_planner` is not None, a BudgetPlan is
-        computed before composition. The planner prunes retrieval context by
-        fact-priority score and history by strategy (sliding-window default)
-        so the total prompt fits within
+          1. Stable prefix: persona block (MistContext, when provided),
+             static system template, MIST.md conventions, user profile.
+          2. History: the window the history strategy selects from the
+             session's full history (`stable_window` moves its start only
+             in steps), raw user text as stored.
+          3. Delta and user text: the interruption note, retrieval context
+             and live-data advisory as labelled blocks in the final user
+             message ahead of the user's words (`delta_placement`
+             `user_prefix`), or as one system message directly before it
+             (`system_tail`). Nothing else follows the history.
+
+        The history window is chosen over the session history plus the
+        pending user message, so the window counts the turn's own message;
+        that message is always sent, as the final user message, even when
+        the budget has no room left for history.
+
+        When `self._budget_planner` is not None it prunes retrieval to the
+        delta budget and history by strategy so the prompt fits within
         `config.context_budget.context_window - max_output_tokens - reserves`.
+        Without it, retrieval is sent whole and the strategy selects the
+        window with no token limit.
 
         Args:
-            session: Conversation session
-            max_history: Maximum history messages to include (upper bound;
-                the budget planner may prune further).
-            retrieval_result: Optional hybrid retrieval result from auto-RAG
+            session: Conversation session.
+            max_history: History message cap handed to the history strategy.
+            retrieval_result: Optional hybrid retrieval result from auto-RAG.
             mist_context: Optional MistContext to prepend as persona block.
                 When None, falls back to the legacy full static template.
             max_output_tokens: Expected output budget for the coming LLM call.
                 Subtracted from the total budget so pruning leaves headroom.
             pending_user_message: The current turn's user message, not yet
                 in session history (`stream_turn` writes no history; the
-                commit adds it). History is built as if it had been
-                appended, so the prompt is the same as when the message was
-                written to history before the turn ran.
+                commit adds it, raw).
+            interruption_note: The request's note about the previous turn
+                being cut off, rendered as one fixed line in the delta.
             scope: The turn whose trace receives the profile-dedup and
                 budget feeds. None (a direct call outside a turn) feeds
                 nothing.
 
         Returns:
-            List of messages for LLM, budget-compliant when planner is active.
+            The `PromptLayout`: the messages plus the prefix fingerprint and
+            token estimates the turn reports.
         """
         # Compute persona + static text first so the planner can account for them.
         persona_text = mist_context.as_system_prompt_block() if mist_context is not None else None
@@ -3525,25 +3680,37 @@ class ConversationHandler:
                 ),
             )
 
-        # Live-data advisory is a fixed-cost segment when present.
-        live_advisory_text: str | None = None
+        # Delta parts charged whole: the interruption note and the live-data
+        # advisory. Retrieval is added after planning, pruned to what is left.
+        whole_parts: list[TurnDeltaPart] = []
+        if interruption_note is not None:
+            whole_parts.append(
+                TurnDeltaPart(
+                    kind="interruption",
+                    text=_INTERRUPTION_NOTES[interruption_note],
+                    prunable=False,
+                )
+            )
         if retrieval_result and retrieval_result.requires_mcp and retrieval_result.suggested_tools:
-            live_advisory_text = (
-                "=== LIVE DATA ADVISORY ===\n"
-                "This query appears to request real-time information. Consider using\n"
-                "available tools for current data rather than relying on stored knowledge.\n"
-                "Suggested tools: %s" % ", ".join(retrieval_result.suggested_tools)
+            whole_parts.append(
+                TurnDeltaPart(
+                    kind="live_advisory",
+                    text=(
+                        "This query appears to request real-time information. Consider using\n"
+                        "available tools for current data rather than relying on stored "
+                        "knowledge.\nSuggested tools: %s"
+                        % ", ".join(retrieval_result.suggested_tools)
+                    ),
+                    prunable=False,
+                )
             )
 
-        if pending_user_message is None:
-            raw_history = session.get_history(max_history)
-        else:
-            raw_history = [
-                *session.get_history(),
-                {"role": "user", "content": pending_user_message},
-            ]
-            if max_history:
-                raw_history = raw_history[-max_history:]
+        # The full history plus the pending message: the strategy chooses the
+        # window, so the start can stay put across turns instead of sliding.
+        full_history = [
+            *session.get_history(None),
+            {"role": "user", "content": pending_user_message},
+        ]
 
         # Pre-load the conventions block so the planner can charge it as a
         # fixed segment (it is appended unconditionally below). Formatted
@@ -3561,8 +3728,7 @@ class ConversationHandler:
                 persona_text=persona_text,
                 static_text=static_template,
                 retrieval_result=retrieval_result,
-                live_advisory_text=live_advisory_text,
-                history=raw_history,
+                history=full_history,
                 tools=self._tool_schemas,
                 max_output_tokens=max_output_tokens,
                 # Always-injected blocks below MUST be charged as fixed cost
@@ -3571,13 +3737,18 @@ class ConversationHandler:
                 extra_fixed_texts=[
                     t for t in (conventions_message, profile_block) if t is not None
                 ],
+                max_history=max_history,
+                delta_parts=whole_parts,
             )
             retrieval_text = plan.pruned_retrieval_text
-            history = plan.pruned_history
+            window = plan.pruned_history
+            history_compacted = plan.history_compacted
             # Covers the minimal fallback too: a plan that does not fit is
             # recorded with `fits` false, and its facts as `dropped_no_fit`.
+            # `history_raw` counts the list the planner chose the window
+            # from, so `history_kept` (the window) never exceeds it.
             self._feed_trace(
-                scope, lambda trace: trace.budget_planned(plan, history_raw=len(raw_history))
+                scope, lambda trace: trace.budget_planned(plan, history_raw=len(full_history))
             )
             if not plan.fits:
                 logger.warning(
@@ -3586,43 +3757,74 @@ class ConversationHandler:
                     plan.fixed_cost,
                     plan.total_budget,
                 )
-            elif plan.facts_dropped or len(history) < len(raw_history):
+            elif plan.facts_dropped or plan.history_compacted == "budget":
                 logger.info(
                     "[BUDGET] Pruned: retrieval=%d used / %d budget (%d facts kept, %d dropped) | "
-                    "history=%d used / %d budget (%d kept / %d raw) | fixed_cost=%d total=%d",
+                    "history=%d used / %d budget (%d kept / %d in session) | fixed_cost=%d "
+                    "total=%d",
                     plan.retrieval_used,
                     plan.retrieval_budget,
                     plan.facts_kept,
                     plan.facts_dropped,
                     plan.history_used,
                     plan.history_budget,
-                    len(history),
-                    len(raw_history),
+                    len(window),
+                    len(full_history),
                     plan.fixed_cost,
                     plan.total_budget,
                 )
         else:
-            # Legacy behavior (budget disabled): full retrieval text, no history pruning.
+            # Budget disabled: full retrieval text; the strategy still picks
+            # the window, with no token limit.
             retrieval_text = (
                 retrieval_result.formatted_context
                 if retrieval_result and retrieval_result.total_facts > 0
                 else None
             )
-            history = raw_history
+            selection = self._history_strategy.select(
+                full_history,
+                sys.maxsize,
+                self._prompt_counter,
+                max_messages=max_history,
+                high_water_factor=self._context_budget_config.history_high_water_factor,
+            )
+            window = selection.messages
+            history_compacted = selection.compacted
+
+        # The window is a tail of `full_history`, whose last element is the
+        # pending message. That message is sent below as the final user
+        # message, with the delta, whether or not the window kept it.
+        window_start = len(full_history) - len(window)
+        history = full_history[min(window_start, len(full_history) - 1) : -1]
+
+        parts = list(whole_parts)
+        if retrieval_text:
+            if retrieval_result:
+                logger.info(
+                    "[AUTO-RAG] Injecting retrieval context: intent=%s, facts=%d, chunks=%d",
+                    retrieval_result.intent,
+                    retrieval_result.total_facts,
+                    retrieval_result.document_chunks_used,
+                )
+            parts.append(TurnDeltaPart(kind="retrieval", text=retrieval_text, prunable=True))
+        final_messages, delta_text = _render_turn_delta(
+            parts, pending_user_message, self._context_budget_config.delta_placement
+        )
 
         # --- Compose messages ---
         # Ordering rationale (KV-cache discipline, G6 in parity audit v2.1):
         # llama.cpp's KV cache is prefix-based -- once a token mismatches, all
         # subsequent positions must re-process. So stable content goes at the
-        # front; variable content goes at the tail. Order:
+        # front and everything that varies per turn goes last:
         #   1. Persona block       (stable within session; cached MistContext)
         #   2. Static template     (stable across all sessions)
         #   3. MIST.md             (stable across turns; mtime-cached)
-        #   4. Retrieval text      (VARIES per turn -- breaks cache here)
-        #   5. Live-data advisory  (conditional, varies)
-        #   6. History             (variable, growing tail)
-        # Pre-2026-05-25 the order was 1,2,4,5,3,6 which broke MIST.md cache
-        # reuse every turn even though its content was unchanged.
+        #   3b. User profile       (stable until the profile file changes)
+        #   4. History             (append-only between stepped window moves)
+        #   5. Delta + user text   (VARIES per turn: note, retrieval, advisory)
+        # Before the cache-stable layout, retrieval and the advisory sat
+        # between the prefix and the history, so a new retrieval block broke
+        # the cache for the whole history on every turn.
         messages: list[dict[str, str]] = []
 
         # 1. Persona block (Cluster 3)
@@ -3634,42 +3836,78 @@ class ConversationHandler:
 
         # 3. Vault conventions (ADR-014): MIST.md auto-load as user message.
         # Mirrors Claude Code's CLAUDE.md user-message-after-system-prompt
-        # position. Placed before retrieval to preserve KV-cache reuse across
-        # turns (parity audit v2.1 G6). Omitted when no conventions file
-        # exists (vault-less or test contexts).
+        # position. Placed in the stable prefix to preserve KV-cache reuse
+        # across turns (parity audit v2.1 G6). Omitted when no conventions
+        # file exists (vault-less or test contexts).
         if conventions_message is not None:
             messages.append({"role": "user", "content": conventions_message})
 
         # 3b. User profile (ADR-010): always-inject the known user's curated
         # users/<user_id>.md body, independent of retrieval similarity/intent
         # -- the analog of the MIST.md conventions always-inject above. Placed
-        # in the stable prefix (before variable retrieval/advisory/history) so
-        # it does not break KV-cache reuse across turns, and deduped against
-        # the auto-inject earlier so the body appears exactly once. Omitted
-        # when no profile file exists (graceful skip).
+        # in the stable prefix (before history and the delta) so it does not
+        # break KV-cache reuse across turns, and deduped against the
+        # auto-inject earlier so the body appears exactly once. Omitted when
+        # no profile file exists (graceful skip).
         if profile_block is not None:
             logger.debug("[USER-PROFILE] Injecting curated profile from %s", profile_path)
             messages.append({"role": "user", "content": profile_block})
 
-        # 4. Retrieval context (pruned by planner when active)
-        if retrieval_text:
-            if retrieval_result:
-                logger.info(
-                    "[AUTO-RAG] Injecting retrieval context: intent=%s, facts=%d, chunks=%d",
-                    retrieval_result.intent,
-                    retrieval_result.total_facts,
-                    retrieval_result.document_chunks_used,
-                )
-            messages.append({"role": "system", "content": retrieval_text})
+        prefix_messages = list(messages)
 
-        # 5. Live-data advisory
-        if live_advisory_text:
-            messages.append({"role": "system", "content": live_advisory_text})
-
-        # 6. Conversation history
+        # 4. Conversation history (raw, as stored)
         messages.extend(history)
 
-        return messages
+        # 5. The delta and the user's words, last.
+        messages.extend(final_messages)
+
+        tools_json = json.dumps(self._tool_schemas, sort_keys=True)
+        counter = self._prompt_counter
+        return PromptLayout(
+            messages=messages,
+            prefix_fingerprint=(
+                ("persona", _sha256(persona_text or "")),
+                ("static template", _sha256(static_template)),
+                ("MIST.md conventions", _sha256(conventions_message or "")),
+                ("user profile", _sha256(profile_block or "")),
+                ("tool schemas", _sha256(tools_json)),
+            ),
+            prefix_tokens_est=counter.count_messages(prefix_messages) + counter.count(tools_json),
+            history_tokens_est=counter.count_messages(history),
+            delta_tokens_est=counter.count(delta_text),
+            history_compacted=history_compacted,
+        )
+
+    def _note_prefix_change(
+        self, session_id: str, fingerprint: tuple[tuple[str, str], ...]
+    ) -> bool:
+        """Record this turn's stable-prefix fingerprint; log and report a change.
+
+        A changed prefix means llama-server re-processes the whole prompt,
+        so the log names which component moved. The persona comes from the
+        per-session `MistContext` cache, so a changed persona means that
+        entry was evicted and refetched with new content. The first turn of a session has nothing to compare against
+        and reports no change.
+
+        Args:
+            session_id: The session the turn belongs to.
+            fingerprint: `PromptLayout.prefix_fingerprint` for this turn.
+
+        Returns:
+            True when the session had a previous fingerprint and it differs.
+        """
+        previous = self._prefix_fingerprints.get(session_id)
+        self._prefix_fingerprints[session_id] = fingerprint
+        if previous is None or previous == fingerprint:
+            return False
+        old = dict(previous)
+        changed = [name for name, digest in fingerprint if old.get(name) != digest]
+        logger.info(
+            "[PROMPT] Stable prefix changed for session %s: %s",
+            session_id,
+            ", ".join(changed),
+        )
+        return True
 
     def clear_session(self, session_id: str):
         """Clear a conversation session."""
@@ -3687,6 +3925,7 @@ class ConversationHandler:
                     logger.error("Failed to end event store session: %s", e)
             # Evict cached MistContext so the next session gets a fresh fetch.
             self._mist_context_cache.pop(session_id, None)
+            self._prefix_fingerprints.pop(session_id, None)
             logger.info(f"Cleared session: {session_id}")
 
     def get_session_info(self, session_id: str) -> dict[str, Any] | None:
