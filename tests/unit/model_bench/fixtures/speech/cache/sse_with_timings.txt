@@ -1,0 +1,11 @@
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}],"created":1794426000,"id":"chatcmpl-cache-fixture","model":"gemma-4-E4B-it-Q5_K_M.gguf","system_fingerprint":"b11151","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"Put the tomatoes and beans"}}],"created":1794426000,"id":"chatcmpl-cache-fixture","model":"gemma-4-E4B-it-Q5_K_M.gguf","system_fingerprint":"b11151","object":"chat.completion.chunk","timings":{"cache_n":6188,"prompt_n":97,"prompt_ms":61.3,"prompt_per_token_ms":0.632,"prompt_per_second":1582.4,"predicted_n":1,"predicted_ms":11.9,"predicted_per_token_ms":11.9,"predicted_per_second":84.03}}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":" in the two beds at the north edge,"}}],"created":1794426000,"id":"chatcmpl-cache-fixture","model":"gemma-4-E4B-it-Q5_K_M.gguf","system_fingerprint":"b11151","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":" and keep the lettuce and herbs in front of them."}}],"created":1794426000,"id":"chatcmpl-cache-fixture","model":"gemma-4-E4B-it-Q5_K_M.gguf","system_fingerprint":"b11151","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":"stop","index":0,"delta":{}}],"created":1794426000,"id":"chatcmpl-cache-fixture","model":"gemma-4-E4B-it-Q5_K_M.gguf","system_fingerprint":"b11151","object":"chat.completion.chunk","timings":{"cache_n":6188,"prompt_n":97,"prompt_ms":61.3,"prompt_per_token_ms":0.632,"prompt_per_second":1582.4,"predicted_n":42,"predicted_ms":520.4,"predicted_per_token_ms":12.39,"predicted_per_second":80.71}}
+
+data: [DONE]
