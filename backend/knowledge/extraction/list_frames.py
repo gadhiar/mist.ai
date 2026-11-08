@@ -1,4 +1,4 @@
-"""Group a structured turn's units into list frames for the list path.
+"""Group a structured turn's units into list frames, and parse the list calls' outputs.
 
 The list path sends a structured turn to one frame call, which decides what each group of
 items states, and to item calls that read the items a few at a time. Both calls read the
@@ -10,16 +10,39 @@ A group is a maximal run of list items or table rows that share one context tupl
 `split_structured` writes it. A nested child's units carry a longer context, so they open a
 group of their own without ending their parent's run, and a sibling after a nested child
 stays in its group.
+
+The parsers are strict: an output that misses a key, has a value of the wrong type or
+outside its enum, holds a key its schema does not declare, gives a group more than 3
+templates, or misses or invents a group or item id raises `ListOutputError`. That
+subclasses `ExtractionValidationError`, so the extraction service's attempt loop sends
+the repair instruction and retries, as it does for a Stage 2 output.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import json
+import re
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+
+from backend.errors import ExtractionValidationError
+from backend.extraction_service.list_schemas import (
+    ASSERTION_KIND_ENUM,
+    EXTRACTABLE_TYPE_ENUM,
+    PREDICATE_ENUM,
+    TEMPORAL_STATUS_ENUM,
+    UNCHECKED_ENUM,
+)
 
 from .structure_splitter import InputUnit, _as_context
 
 _LIST_KINDS = frozenset({"list_item", "table_row"})
+_TEMPLATES_MAX = 3
+_ROLES = frozenset({"user", "mist", "item", "parent"})
+
+
+class ListOutputError(ExtractionValidationError):
+    """A frame or item output that does not have the shape its stage asks for."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,3 +280,281 @@ def render_frame_input(groups: Sequence[ListGroup], prose: Sequence[InputUnit]) 
             for item_id, unit in zip(group.item_ids, group.items)
         )
     return "\n".join(lines)
+
+
+# -- strict parsers -------------------------------------------------------------------------
+
+_Check = Callable[[object], bool]
+
+
+def _text(value: object) -> bool:
+    return isinstance(value, str) and value != ""
+
+
+def _string(value: object) -> bool:
+    return isinstance(value, str)
+
+
+def _boolean(value: object) -> bool:
+    return isinstance(value, bool)
+
+
+def _number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _list(value: object) -> bool:
+    return isinstance(value, list)
+
+
+def _one_of(values: Sequence[str]) -> _Check:
+    allowed = frozenset(values)
+    return lambda value: isinstance(value, str) and value in allowed
+
+
+def _object_or_null(value: object) -> bool:
+    return value is None or isinstance(value, dict)
+
+
+_TYPE = _one_of(EXTRACTABLE_TYPE_ENUM)
+_PREDICATE = _one_of(PREDICATE_ENUM)
+_TEMPORAL_STATUS = _one_of(TEMPORAL_STATUS_ENUM)
+_ASSERTION_KIND = _one_of(ASSERTION_KIND_ENUM)
+
+_PROPERTY_CHECKS: dict[str, _Check] = {
+    "confidence": _number,
+    "temporal_status": _TEMPORAL_STATUS,
+    "start_date": _string,
+    "end_date": _string,
+    "temporal_expression": _string,
+    "context": _string,
+    "negated": _boolean,
+    "assertion_kind": _ASSERTION_KIND,
+}
+_ENTITY_REQUIRED: dict[str, _Check] = {"key": _text, "span": _text, "name": _text, "type": _TYPE}
+_ENTITY_OPTIONAL: dict[str, _Check] = {
+    "activity": _boolean,
+    "value": _string,
+    "unit": _string,
+    "quantity": _string,
+}
+
+
+def _record(
+    value: object,
+    where: str,
+    required: Mapping[str, _Check],
+    optional: Mapping[str, _Check] | None = None,
+) -> dict:
+    """The object's declared keys, each checked; an optional key given as null is left out.
+
+    Raises:
+        ListOutputError: `value` is not an object, misses a required key, holds an
+            undeclared key, or has a value its check refuses.
+    """
+    optional = optional or {}
+    if not isinstance(value, dict):
+        raise ListOutputError(f"{where}: expected an object, got {type(value).__name__}")
+    unknown = sorted(set(value) - set(required) - set(optional))
+    if unknown:
+        raise ListOutputError(f"{where}: undeclared keys {unknown}")
+    checked = {}
+    for key, check in required.items():
+        if key not in value:
+            raise ListOutputError(f"{where}: missing key {key!r}")
+        if not check(value[key]):
+            raise ListOutputError(f"{where}.{key}: wrong type or value {value[key]!r}")
+        checked[key] = value[key]
+    for key, check in optional.items():
+        if value.get(key) is None:
+            continue
+        if not check(value[key]):
+            raise ListOutputError(f"{where}.{key}: wrong type or value {value[key]!r}")
+        checked[key] = value[key]
+    return checked
+
+
+def _load(text: str) -> dict:
+    """The output's JSON object; a code fence or a line around it is tolerated, as Stage 2's is."""
+    if not text or not text.strip():
+        raise ListOutputError("empty list output")
+    for candidate in (text, *re.findall(r"\{.*\}", text, re.DOTALL)):
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    raise ListOutputError(f"list output is not a JSON object: {text[:200]!r}")
+
+
+def _entities(values: list, where: str, taken: set[str]) -> tuple[ListEntity, ...]:
+    """Keyed entities; a key may not repeat, nor reuse a role or an earlier key in `taken`."""
+    entities = []
+    for n, value in enumerate(values):
+        record = _record(value, f"{where}[{n}]", _ENTITY_REQUIRED, _ENTITY_OPTIONAL)
+        if record["key"] in taken or record["key"] in _ROLES:
+            raise ListOutputError(f"{where}[{n}].key: {record['key']!r} is already taken")
+        taken.add(record["key"])
+        entities.append(ListEntity(**record))
+    return tuple(entities)
+
+
+def _relationships(values: list, where: str) -> tuple[ListRelationship, ...]:
+    relationships = []
+    for n, value in enumerate(values):
+        at = f"{where}[{n}]"
+        record = _record(
+            value,
+            at,
+            {"source": _text, "target": _text, "type": _PREDICATE},
+            {"properties": lambda v: isinstance(v, dict)},
+        )
+        properties = _record(record.pop("properties", {}), f"{at}.properties", {}, _PROPERTY_CHECKS)
+        relationships.append(ListRelationship(**record, properties=properties))
+    return tuple(relationships)
+
+
+def _facts(value: object, where: str, taken: set[str]) -> ListFacts:
+    record = _record(value, where, {"entities": _list, "relationships": _list})
+    return ListFacts(
+        entities=_entities(record["entities"], f"{where}.entities", taken),
+        relationships=_relationships(record["relationships"], f"{where}.relationships"),
+    )
+
+
+def _ordered(found: Mapping[str, object], expected: Sequence[str], what: str) -> list:
+    missing = [i for i in expected if i not in found]
+    if missing:
+        raise ListOutputError(f"missing {what} ids {missing}")
+    return [found[i] for i in expected]
+
+
+def _claim(found: dict, key: str, value: object, expected: set[str], what: str) -> None:
+    if key not in expected:
+        raise ListOutputError(f"unknown {what} id {key!r}")
+    if key in found:
+        raise ListOutputError(f"{what} id {key!r} given twice")
+    found[key] = value
+
+
+def _group_frame(value: object, where: str, roles: frozenset[str]) -> GroupFrame:
+    record = _record(
+        value,
+        where,
+        {
+            "group": _text,
+            "templates": _list,
+            "item_type": lambda v: v is None or _TYPE(v),
+            "unchecked": _one_of(UNCHECKED_ENUM),
+        },
+    )
+    if len(record["templates"]) > _TEMPLATES_MAX:
+        raise ListOutputError(f"{where}.templates: more than {_TEMPLATES_MAX} templates")
+    role = _one_of(sorted(roles))
+    templates = tuple(
+        Template(
+            **_record(
+                t,
+                f"{where}.templates[{n}]",
+                {"subject": role, "predicate": _PREDICATE, "object": role},
+            )
+        )
+        for n, t in enumerate(record["templates"])
+    )
+    return GroupFrame(record["group"], templates, record["item_type"], record["unchecked"])
+
+
+def parse_frame_output(text: str, expected_groups: Sequence[str]) -> FrameOutput:
+    """Parse a frame call's output, its groups in `expected_groups` order.
+
+    Args:
+        text: The model's output.
+        expected_groups: The turn's group ids; the output must give each exactly once.
+
+    Raises:
+        ListOutputError: The output is not a JSON object of the FRAME shape, a
+            template names a role that is neither a fixed role nor a frame key, or the
+            group ids differ from `expected_groups`.
+    """
+    record = _record(
+        _load(text),
+        "frame",
+        {"frame_entities": _list, "groups": _list, "facts": lambda v: isinstance(v, dict)},
+    )
+    taken: set[str] = set()
+    frame_entities = []
+    for n, value in enumerate(record["frame_entities"]):
+        at = f"frame_entities[{n}]"
+        entity = ListEntity(**_record(value, at, _ENTITY_REQUIRED))
+        if entity.key in taken or entity.key in _ROLES:
+            raise ListOutputError(f"{at}.key: {entity.key!r} is already taken")
+        taken.add(entity.key)
+        frame_entities.append(entity)
+    roles = _ROLES | taken
+    found: dict[str, GroupFrame] = {}
+    for n, value in enumerate(record["groups"]):
+        group = _group_frame(value, f"groups[{n}]", roles)
+        _claim(found, group.group, group, set(expected_groups), "group")
+    groups = _ordered(found, expected_groups, "group")
+    return FrameOutput(
+        tuple(frame_entities), tuple(groups), _facts(record["facts"], "facts", taken)
+    )
+
+
+def _item_output(value: object, where: str) -> ItemOutput:
+    record = _record(
+        value,
+        where,
+        {
+            "item": _text,
+            "entity": _object_or_null,
+            "template": lambda v: isinstance(v, dict),
+            "entities": _list,
+            "relationships": _list,
+        },
+    )
+    entity = None
+    if record["entity"] is not None:
+        entity = ItemEntity(
+            **_record(
+                record["entity"],
+                f"{where}.entity",
+                {"span": _text, "name": _text, "type": _TYPE},
+                {"activity": _boolean},
+            )
+        )
+    template = ItemTemplate(
+        **_record(
+            record["template"],
+            f"{where}.template",
+            {
+                "applies": _boolean,
+                "assertion_kind": _ASSERTION_KIND,
+                "temporal_status": _TEMPORAL_STATUS,
+            },
+            {"start_date": _string, "end_date": _string},
+        )
+    )
+    return ItemOutput(
+        item=record["item"],
+        entity=entity,
+        template=template,
+        entities=_entities(record["entities"], f"{where}.entities", set()),
+        relationships=_relationships(record["relationships"], f"{where}.relationships"),
+    )
+
+
+def parse_item_output(text: str, expected: Sequence[str]) -> tuple[ItemOutput, ...]:
+    """Parse an item call's output, one record per id in `expected`, in that order.
+
+    Raises:
+        ListOutputError: The output is not a JSON object of the ITEMS shape, or its item
+            ids differ from `expected`.
+    """
+    record = _record(_load(text), "items", {"items": _list})
+    found: dict[str, ItemOutput] = {}
+    for n, value in enumerate(record["items"]):
+        item = _item_output(value, f"items[{n}]")
+        _claim(found, item.item, item, set(expected), "item")
+    return tuple(_ordered(found, expected, "item"))
