@@ -14,8 +14,8 @@ stays in its group.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 
 from .structure_splitter import InputUnit, _as_context
 
@@ -44,6 +44,113 @@ class ListGroup:
     def item_ids(self) -> tuple[str, ...]:
         """`G1.1`, `G1.2` and so on, one per item."""
         return tuple(f"{self.gid}.{n}" for n in range(1, len(self.items) + 1))
+
+
+@dataclass(frozen=True, slots=True)
+class Template:
+    """One fact every item of a group states, its ends given as roles.
+
+    A role is `user`, `mist`, `item` (each item's own entity), `parent` (the item a
+    nested group sits under) or a frame entity's key.
+    """
+
+    subject: str
+    predicate: str
+    object: str
+
+
+@dataclass(frozen=True, slots=True)
+class GroupFrame:
+    """What the frame call decided one group states.
+
+    Attributes:
+        group: The group's id, `G1`.
+        templates: At most 3; none means the group states nothing durable.
+        item_type: The type every item shares, or None.
+        unchecked: `plan` or `goal`, what an unchecked box under this group is.
+    """
+
+    group: str
+    templates: tuple[Template, ...]
+    item_type: str | None
+    unchecked: str
+
+
+@dataclass(frozen=True, slots=True)
+class ListEntity:
+    """An entity a list call names, keyed so the call's relationships can refer to it.
+
+    `activity` marks a habit or recurring activity; `value`, `unit` and `quantity` are a
+    Metric's, and a Date's ISO value is its `value`.
+    """
+
+    key: str
+    span: str
+    name: str
+    type: str
+    activity: bool = False
+    value: str | None = None
+    unit: str | None = None
+    quantity: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ListRelationship:
+    """A relationship whose ends are roles, keys or item references such as `item:G1.2`."""
+
+    source: str
+    target: str
+    type: str
+    properties: Mapping[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ListFacts:
+    """Entities and relationships a list call states beyond the group templates."""
+
+    entities: tuple[ListEntity, ...]
+    relationships: tuple[ListRelationship, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FrameOutput:
+    """The frame call's output: frame entities, one frame per group, and turn facts."""
+
+    frame_entities: tuple[ListEntity, ...]
+    groups: tuple[GroupFrame, ...]
+    facts: ListFacts
+
+
+@dataclass(frozen=True, slots=True)
+class ItemEntity:
+    """An item's own entity; for a table row, its first column's."""
+
+    span: str
+    name: str
+    type: str
+    activity: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ItemTemplate:
+    """Whether the group's templates hold for one item, and with what temporal fields."""
+
+    applies: bool
+    assertion_kind: str
+    temporal_status: str
+    start_date: str | None = None
+    end_date: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ItemOutput:
+    """One item's record from an item call."""
+
+    item: str
+    entity: ItemEntity | None
+    template: ItemTemplate
+    entities: tuple[ListEntity, ...]
+    relationships: tuple[ListRelationship, ...]
 
 
 @dataclass(slots=True)

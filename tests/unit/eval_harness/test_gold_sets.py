@@ -29,6 +29,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from backend.knowledge.extraction.list_prompts import LIST_SYSTEM_PROMPT  # noqa: E402
 from backend.knowledge.extraction.prompts import EXTRACTION_SYSTEM_PROMPT  # noqa: E402
 from backend.knowledge.extraction.validator import RELATIONSHIP_CONSTRAINTS  # noqa: E402
 from backend.knowledge.ontologies.v1_0_0 import (  # noqa: E402
@@ -325,6 +326,26 @@ def test_heldout_utterances_avoid_entity_names_in_the_production_prompt(heldout)
 
     assert len(patterns) > 20, "the prompt's example entities were not found"
     assert hits == []
+
+
+def _list_prompt_entity_terms() -> set[str]:
+    """Entity names and spans the list prompt's own examples carry, beyond the main prompt's."""
+    found = set(re.findall(r'"(?:name|span)": "([^"]+)"', LIST_SYSTEM_PROMPT))
+    return found - _prompt_entity_terms() - {"user", "mist-identity", "User", "MIST"}
+
+
+def _heldout_utterances_naming_list_prompt_terms(heldout: list[dict[str, str]]) -> int:
+    patterns = [_term_pattern(term) for term in _list_prompt_entity_terms()]
+    return sum(1 for row in heldout for p in patterns if p.search(row["utterance"]))
+
+
+def test_heldout_utterances_avoid_entity_names_in_the_list_prompt(heldout):
+    """Count only: the message names no probe, term or tag, so held-out content stays unseen."""
+    assert _list_prompt_entity_terms(), "the list prompt's example entities were not found"
+
+    count = _heldout_utterances_naming_list_prompt_terms(heldout)
+
+    assert count == 0, f"{count} held-out utterance and list-prompt term pairs match"
 
 
 def test_no_utterance_mentions_raj(rows):
@@ -672,6 +693,24 @@ def test_no_heldout_entity_id_occurs_in_the_production_prompt():
     hits = _heldout_ids_in_the_prompt()
 
     assert {i: tags for i, tags in hits.items() if i not in _PROMPT_WORD_EXEMPTIONS} == {}
+
+
+def _heldout_ids_in_the_list_prompt() -> int:
+    """How many held-out ids the list prompt spells out, beyond the prompt-word exemptions."""
+    ids = {
+        entity["id"]
+        for row in _gold_rows(_HELDOUT_GOLD)
+        for entity in row["expected_entities"]
+        if entity["id"] not in _PROMPT_ANCHOR_IDS and entity["id"] not in _PROMPT_WORD_EXEMPTIONS
+    }
+    return sum(1 for i in ids if _term_pattern(i).search(LIST_SYSTEM_PROMPT))
+
+
+def test_no_heldout_entity_id_occurs_in_the_list_prompt():
+    """Count only, as above: a failure gives how many ids, never which."""
+    count = _heldout_ids_in_the_list_prompt()
+
+    assert count == 0, f"{count} held-out entity ids occur in the list prompt"
 
 
 def test_every_prompt_word_exemption_is_still_needed():
