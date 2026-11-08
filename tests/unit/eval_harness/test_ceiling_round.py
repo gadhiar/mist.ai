@@ -10,6 +10,10 @@ The probes are synthetic: one prose turn, and one list turn of six items, which 
 engine extracts in two batches (at most four units each). Ports are chosen by the system,
 so the test never collides with a running relay or service. The rounds run once per
 module, and each test reads the record they leave.
+
+The replay tests then rerun every stored answer through the service twice, with the bench
+probe once over both probes, and compare the two replays; an altered answer must make the
+comparison fail and name the probe, without printing a value.
 """
 
 from __future__ import annotations
@@ -37,8 +41,9 @@ from backend.knowledge.extraction.prompts import EXTRACTION_SYSTEM_PROMPT  # noq
 from backend.knowledge.extraction.scope_classifier import (  # noqa: E402
     SCOPE_CLASSIFIER_SYSTEM_PROMPT,
 )
+from scripts.eval_harness.ceiling import replay as rp  # noqa: E402
 from scripts.eval_harness.ceiling import round as rd  # noqa: E402
-from scripts.eval_harness.ceiling.store import AnswerStore  # noqa: E402
+from scripts.eval_harness.ceiling.store import AnswerStore, OfferedRequest  # noqa: E402
 
 H3_MARKERS = (
     "expected_relationships",
@@ -528,3 +533,168 @@ def test_add_refuses_a_key_not_offered_and_a_line_that_is_not_an_answer(
     assert lines[1] == f"refused {stored_key[:12]} already has an answer"
     assert lines[2] == "refused 000000000000 was not offered in round 4"
     assert lines[3].startswith("refused line 3:")
+
+
+# --- the replay --------------------------------------------------------------------------
+
+ALTERED = "ALTERED-VALUE"
+
+
+def _replay(*args: str) -> subprocess.CompletedProcess[str]:
+    return _run_tool("scripts.eval_harness.ceiling.replay", *args)
+
+
+def _replay_out(layout: Layout, out: Path, store_dir: Path | None = None):
+    return _replay(
+        "--out",
+        str(out),
+        "--probes",
+        str(layout.probes),
+        "--store-dir",
+        str(store_dir or layout.store_dir),
+        "--relay-port",
+        "0",
+        "--service-port",
+        "0",
+    )
+
+
+def _jsonl(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+@dataclass
+class Replays:
+    first: Path
+    second: Path
+    results: tuple[subprocess.CompletedProcess[str], subprocess.CompletedProcess[str]]
+
+
+@pytest.fixture(scope="module")
+def replays(campaign: Campaign, tmp_path_factory: pytest.TempPathFactory) -> Replays:
+    root = tmp_path_factory.mktemp("replay")
+    first, second = root / "run-a-1", root / "run-a-2"
+    results = (_replay_out(campaign.layout, first), _replay_out(campaign.layout, second))
+    return Replays(first=first, second=second, results=results)
+
+
+def test_two_replays_of_the_stored_answers_leave_nothing_pending(replays: Replays) -> None:
+    for result in replays.results:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "replay: probes 2, complete 2, requests 5, pending 0\n"
+    for out in (replays.first, replays.second):
+        assert [r["id"] for r in _jsonl(out / "extraction_service_raw.jsonl")] == [
+            PROSE_TAG,
+            LIST_TAG,
+        ]
+
+
+def test_the_replay_log_attributes_every_request_to_its_probe(
+    campaign: Campaign, replays: Replays
+) -> None:
+    requests = _jsonl(replays.first / "requests.jsonl")
+    assert [list(r) for r in requests] == [["seq", "tag", "key", "kind", "answered"]] * 5
+    assert [(r["tag"], r["kind"]) for r in requests] == [
+        (PROSE_TAG, "scope"),
+        (PROSE_TAG, "extract"),
+        (LIST_TAG, "scope"),
+        (LIST_TAG, "extract"),
+        (LIST_TAG, "extract"),
+    ]
+    assert all(r["answered"] for r in requests)
+    stored = AnswerStore.load(campaign.layout.store).entries
+    assert sorted(r["key"] for r in requests) == sorted(e.key for e in stored)
+
+
+def test_two_replays_of_the_same_answers_compare_equal(replays: Replays) -> None:
+    result = _replay("--compare", str(replays.first), str(replays.second))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == "compare: equal, requests 5, rows 2\n"
+
+
+def _altered_store(campaign: Campaign, store_dir: Path) -> None:
+    """Rebuild the store through its own API with the list's last answer altered."""
+    schemas = {"scope": SCOPE_OUTPUT_SCHEMA, "extract": EXTRACTION_OUTPUT_SCHEMA}
+    entries = AnswerStore.load(campaign.layout.store).entries
+    store_dir.mkdir()
+    store = AnswerStore.load(store_dir / "answers-1.jsonl")
+    store.offer(
+        1, [OfferedRequest(key=e.key, kind=e.kind, schema=schemas[e.kind]) for e in entries]
+    )
+    for entry in entries:
+        answer = entry.answer
+        if entry.seq == len(entries):
+            extra = {"id": "altered-entity", "type": "Thing", "name": ALTERED}
+            answer = {**answer, "entities": [*answer["entities"], extra]}
+        store.add(entry.key, answer)
+
+
+def test_an_altered_answer_makes_compare_exit_1_and_name_the_tag(
+    campaign: Campaign, replays: Replays, tmp_path: Path
+) -> None:
+    _altered_store(campaign, tmp_path / "altered-store")
+    out = tmp_path / "run-altered"
+    assert _replay_out(campaign.layout, out, tmp_path / "altered-store").returncode == 0
+    result = _replay("--compare", str(replays.first), str(out))
+    assert result.returncode == 1
+    assert result.stdout == f"compare: rows differ at tag {LIST_TAG}: response.payload.entities\n"
+    assert ALTERED not in result.stdout + result.stderr
+
+
+def test_a_differing_request_key_makes_compare_exit_1_without_the_key(
+    replays: Replays, tmp_path: Path
+) -> None:
+    copy = tmp_path / "copy"
+    shutil.copytree(replays.second, copy)
+    requests = _jsonl(copy / "requests.jsonl")
+    original = requests[1]["key"]
+    requests[1]["key"] = "0" * 64
+    (copy / "requests.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in requests), encoding="utf-8"
+    )
+    result = _replay("--compare", str(replays.first), str(copy))
+    assert result.returncode == 1
+    assert result.stdout == f"compare: requests differ at request 2, tag {PROSE_TAG}: key\n"
+    assert original[:12] not in result.stdout and "0" * 12 not in result.stdout
+
+
+def test_compare_exits_1_on_a_missing_replay(replays: Replays, tmp_path: Path) -> None:
+    result = _replay("--compare", str(replays.first), str(tmp_path / "absent"))
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "requests.jsonl" in result.stderr
+
+
+def test_replay_refuses_an_out_dir_that_holds_a_replay(
+    campaign: Campaign, replays: Replays
+) -> None:
+    before = (replays.first / "requests.jsonl").read_bytes()
+    result = _replay_out(campaign.layout, replays.first)
+    assert result.returncode == 1
+    assert "already" in result.stderr
+    assert (replays.first / "requests.jsonl").read_bytes() == before
+
+
+def test_replay_exits_1_while_answers_are_missing(tmp_path: Path) -> None:
+    layout = make_layout(tmp_path / "fresh")
+    result = _replay_out(layout, tmp_path / "out")
+    assert result.returncode == 1
+    assert result.stdout == "replay: probes 2, complete 0, requests 4, pending 4\n"
+
+
+def test_replay_refuses_a_key_held_by_two_stores(campaign: Campaign, tmp_path: Path) -> None:
+    store_dir = tmp_path / "stores"
+    store_dir.mkdir()
+    shutil.copy(campaign.layout.store, store_dir / "answers-1.jsonl")
+    shutil.copy(campaign.layout.store, store_dir / "answers-2.jsonl")
+    result = _replay_out(campaign.layout, tmp_path / "out", store_dir)
+    assert result.returncode == 1
+    assert "SharedKeyError" in result.stderr
+
+
+def test_replay_defaults_to_the_four_committed_stores_and_the_probes_file() -> None:
+    args = rp.parse_args(["--out", "x"])
+    assert args.probes == _REPO_ROOT / "data" / "ceiling" / "probes.jsonl"
+    assert args.store_dir == _REPO_ROOT / "data" / "ceiling"
+    assert (args.relay_port, args.service_port) == (18080, 18090)
+    assert tuple(f"answers-{k}.jsonl" for k in (1, 2, 3, 4)) == rp.STORE_NAMES
