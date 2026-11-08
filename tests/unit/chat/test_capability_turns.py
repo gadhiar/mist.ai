@@ -449,16 +449,12 @@ def _history(handler: ConversationHandler, session_id: str = "s1") -> list[tuple
 
 def _without_sentence(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The messages with the static sentence a host adds taken out again."""
-    return [
-        {**m, "content": str(m["content"]).replace(f"\n{_SENTENCE}", "")} for m in messages
-    ]
+    return [{**m, "content": str(m["content"]).replace(f"\n{_SENTENCE}", "")} for m in messages]
 
 
 def _shape(events: list[StreamEvent]) -> list[Any]:
     """The stream with `Complete.duration_ms`, the one field that varies by run, left out."""
-    return [
-        (e.final_response, e.tool_calls_used) if isinstance(e, Complete) else e for e in events
-    ]
+    return [(e.final_response, e.tool_calls_used) if isinstance(e, Complete) else e for e in events]
 
 
 def _main_calls(provider: FakeStreamingLLMProvider) -> list[LLMRequest]:
@@ -584,9 +580,7 @@ class TestDecodeCallback:
         decode_provider = FakeStreamingLLMProvider([_decode_pass()])
         tiers = _RecordingTiers(decode_provider)
         port = _Port(plan=_plan(), result=_result())
-        handler, provider, _ = _make_handler(
-            [ScriptedPass(chunks=["Ok."])], port=port, tiers=tiers
-        )
+        handler, provider, _ = _make_handler([ScriptedPass(chunks=["Ok."])], port=port, tiers=tiers)
 
         assert tiers.asked == []
         await _collect(handler, "set a timer for ten minutes")
@@ -612,9 +606,7 @@ class TestDecodeCallback:
     @pytest.mark.asyncio
     async def test_a_cancelled_decode_closes_the_provider_stream(self):
         provider = _BlockingDecodeProvider([ScriptedPass(chunks=["Sure thing."])])
-        port = _Port(
-            plan=_plan(), decode_wrapper=lambda call: asyncio.wait_for(call, timeout=0.05)
-        )
+        port = _Port(plan=_plan(), decode_wrapper=lambda call: asyncio.wait_for(call, timeout=0.05))
         handler, _provider, _ = _make_handler(port=port, provider=provider)
 
         events = await _collect(handler, "set a timer for ten minutes")
@@ -729,9 +721,7 @@ class TestAnsweredByActions:
             plan=_plan(),
             result=_result(_record(), also_reply=False, reply="Timer set. It ends at noon."),
         )
-        handler, provider, store = _make_handler(
-            [_decode_pass()], port=port, dispatcher=dispatcher
-        )
+        handler, provider, store = _make_handler([_decode_pass()], port=port, dispatcher=dispatcher)
 
         events = await _collect(handler, "set a timer for ten minutes")
 
