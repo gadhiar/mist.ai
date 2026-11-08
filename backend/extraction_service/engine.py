@@ -7,10 +7,14 @@ ontology_extractor, internal_derivation) against a locally-configured
 parse-and-repair so a failed job is reported as an error -- never cached
 as an empty extraction.
 
-Stage 2 runs the list pass: `structure_splitter` cuts a structured utterance
-into units that keep their parent context, and each batch of units is one
-Stage 2 call. An utterance without structure is one batch, sent exactly as
-before the list pass existed.
+Stage 2 cuts the utterance into units with `structure_splitter`. A turn with
+list items or table rows takes the list frame path: one frame call decides
+what each group of items states, item calls read the items a few at a time,
+and `list_assembly` builds the payload in code. A turn without them takes the
+r6 list pass, where each batch of units is one Stage 2 call; an utterance
+without structure is one batch, sent exactly as before the list pass existed.
+The r6 pass is also the list path's fallback, for the whole turn when its
+frame fails and for one item when that item's call does.
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ import importlib
 import json
 import logging
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import ModuleType
@@ -48,6 +52,10 @@ from backend.extraction_contract.models import (
     TimingsMs,
 )
 from backend.extraction_service.adapters import ModelFamilyAdapter
+from backend.extraction_service.list_schemas import (
+    LIST_FRAME_OUTPUT_SCHEMA,
+    LIST_ITEM_OUTPUT_SCHEMA,
+)
 from backend.extraction_service.schemas import (
     DERIVATION_OUTPUT_SCHEMA,
     EXTRACTION_OUTPUT_SCHEMA,
@@ -61,6 +69,23 @@ from backend.knowledge.extraction.internal_derivation import (
 from backend.knowledge.extraction.internal_prompts import (
     INTERNAL_DERIVATION_SYSTEM_PROMPT,
     INTERNAL_DERIVATION_USER_TEMPLATE,
+)
+from backend.knowledge.extraction.list_assembly import assemble
+from backend.knowledge.extraction.list_frames import (
+    ItemOutput,
+    ListGroup,
+    group_units,
+    parse_frame_output,
+    parse_item_output,
+    render_frame_input,
+)
+from backend.knowledge.extraction.list_prompts import (
+    LIST_FRAME_REPAIR_INSTRUCTION,
+    LIST_FRAME_USER_TEMPLATE,
+    LIST_ITEM_REPAIR_INSTRUCTION,
+    LIST_ITEM_USER_TEMPLATE,
+    LIST_SYSTEM_PROMPT,
+    render_frames_for_items,
 )
 from backend.knowledge.extraction.ontology_extractor import (
     NO_PRIOR_CONTEXT,
@@ -89,7 +114,8 @@ from backend.llm.provider import StreamingLLMProvider
 
 logger = logging.getLogger(__name__)
 
-# What a Stage 2 call's strict parser returns: a payload for an r6 batch.
+# What a Stage 2 call's strict parser returns: a payload for an r6 batch, a
+# frame output for a frame call, the item outputs for an item call.
 _Parsed = TypeVar("_Parsed")
 
 # Exceptions a failed LLM transport call surfaces as, across the openai
@@ -122,6 +148,46 @@ DERIVE_MAX_TOKENS = 400
 # limits, so the run identity reads them from the module that applies them.
 LIST_BATCH_MAX_UNITS: int = 4
 LIST_CONTEXT_MAX_UNITS: int = 8
+
+# The list frame path's limits: the frame and item calls' output limits, the
+# most items one item call extracts, and the most characters a frame or item
+# user message may hold. The r6 limits above stay, because its fallback uses
+# them.
+LIST_FRAME_MAX_TOKENS: int = 2048
+LIST_ITEM_MAX_TOKENS: int = 2048
+LIST_ITEM_BATCH_MAX_UNITS: int = 4
+# 14,336 input tokens (ctx 16,384 less the 2,048-token output), less the list
+# system prompt at its 42,000-character cap (about 11,667 tokens at the main
+# prompt's measured 3.6 characters a token) and a 256-token framing reserve,
+# leave about 2,413 tokens; at 3 characters a token, a conservative figure for
+# history text, that is about 7,200 characters. Estimates, not a tokenizer count.
+LIST_USER_MAX_CHARS: int = 7200
+
+_LIST_INPUT_TOKENS = 14336
+_LIST_FRAMING_RESERVE_TOKENS = 256
+
+# The warnings the list path adds; the assembly adds its own.
+_LIST_FRAME_FALLBACK = "list_frame_fallback"
+_LIST_ITEM_FALLBACK = "list_item_fallback"
+_LIST_FRAME_OVER_BUDGET = "list_frame_over_budget"
+_LIST_HISTORY_TRIMMED = "list_history_trimmed"
+_LIST_REPAIR_SKIPPED = "list_repair_skipped"
+
+
+def list_call_fits(messages: Sequence[Mapping[str, str]]) -> bool:
+    """Whether a list call sending `messages` stays inside the model's input budget.
+
+    The system prompt counts at 3.6 characters a token, the main prompt's
+    measured ratio, and every other message at 3, the conservative figure for
+    history and model output, plus the framing reserve. A repair resends each
+    failed output with its instruction, so the estimate runs over the whole
+    list the call would send.
+    """
+    system = sum(len(m["content"]) for m in messages if m["role"] == "system")
+    other = sum(len(m["content"]) for m in messages if m["role"] != "system")
+    tokens = -(-system * 10 // 36) + -(-other // 3) + _LIST_FRAMING_RESERVE_TOKENS
+    return tokens <= _LIST_INPUT_TOKENS
+
 
 # The code the run identity covers (`code_sha256` in
 # `backend.knowledge.extraction.run_identity`): this module, the adapters and
@@ -218,7 +284,15 @@ class _OutputUnparsableError(UpstreamLLMError):
 
     A subclass of `UpstreamLLMError`, so a caller that does not fall back sees
     what it saw before the attempt loop was shared between stages.
+
+    Attributes:
+        repair_skipped: True when the attempts ended early because the next
+            repair would not fit the model's input (`fits` returned False).
     """
+
+    def __init__(self, message: str, *, repair_skipped: bool = False) -> None:
+        super().__init__(message)
+        self.repair_skipped = repair_skipped
 
 
 class InvalidRequestError(ExtractionServiceError):
@@ -320,6 +394,91 @@ class _Stage2Run:
     attempts: int = 0
     elapsed_ms: float = 0.0
     payloads: list[ExtractionPayload] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class _ListTurn:
+    """What every list call of one structured turn shares.
+
+    Attributes:
+        pre_processed: The turn's pre-processed input, its full history included.
+        units: The turn's units, from `split_structured`.
+        groups: The turn's groups, from `group_units`.
+        prose: The turn's prose units, from `group_units`.
+        items: `(item id, position in units)` of every item, in turn order.
+        system: The list system prompt message, its reference date filled in.
+        render: The turn as `render_frame_input` writes it.
+    """
+
+    pre_processed: PreProcessedInput
+    units: tuple[InputUnit, ...]
+    groups: tuple[ListGroup, ...]
+    prose: tuple[InputUnit, ...]
+    items: tuple[tuple[str, int], ...]
+    system: dict[str, str]
+    render: str
+
+    @property
+    def subject_scope(self) -> str:
+        return self.pre_processed.metadata.get("subject_scope", "unknown")
+
+
+def _list_turn(
+    pre_processed: PreProcessedInput,
+    units: Sequence[InputUnit],
+    groups: Sequence[ListGroup],
+    prose: Sequence[InputUnit],
+) -> _ListTurn:
+    positions = {id(unit): index for index, unit in enumerate(units)}
+    items = sorted(
+        (
+            (item_id, positions[id(unit)])
+            for group in groups
+            for item_id, unit in zip(group.item_ids, group.items, strict=True)
+        ),
+        key=lambda item: item[1],
+    )
+    system = LIST_SYSTEM_PROMPT.format(
+        reference_date=pre_processed.reference_date.strftime("%Y-%m-%d")
+    )
+    return _ListTurn(
+        pre_processed=pre_processed,
+        units=tuple(units),
+        groups=tuple(groups),
+        prose=tuple(prose),
+        items=tuple(items),
+        system={"role": "system", "content": system},
+        render=render_frame_input(groups, prose),
+    )
+
+
+def _context_text(context: Sequence[str]) -> str:
+    return "\n".join(context) if context else NO_PRIOR_CONTEXT
+
+
+def _fit_user_message(
+    build: Callable[[Sequence[str]], str], context: Sequence[str]
+) -> tuple[str | None, tuple[str, ...], bool]:
+    """Build a list user message, dropping the oldest history while it is over the limit.
+
+    Returns:
+        The message, or None when it is still over `LIST_USER_MAX_CHARS` with
+        no history left; the history it kept; and whether any was dropped.
+    """
+    kept = tuple(context)
+    message = build(kept)
+    trimmed = False
+    while len(message) > LIST_USER_MAX_CHARS and kept:
+        kept = kept[1:]
+        trimmed = True
+        message = build(kept)
+    return (message if len(message) <= LIST_USER_MAX_CHARS else None), kept, trimmed
+
+
+def _warn_once(run: _Stage2Run, warning: str) -> None:
+    if warning not in run.warnings:
+        run.warnings.append(warning)
 
 
 def _batch_input(
@@ -466,6 +625,7 @@ class ExtractionEngine:
         scope_out, scope_ms = await self._run_scope(pre_processed, warnings)
         stage2 = await self._run_extraction(pre_processed)
         payload, merge_warnings = merge_payloads(stage2.payloads)
+        warnings.extend(stage2.warnings)
         warnings.extend(merge_warnings)
         derivation_out, derive_ms = await self._run_derivation(req, warnings)
 
@@ -566,7 +726,29 @@ class ExtractionEngine:
         return ScopeOut(label=label, confidence=confidence), elapsed
 
     async def _run_extraction(self, pre_processed: PreProcessedInput) -> _Stage2Run:
-        """Stage 2: one call sequence per batch of at most `LIST_BATCH_MAX_UNITS` units.
+        """Stage 2: the list frame path for a structured turn, else the r6 list pass.
+
+        A turn is structured when `group_units` finds a group of list items
+        or table rows in it.
+
+        Raises:
+            ExtractionTimeoutError: An attempt exceeded the LLM timeout.
+            UpstreamLLMError: The LLM call failed, or an r6 batch's output
+                stayed unparsable or was cut short on a single unit.
+        """
+        units = split_structured(pre_processed.original_text)
+        run = _Stage2Run()
+        groups, prose = group_units(units)
+        if groups:
+            await self._run_list_frames(_list_turn(pre_processed, units, groups, prose), run)
+        else:
+            await self._run_list_pass(pre_processed, units, run)
+        return run
+
+    async def _run_list_pass(
+        self, pre_processed: PreProcessedInput, units: Sequence[InputUnit], run: _Stage2Run
+    ) -> None:
+        """The r6 list pass: one call sequence per batch of at most `LIST_BATCH_MAX_UNITS` units.
 
         Batches run in order, one at a time, and any batch failing fails the
         turn: there are no partial results.
@@ -576,13 +758,163 @@ class ExtractionEngine:
             UpstreamLLMError: The LLM call failed, or every attempt's
                 output stayed unparsable.
         """
-        units = split_structured(pre_processed.original_text)
-        run = _Stage2Run()
         start = 0
         for batch in batch_units(units, LIST_BATCH_MAX_UNITS):
-            await self._extract_units(pre_processed, units, start, len(batch), run)
+            await self._extract_units(pre_processed, units, start, len(batch), run, run.payloads)
             start += len(batch)
-        return run
+
+    async def _run_list_frames(self, turn: _ListTurn, run: _Stage2Run) -> None:
+        """The list frame path: one frame call, then item calls, then assembly.
+
+        The frame message is fitted to `LIST_USER_MAX_CHARS` by dropping the
+        oldest history; with no history left and still over, the turn takes
+        the r6 list pass before any list call. A frame cut short or still
+        unparsable sends the turn through the r6 list pass too. The item calls
+        start from the history the frame message kept.
+
+        Adds the assembled payload and the path's warnings to `run`.
+
+        Raises:
+            ExtractionTimeoutError: A list or fallback call exceeded the LLM timeout.
+            UpstreamLLMError: A list or fallback call failed, or a fallback's
+                output stayed unparsable.
+        """
+        pre_processed = turn.pre_processed
+        utterance = pre_processed.original_text
+
+        def frame_message(context: Sequence[str]) -> str:
+            return LIST_FRAME_USER_TEMPLATE.format(
+                context=_context_text(context),
+                subject_scope=turn.subject_scope,
+                utterance=utterance,
+                render=turn.render,
+            )
+
+        user, kept, trimmed = _fit_user_message(frame_message, pre_processed.conversation_context)
+        if trimmed:
+            _warn_once(run, _LIST_HISTORY_TRIMMED)
+        if user is None:
+            logger.warning("List frame message over %d characters; r6 pass", LIST_USER_MAX_CHARS)
+            run.warnings.append(_LIST_FRAME_OVER_BUDGET)
+            await self._run_list_pass(pre_processed, turn.units, run)
+            return
+
+        group_ids = [group.gid for group in turn.groups]
+        try:
+            frame = await self._list_attempts(
+                user,
+                turn,
+                run,
+                max_tokens=LIST_FRAME_MAX_TOKENS,
+                schema=LIST_FRAME_OUTPUT_SCHEMA,
+                parse=lambda raw: parse_frame_output(raw, group_ids),
+                repair=LIST_FRAME_REPAIR_INSTRUCTION,
+            )
+        except (_OutputTruncatedError, _OutputUnparsableError) as exc:
+            if isinstance(exc, _OutputUnparsableError) and exc.repair_skipped:
+                run.warnings.append(_LIST_REPAIR_SKIPPED)
+            logger.warning("List frame call failed (%s); r6 pass for the turn", exc)
+            run.warnings.append(_LIST_FRAME_FALLBACK)
+            await self._run_list_pass(pre_processed, turn.units, run)
+            return
+
+        frames = render_frames_for_items(frame, turn.groups)
+        outputs: list[ItemOutput] = []
+        fallbacks: dict[str, ExtractionPayload] = {}
+        for start in range(0, len(turn.items), LIST_ITEM_BATCH_MAX_UNITS):
+            batch = turn.items[start : start + LIST_ITEM_BATCH_MAX_UNITS]
+            await self._list_items(turn, kept, frames, batch, run, outputs, fallbacks)
+
+        payload, warnings = assemble(frame, outputs, turn.groups, turn.prose, utterance, fallbacks)
+        run.payloads.append(payload)
+        run.warnings.extend(warnings)
+
+    async def _list_items(
+        self,
+        turn: _ListTurn,
+        context: Sequence[str],
+        frames: str,
+        batch: Sequence[tuple[str, int]],
+        run: _Stage2Run,
+        outputs: list[ItemOutput],
+        fallbacks: dict[str, ExtractionPayload],
+    ) -> None:
+        """Extract one batch of items, halving it while a call is cut short or unparsable.
+
+        A single item still cut short or unparsable, or a batch whose message
+        is over `LIST_USER_MAX_CHARS` with no history left, takes the item
+        fallback: the r6 pass over that item's unit alone.
+
+        Raises:
+            ExtractionTimeoutError: A call exceeded the LLM timeout.
+            UpstreamLLMError: A call failed, or a fallback's output stayed
+                unparsable or was cut short.
+        """
+        ids = [item_id for item_id, _position in batch]
+
+        def item_message(kept: Sequence[str]) -> str:
+            return LIST_ITEM_USER_TEMPLATE.format(
+                context=_context_text(kept),
+                subject_scope=turn.subject_scope,
+                utterance=turn.pre_processed.original_text,
+                render=turn.render,
+                frames=frames,
+                items=", ".join(ids),
+            )
+
+        user, _kept, trimmed = _fit_user_message(item_message, context)
+        if trimmed:
+            _warn_once(run, _LIST_HISTORY_TRIMMED)
+        if user is None:
+            logger.warning(
+                "List item message over %d characters; item fallback", LIST_USER_MAX_CHARS
+            )
+            for item in batch:
+                await self._item_fallback(turn, item, run, fallbacks)
+            return
+
+        try:
+            outputs.extend(
+                await self._list_attempts(
+                    user,
+                    turn,
+                    run,
+                    max_tokens=LIST_ITEM_MAX_TOKENS,
+                    schema=LIST_ITEM_OUTPUT_SCHEMA,
+                    parse=lambda raw: parse_item_output(raw, ids),
+                    repair=LIST_ITEM_REPAIR_INSTRUCTION,
+                )
+            )
+            return
+        except (_OutputTruncatedError, _OutputUnparsableError) as exc:
+            if isinstance(exc, _OutputUnparsableError) and exc.repair_skipped:
+                run.warnings.append(_LIST_REPAIR_SKIPPED)
+            logger.warning("List item call on %d items failed: %s", len(batch), exc)
+
+        if len(batch) == 1:
+            await self._item_fallback(turn, batch[0], run, fallbacks)
+            return
+        half = (len(batch) + 1) // 2
+        for part in (batch[:half], batch[half:]):
+            await self._list_items(turn, context, frames, part, run, outputs, fallbacks)
+
+    async def _item_fallback(
+        self,
+        turn: _ListTurn,
+        item: tuple[str, int],
+        run: _Stage2Run,
+        fallbacks: dict[str, ExtractionPayload],
+    ) -> None:
+        """Send one item's unit through the r6 pass, with r6's context, for its payload.
+
+        Raises:
+            As `_extract_units`.
+        """
+        item_id, position = item
+        run.warnings.append(_LIST_ITEM_FALLBACK)
+        payloads: list[ExtractionPayload] = []
+        await self._extract_units(turn.pre_processed, turn.units, position, 1, run, payloads)
+        (fallbacks[item_id],) = payloads
 
     async def _extract_units(
         self,
@@ -591,13 +923,15 @@ class ExtractionEngine:
         start: int,
         size: int,
         run: _Stage2Run,
+        out: list[ExtractionPayload],
     ) -> None:
         """Extract `units[start:start + size]`, halving the batch while its output is cut short.
 
         An output that stops at `EXTRACT_MAX_TOKENS` is never repaired: the
         repair retry would ask for the same output under the same limit. The
         batch is split in two and each half extracted in turn, each seeing
-        the units before it as context, down to single units.
+        the units before it as context, down to single units. Each payload is
+        appended to `out`, in unit order.
 
         Raises:
             UpstreamLLMError: A single unit's output was still cut short, or
@@ -620,10 +954,10 @@ class ExtractionEngine:
                 half,
                 size - half,
             )
-            await self._extract_units(pre_processed, units, start, half, run)
-            await self._extract_units(pre_processed, units, start + half, size - half, run)
+            await self._extract_units(pre_processed, units, start, half, run, out)
+            await self._extract_units(pre_processed, units, start + half, size - half, run, out)
             return
-        run.payloads.append(payload)
+        out.append(payload)
 
     async def _extract_batch(
         self, batch_input: PreProcessedInput, run: _Stage2Run
@@ -650,6 +984,37 @@ class ExtractionEngine:
         finally:
             run.elapsed_ms += (time.perf_counter() - start) * 1000
 
+    async def _list_attempts(
+        self,
+        user: str,
+        turn: _ListTurn,
+        run: _Stage2Run,
+        *,
+        max_tokens: int,
+        schema: dict,
+        parse: Callable[[str], _Parsed],
+        repair: str,
+    ) -> _Parsed:
+        """One frame or item call sequence, timed into `run`, its repairs budgeted.
+
+        Raises:
+            As `_extract_attempts`; a skipped repair raises
+            `_OutputUnparsableError` with `repair_skipped` set.
+        """
+        start = time.perf_counter()
+        try:
+            return await self._extract_attempts(
+                [turn.system, {"role": "user", "content": user}],
+                run,
+                max_tokens=max_tokens,
+                schema=schema,
+                parse=parse,
+                repair=repair,
+                fits=list_call_fits,
+            )
+        finally:
+            run.elapsed_ms += (time.perf_counter() - start) * 1000
+
     async def _extract_attempts(
         self,
         messages: list[dict],
@@ -659,6 +1024,7 @@ class ExtractionEngine:
         schema: dict,
         parse: Callable[[str], _Parsed],
         repair: str,
+        fits: Callable[[Sequence[Mapping[str, str]]], bool] | None = None,
     ) -> _Parsed:
         """One Stage 2 call sequence: strict parse with repair-retry up to `max_attempts`.
 
@@ -676,16 +1042,31 @@ class ExtractionEngine:
             parse: The strict parser; an `ExtractionValidationError` from it
                 gets the repair retry.
             repair: The instruction sent after a failed output.
+            fits: When given, called with the whole message list before each
+                repair attempt; a False return ends the attempts as an
+                unparsable output, with `repair_skipped` set. The r6 batches
+                pass none, so their repair is unbudgeted, as before.
 
         Raises:
             ExtractionTimeoutError: An attempt exceeded the LLM timeout.
             UpstreamLLMError: The LLM call failed.
-            _OutputUnparsableError: Every attempt's output stayed unparsable.
+            _OutputUnparsableError: Every attempt's output stayed unparsable,
+                or the next repair would not fit.
             _OutputTruncatedError: An output stopped at `max_tokens`.
         """
         last_error: Exception | None = None
 
         for attempt in range(1, self._settings.max_attempts + 1):
+            if attempt > 1 and fits is not None and not fits(messages):
+                logger.warning(
+                    "Extraction repair %d/%d skipped: it would not fit the input budget",
+                    attempt,
+                    self._settings.max_attempts,
+                )
+                raise _OutputUnparsableError(
+                    f"Extraction output unparsable; repair attempt {attempt} would not fit",
+                    repair_skipped=True,
+                ) from last_error
             run.calls += 1
             run.attempts = max(run.attempts, attempt)
             request = self._build_request(messages=messages, max_tokens=max_tokens, schema=schema)

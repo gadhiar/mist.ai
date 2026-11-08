@@ -181,8 +181,10 @@ class ExtractResponse(BaseModel):
         attempts: The most attempts any one Stage 2 call sequence took: 1, or
             more when a repair retry ran.
         stage2_calls: Every Stage 2 model call the turn took (contract 1.2.0):
-            one per batch of units, plus splits and repair retries. Defaults
-            to 1, the one call a pre-1.2.0 service makes.
+            for a structured turn, the frame call and each item call; for any
+            other turn, one per batch of units; plus the r6 calls a frame or
+            item fallback makes, splits, and repair retries, abandoned calls
+            included. Defaults to 1, the one call a pre-1.2.0 service makes.
     """
 
     contract_version: str
