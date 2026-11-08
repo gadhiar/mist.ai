@@ -69,6 +69,12 @@ SKIP_DUPLICATE = "duplicate"
 # deletable by `python -m backend.extraction_backlog.admin retry-dead-letters`,
 # which puts the turn back into the backlog.
 SKIP_EXTRACTION_FAILED = "extraction_failed"
+# T31 policy skip: a capability's template answered the turn alone, so it holds
+# a command and a template, not knowledge. Written by the backlog without a
+# service call (`backend.extraction_backlog.eligibility.policy_skip_reason`). A
+# recorded decision, not a failure: only `SKIP_EXTRACTION_FAILED` counts as
+# dead-lettered.
+SKIP_CAPABILITY_ONLY = "capability_only"
 
 VALID_SKIP_REASONS = frozenset(
     {
@@ -77,6 +83,7 @@ VALID_SKIP_REASONS = frozenset(
         SKIP_BELOW_SIGNIFICANCE,
         SKIP_DUPLICATE,
         SKIP_EXTRACTION_FAILED,
+        SKIP_CAPABILITY_ONLY,
     }
 )
 

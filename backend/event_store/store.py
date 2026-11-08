@@ -908,14 +908,17 @@ class EventStore:
         see the MIS-138 comment there for why content order and not rowid), so
         the live dispatcher applies turns in the order a rebuild replays them.
 
-        Deliberately unfiltered: EVERY turn the live path records is eligible,
-        whatever its session's `origin` and whatever `ontology_version` it was
-        logged under. That matches what the pre-T2a live path did -- it fired
-        extraction for every recorded turn (`conversation_handler.py`, the
-        `if event_id:` branch after `_record_turn_event`) with no origin or
-        ontology check. A rebuild still scopes itself (`LogRegenerator.rebuild`
-        passes `origins=CANONICAL_ORIGINS`); that is the rebuild's policy, not
-        the backlog's.
+        Deliberately unfiltered: every recorded turn is listed, whatever its
+        session's `origin` and whatever `ontology_version` it was logged under,
+        as the pre-T2a live path fired extraction for every recorded turn
+        with no origin or ontology check. Which listed turns are extracted is
+        decided by one predicate on the `answered_by` returned here,
+        `backend.extraction_backlog.eligibility.policy_skip_reason` (T31: a
+        capability-only turn is covered by a skip row instead), and the backlog
+        applies it, so the turn stays in this list and in log order. A rebuild
+        still scopes itself (`LogRegenerator.rebuild` passes
+        `origins=CANONICAL_ORIGINS`); that is the rebuild's policy, not the
+        backlog's.
 
         Returns:
             Dicts with `event_id`, `session_id`, `turn_index`, `timestamp` and

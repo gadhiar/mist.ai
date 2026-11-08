@@ -14,8 +14,15 @@ There is no queue table. For the ACTIVE epoch (the latest `epoch_ledger` row):
 
 Order is replay order, `ORDER BY timestamp, session_id, turn_index`
 (`EventStore.list_turn_keys_in_replay_order`), the order a rebuild replays in.
-Every logged turn is eligible whatever its origin -- the pre-T2a live path
-extracted every recorded turn, and so does the backlog.
+Eligibility is whatever `eligibility.policy_skip_reason` says about the turn's
+`answered_by`, whatever its origin. A turn it gives a reason (a capability-only
+turn, T31) is POLICY-COVERED under an epoch or candidate when it is not a legacy
+turn of that epoch and its cache row is absent or is a skip row with that
+reason: it stays pending, in log order, with `PendingTurn.policy_skip` set, and
+the dispatcher covers it with that skip row and no service call. It is left out
+of `backlog_depth`, `apply_pending` and the lag, and counted in
+`BacklogScan.policy_skipped`. Every other turn is dispatched, as the pre-T2a
+live path extracted every recorded turn.
 
 The event store and the cache are separate SQLite files
 (`backend.factories.production_cache_path` puts the cache beside the event
@@ -26,6 +33,7 @@ one stamp-filtered id scan of the cache per call.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -38,6 +46,8 @@ from backend.knowledge.extraction_cache import (
     ExtractionCache,
 )
 from backend.knowledge.version_stamps import compose_model_hash
+
+from .eligibility import policy_skip_reason
 
 STAGE_CURATED = "curated"
 STAGE_APPLIED = "applied"
@@ -194,6 +204,9 @@ class PendingTurn:
     timestamp: str
     cached: bool
     curated: bool
+    # Set only for a policy-covered turn (module docstring): the skip reason the
+    # dispatcher records for it instead of dispatching it.
+    policy_skip: str | None = None
 
     @property
     def turn_id(self) -> str:
@@ -210,6 +223,9 @@ class BacklogScan:
     apply_pending: int
     dead_lettered: int
     legacy_unextracted: int
+    # Policy-covered logged turns, pending or applied, by skip reason; legacy
+    # turns are counted in `legacy_unextracted` instead.
+    policy_skipped: Mapping[str, int]
 
     @property
     def head(self) -> PendingTurn | None:
@@ -218,8 +234,15 @@ class BacklogScan:
 
     @property
     def oldest_pending_timestamp(self) -> str | None:
-        """Logged timestamp of the oldest pending turn (the head, by ordering)."""
-        return self.pending[0].timestamp if self.pending else None
+        """Logged timestamp of the oldest pending turn that needs extraction or an apply.
+
+        Policy-covered turns are passed over: they need no service and are
+        covered at the next step, so they are not lag.
+        """
+        for turn in self.pending:
+            if turn.policy_skip is None:
+                return turn.timestamp
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,6 +398,11 @@ class BacklogStore:
         `list_turn_keys_in_replay_order` the active backlog uses), so the
         candidate re-extracts the whole log from the beginning, in log order,
         and a turn logged mid-fill is reached in its place.
+
+        A policy-covered head (module docstring) carries `policy_skip`, and the
+        fill writes its skip row without a job; it counts in `covered` once
+        written, like any other row, so filling reaches 'ready'. A candidate
+        has no legacy turns: it re-extracts the whole log.
         """
         keys = self._events.list_turn_keys_in_replay_order()
         cached = self._cache.event_ids_for(cutover.extraction_version, cutover.model_hash)
@@ -391,6 +419,8 @@ class BacklogStore:
                     timestamp=str(key["timestamp"]),
                     cached=False,
                     curated=False,
+                    # Uncached by construction, so the reason alone decides.
+                    policy_skip=policy_skip_reason(key.get("answered_by")),
                 )
         return FillScan(head=head, covered=covered, total=len(keys))
 
@@ -460,7 +490,13 @@ class BacklogStore:
     # -- scanning --------------------------------------------------------------
 
     def scan(self, epoch: Epoch) -> BacklogScan:
-        """The backlog for `epoch`; a marker counts only beside a cache row (see retry)."""
+        """The backlog for `epoch`; a marker counts only beside a cache row (see retry).
+
+        A policy-covered turn (module docstring) stays in `pending`, in log
+        order, so the head and the crash-replay rule are unchanged; it is left
+        out of `backlog_depth` and `apply_pending`, and counted, pending or
+        applied, in `policy_skipped`.
+        """
         keys = self._events.list_turn_keys_in_replay_order()
         cached = self._cache.event_ids_for(epoch.extraction_version, epoch.model_hash)
         applied = self._events.get_extraction_applied(epoch.epoch_id)
@@ -469,15 +505,23 @@ class BacklogStore:
         pending: list[PendingTurn] = []
         inference_pending = 0
         apply_pending = 0
+        policy_skipped: dict[str, int] = {}
         for key in keys:
             event_id = key["event_id"]
+            # Policy-covered: a reason, not legacy, and the row absent or a skip
+            # row with that reason (`cached` maps event_id to skip_reason, None
+            # for `extracted`). Any other row is applied and counted as before.
+            reason = None if event_id in legacy else policy_skip_reason(key.get("answered_by"))
+            policy_skip = reason if cached.get(event_id, reason) == reason else None
+            if policy_skip is not None:
+                policy_skipped[policy_skip] = policy_skipped.get(policy_skip, 0) + 1
             stage = applied.get(event_id) if event_id in cached else None
             if stage == STAGE_APPLIED or event_id in legacy:
                 continue
             is_cached = event_id in cached
-            if is_cached:
+            if policy_skip is None and is_cached:
                 apply_pending += 1
-            else:
+            elif policy_skip is None:
                 inference_pending += 1
             pending.append(
                 PendingTurn(
@@ -487,6 +531,7 @@ class BacklogStore:
                     timestamp=str(key["timestamp"]),
                     cached=is_cached,
                     curated=stage == STAGE_CURATED,
+                    policy_skip=policy_skip,
                 )
             )
         dead_lettered = sum(1 for reason in cached.values() if reason == SKIP_EXTRACTION_FAILED)
@@ -496,6 +541,7 @@ class BacklogStore:
             apply_pending=apply_pending,
             dead_lettered=dead_lettered,
             legacy_unextracted=len(legacy),
+            policy_skipped=policy_skipped,
         )
 
     # -- per-turn reads / writes -----------------------------------------------

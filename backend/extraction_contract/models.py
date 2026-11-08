@@ -374,6 +374,11 @@ class ExtractionStatus(BaseModel):
     oldest_pending_age_ms: int | None
     unrecorded_turns: int = 0
     legacy_unextracted: int = 0
+    # T31, ADR-017 additive: logged turns covered by a policy skip row, pending
+    # or applied, by skip reason (`capability_only`). Not exchanged with the
+    # extraction service, so `CONTRACT_VERSION` is unchanged; a payload without
+    # the key validates as `{}`.
+    policy_skipped: dict[str, int] = Field(default_factory=dict)
     service: ServiceStatus
     last_job: LastJob | None
     cutover: CutoverStatus | None = None

@@ -336,6 +336,16 @@ class TestExtractionStatus:
 
         assert restored.legacy_unextracted == 0
 
+    def test_policy_skipped_defaults_to_empty_when_omitted_from_the_payload(self):
+        """T31: a payload with no `policy_skipped` key still validates, as `{}`."""
+        payload = _extraction_status().model_dump(mode="json")
+        payload.pop("policy_skipped", None)
+
+        restored = ExtractionStatus.model_validate(payload)
+
+        assert restored.policy_skipped == {}
+        assert _extraction_status().policy_skipped == {}
+
     def test_last_job_and_cutover_optional_none(self):
         status = ExtractionStatus(
             state="disabled",
