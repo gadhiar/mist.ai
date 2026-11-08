@@ -11,11 +11,20 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
+from .alarms.records import REPORT_MAX_AGE, REPORT_MAX_AHEAD, ReportResult
 from .contracts import CapabilityState, OutcomeStatus, RiskClass, ToolOutcome
 from .power import PowerLevel
 
@@ -228,44 +237,119 @@ class AlarmActionMessage(_Inbound):
         return self.model_dump(mode="json", exclude=exclude)
 
 
+class AlarmReportMessage(BaseModel):
+    """`alarm_report` from an endpoint: a ring it started playing, or its local ring's outcome.
+
+    `rang_at` is when the reported ring started playing and `at` when its outcome happened;
+    for `rang` they are the same instant. Both are aware, at most `REPORT_MAX_AGE` old and at
+    most `REPORT_MAX_AHEAD` ahead of the owner's clock (an endpoint's clock skew), and `rang_at`
+    is not after `at`. `snoozed_until` comes with `snoozed` and with nothing else.
+
+    There is no `endpoint` field: the server attaches the endpoint of the connection the report
+    arrived on, so no endpoint can report as another. Unlike the other inbound messages, an
+    unknown field is refused rather than ignored, so a payload that names its own endpoint is
+    an error and not a silently dropped claim.
+
+    The window is checked against `now` from the validation context when given
+    (`model_validate(data, context={"now": ...})`), else against the real clock; `window_error`
+    checks it again against the caller's clock.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    type: Literal["alarm_report"]
+    alarm_id: str = Field(min_length=1)
+    outcome: Literal["rang", "stopped", "snoozed"]
+    at: AwareDatetime
+    rang_at: AwareDatetime
+    snoozed_until: AwareDatetime | None = None
+    request_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _check_report(self, info: ValidationInfo) -> AlarmReportMessage:
+        if (self.snoozed_until is None) == (self.outcome == "snoozed"):
+            raise ValueError("snoozed_until is required with snoozed and refused otherwise")
+        context = info.context if isinstance(info.context, dict) else {}
+        now = context.get("now")
+        error = self.window_error(now if isinstance(now, datetime) else datetime.now(UTC))
+        if error is not None:
+            raise ValueError(error)
+        return self
+
+    def window_error(self, now: datetime) -> str | None:
+        """Return why the report's times are refused against `now`, or None when they are not.
+
+        Raises:
+            ValueError: `now` is naive.
+        """
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("window_error needs an aware now")
+        for name, value in (("at", self.at), ("rang_at", self.rang_at)):
+            if value < now - REPORT_MAX_AGE:
+                return f"{name} is more than 24 h old"
+            if value > now + REPORT_MAX_AHEAD:
+                return f"{name} is more than 60 s ahead of the owner's clock"
+        if self.rang_at > self.at:
+            return "rang_at is after at"
+        if self.outcome == "rang" and self.rang_at != self.at:
+            return "a rang report has rang_at equal to at"
+        return None
+
+    def to_payload(self) -> dict[str, object]:
+        """Return the message's fields, without the optional ones it did not carry."""
+        return self.model_dump(mode="json", exclude_none=True)
+
+
 class AlarmActionResultEvent(_Outbound):
-    """`alarm_action_result`: the one answer to each valid `alarm_action`, on its socket only.
+    """`alarm_action_result`: the one answer to each valid `alarm_action` or `alarm_report`, on
+    its socket only.
 
     `reason` is null for `ok`. `request_id` echoes the client's and is absent from the payload
-    when the client sent none.
+    when the client sent none. `detail` is the `ReportResult` of a report that reached the
+    alarm records, and absent otherwise.
     """
 
     type: Literal["alarm_action_result"]
     alarm_id: str
-    action: Literal["stop", "snooze", "dismiss"]
+    action: Literal["stop", "snooze", "dismiss", "report"]
     request_id: str | None = Field(default=None, min_length=1, max_length=64)
     outcome: Literal["ok", "invalid_args", "unavailable", "failed"]
     reason: str | None = Field(max_length=200)
+    detail: ReportResult | None = None
     at: datetime
 
+    @model_validator(mode="after")
+    def _detail_is_a_reports(self) -> AlarmActionResultEvent:
+        if self.detail is not None and self.action != "report":
+            raise ValueError(f"only a report carries detail, not {self.action}")
+        return self
+
     def to_payload(self) -> dict[str, object]:
-        """Return the wire payload, without `request_id` when it is None."""
-        exclude = {"request_id"} if self.request_id is None else None
-        return self.model_dump(mode="json", exclude=exclude)
+        """Return the wire payload, without `request_id` or `detail` when it is None."""
+        exclude = {name for name in ("request_id", "detail") if getattr(self, name) is None}
+        return self.model_dump(mode="json", exclude=exclude or None)
 
 
 def alarm_action_result_payload(
     alarm_id: str,
-    action: Literal["stop", "snooze", "dismiss"],
+    action: Literal["stop", "snooze", "dismiss", "report"],
     request_id: str | None,
     outcome: ToolOutcome,
     at: datetime,
 ) -> dict[str, object]:
-    """Build the `alarm_action_result` payload for an outcome `CapabilityHost.alarm_action` gave.
+    """Build the `alarm_action_result` payload for an outcome `CapabilityHost.alarm_action` or
+    `CapabilityHost.alarm_report` gave.
 
     `ok`, `invalid_args` and `unavailable` keep their names and `error` becomes `failed`. The
     caller passes an outcome that is already redacted; its reason is capped at 200 characters.
+    For a report, `detail` is the `result` in the outcome's data, which `alarm_report` sets once
+    the alarm records have answered; a report refused before that has none.
 
     Raises:
         ValueError: The outcome is `pending_confirmation` or `denied`; an alarm action takes
             neither path, so building one is a bug in the caller.
         pydantic.ValidationError: An argument breaks the payload's schema, such as an unknown
-            action or a `request_id` outside 1 to 64 characters.
+            action, a `request_id` outside 1 to 64 characters or an unknown report result.
     """
     wire_names: dict[str, Literal["ok", "invalid_args", "unavailable", "failed"]] = {
         "ok": "ok",
@@ -277,6 +361,9 @@ def alarm_action_result_payload(
     if wire is None:
         raise ValueError(f"an alarm action never has the outcome {outcome.status}")
     reason = None if wire == "ok" or outcome.reason is None else outcome.reason[:200]
+    detail = None
+    if action == "report" and outcome.data is not None:
+        detail = outcome.data.get("result")
     return AlarmActionResultEvent(
         type="alarm_action_result",
         alarm_id=alarm_id,
@@ -284,6 +371,7 @@ def alarm_action_result_payload(
         request_id=request_id,
         outcome=wire,
         reason=reason,
+        detail=detail,  # type: ignore[arg-type]  # validated against `ReportResult`
         at=at,
     ).to_payload()
 

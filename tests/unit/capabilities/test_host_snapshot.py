@@ -109,25 +109,32 @@ def _alarm_state(rev: int = 4) -> dict[str, object]:
 
 
 class FakeAlarmControl:
-    """An `AlarmControl` scripted through attributes, recording each `act`."""
+    """An `AlarmControl` scripted through attributes, recording each `act` and `report`."""
 
     def __init__(self) -> None:
         self.state = _alarm_state()
         self.snapshot_error: BaseException | None = None
         self.outcome = ToolOutcome(status="ok", summary="Alarm stopped.")
         self.act_error: BaseException | None = None
-        self.acts: list[tuple[str, str, int | None]] = []
+        self.acts: list[tuple[str, str, int | None, str]] = []
+        self.reports: list[dict[str, object]] = []
 
     async def snapshot(self) -> dict[str, object]:
         if self.snapshot_error is not None:
             raise self.snapshot_error
         return dict(self.state)
 
-    async def act(self, alarm_id: str, action: AlarmAction, minutes: int | None) -> ToolOutcome:
-        self.acts.append((alarm_id, action, minutes))
+    async def act(
+        self, alarm_id: str, action: AlarmAction, minutes: int | None, *, endpoint: str
+    ) -> ToolOutcome:
+        self.acts.append((alarm_id, action, minutes, endpoint))
         if self.act_error is not None:
             raise self.act_error
         return self.outcome
+
+    async def report(self, alarm_id: str, **fields: object) -> Literal["applied"]:
+        self.reports.append({"alarm_id": alarm_id, **fields})
+        return "applied"
 
 
 class FailingSleepClock(FakeClock):
@@ -616,7 +623,7 @@ class TestAlarmAction:
         alarms.set_status("unavailable", "MIST_TIMEZONE unset")
         rig = _rig(alarms, FakeCapability("clock"))
 
-        outcome = await rig.host.alarm_action("a1", "stop", None)
+        outcome = await rig.host.alarm_action("a1", "stop", None, endpoint="desktop")
 
         assert outcome.status == "unavailable"
         assert outcome.reason == "MIST_TIMEZONE unset"
@@ -630,7 +637,7 @@ class TestAlarmAction:
         control = FakeAlarmControl()
         rig = _rig(alarms, alarm_control=control)
 
-        outcome = await rig.host.alarm_action("a1", "snooze", 5)
+        outcome = await rig.host.alarm_action("a1", "snooze", 5, endpoint="desktop")
 
         assert (outcome.status, outcome.reason) == (
             "unavailable",
@@ -645,7 +652,7 @@ class TestAlarmAction:
         control = FakeAlarmControl()
         rig = _rig(alarms, alarm_control=control)
 
-        outcome = await rig.host.alarm_action("a1", "stop", None)
+        outcome = await rig.host.alarm_action("a1", "stop", None, endpoint="desktop")
 
         assert (outcome.status, outcome.reason) == ("unavailable", "disabled")
         assert outcome.summary == "Alarms and timers are disabled: disabled."
@@ -659,7 +666,7 @@ class TestAlarmAction:
         rig = _rig(alarms, alarm_control=control)
         await _started(rig)
 
-        outcome = await rig.host.alarm_action("a1", "stop", None)
+        outcome = await rig.host.alarm_action("a1", "stop", None, endpoint="desktop")
 
         assert (outcome.status, outcome.reason) == ("unavailable", "alarm database unwritable")
         assert control.acts == []
@@ -671,7 +678,7 @@ class TestAlarmAction:
         control = FakeAlarmControl()
         rig = _rig(timers, alarm_control=control)
 
-        outcome = await rig.host.alarm_action("t1", "stop", None)
+        outcome = await rig.host.alarm_action("t1", "stop", None, endpoint="desktop")
 
         assert (outcome.status, outcome.reason) == ("unavailable", "MIST_TIMEZONE unset")
         assert control.acts == []
@@ -683,7 +690,7 @@ class TestAlarmAction:
         timers = FakeCapability("timers")
         rig = _rig(timers, alarms, alarm_control=FakeAlarmControl())
 
-        outcome = await rig.host.alarm_action("a1", "stop", None)
+        outcome = await rig.host.alarm_action("a1", "stop", None, endpoint="desktop")
 
         assert outcome.reason == "alarms reason"
 
@@ -691,7 +698,7 @@ class TestAlarmAction:
     async def test_neither_alarms_nor_timers_built(self):
         rig = _rig(FakeCapability("clock"))
 
-        outcome = await rig.host.alarm_action("a1", "stop", None)
+        outcome = await rig.host.alarm_action("a1", "stop", None, endpoint="desktop")
 
         assert outcome.status == "unavailable"
         assert outcome.reason == "alarms and timers are not in MIST_CAPABILITIES"
@@ -702,7 +709,7 @@ class TestAlarmAction:
         rig = _rig(FakeCapability("alarms"))
         caplog.set_level(logging.INFO, logger=LOGGER)
 
-        outcome = await rig.host.alarm_action("a1", "stop", None)
+        outcome = await rig.host.alarm_action("a1", "stop", None, endpoint="desktop")
 
         assert (outcome.status, outcome.reason) == ("unavailable", "alarm control is not wired")
         assert len(_records(caplog, logging.ERROR)) == 1
@@ -716,10 +723,10 @@ class TestAlarmAction:
         control.outcome = ToolOutcome(status="ok", summary="Done.")
         rig = _rig(FakeCapability("alarms"), alarm_control=control)
 
-        outcome = await rig.host.alarm_action("a1", action, minutes)
+        outcome = await rig.host.alarm_action("a1", action, minutes, endpoint="room")
 
         assert outcome == ToolOutcome(status="ok", summary="Done.")
-        assert control.acts == [("a1", action, minutes)]
+        assert control.acts == [("a1", action, minutes, "room")]
 
     @pytest.mark.asyncio
     async def test_degraded_alarms_pass_the_gate(self):
@@ -728,10 +735,10 @@ class TestAlarmAction:
         control = FakeAlarmControl()
         rig = _rig(alarms, alarm_control=control)
 
-        outcome = await rig.host.alarm_action("a1", "dismiss", None)
+        outcome = await rig.host.alarm_action("a1", "dismiss", None, endpoint="desktop")
 
         assert outcome.status == "ok"
-        assert control.acts == [("a1", "dismiss", None)]
+        assert control.acts == [("a1", "dismiss", None, "desktop")]
 
     @pytest.mark.asyncio
     async def test_outcome_from_act_is_redacted(self):
@@ -742,7 +749,7 @@ class TestAlarmAction:
         rig = _rig(FakeCapability("alarms"), alarm_control=control)
         rig.secrets.register(Secret(TOKEN))
 
-        outcome = await rig.host.alarm_action("a1", "stop", None)
+        outcome = await rig.host.alarm_action("a1", "stop", None, endpoint="desktop")
 
         assert outcome.status == "invalid_args"
         assert outcome.summary == "no alarm ***"
@@ -755,7 +762,7 @@ class TestAlarmAction:
         rig = _rig(FakeCapability("alarms"), alarm_control=control)
         rig.secrets.register(Secret(TOKEN))
 
-        outcome = await rig.host.alarm_action("a1", "stop", None)
+        outcome = await rig.host.alarm_action("a1", "stop", None, endpoint="desktop")
 
         assert outcome.status == "error"
         assert outcome.reason == "alarm store locked ***"
@@ -767,7 +774,7 @@ class TestAlarmAction:
         control.act_error = CapabilityUnavailableError("scheduler is dead")
         rig = _rig(FakeCapability("alarms"), alarm_control=control)
 
-        outcome = await rig.host.alarm_action("a1", "snooze", 5)
+        outcome = await rig.host.alarm_action("a1", "snooze", 5, endpoint="desktop")
 
         assert (outcome.status, outcome.reason) == ("unavailable", "scheduler is dead")
 
@@ -778,7 +785,7 @@ class TestAlarmAction:
         rig = _rig(FakeCapability("alarms"), alarm_control=control)
 
         with pytest.raises(RuntimeError, match="bug in act"):
-            await rig.host.alarm_action("a1", "stop", None)
+            await rig.host.alarm_action("a1", "stop", None, endpoint="desktop")
 
     @pytest.mark.asyncio
     async def test_logs_one_info_line_and_writes_no_action_log_row(self, caplog):
@@ -786,7 +793,7 @@ class TestAlarmAction:
         rig = _rig(FakeCapability("alarms"), alarm_control=control)
         caplog.set_level(logging.INFO, logger=LOGGER)
 
-        await rig.host.alarm_action("alarm-42", "snooze", 5)
+        await rig.host.alarm_action("alarm-42", "snooze", 5, endpoint="desktop")
 
         (info,) = _records(caplog, logging.INFO)
         assert "alarm-42" in info.getMessage()

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -18,6 +18,7 @@ from backend.capabilities.events import (
     AlarmActionMessage,
     AlarmActionResultEvent,
     AlarmFiredEvent,
+    AlarmReportMessage,
     AlarmStateEvent,
     CapabilitiesStatusEvent,
     QueueEventSink,
@@ -525,3 +526,193 @@ class TestAlarmActionResult:
 
         with pytest.raises(ValidationError):
             AlarmActionResultEvent.model_validate(dict(payload, outcome="error"))
+
+    @pytest.mark.parametrize(
+        ("status", "result", "wire"),
+        [
+            ("ok", "applied", "ok"),
+            ("ok", "late", "ok"),
+            ("ok", "already_ended", "ok"),
+            ("ok", "duplicate", "ok"),
+            ("invalid_args", "not_due", "invalid_args"),
+            ("invalid_args", "unknown", "invalid_args"),
+        ],
+    )
+    def test_a_report_result_sets_detail(self, status, result, wire):
+        outcome = ToolOutcome(status=status, summary="s", data={"result": result}, reason="why")
+
+        payload = alarm_action_result_payload("a1", "report", "q1", outcome, self.AT_TIME)
+
+        assert payload == {
+            "type": "alarm_action_result",
+            "alarm_id": "a1",
+            "action": "report",
+            "request_id": "q1",
+            "outcome": wire,
+            "reason": None if wire == "ok" else "why",
+            "detail": result,
+            "at": AT,
+        }
+        assert AlarmActionResultEvent.model_validate(payload).to_payload() == payload
+
+    def test_a_report_refused_before_it_ran_has_no_detail(self):
+        outcome = ToolOutcome(status="invalid_args", summary="s", reason="at is too old")
+
+        payload = alarm_action_result_payload("a1", "report", None, outcome, self.AT_TIME)
+
+        assert payload["outcome"] == "invalid_args"
+        assert "detail" not in payload
+
+    def test_detail_is_refused_on_an_action_that_is_not_a_report(self):
+        payload = self._payload(ToolOutcome(status="ok", summary="s"))
+
+        with pytest.raises(ValidationError):
+            AlarmActionResultEvent.model_validate(dict(payload, detail="applied"))
+
+    def test_an_unknown_report_result_is_refused(self):
+        outcome = ToolOutcome(status="ok", summary="s", data={"result": "maybe"})
+
+        with pytest.raises(ValidationError):
+            alarm_action_result_payload("a1", "report", None, outcome, self.AT_TIME)
+
+
+class TestAlarmReportMessage:
+    NOW = datetime(2026, 1, 5, 7, 0, tzinfo=UTC)
+
+    def _parse(self, **changes: object) -> AlarmReportMessage:
+        message: dict[str, object] = {
+            "type": "alarm_report",
+            "alarm_id": "a1",
+            "outcome": "rang",
+            "at": "2026-01-05T06:59:00Z",
+            "rang_at": "2026-01-05T06:59:00Z",
+        }
+        message.update(changes)
+        message = {key: value for key, value in message.items() if value is not None}
+        return AlarmReportMessage.model_validate(message, context={"now": self.NOW})
+
+    def test_a_rang_report_validates_and_round_trips(self):
+        parsed = self._parse(request_id="q1")
+
+        assert parsed.outcome == "rang"
+        assert parsed.at == datetime(2026, 1, 5, 6, 59, tzinfo=UTC)
+        assert parsed.to_payload() == {
+            "type": "alarm_report",
+            "alarm_id": "a1",
+            "outcome": "rang",
+            "at": "2026-01-05T06:59:00Z",
+            "rang_at": "2026-01-05T06:59:00Z",
+            "request_id": "q1",
+        }
+
+    def test_a_stopped_report_may_come_after_its_ring_started(self):
+        parsed = self._parse(outcome="stopped", rang_at="2026-01-05T06:30:00Z")
+
+        assert parsed.rang_at < parsed.at
+
+    def test_a_snoozed_report_carries_snoozed_until(self):
+        parsed = self._parse(
+            outcome="snoozed",
+            rang_at="2026-01-05T06:30:00Z",
+            snoozed_until="2026-01-05T07:08:00Z",
+        )
+
+        assert parsed.snoozed_until == datetime(2026, 1, 5, 7, 8, tzinfo=UTC)
+        assert parsed.to_payload()["snoozed_until"] == "2026-01-05T07:08:00Z"
+
+    @pytest.mark.parametrize("field", ["type", "alarm_id", "outcome", "at", "rang_at"])
+    def test_a_missing_required_field_is_refused(self, field):
+        with pytest.raises(ValidationError):
+            self._parse(**{field: None})
+
+    @pytest.mark.parametrize("field", ["endpoint", "minutes", "extra"])
+    def test_an_unknown_field_is_refused_and_no_payload_names_its_endpoint(self, field):
+        with pytest.raises(ValidationError):
+            self._parse(**{field: "desktop"})
+
+    def test_it_has_no_endpoint_field(self):
+        assert "endpoint" not in AlarmReportMessage.model_fields
+
+    @pytest.mark.parametrize(
+        "changes",
+        [
+            pytest.param({"at": "2026-01-05T06:59:00"}, id="naive-at"),
+            pytest.param({"rang_at": "2026-01-05T06:59:00"}, id="naive-rang-at"),
+            pytest.param(
+                {"at": "2026-01-04T06:59:59Z", "rang_at": "2026-01-04T06:59:59Z"},
+                id="over-24h-old",
+            ),
+            pytest.param(
+                {"at": "2026-01-05T07:01:01Z", "rang_at": "2026-01-05T07:01:01Z"},
+                id="over-60s-ahead",
+            ),
+            pytest.param(
+                {"outcome": "stopped", "rang_at": "2026-01-04T06:00:00Z"},
+                id="rang-at-over-24h-old",
+            ),
+            pytest.param(
+                {"outcome": "stopped", "rang_at": "2026-01-05T06:59:01Z"},
+                id="rang-at-after-at",
+            ),
+            pytest.param({"rang_at": "2026-01-05T06:58:00Z"}, id="rang-with-rang-at-not-at"),
+            pytest.param({"outcome": "snoozed"}, id="snoozed-without-until"),
+            pytest.param(
+                {"outcome": "stopped", "snoozed_until": "2026-01-05T07:08:00Z"},
+                id="until-with-stopped",
+            ),
+            pytest.param({"snoozed_until": "2026-01-05T07:08:00Z"}, id="until-with-rang"),
+            pytest.param(
+                {"outcome": "snoozed", "snoozed_until": "2026-01-05T07:08:00"},
+                id="naive-until",
+            ),
+            pytest.param({"outcome": "dismiss"}, id="unknown-outcome"),
+            pytest.param({"type": "alarm_action"}, id="wrong-type"),
+            pytest.param({"request_id": ""}, id="request-id-empty"),
+            pytest.param({"request_id": "q" * 65}, id="request-id-65"),
+        ],
+    )
+    def test_a_report_outside_the_protocol_is_refused(self, changes):
+        with pytest.raises(ValidationError):
+            self._parse(**changes)
+
+    @pytest.mark.parametrize(
+        ("at", "loads"),
+        [
+            ("2026-01-04T07:00:00Z", True),
+            ("2026-01-05T07:01:00Z", True),
+            ("2026-01-04T06:59:59Z", False),
+            ("2026-01-05T07:01:01Z", False),
+        ],
+        ids=["24h-old", "60s-ahead", "past-24h", "past-60s"],
+    )
+    def test_the_window_bounds_are_inclusive(self, at, loads):
+        if loads:
+            assert self._parse(at=at, rang_at=at).at == datetime.fromisoformat(at)
+        else:
+            with pytest.raises(ValidationError):
+                self._parse(at=at, rang_at=at)
+
+    def test_window_error_names_what_is_wrong_against_a_given_now(self):
+        parsed = self._parse()
+
+        assert parsed.window_error(self.NOW) is None
+        error = parsed.window_error(self.NOW + timedelta(days=2))
+        assert error is not None
+        assert "at" in error
+
+    def test_without_a_context_the_window_is_the_real_clock(self):
+        now = datetime.now(UTC)
+
+        def report(at: datetime) -> dict[str, object]:
+            stamp = at.isoformat()
+            return {
+                "type": "alarm_report",
+                "alarm_id": "a1",
+                "outcome": "rang",
+                "at": stamp,
+                "rang_at": stamp,
+            }
+
+        assert AlarmReportMessage.model_validate(report(now)).at == now
+        with pytest.raises(ValidationError):
+            AlarmReportMessage.model_validate(report(now - timedelta(days=2)))

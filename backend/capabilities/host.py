@@ -78,6 +78,7 @@ from backend.errors import (
 from backend.llm.models import ToolCall
 
 from .action_log import ActionLog, ActionLogEntry
+from .alarms.records import ReportOutcome, ReportResult
 from .clock import Clock
 from .config import CapabilitiesConfig
 from .contracts import (
@@ -101,6 +102,7 @@ from .decoder import ActionDecoder
 from .events import (
     ActionProposedEvent,
     ActionResolvedEvent,
+    AlarmReportMessage,
     AlarmStateEvent,
     CapabilitiesStatusEvent,
     CapabilityStatusEntry,
@@ -217,11 +219,35 @@ class AlarmControl(Protocol):
         """
         ...
 
-    async def act(self, alarm_id: str, action: AlarmAction, minutes: int | None) -> ToolOutcome:
+    async def act(
+        self, alarm_id: str, action: AlarmAction, minutes: int | None, *, endpoint: str
+    ) -> ToolOutcome:
         """Stop or snooze a ringing alarm, or dismiss a missed one.
+
+        `endpoint` is the endpoint of the connection the action arrived on, recorded as the
+        actor; a stop or snooze from any endpoint ends or snoozes the alarm everywhere.
 
         Raises:
             CapabilityStoreError: The alarm store cannot be written.
+            CapabilityUnavailableError: The scheduler is not running; the message is its
+                health reason.
+        """
+        ...
+
+    async def report(
+        self,
+        alarm_id: str,
+        *,
+        endpoint: str,
+        outcome: ReportOutcome,
+        at: datetime,
+        rang_at: datetime,
+        snoozed_until: datetime | None,
+    ) -> ReportResult:
+        """Apply an endpoint's `alarm_report` (`AlarmScheduler.report`).
+
+        Raises:
+            CapabilityStoreError: The alarm store cannot be read or written.
             CapabilityUnavailableError: The scheduler is not running; the message is its
                 health reason.
         """
@@ -344,6 +370,7 @@ class CapabilityHost(CapabilityTurnPort):
         power: PowerState = FixedPower(),
         tiers: TierProviders | None = None,
         register: ReplyRegister = NoAddress(),
+        turn_endpoint: str = "desktop",
     ) -> None:
         """Register the capabilities; nothing is started and no file is touched.
 
@@ -371,6 +398,9 @@ class CapabilityHost(CapabilityTurnPort):
             register: Supplies the address form that ends each session's first templated
                 reply (`with_address`). `NoAddress()` by default, which leaves every reply
                 as `replies.py` renders it.
+            turn_endpoint: The endpoint every call's `InvocationContext.endpoint` names when
+                its context names none: `desktop`, the endpoint of typed turns, until turns
+                are routed per connection.
 
         Raises:
             CapabilityRegistrationError: Two capabilities share a name, or two offer the same
@@ -416,6 +446,7 @@ class CapabilityHost(CapabilityTurnPort):
         self._power = power
         self._tiers = tiers
         self._register = register
+        self._turn_endpoint = turn_endpoint
         # Sessions that have had a templated reply, so only each one's first is addressed.
         self._addressed: set[str] = set()
         # Per session, the `received_at` of the turn `plan_turn` built a decode for, which its
@@ -571,20 +602,82 @@ class CapabilityHost(CapabilityTurnPort):
         return events
 
     async def alarm_action(
-        self, alarm_id: str, action: AlarmAction, minutes: int | None
+        self, alarm_id: str, action: AlarmAction, minutes: int | None, *, endpoint: str
     ) -> ToolOutcome:
         """Run a client's `stop`, `snooze` or `dismiss` on an alarm through the alarm control.
 
-        The status of alarms, or of timers when alarms is not built, gates it as step 4 of the
-        pipeline gates a tool call: while it is `unavailable` or `disabled`, the answer is
-        `unavailable` with the reason the status surface shows, and `act` is not called. A
-        `CapabilityError` from `act` becomes the outcome step 7 gives it. The outcome is
-        redacted. Any other exception from `act` propagates to the caller.
+        `endpoint` is the endpoint of the connection the action arrived on, which `act`
+        records as the actor. The status of alarms, or of timers when alarms is not built,
+        gates it as step 4 of the pipeline gates a tool call: while it is `unavailable` or
+        `disabled`, the answer is `unavailable` with the reason the status surface shows, and
+        `act` is not called. A `CapabilityError` from `act` becomes the outcome step 7 gives
+        it. The outcome is redacted. Any other exception from `act` propagates to the caller.
 
         No action-log row is written: the log's sources cover turn and proposal calls, and
         the alarm store records the transition itself.
         """
-        logger.info("Alarm action %s for alarm %s", action, alarm_id)
+        logger.info("Alarm action %s for alarm %s from %s", action, alarm_id, endpoint)
+        control = self._alarm_gate(f"Alarm action {action}", alarm_id)
+        if isinstance(control, ToolOutcome):
+            return control
+        try:
+            outcome = await control.act(alarm_id, action, minutes, endpoint=endpoint)
+        except CapabilityError as exc:
+            logger.warning(
+                "Alarm action %s for alarm %s failed: %s",
+                action,
+                alarm_id,
+                self.redact(_describe(exc)),
+            )
+            outcome = _outcome_for_error(f"alarm {action}", exc)
+        return self._redacted(outcome)
+
+    async def alarm_report(self, message: AlarmReportMessage, *, endpoint: str) -> ToolOutcome:
+        """Apply an endpoint's `alarm_report` through the alarm control's `report`.
+
+        `endpoint` is the endpoint of the connection the report arrived on; the message
+        carries none. It is gated as `alarm_action` is. The report's times are checked again
+        against the host's clock, since the message was validated on arrival: one outside the
+        window answers `invalid_args` and `report` is not called. The `ReportResult` is the
+        outcome's `data` `{"result": ...}`: `ok` for `applied`, `late`, `already_ended` and
+        `duplicate`, and `invalid_args` for `not_due` and `unknown`. A `CapabilityError` from
+        `report` becomes the outcome step 7 gives it; the outcome is redacted, and any other
+        exception propagates. As for `alarm_action`, no action-log row is written.
+        """
+        alarm_id = message.alarm_id
+        logger.info("Alarm report %s for alarm %s from %s", message.outcome, alarm_id, endpoint)
+        control = self._alarm_gate("Alarm report", alarm_id)
+        if isinstance(control, ToolOutcome):
+            return control
+        window_error = message.window_error(self._clock.now())
+        if window_error is not None:
+            return ToolOutcome(
+                status="invalid_args",
+                summary=f"Alarm report refused: {window_error}.",
+                reason=window_error,
+            )
+        try:
+            result = await control.report(
+                alarm_id,
+                endpoint=endpoint,
+                outcome=message.outcome,
+                at=message.at,
+                rang_at=message.rang_at,
+                snoozed_until=message.snoozed_until,
+            )
+        except CapabilityError as exc:
+            logger.warning(
+                "Alarm report for alarm %s failed: %s", alarm_id, self.redact(_describe(exc))
+            )
+            return self._redacted(_outcome_for_error("alarm report", exc))
+        return self._redacted(_report_outcome(result))
+
+    def _alarm_gate(self, what: str, alarm_id: str) -> AlarmControl | ToolOutcome:
+        """Return the alarm control when the alarm status lets a client's request through.
+
+        Otherwise return the `unavailable` outcome that answers it: alarms and timers not
+        built, their gating status `unavailable` or `disabled`, or no alarm control passed.
+        """
         statuses = {
             capability.name: status
             for capability, status in zip(self._capabilities, self.statuses())
@@ -605,9 +698,9 @@ class CapabilityHost(CapabilityTurnPort):
             )
         if self._alarm_control is None:
             logger.error(
-                "Alarm action %s for alarm %s cannot run: alarms or timers is built but no "
-                "alarm control was passed to the host",
-                action,
+                "%s for alarm %s cannot run: alarms or timers is built but no alarm control "
+                "was passed to the host",
+                what,
                 alarm_id,
             )
             return ToolOutcome(
@@ -615,17 +708,7 @@ class CapabilityHost(CapabilityTurnPort):
                 summary=f"Alarms and timers are unavailable: {ALARM_CONTROL_NOT_WIRED_REASON}.",
                 reason=ALARM_CONTROL_NOT_WIRED_REASON,
             )
-        try:
-            outcome = await self._alarm_control.act(alarm_id, action, minutes)
-        except CapabilityError as exc:
-            logger.warning(
-                "Alarm action %s for alarm %s failed: %s",
-                action,
-                alarm_id,
-                self.redact(_describe(exc)),
-            )
-            outcome = _outcome_for_error(f"alarm {action}", exc)
-        return self._redacted(outcome)
+        return self._alarm_control
 
     # -- CapabilityTurnPort ----------------------------------------------------------------
 
@@ -768,7 +851,12 @@ class CapabilityHost(CapabilityTurnPort):
 
         now = self._clock.now()
         items = [
-            (call, InvocationContext(session_id, turn_id, utterance, call.id, "model", now))
+            (
+                call,
+                InvocationContext(
+                    session_id, turn_id, utterance, call.id, "model", now, self._turn_endpoint
+                ),
+            )
             for call in calls
         ]
         async with self._lock(session_id):
@@ -847,9 +935,12 @@ class CapabilityHost(CapabilityTurnPort):
         Returns:
             The record. A call that needs confirmation becomes a proposal of its own,
             superseding the session's live one, and its outcome is `pending_confirmation`.
-            Its `turn_ms` counts from this call.
+            Its `turn_ms` counts from this call. A context that names no endpoint is given the
+            host's turn endpoint.
         """
         received = time.monotonic()
+        if ctx.endpoint is None:
+            ctx = dataclasses.replace(ctx, endpoint=self._turn_endpoint)
         async with self._lock(ctx.session_id):
             (record,) = await self._run_calls(
                 ctx.session_id, [(tool_call, ctx)], offered, None, received
@@ -1176,6 +1267,7 @@ class CapabilityHost(CapabilityTurnPort):
                 tool_call_id=str(uuid.uuid4()),
                 source="proposal",
                 now=self._clock.now(),
+                endpoint=self._turn_endpoint,
             )
             processed = await self._decide_and_run(
                 _Ready(capability, spec, call.args, call.summary), ctx, received
@@ -1234,6 +1326,7 @@ class CapabilityHost(CapabilityTurnPort):
                 tool_call_id=str(uuid.uuid4()),
                 source="fastpath",
                 now=self._clock.now(),
+                endpoint=self._turn_endpoint,
             )
             record = await self._record(
                 ctx,
@@ -1270,6 +1363,7 @@ class CapabilityHost(CapabilityTurnPort):
             tool_call_id=call.id,
             source="fastpath",
             now=self._clock.now(),
+            endpoint=self._turn_endpoint,
         )
         async with self._lock(session_id):
             records = await self._run_calls(session_id, [(call, ctx)], None, None, received)
@@ -1515,6 +1609,22 @@ def _outcome_for_error(tool: str, exc: CapabilityError) -> ToolOutcome:
             status="invalid_args", summary=f"Invalid details for {tool}: {reason}.", reason=reason
         )
     return ToolOutcome(status="error", summary=f"{tool} failed.", reason=reason)
+
+
+_REPORT_SUMMARIES: dict[ReportResult, tuple[OutcomeStatus, str, str | None]] = {
+    "applied": ("ok", "Alarm report applied.", None),
+    "late": ("ok", "Alarm report recorded: the ring started after the grace window.", None),
+    "already_ended": ("ok", "Alarm report recorded: the alarm had already ended.", None),
+    "duplicate": ("ok", "Alarm report already received.", None),
+    "not_due": ("invalid_args", "Alarm report refused: the alarm is not due yet.", "not due"),
+    "unknown": ("invalid_args", "Alarm report refused: no such alarm.", "unknown alarm"),
+}
+
+
+def _report_outcome(result: ReportResult) -> ToolOutcome:
+    """The outcome of an `alarm_report` the records answered, with the result in its data."""
+    status, summary, reason = _REPORT_SUMMARIES[result]
+    return ToolOutcome(status=status, summary=summary, data={"result": result}, reason=reason)
 
 
 def _timeout_outcome(tool: str, timeout: float) -> ToolOutcome:

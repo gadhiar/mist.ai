@@ -160,6 +160,8 @@ class InvocationContext:
         tool_call_id: Correlates the call's `tool_call_started` and `tool_call_completed`.
         source: Policy applies by source; an approved proposal skips it.
         now: Aware UTC time of the call.
+        endpoint: The endpoint the turn came from (`desktop` for typed turns), so a capability
+            such as alarms can act where the user is; None when no host filled it.
     """
 
     session_id: str
@@ -168,6 +170,7 @@ class InvocationContext:
     tool_call_id: str
     source: CallSource
     now: datetime
+    endpoint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
