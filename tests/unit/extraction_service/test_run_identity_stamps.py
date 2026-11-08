@@ -278,6 +278,7 @@ def test_the_effective_constrained_mode_is_recorded(service_settings):
         "LIST_ITEM_USER_TEMPLATE",
         "LIST_FRAME_REPAIR_INSTRUCTION",
         "LIST_ITEM_REPAIR_INSTRUCTION",
+        "LIST_REFUSAL_TEMPLATE",
     ],
 )
 def test_a_prompt_edit_moves_the_identity(service_settings, monkeypatch, name):

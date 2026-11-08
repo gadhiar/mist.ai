@@ -6,7 +6,8 @@ plus the composed model_hash). A prompt edit that left it unchanged would make
 two different requests look identical in the audit trail, so each component
 must move the hash on its own: the scope, extraction and derivation templates,
 the Stage 2 empty-context placeholder and repair instruction, the list system
-prompt, user templates and repair instructions, the five output schemas, and
+prompt, user templates, repair instructions and the refusal line its repairs end
+with, the five output schemas, and
 the adapter identity. The two list schemas are hashed in declared key order,
 because the order changes what the grammar lets the model emit.
 """
@@ -34,6 +35,7 @@ _COMPONENTS = (
     "LIST_ITEM_USER_TEMPLATE",
     "LIST_FRAME_REPAIR_INSTRUCTION",
     "LIST_ITEM_REPAIR_INSTRUCTION",
+    "LIST_REFUSAL_TEMPLATE",
 )
 
 _SCHEMAS = (

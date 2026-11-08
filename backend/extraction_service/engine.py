@@ -55,6 +55,8 @@ from backend.extraction_service.adapters import ModelFamilyAdapter
 from backend.extraction_service.list_schemas import (
     LIST_FRAME_OUTPUT_SCHEMA,
     LIST_ITEM_OUTPUT_SCHEMA,
+    list_frame_output_schema,
+    list_item_output_schema,
 )
 from backend.extraction_service.schemas import (
     DERIVATION_OUTPUT_SCHEMA,
@@ -76,6 +78,7 @@ from backend.knowledge.extraction.list_frames import (
     ItemOutput,
     ListGroup,
     group_units,
+    item_slots,
     parse_frame_output,
     parse_item_output,
     render_frame_input,
@@ -85,7 +88,9 @@ from backend.knowledge.extraction.list_prompts import (
     LIST_FRAME_USER_TEMPLATE,
     LIST_ITEM_REPAIR_INSTRUCTION,
     LIST_ITEM_USER_TEMPLATE,
+    LIST_REFUSAL_TEMPLATE,
     LIST_SYSTEM_PROMPT,
+    list_repair_text,
     render_frames_for_items,
 )
 from backend.knowledge.extraction.ontology_extractor import (
@@ -196,10 +201,10 @@ def list_call_fits(messages: Sequence[Mapping[str, str]]) -> bool:
 # above, whose renderers, strict parsers and list assembly Stages 1.5, 2 and 9
 # call, `canonical_id`, which the list assembly builds Metric ids with, the
 # validator, whose relationship constraints the list parsers check templates
-# and item entities against, and the provider module the service builds.
-# Whole modules rather than functions, so a
-# helper a covered function calls is covered too; an edit elsewhere in a
-# covered module costs one `CODE_REVISIONS` line, never a silent miss.
+# and item entities against, and the provider module the service builds. Whole
+# modules rather than functions, so a helper a covered function calls is
+# covered too; an edit elsewhere in a covered module costs one `CODE_REVISIONS`
+# line, never a silent miss.
 RUN_IDENTITY_CODE: tuple[ModuleType, ...] = tuple(
     importlib.import_module(name)
     for name in (
@@ -440,6 +445,11 @@ class _ListTurn:
     def subject_scope(self) -> str:
         return self.pre_processed.metadata.get("subject_scope", "unknown")
 
+    @property
+    def item_ids(self) -> tuple[str, ...]:
+        """Every item id of the turn, group by group, as the render lists them."""
+        return tuple(item for group in self.groups for item in group.item_ids)
+
 
 def _list_turn(
     pre_processed: PreProcessedInput,
@@ -537,10 +547,12 @@ def _compute_prompt_sha256(adapter: ModelFamilyAdapter) -> str:
     retry, the three constrained-decoding output schemas (serialised with
     sorted keys; hashed whether or not the active mode sends them, which
     only makes the stamp stricter), the list path's system prompt, its two
-    user templates and two repair instructions, its two output schemas, and
-    the adapter's own name/version. The list schemas are serialised in
-    declared key order, because the grammar emits keys in that order, so a
-    reorder changes decoding.
+    user templates, two repair instructions and the refusal line each list
+    repair ends with, its two output schemas, and the adapter's own
+    name/version. The list schemas are serialised in declared key order,
+    because the grammar emits keys in that order, so a reorder changes
+    decoding. They are the static supersets every call's built schema
+    narrows; the builders are code, which `code_sha256` covers.
 
     Not covered: the PreProcessor's context formatting (code, not a
     template) and request parameters (temperature, max_tokens, reasoning
@@ -573,6 +585,7 @@ def _compute_prompt_sha256(adapter: ModelFamilyAdapter) -> str:
             LIST_ITEM_USER_TEMPLATE,
             LIST_FRAME_REPAIR_INSTRUCTION,
             LIST_ITEM_REPAIR_INSTRUCTION,
+            LIST_REFUSAL_TEMPLATE,
             json.dumps(LIST_FRAME_OUTPUT_SCHEMA, sort_keys=False),
             json.dumps(LIST_ITEM_OUTPUT_SCHEMA, sort_keys=False),
             adapter.name,
@@ -800,6 +813,13 @@ class ExtractionEngine:
         unparsable sends the turn through the r6 list pass too. The item calls
         start from the history the frame message kept.
 
+        Each call sends the schema built for it, so most shapes the parsers
+        refuse cannot be decoded: the frame call's from the turn's groups and
+        items, each item call's from the item slots the parsed frame gives its
+        batch. A refused output is repaired with the stage's repair text and a
+        line naming the refusal, because at temperature 0 a repair that names
+        no reason tends to repeat the output.
+
         Adds the assembled payload and the path's warnings to `run`.
 
         Raises:
@@ -827,15 +847,20 @@ class ExtractionEngine:
             await self._run_list_pass(pre_processed, turn.units, run)
             return
 
+        schema = list_frame_output_schema(
+            [group.gid for group in turn.groups],
+            {group.gid for group in turn.groups if group.parent is not None},
+            turn.item_ids,
+        )
         try:
             frame = await self._list_attempts(
                 user,
                 turn,
                 run,
                 max_tokens=LIST_FRAME_MAX_TOKENS,
-                schema=LIST_FRAME_OUTPUT_SCHEMA,
+                schema=schema,
                 parse=lambda raw: parse_frame_output(raw, turn.groups),
-                repair=LIST_FRAME_REPAIR_INSTRUCTION,
+                repair=lambda error: list_repair_text(LIST_FRAME_REPAIR_INSTRUCTION, error),
             )
         except (_OutputTruncatedError, _OutputUnparsableError) as exc:
             if isinstance(exc, _OutputUnparsableError) and exc.repair_skipped:
@@ -903,6 +928,11 @@ class ExtractionEngine:
             return
 
         earlier = {output.item: output for output in outputs}
+        schema = list_item_output_schema(
+            item_slots(frame, turn.groups, ids),
+            [entity.key for entity in frame.frame_entities],
+            turn.item_ids,
+        )
         try:
             outputs.extend(
                 await self._list_attempts(
@@ -910,9 +940,9 @@ class ExtractionEngine:
                     turn,
                     run,
                     max_tokens=LIST_ITEM_MAX_TOKENS,
-                    schema=LIST_ITEM_OUTPUT_SCHEMA,
+                    schema=schema,
                     parse=lambda raw: parse_item_output(raw, ids, frame, turn.groups, earlier),
-                    repair=LIST_ITEM_REPAIR_INSTRUCTION,
+                    repair=lambda error: list_repair_text(LIST_ITEM_REPAIR_INSTRUCTION, error),
                 )
             )
             return
@@ -1023,7 +1053,7 @@ class ExtractionEngine:
         max_tokens: int,
         schema: dict,
         parse: Callable[[str], _Parsed],
-        repair: str,
+        repair: str | Callable[[ExtractionValidationError], str],
     ) -> _Parsed:
         """One frame or item call sequence, timed into `run`, its repairs budgeted.
 
@@ -1053,7 +1083,7 @@ class ExtractionEngine:
         max_tokens: int,
         schema: dict,
         parse: Callable[[str], _Parsed],
-        repair: str,
+        repair: str | Callable[[ExtractionValidationError], str],
         fits: Callable[[Sequence[Mapping[str, str]]], bool] | None = None,
     ) -> _Parsed:
         """One Stage 2 call sequence: strict parse with repair-retry up to `max_attempts`.
@@ -1071,7 +1101,11 @@ class ExtractionEngine:
             schema: The output schema sent in `schema` constrained mode.
             parse: The strict parser; an `ExtractionValidationError` from it
                 gets the repair retry.
-            repair: The instruction sent after a failed output.
+            repair: The instruction sent after a failed output, or a function
+                of the parser's error that returns it. The list calls pass a
+                function, so the repair names the refusal; the r6 batches pass
+                the fixed `_REPAIR_INSTRUCTION`, so their requests stay as
+                they were.
             fits: When given, called with the whole message list before each
                 repair attempt; a False return ends the attempts as an
                 unparsable output, with `repair_skipped` set. The r6 batches
@@ -1131,7 +1165,7 @@ class ExtractionEngine:
                 messages = [
                     *messages,
                     {"role": "assistant", "content": raw},
-                    {"role": "user", "content": repair},
+                    {"role": "user", "content": repair if isinstance(repair, str) else repair(exc)},
                 ]
                 continue
 
