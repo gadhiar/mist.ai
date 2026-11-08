@@ -2,7 +2,8 @@
 
 Runs on the Windows host in a no-gaming session (Python 3.11.9) and its
 `voice` subcommand shells out to a copy of `probes/voice_vram.py` running
-inside the mist-backend container (Python 3.11.0rc1). Stops MIST's
+inside the mist-backend container (the CPython 3.11 release that
+`docker/backend/Dockerfile` pins). Stops MIST's
 production containers, serves a pinned llama-server build under the name
 `mist-bench-llm`, runs benchmark suites against it, and restores MIST
 exactly. Stdlib only (see `probes/voice_vram.py` for the one exception).
