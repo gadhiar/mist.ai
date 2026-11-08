@@ -77,11 +77,17 @@ EventKind = Literal[
     "reported",
 ]
 EventSource = Literal["fastpath", "model", "proposal", "alarm_action", "alarm_report", "scheduler"]
+ReportOutcome = Literal["rang", "stopped", "snoozed"]
+ReportResult = Literal["applied", "late", "already_ended", "duplicate", "not_due", "unknown"]
 RingTarget = Literal["all"] | tuple[str, ...]
 """`all`, or endpoint names: sorted, unique, at least one."""
 
 MAX_EVENTS = 20_000
 MAX_DURATION_S = 86_400
+REPORT_MAX_AGE = timedelta(hours=24)
+"""How old a report's `at` and `rang_at` may be; the caller checks it before `report`."""
+REPORT_MAX_AHEAD = timedelta(seconds=60)
+"""How far ahead of the owner's clock an endpoint's may run (skew tolerance); checked likewise."""
 
 _KINDS: frozenset[str] = frozenset({"alarm", "timer"})
 _CATEGORIES: frozenset[str] = frozenset({"one_off", "recurring", "tagged"})
@@ -93,6 +99,7 @@ _OUTCOMES: frozenset[str] = frozenset(
 _SOURCES: frozenset[str] = frozenset(
     {"fastpath", "model", "proposal", "alarm_action", "alarm_report", "scheduler"}
 )
+_REPORT_OUTCOMES: frozenset[str] = frozenset({"rang", "stopped", "snoozed"})
 _ALL = "all"
 _WALL_TIME = re.compile(r"([01]\d|2[0-3]):([0-5]\d)")
 # The latest stored time a row may hold. The furthest a caller adds to a stored time is the ring
@@ -208,6 +215,15 @@ _SET_SENT_TO = "UPDATE alarm_occurrences SET sent_to = ? WHERE id = ? AND state 
 _SET_DELIVERED_TO = (
     "UPDATE alarm_occurrences SET delivered_to = ? WHERE id = ? AND state = 'ringing'"
 )
+_MISSED_TO_SNOOZED = (
+    "UPDATE alarm_occurrences SET state = 'snoozed', next_fire_at = ?, "
+    "fired_at = COALESCE(fired_at, ?), missed_at = NULL, missed_reason = NULL "
+    "WHERE id = ? AND state = 'missed'"
+)
+_SNOOZE_LATER = (
+    "UPDATE alarm_occurrences SET next_fire_at = ? "
+    "WHERE id = ? AND state = 'snoozed' AND next_fire_at < ?"
+)
 _SET_OCCURRENCE_RING_ON = "UPDATE alarm_occurrences SET ring_on = ? WHERE id = ?"
 _DELETE_OCCURRENCE = "DELETE FROM alarm_occurrences WHERE id = ?"
 
@@ -220,6 +236,13 @@ _INSERT_EVENT = (
 _TRIM_EVENTS = "DELETE FROM alarm_events WHERE seq <= (SELECT MAX(seq) FROM alarm_events) - ?"
 _SELECT_EVENTS_SINCE = "SELECT at, kind, detail FROM alarm_events WHERE at >= ? ORDER BY seq"
 _SELECT_OLDEST_EVENT = "SELECT at FROM alarm_events ORDER BY seq LIMIT 1"
+_SELECT_REPORTED = (
+    "SELECT detail FROM alarm_events "
+    "WHERE occurrence_id = ? AND kind = 'reported' AND endpoint = ? AND at = ?"
+)
+_SELECT_ENDED_RECORD = (
+    "SELECT record_id FROM alarm_events WHERE occurrence_id = ? ORDER BY seq LIMIT 1"
+)
 _BUMP_REV = "UPDATE alarm_records_rev SET rev = rev + 1 WHERE id = 1"
 _SELECT_REV = "SELECT rev FROM alarm_records_rev WHERE id = 1"
 
@@ -311,6 +334,28 @@ class _ArmWrite:
     created_record: bool
     already_set: bool
     moved: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _Report:
+    """An endpoint's report as `report`'s transaction applies it, its times encoded."""
+
+    endpoint: str
+    outcome: ReportOutcome
+    at: datetime
+    rang_at: datetime
+    snoozed_until: datetime | None
+    now: datetime
+    next_at: str | None
+    next_id: str
+
+    @property
+    def stamp(self) -> str:
+        return _encode_time(self.at)
+
+    @property
+    def rang_stamp(self) -> str:
+        return _encode_time(self.rang_at)
 
 
 def normalise_label(label: str) -> str:
@@ -658,20 +703,19 @@ class AlarmRecords:
                 changed = conn.execute(_TO_MISSED_LATE, params).rowcount > 0
             if not changed:
                 return False
-            detail: dict[str, object] = {}
             if from_state == "scheduled":
-                conn.execute(_RECORD_FIRED, (stamp, record_id))
-                if next_at is not None:
-                    if not repeating:
-                        raise ValueError(
-                            f"occurrence {occurrence_id} has no weekday set, so no next occurrence"
-                        )
-                    conn.execute(
-                        _INSERT_OCCURRENCE, (next_id, record_id, ring_on, next_at, next_at)
-                    )
-                    detail["next_occurrence_id"] = next_id
+                detail = _count_first_fire(
+                    conn,
+                    occurrence_id,
+                    record_id,
+                    ring_on,
+                    bool(repeating),
+                    stamp,
+                    next_at,
+                    next_id,
+                )
             else:
-                detail["after_snooze"] = True
+                detail = {"after_snooze": True}
             if outcome == "missed":
                 conn.execute(_RECORD_OUTCOME, ("missed", record_id))
                 detail["reason"] = "late"
@@ -999,6 +1043,117 @@ class AlarmRecords:
         self._forget("occurrence", cancelled)
         return len(cancelled)
 
+    async def report(
+        self,
+        occurrence_id: str,
+        *,
+        endpoint: str,
+        outcome: ReportOutcome,
+        at: datetime,
+        rang_at: datetime,
+        snoozed_until: datetime | None,
+        now: datetime,
+        next_fire_at: datetime | None,
+        grace: timedelta,
+    ) -> ReportResult:
+        """Apply an endpoint's report of a ring by the occurrence's state, in one write transaction.
+
+        The caller has validated the report (`REPORT_MAX_AGE`, `REPORT_MAX_AHEAD`, `rang_at` not
+        after `at` and equal to it for `rang`). `rang_at` is when the reported ring started and
+        `at` when its outcome happened. A report whose occurrence, endpoint, outcome and `at`
+        match a `reported` event in the trail is a resend: `duplicate`, writing nothing. Else:
+
+        - Scheduled and due by `at` (the owner has not fired it): the report is the firing, at
+          `rang_at`, with the series' next occurrence when `next_fire_at` is given and the
+          endpoint in `delivered_to`; then the outcome applies as for a ringing one.
+        - Scheduled and not due: `not_due`, writing nothing.
+        - Ringing: `rang` adds the endpoint to `delivered_to`, `stopped` finishes it, `snoozed`
+          snoozes it until `snoozed_until`.
+        - Snoozed: `rang` is recorded only, `stopped` finishes it, `snoozed` keeps the later of
+          its fire time and `snoozed_until`.
+        - Missed: `rang` ends it `timed_out`, since it was heard; `stopped` ends it `stopped`;
+          `snoozed` snoozes it, or ends it `timed_out` when `snoozed_until` is not after `now`.
+        - Ended (only its events remain): `already_ended`.
+        - Unknown (no row and no event): `unknown`, writing nothing.
+
+        A scheduled or missed occurrence whose `rang_at` is after `next_fire_at + grace` came
+        from a ring no endpoint following D3 plays, so it is recorded only and gives `late`; the
+        occurrence keeps to the owner's grace rule. The bound is on the ring's start, so a timely
+        ring stopped after local snoozes still applies. Every answer but `duplicate`, `not_due`
+        and `unknown` appends exactly one `reported` event at `at`, with the endpoint in its
+        column and the outcome, `rang_at` and result in its detail, which is what the duplicate
+        check matches.
+
+        Args:
+            grace: The effective grace window, max(60 s, `missed_grace_s`).
+            next_fire_at: The series' next instant, when the report fires a repeating record.
+
+        Returns:
+            `applied`, `late`, `already_ended`, `duplicate`, `not_due` or `unknown`.
+
+        Raises:
+            ValueError: `outcome` is unknown, the endpoint name is invalid, a time is naive,
+                `snoozed_until` is not given exactly with `snoozed`, `grace` is negative, or
+                `next_fire_at` is given when a record with no weekday set would fire; nothing is
+                written.
+            CapabilityStoreError: The write failed, or the occurrence's row does not decode.
+        """
+        if outcome not in _REPORT_OUTCOMES:
+            raise ValueError(f"unknown report outcome {outcome!r}")
+        (name,) = _check_names([endpoint])
+        if (snoozed_until is None) == (outcome == "snoozed"):
+            raise ValueError("snoozed_until is given exactly when the outcome is snoozed")
+        if not isinstance(grace, timedelta) or grace < timedelta(0):
+            raise ValueError(f"grace must be a non-negative timedelta: {grace!r}")
+        report = _Report(
+            endpoint=name,
+            outcome=outcome,
+            at=_to_utc(at, "at"),
+            rang_at=_to_utc(rang_at, "rang_at"),
+            snoozed_until=(
+                None if snoozed_until is None else _to_utc(snoozed_until, "snoozed_until")
+            ),
+            now=_to_utc(now, "now"),
+            next_at=(
+                None
+                if next_fire_at is None
+                else _encode_time(_to_utc(next_fire_at, "next_fire_at"))
+            ),
+            next_id=uuid.uuid4().hex,
+        )
+
+        def work(conn: sqlite3.Connection) -> ReportResult:
+            if _reported_before(conn, occurrence_id, name, outcome, report.stamp):
+                return "duplicate"
+            found = _fetch_rows(conn, _SELECT_ONE_LIVE, (occurrence_id,))
+            if not found:
+                ended = conn.execute(_SELECT_ENDED_RECORD, (occurrence_id,)).fetchone()
+                if ended is None:
+                    return "unknown"
+                self._report_event(conn, ended[0], occurrence_id, report, "already_ended")
+                self._close(conn, bump=False)
+                return "already_ended"
+            occurrence = _decode_live(found[0], f"occurrence {occurrence_id}")
+            if occurrence.state == "scheduled" and occurrence.next_fire_at > report.at:
+                return "not_due"
+            result: ReportResult = "applied"
+            changed = False
+            if (
+                occurrence.state in ("scheduled", "missed")
+                and report.rang_at > occurrence.next_fire_at + grace
+            ):
+                result = "late"
+            else:
+                changed = self._apply_report(conn, occurrence, report)
+            self._report_event(conn, occurrence.record.record_id, occurrence_id, report, result)
+            self._close(conn, bump=changed)
+            return result
+
+        result = await self._transact(f"apply a report on occurrence {occurrence_id}", work)
+        if result == "applied":
+            self._forget("occurrence", [occurrence_id])
+        return result
+
     async def event_counts(self, since: datetime, tz: tzinfo) -> dict[str, dict[str, int]]:
         """Count the kept events at or after `since`, per local date in `tz` and event kind.
 
@@ -1111,6 +1266,128 @@ class AlarmRecords:
             conn.execute(_RECORD_RETARGETED, (target, record_id))
             self._close(conn, bump=True)
         return _ArmWrite(_fetch_one_live(conn, occurrence_id), False, True, ())
+
+    def _apply_report(
+        self, conn: sqlite3.Connection, occurrence: Occurrence, report: _Report
+    ) -> bool:
+        """Apply a timely report by the occurrence's state; True when a live row changed."""
+        occurrence_id = occurrence.occurrence_id
+        record_id = occurrence.record.record_id
+        state = occurrence.state
+        delivered = occurrence.delivered_to
+        fired = state == "scheduled"
+        if fired:
+            self._fire_by_report(conn, occurrence, report)
+            state, delivered = "ringing", frozenset({report.endpoint})
+        if report.outcome == "stopped":
+            self._end(
+                conn,
+                occurrence_id,
+                record_id,
+                report.stamp,
+                "stopped",
+                "alarm_report",
+                report.endpoint,
+            )
+            return True
+        if state == "ringing" and report.outcome == "rang":
+            if report.endpoint in delivered:
+                return fired
+            conn.execute(
+                _SET_DELIVERED_TO, (_encode_names(delivered | {report.endpoint}), occurrence_id)
+            )
+            return True
+        if state == "snoozed" and report.outcome == "rang":
+            return False
+        if state == "missed" and (
+            report.outcome == "rang"
+            or (report.snoozed_until is not None and report.snoozed_until <= report.now)
+        ):
+            self._end(
+                conn,
+                occurrence_id,
+                record_id,
+                _encode_time(report.now),
+                "timed_out",
+                "alarm_report",
+                report.endpoint,
+                detail={"delivered_to": [report.endpoint]},
+            )
+            return True
+        # Only `snoozed` remains, on a ringing, snoozed or missed occurrence.
+        assert report.snoozed_until is not None
+        until = _encode_time(report.snoozed_until)
+        if state == "ringing":
+            changed = conn.execute(_TO_SNOOZED, (until, occurrence_id)).rowcount > 0
+        elif state == "snoozed":
+            changed = conn.execute(_SNOOZE_LATER, (until, occurrence_id, until)).rowcount > 0
+        else:
+            params = (until, report.rang_stamp, occurrence_id)
+            changed = conn.execute(_MISSED_TO_SNOOZED, params).rowcount > 0
+        if changed:
+            self._event(
+                conn,
+                record_id,
+                occurrence_id,
+                report.stamp,
+                "snoozed",
+                "alarm_report",
+                endpoint=report.endpoint,
+                detail={"until": until},
+            )
+        return changed or fired
+
+    def _fire_by_report(
+        self, conn: sqlite3.Connection, occurrence: Occurrence, report: _Report
+    ) -> None:
+        """Fire a scheduled occurrence as the report's ring, which started at `rang_at`."""
+        occurrence_id = occurrence.occurrence_id
+        record_id = occurrence.record.record_id
+        late_by_s = max(0.0, (report.rang_at - occurrence.next_fire_at).total_seconds())
+        params = (report.rang_stamp, late_by_s, occurrence_id, "scheduled")
+        conn.execute(_TO_RINGING, params)
+        conn.execute(_SET_DELIVERED_TO, (report.endpoint, occurrence_id))
+        detail = _count_first_fire(
+            conn,
+            occurrence_id,
+            record_id,
+            _encode_ring_on(occurrence.ring_on),
+            occurrence.record.days is not None,
+            report.rang_stamp,
+            report.next_at,
+            report.next_id,
+        )
+        self._event(
+            conn,
+            record_id,
+            occurrence_id,
+            report.rang_stamp,
+            "fired",
+            "alarm_report",
+            endpoint=report.endpoint,
+            late_by_s=late_by_s,
+            detail=detail or None,
+        )
+
+    def _report_event(
+        self,
+        conn: sqlite3.Connection,
+        record_id: object,
+        occurrence_id: str,
+        report: _Report,
+        result: ReportResult,
+    ) -> None:
+        """Append the one `reported` event a non-duplicate report leaves, keyed for resends."""
+        self._event(
+            conn,
+            record_id,
+            occurrence_id,
+            report.stamp,
+            "reported",
+            "alarm_report",
+            endpoint=report.endpoint,
+            detail={"outcome": report.outcome, "rang_at": report.rang_stamp, "result": result},
+        )
 
     def _end(
         self,
@@ -1291,13 +1568,53 @@ def _fetch_one_live(conn: sqlite3.Connection, occurrence_id: str) -> _Row:
     return row
 
 
-def _decode_live(row: _Row) -> Occurrence:
-    """Decode a joined row an arm just wrote, which the store's own encoding makes decodable."""
+def _count_first_fire(
+    conn: sqlite3.Connection,
+    occurrence_id: str,
+    record_id: str,
+    ring_on: str,
+    repeating: bool,
+    stamp: str,
+    next_at: str | None,
+    next_id: str,
+) -> dict[str, object]:
+    """Count a scheduled occurrence's fire and insert its series' next occurrence, if given.
+
+    Returns the fire event's detail.
+
+    Raises:
+        ValueError: `next_at` is given for a record with no weekday set.
+    """
+    conn.execute(_RECORD_FIRED, (stamp, record_id))
+    if next_at is None:
+        return {}
+    if not repeating:
+        raise ValueError(f"occurrence {occurrence_id} has no weekday set, so no next occurrence")
+    conn.execute(_INSERT_OCCURRENCE, (next_id, record_id, ring_on, next_at, next_at))
+    return {"next_occurrence_id": next_id}
+
+
+def _reported_before(
+    conn: sqlite3.Connection, occurrence_id: str, endpoint: str, outcome: str, stamp: str
+) -> bool:
+    """Whether the trail holds a `reported` event with this id, endpoint, outcome and `at`."""
+    for (detail,) in conn.execute(_SELECT_REPORTED, (occurrence_id, endpoint, stamp)).fetchall():
+        try:
+            data = json.loads(detail)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("outcome") == outcome:
+            return True
+    return False
+
+
+def _decode_live(row: _Row, what: str = "an armed row") -> Occurrence:
+    """Decode a joined row the store wrote, which its own encoding makes decodable."""
     try:
         record = _decode_record(row[_OCCURRENCE_WIDTH:], active=True)
         return _decode_occurrence(row[:_OCCURRENCE_WIDTH], record)
     except ValueError as exc:
-        raise CapabilityStoreError(f"alarm records: an armed row does not decode: {exc}") from exc
+        raise CapabilityStoreError(f"alarm records: {what} does not decode: {exc}") from exc
 
 
 def _decode_record(row: _Row, *, active: bool) -> AlarmRecord:
