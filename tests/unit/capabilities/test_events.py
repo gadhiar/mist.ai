@@ -99,12 +99,33 @@ PAYLOADS: list[tuple[type[BaseModel], dict[str, object]]] = [
         {
             "type": "alarm_fired",
             "alarm_id": "a1",
+            "record_id": "r1",
             "kind": "alarm",
+            "category": "one_off",
             "label": None,
             "scheduled_for": AT,
             "fired_at": LATER,
             "late_by_s": 60.0,
             "ring_timeout_s": 600.0,
+            "ring_on": "all",
+            "fallback": False,
+        },
+    ),
+    (
+        AlarmFiredEvent,
+        {
+            "type": "alarm_fired",
+            "alarm_id": "a2",
+            "record_id": "r2",
+            "kind": "timer",
+            "category": "tagged",
+            "label": "pasta",
+            "scheduled_for": AT,
+            "fired_at": AT,
+            "late_by_s": 0.0,
+            "ring_timeout_s": 600.0,
+            "ring_on": ["bedroom", "desktop"],
+            "fallback": True,
         },
     ),
     (
@@ -115,23 +136,69 @@ PAYLOADS: list[tuple[type[BaseModel], dict[str, object]]] = [
             "alarms": [
                 {
                     "alarm_id": "a1",
+                    "record_id": "r1",
                     "kind": "alarm",
-                    "label": "work",
+                    "category": "recurring",
+                    "label": None,
                     "state": "ringing",
-                    "next_fire_at": None,
+                    "next_fire_at": AT,
+                    "wall_time": "07:00",
                     "repeat": "weekdays",
+                    "days": [0, 1, 2, 3, 4],
+                    "duration_s": None,
+                    "ring_on": "all",
+                },
+                {
+                    "alarm_id": "a3",
+                    "record_id": "r3",
+                    "kind": "alarm",
+                    "category": "tagged",
+                    "label": "gym",
+                    "state": "snoozed",
+                    "next_fire_at": LATER,
+                    "wall_time": "06:30",
+                    "repeat": "custom",
+                    "days": [0, 3],
+                    "duration_s": None,
+                    "ring_on": ["bedroom"],
                 },
                 {
                     "alarm_id": "t1",
+                    "record_id": "r2",
                     "kind": "timer",
+                    "category": "one_off",
                     "label": None,
                     "state": "scheduled",
                     "next_fire_at": LATER,
+                    "wall_time": None,
                     "repeat": "none",
+                    "days": None,
+                    "duration_s": 600,
+                    "ring_on": "all",
                 },
             ],
             "ringing": [{"alarm_id": "a1", "late_by_s": 0.0}],
-            "missed": [{"alarm_id": "a0", "label": "gym", "scheduled_for": AT}],
+            "missed": [
+                {
+                    "alarm_id": "a0",
+                    "record_id": "r0",
+                    "label": "gym",
+                    "scheduled_for": AT,
+                    "reason": "late",
+                },
+                {
+                    "alarm_id": "a4",
+                    "record_id": "r4",
+                    "label": None,
+                    "scheduled_for": AT,
+                    "reason": "unheard",
+                },
+            ],
+            "fallback_after_s": 30.0,
+            "missed_grace_s": 900.0,
+            "ring_timeout_s": 600.0,
+            "snooze_minutes": 9,
+            "tz": "America/New_York",
             "at": AT,
         },
     ),
@@ -176,6 +243,86 @@ def test_status_with_an_unknown_level_or_decode_flag_is_rejected(field, value):
 
     with pytest.raises(ValidationError):
         CapabilitiesStatusEvent.model_validate(payload)
+
+
+ALARM_STATE = next(payload for model, payload in PAYLOADS if model is AlarmStateEvent)
+
+
+def _alarm_state_with(entry_changes: dict[str, object], index: int = 0) -> dict[str, object]:
+    alarms = [dict(entry) for entry in ALARM_STATE["alarms"]]  # type: ignore[attr-defined]
+    alarms[index].update(entry_changes)
+    return dict(ALARM_STATE, alarms=alarms)
+
+
+@pytest.mark.parametrize("field", ["record_id", "category", "wall_time", "days", "ring_on"])
+def test_an_alarm_entry_missing_a_1_4_0_field_is_rejected(field):
+    alarms = [dict(entry) for entry in ALARM_STATE["alarms"]]  # type: ignore[attr-defined]
+    del alarms[0][field]
+
+    with pytest.raises(ValidationError):
+        AlarmStateEvent.model_validate(dict(ALARM_STATE, alarms=alarms))
+
+
+@pytest.mark.parametrize("field", ["record_id", "reason"])
+def test_a_missed_entry_missing_a_1_4_0_field_is_rejected(field):
+    missed = [dict(entry) for entry in ALARM_STATE["missed"]]  # type: ignore[attr-defined]
+    del missed[0][field]
+
+    with pytest.raises(ValidationError):
+        AlarmStateEvent.model_validate(dict(ALARM_STATE, missed=missed))
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"category": "repeating"},
+        {"repeat": "hourly"},
+        {"days": [7]},
+        {"days": [-1]},
+        {"days": []},
+        {"wall_time": "7:00"},
+        {"wall_time": "24:00"},
+        {"duration_s": 0},
+        {"duration_s": 86_401},
+        {"ring_on": "bedroom"},
+        {"ring_on": []},
+    ],
+)
+def test_an_alarm_entry_outside_the_protocol_is_rejected(changes):
+    with pytest.raises(ValidationError):
+        AlarmStateEvent.model_validate(_alarm_state_with(changes))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("fallback_after_s", 0.0),
+        ("missed_grace_s", -1.0),
+        ("ring_timeout_s", 0.0),
+        ("snooze_minutes", 0),
+        ("tz", ""),
+    ],
+)
+def test_alarm_state_settings_outside_the_protocol_are_rejected(field, value):
+    with pytest.raises(ValidationError):
+        AlarmStateEvent.model_validate(dict(ALARM_STATE, **{field: value}))
+
+
+def test_a_missed_entry_with_an_unknown_reason_is_rejected():
+    missed = [dict(ALARM_STATE["missed"][0], reason="ignored")]  # type: ignore[index]
+
+    with pytest.raises(ValidationError):
+        AlarmStateEvent.model_validate(dict(ALARM_STATE, missed=missed))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"), [("ring_on", "everywhere"), ("fallback", "maybe"), ("category", "x")]
+)
+def test_alarm_fired_outside_the_protocol_is_rejected(field, value):
+    fired = next(payload for model, payload in PAYLOADS if model is AlarmFiredEvent)
+
+    with pytest.raises(ValidationError):
+        AlarmFiredEvent.model_validate(dict(fired, **{field: value}))
 
 
 def test_alarm_action_minutes_is_optional():

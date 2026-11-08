@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
-from datetime import UTC, datetime, timedelta, timezone
+import zoneinfo
+from datetime import UTC, datetime, time, timedelta, timezone, tzinfo
 
 import pytest
 
@@ -11,31 +13,93 @@ from backend.capabilities.alarms.notifier import (
     CompositeNotifier,
     WsAlarmNotifier,
     alarm_state_payload,
+    effective_grace_s,
 )
-from backend.capabilities.alarms.store import Alarm
-from backend.capabilities.alarms.timeparse import RepeatRule
+from backend.capabilities.alarms.records import AlarmRecord, Occurrence
+from backend.capabilities.config import AlarmSettings
 from backend.capabilities.events import AlarmFiredEvent, AlarmStateEvent
 from backend.errors import CapabilityStoreError
 from tests.unit.capabilities.fakes import RecordingEventSink
 
 T0 = datetime(2026, 1, 5, 7, 0, tzinfo=UTC)
 NOTIFIER_LOGGER = "backend.capabilities.alarms.notifier"
+SETTINGS = AlarmSettings(ring_timeout_s=600.0, snooze_minutes=9, missed_grace_s=900.0)
+FALLBACK_AFTER_S = 30.0
 
 
-def _alarm(alarm_id: str, state: str = "scheduled", **changes: object) -> Alarm:
+def _record(record_id: str = "r1", **changes: object) -> AlarmRecord:
     fields: dict[str, object] = {
-        "alarm_id": alarm_id,
+        "record_id": record_id,
         "kind": "alarm",
+        "category": "one_off",
+        "identity": "alarm:one_off:07:00",
         "label": None,
-        "state": state,
-        "scheduled_for": T0,
-        "next_fire_at": T0,
-        "repeat": None,
-        "late_by_s": None,
-        "fired_at": None,
+        "wall_time": time(7, 0),
+        "days": None,
+        "duration_s": None,
+        "ring_on": "all",
+        "use_count": 1,
+        "fire_count": 0,
+        "created_at": T0 - timedelta(days=1),
+        "last_set_at": T0 - timedelta(days=1),
+        "last_fired_at": None,
+        "last_outcome": None,
+        "active": True,
     }
     fields.update(changes)
-    return Alarm(**fields)  # type: ignore[arg-type]
+    return AlarmRecord(**fields)  # type: ignore[arg-type]
+
+
+def _timer_record(record_id: str = "r2", **changes: object) -> AlarmRecord:
+    fields: dict[str, object] = {
+        "kind": "timer",
+        "identity": "timer:one_off:600",
+        "wall_time": None,
+        "duration_s": 600,
+    }
+    fields.update(changes)
+    return _record(record_id, **fields)
+
+
+def _occurrence(
+    occurrence_id: str,
+    state: str = "scheduled",
+    record: AlarmRecord | None = None,
+    **changes: object,
+) -> Occurrence:
+    fields: dict[str, object] = {
+        "occurrence_id": occurrence_id,
+        "record": record if record is not None else _record(),
+        "state": state,
+        "ring_on": "all",
+        "scheduled_for": T0,
+        "next_fire_at": T0,
+        "fired_at": None,
+        "late_by_s": None,
+        "missed_at": None,
+        "missed_reason": None,
+        "sent_to": frozenset(),
+        "delivered_to": frozenset(),
+    }
+    fields.update(changes)
+    return Occurrence(**fields)  # type: ignore[arg-type]
+
+
+def _payload(
+    occurrences: list[Occurrence],
+    rev: int = 1,
+    now: datetime = T0,
+    *,
+    settings: AlarmSettings = SETTINGS,
+    tz: tzinfo = UTC,
+) -> dict[str, object]:
+    return alarm_state_payload(
+        occurrences, rev, now, settings=settings, tz=tz, fallback_after_s=FALLBACK_AFTER_S
+    )
+
+
+def _ws(sink: RecordingEventSink, tz: tzinfo = UTC) -> WsAlarmNotifier:
+    return WsAlarmNotifier(sink, SETTINGS, tz, fallback_after_s=FALLBACK_AFTER_S)
 
 
 class RecordingNotifier:
@@ -45,123 +109,196 @@ class RecordingNotifier:
         self.error = error
         self.calls: list[tuple[str, tuple[object, ...]]] = []
 
-    async def ring(self, alarm: Alarm, ring_timeout_s: float) -> None:
-        self.calls.append(("ring", (alarm, ring_timeout_s)))
+    async def ring(self, occurrence: Occurrence, ring_timeout_s: float) -> None:
+        self.calls.append(("ring", (occurrence, ring_timeout_s)))
         if self.error is not None:
             raise self.error
 
-    async def stopped(self, alarm_id: str) -> None:
-        self.calls.append(("stopped", (alarm_id,)))
+    async def stopped(self, occurrence_id: str) -> None:
+        self.calls.append(("stopped", (occurrence_id,)))
         if self.error is not None:
             raise self.error
 
-    async def state_changed(self, alarms: list[Alarm], rev: int, at: datetime) -> None:
-        self.calls.append(("state_changed", (alarms, rev, at)))
+    async def state_changed(self, occurrences: list[Occurrence], rev: int, at: datetime) -> None:
+        self.calls.append(("state_changed", (occurrences, rev, at)))
         if self.error is not None:
             raise self.error
 
 
 class TestAlarmStatePayload:
-    def test_lists_live_alarms_with_ringing_and_missed_entries(self):
-        rule = RepeatRule(kind="weekdays", hour=7, minute=0)
-        scheduled = _alarm(
-            "a1",
-            label="gym",
+    def test_lists_live_occurrences_with_the_1_4_0_fields(self):
+        gym = _record(
+            "r-gym",
+            category="tagged",
+            identity="alarm:tagged:gym",
+            label="Gym",
+            wall_time=time(6, 30),
+            days=frozenset({3, 0}),
+            ring_on=("bedroom", "desktop"),
+        )
+        scheduled = _occurrence(
+            "o1",
+            record=gym,
+            ring_on=("bedroom", "desktop"),
             scheduled_for=T0 + timedelta(hours=1),
             next_fire_at=T0 + timedelta(hours=1),
-            repeat=rule,
         )
-        ringing = _alarm(
-            "a2",
+        ringing = _occurrence(
+            "o2",
             "ringing",
-            kind="timer",
+            record=_timer_record(),
             late_by_s=120.5,
             fired_at=T0,
             scheduled_for=T0 - timedelta(seconds=120.5),
             next_fire_at=T0 - timedelta(seconds=120.5),
         )
-        missed = _alarm(
-            "a3",
+        pills = _record("r-pills", category="tagged", identity="alarm:tagged:pills", label="pills")
+        missed = _occurrence(
+            "o3",
             "missed",
-            label="pills",
+            record=pills,
             scheduled_for=T0 - timedelta(hours=2),
             next_fire_at=T0 - timedelta(hours=2),
+            missed_at=T0 - timedelta(hours=2),
+            missed_reason="unheard",
         )
-        snoozed = _alarm("a4", "snoozed", next_fire_at=T0 + timedelta(minutes=9))
+        snoozed = _occurrence("o4", "snoozed", next_fire_at=T0 + timedelta(minutes=9))
 
-        payload = alarm_state_payload([scheduled, ringing, missed, snoozed], 17, T0)
+        payload = _payload([scheduled, ringing, missed, snoozed], 17)
 
         assert payload == {
             "type": "alarm_state",
             "rev": 17,
             "alarms": [
                 {
-                    "alarm_id": "a1",
+                    "alarm_id": "o1",
+                    "record_id": "r-gym",
                     "kind": "alarm",
-                    "label": "gym",
+                    "category": "tagged",
+                    "label": "Gym",
                     "state": "scheduled",
                     "next_fire_at": "2026-01-05T08:00:00Z",
-                    "repeat": "weekdays",
+                    "wall_time": "06:30",
+                    "repeat": "custom",
+                    "days": [0, 3],
+                    "duration_s": None,
+                    "ring_on": ["bedroom", "desktop"],
                 },
                 {
-                    "alarm_id": "a2",
+                    "alarm_id": "o2",
+                    "record_id": "r2",
                     "kind": "timer",
+                    "category": "one_off",
                     "label": None,
                     "state": "ringing",
                     "next_fire_at": "2026-01-05T06:57:59.500000Z",
+                    "wall_time": None,
                     "repeat": "none",
+                    "days": None,
+                    "duration_s": 600,
+                    "ring_on": "all",
                 },
                 {
-                    "alarm_id": "a3",
+                    "alarm_id": "o3",
+                    "record_id": "r-pills",
                     "kind": "alarm",
+                    "category": "tagged",
                     "label": "pills",
                     "state": "missed",
                     "next_fire_at": "2026-01-05T05:00:00Z",
+                    "wall_time": "07:00",
                     "repeat": "none",
+                    "days": None,
+                    "duration_s": None,
+                    "ring_on": "all",
                 },
                 {
-                    "alarm_id": "a4",
+                    "alarm_id": "o4",
+                    "record_id": "r1",
                     "kind": "alarm",
+                    "category": "one_off",
                     "label": None,
                     "state": "snoozed",
                     "next_fire_at": "2026-01-05T07:09:00Z",
+                    "wall_time": "07:00",
                     "repeat": "none",
+                    "days": None,
+                    "duration_s": None,
+                    "ring_on": "all",
                 },
             ],
-            "ringing": [{"alarm_id": "a2", "late_by_s": 120.5}],
+            "ringing": [{"alarm_id": "o2", "late_by_s": 120.5}],
             "missed": [
-                {"alarm_id": "a3", "label": "pills", "scheduled_for": "2026-01-05T05:00:00Z"}
+                {
+                    "alarm_id": "o3",
+                    "record_id": "r-pills",
+                    "label": "pills",
+                    "scheduled_for": "2026-01-05T05:00:00Z",
+                    "reason": "unheard",
+                }
             ],
+            "fallback_after_s": 30.0,
+            "missed_grace_s": 900.0,
+            "ring_timeout_s": 600.0,
+            "snooze_minutes": 9,
+            "tz": "UTC",
             "at": "2026-01-05T07:00:00Z",
         }
 
+    @pytest.mark.parametrize(
+        ("days", "repeat"),
+        [
+            (None, "none"),
+            (frozenset(range(7)), "daily"),
+            (frozenset(range(5)), "weekdays"),
+            (frozenset({5, 6}), "weekends"),
+            (frozenset({0, 3}), "custom"),
+            (frozenset({6}), "custom"),
+        ],
+    )
+    def test_names_the_repeat_of_each_weekday_set(self, days, repeat):
+        record = _record(category="recurring" if days else "one_off", days=days)
+
+        [entry] = _payload([_occurrence("o1", record=record)])["alarms"]  # type: ignore[misc]
+
+        assert entry["repeat"] == repeat
+        assert entry["days"] == (None if days is None else sorted(days))
+
+    @pytest.mark.parametrize(("grace_s", "sent"), [(0.0, 60.0), (60.0, 60.0), (900.0, 900.0)])
+    def test_sends_the_effective_grace_window(self, grace_s, sent):
+        settings = dataclasses.replace(SETTINGS, missed_grace_s=grace_s)
+
+        assert _payload([], settings=settings)["missed_grace_s"] == sent
+        assert effective_grace_s(grace_s) == sent
+
+    def test_names_the_time_zone_by_its_key(self):
+        try:
+            tz = zoneinfo.ZoneInfo("America/New_York")
+        except zoneinfo.ZoneInfoNotFoundError:
+            pytest.skip("tzdata absent")
+
+        assert _payload([], tz=tz)["tz"] == "America/New_York"
+
     def test_validates_against_the_alarm_state_model(self):
         alarms = [
-            _alarm("a1", repeat=RepeatRule(kind="daily", hour=7, minute=0)),
-            _alarm("a2", "ringing", kind="timer", late_by_s=12.0, fired_at=T0),
-            _alarm("a3", "missed", label="pills"),
-            _alarm("a4", "snoozed"),
+            _occurrence("o1", record=_record(category="recurring", days=frozenset(range(7)))),
+            _occurrence("o2", "ringing", record=_timer_record(), late_by_s=12.0, fired_at=T0),
+            _occurrence("o3", "missed", missed_at=T0, missed_reason="late"),
+            _occurrence("o4", "snoozed"),
         ]
 
-        payload = alarm_state_payload(alarms, 9, T0)
+        payload = _payload(alarms, 9)
 
         assert AlarmStateEvent.model_validate(payload).to_payload() == payload
 
-    def test_a_ringing_alarm_without_late_by_lists_zero(self):
-        payload = alarm_state_payload([_alarm("a1", "ringing", fired_at=T0)], 2, T0)
+    def test_a_ringing_occurrence_without_late_by_lists_zero(self):
+        payload = _payload([_occurrence("o1", "ringing", fired_at=T0)], 2)
 
-        assert payload["ringing"] == [{"alarm_id": "a1", "late_by_s": 0.0}]
-
-    def test_leaves_out_done_alarms(self):
-        payload = alarm_state_payload([_alarm("old", "done"), _alarm("new")], 3, T0)
-
-        assert [entry["alarm_id"] for entry in payload["alarms"]] == ["new"]  # type: ignore[index, union-attr]
-        assert payload["ringing"] == []
-        assert payload["missed"] == []
+        assert payload["ringing"] == [{"alarm_id": "o1", "late_by_s": 0.0}]
 
     def test_renders_times_in_utc(self):
         local = datetime(2026, 1, 5, 14, 30, tzinfo=timezone(timedelta(hours=5)))
-        payload = alarm_state_payload([_alarm("a", next_fire_at=local)], 1, local)
+        payload = _payload([_occurrence("o", next_fire_at=local)], 1, local)
 
         assert payload["at"] == "2026-01-05T09:30:00Z"
         assert payload["alarms"][0]["next_fire_at"] == "2026-01-05T09:30:00Z"  # type: ignore[index]
@@ -169,31 +306,36 @@ class TestAlarmStatePayload:
 
 class TestWsAlarmNotifier:
     @pytest.mark.asyncio
-    async def test_ring_emits_alarm_fired(self):
+    async def test_ring_emits_alarm_fired_with_the_1_4_0_fields(self):
         sink = RecordingEventSink()
-        alarm = _alarm(
-            "a1",
+        tea = _timer_record(category="tagged", identity="timer:tagged:tea", label="tea")
+        occurrence = _occurrence(
+            "o1",
             "ringing",
-            kind="timer",
-            label="tea",
+            record=tea,
+            ring_on=("desktop",),
             scheduled_for=T0,
             next_fire_at=T0,
             fired_at=T0 + timedelta(seconds=90),
             late_by_s=90.0,
         )
 
-        await WsAlarmNotifier(sink).ring(alarm, 600.0)
+        await _ws(sink).ring(occurrence, 600.0)
 
         assert sink.payloads == [
             {
                 "type": "alarm_fired",
-                "alarm_id": "a1",
+                "alarm_id": "o1",
+                "record_id": "r2",
                 "kind": "timer",
+                "category": "tagged",
                 "label": "tea",
                 "scheduled_for": "2026-01-05T07:00:00Z",
                 "fired_at": "2026-01-05T07:01:30Z",
                 "late_by_s": 90.0,
                 "ring_timeout_s": 600.0,
+                "ring_on": ["desktop"],
+                "fallback": False,
             }
         ]
         assert AlarmFiredEvent.model_validate(sink.payloads[0]).to_payload() == sink.payloads[0]
@@ -201,34 +343,37 @@ class TestWsAlarmNotifier:
     @pytest.mark.asyncio
     async def test_ring_without_fired_at_or_late_by_reports_next_fire_at_and_zero(self):
         sink = RecordingEventSink()
-        alarm = _alarm("a1", "ringing", scheduled_for=T0, next_fire_at=T0 + timedelta(minutes=9))
+        occurrence = _occurrence(
+            "o1", "ringing", scheduled_for=T0, next_fire_at=T0 + timedelta(minutes=9)
+        )
 
-        await WsAlarmNotifier(sink).ring(alarm, 600.0)
+        await _ws(sink).ring(occurrence, 600.0)
 
         [payload] = sink.payloads
         assert payload["scheduled_for"] == "2026-01-05T07:00:00Z"
         assert payload["fired_at"] == "2026-01-05T07:09:00Z"
         assert payload["late_by_s"] == 0.0
+        assert payload["ring_on"] == "all"
 
     @pytest.mark.asyncio
     async def test_state_changed_emits_exactly_the_shared_payload(self):
         sink = RecordingEventSink()
         alarms = [
-            _alarm("a1"),
-            _alarm("a2", "ringing", late_by_s=75.0, fired_at=T0 + timedelta(seconds=75)),
+            _occurrence("o1"),
+            _occurrence("o2", "ringing", late_by_s=75.0, fired_at=T0 + timedelta(seconds=75)),
         ]
 
-        await WsAlarmNotifier(sink).state_changed(alarms, 42, T0)
+        await _ws(sink).state_changed(alarms, 42, T0)
 
-        assert sink.payloads == [alarm_state_payload(alarms, 42, T0)]
+        assert sink.payloads == [_payload(alarms, 42)]
         assert sink.payloads[0]["rev"] == 42
-        assert sink.payloads[0]["ringing"] == [{"alarm_id": "a2", "late_by_s": 75.0}]
+        assert sink.payloads[0]["ringing"] == [{"alarm_id": "o2", "late_by_s": 75.0}]
 
     @pytest.mark.asyncio
     async def test_stopped_emits_nothing_because_alarm_state_follows(self):
         sink = RecordingEventSink()
 
-        await WsAlarmNotifier(sink).stopped("a1")
+        await _ws(sink).stopped("o1")
 
         assert sink.payloads == []
 
@@ -238,16 +383,16 @@ class TestCompositeNotifier:
     async def test_fans_out_every_call_to_every_notifier(self):
         first, second = RecordingNotifier(), RecordingNotifier()
         composite = CompositeNotifier([first, second])
-        alarm = _alarm("a1", "ringing", late_by_s=0.0, fired_at=T0)
+        occurrence = _occurrence("o1", "ringing", late_by_s=0.0, fired_at=T0)
 
-        await composite.ring(alarm, 600.0)
-        await composite.stopped("a1")
-        await composite.state_changed([alarm], 5, T0)
+        await composite.ring(occurrence, 600.0)
+        await composite.stopped("o1")
+        await composite.state_changed([occurrence], 5, T0)
 
         expected = [
-            ("ring", (alarm, 600.0)),
-            ("stopped", ("a1",)),
-            ("state_changed", ([alarm], 5, T0)),
+            ("ring", (occurrence, 600.0)),
+            ("stopped", ("o1",)),
+            ("state_changed", ([occurrence], 5, T0)),
         ]
         assert first.calls == expected
         assert second.calls == expected
@@ -259,12 +404,12 @@ class TestCompositeNotifier:
     async def test_a_failing_notifier_does_not_stop_the_others(self, error, caplog):
         failing, healthy = RecordingNotifier(error=error), RecordingNotifier()
         composite = CompositeNotifier([failing, healthy])
-        alarm = _alarm("a1", "ringing", late_by_s=0.0, fired_at=T0)
+        occurrence = _occurrence("o1", "ringing", late_by_s=0.0, fired_at=T0)
 
         with caplog.at_level(logging.ERROR, logger=NOTIFIER_LOGGER):
-            await composite.ring(alarm, 600.0)
-            await composite.stopped("a1")
-            await composite.state_changed([alarm], 5, T0)
+            await composite.ring(occurrence, 600.0)
+            await composite.stopped("o1")
+            await composite.state_changed([occurrence], 5, T0)
 
         assert [name for name, _ in healthy.calls] == ["ring", "stopped", "state_changed"]
         errors = [r for r in caplog.records if r.levelno == logging.ERROR]
@@ -276,4 +421,4 @@ class TestCompositeNotifier:
         composite = CompositeNotifier([RecordingNotifier(error=RuntimeError("bug"))])
 
         with pytest.raises(RuntimeError, match="bug"):
-            await composite.stopped("a1")
+            await composite.stopped("o1")
