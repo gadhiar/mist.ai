@@ -239,18 +239,29 @@ the adjacent findings it deliberately left out of scope.
   grows without limit. No TTL, no eviction, no max size. Memory leak over
   long uptime.
 
-- [ ] **conversation_handler.py:373 -- Final LLM call uses `self.llm` (no tools).**
-  After tool execution, the final response call uses the raw ChatOllama
-  without tool bindings. May confuse LLM when tool-result messages are
-  in context but tools are unavailable. Likely intentional but undocumented.
+- [ ] **conversation_handler.py -- Final LLM call has no tools bound.**
+  After tool execution, the final response call (`self._provider`, call site
+  `chat.final`) runs without tool bindings. May confuse the LLM when
+  tool-result messages are in context but tools are unavailable. Likely
+  intentional but undocumented. Capability tools sidestep this: their outcomes
+  reach the model in the prompt's capability actions block, not as tool
+  messages. Still open for the core tools.
 
 - [x] **conversation_handler.py -- Blocking Neo4j calls in async tool handlers.** -- resolved in Phase 2B: extract_knowledge and extract_knowledge_from_document tools removed. Extraction routed through ExtractionPipeline via GraphExecutor (async). query_knowledge_graph still calls sync GraphStore (separate issue).
 
-- [ ] **conversation_handler.py -- No timeout on tool execution.** `await tool.ainvoke()`
-  has no timeout. If Neo4j hangs, entire message handling blocks forever.
+- [ ] **conversation_handler.py -- No timeout on core tool execution.**
+  `ConversationHandler._dispatch_tool` awaits the tool with no timeout
+  (`git grep -n 'wait_for\|asyncio.timeout' -- backend/chat/conversation_handler.py`
+  prints nothing). If Neo4j hangs, entire message handling blocks forever.
+  Resolved for capability tools: `CapabilityHost` bounds each invoke and each
+  decode with its `timeout_runner`, `asyncio.wait_for` by default
+  (`grep -n 'self._timeout(' backend/capabilities/host.py`). Still open for the
+  core tools.
 
 - [ ] **conversation_handler.py -- Sequential tool execution.** Multiple tool calls
   are executed in a loop, not with `asyncio.gather`. Adds unnecessary latency.
+  Capability calls run in order by design, in `CapabilityHost.run_actions`.
+  Still open for the core tools.
 
 - [ ] **knowledge_integration.py:89-92 -- Overly broad exception suppression.**
   `contextlib.suppress(BaseException)` around `nest_asyncio.apply()`.
