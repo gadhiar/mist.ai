@@ -9,17 +9,19 @@ Enables LLM to autonomously:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import random
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from backend.capabilities.contracts import DecodeReply
 from backend.capabilities.tool_events import tool_event_fields
 from backend.chat.context_budget import ContextBudgetPlanner
 from backend.chat.hydration_clock import HydrationClockError
@@ -43,7 +45,7 @@ from backend.knowledge.storage.graph_store import GraphStore
 from backend.knowledge.storage.partitions import USER_ENTITY_ID
 from backend.llm import LLMRequest, StreamingLLMProvider
 from backend.llm.instrumented_provider import llm_call_context
-from backend.llm.models import LLMResponse, UsageMetadata
+from backend.llm.models import LLMResponse, ThinkingConfig, UsageMetadata
 from backend.llm.models import ToolCall as LLMToolCall
 from backend.sentence_detector import SentenceBoundaryDetector
 from backend.vault.conventions import ConventionsLoader
@@ -51,7 +53,14 @@ from backend.vault.conventions import ConventionsLoader
 from .retrieval_trace import TurnTraceBuilder, refs_removed, trace_failed
 
 if TYPE_CHECKING:
-    from backend.capabilities.contracts import ActionRecord, CapabilityTurnPort
+    from backend.capabilities.contracts import (
+        ActionDecode,
+        ActionRecord,
+        ActionResult,
+        CapabilityTurnPort,
+        DecodeFn,
+    )
+    from backend.capabilities.power import TierProviders
     from backend.chat.hydration_clock import HydrationClock
     from backend.debug_jsonl_logger import DebugJSONLLogger, TurnRecord
     from backend.extraction_backlog.dispatcher import ExtractionDispatcher
@@ -822,10 +831,27 @@ class _PreTurnResult:
     `answered` is True when the turn is complete without the model. `utterance` is the text
     the rest of the turn routes and decodes: the user message, or the remainder after a
     handled leading "yes". The session keeps the whole user message either way.
+
+    `used` collects the capability of every call the turn made, on either path, in order and
+    without repeats, for the one `record_turn` the turn reports.
     """
 
     utterance: str
     answered: bool = False
+    used: list[str] = field(default_factory=list)
+
+    def note_records(self, records: Sequence[ActionRecord]) -> None:
+        """Add the capabilities of `records` that `used` does not hold yet."""
+        for record in records:
+            if record.capability not in self.used:
+                self.used.append(record.capability)
+
+
+@dataclass(slots=True)
+class _ActionsOutcome:
+    """What the model-path capability step decided; `result` is None when nothing was decoded."""
+
+    result: ActionResult | None = None
 
 
 # Statuses whose completed tool event carries no `error`: the call ran, or waits for a yes.
@@ -1134,7 +1160,9 @@ class ConversationHandler:
         # Capabilities: None until `attach_capability_host`, and every turn is today's turn
         # while it is None. `_capability_history` holds, per session, the history entries of
         # decisions made between turns (`decide_proposal`), merged at the next turn's start.
+        # `_capability_tiers` serves the action decode; while it is None no turn is routed.
         self._capability_host: CapabilityTurnPort | None = None
+        self._capability_tiers: TierProviders | None = None
         self._capability_history: dict[str, list[tuple[str, str]]] = {}
 
         logger.info("ConversationHandler initialized with model: %s", llm_provider.model)
@@ -1858,19 +1886,19 @@ class ConversationHandler:
         state.pass_duration_ms[pass_num] = duration_ms
 
     def _template_tokens(
-        self, text: str, *, session_id: str, state: _StreamTurnState
+        self, text: str, *, session_id: str, state: _StreamTurnState, pass_num: int = 1
     ) -> list[Token]:
         """Split a templated reply into the Token events a model reply of that text would give.
 
         The text goes through the same sentence gate and slop filter as a streamed pass, as
-        pass 1, and is added to `state.emitted`, so `Complete.final_response` stays the
-        concatenation of every Token.
+        `pass_num` (a notice after pass 2 carries 2), and is added to `state.emitted`, so
+        `Complete.final_response` stays the concatenation of every Token.
         """
         gate = SentenceBoundaryDetector()
         emitter = _PassEmitter(
             lambda sentence: self._gate_sentence_text(sentence, session_id=session_id),
             state,
-            1,
+            pass_num,
         )
         segments = [*gate.feed_segments(text), *gate.flush_segments()]
         return [token for segment in segments if (token := emitter.emit(segment)) is not None]
@@ -1908,6 +1936,7 @@ class ConversationHandler:
                 for payload in host.drain_events(session_id):
                     yield WSEvent(payload=payload)
                 return
+            result.note_records(resolution.records)
             for record in resolution.records:
                 for payload in _capability_tool_events(record, host.redact):
                     yield WSEvent(payload=payload)
@@ -1930,6 +1959,98 @@ class ConversationHandler:
                 result.answered = True
                 return
             result.utterance = remainder
+
+    async def _capability_actions(
+        self,
+        host: CapabilityTurnPort,
+        *,
+        session: ConversationSession,
+        turn_id: str,
+        received_at: float,
+        pre: _PreTurnResult,
+        outcome: _ActionsOutcome,
+    ) -> AsyncIterator[StreamEvent]:
+        """Route the turn through the host and run the actions its decode chooses.
+
+        `plan_turn` reads `pre.utterance` (the remainder after a handled "yes", else the user
+        message) and, as `recent`, the session's stored messages before this turn's user
+        message. Neither carries retrieval, profile or memory text, so the decode prompt never
+        holds the main prompt's context. A plan with no decode leaves the turn as today's, with
+        no `run_actions` call.
+
+        Otherwise each record yields its tool-event pair, then the result's payloads and the
+        session's drained ones follow, all before any main-pass text: every call has its
+        outcome before the model speaks.
+
+        Mutates `outcome` (async generators cannot return a value) with the `ActionResult`, and
+        `pre.used` with the records' capabilities.
+        """
+        session_id = session.session_id
+        # The last message is this turn's own; the decode receives the utterance separately.
+        recent = [(m.role, m.content) for m in session.messages[:-1]]
+        plan = host.plan_turn(session_id, pre.utterance, recent, received_at=received_at)
+        if plan.decode is None:
+            return
+        result = await host.run_actions(
+            session_id, turn_id, pre.utterance, plan, self._capability_decoder(session_id)
+        )
+        outcome.result = result
+        pre.note_records(result.records)
+        for record in result.records:
+            for payload in _capability_tool_events(record, host.redact):
+                yield WSEvent(payload=payload)
+        for payload in (*result.events, *host.drain_events(session_id)):
+            yield WSEvent(payload=payload)
+
+    def _capability_decoder(self, session_id: str) -> DecodeFn:
+        """Bind the action decode to this turn's session, as the host's `DecodeFn`."""
+
+        async def decode(request: ActionDecode) -> DecodeReply:
+            return await self._run_capability_decode(request, session_id=session_id)
+
+        return decode
+
+    async def _run_capability_decode(self, decode: ActionDecode, *, session_id: str) -> DecodeReply:
+        """Run one constrained action decode on the interaction tier and join its content.
+
+        The tier's provider is read at call time, not at attach time, because the tier can
+        go away between turns (a power level that forbids it, a model being reloaded). The
+        decode sends no tools and no thinking budget: the JSON-schema grammar is the whole
+        answer, and reasoning tokens would only delay it.
+
+        The stream is closed through `contextlib.aclosing` whichever way the loop ends, as
+        `adaptive_thinking.py` closes its streams. When the host's decode timeout cancels this
+        coroutine, the provider's HTTP stream therefore closes at once; llama-server has one
+        slot, so an orphaned decode would otherwise hold back the turn's main pass.
+
+        Raises:
+            CapabilityUnavailableError: No capability tiers are attached, or the interaction
+                tier has no provider now. `run_actions` turns it into its decode-failure notice.
+        """
+        tiers = self._capability_tiers
+        provider = tiers.provider("interaction") if tiers is not None else None
+        if provider is None:
+            raise CapabilityUnavailableError("the interaction model tier is not available")
+        request = self._build_request(
+            call_site="chat.capability_actions",
+            session_id=session_id,
+            messages=[dict(message) for message in decode.messages],
+            tools=None,
+            response_schema=dict(decode.response_schema),
+            thinking=ThinkingConfig(budget_tokens=0),
+            temperature=decode.temperature,
+            max_tokens=decode.max_tokens,
+        )
+        parts: list[str] = []
+        finish_reason: str | None = None
+        with llm_call_context(session_id=session_id, call_site="chat.capability_actions"):
+            async with contextlib.aclosing(provider.generate(request, stream=True)) as stream:
+                async for chunk in stream:
+                    if chunk.content:
+                        parts.append(chunk.content)
+                    if not chunk.partial:
+                        finish_reason = chunk.finish_reason
+        return DecodeReply(content="".join(parts), finish_reason=finish_reason)
 
     async def handle_message(
         self, user_message: str, session_id: str, user_id: str = "User", max_history: int = 10
@@ -2050,10 +2171,16 @@ class ConversationHandler:
         first asks `host.pre_llm`. A ringing item, a proposal decision or a
         fast-path intent is answered there: its tool events and its templated
         reply stream like a normal reply's, the turn is recorded with no
-        extraction, and no LLM call is made (`_capability_pre_llm`). Without a
-        host the turn is today's. Either way the turn's `try` covers prompt
-        assembly too, so an exception from `_get_or_fetch_mist_context` or
-        `_build_messages` gets the recorded error turn.
+        extraction, and no LLM call is made (`_capability_pre_llm`). Otherwise,
+        with tiers attached too, the host routes the turn and runs the calls a
+        constrained decode chooses (`_capability_actions`): calls that answer
+        the turn alone stream their templated reply in place of the main
+        passes; calls that also need an answer give today's passes an actions
+        block and append their notices after the final text. With no calls the
+        turn is today's, plus any decode-failure notice. Without a host the turn
+        is today's. Either way the turn's `try` covers prompt assembly too, so
+        an exception from `_get_or_fetch_mist_context` or `_build_messages`
+        gets the recorded error turn.
 
         Thinking and Filler events are reserved for future iterations and
         are not emitted here.
@@ -2108,6 +2235,11 @@ class ConversationHandler:
         # inside the except block (see the comment there).
         error_token: Token | None = None
         pre = _PreTurnResult(utterance=user_message)
+        # One id for every host call this turn makes, pre-LLM and model path.
+        turn_id = str(uuid.uuid4())
+        actions = _ActionsOutcome()
+        retrieval_result: RetrievalResult | None = None
+        mist_context: MistContext | None = None
 
         # The turn's `try` starts right after the user message is recorded, so
         # capability code, retrieval, the mist context and prompt assembly all
@@ -2119,7 +2251,7 @@ class ConversationHandler:
                 async for stream_event in self._capability_pre_llm(
                     host,
                     session_id=session_id,
-                    turn_id=str(uuid.uuid4()),
+                    turn_id=turn_id,
                     received_at=received_at,
                     state=state,
                     result=pre,
@@ -2131,20 +2263,7 @@ class ConversationHandler:
                         tool_calls_used += 1
                     yield stream_event
 
-            if pre.answered:
-                # A command answered from a template: recorded as a turn, with
-                # no extraction scheduled, because the text is a command and
-                # the reply a template, not knowledge.
-                final_text = state.emitted
-                session.add_message("assistant", final_text)
-                self._get_or_allocate_vault_path(session_id, first_utterance=user_message)
-                self._record_turn_event(
-                    session_id=session_id,
-                    user_message=user_message,
-                    assistant_message=final_text,
-                    trace=self._turn_trace_payload(),
-                )
-            else:
+            if not pre.answered:
                 # When pre-LLM handled a leading "yes" and left a remainder,
                 # `pre.utterance` holds it for routing and the action decode;
                 # retrieval and history still read the whole user message.
@@ -2169,7 +2288,6 @@ class ConversationHandler:
                 # `force_intent="historical"` bypasses the query classifier and
                 # routes the retriever exclusively to the vault sidecar. Graph
                 # is left untouched here — reserved for the tool path.
-                retrieval_result: RetrievalResult | None = None
                 auto_inject_enabled = (
                     self.config.auto_inject_docs and len(user_message.split()) >= 3
                 )
@@ -2200,12 +2318,66 @@ class ConversationHandler:
                 )
 
                 mist_context = await self._get_or_fetch_mist_context(session_id)
+
+                # Capability actions on the model path. Without tiers there is
+                # no decode to run, so the turn is not routed at all.
+                if host is not None and self._capability_tiers is not None:
+                    async for stream_event in self._capability_actions(
+                        host,
+                        session=session,
+                        turn_id=turn_id,
+                        received_at=received_at,
+                        pre=pre,
+                        outcome=actions,
+                    ):
+                        if (
+                            isinstance(stream_event, WSEvent)
+                            and stream_event.payload.get("type") == "tool_call_started"
+                        ):
+                            tool_calls_used += 1
+                        yield stream_event
+                    result = actions.result
+                    if result is not None and result.records and not result.also_reply:
+                        # The calls answer the turn: their template is the reply,
+                        # and no main pass runs.
+                        for token in self._template_tokens(
+                            result.reply or "", session_id=session_id, state=state
+                        ):
+                            yield token
+                        pre.answered = True
+
+            if host is not None:
+                # Once per turn, so the router's stickiness ages by turns.
+                host.record_turn(session_id, pre.used)
+
+            if pre.answered:
+                # A command answered from a template: recorded as a turn, with
+                # no extraction scheduled, because the text is a command and
+                # the reply a template, not knowledge.
+                final_text = state.emitted
+                session.add_message("assistant", final_text)
+                self._get_or_allocate_vault_path(session_id, first_utterance=user_message)
+                self._record_turn_event(
+                    session_id=session_id,
+                    user_message=user_message,
+                    assistant_message=final_text,
+                    trace=self._turn_trace_payload(),
+                )
+            else:
+                # On a turn whose calls also need an answer, today's passes read
+                # the actions block; with no calls the prompt is today's.
+                action_result = actions.result
                 messages = self._build_messages(
                     session,
                     max_history,
                     retrieval_result=retrieval_result,
                     mist_context=mist_context,
                     max_output_tokens=self.config.llm.conversation_max_tokens,
+                    capability_block=(
+                        action_result.block
+                        if action_result is not None and action_result.records
+                        else None
+                    ),
                 )
 
                 # LLM autonomously decides to use tools
@@ -2357,6 +2529,16 @@ class ConversationHandler:
                 # post-filter text. No separate post-filter call here (see the
                 # docstring above for why whole-response regeneration is no
                 # longer available once content has streamed).
+                #
+                # Each capability notice follows the final text, so the user
+                # hears a pending, failed or undecoded action whatever the
+                # model wrote about it.
+                if action_result is not None:
+                    for notice in action_result.notices:
+                        for token in self._template_tokens(
+                            notice, session_id=session_id, state=state, pass_num=current_pass
+                        ):
+                            yield token
                 assistant_message = state.emitted
 
                 # Add assistant response to history
@@ -2777,14 +2959,23 @@ class ConversationHandler:
         self._extraction_dispatcher = dispatcher
         dispatcher.add_apply_listener(self._on_extraction_applied)
 
-    def attach_capability_host(self, host: CapabilityTurnPort) -> None:
+    def attach_capability_host(
+        self, host: CapabilityTurnPort, *, tiers: TierProviders | None = None
+    ) -> None:
         """Answer capability commands through `host` from the next turn on.
 
         Late binding, as for `attach_extraction_dispatcher`: the server builds the host
         before the handler exists and attaches it afterwards. The host's lifecycle belongs to
         the caller. Until a host is attached, every turn is today's turn.
+
+        Args:
+            host: The capability port every turn asks first.
+            tiers: Serves the action decode from its `interaction` tier, read at each decode.
+                With None there is no decode tier, so only the pre-LLM pass runs and the turn
+                is never routed; a decode asked for anyway raises `CapabilityUnavailableError`.
         """
         self._capability_host = host
+        self._capability_tiers = tiers
 
     async def decide_proposal(
         self, session_id: str, proposal_id: str, decision: Literal["approve", "reject"]
@@ -3507,15 +3698,18 @@ class ConversationHandler:
         retrieval_result: RetrievalResult | None = None,
         mist_context: MistContext | None = None,
         max_output_tokens: int = 400,
+        *,
+        capability_block: str | None = None,
     ) -> list[dict[str, str]]:
         """Build message list for LLM.
 
         Ordering:
           1. Persona block from MistContext (when provided) -- identity + HARD RULES
           2. Static system template -- tool availability, strategy, guidelines
-          3. Retrieval context (when auto-RAG produced facts) — budget-pruned
-          4. Live-data advisory (when retrieval requires MCP)
-          5. Conversation history — budget-pruned via history strategy
+          3. Capability actions block (when this turn's calls also need an answer)
+          4. Retrieval context (when auto-RAG produced facts) — budget-pruned
+          5. Live-data advisory (when retrieval requires MCP)
+          6. Conversation history — budget-pruned via history strategy
 
         Cluster 6: when `self._budget_planner` is not None, a BudgetPlan is
         computed before composition. The planner prunes retrieval context by
@@ -3532,6 +3726,10 @@ class ConversationHandler:
                 When None, falls back to the legacy full static template.
             max_output_tokens: Expected output budget for the coming LLM call.
                 Subtracted from the total budget so pruning leaves headroom.
+            capability_block: The actions block of this turn's capability calls
+                (`ActionResult.block`). It is never pruned, so the planner
+                charges it as a fixed segment; None, the default, leaves the
+                messages as they are without capabilities.
 
         Returns:
             List of messages for LLM, budget-compliant when planner is active.
@@ -3609,7 +3807,9 @@ class ConversationHandler:
                 # or they silently eat the 8K quality envelope past the
                 # 256-token safety margin (deep review phase1-conversation-1).
                 extra_fixed_texts=[
-                    t for t in (conventions_message, profile_block) if t is not None
+                    t
+                    for t in (conventions_message, profile_block, capability_block)
+                    if t is not None
                 ],
             )
             retrieval_text = plan.pruned_retrieval_text
@@ -3688,6 +3888,12 @@ class ConversationHandler:
         if profile_block is not None:
             logger.debug("[USER-PROFILE] Injecting curated profile from %s", profile_path)
             messages.append({"role": "user", "content": profile_block})
+
+        # 3c. Capability actions block: this turn's call outcomes, already
+        # decided, so the model describes them rather than deciding them. It
+        # varies per turn, so it starts the variable tail, ahead of retrieval.
+        if capability_block:
+            messages.append({"role": "system", "content": capability_block})
 
         # 4. Retrieval context (pruned by planner when active)
         if retrieval_text:
