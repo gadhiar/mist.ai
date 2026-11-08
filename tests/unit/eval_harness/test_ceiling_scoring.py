@@ -488,3 +488,217 @@ def test_a_missing_raw_file_exits_1(tmp_path: Path) -> None:
     result = _run(root, files)
     assert result.returncode == 1
     assert "absent.jsonl" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# The adjudication worksheet
+# ---------------------------------------------------------------------------
+
+
+def _worksheet(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def _with_worksheet(
+    tmp_path: Path, out: Path, *extra: str, files: dict[str, Path] | None = None
+) -> subprocess.CompletedProcess[str]:
+    root = tmp_path / "code"
+    if not root.exists():
+        _write_stub_root(root)
+    files = files or _inputs(tmp_path)
+    return _run(root, files, "--worksheet-run", "a", "--worksheet", str(out), *extra)
+
+
+def test_worksheet_items_are_the_misses_and_the_false_positives(tmp_path: Path) -> None:
+    out = tmp_path / "worksheet.jsonl"
+    result = _with_worksheet(tmp_path, out)
+    assert result.returncode == 0, result.stderr
+    probes = _worksheet(out)
+    assert [p["tag"] for p in probes] == ["t-01", "t-02", "t-03"]
+    assert [p["counts"] for p in probes] == [
+        {
+            "gold": 3,
+            "found": 2,
+            "produced": 3,
+            "matched": 2,
+            "beyond_prompt_gold": 1,
+            "beyond_prompt_found": 0,
+        },
+        {
+            "gold": 2,
+            "found": 1,
+            "produced": 1,
+            "matched": 1,
+            "beyond_prompt_gold": 0,
+            "beyond_prompt_found": 0,
+        },
+        {
+            "gold": 1,
+            "found": 0,
+            "produced": 0,
+            "matched": 0,
+            "beyond_prompt_gold": 0,
+            "beyond_prompt_found": 0,
+        },
+    ]
+    for probe in probes:
+        counts = probe["counts"]
+        kinds = [item["kind"] for item in probe["items"]]
+        assert kinds.count("miss") == counts["gold"] - counts["found"]
+        assert kinds.count("fp") == counts["produced"] - counts["matched"]
+    assert probes[0]["items"] == [
+        {
+            "id": "t-01:miss:1",
+            "kind": "miss",
+            "relation": ["user", "USES", "c"],
+            "class": "OMITTED",
+            "beyond_prompt": True,
+        },
+        {
+            "id": "t-01:fp:1",
+            "kind": "fp",
+            "relation": ["user", "KNOWS", "x"],
+            "class": None,
+            "beyond_prompt": False,
+        },
+    ]
+    assert probes[2]["items"][0]["class"] == "NOT_RUN"
+
+
+def test_worksheet_holds_the_probe_and_both_sides(tmp_path: Path) -> None:
+    out = tmp_path / "worksheet.jsonl"
+    assert _with_worksheet(tmp_path, out).returncode == 0
+    probes = _worksheet(out)
+    first = probes[0]
+    assert list(first) == [
+        "tag",
+        "utterance",
+        "gold_entities",
+        "gold_relations",
+        "produced_entities",
+        "produced_relations",
+        "counts",
+        "items",
+    ]
+    assert first["utterance"] == "first  probe"
+    assert first["gold_entities"] == [
+        ["user", "Person"],
+        ["a", "Concept"],
+        ["b", "Concept"],
+        ["c", "Concept"],
+    ]
+    assert first["gold_relations"] == [
+        ["user", "KNOWS", "a"],
+        ["user", "KNOWS", "b"],
+        ["user", "USES", "c"],
+    ]
+    assert first["produced_entities"] == [
+        ["user", "Person"],
+        ["a", "Concept"],
+        ["b", "Concept"],
+        ["x", "Concept"],
+    ]
+    assert first["produced_relations"] == [
+        ["user", "KNOWS", "a"],
+        ["user", "KNOWS", "b"],
+        ["user", "KNOWS", "x"],
+    ]
+    assert probes[2]["produced_entities"] == []
+    assert probes[2]["produced_relations"] == []
+
+
+def test_worksheet_ids_are_stable(tmp_path: Path) -> None:
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+    files = _inputs(tmp_path)
+    assert _with_worksheet(tmp_path, first, files=files).returncode == 0
+    assert _with_worksheet(tmp_path, second, files=files).returncode == 0
+    assert first.read_bytes() == second.read_bytes()
+    ids = [item["id"] for probe in _worksheet(first) for item in probe["items"]]
+    assert ids == ["t-01:miss:1", "t-01:fp:1", "t-02:miss:1", "t-03:miss:1"]
+
+
+def test_worksheet_counts_a_found_relation_beyond_the_prompt(tmp_path: Path) -> None:
+    files = _inputs(tmp_path)
+    pre = [dict(row) for row in _GOLD]
+    # Now t-01's found KNOWS b edge lies beyond the prompt too, beside its missed USES c edge.
+    pre[0] = {**pre[0], "expected_relationships": pre[0]["expected_relationships"][:1]}
+    _jsonl(files["pre"], pre)
+    out = tmp_path / "worksheet.jsonl"
+    assert _with_worksheet(tmp_path, out, files=files).returncode == 0
+    counts = _worksheet(out)[0]["counts"]
+    assert (counts["beyond_prompt_gold"], counts["beyond_prompt_found"]) == (2, 1)
+
+
+def test_worksheet_holds_no_recall_or_precision(tmp_path: Path) -> None:
+    out = tmp_path / "worksheet.jsonl"
+    assert _with_worksheet(tmp_path, out).returncode == 0
+    text = out.read_text(encoding="utf-8")
+    assert "recall" not in text
+    assert "precision" not in text
+
+    def floats(value: object) -> list[float]:
+        if isinstance(value, float):
+            return [value]
+        if isinstance(value, dict):
+            return [f for v in value.values() for f in floats(v)]
+        if isinstance(value, list):
+            return [f for v in value for f in floats(v)]
+        return []
+
+    assert floats(_worksheet(out)) == []
+
+
+def test_an_existing_worksheet_exits_1_before_scoring(tmp_path: Path) -> None:
+    outside = tmp_path / "outside" / "backend"
+    outside.mkdir(parents=True)
+    (outside / "elsewhere.py").write_text("VALUE = 1\n", encoding="utf-8")
+    # Scoring against this root would exit 2, so exit 1 shows the refusal came first.
+    tail = f"""
+    import sys as _sys
+
+    _sys.path.append({str(tmp_path / "outside")!r})
+    import backend.elsewhere  # noqa: E402,F401
+    """
+    _write_stub_root(tmp_path / "code", scorer_tail=tail)
+    out = tmp_path / "worksheet.jsonl"
+    out.write_text("kept\n", encoding="utf-8")
+    result = _with_worksheet(tmp_path, out)
+    assert result.returncode == 1
+    assert "already exists" in result.stderr
+    assert result.stdout == ""
+    assert out.read_text(encoding="utf-8") == "kept\n"
+
+
+def test_an_expect_mismatch_writes_no_worksheet(tmp_path: Path) -> None:
+    out = tmp_path / "worksheet.jsonl"
+    result = _with_worksheet(tmp_path, out, "--expect", "b=0.900")
+    assert result.returncode == 1
+    assert not out.exists()
+    assert "[a]" not in result.stdout
+
+
+def test_the_worksheet_is_written_after_every_expect_holds(tmp_path: Path) -> None:
+    out = tmp_path / "worksheet.jsonl"
+    result = _with_worksheet(tmp_path, out, "--expect", "b=0.333")
+    assert result.returncode == 0, result.stderr
+    assert "worksheet a: probes 3, misses 3, fps 1" in result.stdout
+    assert out.exists()
+
+
+def test_a_worksheet_run_must_be_a_named_run(tmp_path: Path) -> None:
+    root = _write_stub_root(tmp_path / "code")
+    out = tmp_path / "worksheet.jsonl"
+    result = _run(root, _inputs(tmp_path), "--worksheet-run", "c", "--worksheet", str(out))
+    assert result.returncode == 1
+    assert "no --run named c" in result.stderr
+    assert not out.exists()
+
+
+def test_worksheet_flags_go_together(tmp_path: Path) -> None:
+    root = _write_stub_root(tmp_path / "code")
+    out = tmp_path / "worksheet.jsonl"
+    result = _run(root, _inputs(tmp_path), "--worksheet", str(out))
+    assert result.returncode == 1
+    assert "--worksheet-run" in result.stderr
+    assert not out.exists()

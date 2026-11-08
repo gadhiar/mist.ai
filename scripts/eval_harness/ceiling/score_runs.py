@@ -28,6 +28,20 @@ gold, and `diagnose` classifies the rest. Every figure is the scorer's or the cl
 fails, only the expected runs' lines print, nothing is written, and the exit is 1, so no
 other run's figure appears before the reproductions hold.
 
+`--worksheet-run NAME --worksheet OUT` writes NAME's adjudication worksheet in the same
+invocation, after every expectation holds, so the worksheet comes from the scorer the
+reproductions just checked. An existing OUT is refused before anything is scored, so a
+committed worksheet is never rewritten; a later check writes to a scratch path and compares
+bytes. One JSON line per gold probe, in gold order, holds the tag and utterance, gold and
+produced entities and relations (scorer-canonical ids), the counts `gold`, `found`, `produced`
+and `matched` with `beyond_prompt_gold` and `beyond_prompt_found`, and the items: one per
+missed gold relation (`<tag>:miss:<n>`) and one per produced relation gold lacks
+(`<tag>:fp:<n>`), numbered in the scorer's sorted `rel_fns` and `rel_fps` order, so the ids
+are stable across runs. A miss carries the classifier's class: from the same diagnosis the
+printed class counts come from, or, for a relation beyond the prompt, which that diagnosis
+sets aside, from a diagnosis that sets nothing aside. The worksheet holds no recall or
+precision figure: the adjudicator classifies items without a score in view.
+
 Exit codes: 0 scored, 1 a usage or input error or a failed expectation, 2 a module loaded
 from outside `--code-root`.
 """
@@ -39,16 +53,49 @@ import importlib
 import json
 import math
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
+from typing import Protocol
 
 SCORER_MODULE = "scripts.eval_harness.score_extraction_run"
 CLASSIFIER_MODULE = "scripts.eval_harness.diagnose_list_misses"
 _GUARDED_PACKAGES = frozenset({"scripts", "backend"})
 
 RawRow = dict[str, object]
+Key = tuple[str, str, str]
+
+
+class _Entity(Protocol):
+    """The pinned scorer's `GoldEntity`, as far as this script reads it."""
+
+    id: str
+    type: str
+
+
+class _Relation(Protocol):
+    """The pinned scorer's `GoldRel`, as far as this script reads it."""
+
+    source: str
+    predicate: str
+    target: str
+
+
+class _Probe(Protocol):
+    """The pinned scorer's `GoldProbe`, as far as this script reads it."""
+
+    tag: str
+    utterance: str
+    entities: Sequence[_Entity]
+    relationships: Sequence[_Relation]
+
+
+class _Produced(Protocol):
+    """The pinned scorer's `Produced`, as far as this script reads it."""
+
+    entities: Sequence[_Entity]
+    relationships: Sequence[Mapping[str, str]]
 
 
 class ScoreRunsError(Exception):
@@ -63,6 +110,10 @@ class UsageError(ScoreRunsError):
 
 class InputError(ScoreRunsError):
     """A gold or raw file is missing or unreadable, or a module cannot be imported."""
+
+
+class WorksheetError(ScoreRunsError):
+    """The worksheet cannot be written: its path exists, or scorer and classifier disagree."""
 
 
 class CodeRootError(ScoreRunsError):
@@ -131,6 +182,20 @@ class RunScore:
         return out
 
 
+@dataclass(frozen=True, slots=True)
+class ScoredRun:
+    """What the worksheet is built from.
+
+    The run's rows and index, and the scorer's per-probe missed and false-positive relation
+    keys in the scorer's sorted order, which fixes the item numbering.
+    """
+
+    rows: dict[str, RawRow]
+    index: dict[str, _Produced]
+    misses: dict[str, list[Key]]
+    fps: dict[str, list[Key]]
+
+
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = _Parser(description=__doc__.splitlines()[0])
     parser.add_argument("--code-root", type=Path, required=True)
@@ -138,7 +203,24 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--pre-h8-gold", type=Path, required=True)
     parser.add_argument("--run", action="append", required=True, metavar="NAME=PATH")
     parser.add_argument("--expect", action="append", default=[], metavar="NAME=R")
+    parser.add_argument("--worksheet-run", metavar="NAME")
+    parser.add_argument("--worksheet", type=Path, metavar="OUT")
     return parser.parse_args(argv)
+
+
+def _worksheet_target(args: argparse.Namespace, runs: dict[str, Path]) -> Path | None:
+    if (args.worksheet_run is None) != (args.worksheet is None):
+        raise UsageError("--worksheet-run and --worksheet go together")
+    if args.worksheet is None:
+        return None
+    if args.worksheet_run not in runs:
+        raise UsageError(
+            f"--worksheet-run names {args.worksheet_run!r}, "
+            f"but there is no --run named {args.worksheet_run}"
+        )
+    if args.worksheet.exists():
+        raise WorksheetError(f"worksheet {args.worksheet} already exists; nothing was scored")
+    return args.worksheet
 
 
 def _named_runs(specs: list[str]) -> dict[str, Path]:
@@ -199,7 +281,7 @@ def _check_code_root(code_root: Path) -> None:
         )
 
 
-def _load_gold(scorer: ModuleType, path: Path) -> list[object]:
+def _load_gold(scorer: ModuleType, path: Path) -> list[_Probe]:
     try:
         return list(scorer.iter_gold_probes(path))
     except (OSError, ValueError, KeyError) as exc:
@@ -232,9 +314,11 @@ def _read_raw(name: str, path: Path) -> dict[str, RawRow]:
     return rows
 
 
-def _produced_index(scorer: ModuleType, path: Path, rows: dict[str, RawRow]) -> dict[str, object]:
+def _produced_index(
+    scorer: ModuleType, path: Path, rows: dict[str, RawRow]
+) -> dict[str, _Produced]:
     """The bench probe's `build_produced_index`, fed from raw rows instead of live cases."""
-    index: dict[str, object] = {}
+    index: dict[str, _Produced] = {}
     for probe_id, row in rows.items():
         response = row.get("response")
         if response is None:
@@ -258,19 +342,19 @@ def _score_run(
     classifier: ModuleType,
     name: str,
     path: Path,
-    probes: list[object],
-    beyond_prompt: set[object],
-) -> RunScore:
+    probes: list[_Probe],
+    beyond_prompt: set[tuple[str, Key]],
+) -> tuple[RunScore, ScoredRun]:
     rows = _read_raw(name, path)
     index = _produced_index(scorer, path, rows)
     report = scorer.score_run(probes, index)
-    covered = [p for p in probes if p.tag in rows]  # type: ignore[attr-defined]
+    covered = [p for p in probes if p.tag in rows]
     covered_report = scorer.score_run(covered, index)
     diagnosis = classifier.diagnose(probes, rows, beyond_prompt)
     counts = {cls: 0 for cls in classifier.CLASSES}
     for miss in diagnosis.misses:
         counts[miss.cls] = counts.get(miss.cls, 0) + 1
-    return RunScore(
+    score = RunScore(
         name=name,
         relation_recall=Ratio(report.rel_recall, report.rel_tp, report.rel_recall_denominator),
         covered_recall=Ratio(
@@ -292,12 +376,117 @@ def _score_run(
         classifier_recall=Ratio.of(diagnosis.found, diagnosis.total),
         class_counts=tuple(counts.items()),
     )
+    return score, ScoredRun(
+        rows=rows,
+        index=index,
+        misses={r["tag"]: [_key(k) for k in r["rel_fns"]] for r in report.per_probe},
+        fps={r["tag"]: [_key(k) for k in r["rel_fps"]] for r in report.per_probe},
+    )
+
+
+def _key(parts: Sequence[str]) -> Key:
+    source, predicate, target = parts
+    return source, predicate, target
+
+
+def _unique(keys: list[Key]) -> list[Key]:
+    return list(dict.fromkeys(keys))
+
+
+def _worksheet_lines(
+    scorer: ModuleType,
+    classifier: ModuleType,
+    probes: list[_Probe],
+    run: ScoredRun,
+    beyond_prompt: set[tuple[str, Key]],
+) -> list[dict[str, object]]:
+    """One line per gold probe, its items numbered in the scorer's sorted miss and fp order."""
+    asked = {
+        (m.tag, m.key): m.cls for m in classifier.diagnose(probes, run.rows, beyond_prompt).misses
+    }
+    every = {(m.tag, m.key): m.cls for m in classifier.diagnose(probes, run.rows, set()).misses}
+    lines: list[dict[str, object]] = []
+    for probe in probes:
+        tag = probe.tag
+        produced = run.index.get(scorer._norm_ws(probe.utterance))
+        gold_keys = _unique([(r.source, r.predicate, r.target) for r in probe.relationships])
+        produced_keys: list[Key] = []
+        produced_entities: list[list[str]] = []
+        if produced is not None:
+            produced_keys = _unique(
+                [(r["source"], r["predicate"], r["target"]) for r in produced.relationships]
+            )
+            produced_entities = [[e.id, e.type] for e in produced.entities]
+        misses = run.misses[tag]
+        fps = run.fps[tag]
+        items: list[dict[str, object]] = []
+        for n, key in enumerate(misses, start=1):
+            beyond = (tag, key) in beyond_prompt
+            cls = (every if beyond else asked).get((tag, key))
+            if cls is None:
+                raise WorksheetError(
+                    f"{tag}: the scorer misses {' '.join(key)}, the classifier does not"
+                )
+            items.append(
+                {
+                    "id": f"{tag}:miss:{n}",
+                    "kind": "miss",
+                    "relation": list(key),
+                    "class": cls,
+                    "beyond_prompt": beyond,
+                }
+            )
+        for n, key in enumerate(fps, start=1):
+            items.append(
+                {
+                    "id": f"{tag}:fp:{n}",
+                    "kind": "fp",
+                    "relation": list(key),
+                    "class": None,
+                    "beyond_prompt": False,
+                }
+            )
+        beyond_gold = sum(1 for key in gold_keys if (tag, key) in beyond_prompt)
+        beyond_missed = sum(1 for key in misses if (tag, key) in beyond_prompt)
+        lines.append(
+            {
+                "tag": tag,
+                "utterance": probe.utterance,
+                "gold_entities": [[e.id, e.type] for e in probe.entities],
+                "gold_relations": [list(key) for key in gold_keys],
+                "produced_entities": produced_entities,
+                "produced_relations": [list(key) for key in produced_keys],
+                "counts": {
+                    "gold": len(gold_keys),
+                    "found": len(gold_keys) - len(misses),
+                    "produced": len(produced_keys),
+                    "matched": len(produced_keys) - len(fps),
+                    "beyond_prompt_gold": beyond_gold,
+                    "beyond_prompt_found": beyond_gold - beyond_missed,
+                },
+                "items": items,
+            }
+        )
+    return lines
+
+
+def _write_worksheet(path: Path, lines: list[dict[str, object]]) -> None:
+    text = "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines)
+    try:
+        # Exclusive create: a worksheet that appeared since the start is still not rewritten.
+        with path.open("x", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+    except FileExistsError as exc:
+        raise WorksheetError(f"worksheet {path} already exists") from exc
+    except OSError as exc:
+        raise WorksheetError(f"cannot write worksheet {path}: {exc}") from exc
 
 
 def _run(argv: Sequence[str] | None) -> int:
     args = _parse_args(argv)
     runs = _named_runs(args.run)
     expects = _expectations(args.expect, runs)
+    worksheet = _worksheet_target(args, runs)
     code_root = args.code_root.resolve()
     if not code_root.is_dir():
         raise UsageError(f"--code-root {code_root} is not a directory")
@@ -312,19 +501,25 @@ def _run(argv: Sequence[str] | None) -> int:
 
     probes = _load_gold(scorer, args.gold)
     beyond_prompt = classifier._beyond_prompt(probes, _load_gold(scorer, args.pre_h8_gold))
-    scores = {
+    scored = {
         name: _score_run(scorer, classifier, name, path, probes, beyond_prompt)
         for name, path in runs.items()
     }
-    _check_code_root(code_root)
-
-    print(f"scorer: {Path(scorer.__file__).resolve()}")
-    print(f"classifier: {Path(classifier.__file__).resolve()}")
+    scores = {name: score for name, (score, _) in scored.items()}
     failed = [
         f"expect {name}: wanted {want:.3f}, got {scores[name].relation_recall.value:.3f}"
         for name, want in expects.items()
         if f"{scores[name].relation_recall.value:.3f}" != f"{want:.3f}"
     ]
+    lines: list[dict[str, object]] = []
+    if worksheet is not None and not failed:
+        lines = _worksheet_lines(
+            scorer, classifier, probes, scored[args.worksheet_run][1], beyond_prompt
+        )
+    _check_code_root(code_root)
+
+    print(f"scorer: {Path(scorer.__file__).resolve()}")
+    print(f"classifier: {Path(classifier.__file__).resolve()}")
     shown = [name for name in runs if name in expects] if failed else list(runs)
     for name in shown:
         print()
@@ -335,6 +530,12 @@ def _run(argv: Sequence[str] | None) -> int:
         return 1
     for name, want in expects.items():
         print(f"expect {name}: {want:.3f} holds")
+    if worksheet is not None:
+        _write_worksheet(worksheet, lines)
+        run = scored[args.worksheet_run][1]
+        misses = sum(len(keys) for keys in run.misses.values())
+        fps = sum(len(keys) for keys in run.fps.values())
+        print(f"worksheet {args.worksheet_run}: probes {len(lines)}, misses {misses}, fps {fps}")
     return 0
 
 
