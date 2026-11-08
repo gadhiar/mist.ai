@@ -409,7 +409,11 @@ class _Assembler:
         )
 
     def _item(self, item_id: str) -> dict | None:
-        """The item's own entity, or None when it has none or went to the r6 fallback."""
+        """The item's own entity, or None when it has none or went to the r6 fallback.
+
+        A Metric item takes its value, unit and quantity to the id rail, so a row such
+        as "p95 latency: 120 ms" gets the id a keyed Metric with those properties gets.
+        """
         output = self.outputs.get(item_id)
         if output is None or output.entity is None:
             return None
@@ -417,7 +421,14 @@ class _Assembler:
         group_frame = self.frames.get(self.places[item_id][0].gid)
         etype = entity.type or (group_frame.item_type if group_frame else None) or ""
         return self._record(
-            ("item", item_id), entity.span, entity.name, etype, activity=entity.activity
+            ("item", item_id),
+            entity.span,
+            entity.name,
+            etype,
+            activity=entity.activity,
+            value=entity.value,
+            unit=entity.unit,
+            quantity=entity.quantity,
         )
 
     # -- endpoints ------------------------------------------------------------------------
@@ -562,6 +573,8 @@ def assemble(
           `list_item_edge_on_template_pair`. An edge whose end does not resolve is
           dropped with `list_item_ref_unresolved`. Each warning is added once per edge,
           so a count of them is a count of edges.
+        - Every entity, an item's own included, takes `list_entity_id`'s rails, so a
+          Metric item with a value and a unit or a quantity has its id built from them.
         - A payload holds each entity a kept edge uses, so an unchecked plan item's
           entity is left out unless another edge uses it.
         - The frame's payload and one per item, in the groups' order, go through

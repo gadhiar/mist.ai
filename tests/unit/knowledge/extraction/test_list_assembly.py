@@ -855,3 +855,144 @@ class TestValueOnlyMetric:
             [("ostrel", "HAS_METRIC", expected)],
         )
         assert _produced_entity_match_id(expected, "Metric", record["properties"]) == expected
+
+
+# -- Metric items -------------------------------------------------------------------------------
+
+
+def _metric_item(
+    item_id: str,
+    span: str,
+    name: str,
+    *,
+    value: str | None = None,
+    unit: str | None = None,
+    quantity: str | None = None,
+) -> ItemOutput:
+    return ItemOutput(
+        item_id,
+        ItemEntity(span, name, "Metric", value=value, unit=unit, quantity=quantity),
+        ItemTemplate(True, "assert", "current"),
+        (),
+        (),
+    )
+
+
+def _metric_items_turn():
+    """A durable group whose items are Metrics of the frame's project, one per row."""
+    utterance = "Ostrel numbers:\n- p95 latency: 120 ms\n- p99 latency: 120 ms\n- 3 deploys a week"
+    frame = _frame(
+        _group("G1", ("f1", "HAS_METRIC", "item"), item_type="Metric"),
+        frame_entities=[ListEntity("f1", "Ostrel", "Ostrel", "Project")],
+    )
+    items = [
+        _metric_item(
+            "G1.1", "p95 latency: 120 ms", "120 ms", value="120", unit="ms", quantity="p95 latency"
+        ),
+        _metric_item(
+            "G1.2", "p99 latency: 120 ms", "120 ms", value="120", unit="ms", quantity="p99 latency"
+        ),
+        _metric_item("G1.3", "3 deploys a week", "deploys", value="3", quantity="deploys a week"),
+    ]
+    return utterance, frame, items
+
+
+class TestMetricItems:
+    """An item whose own entity is a Metric takes the Metric id rail, as a keyed Metric does."""
+
+    def test_its_id_is_built_from_its_value_unit_and_quantity(self):
+        payload, warnings = _run(*_metric_items_turn())
+
+        assert payload.entities[1:] == [
+            {
+                "id": "120-ms-p95-latency",
+                "name": "120 ms",
+                "type": "Metric",
+                "properties": {"value": "120", "unit": "ms", "quantity": "p95 latency"},
+            },
+            {
+                "id": "120-ms-p99-latency",
+                "name": "120 ms",
+                "type": "Metric",
+                "properties": {"value": "120", "unit": "ms", "quantity": "p99 latency"},
+            },
+            {
+                "id": canonical_metric_id("3", None, "deploys a week"),
+                "name": "deploys",
+                "type": "Metric",
+                "properties": {"value": "3", "unit": None, "quantity": "deploys a week"},
+            },
+        ]
+        assert _triples(payload) == [
+            ("ostrel", "HAS_METRIC", "120-ms-p95-latency"),
+            ("ostrel", "HAS_METRIC", "120-ms-p99-latency"),
+            ("ostrel", "HAS_METRIC", canonical_metric_id("3", None, "deploys a week")),
+        ]
+        assert warnings == []
+
+    def test_its_id_comes_from_canonical_metric_id(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(
+            list_assembly,
+            "canonical_metric_id",
+            lambda *args: seen.append(args) or f"built-{len(seen)}",
+        )
+
+        payload, _ = _run(*_metric_items_turn())
+
+        assert _ids(payload) == ["ostrel", "built-1", "built-2", "built-3"]
+        assert seen == [
+            ("120", "ms", "p95 latency"),
+            ("120", "ms", "p99 latency"),
+            ("3", None, "deploys a week"),
+        ]
+
+    @pytest.mark.parametrize(
+        ("span", "value", "expected"),
+        [
+            # No value: the span rail, then `canonical_metric_id_from_id`.
+            ("fast cold starts", None, None),
+            # A value alone, which Pass 4 does not rebuild: the span rail as well.
+            ("180 queued jobs", "180", "180-queued-jobs"),
+        ],
+    )
+    def test_with_no_value_or_a_value_alone_it_keeps_the_span_rail(self, span, value, expected):
+        utterance = f"Ostrel:\n- {span}"
+        frame = _frame(
+            _group("G1", ("f1", "HAS_METRIC", "item"), item_type="Metric"),
+            frame_entities=[ListEntity("f1", "Ostrel", "Ostrel", "Project")],
+        )
+        items = [_metric_item("G1.1", span, "queue depth", value=value)]
+
+        payload, warnings = _run(utterance, frame, items)
+
+        rail_id, rail_warnings = list_entity_id(
+            span, "queue depth", "Metric", utterance, value=value
+        )
+        assert expected is None or rail_id == expected
+        assert payload.entities[1] == {
+            "id": rail_id,
+            "name": span,
+            "type": "Metric",
+            "properties": {"value": value, "unit": None, "quantity": None},
+        }
+        assert warnings == rail_warnings == []
+
+    @pytest.mark.asyncio
+    async def test_the_normalizer_keeps_every_assembled_metric_item_id(self):
+        payload, _ = _run(*_metric_items_turn())
+
+        ids, triples = await _normalized_ids(payload)
+
+        assert ids == _ids(payload)
+        assert triples == _triples(payload)
+
+    def test_the_same_inputs_give_the_same_payload_and_are_not_changed(self):
+        utterance, frame, items = _metric_items_turn()
+        before = copy.deepcopy((frame, items))
+
+        first = _run(utterance, frame, items)
+        second = _run(utterance, frame, items)
+
+        assert first == second
+        assert (frame, items) == before
