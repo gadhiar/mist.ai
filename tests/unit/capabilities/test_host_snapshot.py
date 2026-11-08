@@ -84,15 +84,26 @@ def _alarm_state(rev: int = 4) -> dict[str, object]:
         "alarms": [
             {
                 "alarm_id": "a1",
+                "record_id": "r1",
                 "kind": "alarm",
+                "category": "tagged",
                 "label": "work",
                 "state": "ringing",
                 "next_fire_at": None,
+                "wall_time": "07:00",
                 "repeat": "none",
+                "days": None,
+                "duration_s": None,
+                "ring_on": "all",
             }
         ],
         "ringing": [{"alarm_id": "a1", "late_by_s": 0.0}],
         "missed": [],
+        "fallback_after_s": 30.0,
+        "missed_grace_s": 900.0,
+        "ring_timeout_s": 600.0,
+        "snooze_minutes": 9,
+        "tz": "UTC",
         "at": "2026-01-05T07:00:00Z",
     }
 

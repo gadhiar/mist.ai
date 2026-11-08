@@ -14,14 +14,14 @@ import json
 from datetime import datetime
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .contracts import CapabilityState, OutcomeStatus, RiskClass, ToolOutcome
 from .power import PowerLevel
 
 AlarmKind = Literal["alarm", "timer"]
 AlarmStateName = Literal["scheduled", "ringing", "snoozed", "done", "cancelled", "missed"]
-AlarmRepeat = Literal["none", "daily", "weekdays", "weekends"]
+AlarmRepeat = Literal["none", "daily", "weekdays", "weekends", "custom"]
 ResolutionDecision = Literal["approved", "rejected", "expired", "superseded"]
 
 
@@ -106,27 +106,55 @@ class ActionResolvedEvent(_Outbound):
 
 
 class AlarmFiredEvent(_Outbound):
-    """`alarm_fired`: an alarm or timer started ringing, `late_by_s` after its time."""
+    """`alarm_fired`: an occurrence of an alarm or timer started ringing, `late_by_s` late.
+
+    `alarm_id` is the occurrence and `record_id` the alarm it belongs to, so a client can tell
+    two rings of one daily alarm apart and still group them. `ring_on` is the occurrence's own
+    target, `"all"` or endpoint names; `fallback` says none of the named endpoints was present
+    and the ring went to every endpoint that was.
+    """
 
     type: Literal["alarm_fired"]
     alarm_id: str
+    record_id: str
     kind: AlarmKind
+    category: Literal["one_off", "recurring", "tagged"]
     label: str | None
     scheduled_for: datetime
     fired_at: datetime
     late_by_s: float = Field(ge=0)
     ring_timeout_s: float = Field(gt=0)
+    ring_on: Literal["all"] | list[str] = Field(min_length=1)
+    fallback: bool
 
 
 class AlarmEntry(_Outbound):
-    """One alarm or timer in `alarm_state`."""
+    """One live occurrence in `alarm_state`, with the values of the alarm it belongs to.
+
+    `wall_time` (`"HH:MM"`) is set for an alarm and `duration_s` for a timer. `days` is the
+    record's weekday set, Monday 0, or null for one that does not repeat; `repeat` names the
+    set, `"custom"` for one that is not a preset.
+    """
 
     alarm_id: str
+    record_id: str
     kind: AlarmKind
+    category: Literal["one_off", "recurring", "tagged"]
     label: str | None
     state: AlarmStateName
     next_fire_at: datetime | None
+    wall_time: str | None = Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     repeat: AlarmRepeat
+    days: list[int] | None = Field(min_length=1, max_length=7)
+    duration_s: int | None = Field(ge=1, le=86_400)
+    ring_on: Literal["all"] | list[str] = Field(min_length=1)
+
+    @field_validator("days")
+    @classmethod
+    def _days_are_weekdays(cls, days: list[int] | None) -> list[int] | None:
+        if days is not None and any(day < 0 or day > 6 for day in days):
+            raise ValueError(f"days must be weekdays from 0 to 6: {days}")
+        return days
 
 
 class RingingEntry(_Outbound):
@@ -137,21 +165,38 @@ class RingingEntry(_Outbound):
 
 
 class MissedEntry(_Outbound):
-    """An item that fired beyond the grace window, in `alarm_state`."""
+    """A missed occurrence in `alarm_state`, until it is dismissed or expires.
+
+    `reason` is `"late"` when it was found past the grace window and `"unheard"` when it rang
+    to its ring timeout and no endpoint acknowledged playing it.
+    """
 
     alarm_id: str
+    record_id: str
     label: str | None
     scheduled_for: datetime
+    reason: Literal["late", "unheard"]
 
 
 class AlarmStateEvent(_Outbound):
-    """`alarm_state`: sent on connect and broadcast on every change, ordered by `rev`."""
+    """`alarm_state`: sent on connect and broadcast on every change, ordered by `rev`.
+
+    It carries the settings an endpoint rings by, so an endpoint that loses the backend can
+    still ring and time out alone: `missed_grace_s` is the effective window, never under 60 s,
+    after `next_fire_at` beyond which an endpoint never rings alone, and `tz` is the user's
+    time zone (`MIST_TIMEZONE`).
+    """
 
     type: Literal["alarm_state"]
     rev: int = Field(ge=0)
     alarms: list[AlarmEntry]
     ringing: list[RingingEntry]
     missed: list[MissedEntry]
+    fallback_after_s: float = Field(gt=0)
+    missed_grace_s: float = Field(ge=60)
+    ring_timeout_s: float = Field(gt=0)
+    snooze_minutes: int = Field(ge=1, le=60)
+    tz: str = Field(min_length=1)
     at: datetime
 
 
