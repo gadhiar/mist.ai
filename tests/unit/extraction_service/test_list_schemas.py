@@ -777,7 +777,7 @@ def test_the_decided_frames_render_as_one_sentence_a_group():
                 None,
                 "plan",
             ),
-            GroupFrame("G3", (), None, "goal"),
+            GroupFrame("G3", (), None, "goal", durable=False),
         ),
         facts=ListFacts(entities=(), relationships=()),
     )
@@ -789,6 +789,33 @@ def test_the_decided_frames_render_as_one_sentence_a_group():
         "each item is the object of f1 USES\n"
         "G3: no template, nothing durable; unchecked items are goals"
     )
+
+
+@pytest.mark.parametrize(
+    ("durable", "sentence"),
+    [
+        pytest.param(True, "G1: no shared template; extract each item's own facts", id="durable"),
+        pytest.param(False, "G1: no template, nothing durable", id="not-durable"),
+    ],
+)
+def test_a_group_with_no_template_renders_whether_it_is_durable(durable, sentence):
+    """A table whose fact is in each row is durable with no template; an errand list is not."""
+    groups, _ = group_units(split_structured("Brindle runs:\n- Corvel\n- Ashwick"))
+    frame = FrameOutput(
+        frame_entities=(),
+        groups=(GroupFrame("G1", (), None, "plan", durable=durable),),
+        facts=ListFacts(entities=(), relationships=()),
+    )
+
+    assert render_frames_for_items(frame, groups) == sentence
+
+
+def test_list_rule_5_is_keyed_to_a_group_that_is_not_durable():
+    rules = _section("## LIST RULES", "## REFERENCE DATE")
+    rule = rules.split("\n5. ", 1)[1].split("\n", 1)[0]
+
+    assert "durable false" in rule
+    assert "durable true" in rule
 
 
 # --- no gold content in the list prompt -------------------------------------------------------

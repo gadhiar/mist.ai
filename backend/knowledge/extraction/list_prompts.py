@@ -104,7 +104,7 @@ Units is the utterance cut into prose units (P1, P2) and groups (G1, G2) of item
 2. An item that refers back ("the second one", "both of them") points at the earlier item as item:G1.2 and makes no new entity. An option that was only listed, which nobody chose, gets no edge: applies false.
 3. Checkboxes: [x] states a done fact. [ ] is a plan and gets no edge; unchecked is plan. When the lead-in names goals, unchecked is goal, and each [ ] item becomes user HAS_GOAL item.
 4. Tables: the header row names the columns, and each row is one fact about its first column, whose entity is the row's entity.
-5. A list with nothing durable (an errand list) gets no templates, and its items return entity null, applies false and no facts.
+5. A list with nothing durable (an errand list) gets durable false and no templates, and its items return entity null, applies false and no facts. A table whose fact is in each row gets durable true and no templates, and each item states its own facts.
 6. Copy every span exactly from the utterance. A Goal span is the goal's verb phrase. An Event's name, and an activity's (activity true: a habit or recurring activity), is the bare noun, with no date and no possessor. A Metric gives value, unit and quantity. A Date's value is its ISO date, resolved against the reference date.
 7. Where a rule returns an empty extraction, return the stage's object with empty lists.
 
@@ -231,7 +231,18 @@ def _has_checkbox(group: ListGroup | None) -> bool:
 
 
 def _frame_sentence(frame: GroupFrame, group: ListGroup | None) -> str:
-    parts = [_template_text(t, group) for t in frame.templates] or ["no template, nothing durable"]
+    """The group's decisions in one sentence.
+
+    A group with no template says whether it is durable: an errand list states nothing,
+    while a table whose fact is in each row states each item's own facts, and the item
+    call must not read the two alike.
+    """
+    if frame.templates:
+        parts = [_template_text(t, group) for t in frame.templates]
+    elif frame.durable:
+        parts = ["no shared template; extract each item's own facts"]
+    else:
+        parts = ["no template, nothing durable"]
     if frame.item_type is not None:
         parts.append(f"item type {frame.item_type}")
     if _has_checkbox(group):
