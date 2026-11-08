@@ -66,7 +66,23 @@
           "aec": "browser",
           "playback": true,
           "endpoint": "desktop",
-          "local_kws": false
+          "local_kws": false,
+          "muted": false
+        }
+      },
+      {
+        "name": "voice_start_muted",
+        "message": {
+          "type": "voice_start",
+          "req": 2,
+          "mode": "ptt",
+          "sample_rate": 16000,
+          "frame_ms": 20,
+          "aec": "browser",
+          "playback": true,
+          "endpoint": "desktop",
+          "local_kws": false,
+          "muted": true
         }
       },
       {
@@ -96,6 +112,10 @@
       {
         "name": "gpu_yield",
         "message": {"type": "gpu_yield", "active": true, "source": "fullscreen"}
+      },
+      {
+        "name": "mute",
+        "message": {"type": "mute", "active": true}
       },
       {
         "name": "text",
@@ -157,22 +177,10 @@
             },
             "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null}
           },
-          "tts_voice": {
-            "variant": "turbo",
-            "profile": null,
-            "source": "builtin",
-            "seconds": null,
-            "sha256_prefix": null
-          },
+          "tts_voice": {"engine": "pocket", "voice": "alba", "profile": "mist"},
           "vram_budget_mib": 4096,
-          "gpu": {"mode": "primary", "triggers": []},
-          "speech_service": {
-            "configured": false,
-            "connected": false,
-            "rtt_ms": null,
-            "location_label": null,
-            "model_mismatch": false
-          },
+          "power_level": "full",
+          "muted": false,
           "refused": null
         }
       },
@@ -189,41 +197,29 @@
           "playback": {"client_prebuffer_ms": 80, "fade_ms": 30, "progress_interval_ms": 240},
           "barge_in": {"policy": "keyword", "keywords": ["stop", "wait"], "arm_delay_ms": 300},
           "budget": {
-            "preset": "floor_yield",
+            "preset": "floor",
             "end_of_turn_ms": 250,
-            "stt_final_ms": 600,
+            "stt_final_ms": 250,
             "context_build_ms": 0,
-            "llm_first_token_ms": 500,
-            "first_segment_ms": 240,
-            "tts_first_chunk_ms": 1200,
-            "transport_playback_ms": 130,
-            "total_p50_ms": 2920,
-            "total_p90_ms": 4100,
-            "tool_call_ms": 900,
-            "barge_in_reaction_ms": 1200
+            "llm_first_token_ms": 250,
+            "first_segment_ms": 120,
+            "tts_first_chunk_ms": 500,
+            "transport_playback_ms": 100,
+            "total_p50_ms": 1470,
+            "total_p90_ms": 2100,
+            "tool_call_ms": 450,
+            "barge_in_reaction_ms": 700
           },
           "engines": {
             "vad": {"loaded": true, "location": "cpu", "model_id": "silero-vad", "vram_mib": null},
             "eot": {"loaded": true, "location": "cpu", "model_id": "smart-turn", "vram_mib": null},
             "stt": {"loaded": true, "location": "cpu", "model_id": "whisper-small", "vram_mib": null},
-            "tts": {"loaded": true, "location": "remote", "model_id": null, "vram_mib": null}
+            "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null}
           },
-          "tts_voice": {
-            "variant": "turbo",
-            "profile": null,
-            "source": "builtin",
-            "seconds": null,
-            "sha256_prefix": null
-          },
+          "tts_voice": {"engine": "pocket", "voice": "alba", "profile": "mist"},
           "vram_budget_mib": 4096,
-          "gpu": {"mode": "yield", "triggers": ["fullscreen"]},
-          "speech_service": {
-            "configured": true,
-            "connected": true,
-            "rtt_ms": 4,
-            "location_label": "lan",
-            "model_mismatch": false
-          },
+          "power_level": "off",
+          "muted": false,
           "refused": null
         }
       },
@@ -264,22 +260,10 @@
             },
             "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null}
           },
-          "tts_voice": {
-            "variant": "turbo",
-            "profile": null,
-            "source": "builtin",
-            "seconds": null,
-            "sha256_prefix": null
-          },
+          "tts_voice": {"engine": "pocket", "voice": "alba", "profile": "mist"},
           "vram_budget_mib": 4096,
-          "gpu": {"mode": "primary", "triggers": []},
-          "speech_service": {
-            "configured": false,
-            "connected": false,
-            "rtt_ms": null,
-            "location_label": null,
-            "model_mismatch": false
-          },
+          "power_level": "full",
+          "muted": false,
           "refused": "superseded"
         }
       },
@@ -320,22 +304,10 @@
             },
             "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null}
           },
-          "tts_voice": {
-            "variant": "turbo",
-            "profile": null,
-            "source": "builtin",
-            "seconds": null,
-            "sha256_prefix": null
-          },
+          "tts_voice": {"engine": "pocket", "voice": "alba", "profile": "mist"},
           "vram_budget_mib": 4096,
-          "gpu": {"mode": "primary", "triggers": []},
-          "speech_service": {
-            "configured": false,
-            "connected": false,
-            "rtt_ms": null,
-            "location_label": null,
-            "model_mismatch": false
-          },
+          "power_level": "full",
+          "muted": false,
           "refused": "invalid"
         }
       },
@@ -376,23 +348,138 @@
             },
             "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null}
           },
-          "tts_voice": {
-            "variant": "turbo",
-            "profile": null,
-            "source": "builtin",
-            "seconds": null,
-            "sha256_prefix": null
-          },
+          "tts_voice": {"engine": "pocket", "voice": "alba", "profile": "mist"},
           "vram_budget_mib": 4096,
-          "gpu": {"mode": "primary", "triggers": []},
-          "speech_service": {
-            "configured": false,
-            "connected": false,
-            "rtt_ms": null,
-            "location_label": null,
-            "model_mismatch": false
-          },
+          "power_level": "full",
+          "muted": false,
           "refused": "invalid"
+        }
+      },
+      {
+        "name": "voice_state_broadcast_muted",
+        "message": {
+          "type": "voice_state",
+          "cause": "broadcast",
+          "req": null,
+          "active": true,
+          "mode": "open",
+          "uplink": {"sample_rate": 16000, "frame_ms": 20},
+          "downlink": {"sample_rate": 24000, "frame_ms": 40},
+          "playback": {"client_prebuffer_ms": 80, "fade_ms": 30, "progress_interval_ms": 240},
+          "barge_in": {"policy": "keyword", "keywords": ["stop", "wait"], "arm_delay_ms": 300},
+          "budget": {
+            "preset": "floor",
+            "end_of_turn_ms": 250,
+            "stt_final_ms": 250,
+            "context_build_ms": 0,
+            "llm_first_token_ms": 250,
+            "first_segment_ms": 120,
+            "tts_first_chunk_ms": 500,
+            "transport_playback_ms": 100,
+            "total_p50_ms": 1470,
+            "total_p90_ms": 2100,
+            "tool_call_ms": 450,
+            "barge_in_reaction_ms": 700
+          },
+          "engines": {
+            "vad": {"loaded": true, "location": "cpu", "model_id": "silero-vad", "vram_mib": null},
+            "eot": {"loaded": true, "location": "cpu", "model_id": "smart-turn", "vram_mib": null},
+            "stt": {
+              "loaded": true,
+              "location": "cuda:0",
+              "model_id": "whisper-small",
+              "vram_mib": 1024
+            },
+            "tts": {
+              "loaded": true,
+              "location": "cuda:0",
+              "model_id": "pocket-tts",
+              "vram_mib": 512
+            }
+          },
+          "tts_voice": {"engine": "pocket", "voice": "alba", "profile": "mist"},
+          "vram_budget_mib": 4096,
+          "power_level": "full",
+          "muted": true,
+          "refused": null
+        }
+      },
+      {
+        "name": "voice_state_broadcast_power_off_capability_only",
+        "message": {
+          "type": "voice_state",
+          "cause": "broadcast",
+          "req": null,
+          "active": true,
+          "mode": "open",
+          "uplink": {"sample_rate": 16000, "frame_ms": 20},
+          "downlink": {"sample_rate": 24000, "frame_ms": 40},
+          "playback": {"client_prebuffer_ms": 80, "fade_ms": 30, "progress_interval_ms": 240},
+          "barge_in": {"policy": "keyword", "keywords": ["stop", "wait"], "arm_delay_ms": 300},
+          "budget": {
+            "preset": "floor",
+            "end_of_turn_ms": 250,
+            "stt_final_ms": 250,
+            "context_build_ms": 0,
+            "llm_first_token_ms": 250,
+            "first_segment_ms": 120,
+            "tts_first_chunk_ms": 500,
+            "transport_playback_ms": 100,
+            "total_p50_ms": 1470,
+            "total_p90_ms": 2100,
+            "tool_call_ms": 450,
+            "barge_in_reaction_ms": 700
+          },
+          "engines": {
+            "vad": {"loaded": true, "location": "cpu", "model_id": "silero-vad", "vram_mib": null},
+            "eot": {"loaded": true, "location": "cpu", "model_id": "smart-turn", "vram_mib": null},
+            "stt": {"loaded": true, "location": "cpu", "model_id": "whisper-small", "vram_mib": null},
+            "tts": {"loaded": true, "location": "cpu", "model_id": "pocket-tts", "vram_mib": null}
+          },
+          "tts_voice": {"engine": "pocket", "voice": "alba", "profile": "mist"},
+          "vram_budget_mib": 4096,
+          "power_level": "off",
+          "muted": false,
+          "refused": null
+        }
+      },
+      {
+        "name": "voice_state_answer_refused_power_off",
+        "message": {
+          "type": "voice_state",
+          "cause": "answer",
+          "req": 4,
+          "active": false,
+          "mode": null,
+          "uplink": {"sample_rate": 16000, "frame_ms": 20},
+          "downlink": {"sample_rate": 24000, "frame_ms": 40},
+          "playback": {"client_prebuffer_ms": 80, "fade_ms": 30, "progress_interval_ms": 240},
+          "barge_in": {"policy": "keyword", "keywords": ["stop", "wait"], "arm_delay_ms": 300},
+          "budget": {
+            "preset": "floor",
+            "end_of_turn_ms": 250,
+            "stt_final_ms": 250,
+            "context_build_ms": 0,
+            "llm_first_token_ms": 250,
+            "first_segment_ms": 120,
+            "tts_first_chunk_ms": 500,
+            "transport_playback_ms": 100,
+            "total_p50_ms": 1470,
+            "total_p90_ms": 2100,
+            "tool_call_ms": 450,
+            "barge_in_reaction_ms": 700
+          },
+          "engines": {
+            "vad": {"loaded": true, "location": "cpu", "model_id": "silero-vad", "vram_mib": null},
+            "eot": {"loaded": true, "location": "cpu", "model_id": "smart-turn", "vram_mib": null},
+            "stt": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null},
+            "tts": {"loaded": false, "location": "off", "model_id": null, "vram_mib": null}
+          },
+          "tts_voice": {"engine": "pocket", "voice": "alba", "profile": "mist"},
+          "vram_budget_mib": 4096,
+          "power_level": "off",
+          "muted": false,
+          "refused": "power_off"
         }
       },
       {
@@ -519,6 +606,22 @@
         }
       },
       {
+        "name": "voice_decision_dropped_muted",
+        "message": {
+          "type": "voice_decision",
+          "kind": "dropped",
+          "turn_id": null,
+          "reason": "muted",
+          "detail": {
+            "utterance_id": "utt-7",
+            "duration_ms": 360,
+            "text": null,
+            "no_speech_prob": null,
+            "avg_logprob": null
+          }
+        }
+      },
+      {
         "name": "voice_decision_degraded",
         "message": {
           "type": "voice_decision",
@@ -574,11 +677,39 @@
           "type": "voice_decision",
           "kind": "placement",
           "turn_id": null,
-          "reason": "fullscreen",
+          "reason": "power_off",
           "detail": {
-            "mode": "yield",
-            "engines": {"stt": "cpu", "tts": "remote"},
-            "released_mib": 3072
+            "power_level": "off",
+            "engines": {"stt": "off", "tts": "off"},
+            "released_mib": 1536
+          }
+        }
+      },
+      {
+        "name": "voice_decision_placement_release_timeout",
+        "message": {
+          "type": "voice_decision",
+          "kind": "placement",
+          "turn_id": null,
+          "reason": "release_timeout",
+          "detail": {
+            "power_level": "off",
+            "engines": {"stt": "off", "tts": "off"},
+            "released_mib": null
+          }
+        }
+      },
+      {
+        "name": "voice_decision_placement_reload_failed",
+        "message": {
+          "type": "voice_decision",
+          "kind": "placement",
+          "turn_id": null,
+          "reason": "reload_failed",
+          "detail": {
+            "power_level": "full",
+            "engines": {"stt": "cuda:0", "tts": "off"},
+            "released_mib": null
           }
         }
       },
@@ -606,7 +737,7 @@
           "kind": "plain",
           "outcome": "completed",
           "recorded": true,
-          "placement_mode": "primary",
+          "power_level": "full",
           "engines": {"stt": "cuda:0", "tts": "cuda:0"},
           "timings": {
             "eot_decided": 240,
@@ -617,7 +748,8 @@
             "first_segment": 895,
             "first_tts_chunk": 1430,
             "first_frame_sent": 1440,
-            "first_played": 1530
+            "first_played": 1530,
+            "caption_lag_ms": 310
           },
           "budget": {
             "preset": "floor",
@@ -647,8 +779,7 @@
           "lanes": {
             "stt_wait_ms": 0,
             "tts_wait_ms": 12,
-            "tts_busy_after_cancel_ms": 0,
-            "remote_rtt_ms": null
+            "tts_busy_after_cancel_ms": 0
           },
           "stale_events": 0,
           "bulk_dropped": 0

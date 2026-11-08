@@ -211,7 +211,9 @@ def next_turn_tag(tag: int) -> int:
 # -- Control messages: shared types --------------------------------------------
 
 VoiceMode = Literal["open", "ptt", "wake"]
-GpuMode = Literal["primary", "yield"]
+# The same values as capabilities' power level. Only gaming mode sets it; nothing in the voice
+# path detects games, full-screen windows or VRAM pressure.
+PowerLevel = Literal["full", "low", "off"]
 BackendMistState = Literal["idle", "listen", "think", "speak"]
 StreamChannel = Literal["tts", "text"]
 TurnOrigin = Literal["voice", "text", "system"]
@@ -257,6 +259,13 @@ class VoiceStartMessage(_WireModel):
             be read both carry `req` null, and only `cause` tells them apart. The schema checks
             only the range; the strictly-increasing check needs the connection's
             history, so it belongs to the session.
+        endpoint: The client's view of its endpoint, which is advisory: the server binds each
+            connection's endpoint when it accepts it, and logs and ignores a value that
+            differs from the bound one.
+        muted: The client's mute state, which the session applies before it accepts any uplink
+            frame of this voice session, so a reconnect cannot unmute the client. A client that
+            offers mute must send it. A missing `muted` reads as false, so frontend v1's C1,
+            which has no mute, works unchanged.
     """
 
     type: Literal["voice_start"] = "voice_start"
@@ -268,6 +277,7 @@ class VoiceStartMessage(_WireModel):
     playback: bool
     endpoint: Literal["desktop", "room"]
     local_kws: bool
+    muted: bool = False
 
 
 class VoiceStopMessage(_WireModel):
@@ -316,11 +326,30 @@ class WakeMessage(_WireModel):
 
 
 class GpuYieldMessage(_WireModel):
-    """Ask the process to yield the GPU, or to take it back; process-wide."""
+    """Frontend v1's request to yield the GPU or take it back, which the session ignores.
+
+    It still parses because frontend v1's C1 sends it, and an unknown `type` would raise. The
+    session logs it once per session at INFO and changes nothing, because only gaming mode sets
+    the power level. A later major removes it once no client sends it.
+    """
 
     type: Literal["gpu_yield"] = "gpu_yield"
     active: bool
     source: Literal["manual", "fullscreen"]
+
+
+class MuteMessage(_WireModel):
+    """Mute or unmute this session's microphone.
+
+    Muting closes the session's open utterance with a `dropped` decision of reason `muted`;
+    ingress then discards every uplink frame until a `mute` with `active` false. It carries no
+    `req`: the session follows each one with a `voice_state` of cause `broadcast` and `req` null,
+    sent to the muting session only, because `muted` is that session's own state. So the
+    `answer` cause stays tied to `voice_start`.
+    """
+
+    type: Literal["mute"] = "mute"
+    active: bool
 
 
 class TextMessage(_WireModel):
@@ -362,6 +391,7 @@ ClientMessage = (
     | BargeInMessage
     | WakeMessage
     | GpuYieldMessage
+    | MuteMessage
     | TextMessage
     | InterruptMessage
     | LogConfigMessage
@@ -412,7 +442,7 @@ class EngineStatus(_WireModel):
     """Where one speech engine runs and what it holds."""
 
     loaded: bool
-    location: str = Field(pattern=r"^(cpu|cuda|cuda:\d+|remote|off)$")
+    location: str = Field(pattern=r"^(cpu|cuda|cuda:\d+|off)$")
     model_id: str | None
     vram_mib: int | None
 
@@ -427,30 +457,17 @@ class EngineStatuses(_WireModel):
 
 
 class TtsVoice(_WireModel):
-    """The synthesizer variant and the reference voice it speaks with."""
+    """The stock voice the synthesizer speaks with; nothing is cloned, so no reference is named.
 
-    variant: Literal["turbo", "original"]
-    profile: str | None
-    source: Literal["profile", "builtin"]
-    seconds: float | None
-    sha256_prefix: str | None
+    Attributes:
+        engine: The TTS engine id, for example `pocket`.
+        voice: One of that engine's stock voice names.
+        profile: The active voice profile, `mist` by default.
+    """
 
-
-class GpuState(_WireModel):
-    """The process GPU mode and the triggers holding it in yield."""
-
-    mode: GpuMode
-    triggers: list[str]
-
-
-class SpeechServiceState(_WireModel):
-    """The remote speech service connection, when one is configured."""
-
-    configured: bool
-    connected: bool
-    rtt_ms: int | None
-    location_label: str | None
-    model_mismatch: bool
+    engine: str
+    voice: str
+    profile: str
 
 
 class EnginePlacement(_WireModel):
@@ -478,7 +495,6 @@ class TurnLaneStats(_WireModel):
     stt_wait_ms: int
     tts_wait_ms: int
     tts_busy_after_cancel_ms: int
-    remote_rtt_ms: int | None
 
 
 class VoiceCapabilities(_WireModel):
@@ -506,7 +522,7 @@ class SessionCapabilities(_WireModel):
 
 
 class VoiceStateMessage(_WireModel):
-    """The session's voice configuration, engines and GPU placement.
+    """The session's voice configuration, engines, power level and mute.
 
     `cause` says why it was sent, and has two values:
 
@@ -514,9 +530,10 @@ class VoiceStateMessage(_WireModel):
       exactly once per `voice_start`, a refused one and one that failed validation included.
       Answers go out in the order the `voice_start`s were received; an answer ready early waits
       for every earlier one.
-    - `broadcast`: a resend to every session, whether or not it has started voice, whenever one
-      of the three things it carries about the GPU changes: the mode, an engine's location, or
-      the active trigger set.
+    - `broadcast`: every other `voice_state`. Every broadcast is composed per session, with that
+      session's own `muted`: one session gets one after each `mute` it sends, sent to it alone,
+      and each session gets its own whenever the power level or an engine's location changes,
+      whether or not it has started voice.
 
     A client takes the answer to its `voice_start` from `cause` and `req`, never from `active`
     or `mode`: a broadcast can carry the same mode, and matching by arrival order alone would
@@ -528,17 +545,23 @@ class VoiceStateMessage(_WireModel):
             that `voice_start`'s `req` could not be read. A broadcast with `req` set fails
             validation, which `parse_server_message` raises as `ProtocolError`.
         active: Whether voice is active in the session when the message is sent, in an answer
-            and a broadcast alike.
+            and a broadcast alike. True with `power_level` `off` means voice takes capability
+            commands only.
         mode: The session's active voice mode, null while voice is off; so a broadcast to a
             session that has not started voice carries null, and a broadcast sent while a
             reconfigure is pending carries the current mode, not the requested one.
+        power_level: The process's power level when the message is sent.
+        muted: This session's mute as the server applies it, so the client's indicator shows
+            what the server does.
         refused: In an answer, null when the request was applied, and otherwise why it was
-            not: a reason the requested mode is unavailable, `superseded` (a newer valid
-            `voice_start` arrived first), `voice_stop` (a `voice_stop` arrived first) or
-            `invalid` (the `voice_start` failed validation). In a broadcast it names a mode the
-            session lost to a GPU change, for example when a `switch_failed` placement leaves
-            an engine `off`. `active` stays true then, because a lost mode does not turn voice
-            off.
+            not: a reason the requested mode is unavailable, `power_off` (the level is off and
+            voice cannot take capability commands, so `active` is false), `superseded` (a newer
+            valid `voice_start` arrived first), `voice_stop` (a `voice_stop` arrived first) or
+            `invalid` (the `voice_start` failed validation). In a broadcast it is `power_off`,
+            with `active` false, when the level went off and voice cannot take capability
+            commands. Otherwise it names a mode the session lost to an engine change, for
+            example when a `reload_failed` placement leaves an engine `off`; `active` stays true
+            then, because a lost mode does not turn voice off.
     """
 
     type: Literal["voice_state"] = "voice_state"
@@ -554,8 +577,8 @@ class VoiceStateMessage(_WireModel):
     engines: EngineStatuses
     tts_voice: TtsVoice
     vram_budget_mib: int
-    gpu: GpuState
-    speech_service: SpeechServiceState
+    power_level: PowerLevel
+    muted: bool
     refused: str | None
 
     @field_validator("req")
@@ -695,9 +718,13 @@ class WakeLostDetail(_WireModel):
 
 
 class PlacementDetail(_WireModel):
-    """Detail of a `placement` decision."""
+    """Detail of a `placement` decision.
 
-    mode: GpuMode
+    `power_level` is the level the placement follows, `engines` where STT and TTS settled, and
+    `released_mib` the VRAM a release freed, which a `power_off` placement carries.
+    """
+
+    power_level: PowerLevel
     engines: EnginePlacement
     released_mib: int | None
 
@@ -768,15 +795,24 @@ class VoiceDecisionDropped(_WireModel):
     `noise`, `no_speech` and `stt_error` are ingress drops. `text_input`: a `text` message
     closed it. `keyword`: a keyword interrupt consumed it with nothing after the keyword.
     `ignored`: it ended while MIST spoke without interrupting. `voice_stop`: `voice_stop`
-    closed it. `detail.no_speech_prob` and `detail.avg_logprob` are null when no final
-    transcript exists.
+    closed it. `muted`: a `mute` closed it. `power_off`: the power level went off and voice
+    cannot take capability commands. `detail.no_speech_prob` and `detail.avg_logprob` are null
+    when no final transcript exists.
     """
 
     type: Literal["voice_decision"] = "voice_decision"
     kind: Literal["dropped"] = "dropped"
     turn_id: str | None
     reason: Literal[
-        "noise", "no_speech", "stt_error", "text_input", "keyword", "voice_stop", "ignored"
+        "noise",
+        "no_speech",
+        "stt_error",
+        "text_input",
+        "keyword",
+        "voice_stop",
+        "ignored",
+        "muted",
+        "power_off",
     ]
     detail: DroppedDetail
 
@@ -840,20 +876,21 @@ class VoiceDecisionWakeLost(_WireModel):
 
 
 class VoiceDecisionPlacement(_WireModel):
-    """The speech engines moved; process-wide, so it belongs to no turn."""
+    """The speech engines moved; process-wide, so it belongs to no turn.
+
+    `power_off`: a release finished, and
+    `detail.released_mib` says what it freed. `release_timeout`: a job outlived the release
+    timeout, so every slot is `off` and that job keeps its memory until it ends, when a
+    `power_off` follows. `power_restored`: engines loaded again after the level rose, or a retry
+    loaded a slot that had settled below its device before the release. `reload_failed`: a slot
+    failed to load on the reload and fell down its device list; `detail.engines` says where each
+    slot settled.
+    """
 
     type: Literal["voice_decision"] = "voice_decision"
     kind: Literal["placement"] = "placement"
     turn_id: None = None
-    reason: Literal[
-        "manual",
-        "fullscreen",
-        "pressure",
-        "resume",
-        "switch_failed",
-        "remote_lost",
-        "remote_restored",
-    ]
+    reason: Literal["power_off", "power_restored", "reload_failed", "release_timeout"]
     detail: PlacementDetail
 
 
@@ -891,7 +928,12 @@ class PlaybackDuckMessage(_WireModel):
 
 
 class TurnMetricsMessage(_WireModel):
-    """Timings, budget and outcome of one turn, judged against its placement mode's budget."""
+    """Timings, budget and outcome of one turn.
+
+    `power_level` is the level at the turn's open. `timings` is keyed by stage timestamp, plus
+    `caption_lag_ms` (the turn's P90 over its utterance's partials) and `wake_screen_ms` (set
+    when a wake opened the utterance); new keys keep the schema, which is any string to an int.
+    """
 
     type: Literal["turn_metrics"] = "turn_metrics"
     turn_id: str
@@ -900,7 +942,7 @@ class TurnMetricsMessage(_WireModel):
     kind: Literal["plain", "tool"]
     outcome: Literal["completed", "interrupted", "superseded", "error"]
     recorded: bool
-    placement_mode: GpuMode
+    power_level: PowerLevel
     engines: EnginePlacement
     timings: dict[str, int]
     budget: LatencyBudget

@@ -27,12 +27,15 @@ from backend.realtime.protocol import (
     DegradedDetail,
     Direction,
     Frame,
+    GpuYieldMessage,
     MsgType,
+    MuteMessage,
     PlaybackStopMessage,
     StateCycleMessage,
     StreamCancelledMessage,
     StreamStartMessage,
     TranscriptionMessage,
+    TtsVoice,
     VoiceDecisionDropped,
     VoiceDecisionPlacement,
     VoiceDecisionWakeLost,
@@ -133,6 +136,7 @@ def test_client_message_set_matches_design_doc():
         "barge_in",
         "wake",
         "gpu_yield",
+        "mute",
         "text",
         "interrupt",
         "log_config",
@@ -347,8 +351,8 @@ def test_optional_fields_are_omitted_when_unset():
 
 def test_placement_decision_has_null_turn_id():
     decision = VoiceDecisionPlacement(
-        reason="manual",
-        detail={"mode": "yield", "engines": {"stt": "cpu", "tts": "cpu"}, "released_mib": None},
+        reason="power_off",
+        detail={"power_level": "off", "engines": {"stt": "cpu", "tts": "off"}, "released_mib": 0},
     )
     assert json.loads(encode_message(decision))["turn_id"] is None
     with pytest.raises(ProtocolError) as excinfo:
@@ -499,6 +503,9 @@ DESIGN_TIMING_KEYS = {
     "first_played",
     "tool_call_parsed",
     "tool_done",
+    # v3's D4: the caption's P90 lag over the turn's partials, and the wake's screen latency.
+    "caption_lag_ms",
+    "wake_screen_ms",
 }
 
 
@@ -511,8 +518,8 @@ def test_vector_budget_keys_come_from_the_design_doc(name):
 
 
 # The Design doc's budget table (v1 plan, Latency budget): every preset the server can send, with
-# its eleven rows. A vector carrying another preset or other figures teaches the client a budget
-# the server never reports.
+# its eleven rows. v3 keeps only `floor` and `memo` (its Settings section). A vector carrying
+# another preset or other figures teaches the client a budget the server never reports.
 DESIGN_BUDGET_PRESETS = {
     "floor": {
         "end_of_turn_ms": 250,
@@ -526,19 +533,6 @@ DESIGN_BUDGET_PRESETS = {
         "total_p90_ms": 2100,
         "tool_call_ms": 450,
         "barge_in_reaction_ms": 700,
-    },
-    "floor_yield": {
-        "end_of_turn_ms": 250,
-        "stt_final_ms": 600,
-        "context_build_ms": 0,
-        "llm_first_token_ms": 500,
-        "first_segment_ms": 240,
-        "tts_first_chunk_ms": 1200,
-        "transport_playback_ms": 130,
-        "total_p50_ms": 2920,
-        "total_p90_ms": 4100,
-        "tool_call_ms": 900,
-        "barge_in_reaction_ms": 1200,
     },
     "memo": {
         "end_of_turn_ms": 250,
@@ -683,6 +677,18 @@ def _without(message: dict, path: tuple[str, ...]) -> dict:
         pytest.param("server", "voice_state", ("cause",), id="voice_state-cause"),
         pytest.param("server", "voice_state", ("req",), id="voice_state-req"),
         pytest.param("client", "voice_start", ("req",), id="voice_start-req"),
+        pytest.param("server", "voice_state", ("power_level",), id="voice_state-power_level"),
+        pytest.param("server", "voice_state", ("muted",), id="voice_state-muted"),
+        pytest.param("server", "turn_metrics", ("power_level",), id="turn_metrics-power_level"),
+        pytest.param(
+            "server",
+            "voice_decision_placement",
+            ("detail", "power_level"),
+            id="placement-power_level",
+        ),
+        pytest.param("server", "voice_state", ("tts_voice", "engine"), id="tts_voice-engine"),
+        pytest.param("server", "voice_state", ("tts_voice", "voice"), id="tts_voice-voice"),
+        pytest.param("server", "voice_state", ("tts_voice", "profile"), id="tts_voice-profile"),
     ],
 )
 def test_each_new_key_is_required(direction, name, path):
@@ -944,17 +950,31 @@ def test_encode_rejects_empty_marker_at_rate_other_than_24000(msg_type, rate):
                 "answer",
                 "broadcast",
                 "engine",
-                "trigger",
                 "order",
                 "req",
                 "active",
                 "superseded",
                 "voice_stop",
                 "invalid",
-                "switch_failed",
+                "power_off",
+                "power_level",
+                "muted",
+                "per session",
+                "reload_failed",
             ),
             id="VoiceStateMessage",
         ),
+        pytest.param(GpuYieldMessage, ("frontend v1", "ignores"), id="GpuYieldMessage"),
+        pytest.param(MuteMessage, ("req", "broadcast", "dropped"), id="MuteMessage"),
+        pytest.param(
+            VoiceStartMessage, ("muted", "false", "advisory"), id="VoiceStartMessage.muted"
+        ),
+        pytest.param(
+            VoiceDecisionPlacement,
+            ("power_off", "power_restored", "reload_failed", "release_timeout"),
+            id="VoiceDecisionPlacement",
+        ),
+        pytest.param(VoiceDecisionDropped, ("muted", "power_off"), id="VoiceDecisionDropped.v3"),
         pytest.param(peek_voice_start, ("recursion limit",), id="peek_voice_start"),
         pytest.param(StreamCancelledMessage, ("null", "`text`"), id="StreamCancelledMessage"),
         pytest.param(TranscriptionMessage, ("closes",), id="TranscriptionMessage"),
@@ -978,3 +998,277 @@ def test_docstrings_state_the_v2_rules(documented, terms):
     missing = [term for term in terms if term not in doc]
 
     assert missing == []
+
+
+# -- third commit: the power level, mute and stock voices --------------------
+
+PROTOCOL_SOURCE = Path(__file__).resolve().parents[3] / "backend" / "realtime" / "protocol.py"
+
+
+def test_gpu_yield_from_frontend_v1_still_parses():
+    """Frontend v1's C1 sends `gpu_yield`; an unknown type would end its session's voice."""
+    sent_by_frontend_v1 = {"type": "gpu_yield", "active": True, "source": "fullscreen"}
+
+    parsed = parse_client_message(json.dumps(sent_by_frontend_v1))
+
+    assert isinstance(parsed, GpuYieldMessage)
+    assert parsed.active is True
+
+
+@pytest.mark.parametrize("retired", ["gpu", "speech_service"])
+def test_voice_state_ignores_the_retired_gpu_keys(retired):
+    """A v2.0 sender's `gpu` or `speech_service` is an unknown key, dropped like any other."""
+    message = _vector_message(SERVER_VECTORS, "voice_state")
+    sent = dict(message, **{retired: {"mode": "primary", "triggers": []}})
+
+    parsed = parse_server_message(json.dumps(sent))
+
+    assert json.loads(encode_message(parsed)) == message
+
+
+@pytest.mark.parametrize("engine", ["vad", "eot", "stt", "tts"])
+def test_engine_location_remote_is_refused(engine):
+    message = _vector_message(SERVER_VECTORS, "voice_state")
+    message["engines"][engine]["location"] = "remote"
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_server_message(json.dumps(message))
+
+    assert excinfo.value.field == f"engines.{engine}.location"
+
+
+@pytest.mark.parametrize("location", ["cpu", "cuda", "cuda:1", "off"])
+def test_engine_location_keeps_the_local_values(location):
+    message = _vector_message(SERVER_VECTORS, "voice_state")
+    message["engines"]["tts"]["location"] = location
+
+    parsed = parse_server_message(json.dumps(message))
+
+    assert parsed.engines.tts.location == location
+
+
+def test_tts_voice_takes_exactly_engine_voice_and_profile():
+    """A stock voice has no reference audio, so its provenance fields are gone."""
+    assert set(TtsVoice.model_fields) == {"engine", "voice", "profile"}
+    message = _vector_message(SERVER_VECTORS, "voice_state")
+    sent = json.loads(json.dumps(message))
+    sent["tts_voice"].update(variant="turbo", source="builtin", seconds=None, sha256_prefix=None)
+
+    parsed = parse_server_message(json.dumps(sent))
+
+    assert json.loads(encode_message(parsed))["tts_voice"] == message["tts_voice"]
+
+
+@pytest.mark.parametrize("key", ["engine", "voice", "profile"])
+def test_tts_voice_fields_are_never_null(key):
+    message = _vector_message(SERVER_VECTORS, "voice_state")
+    message["tts_voice"][key] = None
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_server_message(json.dumps(message))
+
+    assert excinfo.value.field == f"tts_voice.{key}"
+
+
+POWER_PLACEMENT_REASONS = ["power_off", "power_restored", "reload_failed", "release_timeout"]
+
+
+def test_placement_reasons_are_exactly_the_power_reasons():
+    schema = VoiceDecisionPlacement.model_json_schema()
+
+    assert schema["properties"]["reason"]["enum"] == POWER_PLACEMENT_REASONS
+
+
+@pytest.mark.parametrize("reason", POWER_PLACEMENT_REASONS)
+def test_placement_power_reasons_round_trip(reason):
+    message = dict(_vector_message(SERVER_VECTORS, "voice_decision_placement"), reason=reason)
+
+    parsed = parse_server_message(json.dumps(message))
+
+    assert json.loads(encode_message(parsed)) == message
+
+
+@pytest.mark.parametrize(
+    "retired",
+    [
+        "manual",
+        "fullscreen",
+        "pressure",
+        "resume",
+        "switch_failed",
+        "remote_lost",
+        "remote_restored",
+    ],
+)
+def test_placement_retired_reasons_raise(retired):
+    message = dict(_vector_message(SERVER_VECTORS, "voice_decision_placement"), reason=retired)
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_server_message(json.dumps(message))
+
+    assert excinfo.value.field == "reason"
+
+
+def test_placement_detail_carries_the_level_not_the_gpu_mode():
+    message = _vector_message(SERVER_VECTORS, "voice_decision_placement")
+    message["detail"]["mode"] = "yield"
+
+    parsed = parse_server_message(json.dumps(message))
+
+    assert "mode" not in json.loads(encode_message(parsed))["detail"]
+    assert parsed.detail.power_level == "off"
+
+
+@pytest.mark.parametrize("reason", ["muted", "power_off"])
+def test_dropped_gains_muted_and_power_off(reason):
+    message = dict(_vector_message(SERVER_VECTORS, "voice_decision_dropped"), reason=reason)
+
+    parsed = parse_server_message(json.dumps(message))
+
+    assert json.loads(encode_message(parsed)) == message
+
+
+def test_voice_state_refused_power_off_round_trips():
+    message = _vector_message(SERVER_VECTORS, "voice_state_answer_refused_power_off")
+
+    parsed = parse_server_message(json.dumps(message))
+
+    assert parsed.refused == "power_off"
+    assert parsed.active is False
+    assert json.loads(encode_message(parsed)) == message
+
+
+@pytest.mark.parametrize("name", ["voice_state", "turn_metrics"])
+@pytest.mark.parametrize("level", ["full", "low", "off"])
+def test_power_level_takes_the_capability_levels(name, level):
+    message = dict(_vector_message(SERVER_VECTORS, name), power_level=level)
+
+    parsed = parse_server_message(json.dumps(message))
+
+    assert parsed.power_level == level
+
+
+@pytest.mark.parametrize("name", ["voice_state", "turn_metrics"])
+@pytest.mark.parametrize("level", ["primary", "yield", "Full"])
+def test_power_level_rejects_other_values(name, level):
+    message = dict(_vector_message(SERVER_VECTORS, name), power_level=level)
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_server_message(json.dumps(message))
+
+    assert excinfo.value.field == "power_level"
+
+
+def test_turn_metrics_ignores_the_retired_placement_keys():
+    message = _vector_message(SERVER_VECTORS, "turn_metrics")
+    sent = json.loads(json.dumps(message))
+    sent["placement_mode"] = "primary"
+    sent["lanes"]["remote_rtt_ms"] = None
+
+    parsed = parse_server_message(json.dumps(sent))
+
+    assert json.loads(encode_message(parsed)) == message
+
+
+def test_voice_state_muted_must_be_a_bool():
+    message = dict(_vector_message(SERVER_VECTORS, "voice_state"), muted="yes")
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_server_message(json.dumps(message))
+
+    assert excinfo.value.field == "muted"
+
+
+@pytest.mark.parametrize("active", [True, False])
+def test_mute_round_trips(active):
+    message = {"type": "mute", "active": active}
+
+    parsed = parse_client_message(json.dumps(message))
+
+    assert isinstance(parsed, MuteMessage)
+    assert parsed.active is active
+    assert json.loads(encode_message(parsed)) == message
+
+
+def test_mute_carries_no_req():
+    """The answer cause stays tied to `voice_start`, so a `mute` has no request to answer."""
+    assert "req" not in MuteMessage.model_fields
+
+    parsed = parse_client_message(json.dumps({"type": "mute", "active": True, "req": 4}))
+
+    assert json.loads(encode_message(parsed)) == {"type": "mute", "active": True}
+
+
+def test_mute_active_is_required_and_strict():
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_client_message(json.dumps({"type": "mute"}))
+    assert excinfo.value.field == "active"
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_client_message(json.dumps({"type": "mute", "active": 1}))
+    assert excinfo.value.field == "active"
+
+
+def test_voice_start_without_muted_reads_false():
+    """Frontend v1's C1 has no mute and sends no `muted`."""
+    message = _vector_message(CLIENT_VECTORS, "voice_start")
+    del message["muted"]
+
+    parsed = parse_client_message(json.dumps(message))
+
+    assert parsed.muted is False
+
+
+def test_voice_start_muted_true_round_trips():
+    message = _vector_message(CLIENT_VECTORS, "voice_start_muted")
+
+    parsed = parse_client_message(json.dumps(message))
+
+    assert parsed.muted is True
+    assert json.loads(encode_message(parsed)) == message
+
+
+def test_voice_start_muted_is_strict():
+    message = dict(_vector_message(CLIENT_VECTORS, "voice_start"), muted="true")
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parse_client_message(json.dumps(message))
+
+    assert excinfo.value.field == "muted"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "voice_state_broadcast_before_voice_start",
+        "voice_state_broadcast_muted",
+        "voice_state_broadcast_power_off_capability_only",
+    ],
+)
+def test_voice_state_broadcast_vectors_answer_no_request(name):
+    message = _vector_message(SERVER_VECTORS, name)
+
+    parsed = parse_server_message(json.dumps(message))
+
+    assert parsed.cause == "broadcast"
+    assert parsed.req is None
+
+
+def test_retired_gpu_names_are_gone_from_the_contract():
+    """The T1c acceptance grep: no retired GPU yield or voice-cloning name is left."""
+    retired = [
+        "GpuMode",
+        "GpuState",
+        "SpeechServiceState",
+        "remote_rtt_ms",
+        "placement_mode",
+        "sha256_prefix",
+    ]
+    source = PROTOCOL_SOURCE.read_text(encoding="utf-8")
+
+    assert [name for name in retired if name in source] == []
+
+
+def test_vectors_keep_the_gpu_yield_vector():
+    names = {vector["name"] for vector in CLIENT_VECTORS}
+
+    assert {"gpu_yield", "mute", "voice_start", "voice_start_muted"} <= names
