@@ -53,6 +53,62 @@
       "frame_hex": "5453494d1000000000000000803e000064009cff"
     }
   ],
+  "binary_invalid": [
+    {
+      "name": "header: 15 bytes, one short of the 16-byte header",
+      "direction": "down",
+      "frame_hex": "5453494d020007000d000000c05d00",
+      "field": "header"
+    },
+    {
+      "name": "magic: 0x4D495355, not 0x4D495354",
+      "direction": "down",
+      "frame_hex": "5553494d020007000d000000c05d0000",
+      "field": "magic"
+    },
+    {
+      "name": "msg_type: unknown type 0x04",
+      "direction": "down",
+      "frame_hex": "5453494d0400070000000000c05d0000",
+      "field": "msg_type"
+    },
+    {
+      "name": "msg_type: uplink mic_audio 0x10 decoded as downlink, a type of the other direction",
+      "direction": "down",
+      "frame_hex": "5453494d1000000000000000803e000064009cff",
+      "field": "msg_type"
+    },
+    {
+      "name": "msg_type: downlink audio_chunk 0x01 decoded as uplink, a type of the other direction",
+      "direction": "up",
+      "frame_hex": "5453494d010007002a000000c05d00000000e80318fcff7f",
+      "field": "msg_type"
+    },
+    {
+      "name": "sample_rate: uplink mic_audio 0x10 at 48000 Hz, 16000 required",
+      "direction": "up",
+      "frame_hex": "5453494d100000000000000080bb00000000",
+      "field": "sample_rate"
+    },
+    {
+      "name": "turn_tag: uplink mic_audio 0x10 with tag 1, the uplink tag is always 0",
+      "direction": "up",
+      "frame_hex": "5453494d1000010000000000803e00000000",
+      "field": "turn_tag"
+    },
+    {
+      "name": "payload: odd PCM byte count, mic_audio 0x10 with 3 payload bytes",
+      "direction": "up",
+      "frame_hex": "5453494d1000000000000000803e0000000000",
+      "field": "payload"
+    },
+    {
+      "name": "payload: audio_complete 0x02 with a 2-byte payload, must be empty",
+      "direction": "down",
+      "frame_hex": "5453494d020007002b000000c05d00000000",
+      "field": "payload"
+    }
+  ],
   "control": {
     "client_to_server": [
       {
@@ -60,13 +116,12 @@
         "message": {
           "type": "voice_start",
           "req": 1,
-          "mode": "open",
+          "mode": "wake",
           "sample_rate": 16000,
           "frame_ms": 20,
           "aec": "browser",
           "playback": true,
           "endpoint": "desktop",
-          "local_kws": false,
           "muted": false
         }
       },
@@ -75,23 +130,18 @@
         "message": {
           "type": "voice_start",
           "req": 2,
-          "mode": "ptt",
+          "mode": "wake",
           "sample_rate": 16000,
           "frame_ms": 20,
           "aec": "browser",
           "playback": true,
           "endpoint": "desktop",
-          "local_kws": false,
           "muted": true
         }
       },
       {
         "name": "voice_stop",
         "message": {"type": "voice_stop"}
-      },
-      {
-        "name": "ptt",
-        "message": {"type": "ptt", "pressed": true}
       },
       {
         "name": "playback_progress",
@@ -147,7 +197,7 @@
           "cause": "answer",
           "req": 1,
           "active": true,
-          "mode": "open",
+          "mode": "wake",
           "uplink": {"sample_rate": 16000, "frame_ms": 20},
           "downlink": {"sample_rate": 24000, "frame_ms": 40},
           "playback": {"client_prebuffer_ms": 80, "fade_ms": 30, "progress_interval_ms": 240},
@@ -230,7 +280,7 @@
           "cause": "answer",
           "req": 2,
           "active": true,
-          "mode": "ptt",
+          "mode": "wake",
           "uplink": {"sample_rate": 16000, "frame_ms": 20},
           "downlink": {"sample_rate": 24000, "frame_ms": 40},
           "playback": {"client_prebuffer_ms": 80, "fade_ms": 30, "progress_interval_ms": 240},
@@ -274,7 +324,7 @@
           "cause": "answer",
           "req": 3,
           "active": true,
-          "mode": "ptt",
+          "mode": "wake",
           "uplink": {"sample_rate": 16000, "frame_ms": 20},
           "downlink": {"sample_rate": 24000, "frame_ms": 40},
           "playback": {"client_prebuffer_ms": 80, "fade_ms": 30, "progress_interval_ms": 240},
@@ -362,7 +412,7 @@
           "cause": "broadcast",
           "req": null,
           "active": true,
-          "mode": "open",
+          "mode": "wake",
           "uplink": {"sample_rate": 16000, "frame_ms": 20},
           "downlink": {"sample_rate": 24000, "frame_ms": 40},
           "playback": {"client_prebuffer_ms": 80, "fade_ms": 30, "progress_interval_ms": 240},
@@ -411,7 +461,7 @@
           "cause": "broadcast",
           "req": null,
           "active": true,
-          "mode": "open",
+          "mode": "wake",
           "uplink": {"sample_rate": 16000, "frame_ms": 20},
           "downlink": {"sample_rate": 24000, "frame_ms": 40},
           "playback": {"client_prebuffer_ms": 80, "fade_ms": 30, "progress_interval_ms": 240},
@@ -839,7 +889,7 @@
             "vad_enabled": true,
             "voice": {
               "protocol": 2,
-              "modes": ["open", "ptt", "wake"],
+              "modes": ["wake"],
               "uplink_sample_rate": 16000,
               "downlink_sample_rate": 24000,
               "barge_in": "keyword",
@@ -851,5 +901,74 @@
         }
       }
     ]
-  }
+  },
+  "control_invalid": [
+    {
+      "name": "ptt: the push-to-talk message is removed, so its type is unknown",
+      "direction": "client_to_server",
+      "json": {"type": "ptt", "pressed": true},
+      "rule": "protocol 2 has no push-to-talk; MIST wakes by name on every endpoint",
+      "field": "type"
+    },
+    {
+      "name": "voice_start: mode open is removed",
+      "direction": "client_to_server",
+      "json": {
+        "type": "voice_start",
+        "req": 1,
+        "mode": "open",
+        "sample_rate": 16000,
+        "frame_ms": 20,
+        "aec": "browser",
+        "playback": true,
+        "endpoint": "desktop",
+        "muted": false
+      },
+      "rule": "wake is the one voice mode; open mode answered unnamed speech",
+      "field": "mode"
+    },
+    {
+      "name": "voice_start: mode ptt is removed",
+      "direction": "client_to_server",
+      "json": {
+        "type": "voice_start",
+        "req": 1,
+        "mode": "ptt",
+        "sample_rate": 16000,
+        "frame_ms": 20,
+        "aec": "browser",
+        "playback": true,
+        "endpoint": "desktop",
+        "muted": false
+      },
+      "rule": "wake is the one voice mode; protocol 2 has no push-to-talk",
+      "field": "mode"
+    },
+    {
+      "name": "voice_decision endpoint: reason ptt_release is removed",
+      "direction": "server_to_client",
+      "json": {
+        "type": "voice_decision",
+        "kind": "endpoint",
+        "turn_id": null,
+        "reason": "ptt_release",
+        "detail": {"utterance_id": "utt-1", "eot_probability": null, "silence_ms": 0}
+      },
+      "rule": "an utterance ends by endpointing only: semantic, silence_cap or silence_cap_no_model",
+      "field": "reason"
+    },
+    {
+      "name": "voice_decision barge_in: reason ptt is removed",
+      "direction": "server_to_client",
+      "json": {
+        "type": "voice_decision",
+        "kind": "barge_in",
+        "turn_id": "turn-1",
+        "reason": "ptt",
+        "detail": {"keyword": null, "phase": "speaking", "utterance_id": "utt-4"}
+      },
+      "rule": "a barge-in comes from a keyword, an endpoint report, the UI, a wake or voice_stop",
+      "field": "reason"
+    }
+  ]
 }

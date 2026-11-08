@@ -7,8 +7,10 @@ bytes or JSON back.
 """
 
 import json
+import re
 import struct
 from pathlib import Path
+from typing import get_args
 
 import pytest
 
@@ -39,6 +41,7 @@ from backend.realtime.protocol import (
     VoiceDecisionDropped,
     VoiceDecisionPlacement,
     VoiceDecisionWakeLost,
+    VoiceMode,
     VoiceStartMessage,
     VoiceStartPeek,
     VoiceStateMessage,
@@ -58,6 +61,11 @@ VECTORS = json.loads(VECTORS_PATH.read_text(encoding="utf-8"))
 BINARY_VECTORS = VECTORS["binary"]
 CLIENT_VECTORS = VECTORS["control"]["client_to_server"]
 SERVER_VECTORS = VECTORS["control"]["server_to_client"]
+# The invalid arrays take the frontend fixture's entry shape: `binary_invalid` entries are
+# `{name, direction, frame_hex, field}` and `control_invalid` entries `{name, direction, json,
+# rule, field}`, where `field` is the field the `ProtocolError` must name.
+BINARY_INVALID_VECTORS = VECTORS["binary_invalid"]
+CONTROL_INVALID_VECTORS = VECTORS["control_invalid"]
 
 
 def _header(
@@ -126,11 +134,116 @@ def test_vectors_cover_every_server_message_and_decision_kind():
     assert kinds == VOICE_DECISION_KINDS
 
 
+def test_vectors_have_both_invalid_arrays():
+    """An empty array would let `test_invalid_vectors_fail_naming_their_field` pass vacuously."""
+    assert BINARY_INVALID_VECTORS
+    assert CONTROL_INVALID_VECTORS
+    for vector in BINARY_INVALID_VECTORS:
+        assert set(vector) == {"name", "direction", "frame_hex", "field"}
+    for vector in CONTROL_INVALID_VECTORS:
+        assert set(vector) == {"name", "direction", "json", "rule", "field"}
+
+
+def _decode_invalid(vector: dict) -> None:
+    decode_frame(bytes.fromhex(vector["frame_hex"]), direction=Direction(vector["direction"]))
+
+
+def _parse_invalid(vector: dict) -> None:
+    parse = {
+        "client_to_server": parse_client_message,
+        "server_to_client": parse_server_message,
+    }[vector["direction"]]
+    parse(json.dumps(vector["json"]))
+
+
+@pytest.mark.parametrize(
+    ("check", "vector"),
+    [
+        *(
+            pytest.param(_decode_invalid, v, id=f"binary-{v['name']}")
+            for v in BINARY_INVALID_VECTORS
+        ),
+        *(
+            pytest.param(_parse_invalid, v, id=f"control-{v['name']}")
+            for v in CONTROL_INVALID_VECTORS
+        ),
+    ],
+)
+def test_invalid_vectors_fail_naming_their_field(check, vector):
+    with pytest.raises(ProtocolError) as excinfo:
+        check(vector)
+
+    assert excinfo.value.field == vector["field"]
+
+
+# The removed push-to-talk and open-mode names. `control_invalid` must name them to prove they
+# fail, so it is the one path the walk skips.
+_REMOVED_MODES = {"open", "ptt"}
+
+
+def _removed_names_in(node: object, path: str) -> list[str]:
+    found: list[str] = []
+    if isinstance(node, dict):
+        if node.get("type") == "ptt":
+            found.append(f"{path}: type ptt")
+        for key, value in node.items():
+            if key in ("local_kws", "pressed"):
+                found.append(f"{path}.{key}")
+            if key == "mode" and value in _REMOVED_MODES:
+                found.append(f"{path}.mode: {value}")
+            if key == "modes" and isinstance(value, list):
+                found.extend(f"{path}.modes: {m}" for m in value if m in _REMOVED_MODES)
+            found.extend(_removed_names_in(value, f"{path}.{key}"))
+    elif isinstance(node, list):
+        for index, item in enumerate(node):
+            found.extend(_removed_names_in(item, f"{path}[{index}]"))
+    return found
+
+
+def _removed_names_outside_control_invalid(vectors: dict) -> list[str]:
+    return [
+        *_removed_names_in(vectors["binary"], "binary"),
+        *_removed_names_in(vectors["control"]["client_to_server"], "control.client_to_server"),
+        *_removed_names_in(vectors["control"]["server_to_client"], "control.server_to_client"),
+    ]
+
+
+def test_removed_names_absent_outside_control_invalid():
+    assert _removed_names_outside_control_invalid(VECTORS) == []
+
+    # The walk must see the removed names where they would be: a copy with the old `ptt`
+    # vector put back fails it, and one with a `ptt` vector only under `control_invalid` does not.
+    restored = json.loads(json.dumps(VECTORS))
+    restored["control"]["client_to_server"].append(
+        {"name": "ptt", "message": {"type": "ptt", "pressed": True}}
+    )
+    restored_path = f"control.client_to_server[{len(CLIENT_VECTORS)}].message"
+    assert _removed_names_outside_control_invalid(restored) == [
+        f"{restored_path}: type ptt",
+        f"{restored_path}.pressed",
+    ]
+    invalid_only = json.loads(json.dumps(VECTORS))
+    invalid_only["control_invalid"].append(
+        {"name": "ptt", "direction": "client_to_server", "json": {"type": "ptt"}}
+    )
+    assert _removed_names_outside_control_invalid(invalid_only) == []
+
+
+def test_voice_mode_is_wake_only():
+    assert get_args(VoiceMode) == ("wake",)
+
+
+def test_removed_push_to_talk_names_are_gone_from_the_source():
+    """T31's acceptance grep over `backend/realtime`, pinned for `protocol.py`."""
+    source = PROTOCOL_SOURCE.read_text(encoding="utf-8")
+
+    assert re.findall(r"\bptt\b|Ptt|ptt_release|local_kws", source) == []
+
+
 def test_client_message_set_matches_design_doc():
     assert {
         "voice_start",
         "voice_stop",
-        "ptt",
         "playback_progress",
         "playback_done",
         "barge_in",
@@ -380,7 +493,7 @@ def test_removed_v1_messages_are_unknown(removed):
 
 def test_missing_type_raises_protocol_error():
     with pytest.raises(ProtocolError) as excinfo:
-        parse_client_message(json.dumps({"pressed": True}))
+        parse_client_message(json.dumps({"active": True}))
     assert excinfo.value.field == "type"
 
 
@@ -423,8 +536,8 @@ def test_voice_start_rejects_uplink_rate_other_than_16000():
 
 def test_wrong_field_type_is_not_coerced():
     with pytest.raises(ProtocolError) as excinfo:
-        parse_client_message(json.dumps({"type": "ptt", "pressed": "yes"}))
-    assert excinfo.value.field == "pressed"
+        parse_client_message(json.dumps({"type": "mute", "active": "yes"}))
+    assert excinfo.value.field == "active"
 
 
 def test_invalid_json_raises_protocol_error():
@@ -611,9 +724,9 @@ def test_integer_fields_are_strict(played_ms):
 def test_unknown_field_on_client_message_is_dropped():
     """A field a newer client adds must not break this server."""
     message = parse_client_message(
-        json.dumps({"type": "ptt", "pressed": True, "added_in_minor": 1})
+        json.dumps({"type": "mute", "active": True, "added_in_minor": 1})
     )
-    assert json.loads(encode_message(message)) == {"type": "ptt", "pressed": True}
+    assert json.loads(encode_message(message)) == {"type": "mute", "active": True}
 
 
 def test_unknown_field_on_server_message_is_dropped():
@@ -862,7 +975,7 @@ _DEEPLY_NESTED = '{"type": "voice_start", "req": 7, "x": ' + "[" * 100_000 + "]"
         pytest.param(_voice_start_text(), VoiceStartPeek(req=1), id="valid"),
         pytest.param(_voice_start_text(mode="loud", req=5), VoiceStartPeek(req=5), id="bad-mode"),
         pytest.param(_voice_start_text(req="x"), VoiceStartPeek(req=None), id="req-string"),
-        pytest.param(json.dumps({"type": "ptt"}), None, id="other-type"),
+        pytest.param(json.dumps({"type": "mute"}), None, id="other-type"),
         pytest.param("{not json", None, id="not-json"),
         pytest.param(json.dumps({"type": "voice_start"}), VoiceStartPeek(req=None), id="no-req"),
         pytest.param(_voice_start_text(req=True), VoiceStartPeek(req=None), id="req-bool"),

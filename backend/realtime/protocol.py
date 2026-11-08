@@ -13,7 +13,7 @@ Downlink frames are PCM16 mono at 24 kHz, tagged with the turn's audio tag (1..6
 past 0) so the client can flush every frame of a stopped turn by tag.
 
 Control messages are JSON text frames discriminated by `type`. `parse_client_message` and
-`parse_server_message` validate in strict mode, so a client sending `"pressed": "yes"` gets a
+`parse_server_message` validate in strict mode, so a client sending `"active": "yes"` gets a
 `ProtocolError` instead of a silent coercion; a JavaScript client must round integer fields
 before sending. Fields a newer client adds are ignored rather than rejected, which keeps a minor
 protocol bump compatible with this server.
@@ -210,7 +210,9 @@ def next_turn_tag(tag: int) -> int:
 
 # -- Control messages: shared types --------------------------------------------
 
-VoiceMode = Literal["open", "ptt", "wake"]
+# MIST wakes by name on every endpoint, so `wake` is the one listening mode. It stays a `Literal`
+# so `voice_start.mode` and `capabilities.voice.modes` keep a place for a later mode.
+VoiceMode = Literal["wake"]
 # The same values as capabilities' power level. Only gaming mode sets it; nothing in the voice
 # path detects games, full-screen windows or VRAM pressure.
 PowerLevel = Literal["full", "low", "off"]
@@ -276,7 +278,6 @@ class VoiceStartMessage(_WireModel):
     aec: Literal["browser", "native", "device", "headset", "none"]
     playback: bool
     endpoint: Literal["desktop", "room"]
-    local_kws: bool
     muted: bool = False
 
 
@@ -284,13 +285,6 @@ class VoiceStopMessage(_WireModel):
     """Close the session's voice path."""
 
     type: Literal["voice_stop"] = "voice_stop"
-
-
-class PttMessage(_WireModel):
-    """Push-to-talk key state; a release ends the utterance."""
-
-    type: Literal["ptt"] = "ptt"
-    pressed: bool
 
 
 class PlaybackProgressMessage(_WireModel):
@@ -385,7 +379,6 @@ class SubscribeLogsMessage(_WireModel):
 ClientMessage = (
     VoiceStartMessage
     | VoiceStopMessage
-    | PttMessage
     | PlaybackProgressMessage
     | PlaybackDoneMessage
     | BargeInMessage
@@ -644,7 +637,7 @@ class BargeInDetail(_WireModel):
     """Detail of a `barge_in` decision.
 
     `utterance_id` is set or null by what produced the verdict, not by its reason: it names the
-    utterance when a transcript (partial or final), a press or a wake produced it, and is null
+    utterance when a transcript (partial or final) or a wake produced it, and is null
     when an endpoint `barge_in` report, the UI stop or `voice_stop` did.
     """
 
@@ -735,7 +728,7 @@ class VoiceDecisionEndpoint(_WireModel):
     type: Literal["voice_decision"] = "voice_decision"
     kind: Literal["endpoint"] = "endpoint"
     turn_id: str | None
-    reason: Literal["semantic", "silence_cap", "silence_cap_no_model", "ptt_release"]
+    reason: Literal["semantic", "silence_cap", "silence_cap_no_model"]
     detail: EndpointDetail
 
 
@@ -775,7 +768,7 @@ class VoiceDecisionBargeIn(_WireModel):
     type: Literal["voice_decision"] = "voice_decision"
     kind: Literal["barge_in"] = "barge_in"
     turn_id: str | None
-    reason: Literal["keyword", "endpoint_kws", "ptt", "ui", "wake", "voice_stop"]
+    reason: Literal["keyword", "endpoint_kws", "ui", "wake", "voice_stop"]
     detail: BargeInDetail
 
 
