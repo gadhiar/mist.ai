@@ -221,6 +221,10 @@ def test_the_render_is_deterministic():
 
 # --- strict parsers ---------------------------------------------------------------------------
 
+# The turn `_FRAME` and `_ITEMS` answer: G1 holds G1.1 and G1.2, G2 holds G2.1.
+_TURN = "Tools at Thrennic:\n- Quorvane\n- Brellix\n\nPeople:\n- Iselde"
+_GROUPS = group_units(split_structured(_TURN))[0]
+
 _FRAME = {
     "frame_entities": [
         {"key": "f1", "span": "Thrennic", "name": "Thrennic", "type": "Organization"}
@@ -228,14 +232,16 @@ _FRAME = {
     "groups": [
         {
             "group": "G1",
+            "durable": True,
             "templates": [{"subject": "user", "predicate": "USES", "object": "item"}],
             "item_type": "Technology",
             "unchecked": "plan",
         },
         {
             "group": "G2",
-            "templates": [{"subject": "item", "predicate": "PART_OF", "object": "f1"}],
-            "item_type": None,
+            "durable": True,
+            "templates": [{"subject": "item", "predicate": "MEMBER_OF", "object": "f1"}],
+            "item_type": "Person",
             "unchecked": "goal",
         },
     ],
@@ -267,20 +273,20 @@ _ITEMS = {
     "items": [
         {
             "item": "G1.1",
-            "entity": {"span": "Quorvane", "name": "Quorvane", "type": "Technology"},
             "template": {"applies": True, "assertion_kind": "assert", "temporal_status": "current"},
+            "entity": {"span": "Quorvane", "name": "Quorvane", "type": "Technology"},
             "entities": [],
             "relationships": [],
         },
         {
             "item": "G1.2",
-            "entity": None,
             "template": {
                 "applies": False,
                 "assertion_kind": "cease",
                 "temporal_status": "past",
                 "end_date": "2031-01-05",
             },
+            "entity": None,
             "entities": [
                 {
                     "key": "e1",
@@ -302,18 +308,26 @@ def _frame(**changes: object) -> str:
     return json.dumps(frame)
 
 
+def _parse_frame(text: str) -> FrameOutput:
+    return parse_frame_output(text, [g.gid for g in _GROUPS])
+
+
+def _parse_items(text: str, expected: list[str]) -> tuple[ItemOutput, ...]:
+    return parse_item_output(text, expected)
+
+
 def test_list_output_error_is_an_extraction_validation_error():
     assert issubclass(ListOutputError, ExtractionValidationError)
 
 
 def test_a_well_formed_frame_parses_into_frames_in_the_turns_group_order():
-    frame = parse_frame_output(_frame(groups=_FRAME["groups"][::-1]), ["G1", "G2"])
+    frame = _parse_frame(_frame(groups=_FRAME["groups"][::-1]))
 
     assert frame == FrameOutput(
         frame_entities=(ListEntity("f1", "Thrennic", "Thrennic", "Organization"),),
         groups=(
             GroupFrame("G1", (Template("user", "USES", "item"),), "Technology", "plan"),
-            GroupFrame("G2", (Template("item", "PART_OF", "f1"),), None, "goal"),
+            GroupFrame("G2", (Template("item", "MEMBER_OF", "f1"),), "Person", "goal"),
         ),
         facts=frame.facts,
     )
@@ -329,7 +343,33 @@ def test_a_well_formed_frame_parses_into_frames_in_the_turns_group_order():
 
 
 def test_a_frame_in_a_code_fence_parses():
-    assert parse_frame_output(f"```json\n{_frame()}\n```", ["G1", "G2"]).groups[0].group == "G1"
+    assert _parse_frame(f"```json\n{_frame()}\n```").groups[0].group == "G1"
+
+
+def test_a_group_frame_built_without_durable_is_durable():
+    assert GroupFrame("G1", (), None, "plan").durable is True
+
+
+def _second_group(**changes: object) -> str:
+    group = {"group": "G2", "durable": True, "templates": [], "item_type": None}
+    return _with(["groups", 1], group | {"unchecked": "plan"} | changes)
+
+
+def test_a_group_that_states_nothing_durable_parses_with_no_templates():
+    frame = _parse_frame(_second_group(durable=False))
+
+    assert frame.groups[1] == GroupFrame("G2", (), None, "plan", durable=False)
+
+
+def test_a_durable_group_with_no_shared_template_parses():
+    frame = _parse_frame(_second_group())
+
+    assert frame.groups[1] == GroupFrame("G2", (), None, "plan", durable=True)
+
+
+def test_a_group_that_is_not_durable_but_has_templates_is_refused():
+    with pytest.raises(ListOutputError, match=r"groups\[0\].*G1.*durable"):
+        _parse_frame(_with(["groups", 0, "durable"], False))
 
 
 def _with(path: list, value: object) -> str:
@@ -357,6 +397,8 @@ _TEMPLATE = {"subject": "user", "predicate": "USES", "object": "item"}
         pytest.param(_with(["facts"], _DROP), id="missing-facts"),
         pytest.param(_with(["groups", 0, "unchecked"], _DROP), id="missing-unchecked"),
         pytest.param(_with(["groups", 0, "item_type"], _DROP), id="missing-item-type"),
+        pytest.param(_with(["groups", 0, "durable"], _DROP), id="missing-durable"),
+        pytest.param(_with(["groups", 0, "durable"], "yes"), id="durable-a-string"),
         pytest.param(_with(["frame_entities", 0, "span"], _DROP), id="missing-entity-span"),
         pytest.param(_with(["groups"], "G1"), id="groups-not-a-list"),
         pytest.param(_with(["groups", 0, "templates"], "user USES item"), id="templates-a-string"),
@@ -380,11 +422,11 @@ _TEMPLATE = {"subject": "user", "predicate": "USES", "object": "item"}
 )
 def test_the_frame_parser_refuses_a_malformed_output(text):
     with pytest.raises(ListOutputError):
-        parse_frame_output(text, ["G1", "G2"])
+        _parse_frame(text)
 
 
 def test_a_well_formed_item_output_parses_in_the_order_asked_for():
-    items = parse_item_output(json.dumps(_ITEMS), ["G1.2", "G1.1"])
+    items = _parse_items(json.dumps(_ITEMS), ["G1.2", "G1.1"])
 
     assert [i.item for i in items] == ["G1.2", "G1.1"]
     assert items[1] == ItemOutput(
@@ -429,11 +471,34 @@ def _items_with(path: list, value: object) -> str:
             _items_with(["items", 0, "template", "temporal_status"], "soon"), id="unknown-status"
         ),
         pytest.param(_items_with(["items", 1, "entities", 0, "key"], "item"), id="key-a-role"),
+        pytest.param(_items_with(["items", 0, "entity", "value"], 40), id="value-a-number"),
+        pytest.param(_items_with(["items", 0, "entity", "unit"], ["ms"]), id="unit-a-list"),
+        pytest.param(_items_with(["items", 0, "entity", "extra"], "x"), id="entity-extra-key"),
     ],
 )
 def test_the_item_parser_refuses_a_malformed_output(text):
     with pytest.raises(ListOutputError):
-        parse_item_output(text, ["G1.1", "G1.2"])
+        _parse_items(text, ["G1.1", "G1.2"])
+
+
+def test_an_item_entity_carries_a_metrics_value_unit_and_quantity():
+    metric = {"span": "40 ms", "name": "40 ms", "type": "Metric"}
+    metric |= {"value": "40", "unit": "ms", "quantity": "lag"}
+    text = _items_with(["items", 0], copy.deepcopy(_ITEMS["items"][0]) | {"entity": metric})
+    text = text.replace('"applies": true', '"applies": false')
+
+    items = _parse_items(text, ["G1.1", "G1.2"])
+
+    assert items[0].entity == ItemEntity(
+        "40 ms", "40 ms", "Metric", value="40", unit="ms", quantity="lag"
+    )
+
+
+def test_an_item_entity_without_metric_keys_leaves_them_none():
+    entity = _parse_items(json.dumps(_ITEMS), ["G1.1", "G1.2"])[0].entity
+
+    assert entity is not None
+    assert (entity.value, entity.unit, entity.quantity) == (None, None, None)
 
 
 # --- the list prompt's examples ---------------------------------------------------------------
@@ -460,3 +525,15 @@ def test_each_list_example_parses_and_its_frames_are_the_render_of_its_frame_out
 
         assert frames == render_frames_for_items(frame, groups)
         assert len(items) == sum(len(g.items) for g in groups)
+
+
+def test_each_list_example_writes_its_keys_in_the_schemas_order():
+    for example in _list_examples():
+        frame_text = example.split("FRAME output:\n", 1)[1].split("\n", 1)[0]
+        items_text = example.split(" output:\n")[-1].split("\n", 1)[0]
+
+        for group in json.loads(frame_text)["groups"]:
+            assert list(group) == ["group", "durable", "templates", "item_type", "unchecked"]
+            assert group["durable"] is True
+        for item in json.loads(items_text)["items"]:
+            assert list(item) == ["item", "template", "entity", "entities", "relationships"]

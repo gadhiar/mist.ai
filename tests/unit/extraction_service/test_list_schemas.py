@@ -68,7 +68,7 @@ _RELATIONSHIP_KEYS = ["source", "target", "type", "properties"]
 _FRAME_OBJECTS = {
     "": (["frame_entities", "groups", "facts"], 3),
     "frame_entities[]": (["key", "span", "name", "type"], 4),
-    "groups[]": (["group", "templates", "item_type", "unchecked"], 4),
+    "groups[]": (["group", "durable", "templates", "item_type", "unchecked"], 5),
     "groups[].templates[]": (["subject", "predicate", "object"], 3),
     "facts": (["entities", "relationships"], 2),
     "facts.entities[]": (_ENTITY_KEYS, 4),
@@ -77,8 +77,10 @@ _FRAME_OBJECTS = {
 }
 _ITEM_OBJECTS = {
     "": (["items"], 1),
-    "items[]": (["item", "entity", "template", "entities", "relationships"], 5),
-    "items[].entity": (["span", "name", "type", "activity"], 3),
+    # `template` before `entity`: the item states whether the shared fact applies before
+    # it names its entity, so a built schema's `applies` branch can then constrain it.
+    "items[]": (["item", "template", "entity", "entities", "relationships"], 5),
+    "items[].entity": (["span", "name", "type", "activity", "value", "unit", "quantity"], 3),
     "items[].template": (
         ["applies", "assertion_kind", "temporal_status", "start_date", "end_date"],
         3,
@@ -203,6 +205,15 @@ def test_a_group_holds_at_most_three_templates():
     group = _objects(LIST_FRAME_OUTPUT_SCHEMA)["groups[]"]
 
     assert group["properties"]["templates"]["maxItems"] == 3
+
+
+def test_a_group_states_durable_as_a_boolean_and_an_item_entity_a_metrics_strings():
+    group = _objects(LIST_FRAME_OUTPUT_SCHEMA)["groups[]"]
+    entity = _objects(LIST_ITEM_OUTPUT_SCHEMA)["items[].entity"]
+
+    assert group["properties"]["durable"] == {"type": "boolean"}
+    for key in ("value", "unit", "quantity"):
+        assert entity["properties"][key] == {"type": "string"}, key
 
 
 def test_the_schemas_serialise_as_json():

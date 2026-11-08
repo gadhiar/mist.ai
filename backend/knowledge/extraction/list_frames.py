@@ -88,15 +88,20 @@ class GroupFrame:
 
     Attributes:
         group: The group's id, `G1`.
-        templates: At most 3; none means the group states nothing durable.
+        templates: At most 3. None in a durable group means no fact is shared across
+            the items, and each item states its own (a table whose fact is in each row).
         item_type: The type every item shares, or None.
         unchecked: `plan` or `goal`, what an unchecked box under this group is.
+        durable: False when the group states nothing durable (an errand list), which
+            then takes no templates. Last, with a default, so a frame built in code
+            without it stays durable; the parser always sets it.
     """
 
     group: str
     templates: tuple[Template, ...]
     item_type: str | None
     unchecked: str
+    durable: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,12 +151,18 @@ class FrameOutput:
 
 @dataclass(frozen=True, slots=True)
 class ItemEntity:
-    """An item's own entity; for a table row, its first column's."""
+    """An item's own entity; for a table row, its first column's.
+
+    `value`, `unit` and `quantity` are a Metric item's, as a keyed Metric's are.
+    """
 
     span: str
     name: str
     type: str
     activity: bool = False
+    value: str | None = None
+    unit: str | None = None
+    quantity: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,6 +455,7 @@ def _group_frame(value: object, where: str, roles: frozenset[str]) -> GroupFrame
         where,
         {
             "group": _text,
+            "durable": _boolean,
             "templates": _list,
             "item_type": lambda v: v is None or _TYPE(v),
             "unchecked": _one_of(UNCHECKED_ENUM),
@@ -451,6 +463,11 @@ def _group_frame(value: object, where: str, roles: frozenset[str]) -> GroupFrame
     )
     if len(record["templates"]) > _TEMPLATES_MAX:
         raise ListOutputError(f"{where}.templates: more than {_TEMPLATES_MAX} templates")
+    if not record["durable"] and record["templates"]:
+        raise ListOutputError(
+            f"{where} ({record['group']}): durable is false, so the group takes no "
+            "templates; give durable true or no templates"
+        )
     role = _one_of(sorted(roles))
     templates = tuple(
         Template(
@@ -462,7 +479,9 @@ def _group_frame(value: object, where: str, roles: frozenset[str]) -> GroupFrame
         )
         for n, t in enumerate(record["templates"])
     )
-    return GroupFrame(record["group"], templates, record["item_type"], record["unchecked"])
+    return GroupFrame(
+        record["group"], templates, record["item_type"], record["unchecked"], record["durable"]
+    )
 
 
 def parse_frame_output(text: str, expected_groups: Sequence[str]) -> FrameOutput:
@@ -521,7 +540,7 @@ def _item_output(value: object, where: str) -> ItemOutput:
                 record["entity"],
                 f"{where}.entity",
                 {"span": _text, "name": _text, "type": _TYPE},
-                {"activity": _boolean},
+                _ENTITY_OPTIONAL,
             )
         )
     template = ItemTemplate(

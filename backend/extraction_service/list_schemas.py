@@ -87,6 +87,7 @@ _TEMPLATE = _object({"subject": _STRING, "predicate": _PREDICATE, "object": _STR
 _GROUP = _object(
     {
         "group": _STRING,
+        "durable": _BOOLEAN,
         "templates": _array(_TEMPLATE, max_items=3),
         "item_type": {"type": ["string", "null"], "enum": [*EXTRACTABLE_TYPE_ENUM, None]},
         "unchecked": _enum(UNCHECKED_ENUM),
@@ -99,7 +100,7 @@ LIST_FRAME_OUTPUT_SCHEMA: dict = _object(
 
 _ITEM_ENTITY = _object(
     {"span": _STRING, "name": _STRING, "type": _TYPE},
-    {"activity": _BOOLEAN},
+    {"activity": _BOOLEAN, "value": _STRING, "unit": _STRING, "quantity": _STRING},
 )
 
 _ITEM_TEMPLATE = _object(
@@ -107,11 +108,14 @@ _ITEM_TEMPLATE = _object(
     {"start_date": _STRING, "end_date": _STRING},
 )
 
+# `template` comes before `entity`: the item says whether the group's templates apply
+# before it names its entity, so a built schema can let `applies` pick the branch that
+# then requires and narrows the entity, rather than the entity forcing `applies: false`.
 _ITEM = _object(
     {
         "item": _STRING,
-        "entity": {"anyOf": [_ITEM_ENTITY, {"type": "null"}]},
         "template": _ITEM_TEMPLATE,
+        "entity": {"anyOf": [_ITEM_ENTITY, {"type": "null"}]},
         "entities": _array(_ENTITY),
         "relationships": _array(_RELATIONSHIP),
     }
