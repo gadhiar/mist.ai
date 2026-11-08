@@ -1385,6 +1385,7 @@ class TestStats:
             "repairs_ok": 0,
             "routed_no_call": 0,
             "proposals": {"approved": 0, "rejected": 0, "expired": 0, "superseded": 0},
+            "status_watcher": "stopped",
         }
 
     @pytest.mark.asyncio

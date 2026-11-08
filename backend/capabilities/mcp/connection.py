@@ -81,6 +81,9 @@ class McpConnection:
     credentials are rejected the session is dropped the same way, but the supervisor waits the
     auth delay before it reconnects, as after a rejected connect. Consecutive failures back off
     by `backoff`. A call is never retried here: the caller decides.
+
+    A state listener, when set, hears of every change of the (state, reason) pair `state()`
+    reports, so the host can broadcast it without waiting for its poll.
     """
 
     def __init__(
@@ -88,10 +91,28 @@ class McpConnection:
         transport_factory: Callable[[], McpTransport],
         clock: Clock,
         backoff: BackoffPolicy,
+        *,
+        stop_timeout_s: float = 5.0,
     ) -> None:
+        """Build a stopped connection; nothing connects until `start`.
+
+        Args:
+            transport_factory: Builds a fresh transport for each connect attempt.
+            clock: Supplies the backoff sleeps and status check times.
+            backoff: The delays between consecutive failed attempts.
+            stop_timeout_s: How long `stop` waits, in real loop time, for the supervisor to
+                end before it returns and leaves the task to end on its own.
+
+        Raises:
+            ValueError: `stop_timeout_s` is not finite or not above 0.
+        """
+        # False for 0, a negative value, `nan` and `inf` alike.
+        if not 0 < stop_timeout_s < float("inf"):
+            raise ValueError(f"stop_timeout_s must be finite and above 0, not {stop_timeout_s}")
         self._transport_factory = transport_factory
         self._clock = clock
         self._backoff = backoff
+        self._stop_timeout_s = stop_timeout_s
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
         self._dead = False
@@ -106,30 +127,60 @@ class McpConnection:
         # Set with `_reconnect` when a call's credentials were rejected, so the supervisor
         # backs off before reconnecting instead of retrying a refused credential at once.
         self._dropped_for_auth: CapabilityUnavailableError | None = None
+        self._listener: Callable[[], None] | None = None
+        # The (state, reason) pair last notified, so only a real change schedules the listener.
+        self._notified: tuple[str, str | None] = ("unavailable", self._reason)
+
+    def set_state_listener(self, listener: Callable[[], None] | None) -> None:
+        """Register the one callable told of each state change, or clear it with None.
+
+        It is scheduled with `loop.call_soon`, never called in place, so a listener that raises
+        reaches the loop's exception handler and cannot end the supervisor.
+        """
+        self._listener = listener
 
     async def start(self) -> None:
         """Schedule the supervisor task and return without waiting for the first connect."""
         if self._task is not None:
             return
         self._reason = "connecting"
+        self._notify_if_changed()
         self._task = asyncio.create_task(self._supervise(), name="mcp-connection")
         self._task.add_done_callback(self._on_supervisor_done)
 
     async def stop(self) -> None:
         """Stop the supervisor, which closes an open transport in its own task first.
 
+        The wait for the supervisor is bounded by `stop_timeout_s` of real loop time, not the
+        injected clock, so a transport whose `close` hangs cannot hang the caller. At the
+        bound one WARNING is logged and this returns, leaving the task to end on its own; once
+        the stopping flag is set it publishes no session, makes no further connect attempt
+        and writes no reason, so the connection still reads "stopped".
+
         The stopping flag is set before the cancel, so the done-callback reads the end as
-        orderly. A dead supervisor stays recorded as dead.
+        orderly. A dead supervisor stays recorded as dead. The reason is set to "stopped"
+        before the cancel, so a stop notifies the listener once: here when no session is open,
+        or from the supervisor's `finally` when it clears the open one.
         """
         self._stopping = True
+        if not self._dead:
+            self._reason = "stopped"
+        self._notify_if_changed()
         task = self._task
         if task is not None and not task.done():
             task.cancel()
-            await asyncio.wait({task})
+            done, _ = await asyncio.wait({task}, timeout=self._stop_timeout_s)
+            if not done:
+                # Not cancelled again and awaited: that wait would be unbounded too.
+                logger.warning(
+                    "MCP supervisor still running %g s after stop; leaving it to end on its own",
+                    self._stop_timeout_s,
+                )
         self._session = None
         self._tools = []
         if not self._dead:
             self._reason = "stopped"
+        self._notify_if_changed()
 
     def state(self) -> CapabilityStatus:
         """Return the connection's status; `task_dead` is set once the supervisor has died."""
@@ -190,15 +241,23 @@ class McpConnection:
             self._dropped_for_auth = failure
         self._reconnect.set()
         logger.warning("MCP session dropped after a failed call: %s; reconnecting", reason)
+        self._notify_if_changed()
 
     async def _supervise(self) -> None:
         failures = 0
         try:
-            while True:
+            # The flag is checked after each connect attempt, each serve and each backoff
+            # sleep, so a supervisor whose callee swallowed the stop's cancel ends at the next
+            # check instead of running on after `stop()`.
+            while not self._stopping:
                 failure = await self._connect()
+                if self._stopping:
+                    break
                 if failure is None:
                     failures = 0
                     failure = await self._serve()
+                    if self._stopping:
+                        break
                     if failure is None:
                         continue
                 failures += 1
@@ -219,6 +278,7 @@ class McpConnection:
             # the task that called `open`.
             self._session = None
             self._tools = []
+            self._notify_if_changed()
             await self._close_open()
 
     async def _serve(self) -> CapabilityUnavailableError | None:
@@ -232,7 +292,12 @@ class McpConnection:
         return self._dropped_for_auth
 
     async def _connect(self) -> BaseException | None:
-        """Make one connect attempt; return the contained failure, or None once connected."""
+        """Make one connect attempt; return the contained failure, or None once connected.
+
+        Once `stop()` has set its flag, an attempt that still completes publishes no session
+        and writes no reason, so the connection keeps reading "stopped"; a transport it opened
+        stays in `_open` for the supervisor's `finally` to close.
+        """
         self._reconnect.clear()
         self._dropped_for_auth = None
         try:
@@ -243,11 +308,16 @@ class McpConnection:
         except _CONTAINED_ERRORS as exc:
             failure = exc
         else:
+            if self._stopping:
+                return None
             self._tools = list(tools)
             self._session = transport
             logger.info("MCP session open with %d tools", len(tools))
+            self._notify_if_changed()
             return None
-        self._reason = _describe(failure)
+        if not self._stopping:
+            self._reason = _describe(failure)
+            self._notify_if_changed()
         await self._close_open()
         return failure
 
@@ -295,3 +365,19 @@ class McpConnection:
         self._session = None
         self._tools = []
         self._reason = reason
+        self._notify_if_changed()
+
+    def _notify_if_changed(self) -> None:
+        """Schedule the listener when the (state, reason) pair differs from the last notified.
+
+        Every write to the session, the reason or the dead flag is followed by this call. The
+        pair is recorded even with no listener set, so a listener set later hears only of
+        changes made after it.
+        """
+        status = self.state()
+        pair = (status.state, status.reason)
+        if pair == self._notified:
+            return
+        self._notified = pair
+        if self._listener is not None:
+            asyncio.get_running_loop().call_soon(self._listener)

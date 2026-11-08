@@ -10,15 +10,18 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import BaseModel, ValidationError
 
+from backend.capabilities.contracts import ToolOutcome
 from backend.capabilities.events import (
     ActionDecisionMessage,
     ActionProposedEvent,
     ActionResolvedEvent,
     AlarmActionMessage,
+    AlarmActionResultEvent,
     AlarmFiredEvent,
     AlarmStateEvent,
     CapabilitiesStatusEvent,
     QueueEventSink,
+    alarm_action_result_payload,
 )
 
 AT = "2026-01-05T07:00:00Z"
@@ -246,3 +249,120 @@ async def test_queue_event_sink_hands_its_put_to_call_soon_threadsafe():
     assert [json.loads(arg) for arg in args] == [payload]
     message = await asyncio.wait_for(queue.get(), 2.0)
     assert json.loads(message) == payload
+
+
+class TestAlarmActionResult:
+    AT_TIME = datetime(2026, 1, 5, 7, 0, tzinfo=UTC)
+
+    def _payload(self, outcome: ToolOutcome, request_id: str | None = "r1") -> dict[str, object]:
+        return alarm_action_result_payload("a1", "stop", request_id, outcome, self.AT_TIME)
+
+    @pytest.mark.parametrize(
+        ("status", "expected"),
+        [
+            ("ok", "ok"),
+            ("invalid_args", "invalid_args"),
+            ("unavailable", "unavailable"),
+            ("error", "failed"),
+        ],
+    )
+    def test_each_outcome_maps_to_its_wire_name(self, status, expected):
+        payload = self._payload(ToolOutcome(status=status, summary="s", reason="why"))
+
+        assert payload == {
+            "type": "alarm_action_result",
+            "alarm_id": "a1",
+            "action": "stop",
+            "request_id": "r1",
+            "outcome": expected,
+            "reason": None if expected == "ok" else "why",
+            "at": AT,
+        }
+        assert AlarmActionResultEvent.model_validate(payload).to_payload() == payload
+
+    def test_ok_reason_is_null_even_when_the_outcome_has_one(self):
+        payload = self._payload(ToolOutcome(status="ok", summary="Stopped.", reason="extra"))
+
+        assert payload["reason"] is None
+
+    @pytest.mark.parametrize("status", ["pending_confirmation", "denied"])
+    def test_outcomes_alarm_actions_never_take_raise(self, status):
+        with pytest.raises(ValueError, match=status):
+            self._payload(ToolOutcome(status=status, summary="s"))
+
+    def test_request_id_is_absent_when_none(self):
+        payload = self._payload(ToolOutcome(status="ok", summary="s"), request_id=None)
+
+        assert "request_id" not in payload
+        assert AlarmActionResultEvent.model_validate(payload).to_payload() == payload
+
+    def test_reason_is_capped_at_200_characters(self):
+        payload = self._payload(ToolOutcome(status="error", summary="s", reason="x" * 500))
+
+        assert payload["reason"] == "x" * 200
+
+    @pytest.mark.parametrize("request_id", ["", "r" * 65])
+    def test_request_id_of_0_or_65_characters_fails_validation(self, request_id):
+        with pytest.raises(ValidationError):
+            AlarmActionMessage.model_validate(
+                {
+                    "type": "alarm_action",
+                    "alarm_id": "a1",
+                    "action": "stop",
+                    "request_id": request_id,
+                }
+            )
+        with pytest.raises(ValidationError):
+            self._payload(ToolOutcome(status="ok", summary="s"), request_id=request_id)
+
+    def test_request_id_of_1_and_64_characters_validates_and_round_trips(self):
+        for request_id in ("r", "r" * 64):
+            message = {
+                "type": "alarm_action",
+                "alarm_id": "a1",
+                "action": "stop",
+                "request_id": request_id,
+            }
+            parsed = AlarmActionMessage.model_validate(message)
+            assert parsed.request_id == request_id
+            assert parsed.to_payload() == dict(message, minutes=None)
+
+    def test_message_without_request_id_leaves_it_out(self):
+        parsed = AlarmActionMessage.model_validate(
+            {"type": "alarm_action", "alarm_id": "a1", "action": "stop"}
+        )
+
+        assert parsed.request_id is None
+        assert "request_id" not in parsed.to_payload()
+
+    def test_dismiss_validates_in_the_message_and_the_result(self):
+        message = AlarmActionMessage.model_validate(
+            {"type": "alarm_action", "alarm_id": "a1", "action": "dismiss"}
+        )
+        payload = alarm_action_result_payload(
+            "a1", "dismiss", None, ToolOutcome(status="ok", summary="s"), self.AT_TIME
+        )
+
+        assert message.action == "dismiss"
+        assert payload["action"] == "dismiss"
+        assert AlarmActionResultEvent.model_validate(payload).action == "dismiss"
+
+    def test_unknown_action_fails_validation(self):
+        with pytest.raises(ValidationError):
+            AlarmActionMessage.model_validate(
+                {"type": "alarm_action", "alarm_id": "a1", "action": "pause"}
+            )
+        with pytest.raises(ValidationError):
+            alarm_action_result_payload(
+                "a1",
+                "pause",  # type: ignore[arg-type]
+                None,
+                ToolOutcome(status="ok", summary="s"),
+                self.AT_TIME,
+            )
+
+    def test_result_rejects_an_unknown_outcome_name(self):
+        payload = self._payload(ToolOutcome(status="ok", summary="s"))
+
+        with pytest.raises(ValidationError):
+            AlarmActionResultEvent.model_validate(dict(payload, outcome="error"))

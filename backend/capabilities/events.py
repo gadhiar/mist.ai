@@ -16,7 +16,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .contracts import CapabilityState, OutcomeStatus, RiskClass
+from .contracts import CapabilityState, OutcomeStatus, RiskClass, ToolOutcome
 
 AlarmKind = Literal["alarm", "timer"]
 AlarmStateName = Literal["scheduled", "ringing", "snoozed", "done", "cancelled", "missed"]
@@ -159,12 +159,83 @@ class ActionDecisionMessage(_Inbound):
 
 
 class AlarmActionMessage(_Inbound):
-    """`alarm_action` from the client; `minutes` applies to a snooze only."""
+    """`alarm_action` from the client; `minutes` applies to a snooze only.
+
+    `stop` and `snooze` act on a ringing alarm and `dismiss` on a missed one. `request_id` is
+    an opaque client string that `alarm_action_result` echoes, so a client can pair the answer
+    with its request.
+    """
 
     type: Literal["alarm_action"]
     alarm_id: str
-    action: Literal["stop", "snooze"]
+    action: Literal["stop", "snooze", "dismiss"]
     minutes: int | None = Field(default=None, ge=1, le=60)
+    request_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+    def to_payload(self) -> dict[str, object]:
+        """Return the fields the server reads; `request_id` is left out when none was sent."""
+        exclude = {"request_id"} if self.request_id is None else None
+        return self.model_dump(mode="json", exclude=exclude)
+
+
+class AlarmActionResultEvent(_Outbound):
+    """`alarm_action_result`: the one answer to each valid `alarm_action`, on its socket only.
+
+    `reason` is null for `ok`. `request_id` echoes the client's and is absent from the payload
+    when the client sent none.
+    """
+
+    type: Literal["alarm_action_result"]
+    alarm_id: str
+    action: Literal["stop", "snooze", "dismiss"]
+    request_id: str | None = Field(default=None, min_length=1, max_length=64)
+    outcome: Literal["ok", "invalid_args", "unavailable", "failed"]
+    reason: str | None = Field(max_length=200)
+    at: datetime
+
+    def to_payload(self) -> dict[str, object]:
+        """Return the wire payload, without `request_id` when it is None."""
+        exclude = {"request_id"} if self.request_id is None else None
+        return self.model_dump(mode="json", exclude=exclude)
+
+
+def alarm_action_result_payload(
+    alarm_id: str,
+    action: Literal["stop", "snooze", "dismiss"],
+    request_id: str | None,
+    outcome: ToolOutcome,
+    at: datetime,
+) -> dict[str, object]:
+    """Build the `alarm_action_result` payload for an outcome `CapabilityHost.alarm_action` gave.
+
+    `ok`, `invalid_args` and `unavailable` keep their names and `error` becomes `failed`. The
+    caller passes an outcome that is already redacted; its reason is capped at 200 characters.
+
+    Raises:
+        ValueError: The outcome is `pending_confirmation` or `denied`; an alarm action takes
+            neither path, so building one is a bug in the caller.
+        pydantic.ValidationError: An argument breaks the payload's schema, such as an unknown
+            action or a `request_id` outside 1 to 64 characters.
+    """
+    wire_names: dict[str, Literal["ok", "invalid_args", "unavailable", "failed"]] = {
+        "ok": "ok",
+        "invalid_args": "invalid_args",
+        "unavailable": "unavailable",
+        "error": "failed",
+    }
+    wire = wire_names.get(outcome.status)
+    if wire is None:
+        raise ValueError(f"an alarm action never has the outcome {outcome.status}")
+    reason = None if wire == "ok" or outcome.reason is None else outcome.reason[:200]
+    return AlarmActionResultEvent(
+        type="alarm_action_result",
+        alarm_id=alarm_id,
+        action=action,
+        request_id=request_id,
+        outcome=wire,
+        reason=reason,
+        at=at,
+    ).to_payload()
 
 
 class EventSink(Protocol):

@@ -29,6 +29,13 @@ exception from `invoke` or `on_active_utterance`, and any exception at all from 
 (a synchronous grammar over in-memory data, so it stays uncontained), reaches the host's
 caller: inside a turn, the turn's own error backstop. A capability's `start` runs in a task of
 its own, and a failure of any kind there makes that capability `unavailable`.
+
+Clients learn of status changes from `capabilities_status`, which `status_changed` emits only
+when the status set differs from the one last broadcast. The host's own transition sites (a
+finished start, `stop`) and the MCP connection's state listener call it at once; a watcher
+task polls it every second for statuses that change with no transition site, such as the
+alarm scheduler's health. The watcher contains `MistError` per tick and backs off after a
+failing tick; any other end it was not asked for is logged at ERROR and costs only the poll.
 """
 
 from __future__ import annotations
@@ -54,6 +61,7 @@ from backend.errors import (
     CapabilityRegistrationError,
     CapabilityUnavailableError,
     McpTransportError,
+    MistError,
     TimeParseError,
 )
 from backend.llm.models import ToolCall
@@ -66,6 +74,7 @@ from .contracts import (
     ActionResult,
     CallSource,
     Capability,
+    CapabilityState,
     CapabilityStatus,
     CapabilityTurnPort,
     DecodeFn,
@@ -81,6 +90,9 @@ from .decoder import ActionDecoder
 from .events import (
     ActionProposedEvent,
     ActionResolvedEvent,
+    AlarmStateEvent,
+    CapabilitiesStatusEvent,
+    CapabilityStatusEntry,
     EventSink,
     OutcomeEntry,
     ProposedCallEntry,
@@ -138,6 +150,61 @@ _RESOLUTIONS: tuple[ResolutionDecision, ...] = ("approved", "rejected", "expired
 # `ActionRecord` and a log row under a name that says which hook ran.
 _ACTIVE_HOOK_SUFFIX = ".on_active_utterance"
 _RAW_ARGS_CHARS = 120
+
+AlarmAction = Literal["stop", "snooze", "dismiss"]
+
+ALARMS_NOT_BUILT_REASON = "alarms and timers are not in MIST_CAPABILITIES"
+"""The `alarm_action` reason when the config builds neither alarms nor timers."""
+
+ALARM_CONTROL_NOT_WIRED_REASON = "alarm control is not wired"
+"""The `alarm_action` reason when alarms or timers is built but no `AlarmControl` was passed."""
+
+# The capabilities whose status gates `alarm_action`, in order: timers stand in for alarms
+# only when alarms is not built.
+_ALARM_GATES = ("alarms", "timers")
+
+# The watcher's poll interval, and the first and largest backoff after a failing tick.
+_WATCH_INTERVAL_S = 1.0
+_WATCH_BACKOFF_CAP_S = 60.0
+# Bounds the doubling exponent so a long run of failures cannot overflow the float.
+_WATCH_MAX_EXPONENT = 30
+_WATCHER_NAME = "capability-status-watcher"
+
+# Failures one watcher tick contains rather than dying on (Supervision). Anything else is a
+# bug and ends the watcher, which `_on_watcher_done` records. No broader catch is added.
+_WATCHER_CONTAINED_ERRORS: tuple[type[BaseException], ...] = (MistError,)
+
+# The compared part of a broadcast: per capability, in name order, its name, state, reason
+# and tool names. `at` and `checked_at` are left out, so a poll that finds only a newer check
+# time emits nothing.
+_StatusSet = tuple[tuple[str, CapabilityState, str | None, tuple[str, ...]], ...]
+
+
+class AlarmControl(Protocol):
+    """The host's route to alarm state, for the connect snapshot and the client's alarm actions.
+
+    The `Capability` contract carries no alarm state, so the factory passes one of these to
+    the host for alarms and timers together, because `alarm_state` carries both kinds.
+    """
+
+    async def snapshot(self) -> dict[str, object]:
+        """Return the `alarm_state` payload, its `rev` and alarms from one store read.
+
+        Raises:
+            CapabilityUnavailableError: The scheduler's health is not `running`.
+            CapabilityStoreError: The alarm store cannot be read.
+        """
+        ...
+
+    async def act(self, alarm_id: str, action: AlarmAction, minutes: int | None) -> ToolOutcome:
+        """Stop or snooze a ringing alarm, or dismiss a missed one.
+
+        Raises:
+            CapabilityStoreError: The alarm store cannot be written.
+            CapabilityUnavailableError: The scheduler is not running; the message is its
+                health reason.
+        """
+        ...
 
 
 class TimeoutRunner(Protocol):
@@ -235,7 +302,7 @@ class CapabilityHost(CapabilityTurnPort):
     payload in `PreTurnResolution.events` and never touches a session's buffer. Expiry goes to
     the event sink. The store reports it through `on_expire`, which is given no turn: it runs
     from the store's timer task, outside any turn, or synchronously inside a `pop` made by a
-    turn or by `decide`.
+    turn or by `decide`. `capabilities_status` goes to the event sink too (module docstring).
     """
 
     def __init__(
@@ -252,6 +319,7 @@ class CapabilityHost(CapabilityTurnPort):
         clock: Clock,
         settings: HostSettings,
         timeout_runner: TimeoutRunner = asyncio.wait_for,
+        alarm_control: AlarmControl | None = None,
     ) -> None:
         """Register the capabilities; nothing is started and no file is touched.
 
@@ -264,10 +332,13 @@ class CapabilityHost(CapabilityTurnPort):
             secrets: Every secret value, for `redact`.
             action_log: Where each invocation is recorded.
             event_sink: Receives each proposal expiry, which the store reports from its timer
-                task or from inside `pop`.
-            clock: Supplies call times, proposal deadlines and the expiry timer.
+                task or from inside `pop`, and each `capabilities_status` broadcast.
+            clock: Supplies call times, proposal deadlines, the expiry timer and the status
+                watcher's sleeps.
             settings: Timeouts, the proposal lifetime, the fast-path switch and wake words.
             timeout_runner: Bounds each invoke and decode; `asyncio.wait_for` by default.
+            alarm_control: The alarm state and actions behind `snapshot_events` and
+                `alarm_action`; None when no alarm scheduler is built.
 
         Raises:
             CapabilityRegistrationError: Two capabilities share a name, or two offer the same
@@ -309,6 +380,13 @@ class CapabilityHost(CapabilityTurnPort):
         # warns once per change rather than on every turn.
         self._oversized: dict[str, tuple[str, ...]] = {}
         self._stats = _Stats(clock.now())
+        self._alarm_control = alarm_control
+        self._status_rev = 0
+        # None until the first broadcast, so the first `status_changed` always emits.
+        self._broadcast: _StatusSet | None = None
+        self._watcher: asyncio.Task[None] | None = None
+        self._watcher_stopping = False
+        self._watcher_dead = False
 
     # -- Lifecycle -------------------------------------------------------------------------
 
@@ -317,7 +395,9 @@ class CapabilityHost(CapabilityTurnPort):
 
         A start that raises `CapabilityError` makes that capability `unavailable` with the
         error's message. Any other exception is logged at ERROR with its traceback, and the
-        capability is `unavailable` with the exception's class name. Call it once.
+        capability is `unavailable` with the exception's class name. Each start that finishes
+        is broadcast. The status watcher starts too; its first poll is a second later. Call it
+        once.
         """
         loop = asyncio.get_running_loop()
         for capability in self._capabilities:
@@ -326,6 +406,9 @@ class CapabilityHost(CapabilityTurnPort):
             )
             task.add_done_callback(functools.partial(self._on_start_done, capability.name))
             self._start_tasks[capability.name] = task
+        if self._watcher is None:
+            self._watcher = loop.create_task(self._watch_statuses(), name=_WATCHER_NAME)
+            self._watcher.add_done_callback(self._on_watcher_done)
 
     async def wait_started(self) -> None:
         """Return once every start has finished, whether it succeeded or raised.
@@ -337,16 +420,19 @@ class CapabilityHost(CapabilityTurnPort):
             await asyncio.wait(list(self._start_tasks.values()))
 
     async def stop(self) -> None:
-        """Cancel pending starts, stop each capability in order, then close the proposal store.
+        """Stop the watcher, cancel pending starts, stop each capability, then close the store.
 
         A `CapabilityError` from one capability's `stop` is logged at WARNING and the others
-        still stop. The store closes in a `finally`, so it closes after the capabilities stop
-        even when a `stop` raises outside `CapabilityError`, which still propagates. Closing
-        drops the live proposals without announcing an expiry and waits for every expiry timer
-        to end, so none outlives the host; a later `decide` finds no live proposal, and a call
-        that policy holds is recorded as an error.
+        still stop. Once every capability has stopped, the stopped states are broadcast once;
+        a start this cancelled is covered by that broadcast. The store closes in a `finally`,
+        so it closes after the capabilities stop even when a `stop` raises outside
+        `CapabilityError`, which still propagates. Closing drops the live proposals without
+        announcing an expiry and waits for every expiry timer to end, so none outlives the
+        host; a later `decide` finds no live proposal, and a call that policy holds is
+        recorded as an error.
         """
         try:
+            await self._stop_watcher()
             pending = [task for task in self._start_tasks.values() if not task.done()]
             for task in pending:
                 task.cancel()
@@ -357,6 +443,7 @@ class CapabilityHost(CapabilityTurnPort):
                     await capability.stop()
                 except CapabilityError as exc:
                     logger.warning("Capability %s failed to stop: %s", capability.name, exc)
+            self.status_changed()
         finally:
             await self._proposals.close()
 
@@ -377,9 +464,110 @@ class CapabilityHost(CapabilityTurnPort):
         source. `decodes` counts turn decodes, not repairs; `decode_failures` those that failed
         or timed out; `repairs` each repair decode and `repairs_ok` those whose arguments then
         validated. `routed_no_call` counts decodes that chose no call. `proposals` counts each
-        proposal's resolution.
+        proposal's resolution. `status_watcher` is `running`, `stopped` (before `start` and
+        after `stop`) or `dead` (it ended without `stop`, so only transition sites broadcast).
         """
-        return self._stats.snapshot()
+        stats = self._stats.snapshot()
+        stats["status_watcher"] = self._watcher_state()
+        return stats
+
+    # -- Status broadcast, connect snapshot and alarm actions ------------------------------
+
+    def status_changed(self) -> None:
+        """Broadcast `capabilities_status` if the status set differs from the last broadcast.
+
+        The one entry point for every broadcast: the host's transition sites, the MCP
+        connection's state listener and the watcher all call it, so one change is emitted
+        once. It is synchronous and runs on the loop. On a difference it bumps `rev` and emits
+        one payload through the event sink; otherwise it emits nothing.
+        """
+        current = self._status_set()
+        if current == self._broadcast:
+            return
+        payload = _status_payload(self._status_rev + 1, current, self._clock.now())
+        self._status_rev += 1
+        self._broadcast = current
+        self._sink.emit(payload)
+
+    async def snapshot_events(self) -> list[dict[str, object]]:
+        """Return the payloads a connecting client gets: status first, then alarm state.
+
+        `status_changed` runs first, so the `capabilities_status` returned carries the current
+        `rev` and no broadcast of a change can be newer than it. `alarm_state` follows when
+        there is an alarm control. A `CapabilityError` from it is logged at WARNING and
+        `alarm_state` left out, because `capabilities_status` already shows alarms and timers
+        `unavailable` with the reason; any other exception propagates to the caller.
+        """
+        self.status_changed()
+        events = [_status_payload(self._status_rev, self._broadcast or (), self._clock.now())]
+        if self._alarm_control is not None:
+            try:
+                state = await self._alarm_control.snapshot()
+            except CapabilityError as exc:
+                logger.warning(
+                    "Alarm state left out of the connect snapshot: %s",
+                    self.redact(_describe(exc)),
+                )
+            else:
+                events.append(AlarmStateEvent.model_validate(state).to_payload())
+        return events
+
+    async def alarm_action(
+        self, alarm_id: str, action: AlarmAction, minutes: int | None
+    ) -> ToolOutcome:
+        """Run a client's `stop`, `snooze` or `dismiss` on an alarm through the alarm control.
+
+        The status of alarms, or of timers when alarms is not built, gates it as step 4 of the
+        pipeline gates a tool call: while it is `unavailable` or `disabled`, the answer is
+        `unavailable` with the reason the status surface shows, and `act` is not called. A
+        `CapabilityError` from `act` becomes the outcome step 7 gives it. The outcome is
+        redacted. Any other exception from `act` propagates to the caller.
+
+        No action-log row is written: the log's sources cover turn and proposal calls, and
+        the alarm store records the transition itself.
+        """
+        logger.info("Alarm action %s for alarm %s", action, alarm_id)
+        statuses = {
+            capability.name: status
+            for capability, status in zip(self._capabilities, self.statuses())
+        }
+        gate = next((statuses[name] for name in _ALARM_GATES if name in statuses), None)
+        if gate is None:
+            return ToolOutcome(
+                status="unavailable",
+                summary="Alarms and timers are not in MIST_CAPABILITIES.",
+                reason=ALARMS_NOT_BUILT_REASON,
+            )
+        if gate.state in ("unavailable", "disabled"):
+            reason = gate.reason or gate.state
+            return ToolOutcome(
+                status="unavailable",
+                summary=f"Alarms and timers are {gate.state}: {reason}.",
+                reason=reason,
+            )
+        if self._alarm_control is None:
+            logger.error(
+                "Alarm action %s for alarm %s cannot run: alarms or timers is built but no "
+                "alarm control was passed to the host",
+                action,
+                alarm_id,
+            )
+            return ToolOutcome(
+                status="unavailable",
+                summary=f"Alarms and timers are unavailable: {ALARM_CONTROL_NOT_WIRED_REASON}.",
+                reason=ALARM_CONTROL_NOT_WIRED_REASON,
+            )
+        try:
+            outcome = await self._alarm_control.act(alarm_id, action, minutes)
+        except CapabilityError as exc:
+            logger.warning(
+                "Alarm action %s for alarm %s failed: %s",
+                action,
+                alarm_id,
+                self.redact(_describe(exc)),
+            )
+            outcome = _outcome_for_error(f"alarm {action}", exc)
+        return self._redacted(outcome)
 
     # -- CapabilityTurnPort ----------------------------------------------------------------
 
@@ -720,11 +908,7 @@ class CapabilityHost(CapabilityTurnPort):
         as compact JSON and capped.
         """
         args_summary = self.redact(args if isinstance(args, str) else _raw_args(args))
-        outcome = dataclasses.replace(
-            outcome,
-            summary=self.redact(outcome.summary),
-            reason=None if outcome.reason is None else self.redact(outcome.reason),
-        )
+        outcome = self._redacted(outcome)
         record = ActionRecord(
             tool_call_id=tool_call_id,
             tool=tool,
@@ -972,19 +1156,116 @@ class CapabilityHost(CapabilityTurnPort):
 
     def _on_start_done(self, name: str, task: asyncio.Task[None]) -> None:
         if task.cancelled():
+            # Only `stop()` cancels a start, and it broadcasts once every capability stops.
             return
         error = task.exception()
-        if error is None:
-            return
         if isinstance(error, CapabilityError):
             logger.warning("Capability %s failed to start: %s", name, error)
+        elif error is not None:
+            logger.error(
+                "Capability %s start raised an unexpected %s",
+                name,
+                type(error).__name__,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+        self.status_changed()
+
+    def _redacted(self, outcome: ToolOutcome) -> ToolOutcome:
+        """Stage 8: the outcome with its summary and reason through `redact()`."""
+        return dataclasses.replace(
+            outcome,
+            summary=self.redact(outcome.summary),
+            reason=None if outcome.reason is None else self.redact(outcome.reason),
+        )
+
+    def _status_set(self) -> _StatusSet:
+        """Read `statuses()` into the compared form, keyed by capability name."""
+        rows = [
+            (
+                capability.name,
+                status.state,
+                status.reason,
+                tuple(spec.name for spec in capability.tools()),
+            )
+            for capability, status in zip(self._capabilities, self.statuses())
+        ]
+        return tuple(sorted(rows, key=lambda row: row[0]))
+
+    # -- The status watcher ----------------------------------------------------------------
+
+    async def _watch_statuses(self) -> None:
+        """Poll `status_changed` every second, backing off after a failing tick."""
+        failures = 0
+        while not self._watcher_stopping:
+            if failures:
+                exponent = min(failures - 1, _WATCH_MAX_EXPONENT)
+                delay = min(_WATCH_BACKOFF_CAP_S, _WATCH_INTERVAL_S * 2.0**exponent)
+            else:
+                delay = _WATCH_INTERVAL_S
+            # Outside the contained `try`: a sleep's own error is not a failed tick.
+            await self._clock.sleep(delay)
+            try:
+                self.status_changed()
+            except _WATCHER_CONTAINED_ERRORS as exc:
+                failures += 1
+                logger.warning(
+                    "Capability status poll failed (%d in a row): %s",
+                    failures,
+                    self.redact(_describe(exc)),
+                )
+            else:
+                failures = 0
+
+    async def _stop_watcher(self) -> None:
+        # The flag is set before the cancel, so the done-callback reads the end as orderly.
+        self._watcher_stopping = True
+        watcher = self._watcher
+        if watcher is not None and not watcher.done():
+            watcher.cancel()
+            await asyncio.wait({watcher})
+
+    def _on_watcher_done(self, task: asyncio.Task[None]) -> None:
+        """Record how the watcher ended, keyed on the stopping flag rather than cancellation.
+
+        A cancellation `stop()` did not ask for is a death like an exception or a return, so
+        a watcher that stops polling never does so silently.
+        """
+        if self._watcher_stopping:
+            if not task.cancelled():
+                exc = task.exception()
+                if exc is not None:
+                    logger.warning(
+                        "Capability status watcher raised while the host stopped: %s",
+                        self.redact(_describe(exc)),
+                        exc_info=exc,
+                    )
+            return
+        self._watcher_dead = True
+        consequence = "status changes now reach clients only from transition sites"
+        if task.cancelled():
+            logger.error("Capability status watcher was cancelled without stop(); %s", consequence)
+            return
+        exc = task.exception()
+        if exc is None:
+            logger.error(
+                "Capability status watcher returned, which it never does by design; %s",
+                consequence,
+            )
             return
         logger.error(
-            "Capability %s start raised an unexpected %s",
-            name,
-            type(error).__name__,
-            exc_info=(type(error), error, error.__traceback__),
+            "Capability status watcher died: %s: %s; %s",
+            type(exc).__name__,
+            self.redact(str(exc)),
+            consequence,
+            exc_info=exc,
         )
+
+    def _watcher_state(self) -> str:
+        if self._watcher_dead:
+            return "dead"
+        if self._watcher is not None and not self._watcher.done():
+            return "running"
+        return "stopped"
 
     def _turn_schemas(self, capability: Capability) -> dict[str, dict[str, object]]:
         """Return the capability's arguments schemas for this turn, refined when they fit."""
@@ -1082,6 +1363,18 @@ def _raw_args(arguments: Mapping[str, object]) -> str:
 
 def _describe(exc: BaseException) -> str:
     return str(exc) or type(exc).__name__
+
+
+def _status_payload(rev: int, statuses: _StatusSet, at: datetime) -> dict[str, object]:
+    return CapabilitiesStatusEvent(
+        type="capabilities_status",
+        rev=rev,
+        capabilities=[
+            CapabilityStatusEntry(name=name, state=state, reason=reason, tools=list(tools))
+            for name, state, reason, tools in statuses
+        ],
+        at=at,
+    ).to_payload()
 
 
 def _proposed_payload(proposal: Proposal) -> dict[str, object]:

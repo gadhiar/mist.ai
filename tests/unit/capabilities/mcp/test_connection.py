@@ -500,6 +500,379 @@ class TestSupervision:
         assert conn.state().task_dead is False
 
 
+class _Listener:
+    """Counts its calls; `error`, when set, is raised from every call after counting it."""
+
+    def __init__(self, error: BaseException | None = None) -> None:
+        self.calls = 0
+        self.error = error
+
+    def __call__(self) -> None:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+
+
+async def _settle() -> None:
+    # Lets every `call_soon` callback scheduled so far run.
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+class TestStateListener:
+    @pytest.mark.asyncio
+    async def test_listener_is_scheduled_not_called(self):
+        server = FakeHomeAssistant()
+        server.open_gate = asyncio.Event()
+        conn = _connection(server, FakeClock())
+        listener = _Listener()
+        conn.set_state_listener(listener)
+        async with _running(conn):
+            # `start` wrote "connecting"; the listener runs only once the loop turns.
+            assert listener.calls == 0
+            await _settle()
+            assert listener.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_each_transition_schedules_the_listener_once(self):
+        server = FakeHomeAssistant()
+        server.open_gate = asyncio.Event()
+        conn = _connection(server, FakeClock())
+        listener = _Listener()
+        conn.set_state_listener(listener)
+        await conn.start()
+        await _until(lambda: len(server.open_tasks) == 1)
+        await _settle()
+        assert listener.calls == 1  # connecting
+
+        server.open_gate.set()
+        await _connected(conn)
+        await _settle()
+        assert listener.calls == 2  # connected
+
+        server.open_gate.clear()
+        server.call_script.append(McpTransportError("connection reset"))
+        with pytest.raises(McpTransportError):
+            await conn.call_tool(TURN_ON, {}, 5.0)
+        await _until(lambda: len(server.open_tasks) == 2)
+        await _settle()
+        assert listener.calls == 3  # unavailable, with the reconnect held at `open`
+
+        await conn.stop()
+        await _settle()
+        assert listener.calls == 4  # stopped
+        assert (conn.state().state, conn.state().reason) == ("unavailable", "stopped")
+
+    @pytest.mark.asyncio
+    async def test_stop_while_connected_schedules_the_listener_once(self):
+        server = FakeHomeAssistant()
+        conn = _connection(server, FakeClock())
+        listener = _Listener()
+        conn.set_state_listener(listener)
+        await conn.start()
+        await _connected(conn)
+        await _settle()
+        before = listener.calls
+
+        await conn.stop()
+        await _settle()
+
+        assert listener.calls == before + 1
+
+    @pytest.mark.asyncio
+    async def test_death_from_the_done_callback_schedules_the_listener_once(self):
+        server = FakeHomeAssistant()
+        server.open_gate = asyncio.Event()
+        server.open_failures.append(unexpected_error())
+        conn = _connection(server, FakeClock())
+        listener = _Listener()
+        conn.set_state_listener(listener)
+        await conn.start()
+        await _until(lambda: len(server.open_tasks) == 1)
+        await _settle()
+        assert listener.calls == 1
+
+        server.open_gate.set()
+        await _until(conn.task_dead)
+        await _settle()
+
+        assert listener.calls == 2
+        await conn.stop()
+        await _settle()
+        # A dead connection keeps its death reason, so stopping it changes nothing.
+        assert listener.calls == 2
+
+    @pytest.mark.asyncio
+    async def test_failed_connect_connect_and_drop_schedule_three_times(self):
+        server = FakeHomeAssistant()
+        server.open_gate = asyncio.Event()
+        server.open_failures.append(connect_refused())
+        clock = FakeClock(settle_timeout_s=0.3)
+        conn = _connection(server, clock)
+        listener = _Listener()
+        async with _running(conn):
+            conn.set_state_listener(listener)
+            await _settle()
+            server.open_gate.set()
+            await clock.wait_for_sleepers(1)
+            await _settle()
+            assert listener.calls == 1  # the failed connect
+
+            await clock.advance(1.0)
+            await _connected(conn)
+            await _settle()
+            assert listener.calls == 2  # connected
+
+            server.open_gate.clear()
+            server.call_script.append(McpTransportError("connection refused"))
+            with pytest.raises(McpTransportError):
+                await conn.call_tool(TURN_ON, {}, 5.0)
+            await _until(lambda: len(server.open_tasks) == 3)
+            await _settle()
+            assert listener.calls == 3  # the drop, though its reason matches the failed connect
+
+    @pytest.mark.asyncio
+    async def test_repeated_failed_connect_with_the_same_reason_schedules_nothing_new(self):
+        server = FakeHomeAssistant()
+        server.open_failures.extend([connect_refused(), connect_refused(), connect_refused()])
+        clock = FakeClock(settle_timeout_s=0.3)
+        conn = _connection(server, clock)
+        listener = _Listener()
+        conn.set_state_listener(listener)
+        async with _running(conn):
+            await clock.wait_for_sleepers(1)
+            await _settle()
+            assert listener.calls == 2  # connecting, then the first failure
+
+            await clock.advance(1.0)
+            await clock.advance(2.0)
+            await _settle()
+
+            assert len(server.open_tasks) == 3
+            assert listener.calls == 2
+
+    @pytest.mark.asyncio
+    async def test_raising_listener_leaves_the_supervisor_running(self):
+        loop = asyncio.get_running_loop()
+        handled: list[dict[str, object]] = []
+        previous = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: handled.append(context))
+        try:
+            server = FakeHomeAssistant()
+            conn = _connection(server, FakeClock())
+            conn.set_state_listener(_Listener(RuntimeError("listener bug")))
+            async with _running(conn):
+                await _connected(conn)
+                await _settle()
+                assert conn.task_dead() is False
+                assert conn.state().state == "available"
+                assert [t.name for t in conn.tools()] == CORE_TOOLS
+                result = await conn.call_tool(TURN_ON, {}, 5.0)
+                assert result.is_error is False
+        finally:
+            loop.set_exception_handler(previous)
+        assert handled
+        assert all(isinstance(c.get("exception"), RuntimeError) for c in handled)
+        assert conn.task_dead() is False
+
+    @pytest.mark.asyncio
+    async def test_cleared_listener_is_not_scheduled(self):
+        server = FakeHomeAssistant()
+        conn = _connection(server, FakeClock())
+        listener = _Listener()
+        conn.set_state_listener(listener)
+        conn.set_state_listener(None)
+        async with _running(conn):
+            await _connected(conn)
+            await _settle()
+        await _settle()
+        assert listener.calls == 0
+
+    @pytest.mark.asyncio
+    async def test_reconnect_after_an_auth_drop_resets_the_auth_delay(self):
+        server = FakeHomeAssistant()
+        clock = FakeClock(settle_timeout_s=0.3)
+        conn = _connection(server, clock)
+        async with _running(conn):
+            await _connected(conn)
+            server.call_script.append(auth_rejected())
+            with pytest.raises(CapabilityUnavailableError):
+                await conn.call_tool(TURN_ON, {}, 5.0)
+            await clock.wait_for_sleepers(1)
+            await clock.advance(300.0)
+            await _connected(conn)
+            assert len(server.open_tasks) == 2
+
+            server.call_script.append(McpTransportError("connection reset"))
+            with pytest.raises(McpTransportError):
+                await conn.call_tool(TURN_ON, {}, 5.0)
+            await _until(lambda: len(server.open_tasks) == 3)
+            await _connected(conn)
+
+            assert clock.sleeps == [300.0]
+
+
+class _HeldTransport:
+    """An `McpTransport` whose `open` or `close` can be held on `release` past a stop's cancel.
+
+    `open_after_cancel` set to "return" or "raise" makes `open` wait until cancelled, catch the
+    cancel, wait for `release`, and then return normally or raise `McpTransportError`.
+    `hold_close` makes `close` wait for `release`.
+    """
+
+    def __init__(
+        self,
+        release: asyncio.Event,
+        *,
+        open_after_cancel: str | None = None,
+        hold_close: bool = False,
+    ) -> None:
+        self.release = release
+        self.open_after_cancel = open_after_cancel
+        self.hold_close = hold_close
+        self.opened = False
+        self.closed = False
+
+    async def open(self) -> None:
+        if self.open_after_cancel is not None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await self.release.wait()
+                if self.open_after_cancel == "raise":
+                    raise McpTransportError("connect failed after the stop") from None
+        self.opened = True
+
+    async def list_tools(self) -> list[McpToolSpec]:
+        return [McpToolSpec(TURN_ON, "Turns on a device", {})]
+
+    async def call_tool(self, name, arguments, timeout_s) -> McpToolResult:
+        return McpToolResult(is_error=False, text="ok", structured=None)
+
+    async def close(self) -> None:
+        if self.hold_close:
+            await self.release.wait()
+        self.closed = True
+
+
+class _HeldFactory:
+    def __init__(self, **options: object) -> None:
+        self.release = asyncio.Event()
+        self.options = options
+        self.built: list[_HeldTransport] = []
+
+    def __call__(self) -> _HeldTransport:
+        transport = _HeldTransport(self.release, **self.options)  # type: ignore[arg-type]
+        self.built.append(transport)
+        return transport
+
+
+def _supervisor_task() -> asyncio.Task[object]:
+    (task,) = (t for t in asyncio.all_tasks() if t.get_name() == "mcp-connection")
+    return task
+
+
+class TestBoundedStop:
+    @pytest.mark.asyncio
+    async def test_close_that_hangs_past_the_bound_leaves_the_task_running(self, caplog):
+        factory = _HeldFactory(hold_close=True)
+        conn = McpConnection(
+            factory, FakeClock(), BackoffPolicy(jitter=_identity), stop_timeout_s=0.05
+        )
+        caplog.set_level(logging.WARNING, logger=LOGGER)
+        await conn.start()
+        await _connected(conn)
+        task = _supervisor_task()
+        loop = asyncio.get_running_loop()
+
+        started = loop.time()
+        await asyncio.wait_for(conn.stop(), 1.0)
+
+        assert loop.time() - started < 1.0
+        (warning,) = _records(caplog, logging.WARNING)
+        assert "0.05" in warning.getMessage()
+        assert (conn.state().state, conn.state().reason) == ("unavailable", "stopped")
+        assert conn.tools() == []
+        assert conn.task_dead() is False
+        assert not task.done()
+
+        factory.release.set()
+        await asyncio.wait({task}, timeout=1.0)
+
+        assert task.done()
+        assert factory.built[0].closed is True
+        assert conn.task_dead() is False
+        assert _records(caplog, logging.ERROR) == []
+
+    @pytest.mark.asyncio
+    async def test_open_that_swallows_the_cancel_and_returns_publishes_no_session(self):
+        factory = _HeldFactory(open_after_cancel="return")
+        conn = McpConnection(
+            factory, FakeClock(), BackoffPolicy(jitter=_identity), stop_timeout_s=0.05
+        )
+        await conn.start()
+        await _until(lambda: len(factory.built) == 1)
+        await _settle()
+        task = _supervisor_task()
+
+        await conn.stop()
+        factory.release.set()
+        await asyncio.wait({task}, timeout=1.0)
+
+        assert task.done()
+        assert (conn.state().state, conn.state().reason) == ("unavailable", "stopped")
+        assert conn.tools() == []
+        assert len(factory.built) == 1
+        assert factory.built[0].opened is True
+        assert factory.built[0].closed is True
+        assert conn.task_dead() is False
+
+    @pytest.mark.asyncio
+    async def test_open_that_swallows_the_cancel_and_raises_keeps_the_stopped_reason(self):
+        factory = _HeldFactory(open_after_cancel="raise")
+        clock = FakeClock()
+        conn = McpConnection(factory, clock, BackoffPolicy(jitter=_identity), stop_timeout_s=0.05)
+        await conn.start()
+        await _until(lambda: len(factory.built) == 1)
+        await _settle()
+        task = _supervisor_task()
+
+        await conn.stop()
+        factory.release.set()
+        await asyncio.wait({task}, timeout=1.0)
+
+        assert task.done()
+        assert (conn.state().state, conn.state().reason) == ("unavailable", "stopped")
+        assert len(factory.built) == 1
+        assert clock.sleeps == []
+        assert conn.task_dead() is False
+
+    @pytest.mark.parametrize("bound", [0.0, -1.0, float("nan"), float("inf")])
+    def test_stop_timeout_must_be_finite_and_positive(self, bound):
+        with pytest.raises(ValueError, match="stop_timeout_s"):
+            McpConnection(
+                FakeHomeAssistant().transport,
+                FakeClock(),
+                BackoffPolicy(jitter=_identity),
+                stop_timeout_s=bound,
+            )
+
+    @pytest.mark.asyncio
+    async def test_supervisor_that_ends_within_the_bound_gives_no_warning(self, caplog):
+        server = FakeHomeAssistant()
+        conn = McpConnection(
+            server.transport, FakeClock(), BackoffPolicy(jitter=_identity), stop_timeout_s=1.0
+        )
+        caplog.set_level(logging.WARNING, logger=LOGGER)
+        async with _running(conn):
+            await _connected(conn)
+            task = _supervisor_task()
+
+        assert task.done()
+        assert server.transports[0].is_open is False
+        assert _records(caplog, logging.WARNING) == []
+
+
 class TestFakeHomeAssistant:
     def test_lists_the_documented_intents_with_their_slots(self):
         tools = {spec.name: spec for spec in FakeHomeAssistant().tool_specs()}
