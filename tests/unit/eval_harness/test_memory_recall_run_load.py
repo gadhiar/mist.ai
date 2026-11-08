@@ -1,8 +1,9 @@
-"""The run modes: `--cpu-load-procs`, `--placement`, `--threads` and `--rescan-facts`.
+"""The run modes: `--cpu-load-procs`, `--placement`, `--threads`, `--rescan-facts`, `--trace`.
 
 The busy-loop processes start for the run and stop after it; the block builder gets the
-placement asked for; torch's thread count is set before any model loads; and forced rescans
-of the fact index run for the whole run and are logged.
+placement asked for; torch's thread count is set before any model loads; forced rescans of the
+fact index run for the whole run and are logged; and the trace writes a run header and one
+record per probe that agrees with the run file.
 """
 
 from __future__ import annotations
@@ -228,15 +229,20 @@ def test_rescan_facts_needs_a_log(tmp_path: Path, capsys: pytest.CaptureFixture[
     assert "--rescan-facts needs --rescan-log" in capsys.readouterr().err
 
 
-def test_a_run_in_every_mode_writes_every_probe_and_logs_the_rescans(
+@pytest.fixture
+def every_mode(
     tmp_path: Path, placements: list[str], events: list[tuple[str, object]]
-) -> None:
-    output, log = tmp_path / "run.jsonl", tmp_path / "rescan.json"
-
+) -> dict[str, Path]:
+    """One fake run with every mode on: the run file, the rescan log and the trace."""
+    paths = {
+        "output": tmp_path / "run.jsonl",
+        "log": tmp_path / "rescan.json",
+        "trace": tmp_path / "trace.jsonl",
+    }
     code = main(
         [
             "--output",
-            str(output),
+            str(paths["output"]),
             "--placement",
             "system_tail",
             "--threads",
@@ -244,13 +250,22 @@ def test_a_run_in_every_mode_writes_every_probe_and_logs_the_rescans(
             "--rescan-facts",
             "3",
             "--rescan-log",
-            str(log),
+            str(paths["log"]),
+            "--trace",
+            str(paths["trace"]),
             "--deadline-ms",
             "10000",
         ]
     )
-
     assert code == 0
+    return paths
+
+
+def test_a_run_in_every_mode_writes_every_probe_and_logs_the_rescans(
+    every_mode: dict[str, Path], placements: list[str], events: list[tuple[str, object]]
+) -> None:
+    output, log = every_mode["output"], every_mode["log"]
+
     records = _records(output)
     assert [r["probe_id"] for r in records] == [p.probe_id for p in load_probes()]
     assert all(isinstance(r["shortlisted"], int) and r["shortlisted"] >= 0 for r in records)
@@ -266,3 +281,73 @@ def test_a_run_in_every_mode_writes_every_probe_and_logs_the_rescans(
         # Each cycle moves the synthetic facts to a new revision: three re-embedded rows.
         assert (cycle["report"]["updated"], cycle["report"]["embedded"]) == (3, 3)
         assert cycle["report"]["inserted"] == cycle["report"]["deleted"] == 0
+
+
+# -- the trace ----------------------------------------------------------------------------------
+
+
+def test_the_trace_opens_with_the_run_header(every_mode: dict[str, Path]) -> None:
+    header = _records(every_mode["trace"])[0]
+
+    assert header["record"] == "run"
+    assert (header["device"], header["placement"], header["rescan_facts"]) == (
+        "cpu",
+        "system_tail",
+        3,
+    )
+    assert isinstance(header["threads"], int) and header["threads"] > 0
+    assert (header["embedder_path"], header["reranker_path"]) == (None, None)
+    assert header["cost_per_pair_ms"] is None and header["call_overhead_ms"] is None
+    assert header["config"]["deadline_ms"] == 10000
+    assert {"min_score", "rerank_top_n", "block_tokens", "rerank_weight"} <= set(header["config"])
+
+
+def test_the_trace_has_one_record_per_probe_matching_its_run_record(
+    every_mode: dict[str, Path],
+) -> None:
+    traces = _records(every_mode["trace"])[1:]
+    records = {r["probe_id"]: r for r in _records(every_mode["output"])}
+    top_n = _records(every_mode["trace"])[0]["config"]["rerank_top_n"]
+
+    assert sorted(t["probe_id"] for t in traces) == sorted(records)
+    for trace in traces:
+        record = records[trace["probe_id"]]
+        assert trace["record"] == "probe"
+        assert trace["shortlisted"] == record["shortlisted"] == len(trace["scored"])
+        assert trace["reranked"] == record["reranked"]
+        assert trace["rerank_matches_shortlist"] is True
+        assert len(trace["embed_calls"]) == 1 and trace["embed_calls"][0]["wall_ms"] >= 0
+        positions = [entry["shortlist"] for entry in trace["fused"]]
+        assert positions == [n if n <= top_n else None for n in range(1, len(positions) + 1)]
+        assert [s["rank"] for s in trace["scored"]] == list(range(1, len(trace["scored"]) + 1))
+        for scored in trace["scored"]:
+            assert (scored["logit"] is None) == (not scored["reranked"])
+        for call in trace["rerank_calls"]:
+            assert call["pairs_scored"] == record["reranked"] == len(call["pair_tokens"])
+            assert call["pairs_within"] >= call["pairs_scored"] and call["discarded"] == 0
+
+
+def test_the_trace_follows_each_target_through_the_stages(every_mode: dict[str, Path]) -> None:
+    traces = _records(every_mode["trace"])[1:]
+    targets = [target for trace in traces for target in trace["targets"]]
+
+    traced = [target for target in targets if target["traced"]]
+    assert {target["kind"] for target in traced} == {"fact", "note"}
+    assert all(target["kind"] not in ("fact", "note") for target in targets if not target["traced"])
+    in_block = [target for target in traced if target["in_block"]]
+    assert in_block and all(target["indexed_at_now"] for target in in_block)
+    assert any(target["disposition"] == "injected" for target in in_block)
+    for target in traced:
+        if target["shortlist"] is not None:
+            assert target["fused"] == target["shortlist"]
+        if not target["indexed_at_now"]:
+            continue
+        oracle = target["oracle"]
+        if target["kind"] == "fact":
+            assert set(target["ranks"]) == {"fts", "vector", "entity"}
+            assert oracle["text"] and isinstance(oracle["logit"], float)
+        else:
+            assert set(target["ranks"]) == {"note_vector", "note_fts"}
+            logits = [chunk["logit"] for chunk in oracle["chunks"]]
+            assert logits and oracle["max"] == max(logits)
+            assert all(chunk["heading"] and chunk["text"] for chunk in oracle["chunks"])
