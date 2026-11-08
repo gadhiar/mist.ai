@@ -795,6 +795,17 @@ class TestAnsweredByActions:
         assert handler._extraction_tasks == {}
 
     @pytest.mark.asyncio
+    async def test_the_turn_is_recorded_as_answered_by_a_capability(self):
+        port = _Port(plan=_plan(), result=_result(_record(), also_reply=False, reply="Timer set."))
+        handler, _provider, store = _make_handler([_decode_pass()], port=port)
+
+        await _collect(handler, "set a timer for ten minutes")
+
+        assert [(e.system_response, e.answered_by) for e in store.events] == [
+            ("Timer set.", "capability")
+        ]
+
+    @pytest.mark.asyncio
     async def test_records_give_tool_events_with_the_model_source(self):
         proposed = {"type": "action_proposed", "proposal_id": "p1"}
         later = {"type": "action_resolved", "proposal_id": "p0", "resolution": "superseded"}

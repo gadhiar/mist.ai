@@ -112,6 +112,17 @@ class EventStore:
             )
             logger.info("Event store: added `provisional` column to epoch_ledger")
 
+        # T31: `answered_by` (who answered the turn), same guard shape again.
+        # Nullable with no default, so every existing row stays NULL, which
+        # `backend.extraction_backlog.eligibility.policy_skip_reason` reads as
+        # a model-answered turn.
+        turn_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(conversation_turn_events)")
+        }
+        if "answered_by" not in turn_columns:
+            conn.execute("ALTER TABLE conversation_turn_events ADD COLUMN answered_by TEXT")
+            logger.info("Event store: added `answered_by` column to conversation_turn_events")
+
         logger.info("Event store initialized at %s", self.db_path)
 
     def start_session(
@@ -227,14 +238,14 @@ class EventStore:
                     context_window, retrieval_context, tool_calls,
                     audio_hash, audio_format, audio_duration_ms, audio_sample_rate,
                     stt_model, tts_model, llm_model, llm_parameters,
-                    ontology_version
+                    ontology_version, answered_by
                 ) VALUES (
                     :event_id, :session_id, :turn_index, :timestamp,
                     :user_utterance, :system_response,
                     :context_window, :retrieval_context, :tool_calls,
                     :audio_hash, :audio_format, :audio_duration_ms, :audio_sample_rate,
                     :stt_model, :tts_model, :llm_model, :llm_parameters,
-                    :ontology_version
+                    :ontology_version, :answered_by
                 )
                 """,
                 row,
@@ -897,24 +908,28 @@ class EventStore:
         see the MIS-138 comment there for why content order and not rowid), so
         the live dispatcher applies turns in the order a rebuild replays them.
 
-        Deliberately unfiltered: EVERY turn the live path records is eligible,
-        whatever its session's `origin` and whatever `ontology_version` it was
-        logged under. That matches what the pre-T2a live path did -- it fired
-        extraction for every recorded turn (`conversation_handler.py`, the
-        `if event_id:` branch after `_record_turn_event`) with no origin or
-        ontology check. A rebuild still scopes itself (`LogRegenerator.rebuild`
-        passes `origins=CANONICAL_ORIGINS`); that is the rebuild's policy, not
-        the backlog's.
+        Deliberately unfiltered: every recorded turn is listed, whatever its
+        session's `origin` and whatever `ontology_version` it was logged under,
+        as the pre-T2a live path fired extraction for every recorded turn
+        with no origin or ontology check. Which listed turns are extracted is
+        decided by one predicate on the `answered_by` returned here,
+        `backend.extraction_backlog.eligibility.policy_skip_reason` (T31: a
+        capability-only turn is covered by a skip row instead), and the backlog
+        applies it, so the turn stays in this list and in log order. A rebuild
+        still scopes itself (`LogRegenerator.rebuild` passes
+        `origins=CANONICAL_ORIGINS`); that is the rebuild's policy, not the
+        backlog's.
 
         Returns:
-            Dicts with `event_id`, `session_id`, `turn_index` and `timestamp`
-            only -- the full row (context window, retrieval context) is read per
-            turn by `get_turn` when the turn reaches the head.
+            Dicts with `event_id`, `session_id`, `turn_index`, `timestamp` and
+            `answered_by` only -- the full row (context window, retrieval
+            context) is read per turn by `get_turn` when the turn reaches the
+            head.
         """
         conn = self._get_connection()
         cursor = conn.execute(
             """
-            SELECT event_id, session_id, turn_index, timestamp
+            SELECT event_id, session_id, turn_index, timestamp, answered_by
             FROM conversation_turn_events
             ORDER BY timestamp ASC, session_id ASC, turn_index ASC
             """

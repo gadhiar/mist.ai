@@ -207,6 +207,10 @@ def _status(store: BacklogStore, config: KnowledgeConfig, out: TextIO) -> int:
     print(f"apply_pending={scan.apply_pending}", file=out)
     print(f"dead_lettered={scan.dead_lettered}", file=out)
     print(f"legacy_unextracted={scan.legacy_unextracted}", file=out)
+    policy_skipped = ",".join(
+        f"{reason}:{count}" for reason, count in sorted(scan.policy_skipped.items())
+    )
+    print(f"policy_skipped={policy_skipped or '-'}", file=out)
     print(f"oldest_pending={scan.oldest_pending_timestamp or '-'}", file=out)
     for event_id in store.list_dead_letters(epoch):
         print(f"dead_letter event_id={event_id}", file=out)

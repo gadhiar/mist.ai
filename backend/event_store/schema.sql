@@ -51,7 +51,13 @@ CREATE TABLE IF NOT EXISTS conversation_turn_events (
     ontology_version TEXT NOT NULL DEFAULT '1.0.0',
 
     -- Immutability timestamp
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+
+    -- Who answered the turn: 'model' or 'capability' (a capability's template
+    -- was the whole reply). NULL: recorded before the column existed, read as
+    -- 'model'. Last, so `EventStore.initialize`'s ALTER TABLE on an older
+    -- database gives the same column order as this CREATE.
+    answered_by TEXT
 );
 
 -- Re-extraction job tracking (Phase 5)

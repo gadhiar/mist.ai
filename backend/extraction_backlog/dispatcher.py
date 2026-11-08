@@ -418,12 +418,14 @@ class ExtractionDispatcher:
         epoch = self._store.active_epoch()
         backlog_depth = apply_pending = dead_lettered = legacy_unextracted = 0
         oldest: int | None = None
+        policy_skipped: dict[str, int] = {}
         if epoch is not None:
             scan = self._store.scan(epoch)
             backlog_depth = scan.backlog_depth
             apply_pending = scan.apply_pending
             dead_lettered = scan.dead_lettered
             legacy_unextracted = scan.legacy_unextracted
+            policy_skipped = dict(scan.policy_skipped)
             oldest = age_ms(scan.oldest_pending_timestamp, self._clock())
         cutover_status = None
         cutover = self._store.open_cutover()
@@ -444,6 +446,7 @@ class ExtractionDispatcher:
             oldest_pending_age_ms=oldest,
             unrecorded_turns=telemetry.unrecorded_turns(),
             legacy_unextracted=legacy_unextracted,
+            policy_skipped=policy_skipped,
             service=self._service,
             last_job=self._last_job,
             cutover=cutover_status,
@@ -521,6 +524,9 @@ class ExtractionDispatcher:
             self._set_state(STATE_IDLE)
             return _Wait(self._settings.idle_poll_s, True)
 
+        if head.policy_skip is not None:
+            return await self._skip_by_policy(head, epoch, apply=True)
+
         if head.cached:
             self._set_state(STATE_WORKING)
             await self._apply(head, epoch, request_id="", attempt=0, started=time.perf_counter())
@@ -565,6 +571,9 @@ class ExtractionDispatcher:
                 self._emit_state(self._state, self._state)
             self._set_state(STATE_IDLE)
             return _Wait(self._settings.idle_poll_s, True)
+
+        if head.policy_skip is not None:
+            return await self._skip_by_policy(head, candidate, apply=False)
 
         self._phase = "inference"
         info_or_wait = await self._check_service(candidate)
@@ -657,6 +666,55 @@ class ExtractionDispatcher:
     # ------------------------------------------------------------------
     # One job
     # ------------------------------------------------------------------
+
+    async def _skip_by_policy(self, head: PendingTurn, epoch: Epoch, *, apply: bool) -> None:
+        """Cover a policy-covered head with its skip row: no job, no service call.
+
+        The row is the one a gate skip writes (`put_skip`, `created_at` = the
+        turn's logged timestamp, so two fills write identical rows), and the
+        rebuild and the cutover check read it as any skip. A head whose row
+        already exists (a crash between the write and the apply) gets no second
+        write. In the active epoch (`apply`) the row is then applied as a no-op
+        that writes the `applied` marker; in the cutover fill nothing is
+        applied and the job line is logged, as `_dispatch` does for a gate skip.
+
+        `_state` is left as it is: no service work happens here, so neither
+        `working` is set nor `unreachable`, `epoch_mismatch` or `idle` cleared,
+        and a run of such heads pushes no `extraction_status` transitions.
+        Returns None, so the next step runs at once.
+        """
+        started = time.perf_counter()
+        skip_reason = head.policy_skip
+        assert skip_reason is not None  # the callers branch on it
+        if not head.cached:
+            if apply and self._store.clear_stale_marker(head, epoch):
+                # As in `_dispatch`: a marker beside no cache row is stale and
+                # must go before the row is written, or a crash in between
+                # reads as done.
+                logger.info(
+                    "Cleared a stale apply marker for %s (event %s, no cache row under %s); "
+                    "covering it by policy (%s)",
+                    head.turn_id,
+                    head.event_id,
+                    epoch.label,
+                    skip_reason,
+                )
+            self._store.put_skip(
+                head.event_id, epoch, skip_reason=skip_reason, created_at=head.timestamp
+            )
+        if apply:
+            await self._apply(head, epoch, request_id="", attempt=0, started=started)
+        else:
+            self._log_job(
+                head,
+                request_id="-",
+                job_id="-",
+                attempt=0,
+                duration_ms=(time.perf_counter() - started) * 1000,
+                error_code=skip_reason,
+                outcome="skipped",
+            )
+        return None
 
     async def _dispatch(
         self, head: PendingTurn, epoch: Epoch, info: InfoResponse, *, apply: bool = True
@@ -1066,7 +1124,9 @@ class ExtractionDispatcher:
         if epoch is None:
             return True
         scan = self._store.scan(epoch)
-        return scan.head is None
+        # Policy-covered heads need no service and are left out of both counts,
+        # so a backlog of only those is empty for `drain`.
+        return scan.backlog_depth == 0 and scan.apply_pending == 0
 
     def _set_state(self, state: str, *, reason: str | None = None) -> None:
         if state == self._state:

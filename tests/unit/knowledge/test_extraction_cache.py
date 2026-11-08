@@ -194,6 +194,30 @@ def test_put_refuses_an_unknown_skip_reason():
         )
 
 
+def test_put_accepts_the_capability_only_skip_reason():
+    """T31: a capability-only turn is covered by a skip row with this reason."""
+    from backend.knowledge.extraction_cache import SKIP_CAPABILITY_ONLY
+
+    cache = ExtractionCache(":memory:")
+    cache.initialize()
+
+    cache.put(
+        "evt-6",
+        "1.4.0",
+        "2026-06-14-r5",
+        "model-abc",
+        outcome=OUTCOME_SKIPPED,
+        skip_reason=SKIP_CAPABILITY_ONLY,
+        created_at="2026-08-18T00:00:00+00:00",
+    )
+
+    assert SKIP_CAPABILITY_ONLY == "capability_only"
+    assert SKIP_CAPABILITY_ONLY in VALID_SKIP_REASONS
+    hit = cache.get("evt-6", "2026-06-14-r5", "model-abc")
+    assert hit is not None
+    assert hit["skip_reason"] == SKIP_CAPABILITY_ONLY
+
+
 def test_put_refuses_an_unknown_outcome():
     """The `outcome not in (OUTCOME_EXTRACTED, OUTCOME_SKIPPED)` guard had no
     test at all -- deleting it left all 8 original tests green.
