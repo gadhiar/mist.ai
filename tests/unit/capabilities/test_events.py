@@ -42,6 +42,8 @@ PAYLOADS: list[tuple[type[BaseModel], dict[str, object]]] = [
                 },
                 {"name": "clock", "state": "available", "reason": None, "tools": ["clock.now"]},
             ],
+            "power_level": "low",
+            "decode_available": True,
             "at": AT,
         },
     ),
@@ -164,6 +166,16 @@ def test_payload_missing_a_required_field_is_rejected(model, payload):
         broken = {key: value for key, value in payload.items() if key != field}
         with pytest.raises(ValidationError):
             model.model_validate(broken)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"), [("power_level", "medium"), ("decode_available", "sometimes")]
+)
+def test_status_with_an_unknown_level_or_decode_flag_is_rejected(field, value):
+    payload = dict(PAYLOADS[0][1], **{field: value})
+
+    with pytest.raises(ValidationError):
+        CapabilitiesStatusEvent.model_validate(payload)
 
 
 def test_alarm_action_minutes_is_optional():

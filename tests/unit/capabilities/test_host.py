@@ -10,9 +10,10 @@ import asyncio
 import inspect
 import json
 import logging
+import time
 from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import TypeVar, cast
 
 import pytest
 import pytest_asyncio
@@ -29,6 +30,7 @@ from backend.capabilities.contracts import (
 )
 from backend.capabilities.db import CapabilitiesDb
 from backend.capabilities.decoder import ActionDecoder
+from backend.capabilities.events import CapabilitiesStatusEvent
 from backend.capabilities.host import (
     DECODE_FAILURE_NOTICE,
     NO_LIVE_PROPOSAL_REPLY,
@@ -38,6 +40,7 @@ from backend.capabilities.host import (
     HostSettings,
 )
 from backend.capabilities.policy import PolicyTable
+from backend.capabilities.power import PowerState, SingleModelTiers, TierProviders
 from backend.capabilities.replies import actions_block, notices_for, reply_for
 from backend.capabilities.router import RouterConfig, ToolRouter
 from backend.capabilities.schema import to_args_schema
@@ -50,11 +53,14 @@ from backend.errors import (
     TimeParseError,
 )
 from backend.llm.models import ToolCall
+from backend.llm.provider import StreamingLLMProvider
 from tests.unit.capabilities.fakes import (
     DEFAULT_START,
     EmptyArgs,
     FakeCapability,
     FakeClock,
+    FakePower,
+    FakeTiers,
     RecordingEventSink,
     ScriptedDecode,
     make_tool_spec,
@@ -174,6 +180,8 @@ def _rig(
     settings: HostSettings | None = None,
     timeout_runner: object | None = None,
     policy: PolicyTable | None = None,
+    power: PowerState | None = None,
+    tiers: TierProviders | None = None,
 ) -> Rig:
     counter = ApproximateTokenCounter()
     router = ToolRouter(
@@ -187,7 +195,11 @@ def _rig(
     clock = FakeClock()
     secrets = SecretRegistry()
     db = CapabilitiesDb(":memory:")
-    extra = {} if timeout_runner is None else {"timeout_runner": timeout_runner}
+    extra: dict[str, object] = {} if timeout_runner is None else {"timeout_runner": timeout_runner}
+    if power is not None:
+        extra["power"] = power
+    if tiers is not None:
+        extra["tiers"] = tiers
     host = CapabilityHost(
         list(capabilities),
         router=router,
@@ -1632,3 +1644,209 @@ class TestConcurrency:
         ]
         assert {e["session_id"] for e in mine} == {SESSION}
         assert rig.host.drain_events(SESSION) == []
+
+
+# -- Power levels and tiers (T24) ------------------------------------------------------------
+
+PROVIDER = cast(StreamingLLMProvider, object())
+TIMER_PHRASE = "set a timer for five minutes"
+TIMER_START = make_tool_spec("timers.start", summarize=lambda args: "start a five minute timer")
+
+
+def _timers() -> FakeCapability:
+    # The grammar reads the normalised text, in which number words are digits.
+    return FakeCapability(
+        "timers",
+        tools=(TIMER_START,),
+        intents={"set a timer for 5 minutes": FastIntent("timers.start", {})},
+    )
+
+
+async def _log_columns(db: CapabilitiesDb) -> list[tuple[object, ...]]:
+    return await db.run(
+        lambda conn: conn.execute(
+            "SELECT tool, power_level, turn_ms FROM action_log ORDER BY id"
+        ).fetchall()
+    )
+
+
+async def _settle() -> None:
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+
+class TestPowerPort:
+    def test_received_at_is_a_keyword_defaulting_to_the_call_time(self):
+        for owner in (CapabilityTurnPort, CapabilityHost):
+            for name in ("pre_llm", "plan_turn"):
+                parameter = inspect.signature(getattr(owner, name)).parameters["received_at"]
+                assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, (owner, name)
+                assert parameter.default is None, (owner, name)
+
+    def test_power_and_tiers_are_keywords_whose_defaults_keep_full_and_the_decode(self):
+        parameters = inspect.signature(CapabilityHost).parameters
+        assert parameters["power"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameters["tiers"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameters["tiers"].default is None
+
+        rig = _rig(_lights())
+
+        assert rig.host.decode_available() is True
+        assert rig.host.plan_turn(SESSION, "dim the lamp", []).decode is not None
+
+    def test_decode_available_at_low_with_the_interaction_tier_present(self):
+        tiers = FakeTiers({"interaction": PROVIDER})
+        rig = _rig(_lights(), power=FakePower("low"), tiers=tiers)
+
+        assert rig.host.decode_available() is True
+        assert tiers.asked == ["interaction"]
+
+    def test_decode_unavailable_at_full_when_the_interaction_tier_is_none(self):
+        tiers = FakeTiers({"interaction": None, "smart": PROVIDER})
+        rig = _rig(_lights(), power=FakePower("full"), tiers=tiers)
+
+        assert rig.host.decode_available() is False
+
+    @pytest.mark.asyncio
+    async def test_plan_turn_builds_no_decode_while_it_is_unavailable(self):
+        tiers = FakeTiers({})
+        rig = _rig(_lights(), power=FakePower("off"), tiers=tiers)
+        decode = ScriptedDecode()
+
+        plan = rig.host.plan_turn(SESSION, "dim the lamp", [])
+        result = await rig.host.run_actions(SESSION, "turn-1", "dim the lamp", plan, decode)
+
+        assert plan.decode is None
+        assert plan.offered == frozenset()
+        assert decode.requests == []
+        assert result.records == ()
+        tiers.providers["interaction"] = PROVIDER
+        assert rig.host.plan_turn(SESSION, "dim the lamp", []).decode is not None
+
+
+class TestModelFreePathsAtOff:
+    @pytest.mark.asyncio
+    async def test_fast_path_timer_at_off_is_handled_with_no_decode(self):
+        tiers = FakeTiers({})
+        timers = _timers()
+        timers.outcomes.append(ToolOutcome(status="ok", summary="Timer set for five minutes."))
+        rig = _rig(timers, power=FakePower("off"), tiers=tiers)
+
+        resolution = await rig.host.pre_llm(SESSION, "turn-1", "Set a timer for five minutes")
+
+        assert resolution is not None and resolution.handled
+        assert resolution.reply == "Timer set for five minutes."
+        (record,) = resolution.records
+        assert (record.tool, record.outcome.status, record.power_level) == (
+            "timers.start",
+            "ok",
+            "off",
+        )
+        assert tiers.asked == []
+        assert rig.host.decode_available() is False
+
+    @pytest.mark.asyncio
+    async def test_ringing_stop_at_off_is_handled(self):
+        alarms = _alarms()
+        alarms.ringing = True
+        alarms.active_replies["stop"] = ToolOutcome(status="ok", summary="Alarm stopped.")
+        rig = _rig(alarms, power=FakePower("off"), tiers=FakeTiers({}))
+
+        resolution = await rig.host.pre_llm(SESSION, "turn-1", "Stop.")
+
+        assert resolution is not None and resolution.reply == "Alarm stopped."
+        assert [r.power_level for r in resolution.records] == ["off"]
+
+    @pytest.mark.asyncio
+    async def test_proposal_yes_and_no_at_off_are_handled(self):
+        power = FakePower("full")
+        rig = _rig(
+            _lights(), _music(), power=power, tiers=SingleModelTiers(lambda: PROVIDER, power)
+        )
+        await _propose(rig, ("lights.power", {"target": "bedroom"}))
+        power.current = "off"
+
+        approved = await rig.host.pre_llm(SESSION, "turn-1", "yes")
+        power.current = "full"
+        await _propose(rig, ("music.play", {}))
+        power.current = "off"
+        rejected = await rig.host.pre_llm(SESSION, "turn-2", "no")
+
+        assert approved is not None and approved.handled
+        assert [(r.tool, r.power_level) for r in approved.records] == [("lights.power", "off")]
+        assert rejected is not None and rejected.reply == REJECTED_REPLY
+        assert rig.caps["music"].invocations == []
+
+
+class TestLevelAndLatencyRecords:
+    @pytest.mark.asyncio
+    async def test_every_record_and_row_carries_the_level_read_at_its_call(self):
+        power = FakePower("low")
+        rig = _rig(_lights(), power=power, tiers=FakeTiers({"interaction": PROVIDER}))
+
+        first = await rig.host.invoke(_call("lights.adjust", brightness=30), _ctx("model"), None)
+        power.current = "full"
+        second = await rig.host.invoke(_call("nope.do", call_id="call-2"), _ctx("model"), None)
+
+        assert (first.power_level, second.power_level) == ("low", "full")
+        rows = await _log_columns(rig.db)
+        assert [row[:2] for row in rows] == [("lights.adjust", "low"), ("nope.do", "full")]
+
+    @pytest.mark.asyncio
+    async def test_turn_ms_runs_from_received_at_to_the_fast_path_outcome(self):
+        rig = _rig(_timers())
+
+        await rig.host.pre_llm(SESSION, "turn-1", TIMER_PHRASE, received_at=time.monotonic() - 0.4)
+        await rig.host.pre_llm(SESSION, "turn-2", TIMER_PHRASE)
+
+        (late, prompt) = await _log_columns(rig.db)
+        assert late[0] == "timers.start" and late[2] >= 400
+        assert 0 <= prompt[2] < 400
+
+    @pytest.mark.asyncio
+    async def test_turn_ms_runs_from_plan_turns_received_at_to_the_model_outcome(self):
+        rig = _rig(_lights())
+        received_at = time.monotonic() - 0.4
+
+        plan = rig.host.plan_turn(SESSION, "dim the lamp", [], received_at=received_at)
+        await rig.host.run_actions(
+            SESSION,
+            "turn-1",
+            "dim the lamp",
+            plan,
+            ScriptedDecode(_decoded(("lights.adjust", {"brightness": 30}))),
+        )
+
+        ((tool, level, turn_ms),) = await _log_columns(rig.db)
+        assert (tool, level) == ("lights.adjust", "full")
+        assert turn_ms >= 400
+
+
+class TestLevelInStatus:
+    @pytest.mark.asyncio
+    async def test_status_payload_carries_the_level_and_decode_availability(self):
+        rig = _rig(_lights(), power=FakePower("low"), tiers=FakeTiers({"interaction": PROVIDER}))
+
+        (status, *_) = await rig.host.snapshot_events()
+
+        assert CapabilitiesStatusEvent.model_validate(status).to_payload() == status
+        assert (status["power_level"], status["decode_available"]) == ("low", True)
+
+    @pytest.mark.asyncio
+    async def test_watcher_broadcasts_a_switch_from_full_to_off(self):
+        power = FakePower("full")
+        rig = _rig(_lights(), power=power, tiers=SingleModelTiers(lambda: PROVIDER, power))
+        await rig.host.start()
+        await rig.host.wait_started()
+        await _settle()
+        before = rig.sink.of_type("capabilities_status")
+        assert (before[-1]["power_level"], before[-1]["decode_available"]) == ("full", True)
+
+        power.current = "off"
+        await rig.clock.advance(1.0)
+
+        after = rig.sink.of_type("capabilities_status")
+        assert len(after) == len(before) + 1
+        assert (after[-1]["power_level"], after[-1]["decode_available"]) == ("off", False)
+        assert after[-1]["rev"] == before[-1]["rev"] + 1
+        assert rig.clock.stalled == []

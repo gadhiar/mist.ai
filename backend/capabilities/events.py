@@ -17,6 +17,7 @@ from typing import Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field
 
 from .contracts import CapabilityState, OutcomeStatus, RiskClass, ToolOutcome
+from .power import PowerLevel
 
 AlarmKind = Literal["alarm", "timer"]
 AlarmStateName = Literal["scheduled", "ringing", "snoozed", "done", "cancelled", "missed"]
@@ -53,12 +54,16 @@ class CapabilitiesStatusEvent(_Outbound):
     """`capabilities_status`: sent on connect and broadcast on every state change.
 
     `rev` increases monotonically, so a client can order the on-connect snapshot against later
-    broadcasts.
+    broadcasts. `power_level` and `decode_available` are part of the state, so a change of
+    either is broadcast like a capability's: at off the client can show that only model-free
+    paths answer.
     """
 
     type: Literal["capabilities_status"]
     rev: int = Field(ge=0)
     capabilities: list[CapabilityStatusEntry]
+    power_level: PowerLevel
+    decode_available: bool
     at: datetime
 
 

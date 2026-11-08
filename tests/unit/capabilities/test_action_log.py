@@ -29,6 +29,26 @@ from tests.unit.capabilities.fakes import (
 
 T = TypeVar("T")
 
+# The action log's component step 1, copied here so the migration test starts from the schema a
+# step-1 database holds, whatever later steps the code gains.
+STEP_ONE = (
+    "CREATE TABLE action_log ("
+    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " at TEXT NOT NULL,"
+    " session_id TEXT NOT NULL,"
+    " turn_id TEXT NOT NULL,"
+    " tool_call_id TEXT NOT NULL,"
+    " tool TEXT NOT NULL,"
+    " capability TEXT NOT NULL,"
+    " source TEXT NOT NULL,"
+    " status TEXT NOT NULL,"
+    " args_summary TEXT NOT NULL,"
+    " summary TEXT NOT NULL,"
+    " reason TEXT,"
+    " proposal_id TEXT,"
+    " duration_ms INTEGER NOT NULL)",
+)
+
 
 class CountingDb(CapabilitiesDb):
     """A real database that counts `run` calls, to show writes go through it."""
@@ -179,6 +199,53 @@ class TestWrites:
         assert MAX_ROWS == 10000
         assert count == MAX_ROWS
         assert oldest == "fill-0"
+
+
+class TestStepTwo:
+    @pytest.mark.asyncio
+    async def test_writes_the_level_and_turn_ms(self, tmp_path):
+        db = CapabilitiesDb(str(tmp_path / "capabilities.db"))
+        log = ActionLog(db)
+
+        await log.record(_entry(0, power_level="low", turn_ms=412))
+        await log.record(_entry(1))
+
+        rows = await db.run(
+            lambda conn: conn.execute(
+                "SELECT tool_call_id, power_level, turn_ms FROM action_log ORDER BY id"
+            ).fetchall()
+        )
+        assert rows == [("call-0", "low", 412), ("call-1", None, None)]
+
+    @pytest.mark.asyncio
+    async def test_step_one_database_migrates_and_its_rows_read_null(self, tmp_path):
+        db = CapabilitiesDb(str(tmp_path / "capabilities.db"))
+        db.migrate("action_log", STEP_ONE)
+
+        def old_row(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "INSERT INTO action_log (tool_call_id, at, session_id, turn_id, tool,"
+                " capability, source, status, args_summary, summary, duration_ms)"
+                " VALUES ('old', ?, 's', 't', 'x.y', 'x', 'model', 'ok', '', '', 0)",
+                (DEFAULT_START.isoformat(),),
+            )
+
+        await db.run(old_row)
+
+        await ActionLog(db).record(_entry(1, power_level="off", turn_ms=5))
+
+        rows = await db.run(
+            lambda conn: conn.execute(
+                "SELECT tool_call_id, power_level, turn_ms FROM action_log ORDER BY id"
+            ).fetchall()
+        )
+        version = await db.run(
+            lambda conn: conn.execute(
+                "SELECT version FROM schema_versions WHERE component = 'action_log'"
+            ).fetchone()
+        )
+        assert rows == [("old", None, None), ("call-1", "off", 5)]
+        assert version == (2,)
 
 
 class TestFailures:
