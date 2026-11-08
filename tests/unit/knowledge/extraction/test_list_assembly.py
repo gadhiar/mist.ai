@@ -855,3 +855,233 @@ class TestValueOnlyMetric:
             [("ostrel", "HAS_METRIC", expected)],
         )
         assert _produced_entity_match_id(expected, "Metric", record["properties"]) == expected
+
+
+# -- Metric items -------------------------------------------------------------------------------
+
+
+def _metric_item(
+    item_id: str,
+    span: str,
+    name: str,
+    *,
+    value: str | None = None,
+    unit: str | None = None,
+    quantity: str | None = None,
+) -> ItemOutput:
+    return ItemOutput(
+        item_id,
+        ItemEntity(span, name, "Metric", value=value, unit=unit, quantity=quantity),
+        ItemTemplate(True, "assert", "current"),
+        (),
+        (),
+    )
+
+
+def _metric_items_turn():
+    """A durable group whose items are Metrics of the frame's project, one per row."""
+    utterance = "Ostrel numbers:\n- p95 latency: 120 ms\n- p99 latency: 120 ms\n- 3 deploys a week"
+    frame = _frame(
+        _group("G1", ("f1", "HAS_METRIC", "item"), item_type="Metric"),
+        frame_entities=[ListEntity("f1", "Ostrel", "Ostrel", "Project")],
+    )
+    items = [
+        _metric_item(
+            "G1.1", "p95 latency: 120 ms", "120 ms", value="120", unit="ms", quantity="p95 latency"
+        ),
+        _metric_item(
+            "G1.2", "p99 latency: 120 ms", "120 ms", value="120", unit="ms", quantity="p99 latency"
+        ),
+        _metric_item("G1.3", "3 deploys a week", "deploys", value="3", quantity="deploys a week"),
+    ]
+    return utterance, frame, items
+
+
+class TestMetricItems:
+    """An item whose own entity is a Metric takes the Metric id rail, as a keyed Metric does."""
+
+    def test_its_id_is_built_from_its_value_unit_and_quantity(self):
+        payload, warnings = _run(*_metric_items_turn())
+
+        assert payload.entities[1:] == [
+            {
+                "id": "120-ms-p95-latency",
+                "name": "120 ms",
+                "type": "Metric",
+                "properties": {"value": "120", "unit": "ms", "quantity": "p95 latency"},
+            },
+            {
+                "id": "120-ms-p99-latency",
+                "name": "120 ms",
+                "type": "Metric",
+                "properties": {"value": "120", "unit": "ms", "quantity": "p99 latency"},
+            },
+            {
+                "id": canonical_metric_id("3", None, "deploys a week"),
+                "name": "deploys",
+                "type": "Metric",
+                "properties": {"value": "3", "unit": None, "quantity": "deploys a week"},
+            },
+        ]
+        assert _triples(payload) == [
+            ("ostrel", "HAS_METRIC", "120-ms-p95-latency"),
+            ("ostrel", "HAS_METRIC", "120-ms-p99-latency"),
+            ("ostrel", "HAS_METRIC", canonical_metric_id("3", None, "deploys a week")),
+        ]
+        assert warnings == []
+
+    def test_its_id_comes_from_canonical_metric_id(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(
+            list_assembly,
+            "canonical_metric_id",
+            lambda *args: seen.append(args) or f"built-{len(seen)}",
+        )
+
+        payload, _ = _run(*_metric_items_turn())
+
+        assert _ids(payload) == ["ostrel", "built-1", "built-2", "built-3"]
+        assert seen == [
+            ("120", "ms", "p95 latency"),
+            ("120", "ms", "p99 latency"),
+            ("3", None, "deploys a week"),
+        ]
+
+    @pytest.mark.parametrize(
+        ("span", "value", "expected"),
+        [
+            # No value: the span rail, then `canonical_metric_id_from_id`.
+            ("fast cold starts", None, None),
+            # A value alone, which Pass 4 does not rebuild: the span rail as well.
+            ("180 queued jobs", "180", "180-queued-jobs"),
+        ],
+    )
+    def test_with_no_value_or_a_value_alone_it_keeps_the_span_rail(self, span, value, expected):
+        utterance = f"Ostrel:\n- {span}"
+        frame = _frame(
+            _group("G1", ("f1", "HAS_METRIC", "item"), item_type="Metric"),
+            frame_entities=[ListEntity("f1", "Ostrel", "Ostrel", "Project")],
+        )
+        items = [_metric_item("G1.1", span, "queue depth", value=value)]
+
+        payload, warnings = _run(utterance, frame, items)
+
+        rail_id, rail_warnings = list_entity_id(
+            span, "queue depth", "Metric", utterance, value=value
+        )
+        assert expected is None or rail_id == expected
+        assert payload.entities[1] == {
+            "id": rail_id,
+            "name": span,
+            "type": "Metric",
+            "properties": {"value": value, "unit": None, "quantity": None},
+        }
+        assert warnings == rail_warnings == []
+
+    @pytest.mark.asyncio
+    async def test_the_normalizer_keeps_every_assembled_metric_item_id(self):
+        payload, _ = _run(*_metric_items_turn())
+
+        ids, triples = await _normalized_ids(payload)
+
+        assert ids == _ids(payload)
+        assert triples == _triples(payload)
+
+    def test_the_same_inputs_give_the_same_payload_and_are_not_changed(self):
+        utterance, frame, items = _metric_items_turn()
+        before = copy.deepcopy((frame, items))
+
+        first = _run(utterance, frame, items)
+        second = _run(utterance, frame, items)
+
+        assert first == second
+        assert (frame, items) == before
+
+
+# -- durable groups -----------------------------------------------------------------------------
+
+
+class TestDurableGroupWithNoTemplate:
+    """A durable group with no template: no fact is shared, and each item states its own."""
+
+    def test_each_applying_item_keeps_its_own_edges(self):
+        utterance = "Service latencies:\n- Quorvane: 120 ms\n- Ostrel: 80 ms"
+        group = GroupFrame("G1", (), "Technology", "plan", durable=True)
+        frame = _frame(group)
+
+        def row(item_id: str, name: str, value: str) -> ItemOutput:
+            metric = ListEntity(
+                "e1", f"{value} ms", f"{value} ms", "Metric", value=value, unit="ms"
+            )
+            return _item(
+                item_id,
+                name,
+                entities=[metric],
+                relationships=[_rel("item", "HAS_METRIC", "e1")],
+            )
+
+        items = [row("G1.1", "Quorvane", "120"), row("G1.2", "Ostrel", "80")]
+
+        payload, warnings = _run(utterance, frame, items)
+
+        assert group.durable and group.templates == ()
+        assert _ids(payload) == [
+            "quorvane",
+            canonical_metric_id("120", "ms", None),
+            "ostrel",
+            canonical_metric_id("80", "ms", None),
+        ]
+        assert payload.relationships == [
+            _edge("quorvane", "HAS_METRIC", canonical_metric_id("120", "ms", None), {}),
+            _edge("ostrel", "HAS_METRIC", canonical_metric_id("80", "ms", None), {}),
+        ]
+        assert warnings == []
+
+
+# -- the last-resort drop -----------------------------------------------------------------------
+
+
+class TestLastResortDrop:
+    """The two unresolved ends no parse check can refuse, which assembly drops with a warning."""
+
+    def test_an_item_edge_to_a_later_batchs_null_entity_item_is_dropped(self):
+        utterance = "Editors I tried:\n- Kestrel\n- Tallow\n- the one after both"
+        frame = _frame(_group("G1", ("user", "USES", "item")))
+        items = [
+            # G1.1's call ran before G1.3's, so it could not see that G1.3 has no entity.
+            _item("G1.1", "Kestrel", relationships=[_rel("item", "RELATED_TO", "item:G1.3")]),
+            _item("G1.2", "Tallow"),
+            _item("G1.3", None, applies=False),
+        ]
+
+        payload, warnings = _run(utterance, frame, items)
+
+        assert _triples(payload) == [("user", "USES", "kestrel"), ("user", "USES", "tallow")]
+        assert warnings == ["list_item_ref_unresolved"]
+
+    def test_each_end_naming_an_item_that_took_the_fallback_is_dropped(self):
+        utterance = "Tools MIST runs on:\n- Ostrel:\n  - Velquist\n- Brill"
+        frame = _frame(
+            _group("G1", ("mist", "IMPLEMENTED_WITH", "item")),
+            _group("G2", ("item", "DEPENDS_ON", "parent")),
+            relationships=[_rel("user", "PREFERS", "item:G1.1")],
+        )
+        fallback = ExtractionPayload(
+            entities=[_MIST, {"id": "ostrel", "name": "Ostrel", "type": "Technology"}],
+            relationships=[_edge("mist-identity", "IMPLEMENTED_WITH", "ostrel", {})],
+        )
+        items = [
+            # G1.1 took the fallback, so its item output, entity and all, is ignored.
+            _item("G1.1", "Ostrel"),
+            _item("G2.1", "Velquist"),
+            _item("G1.2", "Brill", relationships=[_rel("item", "RELATED_TO", "item:G1.1")]),
+        ]
+
+        payload, warnings = _run(utterance, frame, items, {"G1.1": fallback})
+
+        # The frame fact, G2.1's `parent` template end and G1.2's own edge each name G1.1.
+        assert _triples(payload) == [
+            ("mist-identity", "IMPLEMENTED_WITH", "ostrel"),
+            ("mist-identity", "IMPLEMENTED_WITH", "brill"),
+        ]
+        assert warnings == ["list_item_ref_unresolved"] * 3
