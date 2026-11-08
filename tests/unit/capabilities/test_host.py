@@ -1305,6 +1305,41 @@ class TestRunActions:
         assert result.also_reply is True
         assert result.notices == (DECODE_FAILURE_NOTICE,)
 
+    @pytest.mark.asyncio
+    async def test_decode_with_no_tier_serving_gives_no_records_and_the_notice(self, caplog):
+        # The handler's decode callback raises this when the interaction tier has no
+        # provider at call time, though it had one when the plan was built.
+        rig = _rig(_lights())
+        plan = rig.host.plan_turn(SESSION, "lights", [])
+        decode = ScriptedDecode(CapabilityUnavailableError("the interaction tier is gone"))
+
+        with caplog.at_level(logging.WARNING, logger="backend.capabilities.host"):
+            result = await rig.host.run_actions(SESSION, "turn-1", "lights", plan, decode)
+
+        assert result.records == ()
+        assert result.also_reply is True
+        assert result.notices == (DECODE_FAILURE_NOTICE,)
+        assert (result.reply, result.block) == (None, "")
+        assert rig.host.stats()["decode_failures"] == 1
+        (warning,) = (r for r in caplog.records if r.levelno == logging.WARNING)
+        assert "the interaction tier is gone" in warning.getMessage()
+
+    @pytest.mark.asyncio
+    async def test_repair_with_no_tier_serving_is_no_repair(self):
+        rig = _rig(_lights())
+        plan = rig.host.plan_turn(SESSION, "lights warmer", [])
+        decode = ScriptedDecode(
+            _decoded(("lights.adjust", {})),
+            CapabilityUnavailableError("the interaction tier is gone"),
+        )
+
+        result = await rig.host.run_actions(SESSION, "turn-1", "lights warmer", plan, decode)
+
+        assert [r.outcome.status for r in result.records] == ["invalid_args"]
+        assert len(decode.requests) == 2
+        assert rig.caps["lights"].invocations == []
+        assert (rig.host.stats()["repairs"], rig.host.stats()["repairs_ok"]) == (1, 0)
+
     def test_decode_failure_notice_text(self):
         # It says the meant action did not run, and not that nothing ran: a "yes, and ..."
         # turn may already have run approved calls.

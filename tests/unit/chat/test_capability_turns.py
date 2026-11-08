@@ -20,6 +20,7 @@ from typing import Any, Literal
 import pytest
 from pydantic import BaseModel
 
+from backend.capabilities.action_log import ActionLog
 from backend.capabilities.contracts import (
     ActionDecode,
     ActionRecord,
@@ -31,11 +32,15 @@ from backend.capabilities.contracts import (
     ToolSpec,
     TurnPlan,
 )
+from backend.capabilities.db import CapabilitiesDb
 from backend.capabilities.decoder import ActionDecoder
+from backend.capabilities.host import DECODE_FAILURE_NOTICE, CapabilityHost, HostSettings
+from backend.capabilities.policy import PolicyTable
 from backend.capabilities.power import FixedTiers, ModelTier
-from backend.capabilities.router import RouteDecision
+from backend.capabilities.router import RouteDecision, RouterConfig, ToolRouter
 from backend.capabilities.schema import to_args_schema
-from backend.chat.context_budget import ContextBudgetPlanner
+from backend.capabilities.secrets import SecretRegistry
+from backend.chat.context_budget import ApproximateTokenCounter, ContextBudgetPlanner
 from backend.chat.conversation_handler import KNOWLEDGE_TOOL_SCHEMAS, ConversationHandler
 from backend.chat.stream_events import Complete, StreamEvent, Token, WSEvent
 from backend.errors import ActionDecodeError, CapabilityUnavailableError
@@ -50,6 +55,12 @@ from tests.mocks.config import build_test_config
 from tests.mocks.embeddings import FakeEmbeddingGenerator
 from tests.mocks.neo4j import FakeNeo4jConnection
 from tests.mocks.streaming_llm import FakeStreamingLLMProvider, ScriptedPass
+from tests.unit.capabilities.fakes import (
+    FakeCapability,
+    FakeClock,
+    RecordingEventSink,
+    make_tool_spec,
+)
 from tests.unit.conftest import make_test_conventions_loader
 
 _SECRET = "tok-quince-7741"
@@ -208,6 +219,27 @@ class _Port:
 
     def drain_events(self, session_id: str) -> list[dict[str, object]]:
         return self._drain_script.pop(0) if self._drain_script else []
+
+
+def _real_host() -> CapabilityHost:
+    """A `CapabilityHost` over one timers capability, with no tier gating its plans."""
+    timers = FakeCapability("timers", tools=(make_tool_spec("timers.start"),), keywords=("timer",))
+    counter = ApproximateTokenCounter()
+    router = ToolRouter(
+        [timers], RouterConfig(token_budget=1200, reserved_tokens=100), counter, None
+    )
+    return CapabilityHost(
+        [timers],
+        router=router,
+        counter=counter,
+        policy=PolicyTable.from_specs(timers.tools(), None),
+        decoder=ActionDecoder(),
+        secrets=SecretRegistry(),
+        action_log=ActionLog(CapabilitiesDb(":memory:")),
+        event_sink=RecordingEventSink(),
+        clock=FakeClock(),
+        settings=HostSettings(),
+    )
 
 
 class _RecordingTiers:
@@ -602,6 +634,29 @@ class TestDecodeCallback:
         assert [type(e) for e in port.decode_errors] == [CapabilityUnavailableError]
         assert len(provider.calls) == 1
         assert _complete(events).final_response == f"Sure thing. {_NOTICE}"
+
+    @pytest.mark.asyncio
+    async def test_the_real_host_turns_no_interaction_provider_into_the_notice(self):
+        # The fake port above catches the error itself, so this drives the real host: its
+        # plan has a decode, and the tier has no provider by the time the decode runs.
+        host = _real_host()
+        handler, provider, store = _make_handler(
+            [ScriptedPass(chunks=["Sure thing."])], port=host, tiers=FixedTiers({})
+        )
+
+        try:
+            events = await _collect(handler, "set a timer for ten minutes")
+        finally:
+            await host.stop()
+
+        expected = f"Sure thing. {DECODE_FAILURE_NOTICE}"
+        assert len(_main_calls(provider)) == 1
+        assert [t.text for t in _tokens(events)] == ["Sure thing.", f" {DECODE_FAILURE_NOTICE}"]
+        assert _complete(events).final_response == expected
+        assert _history(handler)[-1] == ("assistant", expected)
+        assert [e.system_response for e in store.events] == [expected]
+        assert all("I encountered an error" not in repr(e) for e in store.events)
+        assert host.stats()["decode_failures"] == 1
 
     @pytest.mark.asyncio
     async def test_a_cancelled_decode_closes_the_provider_stream(self):
