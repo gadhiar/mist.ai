@@ -104,7 +104,13 @@ ONTOLOGY_VERSION: str = ONTOLOGY_V1_0_0.version
 # context and extracted four units a call, each later call seeing up to eight
 # earlier units; a batch cut short at the output limit is split and retried.
 # Bumped so history is re-extracted under it at the next cutover.
-EXTRACTION_VERSION: str = "2026-11-06-r6"
+# 2026-11-08-r7: list frame path, a code change with no change to the prose
+# prompt -- a structured turn takes one frame call, which decides what each
+# group of items states, and item calls of at most four items that read the
+# whole turn; code assembles the payload and derives list ids from source spans.
+# The r6 list pass stays as the fallback. Each tuning round updates the one r7
+# CODE_REVISIONS entry, because only the final candidate ships.
+EXTRACTION_VERSION: str = "2026-11-08-r7"
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +162,19 @@ CODE_REVISIONS: tuple[CodeRevision, ...] = (
             "a structured turn is extracted in batches of LIST_BATCH_MAX_UNITS = 4 units "
             "with LIST_CONTEXT_MAX_UNITS = 8 earlier units as context; a batch cut short "
             "at EXTRACT_MAX_TOKENS is split in two and retried. Re-extracts history."
+        ),
+    ),
+    CodeRevision(
+        extraction_version="2026-11-08-r7",
+        code_identity="ci1-994c81a3b88b345a7f89806dd819ffb6c6cc0d2134f0363656220ffab4eddbe8",
+        date="2026-11-08",
+        reason=(
+            "List frame path: list_frames, list_prompts, list_schemas, list_assembly and "
+            "canonical_id join the covered code. A structured turn takes one frame call "
+            "(LIST_FRAME_MAX_TOKENS = 2048) and item calls of LIST_ITEM_BATCH_MAX_UNITS = 4 "
+            "items (LIST_ITEM_MAX_TOKENS = 2048), each user message fitted to "
+            "LIST_USER_MAX_CHARS = 7200; the r6 list pass is the fallback. Re-extracts "
+            "history."
         ),
     ),
 )
