@@ -54,6 +54,8 @@ from tests.unit.capabilities.fakes import (
     DEFAULT_START,
     FakeCapability,
     FakeClock,
+    FakePower,
+    FakeTiers,
     RecordingEventSink,
     make_tool_spec,
 )
@@ -1145,7 +1147,13 @@ async def _eventually(predicate: Callable[[], bool], timeout_s: float = 2.0) -> 
         await asyncio.sleep(0.01)
 
 
-def _host(capabilities: list[object], clock: FakeClock) -> CapabilityHost:
+def _host(
+    capabilities: list[object],
+    clock: FakeClock,
+    *,
+    power: FakePower | None = None,
+    tiers: FakeTiers | None = None,
+) -> CapabilityHost:
     router = ToolRouter(
         capabilities, RouterConfig(token_budget=1200, reserved_tokens=100), COUNTER, None  # type: ignore[arg-type]
     )
@@ -1163,6 +1171,8 @@ def _host(capabilities: list[object], clock: FakeClock) -> CapabilityHost:
         event_sink=RecordingEventSink(),
         clock=clock,
         settings=HostSettings(),
+        power=power or FakePower(),
+        tiers=tiers,
     )
 
 
@@ -1371,6 +1381,104 @@ class TestFastPath:
             assert clock is not None and clock.reply == "It's 7:00 AM, Monday January 5."
         finally:
             await host.stop()
+
+    @pytest.mark.asyncio
+    async def test_the_tag_rows_match_only_the_tags_the_store_has_saved(self, rig):
+        assert rig.alarms.match_intent(_norm("set my gym alarm")) is None
+        assert rig.timers.match_intent(_norm("start my pasta timer")) is None
+
+        await _call(rig.alarms, "alarms.set", {"time": "6am", "label": "Gym"}, clock=rig.clock)
+        await _call(rig.timers, "timers.start", {"minutes": 9, "label": "Pasta"}, clock=rig.clock)
+
+        assert rig.alarms.match_intent(_norm("set my GYM alarm for 6:30")) == FastIntent(
+            "alarms.set", {"label": "gym", "time": "6:30"}
+        )
+        assert rig.alarms.match_intent(_norm("cancel the gym alarm")) == FastIntent(
+            "alarms.cancel", {"label": "gym"}
+        )
+        assert rig.timers.match_intent(_norm("start my pasta timer")) == FastIntent(
+            "timers.start", {"label": "pasta"}
+        )
+        assert rig.alarms.match_intent(_norm("set my pasta alarm")) is None
+        assert rig.timers.match_intent(_norm("start my gym timer")) is None
+
+    @pytest.mark.asyncio
+    async def test_a_repeat_said_on_the_fast_path_arms_the_weekday_set(self, rig):
+        host = _host(_capabilities(rig), rig.clock)
+        await host.start()
+        await host.wait_started()
+        try:
+            resolution = await host.pre_llm(
+                "s1", "t1", "set an alarm for 7am every Monday and Thursday"
+            )
+        finally:
+            await host.stop()
+
+        assert resolution is not None and resolution.handled
+        assert resolution.reply == "Alarm set for 7:00 AM every Monday and Thursday."
+        [occurrence] = await rig.live()
+        assert occurrence.record.days == frozenset({0, 3})
+
+    @pytest.mark.asyncio
+    async def test_reads_and_cancels_run_with_no_decode_at_the_off_level(self, rig):
+        tiers = FakeTiers({})
+        host = _host(_capabilities(rig), rig.clock, power=FakePower("off"), tiers=tiers)
+        for hour in range(1, 8):
+            await _call(rig.alarms, "alarms.set", {"time": f"{hour}pm"}, clock=rig.clock)
+        await _call(rig.timers, "timers.start", {"minutes": 10}, clock=rig.clock)
+        await host.start()
+        await host.wait_started()
+        # `pre_llm` takes no decode function, so a handled turn there ran no model; the status
+        # broadcast reads the tiers for `decode_available`, which is why `asked` is not empty.
+        assert host.decode_available() is False
+        try:
+            listed = await host.pre_llm("s1", "t1", "List my alarms")
+            cancelled = await host.pre_llm("s1", "t2", "cancel the timer")
+        finally:
+            await host.stop()
+
+        assert listed is not None and listed.handled
+        assert listed.reply.startswith("You have 7 alarms. 1:00 PM today.")
+        assert listed.reply.endswith("5:00 PM today, and 2 more on screen.")
+        assert "6:00 PM" not in listed.reply
+        assert cancelled is not None and cancelled.handled
+        assert cancelled.reply == "Timer cancelled."
+        assert [
+            (r.tool, r.source, r.power_level) for r in (*listed.records, *cancelled.records)
+        ] == [
+            ("alarms.list", "fastpath", "off"),
+            ("timers.cancel", "fastpath", "off"),
+        ]
+        assert [o.record.kind for o in await rig.live()] == ["alarm"] * 7
+        assert set(tiers.asked) == {"interaction"}
+
+    @pytest.mark.asyncio
+    async def test_cancel_the_timer_takes_the_one_live_timer_or_asks_which(self, rig):
+        host = _host(_capabilities(rig), rig.clock)
+        await host.start()
+        await host.wait_started()
+        try:
+            none = await host.pre_llm("s1", "t1", "cancel the timer")
+            await _call(rig.timers, "timers.start", {"minutes": 10}, clock=rig.clock)
+            one = await host.pre_llm("s1", "t2", "cancel my timer")
+            await _call(rig.timers, "timers.start", {"minutes": 10}, clock=rig.clock)
+            await _call(
+                rig.timers, "timers.start", {"minutes": 5, "label": "eggs"}, clock=rig.clock
+            )
+            several = await host.pre_llm("s1", "t3", "cancel the timer")
+        finally:
+            await host.stop()
+
+        assert none is not None and none.reply == "No timer is running."
+        assert one is not None and one.reply == "Timer cancelled."
+        assert several is not None and several.handled
+        [record] = several.records
+        assert record.outcome.status == "invalid_args"
+        assert record.outcome.summary == (
+            "Which timer should I cancel? 2 timers are running. Eggs, 5 minutes left. "
+            "10 minutes left."
+        )
+        assert len(await rig.live()) == 2
 
 
 # -- SchedulerAlarmControl ---------------------------------------------------------------------
