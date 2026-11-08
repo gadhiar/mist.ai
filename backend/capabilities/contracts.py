@@ -31,6 +31,12 @@ OutcomeStatus = Literal[
     "ok", "invalid_args", "pending_confirmation", "unavailable", "error", "denied"
 ]
 CapabilityState = Literal["available", "degraded", "unavailable", "disabled"]
+ScreenView = Literal["alarms", "timers", "clock", "lights", "music"]
+SCREEN_VIEWS: frozenset[str] = frozenset({"alarms", "timers", "clock", "lights", "music"})
+"""The screen views a tool's outcome can fill; `ScreenView` at run time."""
+
+ACK_WORDS_MAX = 5
+"""An `ack` is spoken while a slow call runs, so it stays a few words long."""
 
 # The model reads outcomes in the actions block; a pending call must never read as done.
 _PENDING_NOTE = "not run: waiting for the user's yes or no"
@@ -48,6 +54,15 @@ class ToolSpec:
         default_policy: The confirmation mode unless the policy file overrides it.
         summarize: Renders validated arguments as a short phrase for proposals and
             `args_summary` ("turn off the bedroom lights").
+        ack: A phrase of at most `ACK_WORDS_MAX` words a voice turn may speak while the call
+            runs ("Turning them off."), so a slow provider is not heard as silence. None when
+            the tool has none.
+        view: The screen view the outcome's `data` fills, so the screen can show the depth
+            the spoken summary leaves out. None when the outcome fills no view.
+
+    Raises:
+        ValueError: `ack` is longer than `ACK_WORDS_MAX` words, or `view` is not one of
+            `SCREEN_VIEWS`.
     """
 
     name: str
@@ -56,6 +71,18 @@ class ToolSpec:
     risk: RiskClass
     default_policy: ConfirmPolicy
     summarize: Callable[[BaseModel], str]
+    ack: str | None = None
+    view: ScreenView | None = None
+
+    def __post_init__(self) -> None:
+        if self.ack is not None and len(self.ack.split()) > ACK_WORDS_MAX:
+            raise ValueError(
+                f"tool {self.name!r}: ack {self.ack!r} must be at most {ACK_WORDS_MAX} words"
+            )
+        if self.view is not None and self.view not in SCREEN_VIEWS:
+            raise ValueError(
+                f"tool {self.name!r}: view {self.view!r} is not one of {sorted(SCREEN_VIEWS)}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,8 +298,10 @@ class TurnPlan:
 class ActionRecord:
     """One executed or proposed call, for the handler's tool-call events.
 
-    `power_level` is the level the host read at the call. It defaults to None so a record built
-    before the power port existed stays valid.
+    `power_level` is the level the host read at the call. `ack` and `view` are copied from the
+    call's `ToolSpec`, and are None when no spec ran it (an unknown tool or an active-item
+    hook). `source` is the path that ran the call. Each has a default, so a record built before
+    these fields existed stays valid; `source` defaults to `model`, the general path.
     """
 
     tool_call_id: str
@@ -283,6 +312,9 @@ class ActionRecord:
     outcome: ToolOutcome
     duration_ms: int
     power_level: PowerLevel | None = None
+    ack: str | None = None
+    view: ScreenView | None = None
+    source: CallSource = "model"
 
 
 @dataclass(frozen=True, slots=True)

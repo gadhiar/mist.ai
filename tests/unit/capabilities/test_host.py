@@ -12,7 +12,7 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TypeVar, cast
 
 import pytest
@@ -41,7 +41,13 @@ from backend.capabilities.host import (
 )
 from backend.capabilities.policy import PolicyTable
 from backend.capabilities.power import PowerState, SingleModelTiers, TierProviders
-from backend.capabilities.replies import actions_block, notices_for, reply_for
+from backend.capabilities.replies import (
+    NoAddress,
+    ReplyRegister,
+    actions_block,
+    notices_for,
+    reply_for,
+)
 from backend.capabilities.router import RouterConfig, ToolRouter
 from backend.capabilities.schema import to_args_schema
 from backend.capabilities.secrets import Secret, SecretRegistry
@@ -182,6 +188,7 @@ def _rig(
     policy: PolicyTable | None = None,
     power: PowerState | None = None,
     tiers: TierProviders | None = None,
+    register: ReplyRegister | None = None,
 ) -> Rig:
     counter = ApproximateTokenCounter()
     router = ToolRouter(
@@ -200,6 +207,8 @@ def _rig(
         extra["power"] = power
     if tiers is not None:
         extra["tiers"] = tiers
+    if register is not None:
+        extra["register"] = register
     host = CapabilityHost(
         list(capabilities),
         router=router,
@@ -1850,3 +1859,240 @@ class TestLevelInStatus:
         assert (after[-1]["power_level"], after[-1]["decode_available"]) == ("off", False)
         assert after[-1]["rev"] == before[-1]["rev"] + 1
         assert rig.clock.stalled == []
+
+
+# -- Voice-ready records and the address form (T25) ------------------------------------------
+
+
+VOICED_POWER = replace(POWER, ack="Turning them off.", view="lights")
+VOICED_ADJUST = replace(ADJUST, ack="Adjusting them.", view="lights")
+VOICED_TIMER = replace(TIMER_START, ack="Starting it.", view="timers")
+
+
+def _voiced_lights() -> FakeCapability:
+    return FakeCapability("lights", tools=(VOICED_POWER, VOICED_ADJUST))
+
+
+def _voiced_timers() -> FakeCapability:
+    return FakeCapability(
+        "timers",
+        tools=(VOICED_TIMER,),
+        intents={"set a timer for 5 minutes": FastIntent("timers.start", {})},
+    )
+
+
+class TestVoiceRecords:
+    @pytest.mark.asyncio
+    async def test_a_fast_path_record_carries_the_specs_ack_and_view_and_source_fastpath(self):
+        rig = _rig(_voiced_timers())
+
+        resolution = await rig.host.pre_llm(SESSION, "turn-1", TIMER_PHRASE)
+
+        assert resolution is not None
+        (record,) = resolution.records
+        assert (record.ack, record.view, record.source) == ("Starting it.", "timers", "fastpath")
+        assert record.power_level == "full"
+
+    @pytest.mark.asyncio
+    async def test_a_decoded_call_record_carries_ack_view_and_source_model(self):
+        rig = _rig(_voiced_lights())
+        plan = rig.host.plan_turn(SESSION, "dim the lamp", [])
+
+        result = await rig.host.run_actions(
+            SESSION,
+            "turn-1",
+            "dim the lamp",
+            plan,
+            ScriptedDecode(_decoded(("lights.adjust", {"brightness": 30}))),
+        )
+
+        (record,) = result.records
+        assert record.outcome.status == "ok"
+        assert (record.ack, record.view, record.source) == ("Adjusting them.", "lights", "model")
+
+    @pytest.mark.asyncio
+    async def test_a_proposed_call_is_model_and_its_approved_run_is_proposal(self):
+        rig = _rig(_voiced_lights(), _music())
+        plan = rig.host.plan_turn(SESSION, "lights and music", [])
+        proposed = await rig.host.run_actions(
+            SESSION,
+            "turn-0",
+            "lights and music",
+            plan,
+            ScriptedDecode(_decoded(("lights.power", {"target": "bedroom"}))),
+        )
+
+        approved = await rig.host.pre_llm(SESSION, "turn-1", "yes")
+
+        (pending,) = proposed.records
+        assert pending.outcome.status == "pending_confirmation"
+        assert (pending.ack, pending.view, pending.source) == (
+            "Turning them off.",
+            "lights",
+            "model",
+        )
+        assert approved is not None
+        (ran,) = approved.records
+        assert ran.outcome.status == "ok"
+        assert (ran.ack, ran.view, ran.source) == ("Turning them off.", "lights", "proposal")
+
+    @pytest.mark.asyncio
+    async def test_a_client_approval_runs_with_source_proposal(self):
+        rig = _rig(_voiced_lights(), _music())
+        proposal_id = await _propose(rig, ("lights.power", {"target": "bedroom"}))
+
+        decided = await rig.host.decide(SESSION, proposal_id, "approve")
+
+        (ran,) = decided.records
+        assert (ran.ack, ran.view, ran.source) == ("Turning them off.", "lights", "proposal")
+
+    @pytest.mark.asyncio
+    async def test_an_invalid_call_keeps_its_specs_ack_and_view(self):
+        rig = _rig(_voiced_lights())
+
+        record = await rig.host.invoke(_call("lights.adjust"), _ctx("model"), None)
+
+        assert record.outcome.status == "invalid_args"
+        assert (record.ack, record.view, record.source) == ("Adjusting them.", "lights", "model")
+
+    @pytest.mark.asyncio
+    async def test_a_record_with_no_spec_has_no_ack_or_view(self):
+        alarms = _alarms()
+        alarms.ringing = True
+        alarms.active_replies["stop"] = ToolOutcome(status="ok", summary="Alarm stopped.")
+        rig = _rig(_voiced_lights(), alarms)
+
+        unknown = await rig.host.invoke(_call("lights.explode"), _ctx("fastpath"), None)
+        stopped = await rig.host.pre_llm(SESSION, "turn-1", "Stop.")
+
+        assert (unknown.ack, unknown.view, unknown.source) == (None, None, "fastpath")
+        assert stopped is not None
+        (hook,) = stopped.records
+        assert (hook.ack, hook.view, hook.source) == (None, None, "fastpath")
+
+
+class _Boss:
+    def __init__(self) -> None:
+        self.asked = 0
+
+    def address_form(self) -> str | None:
+        self.asked += 1
+        return "boss"
+
+
+TIMER_SET = "Timer set for five minutes."
+
+
+def _timer_rig(register: ReplyRegister | None = None, turns: int = 3) -> Rig:
+    timers = _timers()
+    timers.outcomes.extend(ToolOutcome(status="ok", summary=TIMER_SET) for _ in range(turns))
+    return _rig(timers, _lights(), register=register)
+
+
+class TestAddressForm:
+    def test_register_is_a_keyword_defaulting_to_no_address(self):
+        parameter = inspect.signature(CapabilityHost).parameters["register"]
+
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert isinstance(parameter.default, NoAddress)
+
+    @pytest.mark.asyncio
+    async def test_the_form_ends_the_first_templated_reply_of_a_session_only(self):
+        rig = _timer_rig(_Boss())
+
+        first = await rig.host.pre_llm(SESSION, "turn-1", TIMER_PHRASE)
+        second = await rig.host.pre_llm(SESSION, "turn-2", TIMER_PHRASE)
+        other = await rig.host.pre_llm(OTHER, "turn-1", TIMER_PHRASE)
+
+        assert first is not None and second is not None and other is not None
+        assert first.reply == "Timer set for five minutes, boss."
+        assert second.reply == TIMER_SET
+        assert other.reply == "Timer set for five minutes, boss."
+        assert first.records[0].outcome.summary == TIMER_SET
+
+    @pytest.mark.asyncio
+    async def test_a_decode_reply_and_a_decision_after_it_are_addressed_once(self):
+        rig = _rig(_lights(), _music(), register=_Boss())
+        plan = rig.host.plan_turn(SESSION, "lights and music", [])
+
+        proposed = await rig.host.run_actions(
+            SESSION,
+            "turn-1",
+            "lights and music",
+            plan,
+            ScriptedDecode(_decoded(("lights.power", {"target": "bedroom"}))),
+        )
+        (pending,) = proposed.records
+        decided = await rig.host.decide(SESSION, pending.outcome.proposal_id or "", "reject")
+
+        assert proposed.reply == "Should I turn off the bedroom lights? Say yes or no, boss."
+        assert decided.reply == REJECTED_REPLY
+
+    @pytest.mark.asyncio
+    async def test_a_client_decision_can_be_the_first_reply(self):
+        rig = _rig(_lights(), register=_Boss())
+        # `invoke` gives a record and no reply, so the decision is the session's first reply.
+        pending = await rig.host.invoke(_call("lights.power", target="bedroom"), _ctx(), None)
+
+        decided = await rig.host.decide(SESSION, pending.outcome.proposal_id or "", "reject")
+
+        assert decided.handled is True
+        assert decided.reply == "Okay, I won't do that, boss."
+
+    @pytest.mark.asyncio
+    async def test_a_reply_the_main_pass_replaces_is_not_addressed_and_waits(self):
+        rig = _timer_rig(_Boss())
+        plan = rig.host.plan_turn(SESSION, "dim the lamp", [])
+
+        result = await rig.host.run_actions(
+            SESSION,
+            "turn-1",
+            "dim the lamp",
+            plan,
+            ScriptedDecode(_decoded(("lights.adjust", {"brightness": 30}), also_reply=True)),
+        )
+        fast = await rig.host.pre_llm(SESSION, "turn-2", TIMER_PHRASE)
+
+        assert result.also_reply is True
+        assert result.reply == reply_for(result.records)
+        assert fast is not None and fast.reply == "Timer set for five minutes, boss."
+
+    @pytest.mark.asyncio
+    async def test_an_unhandled_decision_reply_is_not_addressed_and_does_not_count(self):
+        rig = _timer_rig(_Boss())
+
+        missing = await rig.host.decide(SESSION, "p-unknown", "approve")
+        fast = await rig.host.pre_llm(SESSION, "turn-1", TIMER_PHRASE)
+
+        assert missing.handled is False
+        assert missing.reply == "proposal p-unknown is unknown"
+        assert fast is not None and fast.reply == "Timer set for five minutes, boss."
+
+    @pytest.mark.asyncio
+    async def test_no_address_replies_are_byte_identical_to_the_default_hosts(self):
+        async def replies(rig: Rig) -> list[str | None]:
+            fast = await rig.host.pre_llm(SESSION, "turn-1", TIMER_PHRASE)
+            plan = rig.host.plan_turn(SESSION, "dim the lamp", [])
+            decoded = await rig.host.run_actions(
+                SESSION,
+                "turn-2",
+                "dim the lamp",
+                plan,
+                ScriptedDecode(_decoded(("lights.power", {"target": "bedroom"}))),
+            )
+            approved = await rig.host.pre_llm(SESSION, "turn-3", "yes")
+            assert fast is not None and approved is not None
+            return [fast.reply, decoded.reply, approved.reply]
+
+        default = await replies(_timer_rig())
+        explicit = await replies(_timer_rig(NoAddress()))
+
+        assert (
+            explicit
+            == default
+            == [
+                TIMER_SET,
+                "Should I turn off the bedroom lights? Say yes or no.",
+                "lights.power done.",
+            ]
+        )

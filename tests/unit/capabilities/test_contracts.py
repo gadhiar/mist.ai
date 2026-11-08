@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from backend import errors
 from backend.capabilities.clock import SystemClock
 from backend.capabilities.contracts import (
+    SCREEN_VIEWS,
     ActionDecode,
     ActionRecord,
     ActionResult,
@@ -413,3 +414,65 @@ class TestFakeCapability:
 
         assert capability.status().task_dead is True
         assert capability.status().checked_at.tzinfo is UTC
+
+
+class TestVoiceContract:
+    """T25: the spoken `ack` and screen `view` on a tool, and what a record carries of them."""
+
+    def test_tool_spec_ack_and_view_default_to_none(self):
+        spec = make_tool_spec("x.do")
+
+        assert (spec.ack, spec.view) == (None, None)
+
+    def test_tool_spec_takes_an_ack_of_at_most_five_words_and_a_view(self):
+        spec = dataclasses.replace(
+            make_tool_spec("lights.power"), ack="Turning the bedroom lights off.", view="lights"
+        )
+
+        assert (spec.ack, spec.view) == ("Turning the bedroom lights off.", "lights")
+
+    def test_an_ack_over_five_words_raises(self):
+        with pytest.raises(ValueError, match="at most 5 words"):
+            dataclasses.replace(make_tool_spec("x.do"), ack="Turning all of the lights off.")
+
+    def test_an_unknown_view_raises(self):
+        with pytest.raises(ValueError, match="view"):
+            dataclasses.replace(make_tool_spec("x.do"), view="weather")  # type: ignore[arg-type]
+
+    def test_screen_views_are_the_five_the_screen_draws(self):
+        assert frozenset({"alarms", "timers", "clock", "lights", "music"}) == SCREEN_VIEWS
+
+    def test_action_record_ack_view_and_source_have_defaults(self):
+        record = ActionRecord(
+            tool_call_id="c1",
+            tool="x.do",
+            capability="x",
+            risk="read",
+            args_summary="x",
+            outcome=ToolOutcome(status="ok", summary="done"),
+            duration_ms=3,
+        )
+
+        assert (record.ack, record.view, record.source, record.power_level) == (
+            None,
+            None,
+            "model",
+            None,
+        )
+
+    def test_action_record_carries_ack_view_and_source(self):
+        record = ActionRecord(
+            tool_call_id="c1",
+            tool="timers.start",
+            capability="timers",
+            risk="reversible",
+            args_summary="start a timer",
+            outcome=ToolOutcome(status="ok", summary="Timer set for 10 minutes."),
+            duration_ms=3,
+            power_level="low",
+            ack="Starting it.",
+            view="timers",
+            source="fastpath",
+        )
+
+        assert (record.ack, record.view, record.source) == ("Starting it.", "timers", "fastpath")
