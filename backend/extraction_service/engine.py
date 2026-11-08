@@ -191,19 +191,25 @@ def list_call_fits(messages: Sequence[Mapping[str, str]]) -> bool:
 
 # The code the run identity covers (`code_sha256` in
 # `backend.knowledge.extraction.run_identity`): this module, the adapters and
-# schemas, every `backend.knowledge.extraction` module imported above, whose
-# renderers and strict parsers Stages 1.5, 2 and 9 call, and the provider
-# module the service builds. Whole modules rather than functions, so a helper
-# a covered function calls is covered too; an edit elsewhere in a covered
-# module costs one `CODE_REVISIONS` line, never a silent miss.
+# both schema modules, every `backend.knowledge.extraction` module imported
+# above, whose renderers, strict parsers and list assembly Stages 1.5, 2 and 9
+# call, `canonical_id`, which the list assembly builds Metric ids with, and the
+# provider module the service builds. Whole modules rather than functions, so a
+# helper a covered function calls is covered too; an edit elsewhere in a
+# covered module costs one `CODE_REVISIONS` line, never a silent miss.
 RUN_IDENTITY_CODE: tuple[ModuleType, ...] = tuple(
     importlib.import_module(name)
     for name in (
         __name__,
         "backend.extraction_service.adapters",
         "backend.extraction_service.schemas",
+        "backend.extraction_service.list_schemas",
+        "backend.knowledge.extraction.canonical_id",
         "backend.knowledge.extraction.internal_derivation",
         "backend.knowledge.extraction.internal_prompts",
+        "backend.knowledge.extraction.list_assembly",
+        "backend.knowledge.extraction.list_frames",
+        "backend.knowledge.extraction.list_prompts",
         "backend.knowledge.extraction.ontology_extractor",
         "backend.knowledge.extraction.preprocessor",
         "backend.knowledge.extraction.prompts",
@@ -213,10 +219,10 @@ RUN_IDENTITY_CODE: tuple[ModuleType, ...] = tuple(
     )
 )
 
-# The backend modules this module and the adapters import from that the run
-# identity does not hash, each with the reason. The coverage test in
-# tests/unit/knowledge/extraction/test_run_identity.py fails on an import in
-# neither tuple.
+# The backend modules this module, the adapters and the list modules import
+# from that the run identity does not hash, each with the reason. The coverage
+# test in tests/unit/knowledge/extraction/test_run_identity.py fails on an
+# import in neither tuple.
 RUN_IDENTITY_EXCLUDED: tuple[tuple[str, str], ...] = (
     (
         "backend.errors",
@@ -234,6 +240,11 @@ RUN_IDENTITY_EXCLUDED: tuple[tuple[str, str], ...] = (
     (
         "backend.llm.provider",
         "the provider Protocol, with no implementation",
+    ),
+    (
+        "backend.knowledge.ontologies",
+        "its type and predicate lists reach the model only through the list schemas, "
+        "which prompt_sha256 covers, and ontology_version is a component already",
     ),
     (
         "backend.extraction_service.settings",
@@ -519,7 +530,11 @@ def _compute_prompt_sha256(adapter: ModelFamilyAdapter) -> str:
     empty-context placeholder, the Stage 2 repair instruction sent on a
     retry, the three constrained-decoding output schemas (serialised with
     sorted keys; hashed whether or not the active mode sends them, which
-    only makes the stamp stricter), and the adapter's own name/version.
+    only makes the stamp stricter), the list path's system prompt, its two
+    user templates and two repair instructions, its two output schemas, and
+    the adapter's own name/version. The list schemas are serialised in
+    declared key order, because the grammar emits keys in that order, so a
+    reorder changes decoding.
 
     Not covered: the PreProcessor's context formatting (code, not a
     template) and request parameters (temperature, max_tokens, reasoning
@@ -547,6 +562,13 @@ def _compute_prompt_sha256(adapter: ModelFamilyAdapter) -> str:
             json.dumps(SCOPE_OUTPUT_SCHEMA, sort_keys=True),
             json.dumps(EXTRACTION_OUTPUT_SCHEMA, sort_keys=True),
             json.dumps(DERIVATION_OUTPUT_SCHEMA, sort_keys=True),
+            LIST_SYSTEM_PROMPT,
+            LIST_FRAME_USER_TEMPLATE,
+            LIST_ITEM_USER_TEMPLATE,
+            LIST_FRAME_REPAIR_INSTRUCTION,
+            LIST_ITEM_REPAIR_INSTRUCTION,
+            json.dumps(LIST_FRAME_OUTPUT_SCHEMA, sort_keys=False),
+            json.dumps(LIST_ITEM_OUTPUT_SCHEMA, sort_keys=False),
             adapter.name,
             adapter.version,
         ]

@@ -5,8 +5,10 @@ what the model was asked (not the epoch's identity, which is extraction_version
 plus the composed model_hash). A prompt edit that left it unchanged would make
 two different requests look identical in the audit trail, so each component
 must move the hash on its own: the scope, extraction and derivation templates,
-the Stage 2 empty-context placeholder and repair instruction, the three output
-schemas, and the adapter identity.
+the Stage 2 empty-context placeholder and repair instruction, the list system
+prompt, user templates and repair instructions, the five output schemas, and
+the adapter identity. The two list schemas are hashed in declared key order,
+because the order changes what the grammar lets the model emit.
 """
 
 from __future__ import annotations
@@ -27,9 +29,22 @@ _COMPONENTS = (
     "INTERNAL_DERIVATION_USER_TEMPLATE",
     "_REPAIR_INSTRUCTION",
     "NO_PRIOR_CONTEXT",
+    "LIST_SYSTEM_PROMPT",
+    "LIST_FRAME_USER_TEMPLATE",
+    "LIST_ITEM_USER_TEMPLATE",
+    "LIST_FRAME_REPAIR_INSTRUCTION",
+    "LIST_ITEM_REPAIR_INSTRUCTION",
 )
 
-_SCHEMAS = ("SCOPE_OUTPUT_SCHEMA", "EXTRACTION_OUTPUT_SCHEMA", "DERIVATION_OUTPUT_SCHEMA")
+_SCHEMAS = (
+    "SCOPE_OUTPUT_SCHEMA",
+    "EXTRACTION_OUTPUT_SCHEMA",
+    "DERIVATION_OUTPUT_SCHEMA",
+    "LIST_FRAME_OUTPUT_SCHEMA",
+    "LIST_ITEM_OUTPUT_SCHEMA",
+)
+
+_LIST_SCHEMAS = ("LIST_FRAME_OUTPUT_SCHEMA", "LIST_ITEM_OUTPUT_SCHEMA")
 
 
 def _hash() -> str:
@@ -53,6 +68,34 @@ def test_each_output_schema_moves_the_hash(monkeypatch, name) -> None:
     edited = {**getattr(engine, name), "description": "edited"}
     monkeypatch.setattr(engine, name, edited)
     assert _hash() != before, f"editing {name} left prompt_sha256 unchanged"
+
+
+def _reordered(schema: dict) -> dict:
+    """`schema` with every `properties` object's keys in reverse order, content unchanged."""
+    copy = {
+        key: _reordered(value) if isinstance(value, dict) else value
+        for key, value in schema.items()
+    }
+    if isinstance(copy.get("properties"), dict):
+        copy["properties"] = dict(reversed(list(copy["properties"].items())))
+    return copy
+
+
+@pytest.mark.parametrize("name", _LIST_SCHEMAS)
+def test_a_list_schemas_key_order_moves_the_hash(monkeypatch, name) -> None:
+    before = _hash()
+    reordered = _reordered(getattr(engine, name))
+    assert reordered == getattr(engine, name)
+    monkeypatch.setattr(engine, name, reordered)
+    assert _hash() != before, f"reordering {name}'s keys left prompt_sha256 unchanged"
+
+
+def test_the_r6_schemas_key_order_does_not_move_the_hash(monkeypatch) -> None:
+    before = _hash()
+    monkeypatch.setattr(
+        engine, "EXTRACTION_OUTPUT_SCHEMA", _reordered(engine.EXTRACTION_OUTPUT_SCHEMA)
+    )
+    assert _hash() == before
 
 
 def test_adapter_identity_moves_the_hash() -> None:
