@@ -8,6 +8,7 @@ served in two chunks, and a note ranked above the facts the block places before 
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 
 import pytest
 
@@ -213,6 +214,19 @@ def test_the_scorer_accepts_the_record_with_its_ranks() -> None:
     assert [(item.ref, item.id, item.rank) for item in parsed.items] == [
         (entry["ref"], entry["id"], entry["rank"]) for entry in _EXPECTED
     ]
+
+
+def test_the_record_carries_the_scored_shortlist_size() -> None:
+    # The stage keeps 50 candidates at most; the ones past the cap count as well.
+    result = _result(_ITEMS, _CANDIDATES)
+    truncated = replace(result, stage=replace(result.stage, truncated=3))
+    probe = load_probes(FIXTURE_DIR / "probes.jsonl")[0]
+
+    record = run_record(
+        probe, truncated, [_LIST], counter=ApproximateTokenCounter(), cpu_load_procs=0
+    )
+
+    assert record["shortlisted"] == len(_CANDIDATES) + 3
 
 
 def test_an_item_without_an_injected_candidate_is_refused() -> None:

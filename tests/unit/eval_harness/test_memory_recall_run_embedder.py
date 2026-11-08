@@ -3,12 +3,17 @@
 One recording fake is patched in as `SentenceTransformer` in both the harness and
 `backend/knowledge/embeddings/embedding_generator.py`, so the two classes drive the same fake
 and any difference in their encode arguments, or in what they do without encoding, fails here.
+
+The reranker side: real models load from `/opt/models` only, `--rerank-model` included, and
+the trace counts a pair's tokens with the tokenizer of the cross-encoder the reranker loaded.
 """
 
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -124,3 +129,97 @@ def test_real_models_load_from_opt_models_only() -> None:
     assert harness._model_path("/opt/models/ms-marco-MiniLM-L-6-v2") == (
         "/opt/models/ms-marco-MiniLM-L-6-v2"
     )
+
+
+def test_rerank_model_overrides_the_configured_cross_encoder() -> None:
+    args = harness._parser().parse_args(
+        ["--output", "run.jsonl", "--rerank-model", "/opt/models/bge-reranker-base"]
+    )
+
+    assert harness.config_from_args(args).rerank_model == "/opt/models/bge-reranker-base"
+
+
+class RecordingTokenizer:
+    """Records each call; a pair's ids are its words, cut to `max_length` when truncating."""
+
+    model_max_length = 512
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+
+    def __call__(self, *texts: str, **kwargs: Any) -> dict[str, list[int]]:
+        self.calls.append((texts, dict(kwargs)))
+        ids = [0] * sum(len(text.split()) for text in texts)
+        limit = kwargs.get("max_length") or self.model_max_length
+        return {"input_ids": ids[:limit] if kwargs.get("truncation") else ids}
+
+
+class FakeCrossEncoder:
+    """The `CrossEncoder` attributes the trace reads: its tokenizer and its `max_length`."""
+
+    instances: list[FakeCrossEncoder] = []
+
+    def __init__(self, model_name: str, *, device: str, local_files_only: bool) -> None:
+        self.args = (model_name, device, local_files_only)
+        self.tokenizer = RecordingTokenizer()
+        self.max_length: int | None = 4
+        FakeCrossEncoder.instances.append(self)
+
+
+def test_pair_tokens_come_from_the_loaded_cross_encoders_tokenizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(harness, "CrossEncoder", FakeCrossEncoder)
+    capture = harness.CrossEncoderCapture()
+
+    model = capture("/opt/models/ms-marco-MiniLM-L-6-v2", device="cpu", local_files_only=True)
+
+    assert model.args == ("/opt/models/ms-marco-MiniLM-L-6-v2", "cpu", True)
+    assert capture.pair_tokens("one two", "three") == 3
+    assert capture.pair_tokens("one two", "three four five") == 4  # truncated to max_length
+    # Truncated as CrossEncoder.predict truncates: the pair together, longest first.
+    assert model.tokenizer.calls[-1] == (
+        ("one two", "three four five"),
+        {"truncation": "longest_first", "max_length": 4},
+    )
+
+
+def test_the_real_reranker_is_loaded_through_the_capture(monkeypatch: pytest.MonkeyPatch) -> None:
+    class StubCrossEncoderReranker:
+        def __init__(self, model_path: str, *, device: str, cross_encoder_cls: Any) -> None:
+            self.model = cross_encoder_cls(model_path, device=device, local_files_only=True)
+
+    FakeCrossEncoder.instances = []
+    monkeypatch.setattr(harness, "CrossEncoder", FakeCrossEncoder)
+    monkeypatch.setattr(harness, "CrossEncoderReranker", StubCrossEncoderReranker)
+
+    built = harness.build_reranker("real", device="cpu", config=harness.MemoryConfig())
+
+    [model] = FakeCrossEncoder.instances
+    assert built.path == "/opt/models/ms-marco-MiniLM-L-6-v2"
+    assert built.pair_tokens("a b", "c") == 3 and model.tokenizer.calls
+
+
+def test_the_fake_reranker_counts_whitespace_words() -> None:
+    built = harness.build_reranker("fake", device="cpu", config=harness.MemoryConfig())
+
+    assert built.path is None
+    assert built.pair_tokens("which  drink", "Wren orders a flat white.") == 7
+
+
+@pytest.mark.parametrize(
+    ("p", "expected"),
+    [(0.5, 0.0), (0.75, math.log(3.0)), (0.0, math.log(1e-7 / (1 - 1e-7)))],
+    ids=["even", "three-to-one", "zero-clamped"],
+)
+def test_logit_inverts_the_sigmoid_within_the_clamp(p: float, expected: float) -> None:
+    assert harness.logit(p) == pytest.approx(expected)
+    assert harness.logit(1.0) == pytest.approx(-harness.logit(0.0))
+
+
+def test_a_rerank_model_outside_opt_models_is_refused(tmp_path: Path) -> None:
+    output = tmp_path / "run.jsonl"
+
+    with pytest.raises(ValueError, match="/opt/models"):
+        harness.main(["--output", str(output), "--rerank-model", "/home/user/ms-marco"])
+    assert not output.exists()
