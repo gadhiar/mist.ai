@@ -1030,7 +1030,9 @@ def build_rebuild_deps_from_env(
     assert_rebuild_target_not_live(staging_uri, live_uri)
 
     seed_documents = load_seed_documents(Path(config.vault.root) / "seed")
-    embedding_provider = EmbeddingGenerator(config.embedding.model_name)
+    embedding_provider = EmbeddingGenerator(
+        config.embedding.model_name, device=config.embedding.resolved_device()
+    )
 
     staging_conn = Neo4jConnection(
         Neo4jConfig(uri=staging_uri, username=config.neo4j.username, password=config.neo4j.password)

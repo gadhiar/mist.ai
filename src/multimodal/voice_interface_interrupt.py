@@ -14,7 +14,6 @@ from datetime import datetime
 
 import numpy as np
 import ollama
-import sounddevice as sd
 import torch
 
 from src.multimodal.stt import WhisperSTT
@@ -135,6 +134,8 @@ class InterruptibleVoiceInterface:
         """Background thread that continuously listens to microphone
         Uses VAD to detect speech and handle interruptions.
         """
+        import sounddevice as sd
+
         print("Microphone listening started (VAD-based)...")
 
         def audio_callback(indata, frames, time_info, status):
@@ -166,6 +167,7 @@ class InterruptibleVoiceInterface:
         Now supports interruption when user speaks.
         """
         import numpy as np
+        import sounddevice as sd
 
         # Internal buffer for the OutputStream callback
         self._playback_buffer = queue.Queue(maxsize=50)

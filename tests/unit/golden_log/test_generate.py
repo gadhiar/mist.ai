@@ -14,6 +14,11 @@ from pathlib import Path
 import pytest
 
 from backend.knowledge.config import KnowledgeConfig
+from backend.knowledge.eval_isolation import (
+    LIVE_INSTANCE_MARKER,
+    LIVE_INSTANCES_FILE_ENV,
+    IsolatedRootError,
+)
 from backend.knowledge.extraction_cache import cache_key
 from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
 from scripts.golden_log.generate import (
@@ -243,6 +248,32 @@ class TestIsolation:
 
     def test_accepts_a_tmp_root(self, tmp_path):
         assert_isolated_root(tmp_path)  # no raise
+
+    def test_refuses_a_root_under_a_marked_live_instance_as_a_golden_log_error(
+        self, tmp_path, monkeypatch
+    ):
+        # A daily instance's state lives outside the repository, where the
+        # twin's own candidate list cannot see it. The shared marker check does,
+        # and its refusal arrives as the error this CLI already handles.
+        monkeypatch.setenv(LIVE_INSTANCES_FILE_ENV, str(tmp_path / "no-registry"))
+        instance = tmp_path / "daily"
+        instance.mkdir()
+        (instance / LIVE_INSTANCE_MARKER).write_text("{}", encoding="utf-8")
+
+        with pytest.raises(GoldenLogError, match=LIVE_INSTANCE_MARKER) as refusal:
+            assert_isolated_root(instance / "state")
+
+        assert isinstance(refusal.value.__cause__, IsolatedRootError)
+
+    def test_refuses_a_registered_live_instance_root(self, tmp_path, monkeypatch):
+        instance = tmp_path / "daily"
+        instance.mkdir()
+        registry = tmp_path / "live-instances"
+        registry.write_text(f"{instance}\n", encoding="utf-8")
+        monkeypatch.setenv(LIVE_INSTANCES_FILE_ENV, str(registry))
+
+        with pytest.raises(GoldenLogError, match="registered"):
+            assert_isolated_root(instance)
 
     def test_refuses_to_materialize_zero_turns(self, tmp_path):
         # Assert: fail closed. A log that replays nothing passes every other assertion.

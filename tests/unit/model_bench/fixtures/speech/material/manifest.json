@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "_comment": "Test fixture for core.verify_material: two synthetic integer sawtooth WAVs (16 kHz mono 16-bit) that tests/unit/model_bench/test_speech_core.py writes with the stdlib wave module. No audio is committed.",
+  "items": [
+    {"id": "S01", "file": "S01.wav", "kind": "complete", "text": "Synthetic tone one.", "duration_s": 0.5, "sha256": "82ec4646d8308960ab8922f4783cdfcd82b08eb76b538d9758c29b4270ed1b44"},
+    {"id": "S02", "file": "S02.wav", "kind": "pause", "text": "Synthetic ... tone two.", "duration_s": 0.25, "sha256": "22529ede62dbc28852544f04730810015e5605a4881156a7f7d9583589d337db"}
+  ]
+}

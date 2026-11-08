@@ -18,7 +18,12 @@ from pathlib import Path
 
 import pytest
 
-from backend.knowledge.eval_isolation import REPO_ROOT, assert_isolated_root
+from backend.knowledge.eval_isolation import (
+    LIVE_INSTANCE_MARKER,
+    LIVE_INSTANCES_FILE_ENV,
+    REPO_ROOT,
+    assert_isolated_root,
+)
 from scripts.backup.destination import (
     BACKUP_ROOT_ENV,
     assert_backup_destination,
@@ -92,6 +97,21 @@ class TestRefusesLiveState:
         assert "live state" in message
         assert BACKUP_ROOT_ENV in message
         assert "Nothing was written" in message
+
+    def test_a_destination_under_a_marked_live_instance_is_refused(self, tmp_path, monkeypatch):
+        # No change to destination.py: the marker check lives in the shared
+        # guard it already calls, so a backup cannot land inside a daily
+        # instance's root, where it would die with the state it protects.
+        monkeypatch.setenv(LIVE_INSTANCES_FILE_ENV, str(tmp_path / "no-registry"))
+        instance = tmp_path / "daily"
+        instance.mkdir()
+        (instance / LIVE_INSTANCE_MARKER).write_text("{}", encoding="utf-8")
+
+        with pytest.raises(BackupDestinationError) as refusal:
+            assert_backup_destination(instance / "backups")
+
+        assert LIVE_INSTANCE_MARKER in str(refusal.value)
+        assert not (instance / "backups").exists()
 
     def test_env_supplied_live_root_is_refused_too(self, monkeypatch):
         # The env var is not a trusted channel; it goes through the same arms.

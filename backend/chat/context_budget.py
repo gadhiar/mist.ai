@@ -41,7 +41,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from backend.knowledge.config import ContextBudgetConfig
-from backend.knowledge.models import RetrievalResult, RetrievedFact
+from backend.knowledge.models import RetrievalResult, RetrievedFact, fact_ref
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +248,13 @@ class BudgetPlan:
     `retrieval_budget` and `history_budget` are the allocated token budgets;
     `retrieval_used` and `history_used` are what the pruned output actually
     consumed.
+
+    `kept_fact_refs` and `dropped_fact_refs` name the facts behind
+    `facts_kept` and `facts_dropped` (see `fact_ref`), so the turn trace can
+    say which memories the budget cost. `retrieval_rerendered` is True when the
+    planner rendered the kept facts itself as `subject -[predicate]-> object`
+    lines instead of passing the retriever's block through, which leaves a
+    vault or vector fact in the prompt as a label without its text.
     """
 
     fits: bool
@@ -261,6 +268,24 @@ class BudgetPlan:
     history_used: int
     facts_kept: int
     facts_dropped: int
+    kept_fact_refs: tuple[str, ...] = ()
+    dropped_fact_refs: tuple[str, ...] = ()
+    retrieval_rerendered: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _RetrievalPrune:
+    """What `_prune_retrieval` emitted and which facts it kept and dropped."""
+
+    text: str
+    used_tokens: int
+    kept: tuple[RetrievedFact, ...]
+    dropped: tuple[RetrievedFact, ...]
+    rerendered: bool
+
+
+def _refs(facts: list[RetrievedFact] | tuple[RetrievedFact, ...]) -> tuple[str, ...]:
+    return tuple(fact_ref(fact) for fact in facts)
 
 
 class ContextBudgetPlanner:
@@ -408,6 +433,7 @@ class ContextBudgetPlanner:
                 history_used=0,
                 facts_kept=0,
                 facts_dropped=(len(retrieval_result.facts) if retrieval_result else 0),
+                dropped_fact_refs=(_refs(retrieval_result.facts) if retrieval_result else ()),
             )
 
         # Allocate flex budget by ratio.
@@ -417,12 +443,16 @@ class ContextBudgetPlanner:
         # Prune retrieval by priority score.
         pruned_retrieval_text: str | None = None
         retrieval_used = 0
-        facts_kept = 0
-        facts_dropped = 0
+        kept_facts: tuple[RetrievedFact, ...] = ()
+        dropped_facts: tuple[RetrievedFact, ...] = ()
+        retrieval_rerendered = False
         if retrieval_result is not None and retrieval_result.total_facts > 0:
-            pruned_retrieval_text, retrieval_used, facts_kept, facts_dropped = (
-                self._prune_retrieval(retrieval_result, retrieval_budget)
-            )
+            prune = self._prune_retrieval(retrieval_result, retrieval_budget)
+            pruned_retrieval_text = prune.text
+            retrieval_used = prune.used_tokens
+            kept_facts = prune.kept
+            dropped_facts = prune.dropped
+            retrieval_rerendered = prune.rerendered
 
         # Prune history by strategy.
         pruned_history = self._history_strategy.select(history, history_budget, self._counter)
@@ -438,27 +468,38 @@ class ContextBudgetPlanner:
             pruned_history=pruned_history,
             retrieval_used=retrieval_used,
             history_used=history_used,
-            facts_kept=facts_kept,
-            facts_dropped=facts_dropped,
+            facts_kept=len(kept_facts),
+            facts_dropped=len(dropped_facts),
+            kept_fact_refs=_refs(kept_facts),
+            dropped_fact_refs=_refs(dropped_facts),
+            retrieval_rerendered=retrieval_rerendered,
         )
 
     def _prune_retrieval(
         self,
         retrieval_result: RetrievalResult,
         budget_tokens: int,
-    ) -> tuple[str, int, int, int]:
+    ) -> _RetrievalPrune:
         """Score facts, sort descending, emit as formatted context until budget hits.
 
-        Returns `(text, used_tokens, kept_count, dropped_count)`. When the
-        full formatted context already fits, emits it verbatim (no scoring
-        overhead).
+        When the full formatted context already fits, emits it verbatim (no
+        scoring overhead) and keeps every fact in retrieval order. Otherwise
+        the kept facts are the highest-scored prefix and the dropped facts the
+        rest, both in score order, and the result counts as re-rendered even
+        when nothing fits.
         """
         full_text = retrieval_result.formatted_context or ""
         full_cost = (
             self._counter.count(full_text) + ApproximateTokenCounter.PER_MESSAGE_OVERHEAD_TOKENS
         )
         if full_cost <= budget_tokens:
-            return full_text, full_cost, len(retrieval_result.facts), 0
+            return _RetrievalPrune(
+                text=full_text,
+                used_tokens=full_cost,
+                kept=tuple(retrieval_result.facts),
+                dropped=(),
+                rerendered=False,
+            )
 
         scored = sorted(
             retrieval_result.facts,
@@ -486,9 +527,15 @@ class ContextBudgetPlanner:
             kept.append(fact)
             used += cost
 
+        # `kept` is a prefix of `scored`: the loop stops at the first misfit.
+        dropped = tuple(scored[len(kept) :])
         if not kept:
-            return "", 0, 0, len(retrieval_result.facts)
+            return _RetrievalPrune(
+                text="", used_tokens=0, kept=(), dropped=dropped, rerendered=True
+            )
 
         body = "".join(f"- {f.subject} -[{f.predicate}]-> {f.object}\n" for f in kept)
         text = header + body
-        return text, used, len(kept), len(retrieval_result.facts) - len(kept)
+        return _RetrievalPrune(
+            text=text, used_tokens=used, kept=tuple(kept), dropped=dropped, rerendered=True
+        )

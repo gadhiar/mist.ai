@@ -8,7 +8,6 @@ import threading
 import time
 
 import ollama
-import sounddevice as sd
 import torch
 
 from src.multimodal.stt import WhisperSTT
@@ -72,6 +71,7 @@ class StreamingVoiceInterface:
         eliminating gaps caused by sd.play() reopening the device each time.
         """
         import numpy as np
+        import sounddevice as sd
 
         # Internal buffer for the OutputStream callback
         self._playback_buffer = queue.Queue(maxsize=50)

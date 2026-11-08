@@ -2,11 +2,13 @@
 
 Read this at 3am. It assumes you did not write any of it and that you are not calm.
 
-Three commands exist:
+Five commands exist:
 
     python -m scripts.backup.dump       take a backup      (read-only, safe to run any time)
     python -m scripts.backup.restore    put one back       (DESTRUCTIVE, four gates, see below)
+    python -m scripts.backup.verify     compare a restore with its artifact (read-only)
     python -m scripts.backup.prune      delete old ones    (deletes nothing without --confirm)
+    python -m scripts.backup.scheduler  run dumps on a schedule (section 6)
 
 Exit codes are the same shape everywhere: `0` it worked, `2` it refused and changed nothing,
 `1` it failed part way and the message says what state that leaves.
@@ -226,6 +228,11 @@ than a smaller success.
 
 This is the step that turns the backup from a rumour into a fact. Do it once before anything is
 scheduled, and repeat it after any change to this package.
+
+For the daily instance, the drill runs through compose instead, as `instance.py` commands that
+restore into a fresh labelled volume and a standby directory and run
+`python -m scripts.backup.verify` for the comparison in 4.8: follow `deploy/daily/RESTORE.md`.
+This section is the same restore against the dev-hydration stack, by hand.
 
 The target is the dev-hydration stack. It is a real, already-existing non-live target: its own
 Neo4j (`mist-neo4j-dev`, host Bolt port 7690) and its own state root (`./dev-state`).
@@ -553,6 +560,16 @@ Three graph numbers, one vector, and the vault count. Run all five checks; a res
 the counts right and the vectors wrong is the failure mode that hides behind every similarity
 threshold in the codebase.
 
+One command makes the exact comparisons, (a) against (c) and (d) for every node, plus each
+store's per-table row counts and the vault's file count. It refuses (exit 2) a graph URI
+outside the dev allowlist and a state or vault root that is live, and prints one JSON object of
+counts, exit 0 on a match and 1 on a mismatch:
+
+    python -m scripts.backup.verify --artifact /mnt/backup/mist/20260917T030000Z \
+      --graph-uri bolt://localhost:7690 --state-root ./dev-state
+
+The steps below are the same checks by hand, and (b), which the command does not make.
+
 (a) What the artifact says it holds:
 
     python -c "import json;m=json.load(open('/mnt/backup/mist/20260917T030000Z/manifest.json'));print(m['graph'])"
@@ -714,25 +731,67 @@ Deleting it also frees that `--label` for reuse, which the dump refuses while th
 
 ---
 
-## 6. Scheduling the dump
+## 6. Scheduled backups
 
-NOTHING IS ARMED. This goal ships no cron file, no systemd unit, no scheduled task and no timer,
-and none should be added until the rehearsal in section 4 has passed once on the host.
+The scheduler is `python -m scripts.backup.scheduler`. On the daily instance it is the
+`mist-backup` service of `deploy/daily/compose.yml`, under profile `backup`, so nothing starts
+it until backups are armed. It is the dump of section 1 followed by the prune of section 5, run
+in one process and judged before prune is allowed to delete anything.
 
-The dump leg is schedulable BY CONSTRUCTION: it is read-only against live state, takes no input,
-prompts for nothing, and returns deterministic exit codes (0 written, 2 destination refused and
-nothing written, 1 failed with a `.partial` directory left behind). The invocation a schedule would
-use is exactly the one in section 1:
+NOTHING IS ARMED UNTIL A DRILL PASSES. A schedule wired up before a restore has been rehearsed
+produces a directory that fills up with files nobody has proved are usable. That is the
+condition this package exists to end, so the order is not negotiable: rehearse first, arm
+second. On the daily instance the rehearsal is the drill in `deploy/daily/RESTORE.md`, and
+backups are armed only after `drill-verify` records a `match`:
 
-    MIST_BACKUP_ROOT=/mnt/backup/mist python -m scripts.backup.dump
+    python <root>/bin/instance.py arm-backups --root <root>
 
-followed by
+`arm-backups` writes `ops/backups-armed` and starts `mist-backup`; from then on every `up`
+starts it too. `disarm-backups` removes the marker and stops it. `backup-now` makes one attempt,
+armed or not, with `python -m scripts.backup.scheduler --once`.
 
-    MIST_BACKUP_ROOT=/mnt/backup/mist python -m scripts.backup.prune --retain 7 --confirm
+WHEN IT RUNS. Every `MIST_BACKUP_CHECK_MINUTES` (default 10) it reads its status file and takes
+a backup when there is no recorded success or the last one is older than
+`MIST_BACKUP_INTERVAL_HOURS` (default 24). Counting from the last success rather than a clock
+time is what catches up after the host slept or the stack was down. A `failed` or `refused`
+attempt is retried after `MIST_BACKUP_RETRY_MINUTES` (default 60).
 
-A schedule wired up before a restore has been rehearsed produces a directory that fills up with
-files nobody has proved are usable. That is the condition this package exists to end, so the order
-is not negotiable: rehearse first, arm second.
+THE STATUS FILE, `MIST_BACKUP_STATUS_PATH` (`ops/backup-status.json` on the daily instance), is
+written after every attempt through a temporary file and a rename, and `/health`'s `backup`
+check reads it. It holds `v`, `last_attempt_at`, `last_result` (`ok`, `failed`, `refused` or
+`suspect`), `last_exit_code`, `last_success_at`, `last_label`, `last_duration_s`, `retained`, and
+`last_success_counts`: the last success's `graph_nodes`, `vault_corpus_files` and the `stores`
+it captured, which the next attempt is compared with. Timestamps are UTC, and every key is null
+before the first event.
+
+THE SUCCESS RULE. A dump that exits 0 is a success only when its manifest reads and:
+
+- `graph.nodes` is above 0;
+- `vault.corpus_file_count` is above 0;
+- every store the last success captured is present, where present means the manifest's `file`
+  for it is not null (the `stores` map names every live store whether or not it was captured);
+- `graph.nodes` is at least `MIST_BACKUP_MIN_NODE_RATIO` (default 0.5) times the last
+  success's.
+
+Only a success runs prune, with `--retain $MIST_BACKUP_RETAIN --confirm` (default 7).
+
+`suspect/`. A dump that fails the rule is `suspect`: it is moved to
+`<backup root>/suspect/<label>`, every other directory in `suspect/` is then deleted, so only
+the newest suspect is kept, and prune does not run. Prune never looks inside `suspect/`, so seven
+empty dumps in a row cannot delete seven good ones. The next attempt waits the full interval,
+not the retry window. `/health` reports `backup_suspect` while no success is recent.
+
+`--accept-suspect LABEL` is for a shrink you expected, such as a deliberate graph cleanup.
+Compare `<backup root>/suspect/<label>/manifest.json` with `last_success_counts` in the status
+file first. Accepting refuses unless `suspect/LABEL` holds a manifest this build reads;
+otherwise it moves the artifact back into the backup root and records it as the last success,
+the baseline later attempts are judged against. On the daily instance:
+
+    python <root>/bin/instance.py accept-backup-baseline --root <root> --label <label>
+
+Exit codes: the loop exits 0 after SIGTERM and 2 when its configuration is refused; `--once`
+exits 0 on success, 3 on suspect, and the dump's code otherwise; `--accept-suspect` exits 0
+accepted, 2 refused with nothing changed, 1 failed part way.
 
 The restore leg is NOT schedulable and must never be automated. It requires a typed confirmation
 token equal to the resolved target path and a handshake marker placed by hand, and both of those

@@ -1,0 +1,62 @@
+# MIST.AI restore drill: restores a backup into a fresh graph volume and a standby directory.
+#
+# Never run this file by hand. `instance.py drill-restore`, `drill-verify`, `drill-end` and
+# `promote` run it, after checking that the volume is the labelled one `drill-start` created and
+# that no container outside the drill project mounts it (deploy/daily/RESTORE.md). They run it as
+#   docker compose -p mist-<instance>-drill -f <root>/release/<tag>/deploy/daily/restore-drill.yml \
+#     --env-file <root>/daily.env ...
+# with MIST_DRILL_NEO4J_VOLUME and MIST_DRILL_ROOT set in that command's environment only. The
+# env file gives the drill graph the instance's password, so a promoted volume keeps the
+# authentication the instance's Neo4j expects.
+#
+# There is no top-level `name`: the CLI's `-p` names the project. Nothing here publishes a port
+# or mounts the instance root, and the only writable bind is the drill root.
+# Contract: tests/unit/deploy/test_restore_drill_compose.py.
+
+services:
+  mist-neo4j-dev:
+    # The instance's pinned image, so a promoted volume is one the instance's Neo4j can open.
+    image: neo4j:5.26.23@sha256:40bf5ae9282213087e4d6036aab3ec443fe9c974d3dd4f14a11892c63157238f
+    environment:
+      - NEO4J_AUTH=${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in daily.env}
+      - NEO4J_server_memory_heap_initial__size=${MIST_DAILY_NEO4J_HEAP:-1g}
+      - NEO4J_server_memory_heap_max__size=${MIST_DAILY_NEO4J_HEAP:-1g}
+      - NEO4J_server_memory_pagecache_size=${MIST_DAILY_NEO4J_PAGECACHE:-512m}
+    volumes:
+      - drill-neo4j:/data
+    mem_limit: ${MIST_DAILY_NEO4J_MEM_LIMIT:-3g}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  mist-restore:
+    # Started only by `run --rm`; the CLI appends `-m scripts.backup.restore ...` or
+    # `-m scripts.backup.verify ...` to the `python` entrypoint.
+    profiles: ["run"]
+    image: mist-backend:${MIST_RELEASE_TAG:?set MIST_RELEASE_TAG in daily.env}
+    pull_policy: never
+    user: "1000:1000"
+    entrypoint: ["python"]
+    environment:
+      # In the dev allowlist of backend/knowledge/eval_isolation.py, which restore and verify
+      # check before they connect.
+      - NEO4J_URI=bolt://mist-neo4j-dev:7687
+      - NEO4J_USERNAME=${NEO4J_USERNAME:-neo4j}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:?set NEO4J_PASSWORD in daily.env}
+    volumes:
+      - ${MIST_BACKUP_HOST_PATH:?set MIST_BACKUP_HOST_PATH in daily.env}:/backup:ro
+      - ${MIST_DRILL_ROOT:?set by instance.py}:/drill
+    mem_limit: ${MIST_DAILY_BACKUP_MEM_LIMIT:-4g}
+    depends_on:
+      mist-neo4j-dev:
+        condition: service_healthy
+
+volumes:
+  # Created and labelled by `instance.py drill-start`; external, so compose never creates or
+  # removes it.
+  drill-neo4j:
+    external: true
+    name: ${MIST_DRILL_NEO4J_VOLUME:?set by instance.py drill-start}

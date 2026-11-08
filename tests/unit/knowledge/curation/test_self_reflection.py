@@ -1,7 +1,7 @@
 """Tests for SelfReflectionJob batch internal derivation."""
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -13,13 +13,41 @@ from tests.mocks.ollama import FakeLLM
 
 
 class FakeEventStore:
-    """Minimal event store fake that returns canned turns from get_turns_since."""
+    """Minimal event store fake that returns canned turns from get_turns_since.
+
+    Records each `since` it is asked for, so a test can check the window.
+    """
 
     def __init__(self, turns: list[dict] | None = None):
         self._turns = turns or []
+        self.since_calls: list[datetime] = []
 
     def get_turns_since(self, since: datetime) -> list[dict]:
+        self.since_calls.append(since)
         return self._turns
+
+
+class WindowedEventStore:
+    """Applies `EventStore.get_turns_since`'s own predicate, `timestamp >= since`,
+    compared as ISO-8601 text the way SQLite compares the column.
+    """
+
+    def __init__(self, turns: list[dict]) -> None:
+        self._turns = turns
+
+    def get_turns_since(self, since: datetime) -> list[dict]:
+        bound = since.isoformat()
+        return [turn for turn in self._turns if turn["timestamp"] >= bound]
+
+
+class FakeClock:
+    """A settable UTC wall clock for `SelfReflectionJob`."""
+
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
 
 
 def _make_turn(
@@ -44,17 +72,20 @@ def _build_job(
     llm_response: str | None = None,
     event_store: FakeEventStore | None = None,
     connection: FakeNeo4jConnection | None = None,
+    clock: FakeClock | None = None,
 ) -> tuple[SelfReflectionJob, FakeLLM, FakeGraphExecutor]:
     """Build a SelfReflectionJob with test doubles."""
     conn = connection or FakeNeo4jConnection()
     executor = FakeGraphExecutor(conn)
     llm = FakeLLM(default_response=llm_response or '{"operations": []}')
     deriver = InternalKnowledgeDeriver(llm=llm, executor=executor)
+    extra = {"clock": clock} if clock is not None else {}
     job = SelfReflectionJob(
         executor=executor,
         internal_deriver=deriver,
         signal_detector=SignalDetector(),
         event_store=event_store,
+        **extra,
     )
     return job, llm, executor
 
@@ -171,6 +202,82 @@ class TestNoEventStore:
         assert result.operations_applied == 0
         assert result.duration_ms == 0.0
         llm.assert_not_called()
+
+
+class TestReflectionWindow:
+    """The window starts where the previous run's ended, so a deferred run
+    covers the hours it was deferred instead of a fixed 24 h.
+    """
+
+    _T0 = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
+
+    @pytest.mark.asyncio
+    async def test_first_run_looks_back_24_hours(self):
+        store = FakeEventStore()
+        job, _, _ = _build_job(event_store=store, clock=FakeClock(self._T0))
+
+        await job.run()
+
+        assert store.since_calls == [self._T0 - timedelta(hours=24)]
+
+    @pytest.mark.asyncio
+    async def test_second_run_starts_at_the_first_runs_window_end(self):
+        store = FakeEventStore()
+        clock = FakeClock(self._T0)
+        job, _, _ = _build_job(event_store=store, clock=clock)
+        await job.run()
+
+        clock.now = self._T0 + timedelta(hours=29)
+        await job.run()
+
+        assert store.since_calls[1] == self._T0
+
+    @pytest.mark.asyncio
+    async def test_explicit_lookback_hours_is_used_as_given(self):
+        store = FakeEventStore()
+        clock = FakeClock(self._T0)
+        job, _, _ = _build_job(event_store=store, clock=clock)
+        await job.run()
+
+        clock.now = self._T0 + timedelta(hours=29)
+        await job.run(lookback_hours=6)
+
+        assert store.since_calls[1] == self._T0 + timedelta(hours=23)
+
+    @pytest.mark.asyncio
+    async def test_explicit_lookback_run_does_not_move_the_window(self):
+        """A shorter manual window must not make the next scheduled run skip
+        the hours between the last scheduled window and the manual one.
+        """
+        store = FakeEventStore()
+        clock = FakeClock(self._T0)
+        job, _, _ = _build_job(event_store=store, clock=clock)
+        await job.run()
+        clock.now = self._T0 + timedelta(hours=29)
+        await job.run(lookback_hours=6)
+
+        clock.now = self._T0 + timedelta(hours=30)
+        await job.run()
+
+        assert store.since_calls[2] == self._T0
+
+    @pytest.mark.asyncio
+    async def test_turn_stamped_at_the_window_end_is_derived_once_by_the_next_run(self):
+        """The window is `[since, now)`: a turn committed at `now` before the
+        query belongs to the next window, not to both.
+        """
+        earlier = _make_turn(utterance="earlier turn", event_id="evt-early")
+        earlier["timestamp"] = (self._T0 - timedelta(hours=1)).isoformat()
+        boundary = _make_turn(utterance="boundary turn", event_id="evt-boundary")
+        boundary["timestamp"] = self._T0.isoformat()
+        clock = FakeClock(self._T0)
+        job, _, _ = _build_job(event_store=WindowedEventStore([earlier, boundary]), clock=clock)
+
+        first = await job.run()
+        clock.now = self._T0 + timedelta(hours=24)
+        second = await job.run()
+
+        assert (first.events_processed, second.events_processed) == (1, 1)
 
 
 class TestEmptyEvents:

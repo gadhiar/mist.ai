@@ -1,0 +1,7 @@
+# mist-speech-bench-base: what the base bench image adds to the backend image (mist-model-host
+# plan v3, T9). Every bench image is built from base, so asr, pocket and qwen3 carry these too.
+# onnxruntime runs Smart Turn and onnx-asr's `parakeet-cpu`; the backend image does not hold it.
+# 1.31.1 is the release pip resolved into the qwen3 image beside numpy 1.26.4 without moving it.
+onnxruntime==1.31.1
+# numpy is held at the backend's 1.26.4: chatterbox-tts holds numpy below 2 (requirements.txt).
+numpy==1.26.4

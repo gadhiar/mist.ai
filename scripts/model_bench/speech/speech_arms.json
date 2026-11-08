@@ -1,0 +1,115 @@
+{
+  "schema": 1,
+  "_comment": "Speech engines for runs 1, 3, 4 and 7 (mist-model-host plan v2, engine facts). Every engine speaks with a stock voice of its own; nothing is cloned. `voices` is the engine's full stock-voice list, `female_voices` the subset heard for listening, `timing_voice` the one voice timed per engine, and `listening_voices` the voices rendered untimed after the timed passes. The voice lists are read from model cards and package READMEs, not from the installed packages, so each engine carries `verified: false` until host step H2 checks them against the installed packages. Weights are read offline from the mounted models directory.",
+  "tts": {
+    "qwen3": {
+      "verified": false,
+      "image": "mist-speech-bench-qwen3",
+      "device": "cuda",
+      "streaming": true,
+      "packages": {"faster-qwen3-tts": "0.5.4", "transformers": "5.16.1", "qwen-tts-hf": "0.1.1.post1", "torch": "2.6.0+cu124"},
+      "model": {"repository": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "revision": "85e237c1", "bytes": 2493919668},
+      "licence": "Apache-2.0",
+      "settings": {
+        "default": {"chunk_size": 8, "dtype": "bfloat16", "language": "English", "instruct": null}
+      },
+      "voices": ["vivian", "serena", "uncle_fu", "dylan", "eric", "ryan", "aiden", "ono_anna", "sohee"],
+      "female_voices": ["vivian", "serena", "ono_anna", "sohee"],
+      "timing_voice": "aiden",
+      "listening_voices": ["ryan", "vivian", "serena", "ono_anna", "sohee"]
+    },
+    "turbo": {
+      "verified": false,
+      "image": "mist-speech-bench-base",
+      "device": "cuda",
+      "streaming": false,
+      "packages": {"chatterbox-tts": "0.1.7"},
+      "model": {"repository": "ResembleAI/chatterbox-turbo", "class": "chatterbox.tts_turbo.ChatterboxTurboTTS"},
+      "licence": "MIT",
+      "settings": {"default": {}},
+      "text_field": "turbo_text",
+      "voices": ["builtin"],
+      "female_voices": [],
+      "timing_voice": "builtin",
+      "listening_voices": []
+    },
+    "original": {
+      "verified": false,
+      "image": "mist-speech-bench-base",
+      "device": "cuda",
+      "streaming": false,
+      "packages": {"chatterbox-tts": "0.1.7"},
+      "model": {"repository": "ResembleAI/chatterbox", "class": "chatterbox.tts.ChatterboxTTS"},
+      "licence": "MIT",
+      "settings": {
+        "default": {"exaggeration": 0.5, "cfg_weight": 0.5, "temperature": 0.8},
+        "expressive": {"exaggeration": 0.7, "cfg_weight": 0.3, "temperature": 0.8, "lines": "emotive", "timed": false}
+      },
+      "voices": ["builtin"],
+      "female_voices": [],
+      "timing_voice": "builtin",
+      "listening_voices": []
+    },
+    "pocket": {
+      "verified": false,
+      "image": "mist-speech-bench-pocket",
+      "device": "cpu",
+      "threads": 4,
+      "streaming": true,
+      "packages": {"pocket-tts": "4.0.1", "torch": "2.6.0+cu124"},
+      "model": {"repository": "kyutai/pocket-tts-without-voice-cloning", "gated_fallback": "kyutai/pocket-tts"},
+      "licence": "code MIT, weights CC-BY-4.0",
+      "settings": {"default": {}},
+      "voices": ["alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma"],
+      "female_voices": ["alba", "fantine", "cosette", "eponine", "azelma"],
+      "timing_voice": "alba",
+      "listening_voices": ["fantine", "cosette", "eponine", "azelma"]
+    }
+  },
+  "stt": {
+    "whisper-base": {
+      "image": "mist-speech-bench-base",
+      "device": "cuda",
+      "streaming": false,
+      "packages": {"openai-whisper": "20250625"},
+      "model": {"name": "base"},
+      "licence": "MIT"
+    },
+    "parakeet-gpu": {
+      "image": "mist-speech-bench-asr",
+      "device": "cuda",
+      "streaming": false,
+      "packages": {"nemo_toolkit[asr]": "2.7.3"},
+      "model": {"repository": "nvidia/parakeet-tdt-0.6b-v2"},
+      "licence": "CC-BY-4.0"
+    },
+    "parakeet-cpu": {
+      "image": "mist-speech-bench-asr",
+      "device": "cpu",
+      "threads": 4,
+      "streaming": false,
+      "packages": {"onnx-asr": "0.12.0", "onnxruntime": "1.31.1"},
+      "model": {"onnx_asr_id": "nemo-parakeet-tdt-0.6b-v2", "verified": false},
+      "licence": "code MIT, weights CC-BY-4.0"
+    },
+    "nemotron-160": {
+      "image": "mist-speech-bench-asr",
+      "device": "cuda",
+      "streaming": true,
+      "chunk_ms": 160,
+      "packages": {"nemo_toolkit[asr]": "2.7.3"},
+      "model": {"repository": "nvidia/nemotron-speech-streaming-en-0.6b"},
+      "licence": "NVIDIA Open Model License"
+    }
+  },
+  "turn": {
+    "smart-turn-v3.2": {
+      "image": "mist-speech-bench-base",
+      "device": "cpu",
+      "threads": 4,
+      "packages": {"onnxruntime": "1.31.1"},
+      "model": {"repository": "pipecat-ai/smart-turn-v3", "file": "smart-turn-v3.2-cpu.onnx", "bytes": 8679182, "quant": "int8"},
+      "licence": "BSD-2-Clause"
+    }
+  }
+}

@@ -4,6 +4,7 @@ Central configuration for Neo4j connection, embedding models, and extraction set
 """
 
 import os
+import re
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -39,16 +40,36 @@ class EmbeddingConfig:
 
     model_name: str = "all-MiniLM-L6-v2"  # Fast, local model
     dimension: int = 384  # MiniLM embedding dimension
-    device: str = "cpu"  # or "cuda" if GPU available
+    # `cpu` by default so the model takes no GPU memory from a game or the
+    # LLM; `auto` defers to sentence-transformers, which picks CUDA when present.
+    device: str = "cpu"
 
     @classmethod
     def from_env(cls) -> "EmbeddingConfig":
-        """Load configuration from environment variables."""
+        """Load configuration from environment variables.
+
+        Raises:
+            ValueError: `EMBEDDING_DEVICE` is not `auto`, `cpu`, `cuda` or
+                `cuda:<n>`. A typo fails at startup rather than surfacing as a
+                torch error on the first embedding, or silently on the GPU.
+        """
+        device = os.getenv("EMBEDDING_DEVICE", "cpu")
+        if device not in ("auto", "cpu", "cuda") and not re.fullmatch(r"cuda:[0-9]+", device):
+            raise ValueError(
+                f"EMBEDDING_DEVICE must be auto, cpu, cuda or cuda:<n>, got {device!r}"
+            )
         return cls(
             model_name=os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
             dimension=int(os.getenv("EMBEDDING_DIMENSION", "384")),
-            device=os.getenv("EMBEDDING_DEVICE", "cpu"),
+            device=device,
         )
+
+    def resolved_device(self) -> str | None:
+        """Return the device to pass to `EmbeddingGenerator`, None for `auto`.
+
+        None is what tells sentence-transformers to choose the device itself.
+        """
+        return None if self.device == "auto" else self.device
 
 
 @dataclass
