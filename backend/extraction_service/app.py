@@ -5,12 +5,15 @@ health probe are all constructed by the caller and passed in, so unit
 tests can wire a `FakeGraphExecutor`-style fake llama-server (an ASGI app
 behind `httpx.ASGITransport`) without touching a real network.
 `build_app_from_env()` is the one function that wires the real
-`LlamaServerProvider` and a real health probe from `EXTRACTION_*` env vars.
+`LlamaServerProvider` and a real health probe from `EXTRACTION_*` env vars;
+`build_app()` is the wiring it runs, given the provider and HTTP client, and
+the place the run identity is computed, once per process.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import time
 from collections import OrderedDict
@@ -36,17 +39,30 @@ from backend.extraction_contract.models import (
     error_envelope,
     is_compatible,
 )
-from backend.extraction_service.adapters import get_adapter
+from backend.extraction_service.adapters import ModelFamilyAdapter, get_adapter
 from backend.extraction_service.engine import (
+    DERIVE_MAX_TOKENS,
+    EXTRACT_MAX_TOKENS,
+    LIST_BATCH_MAX_UNITS,
+    LIST_CONTEXT_MAX_UNITS,
+    RUN_IDENTITY_CODE,
+    SCOPE_MAX_TOKENS,
     ExtractionEngine,
     ExtractionTimeoutError,
     InvalidRequestError,
     UpstreamLLMError,
+    _compute_prompt_sha256,
     parse_recorded_at,
 )
 from backend.extraction_service.settings import ServiceSettings
-from backend.knowledge.version_stamps import EXTRACTION_VERSION
+from backend.knowledge.extraction.run_identity import (
+    RunIdentityComponents,
+    code_sha256,
+    compute_run_identity,
+)
+from backend.knowledge.version_stamps import EXTRACTION_VERSION, ONTOLOGY_VERSION
 from backend.llm.llama_server_provider import LlamaServerProvider
+from backend.llm.provider import StreamingLLMProvider
 
 logger = logging.getLogger(__name__)
 
@@ -283,13 +299,67 @@ def _effective_constrained_mode(settings: ServiceSettings, adapter_name: str) ->
         return None
 
 
+def run_identity_components(
+    settings: ServiceSettings, adapter: ModelFamilyAdapter
+) -> RunIdentityComponents:
+    """The run identity's components for a service running `settings` with `adapter`.
+
+    Every value is read from where the engine reads it: the prompt hash from
+    the same function the engine stamps with, the token and list-pass limits
+    from the engine's constants, and the constrained mode as the engine resolves it
+    (`settings.constrained_mode or adapter.default_constrained_mode`).
+    """
+    return RunIdentityComponents(
+        prompt_sha256=_compute_prompt_sha256(adapter),
+        code_sha256=code_sha256(RUN_IDENTITY_CODE),
+        ontology_version=ONTOLOGY_VERSION,
+        extraction_version=EXTRACTION_VERSION,
+        adapter=adapter.name,
+        model_hash=settings.model_hash,
+        llama_cpp_build=settings.llama_cpp_build,
+        constrained_mode=settings.constrained_mode or adapter.default_constrained_mode,
+        reasoning_effort=settings.reasoning_effort,
+        reasoning_budget_tokens=settings.reasoning_budget_tokens,
+        temperature=settings.temperature,
+        max_attempts=settings.max_attempts,
+        scope_enabled=settings.scope_enabled,
+        scope_max_tokens=SCOPE_MAX_TOKENS,
+        extract_max_tokens=EXTRACT_MAX_TOKENS,
+        derive_max_tokens=DERIVE_MAX_TOKENS,
+        list_batch_max_units=LIST_BATCH_MAX_UNITS,
+        list_context_max_units=LIST_CONTEXT_MAX_UNITS,
+    )
+
+
 def create_app(
     settings: ServiceSettings,
     engine: ExtractionEngine,
     health_probe: HealthProbe,
     ctx_size_source: ContextSizeSource,
+    run_identity: RunIdentityComponents | None = None,
 ) -> FastAPI:
-    """Build the extraction service's FastAPI app from injected collaborators."""
+    """Build the extraction service's FastAPI app from injected collaborators.
+
+    Args:
+        settings: Service configuration.
+        engine: The engine that runs each job.
+        health_probe: Reads llama-server's readiness.
+        ctx_size_source: Reads llama-server's context window.
+        run_identity: The components of the run identity `engine` stamps,
+            reported on `/v1/info`. None reports no run identity.
+
+    Raises:
+        ValueError: `run_identity` is given and its hash differs from the one
+            `engine` stamps, so `/v1/info` would describe other results than
+            the service returns.
+    """
+    identity = None if run_identity is None else compute_run_identity(run_identity)
+    if run_identity is not None and engine.run_identity != identity:
+        raise ValueError(
+            f"engine stamps run identity {engine.run_identity!r}, but the components "
+            f"given hash to {identity!r}"
+        )
+    identity_components = None if run_identity is None else dataclasses.asdict(run_identity)
     app = FastAPI(title="MIST extraction service")
     cache = _IdempotencyCache(maxsize=settings.idempotency_cache_size)
     started_at = time.monotonic()
@@ -427,22 +497,46 @@ def create_app(
             reasoning_effort=settings.reasoning_effort,
             temperature=settings.temperature,
             ctx_size=await ctx_size_source.ctx_size(),
+            run_identity=identity,
+            run_identity_components=identity_components,
         )
 
     return app
+
+
+def build_app(
+    settings: ServiceSettings, llm: StreamingLLMProvider, http_client: httpx.AsyncClient
+) -> FastAPI:
+    """Wire the service around `llm`, computing its run identity once.
+
+    The identity is computed here, before the engine exists, and handed both
+    to the engine, which stamps it on every result, and to `create_app`,
+    which reports it with its components on `/v1/info`.
+
+    Args:
+        settings: Service configuration.
+        llm: The provider for the service's own llama-server.
+        http_client: The client the health probe and context-size read use.
+    """
+    adapter = get_adapter(
+        settings.adapter_name,
+        reasoning_effort=settings.reasoning_effort,
+        reasoning_budget_tokens=settings.reasoning_budget_tokens,
+    )
+    components = run_identity_components(settings, adapter)
+    engine = ExtractionEngine(
+        llm=llm,
+        adapter=adapter,
+        settings=settings,
+        run_identity=compute_run_identity(components),
+    )
+    health_probe = LlamaHealthProbe(http_client=http_client, base_url=settings.llm_base_url)
+    ctx_size_source = LlamaPropsContextSize(http_client=http_client, base_url=settings.llm_base_url)
+    return create_app(settings, engine, health_probe, ctx_size_source, run_identity=components)
 
 
 def build_app_from_env() -> FastAPI:
     """Wire the real `LlamaServerProvider` and health probe from env vars."""
     settings = ServiceSettings.from_env()
     llm = LlamaServerProvider(base_url=settings.llm_base_url, model=settings.model_file)
-    adapter = get_adapter(
-        settings.adapter_name,
-        reasoning_effort=settings.reasoning_effort,
-        reasoning_budget_tokens=settings.reasoning_budget_tokens,
-    )
-    engine = ExtractionEngine(llm=llm, adapter=adapter, settings=settings)
-    http_client = httpx.AsyncClient()
-    health_probe = LlamaHealthProbe(http_client=http_client, base_url=settings.llm_base_url)
-    ctx_size_source = LlamaPropsContextSize(http_client=http_client, base_url=settings.llm_base_url)
-    return create_app(settings, engine, health_probe, ctx_size_source)
+    return build_app(settings, llm, httpx.AsyncClient())

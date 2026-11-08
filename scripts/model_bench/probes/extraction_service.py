@@ -7,7 +7,9 @@ extraction service (`POST /v1/extract`, contract 1.x), so a cutover candidate
 can be compared with the ADR-027 baseline. The preflight prints the serving config
 `/v1/info` reports (constrained mode, reasoning effort, temperature, ctx size; contract
 1.1.0) and the summary records it under `serving_config`; a field an older server does
-not report gets a `[WARN]` line and is recorded as null.
+not report gets a `[WARN]` line and is recorded as null. The summary also records the
+service's run identity and its components (contract 1.2.0; null, "unrecorded", from an
+older server), and a `[WARN]` line names every result stamped with a different one.
 
 Nothing is re-implemented:
 - Corpus and scoring: `scripts.eval_harness.score_extraction_run` (`iter_gold_probes`,
@@ -457,6 +459,43 @@ def log_serving_config(info: InfoResponse) -> list[str]:
     return missing
 
 
+def log_run_identity(info: InfoResponse) -> None:
+    """Print the run identity `/v1/info` reports, or that the service reports none."""
+    if info.run_identity is None:
+        _log(
+            f"[INFO] run identity: unrecorded (service contract {info.contract_version}; "
+            "a pre-1.2.0 server reports none)"
+        )
+        return
+    _log(f"[INFO] run identity: {info.run_identity}")
+
+
+def run_identity_mismatches(info: InfoResponse, cases: list[CaseResult]) -> list[dict[str, Any]]:
+    """Every result whose `run_identity` stamp differs from the one `/v1/info` reported.
+
+    A difference means the results were not all produced by the setup the run records,
+    for example a service restarted with other settings mid-run.
+    """
+    return [
+        {"id": c.probe_id, "run_identity": c.response.stamps.run_identity}
+        for c in cases
+        if c.response is not None and c.response.stamps.run_identity != info.run_identity
+    ]
+
+
+def warn_run_identity_mismatches(
+    info: InfoResponse, mismatches: list[dict[str, Any]], results: int
+) -> None:
+    """One `[WARN]` line naming every result stamped with another run identity."""
+    if not mismatches:
+        return
+    ids = ", ".join(f"{m['id']}={m['run_identity']}" for m in mismatches)
+    _log(
+        f"[WARN] run identity: {len(mismatches)} of {results} results carry a run identity "
+        f"other than /v1/info's {info.run_identity}: {ids}"
+    )
+
+
 def build_run_summary(
     *,
     probes: list[GoldProbe],
@@ -511,6 +550,9 @@ def build_run_summary(
     config = serving_config(info)
     summary["serving_config"] = config
     summary["serving_config_missing"] = [name for name, value in config.items() if value is None]
+    summary["run_identity"] = info.run_identity
+    summary["run_identity_components"] = info.run_identity_components
+    summary["run_identity_mismatches"] = run_identity_mismatches(info, result.cases)
     summary["run"] = {
         "session_id": session_id,
         "recorded_at": recorded_at,
@@ -582,7 +624,9 @@ def case_row_fields(case: CaseResult) -> dict[str, Any]:
                 "scope_label": resp.scope.label,
                 "scope_confidence": resp.scope.confidence,
                 "attempts": resp.attempts,
+                "stage2_calls": resp.stage2_calls,
                 "warnings": list(resp.warnings),
+                "run_identity": resp.stamps.run_identity,
                 "timings_ms": resp.timings_ms.model_dump(mode="json"),
                 "n_entities": len(resp.payload.entities),
                 "n_relationships": len(resp.payload.relationships),
@@ -1075,6 +1119,7 @@ async def execute(
         _log(f"[FAIL] preflight: incompatible contract_version {info.contract_version!r}")
         return 1
     log_serving_config(info)
+    log_run_identity(info)
     if health.status != "ok":
         _log(f"[FAIL] preflight: service health is {health.status!r}, not 'ok'")
         return 1
@@ -1127,6 +1172,11 @@ async def execute(
         drain_s=drain_s,
     )
     rows = build_case_rows(report, result)
+    warn_run_identity_mismatches(
+        info,
+        summary["run_identity_mismatches"],
+        sum(1 for c in result.cases if c.response is not None),
+    )
 
     _replace_jsonl(rows_path, rows)
     (out_dir / OUT_SUMMARY).write_text(
