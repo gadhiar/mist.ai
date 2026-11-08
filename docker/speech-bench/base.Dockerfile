@@ -1,5 +1,5 @@
-# mist-speech-bench-base: the running mist-backend image, plus onnxruntime 1.31.1 with numpy
-# held at 1.26.4 (requirements-base.txt).
+# mist-speech-bench-base: the mist-backend image the pin file records, plus onnxruntime 1.31.1
+# with numpy held at 1.26.4 (requirements-base.txt).
 #
 # The backend image already holds chatterbox-tts 0.1.7 (with Turbo), openai-whisper and ffmpeg,
 # so the speech bench's `turbo` and `original` engines and whisper-base run on it as built. It

@@ -3,10 +3,10 @@
 Every Dockerfile in the directory is found by glob, so an image another task adds is held to the
 same rules: the lead builds each with `docker/speech-bench/` as the context, so a COPY may name
 only a plain requirements or constraints file beside the Dockerfile, never repository code; the
-base image is the running backend image plus one install of `requirements-base.txt` (onnxruntime,
-which the backend image lacks, with numpy held at the backend's version); every other image
-starts from the base and installs its pins under the torch constraints; every pin is `==`; and an
-arm in `speech_arms.json` that names a package pinned here names the pinned version.
+base image is the backend image the pin file records plus one install of `requirements-base.txt`
+(onnxruntime, which the backend image lacks, with numpy held at the backend's version); every
+other image starts from the base and installs its pins under the torch constraints; every pin is
+`==`; and an arm in `speech_arms.json` that names a package pinned here names the pinned version.
 """
 
 from __future__ import annotations

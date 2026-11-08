@@ -162,15 +162,15 @@ downstream of here means anything.
 
     MSYS_NO_PATHCONV=1 docker exec mist-backend-smoke ls -la /app/mist-memory /app/dev-state
 
-Expect **both to exist and be empty.** `docker/backend/Dockerfile:119-122`
-creates them as empty directories owned by appuser, so they are baked into the
+Expect **both to exist and be empty.** The runtime-directory step of
+`docker/backend/Dockerfile` creates them as empty directories owned by appuser, so they are baked into the
 image. The compose file does not mount them: they are container-layer
 directories, not the host's `./mist-memory` or `./dev-state`.
 
     MSYS_NO_PATHCONV=1 docker exec mist-backend-smoke ls -la /app/data
 
 This one exists too, and that is correct rather than alarming: the same
-`docker/backend/Dockerfile:119-122` creates `/app/data` and its
+runtime-directory step creates `/app/data` and its
 `voice_profiles`, `vector_store` and `audio` subdirectories. It is a
 container-layer directory, not the host's `./data`.
 
@@ -229,7 +229,7 @@ reached a live smoke run: invoked by path, `sys.path[0]` is `scripts/` rather
 than the repo root, so `import backend` raised `ModuleNotFoundError` before
 `main()` ran. `-m` puts the working directory on `sys.path` instead, and
 `docker exec` inherits the image's `WORKDIR /app`
-(`docker/backend/Dockerfile:102`), so the repo root is found by construction.
+(set in `docker/backend/Dockerfile`), so the repo root is found by construction.
 The path form works again now -- `scripts/initialize_schema.py:17-19` adds the
 repo root itself, and `tests/unit/scripts/test_initialize_schema.py` pins that
 -- but `-m` does not depend on that bootstrap staying in place, and it is the
