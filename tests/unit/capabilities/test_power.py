@@ -70,7 +70,7 @@ class TestModule:
     def test_holds_no_level_to_tier_table(self):
         levels = {"full", "low", "off"}
         tiers = {"interaction", "smart"}
-        for name, value in vars(power).items():
+        for value in vars(power).values():
             if not isinstance(value, Mapping):
                 continue
             keyed_by_level = bool(value) and set(value) <= levels
