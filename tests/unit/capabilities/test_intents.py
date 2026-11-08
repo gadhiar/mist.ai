@@ -7,9 +7,6 @@ import pytest
 from backend.capabilities.intents import normalize_utterance
 
 WAKE_WORDS = ("mist", "hey mist", "ok mist", "okay mist")
-# The normalised form of "what's". Built in two parts because codespell reads the joined word
-# as a misspelling, and its configuration lives outside this file.
-WHAT_S = "what" + "s"
 
 
 class TestPlanCases:
@@ -18,7 +15,7 @@ class TestPlanCases:
     @pytest.mark.parametrize(
         ("raw", "expected"),
         [
-            ("What's the time?", f"{WHAT_S} the time"),
+            ("What's the time?", "whats the time"),
             ("Set an alarm for 7.30 a.m.", "set an alarm for 7:30 am"),
             ("set a timer for twenty five minutes", "set a timer for 25 minutes"),
             ("a minute timer", "1 minute timer"),
@@ -37,7 +34,7 @@ class TestPunctuation:
     def test_curly_apostrophe_is_dropped(self):
         curly = "what" + chr(0x2019) + "s playing"
 
-        assert normalize_utterance(curly, WAKE_WORDS) == f"{WHAT_S} playing"
+        assert normalize_utterance(curly, WAKE_WORDS) == "whats playing"
 
     def test_pm_with_dots_and_space(self):
         assert normalize_utterance("wake me at 6 p.m. tomorrow", WAKE_WORDS) == (
