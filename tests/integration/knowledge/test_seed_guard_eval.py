@@ -161,6 +161,14 @@ class TestAGraphTheSeedMayWrite:
 
         assert seed(conn) == {"nodes": 4, "facts": 2}
         assert _count(conn, "MATCH (n) RETURN count(n) AS c") == 4
+        # Typed labels: each seeded node carries its own type label.
+        labels = {node_id: set(lbls) for node_id, lbls, _props in _snapshot(conn)[0]}
+        assert labels == {
+            "sg-mist": {SELF_MODEL_LABEL, "MistIdentity"},
+            "sg-rust": {ENTITY_LABEL, "Technology"},
+            "sg-user": {ENTITY_LABEL, "User"},
+            "sg-warm": {SELF_MODEL_LABEL, "MistTrait"},
+        }
 
     def test_a_seed_only_graph_counts_nothing_and_is_seeded_again(self, eval_connection, seed):
         conn = eval_connection
@@ -196,7 +204,9 @@ _ENTITY_PAIR = "MATCH (u:__Entity__ {id: 'sg-user'}), (t:__Entity__ {id: 'sg-rus
 # (statement added to a seeded graph, the one SeedGuardCounts field it must raise)
 _BLOCKING = [
     pytest.param(
-        "CREATE (:__Entity__ {id: 'sg-py', entity_type: 'Technology', display_name: 'Python'})",
+        # Labelled as the curation graph writer now writes an extracted node.
+        "CREATE (:__Entity__:Technology {id: 'sg-py', entity_type: 'Technology', "
+        "display_name: 'Python'})",
         "reset_guard_nodes",
         id="non-seed-entity-node",
     ),

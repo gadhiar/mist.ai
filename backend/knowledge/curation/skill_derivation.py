@@ -15,11 +15,30 @@ from backend.knowledge.config import SkillDerivationConfig
 from backend.knowledge.extraction.tool_usage_tracker import ToolUsageTracker
 from backend.knowledge.storage.graph_executor import GraphExecutor
 from backend.knowledge.storage.partitions import SELF_MODEL_LABEL, USER_ENTITY_ID
+from backend.knowledge.storage.type_labels import entity_type_label
 from backend.knowledge.version_stamps import ONTOLOGY_VERSION
 
 logger = logging.getLogger(__name__)
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _type_label(entity_type: str) -> str:
+    """Return the type label for a type this job writes; raise if it has none."""
+    label = entity_type_label(entity_type)
+    if label is None:
+        raise ValueError(f"{entity_type!r} has no entity type label")
+    return label
+
+
+# Type labels of the two `:__Entity__` nodes `_create_skill` may create, set on
+# create beside `entity_type` as the curation graph writer does
+# (`backend/knowledge/storage/type_labels.py`). The user node is usually
+# already in the graph (seed or extraction) and is then left as it is; when
+# this job creates it, it gets the `entity_type` and the `:User` label the
+# graph writer and the seed applier give it, rather than neither.
+_SKILL_LABEL = _type_label("Skill")
+_USER_LABEL = _type_label("User")
 
 
 def _slugify(text: str) -> str:
@@ -168,9 +187,11 @@ class SkillDerivationJob:
             "  e.status = 'active', "
             "  e.created_at = $now, "
             "  e.updated_at = $now, "
-            "  e.ontology_version = $ontology_version "
+            "  e.ontology_version = $ontology_version, "
+            f"  e:{_SKILL_LABEL} "
             "WITH e "
             "MERGE (u:__Entity__ {id: $user_entity_id}) "
+            f"ON CREATE SET u.entity_type = 'User', u:{_USER_LABEL} "
             "MERGE (u)-[:KNOWS]->(e)",
             {
                 "skill_id": skill_id,

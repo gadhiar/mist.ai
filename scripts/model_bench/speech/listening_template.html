@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blind listening</title>
+<style>
+  body {
+    font-family: system-ui, sans-serif;
+    line-height: 1.45;
+    color: #1d1d1f;
+    background: #f6f6f4;
+    max-width: 62rem;
+    margin: 0 auto;
+    padding: 0 1rem 4rem;
+  }
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: #f6f6f4;
+    border-bottom: 1px solid #d8d8d4;
+    padding: 0.75rem 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.5rem;
+    align-items: center;
+  }
+  header h1 { font-size: 1.3rem; margin: 0; }
+  #progress { margin: 0; color: #444; }
+  button { font: inherit; padding: 0.35rem 0.9rem; cursor: pointer; }
+  .intro { max-width: 46rem; }
+  section.line {
+    background: #fff;
+    border: 1px solid #d8d8d4;
+    border-radius: 6px;
+    padding: 0.75rem 1rem 1rem;
+    margin: 1.25rem 0;
+  }
+  section.line h2 { font-size: 0.95rem; font-weight: 600; color: #666; margin: 0; }
+  .text { font-size: 1.2rem; margin: 0.35rem 0; }
+  .feeling { margin: 0 0 0.75rem; color: #444; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 0.35rem 0.5rem; border-top: 1px solid #eee; }
+  th { font-size: 0.85rem; font-weight: 600; color: #555; }
+  td.label { font-family: ui-monospace, monospace; white-space: nowrap; }
+  tr.complete td.label::after { content: " \2713"; color: #2a7d4f; }
+  .scale label { white-space: nowrap; margin-right: 0.5rem; cursor: pointer; }
+  audio { height: 2rem; max-width: 16rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Blind listening</h1>
+  <p id="progress"></p>
+  <button id="export" type="button">Export ratings.csv</button>
+</header>
+<main>
+  <div class="intro">
+    <p>Each block is one line, read by several voices. Clip labels are random, and the clips
+    in each block are in a shuffled order.</p>
+    <p>For every clip, rate <strong>natural</strong>: how much it sounds like a person speaking
+    (1 not at all, 5 completely), and <strong>feeling</strong>: how well it carries the line's
+    intended feeling (1 not at all, 5 exactly). Then pick your favourite clip for the line.</p>
+    <p>Ratings are kept in this browser between sittings. When every clip is rated, export and
+    save the file as <code>ratings.csv</code> in the folder that holds this page.</p>
+  </div>
+  <div id="lines"></div>
+</main>
+<script id="pack-data" type="application/json">__PACK_DATA__</script>
+<script>
+"use strict";
+
+const DATA = JSON.parse(document.getElementById("pack-data").textContent);
+const STORE = "listening-pack-" + DATA.pack;
+const TOTAL = DATA.groups.reduce((n, group) => n + group.clips.length, 0);
+const state = restore();
+
+function restore() {
+  let saved = {};
+  try {
+    saved = JSON.parse(window.localStorage.getItem(STORE) || "{}");
+  } catch (err) {
+    saved = {};
+  }
+  return {
+    natural: saved.natural || {},
+    feeling: saved.feeling || {},
+    preferred: saved.preferred || {},
+  };
+}
+
+function persist() {
+  try {
+    window.localStorage.setItem(STORE, JSON.stringify(state));
+  } catch (err) {
+    // No storage on this page: ratings last until the tab closes, so export before closing.
+  }
+}
+
+function el(tag, attrs, text) {
+  const node = document.createElement(tag);
+  for (const [name, value] of Object.entries(attrs || {})) {
+    node.setAttribute(name, value);
+  }
+  if (text !== undefined) {
+    node.textContent = text;
+  }
+  return node;
+}
+
+function scale(kind, label) {
+  const cell = el("td", { class: "scale" });
+  for (let value = 1; value <= 5; value++) {
+    const id = kind + "-" + label + "-" + value;
+    const input = el("input", { type: "radio", name: kind + "-" + label, id: id });
+    input.checked = state[kind][label] === value;
+    input.addEventListener("change", () => {
+      state[kind][label] = value;
+      persist();
+      refresh();
+    });
+    const tag = el("label", { for: id });
+    tag.append(input, " " + value);
+    cell.append(tag);
+  }
+  return cell;
+}
+
+function rated(label) {
+  return Boolean(state.natural[label]) && Boolean(state.feeling[label]);
+}
+
+function render() {
+  const container = document.getElementById("lines");
+  DATA.groups.forEach((group, index) => {
+    const section = el("section", { class: "line" });
+    section.append(el("h2", {}, "Line " + (index + 1) + " of " + DATA.groups.length));
+    section.append(el("p", { class: "text" }, "“" + group.text + "”"));
+    section.append(el("p", { class: "feeling" }, "Intended feeling: " + group.feeling));
+    const table = el("table");
+    const head = el("tr");
+    for (const title of ["Clip", "Listen", "Natural (1-5)", "Feeling (1-5)", "Favourite"]) {
+      head.append(el("th", {}, title));
+    }
+    table.append(head);
+    for (const label of group.clips) {
+      const row = el("tr", { id: "row-" + label });
+      row.append(el("td", { class: "label" }, label));
+      const listen = el("td");
+      listen.append(el("audio", { controls: "", preload: "none", src: "clips/" + label + ".wav" }));
+      row.append(listen);
+      row.append(scale("natural", label));
+      row.append(scale("feeling", label));
+      const favourite = el("td");
+      const pick = el("input", {
+        type: "radio",
+        name: "preferred-" + group.line_id,
+        "aria-label": "favourite: " + label,
+      });
+      pick.checked = state.preferred[group.line_id] === label;
+      pick.addEventListener("change", () => {
+        state.preferred[group.line_id] = label;
+        persist();
+        refresh();
+      });
+      favourite.append(pick);
+      row.append(favourite);
+      table.append(row);
+    }
+    section.append(table);
+    container.append(section);
+  });
+}
+
+function refresh() {
+  let done = 0;
+  for (const group of DATA.groups) {
+    for (const label of group.clips) {
+      const complete = rated(label);
+      done += complete ? 1 : 0;
+      document.getElementById("row-" + label).classList.toggle("complete", complete);
+    }
+  }
+  const picked = DATA.groups.filter((group) => state.preferred[group.line_id]).length;
+  document.getElementById("progress").textContent =
+    done + " of " + TOTAL + " clips rated; favourites picked for " + picked + " of " +
+    DATA.groups.length + " lines";
+}
+
+function cell(value) {
+  const text = value === undefined || value === null ? "" : String(value);
+  return /[",\r\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+}
+
+function ratingsCsv() {
+  const rows = [DATA.columns.join(",")];
+  for (const group of DATA.groups) {
+    for (const label of group.clips) {
+      const row = {
+        label: label,
+        line_id: group.line_id,
+        natural: state.natural[label],
+        feeling: state.feeling[label],
+        preferred: state.preferred[group.line_id] === label ? 1 : 0,
+      };
+      rows.push(DATA.columns.map((column) => cell(row[column])).join(","));
+    }
+  }
+  return rows.join("\n") + "\n";
+}
+
+function exportRatings() {
+  let done = 0;
+  for (const group of DATA.groups) {
+    for (const label of group.clips) {
+      done += rated(label) ? 1 : 0;
+    }
+  }
+  if (done < TOTAL && !window.confirm((TOTAL - done) + " clips are not fully rated. Export anyway?")) {
+    return;
+  }
+  const url = URL.createObjectURL(new Blob([ratingsCsv()], { type: "text/csv" }));
+  const link = el("a", { href: url, download: DATA.ratings_file });
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// One clip at a time: starting one pauses any other that is playing.
+document.addEventListener("play", (event) => {
+  for (const audio of document.querySelectorAll("audio")) {
+    if (audio !== event.target) {
+      audio.pause();
+    }
+  }
+}, true);
+
+document.getElementById("export").addEventListener("click", exportRatings);
+render();
+refresh();
+</script>
+</body>
+</html>

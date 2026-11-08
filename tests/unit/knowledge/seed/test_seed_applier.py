@@ -17,6 +17,7 @@ from backend.knowledge.ontologies import ALL_NODE_TYPE_NAMES
 from backend.knowledge.seed.applier import (
     apply_seed_documents,
     entity_type_labels_removed,
+    node_type_label,
     reseed,
 )
 from backend.knowledge.seed.models import SeedDocument, SeedFact, SeedNode
@@ -569,12 +570,12 @@ class TestNodeDefinitionWrites:
             "description": "Default register is warm and engaged.",
         }
 
-    def test_entity_node_type_is_not_written_as_a_graph_label(self, fake_connection):
-        """MIS-177 D2 (replaces `test_sets_the_ontology_type_as_a_graph_label`,
-        which pinned the opposite): an `:__Entity__` node's type lives in the
-        `entity_type` property only. The write carries no `SET n:<Type>` and
-        REMOVEs every ontology type label, so a node the MERGE matched (one an
-        earlier seed labelled) ends with none either.
+    def test_entity_node_gets_its_type_label_and_sheds_the_rest(self, fake_connection):
+        """Typed labels (6 Nov, reversing MIS-177 D2, which pinned no label
+        here): an `:__Entity__` node carries its own type label beside
+        `entity_type`. The write SETs it and REMOVEs every other ontology type
+        label, on both MERGE branches, so a node the MERGE matched (one an
+        earlier seed or writer labelled differently) ends with exactly its own.
         """
         docs = [
             _doc(
@@ -590,18 +591,49 @@ class TestNodeDefinitionWrites:
 
         node_writes = [(q, p) for q, p in fake_connection.writes if not p.get("predicate")]
         by_id = {p["id"]: q for q, p in node_writes}
-        for node_id in ("slalom", "mist-ai"):
+        for node_id, node_type in (("slalom", "Organization"), ("mist-ai", "Project")):
             query = by_id[node_id]
-            assert "SET n:" not in query, query
+            assert f"SET n:{node_type} " in query, query
+            assert query.count("SET n:") == 1, query
             removed = _removed_labels(query)
-            assert set(removed) == set(ALL_NODE_TYPE_NAMES), removed
-        assert by_id["slalom"].index("ON MATCH SET") < by_id["slalom"].index("REMOVE n:")
+            assert set(removed) == set(ALL_NODE_TYPE_NAMES) - {node_type}, removed
+        query = by_id["slalom"]
+        assert query.index("ON MATCH SET") < query.index("SET n:Organization ")
+        assert query.index("SET n:Organization ") < query.index("REMOVE n:")
+
+    @pytest.mark.parametrize("node_type", ["MistIdentity", "MistTrait", "LearningEvent"])
+    def test_entity_node_of_a_type_without_a_label_gets_none(self, fake_connection, node_type):
+        """A type outside `ENTITY_TYPE_LABELS` gets no label on `:__Entity__`
+        (for example the duplicate `mist-identity` node), and every ontology
+        type label is removed.
+        """
+        docs = [
+            _doc(
+                facts=[("user", "KNOWS", "odd")],
+                nodes=[SeedNode(id="user", type="User"), SeedNode(id="odd", type=node_type)],
+            )
+        ]
+
+        apply_seed_documents(fake_connection, docs, seed_version="profile-v1", now_iso=_NOW)
+
+        node_writes = [(q, p) for q, p in fake_connection.writes if not p.get("predicate")]
+        query = {p["id"]: q for q, p in node_writes}["odd"]
+        assert "SET n:" not in query, query
+        assert set(_removed_labels(query)) == set(ALL_NODE_TYPE_NAMES)
+
+    def test_the_label_comes_from_entity_type_label(self, monkeypatch):
+        """The SET label is `entity_type_label`'s answer, not the authored type."""
+        monkeypatch.setattr(
+            "backend.knowledge.seed.applier.entity_type_label", lambda node_type: None
+        )
+
+        assert node_type_label(ENTITY_LABEL, "Organization") is None
+        assert node_type_label(SELF_MODEL_LABEL, "MistTrait") == "MistTrait"
 
     def test_user_node_keeps_the_user_label_and_sheds_the_rest(self, fake_connection):
-        """`:User` is the one `:__Entity__` type label the applier keeps
-        (`ENTITY_TYPE_LABELS_KEPT`, which names the writers that set it). It is
-        SET, and excluded from the REMOVE; every other ontology type label is
-        removed.
+        """`:User` is the user node's type label, set like any other type's.
+        It is SET, and excluded from the REMOVE; every other ontology type
+        label is removed.
         """
         docs = [
             _doc(
@@ -693,9 +725,9 @@ class TestNodeDefinitionWrites:
             assert "n.created_at" not in rest
 
     def test_entity_type_property_matches_the_authored_type(self, fake_connection):
-        """`entity_type` is the node's type (MIS-177 D2): every type reader
-        (e.g. `count_nodes_by_type`) queries the property, not `labels(n)`,
-        and an `:__Entity__` non-User node carries no type label at all.
+        """`entity_type` is the node's type: every type reader (e.g.
+        `count_nodes_by_type`) queries the property, not `labels(n)`. The type
+        label mirrors it and does not replace it.
         """
         docs = [
             _doc(

@@ -2,7 +2,8 @@
 
 Runs on the Windows host in a no-gaming session (Python 3.11.9) and its
 `voice` subcommand shells out to a copy of `probes/voice_vram.py` running
-inside the mist-backend container (Python 3.11.0rc1). Stops MIST's
+inside the mist-backend container (the CPython 3.11 release that
+`docker/backend/Dockerfile` pins). Stops MIST's
 production containers, serves a pinned llama-server build under the name
 `mist-bench-llm`, runs benchmark suites against it, and restores MIST
 exactly. Stdlib only (see `probes/voice_vram.py` for the one exception).
@@ -58,15 +59,15 @@ BENCH_LLM_PORT = 8080
 BENCH_LLM_HOST_BIND = "127.0.0.1"
 SNAPSHOT_CONTAINERS: tuple[str, ...] = ("mist-neo4j", "mist-llm", "mist-backend")
 
-# Mirrors scripts/eval_harness/run.py:61-74 (DEFAULT_TEST_ORDER). Duplicated
-# here, not imported, so this module stays stdlib-only -- the harness module
-# imports PyYAML. The harness suite is invoked as a subprocess, never by
-# direct import.
+# Mirrors DEFAULT_TEST_ORDER in scripts/eval_harness/run.py (pinned by
+# tests/unit/model_bench/test_host_run_suites.py). Duplicated here, not
+# imported, so this module stays stdlib-only -- the harness module imports
+# PyYAML. The harness suite is invoked as a subprocess, never by direct
+# import.
 HARNESS_DEFAULT_TEST_ORDER: tuple[str, ...] = (
     "speed_minimal",
     "schema_conformance",
     "schema_conformance_lenient",
-    "schema_conformance_fewshot",
     "tool_selection",
     "personality",
     "adversarial_persona",

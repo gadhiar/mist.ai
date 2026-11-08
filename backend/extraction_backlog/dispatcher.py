@@ -788,6 +788,7 @@ class ExtractionDispatcher:
                 "stamps": response.stamps.model_dump(mode="json"),
                 "timings_ms": response.timings_ms.model_dump(mode="json"),
                 "attempts": response.attempts,
+                "stage2_calls": response.stage2_calls,
                 "warnings": list(response.warnings),
                 "contract_version": response.contract_version,
                 "job_id": job_id,

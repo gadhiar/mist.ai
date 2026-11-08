@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "variant": "h6",
+  "started_utc": "2026-11-20T18:00:05Z",
+  "finished_utc": "2026-11-20T21:41:30Z",
+  "threads": 8,
+  "card_total_mib": 8192,
+  "before": {"gpu_used_mib": 7240, "free_available_mib": 5310},
+  "searches": [
+    {"model": "gemma4-e2b", "ngl": 0, "fa": "on", "cache": "q8_0", "started": true, "gpu_peak_mib": 7590, "gpu_free_mib": 602, "fits": true},
+    {"model": "gemma4-e2b", "ngl": 36, "fa": "on", "cache": "q8_0", "started": true, "gpu_peak_mib": 8120, "gpu_free_mib": 72, "fits": false},
+    {"model": "gemma4-e2b", "ngl": 18, "fa": "on", "cache": "q8_0", "started": true, "gpu_peak_mib": 7905, "gpu_free_mib": 287, "fits": false},
+    {"model": "gemma4-e2b", "ngl": 9, "fa": "on", "cache": "q8_0", "started": true, "gpu_peak_mib": 7672, "gpu_free_mib": 520, "fits": true},
+    {"model": "minicpm5-2b", "ngl": 0, "fa": "on", "cache": "q8_0", "started": true, "gpu_peak_mib": 7701, "gpu_free_mib": 491, "fits": false}
+  ],
+  "windows": [
+    {"model": "gemma4-e2b", "placement": "gtx1070-shared", "pass": "idle", "alias": "gemma4-e2b@gtx1070-shared-idle", "image": "cuda", "ngl": 9, "status": "served", "fallback": "none", "fa": "on", "cache": "q8_0", "start_utc": "2026-11-20T18:09:40Z", "end_utc": "2026-11-20T18:35:02Z", "window_s": 1500, "load_s": 14.212, "unload_s": 2.403, "memory_cap_mib": 4286, "gpu_before_mib": 7238, "gpu_after_load_mib": 7590, "gpu_peak_mib": 7655, "gpu_after_unload_mib": 7240, "free_available_before_mib": 5302, "free_available_peak_mib": 2911},
+    {"model": "gemma4-e2b", "placement": "gtx1070-shared", "pass": "busy", "alias": "gemma4-e2b@gtx1070-shared-busy", "image": "cuda", "ngl": 9, "status": "served", "fallback": "none", "fa": "on", "cache": "q8_0", "start_utc": "2026-11-20T18:36:10Z", "end_utc": "2026-11-20T18:48:31Z", "window_s": 720, "load_s": 15.004, "unload_s": 2.611, "memory_cap_mib": 4286, "gpu_before_mib": 7402, "gpu_after_load_mib": 7744, "gpu_peak_mib": 7680, "gpu_after_unload_mib": 7395, "free_available_before_mib": 5120, "free_available_peak_mib": 2702},
+    {"model": "minicpm5-2b", "placement": "host1070-cpu", "pass": "idle", "alias": "minicpm5-2b@host1070-cpu", "image": "cpu", "ngl": null, "status": "served", "fallback": "none", "fa": "on", "cache": "q8_0", "start_utc": "2026-11-20T18:55:12Z", "end_utc": "2026-11-20T19:20:20Z", "window_s": 1500, "load_s": 6.877, "unload_s": 1.102, "memory_cap_mib": 4290, "gpu_before_mib": 7236, "gpu_after_load_mib": 7236, "gpu_peak_mib": 7241, "gpu_after_unload_mib": 7236, "free_available_before_mib": 5314, "free_available_peak_mib": 3460},
+    {"model": "gemma4-e2b", "placement": "gtx1070", "pass": "alone", "alias": "gemma4-e2b@gtx1070", "image": "cuda", "ngl": 999, "status": "served", "fallback": "fa-off-f16", "fa": "off", "cache": "f16", "start_utc": "2026-11-20T20:10:00Z", "end_utc": "2026-11-20T20:22:40Z", "window_s": 720, "load_s": 21.540, "unload_s": 3.012, "memory_cap_mib": 9800, "gpu_before_mib": 210, "gpu_after_load_mib": 3480, "gpu_peak_mib": 3622, "gpu_after_unload_mib": 212, "free_available_before_mib": 10824, "free_available_peak_mib": 8060},
+    {"model": "minicpm5-2b", "placement": "gtx1070", "pass": "alone", "alias": "minicpm5-2b@gtx1070", "image": "cuda", "ngl": 999, "status": "failed", "fallback": "failed", "fa": "off", "cache": "f16", "start_utc": "2026-11-20T20:23:30Z", "end_utc": "2026-11-20T20:24:55Z", "window_s": 720, "load_s": null, "unload_s": null, "memory_cap_mib": 9810, "gpu_before_mib": 212, "gpu_after_load_mib": null, "gpu_peak_mib": null, "gpu_after_unload_mib": null, "free_available_before_mib": 10834, "free_available_peak_mib": null}
+  ],
+  "skips": [
+    {"model": "qwen35-4b", "placement": "gtx1070-shared", "reason": "model file sha256 differs from the pin file"},
+    {"model": "e4b-ref", "placement": "gtx1070-shared", "reason": "does not fit beside extraction in host memory"},
+    {"model": "minicpm5-2b", "placement": "gtx1070-shared", "reason": "does not fit beside extraction"}
+  ],
+  "restore": {
+    "started": ["mist-extraction-llm-host", "mist-extraction-host"],
+    "health": {"mist-extraction-llm-host": "healthy", "mist-extraction-host": "healthy"},
+    "inspect_diff": {"empty": true, "containers": {"mist-extraction-llm-host": true, "mist-extraction-host": true}}
+  }
+}
