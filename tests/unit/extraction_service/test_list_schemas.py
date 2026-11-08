@@ -46,7 +46,9 @@ from backend.knowledge.extraction.list_prompts import (
     LIST_FRAME_USER_TEMPLATE,
     LIST_ITEM_REPAIR_INSTRUCTION,
     LIST_ITEM_USER_TEMPLATE,
+    LIST_REFUSAL_TEMPLATE,
     LIST_SYSTEM_PROMPT,
+    list_repair_text,
     render_frames_for_items,
 )
 from backend.knowledge.extraction.prompts import EXTRACTION_SYSTEM_PROMPT
@@ -757,6 +759,42 @@ def test_each_repair_instruction_names_its_own_outputs_keys():
         assert f"{key}" in LIST_ITEM_REPAIR_INSTRUCTION, key
     assert "frame_entities" not in LIST_ITEM_REPAIR_INSTRUCTION
     assert '"items"' not in LIST_FRAME_REPAIR_INSTRUCTION
+
+
+def _named_in_order(text: str, keys: list[str]) -> bool:
+    positions = [re.search(rf"\b{key}\b", text) for key in keys]
+    return all(positions) and [p.start() for p in positions] == sorted(p.start() for p in positions)
+
+
+def test_the_frame_repair_names_a_groups_keys_in_schema_order():
+    keys = ["group", "durable", "templates", "item_type", "unchecked"]
+    after = LIST_FRAME_REPAIR_INSTRUCTION.split("each with", 1)[1]
+
+    assert _named_in_order(after, keys)
+
+
+def test_the_item_texts_name_an_items_keys_with_template_before_entity():
+    keys = ["item", "template", "entity", "entities", "relationships"]
+    repair = LIST_ITEM_REPAIR_INSTRUCTION.split("each with", 1)[1]
+    prose = _section("## LIST OUTPUT SCHEMA", "## EXTRACTION RULES").split("\n- items:", 1)[1]
+
+    assert _named_in_order(repair, keys)
+    assert _named_in_order(prose.split("\n", 1)[0], ["template", "entity"])
+
+
+@pytest.mark.parametrize(
+    "instruction", [LIST_FRAME_REPAIR_INSTRUCTION, LIST_ITEM_REPAIR_INSTRUCTION]
+)
+def test_a_list_repair_text_ends_with_the_refusal_line(instruction):
+    error = ListOutputError("groups[0] (G1): a template names item, so item_type must be set")
+
+    text = list_repair_text(instruction, error)
+
+    assert LIST_REFUSAL_TEMPLATE == "The output was refused: {error}"
+    assert text == (
+        instruction + "\nThe output was refused: groups[0] (G1): a template names item, so "
+        "item_type must be set"
+    )
 
 
 # --- frames for the item calls ----------------------------------------------------------------

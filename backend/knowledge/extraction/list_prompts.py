@@ -93,7 +93,7 @@ Stage ITEMS:
 - frame_entities: what a lead-in, heading or parent item names, keyed f1, f2.
 - groups: one per group in Units. templates: at most 3 facts every item of the group states; subject and object are roles: user, mist (MIST itself), item (each item's own entity), parent (the item a nested group is under) or a frame key. item_type: the type every item shares, or null. unchecked: see LIST RULES 3.
 - facts: facts of the prose units and of the frame itself, entities keyed e1, e2.
-- items: one record per item id the user message asks for. entity: the item's own entity, or null. template: whether the group's templates hold for this item (applies), with their assertion_kind, temporal_status and dates. entities and relationships: only facts the templates do not already state.
+- items: one record per item id the user message asks for. template: whether the group's templates hold for this item (applies), with their assertion_kind, temporal_status and dates. entity: the item's own entity, or null. entities and relationships: only facts the templates do not already state.
 - An endpoint is a role, a frame or entity key, or another item as item:G1.2.
 
 """
@@ -198,16 +198,32 @@ LIST_FRAME_REPAIR_INSTRUCTION = (
     "Your previous output was not valid JSON or did not match the FRAME output. Return ONLY "
     'a JSON object {"frame_entities": [...], "groups": [...], "facts": {"entities": [...], '
     '"relationships": [...]}}, with one groups entry for each group id in Units, each with '
-    "group, templates (at most 3), item_type and unchecked. No prose, no markdown code "
-    "fences, no explanation."
+    "group, durable, templates (at most 3), item_type and unchecked. No prose, no markdown "
+    "code fences, no explanation."
 )
 
 LIST_ITEM_REPAIR_INSTRUCTION = (
     "Your previous output was not valid JSON or did not match the ITEMS output. Return ONLY "
     'a JSON object {"items": [...]}, with one record for each item id asked for, each with '
-    "item, entity, template, entities and relationships. No prose, no markdown code fences, "
+    "item, template, entity, entities and relationships. No prose, no markdown code fences, "
     "no explanation."
 )
+
+LIST_REFUSAL_TEMPLATE = "The output was refused: {error}"
+
+
+def list_repair_text(instruction: str, error: Exception) -> str:
+    """A list stage's repair text, then the line naming why the parser refused the output.
+
+    At temperature 0 a repair that names no reason tends to repeat the refused output,
+    so the list calls name it; the fixed instructions stay constants that the prompt
+    hash covers.
+
+    Args:
+        instruction: The stage's fixed repair instruction.
+        error: The parser's refusal.
+    """
+    return instruction + "\n" + LIST_REFUSAL_TEMPLATE.format(error=error)
 
 
 def _role(role: str, group: ListGroup | None) -> str:
