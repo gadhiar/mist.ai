@@ -194,8 +194,10 @@ def list_call_fits(messages: Sequence[Mapping[str, str]]) -> bool:
 # `backend.knowledge.extraction.run_identity`): this module, the adapters and
 # both schema modules, every `backend.knowledge.extraction` module imported
 # above, whose renderers, strict parsers and list assembly Stages 1.5, 2 and 9
-# call, `canonical_id`, which the list assembly builds Metric ids with, and the
-# provider module the service builds. Whole modules rather than functions, so a
+# call, `canonical_id`, which the list assembly builds Metric ids with, the
+# validator, whose relationship constraints the list parsers check templates
+# and item entities against, and the provider module the service builds.
+# Whole modules rather than functions, so a
 # helper a covered function calls is covered too; an edit elsewhere in a
 # covered module costs one `CODE_REVISIONS` line, never a silent miss.
 RUN_IDENTITY_CODE: tuple[ModuleType, ...] = tuple(
@@ -216,6 +218,7 @@ RUN_IDENTITY_CODE: tuple[ModuleType, ...] = tuple(
         "backend.knowledge.extraction.prompts",
         "backend.knowledge.extraction.scope_classifier",
         "backend.knowledge.extraction.structure_splitter",
+        "backend.knowledge.extraction.validator",
         "backend.llm.llama_server_provider",
     )
 )
@@ -245,7 +248,9 @@ RUN_IDENTITY_EXCLUDED: tuple[tuple[str, str], ...] = (
     (
         "backend.knowledge.ontologies",
         "its type and predicate lists reach the model only through the list schemas, "
-        "which prompt_sha256 covers, and ontology_version is a component already",
+        "which prompt_sha256 covers; its relationship constraints reach the list parsers "
+        "through the validator, which code_sha256 covers; and ontology_version, a "
+        "component already, moves with any change to either",
     ),
     (
         "backend.extraction_service.settings",

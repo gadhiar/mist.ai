@@ -14,6 +14,7 @@ import json
 import pytest
 
 from backend.errors import ExtractionValidationError
+from backend.extraction_service.list_schemas import EXTRACTABLE_TYPE_ENUM, PREDICATE_ENUM, ItemSlot
 from backend.knowledge.extraction.list_frames import (
     FrameOutput,
     GroupFrame,
@@ -26,12 +27,15 @@ from backend.knowledge.extraction.list_frames import (
     ListRelationship,
     Template,
     group_units,
+    item_slots,
     parse_frame_output,
     parse_item_output,
     render_frame_input,
 )
 from backend.knowledge.extraction.list_prompts import LIST_SYSTEM_PROMPT, render_frames_for_items
+from backend.knowledge.extraction.ontology_extractor import ExtractionResult
 from backend.knowledge.extraction.structure_splitter import InputUnit, split_structured
+from backend.knowledge.extraction.validator import ExtractionValidator
 
 
 def _item(text: str, *context: str) -> InputUnit:
@@ -768,6 +772,312 @@ def test_an_edge_to_an_item_not_yet_parsed_is_left_to_assembly():
     (item,) = _nested_items(_item_out("G1.2", relationships=[_edge("item", "item:G2.1")]))
 
     assert item.relationships[0].target == "item:G2.1"
+
+
+# --- template types against the relationship constraints ---------------------------------------
+
+_KIT = group_units(split_structured("Kit:\n- Quorvane\n- Brellix"))[0]
+_GOALS_TURN = "Goals:\n- [ ] learn Kestrin\n- [x] visit Ostby"
+# G1.1 is an unchecked box and the parent of G2, so two sources limit its entity.
+_GOAL_PARENT_TURN = "Goals:\n- [ ] learn Kestrin:\n  - Brellix"
+_TECH = {"key": "f1", "span": "Quorvane", "name": "Quorvane", "type": "Technology"}
+
+
+def _frame_text(*groups: dict, frame_entities=(), relationships=()) -> str:
+    facts = {"entities": [], "relationships": list(relationships)}
+    return json.dumps(
+        {"frame_entities": list(frame_entities), "groups": list(groups), "facts": facts}
+    )
+
+
+@pytest.mark.parametrize(
+    ("group", "frame_entities", "message"),
+    [
+        pytest.param(
+            _group_out("G1", "user EXPERIENCED item", item_type="Document"),
+            (),
+            r"groups\[0\]\.templates\[0\] \(G1\): EXPERIENCED does not admit Document at "
+            r"object \(item\); it admits Event$",
+            id="EXPERIENCED-over-Document-items",
+        ),
+        pytest.param(
+            _group_out("G1", "user HAS_GOAL item", item_type="Skill"),
+            (),
+            r"HAS_GOAL does not admit Skill at object \(item\); it admits Goal$",
+            id="HAS_GOAL-over-Skill-items",
+        ),
+        pytest.param(
+            _group_out("G1", "item USES f1"),
+            (_THRENNIC,),
+            r"USES does not admit Technology at subject \(item\); it admits User, Person, "
+            r"Organization, MistIdentity$",
+            id="USES-from-a-Technology-item-to-an-Organization",
+        ),
+        pytest.param(
+            _group_out("G1", "user WORKS_WITH item"),
+            (),
+            r"WORKS_WITH does not admit User at subject \(user\) with Technology at object "
+            r"\(item\) in either orientation; it admits Organization, Technology, "
+            r"MistIdentity with Technology$",
+            id="WORKS_WITH-in-neither-orientation",
+        ),
+    ],
+)
+def test_a_template_whose_predicate_does_not_admit_its_end_types_is_refused(
+    group, frame_entities, message
+):
+    with pytest.raises(ListOutputError, match=message):
+        parse_frame_output(_frame_text(group, frame_entities=frame_entities), _KIT)
+
+
+def test_a_parent_end_is_typed_by_the_parent_groups_item_type():
+    text = _nested_frame(("user WORKS_AT item",), G1={"item_type": "Organization"})
+
+    with pytest.raises(
+        ListOutputError,
+        match=r"groups\[1\]\.templates\[0\] \(G2\): DEPENDS_ON does not admit Organization "
+        r"at object \(parent\); it admits Technology$",
+    ):
+        _nested_parse(text)
+
+
+@pytest.mark.parametrize(
+    ("template", "item_type", "frame_entities"),
+    [
+        pytest.param("f1 WORKS_WITH item", "Organization", (_TECH,), id="WORKS_WITH-reversed"),
+        pytest.param("item WORKS_WITH f1", "Organization", (_TECH,), id="WORKS_WITH-stated"),
+        pytest.param("user RELATED_TO item", "Date", (), id="RELATED_TO-any-target"),
+        pytest.param("item RELATED_TO mist", "Metric", (), id="RELATED_TO-any-source"),
+    ],
+)
+def test_a_template_that_fits_in_either_orientation_or_any_type_parses(
+    template, item_type, frame_entities
+):
+    group = _group_out("G1", template, item_type=item_type)
+
+    frame = parse_frame_output(_frame_text(group, frame_entities=frame_entities), _KIT)
+
+    assert frame.groups[0].templates[0].predicate == template.split()[1]
+
+
+_ONE = group_units(split_structured("Kit:\n- Quorvane"))[0]
+
+
+def _validator_keeps(predicate: str, source_type: str, target_type: str) -> bool:
+    entities = [{"id": "a", "name": "a", "type": source_type}]
+    entities.append({"id": "b", "name": "b", "type": target_type})
+    edge = {"source": "a", "target": "b", "type": predicate, "properties": {"confidence": 0.9}}
+    result = ExtractionValidator().validate(ExtractionResult(entities, [edge]))
+    return len(result.relationships) == 1
+
+
+def _parser_keeps(subject: str, predicate: str, object_: str, entities: list[dict]) -> bool:
+    group = _group_out("G1", f"{subject} {predicate} {object_}", item_type=None)
+    try:
+        parse_frame_output(_frame_text(group, frame_entities=entities), _ONE)
+    except ListOutputError:
+        return False
+    return True
+
+
+def _typed(key: str, etype: str) -> dict:
+    return {"key": key, "span": key, "name": key, "type": etype}
+
+
+@pytest.mark.parametrize("predicate", PREDICATE_ENUM)
+def test_the_template_type_check_agrees_with_the_validator(predicate):
+    types = list(EXTRACTABLE_TYPE_ENUM)
+    disagree = [
+        (s, o)
+        for s in types
+        for o in types
+        if _parser_keeps("f1", predicate, "f2", [_typed("f1", s), _typed("f2", o)])
+        != _validator_keeps(predicate, s, o)
+    ]
+    for role, role_type in (("user", "User"), ("mist", "MistIdentity")):
+        disagree += [
+            (role, o)
+            for o in types
+            if _parser_keeps(role, predicate, "f1", [_typed("f1", o)])
+            != _validator_keeps(predicate, role_type, o)
+        ]
+
+    assert disagree == []
+
+
+# --- item slots -------------------------------------------------------------------------------
+
+
+def _slots(turn: str, *groups: dict, frame_entities=(), relationships=()) -> dict:
+    list_groups = group_units(split_structured(turn))[0]
+    text = _frame_text(*groups, frame_entities=frame_entities, relationships=relationships)
+    frame = parse_frame_output(text, list_groups)
+    ids = [item for group in list_groups for item in group.item_ids]
+    return {slot.item: slot for slot in item_slots(frame, list_groups, ids)}
+
+
+def test_an_item_template_gives_its_items_the_types_it_admits():
+    slots = _slots("Kit:\n- Quorvane", _group_out("G1", "user USES item"))
+
+    assert slots == {"G1.1": ItemSlot("G1.1", False, ("Technology",), False, None)}
+
+
+def test_an_unchecked_goal_box_requires_a_goal_and_takes_no_template():
+    goal = _group_out("G1", "user HAS_GOAL item", item_type="Goal", unchecked="goal")
+
+    slots = _slots(_GOALS_TURN, goal)
+
+    assert slots == {
+        "G1.1": ItemSlot("G1.1", False, None, True, ("Goal",)),
+        "G1.2": ItemSlot("G1.2", False, ("Goal",), False, None),
+    }
+
+
+def test_an_unchecked_plan_box_has_no_slot_type():
+    plan = _group_out("G1", "user HAS_GOAL item", item_type="Goal", unchecked="plan")
+
+    assert _slots(_GOALS_TURN, plan)["G1.1"] == ItemSlot("G1.1", False, None, False, None)
+
+
+def test_the_parent_of_a_group_whose_template_names_parent_is_required():
+    frame = _nested_parse(_nested_frame())
+
+    slots = {s.item: s for s in item_slots(frame, _NESTED, ["G1.1", "G1.2", "G2.1"])}
+
+    assert slots == {
+        "G1.1": ItemSlot("G1.1", False, ("Technology",), True, ("Technology",)),
+        "G1.2": ItemSlot("G1.2", False, ("Technology",), False, None),
+        "G2.1": ItemSlot(
+            "G2.1", True, ("Organization", "Technology", "Project", "MistIdentity"), False, None
+        ),
+    }
+
+
+def test_an_item_a_frame_fact_names_is_required_with_no_type_limit():
+    edge = _edge("user", "item:G1.2", "PREFERS")
+
+    slots = _slots(
+        "Kit:\n- Quorvane\n- Brellix", _group_out("G1", "user USES item"), relationships=[edge]
+    )
+
+    assert slots["G1.2"] == ItemSlot("G1.2", False, ("Technology",), True, None)
+    assert slots["G1.1"].required is False
+
+
+def test_a_group_that_states_nothing_durable_gives_no_slot_type():
+    errands = _group_out("G1", item_type=None, durable=False)
+
+    assert _slots("Errands:\n- Pindle", errands) == {
+        "G1.1": ItemSlot("G1.1", False, None, False, None)
+    }
+
+
+def test_two_sources_on_one_item_give_the_intersection_of_their_types():
+    goal = _group_out("G1", "user HAS_GOAL item", item_type="Goal", unchecked="goal")
+    docs = _group_out("G2", "parent REFERENCES_DOCUMENT item", item_type="Document")
+
+    slots = _slots(_GOAL_PARENT_TURN, goal, docs)
+
+    assert slots["G1.1"] == ItemSlot("G1.1", False, None, True, ("Goal",))
+    assert slots["G2.1"] == ItemSlot("G2.1", True, ("Document",), False, None)
+
+
+def test_an_undirected_template_admits_the_union_over_its_orientations():
+    group = _group_out("G1", "f1 WORKS_WITH item", item_type="Organization")
+
+    slots = _slots("Kit:\n- Quorvane", group, frame_entities=[_TECH])
+
+    assert slots["G1.1"].applying_types == ("Organization", "Technology", "MistIdentity")
+
+
+def test_a_frame_that_leaves_a_slot_no_type_is_refused():
+    goal = _group_out("G1", item_type=None, unchecked="goal")
+    child = _group_out("G2", "item DEPENDS_ON parent")
+
+    with pytest.raises(
+        ListOutputError, match=r"item G1\.1: no type meets every set its slot needs.*Goal.*"
+    ) as refused:
+        _slots(_GOAL_PARENT_TURN, goal, child)
+
+    assert "Technology" in str(refused.value)
+
+
+# --- item entities against their slots --------------------------------------------------------
+
+
+def _applying(record: dict) -> dict:
+    return record | {"template": record["template"] | {"applies": True}}
+
+
+_PREFERS_G12 = _nested_frame(relationships=(_edge("user", "item:G1.2", "PREFERS"),))
+_GOALS = group_units(split_structured(_GOALS_TURN))[0]
+
+
+@pytest.mark.parametrize(
+    ("record", "frame", "message"),
+    [
+        pytest.param(
+            _applying(_item_out("G1.2", None)),
+            None,
+            r"items\[0\] \(G1\.2\)\.entity: .*requires an entity",
+            id="U2-applies-with-a-null-entity",
+        ),
+        pytest.param(
+            _applying(_item_out("G1.2", "Concept")),
+            None,
+            r"items\[0\] \(G1\.2\)\.entity\.type: Concept is not admitted here; give one of "
+            r"Technology, or applies false",
+            id="2b-applies-with-an-unadmitted-type",
+        ),
+        pytest.param(
+            _item_out("G1.1", None),
+            None,
+            r"items\[0\] \(G1\.1\)\.entity: .*requires an entity",
+            id="U5-a-parent-with-a-null-entity",
+        ),
+        pytest.param(
+            _item_out("G1.1", "Concept"),
+            None,
+            r"items\[0\] \(G1\.1\)\.entity\.type: Concept is not admitted here; give one of "
+            r"Technology$",
+            id="a-parent-of-an-unadmitted-type",
+        ),
+        pytest.param(
+            _item_out("G1.2", None),
+            _PREFERS_G12,
+            r"items\[0\] \(G1\.2\)\.entity: .*requires an entity",
+            id="U6-an-item-a-fact-names-with-a-null-entity",
+        ),
+    ],
+)
+def test_the_item_parser_refuses_an_entity_its_slot_does_not_admit(record, frame, message):
+    with pytest.raises(ListOutputError, match=message):
+        _nested_items(record, frame=frame)
+
+
+def test_an_unchecked_goal_box_of_another_type_is_refused():
+    goal = _group_out("G1", "user HAS_GOAL item", item_type="Goal", unchecked="goal")
+    frame = parse_frame_output(_frame_text(goal), _GOALS)
+
+    with pytest.raises(ListOutputError, match=r"Skill is not admitted here; give one of Goal$"):
+        parse_item_output(
+            json.dumps({"items": [_item_out("G1.1", "Skill")]}), ["G1.1"], frame, _GOALS, {}
+        )
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        pytest.param(_item_out("G1.2", None), id="not-applying-null"),
+        pytest.param(_item_out("G1.2", "Concept"), id="not-applying-any-type"),
+        pytest.param(_applying(_item_out("G1.1")), id="applying-and-required"),
+        pytest.param(_item_out("G2.1", "Skill"), id="a-child-not-applying"),
+    ],
+)
+def test_the_item_parser_accepts_an_entity_its_slot_admits(record):
+    (item,) = _nested_items(record)
+
+    assert item.item == record["item"]
 
 
 # --- the list prompt's examples ---------------------------------------------------------------

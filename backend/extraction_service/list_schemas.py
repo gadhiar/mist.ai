@@ -14,6 +14,8 @@ output section is generated from these schemas so it names the keys in that orde
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from backend.knowledge.ontologies import EXTRACTABLE_NODE_TYPES, EXTRACTABLE_RELATIONSHIP_TYPES
 
 EXTRACTABLE_TYPE_ENUM: tuple[str, ...] = tuple(EXTRACTABLE_NODE_TYPES)
@@ -29,6 +31,33 @@ UNCHECKED_ENUM: tuple[str, ...] = ("plan", "goal")
 # turn needs; twenty of each leaves room.
 FRAME_KEY_ENUM: tuple[str, ...] = tuple(f"f{n}" for n in range(1, 21))
 ENTITY_KEY_ENUM: tuple[str, ...] = tuple(f"e{n}" for n in range(1, 21))
+
+
+@dataclass(frozen=True, slots=True)
+class ItemSlot:
+    """What one asked item's own entity must be, from the parsed frame.
+
+    `list_frames.item_slots` computes it, and both the item call's built schema and the
+    item parser read it, so the grammar and the parser agree. It lives here, as plain
+    data, because `list_frames` imports this module.
+
+    Attributes:
+        item: The item's id, `G1.2`.
+        nested: The item's group has a parent, so `parent` is an end of its edges.
+        applying_types: The types an entity may take when `applies` is true; None
+            when no template of the group names `item`, or the item is an unchecked
+            box, which templates never apply to.
+        required: An entity is required whatever `applies` says: the item is an
+            unchecked goal box, the parent of a group whose template names `parent`,
+            or an item a frame fact names.
+        required_types: The types that requirement admits; None for any.
+    """
+
+    item: str
+    nested: bool
+    applying_types: tuple[str, ...] | None
+    required: bool
+    required_types: tuple[str, ...] | None
 
 
 def _object(required: dict[str, dict], optional: dict[str, dict] | None = None) -> dict:

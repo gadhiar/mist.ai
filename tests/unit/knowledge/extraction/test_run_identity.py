@@ -417,6 +417,7 @@ _SERVICE_SOURCES = (
     _BACKEND_ROOT / "knowledge" / "extraction" / "list_frames.py",
     _BACKEND_ROOT / "knowledge" / "extraction" / "list_prompts.py",
     _BACKEND_ROOT / "knowledge" / "extraction" / "list_assembly.py",
+    _BACKEND_ROOT / "knowledge" / "extraction" / "validator.py",
 )
 
 
@@ -545,6 +546,7 @@ class TestRunIdentityCoverage:
             "backend.knowledge.extraction.prompts",
             "backend.knowledge.extraction.scope_classifier",
             "backend.knowledge.extraction.structure_splitter",
+            "backend.knowledge.extraction.validator",
             "backend.llm.llama_server_provider",
         ]
 

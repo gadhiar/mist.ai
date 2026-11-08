@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from backend.errors import ExtractionValidationError
@@ -37,9 +37,12 @@ from backend.extraction_service.list_schemas import (
     PREDICATE_ENUM,
     TEMPORAL_STATUS_ENUM,
     UNCHECKED_ENUM,
+    ItemSlot,
 )
+from backend.knowledge.ontologies import EDGE_TYPES_BY_NAME
 
 from .structure_splitter import InputUnit, _as_context
+from .validator import RELATIONSHIP_CONSTRAINTS
 
 _LIST_KINDS = frozenset({"list_item", "table_row"})
 _TEMPLATES_MAX = 3
@@ -544,6 +547,214 @@ def _group_frame(
     )
 
 
+# -- template types and item slots (A17) ------------------------------------------------------
+#
+# A template's predicate must admit the known type at each end, by the sets the backend
+# validator drops edges by, so a wrong predicate becomes a repair rather than one edge per
+# item that the graph never keeps. Single fact and item edges are not checked here: the
+# validator drops each one, and refusing a whole frame for one edge risks the turn's
+# fallback.
+
+_EXTRACTABLE = frozenset(EXTRACTABLE_TYPE_ENUM)
+_ROLE_TYPES = {"user": "User", "mist": "MistIdentity"}
+_UNCHECKED = "[ ] "
+
+
+def _ordered_types(types: Collection[str]) -> tuple[str, ...]:
+    """Types in the ontology's extractable order, any others after them, sorted."""
+    return tuple(t for t in EXTRACTABLE_TYPE_ENUM if t in types) + tuple(
+        sorted(set(types) - _EXTRACTABLE)
+    )
+
+
+def _names(types: Collection[str] | None) -> str:
+    if types is None:
+        return "any type"
+    return ", ".join(_ordered_types(types)) or "no type"
+
+
+def _admits(allowed: Collection[str] | None, etype: str | None) -> bool:
+    """Whether `allowed` admits `etype`; an unknown type or a None set admits any."""
+    return etype is None or allowed is None or etype in allowed
+
+
+def _undirected(predicate: str) -> bool:
+    definition = EDGE_TYPES_BY_NAME.get(predicate)
+    return definition is not None and not definition.directional
+
+
+def _sides(template: Template) -> tuple[tuple[str, str, str], ...]:
+    """Each end of `template` as (side, end, the other end)."""
+    return (
+        ("subject", template.subject, template.object),
+        ("object", template.object, template.subject),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _Types:
+    """The known type at each end a frame's templates may name."""
+
+    frames: Mapping[str, GroupFrame]
+    groups: Mapping[str, ListGroup]
+    keys: Mapping[str, str]
+
+    @classmethod
+    def of(cls, frame: FrameOutput, groups: Sequence[ListGroup]) -> _Types:
+        return cls(
+            frames={g.group: g for g in frame.groups},
+            groups={g.gid: g for g in groups},
+            keys={e.key: e.type for e in frame.frame_entities},
+        )
+
+    def end(self, end: str, gid: str) -> str | None:
+        """The type at `end` in group `gid`'s templates, or None when it is not known."""
+        if end in _ROLE_TYPES:
+            return _ROLE_TYPES[end]
+        if end == _ITEM:
+            return self.frames[gid].item_type
+        if end == "parent":
+            parent = self.groups[gid].parent
+            return None if parent is None else self.frames[parent[0]].item_type
+        return self.keys.get(end)
+
+
+def _check_template(template: Template, at: str, gid: str, types: _Types) -> None:
+    """Refuse a template whose predicate does not admit the known type at each end.
+
+    An undirected predicate passes in either orientation, as the validator accepts it.
+    """
+    predicate = template.predicate
+    sources, targets = RELATIONSHIP_CONSTRAINTS[predicate]
+    subject, object_ = types.end(template.subject, gid), types.end(template.object, gid)
+    if _undirected(predicate):
+        forward = _admits(sources, subject) and _admits(targets, object_)
+        if forward or (_admits(sources, object_) and _admits(targets, subject)):
+            return
+        raise ListOutputError(
+            f"{at} ({gid}): {predicate} does not admit {subject} at subject "
+            f"({template.subject}) with {object_} at object ({template.object}) in either "
+            f"orientation; it admits {_names(sources)} with {_names(targets)}"
+        )
+    for side, end, etype, allowed in (
+        ("subject", template.subject, subject, sources),
+        ("object", template.object, object_, targets),
+    ):
+        if not _admits(allowed, etype):
+            raise ListOutputError(
+                f"{at} ({gid}): {predicate} does not admit {etype} at {side} ({end}); "
+                f"it admits {_names(allowed)}"
+            )
+
+
+def _admitted(predicate: str, side: str, other: str | None) -> frozenset[str]:
+    """The extractable types `predicate` admits at `side`, given the other end's type.
+
+    For an undirected predicate it is the union over the orientations the other end's
+    type allows, so WORKS_WITH, whose target set is Technology alone, does not narrow
+    an item at its object to Technology when the other end could take the target role.
+    """
+    sources, targets = RELATIONSHIP_CONSTRAINTS[predicate]
+    own, opposite = (sources, targets) if side == "subject" else (targets, sources)
+    sets = [own] if _admits(opposite, other) else []
+    if _undirected(predicate) and _admits(own, other):
+        sets.append(opposite)
+    admitted: set[str] = set()
+    for allowed in sets:
+        admitted |= _EXTRACTABLE if allowed is None else set(allowed) & _EXTRACTABLE
+    return frozenset(admitted)
+
+
+_Source = tuple[str, frozenset[str]]
+
+
+def _slots(
+    frame: FrameOutput, groups: Sequence[ListGroup], items: Sequence[str], types: _Types
+) -> list[tuple[ItemSlot, tuple[_Source, ...]]]:
+    """Each item's slot, with the named type sets it was computed from."""
+    place = {item: (g, unit) for g in groups for item, unit in zip(g.item_ids, g.items)}
+    named = {
+        end[len(_ITEM_REF) :]
+        for relationship in frame.facts.relationships
+        for end in (relationship.source, relationship.target)
+        if end.startswith(_ITEM_REF)
+    }
+    parents: dict[str, list[_Source]] = {}
+    for group in groups:
+        if group.parent is None:
+            continue
+        for template in types.frames[group.gid].templates:
+            for side, end, other in _sides(template):
+                if end == "parent":
+                    admitted = _admitted(template.predicate, side, types.end(other, group.gid))
+                    where = f"{template.predicate} of {group.gid} at parent"
+                    parents.setdefault(group.parent[1], []).append((where, admitted))
+
+    slots = []
+    for item in items:
+        group, unit = place[item]
+        group_frame = types.frames[group.gid]
+        unchecked = unit.text.startswith(_UNCHECKED)
+        applying: frozenset[str] | None = None
+        sources: list[_Source] = []
+        item_sets = [
+            _admitted(template.predicate, side, types.end(other, group.gid))
+            for template in group_frame.templates
+            for side, end, other in _sides(template)
+            if end == _ITEM
+        ]
+        if item_sets and not unchecked:
+            applying = frozenset.intersection(*item_sets)
+            sources.append((f"the templates of {group.gid}", applying))
+        limits: list[_Source] = []
+        if unchecked and group_frame.unchecked == "goal":
+            limits.append(("an unchecked goal box", _admitted("HAS_GOAL", "object", "User")))
+        limits += parents.get(item, [])
+        required_types = frozenset.intersection(*(s for _, s in limits)) if limits else None
+        if required_types == _EXTRACTABLE:
+            required_types = None
+        slot = ItemSlot(
+            item=item,
+            nested=group.parent is not None,
+            applying_types=None if applying is None else _ordered_types(applying),
+            required=bool(limits) or item in named,
+            required_types=None if required_types is None else _ordered_types(required_types),
+        )
+        slots.append((slot, tuple(sources + limits)))
+    return slots
+
+
+def _check_slot(slot: ItemSlot, sources: Sequence[_Source]) -> None:
+    """Refuse a frame that leaves an item no type its entity could take."""
+    applying, required = slot.applying_types, slot.required_types
+    meets = applying != () and required != ()
+    if meets and applying is not None and required is not None:
+        meets = bool(set(applying) & set(required))
+    if not meets:
+        sets = "; ".join(f"{what}: {_names(admitted)}" for what, admitted in sources)
+        raise ListOutputError(f"item {slot.item}: no type meets every set its slot needs: {sets}")
+
+
+def item_slots(
+    frame: FrameOutput, groups: Sequence[ListGroup], items: Sequence[str]
+) -> tuple[ItemSlot, ...]:
+    """What each item's own entity must be, from the parsed frame.
+
+    `applying_types` is the intersection of the types each template of the item's group
+    admits at `item`, unless the item is an unchecked box, which templates never apply
+    to. `required` holds for an unchecked goal box (HAS_GOAL's target types), the parent
+    item of a group whose template names `parent` (the types those templates admit
+    there), and an item a frame fact names (no type limit); `required_types` is the
+    intersection over the sources that limit the type, or None.
+
+    Args:
+        frame: The turn's parsed frame output.
+        groups: The turn's groups.
+        items: The item ids to compute slots for, in order.
+    """
+    return tuple(slot for slot, _ in _slots(frame, groups, items, _Types.of(frame, groups)))
+
+
 def parse_frame_output(text: str, groups: Sequence[ListGroup]) -> FrameOutput:
     """Parse a frame call's output, its groups in the turn's order, every end resolved.
 
@@ -575,15 +786,25 @@ def parse_frame_output(text: str, groups: Sequence[ListGroup]) -> FrameOutput:
     by_gid = {group.gid: group for group in groups}
     expected = [group.gid for group in groups]
     found: dict[str, GroupFrame] = {}
+    where: dict[str, str] = {}
     for n, value in enumerate(record["groups"]):
         group = _group_frame(value, f"groups[{n}]", frame_keys, by_gid)
         _claim(found, group.group, group, set(expected), "group")
+        where[group.group] = f"groups[{n}]"
     items = frozenset(_ITEM_REF + item for group in groups for item in group.item_ids)
-    return FrameOutput(
+    frame = FrameOutput(
         tuple(frame_entities),
         tuple(_ordered(found, expected, "group")),
         _facts(record["facts"], "facts", frame_keys, items),
     )
+    types = _Types.of(frame, groups)
+    for group_frame in frame.groups:
+        for n, template in enumerate(group_frame.templates):
+            at = f"{where[group_frame.group]}.templates[{n}]"
+            _check_template(template, at, group_frame.group, types)
+    for slot, sources in _slots(frame, groups, [i for g in groups for i in g.item_ids], types):
+        _check_slot(slot, sources)
+    return frame
 
 
 def _item_output(value: object, where: str) -> ItemOutput:
@@ -678,6 +899,32 @@ def _edge_end(end: str, at: str, output: ItemOutput, turn: _Turn) -> None:
     )
 
 
+def _check_entity(output: ItemOutput, slot: ItemSlot, at: str) -> None:
+    """Refuse an own entity the item's slot requires and misses, or of a type it does not admit."""
+    applying = slot.applying_types is not None and output.template.applies
+    if output.entity is None:
+        if applying:
+            reason = "applies is true and a template of its group names item"
+        elif slot.required:
+            reason = (
+                "it is an unchecked goal box, a parent a template names, or an item a fact names"
+            )
+        else:
+            return
+        raise ListOutputError(
+            f"{at}.entity: the slot requires an entity, because {reason}; give the item's entity"
+        )
+    allowed = slot.required_types
+    if applying and slot.applying_types is not None:
+        allowed = tuple(t for t in slot.applying_types if allowed is None or t in allowed)
+    if allowed is not None and output.entity.type not in allowed:
+        tail = ", or applies false" if applying else ""
+        raise ListOutputError(
+            f"{at}.entity.type: {output.entity.type} is not admitted here; give one of "
+            f"{', '.join(allowed)}{tail}"
+        )
+
+
 def parse_item_output(
     text: str,
     expected: Sequence[str],
@@ -701,9 +948,11 @@ def parse_item_output(
 
     Raises:
         ListOutputError: The output is not a JSON object of the ITEMS shape; its item
-            ids differ from `expected`; an own key is outside `e1` to `e20`; or an
-            edge end does not resolve.
+            ids differ from `expected`; an own key is outside `e1` to `e20`; an own
+            entity its slot (`item_slots`) requires is missing or of a type it does not
+            admit; or an edge end does not resolve.
     """
+    slots = {slot.item: slot for slot in item_slots(frame, groups, expected)}
     record = _record(_load(text), "items", {"items": _list})
     found: dict[str, ItemOutput] = {}
     at: dict[str, str] = {}
@@ -718,6 +967,7 @@ def parse_item_output(
         known={**earlier, **found},
     )
     for output in outputs:
+        _check_entity(output, slots[output.item], at[output.item])
         for n, relationship in enumerate(output.relationships):
             for side in ("source", "target"):
                 where = f"{at[output.item]}.relationships[{n}].{side}"
