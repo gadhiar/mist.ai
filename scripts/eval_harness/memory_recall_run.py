@@ -12,23 +12,38 @@ same indexes, and the fetcher filters each fact's versions against that `now`.
 
 Each record carries, beside the scorer's keys (`probe_id`, `items`, `tokens`,
 `budget_tokens`): the fetch's timings in milliseconds, with `total_ms` as `critical_path_ms`;
-the pairs reranked; the degraded reason; and `delta_tokens_est`. With no conversation history,
-the turn's uncached delta is the user's new message carrying the block, so the estimate is the
-block's tokens plus the query's, both by the planner's counter. A fact list item is written as
-one item per fact, all under the list's ref, so the scorer sees every sibling the block named.
-Each item carries the fetcher's own rank for it, which the scorer's MRR reads.
+the pairs reranked; `shortlisted`, the size of the scored shortlist, so a short shortlist can
+be told from a rerank cut; the degraded reason; and `delta_tokens_est`. With no conversation
+history, the turn's uncached delta is the user's new message carrying the block, so the
+estimate is the block's tokens plus the query's, both by the planner's counter. A fact list
+item is written as one item per fact, all under the list's ref, so the scorer sees every
+sibling the block named. Each item carries the fetcher's own rank for it, which the scorer's
+MRR reads.
 
 Models are either fakes, deterministic and weight-free (the floors test uses them), or the real
 ones, loaded only from `/opt/models` (Design point 17): the embedder from
-`/opt/models/all-MiniLM-L6-v2` and the cross-encoder from `MemoryConfig.rerank_model`.
+`/opt/models/all-MiniLM-L6-v2` and the cross-encoder from `MemoryConfig.rerank_model`, which
+`--rerank-model` overrides. `--threads N` sets torch's intra-op thread count before any model
+loads; without it torch keeps its default.
 
 `--cpu-load-procs N` runs N busy-loop processes for the whole run, to measure the critical path
 with the CPU contended the way a speaking turn contends it.
 
-Usage:
-    python scripts/eval_harness/memory_recall_run.py --output run.jsonl
+`--placement` builds the block for `user_prefix` (the default) or `system_tail`; it changes
+only the wording of the user's past words inside the block (block.py, `BlockPlacement`).
+
+`--rescan-facts N` runs forced full rescans of the fact index for the whole run, the way
+`FactIndexRefresher` runs `diff_apply` on the `memory-index` executor, so the fetches meet the
+contention of a refresh. Each rescan applies the latest snapshot plus N synthetic facts at a
+new revision, so it re-embeds N facts with the run's embedder. `--rescan-log FILE` records
+each cycle.
+
+Usage, from the repository root (`/app` in the image), so `backend` imports:
+    python -m scripts.eval_harness.memory_recall_run --output run.jsonl
         [--embedder fake|real] [--reranker fake|real] [--device cpu|cuda]
-        [--cpu-load-procs N] [--block-tokens N] [--min-score X] [--rerank-top-n N]
+        [--rerank-model PATH] [--threads N] [--placement user_prefix|system_tail]
+        [--cpu-load-procs N] [--rescan-facts N --rescan-log FILE]
+        [--block-tokens N] [--min-score X] [--rerank-top-n N]
         [--list-max-items N] [--deadline-ms N] [--fixture-dir DIR]
 """
 
@@ -43,20 +58,24 @@ import math
 import multiprocessing
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, replace
+from concurrent.futures import CancelledError, Executor
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Protocol
 
+import torch
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from backend.chat.context_budget import ApproximateTokenCounter
+from backend.errors import MistError
 from backend.knowledge.config import SidecarIndexConfig
-from backend.memory.block import MemoryBlockBuilder, PlacedList
+from backend.memory.block import BlockPlacement, MemoryBlockBuilder, PlacedList
 from backend.memory.config import MemoryConfig
-from backend.memory.fact_index import FactIndex
+from backend.memory.fact_index import DiffReport, FactIndex
 from backend.memory.fetcher import (
     INDEX_EXECUTOR,
     MODEL_EXECUTOR,
@@ -311,6 +330,156 @@ def notes_known_at(notes: Sequence[VaultNote], now: datetime) -> dict[str, NoteF
     return files
 
 
+# -- forced rescans --------------------------------------------------------------------------
+
+
+def synthetic_facts(template: FactRow, count: int, revision: int) -> list[FactRow]:
+    """`count` facts cloned from `template`, each its own fact with its own subject.
+
+    `revision` is part of each object name, so a snapshot at a new revision changes the text,
+    and so the hash, of every one of them: `diff_apply` re-embeds all `count`. Distinct
+    subjects and utterances keep them out of each other's sibling lists.
+    """
+    return [
+        replace(
+            template,
+            row_key=f"rescan-{n:04d}",
+            fact_key=f"rescan-{n:04d}",
+            subject_id=f"rescan-subject-{n:04d}",
+            subject_name=f"Rescan Subject {n:04d}",
+            object_id=f"rescan-object-{n:04d}",
+            object_name=f"rescan object {n:04d} revision {revision}",
+            valid_to=None,
+            source_utterance_id=f"rescan-utt-{n:04d}",
+        )
+        for n in range(count)
+    ]
+
+
+class ForcedRescan:
+    """Forced full rescans of the fact index, back to back, for the whole run.
+
+    `FactIndexRefresher` runs a full rescan as one `diff_apply` on the `memory-index`
+    executor (fact_source.py, `FactIndexRefresher.refresh`); so does each cycle here, on the run's own executor,
+    so the fetcher's index reads queue beside it as they would beside a refresh. A cycle
+    applies the latest snapshot the run applied plus `count` synthetic facts at the next
+    revision, which re-embeds `count` facts with the run's embedder. The run's own applies
+    carry the synthetic facts at the revision last applied, so they never delete or re-embed
+    them. One lock serializes the run's applies and the cycles, so a cycle never writes a
+    snapshot older than the run's.
+
+    The cycles start once the run has applied its first snapshot. The first cycle runs even
+    when the run stops before it starts, so a log always shows the cost of one rescan; each
+    cycle records when it began, relative to `start`, and how long it took.
+
+    Args:
+        count: Synthetic facts each cycle re-embeds.
+        template: The fact row the synthetic facts are cloned from.
+        clock: Monotonic seconds, for the cycle times.
+
+    Raises:
+        ValueError: `count` is not positive.
+    """
+
+    def __init__(
+        self, count: int, template: FactRow, *, clock: Callable[[], float] = time.monotonic
+    ) -> None:
+        if count <= 0:
+            raise ValueError(f"rescan facts must be positive, got {count}")
+        self.count = count
+        self._template = template
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._stop = threading.Event()
+        self._index: FactIndex | None = None
+        self._executor: Executor | None = None
+        self._thread: threading.Thread | None = None
+        self._latest: list[FactRow] | None = None
+        self._revision = 0
+        self._started = 0.0
+        self._stopped: float | None = None
+        self.cycles: list[dict[str, object]] = []
+
+    def start(self, index: FactIndex, executor: Executor) -> None:
+        """Start the rescan thread; its first cycle waits for the run's first `apply`."""
+        self._index = index
+        self._executor = executor
+        self._started = self._clock()
+        self._thread = threading.Thread(target=self._loop, name="memory-forced-rescan", daemon=True)
+        self._thread.start()
+
+    def apply(self, snapshot: Sequence[FactRow]) -> DiffReport:
+        """The run's own apply: `snapshot` with the synthetic facts at the revision applied."""
+        if self._index is None:
+            raise RuntimeError("ForcedRescan.apply before start")
+        rows = list(snapshot)
+        with self._lock:
+            self._latest = rows
+            report = self._index.diff_apply(
+                rows + synthetic_facts(self._template, self.count, self._revision)
+            )
+        self._ready.set()
+        return report
+
+    def stop(self) -> None:
+        """Let the cycle in flight finish, then stop; the run calls it before its executors stop."""
+        self._stop.set()
+        self._ready.set()
+        if self._thread is not None:
+            self._thread.join()
+        self._stopped = self._clock()
+
+    def log(self) -> dict[str, object]:
+        """The rescan log: every cycle and how many completed."""
+        end = self._stopped if self._stopped is not None else self._clock()
+        return {
+            "rescan_facts": self.count,
+            "run_seconds": round(end - self._started, 3),
+            "cycles_completed": sum(1 for cycle in self.cycles if "error" not in cycle),
+            "cycles": list(self.cycles),
+        }
+
+    def _cycle(self, revision: int) -> DiffReport:
+        if self._index is None or self._latest is None:
+            raise RuntimeError("ForcedRescan cycle before the run's first apply")
+        with self._lock:
+            report = self._index.diff_apply(
+                self._latest + synthetic_facts(self._template, self.count, revision)
+            )
+            self._revision = revision
+            return report
+
+    def _loop(self) -> None:
+        self._ready.wait()
+        if self._latest is None or self._executor is None:
+            return  # stopped before the run applied anything
+        while True:
+            revision = self._revision + 1
+            began = self._clock()
+            cycle: dict[str, object] = {
+                "version": revision,
+                "began_s": round(began - self._started, 3),
+            }
+            try:
+                report = self._executor.submit(self._cycle, revision).result()
+            except (MistError, ValueError, RuntimeError, OSError, CancelledError) as exc:
+                # Recorded rather than raised, so the log shows why the rescans stopped.
+                cycle["error"] = f"{type(exc).__name__}: {exc}"
+                self.cycles.append(cycle)
+                return
+            cycle["seconds"] = round(self._clock() - began, 3)
+            cycle["report"] = asdict(report)
+            self.cycles.append(cycle)
+            if self._stop.is_set():
+                return
+
+
+def rescan_template(fixture: Fixture) -> FactRow:
+    """The earliest recorded fixture fact, so its clones are known at every probe's `now`."""
+    return fact_row(min(fixture.facts, key=lambda fact: fact.recorded_at))
+
+
 # -- the run ---------------------------------------------------------------------------------
 
 
@@ -393,6 +562,8 @@ def run_record(
             "queue_wait": round(timings.queue_wait_ms, 3),
         },
         "reranked": result.reranked,
+        # The stage records one candidate per scored shortlist entry, capped, and counts the rest.
+        "shortlisted": len(result.stage.candidates) + result.stage.truncated,
         "degraded_reason": result.degraded_reason,
         "delta_tokens_est": counter.count(result.block_text or "") + counter.count(probe.query),
         "cpu_load_procs": cpu_load_procs,
@@ -428,8 +599,15 @@ async def run_fixture(
     workdir: Path,
     probes: Sequence[Probe] | None = None,
     cpu_load_procs: int = 0,
+    placement: BlockPlacement = "user_prefix",
+    rescan: ForcedRescan | None = None,
 ) -> list[dict[str, object]]:
     """Run each probe through a real fetcher over indexes built in `workdir`.
+
+    Args:
+        placement: The placement the block builder words the block for.
+        rescan: Forced rescans to run on the run's `memory-index` executor for the whole
+            run; started here and stopped before the executors shut down.
 
     Returns:
         One record per probe, in the order of `probes` (all the fixture's by default).
@@ -451,9 +629,7 @@ async def run_fixture(
             index=index,
             embedder=embedder,
             reranker=reranker,
-            block_builder=MemoryBlockBuilder(
-                counter=counter, config=config, placement="user_prefix"
-            ),
+            block_builder=MemoryBlockBuilder(counter=counter, config=config, placement=placement),
             config=config,
             executors=FetcherExecutors(
                 index=executors[INDEX_EXECUTOR], model=executors[MODEL_EXECUTOR]
@@ -462,10 +638,14 @@ async def run_fixture(
             index_state=probe_state,
             notes=VaultCandidates(sidecar, vault_root=str(workdir / "vault"), tz=config.tz),
         )
+        apply = index.diff_apply
+        if rescan is not None:
+            rescan.start(index, executors[INDEX_EXECUTOR])
+            apply = rescan.apply
         records: dict[str, dict[str, object]] = {}
         indexed_notes: set[str] = set()
         for now in sorted({probe.now for probe in chosen}):
-            index.diff_apply(facts_known_at(fixture.facts, fixture.corrections, now))
+            apply(facts_known_at(fixture.facts, fixture.corrections, now))
             for path, note in notes_known_at(fixture.notes, now).items():
                 if path not in indexed_notes:
                     sidecar.upsert_file(path, note.content, note.mtime, note.frontmatter)
@@ -491,6 +671,8 @@ async def run_fixture(
                 )
         return [records[probe.probe_id] for probe in chosen]
     finally:
+        if rescan is not None:
+            rescan.stop()
         for executor in executors.values():
             executor.shutdown(wait=True, cancel_futures=True)
         sidecar.close()
@@ -580,14 +762,28 @@ def cpu_load(
 
 
 def config_from_args(args: argparse.Namespace) -> MemoryConfig:
-    """MemoryConfig from the environment, with each threshold the command line sets."""
+    """MemoryConfig from the environment, with each value the command line sets.
+
+    Raises:
+        ValueError: `--rerank-model` is not under `/opt/models`; refused even with the fake
+            reranker, so a run never records a model path it could not have loaded.
+    """
     config = MemoryConfig.from_env()
     overrides: dict[str, object] = {}
     for name in ("block_tokens", "min_score", "rerank_top_n", "list_max_items", "deadline_ms"):
         value = getattr(args, name)
         if value is not None:
             overrides[name] = value
+    if args.rerank_model is not None:
+        overrides["rerank_model"] = _model_path(args.rerank_model)
     return replace(config, **overrides) if overrides else config
+
+
+def _positive_int(text: str) -> int:
+    value = int(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {text}")
+    return value
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -596,7 +792,22 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--embedder", choices=("fake", "real"), default="fake")
     parser.add_argument("--reranker", choices=("fake", "real"), default="fake")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument(
+        "--rerank-model", help="cross-encoder directory under /opt/models; overrides the config"
+    )
+    parser.add_argument(
+        "--threads", type=_positive_int, help="torch intra-op threads, set before models load"
+    )
+    parser.add_argument(
+        "--placement", choices=("user_prefix", "system_tail"), default="user_prefix"
+    )
     parser.add_argument("--cpu-load-procs", type=int, default=0, help="busy-loop processes")
+    parser.add_argument(
+        "--rescan-facts",
+        type=_positive_int,
+        help="forced full rescans for the whole run, each re-embedding N synthetic facts",
+    )
+    parser.add_argument("--rescan-log", type=Path, help="rescan log to write (JSON)")
     parser.add_argument("--block-tokens", type=int)
     parser.add_argument("--min-score", type=float)
     parser.add_argument("--rerank-top-n", type=int)
@@ -608,9 +819,19 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the fixture and write the run file; print the scorer's overall metrics."""
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.rescan_facts is not None and args.rescan_log is None:
+        parser.error("--rescan-facts needs --rescan-log, the record that the rescans ran")
+    if args.threads is not None:
+        torch.set_num_threads(args.threads)
     config = config_from_args(args)
     fixture = Fixture.load(args.fixture_dir)
+    rescan = (
+        ForcedRescan(args.rescan_facts, rescan_template(fixture))
+        if args.rescan_facts is not None
+        else None
+    )
     with cpu_load(args.cpu_load_procs):
         embedder = build_embedder(args.embedder, device=args.device)
         reranker = build_reranker(args.reranker, device=args.device, config=config)
@@ -623,12 +844,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     reranker=reranker,
                     workdir=Path(workdir),
                     cpu_load_procs=args.cpu_load_procs,
+                    placement=args.placement,
+                    rescan=rescan,
                 )
             )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as handle:
         for record in records:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
+    if rescan is not None:
+        args.rescan_log.parent.mkdir(parents=True, exist_ok=True)
+        args.rescan_log.write_text(json.dumps(rescan.log(), indent=2) + "\n", encoding="utf-8")
     report = score_run(fixture.probes, [parse_run_record(record) for record in records])
     print(json.dumps(report.overall.to_json(), indent=2, sort_keys=True))
     print(f"wrote {len(records)} records to {args.output}", file=sys.stderr)
@@ -642,6 +868,7 @@ if __name__ == "__main__":
 __all__ = [
     "EMBEDDER_PATH",
     "Fixture",
+    "ForcedRescan",
     "NoteFile",
     "SentenceTransformerEmbedder",
     "TokenEmbedder",
@@ -654,8 +881,10 @@ __all__ = [
     "facts_known_at",
     "main",
     "notes_known_at",
+    "rescan_template",
     "run_fixture",
     "run_items",
     "run_record",
     "spin",
+    "synthetic_facts",
 ]

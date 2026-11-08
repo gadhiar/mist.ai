@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -124,3 +125,19 @@ def test_real_models_load_from_opt_models_only() -> None:
     assert harness._model_path("/opt/models/ms-marco-MiniLM-L-6-v2") == (
         "/opt/models/ms-marco-MiniLM-L-6-v2"
     )
+
+
+def test_rerank_model_overrides_the_configured_cross_encoder() -> None:
+    args = harness._parser().parse_args(
+        ["--output", "run.jsonl", "--rerank-model", "/opt/models/bge-reranker-base"]
+    )
+
+    assert harness.config_from_args(args).rerank_model == "/opt/models/bge-reranker-base"
+
+
+def test_a_rerank_model_outside_opt_models_is_refused(tmp_path: Path) -> None:
+    output = tmp_path / "run.jsonl"
+
+    with pytest.raises(ValueError, match="/opt/models"):
+        harness.main(["--output", str(output), "--rerank-model", "/home/user/ms-marco"])
+    assert not output.exists()
